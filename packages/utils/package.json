@@ -1,0 +1,25 @@
+{
+  "name": "einfach-utils",
+  "version": "0.0.1",
+  "main": "es/index.js",
+  "typings": "@types/index.d.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "allroad88888888@vip.qq.com",
+  "files": [
+    "es",
+    "@types"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "@types/node": "^20.11.30",
+    "@types/react": "18.2.69"
+  },
+  "dependencies": {
+    "react": "^18.2.0"
+  }
+}
