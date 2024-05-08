@@ -1,0 +1,30 @@
+{
+  "name": "einfach-state",
+  "version": "0.0.2",
+  "description": "react易上手状态管理",
+  "main": "es/index.js",
+  "typings": "@types/index.d.ts",
+  "type": "module",
+  "license": "MIT",
+  "author": "allroad88888888@vip.qq.com",
+  "files": [
+    "es",
+    "@types"
+  ],
+  "scripts": {
+    "build": "tsc -build"
+  },
+  "keywords": [
+    "react",
+    "atom"
+  ],
+  "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "@types/node": "^20.11.30",
+    "@types/react": "18.2.69"
+  },
+  "dependencies": {
+    "einfach-utils": "workspace:*",
+    "react": "^18.2.0"
+  }
+}
