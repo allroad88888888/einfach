@@ -10,11 +10,11 @@ describe('store', () => {
       return state1.a
     })
     const store = createStore()
-    let a = store.get(atom2)
+    let a = store.getter(atom2)
     store.sub(atom2, () => {
-      a = store.get(atom2)
+      a = store.getter(atom2)
     })
-    store.set(atom1, {
+    store.setter(atom1, {
       a: { b: 1 },
     })
     expect(a.b === 1).toBe(true)

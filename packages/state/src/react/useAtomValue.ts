@@ -8,7 +8,7 @@ type ReducerState<State extends InterState = InterState> = [State, Store, AtomEn
 function valueReducer<State extends InterState = InterState>(
   prev: ReducerState<State>): ReducerState<State> {
   const [state, store, atomEntity] = prev
-  const nextValue = (store as Store).get(atomEntity)
+  const nextValue = (store as Store).getter(atomEntity)
   if (Object.is(state, nextValue)) {
     return prev
   }
@@ -20,9 +20,9 @@ export function useAtomValueByReducer<State extends InterState = InterState>(
   const pStore = useStore()
   const realStore = store || pStore
   const [[state], rerender] = useReducer
-  <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
+    <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
     (valueReducer, undefined, function () {
-      return [realStore.get(atom), realStore, atom] as ReducerState<State>
+      return [realStore.getter(atom), realStore, atom] as ReducerState<State>
     })
   useEffect(() => {
     return realStore.sub(atom, rerender)
@@ -37,12 +37,12 @@ export function useAtomValue<State extends InterState = InterState>(
   const realStore = store || pStore
 
   const [state, setState] = useState(() => {
-    return realStore.get(atom)
+    return realStore.getter(atom)
   })
 
   useEffect(() => {
     return realStore.sub(atom, () => {
-      setState(realStore.get(atom))
+      setState(realStore.getter(atom))
     })
   }, [realStore, atom])
 

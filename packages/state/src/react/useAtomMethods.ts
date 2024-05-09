@@ -34,7 +34,7 @@ export const useAtomMethods = <
 
     Object.keys(methods).forEach((key) => {
       func[key] = (...args: any[]) =>
-        methods[key].call(current.refMethods, store.get, store.set, ...args)
+        methods[key].call(current.refMethods, store.getter, store.setter, ...args)
     })
     current.methods = func
   }

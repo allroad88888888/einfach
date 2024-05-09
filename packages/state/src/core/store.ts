@@ -68,6 +68,6 @@ export function createStore(): Store {
   }
   const key = `store${++keyCount}`
   return {
-    sub: subscribeAtom, get: readAtom, set: setAtom, toString: () => key,
+    sub: subscribeAtom, getter: readAtom, setter: setAtom, toString: () => key,
   }
 }
