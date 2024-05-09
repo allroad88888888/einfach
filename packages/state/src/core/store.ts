@@ -41,9 +41,15 @@ export function createStore(): Store {
 
     atomStateMap.set(atomEntity, state)
     publishAtom(atomEntity)
-    backDependenciesMap.get(atomEntity)?.forEach((backEntity) => {
-      publishAtom(backEntity)
-    })
+    function iteratorPush(backAtomEntity: AtomEntity) {
+      backDependenciesMap.get(backAtomEntity)?.forEach((backEntity) => {
+        publishAtom(backEntity)
+      })
+      backDependenciesMap.get(backAtomEntity)?.forEach((backEntity) => {
+        iteratorPush(backEntity)
+      })
+    }
+    iteratorPush(atomEntity)
   }
 
   function publishAtom<State extends InterState = InterState>(atomEntity: AtomEntity<State>) {

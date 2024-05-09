@@ -24,6 +24,7 @@ export function atom<State extends InterState = InterState>(
   if (write) {
     entity.write = write
   }
+  entity.debugLabel = key
 
   return entity
 }

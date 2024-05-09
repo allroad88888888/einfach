@@ -9,14 +9,27 @@ describe('store', () => {
       const state1 = get(atom1)
       return state1.a
     })
+
+    const atom3 = atom((get) => {
+      const state2 = get(atom2)
+      return state2.b + 123
+    })
+
     const store = createStore()
-    let a = store.getter(atom2)
+    let state2 = store.getter(atom2)
+    let state3 = store.getter(atom3)
+
     store.sub(atom2, () => {
-      a = store.getter(atom2)
+      state2 = store.getter(atom2)
+    })
+
+    store.sub(atom3, () => {
+      state3 = store.getter(atom3)
     })
     store.setter(atom1, {
       a: { b: 1 },
     })
-    expect(a.b === 1).toBe(true)
+    expect(state2.b === 1).toBe(true)
+    expect(state3 === 124).toBe(true)
   })
 })
