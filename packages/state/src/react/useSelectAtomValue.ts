@@ -1,19 +1,22 @@
 import { atom, type AtomEntity } from '../core'
 import { useAtomValue } from './useAtomValue'
 import type { HookOption } from './type'
-import { useInit } from 'einfach-utils'
+import { NamePath, easyGet, useInit } from 'einfach-utils'
 
 export function selectAtom<T, State>(atomEntity: AtomEntity<State>,
-  selectFn: ((prev: State) => T)) {
+  selectFn: ((prev: State) => T) | NamePath) {
   return atom((get) => {
     const info = get(atomEntity)
-    return selectFn(info)
+    if (typeof selectFn === 'function') {
+      return selectFn(info)
+    }
+    return easyGet(info, selectFn)
   })
 }
 
 export function useSelectAtomValue<T, State>(
   atomEntity: AtomEntity<State>,
-  selectFn: ((prev: State) => T), option: HookOption = {}) {
+  selectFn: ((prev: State) => T) | NamePath, option: HookOption = {}) {
   const selectAtomEntity = useInit(() => {
     return selectAtom(atomEntity, selectFn)
   }, [atomEntity, selectFn])

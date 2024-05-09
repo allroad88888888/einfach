@@ -1,6 +1,6 @@
 {
   "name": "einfach-state",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "react易上手状态管理",
   "main": "es/index.js",
   "typings": "@types/index.d.ts",
