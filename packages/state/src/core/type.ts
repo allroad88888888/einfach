@@ -7,11 +7,9 @@ export interface Getter {
 }
 
 export interface Read<State extends InterState = InterState> {
-  // (get: <T>(entity: AtomEntity<T>) => T): State
   (getter: Getter): State
 }
 export interface Write {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (getter: Getter, setter: Setter, ...arg: any[]): void
 }
 
@@ -30,12 +28,5 @@ export interface Store {
   setter: <State extends InterState = InterState>(atomEntity: AtomEntity<State>, state: State) => void
   toString: () => string
 }
-
-// export type InterState = string | number | boolean |
-//   null | { [key in string]: InterState } | InterState[] | undefined
-
-// type AnyJson = boolean | number | string | null | JsonArray | JsonMap | undefined
-// interface JsonMap { [key: string]: AnyJson }
-// interface JsonArray extends Array<AnyJson> {}
 
 export type InterState = unknown
