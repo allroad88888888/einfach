@@ -13,9 +13,10 @@ export function atom<State extends InterState = InterState>(
     entity.read = read as Read<State>
   }
   else {
-    entity.init = read
+    // entity.init = read
     entity.read = function (get: Getter) {
-      return get(entity)
+      // return get(entity)
+      return read
     }
     entity.write = function (get: Getter, set: Setter, arg) {
       return set(entity, typeof arg === 'function' ? arg(get(this)) : arg)

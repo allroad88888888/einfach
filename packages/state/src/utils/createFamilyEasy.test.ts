@@ -5,7 +5,7 @@ import { createAtomFamily } from './createFamilyEasy'
 
 test('createFamilyEasy ', () => {
   // const store = createStore()
-  const getAtomById = createAtomFamily({
+  const getAtomById = createAtomFamily<string>({
     debuggerKey: 'atom-options',
   })
 

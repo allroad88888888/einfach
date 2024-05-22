@@ -14,7 +14,7 @@ export interface Write {
 }
 
 export interface AtomEntity<State extends InterState = InterState> {
-  init?: State
+  // init?: State
   read: Read<State>
   write: Write
   toString: () => string

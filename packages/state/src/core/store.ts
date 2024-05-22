@@ -9,19 +9,14 @@ export function createStore(): Store {
   const backDependenciesMap = new WeakMap<AtomEntity<any>, Set<AtomEntity<any>>>()
 
   function readAtom<State extends InterState = InterState>(atomEntity: AtomEntity<State>): State {
-    const atomState = atomStateMap.get(atomEntity) as State
-    if (atomState) {
-      return atomState
+    if (atomStateMap.has(atomEntity)) {
+      return atomStateMap.get(atomEntity) as State
     }
-    if (Object.prototype.hasOwnProperty.call(atomEntity, 'init')) {
-      return atomEntity.init!
-    }
-
     function getter<T extends InterState = InterState>(atom: AtomEntity<T>) {
       if (!backDependenciesMap.has(atom)) {
         backDependenciesMap.set(atom, new Set())
       }
-      (backDependenciesMap.get(atom)!).add(atomEntity)
+      backDependenciesMap.get(atom)!.add(atomEntity)
 
       return readAtom(atom)
     }
@@ -42,10 +37,12 @@ export function createStore(): Store {
     atomStateMap.set(atomEntity, state)
     publishAtom(atomEntity)
     function iteratorPush(backAtomEntity: AtomEntity) {
-      backDependenciesMap.get(backAtomEntity)?.forEach((backEntity) => {
+      const backEntitySet = backDependenciesMap.get(backAtomEntity)! || []
+      backEntitySet.forEach((backEntity) => {
         publishAtom(backEntity)
       })
-      backDependenciesMap.get(backAtomEntity)?.forEach((backEntity) => {
+
+      backEntitySet.forEach((backEntity) => {
         iteratorPush(backEntity)
       })
     }

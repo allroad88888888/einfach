@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from 'react'
+import { useLayoutEffect, useReducer, useState } from 'react'
 import type { AtomEntity, InterState, Store } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
@@ -24,7 +24,7 @@ export function useAtomValueByReducer<State extends InterState = InterState>(
     (valueReducer, undefined, function () {
       return [realStore.getter(atom), realStore, atom] as ReducerState<State>
     })
-  useEffect(() => {
+  useLayoutEffect(() => {
     return realStore.sub(atom, rerender)
   }, [realStore, atom])
 
@@ -33,14 +33,17 @@ export function useAtomValueByReducer<State extends InterState = InterState>(
 
 export function useAtomValue<State extends InterState = InterState>(
   atom: AtomEntity<State>, { store }: HookOption = {}) {
-  const pStore = useStore()
-  const realStore = store || pStore
+  const realStore = useStore({ store })
 
   const [state, setState] = useState(() => {
     return realStore.getter(atom)
   })
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // init useLayoutEffect有个过程 过程中值可能变了
+    if (realStore.getter(atom) !== state) {
+      setState(realStore.getter(atom))
+    }
     return realStore.sub(atom, () => {
       setState(realStore.getter(atom))
     })
