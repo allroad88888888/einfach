@@ -5,4 +5,4 @@ export * from './useStore'
 export * from './useAtomMethods'
 export * from './useSetAtom'
 export * from './useAtom'
-export * from "./useSelectAtomValue"
+export * from './useSelectAtomValue'

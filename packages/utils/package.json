@@ -1,11 +1,11 @@
 {
   "name": "einfach-utils",
-  "version": "0.0.1",
+  "version": "0.0.2-beta-01",
   "main": "es/index.js",
+  "module": "es/index.js",
   "typings": "@types/index.d.ts",
   "type": "module",
   "license": "MIT",
-  "author": "allroad88888888@vip.qq.com",
   "files": [
     "es",
     "@types"
@@ -17,9 +17,11 @@
   "devDependencies": {
     "@jest/globals": "^29.7.0",
     "@types/node": "^20.11.30",
-    "@types/react": "18.2.69"
+    "@types/react": "18.2.69",
+    "@types/react-dom": "^18.3.0"
   },
   "dependencies": {
-    "react": "^18.2.0"
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

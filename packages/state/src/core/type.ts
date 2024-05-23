@@ -25,7 +25,8 @@ export interface Store {
   sub: <State extends InterState = InterState>(atomEntity: AtomEntity<State>,
     listener: () => void) => () => void
   getter: <State extends InterState = InterState>(atomEntity: AtomEntity<State>) => State
-  setter: <State extends InterState = InterState>(atomEntity: AtomEntity<State>, state: State) => void
+  setter: <State extends InterState = InterState>
+  (atomEntity: AtomEntity<State>, state: State) => void
   toString: () => string
 }
 

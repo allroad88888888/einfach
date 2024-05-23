@@ -6,6 +6,7 @@
     "outDir": "es"
   },
   "include": ["src"],
+  "types": ["./jest.d.ts"],
   "exclude": ["node_modules"],
   "references": [
     { "path": "./../state/tsconfig.json" },

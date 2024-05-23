@@ -20,7 +20,7 @@ export function useAtomValueByReducer<State extends InterState = InterState>(
   const pStore = useStore()
   const realStore = store || pStore
   const [[state], rerender] = useReducer
-    <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
+  <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
     (valueReducer, undefined, function () {
       return [realStore.getter(atom), realStore, atom] as ReducerState<State>
     })
@@ -47,6 +47,7 @@ export function useAtomValue<State extends InterState = InterState>(
     return realStore.sub(atom, () => {
       setState(realStore.getter(atom))
     })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realStore, atom])
 
   return state

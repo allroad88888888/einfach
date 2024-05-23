@@ -1,3 +1,3 @@
 export type FormCoreState = {
-  value: any;
-};
+  value: any
+}

@@ -1,11 +1,12 @@
 import { test } from '@jest/globals'
-import { createAtomFamily } from './createFamilyEasy'
+import { createAtomFamilyStore } from './createFamilyEasy'
 
 // import { createStore } from '../core'
 
 test('createFamilyEasy ', () => {
-  // const store = createStore()
-  const getAtomById = createAtomFamily<string>({
+  // const store = createStore()\
+  const { createAtomFamily } = createAtomFamilyStore()
+  const getAtomById = createAtomFamily({
     debuggerKey: 'atom-options',
   })
 

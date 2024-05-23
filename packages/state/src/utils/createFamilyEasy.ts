@@ -1,15 +1,24 @@
-import type { InterState } from '../core'
 import { atom, type AtomEntity } from '../core'
 
-export interface CreateAtomFamilyOptions<Key extends (WeakKey | string) = WeakKey, State extends InterState = InterState,> {
+type IdObj = {
+  id: string
+}
+
+function createIdObj(id: string): IdObj {
+  const idObj = Object.create(null)
+  idObj.id = id
+  return idObj
+}
+
+export interface CreateAtomFamilyOptions<Key, State> {
   debuggerKey: string
   createAtom?: (key: Key, initState?: State) => AtomEntity<State>
 }
 
-export interface AtomFamilyAtom<State extends InterState = InterState> extends AtomEntity<State> {
+export interface AtomFamilyAtom<State> extends AtomEntity<State> {
   delete: () => void
 }
-export interface GetAtomById<Key extends (WeakKey | string) = WeakKey, State extends InterState = InterState> {
+export interface GetAtomById<Key, State> {
   <CurState extends State = State>(key: Key, initState?: State): AtomEntity<CurState>
   remove: (key: Key) => void
   clear: () => void
@@ -17,51 +26,77 @@ export interface GetAtomById<Key extends (WeakKey | string) = WeakKey, State ext
   has: (key: Key) => boolean
 }
 
-
-export function createAtomFamily<Key extends (WeakKey | string) = WeakKey, State extends InterState = InterState,>(
-  { debuggerKey, createAtom }: CreateAtomFamilyOptions<Key, State>) {
-
-  let atomMap: WeakMap<WeakKey, AtomEntity<State>>
-
-  function getAtomById<CurState extends State = State>(
-    key: Key, initState?: CurState) {
-    if (!atomMap) {
-      if (typeof key === 'string') {
-        atomMap = new Map<Key, AtomEntity<State>>() as WeakMap<WeakKey, AtomEntity<State>>
-      } else {
-        atomMap = new WeakMap()
-      }
+export function createAtomFamilyStore() {
+  const cacheIdObjMap = new Map<string, IdObj>()
+  function getIdObj(key: string) {
+    if (!cacheIdObjMap.has(key)) {
+      cacheIdObjMap.set(key, createIdObj(key))
     }
-    if (!atomMap.has(key as WeakKey)) {
-      let newAtom: AtomEntity<State>
-      if (createAtom) {
-        newAtom = createAtom(key, initState)
-      }
-      else {
-        newAtom = atom(initState) as AtomEntity<State>
-      }
-      atomMap.set(key as WeakKey, newAtom as AtomEntity<State>)
-      if (process.env.NODE_ENV !== 'production') {
-        newAtom.debugLabel = `${debuggerKey}||${(key)?.toString()}`
-      }
-    }
-    return atomMap.get(key as WeakKey)! as AtomEntity<CurState>
+    return cacheIdObjMap.get(key)!
   }
-  getAtomById.remove = (key: Key) => {
-    atomMap.delete(key as WeakKey)
-  }
-  getAtomById.clear = () => {
-    if ('clear' in atomMap) {
-      (atomMap as unknown as Map<string, AtomEntity<State>>).clear()
-    } else {
-      atomMap = new WeakMap()
-    }
+  const types = new Set(['number', 'string', 'boolean', 'undefined'])
 
-  }
-  getAtomById.has = (key: Key) => {
-    return atomMap.has(key as WeakKey)
+  function getWeakKey(key: string): IdObj
+  function getWeakKey(key: number): IdObj
+  function getWeakKey(key: boolean): IdObj
+  function getWeakKey(key: undefined): IdObj
+  function getWeakKey(key: symbol): symbol
+  function getWeakKey<T extends object>(key: T): T
+  function getWeakKey(key: any) {
+    if (types.has(typeof key)) {
+      return getIdObj(key as string)
+    }
+    return key
   }
 
-  getAtomById.get = getAtomById
-  return getAtomById as GetAtomById<Key, State>
+  function createAtomFamily<State, Key = string >(
+    { debuggerKey, createAtom }: CreateAtomFamilyOptions<Key, State>) {
+    let cacheAtomWeakMap = new WeakMap <WeakKey, AtomEntity<State>>()
+
+    function getAtomById<CurState extends State = State>(
+      key: Key, initState?: CurState) {
+      const cacheKey = getWeakKey(key as string)
+
+      if (!cacheAtomWeakMap.has(cacheKey as WeakKey)) {
+        let newAtom: AtomEntity<State>
+        if (createAtom) {
+          if (arguments.length === 1) {
+            newAtom = createAtom(key)
+          }
+          else {
+            newAtom = createAtom(key, initState)
+          }
+        }
+        else {
+          newAtom = atom(initState) as AtomEntity<State>
+        }
+        cacheAtomWeakMap.set(cacheKey as WeakKey, newAtom as AtomEntity<State>)
+        if (process.env.NODE_ENV !== 'production') {
+          newAtom.debugLabel = `${debuggerKey}||${(cacheKey.id)?.toString()}||${newAtom.debugLabel}`
+        }
+      }
+      return cacheAtomWeakMap.get(cacheKey as WeakKey)! as AtomEntity<CurState>
+    }
+    getAtomById.remove = (key: Key) => {
+      const cacheKey = getWeakKey(key as string)
+      cacheAtomWeakMap.delete(cacheKey)
+    }
+    getAtomById.clear = () => {
+      cacheAtomWeakMap = new WeakMap()
+    }
+    getAtomById.has = (key: Key) => {
+      const cacheKey = getWeakKey(key as string)
+      return cacheAtomWeakMap.has(cacheKey)
+    }
+
+    getAtomById.get = getAtomById
+    getAtomById.cacheAtomMap = cacheAtomWeakMap
+    return getAtomById as GetAtomById<Key, State>
+  }
+  return {
+    createAtomFamily,
+    clear: () => {
+      cacheIdObjMap.clear()
+    },
+  }
 }

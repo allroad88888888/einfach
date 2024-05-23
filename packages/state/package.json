@@ -1,6 +1,6 @@
 {
   "name": "einfach-state",
-  "version": "0.0.10-beta-06",
+  "version": "0.0.10-beta-19",
   "description": "react易上手状态管理",
   "main": "es/index.js",
   "typings": "@types/index.d.ts",
@@ -18,11 +18,8 @@
     "atom"
   ],
   "peerDependencies": {
-    "@types/react": ">=16.0.0",
-    "react": ">=16.0.0"
-  },
-  "resolutions": {
-    "@types/react": "18.2.69"
+    "@types/react": "^16 || ^17 || ^18",
+    "react": "^16 || ^17 || ^18"
   },
   "peerDependenciesMeta": {
     "@types/react": {
@@ -38,6 +35,7 @@
     "@types/node": "^20.11.30"
   },
   "dependencies": {
+    "react": "^18.3.1",
     "einfach-utils": "workspace:*"
   }
 }

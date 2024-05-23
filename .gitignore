@@ -76,3 +76,4 @@ common/autoinstallers/*/.npmrc
 .tmp
 .rush
 tsconfig.tsbuildinfo
+!jest.d.ts

@@ -1,8 +1,6 @@
 import tsEslint from 'typescript-eslint'
 import reactHookEsLint from 'eslint-plugin-react-hooks'
 import importEslint from 'eslint-plugin-import'
-// import react from 'eslint-plugin-react'
-
 import stylistic from '@stylistic/eslint-plugin'
 
 export default [
@@ -55,6 +53,7 @@ export default [
       'react-hooks/rules-of-hooks': 'error',
       'react-hooks/exhaustive-deps': 'warn',
       '@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports' }],
+      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
 ]

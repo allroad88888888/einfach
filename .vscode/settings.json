@@ -1,3 +1,39 @@
 {
-  "cSpell.words": ["antd", "einfach"]
+  "eslint.experimental.useFlatConfig": true,
+  "eslint.options": {
+    "overrideConfigFile": "rules/eslint.config.mjs"
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "files.exclude": {
+    "**/.git": true,
+    "**/.svn": true,
+    "**/.hg": true,
+    "**/CVS": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true
+  },
+  "files.associations": {
+    "api-extractor.json": "jsonc",
+    "tsconfig.json": "jsonc"
+  },
+  "editor.tabSize": 2,
+  "editor.formatOnSave": false,
+  
+  "cSpell.words": [
+    "antd",
+    "einfach",
+    "swcrc",
+    "testid",
+    "tsbuildinfo"
+  ],
+  "testing.automaticallyOpenPeekView": "never",
+  // "jest.autoRun": {"watch": false, "onSave":"test-only"}
+  "jest.runMode": {
+    "coverage": true,
+    "deferred": true,
+    "testFileOnly": true,
+    "type": "on-save"
+  }
 }
