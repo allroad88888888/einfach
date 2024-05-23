@@ -6,7 +6,6 @@
     "declarationDir": "@types"
   },
   "include": ["./src/**/*"],
-  "exclude": ["node_modules"],
   "references": [
     {
       "path": "./../utils/tsconfig.json"

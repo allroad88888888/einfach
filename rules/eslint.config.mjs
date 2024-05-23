@@ -54,6 +54,8 @@ export default [
       'react-hooks/exhaustive-deps': 'warn',
       '@typescript-eslint/consistent-type-imports': ['error', { prefer: 'type-imports' }],
       '@typescript-eslint/no-explicit-any': 'off',
+      'react/jsx-uses-react': 'off', // 关闭旧模式校验
+      'react/react-in-jsx-scope': 'off', // 关闭旧模式校验
     },
   },
 ]

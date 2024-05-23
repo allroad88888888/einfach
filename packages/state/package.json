@@ -1,6 +1,6 @@
 {
   "name": "einfach-state",
-  "version": "0.0.10-beta-19",
+  "version": "0.0.10",
   "description": "react易上手状态管理",
   "main": "es/index.js",
   "typings": "@types/index.d.ts",
@@ -30,8 +30,6 @@
     }
   },
   "devDependencies": {
-    "@jest/globals": "^29.7.0",
-    "@testing-library/react": "^15.0.7",
     "@types/node": "^20.11.30"
   },
   "dependencies": {

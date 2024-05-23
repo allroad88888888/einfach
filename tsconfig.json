@@ -26,6 +26,12 @@
     "jsx": "react-jsx",
     "inlineSourceMap": true,
   },  
+  "include": [
+    "./**/*.test.ts",
+    "./**/*.test.tsx",
+    "./**/test",
+    "./rules/setup-jest.ts"
+  ],
   "exclude": ["node_modules", "**/node_modules", "**/@types/"],
   "references": [
     { "path": "./packages/form/tsconfig.json" },
