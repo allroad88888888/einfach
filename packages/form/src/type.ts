@@ -34,3 +34,48 @@ export interface FormInstance {
   getFieldValue: <Value>(name: NamePath, value: Value) => Value
   getFieldsValue: (nameList: true | NamePath[]) => any
 }
+
+export type Rule = {
+  enum?: any[]
+  /**
+   * input type string input number
+   */
+  len?: number
+  /**
+   * 最大
+   */
+  max?: number
+  /**
+   * 最小
+   */
+  min?: number
+  /**
+   * 正则表达式
+   */
+  pattern?: RegExp
+  /**
+   * 是否必填
+   * @default false
+   */
+  required?: boolean
+  /**
+   * 数据转换 再校验
+   * @returns
+   */
+  transform?: (value: any) => any
+  /**
+   * 触发事件
+   */
+  validateTrigger?: string | string[]
+  /**
+   * 自定义校验方法
+   * @param rule
+   * @returns
+   */
+  validator?: (rule: Rule, value: any) => Promise<any>
+  /**
+   * 仅警告，不阻塞表单提交
+   * @default false
+   */
+  warningOnly?: boolean
+}

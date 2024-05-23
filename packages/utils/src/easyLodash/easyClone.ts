@@ -1,24 +1,71 @@
+import type { ObjectType } from './type'
+
 export function easyClone<T>(obj: T): T {
-  if (Array.isArray(obj)) {
-    return obj.map((value) => {
-      if (typeof value !== 'object') {
-        return value
-      }
+  if (typeof obj !== 'object' || !obj) {
+    return obj
+  }
+  const type = Object.prototype.toString.call(obj)
+
+  if (type === '[object Array]') {
+    return (obj as any[]).map((value) => {
       return easyClone(value)
     }) as T
   }
-  if (Object.prototype.toString.call(obj) === '[object Object]') {
+  if (type === '[object Object]') {
     const newObj = {
       ...(obj as object),
-    } as T
-    Object.keys(obj as Record<string, unknown>).forEach((key) => {
-      const value = (obj as Record<string, unknown>)[key]
-      if (typeof value === 'object') {
-        (obj as Record<string, unknown>)[key] = easyClone(value)
-      }
+    }
+    Object.keys(obj as object).forEach((key) => {
+      (obj as Record<string, unknown>)[key] = easyClone((obj as Record<string, unknown>)[key])
     })
-
     return newObj as T
+  }
+
+  if (type === '[object Set]') {
+    const newObj = new Set()
+    for (const value of (obj as unknown as Set<any>)) {
+      newObj.add(easyClone(value))
+    }
+    return newObj as T
+  }
+
+  if (type === '[object Map]') {
+    const newObj = new Map()
+    for (const [key, value] of (obj as unknown as Map<any, any>)) {
+      newObj.set(key, easyClone(value))
+    }
+    return newObj as T
+  }
+
+  throw `can't support ${type}`
+}
+
+export function buildNewObj<T>(obj: T): T {
+  if (typeof obj === 'object') {
+    const type = Object.prototype.toString.call(obj) as ObjectType
+
+    switch (type) {
+      case '[object Array]':{
+        return [...(obj as any[])] as T
+      }
+      case '[object Object]':{
+        return {
+          ...(obj as object),
+        } as T
+      }
+      case '[object Null]':{
+        return obj
+      }
+      case '[object Set]':{
+        return new Set(obj as Set<any>) as T
+      }
+      case '[object Map]':{
+        return new Map(obj as Map<any, any>) as T
+      }
+
+      default:
+        throw `can't support ${type}`
+    }
   }
   return obj
 }
