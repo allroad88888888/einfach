@@ -17,8 +17,7 @@ function valueReducer<State extends InterState = InterState>(
 
 export function useAtomValueByReducer<State extends InterState = InterState>(
   atom: AtomEntity<State>, { store }: HookOption = {}) {
-  const pStore = useStore()
-  const realStore = store || pStore
+  const realStore = useStore({ store })
   const [[state], rerender] = useReducer
   <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
     (valueReducer, undefined, function () {

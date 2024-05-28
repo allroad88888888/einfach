@@ -1,11 +1,10 @@
 import { useAtomValue } from 'einfach-state'
 import { useGetFormInstance } from './useGetFormInstance'
 import { valuesAtom } from './state'
+import type { FormInstance } from './type'
 
-export function WatchFormValue() {
-  const { store } = useGetFormInstance()
+export function useFormValues(formInstance: FormInstance) {
+  const { _store: store } = useGetFormInstance(formInstance)
   const values = useAtomValue(valuesAtom, { store })
-  // eslint-disable-next-line no-console
-  console.info(`表单所有数据`, values)
-  return <></>
+  return values
 }

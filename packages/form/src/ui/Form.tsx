@@ -1,6 +1,6 @@
 import React from 'react'
-import { FormContext } from './content'
-import type { FormInstance } from './type'
+import type { FormInstance } from '../core'
+import { FormContext } from '../core'
 
 export function Form({
   children,

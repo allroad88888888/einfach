@@ -7,11 +7,13 @@ describe('easySetIn', () => {
       'a-1': 'a-1',
       'b-1': 'b-1',
     },
-    b: [{
+    b: ([{
       'b-1': 'b-1',
     }, {
       'b-2': 'b-2',
-    }, 'b-3'],
+    }, 'b-3'] as [
+      Record<string, string>, Record<string, string>, string,
+    ]),
   }
 
   it('setInObj', async () => {
@@ -68,5 +70,30 @@ describe('easySetIn', () => {
         'b-2': 'b-2',
       }, 'b-3'],
     })
+  })
+
+  it('setMap', async () => {
+    const map = new Map<string, Record<string, any>>([['a', {
+      a: '1',
+    }], ['b', { b: '1' }]])
+
+    const temp1 = easySetIn(map, 'a.a', 'c')
+
+    expect(temp1).toEqual(new Map([['a', {
+      a: 'c',
+    }], ['b', { b: '1' }]]))
+  })
+  it('setSet', async () => {
+    const temp = new Set([
+      { a: 'a' },
+      { b: 'b' },
+    ])
+
+    const temp1 = easySetIn(temp, '[0].a', 'c')
+
+    expect(temp1).toEqual(new Set([
+      { a: 'c' },
+      { b: 'b' },
+    ]))
   })
 })

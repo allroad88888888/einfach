@@ -1,9 +1,12 @@
-export function Switch({ value, onChange }:
-{ value?: boolean, onChange?: (value: boolean) => void }) {
+import type { FormComponentProps } from './type'
+
+export function Switch({ value = false, onChange, dataTestid }: FormComponentProps<boolean>) {
   return (
     <input
       type="checkbox"
-      checked={value}
+      role="checkbox"
+      checked={value || false}
+      data-testid={dataTestid}
       onChange={(e) => {
         if (onChange) {
           onChange(e.target.checked)

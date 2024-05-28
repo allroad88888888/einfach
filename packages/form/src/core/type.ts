@@ -1,4 +1,5 @@
 import type { Store } from 'einfach-state'
+import type { Message } from './state'
 
 export type NamePath = string | number | (string | number)[]
 
@@ -27,12 +28,20 @@ export type FieldData = {
   touched?: boolean
 }
 
+export type FieldInfo = {
+  label?: string
+  rules?: Rule[]
+}
+
 export interface FormInstance {
-  store: Store
+  _store: Store
   setFieldValue: <Value>(name: NamePath, value: Value) => void
   setFieldsValue: (values: any) => void
-  getFieldValue: <Value>(name: NamePath, value: Value) => Value
+  getFieldValue: <Value>(name: NamePath) => Value | undefined
   getFieldsValue: (nameList: true | NamePath[]) => any
+  getFieldMessage: (name: NamePath) => Message | undefined
+  validateFields: () => Promise<boolean>
+  validateField: (namePath: NamePath, eventName?: string) => Promise<boolean>
 }
 
 export type Rule = {
@@ -78,4 +87,5 @@ export type Rule = {
    * @default false
    */
   warningOnly?: boolean
+  message?: string
 }

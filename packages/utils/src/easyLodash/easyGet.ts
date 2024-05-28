@@ -1,4 +1,5 @@
 import type { NamePath } from './type'
+import { getObjProp } from './util'
 
 type GetIndexedField<T, K> = K extends keyof T
   ? T[K]
@@ -47,7 +48,8 @@ export function easyGet<TData, TPath extends NamePath, TDefault = GetFieldType<T
   }
   const val = pathList
     .filter(Boolean)
-    .reduce<GetFieldType<TData, TPath>>((value, key) => (value as any)?.[key], data as any)
+    .reduce<GetFieldType<TData, TPath>>((value, key) => getObjProp(value, key), data as any)
+  // .reduce<GetFieldType<TData, TPath>>((value, key) => (value as any)?.[key], data as any)
 
   return val !== undefined ? val : (defaultValue as TDefault)
 }

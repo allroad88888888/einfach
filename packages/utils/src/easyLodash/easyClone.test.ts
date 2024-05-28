@@ -7,13 +7,13 @@ describe('easyClone', () => {
       'a-1': 'a-1',
       'b-1': 'b-1',
     },
-    b: [{
+    b: ([{
       'b-1': 'b-1',
     }, {
       'b-2': {
         'b2-1': 'b2-1',
       },
-    }, 'b-3'],
+    }, 'b-3'] as [ Record<string, string>, Record<string, any>, string]),
     c: new Set([
       { a: 'a' },
     ]),

@@ -1,6 +1,18 @@
 
-### 本项目 有三个包 einfach-state状态管理  einfach-form跟antd-from的api对齐
+###  
+<ul>
+  <li>einfach-state : react state manage</li>
+  <li>einfach-form : react from hooks - Same as antd form api</li>
+  <li>einfach-utils : react hooks help</li>
+</ul>
 
+### einfach-state advantages
+compact
+
+### einfach-form advantages
+no css!!!  no css!!! no css!!! </br>
+no html!!! no html!!! no html!!! </br>
+only hooks
 
 `npm i einfach-state`
 

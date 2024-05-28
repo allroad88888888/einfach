@@ -2,18 +2,19 @@ import { useCallback } from 'react'
 import type { AtomEntity, InterState } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
-import type { Obj } from 'einfach-utils'
+import type { NamePath, Obj } from 'einfach-utils'
 import { easySetIn } from 'einfach-utils'
 
-export function useSetAtom(atom: AtomEntity, option: HookOption = {}) {
+export function useSetAtom<T extends InterState = InterState>(
+  atom: AtomEntity<T>, option: HookOption = {}) {
   const store = useStore(option)
-  return useCallback(<T extends InterState = InterState>(namePath: string | T, value?: T) => {
-    if (arguments.length === 1) {
-      store.setter(atom, namePath)
+  return useCallback((...arg: [NamePath, any ] | [T]) => {
+    if (arg.length === 1) {
+      store.setter(atom, arg[0])
       return
     }
-    const info = store.getter(atom) as Obj
-    const newInfo = easySetIn(info, namePath as string, value)
+    const info = store.getter(atom)
+    const newInfo = easySetIn(info as Obj, arg[0], arg[1]) as T
     store.setter(atom, newInfo)
   }, [atom, store])
 }

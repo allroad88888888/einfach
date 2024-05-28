@@ -10,7 +10,7 @@ export type UseFieldValueOption = {
 }
 
 export function useFieldValue<T>(name: NamePath, { formInstance }: UseFieldValueOption = {}): T {
-  const { store } = useGetFormInstance(formInstance)
+  const { _store: store } = useGetFormInstance(formInstance)
 
   const [atomEntity] = useState(() => {
     return selectAtom(valuesAtom, (state) => {

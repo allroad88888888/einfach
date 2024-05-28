@@ -1,5 +1,6 @@
 import { buildNewObj } from './easyClone'
 import type { NamePath } from './type'
+import { getObjProp, setObjProp } from './util'
 
 export function exprPath(path: NamePath): (string | number)[] {
   if (Array.isArray(path)) {
@@ -22,12 +23,20 @@ export function easySetIn<T extends object | object[]>(obj: T, path: NamePath, v
   const { length } = propList
   propList.forEach((prop: string | number, index) => {
     const realProp = isNaN(prop as number) ? prop : Number(prop)
+
     if (index === length - 1) {
-      prev[prop] = value
+      // prev[prop] = value
+      setObjProp(prev, prop, value)
       return
     }
-    prev[prop] = buildNewObj(prev[realProp])
-    prev = prev[prop]
+    if (typeof prev !== 'object') {
+      throw `can't support`
+    }
+    // prev[prop] = buildNewObj(prev[realProp])
+    setObjProp(prev, prop, buildNewObj(getObjProp(prev, realProp)))
+
+    // prev = prev[prop]
+    prev = getObjProp(prev, realProp)
   })
   return res as T
 }
