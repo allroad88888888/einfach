@@ -77,3 +77,4 @@ common/autoinstallers/*/.npmrc
 .rush
 tsconfig.tsbuildinfo
 !jest.d.ts
+packages/vali

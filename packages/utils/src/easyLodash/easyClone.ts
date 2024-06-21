@@ -40,7 +40,7 @@ export function easyClone<T>(obj: T): T {
   throw `can't support ${type}`
 }
 
-export function buildNewObj<T>(obj: T): T {
+export function buildNewObj<T>(obj: T, path?: string | number): T {
   if (typeof obj === 'object') {
     const type = Object.prototype.toString.call(obj) as ObjectType
 
@@ -65,6 +65,19 @@ export function buildNewObj<T>(obj: T): T {
 
       default:
         throw `can't support ${type}`
+    }
+  }
+  if (obj === undefined && path) {
+    const pathType = typeof path
+    switch (pathType) {
+      case 'string':{
+        return {} as T
+      }
+      case 'number':{
+        return new Array(path) as T
+      }
+      default:
+        return obj
     }
   }
   return obj

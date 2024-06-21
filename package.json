@@ -7,7 +7,7 @@
   "scripts": {
     "eslint": "ESLINT_USE_FLAT_CONFIG=true npx eslint --config rules/eslint.config.mjs ./ --fix",
     "test": "jest --collect-coverage",
-    "clearTypes": "rimraf ./*/*/tsconfig.tsbuildinfo&&rimraf ./*/*/@types",
+    "clearTypes": "rimraf ./*/*/tsconfig.tsbuildinfo&&rimraf ./*/*/@types&&rimraf ./*/*/es",
     "build": "npm run clearTypes&&tsc -build",
     "prepare": "husky"
   },
@@ -32,7 +32,7 @@
     "@swc/jest": "^0.2.36",
     "@jest/globals": "^29.7.0",
     "@testing-library/jest-dom": "^6.4.5",
-    "@testing-library/react": "^15.0.7",
+    "@testing-library/react": "^16.0.0",
     "@testing-library/user-event": "^14.5.2",
     "@types/node": "^20.11.30",
     "husky": "^9.0.11",

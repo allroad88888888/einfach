@@ -22,11 +22,16 @@ export const useAtomMethods = <
 ) => {
   const store = useStore(options)
 
-  const { current } = useRef({
+  const { current } = useRef<{
+    init: boolean
+    refMethods: T
+    methods?: TailActions<T>
+  }>({
     init: false,
     refMethods: methods,
-    methods: undefined as TailActions<T> | undefined,
+    methods: undefined,
   })
+  current.refMethods = methods
   if (current.init === false) {
     current.init = true
     const func = Object.create(null)
@@ -38,5 +43,5 @@ export const useAtomMethods = <
     current.methods = func
   }
 
-  return current.methods as TailActions<T>
+  return current.methods!
 }

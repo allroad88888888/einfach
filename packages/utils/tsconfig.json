@@ -3,7 +3,8 @@
   "compilerOptions": {
     "rootDir": "src",
     "outDir": "es",
-    "declarationDir": "@types"
+    "declarationDir": "@types",
+    "declarationMap": false,
   },
   "include": ["./src/**/*"],
 }

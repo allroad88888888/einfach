@@ -1,10 +1,10 @@
 {
   "name": "einfach-state",
-  "version": "0.0.10",
+  "version": "0.0.19",
   "description": "react易上手状态管理",
   "main": "es/index.js",
+  "module": "es/index.js",
   "typings": "@types/index.d.ts",
-  "type": "module",
   "license": "MIT",
   "files": [
     "es",
@@ -18,22 +18,18 @@
     "atom"
   ],
   "peerDependencies": {
-    "@types/react": "^16 || ^17 || ^18",
     "react": "^16 || ^17 || ^18"
   },
   "peerDependenciesMeta": {
-    "@types/react": {
-      "optional": true
-    },
     "react": {
       "optional": true
     }
   },
   "devDependencies": {
-    "@types/node": "^20.11.30"
+    "@types/node": "^20.11.30",
+    "@types/react": "^18.3.3"
   },
   "dependencies": {
-    "react": "^18.3.1",
     "einfach-utils": "workspace:*"
   }
 }

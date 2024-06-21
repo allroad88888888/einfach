@@ -34,7 +34,8 @@ export function setObjProp(obj: any, prop: any, value: any) {
 
 export function getObjProp(obj: any, prop: any) {
   if (typeof obj !== 'object') {
-    throw `getObjProp can't support`
+    // throw `getObjProp can't support`
+    return obj
   }
   const type = Object.prototype.toString.call(obj) as ObjectType
 

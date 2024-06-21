@@ -5,7 +5,7 @@ import { useSelectAtomValue } from 'einfach-state'
 import type { Message } from './state'
 import { messageMappingAtom, fieldOptionMappingAtom } from './state'
 import { useGetFormInstance } from './useGetFormInstance'
-import { useLayoutEffect } from 'react'
+import { useEffect, useLayoutEffect } from 'react'
 
 export type UseRulesOption = {
   formInstance?: FormInstance
@@ -41,6 +41,15 @@ export function useValidator(
     })
 
     return func
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      const message = _store.getter(messageMappingAtom)
+      message.delete(nameStr)
+      _store.setter(messageMappingAtom, new Map(message))
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return { message, methods: validatorEventsMap }

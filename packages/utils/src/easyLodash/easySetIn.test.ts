@@ -96,4 +96,22 @@ describe('easySetIn', () => {
       { b: 'b' },
     ]))
   })
+  it('empty obj', async () => {
+    const temp = {}
+
+    const temp1 = easySetIn(temp, 'a.b', 'c')
+
+    expect(temp1).toEqual({
+      a: {
+        b: 'c',
+      },
+    })
+  })
+  it('empty array', async () => {
+    const temp = {}
+
+    const temp1 = easySetIn(temp, 'a[2].b', 'c')
+
+    expect(temp1).toEqual({ a: [, , { b: 'c' }] })
+  })
 })

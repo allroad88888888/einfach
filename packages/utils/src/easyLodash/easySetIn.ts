@@ -32,8 +32,17 @@ export function easySetIn<T extends object | object[]>(obj: T, path: NamePath, v
     if (typeof prev !== 'object') {
       throw `can't support`
     }
-    // prev[prop] = buildNewObj(prev[realProp])
-    setObjProp(prev, prop, buildNewObj(getObjProp(prev, realProp)))
+
+    const next = getObjProp(prev, realProp)
+    if (next === undefined) {
+      const nextProp = propList[index + 1]
+      const nextRealProp = isNaN(nextProp as number) ? nextProp : Number(nextProp)
+      setObjProp(prev, prop, buildNewObj(getObjProp(prev, realProp), nextRealProp))
+    }
+    else {
+      // prev[prop] = buildNewObj(prev[realProp])
+      setObjProp(prev, prop, buildNewObj(getObjProp(prev, realProp)))
+    }
 
     // prev = prev[prop]
     prev = getObjProp(prev, realProp)

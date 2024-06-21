@@ -35,6 +35,9 @@ export function createStore(): Store {
     }
 
     atomStateMap.set(atomEntity, state)
+    /**
+     * 触发订阅atom状态的方法
+     */
     publishAtom(atomEntity)
     function iteratorPush(backAtomEntity: AtomEntity) {
       const backEntitySet = backDependenciesMap.get(backAtomEntity)! || []
@@ -46,6 +49,9 @@ export function createStore(): Store {
         iteratorPush(backEntity)
       })
     }
+    /**
+     * 触发衍生态的atom订阅方法
+     */
     iteratorPush(atomEntity)
   }
 
