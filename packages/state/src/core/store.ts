@@ -1,6 +1,3 @@
-// import type { StatesWithPromise } from './promise'
-// import { createContinuablePromise } from './promise'
-// import { isPromiseLike } from './promiseUtils'
 import { createContinuablePromise } from './promise'
 import { isContinuablePromise, isPromiseLike } from './promiseUtils'
 import type { AtomEntity, Read, Store } from './type'
@@ -18,12 +15,13 @@ export function createStore(): Store {
     atomEntity: AtomEntity<State>,
     force: boolean = false,
   ): ReturnState<State> {
-    if (atomStateMap.has(atomEntity)) {
+    const hasEntity = atomStateMap.has(atomEntity)
+    if (hasEntity) {
       if (!(typeof atomEntity.read === 'function') || force !== true) {
         return atomStateMap.get(atomEntity) as ReturnState<State>
       }
     }
-    let res = atomEntity.read as State
+    let next = atomEntity.read as State
     const controller = new AbortController()
     if (typeof atomEntity.read === 'function') {
       function getter<T>(atom: AtomEntity<T>) {
@@ -35,10 +33,20 @@ export function createStore(): Store {
         return readAtom.call(atomEntity, atom) as ReturnState<T>
       }
 
-      res = (atomEntity.read as Read<State>)(getter, controller)
+      next = (atomEntity.read as Read<State>)(getter, controller)
     }
 
-    return setAtomState.call(this, atomEntity, res, () => {
+    if (hasEntity) {
+      const prev = atomStateMap.get(atomEntity) as ReturnState<State>
+      /**
+       * 对比新旧值，移除重复set
+       */
+      if (Object.is(prev, next)) {
+        return next as ReturnState<State>
+      }
+    }
+
+    return setAtomState.call(this, atomEntity, next, () => {
       controller.abort()
     }) as ReturnState<State>
 
