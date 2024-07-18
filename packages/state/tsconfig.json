@@ -6,6 +6,7 @@
     "declarationDir": "@types"
   },
   "include": ["./src/**/*"],
+  "exclude": ["./src/**/*.test.tsx","./src/**/*.test.ts"],
   "references": [
     {
       "path": "./../utils/tsconfig.json"

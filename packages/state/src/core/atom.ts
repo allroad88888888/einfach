@@ -1,7 +1,7 @@
-import type { AtomEntity, Getter, InterState, Read, Setter, Write } from './type'
+import type { AtomEntity, Getter, Read, Setter, Write } from './type'
 
 let keyCount = 0
-export function atom<State extends InterState = InterState>(
+export function atom<State>(
   read: Read<State> | State, write?: Write) {
   const key = `atom${++keyCount}`
   const entity: AtomEntity<State> = {
@@ -13,9 +13,8 @@ export function atom<State extends InterState = InterState>(
     entity.read = read as Read<State>
   }
   else {
-    entity.read = function () {
-      return read
-    }
+    // entity._init = read
+    entity.read = read
     entity.write = function (get: Getter, set: Setter, arg) {
       return set(entity, typeof arg === 'function' ? arg(get(this)) : arg)
     }

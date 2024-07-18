@@ -1,17 +1,18 @@
 import { useCallback } from 'react'
-import type { AtomEntity, InterState } from '../core/type'
+import type { AtomEntity } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
 import type { NamePath, Obj } from 'einfach-utils'
 import { easySetIn } from 'einfach-utils'
+import type { ReturnState } from '../core/typePromise'
 
 export interface SetAtomMethod<Value> {
   (namePath: NamePath, value: any): void
   (value: Value extends (...args: any[]) => any ? never : Value): void
-  (value: (value: Value) => Value): void
+  (value: (value: ReturnState<Value>) => Value): void
 }
 
-export function useSetAtom<Value extends InterState = InterState>(
+export function useSetAtom<Value>(
   atom: AtomEntity<Value>,
   option: HookOption = {},
 ) {
@@ -19,16 +20,16 @@ export function useSetAtom<Value extends InterState = InterState>(
 
   function setAtomMethod(namePath: NamePath, value: any): void
   function setAtomMethod(value: Value extends (...args: any[]) => any ? never : Value): void
-  function setAtomMethod(fn: (value: Value) => Value): void
+  function setAtomMethod(fn: (value: ReturnState<Value>) => Value): void
   function setAtomMethod(
     ...arg:
       | [NamePath, any]
       | [Value extends (...args: any[]) => any ? never : Value]
-      | [(value: Value) => Value]
+      | [(value: ReturnState<Value>) => Value]
   ) {
     if (arg.length === 1) {
       if (typeof arg[0] === 'function') {
-        store.setter(atom, (arg[0] as (value: Value) => Value)(store.getter(atom)))
+        store.setter(atom, (arg[0] as (value: ReturnState<Value>) => Value)(store.getter(atom)))
       }
       else {
         store.setter(atom, arg[0])

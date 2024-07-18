@@ -32,4 +32,34 @@ describe('store', () => {
     expect(state2.b === 1).toBe(true)
     expect(state3 === 124).toBe(true)
   })
+
+  test('function', () => {
+    const atom1 = atom(1)
+
+    let runAtom = 0
+    const atom2 = atom((getter) => {
+      runAtom += 1
+      return getter(atom1)
+    })
+
+    const store = createStore()
+
+    store.getter(atom2)
+
+    let renderAtom2 = 0
+    store.sub(atom2, () => {
+      renderAtom2 += 1
+    })
+
+    expect(runAtom).toBe(1)
+
+    store.setter(atom1, 2)
+    expect(runAtom).toBe(2)
+    store.getter(atom2)
+    const valAtom2 = store.getter(atom2)
+
+    expect(renderAtom2).toBe(1)
+    expect(runAtom).toBe(2)
+    expect(valAtom2).toBe(2)
+  })
 })

@@ -1,37 +1,13 @@
-import { useLayoutEffect, useReducer, useState } from 'react'
-import type { AtomEntity, InterState, Store } from '../core/type'
+import { useLayoutEffect, useState } from 'react'
+import type { AtomEntity } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
+import { isPromiseLike } from '../core/promiseUtils'
+import { use } from './use'
+import type { StatesWithPromise } from '../core/typePromise'
 
-type ReducerState<State extends InterState = InterState> = [State, Store, AtomEntity<State>]
-
-function valueReducer<State extends InterState = InterState>(
-  prev: ReducerState<State>): ReducerState<State> {
-  const [state, store, atomEntity] = prev
-  const nextValue = (store as Store).getter(atomEntity)
-  if (Object.is(state, nextValue)) {
-    return prev
-  }
-  return [nextValue, store, atomEntity]
-}
-
-export function useAtomValueByReducer<State extends InterState = InterState>(
-  atom: AtomEntity<State>, { store }: HookOption = {}) {
-  const realStore = useStore({ store })
-  const [[state], rerender] = useReducer
-  <(prevState: ReducerState<State>) => ReducerState<State>, undefined>
-    (valueReducer, undefined, function () {
-      return [realStore.getter(atom), realStore, atom] as ReducerState<State>
-    })
-  useLayoutEffect(() => {
-    return realStore.sub(atom, rerender)
-  }, [realStore, atom])
-
-  return state
-}
-
-export function useAtomValue<State extends InterState = InterState>(
-  atom: AtomEntity<State>, { store }: HookOption = {}) {
+export function useAtomValue<State>(
+  atom: AtomEntity<State>, { store }: HookOption = {}): State extends Promise<infer T> ? T : State {
   const realStore = useStore({ store })
 
   const [state, setState] = useState(() => {
@@ -43,11 +19,15 @@ export function useAtomValue<State extends InterState = InterState>(
     if (realStore.getter(atom) !== state) {
       setState(realStore.getter(atom))
     }
-    return realStore.sub(atom, () => {
-      setState(realStore.getter(atom))
+    return realStore.sub(atom, (state) => {
+      setState(state)
     })
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realStore, atom])
 
-  return state
+  if (isPromiseLike(state)) {
+    return use(state as StatesWithPromise<State>) as State extends Promise<infer T> ? T : State
+  }
+
+  return state as State extends Promise<infer T> ? T : State
 }

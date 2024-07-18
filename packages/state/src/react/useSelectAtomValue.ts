@@ -3,10 +3,11 @@ import { useAtomValue } from './useAtomValue'
 import type { HookOption } from './type'
 import type { NamePath } from 'einfach-utils'
 import { easyGet, useInit } from 'einfach-utils'
+import type { ReturnState } from '../core/typePromise'
 
 export function selectAtom<T, State>(
   atomEntity: AtomEntity<State>,
-  selectFn: ((prev: State) => T) | NamePath,
+  selectFn: ((prev: ReturnState<State>) => T) | NamePath,
 ) {
   return atom((get) => {
     const info = get(atomEntity)
@@ -19,18 +20,18 @@ export function selectAtom<T, State>(
 
 export function useSelectAtomValue<T, State>(
   atomEntity: AtomEntity<State>,
-  selectFn: (prev: State) => T,
+  selectFn: (prev: ReturnState<State>) => T,
   option?: HookOption
 ): T
 export function useSelectAtomValue<T, State>(
   atomEntity: AtomEntity<State>,
-  selectFn: ((prev: State) => T) | NamePath,
+  selectFn: ((prev: ReturnState<State>) => T) | NamePath,
   option?: HookOption
 ): T
 
 export function useSelectAtomValue<T, State>(
   atomEntity: AtomEntity<State>,
-  selectFn: ((prev: State) => T) | NamePath,
+  selectFn: ((prev: ReturnState<State>) => T) | NamePath,
   option: HookOption = {},
 ) {
   const selectAtomEntity = useInit(() => {
