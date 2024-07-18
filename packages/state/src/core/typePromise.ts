@@ -1,6 +1,7 @@
 export type PromiseStatus = 'pending' | 'fulfilled' | 'rejected'
 
 export interface StatesWithPromise<T> extends Promise<T> {
+  // ()=>
   value?: T
   status?: PromiseStatus
   reason?: any

@@ -21,4 +21,34 @@ describe('async', () => {
     expect(runNum).toBe(1)
     expect(render).toBe(1)
   })
+
+  test('more', async () => {
+    const atom1 = atom(1)
+    let render = 0
+    const atom2 = atom((getter, { signal }) => {
+      return new Promise((rev) => {
+        const val = getter(atom1)
+        const t = setTimeout(() => {
+          render += 1
+          rev(val)
+        }, 1000)
+        signal.addEventListener('abort', () => {
+          clearTimeout(t)
+        })
+      })
+    })
+    const store = createStore()
+
+    const t = store.getter(atom2)
+    store.setter(atom1, 3)
+
+    await new Promise((rev) => {
+      setTimeout(() => {
+        rev(true)
+      }, 3000)
+    })
+    expect(render).toBe(1)
+    expect(store.getter(atom2).value).toBe(3)
+    expect(t.value).toBe(3)
+  })
 })

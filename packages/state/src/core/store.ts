@@ -2,9 +2,9 @@
 // import { createContinuablePromise } from './promise'
 // import { isPromiseLike } from './promiseUtils'
 import { createContinuablePromise } from './promise'
-import { isPromiseLike } from './promiseUtils'
+import { isContinuablePromise, isPromiseLike } from './promiseUtils'
 import type { AtomEntity, Read, Store } from './type'
-import type { ReturnState } from './typePromise'
+import type { ReturnState, StatesWithPromise } from './typePromise'
 
 let keyCount = 0
 export function createStore(): Store {
@@ -38,7 +38,9 @@ export function createStore(): Store {
       res = (atomEntity.read as Read<State>)(getter, controller)
     }
 
-    return setAtomState.call(this, atomEntity, res, controller.abort) as ReturnState<State>
+    return setAtomState.call(this, atomEntity, res, () => {
+      controller.abort()
+    }) as ReturnState<State>
 
     // return res as ReturnState<State>
   }
@@ -53,7 +55,7 @@ export function createStore(): Store {
     return atomEntity.write(readAtom, setAtomState, nextState)
   }
   function setAtomState<State>(this: any,
-    atomEntity: AtomEntity<State>, state: State, abortPromise: () => void = () => {}) {
+    atomEntity: AtomEntity<State>, state: State, abortPromise: () => void = () => { }) {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state)
     }
@@ -68,6 +70,18 @@ export function createStore(): Store {
           // pubAndPubGetterAtom(atomEntity)
         },
       ) as ReturnState<State>
+
+      if (atomStateMap.has(atomEntity)) {
+        const prevState = atomStateMap.get(atomEntity)
+        if (prevState && isContinuablePromise(prevState)) {
+          prevState.CONTINUE_PROMISE?.(newState as StatesWithPromise<State>, abortPromise)
+        }
+      }
+
+      // const state = atomStateMap.get(atomEntity) as ReturnState<State>
+      // if (force === true && isContinuablePromise(state) && state.status === 'pending') {
+      //   state.CONTINUE_PROMISE()
+      // }
     }
 
     atomStateMap.set(atomEntity, newState)

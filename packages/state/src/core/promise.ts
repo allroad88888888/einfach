@@ -10,11 +10,13 @@ const REJECTED = 'rejected'
 const continuablePromiseMap = new WeakMap()
 export function createContinuablePromise<T>(
   promise: Promise<T>,
-  abort: () => void,
+  paramAbort: () => void,
   complete: () => void,
 ) {
   if (!continuablePromiseMap.has(promise)) {
     let continuePromise: ContinuablePromise<T> | undefined
+
+    let abort = paramAbort
 
     const entityPromise: StatesWithPromise<T> = new Promise<T>(function (resolve, reject) {
       let curr = promise
