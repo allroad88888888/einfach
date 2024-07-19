@@ -16,10 +16,11 @@ describe('async', () => {
       render += 1
     })
     const state2 = store.getter(atom1)
+    expect(render).toBe(1)
     await state2
     expect(state2.value).toBe(100)
     expect(runNum).toBe(1)
-    expect(render).toBe(1)
+    expect(render).toBe(2)
   })
 
   test('more', async () => {
@@ -42,13 +43,15 @@ describe('async', () => {
     const t = store.getter(atom2)
     store.setter(atom1, 3)
 
+    const t2= store.getter(atom2)
+
     await new Promise((rev) => {
       setTimeout(() => {
         rev(true)
       }, 3000)
     })
     expect(render).toBe(1)
-    expect(store.getter(atom2).value).toBe(3)
+    expect(t2.value).toBe(3)
     expect(t.value).toBe(3)
   })
 
@@ -75,13 +78,15 @@ describe('async', () => {
 
     store.getter(atom3)
     expect(render).toBe(1)
+    expect(render2).toBe(1)
     store.setter(atom1, (state) => {
       return {
         ...state,
         b: 3,
       }
     })
-    expect(render).toBe(1)
+    store.getter(atom3)
+    expect(render).toBe(2)
     expect(render2).toBe(2)
   })
 

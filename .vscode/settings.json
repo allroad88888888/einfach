@@ -1,7 +1,7 @@
 {
   "eslint.useFlatConfig": true,
   "eslint.options": {
-    "overrideConfigFile": "rules/eslint.config.mjs"
+    "overrideConfigFile": "./rules/eslint.config.mjs"
   },
   "editor.codeActionsOnSave": {
     "source.fixAll.eslint": "explicit"

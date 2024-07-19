@@ -1,37 +1,49 @@
 import type { ReturnState } from './typePromise'
 
 export interface Setter {
-  <State >(entity: AtomEntity<State>, value: State): void
+  <State, Args extends unknown[], Result>(atomEntity: WritableAtom<State, Args, Result>, ...args: Args): Result
 }
 
 export interface Getter {
-  <State >(entity: AtomEntity<State>): ReturnState<State>
+  <State>(entity: AtomEntity<State>): ReturnState<State>
 }
 
-export interface Read<State > {
+export interface Read<State> {
   (getter: Getter, controller: AbortController): State
 }
-export interface Write {
-  (getter: Getter, setter: Setter, ...arg: any[]): void
+
+export interface Write<State, Args extends unknown[], Result> {
+  (getter: Getter, setter: Setter, ...args: Args): Result
 }
 
-export interface AtomEntity<State > {
-  // _init?: State
+export type AtomAbstract = WritableAtom<any, any[], any>
+
+export interface AtomBasic<State> {
   read: Read<State> | State
-  write: Write
   toString: () => string
   debugLabel?: string
 }
 
+
+
+export type AtomEntity<State> = WritableAtom<State, [State | ((prev: ReturnState<State>) => State)], void>
+
+
+export interface WritableAtom<State, Args extends unknown[], Result> extends AtomBasic<State> {
+  write: Write<State, Args, Result>
+}
+
+export type WritableItem<State> = State extends Function ? ((prev: ReturnState<State>) => State) : State
+
+
 export interface Store {
   sub: <State >(atomEntity: AtomEntity<State>,
-    listener: (state: ReturnState<State>) => void) => () => void
-  getter: <State >(atomEntity: AtomEntity<State>) => ReturnState<State>
-  setter: <State >
-  (atomEntity: AtomEntity<State>, state: State | ((prev: ReturnState<State>) => State)) => void
+    listener: () => void) => () => void
+  getter: Getter
+  setter: Setter
   toString: () => string
   debugLabel?: string
   resetAtom: <State >(oldAtomEntity?: AtomEntity<State>) => void
 }
 
-export type InterState = unknown
+

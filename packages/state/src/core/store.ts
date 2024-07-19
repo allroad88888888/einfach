@@ -1,127 +1,122 @@
 import { createContinuablePromise } from './promise'
 import { isContinuablePromise, isPromiseLike } from './promiseUtils'
-import type { AtomEntity, Read, Store } from './type'
-import type { ReturnState, StatesWithPromise } from './typePromise'
+import type { AtomAbstract, AtomEntity, Setter, Store, WritableAtom } from './type'
+import { ReturnState, StatesWithPromise } from './typePromise'
+
+
 
 let keyCount = 0
 export function createStore(): Store {
-  let atomStateMap = new WeakMap<AtomEntity<any>, unknown>()
+  let atomStateMap = new WeakMap<AtomAbstract, unknown>()
 
-  const listenersMap = new WeakMap<AtomEntity<any>, Set<(state: any) => void>>()
+  const listenersMap = new WeakMap<AtomAbstract, Set<() => void>>()
+  // [atom1,[atom2 ,atom3]]
+  const backDependenciesMap = new WeakMap<AtomAbstract, Set<AtomAbstract>>()
+  // [atom2 ,[atom1]]  用来判断是否 强制读取数据
+  const dependenciesUpdateMap = new WeakMap<AtomAbstract, true>()
 
-  const backDependenciesMap = new WeakMap<AtomEntity<any>, Set<AtomEntity<any>>>()
+  function readAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity: Entity): ReturnState<State> {
 
-  function readAtom<State>(this: any,
-    atomEntity: AtomEntity<State>,
-    force: boolean = false,
-  ): ReturnState<State> {
-    const hasEntity = atomStateMap.has(atomEntity)
-    if (hasEntity) {
-      if (!(typeof atomEntity.read === 'function') || force !== true) {
-        return atomStateMap.get(atomEntity) as ReturnState<State>
-      }
+    const force = dependenciesUpdateMap.has(atomEntity)
+    if (force === false && atomStateMap.has(atomEntity)) {
+      return atomStateMap.get(atomEntity) as ReturnState<State>
     }
-    let next = atomEntity.read as State
+
+    let nextState = atomEntity.read
     const controller = new AbortController()
-    if (typeof atomEntity.read === 'function') {
-      function getter<T>(atom: AtomEntity<T>) {
+    if (typeof nextState === 'function') {
+
+      function getter<State, Entity extends AtomAbstract = AtomEntity<State>>(atom: Entity) {
         if (!backDependenciesMap.has(atom)) {
           backDependenciesMap.set(atom, new Set())
         }
         backDependenciesMap.get(atom)!.add(atomEntity)
-
-        return readAtom.call(atomEntity, atom) as ReturnState<T>
+        return readAtom(atom)
       }
 
-      next = (atomEntity.read as Read<State>)(getter, controller)
+      nextState = (atomEntity).read(getter, controller)
     }
+    dependenciesUpdateMap.delete(atomEntity)
 
-    if (hasEntity) {
-      const prev = atomStateMap.get(atomEntity) as ReturnState<State>
-      /**
-       * 对比新旧值，移除重复set
-       */
-      if (Object.is(prev, next)) {
-        return next as ReturnState<State>
-      }
-    }
 
-    return setAtomState.call(this, atomEntity, next, () => {
-      controller.abort()
-    }) as ReturnState<State>
-
-    // return res as ReturnState<State>
+    // return nextState
+    return setAtomState(atomEntity, nextState, () => {
+      return controller.abort()
+    })
   }
 
-  function setAtom<State>(
-    atomEntity: AtomEntity<State>,
-    state: State | ((prev: ReturnState<State>) => State)) {
-    let nextState = state
-    if (typeof state === 'function') {
-      nextState = (state as (prev: ReturnState<State>) => State)(readAtom(atomEntity))
+  function setAtom<State, Args extends unknown[], Result>(this: AtomAbstract,
+    atomEntity: WritableAtom<State, Args, Result>, ...arg: Args[]): Result {
+    if (Object.is(this, atomEntity)) {
+      setAtomState(atomEntity, arg[0])
+      return undefined as Result
     }
-    return atomEntity.write(readAtom, setAtomState, nextState)
+    return atomEntity.write(readAtom, setAtom.bind(atomEntity) as Setter, ...arg as Args)
   }
-  function setAtomState<State>(this: any,
-    atomEntity: AtomEntity<State>, state: State, abortPromise: () => void = () => { }) {
+
+  function setAtomState<State, Entity extends AtomAbstract = AtomEntity<State>>(
+    this: any,
+    atomEntity: Entity,
+    state: State,
+    abortPromise: () => void = () => { }
+  ) {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state)
     }
+    let nextState: StatesWithPromise<State> | State = state
 
-    let newState = state as ReturnState<State>
-
-    if (isPromiseLike(state)) {
-      newState = createContinuablePromise(
-        state as Promise<State>,
-        abortPromise,
-        () => {
-          // pubAndPubGetterAtom(atomEntity)
-        },
-      ) as ReturnState<State>
-
-      if (atomStateMap.has(atomEntity)) {
-        const prevState = atomStateMap.get(atomEntity)
-        if (prevState && isContinuablePromise(prevState)) {
-          prevState.CONTINUE_PROMISE?.(newState as StatesWithPromise<State>, abortPromise)
-        }
+    const prevState = atomStateMap.get(atomEntity)
+    if (isPromiseLike(nextState)) {
+      nextState = createContinuablePromise(nextState, abortPromise, () => {
+        triggerSubScriptionAndDependency.call(atomEntity, atomEntity)
+      })
+      if (isContinuablePromise(prevState)) {
+        prevState.CONTINUE_PROMISE?.(nextState as StatesWithPromise<State>, abortPromise)
       }
-
-      // const state = atomStateMap.get(atomEntity) as ReturnState<State>
-      // if (force === true && isContinuablePromise(state) && state.status === 'pending') {
-      //   state.CONTINUE_PROMISE()
-      // }
     }
 
-    atomStateMap.set(atomEntity, newState)
+    atomStateMap.set(atomEntity, nextState)
+    triggerSubScriptionAndDependency.call(this, atomEntity)
+    return nextState
+  }
+
+
+  function triggerSubScriptionAndDependency<Entity extends AtomAbstract>(this: Entity,
+    atomEntity: Entity) {
     /**
      * 触发订阅atom状态的方法
      */
-    publishAtom(atomEntity, newState)
+    publishAtom(atomEntity)
+    function iteratorPush(backAtomEntity: AtomAbstract) {
+      const backEntitySet = backDependenciesMap.get(backAtomEntity)! || []
+      backEntitySet.forEach((backEntity) => {
+        dependenciesUpdateMap.set(backEntity, true)
+        publishAtom(backEntity)
+      })
 
+      backEntitySet.forEach((backEntity) => {
+        iteratorPush(backEntity)
+      })
+    }
     /**
      * 触发衍生态的atom订阅方法
      */
-    const backEntitySet = backDependenciesMap.get(atomEntity)! || []
-    backEntitySet.forEach((backEntity) => {
-      if (this === backEntity) {
-        return
-      }
-      readAtom(backEntity, true)
-    })
-    return newState
+    iteratorPush(atomEntity)
   }
 
-  function publishAtom<State>(atomEntity: AtomEntity<State>, state: ReturnState<State>) {
+
+  function publishAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity: Entity) {
     const listenerSet = listenersMap.get(atomEntity)
     if (listenerSet) {
       listenerSet.forEach((listener) => {
-        listener(state as State)
+        listener()
       })
     }
   }
 
-  function subscribeAtom<State>(
-    atomEntity: AtomEntity<State>, listener: (state: ReturnState<State>) => void) {
+  function subscribeAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(
+    atomEntity: Entity, listener: () => void) {
+
     if (!listenersMap.has(atomEntity)) {
       listenersMap.set(atomEntity, new Set())
     }
@@ -131,8 +126,9 @@ export function createStore(): Store {
       (listenersMap.get(atomEntity)!).delete(listener)
     }
   }
+  const key = `store${++keyCount}`
 
-  function resetAtom<State>(atomEntity?: AtomEntity<State>) {
+  function resetAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity?: Entity) {
     if (atomEntity) {
       atomStateMap.delete(atomEntity)
     }
@@ -140,14 +136,11 @@ export function createStore(): Store {
       atomStateMap = new WeakMap()
     }
   }
-
-  const key = `store${++keyCount}`
   return {
     sub: subscribeAtom,
     getter: readAtom,
-    setter: setAtom,
+    setter: setAtom as Setter,
     toString: () => key,
-    debugLabel: key,
-    resetAtom,
+    resetAtom
   }
 }

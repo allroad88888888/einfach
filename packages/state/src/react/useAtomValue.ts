@@ -19,8 +19,8 @@ export function useAtomValue<State>(
     if (realStore.getter(atom) !== state) {
       setState(realStore.getter(atom))
     }
-    return realStore.sub(atom, (state) => {
-      setState(state)
+    return realStore.sub(atom, () => {
+      setState(realStore.getter(atom))
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realStore, atom])

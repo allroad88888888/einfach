@@ -54,11 +54,11 @@ describe('store', () => {
     expect(runAtom).toBe(1)
 
     store.setter(atom1, 2)
-    expect(runAtom).toBe(2)
+    expect(runAtom).toBe(1)
     store.getter(atom2)
+    expect(runAtom).toBe(2)
     const valAtom2 = store.getter(atom2)
-
-    expect(renderAtom2).toBe(1)
+    expect(renderAtom2).toBe(2)
     expect(runAtom).toBe(2)
     expect(valAtom2).toBe(2)
   })
