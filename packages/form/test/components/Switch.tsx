@@ -1,4 +1,4 @@
-import type { FormComponentProps } from './type'
+import type { FormComponentProps } from './type';
 
 export function Switch({ value = false, onChange, dataTestid }: FormComponentProps<boolean>) {
   return (
@@ -9,9 +9,9 @@ export function Switch({ value = false, onChange, dataTestid }: FormComponentPro
       data-testid={dataTestid}
       onChange={(e) => {
         if (onChange) {
-          onChange(e.target.checked)
+          onChange(e.target.checked);
         }
       }}
     />
-  )
+  );
 }

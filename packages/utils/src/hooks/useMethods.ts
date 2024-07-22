@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useRef } from 'react';
 
 /**
  *
@@ -9,23 +9,23 @@ import { useRef } from 'react'
 export const useMethods = <
   T extends Record<string, (...arg: any[]) => unknown>,
 >(
-  methods: T,
-) => {
+    methods: T,
+  ) => {
   const { current } = useRef({
     init: false,
     refMethods: methods,
     methods: undefined as T | undefined,
-  })
+  });
   if (current.init === false) {
-    current.init = true
-    const func = Object.create(null)
+    current.init = true;
+    const func = Object.create(null);
 
     Object.keys(methods).forEach((key) => {
       func[key] = (...args: any[]) =>
-        methods[key].call(current.refMethods, ...args)
-    })
-    current.methods = func
+        methods[key].call(current.refMethods, ...args);
+    });
+    current.methods = func;
   }
 
-  return current.methods as T
-}
+  return current.methods as T;
+};

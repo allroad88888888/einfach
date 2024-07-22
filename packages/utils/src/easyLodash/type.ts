@@ -1,4 +1,4 @@
-export type NamePath = string | number | (string | number)[]
+export type NamePath = string | number | (string | number)[];
 
 export type ObjectType =
   '[object Null]' |
@@ -8,4 +8,4 @@ export type ObjectType =
   '[object Map]' |
   '[object WeakSet]' |
   '[object WeakMap]' |
-  '[object Function]'
+  '[object Function]';

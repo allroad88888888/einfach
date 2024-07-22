@@ -1,4 +1,4 @@
-import { useReRef } from './useReRef'
+import { useReRef } from './useReRef';
 
 /**
  * 防抖 节流 用这玩意封装一下
@@ -13,11 +13,11 @@ export function useDepAndFormateFn<T extends (...args: any) => any, T1 extends (
   const { current } = useReRef<{
     fnDep: T
     formatResFn: T
-  }>({})
+  }>({});
   if (current?.fnDep !== fn) {
-    current.fnDep = fn
-    current.formatResFn = formatFn(fn)
+    current.fnDep = fn;
+    current.formatResFn = formatFn(fn);
   }
 
-  return current.formatResFn
+  return current.formatResFn;
 }

@@ -1,30 +1,29 @@
-import { describe, test, expect } from '@jest/globals'
-import { atom } from './atom'
-import { createStore } from './store'
+import { describe, test, expect } from '@jest/globals';
+import { atom } from './atom';
+import { createStore } from './store';
 
 describe('store', () => {
-    test('base', async () => {
-        const atom1 = atom({
-            a: 1,
-        })
+  test('base', async () => {
+    const atom1 = atom({
+      a: 1,
+    });
 
-        let num = 0
-        const atom2 = atom((getter) => {
-            console.log('render more')
-            num += 1
-            return {
-                ...getter(atom1),
-                num: num,
-            }
-        })
+    let num = 0;
+    const atom2 = atom((getter) => {
+      num += 1;
+      return {
+        ...getter(atom1),
+        num: num,
+      };
+    });
 
-        const store = createStore()
+    const store = createStore();
 
-        const res = store.getter(atom2)
-        expect(res).toStrictEqual({ a: 1, num: 1 })
-        store.setter(atom1, { a: 90 })
+    const res = store.getter(atom2);
+    expect(res).toStrictEqual({ a: 1, num: 1 });
+    store.setter(atom1, { a: 90 });
 
-        expect(store.getter(atom2)).toStrictEqual({ a: 90, num: 2 })
-    })
+    expect(store.getter(atom2)).toStrictEqual({ a: 90, num: 2 });
+  });
 
-})
+});

@@ -1,7 +1,8 @@
-import type { ReturnState } from './typePromise'
+import type { ReturnState } from './typePromise';
 
 export interface Setter {
-  <State, Args extends unknown[], Result>(atomEntity: WritableAtom<State, Args, Result>, ...args: Args): Result
+  <State, Args extends unknown[], Result>
+    (atomEntity: WritableAtom<State, Args, Result>, ...args: Args): Result
 }
 
 export interface Getter {
@@ -12,11 +13,11 @@ export interface Read<State> {
   (getter: Getter, controller: AbortController): State
 }
 
-export interface Write<State, Args extends unknown[], Result> {
+export interface Write<Args extends unknown[], Result> {
   (getter: Getter, setter: Setter, ...args: Args): Result
 }
 
-export type AtomAbstract = WritableAtom<any, any[], any>
+export type AtomAbstract = WritableAtom<any, any[], any>;
 
 export interface AtomBasic<State> {
   read: Read<State> | State
@@ -26,14 +27,16 @@ export interface AtomBasic<State> {
 
 
 
-export type AtomEntity<State> = WritableAtom<State, [State | ((prev: ReturnState<State>) => State)], void>
+export type AtomEntity<State> = WritableAtom<State,
+  [State | ((prev: ReturnState<State>) => State)], void>;
 
 
 export interface WritableAtom<State, Args extends unknown[], Result> extends AtomBasic<State> {
-  write: Write<State, Args, Result>
+  write: Write<Args, Result>
 }
 
-export type WritableItem<State> = State extends Function ? ((prev: ReturnState<State>) => State) : State
+export type WritableItem<State> = State extends Function ?
+  ((prev: ReturnState<State>) => State) : State;
 
 
 export interface Store {

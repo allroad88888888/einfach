@@ -1,12 +1,12 @@
-import type { FormInstance, NamePath } from './type'
-import { useFieldValue } from './useFieldValue'
-import { useSetField } from './useSetField'
-import type { Message } from './state'
-import { useGetFormInstance } from './useGetFormInstance'
+import type { FormInstance, NamePath } from './type';
+import { useFieldValue } from './useFieldValue';
+import { useSetField } from './useSetField';
+import type { Message } from './state';
+import { useGetFormInstance } from './useGetFormInstance';
 
 export type UseFieldOption = {
   formInstance?: FormInstance
-}
+};
 
 export function useField<T>(
   name: NamePath,
@@ -16,13 +16,13 @@ export function useField<T>(
     onChange: (param: T) => void
     message?: Message
   } {
-  const form = useGetFormInstance(formInstance)
+  const form = useGetFormInstance(formInstance);
 
-  const value = useFieldValue<T>(name, { formInstance: form })
-  const setField = useSetField<T>(name, { formInstance: form })
+  const value = useFieldValue<T>(name, { formInstance: form });
+  const setField = useSetField<T>(name, { formInstance: form });
 
   return {
     value,
     onChange: setField,
-  }
+  };
 }

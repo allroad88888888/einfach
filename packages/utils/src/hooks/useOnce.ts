@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useRef } from 'react';
 
 export function useOnce<T>(fn: () => T) {
   const { current } = useRef<{
@@ -7,10 +7,10 @@ export function useOnce<T>(fn: () => T) {
   }>({
     initialized: false,
     obj: undefined,
-  })
+  });
   if (current.initialized === false) {
-    current.obj = fn()
-    current.initialized = true
+    current.obj = fn();
+    current.initialized = true;
   }
-  return current.obj
+  return current.obj;
 }

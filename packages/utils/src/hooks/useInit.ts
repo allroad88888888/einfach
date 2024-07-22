@@ -1,4 +1,4 @@
-import { useRef } from 'react'
+import { useRef } from 'react';
 
 export function useInit<Res>(fn: () => Res, deps?: unknown[]) {
   const { current } = useRef<{
@@ -8,20 +8,20 @@ export function useInit<Res>(fn: () => Res, deps?: unknown[]) {
   }>({
     init: false,
     deps,
-  })
+  });
 
   if (current.init === false) {
-    current.init = true
-    current.res = fn()
+    current.init = true;
+    current.res = fn();
   }
   if (deps && deps.length > 0) {
     const isEqual = current.deps?.every((val, index) => {
-      return val === deps[index]
-    })
+      return val === deps[index];
+    });
     if (!isEqual) {
-      current.res = fn()
+      current.res = fn();
     }
   }
 
-  return current.res!
+  return current.res!;
 }

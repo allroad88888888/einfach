@@ -1,2 +1,2 @@
-export * from './createFamilyEasy'
-export * from "./atomWithCompare"
+export * from './createFamilyEasy';
+export * from './atomWithCompare';

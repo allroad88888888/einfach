@@ -1,9 +1,9 @@
-import type { ReactNode } from 'react'
-import { createContext } from 'react'
-import type { Store } from '../core/type'
+import type { ReactNode } from 'react';
+import { createContext } from 'react';
+import type { Store } from '../core/type';
 
 export const StoreContext = createContext<Store>(
-  null as unknown as Store)
+  null as unknown as Store);
 
 export function Provider({ store, children }: {
   store: Store
@@ -13,5 +13,5 @@ export function Provider({ store, children }: {
     <StoreContext.Provider value={store}>
       {children}
     </StoreContext.Provider>
-  )
+  );
 }

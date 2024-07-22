@@ -15,9 +15,9 @@ export function Input({ value, onChange, dataTestid, type = 'text', ...props }: 
       data-testid={dataTestid}
       onChange={(e) => {
         if (onChange) {
-          onChange(e.target.value)
+          onChange(e.target.value);
         }
       }}
     />
-  )
+  );
 }

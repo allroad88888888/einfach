@@ -5,7 +5,7 @@
   "description": "",
   "type": "module",
   "scripts": {
-    "eslint": "ESLINT_USE_FLAT_CONFIG=true npx eslint --config rules/eslint.config.mjs ./ --fix",
+    "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "test": "jest --collect-coverage",
     "clearTypes": "rimraf ./*/*/tsconfig.tsbuildinfo&&rimraf ./*/*/@types&&rimraf ./*/*/es",
     "build": "npm run clearTypes&&tsc -build",

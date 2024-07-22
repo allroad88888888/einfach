@@ -1,4 +1,4 @@
-export type PromiseStatus = 'pending' | 'fulfilled' | 'rejected'
+export type PromiseStatus = 'pending' | 'fulfilled' | 'rejected';
 
 export interface StatesWithPromise<T> extends Promise<T> {
   // ()=>
@@ -13,4 +13,4 @@ export interface ContinuablePromise<T> {
 }
 
 export type ReturnState<State> = State extends Promise<any>
-  ? StatesWithPromise<State> : State
+  ? StatesWithPromise<State> : State;

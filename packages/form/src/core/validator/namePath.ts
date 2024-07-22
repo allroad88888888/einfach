@@ -1,10 +1,10 @@
-import type { NamePath } from '../type'
+import type { NamePath } from '../type';
 
 export function namePathToStr(namePath: NamePath) {
   if (Array.isArray(namePath)) {
     return namePath.map((field) => {
-      return typeof field === 'number' ? `[${field}]` : `.${field}`
-    }).join('')
+      return typeof field === 'number' ? `[${field}]` : `.${field}`;
+    }).join('');
   }
-  return namePath
+  return namePath;
 }

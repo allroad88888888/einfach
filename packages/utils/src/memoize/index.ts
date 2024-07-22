@@ -1,1 +1,1 @@
-export * from './memoizeFn'
+export * from './memoizeFn';

@@ -1,7 +1,7 @@
-import type { Store } from 'einfach-state'
-import type { Message } from './state'
+import type { Store } from 'einfach-state';
+import type { Message } from './state';
 
-export type NamePath = string | number | (string | number)[]
+export type NamePath = string | number | (string | number)[];
 
 export type FieldData = {
   /**
@@ -26,12 +26,12 @@ export type FieldData = {
    * @deprecated
    */
   touched?: boolean
-}
+};
 
 export type FieldInfo = {
   label?: string
   rules?: Rule[]
-}
+};
 
 export interface FormInstance {
   _store: Store
@@ -88,4 +88,4 @@ export type Rule = {
    */
   warningOnly?: boolean
   message?: string
-}
+};

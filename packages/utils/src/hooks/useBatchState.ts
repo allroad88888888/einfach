@@ -1,30 +1,30 @@
-import type { ReactNode } from 'react'
-import React, { useCallback, useLayoutEffect, useReducer, useRef } from 'react'
-import { flushSync, createPortal } from 'react-dom'
+import type { ReactNode } from 'react';
+import React, { useCallback, useLayoutEffect, useReducer, useRef } from 'react';
+import { flushSync, createPortal } from 'react-dom';
 
 export function useBatchState() {
-  return flushSync
+  return flushSync;
 }
 
 export const useBatchEffectState = () => {
   const [renderNum, doRender] = useReducer((val: number) => {
-    return val + 1
-  }, 0)
-  const cbRef = useRef<() => void>()
+    return val + 1;
+  }, 0);
+  const cbRef = useRef<() => void>();
 
   const batchState = useCallback((cb: () => void) => {
-    cbRef.current = cb
-    doRender()
-  }, [])
+    cbRef.current = cb;
+    doRender();
+  }, []);
 
   useLayoutEffect(() => {
     if (cbRef.current) {
-      cbRef.current()
+      cbRef.current();
     }
-  }, [renderNum])
+  }, [renderNum]);
 
-  return batchState
-}
+  return batchState;
+};
 
 interface Props {
   cb: (fn: () => void) => void
@@ -35,23 +35,23 @@ interface Props {
 }
 
 export function useBatchClickState() {
-  const ref = useRef<HTMLDivElement>(null)
+  const ref = useRef<HTMLDivElement>(null);
   const { current } = useRef<Props>({
     init: false,
-  } as Props)
+  } as Props);
   if (!current.init) {
-    current.init = true
+    current.init = true;
     current.click = () => {
       if (current.fn) {
-        current.fn()
+        current.fn();
       }
-    }
+    };
     current.cb = (fn: () => void) => {
-      current.fn = fn
+      current.fn = fn;
       if (ref.current) {
-        ref.current.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+        ref.current.dispatchEvent(new MouseEvent('click', { bubbles: true }));
       }
-    }
+    };
   }
 
   return {
@@ -68,5 +68,5 @@ export function useBatchClickState() {
       }),
       document.body,
     ) as ReactNode,
-  }
+  };
 }
