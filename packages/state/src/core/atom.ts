@@ -1,13 +1,13 @@
-import type { AtomEntity, Getter, Read, Setter, WritableAtom, WritableItem, Write } from './type';
+import type { AtomEntity, Getter, Read, Setter, WritableAtom, Write } from './type';
 import type { ReturnState } from './typePromise';
 
 let keyCount = 0;
 
 export function atom<State>(read: Read<State> | State): AtomEntity<State>;
-export function atom<State, Args extends unknown[], Result>(
+export function atom<State, Args extends unknown[] = [State], Result = void>(
   read: Read<State> | State,
   write: Write<Args, Result>
-): WritableItem<State>;
+): WritableAtom<State, Args, Result>;
 export function atom<
   State,
   Args extends unknown[] = [State | ((prev: ReturnState<State>) => State)],

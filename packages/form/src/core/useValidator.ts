@@ -21,7 +21,7 @@ export function useValidator(
 
   const nameStr = namePathToStr(name);
   const message = useSelectAtomValue(messageMappingAtom,
-    nameStr, { store: _store }) as Message | undefined;
+    nameStr, Object.is, { store: _store }) as Message | undefined;
 
   useLayoutEffect(() => {
     const rulesMapping = _store.getter(fieldOptionMappingAtom);

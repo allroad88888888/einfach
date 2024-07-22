@@ -6,7 +6,7 @@ export interface Setter {
 }
 
 export interface Getter {
-  <State>(entity: AtomEntity<State>): ReturnState<State>
+  <State>(entity: WritableAtom<State>): ReturnState<State>
 }
 
 export interface Read<State> {
@@ -17,7 +17,8 @@ export interface Write<Args extends unknown[], Result> {
   (getter: Getter, setter: Setter, ...args: Args): Result
 }
 
-export type AtomAbstract = WritableAtom<any, any[], any>;
+export type AtomAbstract<State = any, Args extends unknown[] = any[], Result = any> =
+  WritableAtom<State, Args, Result>;
 
 export interface AtomBasic<State> {
   read: Read<State> | State
@@ -31,7 +32,8 @@ export type AtomEntity<State> = WritableAtom<State,
   [State | ((prev: ReturnState<State>) => State)], void>;
 
 
-export interface WritableAtom<State, Args extends unknown[], Result> extends AtomBasic<State> {
+export interface WritableAtom<State,
+  Args extends unknown[] = [State], Result = void> extends AtomBasic<State> {
   write: Write<Args, Result>
 }
 
