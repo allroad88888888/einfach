@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from 'react';
-import { createStore, useSetAtom } from 'einfach-state';
+import { createStore } from 'einfach-state';
+import { useEasySetAtom } from 'einfach-utils';
 import type { FormInstance, NamePath } from './type';
 import { messageMappingAtom, fieldOptionMappingAtom, valuesAtom } from './state';
 import type { Obj } from 'einfach-utils';
@@ -17,7 +18,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
     return createStore();
   });
   const { getter, setter } = store;
-  const setValues = useSetAtom(valuesAtom, { store });
+  const setValues = useEasySetAtom(valuesAtom, { store });
   const { current } = useRef({
     init: false,
   });
@@ -28,7 +29,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
     current.init = true;
   }
 
-  const setMessage = useSetAtom(messageMappingAtom, { store });
+  const setMessage = useEasySetAtom(messageMappingAtom, { store });
 
   const privateMethods = useMethods({
     onValuesChange: (changedValues: any, allValues: Values) => {

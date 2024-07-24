@@ -1,33 +1,62 @@
 import { createContinuablePromise } from './promise';
 import { isContinuablePromise, isPromiseLike } from './promiseUtils';
-import type { AtomAbstract, AtomEntity, Setter, Store, WritableAtom } from './type';
-import type { ReturnState, StatesWithPromise } from './typePromise';
+import type { Atom, ReadOptions, Setter, Store, WritableAtom } from './type';
+import type { StatesWithPromise } from './typePromise';
 
 
 
 let keyCount = 0;
 export function createStore(): Store {
-  let atomStateMap = new WeakMap<AtomAbstract, unknown>();
+  let atomStateMap = new WeakMap<Atom<unknown>, unknown>();
 
-  const listenersMap = new WeakMap<AtomAbstract, Set<() => void>>();
+  const listenersMap = new WeakMap<Atom<unknown>, Set<() => void>>();
   // [atom1,[atom2 ,atom3]]
-  const backDependenciesMap = new WeakMap<AtomAbstract, Set<AtomAbstract>>();
+  const backDependenciesMap = new WeakMap<Atom<unknown>, Set<Atom<unknown>>>();
   // [atom2 ,[atom1]]  用来判断是否 强制读取数据
-  const dependenciesUpdateMap = new WeakMap<AtomAbstract, true>();
+  const dependenciesUpdateMap = new WeakMap<Atom<unknown>, true>();
 
-  function readAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity: Entity)
-    : ReturnState<State> {
+  function readAtom<State extends Promise<unknown>>(atomEntity: Atom<Promise<State>>)
+    : State extends Promise<infer P> ? StatesWithPromise<P> : never;
+  function readAtom<State>(atomEntity: Atom<State>)
+    : State;
+  function readAtom<State, Entity extends Atom<State>>(atomEntity: Entity)
+    : StatesWithPromise<State> | State {
 
     const force = dependenciesUpdateMap.has(atomEntity);
     if (force === false && atomStateMap.has(atomEntity)) {
-      return atomStateMap.get(atomEntity) as ReturnState<State>;
+      return atomStateMap.get(atomEntity) as State;
     }
 
-    let nextState = atomEntity.read;
-    const controller = new AbortController();
-    if (typeof nextState === 'function') {
+    let nextState = atomEntity.init as State;
+    let controller: AbortController;
 
-      function getter<T, T2 extends AtomAbstract = AtomEntity<T>>(atom: T2) {
+    const options = Object.defineProperties({} as ReadOptions, {
+      'signal': {
+        get() {
+          controller = new AbortController();
+          return controller.signal;
+        },
+      },
+      'setter': {
+        get() {
+          return setAtom;
+        },
+      },
+    });
+
+    if (typeof atomEntity.read === 'function') {
+
+      function getter<State2>(atom: Atom<State2>):
+        State2 extends Promise<infer P> ? StatesWithPromise<P> : never;
+      function getter<State2>(atom: Atom<State2>): State2;
+      function getter<State2>(atom: Atom<State2>): StatesWithPromise<State2> | State2 {
+
+        if (Object.is(atom, atomEntity)) {
+          if (!atomStateMap.has(atom)) {
+            return atom.init! as State2;
+          }
+          return atomStateMap.get(atom)! as State2;
+        }
         if (!backDependenciesMap.has(atom)) {
           backDependenciesMap.set(atom, new Set());
         }
@@ -35,32 +64,50 @@ export function createStore(): Store {
         return readAtom(atom);
       }
 
-      nextState = (atomEntity).read(getter, controller);
+      nextState = atomEntity.read(getter, options);
     }
     dependenciesUpdateMap.delete(atomEntity);
 
 
     // return nextState
     return setAtomState(atomEntity, nextState, () => {
-      return controller.abort();
+      return controller?.abort?.();
     });
   }
 
-  function setAtom<State, Args extends unknown[], Result>(this: AtomAbstract,
+  function setAtom<State, Args extends unknown[], Result>(this: Atom<unknown>,
     atomEntity: WritableAtom<State, Args, Result>, ...arg: Args[]): Result {
     if (Object.is(this, atomEntity)) {
-      setAtomState(atomEntity, arg[0]);
+      setAtomState(atomEntity, arg[0] as unknown as State);
       return undefined as Result;
     }
     return atomEntity.write(readAtom, setAtom.bind(atomEntity) as Setter, ...arg as Args);
   }
 
-  function setAtomState<State, Entity extends AtomAbstract = AtomEntity<State>>(
+  function setAtomState<State extends Promise<any>>(
     this: any,
-    atomEntity: Entity,
+    atomEntity: Atom<State>,
+    state: State,
+    abortPromise?: () => void
+  ): State extends Promise<infer P> ? StatesWithPromise<P> : never;
+  function setAtomState<State>(
+    this: any,
+    atomEntity: Atom<State>,
+    state: State,
+    abortPromise?: () => void,
+  ): State | StatesWithPromise<State>;
+  function setAtomState<State>(
+    this: any,
+    atomEntity: Atom<State>,
     state: State,
     abortPromise: () => void = () => { },
-  ) {
+  ): State | StatesWithPromise<State> {
+    // function setAtomState<State, Entity extends Atom<State>>(
+    //   this: any,
+    //   atomEntity: Entity,
+    //   state: State,
+    //   abortPromise: () => void = () => { },
+    // ) {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state);
     }
@@ -72,7 +119,8 @@ export function createStore(): Store {
         triggerSubScriptionAndDependency.call(atomEntity, atomEntity);
       });
       if (isContinuablePromise(prevState)) {
-        prevState.CONTINUE_PROMISE?.(nextState as StatesWithPromise<State>, abortPromise);
+        prevState.CONTINUE_PROMISE?.(
+          nextState as StatesWithPromise<State>, abortPromise);
       }
     }
 
@@ -82,13 +130,13 @@ export function createStore(): Store {
   }
 
 
-  function triggerSubScriptionAndDependency<Entity extends AtomAbstract>(this: Entity,
+  function triggerSubScriptionAndDependency<Entity extends Atom<unknown>>(this: Entity,
     atomEntity: Entity) {
     /**
      * 触发订阅atom状态的方法
      */
     publishAtom(atomEntity);
-    function iteratorPush(backAtomEntity: AtomAbstract) {
+    function iteratorPush(backAtomEntity: Atom<unknown>) {
       const backEntitySet = backDependenciesMap.get(backAtomEntity)! || [];
       backEntitySet.forEach((backEntity) => {
         dependenciesUpdateMap.set(backEntity, true);
@@ -106,7 +154,7 @@ export function createStore(): Store {
   }
 
 
-  function publishAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity: Entity) {
+  function publishAtom<Entity extends Atom<unknown>>(atomEntity: Entity) {
     const listenerSet = listenersMap.get(atomEntity);
     if (listenerSet) {
       listenerSet.forEach((listener) => {
@@ -115,7 +163,7 @@ export function createStore(): Store {
     }
   }
 
-  function subscribeAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(
+  function subscribeAtom<Entity extends Atom<unknown>>(
     atomEntity: Entity, listener: () => void) {
 
     if (!listenersMap.has(atomEntity)) {
@@ -129,7 +177,7 @@ export function createStore(): Store {
   }
   const key = `store${++keyCount}`;
 
-  function resetAtom<State, Entity extends AtomAbstract = AtomEntity<State>>(atomEntity?: Entity) {
+  function resetAtom<Entity extends Atom<unknown>>(atomEntity?: Entity) {
     if (atomEntity) {
       atomStateMap.delete(atomEntity);
     } else {

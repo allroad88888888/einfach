@@ -11,11 +11,13 @@ interface Pagination {
 describe('select', () => {
     it('base', () => {
 
-        const paginationAtom = atom<Pagination>({
+
+
+        const paginationAtom = atom({
             pageSize: 20,
             currentPage: 1,
             total: 0,
-        }, (getter, setter, nextPagination) => {
+        }, (getter, setter, nextPagination: Pagination) => {
             const { total, pageSize, currentPage } = nextPagination;
             const maxPage = Math.ceil(total / pageSize) || 1;
             const fixPage = currentPage < 1 ? 1 : currentPage > maxPage ? maxPage : currentPage;
@@ -44,6 +46,8 @@ describe('select', () => {
             currentPage: 1,
             total: 100,
         });
+
+
 
         const query2 = store.getter(queryAtom);
 

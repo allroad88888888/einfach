@@ -1,7 +1,7 @@
 import type { FormInstance, NamePath, Rule } from './type';
 import { useInit } from 'einfach-utils';
 import { buildEventRulesMapping, namePathToStr } from './validator';
-import { useSelectAtomValue } from 'einfach-state';
+import { useEasySelectAtomValue } from 'einfach-utils';
 import type { Message } from './state';
 import { messageMappingAtom, fieldOptionMappingAtom } from './state';
 import { useGetFormInstance } from './useGetFormInstance';
@@ -20,7 +20,7 @@ export function useValidator(
   const { _store, validateField } = useGetFormInstance(formInstance);
 
   const nameStr = namePathToStr(name);
-  const message = useSelectAtomValue(messageMappingAtom,
+  const message = useEasySelectAtomValue(messageMappingAtom,
     nameStr, Object.is, { store: _store }) as Message | undefined;
 
   useLayoutEffect(() => {

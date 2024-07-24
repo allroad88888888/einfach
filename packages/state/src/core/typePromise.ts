@@ -12,5 +12,5 @@ export interface ContinuablePromise<T> {
   (nextPromise: Promise<T>, nextAbort: () => void): void
 }
 
-export type ReturnState<State> = State extends Promise<any>
-  ? StatesWithPromise<State> : State;
+// export type ReturnState<State> = State extends Promise<any>
+//   ? StatesWithPromise<State> : State;

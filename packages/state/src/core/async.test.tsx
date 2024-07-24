@@ -3,6 +3,16 @@ import { atom } from './atom';
 import { createStore } from './store';
 
 describe('async', () => {
+  test('type', async () => {
+    const atom1 = atom<any>(async function () {
+      return 100;
+    });
+     const store = createStore();
+    
+    const state2 = store.getter(atom1);
+
+    expect(state2.a).toBe(undefined);
+  });
   test('base', async () => {
     let runNum = 0;
     const atom1 = atom(async function () {

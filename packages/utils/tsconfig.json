@@ -6,5 +6,14 @@
     "declarationDir": "@types",
     "declarationMap": false,
   },
-  "include": ["./src/**/*"],
+  "include": [
+    "./src/**/*",
+    "!./src**/*.test.ts",
+    "!./src**/*.test.tsx"
+  ],
+  "references": [
+    {
+      "path": "./../state/tsconfig.json"
+    }
+  ]
 }
