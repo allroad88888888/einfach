@@ -1,4 +1,5 @@
 import type {
+  Atom,
   AtomEntity, Getter, Read, Setter, WritableAtom,
 } from './type';
 
@@ -7,10 +8,13 @@ let keyCount = 0;
 
 type Value<State> = State | ((prev: State) => State);
 
-export function atom<State>(
-  read: Read<State> | State,
-): AtomEntity<State>;
 
+export function atom<State>(
+  read: Read<State>,
+): Atom<State>;
+export function atom<State>(
+  read: State,
+): AtomEntity<State>;
 export function atom<State, Args extends unknown[], Result>(
   read: Read<State> | State,
   write: (getter: Getter, setter: Setter, ...args: Args) => Result

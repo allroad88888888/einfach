@@ -22,7 +22,10 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
       setState(realStore.getter(atom));
     }
     return realStore.sub(atom, () => {
-      setState(realStore.getter(atom));
+      if (setState) {
+        setState(realStore.getter(atom));
+      }
+
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realStore, atom]);

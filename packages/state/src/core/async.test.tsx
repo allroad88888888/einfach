@@ -75,7 +75,7 @@ describe('async', () => {
 
     const atom2 = atom((getter) => {
       render2 += 1;
-      return getter(atom1).a;
+      return getter(atom1).b;
     });
 
     let render = 0;
@@ -95,7 +95,8 @@ describe('async', () => {
         b: 3,
       };
     });
-    store.getter(atom3);
+    const val3 = store.getter(atom3);
+    expect(val3).toBe(3);
     expect(render).toBe(2);
     expect(render2).toBe(2);
   });

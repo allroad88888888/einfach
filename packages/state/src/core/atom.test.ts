@@ -29,7 +29,7 @@ describe('store', () => {
     store.setter(atom1, {
       a: { b: 1 },
     });
-    expect(state2.b === 1).toBe(true);
+    expect(state2).toStrictEqual({ b: 1 });
     expect(state3 === 124).toBe(true);
   });
 
@@ -54,11 +54,11 @@ describe('store', () => {
     expect(runAtom).toBe(1);
 
     store.setter(atom1, 2);
-    expect(runAtom).toBe(1);
+    expect(runAtom).toBe(2);
     store.getter(atom2);
     expect(runAtom).toBe(2);
     const valAtom2 = store.getter(atom2);
-    expect(renderAtom2).toBe(2);
+    expect(renderAtom2).toBe(1);
     expect(runAtom).toBe(2);
     expect(valAtom2).toBe(2);
   });

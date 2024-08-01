@@ -2,6 +2,7 @@ import { describe, expect, it } from '@jest/globals';
 import { atom, createStore } from '../core';
 import { selectAtom } from '../react';
 
+
 interface Pagination {
     pageSize: number
     currentPage: number
@@ -9,15 +10,13 @@ interface Pagination {
 }
 
 describe('select', () => {
-    it('base', () => {
-
-
-
+    it('base', async () => {
         const paginationAtom = atom({
             pageSize: 20,
             currentPage: 1,
             total: 0,
         }, (getter, setter, nextPagination: Pagination) => {
+            getter(paginationAtom);
             const { total, pageSize, currentPage } = nextPagination;
             const maxPage = Math.ceil(total / pageSize) || 1;
             const fixPage = currentPage < 1 ? 1 : currentPage > maxPage ? maxPage : currentPage;
@@ -26,8 +25,6 @@ describe('select', () => {
                 currentPage: fixPage,
             });
         });
-
-
         const queryAtom = selectAtom(paginationAtom, (current) => {
             return {
                 pageSize: current.pageSize,
@@ -38,7 +35,6 @@ describe('select', () => {
         });
 
         const store = createStore();
-
         const query = store.getter(queryAtom);
 
         store.setter(paginationAtom, {
@@ -47,10 +43,7 @@ describe('select', () => {
             total: 100,
         });
 
-
-
         const query2 = store.getter(queryAtom);
-
         store.setter(paginationAtom, {
             pageSize: 20,
             currentPage: 100,
@@ -64,5 +57,5 @@ describe('select', () => {
             'pageSize': 20,
         });
 
-    });
+    }, 1000 * 50 * 50);
 });

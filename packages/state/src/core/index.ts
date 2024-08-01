@@ -3,3 +3,4 @@ export * from './store';
 export * from './type';
 export * from './defaultStore';
 export * from './typePromise';
+export * from './promiseUtils';
