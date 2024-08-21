@@ -9,6 +9,19 @@ export function createStore(): Store {
 
   const listenersMap = new WeakMap<Atom<unknown>, Set<() => void>>();
   const backDependenciesMap = new WeakMap<Atom<unknown>, Set<Atom<unknown>>>();
+  /**
+   * for clean backDependencies
+   */
+  const dependenciesMap = new WeakMap<Atom<unknown>, Set<Atom<unknown>>>();
+
+  function clearDependencies<AtomType extends Atom<unknown>>(atomEntity:AtomType) {
+    const dependencies = Array.from(dependenciesMap.get(atomEntity) || []);
+    dependencies.forEach((depAtomEntity)=>{
+      backDependenciesMap.get(depAtomEntity)?.delete(atomEntity);
+    });
+    dependenciesMap.delete(atomEntity);
+
+  }
 
   function readAtom<State extends Promise<unknown>>(this: Atom<any>,
     atomEntity: Atom<Promise<State>>, force?: boolean):
@@ -54,14 +67,19 @@ export function createStore(): Store {
           backDependenciesMap.set(atom, new Set());
         }
         backDependenciesMap.get(atom)!.add(atomEntity);
+        if (!dependenciesMap.has(atomEntity)) {
+          dependenciesMap.set(atomEntity, new Set());
+        }
+        dependenciesMap.get(atomEntity)!.add(atom);
+
         return readAtom.call(atomEntity, atom) as State2;
       }
 
+      clearDependencies(atomEntity);
+
       nextState = atomEntity.read(getter, options);
     }
-    // dependenciesUpdateMap.delete(atomEntity)
 
-    // return nextState
     return setAtomState.call(this, atomEntity, nextState, () => {
       return controller?.abort?.();
     }) as State | StatesWithPromise<State>;
@@ -125,7 +143,8 @@ export function createStore(): Store {
      * 触发订阅atom状态的方法
      */
     publishAtom(atomEntity);
-    const backEntitySet = backDependenciesMap.get(atomEntity)! || [];
+    // 直接用set 跟clean BackDependencies 冲突，这里进入死循环
+    const backEntitySet = Array.from( backDependenciesMap.get(atomEntity)! || []);
     backEntitySet.forEach((backEntity) => {
       if (this === backEntity) {
         return;

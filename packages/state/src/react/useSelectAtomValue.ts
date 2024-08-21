@@ -1,13 +1,20 @@
-import type { Atom } from '../core';
+
+import type { Atom, AtomEntity, AtomState } from '../core';
 import { atom } from '../core';
 
+
+export function selectAtom<Slice, AtomType extends Atom<unknown>>(
+  atomEntity: AtomType,
+  selectFn: ((current: AtomState<AtomType>, prev?: Slice) => Slice),
+  equalityFn?: (prev: Slice, next: Slice) => boolean
+): AtomEntity<Slice>;
 export function selectAtom<Slice, State>(
-  atomEntity: Atom<State>,
+  atomEntity: AtomEntity<State>,
   selectFn: ((current: State, prev?: Slice) => Slice),
   equalityFn?: (prev: Slice, next: Slice) => boolean
-): State extends Promise<any> ? never : Atom<Slice>;
+): State extends Promise<any> ? never : AtomEntity<Slice>;
 export function selectAtom<Slice, State>(
-  atomEntity: Atom<State>,
+  atomEntity: AtomEntity<State>,
   selectFn: ((current: State, prev?: Slice) => Slice),
   equalityFn: (prev: Slice, next: Slice) => boolean = Object.is,
 ) {
@@ -23,5 +30,5 @@ export function selectAtom<Slice, State>(
   });
   derivedAtom.init = Empty as Slice;
 
-  return derivedAtom as Atom<Slice>;
+  return derivedAtom as AtomEntity<Slice>;
 }

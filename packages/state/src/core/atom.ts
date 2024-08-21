@@ -1,5 +1,4 @@
 import type {
-  Atom,
   AtomEntity, Getter, Read, Setter, WritableAtom,
 } from './type';
 
@@ -11,7 +10,7 @@ type Value<State> = State | ((prev: State) => State);
 
 export function atom<State>(
   read: Read<State>,
-): Atom<State>;
+): AtomEntity<State>;
 export function atom<State>(
   read: State,
 ): AtomEntity<State>;
