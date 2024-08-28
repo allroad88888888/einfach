@@ -13,3 +13,5 @@ export * from './useFormValues';
 export * from './type';
 
 export * from './content';
+
+export * from './useValidator';

@@ -1,9 +1,8 @@
 {
   "name": "einfach-form",
-  "version": "0.0.1-beta-03",
+  "version": "0.0.1-beta-05",
   "main": "es/index.js",
   "typings": "@types/index.d.ts",
-  "type": "module",
   "license": "MIT",
   "author": "allroad88888888@vip.qq.com",
   "files": [
