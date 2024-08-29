@@ -1,4 +1,4 @@
-import type { Store } from '../core/type';
+import type { Store } from '../core/type'
 
 export interface HookOption {
   store?: Store

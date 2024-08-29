@@ -1,7 +1,7 @@
-import { createStore } from './store';
+import { createStore } from './store'
 
-const defaultStore = createStore();
+const defaultStore = createStore()
 
 export function getDefaultStore() {
-  return defaultStore;
+  return defaultStore
 }

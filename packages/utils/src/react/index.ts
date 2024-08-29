@@ -1,1 +1,1 @@
-export * from './hump';
+export * from './hump'

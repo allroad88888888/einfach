@@ -24,9 +24,10 @@
     "noEmitHelpers": true,
     "preserveWatchOutput": true,
     "jsx": "react-jsx",
-    "inlineSourceMap": true,
-  },  
+    "inlineSourceMap": true
+  },
   "include": [
+    "./jest.config.mjs",
     "./**/*.test.ts",
     "./**/*.test.tsx",
     "./**/test",
@@ -34,8 +35,14 @@
   ],
   "exclude": ["node_modules", "**/node_modules", "**/@types/"],
   "references": [
-    { "path": "./packages/form/tsconfig.json" },
-    { "path": "./packages/utils/tsconfig.json" },
-    { "path": "./packages/state/tsconfig.json" }
+    {
+      "path": "./packages/form/tsconfig.json"
+    },
+    {
+      "path": "./packages/utils/tsconfig.json"
+    },
+    {
+      "path": "./packages/state/tsconfig.json"
+    }
   ]
 }

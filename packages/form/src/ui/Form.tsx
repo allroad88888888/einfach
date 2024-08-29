@@ -1,6 +1,6 @@
-import React from 'react';
-import type { FormInstance } from '../core';
-import { FormContext } from '../core';
+import React from 'react'
+import type { FormInstance } from '../core'
+import { FormContext } from '../core'
 
 export function Form({
   children,
@@ -9,5 +9,5 @@ export function Form({
   children: React.ReactNode
   formInstance: FormInstance
 }) {
-  return <FormContext.Provider value={formInstance}>{children}</FormContext.Provider>;
+  return <FormContext.Provider value={formInstance}>{children}</FormContext.Provider>
 }

@@ -101,10 +101,6 @@
         "avoidEscape": true
       }
     ],
-    "@stylistic/semi": [
-      "error",
-      "always"
-    ],
     "@stylistic/space-before-function-paren": [
       "error",
       {

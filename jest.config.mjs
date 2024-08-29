@@ -1,4 +1,3 @@
-// jest（单测基础包）
 import fs from 'node:fs'
 //  typescript转js配置（采用swc包转）
 const config = JSON.parse(fs.readFileSync(`${process.cwd()}/.swcrc`, 'utf-8'))
