@@ -134,127 +134,125 @@ redo()
 
 ### 一个状态，受多个事件影响
 
-比如： 按钮触发了一个操作，更改某个样式， 然后需要撤销这个动作。然后有多个事件修改这个值，每个事件有取消修改这个值
+```tsx
+const countIncrementAtom = incrementAtom<{
+  count: number
+}>
+{
+  count: 1
+}
 
-```jsx
-  const styleAtom = incrementAtom({})  atom({}defalutValue ) Set<ReadFunction>()
+const aCountAtom = atom(0)
+function A() {
+  const { setter } = useStore()
+  const setACount = useSetAtom(aCountAtom)
 
-  function useEventA(){
-    const store = useStore()
+  const [cancel] = useState(() => {
+    return setter(countIncrementAtom, (_getter, prevReturn) => {
+      const aCount = _getter(aCountAtom)
+      return {
+        ...prevReturn,
+        count: prevReturn.count + aCount,
+      }
+    })
+  })
 
-    const clearRef = useRef()
+  return (
+    <div>
+      <button
+        data-testid="btn-a-add"
+        onClick={() => {
+          setACount((prevACount) => {
+            return prevACount + 1
+          })
+        }}
+      >
+        + 1
+      </button>
+      <button data-testid="btn-a-cancel" onClick={cancel}>
+        cancel A count
+      </button>
+    </div>
+  )
+}
 
-   useInit(()=>{
-        /**
-         * 给styleAtom 添加一个新值
-         * prev styleAtom最新值
-         * @ return 清除这个值
-         * */
-        clearRef.current = store.setter(styleAtom,(_getter,prev)=>{
-          return {
-            ...prev,
-            color:"red",
-            border:"1px solid red"
-            number:9
-          }
-       })
-    },[])
+function B() {
+  const { setter } = useStore()
 
-    const onCancelA = useCallback(()=>{
-        clearRef.current?.()
-    },[])
-  }
+  useLayoutEffect(() => {
+    return setter(countIncrementAtom, (_getter, prevReturn) => {
+      return {
+        count: prevReturn.count + 99,
+      }
+    })
+  }, [])
 
-  function useEventB(){
-    const atomEntity = atom(0)
-    const store = useStore()
-    const ref = useRef()
+  const { count } = useAtomValue(countIncrementAtom)
 
+  return <div data-testid="result">{count}</div>
+}
 
-    useInit(()=>{
-       ref.current =  store.setter(styleAtom,(_getter,prevReturn)=>{
-        // 4
-        const a = _getter(atomEntity)
-          return {
-            ...prev,
-            color:"blue",
-            number:prev+a
+function App() {
+  return (
+    <div data-testid="app">
+      <A />
+      <B />
+    </div>
+  )
+}
 
-          }
-       })
-    },[])
+const { baseElement } = render(<App />)
+await screen.findByTestId('app')
+expect(queryByTestId(baseElement, 'result')).toBeInTheDocument()
+expect(queryByTestId(baseElement, 'result')?.textContent).toBe('100')
 
-    const onClickA =()=>{
-      store.setter(atomEntity,(i)=>{
-        return i+1
-      })
-    }
-    const cancelB=()=>{
-      ref.current?.()
-    }
-
-
-
-  }
-
-  const style = useAtomValue(styleAtom)
-  style = {
-     color:"blue",
-     border:"1px solid red"
-  }
-
+await userEvent.click(screen.getByTestId('btn-a-add'))
+expect(queryByTestId(baseElement, 'result')?.textContent).toBe('101')
+await userEvent.click(screen.getByTestId('btn-a-add'))
+expect(queryByTestId(baseElement, 'result')?.textContent).toBe('102')
+await userEvent.click(screen.getByTestId('btn-a-cancel'))
+expect(queryByTestId(baseElement, 'result')?.textContent).toBe('100')
 ```
 
 ### async
 
 ```jsx
-  const serverInfoAtom = atom(()=>{
-    return new Promise((rev,rej)=>{
-        setTimeout(()=>{
-          rev([{
-            id:1,name:"1"
-          },{
-            id:2,name:"2"
-          }])
-        },,3000)
+ const serverInfoAtom = atom(function () {
+      return new Promise((resolve) => {
+        setTimeout(() => {
+          resolve([{ id: 1 }, { id: 2 }])
+        }, 1000)
+      }) as Promise<{ id: number }[]>
     })
-  })
 
-  const cAtom = atom((getter)=>{
-    const xx = getter(serverInfoAtom)
-    return xx[1]
-  })
+    const firstItemAtom = atom(async (getter) => {
+      const serverInfo = await getter(serverInfoAtom)
+      return serverInfo[0]
+    })
 
-  function C(){
-    const c = useAtomValue(cAtom)
-  }
+    function FirstItem() {
+      const firstItemInfo = useAtomValue(firstItemAtom)
 
-  function A(){
-    const serverInfo = useAtom(serverInfoAtom)
-    return <C />
-  }
+      return <div data-testid="firstItem">{firstItemInfo.id}</div>
+    }
+    function App() {
+      return (
+        <div data-testid="app">
+          <Suspense fallback={<div data-testid="loading">loading</div>}>
+            <FirstItem />
+          </Suspense>
 
-  function App(){
-    return <>
-      <React.Supen fallback={<div>loadingg</div>}>
-      <A >
-        <B/>
-      </A>
-      </React.Supen>
-      <D/>
-      <F/>
-    </>
-  }
+          <div data-testid="otherComponents">other components</div>
+        </div>
+      )
+    }
 
-function App2(){
-    return <>
-      <React.Supen>
-      <C/>
-      </React.Supen>
-      <D/>
-      <F/>
-    </>
-  }
+    const { baseElement } = render(<App />)
+    await screen.findByTestId('app')
+    expect(queryByTestId(baseElement, 'firstItem')).not.toBeInTheDocument()
+    expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
+    await screen.findByTestId('firstItem')
+    expect(queryByTestId(baseElement, 'firstItem')).toBeInTheDocument()
 
 
 ```
@@ -263,7 +261,6 @@ function App2(){
 
 ```jsx
  const serverInfoAtom = atom((getter)=>{
-  const a = getter(xxAtom)
     return new Promise((rev,rej)=>{
         setTimeout(()=>{
           rev([{
@@ -280,8 +277,30 @@ function App2(){
     if(loading){
       return <Loading/>
     }
-    return
+    return <div></div>
   }
 
 
+```
+
+### createFamilyEasy 多个相同类型的atom
+
+```tsx
+const { createAtomFamily, clear } = createAtomFamilyEntity()
+
+/**
+ * 子节点详情
+ */
+const getNodeInfoAtomById = createAtomFamily<NodeInfo | null>({
+  debuggerKey: 'getNodeInfoAtomById',
+  defaultValue: null,
+})
+
+/**
+ * 界面树形关系 父-子
+ */
+const getChildrenIdsAtomById = createAtomFamily<string[] | undefined>({
+  defaultValue: [] as string[],
+  debuggerKey: 'getChildrenIdsAtomById',
+})
 ```
