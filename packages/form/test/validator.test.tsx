@@ -9,7 +9,7 @@ describe('form-validator', () => {
     const ValidatorFrom = () => {
       const form = useForm({
         initialValues: {
-          inputText: 'demo1',
+          inputText: 'demo',
           inputDate: new Date('2024-05-28 00:00:00'),
           inputDateMin: new Date('2022-05-28 00:00:00'),
           inputCustom: '12312A',
@@ -96,7 +96,6 @@ describe('form-validator', () => {
           </FormItem>
 
           <button onClick={form.validateFields} data-testid="submit">
-            {' '}
             submit
           </button>
         </Form>

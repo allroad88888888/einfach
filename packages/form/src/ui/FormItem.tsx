@@ -1,8 +1,7 @@
 import type { ReactNode } from 'react'
 import type React from 'react'
-import { cloneElement, isValidElement, memo, useCallback } from 'react'
+import { isValidElement, memo, useCallback } from 'react'
 import { useField, type NamePath, type Rule } from '../core'
-import { useInit } from 'einfach-utils'
 import { useValidator } from '../core/useValidator'
 
 export type FormItemProps = {
@@ -28,17 +27,12 @@ export function FormItemFc(props: FormItemProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const $children = useInit(() => {
-    if (!isValidElement(children)) {
-      return null
-    }
-    return cloneElement(children, {
-      ...children.props,
-      value,
-      ...methods,
-      onChange: handChange,
-    })
-  }, [])
+  if (!isValidElement(children)) {
+    return null
+  }
+
+  const Item = children.type
+  const $children = <Item {...children.props} value={value} {...methods} onChange={handChange} />
 
   if (noStyle) {
     return $children

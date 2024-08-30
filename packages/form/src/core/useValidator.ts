@@ -22,11 +22,12 @@ export function useValidator(name: NamePath, { formInstance, rules = [], label }
   }) as Message | undefined
 
   useLayoutEffect(() => {
-    const rulesMapping = _store.getter(fieldOptionMappingAtom)
+    const rulesMapping = new Map(_store.getter(fieldOptionMappingAtom))
     rulesMapping.set(nameStr, {
       label,
       rules,
     })
+    _store.setter(fieldOptionMappingAtom, rulesMapping)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nameStr, rules])
 
