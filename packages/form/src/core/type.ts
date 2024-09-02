@@ -1,7 +1,11 @@
-import type { Store } from 'einfach-state'
-import type { Message } from './state'
+import type { FormDataHelpType } from './context'
 
 export type NamePath = string | number | (string | number)[]
+
+export type Message = {
+  warn?: string[] | undefined
+  error?: string[] | undefined
+}
 
 export type FieldData = {
   /**
@@ -33,8 +37,7 @@ export type FieldInfo = {
   rules?: Rule[]
 }
 
-export interface FormInstance {
-  _store: Store
+export interface FormInstance extends FormDataHelpType {
   setFieldValue: <Value>(name: NamePath, value: Value) => void
   setFieldsValue: (values: any) => void
   getFieldValue: <Value>(name: NamePath) => Value | undefined

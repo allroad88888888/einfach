@@ -1,7 +1,6 @@
-import type { FormInstance, NamePath } from './type'
+import type { FormInstance, Message, NamePath } from './type'
 import { useFieldValue } from './useFieldValue'
 import { useSetField } from './useSetField'
-import type { Message } from './state'
 import { useGetFormInstance } from './useGetFormInstance'
 
 export type UseFieldOption = {

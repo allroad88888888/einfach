@@ -1,9 +1,8 @@
-import type { FormInstance, NamePath, Rule } from './type'
+import type { FormInstance, Message, NamePath, Rule } from './type'
 import { useInit } from 'einfach-utils'
 import { buildEventRulesMapping, namePathToStr } from './validator'
 import { useEasySelectAtomValue } from 'einfach-utils'
-import type { Message } from './state'
-import { messageMappingAtom, fieldOptionMappingAtom } from './state'
+
 import { useGetFormInstance } from './useGetFormInstance'
 import { useEffect, useLayoutEffect } from 'react'
 
@@ -14,20 +13,21 @@ export type UseRulesOption = {
 }
 
 export function useValidator(name: NamePath, { formInstance, rules = [], label }: UseRulesOption) {
-  const { _store, validateField } = useGetFormInstance(formInstance)
+  const { _store, validateField, _messageMappingAtom, _fieldOptionMappingAtom } =
+    useGetFormInstance(formInstance)
 
   const nameStr = namePathToStr(name)
-  const message = useEasySelectAtomValue(messageMappingAtom, nameStr, Object.is, {
+  const message = useEasySelectAtomValue(_messageMappingAtom, nameStr, Object.is, {
     store: _store,
   }) as Message | undefined
 
   useLayoutEffect(() => {
-    const rulesMapping = new Map(_store.getter(fieldOptionMappingAtom))
+    const rulesMapping = new Map(_store.getter(_fieldOptionMappingAtom))
     rulesMapping.set(nameStr, {
       label,
       rules,
     })
-    _store.setter(fieldOptionMappingAtom, rulesMapping)
+    _store.setter(_fieldOptionMappingAtom, rulesMapping)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nameStr, rules])
 
@@ -45,9 +45,9 @@ export function useValidator(name: NamePath, { formInstance, rules = [], label }
 
   useEffect(() => {
     return () => {
-      const tMessage = _store.getter(messageMappingAtom)
+      const tMessage = _store.getter(_messageMappingAtom)
       tMessage.delete(nameStr)
-      _store.setter(messageMappingAtom, new Map(tMessage))
+      _store.setter(_messageMappingAtom, new Map(tMessage))
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
