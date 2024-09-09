@@ -1,4 +1,4 @@
-import type { FormDataHelpType } from './context'
+import type { createFormDataHelpContext } from './context'
 
 export type NamePath = string | number | (string | number)[]
 
@@ -92,3 +92,7 @@ export type Rule = {
   warningOnly?: boolean
   message?: string
 }
+
+export type FormDataHelpType = ReturnType<typeof createFormDataHelpContext>
+
+export type CreateDataHelpAtoms = typeof createFormDataHelpContext

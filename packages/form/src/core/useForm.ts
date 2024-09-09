@@ -1,6 +1,6 @@
 import { useMemo, useRef } from 'react'
 import { useEasySetAtom, useInit } from 'einfach-utils'
-import type { FormInstance, NamePath } from './type'
+import type { CreateDataHelpAtoms, FormInstance, NamePath } from './type'
 import type { Obj } from 'einfach-utils'
 import { easyGet, easySetIn, useMethods } from 'einfach-utils'
 import { buildEventRulesMapping, namePathToStr, validatorItem } from './validator'
@@ -9,18 +9,18 @@ import { createFormDataHelpContext as defaultCreateDataHelpContext } from './con
 export interface FormProps<T extends Obj> {
   initialValues?: any
   onValuesChange?: (changedValues: any, allValues: T) => void
-  createDataHelpContext?: typeof defaultCreateDataHelpContext
+  createFormDataHelpContext?: CreateDataHelpAtoms
 }
 
 export function useForm<Values extends Obj>(props: FormProps<Values>): FormInstance {
   const {
     initialValues,
     onValuesChange,
-    createDataHelpContext = defaultCreateDataHelpContext,
+    createFormDataHelpContext = defaultCreateDataHelpContext,
   } = props
   const dataHelpContext = useInit(() => {
-    return createDataHelpContext()
-  }, [defaultCreateDataHelpContext])
+    return createFormDataHelpContext()
+  }, [createFormDataHelpContext])
   const { _store, _valuesAtom, _messageMappingAtom, _fieldOptionMappingAtom } = dataHelpContext
   const { getter, setter } = _store
   const setValues = useEasySetAtom(_valuesAtom, { store: _store })
@@ -64,16 +64,13 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
       }
 
       const val = privateMethods.getFieldValue(name)
-      // const runKeys = Object.keys(tempMethods).filter((tempEventName) => {
-      //   return eventName ? tempEventName === eventName : true
-      // })
+
       const warnList: string[] = []
       const errorList: string[] = []
       for (const [key, tRules] of tempMethods) {
         if (eventName && key !== eventName) {
           break
         }
-        // const rules = tempMethods.get(key)!
         try {
           for (const rule of tRules) {
             const res = await validatorItem(val, { rule, label })
@@ -151,6 +148,5 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
       ...dataHelpContext,
       ...methods,
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dataHelpContext])
+  }, [dataHelpContext, methods])
 }

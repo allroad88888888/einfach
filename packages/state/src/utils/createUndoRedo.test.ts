@@ -58,22 +58,44 @@ describe('undo redo ', () => {
     const numberAtom = atom(0)
     const stringAtom = atom('')
     const store = createStore()
-    const { watchAtom, undo, redo, historyTransactionEnd, historyTransactionStart } =
-      createUndoRedo(store)
+    const { watchAtom, undo, redo, mergeState, redoAtom } = createUndoRedo(store)
     watchAtom(numberAtom)
     watchAtom(stringAtom)
 
-    historyTransactionStart()
-    store.setter(numberAtom, 1)
-    store.setter(stringAtom, 'init')
-    store.setter(numberAtom, 2)
-    historyTransactionEnd()
+    mergeState(() => {
+      store.setter(numberAtom, 1)
+      store.setter(stringAtom, 'init')
+      store.setter(numberAtom, 2)
+    })
 
     undo()
     expect(store.getter(numberAtom)).toBe(0)
     expect(store.getter(stringAtom)).toBe('')
+    expect(store.getter(redoAtom)).toBe(true)
     redo()
     expect(store.getter(numberAtom)).toBe(2)
     expect(store.getter(stringAtom)).toBe('init')
+  })
+
+  test('transaction-error', () => {
+    const numberAtom = atom(0)
+    const stringAtom = atom('')
+    const store = createStore()
+    const { watchAtom, mergeState, redoAtom } = createUndoRedo(store)
+    watchAtom(numberAtom)
+    watchAtom(stringAtom)
+
+    try {
+      mergeState(() => {
+        store.setter(numberAtom, 1)
+        store.setter(stringAtom, 'init')
+        throw 'error'
+        store.setter(numberAtom, 2)
+      })
+    } catch (error) {}
+
+    expect(store.getter(numberAtom)).toBe(0)
+    expect(store.getter(stringAtom)).toBe('')
+    expect(store.getter(redoAtom)).toBe(false)
   })
 })

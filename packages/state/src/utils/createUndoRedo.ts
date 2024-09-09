@@ -129,13 +129,25 @@ export function createUndoRedo(store: Store) {
     redo() {
       store.setter(redoAtom)
     },
-    historyTransactionStart() {
-      store.setter(isMergeAtom, true)
-    },
-    historyTransactionEnd() {
-      store.setter(historyIndexAtom, (index) => {
-        return index + 1
-      })
+    mergeState(fn: () => void) {
+      try {
+        store.setter(isMergeAtom, true)
+        fn()
+        store.setter(historyIndexAtom, (index) => {
+          return index + 1
+        })
+      } catch (error) {
+        store.setter(historyIndexAtom, (index) => {
+          return index + 1
+        })
+        store.setter(undoAtom)
+        const currentIndex = store.getter(historyIndexAtom)
+        const nextIndx = currentIndex + 1
+        const hisState = [...store.getter(historyDataAtom)]
+        hisState.splice(nextIndx, 1)
+        store.setter(historyDataAtom, hisState)
+        throw error
+      }
     },
   }
 }
