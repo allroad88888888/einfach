@@ -84,18 +84,62 @@ describe('undo redo ', () => {
     const { watchAtom, mergeState, redoAtom } = createUndoRedo(store)
     watchAtom(numberAtom)
     watchAtom(stringAtom)
-
+    store.setter(numberAtom, 1)
     try {
       mergeState(() => {
-        store.setter(numberAtom, 1)
+        store.setter(numberAtom, 2)
         store.setter(stringAtom, 'init')
         throw 'error'
-        store.setter(numberAtom, 2)
+        store.setter(numberAtom, 3)
       })
-    } catch (error) {}
+    } catch (error) {
+      if (error !== 'error') {
+        throw error
+      }
+    }
+
+    expect(store.getter(numberAtom)).toBe(1)
+    expect(store.getter(stringAtom)).toBe('')
+    expect(store.getter(redoAtom)).toBe(false)
+  })
+  test('transaction-error-null', () => {
+    const numberAtom = atom(0)
+    const stringAtom = atom('')
+    const store = createStore()
+    const { watchAtom, mergeState, redoAtom, undoAtom } = createUndoRedo(store)
+    watchAtom(numberAtom)
+    watchAtom(stringAtom)
+    store.setter(numberAtom, 1)
+    try {
+      mergeState(() => {
+        throw 'error'
+      })
+    } catch (error) {
+      if (error !== 'error') {
+        throw error
+      }
+    }
+
+    expect(store.getter(numberAtom)).toBe(1)
+    expect(store.getter(stringAtom)).toBe('')
+
+    expect(store.getter(undoAtom)).toBe(true)
+    expect(store.getter(redoAtom)).toBe(false)
+  })
+
+  test('transaction-null-todo', () => {
+    const numberAtom = atom(0)
+    const stringAtom = atom('')
+    const store = createStore()
+    const { watchAtom, mergeState, redoAtom, undoAtom } = createUndoRedo(store)
+    watchAtom(numberAtom)
+    watchAtom(stringAtom)
+    mergeState(() => {})
+
+    expect(store.getter(undoAtom)).toBe(false)
+    expect(store.getter(redoAtom)).toBe(false)
 
     expect(store.getter(numberAtom)).toBe(0)
     expect(store.getter(stringAtom)).toBe('')
-    expect(store.getter(redoAtom)).toBe(false)
   })
 })

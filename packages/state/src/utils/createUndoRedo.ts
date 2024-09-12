@@ -52,6 +52,12 @@ export function createUndoRedo(store: Store) {
 
     const newIndex = historyIndex + 1
     const newDataMap = historyData[newIndex]
+    /**
+     * mergeState没有change 直接丢错误
+     */
+    if (!newDataMap) {
+      return
+    }
     const setKeys = new Set<AtomEntity<any>>(newDataMap.get(iteratorKey))
 
     for (let i = historyIndex, j = 0; i >= j; i -= 1) {
@@ -134,6 +140,10 @@ export function createUndoRedo(store: Store) {
         store.setter(isMergeAtom, true)
         fn()
         store.setter(historyIndexAtom, (index) => {
+          const currentHis = store.getter(historyDataAtom)
+          if (currentHis.length === index + 1) {
+            return index
+          }
           return index + 1
         })
       } catch (error) {

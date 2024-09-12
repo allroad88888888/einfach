@@ -40,7 +40,7 @@ describe('incrementAtom', () => {
             + 1
           </button>
           <button data-testid="btn-a-cancel" onClick={cancel}>
-            cancel A count{' '}
+            cancel A count
           </button>
         </div>
       )

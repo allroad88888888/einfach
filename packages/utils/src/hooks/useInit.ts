@@ -16,9 +16,10 @@ export function useInit<Res>(fn: () => Res, deps?: unknown[]) {
   }
   if (deps && deps.length > 0) {
     const isEqual = current.deps?.every((val, index) => {
-      return val === deps[index]
+      return Object.is(val, deps[index])
     })
     if (!isEqual) {
+      current.deps = deps
       current.res = fn()
     }
   }
