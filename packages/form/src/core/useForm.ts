@@ -1,8 +1,8 @@
-import { useMemo, useRef } from 'react'
+import { useCallback, useMemo, useRef } from 'react'
 import { useEasySetAtom, useInit } from 'einfach-utils'
 import type { CreateDataHelpAtoms, FormInstance, NamePath } from './type'
 import type { Obj } from 'einfach-utils'
-import { easyGet, easySetIn, useMethods } from 'einfach-utils'
+import { easyGet, easySetIn } from 'einfach-utils'
 import { buildEventRulesMapping, namePathToStr, validatorItem } from './validator'
 import { createFormDataHelpContext as defaultCreateDataHelpContext } from './context'
 
@@ -15,7 +15,7 @@ export interface FormProps<T extends Obj> {
 export function useForm<Values extends Obj>(props: FormProps<Values>): FormInstance {
   const {
     initialValues,
-    onValuesChange,
+    onValuesChange: propOnValueChange,
     createFormDataHelpContext = defaultCreateDataHelpContext,
   } = props
   const dataHelpContext = useInit(() => {
@@ -36,22 +36,32 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
 
   const setMessage = useEasySetAtom(_messageMappingAtom, { store: _store })
 
-  const privateMethods = useMethods({
-    onValuesChange: (changedValues: any, allValues: Values) => {
-      if (onValuesChange) {
-        onValuesChange(changedValues, allValues)
+  const onValuesChange = useCallback(
+    (changedValues: any, allValues: Values) => {
+      if (propOnValueChange) {
+        propOnValueChange(changedValues, allValues)
       }
     },
-    getFieldValue<T>(name: NamePath) {
+    [propOnValueChange],
+  )
+  const getFieldValue = useCallback(
+    <T>(name: NamePath) => {
       const values = getter(_valuesAtom)
       return easyGet(values, name) as T
     },
-    getFieldMessage(name: NamePath) {
+    [_valuesAtom, getter],
+  )
+
+  const getFieldMessage = useCallback(
+    (name: NamePath) => {
       const messageMap = getter(_messageMappingAtom)
       const nameStr = namePathToStr(name)
       return messageMap.get(nameStr as string)
     },
-    async validateField(name: NamePath, eventName?: string) {
+    [_messageMappingAtom, getter],
+  )
+  const validateField = useCallback(
+    async (name: NamePath, eventName?: string) => {
       const rulesMapping = getter(_fieldOptionMappingAtom)
       const nameStr = namePathToStr(name)
       if (!rulesMapping.has(nameStr) || rulesMapping.get(nameStr)?.rules?.length === 0) {
@@ -63,7 +73,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
         return true
       }
 
-      const val = privateMethods.getFieldValue(name)
+      const val = getFieldValue(name)
 
       const warnList: string[] = []
       const errorList: string[] = []
@@ -92,14 +102,15 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
       })
       return errorList.length === 0
     },
-  })
+    [_fieldOptionMappingAtom, getFieldValue, getter, setMessage],
+  )
 
-  const methods = useMethods({
-    setFieldValue<T>(name: NamePath, value: T) {
+  const setFieldValue = useCallback(
+    <T>(name: NamePath, value: T) => {
       const values = getter(_valuesAtom) as Values
       const res = easySetIn(values, name, value)
       setter(_valuesAtom, res)
-      privateMethods.onValuesChange(
+      onValuesChange(
         {
           name,
           value,
@@ -107,12 +118,19 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
         res,
       )
     },
-    setFieldsValue(values: any) {
+    [_valuesAtom, getter, onValuesChange, setter],
+  )
+
+  const setFieldsValue = useCallback(
+    (values: any) => {
       setter(_valuesAtom, values)
-      privateMethods.onValuesChange(values, values)
+      onValuesChange(values, values)
     },
-    getFieldValue: privateMethods.getFieldValue,
-    getFieldsValue(nameList: true | NamePath[]) {
+    [_valuesAtom, onValuesChange, setter],
+  )
+
+  const getFieldsValue = useCallback(
+    (nameList: true | NamePath[]) => {
       const values = getter(_valuesAtom)
       if (nameList === true) {
         return values
@@ -121,32 +139,46 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
         return easyGet(values, path)
       })
     },
-    async validateFields() {
-      const rulesMapping = getter(_fieldOptionMappingAtom)
-      for (const [namePath] of rulesMapping) {
-        await privateMethods.validateField(namePath)
+    [_valuesAtom, getter],
+  )
+  const validateFields = useCallback(async () => {
+    const rulesMapping = getter(_fieldOptionMappingAtom)
+    for (const [namePath] of rulesMapping) {
+      await validateField(namePath)
+    }
+    const messageMapping = getter(_messageMappingAtom)
+    let hasError = false
+    for (const [, message] of messageMapping) {
+      if (hasError) {
+        break
       }
-      const messageMapping = getter(_messageMappingAtom)
-      let hasError = false
-      for (const [, message] of messageMapping) {
-        if (hasError) {
-          break
-        }
-        if (message.error && message.error.length > 0) {
-          hasError = true
-        }
+      if (message.error && message.error.length > 0) {
+        hasError = true
       }
+    }
 
-      return hasError
-    },
-    validateField: privateMethods.validateField,
-    getFieldMessage: privateMethods.getFieldMessage,
-  })
+    return hasError
+  }, [_fieldOptionMappingAtom, _messageMappingAtom, getter, validateField])
 
   return useMemo<FormInstance>(() => {
     return {
       ...dataHelpContext,
-      ...methods,
+      setFieldValue,
+      setFieldsValue,
+      getFieldValue,
+      getFieldsValue,
+      validateField,
+      validateFields,
+      getFieldMessage: getFieldMessage,
     }
-  }, [dataHelpContext, methods])
+  }, [
+    dataHelpContext,
+    getFieldMessage,
+    getFieldValue,
+    getFieldsValue,
+    setFieldValue,
+    setFieldsValue,
+    validateField,
+    validateFields,
+  ])
 }

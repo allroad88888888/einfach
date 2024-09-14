@@ -28,8 +28,7 @@ export function useValidator(name: NamePath, { formInstance, rules = [], label }
       rules,
     })
     _store.setter(_fieldOptionMappingAtom, rulesMapping)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nameStr, rules])
+  }, [_fieldOptionMappingAtom, _store, label, nameStr, rules])
 
   const validatorEventsMap = useInit(() => {
     const tempMethods = buildEventRulesMapping(rules)
@@ -49,7 +48,6 @@ export function useValidator(name: NamePath, { formInstance, rules = [], label }
       tMessage.delete(nameStr)
       _store.setter(_messageMappingAtom, new Map(tMessage))
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return { message, methods: validatorEventsMap }

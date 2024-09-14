@@ -1,8 +1,7 @@
-import { useState } from 'react'
 import { selectAtom, useAtomValue } from 'einfach-state'
 import type { FormInstance, NamePath } from './type'
 import { useGetFormInstance } from './useGetFormInstance'
-import { easyGet } from 'einfach-utils'
+import { easyGet, useInit } from 'einfach-utils'
 
 export type UseFieldValueOption = {
   formInstance?: FormInstance
@@ -11,11 +10,11 @@ export type UseFieldValueOption = {
 export function useFieldValue<T>(name: NamePath, { formInstance }: UseFieldValueOption = {}): T {
   const { _store: store, _valuesAtom } = useGetFormInstance(formInstance)
 
-  const [atomEntity] = useState(() => {
+  const atomEntity = useInit(() => {
     return selectAtom(_valuesAtom, (state) => {
       return easyGet(state, name) as T
     })
-  })
+  }, [store, _valuesAtom])
 
   const value = useAtomValue(atomEntity, { store })
 

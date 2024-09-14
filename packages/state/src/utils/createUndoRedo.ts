@@ -11,11 +11,16 @@ export function createUndoRedo(store: Store) {
   const isRedoUndoAtom = atom(false)
   const isMergeAtom = atom(false)
 
+  const cacheAtomEntitySet = new WeakSet<AtomEntity<any>>()
   const historyDataAtom = atom<WeakMap<AtomEntity<any>, any>[]>([])
   // Map to WeakMap
   const iteratorKey = Symbol('iteratorKey') as unknown as AtomEntity<any>
 
   function watchAtom<AtomType extends AtomEntity<any>>(atomEntity: AtomType) {
+    if (cacheAtomEntitySet.has(atomEntity)) {
+      return
+    }
+    cacheAtomEntitySet.add(atomEntity)
     function subAtom(isInit: boolean = false) {
       const isRedoUndo = store.getter(isRedoUndoAtom)
       if (isRedoUndo) {
