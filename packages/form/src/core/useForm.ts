@@ -83,7 +83,12 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
         }
         try {
           for (const rule of tRules) {
-            const res = await validatorItem(val, { rule, label })
+            const res = await validatorItem(val, {
+              rule,
+              label,
+              values: getter(_valuesAtom),
+              store: _store,
+            })
             if (typeof res === 'string') {
               warnList.push(res)
             }
@@ -102,7 +107,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
       })
       return errorList.length === 0
     },
-    [_fieldOptionMappingAtom, getFieldValue, getter, setMessage],
+    [_fieldOptionMappingAtom, _store, _valuesAtom, getFieldValue, getter, setMessage],
   )
 
   const setFieldValue = useCallback(

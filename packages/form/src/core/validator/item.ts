@@ -1,3 +1,4 @@
+import type { Store } from 'einfach-state'
 import type { Rule } from '../type'
 import { getLength } from './getLength'
 import { isEmpty } from './isEmpty'
@@ -13,9 +14,16 @@ export function validatorItem(
   {
     label = '',
     rule,
+    values,
+    store,
   }: {
     label?: string
     rule: Rule
+    /**
+     * 有些表单使用配置项配置 need it
+     */
+    values: any
+    store: Store
   },
 ) {
   const {
@@ -55,7 +63,10 @@ export function validatorItem(
   }
 
   if (validator) {
-    return validator(rule, value)
+    return validator(rule, value, {
+      values,
+      store,
+    })
   }
 
   if ('len' in rule) {

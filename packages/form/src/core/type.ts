@@ -1,3 +1,4 @@
+import type { Store } from 'einfach-state'
 import type { createFormDataHelpContext } from './context'
 
 export type NamePath = string | number | (string | number)[]
@@ -84,7 +85,14 @@ export type Rule = {
    * @param rule
    * @returns
    */
-  validator?: (rule: Rule, value: any) => Promise<any>
+  validator?: (
+    rule: Rule,
+    value: any,
+    param: {
+      values: any
+      store: Store
+    },
+  ) => Promise<any>
   /**
    * 仅警告，不阻塞表单提交
    * @default false
