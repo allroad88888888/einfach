@@ -9,17 +9,18 @@ import { createFormDataHelpContext as defaultCreateDataHelpContext } from './con
 export interface FormProps<T extends Obj> {
   initialValues?: any
   onValuesChange?: (changedValues: any, allValues: T) => void
-  createFormDataHelpContext?: CreateDataHelpAtoms
+  createFormDataHelpContext?: (
+    ...param: Parameters<CreateDataHelpAtoms>
+  ) => Partial<ReturnType<CreateDataHelpAtoms>>
 }
 
 export function useForm<Values extends Obj>(props: FormProps<Values>): FormInstance {
-  const {
-    initialValues,
-    onValuesChange: propOnValueChange,
-    createFormDataHelpContext = defaultCreateDataHelpContext,
-  } = props
+  const { initialValues, onValuesChange: propOnValueChange, createFormDataHelpContext } = props
   const dataHelpContext = useInit(() => {
-    return createFormDataHelpContext()
+    return {
+      ...defaultCreateDataHelpContext(),
+      ...(createFormDataHelpContext ? createFormDataHelpContext() : {}),
+    }
   }, [createFormDataHelpContext])
   const { _store, _valuesAtom, _messageMappingAtom, _fieldOptionMappingAtom } = dataHelpContext
   const { getter, setter } = _store

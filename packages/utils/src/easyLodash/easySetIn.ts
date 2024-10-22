@@ -14,7 +14,7 @@ export function exprPath(path: NamePath): (string | number)[] {
 
 type Easy = string | number | symbol | boolean | undefined | null
 
-export type Obj = { [key: string]: Easy | Obj } | Obj[]
+export type Obj = { [key: string]: Easy | Obj | Easy[] } | (Obj | Easy)[]
 
 export function easySetIn<T extends object | object[]>(obj: T, path: NamePath, value: unknown) {
   const propList = exprPath(path)

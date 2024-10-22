@@ -1,14 +1,14 @@
 import { createContext } from 'react'
 import type { FieldInfo, FormInstance, Message } from './type'
 import { atom, createStore } from 'einfach-state'
-import type { NamePath, Obj } from 'einfach-utils'
+import type { NamePath } from 'einfach-utils'
 
 export const FormContext = createContext(undefined as unknown as FormInstance)
 
 export function createFormDataHelpContext() {
   const store = createStore()
 
-  const valuesAtom = atom<Obj>({})
+  const valuesAtom = atom<any>({})
 
   // 校验结果
   const messageMappingAtom = atom(new Map<NamePath, Message>())

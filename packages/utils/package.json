@@ -1,6 +1,6 @@
 {
   "name": "einfach-utils",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "main": "es/index.js",
   "module": "es/index.js",
   "typings": "@types/index.d.ts",

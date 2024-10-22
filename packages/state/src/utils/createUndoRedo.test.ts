@@ -142,4 +142,26 @@ describe('undo redo ', () => {
     expect(store.getter(numberAtom)).toBe(0)
     expect(store.getter(stringAtom)).toBe('')
   })
+
+  test('resetByNow', () => {
+    const numberAtom = atom(0)
+    const stringAtom = atom('')
+    const store = createStore()
+    const { watchAtom, redoAtom, undoAtom, resetByNow } = createUndoRedo(store)
+    watchAtom(numberAtom)
+    watchAtom(stringAtom)
+
+    store.setter(numberAtom, 1)
+    store.setter(numberAtom, 2)
+    store.setter(stringAtom, '1')
+    expect(store.getter(undoAtom)).toBe(true)
+    expect(store.getter(redoAtom)).toBe(false)
+
+    resetByNow()
+    expect(store.getter(numberAtom)).toBe(2)
+    expect(store.getter(stringAtom)).toBe('1')
+
+    expect(store.getter(undoAtom)).toBe(false)
+    expect(store.getter(redoAtom)).toBe(false)
+  })
 })

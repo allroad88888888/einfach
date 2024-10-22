@@ -1,6 +1,6 @@
 {
   "name": "einfach-form",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "main": "es/index.js",
   "typings": "@types/index.d.ts",
   "license": "MIT",

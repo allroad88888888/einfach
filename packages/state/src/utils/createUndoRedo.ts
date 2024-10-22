@@ -130,7 +130,62 @@ export function createUndoRedo(store: Store) {
     },
   )
 
+  function mergeState(fn: () => void) {
+    try {
+      store.setter(isMergeAtom, true)
+      fn()
+      store.setter(historyIndexAtom, (index) => {
+        const currentHis = store.getter(historyDataAtom)
+        if (currentHis.length === index + 1) {
+          return index
+        }
+        return index + 1
+      })
+    } catch (error) {
+      store.setter(historyIndexAtom, (index) => {
+        return index + 1
+      })
+      store.setter(undoAtom)
+      const currentIndex = store.getter(historyIndexAtom)
+      const nextIndx = currentIndex + 1
+      const hisState = [...store.getter(historyDataAtom)]
+      hisState.splice(nextIndx, 1)
+      store.setter(historyDataAtom, hisState)
+      store.setter(isMergeAtom, false)
+      throw error
+    }
+    store.setter(isMergeAtom, false)
+  }
+
+  /**
+   * 将最新状态重置为初始状态
+   */
+  function resetByNow() {
+    store.setter(isRedoUndoAtom, true)
+    const historyData = store.getter(historyDataAtom)
+    const todoAtomEntitySet = new Set()
+
+    const newHisData: WeakMap<AtomEntity<any>, any> = new WeakMap()
+    historyData.forEach((data) => {
+      if (!historyData) {
+        return
+      }
+      const setKeys = new Set<AtomEntity<any>>(data.get(iteratorKey))
+
+      setKeys.forEach((tempAtomEntity) => {
+        if (!todoAtomEntitySet.has(tempAtomEntity)) {
+          todoAtomEntitySet.add(tempAtomEntity)
+          newHisData.set(tempAtomEntity, data.get(tempAtomEntity))
+        }
+      })
+    })
+    store.setter(historyDataAtom, [newHisData])
+    store.setter(historyIndexAtom, 0)
+    store.setter(isRedoUndoAtom, false)
+  }
+
   return {
+    resetByNow,
     watchAtom,
     undoAtom,
     redoAtom,
@@ -140,29 +195,6 @@ export function createUndoRedo(store: Store) {
     redo() {
       store.setter(redoAtom)
     },
-    mergeState(fn: () => void) {
-      try {
-        store.setter(isMergeAtom, true)
-        fn()
-        store.setter(historyIndexAtom, (index) => {
-          const currentHis = store.getter(historyDataAtom)
-          if (currentHis.length === index + 1) {
-            return index
-          }
-          return index + 1
-        })
-      } catch (error) {
-        store.setter(historyIndexAtom, (index) => {
-          return index + 1
-        })
-        store.setter(undoAtom)
-        const currentIndex = store.getter(historyIndexAtom)
-        const nextIndx = currentIndex + 1
-        const hisState = [...store.getter(historyDataAtom)]
-        hisState.splice(nextIndx, 1)
-        store.setter(historyDataAtom, hisState)
-        throw error
-      }
-    },
+    mergeState,
   }
 }
