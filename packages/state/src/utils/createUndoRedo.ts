@@ -166,7 +166,7 @@ export function createUndoRedo(store: Store) {
     const todoAtomEntitySet = new Set()
 
     const newHisData: WeakMap<AtomEntity<any>, any> = new WeakMap()
-    historyData.forEach((data) => {
+    historyData.toReversed().forEach((data) => {
       if (!historyData) {
         return
       }

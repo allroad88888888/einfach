@@ -1,4 +1,4 @@
-import { useLayoutEffect, useState } from 'react'
+import { useDebugValue, useEffect, useState } from 'react'
 import type { Atom, AtomState } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
@@ -20,8 +20,8 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
     return realStore.getter(atom)
   })
 
-  useLayoutEffect(() => {
-    // init useLayoutEffect有个过程 过程中值可能变了
+  useEffect(() => {
+    // init useEffect 过程中值可能变了
     if (realStore.getter(atom) !== state) {
       setState(realStore.getter(atom))
     }
@@ -32,6 +32,8 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [realStore, atom])
+
+  useDebugValue(state)
 
   if (isPromiseLike(state)) {
     return use(state as StatesWithPromise<State>)

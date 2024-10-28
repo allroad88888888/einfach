@@ -50,5 +50,5 @@ export interface Store {
   setter: Setter
   toString: () => string
   debugLabel?: string
-  resetAtom: <AtomType extends Atom<unknown>>(oldAtomEntity?: AtomType) => void
+  // resetAtom: <AtomType extends Atom<unknown>>(oldAtomEntity?: AtomType) => void
 }

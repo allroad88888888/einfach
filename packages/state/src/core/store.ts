@@ -5,7 +5,7 @@ import type { StatesWithPromise } from './typePromise'
 
 let keyCount = 0
 export function createStore(): Store {
-  let atomStateMap = new WeakMap<Atom<unknown>, unknown>()
+  const atomStateMap = new WeakMap<Atom<unknown>, unknown>()
 
   const listenersMap = new WeakMap<Atom<unknown>, Set<() => void>>()
   const backDependenciesMap = new WeakMap<Atom<unknown>, Set<Atom<unknown>>>()
@@ -181,18 +181,10 @@ export function createStore(): Store {
   }
   const key = `store${++keyCount}`
 
-  function resetAtom<Entity extends Atom<unknown>>(atomEntity?: Entity) {
-    if (atomEntity) {
-      atomStateMap.delete(atomEntity)
-    } else {
-      atomStateMap = new WeakMap()
-    }
-  }
   return {
     sub: subscribeAtom,
     getter: readAtom,
     setter: setAtom as Setter,
     toString: () => key,
-    resetAtom,
   }
 }
