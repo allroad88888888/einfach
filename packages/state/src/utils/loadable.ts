@@ -1,4 +1,4 @@
-import type { Atom, AtomState, WritableAtom } from '../core'
+import type { Atom, AtomSetParameters, AtomSetResult, AtomState, WritableAtom } from '../core'
 import { atom } from '../core'
 import type { StatesWithPromise } from '../core/typePromise'
 import { memo } from './memo'
@@ -6,6 +6,22 @@ import { memo } from './memo'
 function isPromise<T>(promise: any): promise is Promise<T> {
   return promise instanceof Promise
 }
+
+// export type Res<Value> =
+//   | {
+//       state: 'init'
+//     }
+//   | {
+//       state: 'loading'
+//     }
+//   | {
+//       state: 'hasError'
+//       error: unknown
+//     }
+//   | {
+//       state: 'hasData'
+//       data: Awaited<Value>
+//     }
 
 interface Res<Value> {
   state: 'loading' | 'hasData' | 'hasError' | 'init'
@@ -28,24 +44,32 @@ interface Options {
   autoRun?: boolean
 }
 
+// AtomState<Entity> extends Promise<infer State1>
+//   ? WritableAtom<Res<State1>, [], void>
+//   : WritableAtom<Res<AtomState<Entity>>, [], void>
+
 /**
  * from jotai
  * @param anAtom
  * @returns
  */
-
-export function loadable<State, Entity extends Atom<State>>(
-  anAtom: Entity,
+export function loadable<AtomType extends Atom<unknown>>(
+  anAtom: AtomType,
   { autoRun = true }: Options = {},
-): AtomState<Entity> extends Promise<infer State1>
-  ? WritableAtom<Res<State1>, [], void>
-  : WritableAtom<Res<AtomState<Entity>>, [], void> {
+): WritableAtom<
+  Res<AtomState<AtomType> extends Promise<infer State1> ? State1 : AtomState<AtomType>>,
+  AtomSetParameters<AtomType> | [],
+  AtomSetResult<AtomType>
+> {
   return memo(function () {
-    var loadableCache = new WeakMap<StatesWithPromise<AtomState<Entity>>, Res<AtomState<Entity>>>()
+    var loadableCache = new WeakMap<
+      StatesWithPromise<AtomState<AtomType>>,
+      Res<AtomState<AtomType>>
+    >()
 
     var refreshAtom = atom(0)
 
-    const derivedAtom = atom<Res<AtomState<Entity>>>(function (getter, { setter }) {
+    const derivedAtom = atom<Res<AtomState<AtomType>>>(function (getter, { setter }) {
       const refreshVal = getter(refreshAtom)
 
       if (refreshVal === 0 && autoRun === false) {
@@ -68,7 +92,7 @@ export function loadable<State, Entity extends Atom<State>>(
           data: value,
         }
       }
-      const promise = value as StatesWithPromise<AtomState<Entity>>
+      const promise = value as StatesWithPromise<AtomState<AtomType>>
       var cached1 = loadableCache.get(promise)
       if (cached1) {
         return cached1
@@ -112,18 +136,25 @@ export function loadable<State, Entity extends Atom<State>>(
       return LOADING
     })
 
-    return atom<Res<State>, [], void>(
+    return atom<Res<AtomState<AtomType>>, AtomSetParameters<AtomType>, AtomSetResult<AtomType>>(
       function (getter) {
         return getter(derivedAtom)
       },
-      function (_get, setter) {
+      // @ts-ignore
+      function (_get, setter, ...args: AtomSetParameters<AtomType> | []) {
         setter(refreshAtom, function (c) {
           return c + 1
         })
-        if ('write' in anAtom) {
-          setter(anAtom as WritableAtom<State, [], void>)
+        if (isWriteAtom(anAtom)) {
+          return setter(anAtom, ...args)
         }
       },
     )
   }, anAtom)
+}
+
+export function isWriteAtom<State, Args extends unknown[], Result>(
+  entity: any,
+): entity is WritableAtom<State, Args, Result> {
+  return 'write' in entity
 }

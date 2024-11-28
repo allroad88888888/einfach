@@ -27,7 +27,12 @@ describe('async', () => {
       }
 
       return (
-        <div data-testid="serverInfo" onClick={run}>
+        <div
+          data-testid="serverInfo"
+          onClick={() => {
+            run()
+          }}
+        >
           {serverInfo?.[0].id}
         </div>
       )

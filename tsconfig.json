@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ESNext",
-    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ESNext"
+    ],
     "noEmitOnError": true,
     "allowJs": false,
     "noEmit": true,
@@ -28,12 +32,17 @@
   },
   "include": [
     "./jest.config.mjs",
+    "rollup.config.mjs",
     "./**/*.test.ts",
     "./**/*.test.tsx",
     "./**/test",
     "./rules/setup-jest.ts"
   ],
-  "exclude": ["node_modules", "**/node_modules", "**/@types/"],
+  "exclude": [
+    "node_modules",
+    "**/node_modules",
+    "**/@types/"
+  ],
   "references": [
     {
       "path": "./packages/form/tsconfig.json"

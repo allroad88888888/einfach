@@ -6,6 +6,8 @@ node_modules
 build
 dist
 es
+esm
+cjs
 @types
 
 # misc
@@ -20,5 +22,5 @@ coverage
 .idea
 .tmp
 .rush
-tsconfig.tsbuildinfo
+*.tsbuildinfo
 packages/vali

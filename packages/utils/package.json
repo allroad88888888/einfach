@@ -1,19 +1,38 @@
 {
   "name": "einfach-utils",
-  "version": "0.5.3",
-  "main": "es/index.js",
-  "module": "es/index.js",
+  "version": "0.5.9",
+  "type": "module",
+  "main": "./cjs/index.js",
+  "exports": {
+    ".": {
+      "import": "./esm/index.mjs",
+      "require": "./cjs/index.js"
+    },
+    "./*": {
+      "import": "./esm/*.mjs",
+      "require": "./cjs/*.js"
+    }
+  },
   "typings": "@types/index.d.ts",
   "license": "MIT",
   "files": [
-    "es",
-    "@types"
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
   ],
+  "scripts": {
+    "build": "tsc"
+  },
   "keywords": [],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
   "peerDependencies": {
-    "react": "^16 || ^17 || ^18",
-    "react-dom": "^16 || ^17 || ^18",
-    "einfach-state": "workspace:^"
+    "react": ">=16.8 <20",
+    "react-dom": ">=16.8 <20",
+    "einfach-state": ">=0.11.11"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -21,14 +40,14 @@
     },
     "react-dom": {
       "optional": true
+    },
+    "einfach-state": {
+      "optional": true
     }
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0"
-  },
-  "scripts": {
-    "build": "tsc"
   }
 }

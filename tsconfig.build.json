@@ -1,7 +1,11 @@
 {
   "compilerOptions": {
     "target": "ESNext",
-    "lib": ["DOM", "DOM.Iterable", "ESNext"],
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ESNext"
+    ],
     "noEmitOnError": true,
     "allowJs": false,
     "skipLibCheck": true,
@@ -25,7 +29,12 @@
     "noEmitHelpers": true,
     "jsx": "react-jsx",
     "preserveWatchOutput": true,
-    "composite": true
+    "composite": true,
   },
-  "exclude": ["node_modules", "**/*.test.ts", "**/*.test.tsx", "**/test"]
+  "exclude": [
+    "node_modules",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/test"
+  ]
 }

@@ -2,9 +2,14 @@
   "extends": "../../tsconfig.build.json",
   "compilerOptions": {
     "rootDir": "src",
-    "outDir": "es",
+    "emitDeclarationOnly": true,
     "declarationDir": "@types"
   },
-  "include": ["./src/**/*"],
-  "exclude": ["./src/**/*.test.tsx", "./src/**/*.test.ts"]
+  "include": [
+    "./src/**/*"
+  ],
+  "exclude": [
+    "./src/**/*.test.tsx",
+    "./src/**/*.test.ts"
+  ]
 }

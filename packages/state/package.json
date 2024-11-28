@@ -1,24 +1,40 @@
 {
   "name": "einfach-state",
-  "version": "0.11.2",
+  "version": "0.11.11",
   "description": "react易上手状态管理",
-  "main": "es/index.js",
-  "module": "es/index.js",
+  "type": "module",
+  "main": "./cjs/index.js",
+  "exports": {
+    ".": {
+      "import": "./esm/index.mjs",
+      "require": "./cjs/index.js"
+    },
+    "./*": {
+      "import": "./esm/*.mjs",
+      "require": "./cjs/*.js"
+    }
+  },
   "typings": "@types/index.d.ts",
   "license": "MIT",
   "files": [
-    "es",
-    "@types"
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
   ],
   "scripts": {
-    "build": "tsc -build"
+    "build": "tsc"
+  },
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
   },
   "keywords": [
     "react",
     "atom"
   ],
   "peerDependencies": {
-    "react": "^16 || ^17 || ^18 ||^19"
+    "react": ">=16.8 <20"
   },
   "peerDependenciesMeta": {
     "react": {

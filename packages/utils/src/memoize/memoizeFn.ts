@@ -28,7 +28,7 @@ export function memoizeFn<T extends (...args: any) => any>(
       cacheMap.set(param, fn(...param))
       return cacheMap.get(param)!
     }
-    return cacheMap.get(next.value)!
+    return cacheMap.get(next.value!)!
   }) as T
 }
 

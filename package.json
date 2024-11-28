@@ -7,8 +7,8 @@
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "test": "jest --collect-coverage",
-    "clearTypes": "rimraf ./*/*/tsconfig.tsbuildinfo&&rimraf ./*/*/@types&&rimraf ./*/*/es",
-    "build": "npm run clearTypes&&tsc -build",
+    "clearTypes": "rimraf ./packages/*/tsconfig.tsbuildinfo&&rimraf ./packages/*/@types&&rimraf ./packages/*/esm&&rimraf ./packages/*/dist",
+    "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",
     "prepare": "husky"
   },
   "keywords": [],
@@ -24,12 +24,14 @@
     "eslint-plugin-promise": "^6.1.1",
     "eslint-plugin-react": "^7.34.1",
     "eslint-plugin-react-hooks": "^4.6.2",
-    "typescript": "^5.4.3",
+    "typescript": "^5.7.2",
     "typescript-eslint": "^7.10.0"
   },
   "devDependencies": {
     "@jest/globals": "^29.7.0",
-    "@swc/core": "^1.4.11",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-swc": "^0.3.1",
+    "@swc/core": "^1.5.0",
     "@swc/jest": "^0.2.36",
     "@testing-library/jest-dom": "^6.4.5",
     "@testing-library/react": "^16.0.0",
@@ -39,6 +41,7 @@
     "jest": "^29.7.0",
     "jest-environment-jsdom": "^29.7.0",
     "prettier": "^3.3.3",
-    "rimraf": "^5.0.7"
+    "rimraf": "^6.0.1",
+    "rollup": "^4.27.4"
   }
 }

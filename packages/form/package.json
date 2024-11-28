@@ -1,13 +1,25 @@
 {
   "name": "einfach-form",
   "version": "0.2.5",
-  "main": "es/index.js",
-  "typings": "@types/index.d.ts",
+  "type": "module",
+  "main": "./cjs/index.js",
+  "exports": {
+    ".": {
+      "import": "./esm/index.mjs",
+      "require": "./cjs/index.js"
+    },
+    "./*": {
+      "import": "./esm/*.mjs",
+      "require": "./cjs/*.js"
+    }
+  },
   "license": "MIT",
   "author": "allroad88888888@vip.qq.com",
   "files": [
-    "es",
-    "@types"
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc"
@@ -19,14 +31,18 @@
     "antd-form-api"
   ],
   "peerDependencies": {
-    "@types/react": "^16 || ^17 || ^18",
-    "react": "^16 || ^17 || ^18"
+    "@types/react": ">=16.8 <20",
+    "react": ">=16.8 <20",
+    "einfach-state": ">=0.11.11"
   },
   "peerDependenciesMeta": {
     "@types/react": {
       "optional": true
     },
     "react": {
+      "optional": true
+    },
+    "einfach-state": {
       "optional": true
     }
   },

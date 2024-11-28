@@ -273,8 +273,8 @@ expect(queryByTestId(baseElement, 'result')?.textContent).toBe('100')
   })
 
   function A(){
-    const {data,loading} = useAtomValue(loadable(serverInfoAtom))
-    if(loading){
+    const {data,state} = useAtomValue(loadable(serverInfoAtom))
+    if(state==='loading'){
       return <Loading/>
     }
     return <div></div>
