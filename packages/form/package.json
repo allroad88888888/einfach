@@ -1,20 +1,11 @@
 {
   "name": "einfach-form",
-  "version": "0.2.5",
+  "version": "0.2.9",
   "type": "module",
   "main": "./cjs/index.js",
-  "exports": {
-    ".": {
-      "import": "./esm/index.mjs",
-      "require": "./cjs/index.js"
-    },
-    "./*": {
-      "import": "./esm/*.mjs",
-      "require": "./cjs/*.js"
-    }
-  },
+  "module": "./esm/index.mjs",
+  "typings": "@types/index.d.ts",
   "license": "MIT",
-  "author": "allroad88888888@vip.qq.com",
   "files": [
     "esm",
     "cjs",

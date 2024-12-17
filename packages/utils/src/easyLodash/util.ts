@@ -2,6 +2,7 @@ import type { ObjectType } from './type'
 
 export function setObjProp(obj: any, prop: any, value: any) {
   if (typeof obj !== 'object') {
+    // return isNaN(prop) ? { [prop]: value } : [value]
     throw "setObjProp can't support"
   }
   const type = Object.prototype.toString.call(obj) as ObjectType
@@ -16,7 +17,7 @@ export function setObjProp(obj: any, prop: any, value: any) {
       return obj
     }
     case '[object Map]': {
-      (obj as Map<any, any>).set(prop, value)
+      ;(obj as Map<any, any>).set(prop, value)
       return obj
     }
     case '[object Set]': {
@@ -35,7 +36,8 @@ export function setObjProp(obj: any, prop: any, value: any) {
 export function getObjProp(obj: any, prop: any) {
   if (typeof obj !== 'object') {
     // throw `getObjProp can't support`
-    return obj
+    // return obj
+    return undefined
   }
   const type = Object.prototype.toString.call(obj) as ObjectType
 

@@ -1,8 +1,25 @@
 import { defineConfig } from 'rollup'
 import resolve from '@rollup/plugin-node-resolve'
 import swc from '@rollup/plugin-swc'
+import terser from '@rollup/plugin-terser'
+import path, { dirname } from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
 
 const products = ['packages/state', 'packages/utils', 'packages/form']
+
+const filename = fileURLToPath(import.meta.url)
+const dirName = dirname(filename)
+
+const outputDirList = ['esm', 'cjs', 'dist', '@types']
+products.forEach((pName) => {
+  outputDirList.forEach((output) => {
+    const outputDir = path.resolve(dirName, pName, output)
+    if (fs.existsSync(outputDir)) {
+      fs.rmSync(outputDir, { recursive: true, force: true })
+    }
+  })
+})
 
 /** @type {import('rollup').RollupOptions} */
 const config = defineConfig({
@@ -15,6 +32,7 @@ const config = defineConfig({
     'react-dom',
     'react/jsx-runtime',
     'react/jsx-dev-runtime',
+    '@deepfos/hooks',
   ],
 
   plugins: [
@@ -61,7 +79,13 @@ export default products.map((dir) => {
         dir: `${dir}/esm`,
         entryFileNames: '[name].mjs',
         preserveModules: true, // 保留模块结构
-        // preserveModulesRoot: 'src', // 去掉 src 的根路径
+        preserveModulesRoot: 'src', // 去掉 src 的根路径
+      },
+      {
+        format: 'commonjs',
+        dir: `${dir}/dist`,
+        entryFileNames: '[name].js',
+        plugins: [terser()],
       },
     ],
   }

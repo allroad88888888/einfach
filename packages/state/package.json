@@ -1,19 +1,10 @@
 {
   "name": "einfach-state",
-  "version": "0.11.11",
+  "version": "0.11.14",
   "description": "react易上手状态管理",
   "type": "module",
   "main": "./cjs/index.js",
-  "exports": {
-    ".": {
-      "import": "./esm/index.mjs",
-      "require": "./cjs/index.js"
-    },
-    "./*": {
-      "import": "./esm/*.mjs",
-      "require": "./cjs/*.js"
-    }
-  },
+  "module": "./esm/index.mjs",
   "typings": "@types/index.d.ts",
   "license": "MIT",
   "files": [

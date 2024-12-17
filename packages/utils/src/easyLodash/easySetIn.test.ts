@@ -24,7 +24,7 @@ describe('easySetIn', () => {
     expect(temp1.a).not.toBe(mockObj.a)
     expect(temp1.b).toBe(mockObj.b)
     expect(temp1.b[0]).toBe(mockObj.b[0])
-    expect(temp1).toEqual({
+    expect(temp1).toStrictEqual({
       a: {
         'a-1': 'c',
         'b-1': 'b-1',
@@ -69,7 +69,7 @@ describe('easySetIn', () => {
     expect(temp1.b[0]).not.toBe(mockObj.b[1])
     expect(temp1.a).toBe(mockObj.a)
     expect(temp1.b[1]).toBe(mockObj.b[1])
-    expect(temp1).toEqual({
+    expect(temp1).toStrictEqual({
       a: {
         'a-1': 'a-1',
         'b-1': 'b-1',
@@ -134,6 +134,17 @@ describe('easySetIn', () => {
 
     const temp1 = easySetIn(temp, 'a[2].b', 'c')
 
-    expect(temp1).toEqual({ a: [, , { b: 'c' }] })
+    expect(temp1).toStrictEqual({ a: [, , { b: 'c' }] })
+  })
+
+  it('没有这个属性', async () => {
+    const temp3 = easySetIn(
+      {
+        c: 'str',
+      },
+      'c.ss',
+      {},
+    )
+    expect(temp3).toStrictEqual({ c: { ss: {} } })
   })
 })

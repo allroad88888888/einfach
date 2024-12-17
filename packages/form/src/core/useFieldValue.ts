@@ -14,7 +14,7 @@ export function useFieldValue<T>(name: NamePath, { formInstance }: UseFieldValue
     return selectAtom(_valuesAtom, (state) => {
       return easyGet(state, name) as T
     })
-  }, [store, _valuesAtom])
+  }, [store, _valuesAtom, name])
 
   const value = useAtomValue(atomEntity, { store })
 

@@ -48,7 +48,9 @@ export function easyGet<TData, TPath extends NamePath, TDefault = GetFieldType<T
     pathList = path.toString().split(/[.[\]]/)
   }
   const val = pathList
-    .filter(Boolean)
+    .filter((temp) => {
+      return Boolean(temp.toString())
+    })
     .reduce<GetFieldType<TData, TPath>>((value, key) => getObjProp(value, key), data as any)
   // .reduce<GetFieldType<TData, TPath>>((value, key) => (value as any)?.[key], data as any)
 

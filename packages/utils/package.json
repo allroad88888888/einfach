@@ -1,18 +1,9 @@
 {
   "name": "einfach-utils",
-  "version": "0.5.9",
+  "version": "0.5.13",
   "type": "module",
   "main": "./cjs/index.js",
-  "exports": {
-    ".": {
-      "import": "./esm/index.mjs",
-      "require": "./cjs/index.js"
-    },
-    "./*": {
-      "import": "./esm/*.mjs",
-      "require": "./cjs/*.js"
-    }
-  },
+  "module": "./esm/index.mjs",
   "typings": "@types/index.d.ts",
   "license": "MIT",
   "files": [
