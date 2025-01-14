@@ -1,5 +1,6 @@
-import { useCallback, useDebugValue, useEffect, useState, useSyncExternalStore } from 'react'
-import type { Atom, AtomState } from '../core/type'
+import type { ReducerWithoutAction } from 'react'
+import { useCallback, useDebugValue, useEffect, useReducer, useSyncExternalStore } from 'react'
+import type { Atom, AtomState, Store } from '../core/type'
 import type { HookOption } from './type'
 import { useStore } from './useStore'
 import { isPromiseLike } from '../core/promiseUtils'
@@ -15,42 +16,58 @@ export function useAtomValue<AtomType extends Atom<unknown>>(
   options?: HookOption,
 ): AtomState<AtomType>
 export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {}) {
-  const realStore = useStore(options)
-  const [state, setState] = useState(() => {
-    return realStore.getter(atom)
-  })
-  useEffect(() => {
-    // init useEffect 过程中值可能变了
-    if (realStore.getter(atom) !== state) {
-      setState(realStore.getter(atom))
-    }
-    return realStore.sub(atom, () => {
-      if (setState) {
-        setState(realStore.getter(atom))
+  const store = useStore(options)
+  type ReducerState = [State, Store, Atom<State>]
+  const [[valueFromReducer, storeFromReducer, atomFromReducer], rerender] = useReducer<
+    ReducerWithoutAction<ReducerState>,
+    undefined
+  >(
+    (prev: ReducerState) => {
+      const nextValue = store.getter(atom)
+      if (Object.is(nextValue, prev[0]) && store === prev[1] && atom === prev[2]) {
+        return prev as ReducerState
       }
-    })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [realStore, atom])
-  useDebugValue(state)
-  if (isPromiseLike(state)) {
-    return use(state as StatesWithPromise<State>)
+      return [nextValue, store, atom] as ReducerState
+    },
+    undefined,
+    () => {
+      return [store.getter(atom), store, atom] as ReducerState
+    },
+  )
+  let value: State = valueFromReducer
+  if (storeFromReducer !== store || atomFromReducer !== atom) {
+    value = store.getter(atom) as State
+    rerender()
   }
-  return state
+  useEffect(() => {
+    if (!Object.is(store.getter(atom), value)) {
+      rerender()
+    }
+    return store.sub(atom, () => {
+      rerender()
+    })
+  }, [store, atom])
+
+  useDebugValue(value)
+  if (isPromiseLike(value)) {
+    return use(value as StatesWithPromise<State>)
+  }
+  return value
 }
 
 export function useAtomValueWith18<State>(atom: Atom<State>, options: HookOption = {}) {
-  const realStore = useStore(options)
+  const store = useStore(options)
 
   const sub = useCallback(
     (callBack: () => void) => {
-      return realStore.sub(atom, callBack)
+      return store.sub(atom, callBack)
     },
-    [atom, realStore],
+    [atom, store],
   )
 
   const getSnapshot = useCallback(() => {
-    return realStore.getter(atom)
-  }, [atom, realStore])
+    return store.getter(atom)
+  }, [atom, store])
 
   const value = useSyncExternalStore(sub, getSnapshot)
   useDebugValue(value)

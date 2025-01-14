@@ -1,8 +1,8 @@
 {
-  "name": "einfach-form",
-  "version": "0.2.9",
+  "name": "@einfach/form",
+  "version": "0.1.4",
   "type": "module",
-  "main": "./cjs/index.js",
+  "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
   "typings": "@types/index.d.ts",
   "license": "MIT",
@@ -24,7 +24,7 @@
   "peerDependencies": {
     "@types/react": ">=16.8 <20",
     "react": ">=16.8 <20",
-    "einfach-state": ">=0.11.11"
+    "@einfach/state": ">=0.1.0"
   },
   "peerDependenciesMeta": {
     "@types/react": {
@@ -33,7 +33,7 @@
     "react": {
       "optional": true
     },
-    "einfach-state": {
+    "@einfach/state": {
       "optional": true
     }
   },
@@ -41,8 +41,8 @@
     "@types/node": "^20.11.30"
   },
   "dependencies": {
-    "einfach-state": "workspace:*",
-    "einfach-utils": "workspace:*",
+    "@einfach/state": "workspace:*",
+    "@einfach/utils": "workspace:*",
     "react": "^18.3.1"
   }
 }

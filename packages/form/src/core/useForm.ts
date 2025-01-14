@@ -1,8 +1,8 @@
 import { useCallback, useMemo, useRef } from 'react'
-import { useEasySetAtom, useInit } from 'einfach-utils'
+import { useEasySetAtom, useInit } from '@einfach/utils'
 import type { CreateDataHelpAtoms, FormInstance, NamePath } from './type'
-import type { Obj } from 'einfach-utils'
-import { easyGet, easySetIn } from 'einfach-utils'
+import type { Obj } from '@einfach/utils'
+import { easyGet, easySetIn } from '@einfach/utils'
 import { buildEventRulesMapping, namePathToStr, validatorItem } from './validator'
 import { createFormDataHelpContext as defaultCreateDataHelpContext } from './context'
 

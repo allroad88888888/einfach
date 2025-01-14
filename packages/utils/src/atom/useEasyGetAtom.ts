@@ -1,5 +1,5 @@
-import { selectAtom, useAtomValue } from 'einfach-state'
-import type { HookOption, AtomEntity } from 'einfach-state'
+import { selectAtom, useAtomValue } from '@einfach/state'
+import type { HookOption, AtomEntity } from '@einfach/state'
 import { easyGet, easyEqual } from './../easyLodash'
 import type { NamePath } from '../easyLodash/type'
 import { useInit } from './../hooks/useInit'

@@ -11,7 +11,7 @@ const products = ['packages/state', 'packages/utils', 'packages/form']
 const filename = fileURLToPath(import.meta.url)
 const dirName = dirname(filename)
 
-const outputDirList = ['esm', 'cjs', 'dist', '@types']
+const outputDirList = ['esm', 'cjs', 'dist']
 products.forEach((pName) => {
   outputDirList.forEach((output) => {
     const outputDir = path.resolve(dirName, pName, output)
@@ -25,8 +25,8 @@ products.forEach((pName) => {
 const config = defineConfig({
   external: [
     '@swc/core',
-    'einfach-state',
-    'einfach-utils',
+    '@einfach/state',
+    '@einfach/utils',
     'einfach-form',
     'react',
     'react-dom',
@@ -70,7 +70,7 @@ export default products.map((dir) => {
       {
         format: 'commonjs',
         dir: `${dir}/cjs`,
-        entryFileNames: '[name].js',
+        entryFileNames: '[name].cjs',
         preserveModules: true, // 保留模块结构
         preserveModulesRoot: 'src', // 去掉 src 的根路径
       },

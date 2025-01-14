@@ -7,7 +7,7 @@
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "test": "jest --collect-coverage",
-    "clearTypes": "rimraf ./packages/*/tsconfig.tsbuildinfo&&rimraf ./packages/*/@types&&rimraf ./packages/*/esm&&rimraf ./packages/*/dist",
+    "clearTypes": "rimraf ./packages/*/tsconfig.tsbuildinfo&&rimraf './packages/*/{es,esm,cjs,@types,dist}'",
     "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",
     "prepare": "husky"
   },

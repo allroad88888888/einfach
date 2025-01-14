@@ -1,7 +1,7 @@
-import { selectAtom, useAtomValue } from 'einfach-state'
+import { selectAtom, useAtomValue } from '@einfach/state'
 import type { FormInstance, NamePath } from './type'
 import { useGetFormInstance } from './useGetFormInstance'
-import { easyGet, useInit } from 'einfach-utils'
+import { easyGet, useInit } from '@einfach/utils'
 
 export type UseFieldValueOption = {
   formInstance?: FormInstance

@@ -1,7 +1,7 @@
 import { createContext } from 'react'
 import type { FieldInfo, FormInstance, Message } from './type'
-import { atom, createStore } from 'einfach-state'
-import type { NamePath } from 'einfach-utils'
+import { atom, createStore } from '@einfach/state'
+import type { NamePath } from '@einfach/utils'
 
 export const FormContext = createContext(undefined as unknown as FormInstance)
 

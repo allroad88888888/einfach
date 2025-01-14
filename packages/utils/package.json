@@ -1,8 +1,8 @@
 {
-  "name": "einfach-utils",
-  "version": "0.5.13",
+  "name": "@einfach/utils",
+  "version": "0.1.4",
   "type": "module",
-  "main": "./cjs/index.js",
+  "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
   "typings": "@types/index.d.ts",
   "license": "MIT",
@@ -23,7 +23,7 @@
   "peerDependencies": {
     "react": ">=16.8 <20",
     "react-dom": ">=16.8 <20",
-    "einfach-state": ">=0.11.11"
+    "@einfach/state": ">=0.1.0"
   },
   "peerDependenciesMeta": {
     "react": {
@@ -32,7 +32,7 @@
     "react-dom": {
       "optional": true
     },
-    "einfach-state": {
+    "@einfach/state": {
       "optional": true
     }
   },

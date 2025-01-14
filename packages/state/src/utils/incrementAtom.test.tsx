@@ -72,6 +72,7 @@ describe('incrementAtom', () => {
     }
 
     const { baseElement } = render(<App />)
+
     await screen.findByTestId('app')
     expect(queryByTestId(baseElement, 'result')).toBeInTheDocument()
     expect(queryByTestId(baseElement, 'result')?.textContent).toBe('100')

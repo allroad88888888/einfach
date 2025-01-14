@@ -1,9 +1,9 @@
-`npm i einfach-state`
+`npm i @einfach/state`
 
 ### 第一步 创建一个 atom实例
 
 ```jsx
-import { atom } from 'einfach-state'
+import { atom } from '@einfach/state'
 
 const helloWorldAtom = atom('Hello World')
 const objAtom = atom({})
@@ -12,7 +12,7 @@ const objAtom = atom({})
 ### 第二步 在组件中调用
 
 ```jsx
-import { useAtom, atom } from 'einfach-state'
+import { useAtom, atom } from '@einfach/state'
 
 const countAtom = atom(0)
 
@@ -30,7 +30,7 @@ function Counter() {
 ### 从状态A衍生状态B
 
 ```jsx
-import { atom } from 'einfach-state'
+import { atom } from '@einfach/state'
 
 const countAtom = atom(0)
 const doubleCountAtom = atom((get) => {
@@ -57,7 +57,7 @@ function B() {
 ### BigObj
 
 ```jsx
-import { atom } from 'einfach-state'
+import { atom } from '@einfach/state'
 
 const bigObjAtom = atom({
   a: { b: 'c' },
@@ -91,13 +91,13 @@ function B() {
   const double = useAtomValue(aAtom)
   return <div>{double}</div>
 }
-import { atom } from 'einfach-state'
+import { atom } from '@einfach/state'
 ```
 
 ### 创建多个store数据仓
 
 ```jsx
-import { createStore } from 'einfach-state'
+import { createStore } from '@einfach/state'
 
 const store = createStore()
 const countAtom = atom(0)

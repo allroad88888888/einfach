@@ -1,7 +1,7 @@
 import type { FormInstance, Message, NamePath, Rule } from './type'
-import { useInit } from 'einfach-utils'
+import { useInit } from '@einfach/utils'
 import { buildEventRulesMapping, namePathToStr } from './validator'
-import { useEasySelectAtomValue } from 'einfach-utils'
+import { useEasySelectAtomValue } from '@einfach/utils'
 
 import { useGetFormInstance } from './useGetFormInstance'
 import { useEffect, useLayoutEffect } from 'react'
