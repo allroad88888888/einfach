@@ -17,6 +17,7 @@ describe('easyGet', () => {
       'b-3',
     ] as [Record<string, string>, Record<string, string>, string],
     c: 'str',
+    d: null,
   }
 
   it('normal', async () => {
@@ -34,6 +35,10 @@ describe('easyGet', () => {
 
   it('没有这个属性', async () => {
     const temp3 = easyGet(mockObj, 'c.ss')
+    expect(temp3).toBe(undefined)
+  })
+  it('没有这个属性-null', async () => {
+    const temp3 = easyGet(mockObj, 'd.xx.xs')
     expect(temp3).toBe(undefined)
   })
 })

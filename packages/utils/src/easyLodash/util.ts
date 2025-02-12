@@ -17,7 +17,7 @@ export function setObjProp(obj: any, prop: any, value: any) {
       return obj
     }
     case '[object Map]': {
-      ;(obj as Map<any, any>).set(prop, value)
+      obj.set(prop, value)
       return obj
     }
     case '[object Set]': {
@@ -34,7 +34,7 @@ export function setObjProp(obj: any, prop: any, value: any) {
 }
 
 export function getObjProp(obj: any, prop: any) {
-  if (typeof obj !== 'object') {
+  if (typeof obj !== 'object' || null === obj) {
     // throw `getObjProp can't support`
     // return obj
     return undefined
