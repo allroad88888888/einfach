@@ -18,15 +18,9 @@ describe('useAtomValue', () => {
 
     let renderANum = 0
     const { result } = renderHook(() => {
-      const [info, setInfo] = useAtom(infoAtom)
+      const [, setInfo] = useAtom(infoAtom)
 
-      const bigInfo = useAtomValue(bigInfoAtom)
-      if (bigInfo > 10) {
-        console.log('error', bigInfo)
-      }
-      if ('a' in info) {
-        console.log('right', info)
-      }
+      useAtomValue(bigInfoAtom)
 
       renderANum += 1
 
@@ -48,59 +42,4 @@ describe('useAtomValue', () => {
 
     expect(renderANum).toBe(2)
   })
-
-  //     const mockData = {
-  //       a: '1',
-  //       b: {
-  //         'b-1': {
-  //           a: 'a',
-  //         },
-  //       },
-  //     };
-  //     const atomEntity = atom(mockData);
-  //     const atomOtherEntity = atom({});
-
-  //     const atomSelect = selectAtom(
-  //       atomEntity,
-  //       (obj) => {
-  //         return obj.b;
-  //       },
-  //       (a, b) => {
-  //         return Object.is(a, b);
-  //       },
-  //     );
-
-  //     const scope = Date.now();
-
-  //     let renderANum = 0;
-  //     const base = renderHook(() => {
-  //       renderANum += 1;
-  //       return useAtom(atomEntity, scope);
-  //     }).result;
-
-  //     let otherNum = 0;
-  //     renderHook(() => {
-  //       otherNum += 1;
-  //       return useAtom(atomOtherEntity, scope);
-  //     });
-
-  //     let renderNum = 0;
-  //     const res: any[] = [];
-  //     renderHook(() => {
-  //       renderNum += 1;
-  //       res.push(useAtomValue(atomSelect, scope));
-  //     });
-
-  //     base.current[1]({
-  //       ...base.current[0],
-  //     });
-
-  //     expect(renderANum).toBe(3);
-
-  //     expect(res[0]).toBe(res[1]);
-  //     expect(res[0]).toBe(res[2]);
-  //     expect(res[0]).toBe(mockData.b);
-  //     expect(renderNum).toBe(3);
-  //     expect(otherNum).toBe(2);
-  //   });
 })
