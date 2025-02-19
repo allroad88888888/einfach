@@ -1,7 +1,7 @@
 import { describe, test, expect } from '@jest/globals'
 import { atom } from './atom'
 import { useAtomValue } from '../react'
-import { queryByTestId, render, screen } from '@testing-library/react'
+import { queryByTestId, render, screen, waitFor } from '@testing-library/react'
 import { Suspense } from 'react'
 
 describe('async', () => {
@@ -34,7 +34,8 @@ describe('async', () => {
     const { baseElement } = render(<App />)
     await screen.findByTestId('app')
     expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
-    await screen.findByTestId('serverInfo')
+    await waitFor(() => expect(screen.queryByTestId('loading')).not.toBeInTheDocument())
+    expect(screen.getByTestId('serverInfo')).toBeInTheDocument()
   })
 
   test('first-item', async () => {
@@ -70,7 +71,10 @@ describe('async', () => {
 
     const { baseElement } = render(<App />)
     await screen.findByTestId('app')
-    expect(queryByTestId(baseElement, 'firstItem')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(queryByTestId(baseElement, 'firstItem')).not.toBeInTheDocument()
+    })
+
     expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
     await screen.findByTestId('firstItem')
     expect(queryByTestId(baseElement, 'firstItem')).toBeInTheDocument()

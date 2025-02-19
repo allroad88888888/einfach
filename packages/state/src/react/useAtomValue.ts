@@ -7,22 +7,22 @@ import { isPromiseLike } from '../core/promiseUtils'
 import { use } from './use'
 import type { StatesWithPromise } from '../core/typePromise'
 
-export function useAtomValue<State>(
+export function useAtomValue17<State>(
   atom: Atom<State>,
   options?: HookOption,
 ): State extends Promise<infer T> ? T : State
-export function useAtomValue<AtomType extends Atom<unknown>>(
+export function useAtomValue17<AtomType extends Atom<unknown>>(
   atom: AtomType,
   options?: HookOption,
 ): AtomState<AtomType>
-export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {}) {
+export function useAtomValue17<State>(atom: Atom<State>, options: HookOption = {}) {
   const store = useStore(options)
   type ReducerState = [State, Store, Atom<State>]
   const [[valueFromReducer, storeFromReducer, atomFromReducer], rerender] = useReducer<
     ReducerWithoutAction<ReducerState>,
     undefined
   >(
-    (prev: ReducerState) => {
+    function (prev: ReducerState) {
       const nextValue = store.getter(atom)
       if (Object.is(nextValue, prev[0]) && store === prev[1] && atom === prev[2]) {
         return prev as ReducerState
@@ -30,7 +30,7 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
       return [nextValue, store, atom] as ReducerState
     },
     undefined,
-    () => {
+    function () {
       return [store.getter(atom), store, atom] as ReducerState
     },
   )
@@ -40,12 +40,12 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
     rerender()
   }
   useEffect(() => {
-    if (!Object.is(store.getter(atom), value)) {
-      rerender()
-    }
-    return store.sub(atom, () => {
+    const unSub = store.sub(atom, () => {
       rerender()
     })
+    // 点睛之笔
+    rerender()
+    return unSub
   }, [store, atom])
 
   useDebugValue(value)
@@ -55,6 +55,14 @@ export function useAtomValue<State>(atom: Atom<State>, options: HookOption = {})
   return value
 }
 
+export function useAtomValueWith18<State>(
+  atom: Atom<State>,
+  options?: HookOption,
+): State extends Promise<infer T> ? T : State
+export function useAtomValueWith18<AtomType extends Atom<unknown>>(
+  atom: AtomType,
+  options?: HookOption,
+): AtomState<AtomType>
 export function useAtomValueWith18<State>(atom: Atom<State>, options: HookOption = {}) {
   const store = useStore(options)
 
@@ -77,3 +85,6 @@ export function useAtomValueWith18<State>(atom: Atom<State>, options: HookOption
   }
   return value
 }
+
+// @ts-ignore
+export const useAtomValue = useSyncExternalStore ? useAtomValueWith18 : useAtomValue17

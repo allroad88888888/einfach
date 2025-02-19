@@ -1,6 +1,6 @@
 {
   "name": "@einfach/state",
-  "version": "0.1.4",
+  "version": "0.1.10",
   "description": "react易上手状态管理",
   "type": "module",
   "main": "./cjs/index.cjs",
@@ -35,6 +35,5 @@
   "devDependencies": {
     "@types/node": "^20.11.30",
     "@types/react": "^18.3.3"
-  },
-  "dependencies": {}
+  }
 }

@@ -24,7 +24,7 @@
   "peerDependencies": {
     "@types/react": ">=16.8 <20",
     "react": ">=16.8 <20",
-    "@einfach/state": ">=0.1.0"
+    "@einfach/state": "workspace:*"
   },
   "peerDependenciesMeta": {
     "@types/react": {
@@ -42,7 +42,6 @@
   },
   "dependencies": {
     "@einfach/state": "workspace:*",
-    "@einfach/utils": "workspace:*",
-    "react": "^18.3.1"
+    "@einfach/utils": "workspace:*"
   }
 }

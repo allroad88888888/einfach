@@ -1,4 +1,3 @@
-import React from 'react'
 import type { FormInstance } from '../core'
 import { FormContext } from '../core'
 

@@ -1,21 +1,21 @@
-import type { ReactNode } from 'react'
+import type { ComponentProps, ReactElement } from 'react'
 import type React from 'react'
 import { isValidElement, memo, useCallback } from 'react'
 import { useField, type NamePath, type Rule } from '../core'
 import { useValidator } from '../core/useValidator'
 
-export type FormItemProps = {
+export type FormItemProps<T extends React.ElementType> = {
   label?: string
   noStyle?: boolean
   style?: React.CSSProperties
   className?: string
-  children: ReactNode
+  children: ReactElement<ComponentProps<T>>
   name: NamePath
   rules?: Rule[]
   dataTestid?: string
 }
 
-export function FormItemFc(props: FormItemProps) {
+export function FormItemFc<T extends React.ElementType>(props: FormItemProps<T>) {
   const { noStyle = false, children, name, rules, dataTestid, label } = props
   const { value, onChange } = useField(name)
 

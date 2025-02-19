@@ -26,11 +26,11 @@ describe('async', () => {
       render += 1
     })
     const state2 = store.getter(atom1)
-    expect(render).toBe(1)
+    expect(render).toBe(0)
     await state2
     expect(state2.value).toBe(100)
     expect(runNum).toBe(1)
-    expect(render).toBe(2)
+    expect(render).toBe(1)
   })
 
   test('more', async () => {

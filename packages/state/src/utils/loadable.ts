@@ -69,7 +69,7 @@ export function loadable<AtomType extends Atom<unknown>>(
 
     var refreshAtom = atom(0)
 
-    const derivedAtom = atom<Res<AtomState<AtomType>>>(function (getter, { setter }) {
+    const derivedAtom = atom<Res<AtomState<AtomType>>>(function (getter, options) {
       const refreshVal = getter(refreshAtom)
 
       if (refreshVal === 0 && autoRun === false) {
@@ -125,7 +125,7 @@ export function loadable<AtomType extends Atom<unknown>>(
             },
           )
           .finally(() => {
-            setter(refreshAtom, refreshVal + 1)
+            options.setter(refreshAtom, refreshVal + 1)
           })
       }
       var cached2 = loadableCache.get(promise)
