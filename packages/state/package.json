@@ -1,6 +1,6 @@
 {
   "name": "@einfach/state",
-  "version": "0.1.10",
+  "version": "0.2.0",
   "description": "react易上手状态管理",
   "type": "module",
   "main": "./cjs/index.cjs",
