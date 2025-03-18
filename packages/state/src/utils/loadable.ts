@@ -68,6 +68,7 @@ export function loadable<AtomType extends Atom<unknown>>(
     >()
 
     var refreshAtom = atom(0)
+    refreshAtom.debugLabel = 'loadable refresh'
 
     const derivedAtom = atom<Res<AtomState<AtomType>>>(function (getter, options) {
       const refreshVal = getter(refreshAtom)
@@ -126,6 +127,7 @@ export function loadable<AtomType extends Atom<unknown>>(
           )
           .finally(() => {
             options.setter(refreshAtom, refreshVal + 1)
+            // options.setter(derivedAtom, undefined as any)
           })
       }
       var cached2 = loadableCache.get(promise)
@@ -136,20 +138,25 @@ export function loadable<AtomType extends Atom<unknown>>(
       return LOADING
     })
 
-    return atom<Res<AtomState<AtomType>>, AtomSetParameters<AtomType>, AtomSetResult<AtomType>>(
-      function (getter) {
-        return getter(derivedAtom)
-      },
-      // @ts-ignore
-      function (_get, setter, ...args: AtomSetParameters<AtomType> | []) {
-        setter(refreshAtom, function (c) {
-          return c + 1
-        })
-        if (isWriteAtom(anAtom)) {
-          return setter(anAtom, ...args)
-        }
-      },
-    )
+    derivedAtom.debugLabel = 'loadable derivedAtom'
+
+    const loadableWritableAtom =
+      atom<Res<AtomState<AtomType>>, AtomSetParameters<AtomType>, AtomSetResult<AtomType>>(
+        function (getter) {
+          return getter(derivedAtom)
+        },
+        // @ts-ignore
+        function (_get, setter, ...args: AtomSetParameters<AtomType> | []) {
+          setter(refreshAtom, function (c) {
+            return c + 1
+          })
+          if (isWriteAtom(anAtom)) {
+            return setter(anAtom, ...args)
+          }
+        },
+      )
+    loadableWritableAtom.debugLabel = 'loadableWritableAtom'
+    return loadableWritableAtom
   }, anAtom)
 }
 

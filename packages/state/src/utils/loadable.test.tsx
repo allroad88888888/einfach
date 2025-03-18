@@ -17,9 +17,13 @@ describe('async', () => {
       }) as Promise<{ id: number }[]>
     })
 
+    serverInfoAtom.debugLabel = ' server async'
+
     function ServerInfoComponent() {
+      const xxAtom = loadable(serverInfoAtom, { autoRun: false })
+      xxAtom.debugLabel = 'loadable atom'
       const [{ data: serverInfo, state }, run] = useAtom(
-        loadable(serverInfoAtom, { autoRun: false }),
+        xxAtom,
       )
 
       if (state === 'loading') {

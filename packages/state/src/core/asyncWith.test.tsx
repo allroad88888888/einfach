@@ -47,10 +47,13 @@ describe('async', () => {
       }) as Promise<{ id: number }[]>
     })
 
+    serverInfoAtom.debugLabel = 'serverInfoAtom'
+
     const firstItemAtom = atom(async (getter) => {
       const serverInfo = await getter(serverInfoAtom)
       return serverInfo[0]
     })
+    firstItemAtom.debugLabel = 'firstItemAtom'
 
     function FirstItem() {
       const firstItemInfo = useAtomValue(firstItemAtom)

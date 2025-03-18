@@ -3,6 +3,7 @@ import { queryByTestId, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { atom } from '../core'
 import { useAtom, useAtomValue } from '../react'
+import { memo } from 'react'
 
 describe('useAtomValue', () => {
   it('base', async () => {
@@ -14,11 +15,11 @@ describe('useAtomValue', () => {
       return getter(atom2) + 1
     })
     let renderNum = 0
-    function ItemThree() {
+    const ItemThree = memo(()=>{
       renderNum += 1
       const val = useAtomValue(atom3)
       return <div data-testid="itemThree">{val}</div>
-    }
+    }) 
 
     function DemoAtomVAlue() {
       const [val, setAtom1] = useAtom(atom1)

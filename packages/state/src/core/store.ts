@@ -163,7 +163,7 @@ export function createStore(): Store {
   function setAtomState<State>(
     atomEntity: Atom<State>,
     state: State,
-    abortPromise: () => void = () => {},
+    abortPromise: () => void = () => { },
   ): State | StatesWithPromise<State> {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state)
@@ -186,31 +186,46 @@ export function createStore(): Store {
     }
 
     if (atomStateMap.has(atomEntity)) {
-      const dependencies = backDependenciesMap.get(atomEntity)
-      if (dependencies) {
-        dependencies.forEach((depAtomEntity) => {
+      function addDependenciesToUpdateSet<AtomType extends Atom<unknown>>(updateEntity: AtomType) {
+        backDependenciesMap.get(updateEntity)?.forEach((depAtomEntity) => {
           updatesSet.add(depAtomEntity)
         })
       }
+      addDependenciesToUpdateSet(atomEntity)
     }
 
     atomStateMap.set(atomEntity, nextState)
 
-    if (!pendingMap.has(atomEntity)) {
-      pendingMap.set(atomEntity, prevState)
-    }
+    pendingMap.set(atomEntity, prevState)
     return nextState
   }
 
+
   function flushPending() {
+    const addDependenciesToSet = <AtomType extends Atom<unknown>>(
+      atomEntity: AtomType,
+      dependencies: Set<Atom<unknown>>,
+    ) => {
+      dependencies.add(atomEntity)
+      backDependenciesMap.get(atomEntity)?.forEach((entity) => {
+        addDependenciesToSet(entity as Atom<unknown>, dependencies)
+      })
+    }
+
     while (pendingMap.size > 0) {
       const pending = Array.from(pendingMap)
       pendingMap.clear()
+
+      const dependencies = new Set<Atom<unknown>>()
+
       pending.forEach(([atomEntity, prevState]) => {
         const nextState = getAtomState(atomEntity)
         if (!Object.is(nextState, prevState)) {
-          publishAtom(atomEntity)
+          addDependenciesToSet(atomEntity, dependencies)
         }
+      })
+      dependencies.forEach((entity) => {
+        publishAtom(entity)
       })
     }
   }

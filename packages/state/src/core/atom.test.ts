@@ -3,6 +3,34 @@ import { atom } from './atom'
 import { createStore } from './store'
 
 describe('store', () => {
+  test('easy', () => {
+    const atom1 = atom(10)
+    const atom2 = atom((getter) => {
+      const state1 = getter(atom1)
+      return state1 + 10
+    })
+    const atom3 = atom((getter) => {
+      return getter(atom2) + 10
+    })
+
+    const atom4 = atom((getter) => {
+      return getter(atom3) + 10
+    })
+
+
+    const store = createStore()
+    let state4 = store.getter(atom4)
+    store.sub(atom4, () => {
+      state4 = store.getter(atom4)
+    })
+    expect(state4).toBe(40)
+    store.setter(atom1, 20)
+    expect(state4).toBe(50)
+    store.setter(atom1, 30)
+    expect(state4).toBe(60)
+  })
+
+
   test('store-sub', () => {
     const atom1 = atom({ a: { b: 123 } })
     const atom2 = atom((get) => {
