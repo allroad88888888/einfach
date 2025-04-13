@@ -1,5 +1,5 @@
 import { describe, test, expect } from '@jest/globals'
-import { atom } from '../src/atom'
+import { atom } from '../../src/atom'
 import { useAtomValue } from '@einfach/react'
 import { queryByTestId, render, screen, waitFor } from '@testing-library/react'
 import { Suspense } from 'react'

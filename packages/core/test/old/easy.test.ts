@@ -1,6 +1,6 @@
 import { describe, test, expect } from '@jest/globals'
-import { atom } from '../src/atom'
-import { createStore } from '../src/store'
+import { atom } from '../../src/atom'
+import { createStore } from '../../src/store'
 
 describe('store', () => {
   test('base', async () => {
