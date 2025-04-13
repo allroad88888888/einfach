@@ -6,7 +6,7 @@ import path, { dirname } from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
 
-const products = ['packages/state', 'packages/utils', 'packages/form']
+const products = ['packages/core', 'packages/react', 'packages/utils', 'packages/form']
 
 const filename = fileURLToPath(import.meta.url)
 const dirName = dirname(filename)
@@ -25,7 +25,8 @@ products.forEach((pName) => {
 const config = defineConfig({
   external: [
     '@swc/core',
-    '@einfach/state',
+    '@einfach/core',
+    '@einfach/react',
     '@einfach/utils',
     'einfach-form',
     'react',

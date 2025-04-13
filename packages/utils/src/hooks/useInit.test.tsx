@@ -2,7 +2,8 @@ import { describe, expect, it } from '@jest/globals'
 import { queryByTestId, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { useInit } from './useInit'
-import { atom, useAtom } from '@einfach/state'
+import { atom } from '@einfach/core'
+import { useAtom } from '@einfach/react'
 
 describe('useInit', () => {
   it('init', async () => {

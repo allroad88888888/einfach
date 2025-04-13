@@ -1,4 +1,5 @@
-import { selectAtom, useAtomValue } from '@einfach/state'
+import { selectAtom } from '@einfach/core'
+import { useAtomValue } from '@einfach/react'
 import type { FormInstance, NamePath } from './type'
 import { useGetFormInstance } from './useGetFormInstance'
 import { easyGet, useInit } from '@einfach/utils'

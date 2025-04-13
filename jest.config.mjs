@@ -20,5 +20,14 @@ const jestConfig = {
    * 单测里面，如需要使用到dom，这里需设置为jsdom
    */
   testEnvironment: 'jsdom',
+
+  /**
+   * 模块名称映射，用于解析 @einfach/core 和 @einfach/react 包
+   */
+  moduleNameMapper: {
+    '^@einfach/core$': '<rootDir>/packages/core/src',
+    '^@einfach/react$': '<rootDir>/packages/react/src',
+    '^@einfach/utils$': '<rootDir>/packages/utils/src'
+  },
 }
 export default jestConfig

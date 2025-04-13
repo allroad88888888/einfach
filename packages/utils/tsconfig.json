@@ -13,7 +13,10 @@
   ],
   "references": [
     {
-      "path": "./../state/tsconfig.json"
+      "path": "./../core/tsconfig.json"
+    },
+    {
+      "path": "./../react/tsconfig.json"
     }
   ]
 }

@@ -24,7 +24,8 @@
   "peerDependencies": {
     "@types/react": ">=16.8 <20",
     "react": ">=16.8 <20",
-    "@einfach/state": "workspace:*"
+    "@einfach/core": "workspace:*",
+    "@einfach/react": "workspace:*"
   },
   "peerDependenciesMeta": {
     "@types/react": {
@@ -33,7 +34,10 @@
     "react": {
       "optional": true
     },
-    "@einfach/state": {
+    "@einfach/core": {
+      "optional": true
+    },
+    "@einfach/react": {
       "optional": true
     }
   },
@@ -41,7 +45,8 @@
     "@types/node": "^20.11.30"
   },
   "dependencies": {
-    "@einfach/state": "workspace:*",
+    "@einfach/core": "workspace:*",
+    "@einfach/react": "workspace:*",
     "@einfach/utils": "workspace:*"
   }
 }

@@ -1,4 +1,4 @@
-import type { Store } from '@einfach/state'
+import type { Store } from '@einfach/core'
 import type { Rule } from '../type'
 import { getLength } from './getLength'
 import { isEmpty } from './isEmpty'

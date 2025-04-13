@@ -1,4 +1,4 @@
-import { type Atom, type Store } from '@einfach/state'
+import { type Atom, type Store } from '@einfach/core'
 import { useInit } from '../hooks'
 import { useEffect } from 'react'
 

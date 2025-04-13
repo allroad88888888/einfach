@@ -1,4 +1,4 @@
-import type { Store } from '@einfach/state'
+import type { Store } from '@einfach/core'
 import type { createFormDataHelpContext } from './context'
 
 export type NamePath = string | number | (string | number)[]

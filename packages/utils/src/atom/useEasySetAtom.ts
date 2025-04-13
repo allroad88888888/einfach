@@ -1,7 +1,7 @@
 import { useCallback } from 'react'
 import { easySetIn, type NamePath } from '../easyLodash'
-import type { AtomEntity } from '@einfach/state'
-import { useStore, type HookOption } from '@einfach/state'
+import type { AtomEntity } from '@einfach/core'
+import { useStore, type HookOption } from '@einfach/react'
 
 export interface SetAtomMethod<Value, Slice> {
   (namePath: NamePath, value: Slice): void

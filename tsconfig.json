@@ -51,7 +51,10 @@
       "path": "./packages/utils/tsconfig.json"
     },
     {
-      "path": "./packages/state/tsconfig.json"
+      "path": "./packages/core/tsconfig.json"
+    },
+    {
+      "path": "./packages/react/tsconfig.json"
     }
   ]
 }
