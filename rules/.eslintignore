@@ -1,0 +1,5 @@
+build
+es
+@types
+dist
+coverage

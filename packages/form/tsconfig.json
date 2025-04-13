@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.build.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "declarationDir": "@types",
+    "emitDeclarationOnly": true,
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "./../state/tsconfig.json"
+    },
+    {
+      "path": "./../utils/tsconfig.json"
+    }
+  ]
+}

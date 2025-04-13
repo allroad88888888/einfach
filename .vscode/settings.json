@@ -1,0 +1,25 @@
+{
+  "eslint.useFlatConfig": false,
+  "eslint.options": {
+    "overrideConfigFile": "./rules/.eslintrc"
+  },
+  "editor.codeActionsOnSave": {
+    "source.fixAll.eslint": "explicit"
+  },
+  "files.exclude": {
+    "**/.git": true,
+    "**/.svn": true,
+    "**/.hg": true,
+    "**/CVS": true,
+    "**/.DS_Store": true,
+    "**/Thumbs.db": true
+  },
+  "files.associations": {
+    "api-extractor.json": "jsonc",
+    "tsconfig.json": "jsonc"
+  },
+  "cSpell.words": ["antd", "einfach", "swcrc", "testid", "tsbuildinfo"],
+  "editor.formatOnSave": true,
+  "jest.runMode": "on-demand",
+  "prettier.configPath": ".prettierrc.mjs"
+}
