@@ -1,5 +1,5 @@
-import type { Atom, AtomEntity, AtomState } from './type'
-import { atom } from './atom'
+import type { Atom, AtomEntity, AtomState } from './../type'
+import { atom } from './../atom'
 
 export function selectAtom<Slice, AtomType extends Atom<unknown>>(
   atomEntity: AtomType,

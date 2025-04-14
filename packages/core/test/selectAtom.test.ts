@@ -92,12 +92,14 @@ describe('selectAtom', () => {
     const nameAtom = selectAtom(userAtom, (user) => user.name)
     const listener = jest.fn()
 
-    store.sub(nameAtom, listener)
+    store.sub(nameAtom, () => {
+      listener()
+    })
 
     // 更新age但不更新name
     store.setter(userAtom, (prev: any) => ({ ...prev, age: 31 }))
     // 在当前实现中，即使只更新了age，也会触发nameAtom的更新
-    expect(listener).toHaveBeenCalledTimes(1)
+    expect(listener).toHaveBeenCalledTimes(0)
     listener.mockClear()
 
     // 更新name，应该触发nameAtom的更新

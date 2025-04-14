@@ -11,5 +11,10 @@
   "exclude": [
     "./src/**/*.test.tsx",
     "./src/**/*.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../core/tsconfig.json"
+    }
   ]
 }

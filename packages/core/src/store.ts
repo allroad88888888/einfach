@@ -19,7 +19,7 @@ export function createStore(): Store {
 
   function clearDependencies<AtomType extends Atom<unknown>>(atomEntity: AtomType) {
     const dependencies = dependenciesMap.get(atomEntity)
-    dependencies?.keys().forEach((depAtomEntity) => {
+    Array.from(dependencies?.keys() ?? []).forEach((depAtomEntity) => {
       backDependenciesMap.get(depAtomEntity)?.delete(atomEntity)
     })
     dependenciesMap.delete(atomEntity)
@@ -45,11 +45,13 @@ export function createStore(): Store {
         return getAtomState(atomEntity)
       }
 
-      const hasChange = depAtomEntityMap.keys().every((tempAntity) => {
-        return Object.is(getAtomState(tempAntity), depAtomEntityMap.get(tempAntity))
+      const noChange = Array.from(depAtomEntityMap.keys()).every((tempAntity) => {
+        const current = getAtomState(tempAntity)
+        const depValue = depAtomEntityMap.get(tempAntity)
+        return Object.is(current, depValue)
       })
 
-      if (hasChange) {
+      if (noChange) {
         return getAtomState(atomEntity)
       }
     }
@@ -160,7 +162,7 @@ export function createStore(): Store {
   function setAtomState<State>(
     atomEntity: Atom<State>,
     state: State,
-    abortPromise: () => void = () => {},
+    abortPromise: () => void = () => { },
   ): State | StatesWithPromise<State> {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state)
@@ -204,7 +206,6 @@ export function createStore(): Store {
     while (pendingMap.size > 0) {
       const pending = Array.from(pendingMap)
       pendingMap.clear()
-      const dependencies = new Set<Atom<unknown>>()
       pending.forEach(([atomEntity, prevState]) => {
         dependenciesChange(atomEntity)
         const nextState = getAtomState(atomEntity)
@@ -212,9 +213,7 @@ export function createStore(): Store {
           publishAtom(atomEntity)
         }
       })
-      dependencies.forEach((entity) => {
-        publishAtom(entity)
-      })
+
     }
   }
 
@@ -225,21 +224,15 @@ export function createStore(): Store {
         listener()
       })
     }
-    const dependencies = backDependenciesMap.get(atomEntity)
-    if (!dependencies) {
-      return
-    }
-    Array.from(dependencies).forEach((depAtomEntity) => {
-      publishAtom(depAtomEntity)
-    })
   }
 
   function subscribeAtom<Entity extends Atom<unknown>>(atomEntity: Entity, listener: () => void) {
+    readAtom.call(atomEntity, atomEntity)
+    flushPending()
     if (!listenersMap.has(atomEntity)) {
       listenersMap.set(atomEntity, new Set())
     }
     listenersMap.get(atomEntity)!.add(listener)
-
     return () => {
       listenersMap.get(atomEntity)!.delete(listener)
     }

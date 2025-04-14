@@ -37,8 +37,8 @@ describe('atomWithCompare', () => {
 
     // 差值小于等于5，应该使用原值，但仍然会触发订阅者
     store.setter(countAtom, 3)
-    // 在当前实现中，即使值没有变化，也会触发订阅者
-    expect(listener).toHaveBeenCalledTimes(1)
+    // 值没有变化 不会通知更新者
+    expect(listener).toHaveBeenCalledTimes(0)
     listener.mockClear()
 
     // 差值大于5，应该触发更新
@@ -57,8 +57,8 @@ describe('atomWithCompare', () => {
 
     // 只更新age，应该使用原值
     store.setter(userAtom, { name: 'John', age: 31 })
-    // 在当前实现中，即使值没有变化，也会触发订阅者
-    expect(listener).toHaveBeenCalledTimes(1)
+    // 在值没有变化 不会通知更新者
+    expect(listener).toHaveBeenCalledTimes(0)
     listener.mockClear()
     expect(store.getter(userAtom)).toEqual({ name: 'John', age: 30 }) // 值不应该更新
 

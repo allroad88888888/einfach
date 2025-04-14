@@ -1,6 +1,6 @@
 import { selectAtom } from '@einfach/core'
-import { useAtomValue } from '@einfach/react'
-import type { HookOption, AtomEntity } from '@einfach/core'
+import { HookOption, useAtomValue } from '@einfach/react'
+import type { AtomEntity } from '@einfach/core'
 import { easyGet, easyEqual } from './../easyLodash'
 import type { NamePath } from '../easyLodash/type'
 import { useInit } from './../hooks/useInit'

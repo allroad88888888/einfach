@@ -1,5 +1,5 @@
-import type { AtomEntity, Getter, Setter } from '../type'
-import { atom, type Read } from '../atom'
+import type { AtomEntity, Getter, Read, Setter } from '../type'
+import { atom } from '../atom'
 
 export function atomWithCompare<State>(
   read: Read<State> | State,

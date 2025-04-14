@@ -45,16 +45,16 @@
   ],
   "references": [
     {
+      "path": "./packages/core/tsconfig.json"
+    },
+    {
+      "path": "./packages/react/tsconfig.json"
+    },
+    {
       "path": "./packages/form/tsconfig.json"
     },
     {
       "path": "./packages/utils/tsconfig.json"
     },
-    {
-      "path": "./packages/core/tsconfig.json"
-    },
-    {
-      "path": "./packages/react/tsconfig.json"
-    }
   ]
 }

@@ -1,8 +1,8 @@
 import { describe, test, expect } from '@jest/globals'
-import { atom } from '../../src/atom'
-import { useAtomValue } from '@einfach/react'
+import { atom } from '@einfach/core'
 import { queryByTestId, render, screen, waitFor } from '@testing-library/react'
 import { Suspense } from 'react'
+import { useAtomValue } from '../src'
 
 describe('async', () => {
   test('serverInfo', async () => {
