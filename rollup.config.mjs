@@ -5,8 +5,20 @@ import terser from '@rollup/plugin-terser'
 import path, { dirname } from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
+import { readFileSync } from 'fs'
+import yaml from 'js-yaml'
 
-const products = ['packages/core', 'packages/react', 'packages/utils', 'packages/form']
+const workspaceConfig = yaml.load(readFileSync('./pnpm-workspace.yaml', 'utf8'))
+const topLevelDirs = workspaceConfig.packages.map((pattern) => pattern.replace('/**', ''))
+
+// 获取所有子目录
+const products = topLevelDirs.reduce((acc, dir) => {
+  const subDirs = fs
+    .readdirSync(dir, { withFileTypes: true })
+    .filter((dirent) => dirent.isDirectory())
+    .map((dirent) => `${dir}/${dirent.name}`)
+  return [...acc, ...subDirs]
+}, [])
 
 const filename = fileURLToPath(import.meta.url)
 const dirName = dirname(filename)
@@ -28,13 +40,16 @@ const config = defineConfig({
     '@einfach/core',
     '@einfach/react',
     '@einfach/utils',
-    'einfach-form',
     'react',
     'react-dom',
     'react/jsx-runtime',
     'react/jsx-dev-runtime',
-    '@deepfos/hooks',
   ],
+  treeshake: {
+    moduleSideEffects: false,
+    propertyReadSideEffects: false,
+    unknownGlobalSideEffects: false,
+  },
 
   plugins: [
     resolve({

@@ -8,7 +8,8 @@
     "sourceType": "module",
     "project": [
       "./tsconfig.json",
-      "./packages/*/tsconfig.json",
+      "./react/*/tsconfig.json",
+      "./vanilla/*/tsconfig.json"
     ]
   },
   "plugins": [

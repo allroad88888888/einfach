@@ -1,0 +1,59 @@
+{
+  "name": "@einfach/react-form",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "react",
+    "form",
+    "atom",
+    "antd-form-api"
+  ],
+  "peerDependencies": {
+    "react": ">=16.8 <20",
+    "@einfach/core": "workspace:*",
+    "@einfach/react": "workspace:*",
+    "@einfach/react-utils": "workspace:*",
+    "@einfach/utils": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "@einfach/core": {
+      "optional": true
+    },
+    "@einfach/react": {
+      "optional": true
+    },
+    "@einfach/utils": {
+      "optional": true
+    },
+    "@einfach/react-utils": {
+      "optional": true
+    }
+  },
+  "sideEffects": false,
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/react": ">=16.8 <20"
+  },
+  "dependencies": {
+    "@einfach/core": "workspace:*",
+    "@einfach/react": "workspace:*",
+    "@einfach/utils": "workspace:*",
+    "@einfach/react-utils": "workspace:*"
+  }
+}

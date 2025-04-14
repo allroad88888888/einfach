@@ -8,10 +8,11 @@
     ],
     "noEmitOnError": true,
     "allowJs": false,
-    "noEmit": true,
     "skipLibCheck": true,
     "alwaysStrict": true,
     "strictNullChecks": true,
+    "declaration": true,
+    "declarationMap": true,
     "esModuleInterop": true,
     "experimentalDecorators": true,
     "allowSyntheticDefaultImports": true,
@@ -24,40 +25,8 @@
     "noImplicitAny": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "declaration": true,
     "noEmitHelpers": true,
     "preserveWatchOutput": true,
-    "jsx": "react-jsx",
-    "inlineSourceMap": true
-  },
-  "include": [
-    "./jest.config.mjs",
-    "rollup.config.mjs",
-    "./**/*.test.ts",
-    "./**/*.test.tsx",
-    "./**/test",
-    "./rules/setup-jest.ts"
-  ],
-  "exclude": [
-    "node_modules",
-    "**/node_modules",
-    "**/@types/"
-  ],
-  "references": [
-    {
-      "path": "./vanilla/core/tsconfig.json"
-    },
-    {
-      "path": "./vanilla/utils/tsconfig.json"
-    },
-    {
-      "path": "./react/react/tsconfig.json"
-    },
-    {
-      "path": "./react/form/tsconfig.json"
-    },
-    {
-      "path": "./react/utils/tsconfig.json"
-    }
-  ]
+    "composite": true,
+  }
 }

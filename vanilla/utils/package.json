@@ -1,0 +1,34 @@
+{
+  "name": "@einfach/utils",
+  "version": "0.1.5",
+  "type": "module",
+  "main": "./cjs/index.cjs",
+  "module": "./esm/index.mjs",
+  "typings": "./@types/index.d.ts",
+  "license": "MIT",
+  "files": [
+    "esm",
+    "cjs",
+    "@types",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=14.18.0"
+  },
+  "peerDependencies": {
+    "@einfach/core": "workspace:*"
+  },
+  "peerDependenciesMeta": {
+    "@einfach/core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30"
+  }
+}

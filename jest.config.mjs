@@ -25,9 +25,11 @@ const jestConfig = {
    * 模块名称映射，用于解析 @einfach/core 和 @einfach/react 包
    */
   moduleNameMapper: {
-    '^@einfach/core$': '<rootDir>/packages/core/src',
-    '^@einfach/react$': '<rootDir>/packages/react/src',
-    '^@einfach/utils$': '<rootDir>/packages/utils/src'
+    '^@einfach/core$': '<rootDir>/vanilla/core/src',
+    '^@einfach/utils$': '<rootDir>/vanilla/utils/src',
+    '^@einfach/react$': '<rootDir>/react/react/src',
+    '^@einfach/react-utils$': '<rootDir>/react/utils/src',
+    '^@einfach/react-form$': '<rootDir>/react/form/src',
   },
 }
 export default jestConfig

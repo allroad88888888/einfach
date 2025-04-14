@@ -1,0 +1,25 @@
+{
+  "extends": "../../tsconfig.react.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "declarationDir": "@types",
+    "emitDeclarationOnly": true,
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "./../../vanilla/core/tsconfig.json"
+    },
+    {
+      "path": "./../react/tsconfig.json"
+    },
+    {
+      "path": "./../utils/tsconfig.json"
+    },
+    {
+      "path": "./../../vanilla/utils/tsconfig.json"
+    }
+  ]
+}
