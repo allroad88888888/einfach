@@ -1,5 +1,5 @@
-import { atom } from '@einfach/core'
-import type { Getter, Read, Setter } from '@einfach/core'
+import { atom } from "../atom"
+import type { Getter, Read, Setter } from "../type"
 
 export function incrementAtom<T>(initState: T | Read<T>) {
   type ReadFn = (getter: Getter, prev: T) => T

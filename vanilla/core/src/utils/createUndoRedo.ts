@@ -1,5 +1,6 @@
-import type { AtomEntity, AtomState, Store } from '@einfach/core'
-import { atom } from '@einfach/core'
+import { atom } from "../atom"
+import { Store } from "../type"
+import type { AtomEntity, AtomState } from "../type"
 
 /**
  * 前进回退开关
@@ -163,13 +164,18 @@ export function createUndoRedo(store: Store) {
   function resetByNow() {
     store.setter(isRedoUndoAtom, true)
     const historyData = store.getter(historyDataAtom)
+    const historyIndex = store.getter(historyIndexAtom)
     const todoAtomEntitySet = new Set()
 
     const newHisData: WeakMap<AtomEntity<any>, any> = new WeakMap()
-    historyData.toReversed().forEach((data) => {
-      if (!historyData) {
-        return
+
+    // 只处理到当前historyIndex的数据
+    for (let i = historyIndex; i >= 0; i--) {
+      const data = historyData[i]
+      if (!data) {
+        continue
       }
+
       const setKeys = new Set<AtomEntity<any>>(data.get(iteratorKey))
 
       setKeys.forEach((tempAtomEntity) => {
@@ -178,7 +184,8 @@ export function createUndoRedo(store: Store) {
           newHisData.set(tempAtomEntity, data.get(tempAtomEntity))
         }
       })
-    })
+    }
+
     store.setter(historyDataAtom, [newHisData])
     store.setter(historyIndexAtom, 0)
     store.setter(isRedoUndoAtom, false)

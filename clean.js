@@ -24,18 +24,30 @@ try {
       continue
     }
 
-    for (const target of targets) {
-      const targetPath = path.join(pkgPath, target)
+    // 获取子目录
+    const subDirs = fs
+      .readdirSync(pkgPath, { withFileTypes: true })
+      .filter((dirent) => dirent.isDirectory())
+      .map((dirent) => dirent.name)
 
-      if (fs.existsSync(targetPath)) {
-        if (target === 'tsconfig.tsbuildinfo') {
-          // 删除文件
-          fs.unlinkSync(targetPath)
-          console.log(`Deleted file: ${targetPath}`)
-        } else {
-          // 递归删除目录
-          fs.rmSync(targetPath, { recursive: true, force: true })
-          console.log(`Deleted directory: ${targetPath}`)
+    // 遍历子目录
+    for (const subDir of subDirs) {
+      const subDirPath = path.join(pkgPath, subDir)
+
+      // 对每个子目录处理目标
+      for (const target of targets) {
+        const targetPath = path.join(subDirPath, target)
+
+        if (fs.existsSync(targetPath)) {
+          if (target === 'tsconfig.tsbuildinfo') {
+            // 删除文件
+            fs.unlinkSync(targetPath)
+            console.log(`Deleted file: ${targetPath}`)
+          } else {
+            // 删除目录
+            fs.rmSync(targetPath, { recursive: true, force: true })
+            console.log(`Deleted directory: ${targetPath}`)
+          }
         }
       }
     }

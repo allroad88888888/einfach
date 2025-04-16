@@ -1,6 +1,5 @@
 import { describe, expect, test } from '@jest/globals'
-import { atom, createStore } from '@einfach/core'
-import { createUndoRedo } from '../../src/utils/createUndoRedo'
+import { atom, createStore, createUndoRedo } from '@einfach/core'
 
 describe('undo redo ', () => {
   test('easy', () => {
@@ -134,7 +133,7 @@ describe('undo redo ', () => {
     const { watchAtom, mergeState, redoAtom, undoAtom } = createUndoRedo(store)
     watchAtom(numberAtom)
     watchAtom(stringAtom)
-    mergeState(() => {})
+    mergeState(() => { })
 
     expect(store.getter(undoAtom)).toBe(false)
     expect(store.getter(redoAtom)).toBe(false)

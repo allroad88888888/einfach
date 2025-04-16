@@ -2,7 +2,7 @@ import { describe, test, expect } from '@jest/globals'
 import { useAtomValue } from '../../src'
 import { queryByTestId, render, screen } from '@testing-library/react'
 import type { CSSProperties } from 'react'
-import { incrementAtom } from '../../src/utils/incrementAtom'
+import { incrementAtom } from '@einfach/core'
 import userEvent from '@testing-library/user-event'
 import { useIncrementAtom } from '../../src/utils/useIncrementAtom'
 

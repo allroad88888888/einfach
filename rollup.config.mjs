@@ -1,12 +1,12 @@
 import { defineConfig } from 'rollup'
 import resolve from '@rollup/plugin-node-resolve'
 import swc from '@rollup/plugin-swc'
-import terser from '@rollup/plugin-terser'
 import path, { dirname } from 'path'
 import fs from 'fs'
 import { fileURLToPath } from 'url'
 import { readFileSync } from 'fs'
 import yaml from 'js-yaml'
+import { babel } from '@rollup/plugin-babel'
 
 const workspaceConfig = yaml.load(readFileSync('./pnpm-workspace.yaml', 'utf8'))
 const topLevelDirs = workspaceConfig.packages.map((pattern) => pattern.replace('/**', ''))
@@ -40,10 +40,14 @@ const config = defineConfig({
     '@einfach/core',
     '@einfach/react',
     '@einfach/utils',
+    '@einfach/solid',
     'react',
     'react-dom',
     'react/jsx-runtime',
     'react/jsx-dev-runtime',
+    'solid-js',
+    'solid-js/web',
+    'solid-js/store',
   ],
   treeshake: {
     moduleSideEffects: false,
@@ -51,37 +55,74 @@ const config = defineConfig({
     unknownGlobalSideEffects: false,
   },
 
-  plugins: [
-    resolve({
-      extensions: ['.ts', '.tsx'],
-    }),
-    swc({
-      swc: {
-        minify: false,
-        jsc: {
-          target: 'esnext',
-          parser: {
-            tsx: true,
-            syntax: 'typescript',
-          },
-          transform: {
-            react: {
-              runtime: 'automatic',
-            },
-          },
-        },
-      },
-    }),
-  ],
+  plugins: [],
 })
 
 /** @type {import('rollup').RollupOptions} */
 export default products.map((dir) => {
   /** @type {import('rollup').RollupOptions} */
+  const isSolidPackage = dir.includes('solid')
+
+  // 为solid包使用babel，其他包使用swc
+  const pluginsConfig = isSolidPackage
+    ? [
+        resolve({
+          extensions: ['.ts', '.tsx'],
+        }),
+        babel({
+          babelHelpers: 'bundled',
+          extensions: ['.ts', '.jsx', '.tsx'],
+          presets: [
+            [
+              '@babel/preset-env',
+              {
+                targets: { node: 'current' },
+                modules: false,
+              },
+            ],
+            ['@babel/preset-typescript', { isTsx: true, allowDeclareFields: true }],
+          ],
+          plugins: [
+            [
+              'babel-plugin-jsx-dom-expressions',
+              {
+                moduleName: 'solid-js/web',
+                builtIns: ['createElement', 'spread', 'insert', 'createComponent'],
+                contextToCustomElements: true,
+                wrapConditionals: true,
+              },
+            ],
+          ],
+        }),
+      ]
+    : [
+        resolve({
+          extensions: ['.ts', '.tsx'],
+        }),
+        swc({
+          swc: {
+            minify: false,
+            jsc: {
+              target: 'esnext',
+              parser: {
+                tsx: true,
+                syntax: 'typescript',
+              },
+              transform: {
+                react: {
+                  runtime: 'automatic',
+                },
+              },
+            },
+          },
+        }),
+      ]
+
   return {
     ...config,
     input: `${dir}/src/index.ts`,
     // treeshake: false,
+    plugins: pluginsConfig,
     output: [
       {
         format: 'commonjs',
@@ -101,7 +142,11 @@ export default products.map((dir) => {
         format: 'commonjs',
         dir: `${dir}/dist`,
         entryFileNames: '[name].js',
-        plugins: [terser()],
+      },
+      {
+        format: 'es',
+        dir: `${dir}/dist`,
+        entryFileNames: '[name].mjs',
       },
     ],
   }

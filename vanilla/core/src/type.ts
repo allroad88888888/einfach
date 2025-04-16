@@ -42,6 +42,8 @@ export type AtomSetResult<AtomType> =
 
 export type AtomState<AtomType> = AtomType extends Atom<infer Value> ? Value : never
 
+export type AtomAsyncState<AtomType> = AtomType extends Atom<Promise<infer Value>> ? Value : never
+
 export type AtomEntity<State> = WritableAtom<State, [State | ((prev: State) => State)], void>
 
 export interface Store {

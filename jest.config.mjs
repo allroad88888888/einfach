@@ -7,7 +7,10 @@ const config = JSON.parse(fs.readFileSync(`${process.cwd()}/.swcrc`, 'utf-8'))
 const jestConfig = {
   // 转译配置
   transform: {
-    '^.+\\.(t|j)sx?$': ['@swc/jest', { ...config }],
+    // 为 Solid.js 的 TSX 文件使用特定的 Babel 配置
+    'solid/.*\\.tsx$': ['babel-jest'],
+    // 其他文件保持现有的 SWC 配置
+    '^(?!solid/).*\\.(t|j)sx?$': ['@swc/jest', { ...config }],
   },
   extensionsToTreatAsEsm: ['.ts', '.tsx'],
   /**
@@ -30,6 +33,7 @@ const jestConfig = {
     '^@einfach/react$': '<rootDir>/react/react/src',
     '^@einfach/react-utils$': '<rootDir>/react/utils/src',
     '^@einfach/react-form$': '<rootDir>/react/form/src',
+    '^@einfach/solid$': '<rootDir>/solid/solid/src',
   },
 }
 export default jestConfig

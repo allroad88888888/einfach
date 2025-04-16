@@ -6,22 +6,6 @@ function isPromise<T>(promise: any): promise is Promise<T> {
   return promise instanceof Promise
 }
 
-// export type Res<Value> =
-//   | {
-//       state: 'init'
-//     }
-//   | {
-//       state: 'loading'
-//     }
-//   | {
-//       state: 'hasError'
-//       error: unknown
-//     }
-//   | {
-//       state: 'hasData'
-//       data: Awaited<Value>
-//     }
-
 interface Res<Value> {
   state: 'loading' | 'hasData' | 'hasError' | 'init'
   data?: Value
@@ -42,10 +26,6 @@ interface Options {
    */
   autoRun?: boolean
 }
-
-// AtomState<Entity> extends Promise<infer State1>
-//   ? WritableAtom<Res<State1>, [], void>
-//   : WritableAtom<Res<AtomState<Entity>>, [], void>
 
 /**
  * from jotai

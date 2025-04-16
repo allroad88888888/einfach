@@ -2,8 +2,7 @@ import { describe, test, expect } from '@jest/globals'
 import { useAtomValue, useSetAtom, useStore } from '../../src'
 import { queryByTestId, render, screen } from '@testing-library/react'
 import { useLayoutEffect, useState } from 'react'
-import { incrementAtom } from '../../src/utils/incrementAtom'
-import { atom } from '@einfach/core'
+import { atom, incrementAtom } from '@einfach/core'
 import userEvent from '@testing-library/user-event'
 
 describe('incrementAtom', () => {
