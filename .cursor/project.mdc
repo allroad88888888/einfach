@@ -1,0 +1,75 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Einfach项目
+
+Einfach是一个轻量级状态管理和表单处理库集合，类似于Jotai和AntD Form。
+
+## 目录结构
+- `vanilla/core`: 框架无关的原子状态管理核心
+- `react/react`: React状态管理钩子
+- `react/form`: 表单处理库
+- `react/utils`: React工具钩子
+- `vanilla/utils`: 通用工具函数
+- `solid/solid`: Solid.js绑定
+
+## 技术框架约定
+
+### 原子状态管理 (类Jotai)
+
+1. **原子粒度小**: 每个原子只负责单一职责
+2. **通过get函数访问**: `atom(get => get(otherAtom))`
+3. **不可变更新**: 创建新对象而非修改现有对象
+4. **组合小原子**: 避免大而全的状态对象
+
+```typescript
+// ✅ 推荐：小粒度原子组合
+const nameAtom = atom('');
+const ageAtom = atom(0);
+const userAtom = atom(get => ({name: get(nameAtom), age: get(ageAtom)}));
+
+// ❌ 避免：大状态原子
+const bigStateAtom = atom({user: {/*...*/}, settings: {/*...*/}});
+```
+
+### 表单约定 (类AntD Form)
+
+1. **使用表单实例**: 通过`useForm`创建，不自行管理状态
+2. **字段嵌套**: 使用点符号表示嵌套字段，如`user.name`
+3. **验证规则**: 规则为对象数组，按顺序执行
+4. **Field包装**: 字段组件应包裹在`Field`组件内
+
+```typescript
+// ✅ 推荐
+const form = useForm({initialValues: {/*...*/}});
+form.validateFields().then(/*...*/);
+
+// ❌ 避免
+const [formState, setFormState] = useState({});
+```
+
+### 组件设计
+
+1. **UI与逻辑分离**: 使用自定义钩子封装逻辑
+2. **状态下放到原子**: 避免组件内部状态
+3. **函数组件**: 使用函数组件和Hooks
+
+```typescript
+// ✅ 推荐：逻辑与UI分离
+function useCounter() {
+  const [count, setCount] = useAtom(countAtom);
+  return {count, increment: () => setCount(c => c + 1)};
+}
+
+function Counter() {
+  const {count, increment} = useCounter();
+  return <button onClick={increment}>{count}</button>;
+}
+```
+
+## 命名约定
+- 原子: `xxxAtom`
+- 钩子: `useXxx`
+- 工具函数: 驼峰命名法

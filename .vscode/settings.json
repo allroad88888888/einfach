@@ -18,7 +18,13 @@
     "api-extractor.json": "jsonc",
     "tsconfig.json": "jsonc"
   },
-  "cSpell.words": ["antd", "einfach", "swcrc", "testid", "tsbuildinfo"],
+  "cSpell.words": [
+    "antd",
+    "einfach",
+    "swcrc",
+    "testid",
+    "tsbuildinfo"
+  ],
   "editor.formatOnSave": true,
   "jest.runMode": "on-demand",
   "prettier.configPath": ".prettierrc.mjs"
