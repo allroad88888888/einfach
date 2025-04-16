@@ -193,13 +193,32 @@ importers:
         specifier: ^18.3.0
         version: 18.3.6(@types/react@18.3.20)
 
+  solid/form:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../../vanilla/core
+      '@einfach/solid':
+        specifier: workspace:*
+        version: link:../solid
+      '@einfach/utils':
+        specifier: workspace:*
+        version: link:../../vanilla/utils
+      solid-js:
+        specifier: ^1.9.0
+        version: 1.9.5
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
   solid/solid:
     dependencies:
       '@einfach/core':
         specifier: workspace:*
         version: link:../../vanilla/core
       solid-js:
-        specifier: ^1.0.0
+        specifier: ^1.9.0
         version: 1.9.5
     devDependencies:
       '@types/node':

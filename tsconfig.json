@@ -58,6 +58,12 @@
     },
     {
       "path": "./react/utils/tsconfig.json"
-    }
+    },
+    {
+      "path": "./solid/solid/tsconfig.json"
+    },
+    {
+      "path": "./solid/form/tsconfig.json"
+    },
   ]
 }

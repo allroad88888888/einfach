@@ -8,7 +8,6 @@ import { HookOption } from './type'
  * @returns store 实例
  */
 export function useStore(options: HookOption = {}): Store {
-  const { store: optionStore } = options
-  const { store: contextStore } = useStoreContext()
-  return optionStore || contextStore || defaultStore
+  const context = useStoreContext()
+  return options.store || context?.store || defaultStore
 }

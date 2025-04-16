@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "./@types",
+    "emitDeclarationOnly": true,
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js"
+  },
+  "include": [
+    "src"
+  ],
+  "references": [
+    {
+      "path": "./../../vanilla/core/tsconfig.json"
+    },
+    {
+      "path": "./../solid/tsconfig.json"
+    },
+    {
+      "path": "./../../vanilla/utils/tsconfig.json"
+    }
+  ]
+}

@@ -2,14 +2,39 @@
 
 import { describe, it, expect, afterEach } from '@jest/globals'
 import { render, cleanup, fireEvent } from '@solidjs/testing-library'
-import { atom, getDefaultStore } from '@einfach/core'
+import { atom, createStore, getDefaultStore } from '@einfach/core'
 import { useAtomValue } from '../src/useAtomValue'
 import { createSignal, createEffect } from 'solid-js'
+import { Provider } from '../src/Provider'
 
 // 在每个测试后清理
 afterEach(cleanup)
 
 describe('useAtomValue', () => {
+  it('Provider should work', () => {
+    const store = createStore()
+    // 创建测试用的atom
+    const countAtom = atom(42)
+
+    store.setter(countAtom, 100)
+
+    // 创建一个简单的组件来测试useAtomValue
+    function TestComponent() {
+      const value = useAtomValue(countAtom)
+      return <div data-testid="value">{value()}</div>
+    }
+
+    // 渲染组件
+    const { getByTestId } = render(() => (
+      <Provider store={store}>
+        <TestComponent />
+      </Provider>
+    ))
+
+    // 检查值是否正确
+    expect(getByTestId('value').textContent).toBe('100')
+  })
+
   it('应该正确读取atom的值', () => {
     // 创建测试用的atom
     const countAtom = atom(42)

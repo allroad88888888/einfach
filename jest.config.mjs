@@ -34,6 +34,7 @@ const jestConfig = {
     '^@einfach/react-utils$': '<rootDir>/react/utils/src',
     '^@einfach/react-form$': '<rootDir>/react/form/src',
     '^@einfach/solid$': '<rootDir>/solid/solid/src',
+    '^@einfach/solid-form$': '<rootDir>/solid/form/src',
   },
 }
 export default jestConfig
