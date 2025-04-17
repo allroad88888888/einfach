@@ -15,9 +15,9 @@
   "author": "",
   "license": "ISC",
   "workspaces": [
-    "react",
-    "solid",
-    "vanilla"
+    "react/*",
+    "solid/*",
+    "vanilla/*"
   ],
   "dependencies": {
     "@changesets/cli": "^2.27.1",
