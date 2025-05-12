@@ -24,3 +24,4 @@ coverage
 .rush
 *.tsbuildinfo
 packages/vali
+.npmrc
