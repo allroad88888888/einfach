@@ -14,6 +14,7 @@ export interface Getter {
 
 export interface ReadOptions extends Omit<AbortController, 'abort'> {
   setter: Setter
+  getter: Getter
 }
 
 export interface Read<State> {

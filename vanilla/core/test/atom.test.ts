@@ -143,6 +143,130 @@ describe('atom', () => {
       // 不应该再次调用
       expect(listener.mock.calls.length).toBeLessThanOrEqual(1)
     })
+
+    test('在订阅回调中更新其他atom时，派生atom应该正常更新', () => {
+      const countAtom = atom(0)
+      const doubleCountAtom = atom((get) => get(countAtom) * 2)
+      const tripleCountAtom = atom((get) => get(countAtom) * 3)
+
+      const secondaryAtom = atom(10)
+
+      // 创建监听器并跟踪调用次数
+      const countListener = jest.fn(() => {
+        // 在回调中获取当前值并更新secondaryAtom
+        const currentCount = store.getter(countAtom)
+        store.setter(secondaryAtom, currentCount + 5)
+      })
+
+      // 为secondaryAtom创建单独的监听器以验证其更新次数
+      const secondaryListener = jest.fn()
+      const secondaryUnsubscribe = store.sub(secondaryAtom, secondaryListener)
+
+      // 监听countAtom的变化
+      const unsubscribe = store.sub(countAtom, countListener)
+
+      // 验证初始状态
+      expect(store.getter(countAtom)).toBe(0)
+      expect(store.getter(doubleCountAtom)).toBe(0)
+      expect(store.getter(tripleCountAtom)).toBe(0)
+      expect(store.getter(secondaryAtom)).toBe(10)
+      expect(countListener).toHaveBeenCalledTimes(0)
+      expect(secondaryListener).toHaveBeenCalledTimes(0)
+
+      // 更新countAtom，这应该触发订阅回调，进而更新secondaryAtom
+      store.setter(countAtom, 3)
+
+      // 验证所有atom都正确更新
+      expect(store.getter(countAtom)).toBe(3)
+      expect(store.getter(doubleCountAtom)).toBe(6)
+      expect(store.getter(tripleCountAtom)).toBe(9)
+      expect(store.getter(secondaryAtom)).toBe(8) // 3 + 5
+      expect(countListener).toHaveBeenCalledTimes(1)
+      expect(secondaryListener).toHaveBeenCalledTimes(1)
+
+      // 再次更新countAtom
+      store.setter(countAtom, 7)
+
+      // 再次验证所有atom都正确更新
+      expect(store.getter(countAtom)).toBe(7)
+      expect(store.getter(doubleCountAtom)).toBe(14)
+      expect(store.getter(tripleCountAtom)).toBe(21)
+      expect(store.getter(secondaryAtom)).toBe(12) // 7 + 5
+      expect(countListener).toHaveBeenCalledTimes(2)
+      expect(secondaryListener).toHaveBeenCalledTimes(2)
+
+      // 取消订阅
+      unsubscribe()
+
+      // 更新countAtom，不应该再触发secondaryAtom的更新
+      store.setter(countAtom, 10)
+      expect(store.getter(countAtom)).toBe(10)
+      expect(store.getter(doubleCountAtom)).toBe(20)
+      expect(store.getter(tripleCountAtom)).toBe(30)
+      expect(store.getter(secondaryAtom)).toBe(12) // 保持不变
+      expect(countListener).toHaveBeenCalledTimes(2) // 不应该增加
+      expect(secondaryListener).toHaveBeenCalledTimes(2) // 不应该增加
+
+      secondaryUnsubscribe()
+    })
+
+    test('在订阅回调中更新派生atom的依赖时，派生atom应该正常更新', () => {
+      const baseAtom = atom(1)
+      const derivedAtom = atom((get) => get(baseAtom) * 10)
+
+      const controlAtom = atom(0)
+
+      // 创建监听器并跟踪调用次数
+      const controlListener = jest.fn(() => {
+        // 在回调中获取当前值并更新baseAtom
+        const currentControl = store.getter(controlAtom)
+        store.setter(baseAtom, currentControl * 2)
+      })
+
+      // 为baseAtom和derivedAtom创建单独的监听器以验证其更新次数
+      const baseListener = jest.fn()
+      const derivedListener = jest.fn()
+
+      const baseUnsubscribe = store.sub(baseAtom, baseListener)
+      const derivedUnsubscribe = store.sub(derivedAtom, derivedListener)
+
+      // 监听controlAtom的变化
+      const unsubscribe = store.sub(controlAtom, controlListener)
+
+      // 验证初始状态
+      expect(store.getter(baseAtom)).toBe(1)
+      expect(store.getter(derivedAtom)).toBe(10)
+      expect(store.getter(controlAtom)).toBe(0)
+      expect(controlListener).toHaveBeenCalledTimes(0)
+      expect(baseListener).toHaveBeenCalledTimes(0)
+      expect(derivedListener).toHaveBeenCalledTimes(0)
+
+      // 更新controlAtom，这应该触发订阅回调，进而更新baseAtom和derivedAtom
+      store.setter(controlAtom, 5)
+
+      // 验证所有atom都正确更新
+      expect(store.getter(controlAtom)).toBe(5)
+      expect(store.getter(baseAtom)).toBe(10) // 5 * 2
+      expect(store.getter(derivedAtom)).toBe(100) // 10 * 10
+      expect(controlListener).toHaveBeenCalledTimes(1)
+      expect(baseListener).toHaveBeenCalledTimes(1)
+      expect(derivedListener).toHaveBeenCalledTimes(1)
+
+      // 取消订阅
+      unsubscribe()
+
+      // 更新controlAtom，不应该再触发baseAtom的更新
+      store.setter(controlAtom, 8)
+      expect(store.getter(controlAtom)).toBe(8)
+      expect(store.getter(baseAtom)).toBe(10) // 保持不变
+      expect(store.getter(derivedAtom)).toBe(100) // 保持不变
+      expect(controlListener).toHaveBeenCalledTimes(1) // 不应该增加
+      expect(baseListener).toHaveBeenCalledTimes(1) // 不应该增加
+      expect(derivedListener).toHaveBeenCalledTimes(1) // 不应该增加
+
+      baseUnsubscribe()
+      derivedUnsubscribe()
+    })
   })
 
   // 注意：store.reset 方法在当前实现中不存在

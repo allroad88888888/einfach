@@ -3,13 +3,13 @@ import { describe, test, expect } from '@jest/globals'
 import { useAtom } from '../../src'
 import { queryByTestId, render, screen } from '@testing-library/react'
 
-import { atom } from '@einfach/core'
+import { createAsyncParamsAtom } from '@einfach/core'
 import { loadable } from '../../src/utils/loadable'
 import userEvent from '@testing-library/user-event'
 
 describe('async', () => {
   test('serverInfo', async () => {
-    const serverInfoAtom = atom(function () {
+    const serverInfoAtom = createAsyncParamsAtom(function () {
       return new Promise((resolve) => {
         setTimeout(() => {
           resolve([{ id: 1 }, { id: 2 }])
@@ -20,9 +20,9 @@ describe('async', () => {
     serverInfoAtom.debugLabel = ' server async'
 
     function ServerInfoComponent() {
-      const xxAtom = loadable(serverInfoAtom, { autoRun: false })
-      xxAtom.debugLabel = 'loadable atom'
-      const [{ data: serverInfo, state }, run] = useAtom(xxAtom)
+      const tempAtom = loadable(serverInfoAtom)
+      tempAtom.debugLabel = 'loadable atom'
+      const [{ data: serverInfo, state }, run] = useAtom(tempAtom)
 
       if (state === 'loading') {
         return <div data-testid="loading">loading</div>

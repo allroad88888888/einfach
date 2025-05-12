@@ -7,7 +7,7 @@ function isPromise<T>(promise: any): promise is Promise<T> {
 }
 
 interface Res<Value> {
-  state: 'loading' | 'hasData' | 'hasError' | 'init'
+  state: 'loading' | 'hasData' | 'hasError'
   data?: Value
   error?: any
 }
@@ -16,17 +16,6 @@ const LOADING = {
   state: 'loading',
 } as Res<any>
 
-const Init = {
-  state: 'init',
-} as Res<any>
-
-interface Options {
-  /**
-   * @default true
-   */
-  autoRun?: boolean
-}
-
 /**
  * from jotai
  * @param anAtom
@@ -34,7 +23,6 @@ interface Options {
  */
 export function loadable<AtomType extends Atom<unknown>>(
   anAtom: AtomType,
-  { autoRun = true }: Options = {},
 ): WritableAtom<
   Res<AtomState<AtomType> extends Promise<infer State1> ? State1 : AtomState<AtomType>>,
   AtomSetParameters<AtomType> | [],
@@ -50,11 +38,7 @@ export function loadable<AtomType extends Atom<unknown>>(
     refreshAtom.debugLabel = 'loadable refresh'
 
     const derivedAtom = atom<Res<AtomState<AtomType>>>(function (getter, options) {
-      const refreshVal = getter(refreshAtom)
-
-      if (refreshVal === 0 && autoRun === false) {
-        return Init
-      }
+      getter(refreshAtom)
 
       let value
       try {
@@ -105,8 +89,9 @@ export function loadable<AtomType extends Atom<unknown>>(
             },
           )
           .finally(() => {
-            options.setter(refreshAtom, refreshVal + 1)
-            // options.setter(derivedAtom, undefined as any)
+            options.setter(refreshAtom, (prev) => {
+              return prev + 1
+            })
           })
       }
       var cached2 = loadableCache.get(promise)

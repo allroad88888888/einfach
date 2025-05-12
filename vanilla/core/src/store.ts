@@ -76,6 +76,11 @@ export function createStore(): Store {
           return writeAtomState
         },
       },
+      getter: {
+        get() {
+          return readAtom
+        },
+      },
     })
 
     if (typeof atomEntity.read === 'function') {
@@ -118,7 +123,11 @@ export function createStore(): Store {
     atomEntity: WritableAtom<State, Args, Result>,
     ...args: Args
   ): Result {
-    pendingMap.clear()
+    /**
+     * 当一个状态 派生另外一个状态时，
+     * 设置当前态，订阅又去更新其它状态，会触发这里，导致pendingMap 丢失内容
+     */
+    // pendingMap.clear()
     const next = writeAtomState(atomEntity, ...args)
     flushPending()
     return next
@@ -162,7 +171,7 @@ export function createStore(): Store {
   function setAtomState<State>(
     atomEntity: Atom<State>,
     state: State,
-    abortPromise: () => void = () => { },
+    abortPromise: () => void = () => {},
   ): State | StatesWithPromise<State> {
     if (process.env.NODE_ENV !== 'production') {
       Object.freeze(state)
@@ -213,7 +222,6 @@ export function createStore(): Store {
           publishAtom(atomEntity)
         }
       })
-
     }
   }
 

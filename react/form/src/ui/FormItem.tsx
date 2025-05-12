@@ -24,6 +24,7 @@ export function FormItemFc<T extends React.ElementType>(props: FormItemProps<T>)
   const handChange = useCallback((val: any) => {
     onChange(val)
     methods?.onChange?.()
+    children.props.onChange?.(val)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
