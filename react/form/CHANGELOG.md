@@ -1,5 +1,26 @@
 # @einfach/react-form
 
+## 0.1.4
+
+### Patch Changes
+
+- 更新selectATtom的类型
+- Updated dependencies
+  - @einfach/utils@0.1.9
+  - @einfach/core@0.1.6
+  - @einfach/react@0.1.6
+  - @einfach/react-utils@0.0.6
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.1.5
+  - @einfach/react@0.1.5
+  - @einfach/react-utils@0.0.5
+  - @einfach/utils@0.1.8
+
 ## 0.1.2
 
 ### Patch Changes

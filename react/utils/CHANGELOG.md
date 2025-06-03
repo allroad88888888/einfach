@@ -1,5 +1,25 @@
 # @einfach/react-utils
 
+## 0.0.6
+
+### Patch Changes
+
+- 更新selectATtom的类型
+- Updated dependencies
+  - @einfach/utils@0.1.9
+  - @einfach/core@0.1.6
+  - @einfach/react@0.1.6
+
+## 0.0.5
+
+### Patch Changes
+
+- selectAtom支持异步
+- Updated dependencies
+  - @einfach/core@0.1.5
+  - @einfach/react@0.1.5
+  - @einfach/utils@0.1.8
+
 ## 0.0.3
 
 ### Patch Changes

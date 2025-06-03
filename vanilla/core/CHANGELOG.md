@@ -1,5 +1,17 @@
 # @einfach/core
 
+## 0.1.6
+
+### Patch Changes
+
+- 更新selectATtom的类型
+
+## 0.1.5
+
+### Patch Changes
+
+- selectAtom支持异步
+
 ## 0.1.3
 
 ### Patch Changes

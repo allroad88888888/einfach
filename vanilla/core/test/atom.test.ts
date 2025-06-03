@@ -46,6 +46,17 @@ describe('atom', () => {
       expect(store.getter(doubleCountAtom)).toBe(10)
     })
 
+    test('应该创建一个依赖于其他atom的派生atom,再派生一个', () => {
+      const countAtom = atom(0)
+      const doubleCountAtom = atom((get) => get(countAtom) * 2)
+      const tripleCountAtom = atom((get) => get(doubleCountAtom) * 3)
+
+      expect(store.getter(tripleCountAtom)).toBe(0)
+
+      store.setter(countAtom, 5)
+      expect(store.getter(tripleCountAtom)).toBe(30)
+    })
+
     test('应该支持多个依赖的派生atom', () => {
       const firstNameAtom = atom('John')
       const lastNameAtom = atom('Doe')

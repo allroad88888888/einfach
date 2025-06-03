@@ -1,5 +1,20 @@
 # @einfach/utils
 
+## 0.1.9
+
+### Patch Changes
+
+- 更新selectATtom的类型
+- Updated dependencies
+  - @einfach/core@0.1.6
+
+## 0.1.8
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.1.5
+
 ## 0.1.7
 
 ### Patch Changes

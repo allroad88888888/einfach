@@ -24,8 +24,8 @@ export function useEasySelectAtomValue<Slice, State>(
   selectFn: NamePath,
   equalityFn: (prev: Slice, next: Slice) => boolean = easyEqual,
   option: HookOption = {},
-) {
+): Slice {
   const selectAtomEntity = selectEasyAtom<Slice, State>(atomEntity, selectFn, equalityFn)
 
-  return useAtomValue<Slice>(selectAtomEntity, option)
+  return useAtomValue(selectAtomEntity, option) as Slice
 }
