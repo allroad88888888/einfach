@@ -1,5 +1,16 @@
 # @einfach/solid
 
+## 0.2.0
+
+### Minor Changes
+
+- 升级createGetFamilyAtomById 支持重写
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.0
+
 ## 0.1.4
 
 ### Patch Changes

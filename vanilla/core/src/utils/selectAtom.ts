@@ -6,16 +6,15 @@ import { isPromiseLike } from './../promiseUtils'
 type UnwrapPromise<T> = T extends Promise<infer U> ? U : T
 
 // 条件类型：根据输入类型推断返回类型
-type SelectAtomResult<T, Slice> =
-  T extends Promise<any> ? AtomEntity<Promise<Slice>> : AtomEntity<Slice>
+type SelectAtomResult<T, Slice> = T extends Promise<any> ? Atom<Promise<Slice>> : Atom<Slice>
 
 export function selectAtom<Slice, AtomType extends Atom<unknown>>(
   atomEntity: AtomType,
   selectFn: (current: UnwrapPromise<AtomState<AtomType>>, prev?: Slice) => Slice,
   equalityFn?: (prev: Slice, next: Slice) => boolean,
 ): SelectAtomResult<AtomState<AtomType>, Slice>
-export function selectAtom<Slice, State>(
-  atomEntity: AtomEntity<State>,
+export function selectAtom<Slice, State, AtomType extends Atom<unknown> = AtomEntity<State>>(
+  atomEntity: AtomType,
   selectFn: (current: UnwrapPromise<State>, prev?: Slice) => Slice,
   equalityFn?: (prev: Slice, next: Slice) => boolean,
 ): SelectAtomResult<State, Slice>

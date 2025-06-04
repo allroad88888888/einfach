@@ -1,5 +1,11 @@
 # @einfach/core
 
+## 0.2.0
+
+### Minor Changes
+
+- 升级createGetFamilyAtomById 支持重写
+
 ## 0.1.6
 
 ### Patch Changes

@@ -1,5 +1,13 @@
 # @einfach/utils
 
+## 1.0.0
+
+### Patch Changes
+
+- 升级createGetFamilyAtomById 支持重写
+- Updated dependencies
+  - @einfach/core@0.2.0
+
 ## 0.1.9
 
 ### Patch Changes
