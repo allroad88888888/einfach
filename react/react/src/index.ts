@@ -6,6 +6,7 @@ export * from './useStore'
 export * from './useAtomMethods'
 export * from './useSetAtom'
 export * from './useAtom'
+export * from './useAtomCallback'
 
 // 导出工具函数
 export * from './utils/loadable'
