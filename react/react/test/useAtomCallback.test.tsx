@@ -13,7 +13,7 @@ describe('useAtomCallback', () => {
         const current = get(countAtom)
         set(countAtom, current + increment)
         return current + increment
-      })
+      }, []) // 添加 watchParams 参数
 
       const count = useAtomValue(countAtom)
       return { callback, count }
@@ -47,7 +47,7 @@ describe('useAtomCallback', () => {
 
     const { result } = renderHook(() => {
       // 使用 bind 明确绑定 this 上下文
-      const callback = useAtomCallback(handler.formatMessage.bind(handler))
+      const callback = useAtomCallback(handler.formatMessage.bind(handler), [])
       const message = useAtomValue(messageAtom)
       return { callback, message }
     })
@@ -86,7 +86,7 @@ describe('useAtomCallback', () => {
 
     const { result } = renderHook(() => {
       // 直接传递方法，this 上下文丢失
-      const callback = useAtomCallback(handler.formatMessage)
+      const callback = useAtomCallback(handler.formatMessage, [])
       const message = useAtomValue(messageAtom)
       return { callback, message }
     })
@@ -117,7 +117,7 @@ describe('useAtomCallback', () => {
     const calc = new Calculator()
 
     const { result } = renderHook(() => {
-      const callback = useAtomCallback(calc.multiply)
+      const callback = useAtomCallback(calc.multiply, [])
       const result = useAtomValue(resultAtom)
       return { callback, result }
     })
@@ -158,7 +158,7 @@ describe('useAtomCallback', () => {
     }
 
     const { result } = renderHook(() => {
-      const callback = useAtomCallback(callbackWithApplyVoid)
+      const callback = useAtomCallback(callbackWithApplyVoid, [])
       const message = useAtomValue(messageAtom)
       return { callback, message }
     })
@@ -193,7 +193,7 @@ describe('useAtomCallback', () => {
 
         set(dataAtom, newData)
         return newData
-      })
+      }, [])
 
       const data = useAtomValue(dataAtom)
       return { updateData, data }
@@ -212,5 +212,113 @@ describe('useAtomCallback', () => {
     })
 
     expect(result.current.data).toEqual({ x: 10, y: 30 })
+  })
+
+  it('测试 watchParams - 依赖不变时复用 atom', async () => {
+    const countAtom = atom(0)
+    let callbackCreateCount = 0
+
+    const { result, rerender } = renderHook(
+      ({ multiplier }) => {
+        const callback = useAtomCallback(
+          (get, set, value: number) => {
+            callbackCreateCount++
+            const result = value * multiplier
+            set(countAtom, result)
+            return result
+          },
+          [multiplier],
+        ) // multiplier 作为依赖
+
+        const count = useAtomValue(countAtom)
+        return { callback, count }
+      },
+      { initialProps: { multiplier: 2 } },
+    )
+
+    // 第一次调用
+    act(() => {
+      result.current.callback(5)
+    })
+    expect(result.current.count).toBe(10)
+    expect(callbackCreateCount).toBe(1)
+
+    // 重新渲染但 multiplier 没变，callback 应该被复用
+    rerender({ multiplier: 2 })
+    act(() => {
+      result.current.callback(3)
+    })
+    expect(result.current.count).toBe(6)
+    expect(callbackCreateCount).toBe(2) // callback 被复用，但被调用了
+  })
+
+  it('测试 watchParams - 依赖变化时重新创建回调逻辑', async () => {
+    const countAtom = atom(0)
+
+    const { result, rerender } = renderHook(
+      ({ multiplier }) => {
+        const callback = useAtomCallback(
+          (get, set, value: number) => {
+            const result = value * multiplier
+            set(countAtom, result)
+            return result
+          },
+          [multiplier],
+        ) // multiplier 作为依赖
+
+        const count = useAtomValue(countAtom)
+        return { callback, count, multiplier }
+      },
+      { initialProps: { multiplier: 2 } },
+    )
+
+    // 第一次调用
+    act(() => {
+      result.current.callback(5)
+    })
+    expect(result.current.count).toBe(10)
+
+    // 改变 multiplier，应该使用新的值
+    rerender({ multiplier: 3 })
+    act(() => {
+      result.current.callback(5)
+    })
+    expect(result.current.count).toBe(15) // 3 * 5 = 15
+  })
+
+  it('测试 watchParams - 外部变量变化的影响', async () => {
+    const resultAtom = atom<string>('')
+
+    const { result, rerender } = renderHook(
+      ({ prefix, suffix }) => {
+        const formatMessage = useAtomCallback(
+          (get, set, message: string) => {
+            const formatted = `${prefix}${message}${suffix}`
+            set(resultAtom, formatted)
+            return formatted
+          },
+          [prefix, suffix],
+        ) // prefix 和 suffix 作为依赖
+
+        const result = useAtomValue(resultAtom)
+        return { formatMessage, result }
+      },
+      { initialProps: { prefix: '[', suffix: ']' } },
+    )
+
+    // 第一次调用
+    act(() => {
+      const formatted = result.current.formatMessage('Hello')
+      expect(formatted).toBe('[Hello]')
+    })
+    expect(result.current.result).toBe('[Hello]')
+
+    // 改变 prefix，应该使用新的值
+    rerender({ prefix: '(', suffix: ')' })
+    act(() => {
+      const formatted = result.current.formatMessage('World')
+      expect(formatted).toBe('(World)')
+    })
+    expect(result.current.result).toBe('(World)')
   })
 })
