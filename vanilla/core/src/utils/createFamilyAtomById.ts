@@ -16,17 +16,17 @@ const cacheBaseIdsMap = new Map<string, IdObj>()
 // 为undefined参数创建一个固定的对象作为键
 const UNDEFINED_PARAMS_KEY = Object.freeze(Object.create(null))
 
-// 定义单个 override 函数类型
-type OverrideFunction<T2, T> = <T3 = undefined>(
+// 定义基础的 override 函数签名接口
+type BaseOverrideFunction<T2 = any, TResult = any> = (
   id: string,
   params?: T2,
-) => (T3 extends undefined ? T : AtomEntity<T3>) | undefined
+) => TResult | undefined
 
 // 定义 getFamilyAtomById 函数类型，包含 override 数组和 push 方法
 type GetFamilyAtomByIdWithOverride<T2, T> = {
   <T3 = undefined>(id: string, params?: T2): T3 extends undefined ? T : AtomEntity<T3>
-  override: OverrideFunction<T2, T>[]
-  push: (overrideFunc: OverrideFunction<T2, T>) => void
+  override: BaseOverrideFunction<T2>[]
+  push: <TFunc extends BaseOverrideFunction<T2>>(overrideFunc: TFunc) => void
 }
 
 export function createGetFamilyAtomById<T2, T = AtomEntity<T2>>(options: {
@@ -106,7 +106,7 @@ export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity
 
   // 为 getFamilyAtomById 函数添加 override 数组和 push 方法
   ;(getFamilyAtomById as any).override = []
-  ;(getFamilyAtomById as any).push = function (overrideFunc: OverrideFunction<T2, T>) {
+  ;(getFamilyAtomById as any).push = function (overrideFunc: BaseOverrideFunction<T2>) {
     ;(getFamilyAtomById as any).override.push(overrideFunc)
   }
 

@@ -55,6 +55,78 @@ describe('createGetFamilyAtomById', () => {
   })
 
   describe('缓存功能', () => {
+    test('ts类型测试', () => {
+      type TestType = Record<string, any>
+      const getFamilyAtomById = createGetFamilyAtomById<TestType>({
+        createAtom: (id: string) => {
+          return atom<TestType>({})
+        },
+        debuggerKey: 'cache-family',
+      })
+
+      const getFamilyAtomById2 = createGetFamilyAtomById<TestType>({
+        createAtom: (id: string) => {
+          return atom<TestType>({})
+        },
+        debuggerKey: 'cache-family',
+      })
+
+      getFamilyAtomById.push(getFamilyAtomById2)
+    })
+
+    test('灵活的override函数类型支持', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'flexible-family',
+      })
+
+      // 1. 普通的override函数
+      const simpleOverride = (id: string, params?: any) => {
+        if (id === 'simple') return atom({ count: 100 })
+        return undefined
+      }
+
+      // 2. 带有额外逻辑的函数
+      const complexOverride = (id: string, params?: any) => {
+        if (id.startsWith('complex_')) {
+          return atom({ count: 300, complex: true })
+        }
+        return undefined
+      }
+
+      // 3. 另一个getFamilyAtomById函数（只处理特定前缀）
+      const otherFamily = createGetFamilyAtomById({
+        defaultState: { count: 200 },
+        debuggerKey: 'other-family',
+      })
+      // 包装otherFamily，让它只处理特定的id
+      const selectiveOtherFamily = (id: string, params?: any) => {
+        if (id.startsWith('other_')) {
+          return otherFamily(id, params)
+        }
+        return undefined
+      }
+
+      // 4. 返回不同类型的函数（只要签名匹配）
+      const customOverride = (id: string, params?: any) => {
+        if (id === 'custom') return atom({ count: 400, custom: true })
+        return undefined
+      }
+
+      // 所有这些函数都可以被push，展示了类型系统的灵活性
+      getFamilyAtomById.push(simpleOverride)
+      getFamilyAtomById.push(complexOverride)
+      getFamilyAtomById.push(selectiveOtherFamily)
+      getFamilyAtomById.push(customOverride)
+
+      // 验证它们都能正常工作
+      expect(store.getter(getFamilyAtomById('simple'))).toEqual({ count: 100 })
+      expect(store.getter(getFamilyAtomById('complex_test'))).toEqual({ count: 300, complex: true })
+      expect(store.getter(getFamilyAtomById('other_test'))).toEqual({ count: 200 })
+      expect(store.getter(getFamilyAtomById('custom'))).toEqual({ count: 400, custom: true })
+      expect(store.getter(getFamilyAtomById('normal'))).toEqual({ count: 0 }) // 使用默认逻辑
+    })
+
     test('应该缓存相同 id 的 atom（无参数）', () => {
       const getFamilyAtomById = createGetFamilyAtomById({
         defaultState: { count: 0 },
