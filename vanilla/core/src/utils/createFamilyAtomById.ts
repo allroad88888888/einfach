@@ -11,7 +11,20 @@ function createIdObj(id: string): IdObj {
   return idObj
 }
 
-const cacheBaseIdsMap = new Map<string, IdObj>()
+const cacheBaseIdsMap = new WeakMap<object, Map<string, IdObj>>()
+
+function getIdObj(id: string, weakKey: object): IdObj {
+  if (!cacheBaseIdsMap.has(weakKey)) {
+    cacheBaseIdsMap.set(weakKey, new Map())
+  }
+  const idObjMap = cacheBaseIdsMap.get(weakKey)!
+
+  if (!idObjMap.has(id)) {
+    const newIdObj = createIdObj(id)
+    idObjMap.set(id, newIdObj)
+  }
+  return idObjMap.get(id)!
+}
 
 // 为undefined参数创建一个固定的对象作为键
 const UNDEFINED_PARAMS_KEY = Object.freeze(Object.create(null))
@@ -27,13 +40,14 @@ type GetFamilyAtomByIdWithOverride<T2, T> = {
   <T3 = undefined>(id: string, params?: T2): T3 extends undefined ? T : AtomEntity<T3>
   override: BaseOverrideFunction<T2>[]
   push: <TFunc extends BaseOverrideFunction<T2>>(overrideFunc: TFunc) => void
+  set: (id: string, params: T2 | undefined, atom: T) => void
 }
 
 export function createGetFamilyAtomById<T2, T = AtomEntity<T2>>(options: {
   defaultState: T2
   debuggerKey?: string
 }): GetFamilyAtomByIdWithOverride<T2, T>
-export function createGetFamilyAtomById<T2, T = AtomEntity<T2>>(options: {
+export function createGetFamilyAtomById<T2 extends WeakKey, T = AtomEntity<T2>>(options: {
   createAtom: (id: string, params?: T2) => T
   debuggerKey?: string
 }): GetFamilyAtomByIdWithOverride<T2, T>
@@ -48,33 +62,29 @@ export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity
   createAtom?: (id: string, params?: T2) => T
   debuggerKey?: string
 }) {
-  // const cacheAtomWeakMapAtom = atom(() => {
-  //     return new WeakMap<WeakKey, WeakMap<object, T>>()
-  // })
+  const cacheAtomWeakMap = new WeakMap<IdObj, WeakMap<object, T>>()
 
-  const cacheAtomWeakMap = new WeakMap<WeakKey, WeakMap<object, T>>()
+  const weakKey = Object.freeze(Object.create(null))
 
-  function getFamilyAtomById<T3 = undefined>(id: string, params?: T2) {
-    // 先建立缓存结构，无论是否有 override 都可以享受缓存
-    if (!cacheBaseIdsMap.has(id)) {
-      const newIdObj = createIdObj(id)
-      cacheBaseIdsMap.set(id, newIdObj)
-    }
-
-    const cacheKey = cacheBaseIdsMap.get(id)!
-
-    // 处理第一层缓存 - 基于 id
+  function getCacheAtomById(id: string) {
+    const cacheKey = getIdObj(id, weakKey)
     if (!cacheAtomWeakMap.has(cacheKey)) {
       cacheAtomWeakMap.set(cacheKey, new WeakMap())
     }
+    const idCacheAtomWeakMap = cacheAtomWeakMap.get(cacheKey)!
 
-    const paramsWeakMap = cacheAtomWeakMap.get(cacheKey)!
+    return idCacheAtomWeakMap
+  }
 
-    // 处理 params 为 undefined 的情况
-    const paramsKey =
-      params === undefined
-        ? UNDEFINED_PARAMS_KEY // 使用固定的空对象作为键
-        : (params as object) // 使用 params 作为键，要求 params 必须是对象
+  function getCacheKeyByParams(params?: T2) {
+    return params === undefined
+      ? UNDEFINED_PARAMS_KEY // 使用固定的空对象作为键
+      : (params as object) // 使用 params 作为键，要求 params 必须是对象
+  }
+
+  function getFamilyAtomById<T3 = undefined>(id: string, params?: T2) {
+    const paramsWeakMap = getCacheAtomById(id)
+    const paramsKey = getCacheKeyByParams(params)
 
     // 先检查缓存中是否已有结果
     if (paramsWeakMap.has(paramsKey)) {
@@ -104,11 +114,15 @@ export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity
     return newAtom as unknown as T3 extends undefined ? T : AtomEntity<T3>
   }
 
-  // 为 getFamilyAtomById 函数添加 override 数组和 push 方法
-  ;(getFamilyAtomById as any).override = []
-  ;(getFamilyAtomById as any).push = function (overrideFunc: BaseOverrideFunction<T2>) {
-    ;(getFamilyAtomById as any).override.push(overrideFunc)
+  const temp = getFamilyAtomById as GetFamilyAtomByIdWithOverride<T2, T>
+  temp.override = []
+  temp.push = function (overrideFunc: BaseOverrideFunction<T2>) {
+    temp.override.push(overrideFunc)
   }
-
-  return getFamilyAtomById as GetFamilyAtomByIdWithOverride<T2, T>
+  temp.set = function (id: string, params: T2 | undefined, atomEntity: T) {
+    const paramsWeakMap = getCacheAtomById(id)
+    const paramsKey = getCacheKeyByParams(params)
+    paramsWeakMap.set(paramsKey, atomEntity)
+  }
+  return temp
 }

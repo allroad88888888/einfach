@@ -1,41 +1,37 @@
-# @einfach/react
+# @einfach/solid-form
 
-## 0.3.8
+## 0.2.6
 
 ### Patch Changes
 
 - Updated dependencies
   - @einfach/core@0.2.6
+  - @einfach/solid@0.2.6
+  - @einfach/utils@0.2.4
 
-## 0.3.7
+## 0.2.5
 
 ### Patch Changes
 
 - Updated dependencies
   - @einfach/core@0.2.5
+  - @einfach/solid@0.2.5
+  - @einfach/utils@0.2.3
 
-## 0.3.4
+## 0.2.4
 
 ### Patch Changes
 
 - Updated dependencies
   - @einfach/core@0.2.4
+  - @einfach/solid@0.2.4
+  - @einfach/utils@0.2.2
 
-## 0.3.3
+## 0.2.3
 
 ### Patch Changes
 
 - Updated dependencies
   - @einfach/core@0.2.3
-
-## 0.3.2
-
-### Patch Changes
-
-- 重新实现useAtomCallback支持watchParams 而不是watch方法本身
-
-## 0.3.1
-
-### Patch Changes
-
-- 导出useAtomCallback
+  - @einfach/solid@0.2.3
+  - @einfach/utils@0.2.1

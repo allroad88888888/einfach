@@ -1,7 +1,10 @@
 import { createContinuablePromise } from './promise'
 import { isContinuablePromise, isPromiseLike } from './promiseUtils'
+import { storeAtom } from './storeAtom'
 import type { Atom, AtomState, ReadOptions, Setter, Store, WritableAtom } from './type'
 import type { StatesWithPromise } from './typePromise'
+
+
 
 let keyCount = 0
 export function createStore(): Store {
@@ -174,7 +177,9 @@ export function createStore(): Store {
     abortPromise: () => void = () => {},
   ): State | StatesWithPromise<State> {
     if (process.env.NODE_ENV !== 'production') {
-      Object.freeze(state)
+      if (!isPromiseLike(state)) {
+        Object.freeze(state)
+      }
     }
     let nextState: StatesWithPromise<State> | State = state
 
@@ -254,11 +259,15 @@ export function createStore(): Store {
     dependenciesMap = new WeakMap()
   }
 
-  return {
+  const store = {
     sub: subscribeAtom,
     getter: readAtom,
     setter: setAtom as Setter,
     toString: () => key,
     clear,
   }
+
+  store.setter(storeAtom, store)
+
+  return store
 }

@@ -507,6 +507,204 @@ describe('createGetFamilyAtomById', () => {
     })
   })
 
+  describe('set 方法功能', () => {
+    test('getFamilyAtomById 应该有 set 方法', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      expect(typeof getFamilyAtomById.set).toBe('function') // 应该有 set 方法
+    })
+
+    test('使用 set 方法后应该能获取到手动设置的 atom', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const customAtom = atom({ count: 999, custom: true })
+      const params = { count: 10 }
+
+      // 使用 set 方法手动设置缓存
+      getFamilyAtomById.set('user1', params, customAtom as any)
+
+      // 获取应该返回手动设置的 atom
+      const retrievedAtom = getFamilyAtomById('user1', params)
+      expect(retrievedAtom).toBe(customAtom)
+      expect(store.getter(retrievedAtom)).toEqual({ count: 999, custom: true })
+    })
+
+    test('set 方法应该正确处理 undefined params', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const customAtom = atom({ count: 888, undefined_params: true })
+
+      // 使用 undefined params 设置
+      getFamilyAtomById.set('user1', undefined as any, customAtom as any)
+
+      // 通过不同方式获取应该都返回同一个 atom
+      const atom1 = getFamilyAtomById('user1', undefined)
+      const atom2 = getFamilyAtomById('user1')
+
+      expect(atom1).toBe(customAtom)
+      expect(atom2).toBe(customAtom)
+      expect(store.getter(atom1)).toEqual({ count: 888, undefined_params: true })
+    })
+
+    test('set 方法不应该影响其他 id 或 params', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const customAtom = atom({ count: 777, specific: true })
+      const params1 = { count: 10 }
+      const params2 = { count: 20 }
+
+      // 只为特定的 id 和 params 设置
+      getFamilyAtomById.set('user1', params1, customAtom as any)
+
+      // 验证只有匹配的 id 和 params 返回自定义 atom
+      expect(getFamilyAtomById('user1', params1)).toBe(customAtom)
+
+      // 其他组合应该返回默认创建的 atom
+      const otherAtom1 = getFamilyAtomById('user1', params2) // 相同id，不同params
+      const otherAtom2 = getFamilyAtomById('user2', params1) // 不同id，相同params
+      const otherAtom3 = getFamilyAtomById('user2', params2) // 不同id，不同params
+
+      expect(otherAtom1).not.toBe(customAtom)
+      expect(otherAtom2).not.toBe(customAtom)
+      expect(otherAtom3).not.toBe(customAtom)
+
+      expect(store.getter(otherAtom1)).toEqual({ count: 0 })
+      expect(store.getter(otherAtom2)).toEqual({ count: 0 })
+      expect(store.getter(otherAtom3)).toEqual({ count: 0 })
+    })
+
+    test('set 方法应该能覆盖已存在的缓存', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const params = { count: 10 }
+
+      // 先正常获取一个 atom
+      const originalAtom = getFamilyAtomById('user1', params)
+      expect(store.getter(originalAtom)).toEqual({ count: 0 })
+
+      // 使用 set 方法覆盖缓存
+      const newAtom = atom({ count: 555, overridden: true })
+      getFamilyAtomById.set('user1', params, newAtom as any)
+
+      // 再次获取应该返回新设置的 atom
+      const retrievedAtom = getFamilyAtomById('user1', params)
+      expect(retrievedAtom).toBe(newAtom)
+      expect(retrievedAtom).not.toBe(originalAtom)
+      expect(store.getter(retrievedAtom)).toEqual({ count: 555, overridden: true })
+    })
+
+    test('set 方法应该与 override 机制协同工作', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      // 添加一个 override 函数
+      const overrideAtom = atom({ count: 333, from_override: true })
+      const override = jest.fn((id: string, params?: any) => {
+        if (id === 'override_test') return overrideAtom as any
+        return undefined
+      }) as any
+      getFamilyAtomById.push(override)
+
+      const params = { count: 10 }
+
+      // 先通过 override 获取 atom
+      const fromOverride = getFamilyAtomById('override_test', params)
+      expect(fromOverride).toBe(overrideAtom)
+      expect(override).toHaveBeenCalledTimes(1)
+
+      // 使用 set 方法覆盖缓存（包括 override 的结果）
+      const setAtom = atom({ count: 666, from_set: true })
+      getFamilyAtomById.set('override_test', params, setAtom as any)
+
+      // 再次获取应该返回 set 的 atom，而不是 override 的结果
+      const fromCache = getFamilyAtomById('override_test', params)
+      expect(fromCache).toBe(setAtom)
+      expect(fromCache).not.toBe(overrideAtom)
+
+      // override 函数不应该再被调用（因为缓存中已有结果）
+      expect(override).toHaveBeenCalledTimes(1) // 仍然是1次
+      expect(store.getter(fromCache)).toEqual({ count: 666, from_set: true })
+    })
+
+    test('set 方法应该能处理复杂的参数对象', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const complexParams = {
+        count: 10,
+        nested: { deep: { value: 'test' } },
+        array: [1, 2, 3],
+        boolean: true,
+      }
+
+      const customAtom = atom({ count: 999, complex: true })
+
+      // 使用复杂参数对象设置
+      getFamilyAtomById.set('user1', complexParams, customAtom as any)
+
+      // 使用相同的参数对象引用应该能获取到设置的 atom
+      const retrievedAtom = getFamilyAtomById('user1', complexParams)
+      expect(retrievedAtom).toBe(customAtom)
+      expect(store.getter(retrievedAtom)).toEqual({ count: 999, complex: true })
+
+      // 使用内容相同但引用不同的参数对象应该创建新的 atom
+      const differentRefParams = {
+        count: 10,
+        nested: { deep: { value: 'test' } },
+        array: [1, 2, 3],
+        boolean: true,
+      }
+      const differentAtom = getFamilyAtomById('user1', differentRefParams)
+      expect(differentAtom).not.toBe(customAtom) // 不是同一个 atom
+      expect(store.getter(differentAtom)).toEqual({ count: 0 }) // 使用默认值
+    })
+
+    test('set 方法在多次调用时应该更新缓存', () => {
+      const getFamilyAtomById = createGetFamilyAtomById({
+        defaultState: { count: 0 },
+        debuggerKey: 'set-family',
+      })
+
+      const params = { count: 10 }
+
+      // 第一次设置
+      const atom1 = atom({ count: 111, version: 1 })
+      getFamilyAtomById.set('user1', params, atom1 as any)
+      expect(getFamilyAtomById('user1', params)).toBe(atom1)
+
+      // 第二次设置，覆盖第一次
+      const atom2 = atom({ count: 222, version: 2 })
+      getFamilyAtomById.set('user1', params, atom2 as any)
+      expect(getFamilyAtomById('user1', params)).toBe(atom2)
+      expect(getFamilyAtomById('user1', params)).not.toBe(atom1)
+
+      // 第三次设置，再次覆盖
+      const atom3 = atom({ count: 333, version: 3 })
+      getFamilyAtomById.set('user1', params, atom3 as any)
+      expect(getFamilyAtomById('user1', params)).toBe(atom3)
+      expect(store.getter(getFamilyAtomById('user1', params))).toEqual({ count: 333, version: 3 })
+    })
+  })
+
   describe('错误处理', () => {
     test('应该处理 params 不是对象的情况', () => {
       const getFamilyAtomById = createGetFamilyAtomById({
