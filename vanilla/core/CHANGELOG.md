@@ -1,5 +1,17 @@
 # @einfach/core
 
+## 0.2.8
+
+### Patch Changes
+
+- 移除getFamilyAtomById的params缓存，创建对象修改为sysmbol 减少部分内存
+
+## 0.2.7
+
+### Patch Changes
+
+- 类型更换
+
 ## 0.2.6
 
 ### Patch Changes

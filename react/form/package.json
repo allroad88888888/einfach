@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react-form",
-  "version": "0.2.6",
+  "version": "0.2.10",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",

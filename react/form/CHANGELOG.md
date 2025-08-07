@@ -1,5 +1,32 @@
 # @einfach/react-form
 
+## 0.2.10
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.8
+  - @einfach/react@0.3.10
+  - @einfach/react-utils@0.2.8
+  - @einfach/utils@0.2.6
+
+## 0.2.9
+
+### Patch Changes
+
+- 类型更换
+- Updated dependencies
+  - @einfach/core@0.2.7
+  - @einfach/react@0.3.9
+  - @einfach/react-utils@0.2.7
+  - @einfach/utils@0.2.5
+
+## 0.2.7
+
+### Patch Changes
+
+- formItem添加基础的classnmae style支持
+
 ## 0.2.6
 
 ### Patch Changes

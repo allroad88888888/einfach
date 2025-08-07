@@ -1,6 +1,6 @@
 {
   "name": "@einfach/solid",
-  "version": "0.2.6",
+  "version": "0.2.8",
   "description": "Solid.js 状态管理库",
   "type": "module",
   "main": "./cjs/index.cjs",

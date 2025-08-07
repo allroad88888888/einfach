@@ -16,7 +16,7 @@ export type FormItemProps<T extends React.ElementType> = {
 }
 
 export function FormItemFc<T extends React.ElementType>(props: FormItemProps<T>) {
-  const { noStyle = false, children, name, rules, dataTestid, label } = props
+  const { noStyle = false, children, name, rules, dataTestid, label, className, style } = props
   const { value, onChange } = useField(name)
 
   const { message, methods } = useValidator(name, { rules, label })
@@ -40,7 +40,7 @@ export function FormItemFc<T extends React.ElementType>(props: FormItemProps<T>)
   }
 
   return (
-    <div data-testid={dataTestid}>
+    <div data-testid={dataTestid} className={className} style={style}>
       {label ? <label>{label}</label> : null}
       {$children}
       {message?.error ? (

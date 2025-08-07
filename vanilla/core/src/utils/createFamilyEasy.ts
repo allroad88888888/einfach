@@ -1,16 +1,6 @@
 import { atom } from '../atom'
 import type { AtomEntity } from '../type'
 
-type IdObj = {
-  id: string
-}
-
-function createIdObj(id: string): IdObj {
-  const idObj = Object.create(null)
-  idObj.id = id
-  return idObj
-}
-
 export interface CreateAtomFamilyOptions<Key, State> {
   debuggerKey: string
   createAtom?: (key: Key, initState?: State) => AtomEntity<State>
@@ -28,19 +18,19 @@ export interface GetAtomById<Key, State> {
 }
 
 export function createAtomFamilyStore() {
-  const cacheIdObjMap = new Map<string, IdObj>()
+  const cacheIdObjMap = new Map<string, symbol>()
   function getIdObj(key: string) {
     if (!cacheIdObjMap.has(key)) {
-      cacheIdObjMap.set(key, createIdObj(key))
+      cacheIdObjMap.set(key, Symbol(key))
     }
     return cacheIdObjMap.get(key)!
   }
   const types = new Set(['number', 'string', 'boolean', 'undefined'])
 
-  function getWeakKey(key: string): IdObj
-  function getWeakKey(key: number): IdObj
-  function getWeakKey(key: boolean): IdObj
-  function getWeakKey(key: undefined): IdObj
+  function getWeakKey(key: string): symbol
+  function getWeakKey(key: number): symbol
+  function getWeakKey(key: boolean): symbol
+  function getWeakKey(key: undefined): symbol
   function getWeakKey(key: symbol): symbol
   function getWeakKey<T extends object>(key: T): T
   function getWeakKey(key: any) {
@@ -73,7 +63,7 @@ export function createAtomFamilyStore() {
         cacheAtomWeakMap.set(cacheKey as WeakKey, newAtom as AtomEntity<State>)
         if (process.env.NODE_ENV !== 'production') {
           newAtom.debugLabel = `${debuggerKey}
-          ||${cacheKey.id?.toString()}||${newAtom.debugLabel}`
+          ||${cacheKey?.toString()}||${newAtom.debugLabel}`
         }
       }
       return cacheAtomWeakMap.get(cacheKey as WeakKey)! as AtomEntity<CurState>
@@ -84,6 +74,7 @@ export function createAtomFamilyStore() {
     }
     getAtomById.clear = () => {
       cacheAtomWeakMap = new WeakMap()
+      cacheIdObjMap.clear()
     }
     getAtomById.has = (key: Key) => {
       const cacheKey = getWeakKey(key as string)
