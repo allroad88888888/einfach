@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react-utils",
-  "version": "0.2.8",
+  "version": "0.2.10",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",

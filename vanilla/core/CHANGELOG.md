@@ -1,5 +1,17 @@
 # @einfach/core
 
+## 0.2.10
+
+### Patch Changes
+
+- setter 自己设置自身时不应触发 getter 重算
+
+## 0.2.9
+
+### Patch Changes
+
+- 对外暴露getGlobalSymbolForId
+
 ## 0.2.8
 
 ### Patch Changes

@@ -4,8 +4,6 @@ import { storeAtom } from './storeAtom'
 import type { Atom, AtomState, ReadOptions, Setter, Store, WritableAtom } from './type'
 import type { StatesWithPromise } from './typePromise'
 
-
-
 let keyCount = 0
 export function createStore(): Store {
   let atomStateMap = new WeakMap<Atom<unknown>, unknown>()
@@ -146,6 +144,7 @@ export function createStore(): Store {
       ...nextArgs: NextArgs
     ) {
       if (atomEntity === (nextSetAtomEntity as unknown as WritableAtom<State, Args, Result>)) {
+        clearDependencies(nextSetAtomEntity)
         setAtomState(nextSetAtomEntity, nextArgs[0])
         return undefined as Result
       }

@@ -1,5 +1,19 @@
 # @einfach/react
 
+## 0.3.12
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.10
+
+## 0.3.11
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.9
+
 ## 0.3.10
 
 ### Patch Changes

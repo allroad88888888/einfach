@@ -1,9 +1,9 @@
 import { atom } from '../atom'
 import type { AtomEntity, Atom } from './../type'
 
-const globalIdSymbolMap = new Map<string, symbol>()
+export const globalIdSymbolMap = new Map<string, symbol>()
 
-function getGlobalSymbolForId(id: string): symbol {
+export function getGlobalSymbolForId(id: string): symbol {
   let symbolKey = globalIdSymbolMap.get(id)
   if (!symbolKey) {
     symbolKey = Symbol(id)
