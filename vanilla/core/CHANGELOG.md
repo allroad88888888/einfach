@@ -1,5 +1,23 @@
 # @einfach/core
 
+## 0.2.13
+
+### Patch Changes
+
+- fixed:有些场景listenersMap.get(atomEntity) 为undeinfed
+
+## 0.2.12
+
+### Patch Changes
+
+- 如果atom的setter方法是异步的，没有等待所有更新，再去更新flushPending
+
+## 0.2.11
+
+### Patch Changes
+
+- 修复发版本 没有编译
+
 ## 0.2.10
 
 ### Patch Changes

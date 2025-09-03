@@ -1,5 +1,26 @@
 # @einfach/solid
 
+## 0.2.13
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.13
+
+## 0.2.12
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.12
+
+## 0.2.11
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.11
+
 ## 0.2.10
 
 ### Patch Changes

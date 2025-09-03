@@ -9,10 +9,14 @@ export function createStore(): Store {
   let atomStateMap = new WeakMap<Atom<unknown>, unknown>()
 
   let listenersMap = new WeakMap<Atom<unknown>, Set<() => void>>()
+  /**
+   * 谁依赖你-我自己更新值了-要通知谁
+   */
   let backDependenciesMap = new WeakMap<Atom<unknown>, Set<Atom<unknown>>>()
 
   /**
    * for clean backDependencies
+   * 我依赖谁 +值， getter值时候，对比值是否相等
    */
   let dependenciesMap = new WeakMap<Atom<unknown>, Map<Atom<unknown>, unknown>>()
 
@@ -130,7 +134,14 @@ export function createStore(): Store {
      */
     // pendingMap.clear()
     const next = writeAtomState(atomEntity, ...args)
-    flushPending()
+    if (isPromiseLike(next)) {
+      Promise.resolve(next).finally(() => {
+        flushPending()
+      })
+    } else {
+      flushPending()
+    }
+
     return next
   }
 
@@ -244,9 +255,9 @@ export function createStore(): Store {
     if (!listenersMap.has(atomEntity)) {
       listenersMap.set(atomEntity, new Set())
     }
-    listenersMap.get(atomEntity)!.add(listener)
+    listenersMap.get(atomEntity)?.add(listener)
     return () => {
-      listenersMap.get(atomEntity)!.delete(listener)
+      listenersMap.get(atomEntity)?.delete(listener)
     }
   }
   const key = `store${++keyCount}`

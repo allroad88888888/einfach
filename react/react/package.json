@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react",
-  "version": "0.3.12",
+  "version": "0.3.15",
   "description": "React 状态管理库",
   "type": "module",
   "main": "./cjs/index.cjs",
