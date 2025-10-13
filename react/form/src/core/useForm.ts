@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useLayoutEffect, useMemo, useRef } from 'react'
 import type { CreateDataHelpAtoms, FormInstance, NamePath } from './type'
 import type { Obj } from '@einfach/utils'
 import { easyGet, easySetIn } from '@einfach/utils'
@@ -8,6 +8,7 @@ import { useEasySetAtom, useInit } from '@einfach/react-utils'
 
 export interface FormProps<T extends Obj> {
   initialValues?: any
+  values?: any
   onValuesChange?: (changedValues: any, allValues: T) => void
   createFormDataHelpContext?: (
     ...param: Parameters<CreateDataHelpAtoms>
@@ -34,6 +35,14 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
     }
     current.init = true
   }
+
+  useLayoutEffect(() => {
+    if (!('values' in props)) {
+      return
+    }
+
+    setValues(props.values)
+  }, [props.values])
 
   const setMessage = useEasySetAtom(_messageMappingAtom, { store: _store })
 

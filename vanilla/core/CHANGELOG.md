@@ -1,5 +1,11 @@
 # @einfach/core
 
+## 0.2.14
+
+### Patch Changes
+
+- easyset 如果prop为空 则直接返回value
+
 ## 0.2.13
 
 ### Patch Changes

@@ -111,6 +111,33 @@ describe('easySetIn', () => {
       ]),
     )
   })
+
+  it('setMap Number', async () => {
+    const map = new Map<string, Record<string, any>>([
+      [
+        '12',
+        {
+          a: '1',
+        },
+      ],
+      ['23', { b: '1' }],
+    ])
+
+    const temp1 = easySetIn(map, '12.a', 'c')
+
+    expect(temp1).toEqual(
+      new Map([
+        [
+          '12',
+          {
+            a: 'c',
+          },
+        ],
+        ['23', { b: '1' }],
+      ]),
+    )
+  })
+
   it('setSet', async () => {
     const temp = new Set([{ a: 'a' }, { b: 'b' }])
 
@@ -146,5 +173,10 @@ describe('easySetIn', () => {
       {},
     )
     expect(temp3).toStrictEqual({ c: { ss: {} } })
+  })
+
+  it('undefined', async () => {
+    const temp3 = easySetIn(undefined as unknown as object, '', {})
+    expect(temp3).toStrictEqual({})
   })
 })

@@ -18,7 +18,7 @@ export function atom<State, Args extends unknown[], Result>(
   const key = `atom${++keyCount}`
   const entity = {
     toString: function () {
-      return key
+      return entity.debugLabel || key
     },
   } as WritableAtom<State, Args, Result>
   if (typeof read === 'function') {

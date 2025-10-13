@@ -1,5 +1,32 @@
 # @einfach/react-form
 
+## 0.3.18
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/utils@0.2.13
+  - @einfach/react-utils@0.3.18
+  - @einfach/react@0.3.18
+
+## 0.3.17
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/utils@0.2.12
+  - @einfach/core@0.2.14
+  - @einfach/react-utils@0.3.17
+  - @einfach/react@0.3.17
+
+## 0.3.16
+
+### Patch Changes
+
+- feat:form新增values 变为受控form
+  - @einfach/react@0.3.16
+  - @einfach/react-utils@0.3.16
+
 ## 0.3.15
 
 ### Patch Changes

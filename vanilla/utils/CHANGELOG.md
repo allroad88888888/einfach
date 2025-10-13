@@ -1,5 +1,19 @@
 # @einfach/utils
 
+## 0.2.13
+
+### Patch Changes
+
+- 修复easyset 数字混淆
+
+## 0.2.12
+
+### Patch Changes
+
+- easyset 如果prop为空 则直接返回value
+- Updated dependencies
+  - @einfach/core@0.2.14
+
 ## 0.2.11
 
 ### Patch Changes

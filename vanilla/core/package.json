@@ -1,6 +1,6 @@
 {
   "name": "@einfach/core",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "description": "核心状态管理库",
   "type": "module",
   "main": "./cjs/index.cjs",
