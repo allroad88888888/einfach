@@ -1,19 +1,5 @@
 # @einfach/utils
 
-## 1.0.1
-
-### Patch Changes
-
-- Updated dependencies
-  - @einfach/core@0.3.1
-
-## 1.0.0
-
-### Patch Changes
-
-- Updated dependencies
-  - @einfach/core@0.3.0
-
 ## 0.2.14
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@einfach/solid-form",
-  "version": "0.2.18",
+  "version": "0.2.16",
   "description": "Solid.js 表单处理库",
   "type": "module",
   "main": "./cjs/index.cjs",

@@ -1,6 +1,5 @@
 import { atom } from '../atom'
-import { storeAtom } from '../storeAtom'
-import type { Atom, AtomEntity, Store, WritableAtom } from '../type'
+import type { Atom, AtomEntity, WritableAtom } from '../type'
 import { LRUCache } from './LRUCache'
 
 export interface CreateCacheStomOptions<
@@ -24,66 +23,28 @@ export interface CreateCacheStomOptions<
   maxSize?: number
 }
 
-type InferAtomValue<A> = A extends Atom<infer V> | WritableAtom<infer V, any, any> ? V : never
-type InferAtomWriteArgs<A> = A extends WritableAtom<any, infer Args, any> ? Args : never
-
 export function createCacheStom<
   Args extends unknown[],
   AtomEntity extends Atom<unknown> | WritableAtom<unknown, any, any>,
   CacheKey = string,
->(
-  options: CreateCacheStomOptions<Args, AtomEntity, CacheKey>,
-): (
-  ...args: Args
-) => AtomEntity extends WritableAtom<infer V, infer W, infer R>
-  ? WritableAtom<V, W, R>
-  : Atom<InferAtomValue<AtomEntity>> {
-  const {
-    createAtom,
-    getCacheKey = ((...args: Args) => JSON.stringify(args)) as (...args: Args) => CacheKey,
-    debuggerKey,
-    maxSize = Infinity,
-  } = options
-  const cache = new WeakMap<Store, LRUCache<CacheKey, AtomEntity>>()
+>(options: CreateCacheStomOptions<Args, AtomEntity, CacheKey>): (...args: Args) => AtomEntity {
+  const getCacheKey = (options?.getCacheKey ?? ((...args: Args) => JSON.stringify(args))) as (
+    ...args: Args
+  ) => CacheKey
+  const cache = new LRUCache<CacheKey, AtomEntity>(options.maxSize)
 
-  return ((...args: Args) => {
-    const resultAtom = atom(
-      (getter) => {
-        const store = getter(storeAtom)
-
-        if (!cache.has(store)) {
-          cache.set(store, new LRUCache<CacheKey, AtomEntity>(maxSize))
-        }
-        const cacheKey = getCacheKey(...args)
-        const storeCache = cache.get(store)!
-        let cachedAtom = storeCache.get(cacheKey)
-        if (!cachedAtom) {
-          cachedAtom = createAtom(...args)
-          storeCache.set(cacheKey, cachedAtom)
-        }
-        return getter(cachedAtom)
-      },
-      (getter, setter, ...writeArgs: InferAtomWriteArgs<AtomEntity>) => {
-        const store = getter(storeAtom)
-        if (!cache.has(store)) {
-          cache.set(store, new LRUCache<CacheKey, AtomEntity>(maxSize))
-        }
-        const cacheKey = getCacheKey(...args)
-        const storeCache = cache.get(store)!
-        let cachedAtom = storeCache.get(cacheKey)
-        if (!cachedAtom) {
-          cachedAtom = createAtom(...args)
-          storeCache.set(cacheKey, cachedAtom)
-        }
-        // @ts-expect-error - 类型推导限制，运行时正确
-        setter(cachedAtom, ...writeArgs)
-      },
-    )
-    if (process.env.NODE_ENV === 'development') {
-      resultAtom.debugLabel = `${debuggerKey}-${JSON.stringify(args)}`
+  return (...args: Args) => {
+    const cacheKey = getCacheKey(...args)
+    if (!cache.has(cacheKey)) {
+      cache.set(cacheKey, options.createAtom(...args))
     }
-    return resultAtom as any
-  }) as any
+    const newAtom = cache.get(cacheKey)!
+
+    if (process.env.NODE_ENV === 'development') {
+      newAtom.debugLabel = `${options?.debuggerKey}-${JSON.stringify(cacheKey)}`
+    }
+    return newAtom as AtomEntity
+  }
 }
 
 /**

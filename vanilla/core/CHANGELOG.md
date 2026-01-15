@@ -1,17 +1,5 @@
 # @einfach/core
 
-## 0.3.1
-
-### Patch Changes
-
-- 暴露createFamilyAtomById
-
-## 0.3.0
-
-### Minor Changes
-
-- 移除createAtomEasy
-
 ## 0.2.15
 
 ### Patch Changes
