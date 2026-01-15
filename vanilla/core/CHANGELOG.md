@@ -4,6 +4,12 @@
 
 ### Patch Changes
 
+- 降级
+
+## 0.2.15
+
+### Patch Changes
+
 - 暴露storeAtom
 
 ## 0.2.14

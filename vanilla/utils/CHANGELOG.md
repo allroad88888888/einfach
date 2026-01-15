@@ -7,6 +7,13 @@
 - Updated dependencies
   - @einfach/core@0.2.15
 
+## 0.2.14
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.15
+
 ## 0.2.13
 
 ### Patch Changes
