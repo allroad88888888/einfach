@@ -1,5 +1,11 @@
 # @einfach/core
 
+## 0.2.16
+
+### Patch Changes
+
+- 修复版本
+
 ## 0.2.15
 
 ### Patch Changes

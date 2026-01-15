@@ -1,5 +1,14 @@
 # @einfach/solid-form
 
+## 0.2.18
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.16
+  - @einfach/solid@0.2.17
+  - @einfach/utils@0.2.15
+
 ## 0.2.17
 
 ### Patch Changes

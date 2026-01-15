@@ -1,5 +1,14 @@
 # @einfach/react-utils
 
+## 0.3.21
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.16
+  - @einfach/react@0.3.21
+  - @einfach/utils@0.2.15
+
 ## 0.3.20
 
 ### Patch Changes
