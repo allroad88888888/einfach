@@ -24,6 +24,7 @@ describe('selectAtom 异步功能测试', () => {
     expect(name).toBe('John')
   })
 
+  
   test('应该处理异步atom的更新', async () => {
     // 使用可写的原子作为数据源
     const userDataAtom = atom({ name: 'John', age: 30 })

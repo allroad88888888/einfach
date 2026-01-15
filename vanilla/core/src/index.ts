@@ -8,3 +8,4 @@ export * from './promiseUtils'
 
 // 导出工具函数
 export * from './utils'
+export * from './storeAtom'

@@ -1,5 +1,17 @@
 # @einfach/core
 
+## 0.3.0
+
+### Minor Changes
+
+- 移除createAtomEasy
+
+## 0.2.15
+
+### Patch Changes
+
+- 暴露storeAtom
+
 ## 0.2.14
 
 ### Patch Changes

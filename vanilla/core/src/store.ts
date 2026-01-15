@@ -112,6 +112,10 @@ export function createStore(): Store {
         return nextValue
       }
 
+      getter.peek = function peek<State2>(atom: Atom<State2>): StatesWithPromise<State2> | State2 {
+        return readAtom.call(atomEntity, atom) as State2
+      }
+
       clearDependencies(atomEntity)
 
       nextState = atomEntity.read(getter, options)
@@ -197,6 +201,7 @@ export function createStore(): Store {
 
     if (isPromiseLike(nextState)) {
       nextState = createContinuablePromise(nextState, abortPromise, () => {
+        pendingMap.delete(atomEntity)
         publishAtom(atomEntity)
       })
       if (isContinuablePromise(prevState)) {

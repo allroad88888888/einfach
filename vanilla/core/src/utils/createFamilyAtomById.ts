@@ -1,16 +1,6 @@
 import { atom } from '../atom'
 import type { AtomEntity, Atom } from './../type'
-
-export const globalIdSymbolMap = new Map<string, symbol>()
-
-export function getGlobalSymbolForId(id: string): symbol {
-  let symbolKey = globalIdSymbolMap.get(id)
-  if (!symbolKey) {
-    symbolKey = Symbol(id)
-    globalIdSymbolMap.set(id, symbolKey)
-  }
-  return symbolKey
-}
+import { createCacheStomById } from './createCacheStom'
 
 // 定义 getFamilyAtomById 函数类型，包含 override 数组和 push 方法
 type GetFamilyAtomByIdWithOverride<T2, T> = {
@@ -31,31 +21,22 @@ export function createGetFamilyAtomById<T2, T = AtomEntity<T2>>(options: {
  * @param options
  * @returns
  */
-export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity<T2>>(options: {
+export function createGetFamilyAtomById<T2, T extends Atom<unknown> = AtomEntity<T2>>({
+  debuggerKey,
+  defaultState,
+  createAtom,
+}: {
   defaultState?: T2
   createAtom?: (id: string, params?: T2) => T
   debuggerKey?: string
 }) {
-  const cacheAtomWeakMap = new WeakMap<symbol, T>()
-
-  function getFamilyAtomById<T3 = undefined>(id: string, params?: T2) {
-    const symbolKey = getGlobalSymbolForId(id)
-    const cacheAtom = cacheAtomWeakMap.get(symbolKey)
-    if (cacheAtom) {
-      return cacheAtom as unknown as T3 extends undefined ? T : AtomEntity<T3>
-    }
-
-    let newAtom = options.createAtom
-      ? options.createAtom(id, params)
-      : (atom(options.defaultState) as unknown as T)
-
-    newAtom.debugLabel = `${options.debuggerKey}-${id}`
-
-    // 将新创建的 atom 存入缓存
-    cacheAtomWeakMap.set(symbolKey, newAtom)
-
-    return newAtom as unknown as T3 extends undefined ? T : AtomEntity<T3>
+  return (id: string, params?: T2) => {
+    const fn = createCacheStomById({
+      createAtom: (tid: string) => {
+        return createAtom ? createAtom(id, params) : atom(defaultState)
+      },
+      debuggerKey: debuggerKey || 'family',
+    }) as GetFamilyAtomByIdWithOverride<T2, T>
+    return fn(id, params)
   }
-
-  return getFamilyAtomById as GetFamilyAtomByIdWithOverride<T2, T>
 }
