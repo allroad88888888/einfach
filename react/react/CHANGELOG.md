@@ -1,5 +1,11 @@
 # @einfach/react
 
+## 0.3.22
+
+### Patch Changes
+
+- 添加Provider缓存
+
 ## 0.3.21
 
 ### Patch Changes

@@ -15,3 +15,5 @@ export * from './utils/useIncrementAtom'
 
 // 重新导出核心功能
 export * from '@einfach/core'
+
+export * from './cache'
