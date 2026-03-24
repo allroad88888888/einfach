@@ -1,5 +1,13 @@
 # @einfach/react-utils
 
+## 0.3.23
+
+### Patch Changes
+
+- 修复已发布包中的依赖声明：npm 上的版本曾错误地包含 `workspace:*`，导致使用 pnpm 安装 `@einfach/react` 的消费者（例如依赖它的 `@deepfos/tree-help`）报错 `ERR_PNPM_WORKSPACE_PKG_NOT_FOUND`。请始终使用 `pnpm publish` 或 `changeset publish`（在 monorepo 根目录）发布，以便将 workspace 依赖解析为 `@einfach/core` 的实际 semver。
+- Updated dependencies
+  - @einfach/react@0.3.23
+
 ## 0.3.22
 
 ### Patch Changes
