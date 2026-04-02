@@ -1,11 +1,25 @@
 {
   "name": "@einfach/utils",
   "version": "0.2.16",
+  "description": "Einfach 工具函数库",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
   "typings": "./@types/index.d.ts",
   "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "vanilla/utils"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/vanilla/utils",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "esm",
     "cjs",
@@ -15,7 +29,7 @@
   "scripts": {
     "build": "tsc"
   },
-  "keywords": [],
+  "keywords": ["utils", "memoize", "lodash"],
   "sideEffects": false,
   "engines": {
     "node": ">=14.18.0"

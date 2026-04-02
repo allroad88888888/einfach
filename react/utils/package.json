@@ -1,11 +1,25 @@
 {
   "name": "@einfach/react-utils",
   "version": "0.3.24",
+  "description": "Einfach React 工具 hooks 库",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
   "typings": "./@types/index.d.ts",
   "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "react/utils"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/react/utils",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "esm",
     "cjs",
@@ -15,7 +29,7 @@
   "scripts": {
     "build": "tsc"
   },
-  "keywords": [],
+  "keywords": ["react", "hooks", "atom", "utils"],
   "sideEffects": false,
   "engines": {
     "node": ">=14.18.0"

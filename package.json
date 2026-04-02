@@ -2,8 +2,16 @@
   "name": "einfach",
   "private": true,
   "version": "1.0.0",
-  "description": "",
+  "description": "轻量级 atom 状态管理库，支持 React 和 Solid.js",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
   "scripts": {
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "test": "jest --collect-coverage",
@@ -12,8 +20,8 @@
     "prepare": "husky"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "dol",
+  "license": "MIT",
   "workspaces": [
     "react/*",
     "solid/*",

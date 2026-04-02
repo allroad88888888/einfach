@@ -7,6 +7,19 @@
   "module": "./esm/index.mjs",
   "typings": "./@types/index.d.ts",
   "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "vanilla/core"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/vanilla/core",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "esm",
     "cjs",

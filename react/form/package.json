@@ -1,11 +1,25 @@
 {
   "name": "@einfach/react-form",
   "version": "0.3.24",
+  "description": "Einfach React 表单处理库",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
   "typings": "./@types/index.d.ts",
   "license": "MIT",
+  "author": "dol",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/allroad88888888/einfach.git",
+    "directory": "react/form"
+  },
+  "homepage": "https://github.com/allroad88888888/einfach/tree/main/react/form",
+  "bugs": {
+    "url": "https://github.com/allroad88888888/einfach/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "files": [
     "esm",
     "cjs",
