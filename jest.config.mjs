@@ -8,7 +8,7 @@ const jestConfig = {
   // 转译配置
   transform: {
     // 为 Solid.js 的 TSX 文件使用特定的 Babel 配置
-    'solid/.*\\.tsx$': ['babel-jest'],
+    'solid/.*\\.tsx?$': ['babel-jest'],
     // 其他文件保持现有的 SWC 配置
     '^(?!solid/).*\\.(t|j)sx?$': ['@swc/jest', { ...config }],
   },
