@@ -1,5 +1,15 @@
 # @einfach/core
 
+## 0.2.17
+
+### Patch Changes
+
+- fix: dependenciesChange 对 async atom 跳过递归，避免 O(N²) 无效遍历
+
+  async atom 的 readAtom 每次返回新 Promise 引用，导致 Object.is 永远返回 false，
+  dependenciesChange 递归遍历整个反向依赖图。改为由 flushPending while 循环 +
+  Promise 链自然传播，getter 调用从 O(N²) 降到 O(N)。
+
 ## 0.2.16
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@einfach/utils",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",

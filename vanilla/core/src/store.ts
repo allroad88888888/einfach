@@ -227,6 +227,13 @@ export function createStore(): Store {
       if (Object.is(currrnt, nextValue)) {
         return
       }
+      // async atom (Promise) 不递归 — readAtom 已将其加入 pendingMap，
+      // 由 flushPending while 循环处理。递归对 Promise 无意义：
+      // 新旧 Promise 引用必不同，会导致 O(N²) 无效遍历。
+      // promise resolve 后通过 complete 回调中的 dependenciesChange 传播。
+      if (isPromiseLike(nextValue)) {
+        return
+      }
       dependenciesChange(depAtomEntity)
     })
   }

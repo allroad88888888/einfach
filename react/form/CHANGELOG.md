@@ -1,5 +1,15 @@
 # @einfach/react-form
 
+## 0.3.24
+
+### Patch Changes
+
+- Updated dependencies
+  - @einfach/core@0.2.17
+  - @einfach/react@0.3.24
+  - @einfach/react-utils@0.3.24
+  - @einfach/utils@0.2.16
+
 ## 0.3.23
 
 ### Patch Changes
