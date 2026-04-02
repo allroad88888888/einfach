@@ -40,10 +40,12 @@
 
 ---
 
-## Phase 4: WASM 绑定
+## Phase 4: WASM 绑定 ✅
 
-- [ ] Step 16: wasm-bindgen 基础绑定
-- [ ] Step 17: JS 可调用的 Sheet API
+- [x] Step 16: wasm-bindgen 基础绑定（cdylib + rlib）
+- [x] Step 17: JS 可调用的 Sheet API（WasmSheet: set_number/text/formula, get_display/number/type, subscribe, batch_set_numbers）
+
+**状态：10 tests passing (einfach-wasm), cargo build --target wasm32 通过**
 
 ---
 
