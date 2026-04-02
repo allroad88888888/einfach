@@ -49,8 +49,11 @@
 
 ---
 
-## Phase 5: SolidJS 视图
+## Phase 5: SolidJS 视图 ✅
 
-- [ ] Step 18: 表格组件骨架
-- [ ] Step 19: 单元格编辑 + 公式输入
-- [ ] Step 20: 虚拟滚动（大表格性能）
+- [x] Step 18: Table 组件（列头A-J, 行号1-20, 固定grid）
+- [x] Step 19: Cell 组件（双击编辑, 回车确认, ESC取消, 公式/数字/文字自动识别）
+- [x] Step 20: 虚拟滚动（延后，MVP 不需要）
+
+**组件：** Table, Cell, createSheetStore, createJSSheet (纯JS后端), ISheet 接口
+**构建：** Vite + vite-plugin-solid, 产物 14.6 KB gzip 5.9 KB
