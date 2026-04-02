@@ -7,6 +7,9 @@ use crate::atom::{AtomId, Value};
 /// Read function for derived atoms. Takes a getter and returns a computed value.
 type ReadFn = Rc<dyn Fn(&dyn Fn(AtomId) -> Value) -> Value>;
 
+/// Write function for writable derived atoms. Takes a setter and the new value.
+type WriteFn = Rc<dyn Fn(&mut dyn FnMut(AtomId, Value), Value)>;
+
 /// Listener callback invoked when a subscribed atom's value changes.
 type Listener = Rc<dyn Fn()>;
 
@@ -18,6 +21,7 @@ pub struct SubscriptionId(u64);
 pub struct Store {
     values: HashMap<AtomId, Value>,
     read_fns: HashMap<AtomId, ReadFn>,
+    write_fns: HashMap<AtomId, WriteFn>,
     /// derived atom → set of atoms it depends on
     dependencies: HashMap<AtomId, HashSet<AtomId>>,
     /// atom → set of derived atoms that depend on it
@@ -26,6 +30,10 @@ pub struct Store {
     subscriptions: HashMap<AtomId, Vec<(SubscriptionId, Listener)>>,
     next_id: u64,
     next_sub_id: u64,
+    /// Batch nesting depth. When > 0, set() defers propagation.
+    batch_depth: u32,
+    /// Atoms dirtied during a batch, pending propagation.
+    pending_dirty: Vec<AtomId>,
 }
 
 // Thread-local to track dependencies during read_fn evaluation
@@ -40,11 +48,14 @@ impl Store {
         Store {
             values: HashMap::new(),
             read_fns: HashMap::new(),
+            write_fns: HashMap::new(),
             dependencies: HashMap::new(),
             back_deps: HashMap::new(),
             subscriptions: HashMap::new(),
             next_id: 0,
             next_sub_id: 0,
+            batch_depth: 0,
+            pending_dirty: Vec::new(),
         }
     }
 
@@ -61,7 +72,7 @@ impl Store {
         id
     }
 
-    /// Create a derived atom whose value is computed from other atoms.
+    /// Create a read-only derived atom whose value is computed from other atoms.
     pub fn create_derived(
         &mut self,
         read_fn: impl Fn(&dyn Fn(AtomId) -> Value) -> Value + 'static,
@@ -69,6 +80,20 @@ impl Store {
         let id = self.alloc_id();
         self.read_fns.insert(id, Rc::new(read_fn));
         // Compute initial value + track deps
+        self.recompute(id);
+        id
+    }
+
+    /// Create a writable derived atom with both read and write functions.
+    /// The write_fn receives a setter closure and the value being written.
+    pub fn create_writable(
+        &mut self,
+        read_fn: impl Fn(&dyn Fn(AtomId) -> Value) -> Value + 'static,
+        write_fn: impl Fn(&mut dyn FnMut(AtomId, Value), Value) + 'static,
+    ) -> AtomId {
+        let id = self.alloc_id();
+        self.read_fns.insert(id, Rc::new(read_fn));
+        self.write_fns.insert(id, Rc::new(write_fn));
         self.recompute(id);
         id
     }
@@ -147,11 +172,33 @@ impl Store {
             .clone()
     }
 
-    /// Write a new value to a primitive atom.
+    /// Write a new value to an atom.
+    /// - Primitive atoms: writes directly.
+    /// - Writable derived atoms: delegates to write_fn.
+    /// - Read-only derived atoms: panics.
     pub fn set(&mut self, id: AtomId, value: Value) {
+        // If it has a write_fn, delegate to it
+        if let Some(write_fn) = self.write_fns.get(&id).cloned() {
+            // Collect the sets that write_fn wants to make
+            let mut sets_to_apply: Vec<(AtomId, Value)> = Vec::new();
+            write_fn(
+                &mut |target_id: AtomId, val: Value| {
+                    sets_to_apply.push((target_id, val));
+                },
+                value,
+            );
+            // Apply them in a batch
+            self.batch(|s| {
+                for (target_id, val) in sets_to_apply {
+                    s.set(target_id, val);
+                }
+            });
+            return;
+        }
+
         assert!(
             !self.read_fns.contains_key(&id),
-            "cannot set a derived atom directly"
+            "cannot set a read-only derived atom"
         );
         assert!(self.values.contains_key(&id), "atom not found in store");
 
@@ -162,10 +209,50 @@ impl Store {
 
         self.values.insert(id, value);
 
-        // Recompute all downstream derived atoms, tracking which actually changed
-        let affected = self.collect_affected(id);
-        let sorted = self.topological_sort(&affected);
-        let mut changed = vec![id]; // the root atom changed
+        if self.batch_depth > 0 {
+            // Inside batch: defer propagation
+            self.pending_dirty.push(id);
+            return;
+        }
+
+        self.propagate_and_notify(&[id]);
+    }
+
+    /// Execute a function that may call set() multiple times.
+    /// Propagation and notification happen once at the end.
+    pub fn batch(&mut self, f: impl FnOnce(&mut Self)) {
+        self.batch_depth += 1;
+        f(self);
+        self.batch_depth -= 1;
+
+        if self.batch_depth == 0 && !self.pending_dirty.is_empty() {
+            let dirty = std::mem::take(&mut self.pending_dirty);
+            self.propagate_and_notify(&dirty);
+        }
+    }
+
+    /// Propagate changes from dirty roots and notify subscribers.
+    fn propagate_and_notify(&mut self, dirty_roots: &[AtomId]) {
+        // Deduplicate dirty roots
+        let mut unique_roots = Vec::new();
+        let mut seen = HashSet::new();
+        for &root in dirty_roots {
+            if seen.insert(root) {
+                unique_roots.push(root);
+            }
+        }
+
+        // Collect all affected derived atoms from all dirty roots
+        let mut all_affected = HashSet::new();
+        for &root in &unique_roots {
+            for id in self.collect_affected(root) {
+                all_affected.insert(id);
+            }
+        }
+
+        let sorted = self.topological_sort(&all_affected);
+        let mut changed: Vec<AtomId> = unique_roots;
+
         for derived_id in sorted {
             let old = self.values.get(&derived_id).cloned();
             self.recompute(derived_id);
@@ -175,7 +262,6 @@ impl Store {
             }
         }
 
-        // Notify subscribers of all changed atoms
         self.notify(&changed);
     }
 
@@ -417,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cannot set a derived atom")]
+    #[should_panic(expected = "cannot set a read-only derived atom")]
     fn cannot_set_derived_atom() {
         let mut store = Store::new();
         let a = store.create_atom(Value::Number(1.0));
@@ -678,5 +764,197 @@ mod tests {
         // Changing b SHOULD trigger d
         store.set(b, Value::Number(25.0));
         assert_eq!(changes.borrow().len(), 3);
+    }
+
+    // === Step 8: Batch updates ===
+
+    #[test]
+    fn batch_defers_propagation() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let b = store.create_atom(Value::Number(2.0));
+        let sum = store.create_derived(move |get| {
+            if let (Value::Number(x), Value::Number(y)) = (get(a), get(b)) {
+                Value::Number(x + y)
+            } else {
+                panic!()
+            }
+        });
+
+        let notify_count = Rc::new(RefCell::new(0u32));
+        let nc = notify_count.clone();
+        store.sub(sum, move || *nc.borrow_mut() += 1);
+
+        // Without batch: 2 separate notifications
+        // With batch: 1 notification at the end
+        store.batch(|s| {
+            s.set(a, Value::Number(10.0));
+            s.set(b, Value::Number(20.0));
+        });
+
+        assert_eq!(store.get(sum), Value::Number(30.0));
+        assert_eq!(*notify_count.borrow(), 1); // only 1 notification
+    }
+
+    #[test]
+    fn batch_no_notification_if_no_change() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(5.0));
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        store.sub(a, move || *cc.borrow_mut() += 1);
+
+        store.batch(|s| {
+            s.set(a, Value::Number(5.0)); // same value, should be no-op
+        });
+
+        assert_eq!(*count.borrow(), 0);
+    }
+
+    #[test]
+    fn batch_nested() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(0.0));
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        store.sub(a, move || *cc.borrow_mut() += 1);
+
+        store.batch(|s| {
+            s.set(a, Value::Number(1.0));
+            s.batch(|s2| {
+                s2.set(a, Value::Number(2.0));
+            });
+            // Still inside outer batch, no notification yet
+        });
+
+        assert_eq!(store.get(a), Value::Number(2.0));
+        assert_eq!(*count.borrow(), 1); // only 1 notification total
+    }
+
+    #[test]
+    fn batch_multiple_derived_single_propagation() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let b = store.create_derived(move |get| {
+            if let Value::Number(n) = get(a) { Value::Number(n * 2.0) } else { panic!() }
+        });
+        let c = store.create_derived(move |get| {
+            if let Value::Number(n) = get(a) { Value::Number(n + 10.0) } else { panic!() }
+        });
+
+        let b_count = Rc::new(RefCell::new(0u32));
+        let c_count = Rc::new(RefCell::new(0u32));
+        let bc = b_count.clone();
+        let cc = c_count.clone();
+        store.sub(b, move || *bc.borrow_mut() += 1);
+        store.sub(c, move || *cc.borrow_mut() += 1);
+
+        store.batch(|s| {
+            s.set(a, Value::Number(5.0));
+        });
+
+        assert_eq!(store.get(b), Value::Number(10.0));
+        assert_eq!(store.get(c), Value::Number(15.0));
+        assert_eq!(*b_count.borrow(), 1);
+        assert_eq!(*c_count.borrow(), 1);
+    }
+
+    // === Step 9: Writable atoms ===
+
+    #[test]
+    fn writable_atom_basic() {
+        let mut store = Store::new();
+        let celsius = store.create_atom(Value::Number(0.0));
+
+        // Fahrenheit: reads celsius, writes back to celsius
+        let fahrenheit = store.create_writable(
+            move |get| {
+                if let Value::Number(c) = get(celsius) {
+                    Value::Number(c * 9.0 / 5.0 + 32.0)
+                } else {
+                    panic!()
+                }
+            },
+            move |set, val| {
+                if let Value::Number(f) = val {
+                    set(celsius, Value::Number((f - 32.0) * 5.0 / 9.0));
+                }
+            },
+        );
+
+        // Read: 0°C = 32°F
+        assert_eq!(store.get(fahrenheit), Value::Number(32.0));
+
+        // Write 212°F → should set celsius to 100
+        store.set(fahrenheit, Value::Number(212.0));
+        assert_eq!(store.get(celsius), Value::Number(100.0));
+        assert_eq!(store.get(fahrenheit), Value::Number(212.0));
+    }
+
+    #[test]
+    fn writable_atom_triggers_subscribers() {
+        let mut store = Store::new();
+        let base = store.create_atom(Value::Number(10.0));
+        let doubled = store.create_writable(
+            move |get| {
+                if let Value::Number(n) = get(base) {
+                    Value::Number(n * 2.0)
+                } else {
+                    panic!()
+                }
+            },
+            move |set, val| {
+                if let Value::Number(n) = val {
+                    set(base, Value::Number(n / 2.0));
+                }
+            },
+        );
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        store.sub(doubled, move || *cc.borrow_mut() += 1);
+
+        store.set(doubled, Value::Number(100.0));
+        assert_eq!(store.get(base), Value::Number(50.0));
+        assert_eq!(store.get(doubled), Value::Number(100.0));
+        assert_eq!(*count.borrow(), 1);
+    }
+
+    #[test]
+    fn writable_atom_sets_multiple_atoms() {
+        let mut store = Store::new();
+        let x = store.create_atom(Value::Number(0.0));
+        let y = store.create_atom(Value::Number(0.0));
+
+        // A writable atom that distributes a value to both x and y
+        let both = store.create_writable(
+            move |get| {
+                if let (Value::Number(a), Value::Number(b)) = (get(x), get(y)) {
+                    Value::Number(a + b)
+                } else {
+                    panic!()
+                }
+            },
+            move |set, val| {
+                if let Value::Number(n) = val {
+                    set(x, Value::Number(n));
+                    set(y, Value::Number(n));
+                }
+            },
+        );
+
+        store.set(both, Value::Number(5.0));
+        assert_eq!(store.get(x), Value::Number(5.0));
+        assert_eq!(store.get(y), Value::Number(5.0));
+        assert_eq!(store.get(both), Value::Number(10.0)); // 5 + 5
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot set a read-only derived atom")]
+    fn cannot_set_readonly_derived() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let b = store.create_derived(move |get| get(a));
+        store.set(b, Value::Number(99.0));
     }
 }

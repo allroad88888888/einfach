@@ -1,0 +1,8 @@
+[package]
+name = "einfach-excel-core"
+version = "0.1.0"
+edition = "2021"
+description = "Excel-like spreadsheet engine built on einfach-core"
+
+[dependencies]
+einfach-core = { path = "../core" }
