@@ -25,3 +25,6 @@ coverage
 *.tsbuildinfo
 packages/vali
 .npmrc
+
+# Rust
+target/
