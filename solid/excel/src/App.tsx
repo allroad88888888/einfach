@@ -1,35 +1,60 @@
-import { Table } from './Table'
-import { createSheetStore } from './sheet-store'
-import { createJSSheet } from './js-sheet'
+
+import { createSignal, For, Show } from 'solid-js'
+import type { Component } from 'solid-js'
+import { DemoBlank } from './demos/DemoBlank'
+import { DemoFormulas } from './demos/DemoFormulas'
+import { DemoBudget } from './demos/DemoBudget'
+import { DemoGrades } from './demos/DemoGrades'
+import { DemoSales } from './demos/DemoSales'
 import './styles.css'
 
-/**
- * Demo app: renders a spreadsheet table with some initial data.
- * Uses the pure JS sheet backend for development.
- * In production, replace createJSSheet() with the WasmSheet instance.
- */
-export function App() {
-  const sheet = createJSSheet()
-  const store = createSheetStore(sheet)
+interface DemoTab {
+  id: string
+  label: string
+  component: Component
+}
 
-  // Set some demo data
-  store.setNumber('A1', 100)
-  store.setNumber('A2', 200)
-  store.setNumber('A3', 300)
-  store.setText('B1', 'Revenue')
-  store.setText('B2', 'Cost')
-  store.setText('B3', 'Profit')
-  store.setFormula('A4', '=A1-A2')
-  store.setText('B4', 'Net')
-  store.setFormula('C1', '=SUM(A1:A3)')
-  store.setText('D1', 'Total')
+const demos: DemoTab[] = [
+  { id: 'blank',    label: 'Blank',          component: DemoBlank },
+  { id: 'formulas', label: 'Formulas',       component: DemoFormulas },
+  { id: 'budget',   label: 'Budget',         component: DemoBudget },
+  { id: 'grades',   label: 'Grade Calc',     component: DemoGrades },
+  { id: 'sales',    label: 'Sales Dashboard', component: DemoSales },
+]
+
+export function App() {
+  const [activeTab, setActiveTab] = createSignal('formulas')
+
+  const activeDemo = () => demos.find((d) => d.id === activeTab())
 
   return (
-    <div style={{ padding: '20px' }}>
-      <h2 style={{ 'font-family': 'sans-serif', 'margin-bottom': '10px' }}>
-        Einfach Excel
-      </h2>
-      <Table store={store} rows={20} cols={10} />
+    <div class="app">
+      <header class="app-header">
+        <h1 class="app-title">Einfach Excel</h1>
+        <span class="app-subtitle">Rust + WASM + SolidJS</span>
+      </header>
+
+      <nav class="tab-bar">
+        <For each={demos}>
+          {(demo) => (
+            <button
+              class={`tab-btn ${activeTab() === demo.id ? 'tab-active' : ''}`}
+              onClick={() => setActiveTab(demo.id)}
+            >
+              {demo.label}
+            </button>
+          )}
+        </For>
+      </nav>
+
+      <main class="app-main">
+        <Show when={activeDemo()} keyed>
+          {(demo) => {
+            const Comp = demo.component
+            return <Comp />
+          }}
+        </Show>
+      </main>
     </div>
   )
 }

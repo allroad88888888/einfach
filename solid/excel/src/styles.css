@@ -1,8 +1,128 @@
+/* === App Layout === */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: #f0f2f5;
+  color: #1a1a1a;
+}
+
+.app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.app-title {
+  font-size: 24px;
+  font-weight: 700;
+  color: #1a1a1a;
+}
+
+.app-subtitle {
+  font-size: 13px;
+  color: #888;
+  font-weight: 400;
+}
+
+/* === Tab Bar === */
+
+.tab-bar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  border-bottom: 2px solid #e0e0e0;
+  padding-bottom: 0;
+}
+
+.tab-btn {
+  padding: 8px 18px;
+  border: none;
+  background: transparent;
+  color: #666;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab-btn:hover {
+  color: #333;
+}
+
+.tab-active {
+  color: #1a73e8;
+  border-bottom-color: #1a73e8;
+}
+
+/* === Demo Page === */
+
+.demo-page {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  padding: 20px;
+}
+
+.demo-header {
+  margin-bottom: 16px;
+}
+
+.demo-header h3 {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.demo-desc {
+  font-size: 13px;
+  color: #666;
+  line-height: 1.5;
+}
+
+.demo-desc code {
+  background: #f0f0f0;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: 'SF Mono', Menlo, Monaco, monospace;
+}
+
+.demo-desc kbd {
+  background: #f8f8f8;
+  border: 1px solid #d0d0d0;
+  border-radius: 3px;
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: inherit;
+  box-shadow: 0 1px 0 #ccc;
+}
+
+.demo-desc strong {
+  color: #333;
+}
+
+/* === Excel Table === */
+
 .excel-table-wrapper {
   overflow: auto;
-  max-height: 80vh;
-  border: 1px solid #ccc;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  max-height: 70vh;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
   font-size: 13px;
 }
 
@@ -13,64 +133,102 @@
 
 .excel-table th,
 .excel-table td {
-  border: 1px solid #d0d0d0;
+  border: 1px solid #d8d8d8;
   padding: 0;
-  height: 24px;
-  min-width: 80px;
+  height: 26px;
+  min-width: 90px;
   max-width: 200px;
 }
 
+/* Headers */
+
 .col-header,
 .row-header {
-  background: #f5f5f5;
-  color: #333;
+  background: #f8f9fa;
+  color: #444;
   font-weight: 500;
   text-align: center;
   padding: 2px 6px;
   position: sticky;
   user-select: none;
+  font-size: 12px;
 }
 
 .col-header {
   top: 0;
   z-index: 2;
+  border-bottom: 2px solid #d0d0d0;
 }
 
 .row-header {
   left: 0;
   z-index: 1;
-  min-width: 40px;
-  width: 40px;
+  min-width: 44px;
+  width: 44px;
+  border-right: 2px solid #d0d0d0;
 }
+
+/* Corner cell (top-left) */
+thead .row-header {
+  z-index: 3;
+  position: sticky;
+  left: 0;
+  top: 0;
+}
+
+/* Cells */
 
 .cell {
   cursor: cell;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  background: #fff;
+}
+
+.cell:hover {
+  background: #f0f6ff;
 }
 
 .cell-display {
   display: block;
-  padding: 2px 4px;
+  padding: 3px 6px;
   height: 100%;
+  line-height: 20px;
 }
 
 .cell-number .cell-display {
   text-align: right;
+  color: #1a1a1a;
+}
+
+.cell-text .cell-display {
+  color: #1a1a1a;
+}
+
+.cell-null .cell-display {
+  color: #ccc;
+}
+
+.cell-error {
+  background: #fff5f5;
 }
 
 .cell-error .cell-display {
   color: #cc0000;
+  font-size: 11px;
 }
+
+/* Edit mode */
 
 .cell-input {
   width: 100%;
   height: 100%;
   border: 2px solid #1a73e8;
   outline: none;
-  padding: 1px 3px;
-  font-size: inherit;
+  padding: 2px 5px;
+  font-size: 13px;
   font-family: inherit;
   box-sizing: border-box;
+  background: #fff;
 }
