@@ -163,6 +163,7 @@ impl Default for Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use einfach_core::ValueError;
 
     #[test]
     fn new_cell_is_null() {
