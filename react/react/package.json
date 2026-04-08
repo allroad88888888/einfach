@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "description": "Lightweight Jotai-inspired atomic state management for React",
   "type": "module",
   "main": "./cjs/index.cjs",

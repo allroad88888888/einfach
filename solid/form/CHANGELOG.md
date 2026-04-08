@@ -1,5 +1,15 @@
 # @einfach/solid-form
 
+## 0.2.20
+
+### Patch Changes
+
+- 341f8a7: Improve npm search discoverability: English descriptions and add einfach keyword
+- Updated dependencies [341f8a7]
+  - @einfach/core@0.2.18
+  - @einfach/utils@0.2.17
+  - @einfach/solid@0.2.19
+
 ## 0.2.19
 
 ### Patch Changes

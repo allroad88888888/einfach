@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react-form",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "description": "Atom-based form handling for React with Einfach",
   "type": "module",
   "main": "./cjs/index.cjs",
