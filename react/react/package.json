@@ -1,7 +1,7 @@
 {
   "name": "@einfach/react",
   "version": "0.3.24",
-  "description": "React 状态管理库",
+  "description": "Lightweight Jotai-inspired atomic state management for React",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -34,6 +34,7 @@
     "node": ">=14.18.0"
   },
   "keywords": [
+    "einfach",
     "react",
     "atom"
   ],

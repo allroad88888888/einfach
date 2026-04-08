@@ -1,7 +1,7 @@
 {
   "name": "@einfach/react-form",
   "version": "0.3.24",
-  "description": "Einfach React 表单处理库",
+  "description": "Atom-based form handling for React with Einfach",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -30,6 +30,7 @@
     "build": "tsc"
   },
   "keywords": [
+    "einfach",
     "react",
     "form",
     "atom",

@@ -1,7 +1,7 @@
 {
   "name": "@einfach/react-utils",
   "version": "0.3.24",
-  "description": "Einfach React 工具 hooks 库",
+  "description": "React utility hooks for Einfach state management",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -29,7 +29,7 @@
   "scripts": {
     "build": "tsc"
   },
-  "keywords": ["react", "hooks", "atom", "utils"],
+  "keywords": ["einfach", "react", "hooks", "atom", "utils"],
   "sideEffects": false,
   "engines": {
     "node": ">=14.18.0"

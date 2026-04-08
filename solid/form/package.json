@@ -1,7 +1,7 @@
 {
   "name": "@einfach/solid-form",
   "version": "0.2.19",
-  "description": "Solid.js 表单处理库",
+  "description": "Atom-based form handling for Solid.js with Einfach",
   "type": "module",
   "main": "./cjs/index.cjs",
   "module": "./esm/index.mjs",
@@ -34,6 +34,7 @@
     "node": ">=14.18.0"
   },
   "keywords": [
+    "einfach",
     "solid",
     "solidjs",
     "form",
