@@ -1,5 +1,11 @@
 # @einfach/core
 
+## 0.2.18
+
+### Patch Changes
+
+- 341f8a7: Improve npm search discoverability: English descriptions and add einfach keyword
+
 ## 0.2.17
 
 ### Patch Changes

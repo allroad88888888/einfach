@@ -1,6 +1,6 @@
 {
   "name": "@einfach/utils",
-  "version": "0.2.16",
+  "version": "0.2.17",
   "description": "Utility functions for Einfach state management",
   "type": "module",
   "main": "./cjs/index.cjs",
@@ -29,7 +29,12 @@
   "scripts": {
     "build": "tsc"
   },
-  "keywords": ["einfach", "utils", "memoize", "lodash"],
+  "keywords": [
+    "einfach",
+    "utils",
+    "memoize",
+    "lodash"
+  ],
   "sideEffects": false,
   "engines": {
     "node": ">=14.18.0"
