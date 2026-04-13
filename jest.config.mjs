@@ -35,6 +35,8 @@ const jestConfig = {
     '^@einfach/react-form$': '<rootDir>/react/form/src',
     '^@einfach/solid$': '<rootDir>/solid/solid/src',
     '^@einfach/solid-form$': '<rootDir>/solid/form/src',
+    '^exceljs$': '<rootDir>/rules/exceljs.cjs',
+    '^uuid$': '<rootDir>/rules/uuid.cjs',
     '\\.css$': '<rootDir>/rules/styleMock.cjs',
   },
 }

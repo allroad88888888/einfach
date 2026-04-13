@@ -1,4 +1,5 @@
 import type { CellFormat, IWorkbook, SheetMetadata, WorkbookSnapshot } from './types'
+import { exportSnapshotToXLSX, importSnapshotFromXLSX } from './xlsx-interop'
 import {
   cellToDisplay,
   coerceToNumber,
@@ -50,6 +51,7 @@ type SheetState = {
   cells: Map<string, CellRecord>
   formulas: Map<string, string>
   formats: Map<string, CellFormat>
+  mergedRanges: string[]
 }
 
 type ComparisonOperator = '=' | '<>' | '<' | '<=' | '>' | '>='
@@ -73,6 +75,7 @@ function createSheetState(name: string, rows = DEFAULT_ROW_COUNT, cols = DEFAULT
     cells: new Map(),
     formulas: new Map(),
     formats: new Map(),
+    mergedRanges: [],
   }
 }
 
@@ -931,6 +934,7 @@ export function createJSWorkbook(options?: {
         cells: Array.from(sheet.cells.entries()).map(([addr, value]) => [addr, cloneCellRecord(value)]),
         formulas: Array.from(sheet.formulas.entries()),
         formats: Array.from(sheet.formats.entries()).map(([addr, format]) => [addr, cloneCellFormat(format)]),
+        mergedRanges: [...sheet.mergedRanges],
       })),
     }
   }
@@ -945,6 +949,7 @@ export function createJSWorkbook(options?: {
       cells: new Map(sheet.cells.map(([addr, value]) => [addr, cloneCellRecord(value as CellRecord)])),
       formulas: new Map(sheet.formulas),
       formats: new Map((sheet.formats ?? []).map(([addr, format]) => [addr, cloneCellFormat(format)])),
+      mergedRanges: [...(sheet.mergedRanges ?? [])],
     }))
     refreshFormulaCache()
   }
@@ -1170,6 +1175,7 @@ export function createJSWorkbook(options?: {
         sheet.cells = new Map()
         sheet.formulas = new Map()
         sheet.formats = new Map()
+        sheet.mergedRanges = []
         sheet.metadata.rowCount = Math.max(matrix.length, 1)
         sheet.metadata.colCount = Math.max(...matrix.map((row) => row.length), 1)
         for (let rowIndex = 0; rowIndex < matrix.length; rowIndex += 1) {
@@ -1179,6 +1185,18 @@ export function createJSWorkbook(options?: {
         }
       })
       return true
+    },
+    async export_xlsx() {
+      return exportSnapshotToXLSX(snapshot())
+    },
+    async import_xlsx(bytes) {
+      try {
+        const parsed = await importSnapshotFromXLSX(bytes)
+        restore(parsed)
+        return true
+      } catch {
+        return false
+      }
     },
     snapshot,
     restore,

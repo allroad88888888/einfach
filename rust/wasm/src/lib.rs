@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use einfach_core::Value;
-use einfach_excel_core::{Sheet, Workbook};
+use einfach_excel_core::{export_snapshot_json_to_xlsx_bytes, Sheet, Workbook};
 use wasm_bindgen::prelude::*;
 
 /// WASM-exposed spreadsheet. Wraps the Rust Sheet.
@@ -15,6 +15,17 @@ pub struct WasmSheet {
 #[wasm_bindgen]
 pub struct WasmWorkbook {
     workbook: Workbook,
+}
+
+#[wasm_bindgen(js_name = exportWorkbookSnapshotToXlsx)]
+pub fn export_workbook_snapshot_to_xlsx(payload: &str) -> Result<js_sys::Uint8Array, JsValue> {
+    let bytes = export_workbook_snapshot_to_xlsx_bytes(payload)
+        .map_err(|error| JsValue::from_str(&error))?;
+    Ok(js_sys::Uint8Array::from(bytes.as_slice()))
+}
+
+fn export_workbook_snapshot_to_xlsx_bytes(payload: &str) -> Result<Vec<u8>, String> {
+    export_snapshot_json_to_xlsx_bytes(payload)
 }
 
 #[wasm_bindgen]
@@ -338,6 +349,7 @@ fn value_to_display(val: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn wasm_sheet_basic() {
@@ -561,5 +573,48 @@ mod tests {
         assert_eq!(workbook.row_height(0), 32);
         assert!(workbook.freeze_top_row());
         assert!(workbook.freeze_first_column());
+    }
+
+    #[test]
+    fn wasm_exports_workbook_snapshot_to_xlsx_bytes() {
+        let payload = serde_json::json!({
+            "activeSheetIndex": 0,
+            "sheets": [{
+                "name": "Sheet1",
+                "metadata": {
+                    "rowCount": 20,
+                    "colCount": 10,
+                    "freezeTopRow": true,
+                    "freezeFirstColumn": false
+                },
+                "rowHeights": [[0, 32]],
+                "colWidths": [[0, 144]],
+                "cells": [["A1", { "type": "text", "value": "标题" }], ["A2", { "type": "number", "value": 42 }]],
+                "formulas": [["B2", "=A2*2"]],
+                "formats": [],
+                "mergedRanges": ["A1:C1"]
+            }]
+        })
+        .to_string();
+
+        let bytes = export_workbook_snapshot_to_xlsx_bytes(&payload)
+            .expect("xlsx export should succeed");
+        assert!(!bytes.is_empty());
+        let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(bytes), true)
+            .expect("xlsx bytes should be readable");
+        let sheet = book.get_sheet(&0).expect("sheet should exist");
+        assert_eq!(sheet.get_value("A1"), "标题");
+        assert_eq!(
+            sheet
+                .get_merge_cells()
+                .iter()
+                .map(|range| range.get_range())
+                .collect::<Vec<_>>(),
+            vec!["A1:C1".to_string()]
+        );
+        assert_eq!(
+            sheet.get_cell("B2").expect("formula cell should exist").get_formula(),
+            "A2*2"
+        );
     }
 }

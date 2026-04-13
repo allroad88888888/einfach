@@ -42,6 +42,7 @@ const config = defineConfig({
     '@einfach/react-utils',
     '@einfach/utils',
     '@einfach/solid',
+    'exceljs',
     'react',
     'react-dom',
     'react/jsx-runtime',

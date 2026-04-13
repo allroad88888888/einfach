@@ -52,6 +52,7 @@ export type SheetStateSnapshot = {
   cells: Array<[string, { type: string; value: number | string | boolean | null }]>
   formulas: Array<[string, string]>
   formats: Array<[string, CellFormat]>
+  mergedRanges: string[]
 }
 
 export type WorkbookSnapshot = {
@@ -88,6 +89,8 @@ export interface IWorkbook extends ISheet {
   import_json(payload: string): boolean
   export_csv(sheetIndex?: number): string
   import_csv(payload: string): boolean
+  export_xlsx(): Promise<Uint8Array>
+  import_xlsx(bytes: Uint8Array): Promise<boolean>
   snapshot(): WorkbookSnapshot
   restore(snapshot: WorkbookSnapshot): void
 }

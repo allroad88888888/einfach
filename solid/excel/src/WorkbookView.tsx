@@ -5,9 +5,10 @@ import { createTableInteractions } from './table-interactions'
 import type { CellFormat } from './types'
 import type { WorkbookStore } from './workbook-store'
 
-function triggerDownload(filename: string, content: string, type: string) {
+function triggerDownload(filename: string, content: string | Uint8Array, type: string) {
   if (typeof document === 'undefined') return
-  const blob = new Blob([content], { type })
+  const blobPart: BlobPart = typeof content === 'string' ? content : new Uint8Array(content)
+  const blob = new Blob([blobPart], { type })
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
@@ -22,6 +23,7 @@ export function WorkbookView(props: { store: WorkbookStore; persistenceKey?: str
   const interactions = createTableInteractions(props.store, props.store.rowCount, props.store.colCount)
   let csvInputRef: HTMLInputElement | undefined
   let jsonInputRef: HTMLInputElement | undefined
+  let xlsxInputRef: HTMLInputElement | undefined
 
   const selectedAddresses = () => interactions.selectedAddresses()
   const selectedFormat = () => props.store.getCellFormat(interactions.selectedCell())
@@ -29,6 +31,19 @@ export function WorkbookView(props: { store: WorkbookStore; persistenceKey?: str
   function recordSnapshotMutation(kind: string, handler: () => boolean | void, focusAddr = interactions.selectionTopLeft()) {
     const before = props.store.takeSnapshot()
     const result = handler()
+    if (result === false) return false
+    const after = props.store.takeSnapshot()
+    interactions.recordSnapshotChange(kind, before, after, focusAddr)
+    return true
+  }
+
+  async function recordAsyncSnapshotMutation(
+    kind: string,
+    handler: () => Promise<boolean | void>,
+    focusAddr = interactions.selectionTopLeft(),
+  ) {
+    const before = props.store.takeSnapshot()
+    const result = await handler()
     if (result === false) return false
     const after = props.store.takeSnapshot()
     interactions.recordSnapshotChange(kind, before, after, focusAddr)
@@ -48,14 +63,20 @@ export function WorkbookView(props: { store: WorkbookStore; persistenceKey?: str
     })
   }
 
-  async function importFile(file: File | undefined, kind: 'csv' | 'json') {
+  async function importFile(file: File | undefined, kind: 'csv' | 'json' | 'xlsx') {
     if (!file) return
-    const payload = await file.text()
     if (kind === 'csv') {
+      const payload = await file.text()
       recordSnapshotMutation('import_csv', () => props.store.importCSV(payload))
       return
     }
-    recordSnapshotMutation('import_json', () => props.store.importJSON(payload))
+    if (kind === 'json') {
+      const payload = await file.text()
+      recordSnapshotMutation('import_json', () => props.store.importJSON(payload))
+      return
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer())
+    await recordAsyncSnapshotMutation('import_xlsx', () => props.store.importXLSX(bytes))
   }
 
   function renameSheet(index: number) {
@@ -251,8 +272,23 @@ export function WorkbookView(props: { store: WorkbookStore; persistenceKey?: str
           >
             Export JSON
           </button>
+          <button
+            onClick={async () => {
+              const activeName = props.store.sheetNames()[props.store.activeSheetIndex()] ?? 'einfach-workbook'
+              const content = await props.store.exportXLSX()
+              triggerDownload(
+                `${activeName}.xlsx`,
+                content,
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+              )
+            }}
+            type="button"
+          >
+            Export Excel
+          </button>
           <button onClick={() => csvInputRef?.click()} type="button">Import CSV</button>
           <button onClick={() => jsonInputRef?.click()} type="button">Import JSON</button>
+          <button onClick={() => xlsxInputRef?.click()} type="button">Import Excel</button>
           <button onClick={() => recordSnapshotMutation('format_clear', () => props.store.clearCellFormat(selectedAddresses()))} type="button">
             Clear Style
           </button>
@@ -279,6 +315,19 @@ export function WorkbookView(props: { store: WorkbookStore; persistenceKey?: str
             }}
             ref={(element) => {
               jsonInputRef = element
+            }}
+            type="file"
+          />
+          <input
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            aria-label="Import Excel file"
+            class="toolbar-file-input"
+            onChange={(event) => {
+              void importFile(event.currentTarget.files?.[0], 'xlsx')
+              event.currentTarget.value = ''
+            }}
+            ref={(element) => {
+              xlsxInputRef = element
             }}
             type="file"
           />

@@ -197,6 +197,14 @@ export function createWorkbookStore(workbook: IWorkbook) {
       if (success) refreshAll()
       return success
     },
+    async exportXLSX() {
+      return workbook.export_xlsx()
+    },
+    async importXLSX(bytes: Uint8Array) {
+      const success = await workbook.import_xlsx(bytes)
+      if (success) refreshAll()
+      return success
+    },
     version() {
       return revision()
     },

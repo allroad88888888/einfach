@@ -2,6 +2,12 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use einfach_core::{Value, ValueError};
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use umya_spreadsheet::{
+    self, Border, HorizontalAlignmentValues, NumberingFormat, Pane, PaneStateValues, PaneValues,
+    SheetView, SheetViews, Style, VerticalAlignmentValues,
+};
 
 use crate::cell::{CellAddress, CellReference};
 use crate::eval::eval_expr;
@@ -37,6 +43,75 @@ enum Axis {
 enum StructureMode {
     Insert,
     Delete,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkbookSnapshotPayload {
+    active_sheet_index: usize,
+    sheets: Vec<SheetSnapshotPayload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetSnapshotPayload {
+    name: String,
+    metadata: SheetMetadataPayload,
+    row_heights: Vec<(u32, u32)>,
+    col_widths: Vec<(u32, u32)>,
+    cells: Vec<(String, SnapshotCellValuePayload)>,
+    formulas: Vec<(String, String)>,
+    #[serde(default)]
+    formats: Vec<(String, CellFormatPayload)>,
+    #[serde(default)]
+    merged_ranges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SheetMetadataPayload {
+    row_count: u32,
+    col_count: u32,
+    freeze_top_row: bool,
+    freeze_first_column: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotCellValuePayload {
+    #[serde(rename = "type")]
+    kind: String,
+    value: JsonValue,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CellFormatPayload {
+    bold: bool,
+    italic: bool,
+    font_size: Option<f64>,
+    text_color: Option<String>,
+    background_color: Option<String>,
+    horizontal_align: Option<String>,
+    vertical_align: Option<String>,
+    border_style: String,
+    border_color: Option<String>,
+    number_format: NumberFormatPayload,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NumberFormatPayload {
+    kind: String,
+    decimals: u32,
+    use_grouping: bool,
+    currency_symbol: String,
+}
+
+#[derive(Clone)]
+struct ExportMergedRange {
+    range: String,
+    start: CellAddress,
+    end: CellAddress,
 }
 
 pub struct Workbook {
@@ -379,6 +454,116 @@ impl Default for Workbook {
     }
 }
 
+pub fn export_snapshot_json_to_xlsx_bytes(payload: &str) -> Result<Vec<u8>, String> {
+    let snapshot: WorkbookSnapshotPayload =
+        serde_json::from_str(payload).map_err(|error| error.to_string())?;
+    export_snapshot_to_xlsx_bytes(&snapshot)
+}
+
+fn export_snapshot_to_xlsx_bytes(snapshot: &WorkbookSnapshotPayload) -> Result<Vec<u8>, String> {
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheets = if snapshot.sheets.is_empty() {
+        vec![SheetSnapshotPayload {
+            name: "Sheet1".to_string(),
+            metadata: SheetMetadataPayload {
+                row_count: DEFAULT_ROW_COUNT,
+                col_count: DEFAULT_COL_COUNT,
+                freeze_top_row: false,
+                freeze_first_column: false,
+            },
+            row_heights: Vec::new(),
+            col_widths: Vec::new(),
+            cells: Vec::new(),
+            formulas: Vec::new(),
+            formats: Vec::new(),
+            merged_ranges: Vec::new(),
+        }]
+    } else {
+        snapshot.sheets.clone()
+    };
+
+    for sheet in &sheets {
+        book.new_sheet(&sheet.name).map_err(|error| error.to_string())?;
+    }
+
+    for (index, sheet) in sheets.iter().enumerate() {
+        let worksheet = book
+            .get_sheet_mut(&index)
+            .ok_or_else(|| format!("missing worksheet at index {index}"))?;
+        worksheet.set_name(&sheet.name);
+        let _declared_bounds = (sheet.metadata.row_count, sheet.metadata.col_count);
+        apply_sheet_view(worksheet, sheet, index == snapshot.active_sheet_index);
+        let (merged_ranges, covered_non_masters) = collect_merged_ranges(sheet);
+
+        for (row_index, height) in &sheet.row_heights {
+            worksheet
+                .get_row_dimension_mut(&(row_index + 1))
+                .set_height(*height as f64);
+        }
+        for (col_index, width) in &sheet.col_widths {
+            worksheet
+                .get_column_dimension_mut(&column_index_to_letters(*col_index))
+                .set_width(*width as f64);
+        }
+        for (addr, value) in &sheet.cells {
+            if is_covered_non_master(addr, &covered_non_masters) {
+                continue;
+            }
+            let cell = worksheet.get_cell_mut(addr.as_str());
+            match value.kind.as_str() {
+                "number" => {
+                    if let Some(number) = value.value.as_f64() {
+                        cell.set_value_number(number);
+                    } else if let Some(number) = value.value.as_i64() {
+                        cell.set_value_number(number as f64);
+                    }
+                }
+                "boolean" => {
+                    if let Some(flag) = value.value.as_bool() {
+                        cell.set_value_bool(flag);
+                    }
+                }
+                "text" | "error" => {
+                    if let Some(text) = value.value.as_str() {
+                        cell.set_value_string(text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (addr, formula) in &sheet.formulas {
+            if is_covered_non_master(addr, &covered_non_masters) {
+                continue;
+            }
+            worksheet
+                .get_cell_mut(addr.as_str())
+                .set_formula(formula.trim_start_matches('='));
+        }
+        for (addr, format) in &sheet.formats {
+            if is_covered_non_master(addr, &covered_non_masters) {
+                continue;
+            }
+            apply_cell_format(worksheet.get_style_mut(addr.as_str()), format);
+        }
+        for merged in &merged_ranges {
+            worksheet.add_merge_cells(merged.range.as_str());
+        }
+    }
+
+    if !sheets.is_empty() {
+        book.set_active_sheet(
+            snapshot
+                .active_sheet_index
+                .min(sheets.len().saturating_sub(1)) as u32,
+        );
+    }
+
+    let mut bytes = Vec::new();
+    umya_spreadsheet::writer::xlsx::write_writer(&book, &mut bytes)
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
 fn value_to_input(value: &Value) -> String {
     match value {
         Value::Number(n) => {
@@ -412,6 +597,208 @@ fn default_sheet_name(sheets: &[SheetModel]) -> String {
         }
         index += 1;
     }
+}
+
+fn apply_sheet_view(
+    worksheet: &mut umya_spreadsheet::Worksheet,
+    sheet: &SheetSnapshotPayload,
+    is_active: bool,
+) {
+    let mut view = SheetView::default();
+    view.set_workbook_view_id(0);
+    view.set_tab_selected(is_active);
+
+    if sheet.metadata.freeze_top_row || sheet.metadata.freeze_first_column {
+        let mut pane = Pane::default();
+        if sheet.metadata.freeze_first_column {
+            pane.set_horizontal_split(1.0);
+        }
+        if sheet.metadata.freeze_top_row {
+            pane.set_vertical_split(1.0);
+        }
+        let top_left_cell = match (sheet.metadata.freeze_first_column, sheet.metadata.freeze_top_row)
+        {
+            (true, true) => "B2",
+            (true, false) => "B1",
+            (false, true) => "A2",
+            (false, false) => "A1",
+        };
+        pane.get_top_left_cell_mut().set_coordinate(top_left_cell);
+        pane.set_active_pane(match (sheet.metadata.freeze_first_column, sheet.metadata.freeze_top_row)
+        {
+            (true, true) => PaneValues::BottomRight,
+            (true, false) => PaneValues::TopRight,
+            (false, true) => PaneValues::BottomLeft,
+            (false, false) => PaneValues::TopLeft,
+        });
+        pane.set_state(PaneStateValues::Frozen);
+        view.set_pane(pane);
+    }
+
+    let mut views = SheetViews::default();
+    views.add_sheet_view_list_mut(view);
+    worksheet.set_sheets_views(views);
+}
+
+fn apply_cell_format(style: &mut Style, format: &CellFormatPayload) {
+    style.get_font_mut().set_bold(format.bold);
+    style.get_font_mut().set_italic(format.italic);
+    if let Some(size) = format.font_size {
+        style.get_font_mut().set_size(size);
+    }
+    if let Some(color) = normalize_excel_color(format.text_color.as_deref()) {
+        style.get_font_mut().get_color_mut().set_argb(color);
+    }
+    if let Some(color) = normalize_excel_color(format.background_color.as_deref()) {
+        style.set_background_color_solid(color);
+    }
+
+    if let Some(horizontal) = format.horizontal_align.as_deref() {
+        let value = match horizontal {
+            "center" => Some(HorizontalAlignmentValues::Center),
+            "right" => Some(HorizontalAlignmentValues::Right),
+            "left" => Some(HorizontalAlignmentValues::Left),
+            _ => None,
+        };
+        if let Some(value) = value {
+            style.get_alignment_mut().set_horizontal(value);
+        }
+    }
+    if let Some(vertical) = format.vertical_align.as_deref() {
+        let value = match vertical {
+            "middle" => Some(VerticalAlignmentValues::Center),
+            "bottom" => Some(VerticalAlignmentValues::Bottom),
+            "top" => Some(VerticalAlignmentValues::Top),
+            _ => None,
+        };
+        if let Some(value) = value {
+            style.get_alignment_mut().set_vertical(value);
+        }
+    }
+
+    if format.border_style == "solid" {
+        let color = normalize_excel_color(format.border_color.as_deref())
+            .unwrap_or_else(|| "FFAAB6C7".to_string());
+        style.get_borders_mut().get_top_mut().set_border_style(Border::BORDER_THIN);
+        style.get_borders_mut().get_top_mut().get_color_mut().set_argb(&color);
+        style.get_borders_mut().get_right_mut().set_border_style(Border::BORDER_THIN);
+        style.get_borders_mut().get_right_mut().get_color_mut().set_argb(&color);
+        style.get_borders_mut().get_bottom_mut().set_border_style(Border::BORDER_THIN);
+        style.get_borders_mut().get_bottom_mut().get_color_mut().set_argb(&color);
+        style.get_borders_mut().get_left_mut().set_border_style(Border::BORDER_THIN);
+        style.get_borders_mut().get_left_mut().get_color_mut().set_argb(&color);
+    }
+
+    style
+        .get_numbering_format_mut()
+        .set_format_code(number_format_to_excel(&format.number_format));
+}
+
+fn number_format_to_excel(number_format: &NumberFormatPayload) -> String {
+    let fractional = if number_format.decimals == 0 {
+        String::new()
+    } else {
+        format!(".{}", "0".repeat(number_format.decimals as usize))
+    };
+    let grouped = if number_format.use_grouping {
+        "#,##0"
+    } else {
+        "0"
+    };
+    match number_format.kind.as_str() {
+        "fixed" => format!("{grouped}{fractional}"),
+        "percent" => format!("{grouped}{fractional}%"),
+        "currency" => format!("\"{}\"{grouped}{fractional}", number_format.currency_symbol),
+        _ => NumberingFormat::FORMAT_GENERAL.to_string(),
+    }
+}
+
+fn normalize_excel_color(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let normalized = value.trim_start_matches('#');
+    match normalized.len() {
+        6 => Some(format!("FF{}", normalized.to_uppercase())),
+        8 => Some(normalized.to_uppercase()),
+        _ => None,
+    }
+}
+
+fn column_index_to_letters(index: u32) -> String {
+    let mut current = index + 1;
+    let mut result = String::new();
+    while current > 0 {
+        let remainder = (current - 1) % 26;
+        result.insert(0, char::from_u32(65 + remainder).unwrap());
+        current = (current - 1) / 26;
+    }
+    result
+}
+
+fn parse_merged_range(input: &str) -> Option<ExportMergedRange> {
+    let (raw_start, raw_end) = input.split_once(':')?;
+    let start = CellAddress::parse(raw_start)?;
+    let end = CellAddress::parse(raw_end)?;
+    let top = start.row.min(end.row);
+    let bottom = start.row.max(end.row);
+    let left = start.col.min(end.col);
+    let right = start.col.max(end.col);
+    if top == bottom && left == right {
+        return None;
+    }
+    let start = CellAddress::new(top, left);
+    let end = CellAddress::new(bottom, right);
+    Some(ExportMergedRange {
+        range: format!("{}:{}", start.to_string_repr(), end.to_string_repr()),
+        start,
+        end,
+    })
+}
+
+fn collect_merged_ranges(sheet: &SheetSnapshotPayload) -> (Vec<ExportMergedRange>, HashSet<CellAddress>) {
+    let mut merged_ranges = Vec::new();
+    let mut occupied = HashSet::new();
+    let mut covered_non_masters = HashSet::new();
+
+    for raw_range in &sheet.merged_ranges {
+        let Some(parsed) = parse_merged_range(raw_range) else {
+            continue;
+        };
+
+        let mut overlaps = false;
+        for row in parsed.start.row..=parsed.end.row {
+            for col in parsed.start.col..=parsed.end.col {
+                if occupied.contains(&CellAddress::new(row, col)) {
+                    overlaps = true;
+                    break;
+                }
+            }
+            if overlaps {
+                break;
+            }
+        }
+        if overlaps {
+            continue;
+        }
+
+        for row in parsed.start.row..=parsed.end.row {
+            for col in parsed.start.col..=parsed.end.col {
+                let addr = CellAddress::new(row, col);
+                occupied.insert(addr);
+                if addr != parsed.start {
+                    covered_non_masters.insert(addr);
+                }
+            }
+        }
+        merged_ranges.push(parsed);
+    }
+
+    (merged_ranges, covered_non_masters)
+}
+
+fn is_covered_non_master(addr: &str, covered_non_masters: &HashSet<CellAddress>) -> bool {
+    CellAddress::parse(addr)
+        .map(|parsed| covered_non_masters.contains(&parsed))
+        .unwrap_or(false)
 }
 
 fn shift_sized_map(
@@ -841,6 +1228,8 @@ fn rewrite_expr_for_sheet_delete(expr: &Expr, deleted_name: &str) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use umya_spreadsheet::EnumTrait;
 
     #[test]
     fn workbook_supports_cross_sheet_formula_and_sheet_management() {
@@ -902,5 +1291,127 @@ mod tests {
         workbook.delete_col(2, 1);
         workbook.set_active_sheet(0);
         assert_eq!(workbook.get_input("A1"), "=#REF!");
+    }
+
+    #[test]
+    fn workbook_snapshot_export_writes_xlsx_bytes_with_formula_metadata_and_styles() {
+        let payload = serde_json::json!({
+            "activeSheetIndex": 1,
+            "sheets": [
+                {
+                    "name": "Sheet1",
+                    "metadata": {
+                        "rowCount": 20,
+                        "colCount": 10,
+                        "freezeTopRow": true,
+                        "freezeFirstColumn": true
+                    },
+                    "rowHeights": [[0, 36]],
+                    "colWidths": [[0, 180]],
+                    "cells": [["A1", { "type": "text", "value": "标题" }], ["A2", { "type": "number", "value": 1234.5 }]],
+                    "formulas": [["B2", "=A2*2"]],
+                    "formats": [["A2", {
+                        "bold": true,
+                        "italic": false,
+                        "fontSize": 16,
+                        "textColor": "#ff0000",
+                        "backgroundColor": "#00ff00",
+                        "horizontalAlign": "right",
+                        "verticalAlign": "middle",
+                        "borderStyle": "solid",
+                        "borderColor": "#112233",
+                        "numberFormat": {
+                            "kind": "currency",
+                            "decimals": 1,
+                            "useGrouping": true,
+                            "currencySymbol": "¥"
+                        }
+                    }]],
+                    "mergedRanges": ["A1:C1", "A1:A1", "B1:D2"]
+                },
+                {
+                    "name": "Sheet2",
+                    "metadata": {
+                        "rowCount": 20,
+                        "colCount": 10,
+                        "freezeTopRow": false,
+                        "freezeFirstColumn": false
+                    },
+                    "rowHeights": [],
+                    "colWidths": [],
+                    "cells": [["A1", { "type": "text", "value": "inputs" }]],
+                    "formulas": [],
+                    "formats": [],
+                    "mergedRanges": []
+                }
+            ]
+        })
+        .to_string();
+
+        let bytes = export_snapshot_json_to_xlsx_bytes(&payload).expect("xlsx export should succeed");
+        let book = umya_spreadsheet::reader::xlsx::read_reader(Cursor::new(bytes), true)
+            .expect("xlsx bytes should be readable");
+
+        let sheet1 = book.get_sheet(&0).expect("sheet1 should exist");
+        assert_eq!(sheet1.get_value("A1"), "标题");
+        assert_eq!(sheet1.get_value("B1"), "");
+        assert_eq!(sheet1.get_value("A2"), "1234.5");
+        assert_eq!(
+            sheet1.get_cell("B2").expect("formula cell should exist").get_formula(),
+            "A2*2"
+        );
+        assert_eq!(
+            sheet1
+                .get_merge_cells()
+                .iter()
+                .map(|range| range.get_range())
+                .collect::<Vec<_>>(),
+            vec!["A1:C1".to_string()]
+        );
+        assert_eq!(
+            sheet1
+                .get_row_dimension(&1)
+                .expect("row dimension should exist")
+                .get_height(),
+            &36.0
+        );
+        assert_eq!(
+            sheet1
+                .get_column_dimension_by_number(&1)
+                .expect("column dimension should exist")
+                .get_width(),
+            &180.0
+        );
+        assert_eq!(
+            sheet1
+                .get_style("A2")
+                .get_numbering_format()
+                .expect("number format should exist")
+                .get_format_code(),
+            "\"¥\"#,##0.0"
+        );
+        assert_eq!(
+            sheet1
+                .get_style("A2")
+                .get_background_color()
+                .expect("background color should exist")
+                .get_argb(),
+            "FF00FF00"
+        );
+        assert!(sheet1
+            .get_style("A2")
+            .get_font()
+            .expect("font should exist")
+            .get_bold());
+        assert_eq!(
+            sheet1
+                .get_sheets_views()
+                .get_sheet_view_list()
+                .first()
+                .and_then(|view| view.get_pane())
+                .map(|pane| pane.get_state().get_value_string()),
+            Some("frozen")
+        );
+        assert_eq!(book.get_active_sheet().get_name(), "Sheet2");
     }
 }
