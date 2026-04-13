@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { describe, it, expect, afterEach } from '@jest/globals'
+import { describe, it, expect, afterEach, jest } from '@jest/globals'
 import { render, cleanup, fireEvent } from '@solidjs/testing-library'
 import { Cell } from '../src/Cell'
 import { createSheetStore } from '../src/sheet-store'
@@ -150,6 +150,35 @@ describe('Cell', () => {
     expect(container.querySelector('.cell-display')!.textContent).toBe('30')
   })
 
+  it('reopens formula cells with the original formula input', () => {
+    const store = createTestStore()
+    store.setNumber('A1', 10)
+    store.setFormula('B1', '=A1*3')
+    const { container } = render(() => <Cell addr="B1" store={store} />)
+    const td = container.querySelector('td.cell')!
+
+    expect(container.querySelector('.cell-display')!.textContent).toBe('30')
+
+    fireEvent.dblClick(td)
+
+    const input = container.querySelector('.cell-input') as HTMLInputElement
+    expect(input.value).toBe('=A1*3')
+  })
+
+  it('shows a controlled error for invalid formulas', () => {
+    const store = createTestStore()
+    const { container } = render(() => <Cell addr="A1" store={store} />)
+    const td = container.querySelector('td.cell')!
+
+    fireEvent.dblClick(td)
+    const input = container.querySelector('.cell-input') as HTMLInputElement
+    fireEvent.input(input, { target: { value: '=SUM(' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(container.querySelector('.cell-display')!.textContent).toBe('#VALUE!')
+    expect(td.classList.contains('cell-error')).toBe(true)
+  })
+
   it('can input text', () => {
     const store = createTestStore()
     const { container } = render(() => <Cell addr="A1" store={store} />)
@@ -162,5 +191,83 @@ describe('Cell', () => {
     fireEvent.keyDown(input, { key: 'Enter' })
 
     expect(container.querySelector('.cell-display')!.textContent).toBe('hello world')
+  })
+
+  it('calls onSelect with shift state in controlled mode', () => {
+    const store = createTestStore()
+    const onSelect = jest.fn()
+    const { container } = render(() => <Cell addr="A1" onSelect={onSelect} store={store} />)
+    const td = container.querySelector('td.cell')!
+
+    fireEvent.click(td)
+    fireEvent.click(td, { shiftKey: true })
+
+    expect(onSelect).toHaveBeenNthCalledWith(1, false)
+    expect(onSelect).toHaveBeenNthCalledWith(2, true)
+  })
+
+  it('double-click enters controlled editing and announces selection first', () => {
+    const store = createTestStore()
+    store.setFormula('A1', '=1+1')
+    const onSelect = jest.fn()
+    const onEditingChange = jest.fn()
+    const { container } = render(() => (
+      <Cell
+        activeEditing={false}
+        addr="A1"
+        onEditingChange={onEditingChange}
+        onSelect={onSelect}
+        store={store}
+      />
+    ))
+    const td = container.querySelector('td.cell')!
+
+    fireEvent.dblClick(td)
+
+    expect(onSelect).toHaveBeenCalledWith(false)
+    expect(onEditingChange).toHaveBeenCalledWith(true)
+  })
+
+  it('commits edits through controlled callbacks', () => {
+    const store = createTestStore()
+    const onCommitEdit = jest.fn()
+    const onEditingChange = jest.fn()
+    const { container } = render(() => (
+      <Cell
+        activeEditing
+        addr="A1"
+        onCommitEdit={onCommitEdit}
+        onEditingChange={onEditingChange}
+        store={store}
+      />
+    ))
+    const input = container.querySelector('.cell-input') as HTMLInputElement
+
+    fireEvent.input(input, { target: { value: '99' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    expect(onCommitEdit).toHaveBeenCalledWith('99')
+    expect(onEditingChange).toHaveBeenCalledWith(false)
+  })
+
+  it('cancels edits through controlled callbacks', () => {
+    const store = createTestStore()
+    const onCancelEdit = jest.fn()
+    const onEditingChange = jest.fn()
+    const { container } = render(() => (
+      <Cell
+        activeEditing
+        addr="A1"
+        onCancelEdit={onCancelEdit}
+        onEditingChange={onEditingChange}
+        store={store}
+      />
+    ))
+    const input = container.querySelector('.cell-input') as HTMLInputElement
+
+    fireEvent.keyDown(input, { key: 'Escape' })
+
+    expect(onCancelEdit).toHaveBeenCalled()
+    expect(onEditingChange).toHaveBeenCalledWith(false)
   })
 })

@@ -39,6 +39,7 @@ const config = defineConfig({
     '@swc/core',
     '@einfach/core',
     '@einfach/react',
+    '@einfach/react-utils',
     '@einfach/utils',
     '@einfach/solid',
     'react',
@@ -120,7 +121,7 @@ export default products.map((dir) => {
 
   return {
     ...config,
-    input: `${dir}/src/index.ts`,
+    input: path.resolve(dirName, dir, 'src/index.ts'),
     // treeshake: false,
     plugins: pluginsConfig,
     output: [

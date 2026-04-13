@@ -45,6 +45,11 @@ export function createSheetStore(sheet: ISheet) {
       return value()
     },
 
+    /** Get the raw input for a cell, preserving formulas for editing. */
+    getInput(addr: string): string {
+      return sheet.get_input(addr)
+    },
+
     /** Set a cell to a number and refresh reactive state. */
     setNumber(addr: string, value: number) {
       sheet.set_number(addr, value)
@@ -63,14 +68,39 @@ export function createSheetStore(sheet: ISheet) {
       refresh()
     },
 
+    clearCell(addr: string) {
+      sheet.clear_cell(addr)
+      refresh()
+    },
+
+    batchSetInputs(updates: { addr: string; input: string }[]) {
+      const success = sheet.batch_set_inputs(
+        updates.map((update) => update.addr),
+        updates.map((update) => update.input),
+      )
+      if (success) {
+        refresh()
+      }
+      return success
+    },
+
+    getInputSnapshot(addrs: string[]) {
+      return addrs.map((addr) => ({
+        addr,
+        input: sheet.get_input(addr),
+      }))
+    },
+
     /** Set a cell from raw input. Detects formulas (=...), numbers, and text. */
     setCellInput(addr: string, input: string) {
       const trimmed = input.trim()
-      if (trimmed.startsWith('=')) {
+      if (trimmed === '') {
+        sheet.clear_cell(addr)
+      } else if (trimmed.startsWith('=')) {
         sheet.set_formula(addr, trimmed)
       } else {
         const num = Number(trimmed)
-        if (trimmed !== '' && !isNaN(num)) {
+        if (!isNaN(num)) {
           sheet.set_number(addr, num)
         } else {
           sheet.set_text(addr, trimmed)

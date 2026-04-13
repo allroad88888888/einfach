@@ -55,7 +55,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
     [propOnValueChange],
   )
   const getFieldValue = useCallback(
-    <T>(name: NamePath) => {
+    <T,>(name: NamePath) => {
       const values = getter(_valuesAtom)
       return easyGet(values, name) as T
     },
@@ -121,7 +121,7 @@ export function useForm<Values extends Obj>(props: FormProps<Values>): FormInsta
   )
 
   const setFieldValue = useCallback(
-    <T>(name: NamePath, value: T) => {
+    <T,>(name: NamePath, value: T) => {
       const values = getter(_valuesAtom) as Values
       const res = easySetIn(values, name, value)
       setter(_valuesAtom, res)

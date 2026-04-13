@@ -1,9 +1,9 @@
 
-import React from 'react'
+import type { FC, ReactNode } from 'react'
 import { ProviderCacheContext, useCreateCache } from './ProviderCache'
 
-export const CacheProvider: React.FC<{
-    children: React.ReactNode
+export const CacheProvider: FC<{
+    children: ReactNode
 }> = ({ children }) => {
     const cache = useCreateCache()
     return (
@@ -12,5 +12,4 @@ export const CacheProvider: React.FC<{
         </ProviderCacheContext.Provider>
     )
 }
-
 

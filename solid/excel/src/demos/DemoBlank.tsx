@@ -1,13 +1,10 @@
+/** @jsxImportSource solid-js */
+import { WorkbookView } from '../WorkbookView'
+import { createJSWorkbook } from '../js-workbook'
+import { createWorkbookStore } from '../workbook-store'
 
-import { Table } from '../Table'
-import { createSheetStore } from '../sheet-store'
-import { createJSSheet } from '../js-sheet'
-
-/**
- * Demo 1: 空白表格
- */
 export function DemoBlank() {
-  const store = createSheetStore(createJSSheet())
+  const store = createWorkbookStore(createJSWorkbook({ sheets: [{ name: 'Sheet1', rows: 20, cols: 10 }] }))
 
   return (
     <div class="demo-page">
@@ -15,10 +12,10 @@ export function DemoBlank() {
         <h3>Blank Spreadsheet</h3>
         <p class="demo-desc">
           Double-click any cell to edit. Type a number, text, or formula (start with <code>=</code>).
-          Press <kbd>Enter</kbd> to confirm, <kbd>Esc</kbd> to cancel.
+          Use the bottom sheet tabs, right-click headers for structure edits, and drag header edges to resize.
         </p>
       </div>
-      <Table store={store} rows={20} cols={10} />
+      <WorkbookView store={store} />
     </div>
   )
 }
