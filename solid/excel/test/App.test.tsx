@@ -4,7 +4,10 @@ import { describe, it, expect, afterEach } from '@jest/globals'
 import { cleanup, fireEvent, render, screen } from '@solidjs/testing-library'
 import { App } from '../src/App'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  window.localStorage.clear()
+})
 
 describe('App demos', () => {
   it('renders the formulas demo by default', () => {

@@ -59,7 +59,7 @@ export function DemoSales() {
           Quarterly totals, KPI cells, and growth formulas stay live while you resize columns or reshape the report from the headers.
         </p>
       </div>
-      <WorkbookView store={store} />
+      <WorkbookView persistenceKey="einfach-excel-demo-sales" store={store} />
     </div>
   )
 }

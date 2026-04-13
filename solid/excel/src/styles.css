@@ -315,6 +315,114 @@ body {
   gap: 12px;
 }
 
+.workbook-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(62, 80, 106, 0.12);
+  border-radius: 18px;
+  background: rgba(250, 252, 255, 0.92);
+}
+
+.toolbar-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 14px;
+  background: rgba(232, 238, 247, 0.72);
+}
+
+.toolbar-selection {
+  background: rgba(188, 122, 40, 0.12);
+}
+
+.toolbar-label,
+.toolbar-field span,
+.toolbar-color span {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.toolbar-pill {
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(18, 32, 51, 0.08);
+  color: var(--headline);
+  font-family: 'SF Mono', Menlo, Monaco, monospace;
+  font-size: 12px;
+}
+
+.toolbar-meta {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.toolbar-toggle,
+.toolbar-export button {
+  border: 1px solid rgba(62, 80, 106, 0.12);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--headline);
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toolbar-toggle-active {
+  background: rgba(26, 115, 232, 0.14);
+  border-color: rgba(26, 115, 232, 0.24);
+  color: #1558b0;
+}
+
+.toolbar-field,
+.toolbar-color,
+.toolbar-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbar-field select,
+.toolbar-field input,
+.toolbar-color input {
+  border: 1px solid rgba(62, 80, 106, 0.16);
+  border-radius: 10px;
+  background: white;
+  color: var(--headline);
+  padding: 7px 10px;
+  font-size: 13px;
+}
+
+.toolbar-field input[type='number'] {
+  width: 64px;
+}
+
+.toolbar-field input[type='text'] {
+  width: 58px;
+}
+
+.toolbar-color input {
+  width: 38px;
+  height: 34px;
+  padding: 4px;
+}
+
+.toolbar-check {
+  padding: 0 4px;
+  color: var(--headline);
+  font-size: 13px;
+}
+
+.toolbar-file-input {
+  display: none;
+}
+
 /* === Excel Table === */
 
 .excel-table-wrapper {

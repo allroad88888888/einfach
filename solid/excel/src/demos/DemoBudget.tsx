@@ -75,7 +75,7 @@ export function DemoBudget() {
           Totals and summary cells should keep tracking the resized layout.
         </p>
       </div>
-      <WorkbookView store={store} />
+      <WorkbookView persistenceKey="einfach-excel-demo-budget" store={store} />
     </div>
   )
 }

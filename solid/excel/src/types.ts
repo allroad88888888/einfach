@@ -12,6 +12,31 @@ export interface ISheet {
   is_error(addr: string): boolean
 }
 
+export type NumberFormatKind = 'general' | 'fixed' | 'percent' | 'currency'
+
+export type NumberFormat = {
+  kind: NumberFormatKind
+  decimals: number
+  useGrouping: boolean
+  currencySymbol: string
+}
+
+export type HorizontalAlign = 'left' | 'center' | 'right'
+export type VerticalAlign = 'top' | 'middle' | 'bottom'
+
+export type CellFormat = {
+  bold: boolean
+  italic: boolean
+  fontSize: number | null
+  textColor: string | null
+  backgroundColor: string | null
+  horizontalAlign: HorizontalAlign | null
+  verticalAlign: VerticalAlign | null
+  borderStyle: 'none' | 'solid'
+  borderColor: string | null
+  numberFormat: NumberFormat
+}
+
 export type SheetMetadata = {
   rowCount: number
   colCount: number
@@ -26,6 +51,7 @@ export type SheetStateSnapshot = {
   colWidths: Array<[number, number]>
   cells: Array<[string, { type: string; value: number | string | boolean | null }]>
   formulas: Array<[string, string]>
+  formats: Array<[string, CellFormat]>
 }
 
 export type WorkbookSnapshot = {
@@ -55,6 +81,13 @@ export interface IWorkbook extends ISheet {
   delete_row(index: number, count?: number): void
   insert_col(index: number, count?: number): void
   delete_col(index: number, count?: number): void
+  get_format(addr: string): CellFormat
+  set_format(addrs: string[], format: Partial<CellFormat>): void
+  clear_format(addrs: string[]): void
+  export_json(): string
+  import_json(payload: string): boolean
+  export_csv(sheetIndex?: number): string
+  import_csv(payload: string): boolean
   snapshot(): WorkbookSnapshot
   restore(snapshot: WorkbookSnapshot): void
 }

@@ -1,10 +1,12 @@
 import { batch, createSignal } from 'solid-js'
-import type { CellValue, IWorkbook, WorkbookSnapshot } from './types'
+import type { CellFormat, CellValue, IWorkbook, WorkbookSnapshot } from './types'
 
 export function createWorkbookStore(workbook: IWorkbook) {
   const cellSignals = new Map<string, ReturnType<typeof createSignal<CellValue>>>()
+  const formatSignals = new Map<string, ReturnType<typeof createSignal<CellFormat>>>()
   const [metaVersion, setMetaVersion] = createSignal(0)
   const [sheetVersion, setSheetVersion] = createSignal(0)
+  const [revision, setRevision] = createSignal(0)
 
   function readCell(addr: string): CellValue {
     return {
@@ -21,10 +23,29 @@ export function createWorkbookStore(workbook: IWorkbook) {
     return cellSignals.get(addr)!
   }
 
+  function readFormat(addr: string): CellFormat {
+    return workbook.get_format(addr)
+  }
+
+  function getFormatSignal(addr: string) {
+    if (!formatSignals.has(addr)) {
+      formatSignals.set(addr, createSignal(readFormat(addr)))
+    }
+    return formatSignals.get(addr)!
+  }
+
   function refreshCells() {
     batch(() => {
       for (const [addr, [, set]] of cellSignals) {
         set(readCell(addr))
+      }
+    })
+  }
+
+  function refreshFormats() {
+    batch(() => {
+      for (const [addr, [, set]] of formatSignals) {
+        set(readFormat(addr))
       }
     })
   }
@@ -36,11 +57,14 @@ export function createWorkbookStore(workbook: IWorkbook) {
   function refreshSheets() {
     setSheetVersion((value) => value + 1)
     refreshMeta()
+    setRevision((value) => value + 1)
   }
 
   function refreshAll() {
     refreshCells()
+    refreshFormats()
     refreshMeta()
+    setRevision((value) => value + 1)
   }
 
   function applyMutation(handler: () => void) {
@@ -55,6 +79,10 @@ export function createWorkbookStore(workbook: IWorkbook) {
     },
     getInput(addr: string) {
       return workbook.get_input(addr)
+    },
+    getCellFormat(addr: string) {
+      const [value] = getFormatSignal(addr)
+      return value()
     },
     setNumber(addr: string, value: number) {
       applyMutation(() => workbook.set_number(addr, value))
@@ -145,6 +173,33 @@ export function createWorkbookStore(workbook: IWorkbook) {
     deleteCol(index: number, count = 1) {
       applyMutation(() => workbook.delete_col(index, count))
     },
+    applyCellFormat(addrs: string[], format: Partial<CellFormat>) {
+      if (addrs.length === 0) return
+      applyMutation(() => workbook.set_format(addrs, format))
+    },
+    clearCellFormat(addrs: string[]) {
+      if (addrs.length === 0) return
+      applyMutation(() => workbook.clear_format(addrs))
+    },
+    exportJSON() {
+      return workbook.export_json()
+    },
+    importJSON(payload: string) {
+      const success = workbook.import_json(payload)
+      if (success) refreshAll()
+      return success
+    },
+    exportCSV(sheetIndex?: number) {
+      return workbook.export_csv(sheetIndex)
+    },
+    importCSV(payload: string) {
+      const success = workbook.import_csv(payload)
+      if (success) refreshAll()
+      return success
+    },
+    version() {
+      return revision()
+    },
     sheetNames() {
       sheetVersion()
       return Array.from({ length: workbook.sheet_count() }, (_, index) => workbook.sheet_name(index))
@@ -157,6 +212,7 @@ export function createWorkbookStore(workbook: IWorkbook) {
       const success = workbook.set_active_sheet(index)
       if (success) {
         refreshCells()
+        refreshFormats()
         refreshSheets()
       }
       return success
@@ -164,6 +220,7 @@ export function createWorkbookStore(workbook: IWorkbook) {
     addSheet(name?: string) {
       const created = workbook.add_sheet(name)
       refreshCells()
+      refreshFormats()
       refreshSheets()
       return created
     },
@@ -171,6 +228,7 @@ export function createWorkbookStore(workbook: IWorkbook) {
       const success = workbook.remove_sheet(index)
       if (success) {
         refreshCells()
+        refreshFormats()
         refreshSheets()
       }
       return success
@@ -179,6 +237,7 @@ export function createWorkbookStore(workbook: IWorkbook) {
       const success = workbook.rename_sheet(index, nextName)
       if (success) {
         refreshCells()
+        refreshFormats()
         refreshSheets()
       }
       return success
@@ -189,7 +248,9 @@ export function createWorkbookStore(workbook: IWorkbook) {
     restoreSnapshot(snapshot: WorkbookSnapshot) {
       workbook.restore(snapshot)
       refreshCells()
+      refreshFormats()
       refreshSheets()
+      setRevision((value) => value + 1)
     },
     raw: workbook,
   }

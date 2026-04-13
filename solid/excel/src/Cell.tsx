@@ -1,10 +1,12 @@
 /** @jsxImportSource solid-js */
 import { createSignal, Show } from 'solid-js'
 import type { SheetStore } from './sheet-store'
+import type { CellFormat } from './types'
+import type { WorkbookStore } from './workbook-store'
 
 export interface CellProps {
   addr: string
-  store: SheetStore
+  store: SheetStore | WorkbookStore
   selected?: boolean
   inSelection?: boolean
   selectionEdges?: {
@@ -26,7 +28,38 @@ export function Cell(props: CellProps) {
   const [editValue, setEditValue] = createSignal('')
 
   const cellValue = () => props.store.getCell(props.addr)
+  const cellFormat = (): CellFormat => 'getCellFormat' in props.store
+    ? props.store.getCellFormat(props.addr)
+    : {
+        bold: false,
+        italic: false,
+        fontSize: null,
+        textColor: null,
+        backgroundColor: null,
+        horizontalAlign: null,
+        verticalAlign: null,
+        borderStyle: 'none',
+        borderColor: null,
+        numberFormat: {
+          kind: 'general',
+          decimals: 2,
+          useGrouping: false,
+          currencySymbol: '$',
+        },
+      }
   const editing = () => props.activeEditing ?? localEditing()
+  const style = () => ({
+    'font-weight': cellFormat().bold ? '700' : undefined,
+    'font-style': cellFormat().italic ? 'italic' : undefined,
+    'font-size': cellFormat().fontSize ? `${cellFormat().fontSize}px` : undefined,
+    color: cellFormat().textColor ?? undefined,
+    'background-color': props.inSelection ? undefined : cellFormat().backgroundColor ?? undefined,
+    'text-align': cellFormat().horizontalAlign ?? undefined,
+    'vertical-align': cellFormat().verticalAlign === 'middle' ? 'middle' : cellFormat().verticalAlign ?? undefined,
+    border: cellFormat().borderStyle === 'solid'
+      ? `1px solid ${cellFormat().borderColor ?? '#b8c4d6'}`
+      : undefined,
+  })
 
   function setEditing(next: boolean) {
     if (props.onEditingChange) {
@@ -70,6 +103,7 @@ export function Cell(props: CellProps) {
       onClick={(e) => props.onSelect?.(e.shiftKey)}
       onContextMenu={(event) => props.onContextMenu?.(event)}
       onDblClick={startEditing}
+      style={style()}
     >
       <Show
         when={editing()}

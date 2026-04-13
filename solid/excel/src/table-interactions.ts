@@ -367,6 +367,7 @@ export function createTableInteractions(store: TableStore, rows: SizeGetter, col
     selectedCell,
     selectionRange,
     editingCell,
+    selectedAddresses: currentAddresses,
     select,
     moveSelection,
     isSelected,

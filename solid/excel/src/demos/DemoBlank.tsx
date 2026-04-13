@@ -15,7 +15,7 @@ export function DemoBlank() {
           Use the bottom sheet tabs, right-click headers for structure edits, and drag header edges to resize.
         </p>
       </div>
-      <WorkbookView store={store} />
+      <WorkbookView persistenceKey="einfach-excel-demo-blank" store={store} />
     </div>
   )
 }

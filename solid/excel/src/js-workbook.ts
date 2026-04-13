@@ -1,4 +1,4 @@
-import type { IWorkbook, SheetMetadata, WorkbookSnapshot } from './types'
+import type { CellFormat, IWorkbook, SheetMetadata, WorkbookSnapshot } from './types'
 import {
   cellToDisplay,
   coerceToNumber,
@@ -23,6 +23,24 @@ const DEFAULT_COL_WIDTH = 120
 const MIN_ROW_HEIGHT = 24
 const MIN_COL_WIDTH = 56
 const SHEET_NAME_PATTERN = /^[A-Za-z0-9_]+$/
+const DEFAULT_NUMBER_FORMAT: CellFormat['numberFormat'] = {
+  kind: 'general',
+  decimals: 2,
+  useGrouping: false,
+  currencySymbol: '$',
+}
+const DEFAULT_CELL_FORMAT: CellFormat = {
+  bold: false,
+  italic: false,
+  fontSize: null,
+  textColor: null,
+  backgroundColor: null,
+  horizontalAlign: null,
+  verticalAlign: null,
+  borderStyle: 'none',
+  borderColor: null,
+  numberFormat: { ...DEFAULT_NUMBER_FORMAT },
+}
 
 type SheetState = {
   name: string
@@ -31,6 +49,7 @@ type SheetState = {
   colWidths: Map<number, number>
   cells: Map<string, CellRecord>
   formulas: Map<string, string>
+  formats: Map<string, CellFormat>
 }
 
 type ComparisonOperator = '=' | '<>' | '<' | '<=' | '>' | '>='
@@ -53,6 +72,7 @@ function createSheetState(name: string, rows = DEFAULT_ROW_COUNT, cols = DEFAULT
     colWidths: new Map(),
     cells: new Map(),
     formulas: new Map(),
+    formats: new Map(),
   }
 }
 
@@ -61,6 +81,103 @@ function cloneCellRecord(record: CellRecord): CellRecord {
     type: record.type,
     value: record.value,
   }
+}
+
+function cloneCellFormat(format: CellFormat): CellFormat {
+  return {
+    ...format,
+    numberFormat: { ...format.numberFormat },
+  }
+}
+
+function defaultCellFormat(): CellFormat {
+  return cloneCellFormat(DEFAULT_CELL_FORMAT)
+}
+
+function normalizeCellFormat(partial?: Partial<CellFormat> | null, base?: CellFormat): CellFormat {
+  const seed = base ? cloneCellFormat(base) : defaultCellFormat()
+  if (!partial) return seed
+  return {
+    ...seed,
+    ...partial,
+    numberFormat: {
+      ...seed.numberFormat,
+      ...(partial.numberFormat ?? {}),
+    },
+  }
+}
+
+function isDefaultCellFormat(format: CellFormat) {
+  return JSON.stringify(format) === JSON.stringify(DEFAULT_CELL_FORMAT)
+}
+
+function formatCellDisplay(value: CellRecord, format: CellFormat): string {
+  if (value.type !== 'number') return cellToDisplay(value)
+  const options = format.numberFormat
+  if (options.kind === 'general') return cellToDisplay(value)
+
+  const scaled = options.kind === 'percent' ? (value.value as number) * 100 : (value.value as number)
+  const rounded = roundWithDigits(scaled, options.decimals)
+  const sign = rounded < 0 ? '-' : ''
+  const absolute = Math.abs(rounded)
+  const body = options.useGrouping
+    ? formatGrouped(absolute, options.decimals)
+    : absolute.toFixed(options.decimals)
+
+  if (options.kind === 'currency') return `${sign}${options.currencySymbol}${body}`
+  if (options.kind === 'percent') return `${sign}${body}%`
+  return `${sign}${body}`
+}
+
+function serializeCSVValue(value: string): string {
+  if (!/[",\n]/.test(value)) return value
+  return `"${value.replace(/"/g, '""')}"`
+}
+
+function parseCSV(payload: string): string[][] {
+  const rows: string[][] = []
+  let row: string[] = []
+  let current = ''
+  let inQuotes = false
+
+  for (let index = 0; index < payload.length; index += 1) {
+    const char = payload[index]
+    const next = payload[index + 1]
+
+    if (char === '"') {
+      if (inQuotes && next === '"') {
+        current += '"'
+        index += 1
+      } else {
+        inQuotes = !inQuotes
+      }
+      continue
+    }
+
+    if (!inQuotes && char === ',') {
+      row.push(current)
+      current = ''
+      continue
+    }
+
+    if (!inQuotes && char === '\n') {
+      row.push(current)
+      rows.push(row)
+      row = []
+      current = ''
+      continue
+    }
+
+    if (!inQuotes && char === '\r') continue
+    current += char
+  }
+
+  row.push(current)
+  rows.push(row)
+  while (rows.length > 1 && rows[rows.length - 1].every((cell) => cell === '')) {
+    rows.pop()
+  }
+  return rows
 }
 
 function defaultSheetName(existing: string[]) {
@@ -119,6 +236,7 @@ function moveAddr(addr: string, axis: 'row' | 'col', index: number, count: numbe
 function shiftGrid(sheet: SheetState, axis: 'row' | 'col', index: number, count: number, mode: 'insert' | 'delete') {
   const nextCells = new Map<string, CellRecord>()
   const nextFormulas = new Map<string, string>()
+  const nextFormats = new Map<string, CellFormat>()
 
   for (const [addr, value] of sheet.cells) {
     const moved = moveAddr(addr, axis, index, count, mode)
@@ -128,9 +246,14 @@ function shiftGrid(sheet: SheetState, axis: 'row' | 'col', index: number, count:
     const moved = moveAddr(addr, axis, index, count, mode)
     if (moved) nextFormulas.set(moved, value)
   }
+  for (const [addr, value] of sheet.formats) {
+    const moved = moveAddr(addr, axis, index, count, mode)
+    if (moved) nextFormats.set(moved, cloneCellFormat(value))
+  }
 
   sheet.cells = nextCells
   sheet.formulas = nextFormulas
+  sheet.formats = nextFormats
   if (axis === 'row') {
     sheet.metadata.rowCount = Math.max(1, sheet.metadata.rowCount + (mode === 'insert' ? count : -count))
     sheet.rowHeights = moveSizedEntries(sheet.rowHeights, index, count, mode)
@@ -784,6 +907,10 @@ export function createJSWorkbook(options?: {
     return sheet.cells.get(normalized) ?? nullCell()
   }
 
+  function getCellFormat(addr: string) {
+    return cloneCellFormat(currentSheet().formats.get(normalizeAddr(addr)) ?? defaultCellFormat())
+  }
+
   function getInput(addr: string) {
     const sheet = currentSheet()
     const normalized = normalizeAddr(addr)
@@ -803,6 +930,7 @@ export function createJSWorkbook(options?: {
         colWidths: Array.from(sheet.colWidths.entries()),
         cells: Array.from(sheet.cells.entries()).map(([addr, value]) => [addr, cloneCellRecord(value)]),
         formulas: Array.from(sheet.formulas.entries()),
+        formats: Array.from(sheet.formats.entries()).map(([addr, format]) => [addr, cloneCellFormat(format)]),
       })),
     }
   }
@@ -816,6 +944,7 @@ export function createJSWorkbook(options?: {
       colWidths: new Map(sheet.colWidths),
       cells: new Map(sheet.cells.map(([addr, value]) => [addr, cloneCellRecord(value as CellRecord)])),
       formulas: new Map(sheet.formulas),
+      formats: new Map((sheet.formats ?? []).map(([addr, format]) => [addr, cloneCellFormat(format)])),
     }))
     refreshFormulaCache()
   }
@@ -864,7 +993,7 @@ export function createJSWorkbook(options?: {
       return true
     },
     get_display(addr) {
-      return cellToDisplay(getCellRecord(addr))
+      return formatCellDisplay(getCellRecord(addr), getCellFormat(addr))
     },
     get_input(addr) {
       return getInput(addr)
@@ -972,6 +1101,84 @@ export function createJSWorkbook(options?: {
       rewriteFormulasAcrossWorkbook((formula, ownerSheet) =>
         rewriteFormulaForStructure(formula, ownerSheet, target.name, 'col', index, count, 'delete'),
       )
+    },
+    get_format(addr) {
+      return getCellFormat(addr)
+    },
+    set_format(addrs, format) {
+      const normalizedAddrs = addrs.map((addr) => normalizeAddr(addr))
+      if (normalizedAddrs.length === 0) return
+      currentSheet().formats = new Map(currentSheet().formats)
+      for (const addr of normalizedAddrs) {
+        const next = normalizeCellFormat(format, currentSheet().formats.get(addr))
+        if (isDefaultCellFormat(next)) {
+          currentSheet().formats.delete(addr)
+        } else {
+          currentSheet().formats.set(addr, next)
+        }
+      }
+    },
+    clear_format(addrs) {
+      for (const addr of addrs) {
+        currentSheet().formats.delete(normalizeAddr(addr))
+      }
+    },
+    export_json() {
+      return JSON.stringify(snapshot(), null, 2)
+    },
+    import_json(payload) {
+      try {
+        const parsed = JSON.parse(payload) as WorkbookSnapshot
+        if (!parsed || !Array.isArray(parsed.sheets)) return false
+        restore(parsed)
+        return true
+      } catch {
+        return false
+      }
+    },
+    export_csv(sheetIndex) {
+      const targetSheet = sheets[sheetIndex ?? activeSheetIndex] ?? currentSheet()
+      const usedAddrs = [
+        ...targetSheet.cells.keys(),
+        ...targetSheet.formulas.keys(),
+        ...targetSheet.formats.keys(),
+      ]
+      const usedBounds = usedAddrs.map((addr) => parseAddr(addr))
+      const rowCount = Math.max(
+        targetSheet.metadata.rowCount,
+        usedBounds.reduce((max, coords) => Math.max(max, coords.row + 1), 0),
+        1,
+      )
+      const colCount = Math.max(
+        targetSheet.metadata.colCount,
+        usedBounds.reduce((max, coords) => Math.max(max, coords.col + 1), 0),
+        1,
+      )
+      const rows = Array.from({ length: rowCount }, (_, rowIndex) =>
+        Array.from({ length: colCount }, (_, colIndex) => {
+          const addr = `${colIndexToLetters(colIndex)}${rowIndex + 1}`
+          if (targetSheet.formulas.has(addr)) return targetSheet.formulas.get(addr) ?? ''
+          return cellToDisplay(targetSheet.cells.get(addr) ?? nullCell())
+        }).map(serializeCSVValue).join(','),
+      )
+      return rows.join('\n')
+    },
+    import_csv(payload) {
+      const matrix = parseCSV(payload)
+      if (matrix.length === 0) return false
+      applyActiveMutation((sheet) => {
+        sheet.cells = new Map()
+        sheet.formulas = new Map()
+        sheet.formats = new Map()
+        sheet.metadata.rowCount = Math.max(matrix.length, 1)
+        sheet.metadata.colCount = Math.max(...matrix.map((row) => row.length), 1)
+        for (let rowIndex = 0; rowIndex < matrix.length; rowIndex += 1) {
+          for (let colIndex = 0; colIndex < matrix[rowIndex].length; colIndex += 1) {
+            applyInput(sheet, `${colIndexToLetters(colIndex)}${rowIndex + 1}`, matrix[rowIndex][colIndex])
+          }
+        }
+      })
+      return true
     },
     snapshot,
     restore,

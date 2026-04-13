@@ -90,7 +90,7 @@ export function DemoFormulas() {
           Try header right-click actions, freezing, and sheet tabs while formulas stay reactive.
         </p>
       </div>
-      <WorkbookView store={store} />
+      <WorkbookView persistenceKey="einfach-excel-demo-formulas" store={store} />
     </div>
   )
 }

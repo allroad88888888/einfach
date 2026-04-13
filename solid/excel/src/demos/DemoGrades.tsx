@@ -60,7 +60,7 @@ export function DemoGrades() {
           Student averages and class summaries now sit inside a workbook shell, so you can test row insertion and undo/redo on a denser grid.
         </p>
       </div>
-      <WorkbookView store={store} />
+      <WorkbookView persistenceKey="einfach-excel-demo-grades" store={store} />
     </div>
   )
 }
