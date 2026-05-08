@@ -6,6 +6,10 @@ import type { SheetStore } from './sheet-store'
 export interface CellProps {
   addr: string
   store: SheetStore
+  /** Reactive accessor — true when this cell is the active selection. */
+  selected?: () => boolean
+  /** Called on click to request selection of this cell. */
+  onSelect?: () => void
 }
 
 export function Cell(props: CellProps) {
@@ -13,6 +17,7 @@ export function Cell(props: CellProps) {
   const [editValue, setEditValue] = createSignal('')
 
   const cellValue = () => props.store.getCell(props.addr)
+  const isSelected = () => (props.selected ? props.selected() : false)
 
   function startEditing() {
     // For formula cells, edit the source formula (`=A1*2`) instead of the
@@ -40,9 +45,22 @@ export function Cell(props: CellProps) {
     }
   }
 
+  function classes() {
+    const v = cellValue()
+    return [
+      'cell',
+      `cell-${v.type}`,
+      v.isError ? 'cell-error' : '',
+      isSelected() ? 'cell-selected' : '',
+    ]
+      .filter(Boolean)
+      .join(' ')
+  }
+
   return (
     <td
-      class={`cell ${cellValue().isError ? 'cell-error' : ''} cell-${cellValue().type}`}
+      class={classes()}
+      onClick={() => props.onSelect?.()}
       onDblClick={startEditing}
     >
       <Show

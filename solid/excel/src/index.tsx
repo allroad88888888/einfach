@@ -2,6 +2,7 @@
 
 export { Table } from './Table'
 export { Cell } from './Cell'
+export { FormulaBar } from './FormulaBar'
 export { createSheetStore } from './sheet-store'
 export { createJSSheet } from './js-sheet'
 export { App } from './App'
@@ -14,3 +15,5 @@ export type { ISheet, CellValue } from './types'
 export type { SheetStore } from './sheet-store'
 export type { TableProps } from './Table'
 export type { CellProps } from './Cell'
+export type { FormulaBarProps } from './FormulaBar'
+export type { CellCoord } from './selection'
