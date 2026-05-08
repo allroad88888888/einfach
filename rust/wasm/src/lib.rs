@@ -1,7 +1,6 @@
+use einfach_core::{CellListener, Value};
+use einfach_excel_core::{CellSubscription, Sheet};
 use std::collections::HashMap;
-
-use einfach_core::Value;
-use einfach_excel_core::Sheet;
 use wasm_bindgen::prelude::*;
 
 /// Initialize the panic hook once per module load. Called automatically from
@@ -11,12 +10,37 @@ fn install_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
+/// Adapter listener that bridges core change events to a JS callback.
+/// This is the "main-thread adapter" half of the layered subscribe model
+/// (ROADMAP 1A D2). The future worker adapter (7C) will implement
+/// `CellListener` on top of `postMessage` instead of a direct call.
+struct JsCallbackListener {
+    callback: js_sys::Function,
+}
+
+impl CellListener for JsCallbackListener {
+    fn on_change(&self) {
+        // Best-effort fire. If JS throws inside the callback we swallow the
+        // error to keep the propagation pass moving — a single bad listener
+        // shouldn't take down every other listener for the same change.
+        // NOTE on reentrancy: this fires synchronously inside store.notify,
+        // which itself runs inside &mut self on WasmSheet. JS callbacks
+        // that re-enter WasmSheet methods will hit wasm-bindgen's borrow
+        // panic. JS-side users should wrap re-entrant work in
+        // `queueMicrotask` until a proper async fire is added.
+        let _ = self.callback.call0(&JsValue::undefined());
+    }
+}
+
 /// WASM-exposed spreadsheet. Wraps the Rust Sheet.
 #[wasm_bindgen]
 pub struct WasmSheet {
     sheet: Sheet,
-    /// JS callbacks indexed by subscription key (cell address string)
-    listeners: HashMap<String, Vec<js_sys::Function>>,
+    /// Active subscriptions, keyed by an opaque token id we hand back to JS.
+    /// Storing CellSubscription (sub_id + atom_id) lets us call
+    /// Sheet::unsubscribe_cell even after the cell's readable atom changes.
+    subscriptions: HashMap<u32, CellSubscription>,
+    next_token: u32,
 }
 
 #[wasm_bindgen]
@@ -27,29 +51,27 @@ impl WasmSheet {
         install_panic_hook();
         WasmSheet {
             sheet: Sheet::new(),
-            listeners: HashMap::new(),
+            subscriptions: HashMap::new(),
+            next_token: 0,
         }
     }
 
-    /// Set a cell to a numeric value.
+    /// Set a cell to a numeric value. Subscribers fire automatically via the
+    /// store's propagation pass — no manual fire_listeners needed (C.1+C.2).
     pub fn set_number(&mut self, addr: &str, value: f64) {
         self.sheet.set_cell(addr, Value::Number(value));
-        self.fire_listeners(addr);
     }
 
     /// Set a cell to a text value.
     pub fn set_text(&mut self, addr: &str, value: &str) {
         self.sheet.set_cell(addr, Value::Text(value.to_string()));
-        self.fire_listeners(addr);
     }
 
     /// Set a cell's formula (e.g. "=A1+B1").
     /// Returns `true` if the formula parsed successfully, `false` if it was
-    /// invalid (in which case the cell is set to `#VALUE!`).
+    /// invalid (cell becomes `#VALUE!`) or would form a cycle (cell becomes `#CYCLE!`).
     pub fn set_formula(&mut self, addr: &str, formula: &str) -> bool {
-        let ok = self.sheet.set_formula(addr, formula);
-        self.fire_listeners(addr);
-        ok
+        self.sheet.set_formula(addr, formula)
     }
 
     /// Get a cell's display value as a string.
@@ -92,18 +114,26 @@ impl WasmSheet {
         self.sheet.batch_set(&pairs);
     }
 
-    /// Subscribe to changes on a cell. The callback is called whenever the cell value changes.
-    pub fn subscribe(&mut self, addr: &str, callback: js_sys::Function) {
-        self.listeners
-            .entry(addr.to_string())
-            .or_default()
-            .push(callback);
+    /// Subscribe to changes on a cell. Returns an opaque u32 token to pass
+    /// to `unsubscribe`. The callback fires whenever the cell's value
+    /// changes — including transitively through formula dependencies (C.2).
+    pub fn subscribe(&mut self, addr: &str, callback: js_sys::Function) -> u32 {
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+        let listener = JsCallbackListener { callback };
+        let sub = self
+            .sheet
+            .subscribe_cell_boxed(addr, Box::new(listener));
+        self.subscriptions.insert(token, sub);
+        token
     }
 
-    fn fire_listeners(&self, _addr: &str) {
-        // Note: In a full implementation, we'd wire this to the atom store's
-        // subscription system. For now, listeners are fired manually after set calls.
-        // The atom store handles propagation internally.
+    /// Cancel a subscription previously returned from `subscribe`.
+    /// Idempotent: unknown tokens are ignored.
+    pub fn unsubscribe(&mut self, token: u32) {
+        if let Some(sub) = self.subscriptions.remove(&token) {
+            self.sheet.unsubscribe_cell(sub);
+        }
     }
 }
 
