@@ -35,6 +35,16 @@ pub enum BinOperator {
     Sub,
     Mul,
     Div,
+    /// Exponent (`^`).
+    Pow,
+    /// String concatenation (`&`).
+    Concat,
+    Eq,
+    NotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
 }
 
 /// Parse a formula string. Must start with '='.
@@ -95,17 +105,86 @@ impl Parser {
         }
     }
 
-    /// expr = term (('+' | '-') term)*
+    /// Top-level: comparisons (=, <>, <, <=, >, >=) — lowest precedence.
     fn parse_expr(&mut self) -> Option<Expr> {
         self.skip_whitespace();
-        let mut left = self.parse_term()?;
+        let mut left = self.parse_concat()?;
+
+        loop {
+            self.skip_whitespace();
+            let op = match (self.peek(), self.peek_at(1)) {
+                (Some('<'), Some('>')) => {
+                    self.advance();
+                    self.advance();
+                    BinOperator::NotEq
+                }
+                (Some('<'), Some('=')) => {
+                    self.advance();
+                    self.advance();
+                    BinOperator::LtEq
+                }
+                (Some('>'), Some('=')) => {
+                    self.advance();
+                    self.advance();
+                    BinOperator::GtEq
+                }
+                (Some('<'), _) => {
+                    self.advance();
+                    BinOperator::Lt
+                }
+                (Some('>'), _) => {
+                    self.advance();
+                    BinOperator::Gt
+                }
+                (Some('='), _) => {
+                    self.advance();
+                    BinOperator::Eq
+                }
+                _ => break,
+            };
+            let right = self.parse_concat()?;
+            left = Expr::BinOp {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Some(left)
+    }
+
+    /// concat = add_sub ('&' add_sub)* — left-assoc, between comparison and add/sub.
+    fn parse_concat(&mut self) -> Option<Expr> {
+        self.skip_whitespace();
+        let mut left = self.parse_add_sub()?;
+
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some('&') {
+                self.advance();
+                let right = self.parse_add_sub()?;
+                left = Expr::BinOp {
+                    op: BinOperator::Concat,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+        Some(left)
+    }
+
+    /// add_sub = mul_div (('+' | '-') mul_div)*
+    fn parse_add_sub(&mut self) -> Option<Expr> {
+        self.skip_whitespace();
+        let mut left = self.parse_mul_div()?;
 
         loop {
             self.skip_whitespace();
             match self.peek() {
                 Some('+') => {
                     self.advance();
-                    let right = self.parse_term()?;
+                    let right = self.parse_mul_div()?;
                     left = Expr::BinOp {
                         op: BinOperator::Add,
                         left: Box::new(left),
@@ -114,7 +193,7 @@ impl Parser {
                 }
                 Some('-') => {
                     self.advance();
-                    let right = self.parse_term()?;
+                    let right = self.parse_mul_div()?;
                     left = Expr::BinOp {
                         op: BinOperator::Sub,
                         left: Box::new(left),
@@ -127,17 +206,17 @@ impl Parser {
         Some(left)
     }
 
-    /// term = unary (('*' | '/') unary)*
-    fn parse_term(&mut self) -> Option<Expr> {
+    /// mul_div = pow (('*' | '/') pow)*
+    fn parse_mul_div(&mut self) -> Option<Expr> {
         self.skip_whitespace();
-        let mut left = self.parse_unary()?;
+        let mut left = self.parse_pow()?;
 
         loop {
             self.skip_whitespace();
             match self.peek() {
                 Some('*') => {
                     self.advance();
-                    let right = self.parse_unary()?;
+                    let right = self.parse_pow()?;
                     left = Expr::BinOp {
                         op: BinOperator::Mul,
                         left: Box::new(left),
@@ -146,7 +225,7 @@ impl Parser {
                 }
                 Some('/') => {
                     self.advance();
-                    let right = self.parse_unary()?;
+                    let right = self.parse_pow()?;
                     left = Expr::BinOp {
                         op: BinOperator::Div,
                         left: Box::new(left),
@@ -157,6 +236,28 @@ impl Parser {
             }
         }
         Some(left)
+    }
+
+    /// pow = unary ('^' pow)? — right-associative
+    fn parse_pow(&mut self) -> Option<Expr> {
+        self.skip_whitespace();
+        let left = self.parse_unary()?;
+        self.skip_whitespace();
+        if self.peek() == Some('^') {
+            self.advance();
+            let right = self.parse_pow()?;
+            Some(Expr::BinOp {
+                op: BinOperator::Pow,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+        } else {
+            Some(left)
+        }
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.pos + offset).copied()
     }
 
     /// unary = '-' unary | primary
