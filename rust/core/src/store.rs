@@ -374,6 +374,50 @@ impl Store {
         }
     }
 
+    /// Returns whether the atom is still alive (not destroyed).
+    pub fn has_atom(&self, id: AtomId) -> bool {
+        self.values.borrow().contains_key(&id)
+    }
+
+    /// Destroy an atom and free all references to it (A.4).
+    /// Cleans 5 tables: values, read_fns, write_fns, dependencies, back_deps,
+    /// subscriptions. Also removes the atom from any other atom's back_deps
+    /// list so it isn't reported as a downstream of someone else.
+    ///
+    /// Panics if the atom has live downstream derived atoms — callers must
+    /// destroy dependents first to avoid orphaned dangling derived.
+    pub fn destroy_atom(&mut self, id: AtomId) {
+        if !self.has_atom(id) {
+            return;
+        }
+
+        // Refuse to destroy an atom that has live downstream derived atoms.
+        if let Some(backs) = self.back_deps.get(&id) {
+            if !backs.is_empty() {
+                panic!(
+                    "cannot destroy atom {:?}: has {} live downstream derived atom(s)",
+                    id,
+                    backs.len()
+                );
+            }
+        }
+
+        // Remove this atom from upstream atoms' back_deps.
+        if let Some(upstream) = self.dependencies.remove(&id) {
+            for up_id in upstream {
+                if let Some(backs) = self.back_deps.get_mut(&up_id) {
+                    backs.remove(&id);
+                }
+            }
+        }
+
+        self.values.borrow_mut().remove(&id);
+        self.read_fns.remove(&id);
+        self.write_fns.remove(&id);
+        self.back_deps.remove(&id);
+        self.subscriptions.remove(&id);
+    }
+
     /// Notify all subscribers of the given atoms.
     fn notify(&self, changed: &[AtomId]) {
         for id in changed {
@@ -1107,6 +1151,91 @@ mod tests {
         // And the original atom is still usable.
         store.set(b, Value::Number(5.0));
         assert_eq!(store.get(c), Value::Number(10.0));
+    }
+
+    // === A.4 destroy_atom tests ===
+
+    #[test]
+    fn destroy_primitive_atom_frees_storage() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        assert!(store.has_atom(a));
+        store.destroy_atom(a);
+        assert!(!store.has_atom(a));
+    }
+
+    #[test]
+    fn destroy_idempotent() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        store.destroy_atom(a);
+        store.destroy_atom(a); // should not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "atom not found")]
+    fn get_after_destroy_panics() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        store.destroy_atom(a);
+        store.get(a);
+    }
+
+    #[test]
+    fn destroy_clears_subscriptions() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        store.sub(a, move || *cc.borrow_mut() += 1);
+        store.destroy_atom(a);
+        // Recreate an atom (likely re-uses next id, but different) — old
+        // listener's subscription must already be gone.
+        let b = store.create_atom(Value::Number(2.0));
+        store.set(b, Value::Number(3.0));
+        assert_eq!(*count.borrow(), 0);
+    }
+
+    #[test]
+    fn destroy_derived_unregisters_from_upstream() {
+        // After destroy, changing the upstream must not try to recompute the
+        // dead derived (which would panic in recompute).
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let b = store.create_derived(move |get| {
+            if let Value::Number(n) = get(a) {
+                Value::Number(n * 2.0)
+            } else {
+                panic!()
+            }
+        });
+        assert_eq!(store.get(b), Value::Number(2.0));
+
+        store.destroy_atom(b);
+        // a's back_deps should no longer contain b
+        store.set(a, Value::Number(10.0)); // must not panic
+        assert_eq!(store.get(a), Value::Number(10.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "live downstream derived atom")]
+    fn cannot_destroy_atom_with_live_dependents() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let _b = store.create_derived(move |get| get(a));
+        // Destroying a while b still depends on it would orphan b.
+        store.destroy_atom(a);
+    }
+
+    #[test]
+    fn create_destroy_loop_no_unbounded_growth() {
+        let mut store = Store::new();
+        for _ in 0..1000 {
+            let a = store.create_atom(Value::Number(1.0));
+            store.destroy_atom(a);
+        }
+        // values map should be empty after the loop.
+        assert!(!store.has_atom(AtomId::from_raw(0)));
     }
 
     /// A.5: two writable atoms whose write_fns set each other should panic
