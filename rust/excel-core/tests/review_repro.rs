@@ -23,8 +23,8 @@ fn batch_set_should_clear_formula() {
 }
 
 /// ISSUES B.1: cell_map 快照让"先建公式引用某 cell，后给该 cell 加公式"的场景失败。
+/// 1A step 4 修复后通过。
 #[test]
-#[ignore = "B.1: cell_map 快照，已知 bug"]
 fn formula_referencing_cell_that_later_becomes_formula() {
     let mut sheet = Sheet::new();
     sheet.set_cell("A1", Value::Number(10.0));
@@ -40,9 +40,8 @@ fn formula_referencing_cell_that_later_becomes_formula() {
 }
 
 /// ISSUES B.2: 自引用公式应返回 `#CYCLE!`，
-/// 当前实际因 cell_map 快照绕过检测，读到 primitive 初值。
+/// 1A step 4 加了静态环检测后修复。
 #[test]
-#[ignore = "B.2: 自引用绕过环检测，已知 bug"]
 fn self_referential_formula_should_be_cycle_error() {
     let mut sheet = Sheet::new();
     sheet.set_formula("A1", "=A1+1");
@@ -51,7 +50,6 @@ fn self_referential_formula_should_be_cycle_error() {
 
 /// ISSUES B.2: 互引用公式同样应返回 `#CYCLE!`。
 #[test]
-#[ignore = "B.2: 互引用绕过环检测，已知 bug"]
 fn mutual_referential_formulas_should_be_cycle_error() {
     let mut sheet = Sheet::new();
     sheet.set_formula("A1", "=B1+1");
@@ -60,22 +58,6 @@ fn mutual_referential_formulas_should_be_cycle_error() {
     assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::CyclicRef));
 }
 
-/// 文档化当前 buggy 行为，便于修复后对照消除（修了之后这个测试会失败）。
-/// - `=A1+1` 写到 A1：A1 = Number(1.0)（应该是 #CYCLE!）
-/// - `A1=B1+1, B1=A1+1`：A1=1, B1=2（应该都是 #CYCLE!）
-#[test]
-fn document_current_buggy_cycle_behavior() {
-    let mut sheet = Sheet::new();
-    sheet.set_formula("A1", "=A1+1");
-    assert_eq!(
-        sheet.get_cell("A1"),
-        Value::Number(1.0),
-        "当前 buggy 行为：自引用读 primitive Null=0+1=1。修 B.1/B.2 后此断言会失败，改 #CYCLE!"
-    );
-
-    let mut sheet2 = Sheet::new();
-    sheet2.set_formula("A1", "=B1+1");
-    sheet2.set_formula("B1", "=A1+1");
-    assert_eq!(sheet2.get_cell("A1"), Value::Number(1.0));
-    assert_eq!(sheet2.get_cell("B1"), Value::Number(2.0));
-}
+// (the previous `document_current_buggy_cycle_behavior` test has been
+// removed: B.1/B.2 are fixed in 1A step 4 and the canonical regression
+// tests above are now the source of truth)

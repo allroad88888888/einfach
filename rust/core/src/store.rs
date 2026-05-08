@@ -322,6 +322,15 @@ impl Store {
         }
     }
 
+    /// Force a propagation pass starting at the given dirty roots, even if
+    /// the roots' values haven't actually changed. Useful when a sheet-level
+    /// remapping (e.g. cell switched from primitive to formula derived) means
+    /// downstream readers need to re-evaluate even though no atom value moved.
+    /// Skips dedup; safe to call with any subset of valid atom ids.
+    pub fn propagate_force(&mut self, roots: &[AtomId]) {
+        self.propagate_and_notify(roots);
+    }
+
     /// Propagate changes from dirty roots and notify subscribers.
     fn propagate_and_notify(&mut self, dirty_roots: &[AtomId]) {
         // Deduplicate dirty roots
