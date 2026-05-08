@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -31,7 +31,9 @@ pub struct Store {
     next_id: u64,
     next_sub_id: u64,
     /// Batch nesting depth. When > 0, set() defers propagation.
-    batch_depth: u32,
+    /// `Rc<Cell>` so `BatchGuard` can clone the handle (no borrow of self),
+    /// allowing `f(&mut self)` to run inside the guard's lifetime.
+    batch_depth: Rc<Cell<u32>>,
     /// Atoms dirtied during a batch, pending propagation.
     pending_dirty: Vec<AtomId>,
 }
@@ -39,8 +41,100 @@ pub struct Store {
 // Thread-local to track dependencies during read_fn evaluation
 thread_local! {
     static TRACKING: RefCell<Option<HashSet<AtomId>>> = RefCell::new(None);
-    // Set of atoms currently being computed (for cycle detection)
+    // Set of atoms currently being computed (for read-side cycle detection)
     static COMPUTING: RefCell<HashSet<AtomId>> = RefCell::new(HashSet::new());
+    // Set of atoms currently being set (for write-side cycle detection — A.5)
+    static SETTING: RefCell<HashSet<AtomId>> = RefCell::new(HashSet::new());
+}
+
+/// RAII guard for `recompute` — removes `id` from `COMPUTING` and clears `TRACKING`
+/// on drop, even if the read_fn panics. Prevents thread-local pollution (A.11).
+/// Returns the tracked deps via `take_deps()` if the read_fn ran to completion.
+struct RecomputeGuard {
+    id: AtomId,
+    completed: bool,
+}
+
+impl RecomputeGuard {
+    fn enter(id: AtomId) -> Self {
+        let already = COMPUTING.with(|c| !c.borrow_mut().insert(id));
+        if already {
+            panic!("circular dependency detected involving atom {:?}", id);
+        }
+        TRACKING.with(|t| *t.borrow_mut() = Some(HashSet::new()));
+        RecomputeGuard {
+            id,
+            completed: false,
+        }
+    }
+
+    fn take_deps(mut self) -> HashSet<AtomId> {
+        self.completed = true;
+        TRACKING.with(|t| t.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+impl Drop for RecomputeGuard {
+    fn drop(&mut self) {
+        COMPUTING.with(|c| {
+            c.borrow_mut().remove(&self.id);
+        });
+        if !self.completed {
+            // read_fn panicked — clear stale TRACKING so the next recompute starts clean
+            TRACKING.with(|t| {
+                t.borrow_mut().take();
+            });
+        }
+    }
+}
+
+/// RAII guard for `batch` — decrements `batch_depth` on drop, even if the batch fn
+/// panics (A.6). Without this a panic mid-batch would leave depth elevated forever
+/// and all subsequent `set` calls would silently defer.
+struct BatchGuard {
+    depth: Rc<Cell<u32>>,
+}
+
+impl BatchGuard {
+    fn enter(depth: &Rc<Cell<u32>>) -> Self {
+        depth.set(depth.get() + 1);
+        BatchGuard {
+            depth: depth.clone(),
+        }
+    }
+}
+
+impl Drop for BatchGuard {
+    fn drop(&mut self) {
+        self.depth.set(self.depth.get() - 1);
+    }
+}
+
+/// RAII guard for `set` write-side cycle detection (A.5). Two writable atoms
+/// pointing to each other would otherwise stack-overflow.
+struct SetGuard {
+    id: AtomId,
+}
+
+impl SetGuard {
+    fn enter(id: AtomId) -> Self {
+        let already = SETTING.with(|s| !s.borrow_mut().insert(id));
+        if already {
+            panic!(
+                "write-side circular dependency detected: atom {:?} is already being set",
+                id
+            );
+        }
+        SetGuard { id }
+    }
+}
+
+impl Drop for SetGuard {
+    fn drop(&mut self) {
+        SETTING.with(|s| {
+            s.borrow_mut().remove(&self.id);
+        });
+    }
 }
 
 impl Store {
@@ -54,7 +148,7 @@ impl Store {
             subscriptions: HashMap::new(),
             next_id: 0,
             next_sub_id: 0,
-            batch_depth: 0,
+            batch_depth: Rc::new(Cell::new(0)),
             pending_dirty: Vec::new(),
         }
     }
@@ -102,26 +196,21 @@ impl Store {
     fn recompute(&mut self, id: AtomId) {
         let read_fn = self.read_fns.get(&id).expect("not a derived atom").clone();
 
-        // Cycle detection: mark this atom as being computed
-        let already_computing = COMPUTING.with(|c| !c.borrow_mut().insert(id));
-        if already_computing {
-            panic!("circular dependency detected involving atom {:?}", id);
-        }
-
-        // Snapshot current values so the read_fn can access them
+        // Snapshot pointer to values so the read_fn closure can access them.
+        // Safety: the read_fn only reads; we don't mutate `self.values` during
+        // its execution (the `insert` at the bottom happens after the call).
         let values = &self.values as *const HashMap<AtomId, Value>;
 
-        // Start tracking
-        TRACKING.with(|t| *t.borrow_mut() = Some(HashSet::new()));
+        // Enter recompute guard (panics if already computing this atom).
+        // Drop runs on every exit path including panic, clearing thread-locals.
+        let guard = RecomputeGuard::enter(id);
 
-        // The getter: reads a value and records the dep
         let getter = |dep_id: AtomId| -> Value {
-            // Check for cycle: if dep_id is currently being computed, it's a cycle
             let is_cycle = COMPUTING.with(|c| c.borrow().contains(&dep_id));
             if is_cycle {
                 panic!(
                     "circular dependency detected: atom {:?} depends on atom {:?} which is being computed",
-                    dep_id, dep_id
+                    id, dep_id
                 );
             }
 
@@ -130,7 +219,6 @@ impl Store {
                     deps.insert(dep_id);
                 }
             });
-            // Safety: we only read from values, no mutation during read_fn call
             unsafe {
                 if let Some(val) = (*values).get(&dep_id) {
                     return val.clone();
@@ -140,12 +228,7 @@ impl Store {
         };
 
         let new_value = read_fn(&getter);
-
-        // Remove from computing set
-        COMPUTING.with(|c| c.borrow_mut().remove(&id));
-
-        // Collect tracked deps
-        let new_deps = TRACKING.with(|t| t.borrow_mut().take().unwrap());
+        let new_deps = guard.take_deps();
 
         // Update dependency graph: remove old back_deps, add new ones
         if let Some(old_deps) = self.dependencies.get(&id) {
@@ -160,7 +243,6 @@ impl Store {
         }
         self.dependencies.insert(id, new_deps);
 
-        // Store computed value
         self.values.insert(id, new_value);
     }
 
@@ -179,6 +261,10 @@ impl Store {
     pub fn set(&mut self, id: AtomId, value: Value) {
         // If it has a write_fn, delegate to it
         if let Some(write_fn) = self.write_fns.get(&id).cloned() {
+            // Write-side cycle detection: two writable atoms pointing at each
+            // other would otherwise stack-overflow. Guard drops on panic too.
+            let _set_guard = SetGuard::enter(id);
+
             // Collect the sets that write_fn wants to make
             let mut sets_to_apply: Vec<(AtomId, Value)> = Vec::new();
             write_fn(
@@ -209,7 +295,7 @@ impl Store {
 
         self.values.insert(id, value);
 
-        if self.batch_depth > 0 {
+        if self.batch_depth.get() > 0 {
             // Inside batch: defer propagation
             self.pending_dirty.push(id);
             return;
@@ -221,11 +307,14 @@ impl Store {
     /// Execute a function that may call set() multiple times.
     /// Propagation and notification happen once at the end.
     pub fn batch(&mut self, f: impl FnOnce(&mut Self)) {
-        self.batch_depth += 1;
-        f(self);
-        self.batch_depth -= 1;
+        // BatchGuard restores depth even if `f` panics (A.6). Held in inner
+        // scope so it drops *before* the post-batch propagation check below.
+        {
+            let _guard = BatchGuard::enter(&self.batch_depth);
+            f(self);
+        }
 
-        if self.batch_depth == 0 && !self.pending_dirty.is_empty() {
+        if self.batch_depth.get() == 0 && !self.pending_dirty.is_empty() {
             let dirty = std::mem::take(&mut self.pending_dirty);
             self.propagate_and_notify(&dirty);
         }
@@ -956,5 +1045,105 @@ mod tests {
         let a = store.create_atom(Value::Number(1.0));
         let b = store.create_derived(move |get| get(a));
         store.set(b, Value::Number(99.0));
+    }
+
+    // === Step 1A guard tests ===
+
+    /// A.6: batch fn panic should not leave batch_depth elevated.
+    /// After the panic, a normal `set` must propagate immediately, not defer.
+    #[test]
+    fn batch_panic_does_not_leak_depth() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        store.sub(a, move || *cc.borrow_mut() += 1);
+
+        // Trigger a panic inside batch.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.batch(|s| {
+                s.set(a, Value::Number(2.0));
+                panic!("intentional panic in batch");
+            });
+        }));
+        assert!(result.is_err());
+
+        // After panic, a fresh set must propagate immediately (no deferred state).
+        store.set(a, Value::Number(99.0));
+        assert_eq!(store.get(a), Value::Number(99.0));
+        // The notification must fire; if batch_depth were stuck at 1 it wouldn't.
+        assert!(*count.borrow() >= 1, "subscriber should have fired");
+    }
+
+    /// A.11: read_fn panic must not leave COMPUTING/TRACKING dirty,
+    /// otherwise the next recompute spuriously reports a cycle.
+    #[test]
+    fn recompute_panic_does_not_leak_thread_locals() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+
+        // Create a derived whose read_fn panics.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.create_derived(move |get| {
+                let _ = get(a);
+                panic!("intentional panic in read_fn");
+            });
+        }));
+        assert!(result.is_err());
+
+        // A fresh derived on a different atom must work cleanly.
+        let b = store.create_atom(Value::Number(10.0));
+        let c = store.create_derived(move |get| {
+            if let Value::Number(n) = get(b) {
+                Value::Number(n * 2.0)
+            } else {
+                panic!()
+            }
+        });
+        assert_eq!(store.get(c), Value::Number(20.0));
+
+        // And the original atom is still usable.
+        store.set(b, Value::Number(5.0));
+        assert_eq!(store.get(c), Value::Number(10.0));
+    }
+
+    /// A.5: two writable atoms whose write_fns set each other should panic
+    /// with a write-side cycle message, not stack-overflow.
+    #[test]
+    #[should_panic(expected = "write-side circular dependency")]
+    fn writable_atoms_mutual_set_panics() {
+        let mut store = Store::new();
+        let base_a = store.create_atom(Value::Number(0.0));
+        let base_b = store.create_atom(Value::Number(0.0));
+
+        // a_atom: read base_a, write -> sets b_atom
+        let a_atom_id = Rc::new(RefCell::new(None::<AtomId>));
+        let b_atom_id = Rc::new(RefCell::new(None::<AtomId>));
+
+        let a_id_for_b = a_atom_id.clone();
+        let b_id_for_a = b_atom_id.clone();
+
+        let a_atom = store.create_writable(
+            move |get| get(base_a),
+            move |set, val| {
+                if let Some(b) = *b_id_for_a.borrow() {
+                    set(b, val);
+                }
+            },
+        );
+        *a_atom_id.borrow_mut() = Some(a_atom);
+
+        let b_atom = store.create_writable(
+            move |get| get(base_b),
+            move |set, val| {
+                if let Some(a) = *a_id_for_b.borrow() {
+                    set(a, val);
+                }
+            },
+        );
+        *b_atom_id.borrow_mut() = Some(b_atom);
+
+        // Trigger the cycle: setting a_atom -> sets b_atom -> sets a_atom -> panic
+        store.set(a_atom, Value::Number(42.0));
     }
 }

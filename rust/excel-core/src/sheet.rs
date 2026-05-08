@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use einfach_core::{AtomId, Store, Value};
+use einfach_core::{AtomId, Store, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::eval_expr;
@@ -55,9 +55,21 @@ impl Sheet {
 
     /// Set a cell's formula by address string (e.g. "=A1+B1").
     /// The formula is parsed and a derived atom is created.
-    pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) {
+    /// Returns `false` if the formula failed to parse — in that case the cell
+    /// is set to `Value::Error(InvalidValue)` so the user sees `#VALUE!`
+    /// instead of crashing the wasm instance (B.3).
+    pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let expr = parse_formula(formula_str).expect("invalid formula");
+        let expr = match parse_formula(formula_str) {
+            Some(e) => e,
+            None => {
+                // Drop any existing formula and write an error value.
+                self.formula_cells.remove(&addr);
+                let id = self.ensure_cell(addr);
+                self.store.set(id, Value::Error(ValueError::InvalidValue));
+                return false;
+            }
+        };
 
         // Ensure all referenced cells exist so their atoms are in the cells map
         self.ensure_refs(&expr);
@@ -86,6 +98,7 @@ impl Sheet {
         // Ensure the cell primitive atom exists (for later if formula is cleared)
         self.ensure_cell(addr);
         self.formula_cells.insert(addr, derived_id);
+        true
     }
 
     /// Get a cell's value by address string.
@@ -317,6 +330,20 @@ mod tests {
         // Changing A1 should no longer affect B1
         sheet.set_cell("A1", Value::Number(1.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(99.0));
+    }
+
+    #[test]
+    fn invalid_formula_writes_error_not_panic() {
+        // B.3: parse failure must not panic the wasm instance.
+        let mut sheet = Sheet::new();
+        let ok = sheet.set_formula("A1", "=foo bar baz");
+        assert!(!ok);
+        assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::InvalidValue));
+
+        // Subsequent valid formula on the same cell should clear the error.
+        let ok = sheet.set_formula("A1", "=42");
+        assert!(ok);
+        assert_eq!(sheet.get_cell("A1"), Value::Number(42.0));
     }
 
     #[test]

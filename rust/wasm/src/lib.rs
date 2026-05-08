@@ -4,6 +4,13 @@ use einfach_core::Value;
 use einfach_excel_core::Sheet;
 use wasm_bindgen::prelude::*;
 
+/// Initialize the panic hook once per module load. Called automatically from
+/// every `WasmSheet::new()`; idempotent thanks to `set_once`. C.10.
+fn install_panic_hook() {
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+}
+
 /// WASM-exposed spreadsheet. Wraps the Rust Sheet.
 #[wasm_bindgen]
 pub struct WasmSheet {
@@ -17,6 +24,7 @@ impl WasmSheet {
     /// Create a new empty spreadsheet.
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
+        install_panic_hook();
         WasmSheet {
             sheet: Sheet::new(),
             listeners: HashMap::new(),
@@ -36,9 +44,12 @@ impl WasmSheet {
     }
 
     /// Set a cell's formula (e.g. "=A1+B1").
-    pub fn set_formula(&mut self, addr: &str, formula: &str) {
-        self.sheet.set_formula(addr, formula);
+    /// Returns `true` if the formula parsed successfully, `false` if it was
+    /// invalid (in which case the cell is set to `#VALUE!`).
+    pub fn set_formula(&mut self, addr: &str, formula: &str) -> bool {
+        let ok = self.sheet.set_formula(addr, formula);
         self.fire_listeners(addr);
+        ok
     }
 
     /// Get a cell's display value as a string.
