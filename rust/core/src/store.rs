@@ -10,8 +10,26 @@ type ReadFn = Rc<dyn Fn(&dyn Fn(AtomId) -> Value) -> Value>;
 /// Write function for writable derived atoms. Takes a setter and the new value.
 type WriteFn = Rc<dyn Fn(&mut dyn FnMut(AtomId, Value), Value)>;
 
+/// Trait-based subscription target. Lets the core publish change events
+/// without committing to a specific listener flavor — the WASM bindings
+/// supply a `JsCallbackListener` (main-thread JS function); the future
+/// worker adapter (ROADMAP 7C) will supply a `PostMessageListener` that
+/// posts a message instead of invoking a function directly.
+///
+/// A blanket impl makes any `Fn() + 'static` closure satisfy the trait,
+/// so existing `store.sub(id, || …)` call sites still work unchanged.
+pub trait CellListener: 'static {
+    fn on_change(&self);
+}
+
+impl<F: Fn() + 'static> CellListener for F {
+    fn on_change(&self) {
+        self()
+    }
+}
+
 /// Listener callback invoked when a subscribed atom's value changes.
-type Listener = Rc<dyn Fn()>;
+type Listener = Rc<dyn CellListener>;
 
 /// Unique identifier for a subscription.
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
@@ -365,14 +383,30 @@ impl Store {
         self.notify(&changed);
     }
 
-    /// Subscribe to value changes on an atom. Returns a subscription id for unsubscribing.
-    pub fn sub(&mut self, id: AtomId, listener: impl Fn() + 'static) -> SubscriptionId {
+    /// Subscribe to value changes on an atom. Returns a subscription id.
+    /// Accepts any `CellListener` — including bare `Fn()` closures via the
+    /// blanket impl, and adapter types like `JsCallbackListener` from the
+    /// wasm crate.
+    pub fn sub(&mut self, id: AtomId, listener: impl CellListener) -> SubscriptionId {
         let sub_id = SubscriptionId(self.next_sub_id);
         self.next_sub_id += 1;
         self.subscriptions
             .entry(id)
             .or_default()
             .push((sub_id, Rc::new(listener)));
+        sub_id
+    }
+
+    /// Same as `sub` but takes an already-boxed listener trait object.
+    /// Useful for adapter layers that compose listeners dynamically and
+    /// can't express a single concrete type at the call site.
+    pub fn sub_boxed(&mut self, id: AtomId, listener: Box<dyn CellListener>) -> SubscriptionId {
+        let sub_id = SubscriptionId(self.next_sub_id);
+        self.next_sub_id += 1;
+        self.subscriptions
+            .entry(id)
+            .or_default()
+            .push((sub_id, Rc::from(listener)));
         sub_id
     }
 
@@ -442,7 +476,7 @@ impl Store {
         for id in changed {
             if let Some(subs) = self.subscriptions.get(id) {
                 for (_, listener) in subs {
-                    listener();
+                    listener.on_change();
                 }
             }
         }

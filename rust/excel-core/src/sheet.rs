@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use einfach_core::{AtomId, Store, Value, ValueError};
+use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::eval_expr;
@@ -13,6 +13,17 @@ use crate::formula::{parse_formula, Expr};
 /// otherwise the primitive cell atom. Sharing via `Rc<RefCell>` lets
 /// already-created derived closures see later updates (B.1 fix).
 type ReadableMap = Rc<RefCell<HashMap<CellAddress, AtomId>>>;
+
+/// Token returned by `Sheet::subscribe_cell`. Bundles the SubscriptionId
+/// with the AtomId at the moment of subscription so `unsubscribe_cell`
+/// can find the listener entry even if the cell's readable atom has since
+/// been remapped (e.g. set_formula replaced the derived).
+#[derive(Clone, Copy, Debug)]
+pub struct CellSubscription {
+    sub_id: SubscriptionId,
+    #[allow(dead_code)]
+    atom_id: AtomId,
+}
 
 /// A spreadsheet sheet backed by an atom store.
 pub struct Sheet {
@@ -195,6 +206,38 @@ impl Sheet {
     pub fn cell_atom(&mut self, addr_str: &str) -> AtomId {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         self.readable_atom(addr)
+    }
+
+    /// Subscribe to changes on a single cell. Returns a token that bundles the
+    /// underlying SubscriptionId with the AtomId being subscribed to, so
+    /// `unsubscribe_cell` knows where to remove from even if the cell's
+    /// readable atom has since been redirected.
+    pub fn subscribe_cell(
+        &mut self,
+        addr_str: &str,
+        listener: impl CellListener,
+    ) -> CellSubscription {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        let atom_id = self.readable_atom(addr);
+        let sub_id = self.store.sub(atom_id, listener);
+        CellSubscription { sub_id, atom_id }
+    }
+
+    /// Variant of `subscribe_cell` that accepts an already-boxed listener.
+    pub fn subscribe_cell_boxed(
+        &mut self,
+        addr_str: &str,
+        listener: Box<dyn CellListener>,
+    ) -> CellSubscription {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        let atom_id = self.readable_atom(addr);
+        let sub_id = self.store.sub_boxed(atom_id, listener);
+        CellSubscription { sub_id, atom_id }
+    }
+
+    /// Cancel a subscription previously returned from `subscribe_cell`.
+    pub fn unsubscribe_cell(&mut self, sub: CellSubscription) {
+        self.store.unsub(sub.sub_id);
     }
 
     /// Walk AST and ensure all referenced cells exist.
@@ -467,6 +510,29 @@ mod tests {
         // Changing A1 should no longer affect B1
         sheet.set_cell("A1", Value::Number(1.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(99.0));
+    }
+
+    #[test]
+    fn subscribe_cell_fires_on_change() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=A1*2");
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
+        assert!(*count.borrow() >= 1, "subscriber must fire on dependency change");
+
+        sheet.unsubscribe_cell(sub);
+        let prev = *count.borrow();
+        sheet.set_cell("A1", Value::Number(10.0));
+        assert_eq!(*count.borrow(), prev, "no fire after unsubscribe");
     }
 
     #[test]
