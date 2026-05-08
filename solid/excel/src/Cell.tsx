@@ -15,7 +15,11 @@ export function Cell(props: CellProps) {
   const cellValue = () => props.store.getCell(props.addr)
 
   function startEditing() {
-    setEditValue(cellValue().display)
+    // For formula cells, edit the source formula (`=A1*2`) instead of the
+    // computed result (`20`). Without this the formula is silently replaced
+    // by a static value on commit (D.11).
+    const formula = props.store.getFormula(props.addr)
+    setEditValue(formula !== '' ? formula : cellValue().display)
     setEditing(true)
   }
 

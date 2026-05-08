@@ -1,12 +1,24 @@
 import type { ISheet } from './types'
 
 /**
- * Pure JS implementation of ISheet for development/testing
- * without needing the WASM build. Uses a simple map of cell values.
+ * Pure JS implementation of ISheet for development / jest tests.
+ *
+ * NOTE: this is a mock — the formula evaluator only handles a subset of
+ * what the Rust backend supports (see ISSUES.md D.1). It exists so jest
+ * tests can run without the WASM toolchain. Production / e2e tests must
+ * use createWasmSheet().
+ *
+ * Subscribe / unsubscribe is implemented by snapshotting cell display
+ * values around every mutation and firing listeners for any cell whose
+ * snapshot changed. This includes transitively-dependent formula cells
+ * because recalcAll runs before the diff.
  */
 export function createJSSheet(): ISheet {
   const cells = new Map<string, { type: string; value: unknown; formula?: string }>()
   const formulas = new Map<string, string>()
+  const listeners = new Map<string, Map<number, () => void>>()
+  const tokenToAddr = new Map<number, string>()
+  let nextToken = 0
 
   function parseAddr(addr: string): { col: string; row: number } {
     const match = addr.match(/^([A-Za-z]+)(\d+)$/)
@@ -71,39 +83,70 @@ export function createJSSheet(): ISheet {
     }
   }
 
+  /** Snapshot every subscribed address's display value. */
+  function snapshotDisplays(): Map<string, string> {
+    const snap = new Map<string, string>()
+    for (const addr of listeners.keys()) {
+      snap.set(addr, getDisplay(addr))
+    }
+    return snap
+  }
+
+  /** Compare against a snapshot and fire listeners for changed cells. */
+  function fireChanges(before: Map<string, string>) {
+    for (const [addr, prev] of before) {
+      const now = getDisplay(addr)
+      if (now !== prev) {
+        const map = listeners.get(addr)
+        if (map) for (const cb of map.values()) cb()
+      }
+    }
+  }
+
+  function getDisplay(addr: string): string {
+    const cell = cells.get(addr.toUpperCase())
+    if (!cell) return ''
+    if (cell.type === 'number') {
+      const n = cell.value as number
+      return n === Math.floor(n) && Math.abs(n) < 1e15 ? String(Math.round(n)) : String(n)
+    }
+    if (cell.type === 'error') return cell.value as string
+    if (cell.type === 'boolean') return cell.value ? 'TRUE' : 'FALSE'
+    if (cell.type === 'text') return cell.value as string
+    return ''
+  }
+
   return {
     set_number(addr: string, value: number) {
       const a = addr.toUpperCase()
+      const before = snapshotDisplays()
       formulas.delete(a)
       cells.set(a, { type: 'number', value })
       recalcAll()
+      fireChanges(before)
     },
 
     set_text(addr: string, value: string) {
       const a = addr.toUpperCase()
+      const before = snapshotDisplays()
       formulas.delete(a)
       cells.set(a, { type: 'text', value })
       recalcAll()
+      fireChanges(before)
     },
 
-    set_formula(addr: string, formula: string) {
+    set_formula(addr: string, formula: string): boolean {
       const a = addr.toUpperCase()
+      const before = snapshotDisplays()
       formulas.set(a, formula)
       const result = evalFormula(formula)
       cells.set(a, { ...result, formula })
+      fireChanges(before)
+      return result.type !== 'error'
     },
 
     get_display(addr: string): string {
-      const cell = cells.get(addr.toUpperCase())
-      if (!cell) return ''
-      if (cell.type === 'number') {
-        const n = cell.value as number
-        return n === Math.floor(n) && Math.abs(n) < 1e15 ? String(Math.round(n)) : String(n)
-      }
-      if (cell.type === 'error') return cell.value as string
-      if (cell.type === 'boolean') return cell.value ? 'TRUE' : 'FALSE'
-      if (cell.type === 'text') return cell.value as string
-      return ''
+      return getDisplay(addr)
     },
 
     get_number(addr: string): number {
@@ -120,6 +163,34 @@ export function createJSSheet(): ISheet {
     is_error(addr: string): boolean {
       const cell = cells.get(addr.toUpperCase())
       return cell?.type === 'error'
+    },
+
+    get_formula(addr: string): string {
+      return formulas.get(addr.toUpperCase()) ?? ''
+    },
+
+    subscribe(addr: string, callback: () => void): number {
+      const a = addr.toUpperCase()
+      const token = nextToken++
+      let map = listeners.get(a)
+      if (!map) {
+        map = new Map()
+        listeners.set(a, map)
+      }
+      map.set(token, callback)
+      tokenToAddr.set(token, a)
+      return token
+    },
+
+    unsubscribe(token: number): void {
+      const addr = tokenToAddr.get(token)
+      if (!addr) return
+      const map = listeners.get(addr)
+      if (map) {
+        map.delete(token)
+        if (map.size === 0) listeners.delete(addr)
+      }
+      tokenToAddr.delete(token)
     },
   }
 }
