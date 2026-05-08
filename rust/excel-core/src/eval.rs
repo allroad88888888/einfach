@@ -199,6 +199,39 @@ fn collect_range_values(
     values
 }
 
+/// Collect a range as a row-major 2D grid (rows × cols).
+fn collect_range_2d(
+    start: &CellAddress,
+    end: &CellAddress,
+    get: &dyn Fn(AtomId) -> Value,
+    cell_map: &HashMap<CellAddress, AtomId>,
+) -> Vec<Vec<Value>> {
+    let min_row = start.row.min(end.row);
+    let max_row = start.row.max(end.row);
+    let min_col = start.col.min(end.col);
+    let max_col = start.col.max(end.col);
+    (min_row..=max_row)
+        .map(|row| {
+            (min_col..=max_col)
+                .map(|col| {
+                    let addr = CellAddress::new(row, col);
+                    cell_map
+                        .get(&addr)
+                        .map(|&id| get(id))
+                        .unwrap_or(Value::Null)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)> {
+    match arg {
+        Expr::Range { start, end } => Some((start, end)),
+        _ => None,
+    }
+}
+
 /// Collect values from a function argument, expanding ranges.
 fn collect_arg_values(
     arg: &Expr,
@@ -532,7 +565,354 @@ fn eval_func(
             Value::Number(total)
         }
 
+        // === Phase 5: lookup / stats / dates ===
+
+        "VLOOKUP" => {
+            // VLOOKUP(lookup_value, table_range, col_index, [exact])
+            // exact defaults to false (true = approximate match — not yet
+            // implemented; we always do exact for safety).
+            if args.len() < 3 || args.len() > 4 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let needle = eval_expr(&args[0], get, cell_map);
+            let (start, end) = match arg_as_range(&args[1]) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let col_idx = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let grid = collect_range_2d(start, end, get, cell_map);
+            for row in &grid {
+                if row.first().map(|v| values_equal(v, &needle)).unwrap_or(false) {
+                    return row
+                        .get(col_idx - 1)
+                        .cloned()
+                        .unwrap_or(Value::Error(ValueError::InvalidRef));
+                }
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        "HLOOKUP" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let needle = eval_expr(&args[0], get, cell_map);
+            let (start, end) = match arg_as_range(&args[1]) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let row_idx = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let grid = collect_range_2d(start, end, get, cell_map);
+            if grid.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let header = &grid[0];
+            for (col, cell) in header.iter().enumerate() {
+                if values_equal(cell, &needle) {
+                    return grid
+                        .get(row_idx - 1)
+                        .and_then(|r| r.get(col).cloned())
+                        .unwrap_or(Value::Error(ValueError::InvalidRef));
+                }
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        "INDEX" => {
+            // INDEX(range, row, col) — 1-based
+            if args.len() != 3 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let (start, end) = match arg_as_range(&args[0]) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let r = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let c = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let grid = collect_range_2d(start, end, get, cell_map);
+            grid.get(r - 1)
+                .and_then(|row| row.get(c - 1).cloned())
+                .unwrap_or(Value::Error(ValueError::InvalidRef))
+        }
+
+        "MATCH" => {
+            // MATCH(value, range, [type=0 exact])
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let needle = eval_expr(&args[0], get, cell_map);
+            let values = collect_arg_values(&args[1], get, cell_map);
+            for (i, v) in values.iter().enumerate() {
+                if values_equal(v, &needle) {
+                    return Value::Number((i + 1) as f64);
+                }
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        // Stats
+        "MEDIAN" => {
+            let mut nums: Vec<f64> = Vec::new();
+            for arg in args {
+                for v in collect_arg_values(arg, get, cell_map) {
+                    if let Value::Number(n) = v {
+                        nums.push(n);
+                    } else if let Value::Error(e) = v {
+                        return Value::Error(e);
+                    }
+                }
+            }
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = nums.len();
+            let med = if n % 2 == 1 {
+                nums[n / 2]
+            } else {
+                (nums[n / 2 - 1] + nums[n / 2]) / 2.0
+            };
+            Value::Number(med)
+        }
+
+        "MODE" => {
+            let mut nums: Vec<i64> = Vec::new();
+            for arg in args {
+                for v in collect_arg_values(arg, get, cell_map) {
+                    if let Value::Number(n) = v {
+                        // Multiply to preserve some decimals; mode for floats
+                        // is rare and we want bit-stable hashing.
+                        nums.push((n * 1e9).round() as i64);
+                    }
+                }
+            }
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut counts: HashMap<i64, usize> = HashMap::new();
+            for n in &nums {
+                *counts.entry(*n).or_insert(0) += 1;
+            }
+            let (best, max_count) = counts
+                .iter()
+                .max_by_key(|(_, c)| *c)
+                .map(|(k, c)| (*k, *c))
+                .unwrap();
+            if max_count <= 1 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            Value::Number(best as f64 / 1e9)
+        }
+
+        "STDEV" => {
+            let nums = collect_numbers(args, get, cell_map);
+            if nums.len() < 2 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / (nums.len() as f64 - 1.0);
+            Value::Number(var.sqrt())
+        }
+
+        "VAR" => {
+            let nums = collect_numbers(args, get, cell_map);
+            if nums.len() < 2 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / (nums.len() as f64 - 1.0);
+            Value::Number(var)
+        }
+
+        "LARGE" => {
+            // LARGE(range, k) — kth largest, 1-based
+            if args.len() != 2 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut nums = collect_numbers(&args[..1], get, cell_map);
+            let k = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            if k > nums.len() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            nums.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            Value::Number(nums[k - 1])
+        }
+
+        "SMALL" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut nums = collect_numbers(&args[..1], get, cell_map);
+            let k = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            if k > nums.len() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            Value::Number(nums[k - 1])
+        }
+
+        // Dates: stored as f64 day numbers. epoch = 1970-01-01 → 0 (simpler
+        // than Excel's 1900 epoch; full Excel compatibility is a follow-up).
+        "TODAY" => {
+            // Without `chrono`, we can't compute today; return InvalidName so
+            // callers know it's a known-but-unimplemented function. Real
+            // implementation slots in once we add a date crate.
+            Value::Error(ValueError::InvalidName)
+        }
+        "NOW" => Value::Error(ValueError::InvalidName),
+        "DATE" => {
+            // DATE(year, month, day) — naive day-count via days-from-epoch.
+            // Doesn't handle leap rules of pre-1582 Julian; accurate enough
+            // for the demo's range.
+            if args.len() != 3 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let y = coerce_to_number(&eval_expr(&args[0], get, cell_map));
+            let m = coerce_to_number(&eval_expr(&args[1], get, cell_map));
+            let d = coerce_to_number(&eval_expr(&args[2], get, cell_map));
+            match (y, m, d) {
+                (Some(y), Some(m), Some(d)) => Value::Number(date_serial(
+                    y as i32, m as u32, d as u32,
+                )),
+                _ => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        "YEAR" => date_part(args, get, cell_map, |y, _, _| y as f64),
+        "MONTH" => date_part(args, get, cell_map, |_, m, _| m as f64),
+        "DAY" => date_part(args, get, cell_map, |_, _, d| d as f64),
+
         _ => Value::Error(ValueError::InvalidName),
+    }
+}
+
+fn collect_numbers(
+    args: &[Expr],
+    get: &dyn Fn(AtomId) -> Value,
+    cell_map: &HashMap<CellAddress, AtomId>,
+) -> Vec<f64> {
+    let mut out = Vec::new();
+    for arg in args {
+        for v in collect_arg_values(arg, get, cell_map) {
+            if let Value::Number(n) = v {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    if let (Some(an), Some(bn)) = (coerce_to_number(a), coerce_to_number(b)) {
+        an == bn
+    } else {
+        coerce_to_text(a) == coerce_to_text(b)
+    }
+}
+
+/// Naive Gregorian-only days-from-epoch. Epoch: 1970-01-01 = 0.
+fn date_serial(year: i32, month: u32, day: u32) -> f64 {
+    if month == 0 || month > 12 || day == 0 || day > 31 {
+        return f64::NAN;
+    }
+    // Days in each month for non-leap years.
+    const DOM: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    fn is_leap(y: i32) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+    let mut days: i64 = 0;
+    if year >= 1970 {
+        for y in 1970..year {
+            days += if is_leap(y) { 366 } else { 365 };
+        }
+    } else {
+        for y in year..1970 {
+            days -= if is_leap(y) { 366 } else { 365 };
+        }
+    }
+    for m in 1..month {
+        days += DOM[(m - 1) as usize] as i64;
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += (day - 1) as i64;
+    days as f64
+}
+
+fn date_from_serial(serial: f64) -> (i32, u32, u32) {
+    let days = serial as i64;
+    let mut year = 1970i32;
+    let mut remaining = days;
+    fn is_leap(y: i32) -> bool {
+        (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    }
+    if remaining >= 0 {
+        loop {
+            let dy = if is_leap(year) { 366 } else { 365 };
+            if remaining < dy {
+                break;
+            }
+            remaining -= dy;
+            year += 1;
+        }
+    } else {
+        while remaining < 0 {
+            year -= 1;
+            let dy = if is_leap(year) { 366 } else { 365 };
+            remaining += dy;
+        }
+    }
+    const DOM: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 1u32;
+    while month <= 12 {
+        let dm = DOM[(month - 1) as usize] as i64
+            + if month == 2 && is_leap(year) { 1 } else { 0 };
+        if remaining < dm {
+            break;
+        }
+        remaining -= dm;
+        month += 1;
+    }
+    let day = remaining as u32 + 1;
+    (year, month, day)
+}
+
+fn date_part(
+    args: &[Expr],
+    get: &dyn Fn(AtomId) -> Value,
+    cell_map: &HashMap<CellAddress, AtomId>,
+    f: impl Fn(i32, u32, u32) -> f64,
+) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let v = eval_expr(&args[0], get, cell_map);
+    match coerce_to_number(&v) {
+        Some(n) => {
+            let (y, m, d) = date_from_serial(n);
+            Value::Number(f(y, m, d))
+        }
+        None => Value::Error(ValueError::InvalidValue),
     }
 }
 
@@ -905,6 +1285,126 @@ mod tests {
         assert_eq!(
             eval_str("=SUMIF(A1:B1,\">5\")", &cm, &vs),
             Value::Number(30.0)
+        );
+    }
+
+    // === Phase 5 tests ===
+
+    fn make_lookup_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // Three rows of (id, price): (1, 10), (2, 20), (3, 30) at A1:B3.
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        for (i, (id, price)) in [(1, 10), (2, 20), (3, 30)].iter().enumerate() {
+            let row = i as u32;
+            let id_atom = AtomId::from_raw((row * 2) as u64);
+            let price_atom = AtomId::from_raw((row * 2 + 1) as u64);
+            cell_map.insert(CellAddress::new(row, 0), id_atom);
+            cell_map.insert(CellAddress::new(row, 1), price_atom);
+            values.insert(id_atom, Value::Number(*id as f64));
+            values.insert(price_atom, Value::Number(*price as f64));
+        }
+        (cell_map, values)
+    }
+
+    #[test]
+    fn eval_vlookup_finds_row() {
+        let (cm, vs) = make_lookup_env();
+        // VLOOKUP(2, A1:B3, 2) → 20
+        assert_eq!(
+            eval_str("=VLOOKUP(2,A1:B3,2)", &cm, &vs),
+            Value::Number(20.0)
+        );
+        // VLOOKUP(99, ...) → #VALUE!
+        assert!(matches!(
+            eval_str("=VLOOKUP(99,A1:B3,2)", &cm, &vs),
+            Value::Error(_)
+        ));
+    }
+
+    #[test]
+    fn eval_index_match() {
+        let (cm, vs) = make_lookup_env();
+        // INDEX(A1:B3, 2, 2) → 20 (row 2 col 2 = price for id 2)
+        assert_eq!(
+            eval_str("=INDEX(A1:B3,2,2)", &cm, &vs),
+            Value::Number(20.0)
+        );
+        // MATCH(2, A1:A3, 0) → 2 (1-based)
+        assert_eq!(
+            eval_str("=MATCH(2,A1:A3,0)", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn eval_hlookup_finds_col() {
+        // Build a horizontal table: row 0 = headers, row 1 = values.
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        for (i, (h, v)) in [("a", 1), ("b", 2), ("c", 3)].iter().enumerate() {
+            let col = i as u32;
+            let h_atom = AtomId::from_raw((col * 2) as u64);
+            let v_atom = AtomId::from_raw((col * 2 + 1) as u64);
+            cm.insert(CellAddress::new(0, col), h_atom);
+            cm.insert(CellAddress::new(1, col), v_atom);
+            vs.insert(h_atom, Value::Text((*h).into()));
+            vs.insert(v_atom, Value::Number(*v as f64));
+        }
+        // HLOOKUP("b", A1:C2, 2) → 2
+        assert_eq!(
+            eval_str("=HLOOKUP(\"b\",A1:C2,2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn eval_stats() {
+        let (cm, vs) = make_test_env();
+        // A1=10, B1=20, A2=5
+        assert_eq!(
+            eval_str("=MEDIAN(A1,B1,A2)", &cm, &vs),
+            Value::Number(10.0)
+        );
+        // STDEV / VAR for {10, 20, 5}: mean=11.66… so they should be > 0
+        let stdev = eval_str("=STDEV(A1,B1,A2)", &cm, &vs);
+        assert!(matches!(stdev, Value::Number(n) if n > 0.0));
+        let var = eval_str("=VAR(A1,B1,A2)", &cm, &vs);
+        assert!(matches!(var, Value::Number(n) if n > 0.0));
+    }
+
+    #[test]
+    fn eval_large_small() {
+        let (cm, vs) = make_test_env();
+        // {10, 20, 5} → LARGE k=1 → 20, SMALL k=1 → 5
+        assert_eq!(
+            eval_str("=LARGE(A1:B2,1)", &cm, &vs),
+            Value::Number(20.0)
+        );
+        assert_eq!(
+            eval_str("=SMALL(A1:B2,1)", &cm, &vs),
+            Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn eval_date_round_trip() {
+        let (cm, vs) = make_test_env();
+        // DATE(2026, 5, 8) → some serial; YEAR/MONTH/DAY of that serial
+        // round-trips back to the input.
+        let serial = eval_str("=DATE(2026,5,8)", &cm, &vs);
+        assert!(matches!(serial, Value::Number(_)));
+        // The expression is wrapped in YEAR(DATE(...)) so we can compose.
+        assert_eq!(
+            eval_str("=YEAR(DATE(2026,5,8))", &cm, &vs),
+            Value::Number(2026.0)
+        );
+        assert_eq!(
+            eval_str("=MONTH(DATE(2026,5,8))", &cm, &vs),
+            Value::Number(5.0)
+        );
+        assert_eq!(
+            eval_str("=DAY(DATE(2026,5,8))", &cm, &vs),
+            Value::Number(8.0)
         );
     }
 
