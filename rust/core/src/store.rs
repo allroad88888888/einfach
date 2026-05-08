@@ -19,7 +19,10 @@ pub struct SubscriptionId(u64);
 
 /// The central state container. Manages atom values and their relationships.
 pub struct Store {
-    values: HashMap<AtomId, Value>,
+    /// Atom values. `Rc<RefCell>` so the recompute getter closure can hold
+    /// a clone of the handle for the duration of the read_fn call without
+    /// borrowing `self`. Replaces the previous raw-pointer hack (A.2).
+    values: Rc<RefCell<HashMap<AtomId, Value>>>,
     read_fns: HashMap<AtomId, ReadFn>,
     write_fns: HashMap<AtomId, WriteFn>,
     /// derived atom → set of atoms it depends on
@@ -140,7 +143,7 @@ impl Drop for SetGuard {
 impl Store {
     pub fn new() -> Self {
         Store {
-            values: HashMap::new(),
+            values: Rc::new(RefCell::new(HashMap::new())),
             read_fns: HashMap::new(),
             write_fns: HashMap::new(),
             dependencies: HashMap::new(),
@@ -162,7 +165,7 @@ impl Store {
     /// Create a primitive atom with an initial value.
     pub fn create_atom(&mut self, init: Value) -> AtomId {
         let id = self.alloc_id();
-        self.values.insert(id, init);
+        self.values.borrow_mut().insert(id, init);
         id
     }
 
@@ -196,13 +199,12 @@ impl Store {
     fn recompute(&mut self, id: AtomId) {
         let read_fn = self.read_fns.get(&id).expect("not a derived atom").clone();
 
-        // Snapshot pointer to values so the read_fn closure can access them.
-        // Safety: the read_fn only reads; we don't mutate `self.values` during
-        // its execution (the `insert` at the bottom happens after the call).
-        let values = &self.values as *const HashMap<AtomId, Value>;
+        // Clone the Rc handle so the getter closure owns a reference (no
+        // borrow of self). At runtime each `borrow()` is brief; if a hostile
+        // read_fn somehow re-entered with `borrow_mut`, RefCell would panic
+        // — much better than the raw-pointer UB the old code risked (A.2).
+        let values = self.values.clone();
 
-        // Enter recompute guard (panics if already computing this atom).
-        // Drop runs on every exit path including panic, clearing thread-locals.
         let guard = RecomputeGuard::enter(id);
 
         let getter = |dep_id: AtomId| -> Value {
@@ -219,10 +221,8 @@ impl Store {
                     deps.insert(dep_id);
                 }
             });
-            unsafe {
-                if let Some(val) = (*values).get(&dep_id) {
-                    return val.clone();
-                }
+            if let Some(val) = values.borrow().get(&dep_id) {
+                return val.clone();
             }
             panic!("atom {:?} not found in store", dep_id);
         };
@@ -243,12 +243,13 @@ impl Store {
         }
         self.dependencies.insert(id, new_deps);
 
-        self.values.insert(id, new_value);
+        self.values.borrow_mut().insert(id, new_value);
     }
 
     /// Read the current value of an atom.
     pub fn get(&self, id: AtomId) -> Value {
         self.values
+            .borrow()
             .get(&id)
             .expect("atom not found in store")
             .clone()
@@ -286,14 +287,15 @@ impl Store {
             !self.read_fns.contains_key(&id),
             "cannot set a read-only derived atom"
         );
-        assert!(self.values.contains_key(&id), "atom not found in store");
-
-        let old = self.values.get(&id);
-        if old == Some(&value) {
-            return; // no change
+        {
+            let values = self.values.borrow();
+            assert!(values.contains_key(&id), "atom not found in store");
+            if values.get(&id) == Some(&value) {
+                return; // no change
+            }
         }
 
-        self.values.insert(id, value);
+        self.values.borrow_mut().insert(id, value);
 
         if self.batch_depth.get() > 0 {
             // Inside batch: defer propagation
@@ -343,10 +345,10 @@ impl Store {
         let mut changed: Vec<AtomId> = unique_roots;
 
         for derived_id in sorted {
-            let old = self.values.get(&derived_id).cloned();
+            let old = self.values.borrow().get(&derived_id).cloned();
             self.recompute(derived_id);
-            let new_val = self.values.get(&derived_id);
-            if old.as_ref() != new_val {
+            let new_val = self.values.borrow().get(&derived_id).cloned();
+            if old != new_val {
                 changed.push(derived_id);
             }
         }
