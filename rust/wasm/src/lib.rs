@@ -135,6 +135,13 @@ impl WasmSheet {
             self.sheet.unsubscribe_cell(sub);
         }
     }
+
+    /// Return a cell's original formula text, or empty string for cells
+    /// without a formula. Used by the formula bar / double-click edit so
+    /// users edit `=A1*2` instead of the displayed result `20` (D.11).
+    pub fn get_formula(&self, addr: &str) -> String {
+        self.sheet.get_formula(addr).unwrap_or_default()
+    }
 }
 
 fn value_to_display(val: &Value) -> String {

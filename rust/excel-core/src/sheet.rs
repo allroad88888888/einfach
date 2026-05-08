@@ -36,6 +36,10 @@ pub struct Sheet {
     readable: ReadableMap,
     /// AST of each formula cell, used for static cycle detection (B.2).
     formula_exprs: HashMap<CellAddress, Rc<Expr>>,
+    /// Original formula text per cell, for `get_formula` so the formula bar
+    /// and edit-mode entry can show the source instead of the computed
+    /// result (D.11).
+    formula_texts: HashMap<CellAddress, String>,
 }
 
 impl Sheet {
@@ -46,6 +50,7 @@ impl Sheet {
             formula_cells: HashMap::new(),
             readable: Rc::new(RefCell::new(HashMap::new())),
             formula_exprs: HashMap::new(),
+            formula_texts: HashMap::new(),
         }
     }
 
@@ -78,6 +83,7 @@ impl Sheet {
         // Remove formula if present
         self.formula_cells.remove(&addr);
         self.formula_exprs.remove(&addr);
+        self.formula_texts.remove(&addr);
         let id = self.ensure_cell(addr);
         // Restore readable to primitive atom (B.1 — must reflect this change
         // immediately so other derived closures stop reading the old formula).
@@ -137,6 +143,8 @@ impl Sheet {
 
         self.formula_cells.insert(addr, derived_id);
         self.formula_exprs.insert(addr, expr);
+        self.formula_texts
+            .insert(addr, formula_str.to_string());
         // Point readable at the new derived so other formulas referencing
         // this cell start reading the formula result, not the primitive.
         self.readable.borrow_mut().insert(addr, derived_id);
@@ -166,6 +174,7 @@ impl Sheet {
     fn write_error(&mut self, addr: CellAddress, err: ValueError) {
         self.formula_cells.remove(&addr);
         self.formula_exprs.remove(&addr);
+        self.formula_texts.remove(&addr);
         let id = self.ensure_cell(addr);
         self.readable.borrow_mut().insert(addr, id);
         self.store.set(id, Value::Error(err));
@@ -206,6 +215,18 @@ impl Sheet {
     pub fn cell_atom(&mut self, addr_str: &str) -> AtomId {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         self.readable_atom(addr)
+    }
+
+    /// Return the original formula text for a cell, or `None` if the cell
+    /// holds a value rather than a formula. Required by the formula bar /
+    /// double-click-to-edit flow so users see `=A1*2` instead of the
+    /// computed result `20` (D.11).
+    ///
+    /// Takes `&str` so callers can reuse the same address strings. Doesn't
+    /// require `&mut self` because no atom creation is involved.
+    pub fn get_formula(&self, addr_str: &str) -> Option<String> {
+        let addr = CellAddress::parse(addr_str)?;
+        self.formula_texts.get(&addr).cloned()
     }
 
     /// Subscribe to changes on a single cell. Returns a token that bundles the
@@ -291,6 +312,7 @@ impl Sheet {
                 old_deriveds.push(old_derived);
             }
             self.formula_exprs.remove(&addr);
+            self.formula_texts.remove(&addr);
 
             let id = self.ensure_cell(addr);
             // Restore readable to primitive in case it pointed at a formula.
@@ -510,6 +532,29 @@ mod tests {
         // Changing A1 should no longer affect B1
         sheet.set_cell("A1", Value::Number(1.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(99.0));
+    }
+
+    #[test]
+    fn get_formula_returns_source_text() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(10.0));
+        // Cell with no formula: None
+        assert_eq!(sheet.get_formula("A1"), None);
+
+        sheet.set_formula("B1", "=A1*2");
+        assert_eq!(sheet.get_formula("B1").as_deref(), Some("=A1*2"));
+
+        // Setting a value clears the formula text
+        sheet.set_cell("B1", Value::Number(99.0));
+        assert_eq!(sheet.get_formula("B1"), None);
+
+        // Replacing a formula updates the stored text
+        sheet.set_formula("B1", "=A1+1");
+        assert_eq!(sheet.get_formula("B1").as_deref(), Some("=A1+1"));
+
+        // Invalid formula clears the text (cell becomes #VALUE!)
+        sheet.set_formula("B1", "=garbage");
+        assert_eq!(sheet.get_formula("B1"), None);
     }
 
     #[test]
