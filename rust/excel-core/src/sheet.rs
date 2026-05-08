@@ -108,6 +108,11 @@ impl Sheet {
         // readable map and switch their dependency to the new derived.
         let prim_id = self.ensure_cell(addr);
 
+        // Capture any prior formula derived on this cell so we can destroy it
+        // after the new derived has taken over and any dependents have been
+        // retargeted (B.4).
+        let old_derived = self.formula_cells.get(&addr).copied();
+
         let expr = Rc::new(expr);
         let readable = self.readable.clone();
         let expr_for_closure = expr.clone();
@@ -125,10 +130,24 @@ impl Sheet {
         // this cell start reading the formula result, not the primitive.
         self.readable.borrow_mut().insert(addr, derived_id);
 
-        // Force prior dependents (which captured prim_id in their dep graph)
-        // to recompute against the new readable map. After this their dep
-        // graph naturally retargets to derived_id (B.1).
-        self.store.propagate_force(&[prim_id]);
+        // Force prior dependents (which captured prim_id or the old derived's
+        // id in their dep graph) to recompute against the new readable map.
+        // After this their dep graph naturally retargets to derived_id (B.1).
+        let mut roots = vec![prim_id];
+        if let Some(old) = old_derived {
+            roots.push(old);
+        }
+        self.store.propagate_force(&roots);
+
+        // Destroy the old derived atom (B.4 — without this, repeated
+        // set_formula on the same cell leaks atoms forever in the store).
+        // Skip if some dependent still wired to it (defensive; shouldn't
+        // happen after the propagate_force above).
+        if let Some(old) = old_derived {
+            if self.store.has_atom(old) && !self.store.has_dependents(old) {
+                self.store.destroy_atom(old);
+            }
+        }
         true
     }
 
@@ -448,6 +467,31 @@ mod tests {
         // Changing A1 should no longer affect B1
         sheet.set_cell("A1", Value::Number(1.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(99.0));
+    }
+
+    #[test]
+    fn set_formula_releases_old_derived() {
+        // B.4: re-setting a formula on the same cell should not leak the
+        // previous derived atom in the store.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(10.0));
+        sheet.set_formula("B1", "=A1*2");
+        let first_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
+        assert_eq!(sheet.get_cell("B1"), Value::Number(20.0));
+
+        // Replace the formula. Old derived should be destroyed.
+        sheet.set_formula("B1", "=A1*3");
+        let second_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
+        assert_ne!(first_derived, second_derived);
+        assert!(!sheet.store.has_atom(first_derived), "old derived must be destroyed");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
+
+        // Many replacements in a row should not grow the store.
+        for n in 1..=20 {
+            sheet.set_formula("B1", &format!("=A1+{}", n));
+        }
+        // Final formula = A1 + 20 = 30.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
     }
 
     #[test]
