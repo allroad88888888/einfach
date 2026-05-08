@@ -5,6 +5,7 @@ pub mod range;
 pub mod sheet;
 pub mod shift;
 pub mod undo;
+pub mod workbook;
 
 pub use cell::CellAddress;
 pub use eval::eval_expr;
@@ -13,3 +14,4 @@ pub use range::CellRange;
 pub use sheet::{CellSubscription, Sheet};
 pub use shift::{render_formula, shift_refs};
 pub use undo::{CellSnapshot, Edit, UndoStack};
+pub use workbook::Workbook;

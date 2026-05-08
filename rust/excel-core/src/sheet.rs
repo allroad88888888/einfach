@@ -261,6 +261,176 @@ impl Sheet {
         self.store.unsub(sub.sub_id);
     }
 
+    // === Phase 4: structural edits ===
+
+    /// Insert `count` empty rows starting at `at` (0-based). All cells at or
+    /// below `at` shift down by `count`; existing formulas are retargeted so
+    /// `=A5` stays pointing at the same logical row even after a row insert
+    /// pushes it to A6.
+    pub fn insert_row(&mut self, at: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
+        self.retarget_formula_refs(&|addr| {
+            crate::shift::shift_addr_row_insert(addr, at, count)
+        });
+    }
+
+    /// Delete `count` rows starting at `at`. References inside the deleted
+    /// range become `#REF!`; references below shift up.
+    pub fn delete_row(&mut self, at: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        // Drop cell entries inside the deleted band first.
+        self.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
+        self.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
+        self.retarget_formula_refs(&|addr| {
+            crate::shift::shift_addr_row_delete(addr, at, count)
+        });
+    }
+
+    pub fn insert_col(&mut self, at: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
+        self.retarget_formula_refs(&|addr| {
+            crate::shift::shift_addr_col_insert(addr, at, count)
+        });
+    }
+
+    pub fn delete_col(&mut self, at: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        self.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
+        self.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
+        self.retarget_formula_refs(&|addr| {
+            crate::shift::shift_addr_col_delete(addr, at, count)
+        });
+    }
+
+    fn drop_cells_in(&mut self, pred: impl Fn(CellAddress) -> bool) {
+        let to_drop: Vec<CellAddress> = self.cells.keys().copied().filter(|a| pred(*a)).collect();
+        for addr in to_drop {
+            if let Some(prim) = self.cells.remove(&addr) {
+                if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
+                    self.store.destroy_atom(prim);
+                }
+            }
+            if let Some(derived) = self.formula_cells.remove(&addr) {
+                if self.store.has_atom(derived) && !self.store.has_dependents(derived) {
+                    self.store.destroy_atom(derived);
+                }
+            }
+            self.formula_exprs.remove(&addr);
+            self.formula_texts.remove(&addr);
+            self.readable.borrow_mut().remove(&addr);
+        }
+    }
+
+    /// Move every (still-present) cell entry to its new address per `f`.
+    fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
+        // Phase A: rebuild each map under new keys. We materialize Vecs first
+        // because mutating a HashMap while iterating its keys would panic.
+        let new_cells: HashMap<CellAddress, AtomId> =
+            std::mem::take(&mut self.cells)
+                .into_iter()
+                .map(|(addr, id)| (f(addr), id))
+                .collect();
+        let new_formula_cells: HashMap<CellAddress, AtomId> =
+            std::mem::take(&mut self.formula_cells)
+                .into_iter()
+                .map(|(addr, id)| (f(addr), id))
+                .collect();
+        let new_formula_exprs: HashMap<CellAddress, Rc<Expr>> =
+            std::mem::take(&mut self.formula_exprs)
+                .into_iter()
+                .map(|(addr, expr)| (f(addr), expr))
+                .collect();
+        let new_formula_texts: HashMap<CellAddress, String> =
+            std::mem::take(&mut self.formula_texts)
+                .into_iter()
+                .map(|(addr, text)| (f(addr), text))
+                .collect();
+        let new_readable: HashMap<CellAddress, AtomId> = self
+            .readable
+            .borrow()
+            .iter()
+            .map(|(addr, id)| (f(*addr), *id))
+            .collect();
+
+        self.cells = new_cells;
+        self.formula_cells = new_formula_cells;
+        self.formula_exprs = new_formula_exprs;
+        self.formula_texts = new_formula_texts;
+        *self.readable.borrow_mut() = new_readable;
+    }
+
+    /// Apply an address-mapping function to every CellRef inside every
+    /// existing formula AST. Used after structural edits so formulas
+    /// continue to point at the same logical cell.
+    fn retarget_formula_refs(&mut self, f: &dyn Fn(CellAddress) -> CellAddress) {
+        let updated: Vec<(CellAddress, Expr)> = self
+            .formula_exprs
+            .iter()
+            .map(|(addr, expr)| (*addr, crate::shift::map_addrs(expr, f)))
+            .collect();
+        for (addr, new_expr) in updated {
+            if crate::shift::contains_invalid_ref(&new_expr) {
+                // Formula references a cell deleted by this structural edit.
+                // Excel produces #REF!.
+                self.write_error(addr, ValueError::InvalidRef);
+                continue;
+            }
+            let new_expr_rc = Rc::new(new_expr);
+            self.formula_exprs.insert(addr, new_expr_rc.clone());
+            let rendered = crate::shift::render_formula(&new_expr_rc);
+            self.rebuild_formula_derived(addr, rendered);
+        }
+    }
+
+    fn rebuild_formula_derived(&mut self, addr: CellAddress, formula_str: String) {
+        let expr = match crate::formula::parse_formula(&formula_str) {
+            Some(e) => Rc::new(e),
+            None => {
+                // Render produced something unparsable — shouldn't happen,
+                // but be safe.
+                self.write_error(addr, ValueError::InvalidValue);
+                return;
+            }
+        };
+        self.formula_exprs.insert(addr, expr.clone());
+        self.formula_texts.insert(addr, formula_str);
+
+        // Destroy old derived if present.
+        let old_derived = self.formula_cells.remove(&addr);
+
+        let prim_id = self.ensure_cell(addr);
+        let readable = self.readable.clone();
+        let expr_for_closure = expr.clone();
+
+        let derived_id = self.store.create_derived(move |get| {
+            let map = readable.borrow();
+            eval_expr(&expr_for_closure, &|id| get(id), &*map)
+        });
+
+        self.formula_cells.insert(addr, derived_id);
+        self.readable.borrow_mut().insert(addr, derived_id);
+        let mut roots = vec![prim_id];
+        if let Some(old) = old_derived {
+            roots.push(old);
+        }
+        self.store.propagate_force(&roots);
+        if let Some(old) = old_derived {
+            if self.store.has_atom(old) && !self.store.has_dependents(old) {
+                self.store.destroy_atom(old);
+            }
+        }
+    }
+
     /// Walk AST and ensure all referenced cells exist.
     fn ensure_refs(&mut self, expr: &Expr) {
         match expr {
@@ -617,6 +787,75 @@ mod tests {
         let ok = sheet.set_formula("A1", "=42");
         assert!(ok);
         assert_eq!(sheet.get_cell("A1"), Value::Number(42.0));
+    }
+
+    // === Phase 4 tests ===
+
+    #[test]
+    fn insert_row_shifts_data_and_refs() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A5", Value::Number(50.0));
+        sheet.set_formula("B1", "=A5*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(100.0));
+
+        // Insert one row at index 2 (between row 2 and row 3).
+        sheet.insert_row(2, 1);
+        // Old A5 should now be at A6.
+        assert_eq!(sheet.get_cell("A6"), Value::Number(50.0));
+        // B1 formula was retargeted: A5 → A6 inside the expression.
+        // Render adds defensive parens around binops; just check it parses
+        // and references A6 by value.
+        assert!(sheet
+            .get_formula("B1")
+            .map(|s| s.contains("A6") && !s.contains("A5"))
+            .unwrap_or(false));
+        // And still computes correctly.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(100.0));
+    }
+
+    #[test]
+    fn delete_row_invalidates_refs_into_deleted_band() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A5", Value::Number(50.0));
+        sheet.set_formula("B1", "=A5*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(100.0));
+
+        // Delete row 5 (0-based = the row that A5 lives in is row index 4).
+        sheet.delete_row(4, 1);
+        // The formula referencing the deleted row should produce #REF!.
+        assert_eq!(
+            sheet.get_cell("B1"),
+            Value::Error(ValueError::InvalidRef)
+        );
+    }
+
+    #[test]
+    fn insert_col_shifts_data_and_refs() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("C1", Value::Number(30.0));
+        sheet.set_formula("A2", "=C1+1");
+        assert_eq!(sheet.get_cell("A2"), Value::Number(31.0));
+
+        // Insert column at index 1 (between A and B → original B becomes C, C→D).
+        sheet.insert_col(1, 1);
+        assert_eq!(sheet.get_cell("D1"), Value::Number(30.0));
+        assert!(sheet
+            .get_formula("A2")
+            .map(|s| s.contains("D1") && !s.contains("C1"))
+            .unwrap_or(false));
+        assert_eq!(sheet.get_cell("A2"), Value::Number(31.0));
+    }
+
+    #[test]
+    fn delete_col_invalidates_refs() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("C1", Value::Number(30.0));
+        sheet.set_formula("A2", "=C1+1");
+        sheet.delete_col(2, 1); // delete column C (index 2)
+        assert_eq!(
+            sheet.get_cell("A2"),
+            Value::Error(ValueError::InvalidRef)
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use einfach_core::{AtomId, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
+use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
 
 /// Evaluate an AST expression using a getter function for cell values.
 /// `cell_map` maps CellAddress to AtomId so the evaluator can look up cells.
@@ -17,6 +18,9 @@ pub fn eval_expr(
         Expr::Text(s) => Value::Text(s.clone()),
 
         Expr::CellRef(addr) => {
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
             if let Some(&id) = cell_map.get(addr) {
                 get(id)
             } else {
