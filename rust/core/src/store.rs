@@ -49,6 +49,9 @@ pub struct Store {
     back_deps: HashMap<AtomId, HashSet<AtomId>>,
     /// atom → list of (sub_id, listener)
     subscriptions: HashMap<AtomId, Vec<(SubscriptionId, Listener)>>,
+    /// Reverse index for O(1) unsubscribe: sub_id → atom_id (A.8).
+    /// Without this, unsub would scan every entry in `subscriptions`.
+    sub_index: HashMap<SubscriptionId, AtomId>,
     next_id: u64,
     next_sub_id: u64,
     /// Batch nesting depth. When > 0, set() defers propagation.
@@ -167,6 +170,7 @@ impl Store {
             dependencies: HashMap::new(),
             back_deps: HashMap::new(),
             subscriptions: HashMap::new(),
+            sub_index: HashMap::new(),
             next_id: 0,
             next_sub_id: 0,
             batch_depth: Rc::new(Cell::new(0)),
@@ -394,6 +398,7 @@ impl Store {
             .entry(id)
             .or_default()
             .push((sub_id, Rc::new(listener)));
+        self.sub_index.insert(sub_id, id);
         sub_id
     }
 
@@ -407,13 +412,20 @@ impl Store {
             .entry(id)
             .or_default()
             .push((sub_id, Rc::from(listener)));
+        self.sub_index.insert(sub_id, id);
         sub_id
     }
 
-    /// Remove a subscription.
+    /// Remove a subscription. O(1) via the sub_index reverse map (A.8).
+    /// Without the index this would scan every atom's subscription list.
     pub fn unsub(&mut self, sub_id: SubscriptionId) {
-        for subs in self.subscriptions.values_mut() {
-            subs.retain(|(id, _)| *id != sub_id);
+        if let Some(atom_id) = self.sub_index.remove(&sub_id) {
+            if let Some(subs) = self.subscriptions.get_mut(&atom_id) {
+                subs.retain(|(id, _)| *id != sub_id);
+                if subs.is_empty() {
+                    self.subscriptions.remove(&atom_id);
+                }
+            }
         }
     }
 
@@ -468,7 +480,13 @@ impl Store {
         self.read_fns.remove(&id);
         self.write_fns.remove(&id);
         self.back_deps.remove(&id);
-        self.subscriptions.remove(&id);
+        // Removing the subscription bucket: also drop matching sub_index
+        // entries so the reverse map doesn't grow unboundedly with destroys.
+        if let Some(subs) = self.subscriptions.remove(&id) {
+            for (sub_id, _) in subs {
+                self.sub_index.remove(&sub_id);
+            }
+        }
     }
 
     /// Notify all subscribers of the given atoms.
@@ -1289,6 +1307,39 @@ mod tests {
         }
         // values map should be empty after the loop.
         assert!(!store.has_atom(AtomId::from_raw(0)));
+    }
+
+    // === A.8 unsub indexing ===
+
+    #[test]
+    fn unsub_is_o1_via_index() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let b = store.create_atom(Value::Number(2.0));
+        let count_a = Rc::new(RefCell::new(0u32));
+        let count_b = Rc::new(RefCell::new(0u32));
+        let ca = count_a.clone();
+        let cb = count_b.clone();
+        let sub_a = store.sub(a, move || *ca.borrow_mut() += 1);
+        store.sub(b, move || *cb.borrow_mut() += 1);
+
+        store.unsub(sub_a);
+        store.set(a, Value::Number(99.0));
+        store.set(b, Value::Number(99.0));
+        assert_eq!(*count_a.borrow(), 0);
+        assert_eq!(*count_b.borrow(), 1);
+    }
+
+    #[test]
+    fn destroy_atom_purges_sub_index() {
+        let mut store = Store::new();
+        let a = store.create_atom(Value::Number(1.0));
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let sub_id = store.sub(a, move || *cc.borrow_mut() += 1);
+        store.destroy_atom(a);
+        // Calling unsub on the now-orphaned id must not panic and is no-op.
+        store.unsub(sub_id);
     }
 
     /// A.5: two writable atoms whose write_fns set each other should panic
