@@ -6,9 +6,8 @@ use einfach_core::{Value, ValueError};
 use einfach_excel_core::Sheet;
 
 /// ISSUES B.12: `batch_set` 不会像 `set_cell` 那样清掉已有公式。
-/// 期望：批量写入到一个公式格之后，公式被清除。
+/// 1A step 5 修复后通过。
 #[test]
-#[ignore = "B.12: batch_set 不清 formula_cells，已知 bug"]
 fn batch_set_should_clear_formula() {
     let mut sheet = Sheet::new();
     sheet.set_cell("A1", Value::Number(10.0));

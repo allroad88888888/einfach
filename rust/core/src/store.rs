@@ -388,6 +388,16 @@ impl Store {
         self.values.borrow().contains_key(&id)
     }
 
+    /// Returns true if any other atom currently depends on `id`.
+    /// Useful for callers who want to avoid `destroy_atom`'s panic when the
+    /// atom still has live dependents.
+    pub fn has_dependents(&self, id: AtomId) -> bool {
+        self.back_deps
+            .get(&id)
+            .map(|s| !s.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Destroy an atom and free all references to it (A.4).
     /// Cleans 5 tables: values, read_fns, write_fns, dependencies, back_deps,
     /// subscriptions. Also removes the atom from any other atom's back_deps

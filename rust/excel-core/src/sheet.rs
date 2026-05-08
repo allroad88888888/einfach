@@ -210,22 +210,47 @@ impl Sheet {
     }
 
     /// Set multiple cells at once, with a single propagation pass.
+    ///
+    /// Like `set_cell`, this also clears any existing formula on each target
+    /// cell — formula derived atoms are destroyed and `readable` is restored
+    /// to the primitive atom (B.12). Without this, batched writes would read
+    /// the stale formula result on subsequent `get_cell` calls.
     pub fn batch_set(&mut self, updates: &[(&str, Value)]) {
-        // Pre-ensure all cells exist before entering the batch
-        let atom_values: Vec<(AtomId, Value)> = updates
-            .iter()
-            .map(|(addr_str, value)| {
-                let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-                let id = self.ensure_cell(addr);
-                (id, value.clone())
-            })
-            .collect();
+        // For each target: clear formula bookkeeping, ensure primitive atom,
+        // remember the (atom_id, value) pair, and the old derived (if any) to
+        // destroy after propagation completes.
+        let mut atom_values: Vec<(AtomId, Value)> = Vec::with_capacity(updates.len());
+        let mut old_deriveds: Vec<AtomId> = Vec::new();
+
+        for (addr_str, value) in updates {
+            let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+
+            if let Some(old_derived) = self.formula_cells.remove(&addr) {
+                old_deriveds.push(old_derived);
+            }
+            self.formula_exprs.remove(&addr);
+
+            let id = self.ensure_cell(addr);
+            // Restore readable to primitive in case it pointed at a formula.
+            self.readable.borrow_mut().insert(addr, id);
+            atom_values.push((id, value.clone()));
+        }
 
         self.store.batch(|store| {
             for (id, value) in atom_values {
                 store.set(id, value);
             }
         });
+
+        // Destroy orphaned derived atoms after propagation. Skip any that
+        // still have dependents (shouldn't happen after the batch above
+        // retargets them via readable map, but be defensive — leaking a few
+        // atoms is better than panicking the wasm instance).
+        for old in old_deriveds {
+            if self.store.has_atom(old) && !self.store.has_dependents(old) {
+                self.store.destroy_atom(old);
+            }
+        }
     }
 }
 
