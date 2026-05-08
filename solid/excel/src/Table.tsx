@@ -1,3 +1,5 @@
+/** @jsxImportSource solid-js */
+
 import { For } from 'solid-js'
 import { Cell } from './Cell'
 import type { SheetStore } from './sheet-store'

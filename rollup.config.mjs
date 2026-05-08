@@ -17,6 +17,8 @@ const products = topLevelDirs.reduce((acc, dir) => {
     .readdirSync(dir, { withFileTypes: true })
     .filter((dirent) => dirent.isDirectory())
     .map((dirent) => `${dir}/${dirent.name}`)
+    // 跳过没有 src/index.ts 的子包（demo 应用走 vite build，不进 rollup）
+    .filter((p) => fs.existsSync(`${p}/src/index.ts`))
   return [...acc, ...subDirs]
 }, [])
 

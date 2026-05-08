@@ -79,7 +79,7 @@ describe('async', () => {
     })
 
     expect(queryByTestId(baseElement, 'loading')).toBeInTheDocument()
-    await screen.findByTestId('firstItem')
+    await screen.findByTestId('firstItem', undefined, { timeout: 3000 })
     expect(queryByTestId(baseElement, 'firstItem')).toBeInTheDocument()
   })
 

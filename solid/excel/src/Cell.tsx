@@ -1,3 +1,5 @@
+/** @jsxImportSource solid-js */
+
 import { createSignal, Show } from 'solid-js'
 import type { SheetStore } from './sheet-store'
 

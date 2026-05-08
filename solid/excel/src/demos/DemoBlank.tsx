@@ -1,3 +1,4 @@
+/** @jsxImportSource solid-js */
 
 import { Table } from '../Table'
 import { createSheetStore } from '../sheet-store'
