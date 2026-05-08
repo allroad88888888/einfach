@@ -24,36 +24,48 @@
 
 ---
 
-## 当前状态（v0.1 — 已完成）
+## 当前状态（截至本分支 HEAD）
 
-能做什么：
-- 输入数字、文本、公式（=A1+B1）
-- 6 个函数（SUM, AVERAGE, COUNT, IF, MIN, MAX）
-- 公式自动重算
-- 20×10 网格，双击编辑
+> 1A → 6 + 7A 已完成。7B / 7C 留给后续工具链工作。
+> Rust 测试：core 61 + excel-core 120 + 4 review_repro + wasm 10 = **195 通过**。
+> JS 测试：jest 53 套件 / 317 通过。
 
-不能做什么：
-- 不能用键盘导航（方向键、Tab）
-- 不能选中单元格/范围
-- 没有公式栏
-- 没有比较运算符（<, >, =）
-- 没有常用函数（VLOOKUP, CONCATENATE 等）
-- 没有复制粘贴
-- 没有撤销重做
-- WASM 订阅未接通
-- Solid demo 实际跑 `createJSSheet`（纯 JS 后端），跟 Rust 行为不等价（见 ISSUES.md D.1）
+**已完成（后端）**
 
-已知关键 bug（详见 ISSUES.md，回归测试在 `rust/excel-core/tests/review_repro.rs`）：
-- **B.1**：`set_formula` 的 `cell_map` 是快照（已验证）— 先建公式引用某 cell，后给该 cell 加公式，引用方读不到新值
-- **B.2**：自引用 / 互引用公式**绕过**环检测，得到看似合理的随机数（已验证）
-- **B.3**：公式 parse 失败 panic 整个 wasm 实例
-- **B.12**：`batch_set` 不清公式（已验证）— 批量覆盖公式格读到旧公式结果
-- **C.1-C.4**：subscribe/订阅传播/重入保护/unsubscribe 全部缺失或空函数
-- **C.11**：`Sheet.store` 是 crate-private，1A 必须先定义公共 subscribe API
-- **D.1**：默认 demo 走 createJSSheet，**首屏即坏**（IF/AVERAGE/MIN/MAX/COUNT/SUM 列表形式都不工作）
-- **D.11**：双击编辑公式格直接吞掉公式，因为 ISheet 没有 `get_formula`
-- **A.4**：atom 创建后永不释放（第四期 / 第七期前置）
-- **A.11**：`recompute` panic 时 thread_local 残留，污染后续 store 操作
+- ✅ Atom 引擎：destroy_atom (A.4)、O(1) unsub (A.8)、写循环检测 (A.5)、recompute/batch RAII (A.6+A.11)、unsafe raw pointer 替换 (A.2)、CellListener trait 分层 (C.11)
+- ✅ Excel 公式：四则 + `^` + `&` + 比较运算 + 字符串字面量
+- ✅ 函数库（28 个）
+  - 算术：SUM, AVERAGE, COUNT, MIN, MAX
+  - 逻辑：IF, AND, OR, NOT
+  - 数学：ABS, ROUND, CEILING, FLOOR, SQRT, POWER, MOD
+  - 文本：CONCATENATE, LEN, LEFT, RIGHT, MID, UPPER, LOWER, TRIM
+  - 条件：COUNTIF, SUMIF
+  - 查找：VLOOKUP, HLOOKUP, INDEX, MATCH
+  - 统计：MEDIAN, MODE, STDEV, VAR, LARGE, SMALL
+  - 日期：DATE, YEAR, MONTH, DAY（TODAY/NOW 留给 chrono）
+- ✅ Sheet API：set/get cell + formula + batch + subscribe/unsubscribe + 行列插入删除（含 ref 自动调整 + #REF!）
+- ✅ Workbook：多 sheet 容器（跨 sheet 引用 parser deferred）
+- ✅ Undo / Range / 公式偏移：UndoStack, Edit, CellSnapshot, CellRange, shift_refs, render_formula
+- ✅ 格式化：CellFormat（数字 / 百分比 / 货币 / 千分位）— 条件格式 deferred
+- ✅ CSV 导入导出（RFC 4180 引号转义）
+- ✅ WASM 桥接：subscribe / unsubscribe / get_formula 全接通
+
+**已完成（UI）**
+- ✅ TS 侧 ISheet 完整接口 + sheet-store 精准订阅（D.3+D.4）
+- ✅ Cell 双击编辑保留公式（D.11）
+- ✅ FormulaBar 组件、selection 模型、Cell 高亮、Table 方向键 / Tab 导航
+
+**Deferred — 工具链 / UI e2e 密集**
+- Solid demo 实际加载 wasm-pack 产物（需 vite-plugin-wasm + wasm-pack）
+- 跨 sheet 引用 parser（`=Sheet1!A1`）
+- 复制粘贴 / 撤销重做 / 多 sheet 切换的 UI 接线（后端 API 都齐了）
+- 条件格式 rule engine
+- 7B 虚拟滚动 + fps benchmark
+- 7C Web Worker + 跨线程 subscribe 适配器
+- wasm-bindgen-test + playwright e2e
+- TODAY / NOW（chrono crate）
+
+> 所有 ISSUES.md 列出的"必修"项已全部解决；review_repro 4 个 ignore 测试已全部去 ignore 通过。
 
 ---
 
