@@ -482,7 +482,7 @@ impl Sheet {
             // Cross-sheet refs are resolved by the workbook layer; the
             // current sheet doesn't pre-create cells for them.
             Expr::SheetRef { .. } => {}
-            Expr::Number(_) | Expr::Text(_) => {}
+            Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
         }
     }
 
@@ -562,7 +562,7 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         // Cross-sheet refs are out-of-scope for static cycle detection on
         // this sheet (cross-sheet cycles need workbook-level analysis).
         Expr::SheetRef { .. } => {}
-        Expr::Number(_) | Expr::Text(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
     }
 }
 

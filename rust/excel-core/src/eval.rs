@@ -65,6 +65,7 @@ pub fn eval_expr(
     match expr {
         Expr::Number(n) => Value::Number(*n),
         Expr::Text(s) => Value::Text(s.clone()),
+        Expr::Bool(b) => Value::Boolean(*b),
 
         Expr::CellRef(addr) => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
@@ -288,6 +289,71 @@ fn collect_range_2d(
                 .collect()
         })
         .collect()
+}
+
+/// Shared inner loop for VLOOKUP / HLOOKUP. `index` is 1-based; for
+/// horizontal=false it picks the column to return from a matched row,
+/// for horizontal=true it picks the row to return from a matched column.
+///
+/// In approximate mode (range_lookup=TRUE) the lookup column/row must
+/// be ascending; we find the largest value <= needle. Numeric needles
+/// use numeric ordering; otherwise text ordering.
+fn lookup_2d(
+    grid: &[Vec<Value>],
+    needle: &Value,
+    index: usize,
+    approximate: bool,
+    horizontal: bool,
+) -> Value {
+    if grid.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+
+    // Build the key sequence we search through.
+    let keys: Vec<Value> = if horizontal {
+        grid[0].clone()
+    } else {
+        grid.iter().map(|r| r.first().cloned().unwrap_or(Value::Null)).collect()
+    };
+
+    // Find match position.
+    let pos: Option<usize> = if approximate {
+        // Linear scan picking largest key <= needle. (binary search is an
+        // optimization; correctness is identical.)
+        let mut best: Option<usize> = None;
+        for (i, k) in keys.iter().enumerate() {
+            if compare_lookup(k, needle).is_le() {
+                best = Some(i);
+            } else {
+                break; // input is supposed to be sorted; first overshoot ends scan
+            }
+        }
+        best
+    } else {
+        keys.iter().position(|k| values_equal(k, needle))
+    };
+
+    let p = match pos {
+        Some(p) => p,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+
+    // Return the cell at the requested row/column from the matched line.
+    let cell = if horizontal {
+        grid.get(index - 1).and_then(|r| r.get(p))
+    } else {
+        grid.get(p).and_then(|r| r.get(index - 1))
+    };
+    cell.cloned().unwrap_or(Value::Error(ValueError::InvalidRef))
+}
+
+fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if let (Some(an), Some(bn)) = (coerce_to_number(a), coerce_to_number(b)) {
+        an.partial_cmp(&bn).unwrap_or(Ordering::Equal)
+    } else {
+        coerce_to_text(a).cmp(&coerce_to_text(b))
+    }
 }
 
 fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)> {
@@ -633,9 +699,9 @@ fn eval_func(
         // === Phase 5: lookup / stats / dates ===
 
         "VLOOKUP" => {
-            // VLOOKUP(lookup_value, table_range, col_index, [exact])
-            // exact defaults to false (true = approximate match — not yet
-            // implemented; we always do exact for safety).
+            // VLOOKUP(lookup_value, table_range, col_index, [range_lookup])
+            // range_lookup: TRUE/omitted = approximate (range must be sorted
+            // ascending in col 1; finds largest value ≤ needle), FALSE = exact.
             if args.len() < 3 || args.len() > 4 {
                 return Value::Error(ValueError::InvalidValue);
             }
@@ -648,16 +714,13 @@ fn eval_func(
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
+            let approximate = if args.len() == 4 {
+                coerce_to_bool(&eval_expr(&args[3], get, cell_map)).unwrap_or(true)
+            } else {
+                true
+            };
             let grid = collect_range_2d(start, end, get, cell_map);
-            for row in &grid {
-                if row.first().map(|v| values_equal(v, &needle)).unwrap_or(false) {
-                    return row
-                        .get(col_idx - 1)
-                        .cloned()
-                        .unwrap_or(Value::Error(ValueError::InvalidRef));
-                }
-            }
-            Value::Error(ValueError::InvalidValue)
+            lookup_2d(&grid, &needle, col_idx, approximate, /* horizontal = */ false)
         }
 
         "HLOOKUP" => {
@@ -673,20 +736,13 @@ fn eval_func(
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
+            let approximate = if args.len() == 4 {
+                coerce_to_bool(&eval_expr(&args[3], get, cell_map)).unwrap_or(true)
+            } else {
+                true
+            };
             let grid = collect_range_2d(start, end, get, cell_map);
-            if grid.is_empty() {
-                return Value::Error(ValueError::InvalidValue);
-            }
-            let header = &grid[0];
-            for (col, cell) in header.iter().enumerate() {
-                if values_equal(cell, &needle) {
-                    return grid
-                        .get(row_idx - 1)
-                        .and_then(|r| r.get(col).cloned())
-                        .unwrap_or(Value::Error(ValueError::InvalidRef));
-                }
-            }
-            Value::Error(ValueError::InvalidValue)
+            lookup_2d(&grid, &needle, row_idx, approximate, /* horizontal = */ true)
         }
 
         "INDEX" => {
@@ -1389,9 +1445,10 @@ mod tests {
             eval_str("=VLOOKUP(2,A1:B3,2)", &cm, &vs),
             Value::Number(20.0)
         );
-        // VLOOKUP(99, ...) → #VALUE!
+        // VLOOKUP(99, ..., FALSE) → #N/A in exact mode (default became
+        // approximate after C.3, matching Excel; old test expected exact).
         assert!(matches!(
-            eval_str("=VLOOKUP(99,A1:B3,2)", &cm, &vs),
+            eval_str("=VLOOKUP(99,A1:B3,2,FALSE)", &cm, &vs),
             Value::Error(_)
         ));
     }
@@ -1458,6 +1515,53 @@ mod tests {
         assert_eq!(
             eval_str("=SMALL(A1:B2,1)", &cm, &vs),
             Value::Number(5.0)
+        );
+    }
+
+    #[test]
+    fn eval_vlookup_approximate_match() {
+        // Tax bracket lookup: thresholds 0/100/1000/10000 -> rates
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        for (i, (threshold, rate)) in
+            [(0.0, 5.0), (100.0, 10.0), (1000.0, 20.0), (10000.0, 30.0)].iter().enumerate()
+        {
+            let row = i as u32;
+            let t = AtomId::from_raw((row * 2) as u64);
+            let r = AtomId::from_raw((row * 2 + 1) as u64);
+            cm.insert(CellAddress::new(row, 0), t);
+            cm.insert(CellAddress::new(row, 1), r);
+            vs.insert(t, Value::Number(*threshold));
+            vs.insert(r, Value::Number(*rate));
+        }
+        // Approximate (4th arg = TRUE / omitted): largest threshold <= 500 is 100 -> 10
+        assert_eq!(
+            eval_str("=VLOOKUP(500,A1:B4,2)", &cm, &vs),
+            Value::Number(10.0)
+        );
+        assert_eq!(
+            eval_str("=VLOOKUP(500,A1:B4,2,TRUE)", &cm, &vs),
+            Value::Number(10.0)
+        );
+        // 12000 -> 10000 bracket -> 30
+        assert_eq!(
+            eval_str("=VLOOKUP(12000,A1:B4,2)", &cm, &vs),
+            Value::Number(30.0)
+        );
+        // Below smallest -> #N/A (returned as InvalidValue)
+        assert!(matches!(
+            eval_str("=VLOOKUP(-1,A1:B4,2)", &cm, &vs),
+            Value::Error(_)
+        ));
+        // Exact mode (FALSE) on 500 -> #N/A because 500 isn't in the column
+        assert!(matches!(
+            eval_str("=VLOOKUP(500,A1:B4,2,FALSE)", &cm, &vs),
+            Value::Error(_)
+        ));
+        // Exact match on 100 -> 10
+        assert_eq!(
+            eval_str("=VLOOKUP(100,A1:B4,2,FALSE)", &cm, &vs),
+            Value::Number(10.0)
         );
     }
 

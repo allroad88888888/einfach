@@ -80,7 +80,7 @@ pub fn shift_addr_col_delete(addr: CellAddress, at: u32, count: u32) -> CellAddr
 /// Returns a new AST. Used by row/col insert/delete to retarget formulas.
 pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
     match expr {
-        Expr::Number(_) | Expr::Text(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(f(*addr)),
         Expr::Range { start, end } => Expr::Range {
             start: f(*start),
@@ -111,7 +111,7 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
 /// Range references shift both corners by the same delta.
 pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
     Ok(match expr {
-        Expr::Number(_) | Expr::Text(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(shift_addr(*addr, drow, dcol)?),
         Expr::Range { start, end } => Expr::Range {
             start: shift_addr(*start, drow, dcol)?,
@@ -170,6 +170,7 @@ fn render_into(expr: &Expr, out: &mut String) {
             out.push_str(s);
             out.push('"');
         }
+        Expr::Bool(b) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
         Expr::CellRef(addr) => {
             if is_invalid(*addr) {
                 out.push_str("#REF!");

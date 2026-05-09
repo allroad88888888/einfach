@@ -7,6 +7,8 @@ pub enum Expr {
     Number(f64),
     /// A literal string, e.g. "hello"
     Text(String),
+    /// Literal TRUE / FALSE.
+    Bool(bool),
     /// A cell reference, e.g. A1
     CellRef(CellAddress),
     /// Binary operation: left op right
@@ -338,6 +340,17 @@ impl Parser {
         let ident: String = self.chars[start..self.pos].iter().collect();
 
         self.skip_whitespace();
+
+        // Check for TRUE / FALSE literals (case-insensitive). Excel treats
+        // these as bare identifiers (no parens needed) — they shouldn't be
+        // tried as cell addresses or function names.
+        let upper = ident.to_ascii_uppercase();
+        if upper == "TRUE" {
+            return Some(Expr::Bool(true));
+        }
+        if upper == "FALSE" {
+            return Some(Expr::Bool(false));
+        }
 
         // Check if it's a function call
         if self.peek() == Some('(') {
