@@ -50,7 +50,23 @@ export function createSheetStore(sheet: ISheet) {
   // === Selection ===
   // Owned by the store so FormulaBar / Table / future right-click menus
   // / keyboard handlers can all read & write a single source of truth.
-  const [selection, setSelectionRaw] = createSignal<CellCoord>({ row: 0, col: 0 })
+  //
+  // Two layers:
+  //   - `selection()` is the focus cell — what FormulaBar shows, what
+  //     arrow-keys move. Always a single coord.
+  //   - `selectionRange()` is the rectangle anchored at `anchor` and
+  //     extending to `focus`. When the user clicks a cell we collapse
+  //     the range to that cell (anchor === focus); Shift+arrow keeps
+  //     anchor, moves focus, growing/shrinking the rectangle.
+  const [selection, setSelectionInner] = createSignal<CellCoord>({ row: 0, col: 0 })
+  const [anchor, setAnchor] = createSignal<CellCoord>({ row: 0, col: 0 })
+
+  /** Collapse the range to a single cell (existing public semantics). */
+  const setSelectionRaw = (next: CellCoord) => {
+    setSelectionInner(next)
+    setAnchor(next)
+    return next
+  }
 
   type CellHandle = {
     tick: () => number
@@ -145,14 +161,71 @@ export function createSheetStore(sheet: ISheet) {
   }
 
   return {
-    /** Currently selected cell. Reactive — driven by Table & FormulaBar. */
+    /** Currently focused cell. Reactive — driven by Table & FormulaBar.
+     * For ranges this is the "focus" end (the cell arrow-keys move). */
     selection,
 
-    /** Selection setter. Use `setSelection({ row, col })` from any component. */
+    /**
+     * Selection setter. Collapses any active range to this single cell
+     * (anchor === focus). Use `setSelection({ row, col })` from any
+     * component to mimic a click.
+     */
     setSelection: setSelectionRaw,
 
-    /** Convenience accessor — selection's address form. */
+    /** Convenience accessor — focus cell's address form. */
     selectionAddr: () => coordToAddr(selection()),
+
+    /**
+     * The current rectangular selection: `anchor` is where the range
+     * started (last click / setSelectionAnchor), `focus` is where it
+     * currently ends (last arrow-move / extendSelection). For a single-
+     * cell selection the two are equal.
+     */
+    selectionRange: (): { anchor: CellCoord; focus: CellCoord } => ({
+      anchor: anchor(),
+      focus: selection(),
+    }),
+
+    /**
+     * Set both anchor and focus to `coord` — equivalent to a click on
+     * that cell (collapses any existing range). Same effect as
+     * `setSelection`; named for clarity at call sites that "start" a
+     * new range vs. just navigating.
+     */
+    setSelectionAnchor: (coord: CellCoord) => {
+      setSelectionInner(coord)
+      setAnchor(coord)
+    },
+
+    /**
+     * Move the focus end of the range to `coord` while keeping the
+     * existing anchor. Use this for Shift+Arrow / Shift+Click.
+     */
+    extendSelection: (coord: CellCoord) => {
+      setSelectionInner(coord)
+    },
+
+    /**
+     * Row-major grid of addresses covered by the current selection
+     * rectangle. For a single-cell selection returns `[['A1']]`. The
+     * rectangle is normalized so reverse selections (focus above/left
+     * of anchor) still produce top-left-first addresses.
+     */
+    selectionAddrs: (): string[][] => {
+      const a = anchor()
+      const f = selection()
+      const r0 = Math.min(a.row, f.row)
+      const r1 = Math.max(a.row, f.row)
+      const c0 = Math.min(a.col, f.col)
+      const c1 = Math.max(a.col, f.col)
+      const out: string[][] = []
+      for (let r = r0; r <= r1; r++) {
+        const row: string[] = []
+        for (let c = c0; c <= c1; c++) row.push(coordToAddr({ row: r, col: c }))
+        out.push(row)
+      }
+      return out
+    },
 
     getCell(addr: string): CellValue {
       getHandle(addr).tick()

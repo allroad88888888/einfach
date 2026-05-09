@@ -33,9 +33,15 @@ export function Table(props: TableProps) {
     props.store.setSelection(clampCoord(next, rows(), cols()))
   }
 
-  function move(drow: number, dcol: number) {
+  function extendCoord(next: CellCoord) {
+    props.store.extendSelection(clampCoord(next, rows(), cols()))
+  }
+
+  function move(drow: number, dcol: number, extend = false) {
     const cur = selected()
-    selectCoord({ row: cur.row + drow, col: cur.col + dcol })
+    const next = { row: cur.row + drow, col: cur.col + dcol }
+    if (extend) extendCoord(next)
+    else selectCoord(next)
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -65,22 +71,24 @@ export function Table(props: TableProps) {
 
     switch (e.key) {
       case 'ArrowUp':
-        move(-1, 0)
+        move(-1, 0, e.shiftKey)
         e.preventDefault()
         break
       case 'ArrowDown':
-        move(1, 0)
+        move(1, 0, e.shiftKey)
         e.preventDefault()
         break
       case 'ArrowLeft':
-        move(0, -1)
+        move(0, -1, e.shiftKey)
         e.preventDefault()
         break
       case 'ArrowRight':
-        move(0, 1)
+        move(0, 1, e.shiftKey)
         e.preventDefault()
         break
       case 'Tab':
+        // Tab always collapses — that's the spreadsheet convention even
+        // when shift is held (Shift+Tab moves backward, doesn't extend).
         move(0, e.shiftKey ? -1 : 1)
         e.preventDefault()
         break

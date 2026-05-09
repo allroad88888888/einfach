@@ -374,4 +374,76 @@ describe('createSheetStore', () => {
       })
     })
   })
+
+  describe('selection range', () => {
+    it('setSelection collapses to a single cell', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelection({ row: 2, col: 3 })
+        const r = store.selectionRange()
+        expect(r.anchor).toEqual({ row: 2, col: 3 })
+        expect(r.focus).toEqual({ row: 2, col: 3 })
+        expect(store.selectionAddrs()).toEqual([['D3']])
+        dispose()
+      })
+    })
+
+    it('extendSelection moves focus only (anchor stays put)', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelectionAnchor({ row: 1, col: 1 })
+        store.extendSelection({ row: 3, col: 2 })
+        const r = store.selectionRange()
+        expect(r.anchor).toEqual({ row: 1, col: 1 })
+        expect(r.focus).toEqual({ row: 3, col: 2 })
+        // selection() / selectionAddr() track the focus end.
+        expect(store.selectionAddr()).toBe('C4')
+        dispose()
+      })
+    })
+
+    it('selectionAddrs returns row-major grid for forward range', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        // Anchor at B2 (row 1, col 1), extend to D4 (row 3, col 3).
+        store.setSelectionAnchor({ row: 1, col: 1 })
+        store.extendSelection({ row: 3, col: 3 })
+        expect(store.selectionAddrs()).toEqual([
+          ['B2', 'C2', 'D2'],
+          ['B3', 'C3', 'D3'],
+          ['B4', 'C4', 'D4'],
+        ])
+        dispose()
+      })
+    })
+
+    it('selectionAddrs normalizes backward range (focus < anchor)', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        // Anchor at D4, extend "backward" to B2.
+        store.setSelectionAnchor({ row: 3, col: 3 })
+        store.extendSelection({ row: 1, col: 1 })
+        expect(store.selectionAddrs()).toEqual([
+          ['B2', 'C2', 'D2'],
+          ['B3', 'C3', 'D3'],
+          ['B4', 'C4', 'D4'],
+        ])
+        // selection() still reflects focus, not the rectangle's top-left.
+        expect(store.selectionAddr()).toBe('B2')
+        dispose()
+      })
+    })
+
+    it('setSelection after extendSelection collapses again', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 2, col: 2 })
+        // A click somewhere else collapses the range.
+        store.setSelection({ row: 5, col: 5 })
+        expect(store.selectionAddrs()).toEqual([['F6']])
+        dispose()
+      })
+    })
+  })
 })
