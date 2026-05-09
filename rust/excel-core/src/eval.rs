@@ -53,6 +53,14 @@ pub fn eval_expr(
             let _ = (start, end);
             Value::Error(ValueError::InvalidValue)
         }
+
+        Expr::SheetRef { .. } => {
+            // Standalone Sheet eval has no Workbook scope — cross-sheet refs
+            // need the higher-level workbook resolver to translate (sheet,
+            // addr) into an AtomId before they can be read here. Returning
+            // #REF! lets users at least see the call shape in the result.
+            Value::Error(ValueError::InvalidRef)
+        }
     }
 }
 

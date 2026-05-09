@@ -27,6 +27,12 @@ pub enum Expr {
         start: CellAddress,
         end: CellAddress,
     },
+    /// Cross-sheet reference: `Sheet1!A1`. Resolution requires a Workbook
+    /// scope at eval time; standalone Sheet eval treats it as #REF!.
+    SheetRef {
+        sheet: String,
+        addr: CellAddress,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,6 +350,29 @@ impl Parser {
             });
         }
 
+        // Check for cross-sheet reference: `Name!A1` (Excel syntax).
+        // The bang `!` unambiguously marks the preceding identifier as a
+        // sheet name — it's not a token in any other formula context. The
+        // identifier ALWAYS becomes a sheet name when '!' follows, even if
+        // the same chars would also parse as a cell address.
+        if self.peek() == Some('!') {
+            self.advance(); // skip '!'
+            let addr_start = self.pos;
+            while let Some(c) = self.peek() {
+                if c.is_ascii_alphanumeric() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            let addr_str: String = self.chars[addr_start..self.pos].iter().collect();
+            let addr = CellAddress::parse(&addr_str)?;
+            return Some(Expr::SheetRef {
+                sheet: ident,
+                addr,
+            });
+        }
+
         // Check if it's a cell reference (with possible range)
         if let Some(addr) = CellAddress::parse(&ident) {
             self.skip_whitespace();
@@ -581,6 +610,43 @@ mod tests {
             parse_formula("=\"hello\""),
             Some(Expr::Text("hello".into()))
         );
+    }
+
+    #[test]
+    #[test]
+    fn parse_cross_sheet_ref() {
+        let result = parse_formula("=Sheet2!A1").unwrap();
+        assert_eq!(
+            result,
+            Expr::SheetRef {
+                sheet: "Sheet2".into(),
+                addr: CellAddress::new(0, 0),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cross_sheet_in_expression() {
+        // Cross-sheet ref inside a binop. Sheet2!A1 + 5
+        let result = parse_formula("=Sheet2!A1+5").unwrap();
+        assert_eq!(
+            result,
+            Expr::BinOp {
+                op: BinOperator::Add,
+                left: Box::new(Expr::SheetRef {
+                    sheet: "Sheet2".into(),
+                    addr: CellAddress::new(0, 0),
+                }),
+                right: Box::new(Expr::Number(5.0)),
+            }
+        );
+    }
+
+    #[test]
+    fn cell_address_takes_precedence_over_sheet_ref() {
+        // `A1` alone is a cell ref, not a sheet name. The bang disambiguates.
+        let result = parse_formula("=A1").unwrap();
+        assert!(matches!(result, Expr::CellRef(_)));
     }
 
     #[test]

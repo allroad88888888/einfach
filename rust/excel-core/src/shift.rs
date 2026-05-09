@@ -20,6 +20,7 @@ pub fn contains_invalid_ref(expr: &Expr) -> bool {
     match expr {
         Expr::CellRef(addr) => is_invalid(*addr),
         Expr::Range { start, end } => is_invalid(*start) || is_invalid(*end),
+        Expr::SheetRef { addr, .. } => is_invalid(*addr),
         Expr::Negate(inner) => contains_invalid_ref(inner),
         Expr::BinOp { left, right, .. } => {
             contains_invalid_ref(left) || contains_invalid_ref(right)
@@ -85,6 +86,11 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
             start: f(*start),
             end: f(*end),
         },
+        // Cross-sheet refs aren't shifted by within-sheet structural edits.
+        Expr::SheetRef { sheet, addr } => Expr::SheetRef {
+            sheet: sheet.clone(),
+            addr: *addr,
+        },
         Expr::Negate(inner) => Expr::Negate(Box::new(map_addrs(inner, f))),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
@@ -110,6 +116,12 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
         Expr::Range { start, end } => Expr::Range {
             start: shift_addr(*start, drow, dcol)?,
             end: shift_addr(*end, drow, dcol)?,
+        },
+        // Cross-sheet refs aren't shifted on copy/paste — they point to a
+        // fixed location on a different sheet regardless of paste target.
+        Expr::SheetRef { sheet, addr } => Expr::SheetRef {
+            sheet: sheet.clone(),
+            addr: *addr,
         },
         Expr::Negate(inner) => Expr::Negate(Box::new(shift_refs(inner, drow, dcol)?)),
         Expr::BinOp { op, left, right } => Expr::BinOp {
@@ -172,6 +184,15 @@ fn render_into(expr: &Expr, out: &mut String) {
                 out.push_str(&start.to_string_repr());
                 out.push(':');
                 out.push_str(&end.to_string_repr());
+            }
+        }
+        Expr::SheetRef { sheet, addr } => {
+            if is_invalid(*addr) {
+                out.push_str("#REF!");
+            } else {
+                out.push_str(sheet);
+                out.push('!');
+                out.push_str(&addr.to_string_repr());
             }
         }
         Expr::Negate(inner) => {
