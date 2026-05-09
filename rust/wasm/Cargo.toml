@@ -24,3 +24,10 @@ wasm-bindgen-test = "0.3"
 [profile.release]
 opt-level = "s"
 lto = true
+
+# wasm-pack metadata: skip the wasm-opt post-processing step. wasm-opt
+# requires a binaryen binary that wasm-pack tries to download from GitHub
+# at build time, which fails in restricted networks. opt-level = "s" + lto
+# already give us most of the size win; wasm-opt is a marginal extra pass.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
