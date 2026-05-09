@@ -32,6 +32,7 @@ export function Table(props: TableProps) {
   // Selection lives on the store so FormulaBar / future copy-paste / right-
   // click menus all read & write the same source of truth.
   const selected = () => props.store.selection()
+  const range = () => props.store.selectionRange()
 
   function selectCoord(next: CellCoord) {
     props.store.setSelection(clampCoord(next, rows(), cols()))
@@ -195,12 +196,27 @@ export function Table(props: TableProps) {
                   {(col) => {
                     const isSelected = () =>
                       selected().row === row && selected().col === col
+                    // Cheap rectangle hit-test against the normalized
+                    // anchor/focus rect. Recomputed per access — the
+                    // surrounding `range()` accessor is the signal
+                    // subscription, so Solid only rerenders the class
+                    // string per cell, not the whole row.
+                    const isInRange = () => {
+                      const r = range()
+                      const r0 = Math.min(r.anchor.row, r.focus.row)
+                      const r1 = Math.max(r.anchor.row, r.focus.row)
+                      const c0 = Math.min(r.anchor.col, r.focus.col)
+                      const c1 = Math.max(r.anchor.col, r.focus.col)
+                      return row >= r0 && row <= r1 && col >= c0 && col <= c1
+                    }
                     return (
                       <Cell
                         addr={cellAddr(row, col)}
                         store={props.store}
                         selected={isSelected}
+                        inRange={isInRange}
                         onSelect={() => selectCoord({ row, col })}
+                        onExtendSelect={() => extendCoord({ row, col })}
                       />
                     )
                   }}

@@ -233,10 +233,22 @@ thead .row-header {
   background: #fff;
 }
 
-/* Selected cell highlight */
+/* Selected cell highlight (focus cell — outlined + slightly darker tint) */
 .cell-selected {
   outline: 2px solid #1a73e8;
   outline-offset: -2px;
+  background: #e8f0fe;
+}
+
+/* Range cell highlight (every cell in the rectangle EXCEPT the focus cell).
+ * Lighter blue so the focus cell's outline + tint still pop. */
+.cell-in-range {
+  background: #f1f6ff;
+}
+
+/* Hover override inside a range — keep the range tint visible instead of
+ * the generic hover blue, which would otherwise wipe the visual. */
+.cell-in-range:hover {
   background: #e8f0fe;
 }
 

@@ -7,8 +7,16 @@ export interface CellProps {
   store: SheetStore
   /** Reactive accessor — true when this cell is the active selection. */
   selected?: () => boolean
+  /**
+   * Reactive accessor — true when this cell is part of the current
+   * selection range but is NOT the focus cell. Mutually exclusive with
+   * `selected` (the focus cell wins so its outline stays distinct).
+   */
+  inRange?: () => boolean
   /** Called on click to request selection of this cell. */
   onSelect?: () => void
+  /** Called on shift+click to extend the range to this cell. */
+  onExtendSelect?: () => void
 }
 
 export function Cell(props: CellProps) {
@@ -17,6 +25,7 @@ export function Cell(props: CellProps) {
 
   const cellValue = () => props.store.getCell(props.addr)
   const isSelected = () => (props.selected ? props.selected() : false)
+  const isInRange = () => (props.inRange ? props.inRange() : false)
 
   function startEditing() {
     // For formula cells, edit the source formula (`=A1*2`) instead of the
@@ -46,21 +55,33 @@ export function Cell(props: CellProps) {
 
   function classes() {
     const v = cellValue()
+    const sel = isSelected()
     return [
       'cell',
       `cell-${v.type}`,
       v.isError ? 'cell-error' : '',
-      isSelected() ? 'cell-selected' : '',
+      sel ? 'cell-selected' : '',
+      // Focus cell wins — only draw the lighter range tint on non-focus
+      // cells so the outline on the focus cell stays visually distinct.
+      !sel && isInRange() ? 'cell-in-range' : '',
     ]
       .filter(Boolean)
       .join(' ')
+  }
+
+  function onClick(e: MouseEvent) {
+    if (e.shiftKey && props.onExtendSelect) {
+      props.onExtendSelect()
+    } else {
+      props.onSelect?.()
+    }
   }
 
   return (
     <td
       class={classes()}
       data-cell-addr={props.addr}
-      onClick={() => props.onSelect?.()}
+      onClick={onClick}
       onDblClick={startEditing}
     >
       <Show
