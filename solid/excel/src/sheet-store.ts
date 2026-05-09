@@ -46,6 +46,54 @@ export interface ClipboardData {
   originAddr: string
 }
 
+/** Marker prepended to the system-clipboard TSV so we can recover the
+ * source origin when the user re-pastes inside the same app. Format:
+ *
+ *   `# einfach-clipboard-origin: A1\n<TSV body>`
+ *
+ * When the marker is absent (e.g. the user pasted from a real spreadsheet
+ * or a plain text editor), the parser falls back to `originAddr === paste
+ * target`, i.e. no relative-ref shift, which matches "literal paste"
+ * semantics for foreign clipboard data.
+ */
+const CLIPBOARD_ORIGIN_MARKER_PREFIX = '# einfach-clipboard-origin: '
+
+/**
+ * Serialize a `ClipboardData` to the TSV-with-origin-marker string we
+ * write to the system clipboard. Cells are joined by `\t` per row and rows
+ * by `\n`. The first line is the origin marker so a subsequent paste from
+ * the same app can recover the source top-left and shift relative refs.
+ */
+export function serializeClipboardTSV(data: ClipboardData): string {
+  const body = data.cells.map((row) => row.join('\t')).join('\n')
+  return `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${data.originAddr}\n${body}`
+}
+
+/**
+ * Parse a TSV-with-optional-origin-marker string back into a
+ * `ClipboardData`. If the marker line is missing, `fallbackOrigin` is
+ * used as the origin (typical: the paste target itself, so no shift).
+ */
+export function parseClipboardTSV(text: string, fallbackOrigin: string): ClipboardData {
+  // Normalize line endings — Windows clipboards love \r\n, and `\r`
+  // showing up at row boundaries silently turns numbers into text.
+  const normalized = text.replace(/\r\n?/g, '\n')
+  let origin = fallbackOrigin
+  let body = normalized
+  if (normalized.startsWith(CLIPBOARD_ORIGIN_MARKER_PREFIX)) {
+    const newlineIdx = normalized.indexOf('\n')
+    const markerLine =
+      newlineIdx === -1 ? normalized : normalized.slice(0, newlineIdx)
+    origin = markerLine.slice(CLIPBOARD_ORIGIN_MARKER_PREFIX.length).trim() || fallbackOrigin
+    body = newlineIdx === -1 ? '' : normalized.slice(newlineIdx + 1)
+  }
+  // Drop a single trailing newline if present — most editors / spreadsheets
+  // append one, and we don't want a phantom empty row pasted at the bottom.
+  if (body.endsWith('\n')) body = body.slice(0, -1)
+  const cells = body === '' ? [['']] : body.split('\n').map((row) => row.split('\t'))
+  return { cells, originAddr: origin }
+}
+
 export function createSheetStore(sheet: ISheet) {
   // === Selection ===
   // Owned by the store so FormulaBar / Table / future right-click menus

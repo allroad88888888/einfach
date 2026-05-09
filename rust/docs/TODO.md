@@ -31,16 +31,29 @@
 - **重现**：`solid/excel/e2e/smoke.spec.ts` "Ctrl/Cmd+Z undoes" 测试目前要按两次 Meta+Z 才能回到空，已在测试里注释标注
 - **修复路径**：`Cell.tsx::commitEdit` 加幂等守卫——`if (!editing()) return`——或者 commit 后才 `setEditing(false)`，以及把 `onBlur` 改成判断当前是否还在 editing
 - **延后理由**：本次 PR 范围只是 e2e 套件落地，应用源代码改动须独立 commit + review
+
+### 1.3 ✅ Ctrl+C / Ctrl+V 系统剪贴板 — 已做
 - **代码**：`SheetStore.copy(addrs[][])` / `paste(originAddr, data)` 已有；paste 已做相对引用偏移
-- **缺**：
-  - 没监听键盘
-  - selection 仍是单 cell，没 SelectionRange — 复制范围需要先实现 Shift+方向键扩展选区
-  - 没接 `navigator.clipboard.writeText/readText` — 只能在应用内剪贴板
-- **最小步骤**：
-  1. SheetStore 的 selection 升级成 `{ anchor, focus }` 矩形
-  2. Table 处理 Shift+方向键扩展
-  3. Ctrl+C 序列化 selection 为 TSV 写入 navigator.clipboard
-  4. Ctrl+V 读 navigator.clipboard，按 \t/\n 切分调 paste
+- **新增（本批次）**：
+  - SheetStore 加 `selectionRange()` / `setSelectionAnchor()` / `extendSelection()` / `selectionAddrs()`；`selection()` / `setSelection()` 语义不变（focus cell；setSelection 折叠 range）
+  - SheetStore 暴露 `serializeClipboardTSV` / `parseClipboardTSV` 两个 helper，供 Table.tsx 与测试共用
+  - Table.tsx 处理 Shift+ArrowUp/Down/Left/Right → `extendSelection`；普通 Arrow / Tab 仍走 collapse
+  - Table.tsx 处理 Cmd/Ctrl+C / V / X：写入 `navigator.clipboard.writeText` / 从 `readText` 读回；剪切 = 复制 + clearCell（一条 undo）
+  - Cell.tsx 加 `inRange` prop + `cell-in-range` 类；styles.css 加浅蓝底色（`#f1f6ff`），focus cell 仍是 `cell-selected`（深蓝 + outline）
+  - Shift+Click 在 Cell 上调 `onExtendSelect` → `extendSelection`
+  - Delete/Backspace 现在清空整个 selection range（一条 undo），不再仅 focus cell
+- **剪贴板序列化格式**（写入系统剪贴板）：
+  ```
+  # einfach-clipboard-origin: <topLeftAddr>\n
+  cell\tcell\tcell\n
+  cell\tcell\tcell
+  ```
+  marker 行让同一 app 再次粘贴时能恢复 origin → 触发相对引用偏移；marker 缺失（外部剪贴板）时 fallback 到 paste target，按字面 paste 不偏移
+- **测试**：`solid/excel/test/sheet-store.test.ts` 加 12 个用例（selection range 5 + TSV helper 5 + copy/paste roundtrip 2）
+- **未做 / 已知限制**：
+  - jest 不走 `navigator.clipboard`（jsdom 不稳定）— 只测 helper；浏览器内手测靠 `npm run dev`
+  - `navigator.clipboard` 需要 secure context（HTTPS 或 localhost）且需用户手势；非安全上下文下 Ctrl+C/V 静默失败
+  - playwright clipboard e2e 需要权限授予（`context.grantPermissions(['clipboard-read', 'clipboard-write'])`），本批次未加（保持 7 个 smoke 测试不动）
 
 ### 1.4 ✅ Delete 键清空选中 — 已做
 - `Table.tsx::onKeyDown` `case 'Delete'/'Backspace'` 调 `store.clearCell`，走 undo

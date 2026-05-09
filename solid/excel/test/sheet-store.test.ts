@@ -2,7 +2,11 @@
 
 import { describe, it, expect } from '@jest/globals'
 import { createRoot } from 'solid-js'
-import { createSheetStore } from '../src/sheet-store'
+import {
+  createSheetStore,
+  parseClipboardTSV,
+  serializeClipboardTSV,
+} from '../src/sheet-store'
 import { createJSSheet } from '../src/js-sheet'
 
 function createTestStore() {
@@ -442,6 +446,127 @@ describe('createSheetStore', () => {
         // A click somewhere else collapses the range.
         store.setSelection({ row: 5, col: 5 })
         expect(store.selectionAddrs()).toEqual([['F6']])
+        dispose()
+      })
+    })
+  })
+
+  describe('clipboard TSV serialization helpers', () => {
+    it('serialize → parse round-trips a 2x3 grid with origin', () => {
+      const serialized = serializeClipboardTSV({
+        cells: [
+          ['1', '2', '3'],
+          ['hello', '=A1+1', ''],
+        ],
+        originAddr: 'C7',
+      })
+      // First line must be the marker so a same-app paste recovers origin.
+      expect(serialized.startsWith('# einfach-clipboard-origin: C7\n')).toBe(true)
+      // Body is plain TSV — pasteable into a real spreadsheet too.
+      expect(serialized).toContain('1\t2\t3\nhello\t=A1+1\t')
+
+      const parsed = parseClipboardTSV(serialized, 'A1')
+      expect(parsed.originAddr).toBe('C7')
+      expect(parsed.cells).toEqual([
+        ['1', '2', '3'],
+        ['hello', '=A1+1', ''],
+      ])
+    })
+
+    it('parse without marker uses fallback origin', () => {
+      // Foreign clipboard (real Excel, vim, etc.) — no marker line.
+      const parsed = parseClipboardTSV('1\t2\n3\t4\n', 'D5')
+      expect(parsed.originAddr).toBe('D5')
+      expect(parsed.cells).toEqual([
+        ['1', '2'],
+        ['3', '4'],
+      ])
+    })
+
+    it('parse normalizes CRLF line endings', () => {
+      const parsed = parseClipboardTSV('1\t2\r\n3\t4', 'A1')
+      expect(parsed.cells).toEqual([
+        ['1', '2'],
+        ['3', '4'],
+      ])
+    })
+
+    it('parse strips a single trailing newline', () => {
+      const parsed = parseClipboardTSV('1\t2\n', 'A1')
+      // Without strip we'd get a phantom 3rd row [''] from the trailing \n.
+      expect(parsed.cells).toEqual([['1', '2']])
+    })
+
+    it('parse falls back to origin when marker line is empty', () => {
+      // Marker present but empty after the colon → fall back, not '' origin.
+      const parsed = parseClipboardTSV('# einfach-clipboard-origin: \n1\t2', 'A1')
+      expect(parsed.originAddr).toBe('A1')
+      expect(parsed.cells).toEqual([['1', '2']])
+    })
+  })
+
+  describe('copy + paste roundtrip via selectionAddrs', () => {
+    it('copies a 2x3 range, paste at same origin restores values + formula', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        // Seed B2:D3 with a mix of numbers + a formula.
+        store.setNumber('B2', 1)
+        store.setNumber('C2', 2)
+        store.setNumber('D2', 3)
+        store.setNumber('B3', 10)
+        store.setFormula('C3', '=B3+1')
+        store.setText('D3', 'x')
+
+        // Build the rectangular addr grid the way Table.tsx will.
+        store.setSelectionAnchor({ row: 1, col: 1 })
+        store.extendSelection({ row: 2, col: 3 })
+        const addrs = store.selectionAddrs()
+        expect(addrs).toEqual([
+          ['B2', 'C2', 'D2'],
+          ['B3', 'C3', 'D3'],
+        ])
+
+        const data = store.copy(addrs)
+        expect(data.originAddr).toBe('B2')
+        expect(data.cells).toEqual([
+          ['1', '2', '3'],
+          ['10', '=B3+1', 'x'],
+        ])
+
+        // Now wipe and re-paste at the same origin — formula stays
+        // unchanged (no shift) and values come back.
+        store.beginEdit()
+        for (const row of addrs) for (const a of row) store.clearCell(a)
+        store.endEdit()
+        expect(store.getCell('B2').type).toBe('null')
+
+        store.paste('B2', data)
+        expect(store.getCell('B2').display).toBe('1')
+        expect(store.getCell('D2').display).toBe('3')
+        expect(store.getCell('B3').display).toBe('10')
+        expect(store.getFormula('C3')).toBe('=B3+1')
+        expect(store.getCell('D3').display).toBe('x')
+        dispose()
+      })
+    })
+
+    it('serialize → parse → paste roundtrips through the system-clipboard format', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 5)
+        store.setNumber('B1', 6)
+        store.setFormula('C1', '=A1+B1')
+        const data = store.copy([['A1', 'B1', 'C1']])
+        const text = serializeClipboardTSV(data)
+        // Simulate a paste at D5: parser recovers A1 origin from marker.
+        const parsed = parseClipboardTSV(text, 'D5')
+        expect(parsed.originAddr).toBe('A1')
+        store.paste('D5', parsed)
+        expect(store.getCell('D5').display).toBe('5')
+        expect(store.getCell('E5').display).toBe('6')
+        // A1+B1 shifted by (D5 - A1) = (+3 col, +4 row) → D5+E5 = 11.
+        expect(store.getFormula('F5')).toBe('=D5+E5')
+        expect(store.getCell('F5').display).toBe('11')
         dispose()
       })
     })

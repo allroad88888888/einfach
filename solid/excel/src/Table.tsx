@@ -3,7 +3,11 @@ import { For, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { FormulaBar } from './FormulaBar'
 import { clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
-import type { SheetStore } from './sheet-store'
+import {
+  parseClipboardTSV,
+  serializeClipboardTSV,
+  type SheetStore,
+} from './sheet-store'
 
 export interface TableProps {
   store: SheetStore
@@ -44,6 +48,48 @@ export function Table(props: TableProps) {
     else selectCoord(next)
   }
 
+  // Ctrl+C / Ctrl+V handlers — extracted from onKeyDown to keep that switch
+  // small and to allow direct unit-call from tests if needed later.
+  async function handleCopy(e: KeyboardEvent) {
+    e.preventDefault()
+    const addrs = props.store.selectionAddrs()
+    const data = props.store.copy(addrs)
+    const text = serializeClipboardTSV(data)
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // No clipboard permission / not in a secure context. Silently swallow
+      // — there's nothing user-actionable we can surface from here, and a
+      // thrown error would crash the keydown handler.
+    }
+  }
+
+  async function handlePaste(e: KeyboardEvent) {
+    e.preventDefault()
+    let text = ''
+    try {
+      text = await navigator.clipboard.readText()
+    } catch {
+      return
+    }
+    if (text === '') return
+    const target = coordToAddr(selected())
+    // Origin defaults to the paste target so foreign clipboards (no marker)
+    // paste literally without shifting refs.
+    const data = parseClipboardTSV(text, target)
+    props.store.paste(target, data)
+  }
+
+  async function handleCut(e: KeyboardEvent) {
+    await handleCopy(e)
+    const addrs = props.store.selectionAddrs()
+    props.store.beginEdit()
+    for (const row of addrs) {
+      for (const addr of row) props.store.clearCell(addr)
+    }
+    props.store.endEdit()
+  }
+
   function onKeyDown(e: KeyboardEvent) {
     // Skip if the user is editing inside a Cell input — Cell's own handler
     // owns Enter / Escape / arrow semantics during edit.
@@ -65,6 +111,18 @@ export function Table(props: TableProps) {
       if (e.key === 'y' || e.key === 'Y') {
         props.store.redo()
         e.preventDefault()
+        return
+      }
+      if (e.key === 'c' || e.key === 'C') {
+        void handleCopy(e)
+        return
+      }
+      if (e.key === 'v' || e.key === 'V') {
+        void handlePaste(e)
+        return
+      }
+      if (e.key === 'x' || e.key === 'X') {
+        void handleCut(e)
         return
       }
     }
@@ -94,9 +152,14 @@ export function Table(props: TableProps) {
         break
       case 'Delete':
       case 'Backspace': {
-        // Clear the selected cell. Routed through SheetStore so undo works.
-        const cur = selected()
-        props.store.clearCell(coordToAddr(cur))
+        // Clear every cell in the selection range. Routed through SheetStore
+        // so undo collapses to one entry via beginEdit/endEdit.
+        const addrs = props.store.selectionAddrs()
+        props.store.beginEdit()
+        for (const row of addrs) {
+          for (const addr of row) props.store.clearCell(addr)
+        }
+        props.store.endEdit()
         e.preventDefault()
         break
       }
