@@ -28,6 +28,14 @@ export interface ISheet {
   unsubscribe(token: number): void
   /** Clear a cell back to its initial empty / Null state. */
   clear_cell(addr: string): void
+  /**
+   * Structural edits (phase 4 backend). All update referenced formulas to
+   * follow the data; references inside the deleted band become #REF!.
+   */
+  insert_row?(at: number, count: number): void
+  delete_row?(at: number, count: number): void
+  insert_col?(at: number, count: number): void
+  delete_col?(at: number, count: number): void
 }
 
 export type CellValue = {

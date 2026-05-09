@@ -146,6 +146,25 @@ export function createSheetStore(sheet: ISheet) {
       recordSingle(addr, () => sheet.clear_cell(addr))
     },
 
+    /**
+     * Insert `count` empty rows at index `at`. Existing data shifts down;
+     * formula references retarget. Currently NOT undoable — structural
+     * edits don't capture per-cell snapshots (would explode for large
+     * sheets); see TODO A.6 for the full sheet-snapshot approach.
+     */
+    insertRow(at: number, count = 1) {
+      sheet.insert_row?.(at, count)
+    },
+    deleteRow(at: number, count = 1) {
+      sheet.delete_row?.(at, count)
+    },
+    insertCol(at: number, count = 1) {
+      sheet.insert_col?.(at, count)
+    },
+    deleteCol(at: number, count = 1) {
+      sheet.delete_col?.(at, count)
+    },
+
     setCellInput(addr: string, input: string) {
       const trimmed = input.trim()
       recordSingle(addr, () => {

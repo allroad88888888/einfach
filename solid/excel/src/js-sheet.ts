@@ -201,5 +201,70 @@ export function createJSSheet(): ISheet {
       recalcAll()
       fireChanges(before)
     },
+
+    // Structural edits — naive map-rebuild implementations sufficient for
+    // the JS mock. The Rust backend has the canonical version with proper
+    // formula-ref retargeting; this one only relocates cells, formulas
+    // referencing the moved cells will silently still point at old refs.
+    // TODO A.6 follow-up: TS-side ref retarget once createJSSheet shares
+    // an AST with Rust (or just delete this path when WASM is the default).
+    insert_row(at: number, count: number) {
+      const before = snapshotDisplays()
+      relocate((a) => (a.row >= at ? { ...a, row: a.row + count } : a))
+      recalcAll()
+      fireChanges(before)
+    },
+    delete_row(at: number, count: number) {
+      const before = snapshotDisplays()
+      relocate((a) => {
+        if (a.row >= at && a.row < at + count) return null
+        if (a.row >= at + count) return { ...a, row: a.row - count }
+        return a
+      })
+      recalcAll()
+      fireChanges(before)
+    },
+    insert_col(at: number, count: number) {
+      const before = snapshotDisplays()
+      relocate((a) => (a.col >= at ? { ...a, col: a.col + count } : a))
+      recalcAll()
+      fireChanges(before)
+    },
+    delete_col(at: number, count: number) {
+      const before = snapshotDisplays()
+      relocate((a) => {
+        if (a.col >= at && a.col < at + count) return null
+        if (a.col >= at + count) return { ...a, col: a.col - count }
+        return a
+      })
+      recalcAll()
+      fireChanges(before)
+    },
+  }
+
+  /** Apply an address mapping to every cell entry; null = drop. */
+  function relocate(map: (a: { row: number; col: number }) => { row: number; col: number } | null) {
+    const newCells = new Map<string, ReturnType<typeof cells.get>>()
+    const newFormulas = new Map<string, string>()
+    for (const [addr, val] of cells) {
+      const c = parseAddr(addr)
+      const moved = map({ row: c.row - 1, col: c.col.charCodeAt(0) - 65 })
+      if (moved === null) continue
+      const nextAddr = String.fromCharCode(65 + moved.col) + (moved.row + 1)
+      newCells.set(nextAddr, val)
+    }
+    for (const [addr, f] of formulas) {
+      const c = parseAddr(addr)
+      const moved = map({ row: c.row - 1, col: c.col.charCodeAt(0) - 65 })
+      if (moved === null) continue
+      const nextAddr = String.fromCharCode(65 + moved.col) + (moved.row + 1)
+      newFormulas.set(nextAddr, f)
+    }
+    cells.clear()
+    formulas.clear()
+    for (const [a, v] of newCells) {
+      if (v) cells.set(a, v)
+    }
+    for (const [a, f] of newFormulas) formulas.set(a, f)
   }
 }

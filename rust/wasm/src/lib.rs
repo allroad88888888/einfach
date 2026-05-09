@@ -67,6 +67,19 @@ impl WasmSheet {
         self.sheet.clear_cell(addr);
     }
 
+    pub fn insert_row(&mut self, at: u32, count: u32) {
+        self.sheet.insert_row(at, count);
+    }
+    pub fn delete_row(&mut self, at: u32, count: u32) {
+        self.sheet.delete_row(at, count);
+    }
+    pub fn insert_col(&mut self, at: u32, count: u32) {
+        self.sheet.insert_col(at, count);
+    }
+    pub fn delete_col(&mut self, at: u32, count: u32) {
+        self.sheet.delete_col(at, count);
+    }
+
     /// Set a cell to a text value.
     pub fn set_text(&mut self, addr: &str, value: &str) {
         self.sheet.set_cell(addr, Value::Text(value.to_string()));

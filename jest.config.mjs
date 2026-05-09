@@ -25,6 +25,12 @@ const jestConfig = {
   testEnvironment: 'jsdom',
 
   /**
+   * Skip generated `@types` directories — composite projects emit `.d.ts`
+   * + transpiled `.jsx` there, and jest would re-run those duplicates.
+   */
+  testPathIgnorePatterns: ['/node_modules/', '/@types/'],
+
+  /**
    * 模块名称映射，用于解析 @einfach/core 和 @einfach/react 包
    */
   moduleNameMapper: {
