@@ -83,7 +83,7 @@
 
 ### 新增（review 之外完成的功能）
 - ✅ 跨 sheet 引用 parser (`Name!A1`) — c4057ce
-- ✅ Workbook 跨 sheet eval (TLS resolver，单层 read-time 刷新；链式缓存仍 deferred) — 99f8528
+- ✅ Workbook 跨 sheet eval (`WorkbookEvalProvider` + lazy read-time recursion；跨 sheet 订阅仍 deferred) — 99f8528 + lazy formula follow-up
 - ✅ TODAY / NOW (chrono wasmbind) — f92f142
 - ✅ 条件格式后端 (ConditionalRule + apply_rules) — ce973f2
 - ✅ undo / redo + clipboard copy/paste TS API — 2267c54
@@ -99,7 +99,7 @@
 - A.8 格式化 / 条件格式 UI
 - B.3 wasm-bindgen-test, B.4 playwright e2e CI, B.5 criterion benchmark
 - D.1/D.2 7B 虚拟滚动 + 7C Web Worker
-- C.1 follow-up — derived 在 resolver scope 内重算
+- C.1 follow-up — legacy TLS resolver 清理；workbook-wide 跨 sheet 订阅 / 反向依赖图
 
 ---
 
@@ -217,6 +217,7 @@
 ### B.4（必修，已提到 1A）旧 derived atom 永不释放 → 编辑公式越多越慢
 - **位置**：`rust/excel-core/src/sheet.rs:88` `self.formula_cells.insert(addr, derived_id);`
 - **问题**：重新 set_formula 同一个 cell，旧 derived 在 store 里依然存在（依赖关系也还在）。用户在 UI 编辑公式 100 次 → 100 个废弃 derived 全部留在 store，每次源 cell 改动都会重算所有这些幽灵 derived
+- **当前状态**：lazy formula 主体落地后，公式不再是 core derived atom；`formula_cells` 保存的是 `Rc<FormulaRecord>`，替换公式会释放旧 record 并重建地址级依赖。
 - **依赖**：A.4（atom GC 缺失）。**ROADMAP 1A 已选择实现 `destroy_atom`**（不选 replace_read_fn），1A step 3 完成 A.4 后 step 6 在 set_formula 调用 `destroy_atom(old_id)`
 - **原本可选方案（已弃）**：复用旧 derived id 替换 read_fn — 工作量小但 A.4 仍欠债，否决
 
@@ -244,6 +245,7 @@
   });
   ```
 - 内层 `&|id| get(id)` 跟 `get` 类型一致，可直接传 `get`。每次 recompute 创建一个临时闭包，轻微浪费
+- **当前状态**：旧 `create_derived` 公式路径已删除；`Sheet` 公式求值改走 `eval_expr_with_provider`，此项实际不再适用。
 
 ### B.9（轻）`parse_formula` 错误时返回 `None` 信息丢失
 - **位置**：`rust/excel-core/src/formula.rs:42-53`
@@ -251,7 +253,7 @@
 - **改法**：返回 `Result<Expr, ParseError { pos, expected, got }>`，配合 ROADMAP 第一期的"公式栏"才能给出有意义的错误提示
 
 ### B.10（轻）AST 没缓存 / 没常量折叠
-- 每次 derived recompute 都跑完整 AST 树
+- AST 已随 `FormulaRecord` / `formula_exprs` 保存，不再每次重新 parse；常量折叠仍未做。
 - ROADMAP 第七期"性能"目标，目前规模不需要
 
 ### B.11（轻）`Range` 出现在非函数参数位置直接 `InvalidValue`
@@ -264,6 +266,7 @@
 - **结果**：`batch_set("B1", 99)` 之后 `get_cell("B1")` 还是返回旧公式结果（已用测试 `batch_set_should_clear_formula` 验证）
 - **影响放大**：`rust/wasm/src/lib.rs:75` 的 `batch_set_numbers` 直接暴露这个 bug 给 JS。前端任何"批量数据导入"操作覆盖到公式格都失败
 - **改法**：`batch_set` 内每个 update 也走 `formula_cells.remove(&addr)`，或者复用 `set_cell` 路径在 batch 里执行
+- **当前状态**：已修。`batch_set` 覆盖公式格会移除 lazy formula record 并重建依赖索引。
 
 ### 路线图与现实的 gap
 

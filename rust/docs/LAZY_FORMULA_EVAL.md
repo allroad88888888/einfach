@@ -1,10 +1,17 @@
 # Lazy Formula Eval 规划
 
 > 目标：公式结果必须按需计算。导入、批量写入、订阅空白 viewport 都不能把整张表提前算热或提前创建 atom。
+>
+> 当前状态：Step 1/2 主体已落地。`Sheet::set_formula` 不再调用
+> `Store::create_derived`，公式记录为 Sheet 层 `FormulaRecord`；
+> `Workbook::get_cell` 走 `WorkbookEvalProvider` 递归读取跨 sheet 公式。
+> 仍未完成：BulkLoader、range dependency interval index、workbook-wide
+> 跨 sheet 订阅/反向依赖图、primitive atom GC。TLS resolver 仅保留为旧
+> `eval_expr(get, cell_map)` 兼容入口。
 
 ## 背景
 
-当前 `Sheet::set_formula` 会立即调用 `Store::create_derived`。`create_derived` 在创建时立刻 `recompute`，所以大批量导入公式会同步计算全部公式结果。
+旧实现里 `Sheet::set_formula` 会立即调用 `Store::create_derived`。`create_derived` 在创建时立刻 `recompute`，所以大批量导入公式会同步计算全部公式结果。
 
 这在小表可接受，但会限制后续几个方向：
 
@@ -14,10 +21,9 @@
 - Range 公式如 `SUM(A1:A100000)` 会展开大量地址，后续 `SUM(A:A)` 这类整列引用会更差。
 - Workbook 跨 sheet eval 需要在读取公式时带 workbook 上下文，当前 eager derived 很难拿到正确 resolver。
 
-当前已有临时 bridge：`Workbook::get_cell` 会在 resolver scope 内 silent 重算目标
-sheet 上含 `SheetRef` 的公式，单层跨 sheet 和当前 sheet 限定引用能读出正确值；
-但这仍是 O(目标 sheet 跨 sheet 公式数) 的 read-time 刷新，且链式跨 sheet cache
-仍可能 stale。lazy formula 主体仍是根治项。
+旧实现曾有临时 bridge：`Workbook::get_cell` 在 resolver scope 内 silent 重算目标
+sheet 上含 `SheetRef` 的公式。这条路径已被 `WorkbookEvalProvider` 替换；
+Workbook 读取时递归求值并 bypass formula cache，链式跨 sheet 读取能看到 live 值。
 
 ## 设计原则
 
@@ -187,7 +193,8 @@ pub struct WorkbookEvalCtx<'a> {
    **复用同一个 ctx**，computing stack 共享，跨 sheet 环检测自然兜底
 4. 求值过程中再遇到 `sheet_cell` → 递归
 
-这一步顺便干掉当前 `eval.rs` 里的 TLS + `unsafe transmute`（`with_cross_resolver`），是 Step 1 的硬验收项。
+当前落地版已经让 Workbook 读路径脱离 TLS resolver。`with_cross_resolver`
+和 TLS 仍保留给旧 `eval_expr(get, cell_map)` 兼容入口，后续可独立删除。
 
 #### 为什么不用 `&mut self`
 
@@ -274,7 +281,10 @@ trait 形状、归属、为什么 `&self`、为什么 `Rc<FormulaRecord>` ——
 - `MEDIAN/MODE/STDEV/VAR/LARGE/SMALL/VLOOKUP/HLOOKUP/INDEX/MATCH` 仍需临时 `Vec<Value>` 或 2D `Vec<Vec<Value>>`，但这只是 N 个 Value 的栈临时数据，不会污染 store。
 - 整列引用 `SUM(A:A)` 在 range index 升级前先按 sparse range 处理（只遍历真实存在的 cell）。
 
-**TLS resolver 的清算**：当前 `eval.rs::with_cross_resolver` 用 `unsafe { mem::transmute }` 把 `&dyn CrossSheetResolver` 强转成 `'static` 走 thread_local，是历史遗留 hack。Step 1 完成后 `with_cross_resolver` 整体删除，所有跨 sheet 通道都走 `WorkbookEvalCtx`。
+**TLS resolver 的清算**：`eval.rs::with_cross_resolver` 仍用
+`unsafe { mem::transmute }` 把 `&dyn CrossSheetResolver` 强转成 `'static` 走
+thread_local，是历史遗留兼容入口。Workbook 读路径已改走
+`WorkbookEvalProvider`；下一步可以删除 legacy `with_cross_resolver` 通道。
 
 ## 写入与 dirty 传播
 
@@ -431,31 +441,32 @@ bulk load 期间：
 - 公式引用空白 cell 后，primitive atom count 不增加
 - 后续写入这个空白 cell → 依赖公式 cache 状态从 `Clean` / `Uncomputed` 变 `Dirty`
 
-### Step 1：抽出 EvalContext + 拆 TLS resolver（无行为变化）
+### Step 1：抽出 EvalProvider + Workbook provider（主体已完成）
 
-把 `eval_expr(expr, get, cell_map)` 改成 `eval_expr(expr, ctx: &mut dyn EvalContext)`：
+把求值入口拆成两层：保留旧 `eval_expr(expr, get, cell_map)` 兼容 API，
+新增 `eval_expr_with_provider(expr, provider: &dyn EvalProvider)`：
 
-- 实现 `SheetEvalCtx` 包装现有 `(get, cell_map)` 路径，行为完全等价
-- 实现 `WorkbookEvalCtx` 替代当前 `with_cross_resolver` 的 TLS + `unsafe transmute`
-- 删除 `eval.rs::with_cross_resolver` 和 thread_local，删 `unsafe`
+- 已实现 `EvalProvider`，让求值器按地址读取 cell，而不是要求每个引用都有 `AtomId`
+- 已实现 `Sheet` 默认 provider 和 `WorkbookEvalProvider`
+- `Workbook::get_cell` 已替代旧 resolver scope + silent derived recompute bridge
+- 未完成：删除 `eval.rs::with_cross_resolver` 和 thread_local legacy 通道
 
 验收：
 
 - 现有公式测试全过（包括跨 sheet）
-- `unsafe` 块在 excel-core 的 grep 数减少（具体减少 1 处 `mem::transmute`）
-- `eval.rs` 不再 import `std::cell::RefCell` 用作 thread_local
+- Workbook 读路径不再触发 core derived recompute
+- legacy 清理时再要求 `with_cross_resolver` / thread_local grep 为 0
 
-### Step 2：lazy formula 主体（feature flag `lazy-formula` gated）
+### Step 2：lazy formula 主体（主体已完成，无 feature flag）
 
-合并原 Step 2 + Step 3 —— 引入 FormulaRecord 单独上线意义不大（依赖收集只能用假数据测）；feature flag 后面同时上 deps + lazy cache，flag 打开整套生效。
+合并原 Step 2 + Step 3 —— 引入 FormulaRecord 单独上线意义不大（依赖收集只能用假数据测）；当前实现未加 feature flag，直接替换旧 derived formula 路径。
 
 新增结构：
 
-- `FormulaId`, `FormulaRecord`, `FormulaDeps`, `FormulaCache`
-- `cell_dependents`, `range_dependents`（第一阶段用 compact `Vec<(CellRange, FormulaId)>`）
-- `BulkLoader` RAII
+- 已完成：`FormulaRecord`, `FormulaCache`, `cell_dependents`
+- 未完成：`range_dependents` interval index、`BulkLoader` RAII、完整 eval/debug 计数
 
-行为变化（flag on）：
+行为变化：
 
 - `set_formula` 不再 `create_derived`，只写 record + 更新 reverse index
 - `set_cell` 通过 D2 BFS 标 dirty + 通知（不计算）
@@ -463,7 +474,7 @@ bulk load 期间：
 - formula subscriber 收到 dirty 通知（D1 契约切换）
 - `Store::propagate_force` 不再被 sheet 调用（保留 API 但 sheet 路径全部不走）
 
-验收（flag on）：
+验收：
 
 - 100000 set_formula 后 `debug_formula_eval_count == 0`
 - 读取 100 个 viewport formula 后 `debug_formula_eval_count == 100`
@@ -502,11 +513,14 @@ range formula 数量起来后再做：
 
 ### Step 6：feature flag 拆除 + 旧路径删除
 
-- 删除 `formula_cells: HashMap<CellAddress, AtomId>` 和相关 `Store::create_derived` 调用
-- 删除 `Store::propagate_force`
+- 删除旧 `formula_cells: HashMap<CellAddress, AtomId>` 形态；当前 `formula_cells`
+  已是 `HashMap<CellAddress, Rc<FormulaRecord>>`
+- 删除 sheet 公式路径上的 `Store::create_derived` 调用（已完成）
+- 删除 sheet 公式路径上的 `Store::propagate_force` 调用（已完成）
 - 删除 `with_remap` 的 formula→primitive 分支（不再有 derived atom 需要 swap）
 
-验收：grep `formula_cells` / `propagate_force` / `create_derived` 在 excel-core 应为 0 命中。
+验收：sheet 公式路径 grep 不再出现 `Store::create_derived` / `Store::propagate_force`；
+`formula_cells` 名称仍可存在，但 value 不能再是 `AtomId`。
 
 ## 测试清单
 
@@ -578,7 +592,8 @@ range formula 数量起来后再做：
 | 公式依赖空 cell 后写入能 dirty | 写 Z99 后 `debug_cache_state(fid) == Dirty` |
 | range 依赖不通过展开空 atom | `set_formula("=SUM(A1:A100000)")` 后 atom count 不增加 |
 | viewport 是计算边界 | 只读 viewport 后 `debug_formula_eval_count == viewport size` |
-| TLS resolver 已删除 | grep `with_cross_resolver` / `thread_local!` in excel-core == 0 |
-| 旧 derived 路径已删除 | grep `formula_cells` / `propagate_force` / `create_derived` in excel-core == 0 |
+| Workbook 读路径不走 TLS resolver | `Workbook::get_cell` 使用 `WorkbookEvalProvider`，不调用 `with_cross_resolver` |
+| Legacy TLS resolver 已删除 | 后续 cleanup：grep `with_cross_resolver` / `thread_local!` in excel-core == 0 |
+| 旧 derived 路径已删除 | sheet 公式路径不调用 `Store::create_derived` / `Store::propagate_force`；`formula_cells` value 不是 `AtomId` |
 | EvalContext 用 `&self`，cache 用 `RefCell` per-record | grep `&mut dyn EvalContext` / `EvalContext for .*&mut` 在 excel-core == 0 |
 | FormulaRecord 用 Rc 包装 | type alias 形如 `Rc<FormulaRecord>` 在 sheet 内可见 |

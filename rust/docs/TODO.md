@@ -1,20 +1,21 @@
 # TODO — 没做完的角落
 
-> 截至 review 后整改批次（HEAD 之上加了 review 修复 + lazy formula 规划）。
+> 截至 lazy formula 主体落地批次（HEAD 之上加了 review 修复 + lazy formula 实现）。
 > `✅` = 完成；`⚠️` = 部分完成（限制写在条目里）；`□` = 未做。
 
 ## 0. 本批次（review 6 项 + lazy 规划）状态
 
 | 项 | 状态 | 备注 |
 |---|---|---|
-| Workbook 跨 sheet eval 真正算出值 | ✅ | `Store::force_recompute_derived_silent` + `Sheet::recompute_cross_sheet_formulas`；`workbook.rs::cross_sheet_formula_evaluates` 现在断言真实值，读路径不发订阅 |
-| 跨 sheet 链式 ref 缓存 | ⚠️ | A.A→B.A→A.B 链中 B.A 的 cache 仍可能过期；lazy formula 上线后自然修复 |
+| Workbook 跨 sheet eval 真正算出值 | ✅ | `WorkbookEvalProvider` 读路径递归求值；Workbook 读取会 bypass formula cache，保证跨 sheet 源值 live |
+| 跨 sheet 链式 ref 缓存 | ✅ | A.A→B.A→A.B 这类链式读取已由 Workbook provider 覆盖；跨 sheet 订阅 / workbook-wide 反向依赖仍 deferred |
 | 当前 sheet 限定引用 | ✅ | `Sheet1!A1` 在 Sheet1 内按普通 same-sheet ref 求值，自引用返回 `#CYCLE!` |
 | Solid undo/redo snapshot 用值类型 | ✅ | `CellSnapshot` 改 tagged union；number / error / boolean 回归测试已加 |
 | paste 公式按 (paste-copy) 偏移 | ✅ | `formula-shift.ts::shiftFormulaRefs`；3 条测试钉住 |
 | selection 提到 SheetStore | ✅ | `store.selection / setSelection / selectionAddr`；Table + FormulaBar 的 prop 接口都已撤掉 |
 | JS mock 行列编辑 ref retarget | ✅ | js-sheet 用同一组 `formula-shift.ts` helper；字符串 literal 不改写，多字母列搬迁已覆盖 |
-| Lazy formula eval 规划 | ✅ | `LAZY_FORMULA_EVAL.md` 已敲定 4 条决策 + 6 step 路线 |
+| Lazy formula eval 主体 | ✅ | `set_formula` 只记录 AST/deps/cache，不再 `create_derived`，也不再为引用到的空 cell 创建 atom；`get_cell` 按需计算 |
+| Lazy formula eval 规划 | ✅ | `LAZY_FORMULA_EVAL.md` 已更新为当前落地状态 + 后续路线 |
 
 ## 1. UI 接线（后端就位 / UI 未接）
 
@@ -134,11 +135,10 @@
 
 ## 3. 后端漏的角落
 
-### 3.1 ⚠️ Workbook 跨 sheet eval — 部分修
-- **现状**：`Workbook::get_cell` 在 resolver scope 内 silent 走 `recompute_cross_sheet_formulas_reachable_from(addr)`，targeted BFS 沿 `formula_exprs` 找 transitive 跨 sheet 公式，只 force 链路上的子集（不再扫全表）。`Store::recompute_derived_tree` 处理拓扑级联到非跨 sheet 的下游公式（`=B1*2` 这种）。当前 sheet 限定引用 `Sheet1!A1` 也走 same-sheet getter
-- **回归门禁**：`workbook_get_cell_only_recomputes_formulas_on_target_dep_chain`（读 B1 = 1 次 recompute，D1/E1 不动） + `workbook_get_cell_walks_local_dep_chain_to_cross_sheet`（C1 → B1 transitive）+ `workbook_get_cell_no_cross_sheet_chain_does_no_recompute`（同 sheet 公式 = 0 次 recompute）。`Store::debug_recompute_count` 是断言载体
-- **限制**：跨 sheet 链 (Sheet1.A1 → Data.B1 → Other.C1) 中间环节 cache 仍可能过期；`SplitWorkbookResolver::resolve` 只 `peek_value`，不会再递归触发对端 sheet 的 recompute
-- **真正解法**：lazy formula 上线后，formula 不再 cache，每次 read 都按 dep 算；本限制自然消失
+### 3.1 ✅ Workbook 跨 sheet eval — 已按 lazy 读路径修
+- **现状**：`Workbook::get_cell` 走 `WorkbookEvalProvider`，在读取公式时递归进入当前 sheet / 目标 sheet 的 lazy formula record。Workbook 读取会绕过 formula cache，因此 `Sheet1 -> Data -> Other` 这种跨 sheet 链能读到 live 值；普通 `Sheet::get_cell` 仍使用同 sheet dirty/cache。
+- **回归门禁**：`cross_sheet_formula_evaluates` / `workbook_get_cell_walks_local_dep_chain_to_cross_sheet` / `workbook_get_cell_only_recomputes_formulas_on_target_dep_chain` / `workbook_get_cell_no_cross_sheet_chain_does_no_recompute`。derived recompute 计数现在应保持 0，因为公式不再由 core derived atom 承载。
+- **仍缺**：跨 sheet 订阅 / workbook-wide 反向依赖图。写 `Data!A1` 不会主动通知 `Sheet1!B1` subscriber；读取 `Sheet1!B1` 是正确的。
 
 ### 3.2 □ TODAY/NOW 没 wasm32 实测
 - **现状**：chrono `wasmbind` feature 已开，本机测试 OK
@@ -177,26 +177,26 @@
 
 ## 4. Lazy formula 路线（见 LAZY_FORMULA_EVAL.md）
 
-### 4.1 □ Step 0 — debug 计数 / 探针 API
+### 4.1 ⚠️ Step 0 — debug 计数 / 探针 API
 - `debug_primitive_atom_count` / `debug_formula_count` / `debug_formula_eval_count` / `debug_dirty_formula_count` / `debug_dependents_count(addr)` / `debug_cache_state(fid)`
 - 配套 benchmark：100k import eval==0 / viewport read 100 / 公式引用空 cell atom==0 / 写空 cell 后 dirty
 
-### 4.2 □ Step 1 — EvalContext 抽出 + 删 TLS resolver
-- `eval_expr(expr, ctx: &mut dyn EvalContext)`
-- `SheetEvalCtx` / `WorkbookEvalCtx` 两实现
-- 删 `with_cross_resolver` 和 `unsafe { mem::transmute }`
-- 验收：`eval.rs` 不再 import `RefCell` 用于 thread_local；excel-core grep `with_cross_resolver` == 0
+### 4.2 ⚠️ Step 1 — EvalProvider 抽出 + Workbook 接入
+- 已加 `EvalProvider` / `eval_expr_with_provider`
+- `Sheet` 默认 provider + `WorkbookEvalProvider` 已接入，Workbook 不再依赖 read-time derived 重算 bridge
+- `with_cross_resolver` / TLS 仍保留为旧 `eval_expr(get, cell_map)` 兼容入口，后续可独立删除
 
-### 4.3 □ Step 2 — lazy formula 主体（feature flag `lazy-formula`）
-- 同时上 `FormulaRecord` / `FormulaCache` / `cell_dependents` / `range_dependents` / `BulkLoader`
-- D1 契约切换：formula subscriber 改 dirty 通知
+### 4.3 ⚠️ Step 2 — lazy formula 主体
+- 已上 `FormulaRecord` / `FormulaCache` / `cell_dependents`，无 feature flag，直接替换旧 derived formula 路径
+- D1 契约已切换：formula subscriber 收 dirty 通知，不为保持精确值变化而提前计算
+- 未做：`range_dependents` interval index、`BulkLoader`、更完整的 eval/debug 计数
 - 验收硬门禁：跑 Solid demo 5 页 + DemoFormulas 无可见回归
 
 ### 4.4 □ Step 3 — bulk import API（CSV/JSON/xlsx 接入路径）
 ### 4.5 □ Step 4 — range streaming 改造
 ### 4.6 □ Step 5 — range dependency interval index
 ### 4.7 □ Step 6 — feature flag 拆除 + 旧路径删除
-- grep 门禁：`formula_cells` / `propagate_force` / `create_derived` 在 excel-core 应为 0 命中
+- grep 门禁：sheet 公式路径不再调用 `Store::create_derived` / `Store::propagate_force`；`formula_cells` 仍存在但 value 已是 `Rc<FormulaRecord>`，不是 `AtomId`
 
 ## 5. 7B / 7C 工程
 
