@@ -1,3 +1,5 @@
+use einfach_core::Value;
+
 /// Per-cell display + style information. Phase 6.
 ///
 /// Format is independent of the atom dependency graph — changing a cell's
@@ -98,6 +100,95 @@ fn format_fixed(n: f64, digits: u8, thousands: bool, suffix: &str) -> String {
     format!("{}{}", body, suffix)
 }
 
+/// Conditional formatting rule. Multiple rules apply in order — the first
+/// match wins. If no rule matches, the cell uses its base CellFormat.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConditionalRule {
+    pub condition: Condition,
+    /// Style overrides applied when `condition` is true. Only the fields
+    /// you set actually override the base format; `None` means inherit.
+    pub overrides: StyleOverrides,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Condition {
+    /// Numeric comparison against a constant.
+    GreaterThan(f64),
+    GreaterOrEqual(f64),
+    LessThan(f64),
+    LessOrEqual(f64),
+    Equals(f64),
+    /// Numeric within an inclusive range.
+    Between(f64, f64),
+    /// Cell value is an error (#DIV/0!, #VALUE!, etc.)
+    IsError,
+    /// Cell value is empty / Null.
+    IsEmpty,
+    /// Cell text contains a substring (case-insensitive).
+    ContainsText(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StyleOverrides {
+    pub bold: Option<bool>,
+    pub italic: Option<bool>,
+    pub color: Option<String>,
+    pub background: Option<String>,
+}
+
+impl ConditionalRule {
+    pub fn matches(&self, v: &Value) -> bool {
+        match &self.condition {
+            Condition::GreaterThan(t) => num_pred(v, |n| n > *t),
+            Condition::GreaterOrEqual(t) => num_pred(v, |n| n >= *t),
+            Condition::LessThan(t) => num_pred(v, |n| n < *t),
+            Condition::LessOrEqual(t) => num_pred(v, |n| n <= *t),
+            Condition::Equals(t) => num_pred(v, |n| n == *t),
+            Condition::Between(lo, hi) => num_pred(v, |n| n >= *lo && n <= *hi),
+            Condition::IsError => matches!(v, Value::Error(_)),
+            Condition::IsEmpty => matches!(v, Value::Null),
+            Condition::ContainsText(needle) => match v {
+                Value::Text(s) => s.to_lowercase().contains(&needle.to_lowercase()),
+                _ => false,
+            },
+        }
+    }
+}
+
+fn num_pred(v: &Value, f: impl Fn(f64) -> bool) -> bool {
+    match v {
+        Value::Number(n) => f(*n),
+        Value::Boolean(true) => f(1.0),
+        Value::Boolean(false) => f(0.0),
+        _ => false,
+    }
+}
+
+/// Apply rules in order to a value. Returns the merged style — base format
+/// with overrides from the first matching rule. Stable order: rules earlier
+/// in the slice win when multiple match.
+pub fn apply_rules(base: &CellFormat, rules: &[ConditionalRule], v: &Value) -> CellFormat {
+    let mut out = base.clone();
+    for rule in rules {
+        if rule.matches(v) {
+            if let Some(b) = rule.overrides.bold {
+                out.bold = b;
+            }
+            if let Some(i) = rule.overrides.italic {
+                out.italic = i;
+            }
+            if rule.overrides.color.is_some() {
+                out.color = rule.overrides.color.clone();
+            }
+            if rule.overrides.background.is_some() {
+                out.background = rule.overrides.background.clone();
+            }
+            break; // first match wins
+        }
+    }
+    out
+}
+
 fn insert_commas(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 3);
@@ -154,6 +245,68 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(f.format_number(0.125), "12.5%");
+    }
+
+    #[test]
+    fn rule_greater_than() {
+        let r = ConditionalRule {
+            condition: Condition::GreaterThan(100.0),
+            overrides: StyleOverrides {
+                color: Some("red".into()),
+                ..Default::default()
+            },
+        };
+        assert!(r.matches(&Value::Number(150.0)));
+        assert!(!r.matches(&Value::Number(50.0)));
+        assert!(!r.matches(&Value::Text("hi".into())));
+    }
+
+    #[test]
+    fn rule_is_error() {
+        use einfach_core::ValueError;
+        let r = ConditionalRule {
+            condition: Condition::IsError,
+            overrides: Default::default(),
+        };
+        assert!(r.matches(&Value::Error(ValueError::DivisionByZero)));
+        assert!(!r.matches(&Value::Number(0.0)));
+    }
+
+    #[test]
+    fn rule_contains_text_case_insensitive() {
+        let r = ConditionalRule {
+            condition: Condition::ContainsText("ERR".into()),
+            overrides: Default::default(),
+        };
+        assert!(r.matches(&Value::Text("error message".into())));
+        assert!(!r.matches(&Value::Text("ok".into())));
+    }
+
+    #[test]
+    fn apply_rules_first_match_wins() {
+        let base = CellFormat::default();
+        let rules = vec![
+            ConditionalRule {
+                condition: Condition::GreaterThan(100.0),
+                overrides: StyleOverrides {
+                    color: Some("red".into()),
+                    ..Default::default()
+                },
+            },
+            ConditionalRule {
+                condition: Condition::GreaterThan(50.0),
+                overrides: StyleOverrides {
+                    color: Some("orange".into()),
+                    ..Default::default()
+                },
+            },
+        ];
+        let f = apply_rules(&base, &rules, &Value::Number(150.0));
+        assert_eq!(f.color, Some("red".into()));
+        let f = apply_rules(&base, &rules, &Value::Number(75.0));
+        assert_eq!(f.color, Some("orange".into()));
+        let f = apply_rules(&base, &rules, &Value::Number(10.0));
+        assert_eq!(f.color, None);
     }
 
     #[test]

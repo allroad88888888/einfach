@@ -12,7 +12,9 @@ pub mod workbook;
 pub use cell::CellAddress;
 pub use csv::{export_csv, import_csv, parse_csv, to_csv};
 pub use eval::eval_expr;
-pub use format::{Align, CellFormat, NumberFormat};
+pub use format::{
+    apply_rules, Align, CellFormat, Condition, ConditionalRule, NumberFormat, StyleOverrides,
+};
 pub use formula::{parse_formula, BinOperator, Expr};
 pub use range::CellRange;
 pub use sheet::{CellSubscription, Sheet};
