@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use einfach_core::{AtomId, Value, ValueError};
@@ -5,6 +6,54 @@ use einfach_core::{AtomId, Value, ValueError};
 use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
 use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
+
+/// Resolves cross-sheet references during eval. The Workbook layer
+/// installs an implementation around eval_expr calls so `Sheet1!A1`
+/// resolves to a value on another sheet.
+pub trait CrossSheetResolver {
+    fn resolve(&self, sheet: &str, addr: CellAddress) -> Value;
+}
+
+thread_local! {
+    /// Active cross-sheet resolver during eval. Set by `with_cross_resolver`,
+    /// read by the SheetRef arm. Raw pointer because the resolver's lifetime
+    /// is bound to the calling stack frame, not 'static — the guard's Drop
+    /// clears it before the frame returns.
+    static CROSS_RESOLVER: RefCell<Option<*const dyn CrossSheetResolver>> =
+        RefCell::new(None);
+}
+
+/// Run `f` with `resolver` installed as the active cross-sheet resolver.
+/// Restores the previous resolver on return (panic-safe via Drop).
+///
+/// Workbook eval typically does:
+/// ```ignore
+/// with_cross_resolver(&workbook_ctx, || sheet.get_cell("A1"));
+/// ```
+///
+/// SAFETY note: the implementation transmutes the borrowed resolver to a
+/// `'static` trait object so it can sit in a thread_local. The Drop guard
+/// clears the slot before this function returns, so the dangling pointer
+/// is never observable outside `f`'s execution.
+pub fn with_cross_resolver<R>(resolver: &dyn CrossSheetResolver, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<*const (dyn CrossSheetResolver + 'static)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CROSS_RESOLVER.with(|c| *c.borrow_mut() = self.0);
+        }
+    }
+    // Erase the resolver's lifetime to 'static. Sound because the guard
+    // below pops the TLS entry before this stack frame returns.
+    let resolver_static: &'static dyn CrossSheetResolver =
+        unsafe { std::mem::transmute(resolver) };
+    let prev = CROSS_RESOLVER.with(|c| {
+        let p = *c.borrow();
+        *c.borrow_mut() = Some(resolver_static as *const _);
+        p
+    });
+    let _restore = Restore(prev);
+    f()
+}
 
 /// Evaluate an AST expression using a getter function for cell values.
 /// `cell_map` maps CellAddress to AtomId so the evaluator can look up cells.
@@ -54,12 +103,20 @@ pub fn eval_expr(
             Value::Error(ValueError::InvalidValue)
         }
 
-        Expr::SheetRef { .. } => {
-            // Standalone Sheet eval has no Workbook scope — cross-sheet refs
-            // need the higher-level workbook resolver to translate (sheet,
-            // addr) into an AtomId before they can be read here. Returning
-            // #REF! lets users at least see the call shape in the result.
-            Value::Error(ValueError::InvalidRef)
+        Expr::SheetRef { sheet, addr } => {
+            // If a Workbook context installed a resolver via
+            // `with_cross_resolver`, dispatch to it. Otherwise standalone
+            // Sheet eval has no cross-sheet scope and we return #REF!.
+            CROSS_RESOLVER.with(|c| {
+                if let Some(ptr) = *c.borrow() {
+                    // SAFETY: the guard in with_cross_resolver clears this
+                    // pointer before the resolver's stack frame returns,
+                    // so the deref happens during the resolver's lifetime.
+                    unsafe { (*ptr).resolve(sheet, *addr) }
+                } else {
+                    Value::Error(ValueError::InvalidRef)
+                }
+            })
         }
     }
 }

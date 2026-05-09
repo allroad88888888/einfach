@@ -218,6 +218,20 @@ impl Sheet {
         self.store.get(id)
     }
 
+    /// Read a cell's current value without creating any atoms. Returns
+    /// `Value::Null` for cells that haven't been touched. Used by the
+    /// Workbook layer (cross-sheet read) so it can stay `&self`.
+    pub fn peek_value(&self, addr: CellAddress) -> Value {
+        let id = match self.readable.borrow().get(&addr) {
+            Some(&id) => id,
+            None => return Value::Null,
+        };
+        if !self.store.has_atom(id) {
+            return Value::Null;
+        }
+        self.store.get(id)
+    }
+
     /// Get the AtomId for a cell (creating if needed).
     pub fn cell_atom(&mut self, addr_str: &str) -> AtomId {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
