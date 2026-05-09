@@ -25,7 +25,12 @@
 ### 1.2 ✅ Ctrl+Z / Ctrl+Y 全局键盘 — 已做
 - `Table.tsx::onKeyDown` 处理 `Cmd/Ctrl+Z` / `+Y` / `+Shift+Z`，调 `store.undo/redo`
 
-### 1.3 □ Ctrl+C / Ctrl+V 跨进程剪贴板
+### 1.2.1 □ Cell 编辑提交触发两次 commit（playwright 抓到的 bug，未修）
+- **现象**：在单元格里输入并按 Enter 后，`Cell.commitEdit` 被调用两次：第一次来自 `<input>` 的 `onKeyDown`（Enter），第二次来自 `<Show>` 把 input 摘下来时触发的 `onBlur`
+- **后果**：每次编辑产生两条 undo 条目（第二条 before==after，是空操作但占栈）；第一次按 Cmd/Ctrl+Z 看不到任何变化，第二次才真正撤销
+- **重现**：`solid/excel/e2e/smoke.spec.ts` "Ctrl/Cmd+Z undoes" 测试目前要按两次 Meta+Z 才能回到空，已在测试里注释标注
+- **修复路径**：`Cell.tsx::commitEdit` 加幂等守卫——`if (!editing()) return`——或者 commit 后才 `setEditing(false)`，以及把 `onBlur` 改成判断当前是否还在 editing
+- **延后理由**：本次 PR 范围只是 e2e 套件落地，应用源代码改动须独立 commit + review
 - **代码**：`SheetStore.copy(addrs[][])` / `paste(originAddr, data)` 已有；paste 已做相对引用偏移
 - **缺**：
   - 没监听键盘
@@ -95,10 +100,9 @@
 - **依赖**：`wasm-pack test --headless --chrome`
 - **必须覆盖**：subscribe/unsubscribe 跨 JS↔Rust 边界、重入保护、JsCallbackListener panic 不挂 wasm 实例
 
-### 2.4 □ playwright e2e 套件
-- **现状**：本次手工 e2e 验证了双击编辑 / 公式 / 公式保留 / 键盘导航 / Cell 选中
-- **缺**：CI 化、render counter 验证精准订阅、fps benchmark
-- **依赖**：`playwright` + `@playwright/test`（不在 deps）
+### 2.4 ⚠️ playwright e2e 套件
+- **现状**：`solid/excel/e2e/smoke.spec.ts` 落地，覆盖 cell 编辑提交 / 公式提交 / 依赖传播 / undo / redo / FormulaBar 公式源同步 / 键盘导航（Arrow+Tab+Shift+Tab），共 7 个测试。`@playwright/test` 已加入 devDependencies；`solid/excel` 下 `npm run e2e` 启动 vite dev server + 跑测试
+- **缺**：CI 集成（仓库当前没 CI workflow）、render counter 验证精准订阅、fps benchmark；首次跑前需要 `npx playwright install chromium` 下载浏览器
 
 ### 2.5 □ benchmark harness
 - **缺**：criterion 依赖 + benches/atom_bench.rs / sheet_bench.rs

@@ -59,6 +59,7 @@ export function Cell(props: CellProps) {
   return (
     <td
       class={classes()}
+      data-cell-addr={props.addr}
       onClick={() => props.onSelect?.()}
       onDblClick={startEditing}
     >

@@ -71,10 +71,11 @@ export function FormulaBar(props: FormulaBarProps) {
   }
 
   return (
-    <div class="formula-bar">
-      <span class="formula-bar-addr">{addr() ?? ''}</span>
+    <div class="formula-bar" data-testid="formula-bar">
+      <span class="formula-bar-addr" data-testid="formula-bar-addr">{addr() ?? ''}</span>
       <input
         class="formula-bar-input"
+        data-testid="formula-bar-input"
         type="text"
         value={draft()}
         onInput={(e) => setDraft(e.currentTarget.value)}

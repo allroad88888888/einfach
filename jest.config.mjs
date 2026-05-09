@@ -27,8 +27,10 @@ const jestConfig = {
   /**
    * Skip generated `@types` directories — composite projects emit `.d.ts`
    * + transpiled `.jsx` there, and jest would re-run those duplicates.
+   * Also skip Playwright e2e specs (`solid/excel/e2e/`) — those run under
+   * `npm run e2e` from `solid/excel/`, not jest.
    */
-  testPathIgnorePatterns: ['/node_modules/', '/@types/'],
+  testPathIgnorePatterns: ['/node_modules/', '/@types/', '/solid/excel/e2e/'],
 
   /**
    * - wasm-pkg/: ships its own package.json from wasm-pack; haste-map
