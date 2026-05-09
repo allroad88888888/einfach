@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use einfach_core::{AtomId, Value, ValueError};
 
@@ -21,6 +22,10 @@ thread_local! {
     /// clears it before the frame returns.
     static CROSS_RESOLVER: RefCell<Option<*const dyn CrossSheetResolver>> =
         RefCell::new(None);
+    /// Name of the sheet whose formula is currently being evaluated through a
+    /// Workbook. Lets `Sheet1!A1` on Sheet1 use the normal same-sheet getter
+    /// path instead of round-tripping through the cross-sheet resolver.
+    static CURRENT_SHEET: RefCell<Option<String>> = RefCell::new(None);
 }
 
 /// Run `f` with `resolver` installed as the active cross-sheet resolver.
@@ -36,22 +41,52 @@ thread_local! {
 /// clears the slot before this function returns, so the dangling pointer
 /// is never observable outside `f`'s execution.
 pub fn with_cross_resolver<R>(resolver: &dyn CrossSheetResolver, f: impl FnOnce() -> R) -> R {
+    with_cross_resolver_inner(None, resolver, f)
+}
+
+/// Run `f` with both a cross-sheet resolver and the current sheet name
+/// installed. `SheetRef`s that point back at `sheet_name` are evaluated through
+/// the current formula's cell map/getter, matching plain same-sheet refs.
+pub fn with_cross_resolver_for_sheet<R>(
+    sheet_name: &str,
+    resolver: &dyn CrossSheetResolver,
+    f: impl FnOnce() -> R,
+) -> R {
+    with_cross_resolver_inner(Some(sheet_name), resolver, f)
+}
+
+fn with_cross_resolver_inner<R>(
+    current_sheet: Option<&str>,
+    resolver: &dyn CrossSheetResolver,
+    f: impl FnOnce() -> R,
+) -> R {
     struct Restore(Option<*const (dyn CrossSheetResolver + 'static)>);
     impl Drop for Restore {
         fn drop(&mut self) {
             CROSS_RESOLVER.with(|c| *c.borrow_mut() = self.0);
         }
     }
+    struct RestoreSheet(Option<String>);
+    impl Drop for RestoreSheet {
+        fn drop(&mut self) {
+            CURRENT_SHEET.with(|c| *c.borrow_mut() = self.0.take());
+        }
+    }
     // Erase the resolver's lifetime to 'static. Sound because the guard
     // below pops the TLS entry before this stack frame returns.
-    let resolver_static: &'static dyn CrossSheetResolver =
-        unsafe { std::mem::transmute(resolver) };
+    let resolver_static: &'static dyn CrossSheetResolver = unsafe { std::mem::transmute(resolver) };
     let prev = CROSS_RESOLVER.with(|c| {
         let p = *c.borrow();
         *c.borrow_mut() = Some(resolver_static as *const _);
         p
     });
     let _restore = Restore(prev);
+    let prev_sheet = CURRENT_SHEET.with(|c| {
+        let prev = c.borrow().clone();
+        *c.borrow_mut() = current_sheet.map(str::to_string);
+        prev
+    });
+    let _restore_sheet = RestoreSheet(prev_sheet);
     f()
 }
 
@@ -93,9 +128,7 @@ pub fn eval_expr(
             }
         }
 
-        Expr::FuncCall { name, args } => {
-            eval_func(name, args, get, cell_map)
-        }
+        Expr::FuncCall { name, args } => eval_func(name, args, get, cell_map),
 
         Expr::Range { start, end } => {
             // Ranges should be handled by function evaluators, not standalone
@@ -105,6 +138,22 @@ pub fn eval_expr(
         }
 
         Expr::SheetRef { sheet, addr } => {
+            let is_current_sheet =
+                CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet.as_str()));
+            if is_current_sheet {
+                if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                    return Value::Error(ValueError::InvalidRef);
+                }
+                return if let Some(&id) = cell_map.get(addr) {
+                    match catch_unwind(AssertUnwindSafe(|| get(id))) {
+                        Ok(value) => value,
+                        Err(_) => Value::Error(ValueError::CyclicRef),
+                    }
+                } else {
+                    Value::Null
+                };
+            }
+
             // If a Workbook context installed a resolver via
             // `with_cross_resolver`, dispatch to it. Otherwise standalone
             // Sheet eval has no cross-sheet scope and we return #REF!.
@@ -313,7 +362,9 @@ fn lookup_2d(
     let keys: Vec<Value> = if horizontal {
         grid[0].clone()
     } else {
-        grid.iter().map(|r| r.first().cloned().unwrap_or(Value::Null)).collect()
+        grid.iter()
+            .map(|r| r.first().cloned().unwrap_or(Value::Null))
+            .collect()
     };
 
     // Find match position.
@@ -344,7 +395,8 @@ fn lookup_2d(
     } else {
         grid.get(p).and_then(|r| r.get(index - 1))
     };
-    cell.cloned().unwrap_or(Value::Error(ValueError::InvalidRef))
+    cell.cloned()
+        .unwrap_or(Value::Error(ValueError::InvalidRef))
 }
 
 fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -700,7 +752,6 @@ fn eval_func(
         }
 
         // === Phase 5: lookup / stats / dates ===
-
         "VLOOKUP" => {
             // VLOOKUP(lookup_value, table_range, col_index, [range_lookup])
             // range_lookup: TRUE/omitted = approximate (range must be sorted
@@ -723,7 +774,13 @@ fn eval_func(
                 true
             };
             let grid = collect_range_2d(start, end, get, cell_map);
-            lookup_2d(&grid, &needle, col_idx, approximate, /* horizontal = */ false)
+            lookup_2d(
+                &grid,
+                &needle,
+                col_idx,
+                approximate,
+                /* horizontal = */ false,
+            )
         }
 
         "HLOOKUP" => {
@@ -745,7 +802,13 @@ fn eval_func(
                 true
             };
             let grid = collect_range_2d(start, end, get, cell_map);
-            lookup_2d(&grid, &needle, row_idx, approximate, /* horizontal = */ true)
+            lookup_2d(
+                &grid,
+                &needle,
+                row_idx,
+                approximate,
+                /* horizontal = */ true,
+            )
         }
 
         "INDEX" => {
@@ -846,8 +909,8 @@ fn eval_func(
                 return Value::Error(ValueError::InvalidValue);
             }
             let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                / (nums.len() as f64 - 1.0);
+            let var =
+                nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() as f64 - 1.0);
             Value::Number(var.sqrt())
         }
 
@@ -857,8 +920,8 @@ fn eval_func(
                 return Value::Error(ValueError::InvalidValue);
             }
             let mean = nums.iter().sum::<f64>() / nums.len() as f64;
-            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
-                / (nums.len() as f64 - 1.0);
+            let var =
+                nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() as f64 - 1.0);
             Value::Number(var)
         }
 
@@ -899,11 +962,7 @@ fn eval_func(
         "TODAY" => {
             use chrono::{Datelike, Local};
             let today = Local::now().date_naive();
-            Value::Number(date_serial(
-                today.year(),
-                today.month(),
-                today.day(),
-            ))
+            Value::Number(date_serial(today.year(), today.month(), today.day()))
         }
         "NOW" => {
             // Whole+fractional day count. Fractional part = time-of-day / 86400.
@@ -925,9 +984,9 @@ fn eval_func(
             let m = coerce_to_number(&eval_expr(&args[1], get, cell_map));
             let d = coerce_to_number(&eval_expr(&args[2], get, cell_map));
             match (y, m, d) {
-                (Some(y), Some(m), Some(d)) => Value::Number(date_serial(
-                    y as i32, m as u32, d as u32,
-                )),
+                (Some(y), Some(m), Some(d)) => {
+                    Value::Number(date_serial(y as i32, m as u32, d as u32))
+                }
                 _ => Value::Error(ValueError::InvalidValue),
             }
         }
@@ -1019,8 +1078,7 @@ fn date_from_serial(serial: f64) -> (i32, u32, u32) {
     const DOM: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let mut month = 1u32;
     while month <= 12 {
-        let dm = DOM[(month - 1) as usize] as i64
-            + if month == 2 && is_leap(year) { 1 } else { 0 };
+        let dm = DOM[(month - 1) as usize] as i64 + if month == 2 && is_leap(year) { 1 } else { 0 };
         if remaining < dm {
             break;
         }
@@ -1184,11 +1242,13 @@ mod tests {
         (cell_map, values)
     }
 
-    fn eval_str(formula: &str, cell_map: &HashMap<CellAddress, AtomId>, values: &HashMap<AtomId, Value>) -> Value {
+    fn eval_str(
+        formula: &str,
+        cell_map: &HashMap<CellAddress, AtomId>,
+        values: &HashMap<AtomId, Value>,
+    ) -> Value {
         let expr = parse_formula(formula).expect("parse failed");
-        let get = |id: AtomId| -> Value {
-            values.get(&id).cloned().unwrap_or(Value::Null)
-        };
+        let get = |id: AtomId| -> Value { values.get(&id).cloned().unwrap_or(Value::Null) };
         eval_expr(&expr, &get, cell_map)
     }
 
@@ -1308,10 +1368,7 @@ mod tests {
     fn eval_concat_string() {
         let (cm, vs) = make_test_env();
         // B2 = "text"; A1 = 10
-        assert_eq!(
-            eval_str("=B2&A1", &cm, &vs),
-            Value::Text("text10".into())
-        );
+        assert_eq!(eval_str("=B2&A1", &cm, &vs), Value::Text("text10".into()));
     }
 
     #[test]
@@ -1339,10 +1396,7 @@ mod tests {
     #[test]
     fn eval_logical_and() {
         let (cm, vs) = make_test_env();
-        assert_eq!(
-            eval_str("=AND(A1>0,B1>0)", &cm, &vs),
-            Value::Boolean(true)
-        );
+        assert_eq!(eval_str("=AND(A1>0,B1>0)", &cm, &vs), Value::Boolean(true));
         assert_eq!(
             eval_str("=AND(A1>100,B1>0)", &cm, &vs),
             Value::Boolean(false)
@@ -1352,10 +1406,7 @@ mod tests {
     #[test]
     fn eval_logical_or_not() {
         let (cm, vs) = make_test_env();
-        assert_eq!(
-            eval_str("=OR(A1>100,B1>0)", &cm, &vs),
-            Value::Boolean(true)
-        );
+        assert_eq!(eval_str("=OR(A1>100,B1>0)", &cm, &vs), Value::Boolean(true));
         assert_eq!(eval_str("=NOT(A1>5)", &cm, &vs), Value::Boolean(false));
     }
 
@@ -1380,22 +1431,10 @@ mod tests {
             Value::Text("text 10".into())
         );
         assert_eq!(eval_str("=LEN(B2)", &cm, &vs), Value::Number(4.0));
-        assert_eq!(
-            eval_str("=LEFT(B2,2)", &cm, &vs),
-            Value::Text("te".into())
-        );
-        assert_eq!(
-            eval_str("=RIGHT(B2,2)", &cm, &vs),
-            Value::Text("xt".into())
-        );
-        assert_eq!(
-            eval_str("=MID(B2,2,2)", &cm, &vs),
-            Value::Text("ex".into())
-        );
-        assert_eq!(
-            eval_str("=UPPER(B2)", &cm, &vs),
-            Value::Text("TEXT".into())
-        );
+        assert_eq!(eval_str("=LEFT(B2,2)", &cm, &vs), Value::Text("te".into()));
+        assert_eq!(eval_str("=RIGHT(B2,2)", &cm, &vs), Value::Text("xt".into()));
+        assert_eq!(eval_str("=MID(B2,2,2)", &cm, &vs), Value::Text("ex".into()));
+        assert_eq!(eval_str("=UPPER(B2)", &cm, &vs), Value::Text("TEXT".into()));
         assert_eq!(
             eval_str("=LOWER(\"HELLO\")", &cm, &vs),
             Value::Text("hello".into())
@@ -1460,15 +1499,9 @@ mod tests {
     fn eval_index_match() {
         let (cm, vs) = make_lookup_env();
         // INDEX(A1:B3, 2, 2) → 20 (row 2 col 2 = price for id 2)
-        assert_eq!(
-            eval_str("=INDEX(A1:B3,2,2)", &cm, &vs),
-            Value::Number(20.0)
-        );
+        assert_eq!(eval_str("=INDEX(A1:B3,2,2)", &cm, &vs), Value::Number(20.0));
         // MATCH(2, A1:A3, 0) → 2 (1-based)
-        assert_eq!(
-            eval_str("=MATCH(2,A1:A3,0)", &cm, &vs),
-            Value::Number(2.0)
-        );
+        assert_eq!(eval_str("=MATCH(2,A1:A3,0)", &cm, &vs), Value::Number(2.0));
     }
 
     #[test]
@@ -1496,10 +1529,7 @@ mod tests {
     fn eval_stats() {
         let (cm, vs) = make_test_env();
         // A1=10, B1=20, A2=5
-        assert_eq!(
-            eval_str("=MEDIAN(A1,B1,A2)", &cm, &vs),
-            Value::Number(10.0)
-        );
+        assert_eq!(eval_str("=MEDIAN(A1,B1,A2)", &cm, &vs), Value::Number(10.0));
         // STDEV / VAR for {10, 20, 5}: mean=11.66… so they should be > 0
         let stdev = eval_str("=STDEV(A1,B1,A2)", &cm, &vs);
         assert!(matches!(stdev, Value::Number(n) if n > 0.0));
@@ -1511,14 +1541,8 @@ mod tests {
     fn eval_large_small() {
         let (cm, vs) = make_test_env();
         // {10, 20, 5} → LARGE k=1 → 20, SMALL k=1 → 5
-        assert_eq!(
-            eval_str("=LARGE(A1:B2,1)", &cm, &vs),
-            Value::Number(20.0)
-        );
-        assert_eq!(
-            eval_str("=SMALL(A1:B2,1)", &cm, &vs),
-            Value::Number(5.0)
-        );
+        assert_eq!(eval_str("=LARGE(A1:B2,1)", &cm, &vs), Value::Number(20.0));
+        assert_eq!(eval_str("=SMALL(A1:B2,1)", &cm, &vs), Value::Number(5.0));
     }
 
     #[test]
@@ -1526,8 +1550,9 @@ mod tests {
         // Tax bracket lookup: thresholds 0/100/1000/10000 -> rates
         let mut cm = HashMap::new();
         let mut vs = HashMap::new();
-        for (i, (threshold, rate)) in
-            [(0.0, 5.0), (100.0, 10.0), (1000.0, 20.0), (10000.0, 30.0)].iter().enumerate()
+        for (i, (threshold, rate)) in [(0.0, 5.0), (100.0, 10.0), (1000.0, 20.0), (10000.0, 30.0)]
+            .iter()
+            .enumerate()
         {
             let row = i as u32;
             let t = AtomId::from_raw((row * 2) as u64);
