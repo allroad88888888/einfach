@@ -56,6 +56,25 @@ export function Table(props: TableProps) {
     const target = e.target as HTMLElement | null
     if (target && target.tagName === 'INPUT') return
 
+    const meta = e.ctrlKey || e.metaKey
+    if (meta) {
+      // Undo / redo. Cmd/Ctrl + Z = undo; + Shift+Z or + Y = redo.
+      if (e.key === 'z' || e.key === 'Z') {
+        if (e.shiftKey) {
+          props.store.redo()
+        } else {
+          props.store.undo()
+        }
+        e.preventDefault()
+        return
+      }
+      if (e.key === 'y' || e.key === 'Y') {
+        props.store.redo()
+        e.preventDefault()
+        return
+      }
+    }
+
     switch (e.key) {
       case 'ArrowUp':
         move(-1, 0)
@@ -77,6 +96,14 @@ export function Table(props: TableProps) {
         move(0, e.shiftKey ? -1 : 1)
         e.preventDefault()
         break
+      case 'Delete':
+      case 'Backspace': {
+        // Clear the selected cell. Routed through SheetStore so undo works.
+        const cur = selected()
+        props.store.clearCell(coordToAddr(cur))
+        e.preventDefault()
+        break
+      }
       // Enter / F2 / typing-into-cell are not handled here yet — those go
       // through Cell's edit-mode entry. ROADMAP 1B follow-up.
     }

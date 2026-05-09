@@ -241,6 +241,18 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('clearCell empties + is undoable', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 42)
+        store.clearCell('A1')
+        expect(store.getCell('A1').type).toBe('null')
+        store.undo()
+        expect(store.getCell('A1').display).toBe('42')
+        dispose()
+      })
+    })
+
     it('paste is one undo step', () => {
       createRoot((dispose) => {
         const store = createTestStore()

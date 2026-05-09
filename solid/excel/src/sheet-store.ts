@@ -141,6 +141,11 @@ export function createSheetStore(sheet: ISheet) {
       return ok
     },
 
+    /** Clear a cell back to empty. Undoable. */
+    clearCell(addr: string) {
+      recordSingle(addr, () => sheet.clear_cell(addr))
+    },
+
     setCellInput(addr: string, input: string) {
       const trimmed = input.trim()
       recordSingle(addr, () => {
