@@ -274,3 +274,62 @@ thead .row-header {
   color: #999;
   background: #f6f6f6;
 }
+
+/* === Sheet Tabs (bottom-of-grid, multi-sheet workbook) === */
+
+.sheet-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 6px;
+  padding: 4px 6px 0;
+  border-top: 1px solid #d0d7de;
+  background: #fafbfc;
+  overflow-x: auto;
+}
+
+.sheet-tab {
+  padding: 6px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: #eef1f4;
+  color: #555;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+  white-space: nowrap;
+  font-family: inherit;
+  transition: background 0.12s, color 0.12s;
+}
+
+.sheet-tab:hover {
+  background: #e0e6ec;
+  color: #333;
+}
+
+.sheet-tab-active {
+  background: #fff;
+  color: #1a73e8;
+  border-color: #d0d7de;
+  border-bottom-color: #fff;
+  margin-bottom: -1px;
+}
+
+.sheet-tab-add {
+  margin-left: 4px;
+  padding: 4px 10px;
+  border: 1px solid #d0d7de;
+  background: #fff;
+  color: #1a73e8;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  border-radius: 4px;
+  font-family: inherit;
+  line-height: 1;
+}
+
+.sheet-tab-add:hover {
+  background: #e8f0fe;
+}

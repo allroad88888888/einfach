@@ -6,6 +6,7 @@ import { DemoFormulas } from './demos/DemoFormulas'
 import { DemoBudget } from './demos/DemoBudget'
 import { DemoGrades } from './demos/DemoGrades'
 import { DemoSales } from './demos/DemoSales'
+import { MultiSheet } from './demos/MultiSheet'
 import './styles.css'
 
 interface DemoTab {
@@ -20,6 +21,7 @@ const demos: DemoTab[] = [
   { id: 'budget',   label: 'Budget',         component: DemoBudget },
   { id: 'grades',   label: 'Grade Calc',     component: DemoGrades },
   { id: 'sales',    label: 'Sales Dashboard', component: DemoSales },
+  { id: 'multi',    label: 'Multi-Sheet',    component: MultiSheet },
 ]
 
 export function App() {
