@@ -1,4 +1,3 @@
-/** @jsxImportSource solid-js */
 
 import { createSignal, createEffect } from 'solid-js'
 import type { SheetStore } from './sheet-store'

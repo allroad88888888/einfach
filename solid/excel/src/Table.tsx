@@ -1,4 +1,3 @@
-/** @jsxImportSource solid-js */
 
 import { For, Show, createSignal } from 'solid-js'
 import { Cell } from './Cell'
