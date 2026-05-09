@@ -60,6 +60,11 @@ pub struct Store {
     batch_depth: Rc<Cell<u32>>,
     /// Atoms dirtied during a batch, pending propagation.
     pending_dirty: Vec<AtomId>,
+    /// Cumulative count of derived recomputes — every successful `recompute(id)`
+    /// increments this. Test-only signal: lets benchmarks / regression tests
+    /// assert "reading addr A only triggered N recomputes" instead of black-box
+    /// guessing. Wraps; release builds elide via `#[doc(hidden)]` API.
+    recompute_count: usize,
 }
 
 // Thread-local to track dependencies during read_fn evaluation
@@ -175,6 +180,7 @@ impl Store {
             next_sub_id: 0,
             batch_depth: Rc::new(Cell::new(0)),
             pending_dirty: Vec::new(),
+            recompute_count: 0,
         }
     }
 
@@ -266,6 +272,7 @@ impl Store {
         self.dependencies.insert(id, new_deps);
 
         self.values.borrow_mut().insert(id, new_value);
+        self.recompute_count = self.recompute_count.wrapping_add(1);
     }
 
     /// Read the current value of an atom.
@@ -353,6 +360,51 @@ impl Store {
         self.propagate_and_notify(roots);
     }
 
+    /// Force re-evaluation of the given derived atoms (rerun their read_fn
+    /// closures), then recompute dependents and notify subscribers for atoms
+    /// whose values actually changed. Unlike `propagate_force`, the roots
+    /// themselves recompute — required when the closure reads environmental
+    /// state that changed without any tracked atom value moving. Non-derived
+    /// atoms in the input are silently skipped.
+    pub fn force_recompute_derived(&mut self, roots: &[AtomId]) {
+        let changed = self.recompute_derived_tree(roots);
+        if !changed.is_empty() {
+            self.notify(&changed);
+        }
+    }
+
+    /// Same recompute semantics as `force_recompute_derived`, but without
+    /// notifications. This is for read paths that need to refresh cached
+    /// derived values against external context without turning the read into a
+    /// subscriber event.
+    pub fn force_recompute_derived_silent(&mut self, roots: &[AtomId]) {
+        let _ = self.recompute_derived_tree(roots);
+    }
+
+    fn recompute_derived_tree(&mut self, roots: &[AtomId]) -> Vec<AtomId> {
+        let mut to_recompute: HashSet<AtomId> = HashSet::new();
+        for &id in roots {
+            if !self.read_fns.contains_key(&id) || !to_recompute.insert(id) {
+                continue;
+            }
+            for affected in self.collect_affected(id) {
+                to_recompute.insert(affected);
+            }
+        }
+
+        let sorted = self.topological_sort(&to_recompute);
+        let mut changed: Vec<AtomId> = Vec::new();
+        for derived_id in sorted {
+            let old = self.values.borrow().get(&derived_id).cloned();
+            self.recompute(derived_id);
+            let new_val = self.values.borrow().get(&derived_id).cloned();
+            if old != new_val {
+                changed.push(derived_id);
+            }
+        }
+        changed
+    }
+
     /// Propagate changes from dirty roots and notify subscribers.
     fn propagate_and_notify(&mut self, dirty_roots: &[AtomId]) {
         // Deduplicate dirty roots
@@ -432,6 +484,34 @@ impl Store {
     /// Returns whether the atom is still alive (not destroyed).
     pub fn has_atom(&self, id: AtomId) -> bool {
         self.values.borrow().contains_key(&id)
+    }
+
+    /// Total number of live atoms (primitive + derived). Used by
+    /// `Sheet::debug_*_count` family to feed lazy-formula gating tests.
+    #[doc(hidden)]
+    pub fn debug_total_atom_count(&self) -> usize {
+        self.values.borrow().len()
+    }
+
+    /// Number of derived atoms (have a read_fn registered).
+    #[doc(hidden)]
+    pub fn debug_derived_atom_count(&self) -> usize {
+        self.read_fns.len()
+    }
+
+    /// Number of atoms that currently depend on `id`. Counts unique
+    /// dependents, not subscription tokens.
+    #[doc(hidden)]
+    pub fn debug_dependent_count(&self, id: AtomId) -> usize {
+        self.back_deps.get(&id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Cumulative recompute count since `Store::new()`. One increment per
+    /// successful `recompute(id)` call. Tests use deltas across an operation
+    /// to assert "this read triggered N recomputes".
+    #[doc(hidden)]
+    pub fn debug_recompute_count(&self) -> usize {
+        self.recompute_count
     }
 
     /// Returns true if any other atom currently depends on `id`.
@@ -727,10 +807,18 @@ mod tests {
         let mut store = Store::new();
         let a = store.create_atom(Value::Number(1.0));
         let b = store.create_derived(move |get| {
-            if let Value::Number(n) = get(a) { Value::Number(n * 2.0) } else { panic!() }
+            if let Value::Number(n) = get(a) {
+                Value::Number(n * 2.0)
+            } else {
+                panic!()
+            }
         });
         let c = store.create_derived(move |get| {
-            if let Value::Number(n) = get(b) { Value::Number(n + 1.0) } else { panic!() }
+            if let Value::Number(n) = get(b) {
+                Value::Number(n + 1.0)
+            } else {
+                panic!()
+            }
         });
         let d = store.create_derived(move |get| {
             if let (Value::Number(va), Value::Number(vb), Value::Number(vc)) =
@@ -860,6 +948,64 @@ mod tests {
     }
 
     #[test]
+    fn force_recompute_derived_notifies_changed_root_once() {
+        let mut store = Store::new();
+        let external = Rc::new(Cell::new(1.0));
+        let external_for_read = external.clone();
+        let d = store.create_derived(move |_| Value::Number(external_for_read.get()));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let count_clone = count.clone();
+        store.sub(d, move || {
+            *count_clone.borrow_mut() += 1;
+        });
+
+        external.set(2.0);
+        store.force_recompute_derived(&[d]);
+
+        assert_eq!(store.get(d), Value::Number(2.0));
+        assert_eq!(*count.borrow(), 1);
+    }
+
+    #[test]
+    fn force_recompute_derived_silent_updates_without_notify() {
+        let mut store = Store::new();
+        let external = Rc::new(Cell::new(1.0));
+        let external_for_read = external.clone();
+        let d = store.create_derived(move |_| Value::Number(external_for_read.get()));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let count_clone = count.clone();
+        store.sub(d, move || {
+            *count_clone.borrow_mut() += 1;
+        });
+
+        external.set(3.0);
+        store.force_recompute_derived_silent(&[d]);
+
+        assert_eq!(store.get(d), Value::Number(3.0));
+        assert_eq!(*count.borrow(), 0);
+    }
+
+    #[test]
+    fn force_recompute_derived_recomputes_dependents_in_order() {
+        let mut store = Store::new();
+        let external = Rc::new(Cell::new(1.0));
+        let external_for_read = external.clone();
+        let d = store.create_derived(move |_| Value::Number(external_for_read.get()));
+        let e = store.create_derived(move |get| match get(d) {
+            Value::Number(n) => Value::Number(n + 1.0),
+            _ => panic!("expected number"),
+        });
+
+        external.set(10.0);
+        store.force_recompute_derived_silent(&[d]);
+
+        assert_eq!(store.get(d), Value::Number(10.0));
+        assert_eq!(store.get(e), Value::Number(11.0));
+    }
+
+    #[test]
     fn multiple_subscribers() {
         let mut store = Store::new();
         let a = store.create_atom(Value::Number(0.0));
@@ -948,7 +1094,11 @@ mod tests {
 
         let d = store.create_derived(move |get| {
             if let Value::Number(f) = get(flag) {
-                if f > 0.0 { get(a) } else { get(b) }
+                if f > 0.0 {
+                    get(a)
+                } else {
+                    get(b)
+                }
             } else {
                 panic!()
             }
@@ -1046,10 +1196,18 @@ mod tests {
         let mut store = Store::new();
         let a = store.create_atom(Value::Number(1.0));
         let b = store.create_derived(move |get| {
-            if let Value::Number(n) = get(a) { Value::Number(n * 2.0) } else { panic!() }
+            if let Value::Number(n) = get(a) {
+                Value::Number(n * 2.0)
+            } else {
+                panic!()
+            }
         });
         let c = store.create_derived(move |get| {
-            if let Value::Number(n) = get(a) { Value::Number(n + 10.0) } else { panic!() }
+            if let Value::Number(n) = get(a) {
+                Value::Number(n + 10.0)
+            } else {
+                panic!()
+            }
         });
 
         let b_count = Rc::new(RefCell::new(0u32));
