@@ -771,15 +771,25 @@ fn eval_func(
             Value::Number(nums[k - 1])
         }
 
-        // Dates: stored as f64 day numbers. epoch = 1970-01-01 → 0 (simpler
-        // than Excel's 1900 epoch; full Excel compatibility is a follow-up).
+        // Dates: stored as f64 day numbers, epoch = 1970-01-01 → 0.
         "TODAY" => {
-            // Without `chrono`, we can't compute today; return InvalidName so
-            // callers know it's a known-but-unimplemented function. Real
-            // implementation slots in once we add a date crate.
-            Value::Error(ValueError::InvalidName)
+            use chrono::{Datelike, Local};
+            let today = Local::now().date_naive();
+            Value::Number(date_serial(
+                today.year(),
+                today.month(),
+                today.day(),
+            ))
         }
-        "NOW" => Value::Error(ValueError::InvalidName),
+        "NOW" => {
+            // Whole+fractional day count. Fractional part = time-of-day / 86400.
+            use chrono::{Datelike, Local, Timelike};
+            let now = Local::now();
+            let date = now.date_naive();
+            let day_serial = date_serial(date.year(), date.month(), date.day());
+            let secs_in_day = (now.hour() * 3600 + now.minute() * 60 + now.second()) as f64;
+            Value::Number(day_serial + secs_in_day / 86_400.0)
+        }
         "DATE" => {
             // DATE(year, month, day) — naive day-count via days-from-epoch.
             // Doesn't handle leap rules of pre-1582 Julian; accurate enough
@@ -1384,6 +1394,37 @@ mod tests {
             eval_str("=SMALL(A1:B2,1)", &cm, &vs),
             Value::Number(5.0)
         );
+    }
+
+    #[test]
+    fn eval_today_is_valid_date_serial() {
+        let (cm, vs) = make_test_env();
+        // TODAY returns a Number. Round-tripping through YEAR yields a
+        // sensible year (>= 2026 since this test runs after that).
+        let r = eval_str("=TODAY()", &cm, &vs);
+        match r {
+            Value::Number(n) => {
+                let (y, m, d) = date_from_serial(n);
+                assert!(y >= 2026, "year should be at least 2026, got {}", y);
+                assert!((1..=12).contains(&m), "month {} out of range", m);
+                assert!((1..=31).contains(&d), "day {} out of range", d);
+            }
+            other => panic!("TODAY didn't return a Number: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_now_includes_fractional_day() {
+        let (cm, vs) = make_test_env();
+        // NOW() ≥ TODAY() and < TODAY()+1
+        let now_v = eval_str("=NOW()", &cm, &vs);
+        let today_v = eval_str("=TODAY()", &cm, &vs);
+        if let (Value::Number(now), Value::Number(today)) = (now_v, today_v) {
+            assert!(now >= today, "NOW {} should be >= TODAY {}", now, today);
+            assert!(now < today + 1.0, "NOW should be on the same day");
+        } else {
+            panic!("NOW or TODAY didn't return a Number");
+        }
     }
 
     #[test]
