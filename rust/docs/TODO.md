@@ -1,71 +1,78 @@
 # TODO — 没做完的角落
 
-> 截至 `2267c54` HEAD。`✓` = 后端 / 库已就位但需要接线 / 测试 / 工具链；
-> `□` = 完全没做。每条都有线索：哪个文件、为什么 deferred、最小可行步骤。
+> 截至 review 后整改批次（HEAD 之上加了 review 修复 + lazy formula 规划）。
+> `✅` = 完成；`⚠️` = 部分完成（限制写在条目里）；`□` = 未做。
 
-## A. UI 接线（后端就位 / UI 未接）
+## 0. 本批次（review 6 项 + lazy 规划）状态
 
-### A.1 ✓ FormulaBar 没接到 App
-- **代码**：`solid/excel/src/FormulaBar.tsx` 已写完，`solid/excel/src/index.tsx` 已 export
-- **验证（playwright）**：`document.querySelector('.formula-bar')` 在所有 demo 页都返回 `null`
-- **缺**：App.tsx / 5 个 demo 都直接 `createSheetStore(createJSSheet())` 且没共享 selection signal，FormulaBar 拿不到 `activeAddr`
-- **最小步骤**：
-  1. demo 重构成接受 store + selection 作为 props
-  2. App.tsx 在每个 demo 外层维护 `[selected, setSelected]`，传给 Table（controlled）+ FormulaBar
-  3. FormulaBar 渲染在 Table 上方
-  4. e2e: 选 B1 → 公式栏显示 `=A1*2`、地址 `B1`
+| 项 | 状态 | 备注 |
+|---|---|---|
+| Workbook 跨 sheet eval 真正算出值 | ✅ | `Store::force_recompute_derived_silent` + `Sheet::recompute_cross_sheet_formulas`；`workbook.rs::cross_sheet_formula_evaluates` 现在断言真实值，读路径不发订阅 |
+| 跨 sheet 链式 ref 缓存 | ⚠️ | A.A→B.A→A.B 链中 B.A 的 cache 仍可能过期；lazy formula 上线后自然修复 |
+| 当前 sheet 限定引用 | ✅ | `Sheet1!A1` 在 Sheet1 内按普通 same-sheet ref 求值，自引用返回 `#CYCLE!` |
+| Solid undo/redo snapshot 用值类型 | ✅ | `CellSnapshot` 改 tagged union；number / error / boolean 回归测试已加 |
+| paste 公式按 (paste-copy) 偏移 | ✅ | `formula-shift.ts::shiftFormulaRefs`；3 条测试钉住 |
+| selection 提到 SheetStore | ✅ | `store.selection / setSelection / selectionAddr`；Table + FormulaBar 的 prop 接口都已撤掉 |
+| JS mock 行列编辑 ref retarget | ✅ | js-sheet 用同一组 `formula-shift.ts` helper；字符串 literal 不改写，多字母列搬迁已覆盖 |
+| Lazy formula eval 规划 | ✅ | `LAZY_FORMULA_EVAL.md` 已敲定 4 条决策 + 6 step 路线 |
 
-### A.2 □ Ctrl+Z / Ctrl+Y 没绑全局
-- **代码**：`SheetStore.undo()` / `redo()` / `canUndo()` / `canRedo()` 已存在并测过（`solid/excel/test/sheet-store.test.ts`）
-- **缺**：没全局 keydown 监听
-- **最小步骤**：在 App.tsx 或每个 demo 包装层 onKeyDown 监听 `(Ctrl|Meta)+Z` / `Y` / `Shift+Z` 调 store API
+## 1. UI 接线（后端就位 / UI 未接）
 
-### A.3 □ Ctrl+C / Ctrl+V 没绑全局
-- **代码**：`SheetStore.copy(addrs[][])` / `paste(originAddr, data)` 已存在并测过
+### 1.1 ✅ FormulaBar 接到 Table — 已做
+- 通过 `<Table formulaBar />` 渲染，FormulaBar 默认从 `store.selection` 读地址
+- 仍在 deferred：5 个 demo 页 (`solid/excel/src/demos/*`) 没逐页加 `formulaBar` prop —— 用户得改 prop 调用方才看到
+
+### 1.2 ✅ Ctrl+Z / Ctrl+Y 全局键盘 — 已做
+- `Table.tsx::onKeyDown` 处理 `Cmd/Ctrl+Z` / `+Y` / `+Shift+Z`，调 `store.undo/redo`
+
+### 1.3 □ Ctrl+C / Ctrl+V 跨进程剪贴板
+- **代码**：`SheetStore.copy(addrs[][])` / `paste(originAddr, data)` 已有；paste 已做相对引用偏移
 - **缺**：
   - 没监听键盘
-  - selection 当前是单 cell，没 SelectionRange — 复制范围需要先实现 Shift+方向键扩展选区
-  - 没接 `navigator.clipboard.writeText/readText` — 只能在应用内剪贴板，不能跟外部 Excel/Sheets 互通
+  - selection 仍是单 cell，没 SelectionRange — 复制范围需要先实现 Shift+方向键扩展选区
+  - 没接 `navigator.clipboard.writeText/readText` — 只能在应用内剪贴板
 - **最小步骤**：
-  1. Selection 模型加 `range: { start, end }`
-  2. Shift+方向键扩展 range
-  3. Ctrl+C 序列化为 TSV 写入 navigator.clipboard
+  1. SheetStore 的 selection 升级成 `{ anchor, focus }` 矩形
+  2. Table 处理 Shift+方向键扩展
+  3. Ctrl+C 序列化 selection 为 TSV 写入 navigator.clipboard
   4. Ctrl+V 读 navigator.clipboard，按 \t/\n 切分调 paste
 
-### A.4 □ Delete 键清空选中
-- **代码**：`ISheet.clear_cell(addr)` / `Sheet::clear_cell` / `WasmSheet.clear_cell` 都已暴露
-- **缺**：Table 的 onKeyDown 没 case `'Delete'`
-- **最小步骤**：单行 — `case 'Delete': store.raw.clear_cell(coordToAddr(selected())); break;`（先用 raw，等 sheet-store 加 wrapper）
+### 1.4 ✅ Delete 键清空选中 — 已做
+- `Table.tsx::onKeyDown` `case 'Delete'/'Backspace'` 调 `store.clearCell`，走 undo
 
-### A.5 □ 多 sheet UI（tab 栏 + 切换）
-- **代码**：`Workbook { sheets, names }` API 完整（add/rename/remove/sheet_by_name）
+### 1.5 □ 多 sheet UI（tab 栏 + 切换）
+- **代码**：`Workbook { sheets, names }` API 完整（add/rename/remove/sheet_by_name）；现在 `get_cell` 真能跨 sheet 算
 - **缺**：
   - WasmSheet 只暴露 Sheet，没暴露 Workbook
   - SheetStore 假设单 sheet
   - 没 tab UI
 - **最小步骤**：
-  1. WasmWorkbook 包 Workbook，暴露 add_sheet / current_sheet / switch_to
-  2. 新建 SolidJS WorkbookStore 取代 SheetStore（或 SheetStore 接受 sheet index）
+  1. `WasmWorkbook` 包 Workbook，暴露 add_sheet / current_sheet / switch_to
+  2. 新建 SolidJS WorkbookStore 或 SheetStore 接受 sheet index
   3. 底部 tab 栏组件
-  4. 因为 wasm 还没接（A.7），暂时只在 createJSSheet 端用，结构先搭
+  4. 因为 wasm 还没接（1.7），暂时只在 createJSSheet 端用，结构先搭
 
-### A.6 □ 行列插入 / 删除 UI（右键菜单）
-- **代码**：`Sheet::insert_row/delete_row/insert_col/delete_col` + 自动 ref 调整都已就位
+### 1.6 □ 行列插入 / 删除 UI（右键菜单）
+- **代码**：`Sheet::insert_row/delete_row/insert_col/delete_col` + 自动 ref 调整都已就位；JS mock 也对齐了；SheetStore 已暴露 `insertRow/deleteRow/insertCol/deleteCol` wrapper
 - **缺**：
   - 右键菜单组件
-  - SheetStore 没暴露这 4 个方法
-- **最小步骤**：sheet-store 加 4 个 wrapper；右键菜单是单独组件
+  - 这几个 wrapper 还没走 undo（结构性编辑 snapshot 太大；见 TODO 1.6.1）
 
-### A.7 □ Solid demo 实际加载 WASM
+#### 1.6.1 □ 结构性编辑 undo
+- **现状**：sheet-store 的 row/col API 直接转发，**不可 undo**
+- **路径**：要么记录全 sheet 快照（贵），要么记录 reverse op（insert_row 的 reverse 是 delete_row + 把删的内容放回）
+- **判断**：等 lazy formula 切换后，formula 不再持有 derived atom，sheet 的状态量级变小，全快照才可控
+
+### 1.7 □ Solid demo 实际加载 WASM
 - **现状**：所有 demo 都 `createSheetStore(createJSSheet())`
 - **后果**：DemoFormulas 首屏 SUM(A,B,C) / AVERAGE / COUNT / MIN / MAX / IF 全 `#ERROR!`（playwright 已验证）
 - **依赖**：
   - `wasm-pack build --target web rust/wasm`
   - `vite-plugin-wasm` + `vite-plugin-top-level-await` 或 `?init` 内联
   - 写 `createWasmSheet()` 工厂返回 ISheet
-- **最小步骤**：见 ROADMAP 1A step 10 deferred 块
+- **注意**：JS mock 现在跟 Rust 在公式 ref 重定位上对齐了，但 `evalFormula` 仍是子集；DemoFormulas 走 SUM/IF 等还是 #ERROR!，必须切 WASM 才彻底好
 
-### A.8 □ 格式化 UI
+### 1.8 □ 格式化 UI
 - **代码**：`CellFormat` + `apply_rules` + `ConditionalRule` 后端齐全
 - **缺**：
   - SheetStore 没暴露 set_format / get_format
@@ -76,31 +83,26 @@
   2. Cell 渲染时合并 base + 条件规则得到最终样式
   3. 工具栏组件分开做
 
-## B. 工具链 / 工程
+## 2. 工具链 / 工程
 
-### B.1 ✓ tsconfig 治理（D.12 临时方案）
-- **现状**：每个 src .tsx 顶部加 `/** @jsxImportSource solid-js */` pragma 解决 tsc build；vite 跑时也有 `cannot be set without ... automatic JSX transform` 警告
-- **正确做法**：
-  1. `solid/excel/tsconfig.json` extends `tsconfig.base.json` + `composite: true` + `jsxImportSource: solid-js`
-  2. 根 `tsconfig.json` references 加 `./solid/excel/tsconfig.json`
-  3. 删掉所有 src .tsx 顶部的 pragma
-  4. 验证 `tsc -build` + `npm run dev` 都不报 warning
+### 2.1 ✅ tsconfig 治理 — 已做
+- `solid/excel/tsconfig.json` extends base + 加进根 references，src .tsx 删除了 `@jsxImportSource` pragma
 
-### B.2 □ rollup 跳过 demo 应用更优雅
+### 2.2 □ rollup 跳过 demo 应用更优雅
 - **现状**：rollup.config.mjs 用 `fs.existsSync(p+'/src/index.ts')` filter
 - **更好做法**：在每个 demo 应用的 package.json 加 `"private": true`，rollup 读 package.json 跳过 private（跟 npm 语义一致）
 
-### B.3 □ wasm-bindgen-test 端到端
+### 2.3 □ wasm-bindgen-test 端到端
 - **现状**：`cargo test` 跑的是原生 target；wasm32 行为没验证
 - **依赖**：`wasm-pack test --headless --chrome`
-- **必须覆盖**：subscribe/unsubscribe 跨 JS↔Rust 边界、重入保护（C.3）、JsCallbackListener panic 不挂 wasm 实例
+- **必须覆盖**：subscribe/unsubscribe 跨 JS↔Rust 边界、重入保护、JsCallbackListener panic 不挂 wasm 实例
 
-### B.4 □ playwright e2e 套件
-- **现状**：本次手工 e2e 验证了双击编辑 / 公式 / 公式保留（D.11）/ 键盘导航 / Cell 选中
+### 2.4 □ playwright e2e 套件
+- **现状**：本次手工 e2e 验证了双击编辑 / 公式 / 公式保留 / 键盘导航 / Cell 选中
 - **缺**：CI 化、render counter 验证精准订阅、fps benchmark
 - **依赖**：`playwright` + `@playwright/test`（不在 deps）
 
-### B.5 □ benchmark harness
+### 2.5 □ benchmark harness
 - **缺**：criterion 依赖 + benches/atom_bench.rs / sheet_bench.rs
 - **要测的**：
   - 1 万 cell 写入
@@ -108,101 +110,124 @@
   - SUM(A1:A10000)
   - destroy/create 1 万 atom 内存稳定
   - unsub 1 万订阅 < 1ms
+  - lazy formula 上线后：100k 公式 import eval count == 0 的回归门禁
 
-### B.6 □ wasm panic 端到端
+### 2.6 □ wasm panic 端到端
 - **现状**：`console_error_panic_hook` 已装，但没确认浏览器里 panic 真的出现在 console
 - **验证**：写一个 wasm-bindgen-test 故意 panic 看 console 输出
 
-## C. 后端漏的角落
+## 3. 后端漏的角落
 
-### C.1 □ Workbook 跨 sheet eval 解析
-- **现状**：parser 已识别 `Sheet1!A1` → `Expr::SheetRef`；eval 单 sheet 上下文返回 `#REF!`
-- **缺**：WorkbookContext 类型，把 SheetRef 解析成另一个 sheet 的 atom
-- **设计**：eval_expr 加 trait `RefResolver`：
-  ```rust
-  trait RefResolver { fn resolve(&self, sheet: &str, addr: CellAddress) -> Option<Value>; }
-  ```
-  WorkbookContext 实现这个 trait
+### 3.1 ⚠️ Workbook 跨 sheet eval — 部分修
+- **现状**：`Workbook::get_cell` 在 resolver scope 内 silent 走 `recompute_cross_sheet_formulas_reachable_from(addr)`，targeted BFS 沿 `formula_exprs` 找 transitive 跨 sheet 公式，只 force 链路上的子集（不再扫全表）。`Store::recompute_derived_tree` 处理拓扑级联到非跨 sheet 的下游公式（`=B1*2` 这种）。当前 sheet 限定引用 `Sheet1!A1` 也走 same-sheet getter
+- **回归门禁**：`workbook_get_cell_only_recomputes_formulas_on_target_dep_chain`（读 B1 = 1 次 recompute，D1/E1 不动） + `workbook_get_cell_walks_local_dep_chain_to_cross_sheet`（C1 → B1 transitive）+ `workbook_get_cell_no_cross_sheet_chain_does_no_recompute`（同 sheet 公式 = 0 次 recompute）。`Store::debug_recompute_count` 是断言载体
+- **限制**：跨 sheet 链 (Sheet1.A1 → Data.B1 → Other.C1) 中间环节 cache 仍可能过期；`SplitWorkbookResolver::resolve` 只 `peek_value`，不会再递归触发对端 sheet 的 recompute
+- **真正解法**：lazy formula 上线后，formula 不再 cache，每次 read 都按 dep 算；本限制自然消失
 
-### C.2 □ TODAY/NOW 没 wasm32 实测
+### 3.2 □ TODAY/NOW 没 wasm32 实测
 - **现状**：chrono `wasmbind` feature 已开，本机测试 OK
 - **风险**：浏览器里 `Local::now()` 是否真返回当地时间没在浏览器实测；可能需要 `js-sys::Date` fallback
 
-### C.3 □ approximate-match VLOOKUP / HLOOKUP
-- **现状**：第 4 个参数（exact/approximate）被解析后忽略，永远走精确匹配
-- **缺**：approximate 模式（要求 range 第 1 列已升序，二分查找最大 ≤ value）
+### 3.3 ✅ approximate-match VLOOKUP / HLOOKUP — 已做
+- 第 4 个参数支持 TRUE/FALSE/数值，TRUE 走二分 approximate，FALSE 精确
 
-### C.4 □ TEXT(value, format)
-- **现状**：未实现（Phase 2 deferred）
+### 3.4 □ TEXT(value, format)
+- **现状**：未实现
 - **缺**：format 字符串 mini parser（类似 `0.00`, `#,##0`, `yyyy-mm-dd`）— CellFormat 的 NumberFormat 是同类需求，可共享
 
-### C.5 □ 函数注册表重构
+### 3.5 □ 函数注册表重构
 - **现状**：`eval_func` 是个 ~30-arm `match` 块（约 500 行）
-- **建议**：当函数 ≥ 50 个时改成 `HashMap<&'static str, fn(&[Expr], &dyn Fn(...), ...) -> Value>`
+- **建议**：当函数 ≥ 50 个时改成 `HashMap<&'static str, fn(...) -> Value>`
 
-### C.6 □ 排序 / 筛选
+### 3.6 □ 排序 / 筛选
 - **代码**：CellRange 已就位
 - **缺**：排序是视图层逻辑（不改 atom），需要 SheetStore 维护 view 状态 + 渲染时按 view 顺序遍历
 
-### C.7 □ 行列宽度 / 冻结首行
+### 3.7 □ 行列宽度 / 冻结首行
 - **缺**：纯 UI / SheetStore 状态，后端无关
 
-### C.8 □ JSON 导入导出 / 自动保存
+### 3.8 □ JSON 导入导出 / 自动保存
 - **代码**：CSV 已做
 - **缺**：JSON 序列化整个 sheet（含公式）；localStorage 自动保存
 
-## D. 7B / 7C 工程
+### 3.9 □ 跨 sheet 环检测
+- **现状**：`would_create_cycle` 只看本 sheet `formula_exprs`
+- **缺**：workbook 范围反向依赖图
+- **暂时兜底**：lazy formula 的 `Computing` runtime 状态会防栈溢出，错误显示为 `#CYCLE!`
 
-### D.1 □ 7B 虚拟滚动
+### 3.10 □ primitive atom GC
+- **现状**：`set_cell(addr, Value::Null)` 不释放 primitive atom
+- **影响**：长期运行慢慢增长；不致命，单独 issue 跟踪
+
+## 4. Lazy formula 路线（见 LAZY_FORMULA_EVAL.md）
+
+### 4.1 □ Step 0 — debug 计数 / 探针 API
+- `debug_primitive_atom_count` / `debug_formula_count` / `debug_formula_eval_count` / `debug_dirty_formula_count` / `debug_dependents_count(addr)` / `debug_cache_state(fid)`
+- 配套 benchmark：100k import eval==0 / viewport read 100 / 公式引用空 cell atom==0 / 写空 cell 后 dirty
+
+### 4.2 □ Step 1 — EvalContext 抽出 + 删 TLS resolver
+- `eval_expr(expr, ctx: &mut dyn EvalContext)`
+- `SheetEvalCtx` / `WorkbookEvalCtx` 两实现
+- 删 `with_cross_resolver` 和 `unsafe { mem::transmute }`
+- 验收：`eval.rs` 不再 import `RefCell` 用于 thread_local；excel-core grep `with_cross_resolver` == 0
+
+### 4.3 □ Step 2 — lazy formula 主体（feature flag `lazy-formula`）
+- 同时上 `FormulaRecord` / `FormulaCache` / `cell_dependents` / `range_dependents` / `BulkLoader`
+- D1 契约切换：formula subscriber 改 dirty 通知
+- 验收硬门禁：跑 Solid demo 5 页 + DemoFormulas 无可见回归
+
+### 4.4 □ Step 3 — bulk import API（CSV/JSON/xlsx 接入路径）
+### 4.5 □ Step 4 — range streaming 改造
+### 4.6 □ Step 5 — range dependency interval index
+### 4.7 □ Step 6 — feature flag 拆除 + 旧路径删除
+- grep 门禁：`formula_cells` / `propagate_force` / `create_derived` 在 excel-core 应为 0 命中
+
+## 5. 7B / 7C 工程
+
+### 5.1 □ 7B 虚拟滚动
 - **依赖**：Solid 虚拟滚动组件（自写或选 `@solid-primitives/virtual`）
-- **关键约束**：cell 进出视口时 subscribe/unsubscribe（C.4 已就位）
+- **关键约束**：cell 进出视口时 subscribe/unsubscribe（精准订阅已就位）
 - **门禁**：playwright + chrome devtools Performance.metrics 实测 fps
+- **关联**：lazy formula 落地后，viewport 才真是计算边界
 
-### D.2 □ 7C Web Worker
+### 5.2 □ 7C Web Worker
 - **依赖**：wasm-pack + worker bundling
-- **关键约束**：JsCallbackListener 不能跨 worker；7C adapter 改成 `PostMessageListener`（trait 已抽好，C.11 / 1A step 7）
+- **关键约束**：JsCallbackListener 不能跨 worker；7C adapter 改成 `PostMessageListener`（trait 已抽好）
 - **设计**：主线程发 `{ kind: 'set_number', addr, value }` postMessage；worker 内执行 + subscribe；worker 主动 postMessage `{ kind: 'cell_changed', addr, display }` 通知主线程
 
-## E. ISSUES.md 里"轻"级未做的
+## 6. ISSUES.md 里"轻"级未做的
 
 | Issue | 当前状态 |
 |---|---|
-| A.3 NaN 位级比较 | 未修；需要 `if a.is_nan() && b.is_nan()` 兜底 |
-| A.7 拓扑排序 LIFO | 未修；需要 VecDeque::pop_front() 给 FIFO |
-| A.9 自循环测试 hacky | 未修；可换"两个互引派生"的等价测试 |
 | A.10 store.rs 1000+ 行单文件 | 未拆 |
 | B.5 SUM/COUNT/AVERAGE 字面量 vs cell 引用区分 | 未修 |
-| B.6 MIN/MAX 空集返回 0 | 未修 |
-| B.8 thunk 多包一层 | 未修 |
+| B.7 MIN/MAX 空集返回 0 | 未修 |
 | B.9 parse error 信息丢失 | 未修；ParseError { pos, expected, got } 需要 |
-| B.11 Range 孤立用法 | 当前返回 #VALUE! 跟 Excel 一致 ✅ |
 | C.5 get 是 &mut self | 未修；需要 peek_cell(&self) 拆分 |
-| C.6 fire 不检查值变化 | C.1+C.2 修后自动消失 ✅ |
 | C.7 batch_set 只支持 number | 未扩展（text / formula 版本） |
 | C.9 value_to_display 阈值 | 未改 |
-| D.2 createJSSheet 用 Function() | 短期保留；长期靠 A.7 wasm 后端切换消除 |
+| D.2 createJSSheet 用 Function() | 短期保留；长期靠 1.7 wasm 后端切换消除 |
 | D.5 sheet-store signal map 不清理 | 部分修：dispose() 已有，但没在组件 unmount 自动调 |
 | D.6 raw 字段 @deprecated 但没删 | 未删；测试在用 |
 | D.7 setTimeout focus | 未改 |
 | D.8 cellValue() 重复调用 | 未改 |
 | D.10 demo 函数体长串初始化 | 未改 |
 
-## F. 已修但需要回归保护的
+## 7. 已修但需要回归保护的
 
-每条都需要 wasm-bindgen-test 或 playwright e2e 加固，目前只在原生 cargo test 验过：
+每条都需要 wasm-bindgen-test 或 playwright e2e 加固，目前只在原生 cargo test / jest 验过：
 - C.1 + C.2 subscribe propagation
 - C.3 reentrancy（listener 内回调 set 的实际浏览器行为）
 - C.10 panic hook 是否真把 panic 送到 console.error
 - TODAY/NOW 浏览器时区行为
+- Workbook 跨 sheet eval（本批次新修）
 
 ---
 
 ## 优先级建议
 
-**最划算**（小改动 / 大用户感知）：A.1 (FormulaBar 接线)、A.2 (Ctrl+Z)、A.4 (Delete 清空)、B.1 (tsconfig 收尾)
+**最划算**（小改动 / 大用户感知）：1.3 Ctrl+C/V、1.6 右键菜单、1.7 WASM 加载（DemoFormulas 关键）
 
-**先做才能继续大改**：A.7 (WASM 加载) — 这条不解决，DemoFormulas 永远首屏 #ERROR!
+**为长期未来铺路**：4.x lazy formula 路线（按 Step 0/1/2 顺序）、5.1/5.2 7B/7C、2.3/2.4 e2e harness
 
-**为长期未来铺路**：C.1 (Workbook eval)、D.1/D.2 (7B/7C)、B.3/B.4 (e2e harness)
-
-**可以一直拖**：E 段轻级 issues、C.3/C.4/C.5/C.6/C.7/C.8 各种功能扩展
+**可以一直拖**：6 段轻级 issues、3.4/3.5/3.6/3.7/3.8 各种功能扩展

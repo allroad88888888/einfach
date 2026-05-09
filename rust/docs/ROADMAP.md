@@ -4,6 +4,7 @@
 
 > **代码 review 已完成**：见 [ISSUES.md](./ISSUES.md)。每期"前置修复"小节列出阻塞该期的 issue。
 > **状态归属架构约束**：见 [MAIN_FLOW.md 末尾](./MAIN_FLOW.md)。任何新状态必须对照该表确认归属层。
+> **Lazy 公式求值规划**：见 [LAZY_FORMULA_EVAL.md](./LAZY_FORMULA_EVAL.md)。后续大表、导入、虚拟滚动都必须以这份文档的门禁为准。
 
 ## 全期通用门禁基线
 
@@ -62,6 +63,7 @@
 - 条件格式 rule engine
 - 7B 虚拟滚动 + fps benchmark
 - 7C Web Worker + 跨线程 subscribe 适配器
+- Lazy 公式求值：公式导入只建 AST/依赖，不在 `set_formula` 阶段计算
 - wasm-bindgen-test + playwright e2e
 - TODAY / NOW（chrono crate）
 
