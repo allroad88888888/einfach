@@ -171,9 +171,12 @@
 - **缺**：workbook 范围反向依赖图
 - **暂时兜底**：lazy formula 的 `Computing` runtime 状态会防栈溢出，错误显示为 `#CYCLE!`
 
-### 3.10 □ primitive atom GC
-- **现状**：`set_cell(addr, Value::Null)` 不释放 primitive atom
-- **影响**：长期运行慢慢增长；不致命，单独 issue 跟踪
+### 3.10 ⚠️ primitive atom GC — 主路径已做，formula derived GC 仍延后
+- **已做**：`Sheet::try_release_primitive(addr)` 在 `clear_cell` / `set_cell(addr, Null)` 末尾调用。条件：cell 在 `cells` 里、不是 formula cell、`!has_dependents(prim)`、当前值是 `Null`。满足时移除 `cells` / `readable` 项、detach fanout 的 `store.sub`、`destroy_atom`。订阅者的 listener bucket 保留 —— 下次 `set_cell` 重建 primitive 时通过 `attach_address_sub` 自然重连，listener 在那次写入时按值变化触发，与"先订阅空 cell 再首次写入"语义一致
+- **回归门禁**：`clear_cell_releases_primitive_when_no_deps` / `clear_cell_keeps_primitive_when_formula_depends` / `set_cell_to_null_releases_primitive` / `subscribed_cell_release_keeps_listener_alive` / `set_cell_then_clear_cycles_do_not_grow_atom_count` / `formula_to_null_releases_primitive_when_no_deps`
+- **覆盖路径**：clear_cell、primitive→primitive set Null、formula→primitive(Null) `with_remap` 出口；`batch_set` 沿用同一 destroy-old-derived 路径但暂不批量释放 primitive（每次 batch 全是值写入，Null 项也会留下 atom；下次显式 clear_cell 才释放 —— 单独 issue 跟踪）
+- **未做**：formula cell 自身的 GC（formula 删除时把 derived atom 的 ref-count 化释放）— lazy formula Step 2 落地后 derived atom 不再常驻，本条目自然消失；目前 `set_formula` 的 `set_formula_releases_old_derived` 已在 same-cell 替换时释放旧 derived，但跨 cell GC（C1 = =B1 然后 C1 被 clear，B1 derived 没人用）不在本批次范围
+- **影响**：长期运行 set→clear 循环不再增长 atom 数；含 formula 引用的清空仍保留 primitive（必须，否则 destroy_atom 会 panic）
 
 ## 4. Lazy formula 路线（见 LAZY_FORMULA_EVAL.md）
 

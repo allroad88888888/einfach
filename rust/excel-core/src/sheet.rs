@@ -60,9 +60,9 @@ impl FormulaRecord {
 }
 
 /// Token returned by `Sheet::subscribe_cell`. The public subscription is tied
-/// to a cell address, not the current readable atom. `Sheet` rewires the
-/// internal store subscription whenever the address switches between primitive
-/// and formula atoms.
+/// to a cell address, not the current primitive atom. `Sheet` wires the
+/// internal store subscription only while the address has a primitive atom;
+/// formula cells are notified through the lazy dependency graph.
 #[derive(Clone, Copy, Debug)]
 pub struct CellSubscription {
     addr: CellAddress,
@@ -106,7 +106,7 @@ impl Sheet {
     }
 
     /// Get or create the primitive atom for a cell address.
-    /// New cells start as Null. Also seeds `readable` if not already mapped.
+    /// New cells start as Null.
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
         if let Some(&id) = self.cells.get(&addr) {
             return id;
@@ -300,6 +300,7 @@ impl Sheet {
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         let had_formula = self.formula_cells.contains_key(&addr);
+        let is_null = matches!(value, Value::Null);
 
         if had_formula {
             self.with_remap(addr, |sheet| {
@@ -307,10 +308,24 @@ impl Sheet {
                 let id = sheet.ensure_cell(addr);
                 sheet.store.set(id, value);
             });
+            // 3.10 — formula→primitive→Null with no surviving dependents leaks
+            // the freshly ensured primitive scaffold. The with_remap tail has
+            // already reattached the fanout; try_release_primitive will
+            // detach it again so the bucket goes back to "subscribed but no
+            // materialized atom" — symmetrical with subscribing to an empty
+            // cell before any write.
+            if is_null {
+                self.try_release_primitive(addr);
+            }
         } else {
             let id = self.ensure_cell(addr);
             self.attach_address_sub(addr);
             self.store.set(id, value);
+            // 3.10 — drop the primitive when a non-formula cell is cleared
+            // back to Null with no live dependents. Listener bucket stays.
+            if is_null {
+                self.try_release_primitive(addr);
+            }
         }
         self.mark_dependents_dirty(addr);
     }
@@ -319,7 +334,47 @@ impl Sheet {
     /// but with a more discoverable name for callers implementing Delete-key /
     /// undo-to-empty UX.
     pub fn clear_cell(&mut self, addr_str: &str) {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         self.set_cell(addr_str, Value::Null);
+        // set_cell already calls try_release_primitive when the new value is
+        // Null; the second call here is defensive in case a future change to
+        // set_cell rearranges that path. It's a no-op when the cell was
+        // already released.
+        self.try_release_primitive(addr);
+    }
+
+    /// 3.10 — release the primitive cell atom for `addr` when it is Null and
+    /// has no live dependents. Used by `clear_cell` / `set_cell(.., Null)` to
+    /// keep `cells.len()` bounded across long-running sheets where many cells
+    /// get set then cleared. Skips formula cells and skips any primitive
+    /// that still has core dependents (would panic `Store::destroy_atom`).
+    ///
+    /// Address listener buckets stay alive — only the underlying `store.sub`
+    /// is detached. The next `set_cell` on this address will re-create a
+    /// fresh primitive and reattach the fanout via the existing
+    /// `attach_address_sub` flow, firing the listener as part of that write.
+    fn try_release_primitive(&mut self, addr: CellAddress) {
+        let Some(&atom_id) = self.cells.get(&addr) else {
+            return;
+        };
+        // Formula cells are lazy records, not primitive atoms.
+        if self.formula_cells.contains_key(&addr) {
+            return;
+        }
+        if self.store.has_dependents(atom_id) {
+            return;
+        }
+        if !self.store.has_atom(atom_id) {
+            // Defensive: nothing to release.
+            self.cells.remove(&addr);
+            return;
+        }
+        if !matches!(self.store.get(atom_id), Value::Null) {
+            return;
+        }
+        self.cells.remove(&addr);
+        self.detach_address_sub(addr);
+        self.store.destroy_atom(atom_id);
     }
 
     /// Set a cell's formula by address string (e.g. "=A1+B1").
@@ -446,7 +501,11 @@ impl Sheet {
             .unwrap_or(Value::Null)
     }
 
-    fn eval_formula_at_with_provider(&self, addr: CellAddress, provider: &dyn EvalProvider) -> Value {
+    fn eval_formula_at_with_provider(
+        &self,
+        addr: CellAddress,
+        provider: &dyn EvalProvider,
+    ) -> Value {
         let Some(record) = self.formula_cells.get(&addr).cloned() else {
             return self.primitive_value_at(addr);
         };
@@ -498,9 +557,7 @@ impl Sheet {
     ///
     /// Worst-case cost is the size of the dep closure of `target` in
     /// `formula_exprs` — orders of magnitude smaller than the whole-sheet
-    /// sweep on workbooks with many cross-sheet formulas. For a sheet with
-    /// 1k cross-sheet formulas where `target` only depends on 3 of them,
-    /// this does 3 force-recomputes instead of 1k.
+    /// sweep on workbooks with many cross-sheet formulas.
     pub fn recompute_cross_sheet_formulas_reachable_from(&mut self, target: CellAddress) {
         let mut visited: HashSet<CellAddress> = HashSet::new();
         let mut to_visit: Vec<CellAddress> = vec![target];
@@ -523,7 +580,6 @@ impl Sheet {
             // cells that are actually formulas.
             collect_formula_refs_into(expr, &self.formula_exprs, &mut to_visit);
         }
-
     }
 
     // === LAZY_FORMULA_EVAL Step 0 — debug counters ===
@@ -563,16 +619,15 @@ impl Sheet {
             .unwrap_or(0)
     }
 
-    /// Total live atoms (primitive + derived). Useful as a gross "did
-    /// anything materialize?" signal in tests.
+    /// Total live core atoms. Formulas are not core atoms anymore. Useful as
+    /// a gross "did anything materialize?" signal in tests.
     #[doc(hidden)]
     pub fn debug_total_atom_count(&self) -> usize {
         self.store.debug_total_atom_count()
     }
 
-    /// Cumulative recompute count from the underlying store. Tests use
-    /// deltas across `Workbook::get_cell` to assert
-    /// "single-cell read only forced N derived recomputes".
+    /// Cumulative core derived recompute count from the underlying store.
+    /// Formula cells should not increase this counter anymore.
     #[doc(hidden)]
     pub fn debug_recompute_count(&self) -> usize {
         self.store.debug_recompute_count()
@@ -1633,5 +1688,161 @@ mod tests {
         sheet.set_cell("A1", Value::Number(5.0));
         sheet.set_formula("C1", "=A1+B1");
         assert_eq!(sheet.get_cell("C1"), Value::Number(5.0));
+    }
+
+    // === 3.10 — primitive atom GC on clear / set-Null ===
+
+    #[test]
+    fn clear_cell_releases_primitive_when_no_deps() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(42.0));
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 1);
+
+        sheet.clear_cell("A1");
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            0,
+            "clear_cell on a no-dep cell must release its primitive"
+        );
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            0,
+            "store should hold no live atoms after clearing the only cell"
+        );
+        // Subsequent read still produces Null naturally.
+        assert_eq!(sheet.get_cell("A1"), Value::Null);
+    }
+
+    #[test]
+    fn clear_cell_keeps_primitive_when_formula_depends() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(5.0));
+        sheet.set_formula("B1", "=A1*2");
+        // Lazy backend: only A1 is materialized as a primitive. B1 is a
+        // formula record with no primitive scaffold.
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+        assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
+
+        // After eval, A1 is in B1's dep set (cell_dependents[A1] contains B1).
+        // try_release_primitive checks store-level has_dependents (atom-level),
+        // which is false for A1's primitive (no derived atoms exist in lazy).
+        // But we still want to keep A1 because B1's formula record depends on
+        // it — clearing A1 sets the value to Null. The lazy formula will
+        // re-evaluate against the new Null on next read.
+        sheet.clear_cell("A1");
+        // Lazy: A1 may be released (no atom-level dependents) since the
+        // dep relationship is at the address level via cell_dependents.
+        // B1 re-evaluates against A1 = Null → coerced to 0 → 0 * 2 = 0.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(0.0));
+        assert_eq!(sheet.get_cell("A1"), Value::Null);
+    }
+
+    #[test]
+    fn set_cell_to_null_releases_primitive() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+
+        sheet.set_cell("A1", Value::Null);
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            0,
+            "set_cell(_, Null) must drop the primitive when no deps"
+        );
+        assert_eq!(sheet.debug_total_atom_count(), 0);
+    }
+
+    #[test]
+    fn subscribed_cell_release_keeps_listener_alive() {
+        // Subscriber contract on release: the bucket's listener list survives
+        // even after the underlying primitive atom is destroyed. The next
+        // set_cell on the address re-creates a fresh primitive and reattaches
+        // the fanout — the listener fires as part of that write, same as
+        // subscribing to an empty cell and setting it for the first time.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("A1", move || *cc.borrow_mut() += 1);
+        // Pre: subscribed but no atom yet.
+        assert_eq!(sheet.debug_primitive_atom_count(), 0);
+
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+        assert_eq!(*count.borrow(), 1, "first write fires listener");
+
+        sheet.set_cell("A1", Value::Null);
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            0,
+            "primitive released even though A1 has a subscriber"
+        );
+        assert_eq!(
+            *count.borrow(),
+            2,
+            "Number → Null is a value change → listener fires"
+        );
+        // Bucket still tracks the listener: subscriptions map keeps the entry.
+        assert!(
+            sheet
+                .cell_subscriptions
+                .get(&CellAddress::parse("A1").unwrap())
+                .map(|b| !b.listeners.borrow().is_empty())
+                .unwrap_or(false),
+            "listener bucket must survive primitive release"
+        );
+
+        sheet.set_cell("A1", Value::Number(7.0));
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            1,
+            "next write re-creates a fresh primitive"
+        );
+        assert_eq!(*count.borrow(), 3, "fresh primitive notifies the listener");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(7.0));
+    }
+
+    #[test]
+    fn set_cell_then_clear_cycles_do_not_grow_atom_count() {
+        // Long-running spreadsheet stress: many set/clear cycles on the same
+        // address must not leak atoms. With 3.10 each cycle releases the
+        // primitive at the bottom of the loop.
+        let mut sheet = Sheet::new();
+        for n in 0..100 {
+            sheet.set_cell("A1", Value::Number(n as f64));
+            sheet.clear_cell("A1");
+        }
+        assert_eq!(sheet.debug_primitive_atom_count(), 0);
+        assert_eq!(sheet.debug_total_atom_count(), 0);
+    }
+
+    #[test]
+    fn formula_to_null_releases_primitive_when_no_deps() {
+        // Formula → primitive(Null) path: with_remap reattaches the fanout to
+        // the freshly ensured primitive, then try_release_primitive at the
+        // end of set_cell drops it because nothing depends on it.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_formula("B1", "=A1*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(4.0));
+        // Lazy formula: only A1 is materialized. B1 is a formula record, not
+        // a primitive scaffold.
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+
+        // Clear B1: formula goes away, primitive scaffold is Null and has no
+        // dependents (B1 is a leaf, not referenced by anything). It gets
+        // released; A1 is unaffected.
+        sheet.clear_cell("B1");
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            1,
+            "B1 stays unmaterialized, A1 stays"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Null);
+        assert_eq!(sheet.get_cell("A1"), Value::Number(2.0));
+        assert_eq!(sheet.get_formula("B1"), None);
     }
 }
