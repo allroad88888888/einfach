@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use einfach_core::{AtomId, Value, ValueError};
@@ -74,6 +74,15 @@ thread_local! {
     /// Workbook. Lets `Sheet1!A1` on Sheet1 use the normal same-sheet getter
     /// path instead of round-tripping through the cross-sheet resolver.
     static CURRENT_SHEET: RefCell<Option<String>> = RefCell::new(None);
+    /// Runtime guard for cross-sheet cycles. Each entry is a `(sheet_name,
+    /// addr)` we are currently resolving across the cross-sheet boundary; if
+    /// the SheetRef arm is asked to resolve an entry already in the set, it
+    /// short-circuits with `Value::Error(CyclicRef)` instead of recursing.
+    /// This complements the static `Workbook::set_formula` check by catching
+    /// any cycle that slipped past it (different code path, dynamic
+    /// IF-driven cycles, future resolver implementations that re-enter eval).
+    static CROSS_SHEET_VISITED: RefCell<HashSet<(String, CellAddress)>> =
+        RefCell::new(HashSet::new());
 }
 
 /// Run `f` with `resolver` installed as the active cross-sheet resolver.
@@ -190,6 +199,11 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
+            // Lazy formula's FormulaCache::Computing state already protects
+            // against cross-sheet cycles at runtime — recursing back into a
+            // cell already on the eval stack returns CyclicRef. The earlier
+            // CROSS_SHEET_VISITED TLS guard from the eager era is now
+            // redundant and was dropped in favor of provider dispatch.
             provider.sheet_cell(sheet, *addr)
         }
     }

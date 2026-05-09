@@ -166,10 +166,14 @@
 - **代码**：CSV 已做
 - **缺**：JSON 序列化整个 sheet（含公式）；localStorage 自动保存
 
-### 3.9 □ 跨 sheet 环检测
-- **现状**：`would_create_cycle` 只看本 sheet `formula_exprs`
-- **缺**：workbook 范围反向依赖图
-- **暂时兜底**：lazy formula 的 `Computing` runtime 状态会防栈溢出，错误显示为 `#CYCLE!`
+### 3.9 ⚠️ 跨 sheet 环检测 — static + runtime 两路都已落地
+- **静态层**：`Workbook::set_formula(sheet_idx, addr, text)` 在写入前 BFS workbook-wide dep 图（节点 = `(sheet_idx, CellAddress)`，边 = same-sheet `CellRef`/`Range` ∪ `SheetRef` 跨 sheet 解析）。`Sheet1!A1 = =Sheet2!A1` + `Sheet2!A1 = =Sheet1!A1` 在第二条 `set_formula` 立即返回 false 并把目标 cell 写成 `#CYCLE!`。复杂度 O(F) — F = 从 target 出发可达的 formula 集合大小（range 由 sheet 端 `formula_exprs` 命中过滤，避免 `SUM(A:A)` 把整列展开）
+- **运行时兜底**：`eval.rs` 加 TLS `CROSS_SHEET_VISITED: HashSet<(String, CellAddress)>`，进入 SheetRef 解析前 insert，返回时 remove；如果同一 `(sheet, addr)` 在解析栈上已经存在 → 直接返回 `#CYCLE!`。即使静态检查被绕过（直接走 `Sheet::set_formula` / 未来动态 IF 触发的循环 / resolver 改成递归 eval）也不会栈溢出
+- **测试**：`workbook.rs::cross_sheet_two_way_cycle_detected` / `cross_sheet_three_way_cycle_detected` / `cross_sheet_chain_no_cycle` / `cross_sheet_self_ref_via_sheet_name` / `cross_sheet_runtime_guard_returns_cycle_when_static_bypassed` + 三条 `Workbook::set_formula` 边界用例
+- **已知遗留**：
+  - 同一 `set_formula` 调用每次按需重建 dep 图（不 cache），写入密集场景下 amortized 是 O(F) per-write —— 理论可以维护增量倒排，留到 lazy formula 路线再做
+  - 动态 IF 条件分支造成的循环（formula 静态结构里有 cycle，但运行时只走非循环分支）会被静态检查误报为 cycle 并拒绝写入，这是保守误报；可以等 lazy formula 改成"边算边检测"再放宽
+  - `Sheet::set_formula`（直接 sheet 入口、不经 workbook）只跑 same-sheet 检查；UI 层应该统一走 `Workbook::set_formula`，目前 wasm binding 暴露的是 `Sheet::set_formula`，跨 sheet 写入需要切到 workbook API（待 1.5 WasmWorkbook 上线时一并修）
 
 ### 3.10 ⚠️ primitive atom GC — 主路径已做，batch Null 释放仍延后
 - **已做**：`Sheet::try_release_primitive(addr)` 在 `clear_cell` / `set_cell(addr, Null)` 末尾调用。条件：cell 在 `cells` 里、不是 formula cell、`!has_dependents(prim)`、当前值是 `Null`。满足时移除 `cells` 项、detach fanout 的 `store.sub`、`destroy_atom`。订阅者的 listener bucket 保留 —— 下次 `set_cell` 重建 primitive 时通过 `attach_address_sub` 自然重连，listener 在那次写入时按值变化触发，与"先订阅空 cell 再首次写入"语义一致

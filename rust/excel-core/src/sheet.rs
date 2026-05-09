@@ -424,7 +424,10 @@ impl Sheet {
     }
 
     /// Drop any existing formula and write an error value to the cell.
-    fn write_error(&mut self, addr: CellAddress, err: ValueError) {
+    /// `pub(crate)` so the workbook layer can route a cross-sheet cycle
+    /// detection failure (`#CYCLE!`) to the target cell without re-deriving
+    /// the helper logic here.
+    pub(crate) fn write_error(&mut self, addr: CellAddress, err: ValueError) {
         let had_formula = self.formula_cells.contains_key(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
@@ -438,6 +441,14 @@ impl Sheet {
             self.store.set(id, Value::Error(err));
         }
         self.mark_dependents_dirty(addr);
+    }
+
+    /// Read-only access to `formula_exprs` for the workbook-level cycle
+    /// detector. `pub(crate)` because cross-sheet BFS in `Workbook::set_formula`
+    /// needs to walk per-sheet formula ASTs without owning the sheet's
+    /// internal state.
+    pub(crate) fn formula_exprs_iter(&self) -> &HashMap<CellAddress, Rc<Expr>> {
+        &self.formula_exprs
     }
 
     /// Static cycle detection (B.2). Walks the AST of the new formula,

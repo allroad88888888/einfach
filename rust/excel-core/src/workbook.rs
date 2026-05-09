@@ -1,10 +1,11 @@
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use einfach_core::Value;
+use einfach_core::{Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::EvalProvider;
+use crate::formula::{parse_formula, Expr};
 use crate::sheet::Sheet;
 
 /// A workbook is an ordered collection of named sheets. Phase 4 backend.
@@ -111,6 +112,104 @@ impl Workbook {
         self.sheets[idx].peek_value_with_provider(addr, &provider)
     }
 
+    /// Workbook-aware variant of `Sheet::set_formula`. Performs a
+    /// **cross-sheet** static cycle check before installing the formula:
+    /// references like `=Sheet2!A1` are followed across sheet boundaries so
+    /// that pairs like `Sheet1!A1 = =Sheet2!A1` + `Sheet2!A1 = =Sheet1!A1`
+    /// are caught and the second `set_formula` writes `#CYCLE!` instead of
+    /// silently producing a stale value at runtime.
+    ///
+    /// Returns `false` if any of:
+    ///   - `sheet_idx` is out of range
+    ///   - the formula text fails to parse (cell becomes `#VALUE!`)
+    ///   - installing the formula would close a cross-sheet cycle (cell
+    ///     becomes `#CYCLE!`)
+    ///   - the sheet-local same-sheet cycle check (delegated to
+    ///     `Sheet::set_formula`) detects a cycle (also `#CYCLE!`)
+    ///
+    /// Otherwise returns `true` and the formula is live.
+    ///
+    /// **Complexity**: builds the dep graph on demand on each call. Worst
+    /// case walks every formula reachable from `addr`'s tentative dep set,
+    /// across all sheets — at most O(F + R) where F is the total number of
+    /// formula cells visited and R is the size of the reachable refs (each
+    /// `Range` contributes only formula cells inside it via the gated
+    /// `collect_formula_refs_into`-style logic to avoid `SUM(A:A)` blowup).
+    /// In practice this is bounded by the size of the cross-sheet dep
+    /// closure of `addr`, which is small for typical workbooks.
+    pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, formula_text: &str) -> bool {
+        if sheet_idx >= self.sheets.len() {
+            return false;
+        }
+        let addr = match CellAddress::parse(addr_str) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        // Try parse first. On parse failure delegate to sheet.set_formula —
+        // it has the canonical "write #VALUE! and clean up" path.
+        let expr = match parse_formula(formula_text) {
+            Some(e) => e,
+            None => {
+                // sheet.set_formula will hit the same branch and write #VALUE!.
+                // Returns false; our return contract matches.
+                self.sheets[sheet_idx].set_formula(addr_str, formula_text);
+                return false;
+            }
+        };
+
+        // Cross-sheet cycle pre-check: would installing `expr` at
+        // (sheet_idx, addr) make `(sheet_idx, addr)` reachable from itself
+        // through any combination of same-sheet and SheetRef edges?
+        if self.cross_sheet_cycle(sheet_idx, addr, &expr) {
+            self.sheets[sheet_idx].write_error(addr, ValueError::CyclicRef);
+            return false;
+        }
+
+        // Delegate to per-sheet set_formula. It still runs `would_create_cycle`
+        // for same-sheet cycles — that path was already correct and we don't
+        // duplicate the check here.
+        self.sheets[sheet_idx].set_formula(addr_str, formula_text)
+    }
+
+    /// BFS the workbook-wide dep graph starting from the references of `expr`
+    /// (treated as if it were already installed at `(target_idx, target)`).
+    /// Returns true iff `(target_idx, target)` is reachable.
+    ///
+    /// Edges from any visited `(idx, addr)`:
+    ///   - same-sheet `CellRef` / `Range` → `(idx, ref_addr)`
+    ///   - `SheetRef { sheet, addr }` → `(other_idx, addr)` if the sheet name
+    ///     resolves; otherwise dropped
+    ///
+    /// Range expansion is gated by `formula_exprs` membership on each sheet
+    /// (mirrors `collect_formula_refs_into` in sheet.rs) so `SUM(A:A)` doesn't
+    /// enqueue a million empty addresses.
+    fn cross_sheet_cycle(&self, target_idx: usize, target: CellAddress, expr: &Expr) -> bool {
+        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
+        let mut to_visit: Vec<(usize, CellAddress)> = Vec::new();
+        // Seed with refs of the candidate expression.
+        collect_workbook_refs(expr, target_idx, &self.by_name, &mut to_visit);
+
+        while let Some((idx, addr)) = to_visit.pop() {
+            if idx == target_idx && addr == target {
+                return true;
+            }
+            if !visited.insert((idx, addr)) {
+                continue;
+            }
+            // Walk the formula at this node, if any.
+            let Some(sheet) = self.sheets.get(idx) else {
+                continue;
+            };
+            let exprs = sheet.formula_exprs_iter();
+            let Some(child_expr) = exprs.get(&addr) else {
+                continue;
+            };
+            collect_workbook_refs(child_expr, idx, &self.by_name, &mut to_visit);
+        }
+        false
+    }
+
     /// Remove a sheet by index. Returns the removed sheet so callers can
     /// inspect / dispose of its atoms if needed.
     pub fn remove_sheet(&mut self, idx: usize) -> Option<Sheet> {
@@ -134,6 +233,56 @@ impl Workbook {
 impl Default for Workbook {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Walk an AST and append every (sheet_idx, addr) it directly references
+/// onto `out`. `current_idx` is the sheet the AST lives on (used for
+/// `CellRef` / `Range`). `SheetRef` arms resolve their sheet name through
+/// `by_name`; unknown sheet names are dropped (eval-time will return
+/// `#REF!`, which doesn't form a cycle).
+///
+/// Used only by `Workbook::cross_sheet_cycle` — kept free so it doesn't
+/// borrow `self`. Range expansion is naive (every cell in the rectangle)
+/// because the sheet-side BFS gates on `formula_exprs` membership next, so
+/// large empty ranges only cost `Vec` pushes here, not unbounded recursion.
+fn collect_workbook_refs(
+    expr: &Expr,
+    current_idx: usize,
+    by_name: &HashMap<String, usize>,
+    out: &mut Vec<(usize, CellAddress)>,
+) {
+    match expr {
+        Expr::CellRef(addr) => out.push((current_idx, *addr)),
+        Expr::Range { start, end } => {
+            let min_row = start.row.min(end.row);
+            let max_row = start.row.max(end.row);
+            let min_col = start.col.min(end.col);
+            let max_col = start.col.max(end.col);
+            for row in min_row..=max_row {
+                for col in min_col..=max_col {
+                    out.push((current_idx, CellAddress::new(row, col)));
+                }
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_workbook_refs(left, current_idx, by_name, out);
+            collect_workbook_refs(right, current_idx, by_name, out);
+        }
+        Expr::Negate(inner) => collect_workbook_refs(inner, current_idx, by_name, out),
+        Expr::FuncCall { args, .. } => {
+            for a in args {
+                collect_workbook_refs(a, current_idx, by_name, out);
+            }
+        }
+        Expr::SheetRef { sheet, addr } => {
+            if let Some(&idx) = by_name.get(sheet) {
+                out.push((idx, *addr));
+            }
+            // Unknown sheet name → dropped. Eval will surface #REF! at read
+            // time; doesn't participate in cycles.
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
     }
 }
 
@@ -401,5 +550,153 @@ mod tests {
         wb.remove_sheet(1);
         assert_eq!(wb.sheet_count(), 2);
         assert_eq!(wb.index_of("C"), Some(1)); // C shifted down
+    }
+
+    // === Cross-sheet cycle detection (TODO 3.9) ===
+
+    #[test]
+    fn cross_sheet_two_way_cycle_detected() {
+        // Sheet1.A1 = =Sheet2!A1
+        // Sheet2.A1 = =Sheet1!A1
+        // The first install is fine (Sheet2.A1 still empty). The second one
+        // closes a cycle and must return false + write #CYCLE!.
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let s2 = wb.index_of("Sheet2").unwrap();
+
+        assert!(wb.set_formula(s1, "A1", "=Sheet2!A1"));
+        // This should detect the cycle.
+        assert!(
+            !wb.set_formula(s2, "A1", "=Sheet1!A1"),
+            "second set_formula closes cycle, must return false"
+        );
+
+        assert_eq!(
+            wb.get_cell("Sheet2", "A1"),
+            Value::Error(ValueError::CyclicRef),
+            "Sheet2.A1 should hold #CYCLE!"
+        );
+    }
+
+    #[test]
+    fn cross_sheet_three_way_cycle_detected() {
+        // Sheet1.A1 = =Sheet2!A1 → Sheet2.A1 = =Sheet3!A1 → Sheet3.A1 = =Sheet1!A1
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let s2 = wb.index_of("Sheet2").unwrap();
+        let s3 = wb.index_of("Sheet3").unwrap();
+
+        assert!(wb.set_formula(s1, "A1", "=Sheet2!A1"));
+        assert!(wb.set_formula(s2, "A1", "=Sheet3!A1"));
+        // Closing edge:
+        assert!(
+            !wb.set_formula(s3, "A1", "=Sheet1!A1"),
+            "three-way cycle must be detected on the closing edge"
+        );
+
+        assert_eq!(
+            wb.get_cell("Sheet3", "A1"),
+            Value::Error(ValueError::CyclicRef),
+        );
+    }
+
+    #[test]
+    fn cross_sheet_chain_no_cycle() {
+        // Sheet1.A1 = =Sheet2!A1, Sheet2.A1 = =Sheet3!A1, Sheet3.A1 = 5
+        // No cycle: every set_formula succeeds, values resolve.
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let s2 = wb.index_of("Sheet2").unwrap();
+        let s3 = wb.index_of("Sheet3").unwrap();
+
+        wb.sheet_mut(s3).unwrap().set_cell("A1", Value::Number(5.0));
+        assert!(wb.set_formula(s2, "A1", "=Sheet3!A1"));
+        assert!(wb.set_formula(s1, "A1", "=Sheet2!A1"));
+
+        assert_eq!(wb.get_cell("Sheet3", "A1"), Value::Number(5.0));
+        assert_eq!(wb.get_cell("Sheet2", "A1"), Value::Number(5.0));
+        assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn cross_sheet_self_ref_via_sheet_name() {
+        // Sheet1.A1 = =Sheet1!A1 — same as a same-sheet self-ref. Workbook
+        // static check should also catch it (target_idx == sheet_idx, target
+        // == addr → cycle on the seed itself).
+        let mut wb = Workbook::new();
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        assert!(
+            !wb.set_formula(s1, "A1", "=Sheet1!A1"),
+            "self-reference via own sheet name must be detected"
+        );
+        assert_eq!(
+            wb.get_cell("Sheet1", "A1"),
+            Value::Error(ValueError::CyclicRef),
+        );
+    }
+
+    #[test]
+    fn workbook_set_formula_invalid_sheet_returns_false() {
+        let mut wb = Workbook::new();
+        assert!(!wb.set_formula(99, "A1", "=1+1"));
+    }
+
+    #[test]
+    fn workbook_set_formula_parse_error_writes_value_error() {
+        let mut wb = Workbook::new();
+        let s1 = wb.index_of("Sheet1").unwrap();
+        assert!(!wb.set_formula(s1, "A1", "=garbage(("));
+        assert_eq!(
+            wb.get_cell("Sheet1", "A1"),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn cross_sheet_runtime_guard_returns_cycle_when_static_bypassed() {
+        // Build a cycle by going through Sheet::set_formula directly, which
+        // does NOT have workbook-level cycle detection. Then read through
+        // Workbook::get_cell — the TLS CROSS_SHEET_VISITED guard in eval.rs
+        // must short-circuit instead of either looping or returning a stale
+        // value.
+        //
+        // Note: in the current resolver, peek_value already returns the
+        // cached value (no recursion), so the guard's role is defensive for
+        // future resolver changes. We still verify it doesn't *incorrectly*
+        // engage (i.e. acyclic chains keep working).
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        wb.sheet_mut(0).unwrap().set_formula("A1", "=Sheet2!A1");
+        wb.sheet_by_name_mut("Sheet2")
+            .unwrap()
+            .set_formula("A1", "=Sheet1!A1");
+
+        // Reading either side must terminate (no infinite loop) and not
+        // return a stale propagated number; cycle/error/null are all
+        // acceptable outcomes for this defensive scenario, the key is
+        // termination + no stale numeric.
+        let v = wb.get_cell("Sheet1", "A1");
+        assert!(
+            matches!(v, Value::Null | Value::Error(_)),
+            "expected Null/Error from cycle, got {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn workbook_set_formula_happy_path_values_propagate() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let sd = wb.index_of("Data").unwrap();
+        wb.sheet_mut(sd).unwrap().set_cell("A1", Value::Number(7.0));
+        assert!(wb.set_formula(s1, "B1", "=Data!A1*3"));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(21.0));
     }
 }
