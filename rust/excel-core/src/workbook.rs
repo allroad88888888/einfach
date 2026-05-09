@@ -94,7 +94,7 @@ impl Workbook {
     /// Workbook reads bypass formula cache so cross-sheet sources are always
     /// observed live. Plain `Sheet::get_cell` keeps using per-formula dirty
     /// cache for same-sheet formulas.
-    pub fn get_cell(&mut self, sheet_name: &str, addr_str: &str) -> Value {
+    pub fn get_cell(&self, sheet_name: &str, addr_str: &str) -> Value {
         let idx = match self.index_of(sheet_name) {
             Some(i) => i,
             None => return Value::Null,
@@ -144,10 +144,22 @@ struct WorkbookEvalProvider<'a> {
 
 impl<'a> WorkbookEvalProvider<'a> {
     fn with_current(&self, idx: usize, f: impl FnOnce() -> Value) -> Value {
+        struct CurrentGuard<'a> {
+            current: &'a Cell<usize>,
+            prev: usize,
+        }
+        impl Drop for CurrentGuard<'_> {
+            fn drop(&mut self) {
+                self.current.set(self.prev);
+            }
+        }
+
         let prev = self.current.replace(idx);
-        let value = f();
-        self.current.set(prev);
-        value
+        let _guard = CurrentGuard {
+            current: &self.current,
+            prev,
+        };
+        f()
     }
 }
 
@@ -161,7 +173,9 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         let Some(idx) = self.wb.by_name.get(sheet).copied() else {
             return Value::Null;
         };
-        self.with_current(idx, || self.wb.sheets[idx].peek_value_with_provider(addr, self))
+        self.with_current(idx, || {
+            self.wb.sheets[idx].peek_value_with_provider(addr, self)
+        })
     }
 
     fn force_formula_recompute(&self) -> bool {

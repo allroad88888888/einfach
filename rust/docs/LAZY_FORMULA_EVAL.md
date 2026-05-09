@@ -261,7 +261,9 @@ range_dependents: RangeDependencyIndex,
 cell_subscriptions: HashMap<CellAddress, AddressSubscriptionBucket>,
 ```
 
-现有 `formula_cells: HashMap<CellAddress, AtomId>` 会被 `formula_by_addr: HashMap<CellAddress, FormulaId>` 取代。公式结果不再必须有 `AtomId`。
+旧 `formula_cells: HashMap<CellAddress, AtomId>` 形态必须被替换。当前落地实现
+保留了 `formula_cells` 名称，但 value 已变成 `Rc<FormulaRecord>`；公式结果不再
+必须有 `AtomId`。
 
 ## EvalContext 重构
 
