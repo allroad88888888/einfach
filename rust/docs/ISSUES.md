@@ -5,6 +5,104 @@
 
 ---
 
+## 状态总览（截至本分支 HEAD）
+
+✅ = 已修；⚠️ = 部分修 / 后端齐全 / UI 待接；□ = 未修。
+
+### A. Rust core
+| ID | 状态 | 修复点 |
+|---|---|---|
+| A.1 | ✅ | 1A step 1 (2b49660) |
+| A.2 | ✅ | 1A step 2 (59992b6) — Rc<RefCell<HashMap>> 替换 unsafe |
+| A.3 | ✅ | E 段 (db6d039) — NaN 兜底 |
+| A.4 | ✅ | 1A step 3 (c19133e) — destroy_atom |
+| A.5 | ✅ | 1A step 1 — SETTING thread_local |
+| A.6 | ✅ | 1A step 1 — BatchGuard RAII |
+| A.7 | ✅ | E 段 (db6d039) — VecDeque FIFO |
+| A.8 | ✅ | 7A (f929dca) — sub_index 反查 |
+| A.9 | □ | 自循环测试 hacky，未改 |
+| A.10 | □ | store.rs 1100+ 行单文件，未拆 |
+| A.11 | ✅ | 1A step 1 — RecomputeGuard RAII |
+
+### B. Excel core
+| ID | 状态 | 修复点 |
+|---|---|---|
+| B.1 | ✅ | 1A step 4 (438d17c) — Rc<RefCell<HashMap>> + propagate_force |
+| B.2 | ✅ | 1A step 4 — would_create_cycle 静态环检测 |
+| B.3 | ✅ | 1A step 1 — set_formula 返回 bool / 写 #VALUE! |
+| B.4 | ✅ | 1A step 6 (19dffd6) — destroy 旧 derived |
+| B.5 | □ | SUM/COUNT/AVERAGE 字面量 vs cell 引用区分，未做 |
+| B.6 | ⚠️ | E 段 — MIN 改返 #VALUE!；MAX 仍返 0 |
+| B.7 | □ | AVERAGE 错误码（acceptable）|
+| B.8 | ✅ | E 段 — thunk 删除 |
+| B.9 | □ | parse error 信息丢失；ParseError struct 未实现 |
+| B.10 | □ | AST 缓存 / 常量折叠（性能优化）|
+| B.11 | ✅ | Range 孤立返回 #VALUE!（跟 Excel 一致）|
+| B.12 | ✅ | 1A step 5 (9380b27) — batch_set 清公式 |
+
+### C. WASM 桥接
+| ID | 状态 | 修复点 |
+|---|---|---|
+| C.1 | ✅ | 1A step 8 (f66ef57) — JsCallbackListener |
+| C.2 | ✅ | 1A step 8 — store propagate 自动通知 |
+| C.3 | ⚠️ | 1A step 8 — 同步 fire；JS 用 queueMicrotask 防重入（文档化）|
+| C.4 | ✅ | 1A step 8 — token 化 unsubscribe |
+| C.5 | □ | get 都是 &mut self；peek_value 已加但 wasm 层未拆 |
+| C.6 | ✅ | C.1+C.2 间接修 — 走 store 自然检查值变化 |
+| C.7 | □ | batch_set 只支持 number；text/formula 版本未做 |
+| C.8 | □ | wasm-bindgen-test 未集成 |
+| C.9 | □ | value_to_display 阈值，未改 |
+| C.10 | ✅ | 1A step 1 — console_error_panic_hook |
+| C.11 | ✅ | 1A step 7 (44e03be) — CellListener trait + Sheet::subscribe_cell |
+
+### D. Solid Excel
+| ID | 状态 | 修复点 |
+|---|---|---|
+| D.1 | ⚠️ | createJSSheet 仍跟 Rust 不等价；wasm 加载（A.7）才能彻底解决，playwright 实测仍 #ERROR! |
+| D.2 | □ | createJSSheet 用 Function() — 短期保留 |
+| D.3 | ✅ | 1A step 10 (e1fbe0d) — 精准订阅取代 refreshAll |
+| D.4 | ✅ | 1A step 10 — signal 不再存 cell 数据副本 |
+| D.5 | ⚠️ | dispose() 已加，组件 unmount 自动调没接 |
+| D.6 | ⚠️ | raw @deprecated；保留兼容旧测试 |
+| D.7 | □ | setTimeout focus，未改 |
+| D.8 | □ | cellValue() 重复调用，未 createMemo |
+| D.9 | □ | 同 D.8 |
+| D.10 | □ | demo 函数体长串初始化 |
+| D.11 | ✅ | 1A step 9+10 (92956f0+e1fbe0d) — get_formula 全链路 |
+| D.12 | ✅ | B.1 收尾 (421606b) — tsconfig 治理后 pragma 删除 |
+
+### E. ROADMAP / 工程
+| ID | 状态 | 备注 |
+|---|---|---|
+| E.1 | ✅ | def07a9 — review 落地路线图前置依赖 |
+| E.2 | ✅ | def07a9 — 一/七期已拆 1A/1B/7A/7B/7C |
+| E.3 | ✅ | def07a9 — 测试 / 错误模型 / API 稳定性都加进 ROADMAP |
+| E.4 | ✅ | 1A step 7 — CellListener trait 兼容 worker adapter |
+| E.5 | ✅ | 路线图六期前置加了 C.1+C.2+D.3 |
+| E.6 | ✅ | 路线图按期独立可发布的细化已落 |
+
+### 新增（review 之外完成的功能）
+- ✅ 跨 sheet 引用 parser (`Name!A1`) — c4057ce
+- ✅ Workbook 跨 sheet eval (TLS resolver) — 99f8528
+- ✅ TODAY / NOW (chrono wasmbind) — f92f142
+- ✅ 条件格式后端 (ConditionalRule + apply_rules) — ce973f2
+- ✅ undo / redo + clipboard copy/paste TS API — 2267c54
+- ✅ Ctrl+Z/Y/Delete 全局键绑 — 7297173
+- ✅ FormulaBar 接到 Table — 8de2375
+- ✅ approximate-match VLOOKUP/HLOOKUP + TRUE/FALSE — 729d8f3
+- ✅ 行列 insert/delete TS 透传 — ae745c5
+
+### 仍 deferred（需工具链 / 浏览器环境）
+- A.7 vite + wasm-pack 加载真 wasm
+- A.5 多 sheet UI（WasmWorkbook + WorkbookStore + tab UI）
+- A.6 行列右键菜单（后端齐全）
+- A.8 格式化 / 条件格式 UI
+- B.3 wasm-bindgen-test, B.4 playwright e2e CI, B.5 criterion benchmark
+- D.1/D.2 7B 虚拟滚动 + 7C Web Worker
+- C.1 follow-up — derived 在 resolver scope 内重算
+
+---
+
 ## A. Rust core (`rust/core`)
 
 ### A.1（必修）`recompute` 环检测 panic 信息错误
