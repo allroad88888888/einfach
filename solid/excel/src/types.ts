@@ -8,6 +8,8 @@
 export interface ISheet {
   set_number(addr: string, value: number): void
   set_text(addr: string, value: string): void
+  set_boolean?(addr: string, value: boolean): void
+  set_error?(addr: string, value: string): void
   /** Returns false if the formula failed to parse or would cycle. */
   set_formula(addr: string, formula: string): boolean
   get_display(addr: string): string

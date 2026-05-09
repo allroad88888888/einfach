@@ -1,4 +1,4 @@
-use einfach_core::{CellListener, Value};
+use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{CellSubscription, Sheet};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -37,8 +37,8 @@ impl CellListener for JsCallbackListener {
 pub struct WasmSheet {
     sheet: Sheet,
     /// Active subscriptions, keyed by an opaque token id we hand back to JS.
-    /// Storing CellSubscription (sub_id + atom_id) lets us call
-    /// Sheet::unsubscribe_cell even after the cell's readable atom changes.
+    /// Sheet owns the address-level rewiring when a cell switches between
+    /// primitive and formula atoms.
     subscriptions: HashMap<u32, CellSubscription>,
     next_token: u32,
 }
@@ -83,6 +83,24 @@ impl WasmSheet {
     /// Set a cell to a text value.
     pub fn set_text(&mut self, addr: &str, value: &str) {
         self.sheet.set_cell(addr, Value::Text(value.to_string()));
+    }
+
+    /// Set a cell to a boolean value.
+    pub fn set_boolean(&mut self, addr: &str, value: bool) {
+        self.sheet.set_cell(addr, Value::Boolean(value));
+    }
+
+    /// Set a cell to an error value by its display code. Unknown codes fall
+    /// back to #VALUE!, matching the generic invalid-value error.
+    pub fn set_error(&mut self, addr: &str, value: &str) {
+        let err = match value {
+            "#DIV/0!" => ValueError::DivisionByZero,
+            "#REF!" => ValueError::InvalidRef,
+            "#NAME?" => ValueError::InvalidName,
+            "#CYCLE!" => ValueError::CyclicRef,
+            _ => ValueError::InvalidValue,
+        };
+        self.sheet.set_cell(addr, Value::Error(err));
     }
 
     /// Set a cell's formula (e.g. "=A1+B1").
@@ -139,9 +157,7 @@ impl WasmSheet {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
         let listener = JsCallbackListener { callback };
-        let sub = self
-            .sheet
-            .subscribe_cell_boxed(addr, Box::new(listener));
+        let sub = self.sheet.subscribe_cell_boxed(addr, Box::new(listener));
         self.subscriptions.insert(token, sub);
         token
     }

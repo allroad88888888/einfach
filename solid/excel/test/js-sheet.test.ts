@@ -146,4 +146,60 @@ describe('createJSSheet', () => {
       expect(sheet.is_error('Z99')).toBe(false)
     })
   })
+
+  describe('structural edits retarget formula refs', () => {
+    it('insert_row shifts refs at or below the insertion point', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('A5', 10)
+      sheet.set_formula('B1', '=A5*2')
+      expect(sheet.get_number('B1')).toBe(20)
+
+      sheet.insert_row?.(2, 1)
+      // A5 → A6; formula source should now read A6.
+      expect(sheet.get_formula('B1')).toBe('=A6*2')
+      // And the value still resolves correctly.
+      expect(sheet.get_number('B1')).toBe(20)
+    })
+
+    it('delete_row turns refs into the deleted band into #REF!', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('A5', 10)
+      sheet.set_formula('B1', '=A5*2')
+      sheet.delete_row?.(4, 1) // delete row 5 (0-based row 4)
+      const f = sheet.get_formula('B1')
+      expect(f).toContain('#REF!')
+    })
+
+    it('insert_col shifts refs at or after the insertion column', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('C1', 7)
+      sheet.set_formula('A1', '=C1+1')
+      sheet.insert_col?.(1, 1) // insert before col B (index 1) → C → D
+      expect(sheet.get_formula('A1')).toBe('=D1+1')
+    })
+
+    it('delete_col turns refs in the deleted band into #REF!', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('C1', 7)
+      sheet.set_formula('A1', '=C1+1')
+      sheet.delete_col?.(2, 1) // delete col C
+      expect(sheet.get_formula('A1')).toContain('#REF!')
+    })
+
+    it('does not shift refs inside string literals', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('A5', 10)
+      sheet.set_formula('B1', '=A5+"B5"')
+      sheet.insert_row?.(2, 1)
+      expect(sheet.get_formula('B1')).toBe('=A6+"B5"')
+    })
+
+    it('relocates multi-letter columns correctly', () => {
+      const sheet = createJSSheet()
+      sheet.set_number('AA1', 7)
+      sheet.insert_col?.(0, 1)
+      expect(sheet.get_display('AB1')).toBe('7')
+      expect(sheet.get_type('AA1')).toBe('null')
+    })
+  })
 })

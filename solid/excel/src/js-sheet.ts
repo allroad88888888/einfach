@@ -1,4 +1,11 @@
 import type { ISheet } from './types'
+import {
+  shiftFormulaForColDelete,
+  shiftFormulaForColInsert,
+  shiftFormulaForRowDelete,
+  shiftFormulaForRowInsert,
+} from './formula-shift'
+import { addrToCoord, coordToAddr } from './selection'
 
 /**
  * Pure JS implementation of ISheet for development / jest tests.
@@ -135,6 +142,24 @@ export function createJSSheet(): ISheet {
       fireChanges(before)
     },
 
+    set_boolean(addr: string, value: boolean) {
+      const a = addr.toUpperCase()
+      const before = snapshotDisplays()
+      formulas.delete(a)
+      cells.set(a, { type: 'boolean', value })
+      recalcAll()
+      fireChanges(before)
+    },
+
+    set_error(addr: string, value: string) {
+      const a = addr.toUpperCase()
+      const before = snapshotDisplays()
+      formulas.delete(a)
+      cells.set(a, { type: 'error', value })
+      recalcAll()
+      fireChanges(before)
+    },
+
     set_formula(addr: string, formula: string): boolean {
       const a = addr.toUpperCase()
       const before = snapshotDisplays()
@@ -202,63 +227,86 @@ export function createJSSheet(): ISheet {
       fireChanges(before)
     },
 
-    // Structural edits — naive map-rebuild implementations sufficient for
-    // the JS mock. The Rust backend has the canonical version with proper
-    // formula-ref retargeting; this one only relocates cells, formulas
-    // referencing the moved cells will silently still point at old refs.
-    // TODO A.6 follow-up: TS-side ref retarget once createJSSheet shares
-    // an AST with Rust (or just delete this path when WASM is the default).
+    // Structural edits — relocate cells AND retarget formula refs (parity
+    // with Rust shift_addr_*). Refs into the deleted band become #REF!.
     insert_row(at: number, count: number) {
       const before = snapshotDisplays()
-      relocate((a) => (a.row >= at ? { ...a, row: a.row + count } : a))
+      relocate(
+        (a) => (a.row >= at ? { ...a, row: a.row + count } : a),
+        (f) => shiftFormulaForRowInsert(f, at, count),
+      )
       recalcAll()
       fireChanges(before)
     },
     delete_row(at: number, count: number) {
       const before = snapshotDisplays()
-      relocate((a) => {
-        if (a.row >= at && a.row < at + count) return null
-        if (a.row >= at + count) return { ...a, row: a.row - count }
-        return a
-      })
+      relocate(
+        (a) => {
+          if (a.row >= at && a.row < at + count) return null
+          if (a.row >= at + count) return { ...a, row: a.row - count }
+          return a
+        },
+        (f) => shiftFormulaForRowDelete(f, at, count),
+      )
       recalcAll()
       fireChanges(before)
     },
     insert_col(at: number, count: number) {
       const before = snapshotDisplays()
-      relocate((a) => (a.col >= at ? { ...a, col: a.col + count } : a))
+      relocate(
+        (a) => (a.col >= at ? { ...a, col: a.col + count } : a),
+        (f) => shiftFormulaForColInsert(f, at, count),
+      )
       recalcAll()
       fireChanges(before)
     },
     delete_col(at: number, count: number) {
       const before = snapshotDisplays()
-      relocate((a) => {
-        if (a.col >= at && a.col < at + count) return null
-        if (a.col >= at + count) return { ...a, col: a.col - count }
-        return a
-      })
+      relocate(
+        (a) => {
+          if (a.col >= at && a.col < at + count) return null
+          if (a.col >= at + count) return { ...a, col: a.col - count }
+          return a
+        },
+        (f) => shiftFormulaForColDelete(f, at, count),
+      )
       recalcAll()
       fireChanges(before)
     },
   }
 
-  /** Apply an address mapping to every cell entry; null = drop. */
-  function relocate(map: (a: { row: number; col: number }) => { row: number; col: number } | null) {
+  /**
+   * Relocate cells and rewrite formula sources.
+   *
+   * - `mapAddr` decides where a cell ends up; `null` drops it.
+   * - `shiftRefs` rewrites cell references inside any formula that
+   *   survives. Refs into the deleted band become `#REF!`.
+   *
+   * After relocation, surviving formula cell entries (in `cells`) carry
+   * the OLD computed value; we re-eval all formulas via `recalcAll` after
+   * relocate returns, so `cells` gets refreshed against the shifted refs.
+   */
+  function relocate(
+    mapAddr: (a: { row: number; col: number }) => { row: number; col: number } | null,
+    shiftRefs: (formula: string) => string,
+  ) {
     const newCells = new Map<string, ReturnType<typeof cells.get>>()
     const newFormulas = new Map<string, string>()
     for (const [addr, val] of cells) {
-      const c = parseAddr(addr)
-      const moved = map({ row: c.row - 1, col: c.col.charCodeAt(0) - 65 })
+      const c = addrToCoord(addr)
+      if (!c) throw new Error(`Invalid address: ${addr}`)
+      const moved = mapAddr(c)
       if (moved === null) continue
-      const nextAddr = String.fromCharCode(65 + moved.col) + (moved.row + 1)
+      const nextAddr = coordToAddr(moved)
       newCells.set(nextAddr, val)
     }
     for (const [addr, f] of formulas) {
-      const c = parseAddr(addr)
-      const moved = map({ row: c.row - 1, col: c.col.charCodeAt(0) - 65 })
+      const c = addrToCoord(addr)
+      if (!c) throw new Error(`Invalid address: ${addr}`)
+      const moved = mapAddr(c)
       if (moved === null) continue
-      const nextAddr = String.fromCharCode(65 + moved.col) + (moved.row + 1)
-      newFormulas.set(nextAddr, f)
+      const nextAddr = coordToAddr(moved)
+      newFormulas.set(nextAddr, shiftRefs(f))
     }
     cells.clear()
     formulas.clear()
