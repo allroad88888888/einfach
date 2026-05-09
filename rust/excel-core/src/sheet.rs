@@ -14,15 +14,42 @@ use crate::formula::{parse_formula, Expr};
 /// already-created derived closures see later updates (B.1 fix).
 type ReadableMap = Rc<RefCell<HashMap<CellAddress, AtomId>>>;
 
-/// Token returned by `Sheet::subscribe_cell`. Bundles the SubscriptionId
-/// with the AtomId at the moment of subscription so `unsubscribe_cell`
-/// can find the listener entry even if the cell's readable atom has since
-/// been remapped (e.g. set_formula replaced the derived).
+type ListenerRc = Rc<dyn CellListener>;
+type ListenerList = Rc<RefCell<Vec<(u64, ListenerRc)>>>;
+
+/// Snapshot the listener list (so callbacks may freely re-enter `subscribe` /
+/// `unsubscribe` without aliasing the borrow), then dispatch to each.
+fn dispatch_listeners(list: &ListenerList) {
+    let snapshot: Vec<ListenerRc> = list.borrow().iter().map(|(_, l)| l.clone()).collect();
+    for listener in snapshot {
+        listener.on_change();
+    }
+}
+
+struct AddressListenerFanout {
+    listeners: ListenerList,
+}
+
+impl CellListener for AddressListenerFanout {
+    fn on_change(&self) {
+        dispatch_listeners(&self.listeners);
+    }
+}
+
+struct AddressSubscriptionBucket {
+    listeners: ListenerList,
+    atom_id: Option<AtomId>,
+    store_sub: Option<SubscriptionId>,
+}
+
+/// Token returned by `Sheet::subscribe_cell`. The public subscription is tied
+/// to a cell address, not the current readable atom. `Sheet` rewires the
+/// internal store subscription whenever the address switches between primitive
+/// and formula atoms.
 #[derive(Clone, Copy, Debug)]
 pub struct CellSubscription {
-    sub_id: SubscriptionId,
-    #[allow(dead_code)]
-    atom_id: AtomId,
+    addr: CellAddress,
+    listener_id: u64,
 }
 
 /// A spreadsheet sheet backed by an atom store.
@@ -40,6 +67,11 @@ pub struct Sheet {
     /// and edit-mode entry can show the source instead of the computed
     /// result (D.11).
     formula_texts: HashMap<CellAddress, String>,
+    /// Address-level subscriptions. Buckets are only wired to store atoms when
+    /// the address has a materialized readable atom, so subscribing to an empty
+    /// visible cell does not allocate a cell atom by itself.
+    cell_subscriptions: HashMap<CellAddress, AddressSubscriptionBucket>,
+    next_cell_sub_id: u64,
 }
 
 impl Sheet {
@@ -51,6 +83,8 @@ impl Sheet {
             readable: Rc::new(RefCell::new(HashMap::new())),
             formula_exprs: HashMap::new(),
             formula_texts: HashMap::new(),
+            cell_subscriptions: HashMap::new(),
+            next_cell_sub_id: 0,
         }
     }
 
@@ -76,19 +110,119 @@ impl Sheet {
         self.ensure_cell(addr)
     }
 
+    fn current_readable_atom(&self, addr: CellAddress) -> Option<AtomId> {
+        self.readable.borrow().get(&addr).copied()
+    }
+
+    /// Detach this address's fanout from the store. The bucket and its
+    /// listener list are kept; only the underlying `store.sub` goes away.
+    /// Returns `true` if a fanout was actually attached. Used as the first
+    /// half of `with_remap`: detach → mutate → reattach + manual fire.
+    fn detach_address_sub(&mut self, addr: CellAddress) -> bool {
+        let Some(bucket) = self.cell_subscriptions.get_mut(&addr) else {
+            return false;
+        };
+        let store_sub = bucket.store_sub.take();
+        bucket.atom_id = None;
+        if let Some(sub_id) = store_sub {
+            self.store.unsub(sub_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Attach (or re-attach) this address's fanout to the current readable
+    /// atom. No-op when there is no listener bucket or the address has no
+    /// readable atom yet.
+    fn attach_address_sub(&mut self, addr: CellAddress) {
+        let new_atom = self.current_readable_atom(addr);
+        let Some(bucket) = self.cell_subscriptions.get_mut(&addr) else {
+            return;
+        };
+        if bucket.store_sub.is_some() && bucket.atom_id == new_atom {
+            return;
+        }
+        if let Some(sub_id) = bucket.store_sub.take() {
+            self.store.unsub(sub_id);
+        }
+        bucket.atom_id = new_atom;
+        if let Some(atom_id) = new_atom {
+            let fanout = AddressListenerFanout {
+                listeners: bucket.listeners.clone(),
+            };
+            bucket.store_sub = Some(self.store.sub(atom_id, fanout));
+        }
+    }
+
+    /// Run a mutation that may swap the readable atom under `addr`.
+    /// Detaches the fanout for `addr` first, runs `f`, then reattaches the
+    /// fanout to whatever atom `addr` now points at and fires listeners
+    /// exactly once. Use this for any state change that goes formula↔
+    /// primitive (so the inner `store.set` doesn't double-fire through the
+    /// fanout that was wired to the OLD atom).
+    ///
+    /// Fires whenever the bucket has at least one listener — NOT only when
+    /// a store_sub was previously attached. The "previously attached"
+    /// condition would silently drop the first set_formula on an empty cell
+    /// that was subscribed before any value existed (bucket has listeners
+    /// but no store_sub, because attach_address_sub no-ops without a
+    /// readable atom to attach to).
+    fn with_remap<R>(&mut self, addr: CellAddress, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.detach_address_sub(addr);
+        let result = f(self);
+        self.attach_address_sub(addr);
+        if self.has_address_subscribers(addr) {
+            self.notify_address_subscribers(addr);
+        }
+        result
+    }
+
+    fn has_address_subscribers(&self, addr: CellAddress) -> bool {
+        self.cell_subscriptions
+            .get(&addr)
+            .map(|b| !b.listeners.borrow().is_empty())
+            .unwrap_or(false)
+    }
+
+    fn notify_address_subscribers(&self, addr: CellAddress) {
+        if let Some(bucket) = self.cell_subscriptions.get(&addr) {
+            dispatch_listeners(&bucket.listeners);
+        }
+    }
+
     /// Set a cell's value by address string (e.g. "A1").
     /// Clears any existing formula on this cell.
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        // Remove formula if present
-        self.formula_cells.remove(&addr);
-        self.formula_exprs.remove(&addr);
-        self.formula_texts.remove(&addr);
-        let id = self.ensure_cell(addr);
-        // Restore readable to primitive atom (B.1 — must reflect this change
-        // immediately so other derived closures stop reading the old formula).
-        self.readable.borrow_mut().insert(addr, id);
-        self.store.set(id, value);
+        let had_formula = self.formula_cells.contains_key(&addr);
+
+        if had_formula {
+            // Formula → primitive: detach fanout, swap, reattach + fire once.
+            self.with_remap(addr, |sheet| {
+                let old_derived = sheet.formula_cells.remove(&addr);
+                sheet.formula_exprs.remove(&addr);
+                sheet.formula_texts.remove(&addr);
+                let id = sheet.ensure_cell(addr);
+                // B.1 — readable must point at the primitive immediately so
+                // other derived closures stop reading the old formula.
+                sheet.readable.borrow_mut().insert(addr, id);
+                sheet.store.set(id, value);
+                if let Some(old) = old_derived {
+                    sheet.store.propagate_force(&[old]);
+                    if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
+                        sheet.store.destroy_atom(old);
+                    }
+                }
+            });
+        } else {
+            // Primitive → primitive: no remap. Let the fanout fire naturally
+            // on the value diff inside `store.set`.
+            let id = self.ensure_cell(addr);
+            self.readable.borrow_mut().insert(addr, id);
+            self.attach_address_sub(addr);
+            self.store.set(id, value);
+        }
     }
 
     /// Clear a cell back to empty (Null). Equivalent to `set_cell(addr, Value::Null)`
@@ -106,6 +240,14 @@ impl Sheet {
     ///   - the formula would form a dependency cycle (B.2) — cell becomes `#CYCLE!`
     /// In both cases the wasm instance keeps running and any prior formula on
     /// this cell is cleared.
+    ///
+    /// **EAGER (vs LAZY_FORMULA_EVAL.md)**: this path still pre-creates atoms
+    /// for every referenced cell (`ensure_refs`) and runs the formula closure
+    /// once at create-time (inside `Store::create_derived`). The lazy plan
+    /// (Step 2) replaces both: refs are tracked in `cell_dependents`/
+    /// `range_dependents` without materializing atoms, and computation is
+    /// deferred until `get_cell` reads the formula. Until that lands,
+    /// importing N formulas costs N evals + N×deps cell atoms.
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         let expr = match parse_formula(formula_str) {
@@ -125,68 +267,70 @@ impl Sheet {
 
         self.ensure_refs(&expr);
 
-        // Capture the primitive atom id before we redirect `readable`. Other
-        // already-existing derived atoms might still depend on it (they were
-        // tracked against this id when they last computed). After the redirect
-        // we force-propagate from this id so they re-evaluate against the new
-        // readable map and switch their dependency to the new derived.
-        let prim_id = self.ensure_cell(addr);
+        // set_formula always swaps to a freshly-created derived atom, so we
+        // always go through `with_remap` — the inner mutation is suppressed
+        // from firing this cell's fanout, then we fire exactly once.
+        self.with_remap(addr, move |sheet| {
+            // Primitive atom id — needed for propagate_force below so that
+            // dependents that captured this id recompute against the new
+            // readable map and naturally retarget to the new derived (B.1).
+            let prim_id = sheet.ensure_cell(addr);
+            let old_derived = sheet.formula_cells.get(&addr).copied();
 
-        // Capture any prior formula derived on this cell so we can destroy it
-        // after the new derived has taken over and any dependents have been
-        // retargeted (B.4).
-        let old_derived = self.formula_cells.get(&addr).copied();
+            let expr = Rc::new(expr);
+            let readable = sheet.readable.clone();
+            let expr_for_closure = expr.clone();
+            let derived_id = sheet.store.create_derived(move |get| {
+                let map = readable.borrow();
+                eval_expr(&expr_for_closure, get, &*map)
+            });
 
-        let expr = Rc::new(expr);
-        let readable = self.readable.clone();
-        let expr_for_closure = expr.clone();
+            sheet.formula_cells.insert(addr, derived_id);
+            sheet.formula_exprs.insert(addr, expr);
+            sheet.formula_texts.insert(addr, formula_str.to_string());
+            sheet.readable.borrow_mut().insert(addr, derived_id);
 
-        let derived_id = self.store.create_derived(move |get| {
-            // Borrow the current readable map (B.1: not a snapshot — picks up
-            // any later set_formula / set_cell that retargets a cell).
-            let map = readable.borrow();
-            // Pass `get` straight through — wrapping it in `&|id| get(id)`
-            // (the previous shape) was a no-op tier (B.8 cleanup).
-            eval_expr(&expr_for_closure, get, &*map)
-        });
-
-        self.formula_cells.insert(addr, derived_id);
-        self.formula_exprs.insert(addr, expr);
-        self.formula_texts
-            .insert(addr, formula_str.to_string());
-        // Point readable at the new derived so other formulas referencing
-        // this cell start reading the formula result, not the primitive.
-        self.readable.borrow_mut().insert(addr, derived_id);
-
-        // Force prior dependents (which captured prim_id or the old derived's
-        // id in their dep graph) to recompute against the new readable map.
-        // After this their dep graph naturally retargets to derived_id (B.1).
-        let mut roots = vec![prim_id];
-        if let Some(old) = old_derived {
-            roots.push(old);
-        }
-        self.store.propagate_force(&roots);
-
-        // Destroy the old derived atom (B.4 — without this, repeated
-        // set_formula on the same cell leaks atoms forever in the store).
-        // Skip if some dependent still wired to it (defensive; shouldn't
-        // happen after the propagate_force above).
-        if let Some(old) = old_derived {
-            if self.store.has_atom(old) && !self.store.has_dependents(old) {
-                self.store.destroy_atom(old);
+            let mut roots = vec![prim_id];
+            if let Some(old) = old_derived {
+                roots.push(old);
             }
-        }
+            sheet.store.propagate_force(&roots);
+
+            // Destroy the old derived atom (B.4 — without this, repeated
+            // set_formula on the same cell leaks atoms forever in the store).
+            if let Some(old) = old_derived {
+                if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
+                    sheet.store.destroy_atom(old);
+                }
+            }
+        });
         true
     }
 
     /// Drop any existing formula and write an error value to the cell.
     fn write_error(&mut self, addr: CellAddress, err: ValueError) {
-        self.formula_cells.remove(&addr);
-        self.formula_exprs.remove(&addr);
-        self.formula_texts.remove(&addr);
-        let id = self.ensure_cell(addr);
-        self.readable.borrow_mut().insert(addr, id);
-        self.store.set(id, Value::Error(err));
+        let had_formula = self.formula_cells.contains_key(&addr);
+        if had_formula {
+            self.with_remap(addr, |sheet| {
+                let old_derived = sheet.formula_cells.remove(&addr);
+                sheet.formula_exprs.remove(&addr);
+                sheet.formula_texts.remove(&addr);
+                let id = sheet.ensure_cell(addr);
+                sheet.readable.borrow_mut().insert(addr, id);
+                sheet.store.set(id, Value::Error(err));
+                if let Some(old) = old_derived {
+                    sheet.store.propagate_force(&[old]);
+                    if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
+                        sheet.store.destroy_atom(old);
+                    }
+                }
+            });
+        } else {
+            let id = self.ensure_cell(addr);
+            self.readable.borrow_mut().insert(addr, id);
+            self.attach_address_sub(addr);
+            self.store.set(id, Value::Error(err));
+        }
     }
 
     /// Static cycle detection (B.2). Walks the AST of the new formula,
@@ -214,18 +358,17 @@ impl Sheet {
     /// Get a cell's value by address string.
     /// Returns the formula result if the cell has a formula, otherwise the raw value.
     /// Returns Null for cells that haven't been set.
-    pub fn get_cell(&mut self, addr_str: &str) -> Value {
+    pub fn get_cell(&self, addr_str: &str) -> Value {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let id = self.readable_atom(addr);
-        self.store.get(id)
+        self.peek_value(addr)
     }
 
     /// Read a cell's current value without creating any atoms. Returns
     /// `Value::Null` for cells that haven't been touched. Used by the
     /// Workbook layer (cross-sheet read) so it can stay `&self`.
     pub fn peek_value(&self, addr: CellAddress) -> Value {
-        let id = match self.readable.borrow().get(&addr) {
-            Some(&id) => id,
+        let id = match self.current_readable_atom(addr) {
+            Some(id) => id,
             None => return Value::Null,
         };
         if !self.store.has_atom(id) {
@@ -240,6 +383,127 @@ impl Sheet {
         self.readable_atom(addr)
     }
 
+    /// Force-recompute every formula on this sheet whose AST contains a
+    /// cross-sheet reference (`Expr::SheetRef`). Whole-sheet sweep, mostly
+    /// useful for tests / "rebuild everything" scenarios. Hot read paths
+    /// should prefer `recompute_cross_sheet_formulas_reachable_from(addr)`,
+    /// which scopes the work to formulas on the dep chain of `addr`.
+    pub fn recompute_cross_sheet_formulas(&mut self) {
+        let mut roots: Vec<AtomId> = Vec::new();
+        for (addr, expr) in &self.formula_exprs {
+            if expr_has_sheet_ref(expr) {
+                if let Some(&id) = self.formula_cells.get(addr) {
+                    roots.push(id);
+                }
+            }
+        }
+        if !roots.is_empty() {
+            // Silent because Workbook::get_cell is a read path: it refreshes
+            // cached derived values against the live TLS resolver without
+            // turning the read itself into a subscriber event.
+            self.store.force_recompute_derived_silent(&roots);
+        }
+    }
+
+    /// Targeted version of `recompute_cross_sheet_formulas`: BFS over
+    /// `formula_exprs` starting at `target`, collect every formula reached
+    /// whose AST contains a `SheetRef`, then `force_recompute_derived_silent`
+    /// the union. `Store::recompute_derived_tree` then handles the
+    /// topological cascade to dependents (including non-cross-sheet formulas
+    /// like `=B1*2` whose `B1` is a cross-sheet formula).
+    ///
+    /// Worst-case cost is the size of the dep closure of `target` in
+    /// `formula_exprs` — orders of magnitude smaller than the whole-sheet
+    /// sweep on workbooks with many cross-sheet formulas. For a sheet with
+    /// 1k cross-sheet formulas where `target` only depends on 3 of them,
+    /// this does 3 force-recomputes instead of 1k.
+    pub fn recompute_cross_sheet_formulas_reachable_from(&mut self, target: CellAddress) {
+        let mut visited: HashSet<CellAddress> = HashSet::new();
+        let mut to_visit: Vec<CellAddress> = vec![target];
+        let mut roots: Vec<AtomId> = Vec::new();
+
+        while let Some(addr) = to_visit.pop() {
+            if !visited.insert(addr) {
+                continue;
+            }
+            let Some(expr) = self.formula_exprs.get(&addr) else {
+                continue;
+            };
+            if expr_has_sheet_ref(expr) {
+                if let Some(&id) = self.formula_cells.get(&addr) {
+                    roots.push(id);
+                }
+            }
+            // Queue only addresses that themselves have a formula — a leaf
+            // primitive ref doesn't need re-traversal. Range refs are
+            // expanded but each cell is gated by `formula_exprs` so the
+            // typical `SUM(A:A)` only enqueues the small subset of column A
+            // cells that are actually formulas.
+            collect_formula_refs_into(expr, &self.formula_exprs, &mut to_visit);
+        }
+
+        if !roots.is_empty() {
+            self.store.force_recompute_derived_silent(&roots);
+        }
+    }
+
+    // === LAZY_FORMULA_EVAL Step 0 — debug counters ===
+    //
+    // These exist so future lazy-formula work has measurable gating points
+    // (e.g. "100k set_formula calls produce 0 evals", "subscribe to empty
+    // cell creates 0 atoms"). They reflect the *current* eager state today;
+    // when Step 2 lands the same APIs report against the new graph.
+    //
+    // All `#[doc(hidden)]` — not part of the public API surface, intended
+    // for tests / benches / dev tooling.
+
+    /// Number of materialized primitive cell atoms (one per address that
+    /// has been set or referenced from a formula). Empty addresses don't
+    /// count even if subscribed (verified by
+    /// `subscribe_empty_cell_does_not_materialize_until_write`).
+    #[doc(hidden)]
+    pub fn debug_primitive_atom_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    /// Number of formula cells. With the eager backend this also equals the
+    /// number of derived atoms in the store; under lazy this would diverge
+    /// (formulas exist as records, derived atoms vanish).
+    #[doc(hidden)]
+    pub fn debug_formula_count(&self) -> usize {
+        self.formula_cells.len()
+    }
+
+    /// Number of *atom* dependents on the cell at `addr`. Today this only
+    /// covers cells whose primitive/derived atom has tracked back_deps —
+    /// cells referenced by a formula via `ensure_refs`. Under lazy this
+    /// will switch to counting `cell_dependents[addr]` directly.
+    #[doc(hidden)]
+    pub fn debug_dependents_count(&self, addr_str: &str) -> usize {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return 0;
+        };
+        let Some(&id) = self.cells.get(&addr) else {
+            return 0;
+        };
+        self.store.debug_dependent_count(id)
+    }
+
+    /// Total live atoms (primitive + derived). Useful as a gross "did
+    /// anything materialize?" signal in tests.
+    #[doc(hidden)]
+    pub fn debug_total_atom_count(&self) -> usize {
+        self.store.debug_total_atom_count()
+    }
+
+    /// Cumulative recompute count from the underlying store. Tests use
+    /// deltas across `Workbook::get_cell` to assert
+    /// "single-cell read only forced N derived recomputes".
+    #[doc(hidden)]
+    pub fn debug_recompute_count(&self) -> usize {
+        self.store.debug_recompute_count()
+    }
+
     /// Return the original formula text for a cell, or `None` if the cell
     /// holds a value rather than a formula. Required by the formula bar /
     /// double-click-to-edit flow so users see `=A1*2` instead of the
@@ -252,19 +516,15 @@ impl Sheet {
         self.formula_texts.get(&addr).cloned()
     }
 
-    /// Subscribe to changes on a single cell. Returns a token that bundles the
-    /// underlying SubscriptionId with the AtomId being subscribed to, so
-    /// `unsubscribe_cell` knows where to remove from even if the cell's
-    /// readable atom has since been redirected.
+    /// Subscribe to changes on a single cell address. The returned token is
+    /// stable across primitive/formula remaps for this address.
     pub fn subscribe_cell(
         &mut self,
         addr_str: &str,
         listener: impl CellListener,
     ) -> CellSubscription {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let atom_id = self.readable_atom(addr);
-        let sub_id = self.store.sub(atom_id, listener);
-        CellSubscription { sub_id, atom_id }
+        self.subscribe_cell_rc(addr, Rc::new(listener))
     }
 
     /// Variant of `subscribe_cell` that accepts an already-boxed listener.
@@ -274,14 +534,46 @@ impl Sheet {
         listener: Box<dyn CellListener>,
     ) -> CellSubscription {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let atom_id = self.readable_atom(addr);
-        let sub_id = self.store.sub_boxed(atom_id, listener);
-        CellSubscription { sub_id, atom_id }
+        self.subscribe_cell_rc(addr, Rc::from(listener))
     }
 
     /// Cancel a subscription previously returned from `subscribe_cell`.
     pub fn unsubscribe_cell(&mut self, sub: CellSubscription) {
-        self.store.unsub(sub.sub_id);
+        let should_remove = if let Some(bucket) = self.cell_subscriptions.get_mut(&sub.addr) {
+            bucket
+                .listeners
+                .borrow_mut()
+                .retain(|(id, _)| *id != sub.listener_id);
+            bucket.listeners.borrow().is_empty()
+        } else {
+            false
+        };
+
+        if should_remove {
+            if let Some(bucket) = self.cell_subscriptions.remove(&sub.addr) {
+                if let Some(store_sub) = bucket.store_sub {
+                    self.store.unsub(store_sub);
+                }
+            }
+        }
+    }
+
+    fn subscribe_cell_rc(&mut self, addr: CellAddress, listener: ListenerRc) -> CellSubscription {
+        let listener_id = self.next_cell_sub_id;
+        self.next_cell_sub_id += 1;
+
+        let bucket =
+            self.cell_subscriptions
+                .entry(addr)
+                .or_insert_with(|| AddressSubscriptionBucket {
+                    listeners: Rc::new(RefCell::new(Vec::new())),
+                    atom_id: None,
+                    store_sub: None,
+                });
+        bucket.listeners.borrow_mut().push((listener_id, listener));
+        self.attach_address_sub(addr);
+
+        CellSubscription { addr, listener_id }
     }
 
     // === Phase 4: structural edits ===
@@ -294,9 +586,11 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        self.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
-        self.retarget_formula_refs(&|addr| {
-            crate::shift::shift_addr_row_insert(addr, at, count)
+        self.with_structural_edit(|sheet| {
+            sheet.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
+            sheet.retarget_formula_refs(&|addr| {
+                crate::shift::shift_addr_row_insert(addr, at, count)
+            });
         });
     }
 
@@ -306,11 +600,12 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        // Drop cell entries inside the deleted band first.
-        self.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
-        self.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
-        self.retarget_formula_refs(&|addr| {
-            crate::shift::shift_addr_row_delete(addr, at, count)
+        self.with_structural_edit(|sheet| {
+            sheet.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
+            sheet.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
+            sheet.retarget_formula_refs(&|addr| {
+                crate::shift::shift_addr_row_delete(addr, at, count)
+            });
         });
     }
 
@@ -318,9 +613,11 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        self.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
-        self.retarget_formula_refs(&|addr| {
-            crate::shift::shift_addr_col_insert(addr, at, count)
+        self.with_structural_edit(|sheet| {
+            sheet.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
+            sheet.retarget_formula_refs(&|addr| {
+                crate::shift::shift_addr_col_insert(addr, at, count)
+            });
         });
     }
 
@@ -328,11 +625,39 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        self.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
-        self.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
-        self.retarget_formula_refs(&|addr| {
-            crate::shift::shift_addr_col_delete(addr, at, count)
+        self.with_structural_edit(|sheet| {
+            sheet.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
+            sheet.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
+            sheet.retarget_formula_refs(&|addr| {
+                crate::shift::shift_addr_col_delete(addr, at, count)
+            });
         });
+    }
+
+    /// Run a structural edit (row/col insert/delete) so that subscribers are
+    /// notified at most once per address, only when the displayed value at
+    /// that address actually changed. Detaches every fanout for the duration
+    /// of the edit so internal `store.set` / `propagate_force` calls don't
+    /// fan out partial intermediate states; reattaches at the end.
+    fn with_structural_edit(&mut self, f: impl FnOnce(&mut Self)) {
+        let addrs: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
+        let mut pre: Vec<(CellAddress, Value)> = Vec::with_capacity(addrs.len());
+        for addr in &addrs {
+            pre.push((*addr, self.peek_value(*addr)));
+            self.detach_address_sub(*addr);
+        }
+
+        f(self);
+
+        for addr in &addrs {
+            self.attach_address_sub(*addr);
+        }
+        for (addr, pre_val) in pre {
+            let post_val = self.peek_value(addr);
+            if pre_val != post_val {
+                self.notify_address_subscribers(addr);
+            }
+        }
     }
 
     fn drop_cells_in(&mut self, pred: impl Fn(CellAddress) -> bool) {
@@ -351,6 +676,8 @@ impl Sheet {
             self.formula_exprs.remove(&addr);
             self.formula_texts.remove(&addr);
             self.readable.borrow_mut().remove(&addr);
+            // Fanout reattach + per-address fire are handled by the enclosing
+            // `with_structural_edit`; nothing to do here.
         }
     }
 
@@ -358,11 +685,10 @@ impl Sheet {
     fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
         // Phase A: rebuild each map under new keys. We materialize Vecs first
         // because mutating a HashMap while iterating its keys would panic.
-        let new_cells: HashMap<CellAddress, AtomId> =
-            std::mem::take(&mut self.cells)
-                .into_iter()
-                .map(|(addr, id)| (f(addr), id))
-                .collect();
+        let new_cells: HashMap<CellAddress, AtomId> = std::mem::take(&mut self.cells)
+            .into_iter()
+            .map(|(addr, id)| (f(addr), id))
+            .collect();
         let new_formula_cells: HashMap<CellAddress, AtomId> =
             std::mem::take(&mut self.formula_cells)
                 .into_iter()
@@ -442,6 +768,9 @@ impl Sheet {
 
         self.formula_cells.insert(addr, derived_id);
         self.readable.borrow_mut().insert(addr, derived_id);
+        // Fanout reattach + per-address fire are handled by the enclosing
+        // `with_structural_edit` (this is only ever called from
+        // `retarget_formula_refs` during a structural edit).
         let mut roots = vec![prim_id];
         if let Some(old) = old_derived {
             roots.push(old);
@@ -494,10 +823,26 @@ impl Sheet {
     /// cell — formula derived atoms are destroyed and `readable` is restored
     /// to the primitive atom (B.12). Without this, batched writes would read
     /// the stale formula result on subsequent `get_cell` calls.
+    ///
+    /// Subscribers fire at most once per affected address: addresses being
+    /// written go through the same detach-mutate-reattach dance as `set_cell`,
+    /// and other subscribed addresses fire only if `propagate_force` causes
+    /// their displayed value to actually change.
     pub fn batch_set(&mut self, updates: &[(&str, Value)]) {
-        // For each target: clear formula bookkeeping, ensure primitive atom,
-        // remember the (atom_id, value) pair, and the old derived (if any) to
-        // destroy after propagation completes.
+        // Snapshot pre-state for *every* subscribed address so we can fire
+        // exactly once per actual value change at the end. The subset of
+        // those addresses that are also being written get their fanouts
+        // detached up front (so `store.set` doesn't double-fire); other
+        // subscribed addresses keep their fanouts (their natural store
+        // notification would suffice, but we suppress it too so we can
+        // dedupe with the structural-style diff at the end).
+        let subscribed: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
+        let mut pre: Vec<(CellAddress, Value)> = Vec::with_capacity(subscribed.len());
+        for addr in &subscribed {
+            pre.push((*addr, self.peek_value(*addr)));
+            self.detach_address_sub(*addr);
+        }
+
         let mut atom_values: Vec<(AtomId, Value)> = Vec::with_capacity(updates.len());
         let mut old_deriveds: Vec<AtomId> = Vec::new();
 
@@ -521,14 +866,23 @@ impl Sheet {
                 store.set(id, value);
             }
         });
+        if !old_deriveds.is_empty() {
+            self.store.propagate_force(&old_deriveds);
+        }
 
-        // Destroy orphaned derived atoms after propagation. Skip any that
-        // still have dependents (shouldn't happen after the batch above
-        // retargets them via readable map, but be defensive — leaking a few
-        // atoms is better than panicking the wasm instance).
         for old in old_deriveds {
             if self.store.has_atom(old) && !self.store.has_dependents(old) {
                 self.store.destroy_atom(old);
+            }
+        }
+
+        for addr in &subscribed {
+            self.attach_address_sub(*addr);
+        }
+        for (addr, pre_val) in pre {
+            let post_val = self.peek_value(addr);
+            if pre_val != post_val {
+                self.notify_address_subscribers(addr);
             }
         }
     }
@@ -568,6 +922,84 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
     }
 }
 
+/// Variant of `collect_refs` that only enqueues addresses present in
+/// `formula_exprs`. Used by `recompute_cross_sheet_formulas_reachable_from`
+/// to BFS the formula graph without expanding `SUM(A:A)`-style ranges into
+/// every empty cell — only formula cells inside the range get queued.
+fn collect_formula_refs_into(
+    expr: &Expr,
+    formula_exprs: &HashMap<CellAddress, Rc<Expr>>,
+    out: &mut Vec<CellAddress>,
+) {
+    match expr {
+        Expr::CellRef(addr) => {
+            if formula_exprs.contains_key(addr) {
+                out.push(*addr);
+            }
+        }
+        Expr::Range { start, end } => {
+            let min_row = start.row.min(end.row);
+            let max_row = start.row.max(end.row);
+            let min_col = start.col.min(end.col);
+            let max_col = start.col.max(end.col);
+            let cells_in_range = (max_row.saturating_sub(min_row) as usize + 1)
+                * (max_col.saturating_sub(min_col) as usize + 1);
+            // For ranges larger than the formula table, scan formulas and
+            // filter; otherwise iterate cells. Avoids `SUM(A:A)` walking
+            // a million empty addresses.
+            if cells_in_range > formula_exprs.len() {
+                for &addr in formula_exprs.keys() {
+                    if addr.row >= min_row
+                        && addr.row <= max_row
+                        && addr.col >= min_col
+                        && addr.col <= max_col
+                    {
+                        out.push(addr);
+                    }
+                }
+            } else {
+                for row in min_row..=max_row {
+                    for col in min_col..=max_col {
+                        let a = CellAddress::new(row, col);
+                        if formula_exprs.contains_key(&a) {
+                            out.push(a);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_formula_refs_into(left, formula_exprs, out);
+            collect_formula_refs_into(right, formula_exprs, out);
+        }
+        Expr::Negate(inner) => collect_formula_refs_into(inner, formula_exprs, out),
+        Expr::FuncCall { args, .. } => {
+            for a in args {
+                collect_formula_refs_into(a, formula_exprs, out);
+            }
+        }
+        // SheetRef points outside this sheet — handled by the resolver, not
+        // by local BFS.
+        Expr::SheetRef { .. } => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+    }
+}
+
+/// Walk the AST looking for any `Expr::SheetRef`. Used by `Workbook::get_cell`
+/// to skip force-recompute on formulas that don't actually need a cross-sheet
+/// resolver (the common case).
+fn expr_has_sheet_ref(expr: &Expr) -> bool {
+    match expr {
+        Expr::SheetRef { .. } => true,
+        Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
+        Expr::Negate(inner) => expr_has_sheet_ref(inner),
+        Expr::FuncCall { args, .. } => args.iter().any(expr_has_sheet_ref),
+        Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
+            false
+        }
+    }
+}
+
 impl Default for Sheet {
     fn default() -> Self {
         Self::new()
@@ -581,8 +1013,16 @@ mod tests {
 
     #[test]
     fn new_cell_is_null() {
-        let mut sheet = Sheet::new();
+        let sheet = Sheet::new();
         assert_eq!(sheet.get_cell("A1"), Value::Null);
+    }
+
+    #[test]
+    fn get_cell_does_not_materialize_empty_cell() {
+        let sheet = Sheet::new();
+        assert_eq!(sheet.cells.len(), 0);
+        assert_eq!(sheet.get_cell("A1"), Value::Null);
+        assert_eq!(sheet.cells.len(), 0);
     }
 
     #[test]
@@ -771,12 +1211,172 @@ mod tests {
 
         sheet.set_cell("A1", Value::Number(5.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
-        assert!(*count.borrow() >= 1, "subscriber must fire on dependency change");
+        assert_eq!(*count.borrow(), 1, "exactly one fire on dependency change");
 
         sheet.unsubscribe_cell(sub);
-        let prev = *count.borrow();
         sheet.set_cell("A1", Value::Number(10.0));
-        assert_eq!(*count.borrow(), prev, "no fire after unsubscribe");
+        assert_eq!(*count.borrow(), 1, "no fire after unsubscribe");
+    }
+
+    #[test]
+    fn subscribe_empty_cell_does_not_materialize_until_write() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let sub = sheet.subscribe_cell("A1", move || *cc.borrow_mut() += 1);
+
+        assert_eq!(sheet.cells.len(), 0, "subscription should not allocate A1");
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert_eq!(sheet.get_cell("A1"), Value::Number(1.0));
+        assert_eq!(sheet.cells.len(), 1);
+        assert_eq!(*count.borrow(), 1, "exactly one fire on first write");
+
+        sheet.unsubscribe_cell(sub);
+        sheet.set_cell("A1", Value::Number(2.0));
+        assert_eq!(*count.borrow(), 1, "no fire after unsubscribe");
+    }
+
+    #[test]
+    fn debug_counters_reflect_eager_baseline() {
+        // These assertions document the *current* eager backend's behavior.
+        // When LAZY_FORMULA_EVAL Step 2 lands, the formula-import case
+        // should change: dep cells no longer materialize, derived atom
+        // count drops to 0. Update this test then — the divergence is the
+        // signal that Step 2 actually delivered.
+        let mut sheet = Sheet::new();
+        assert_eq!(sheet.debug_primitive_atom_count(), 0);
+        assert_eq!(sheet.debug_formula_count(), 0);
+        assert_eq!(sheet.debug_total_atom_count(), 0);
+
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 1);
+
+        // EAGER: =A1+Z99 materializes (a) Z99 (ensure_refs on missing
+        // CellRef), (b) B1's own primitive (set_formula keeps a primitive
+        // for propagate_force after a later set_cell rewrite). A1 already
+        // existed. So primitives go 1 → 3, derived count goes 0 → 1,
+        // total atoms 1 → 4.
+        sheet.set_formula("B1", "=A1+Z99");
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            3,
+            "A1 (existing) + Z99 (ensure_refs) + B1 primitive (set_formula scaffold)"
+        );
+        assert_eq!(sheet.debug_formula_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 4, "3 primitive + 1 derived");
+
+        // EAGER: A1 has B1's derived as a dependent.
+        assert_eq!(sheet.debug_dependents_count("A1"), 1);
+        // Z99 also got tracked (it was read in the initial eager eval).
+        assert_eq!(sheet.debug_dependents_count("Z99"), 1);
+    }
+
+    #[test]
+    fn debug_subscribe_empty_cell_does_not_materialize() {
+        let mut sheet = Sheet::new();
+        let _sub = sheet.subscribe_cell("Z99", || {});
+        assert_eq!(
+            sheet.debug_primitive_atom_count(),
+            0,
+            "subscribing to an empty cell must not materialize an atom"
+        );
+        assert_eq!(sheet.debug_total_atom_count(), 0);
+    }
+
+    #[test]
+    fn subscribe_empty_cell_then_set_formula_fires_once() {
+        // Regression: with_remap used to gate notify on `had_sub` (whether a
+        // store_sub was already attached). A bucket subscribed to an empty
+        // cell has listeners but no store_sub yet — the first set_formula
+        // would update state but never fire the listener.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(3.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+        // Pre-condition: B1 has no atom yet.
+        assert!(!sheet.cells.contains_key(&CellAddress::new(0, 1)));
+
+        sheet.set_formula("B1", "=A1*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(6.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "first set_formula on empty subscribed cell must fire"
+        );
+
+        // And the subscription stays live: changing A1 fires once more.
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
+        assert_eq!(
+            *count.borrow(),
+            2,
+            "subscriber should also see the dependency change"
+        );
+    }
+
+    #[test]
+    fn subscribe_survives_value_to_formula_remap() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("B1", Value::Number(5.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_formula("B1", "=A1*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(2.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "exactly one fire when B1 becomes a formula"
+        );
+
+        sheet.set_cell("A1", Value::Number(3.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(6.0));
+        assert_eq!(
+            *count.borrow(),
+            2,
+            "subscriber must stay attached to B1's formula atom"
+        );
+    }
+
+    #[test]
+    fn subscribe_survives_formula_to_value_remap() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_formula("B1", "=A1*2");
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("B1", Value::Number(10.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
+        assert_eq!(*count.borrow(), 1, "exactly one fire when formula cleared");
+
+        sheet.set_cell("B1", Value::Number(11.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(11.0));
+        assert_eq!(
+            *count.borrow(),
+            2,
+            "subscriber must stay attached to B1's primitive atom"
+        );
     }
 
     #[test]
@@ -793,7 +1393,10 @@ mod tests {
         sheet.set_formula("B1", "=A1*3");
         let second_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
         assert_ne!(first_derived, second_derived);
-        assert!(!sheet.store.has_atom(first_derived), "old derived must be destroyed");
+        assert!(
+            !sheet.store.has_atom(first_derived),
+            "old derived must be destroyed"
+        );
         assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
 
         // Many replacements in a row should not grow the store.
@@ -802,6 +1405,140 @@ mod tests {
         }
         // Final formula = A1 + 20 = 30.
         assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
+    }
+
+    #[test]
+    fn formula_to_primitive_remap_fires_listener_exactly_once() {
+        // Regression: previously the rewire-then-store.set order caused both
+        // the fanout AND an explicit notify to fire on a formula→primitive
+        // transition where the new primitive value differed from the prior
+        // formula result. Subscribers should see exactly one fire.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_formula("B1", "=A1*2"); // B1 displays 4
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        // Replace the formula with a literal whose value differs from the
+        // formula's result (4 → 99). Should fire once, not twice.
+        sheet.set_cell("B1", Value::Number(99.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(99.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "formula→primitive must fire exactly once"
+        );
+    }
+
+    #[test]
+    fn formula_to_primitive_remap_with_unchanged_value_still_fires_once() {
+        // Even when the new primitive value happens to match the prior
+        // formula result, subscribers should still be notified that the
+        // cell's identity (formula → literal) changed.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_formula("B1", "=A1*2"); // B1 = 4
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("B1", Value::Number(4.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(4.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "identity change must fire even if value is unchanged"
+        );
+    }
+
+    #[test]
+    fn primitive_to_primitive_with_same_value_does_not_fire() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(7.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("A1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("A1", Value::Number(7.0));
+        assert_eq!(*count.borrow(), 0, "no value change → no fire");
+    }
+
+    #[test]
+    fn structural_edit_only_fires_for_addresses_whose_value_changed() {
+        // insert_row should not wake subscribers on cells whose displayed
+        // value didn't actually change.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("A5", Value::Number(5.0));
+
+        // A1 sits above the insert point — its value should not change.
+        let a1_count = Rc::new(RefCell::new(0u32));
+        let a1c = a1_count.clone();
+        let _a1_sub = sheet.subscribe_cell("A1", move || *a1c.borrow_mut() += 1);
+
+        // A5 is below the insert point — it gets shifted to A6, so peeking
+        // A5 after the insert returns Null (a value change) and listener fires.
+        let a5_count = Rc::new(RefCell::new(0u32));
+        let a5c = a5_count.clone();
+        let _a5_sub = sheet.subscribe_cell("A5", move || *a5c.borrow_mut() += 1);
+
+        sheet.insert_row(2, 1);
+
+        assert_eq!(*a1_count.borrow(), 0, "A1 unchanged → no fire");
+        assert_eq!(*a5_count.borrow(), 1, "A5 shifted away → exactly one fire");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(1.0));
+        assert_eq!(sheet.get_cell("A5"), Value::Null);
+        assert_eq!(sheet.get_cell("A6"), Value::Number(5.0));
+    }
+
+    #[test]
+    fn subscribe_cell_boxed_fires_like_subscribe_cell() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let listener: Box<dyn CellListener> = Box::new(move || *cc.borrow_mut() += 1);
+        let sub = sheet.subscribe_cell_boxed("A1", listener);
+
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert_eq!(*count.borrow(), 1);
+
+        sheet.unsubscribe_cell(sub);
+        sheet.set_cell("A1", Value::Number(2.0));
+        assert_eq!(*count.borrow(), 1, "no fire after unsubscribe");
+    }
+
+    #[test]
+    fn set_cell_releases_old_derived() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(10.0));
+        sheet.set_formula("B1", "=A1*2");
+        let old_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
+
+        sheet.set_cell("B1", Value::Number(5.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(5.0));
+        assert!(
+            !sheet.store.has_atom(old_derived),
+            "old formula derived must be destroyed after set_cell"
+        );
     }
 
     #[test]
@@ -852,10 +1589,7 @@ mod tests {
         // Delete row 5 (0-based = the row that A5 lives in is row index 4).
         sheet.delete_row(4, 1);
         // The formula referencing the deleted row should produce #REF!.
-        assert_eq!(
-            sheet.get_cell("B1"),
-            Value::Error(ValueError::InvalidRef)
-        );
+        assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::InvalidRef));
     }
 
     #[test]
@@ -881,10 +1615,7 @@ mod tests {
         sheet.set_cell("C1", Value::Number(30.0));
         sheet.set_formula("A2", "=C1+1");
         sheet.delete_col(2, 1); // delete column C (index 2)
-        assert_eq!(
-            sheet.get_cell("A2"),
-            Value::Error(ValueError::InvalidRef)
-        );
+        assert_eq!(sheet.get_cell("A2"), Value::Error(ValueError::InvalidRef));
     }
 
     #[test]
