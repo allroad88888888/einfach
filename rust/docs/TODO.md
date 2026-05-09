@@ -45,17 +45,18 @@
 ### 1.4 ✅ Delete 键清空选中 — 已做
 - `Table.tsx::onKeyDown` `case 'Delete'/'Backspace'` 调 `store.clearCell`，走 undo
 
-### 1.5 □ 多 sheet UI（tab 栏 + 切换）
-- **代码**：`Workbook { sheets, names }` API 完整（add/rename/remove/sheet_by_name）；现在 `get_cell` 真能跨 sheet 算
-- **缺**：
-  - WasmSheet 只暴露 Sheet，没暴露 Workbook
-  - SheetStore 假设单 sheet
-  - 没 tab UI
-- **最小步骤**：
-  1. `WasmWorkbook` 包 Workbook，暴露 add_sheet / current_sheet / switch_to
-  2. 新建 SolidJS WorkbookStore 或 SheetStore 接受 sheet index
-  3. 底部 tab 栏组件
-  4. 因为 wasm 还没接（1.7），暂时只在 createJSSheet 端用，结构先搭
+### 1.5 ⚠️ 多 sheet UI（tab 栏 + 切换）— UI landed with JS-side mock; WasmWorkbook binding still deferred
+- **代码**：`Workbook { sheets, names }` API 完整（add/rename/remove/sheet_by_name）；`get_cell` 真能跨 sheet 算
+- **已落地**（JS-side mock）：
+  - `solid/excel/src/workbook-store.ts` — `createWorkbookStore()` 镜像了 Rust `Workbook` 的 add/rename/remove/sheet/active 语义；每张 sheet 是 `createSheetStore(createJSSheet())`
+  - `solid/excel/src/SheetTabs.tsx` — 底部 tab 栏，点击切换 / `+` 新增 / 右键 prompt 改名+删除
+  - `solid/excel/src/demos/MultiSheet.tsx` — 用 `Show keyed` 在 active 切换时重挂 Table，3 张预填 sheet
+  - 单元测试：`solid/excel/test/workbook-store.test.ts`（16 用例）
+- **跨 sheet eval gap（重要）**：JS 侧的 `createJSSheet()` 是单 sheet 求值器，没有 workbook 上下文；`=Sheet2!A1` 在这套 mock 里**不会真算**，会按"未识别的 ref"落到 `#ERROR!` / `0`。Rust `Workbook::get_cell` 的 cross-sheet resolver 没有 JS 对应物。这条 gap 在 WasmWorkbook 绑定上线（见下）+ 1.7 把 demo 切到 wasm sheet 之后自然消失
+- **仍缺**：
+  - `rust/wasm/src/lib.rs` 暴露 `WasmWorkbook`（add_sheet / sheet_at / sheet_count / rename_sheet / remove_sheet / get_cell 跨 sheet）
+  - JS 侧加 `createWasmWorkbookSheet(workbook, idx): ISheet` 工厂，让 `createWorkbookStore` 可选地切到 wasm 后端
+  - 真做完之后：`MultiSheet` demo 增加跨 sheet 公式样例（e.g. Notes!A1 = `=Expenses!B5`），把 gap 消掉
 
 ### 1.6 □ 行列插入 / 删除 UI（右键菜单）
 - **代码**：`Sheet::insert_row/delete_row/insert_col/delete_col` + 自动 ref 调整都已就位；JS mock 也对齐了；SheetStore 已暴露 `insertRow/deleteRow/insertCol/deleteCol` wrapper
