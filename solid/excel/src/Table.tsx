@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { For, createSignal } from 'solid-js'
+import { For, Show, createSignal } from 'solid-js'
 import { Cell } from './Cell'
+import { FormulaBar } from './FormulaBar'
 import { clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import type { SheetStore } from './sheet-store'
 
@@ -16,6 +17,8 @@ export interface TableProps {
    */
   selected?: () => CellCoord
   onSelectionChange?: (next: CellCoord) => void
+  /** Render an Excel-style formula bar above the grid. */
+  formulaBar?: boolean
 }
 
 /** Build cell address from row/col: (0,0)→"A1" */
@@ -85,6 +88,12 @@ export function Table(props: TableProps) {
       tabIndex={0}
       onKeyDown={onKeyDown}
     >
+      <Show when={props.formulaBar}>
+        <FormulaBar
+          store={props.store}
+          activeAddr={() => coordToAddr(selected())}
+        />
+      </Show>
       <table class="excel-table">
         <thead>
           <tr>

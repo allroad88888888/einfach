@@ -97,7 +97,7 @@ export function DemoBudget() {
           Positive diff = under budget, negative = over budget.
         </p>
       </div>
-      <Table store={store} rows={17} cols={8} />
+      <Table store={store} rows={17} cols={8} formulaBar />
     </div>
   )
 }

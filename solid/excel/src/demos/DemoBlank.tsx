@@ -19,7 +19,7 @@ export function DemoBlank() {
           Press <kbd>Enter</kbd> to confirm, <kbd>Esc</kbd> to cancel.
         </p>
       </div>
-      <Table store={store} rows={20} cols={10} />
+      <Table store={store} rows={20} cols={10} formulaBar />
     </div>
   )
 }

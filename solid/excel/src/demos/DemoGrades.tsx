@@ -78,7 +78,7 @@ export function DemoGrades() {
           Each student's row uses <code>AVERAGE</code>, <code>MAX</code>, <code>MIN</code>.
         </p>
       </div>
-      <Table store={store} rows={14} cols={8} />
+      <Table store={store} rows={14} cols={8} formulaBar />
     </div>
   )
 }

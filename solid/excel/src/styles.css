@@ -232,3 +232,45 @@ thead .row-header {
   box-sizing: border-box;
   background: #fff;
 }
+
+/* Selected cell highlight */
+.cell-selected {
+  outline: 2px solid #1a73e8;
+  outline-offset: -2px;
+  background: #e8f0fe;
+}
+
+/* Formula bar — sits above the grid, full width */
+.formula-bar {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid #d0d7de;
+  background: #fafbfc;
+  margin-bottom: 6px;
+  font-family: -apple-system, sans-serif;
+  font-size: 13px;
+}
+.formula-bar-addr {
+  padding: 6px 12px;
+  min-width: 60px;
+  background: #f0f3f6;
+  border-right: 1px solid #d0d7de;
+  font-weight: 600;
+  font-family: monospace;
+  display: flex;
+  align-items: center;
+}
+.formula-bar-input {
+  flex: 1;
+  padding: 6px 12px;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-family: monospace;
+  font-size: 13px;
+}
+.formula-bar-input:disabled {
+  color: #999;
+  background: #f6f6f6;
+}

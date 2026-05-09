@@ -82,7 +82,7 @@ export function DemoSales() {
           Growth rates are computed as <code>(new-old)/old*100</code>.
         </p>
       </div>
-      <Table store={store} rows={11} cols={9} />
+      <Table store={store} rows={11} cols={9} formulaBar />
     </div>
   )
 }
