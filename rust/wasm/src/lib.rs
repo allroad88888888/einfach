@@ -62,6 +62,11 @@ impl WasmSheet {
         self.sheet.set_cell(addr, Value::Number(value));
     }
 
+    /// Clear a cell to empty. Mirrors ISheet.clear_cell on the JS side.
+    pub fn clear_cell(&mut self, addr: &str) {
+        self.sheet.clear_cell(addr);
+    }
+
     /// Set a cell to a text value.
     pub fn set_text(&mut self, addr: &str, value: &str) {
         self.sheet.set_cell(addr, Value::Text(value.to_string()));

@@ -192,5 +192,14 @@ export function createJSSheet(): ISheet {
       }
       tokenToAddr.delete(token)
     },
+
+    clear_cell(addr: string): void {
+      const a = addr.toUpperCase()
+      const before = snapshotDisplays()
+      formulas.delete(a)
+      cells.delete(a)
+      recalcAll()
+      fireChanges(before)
+    },
   }
 }

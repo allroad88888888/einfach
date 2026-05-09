@@ -91,6 +91,13 @@ impl Sheet {
         self.store.set(id, value);
     }
 
+    /// Clear a cell back to empty (Null). Equivalent to `set_cell(addr, Value::Null)`
+    /// but with a more discoverable name for callers implementing Delete-key /
+    /// undo-to-empty UX.
+    pub fn clear_cell(&mut self, addr_str: &str) {
+        self.set_cell(addr_str, Value::Null);
+    }
+
     /// Set a cell's formula by address string (e.g. "=A1+B1").
     /// The formula is parsed and a derived atom is created.
     ///

@@ -141,6 +141,122 @@ describe('createSheetStore', () => {
     })
   })
 
+  describe('undo / redo', () => {
+    it('single setNumber is undoable', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 42)
+        expect(store.getCell('A1').display).toBe('42')
+        expect(store.canUndo()).toBe(true)
+        store.undo()
+        expect(store.getCell('A1').type).toBe('null')
+        expect(store.canRedo()).toBe(true)
+        store.redo()
+        expect(store.getCell('A1').display).toBe('42')
+        dispose()
+      })
+    })
+
+    it('undo restores formula source', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 10)
+        store.setFormula('B1', '=A1*2')
+        expect(store.getFormula('B1')).toBe('=A1*2')
+        // Replace with a static value, then undo.
+        store.setNumber('B1', 99)
+        store.undo()
+        expect(store.getFormula('B1')).toBe('=A1*2')
+        dispose()
+      })
+    })
+
+    it('beginEdit / endEdit groups operations', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.beginEdit()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        store.setNumber('C1', 3)
+        store.endEdit()
+        // One undo should clear all three.
+        store.undo()
+        expect(store.getCell('A1').type).toBe('null')
+        expect(store.getCell('B1').type).toBe('null')
+        expect(store.getCell('C1').type).toBe('null')
+        dispose()
+      })
+    })
+
+    it('new edit clears redo stack', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.undo()
+        expect(store.canRedo()).toBe(true)
+        store.setNumber('A1', 99)
+        expect(store.canRedo()).toBe(false)
+        dispose()
+      })
+    })
+  })
+
+  describe('clipboard copy / paste', () => {
+    it('round-trips a 2x2 block', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        store.setNumber('A2', 3)
+        store.setNumber('B2', 4)
+        const data = store.copy([
+          ['A1', 'B1'],
+          ['A2', 'B2'],
+        ])
+        expect(data.cells).toEqual([
+          ['1', '2'],
+          ['3', '4'],
+        ])
+        // Paste at D5 — D5=1, E5=2, D6=3, E6=4.
+        store.paste('D5', data)
+        expect(store.getCell('D5').display).toBe('1')
+        expect(store.getCell('E5').display).toBe('2')
+        expect(store.getCell('D6').display).toBe('3')
+        expect(store.getCell('E6').display).toBe('4')
+        dispose()
+      })
+    })
+
+    it('paste preserves formulas', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 10)
+        store.setFormula('B1', '=A1*2')
+        const data = store.copy([['B1']])
+        // The clipboard captures the formula source, not the result.
+        expect(data.cells[0][0]).toBe('=A1*2')
+        store.paste('D1', data)
+        expect(store.getFormula('D1')).toBe('=A1*2')
+        dispose()
+      })
+    })
+
+    it('paste is one undo step', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        const data = store.copy([['A1', 'B1']])
+        store.paste('D1', data)
+        expect(store.getCell('D1').display).toBe('1')
+        store.undo()
+        expect(store.getCell('D1').type).toBe('null')
+        expect(store.getCell('E1').type).toBe('null')
+        dispose()
+      })
+    })
+  })
+
   it('raw property exposes underlying sheet', () => {
     createRoot((dispose) => {
       const store = createTestStore()

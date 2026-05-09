@@ -26,6 +26,8 @@ export interface ISheet {
    */
   subscribe(addr: string, callback: () => void): number
   unsubscribe(token: number): void
+  /** Clear a cell back to its initial empty / Null state. */
+  clear_cell(addr: string): void
 }
 
 export type CellValue = {
