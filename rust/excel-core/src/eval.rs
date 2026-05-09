@@ -15,6 +15,55 @@ pub trait CrossSheetResolver {
     fn resolve(&self, sheet: &str, addr: CellAddress) -> Value;
 }
 
+/// Address-based evaluation source used by the lazy formula path. It avoids
+/// requiring every referenced cell to have a materialized AtomId.
+pub trait EvalProvider {
+    fn cell(&self, addr: CellAddress) -> Value;
+    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
+    fn force_formula_recompute(&self) -> bool {
+        false
+    }
+}
+
+struct AtomEvalProvider<'a> {
+    get: &'a dyn Fn(AtomId) -> Value,
+    cell_map: &'a HashMap<CellAddress, AtomId>,
+}
+
+impl<'a> EvalProvider for AtomEvalProvider<'a> {
+    fn cell(&self, addr: CellAddress) -> Value {
+        self.cell_map
+            .get(&addr)
+            .map(|&id| (self.get)(id))
+            .unwrap_or(Value::Null)
+    }
+
+    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        let is_current_sheet =
+            CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet));
+        if is_current_sheet {
+            return self
+                .cell_map
+                .get(&addr)
+                .map(|&id| match catch_unwind(AssertUnwindSafe(|| (self.get)(id))) {
+                    Ok(value) => value,
+                    Err(_) => Value::Error(ValueError::CyclicRef),
+                })
+                .unwrap_or(Value::Null);
+        }
+
+        CROSS_RESOLVER.with(|c| {
+            if let Some(ptr) = *c.borrow() {
+                // SAFETY: the guard in with_cross_resolver clears this pointer
+                // before the resolver's stack frame returns.
+                unsafe { (*ptr).resolve(sheet, addr) }
+            } else {
+                Value::Error(ValueError::InvalidRef)
+            }
+        })
+    }
+}
+
 thread_local! {
     /// Active cross-sheet resolver during eval. Set by `with_cross_resolver`,
     /// read by the SheetRef arm. Raw pointer because the resolver's lifetime
@@ -97,6 +146,11 @@ pub fn eval_expr(
     get: &dyn Fn(AtomId) -> Value,
     cell_map: &HashMap<CellAddress, AtomId>,
 ) -> Value {
+    let provider = AtomEvalProvider { get, cell_map };
+    eval_expr_with_provider(expr, &provider)
+}
+
+pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Value {
     match expr {
         Expr::Number(n) => Value::Number(*n),
         Expr::Text(s) => Value::Text(s.clone()),
@@ -106,21 +160,17 @@ pub fn eval_expr(
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
-            if let Some(&id) = cell_map.get(addr) {
-                get(id)
-            } else {
-                Value::Null // unset cell
-            }
+            provider.cell(*addr)
         }
 
         Expr::BinOp { op, left, right } => {
-            let lv = eval_expr(left, get, cell_map);
-            let rv = eval_expr(right, get, cell_map);
+            let lv = eval_expr_with_provider(left, provider);
+            let rv = eval_expr_with_provider(right, provider);
             eval_binop(*op, &lv, &rv)
         }
 
         Expr::Negate(inner) => {
-            let v = eval_expr(inner, get, cell_map);
+            let v = eval_expr_with_provider(inner, provider);
             match v {
                 Value::Number(n) => Value::Number(-n),
                 Value::Error(e) => Value::Error(e),
@@ -128,7 +178,7 @@ pub fn eval_expr(
             }
         }
 
-        Expr::FuncCall { name, args } => eval_func(name, args, get, cell_map),
+        Expr::FuncCall { name, args } => eval_func(name, args, provider),
 
         Expr::Range { start, end } => {
             // Ranges should be handled by function evaluators, not standalone
@@ -138,35 +188,10 @@ pub fn eval_expr(
         }
 
         Expr::SheetRef { sheet, addr } => {
-            let is_current_sheet =
-                CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet.as_str()));
-            if is_current_sheet {
-                if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
-                    return Value::Error(ValueError::InvalidRef);
-                }
-                return if let Some(&id) = cell_map.get(addr) {
-                    match catch_unwind(AssertUnwindSafe(|| get(id))) {
-                        Ok(value) => value,
-                        Err(_) => Value::Error(ValueError::CyclicRef),
-                    }
-                } else {
-                    Value::Null
-                };
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
             }
-
-            // If a Workbook context installed a resolver via
-            // `with_cross_resolver`, dispatch to it. Otherwise standalone
-            // Sheet eval has no cross-sheet scope and we return #REF!.
-            CROSS_RESOLVER.with(|c| {
-                if let Some(ptr) = *c.borrow() {
-                    // SAFETY: the guard in with_cross_resolver clears this
-                    // pointer before the resolver's stack frame returns,
-                    // so the deref happens during the resolver's lifetime.
-                    unsafe { (*ptr).resolve(sheet, *addr) }
-                } else {
-                    Value::Error(ValueError::InvalidRef)
-                }
-            })
+            provider.sheet_cell(sheet, *addr)
         }
     }
 }
@@ -292,8 +317,7 @@ fn coerce_to_number(v: &Value) -> Option<f64> {
 fn collect_range_values(
     start: &CellAddress,
     end: &CellAddress,
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
 ) -> Vec<Value> {
     let min_row = start.row.min(end.row);
     let max_row = start.row.max(end.row);
@@ -304,11 +328,7 @@ fn collect_range_values(
     for row in min_row..=max_row {
         for col in min_col..=max_col {
             let addr = CellAddress::new(row, col);
-            if let Some(&id) = cell_map.get(&addr) {
-                values.push(get(id));
-            } else {
-                values.push(Value::Null);
-            }
+            values.push(provider.cell(addr));
         }
     }
     values
@@ -318,8 +338,7 @@ fn collect_range_values(
 fn collect_range_2d(
     start: &CellAddress,
     end: &CellAddress,
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
 ) -> Vec<Vec<Value>> {
     let min_row = start.row.min(end.row);
     let max_row = start.row.max(end.row);
@@ -330,10 +349,7 @@ fn collect_range_2d(
             (min_col..=max_col)
                 .map(|col| {
                     let addr = CellAddress::new(row, col);
-                    cell_map
-                        .get(&addr)
-                        .map(|&id| get(id))
-                        .unwrap_or(Value::Null)
+                    provider.cell(addr)
                 })
                 .collect()
         })
@@ -418,26 +434,24 @@ fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)>
 /// Collect values from a function argument, expanding ranges.
 fn collect_arg_values(
     arg: &Expr,
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
 ) -> Vec<Value> {
     match arg {
-        Expr::Range { start, end } => collect_range_values(start, end, get, cell_map),
-        _ => vec![eval_expr(arg, get, cell_map)],
+        Expr::Range { start, end } => collect_range_values(start, end, provider),
+        _ => vec![eval_expr_with_provider(arg, provider)],
     }
 }
 
 fn eval_func(
     name: &str,
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
 ) -> Value {
     match name {
         "SUM" => {
             let mut total = 0.0;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Number(n) => total += n,
@@ -455,7 +469,7 @@ fn eval_func(
             let mut total = 0.0;
             let mut count = 0u64;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Number(n) => {
@@ -476,7 +490,7 @@ fn eval_func(
         "COUNT" => {
             let mut count = 0u64;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     if matches!(v, Value::Number(_)) {
                         count += 1;
                     }
@@ -489,7 +503,7 @@ fn eval_func(
             if args.len() < 2 || args.len() > 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let cond = eval_expr(&args[0], get, cell_map);
+            let cond = eval_expr_with_provider(&args[0], provider);
             let is_true = match cond {
                 Value::Boolean(b) => b,
                 Value::Number(n) => n != 0.0,
@@ -497,9 +511,9 @@ fn eval_func(
                 _ => false,
             };
             if is_true {
-                eval_expr(&args[1], get, cell_map)
+                eval_expr_with_provider(&args[1], provider)
             } else if args.len() == 3 {
-                eval_expr(&args[2], get, cell_map)
+                eval_expr_with_provider(&args[2], provider)
             } else {
                 Value::Boolean(false)
             }
@@ -508,7 +522,7 @@ fn eval_func(
         "MIN" => {
             let mut min: Option<f64> = None;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Number(n) => {
@@ -527,7 +541,7 @@ fn eval_func(
         "MAX" => {
             let mut max: Option<f64> = None;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Number(n) => {
@@ -545,7 +559,7 @@ fn eval_func(
             let mut result = true;
             let mut saw_any = false;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Null => {}
@@ -570,7 +584,7 @@ fn eval_func(
             let mut result = false;
             let mut saw_any = false;
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     match v {
                         Value::Error(e) => return Value::Error(e),
                         Value::Null => {}
@@ -595,7 +609,7 @@ fn eval_func(
             if args.len() != 1 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let v = eval_expr(&args[0], get, cell_map);
+            let v = eval_expr_with_provider(&args[0], provider);
             match coerce_to_bool(&v) {
                 Some(b) => Value::Boolean(!b),
                 None => match v {
@@ -606,8 +620,8 @@ fn eval_func(
         }
 
         // === Math ===
-        "ABS" => unary_number(args, get, cell_map, |n| n.abs()),
-        "SQRT" => unary_number(args, get, cell_map, |n| {
+        "ABS" => unary_number(args, provider, |n| n.abs()),
+        "SQRT" => unary_number(args, provider, |n| {
             if n < 0.0 {
                 f64::NAN
             } else {
@@ -619,8 +633,8 @@ fn eval_func(
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let n = eval_expr(&args[0], get, cell_map);
-            let d = eval_expr(&args[1], get, cell_map);
+            let n = eval_expr_with_provider(&args[0], provider);
+            let d = eval_expr_with_provider(&args[1], provider);
             match (coerce_to_number(&n), coerce_to_number(&d)) {
                 (Some(value), Some(digits)) => {
                     let factor = 10f64.powi(digits as i32);
@@ -629,14 +643,14 @@ fn eval_func(
                 _ => Value::Error(ValueError::InvalidValue),
             }
         }
-        "CEILING" => unary_number(args, get, cell_map, f64::ceil),
-        "FLOOR" => unary_number(args, get, cell_map, f64::floor),
+        "CEILING" => unary_number(args, provider, f64::ceil),
+        "FLOOR" => unary_number(args, provider, f64::floor),
         "POWER" => {
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let b = eval_expr(&args[0], get, cell_map);
-            let e = eval_expr(&args[1], get, cell_map);
+            let b = eval_expr_with_provider(&args[0], provider);
+            let e = eval_expr_with_provider(&args[1], provider);
             match (coerce_to_number(&b), coerce_to_number(&e)) {
                 (Some(base), Some(exp)) => {
                     let r = base.powf(exp);
@@ -653,8 +667,8 @@ fn eval_func(
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let a = eval_expr(&args[0], get, cell_map);
-            let b = eval_expr(&args[1], get, cell_map);
+            let a = eval_expr_with_provider(&args[0], provider);
+            let b = eval_expr_with_provider(&args[1], provider);
             match (coerce_to_number(&a), coerce_to_number(&b)) {
                 (Some(_), Some(0.0)) => Value::Error(ValueError::DivisionByZero),
                 (Some(va), Some(vb)) => Value::Number(va.rem_euclid(vb)),
@@ -666,7 +680,7 @@ fn eval_func(
         "CONCATENATE" => {
             let mut out = String::new();
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     if let Value::Error(e) = v {
                         return Value::Error(e);
                     }
@@ -679,14 +693,14 @@ fn eval_func(
             if args.len() != 1 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let v = eval_expr(&args[0], get, cell_map);
+            let v = eval_expr_with_provider(&args[0], provider);
             if let Value::Error(e) = v {
                 return Value::Error(e);
             }
             Value::Number(coerce_to_text(&v).chars().count() as f64)
         }
-        "LEFT" => text_slice(args, get, cell_map, |s, n| s.chars().take(n).collect()),
-        "RIGHT" => text_slice(args, get, cell_map, |s, n| {
+        "LEFT" => text_slice(args, provider, |s, n| s.chars().take(n).collect()),
+        "RIGHT" => text_slice(args, provider, |s, n| {
             let len = s.chars().count();
             s.chars().skip(len.saturating_sub(n)).collect()
         }),
@@ -695,9 +709,9 @@ fn eval_func(
             if args.len() != 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let s = coerce_to_text(&eval_expr(&args[0], get, cell_map));
-            let start_v = eval_expr(&args[1], get, cell_map);
-            let len_v = eval_expr(&args[2], get, cell_map);
+            let s = coerce_to_text(&eval_expr_with_provider(&args[0], provider));
+            let start_v = eval_expr_with_provider(&args[1], provider);
+            let len_v = eval_expr_with_provider(&args[2], provider);
             match (coerce_to_number(&start_v), coerce_to_number(&len_v)) {
                 (Some(start), Some(len)) if start >= 1.0 && len >= 0.0 => {
                     let skip = (start as usize).saturating_sub(1);
@@ -707,17 +721,17 @@ fn eval_func(
                 _ => Value::Error(ValueError::InvalidValue),
             }
         }
-        "UPPER" => text_unary(args, get, cell_map, |s| s.to_uppercase()),
-        "LOWER" => text_unary(args, get, cell_map, |s| s.to_lowercase()),
-        "TRIM" => text_unary(args, get, cell_map, |s| s.trim().to_string()),
+        "UPPER" => text_unary(args, provider, |s| s.to_uppercase()),
+        "LOWER" => text_unary(args, provider, |s| s.to_lowercase()),
+        "TRIM" => text_unary(args, provider, |s| s.trim().to_string()),
 
         // === Conditional aggregates ===
         "COUNTIF" => {
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let criterion = eval_expr(&args[1], get, cell_map);
-            let values = collect_arg_values(&args[0], get, cell_map);
+            let criterion = eval_expr_with_provider(&args[1], provider);
+            let values = collect_arg_values(&args[0], provider);
             let mut count = 0u64;
             for v in values {
                 if matches_criterion(&v, &criterion) {
@@ -731,10 +745,10 @@ fn eval_func(
             if args.len() != 2 && args.len() != 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let criterion = eval_expr(&args[1], get, cell_map);
-            let range_values = collect_arg_values(&args[0], get, cell_map);
+            let criterion = eval_expr_with_provider(&args[1], provider);
+            let range_values = collect_arg_values(&args[0], provider);
             let sum_values = if args.len() == 3 {
-                collect_arg_values(&args[2], get, cell_map)
+                collect_arg_values(&args[2], provider)
             } else {
                 range_values.clone()
             };
@@ -759,21 +773,21 @@ fn eval_func(
             if args.len() < 3 || args.len() > 4 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let needle = eval_expr(&args[0], get, cell_map);
+            let needle = eval_expr_with_provider(&args[0], provider);
             let (start, end) = match arg_as_range(&args[1]) {
                 Some(r) => r,
                 None => return Value::Error(ValueError::InvalidValue),
             };
-            let col_idx = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+            let col_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
             let approximate = if args.len() == 4 {
-                coerce_to_bool(&eval_expr(&args[3], get, cell_map)).unwrap_or(true)
+                coerce_to_bool(&eval_expr_with_provider(&args[3], provider)).unwrap_or(true)
             } else {
                 true
             };
-            let grid = collect_range_2d(start, end, get, cell_map);
+            let grid = collect_range_2d(start, end, provider);
             lookup_2d(
                 &grid,
                 &needle,
@@ -787,21 +801,21 @@ fn eval_func(
             if args.len() < 3 || args.len() > 4 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let needle = eval_expr(&args[0], get, cell_map);
+            let needle = eval_expr_with_provider(&args[0], provider);
             let (start, end) = match arg_as_range(&args[1]) {
                 Some(r) => r,
                 None => return Value::Error(ValueError::InvalidValue),
             };
-            let row_idx = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+            let row_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
             let approximate = if args.len() == 4 {
-                coerce_to_bool(&eval_expr(&args[3], get, cell_map)).unwrap_or(true)
+                coerce_to_bool(&eval_expr_with_provider(&args[3], provider)).unwrap_or(true)
             } else {
                 true
             };
-            let grid = collect_range_2d(start, end, get, cell_map);
+            let grid = collect_range_2d(start, end, provider);
             lookup_2d(
                 &grid,
                 &needle,
@@ -820,15 +834,15 @@ fn eval_func(
                 Some(r) => r,
                 None => return Value::Error(ValueError::InvalidValue),
             };
-            let r = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+            let r = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
-            let c = match coerce_to_number(&eval_expr(&args[2], get, cell_map)) {
+            let c = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
-            let grid = collect_range_2d(start, end, get, cell_map);
+            let grid = collect_range_2d(start, end, provider);
             grid.get(r - 1)
                 .and_then(|row| row.get(c - 1).cloned())
                 .unwrap_or(Value::Error(ValueError::InvalidRef))
@@ -839,8 +853,8 @@ fn eval_func(
             if args.len() < 2 || args.len() > 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let needle = eval_expr(&args[0], get, cell_map);
-            let values = collect_arg_values(&args[1], get, cell_map);
+            let needle = eval_expr_with_provider(&args[0], provider);
+            let values = collect_arg_values(&args[1], provider);
             for (i, v) in values.iter().enumerate() {
                 if values_equal(v, &needle) {
                     return Value::Number((i + 1) as f64);
@@ -853,7 +867,7 @@ fn eval_func(
         "MEDIAN" => {
             let mut nums: Vec<f64> = Vec::new();
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     if let Value::Number(n) = v {
                         nums.push(n);
                     } else if let Value::Error(e) = v {
@@ -877,7 +891,7 @@ fn eval_func(
         "MODE" => {
             let mut nums: Vec<i64> = Vec::new();
             for arg in args {
-                for v in collect_arg_values(arg, get, cell_map) {
+                for v in collect_arg_values(arg, provider) {
                     if let Value::Number(n) = v {
                         // Multiply to preserve some decimals; mode for floats
                         // is rare and we want bit-stable hashing.
@@ -904,7 +918,7 @@ fn eval_func(
         }
 
         "STDEV" => {
-            let nums = collect_numbers(args, get, cell_map);
+            let nums = collect_numbers(args, provider);
             if nums.len() < 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
@@ -915,7 +929,7 @@ fn eval_func(
         }
 
         "VAR" => {
-            let nums = collect_numbers(args, get, cell_map);
+            let nums = collect_numbers(args, provider);
             if nums.len() < 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
@@ -930,8 +944,8 @@ fn eval_func(
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let mut nums = collect_numbers(&args[..1], get, cell_map);
-            let k = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+            let mut nums = collect_numbers(&args[..1], provider);
+            let k = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
@@ -946,8 +960,8 @@ fn eval_func(
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let mut nums = collect_numbers(&args[..1], get, cell_map);
-            let k = match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+            let mut nums = collect_numbers(&args[..1], provider);
+            let k = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
@@ -980,9 +994,9 @@ fn eval_func(
             if args.len() != 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let y = coerce_to_number(&eval_expr(&args[0], get, cell_map));
-            let m = coerce_to_number(&eval_expr(&args[1], get, cell_map));
-            let d = coerce_to_number(&eval_expr(&args[2], get, cell_map));
+            let y = coerce_to_number(&eval_expr_with_provider(&args[0], provider));
+            let m = coerce_to_number(&eval_expr_with_provider(&args[1], provider));
+            let d = coerce_to_number(&eval_expr_with_provider(&args[2], provider));
             match (y, m, d) {
                 (Some(y), Some(m), Some(d)) => {
                     Value::Number(date_serial(y as i32, m as u32, d as u32))
@@ -990,9 +1004,9 @@ fn eval_func(
                 _ => Value::Error(ValueError::InvalidValue),
             }
         }
-        "YEAR" => date_part(args, get, cell_map, |y, _, _| y as f64),
-        "MONTH" => date_part(args, get, cell_map, |_, m, _| m as f64),
-        "DAY" => date_part(args, get, cell_map, |_, _, d| d as f64),
+        "YEAR" => date_part(args, provider, |y, _, _| y as f64),
+        "MONTH" => date_part(args, provider, |_, m, _| m as f64),
+        "DAY" => date_part(args, provider, |_, _, d| d as f64),
 
         _ => Value::Error(ValueError::InvalidName),
     }
@@ -1000,12 +1014,11 @@ fn eval_func(
 
 fn collect_numbers(
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
 ) -> Vec<f64> {
     let mut out = Vec::new();
     for arg in args {
-        for v in collect_arg_values(arg, get, cell_map) {
+        for v in collect_arg_values(arg, provider) {
             if let Value::Number(n) = v {
                 out.push(n);
             }
@@ -1091,14 +1104,13 @@ fn date_from_serial(serial: f64) -> (i32, u32, u32) {
 
 fn date_part(
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
     f: impl Fn(i32, u32, u32) -> f64,
 ) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
-    let v = eval_expr(&args[0], get, cell_map);
+    let v = eval_expr_with_provider(&args[0], provider);
     match coerce_to_number(&v) {
         Some(n) => {
             let (y, m, d) = date_from_serial(n);
@@ -1118,14 +1130,13 @@ fn coerce_to_bool(v: &Value) -> Option<bool> {
 
 fn unary_number(
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
     f: impl Fn(f64) -> f64,
 ) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
-    let v = eval_expr(&args[0], get, cell_map);
+    let v = eval_expr_with_provider(&args[0], provider);
     if let Value::Error(e) = v {
         return Value::Error(e);
     }
@@ -1144,14 +1155,13 @@ fn unary_number(
 
 fn text_unary(
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
     f: impl Fn(&str) -> String,
 ) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
-    let v = eval_expr(&args[0], get, cell_map);
+    let v = eval_expr_with_provider(&args[0], provider);
     if let Value::Error(e) = v {
         return Value::Error(e);
     }
@@ -1160,16 +1170,15 @@ fn text_unary(
 
 fn text_slice(
     args: &[Expr],
-    get: &dyn Fn(AtomId) -> Value,
-    cell_map: &HashMap<CellAddress, AtomId>,
+    provider: &dyn EvalProvider,
     take: impl Fn(&str, usize) -> String,
 ) -> Value {
     if args.is_empty() || args.len() > 2 {
         return Value::Error(ValueError::InvalidValue);
     }
-    let s = coerce_to_text(&eval_expr(&args[0], get, cell_map));
+    let s = coerce_to_text(&eval_expr_with_provider(&args[0], provider));
     let n = if args.len() == 2 {
-        match coerce_to_number(&eval_expr(&args[1], get, cell_map)) {
+        match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
             Some(n) if n >= 0.0 => n as usize,
             _ => return Value::Error(ValueError::InvalidValue),
         }

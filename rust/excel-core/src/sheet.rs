@@ -5,14 +5,8 @@ use std::rc::Rc;
 use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
 
 use crate::cell::CellAddress;
-use crate::eval::eval_expr;
+use crate::eval::{eval_expr_with_provider, EvalProvider};
 use crate::formula::{parse_formula, Expr};
-
-/// Shared, mutable map of cell address → readable atom id.
-/// "Readable" means the formula derived atom if the cell has a formula,
-/// otherwise the primitive cell atom. Sharing via `Rc<RefCell>` lets
-/// already-created derived closures see later updates (B.1 fix).
-type ReadableMap = Rc<RefCell<HashMap<CellAddress, AtomId>>>;
 
 type ListenerRc = Rc<dyn CellListener>;
 type ListenerList = Rc<RefCell<Vec<(u64, ListenerRc)>>>;
@@ -42,6 +36,29 @@ struct AddressSubscriptionBucket {
     store_sub: Option<SubscriptionId>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum FormulaCache {
+    Dirty,
+    Computing,
+    Clean(Value),
+}
+
+struct FormulaRecord {
+    expr: Rc<Expr>,
+    deps: RefCell<HashSet<CellAddress>>,
+    cache: RefCell<FormulaCache>,
+}
+
+impl FormulaRecord {
+    fn new(expr: Rc<Expr>, deps: HashSet<CellAddress>) -> Self {
+        FormulaRecord {
+            expr,
+            deps: RefCell::new(deps),
+            cache: RefCell::new(FormulaCache::Dirty),
+        }
+    }
+}
+
 /// Token returned by `Sheet::subscribe_cell`. The public subscription is tied
 /// to a cell address, not the current readable atom. `Sheet` rewires the
 /// internal store subscription whenever the address switches between primitive
@@ -56,11 +73,9 @@ pub struct CellSubscription {
 pub struct Sheet {
     pub(crate) store: Store,
     pub(crate) cells: HashMap<CellAddress, AtomId>,
-    /// Cells that have formulas (the formula atom replaces the cell atom)
-    pub(crate) formula_cells: HashMap<CellAddress, AtomId>,
-    /// Live cell → readable-atom map shared with every derived closure.
-    /// Updated whenever a cell's primitive or formula atom changes (B.1).
-    readable: ReadableMap,
+    /// Formula cells live at the Sheet layer. Formula results are cached here,
+    /// not as core derived atoms, so `set_formula` does not compute.
+    formula_cells: HashMap<CellAddress, Rc<FormulaRecord>>,
     /// AST of each formula cell, used for static cycle detection (B.2).
     formula_exprs: HashMap<CellAddress, Rc<Expr>>,
     /// Original formula text per cell, for `get_formula` so the formula bar
@@ -71,6 +86,8 @@ pub struct Sheet {
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
     cell_subscriptions: HashMap<CellAddress, AddressSubscriptionBucket>,
+    /// cell address → formula cells that depend on it.
+    cell_dependents: RefCell<HashMap<CellAddress, HashSet<CellAddress>>>,
     next_cell_sub_id: u64,
 }
 
@@ -80,10 +97,10 @@ impl Sheet {
             store: Store::new(),
             cells: HashMap::new(),
             formula_cells: HashMap::new(),
-            readable: Rc::new(RefCell::new(HashMap::new())),
             formula_exprs: HashMap::new(),
             formula_texts: HashMap::new(),
             cell_subscriptions: HashMap::new(),
+            cell_dependents: RefCell::new(HashMap::new()),
             next_cell_sub_id: 0,
         }
     }
@@ -96,22 +113,21 @@ impl Sheet {
         }
         let id = self.store.create_atom(Value::Null);
         self.cells.insert(addr, id);
-        // Only seed readable if no formula has claimed this address.
-        let mut r = self.readable.borrow_mut();
-        r.entry(addr).or_insert(id);
         id
     }
 
-    /// Get the readable atom for a cell: formula atom if exists, otherwise primitive atom.
+    /// Get or create the primitive atom for a cell. Formula results no longer
+    /// have core atoms; callers needing a raw atom get the primitive slot.
     fn readable_atom(&mut self, addr: CellAddress) -> AtomId {
-        if let Some(&id) = self.formula_cells.get(&addr) {
-            return id;
-        }
         self.ensure_cell(addr)
     }
 
     fn current_readable_atom(&self, addr: CellAddress) -> Option<AtomId> {
-        self.readable.borrow().get(&addr).copied()
+        if self.formula_cells.contains_key(&addr) {
+            None
+        } else {
+            self.cells.get(&addr).copied()
+        }
     }
 
     /// Detach this address's fanout from the store. The bucket and its
@@ -191,6 +207,94 @@ impl Sheet {
         }
     }
 
+    fn formula_deps_for(expr: &Expr) -> HashSet<CellAddress> {
+        let mut deps = Vec::new();
+        collect_refs(expr, &mut deps);
+        deps.into_iter().collect()
+    }
+
+    fn add_formula_deps(&self, formula_addr: CellAddress, deps: &HashSet<CellAddress>) {
+        let mut dependents = self.cell_dependents.borrow_mut();
+        for dep in deps {
+            dependents.entry(*dep).or_default().insert(formula_addr);
+        }
+    }
+
+    fn remove_formula_deps(&self, formula_addr: CellAddress, deps: &HashSet<CellAddress>) {
+        let mut dependents = self.cell_dependents.borrow_mut();
+        for dep in deps {
+            let should_remove = if let Some(set) = dependents.get_mut(dep) {
+                set.remove(&formula_addr);
+                set.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                dependents.remove(dep);
+            }
+        }
+    }
+
+    fn replace_formula_deps(
+        &self,
+        formula_addr: CellAddress,
+        record: &FormulaRecord,
+        new_deps: HashSet<CellAddress>,
+    ) {
+        let old_deps = record.deps.replace(new_deps.clone());
+        self.remove_formula_deps(formula_addr, &old_deps);
+        self.add_formula_deps(formula_addr, &new_deps);
+    }
+
+    fn remove_formula_record(&mut self, addr: CellAddress) -> Option<Rc<FormulaRecord>> {
+        let record = self.formula_cells.remove(&addr)?;
+        let deps = record.deps.borrow().clone();
+        self.remove_formula_deps(addr, &deps);
+        self.formula_exprs.remove(&addr);
+        self.formula_texts.remove(&addr);
+        Some(record)
+    }
+
+    fn rebuild_all_formula_dependents(&self) {
+        self.cell_dependents.borrow_mut().clear();
+        for (addr, record) in &self.formula_cells {
+            let deps = record.deps.borrow().clone();
+            self.add_formula_deps(*addr, &deps);
+        }
+    }
+
+    fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
+        let mut notified = HashSet::new();
+        let mut stack: Vec<CellAddress> = self
+            .cell_dependents
+            .borrow()
+            .get(&root)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        while let Some(addr) = stack.pop() {
+            if !notified.insert(addr) {
+                continue;
+            }
+            if let Some(record) = self.formula_cells.get(&addr) {
+                *record.cache.borrow_mut() = FormulaCache::Dirty;
+            }
+            self.notify_address_subscribers(addr);
+
+            let next = self
+                .cell_dependents
+                .borrow()
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+            stack.extend(next);
+        }
+
+        notified
+    }
+
     /// Set a cell's value by address string (e.g. "A1").
     /// Clears any existing formula on this cell.
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
@@ -198,31 +302,17 @@ impl Sheet {
         let had_formula = self.formula_cells.contains_key(&addr);
 
         if had_formula {
-            // Formula → primitive: detach fanout, swap, reattach + fire once.
             self.with_remap(addr, |sheet| {
-                let old_derived = sheet.formula_cells.remove(&addr);
-                sheet.formula_exprs.remove(&addr);
-                sheet.formula_texts.remove(&addr);
+                sheet.remove_formula_record(addr);
                 let id = sheet.ensure_cell(addr);
-                // B.1 — readable must point at the primitive immediately so
-                // other derived closures stop reading the old formula.
-                sheet.readable.borrow_mut().insert(addr, id);
                 sheet.store.set(id, value);
-                if let Some(old) = old_derived {
-                    sheet.store.propagate_force(&[old]);
-                    if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
-                        sheet.store.destroy_atom(old);
-                    }
-                }
             });
         } else {
-            // Primitive → primitive: no remap. Let the fanout fire naturally
-            // on the value diff inside `store.set`.
             let id = self.ensure_cell(addr);
-            self.readable.borrow_mut().insert(addr, id);
             self.attach_address_sub(addr);
             self.store.set(id, value);
         }
+        self.mark_dependents_dirty(addr);
     }
 
     /// Clear a cell back to empty (Null). Equivalent to `set_cell(addr, Value::Null)`
@@ -233,7 +323,8 @@ impl Sheet {
     }
 
     /// Set a cell's formula by address string (e.g. "=A1+B1").
-    /// The formula is parsed and a derived atom is created.
+    /// The formula is parsed and stored as a lazy Sheet-level record. It is
+    /// not evaluated until the cell is read.
     ///
     /// Returns `false` if either:
     ///   - the formula failed to parse (B.3) — cell becomes `#VALUE!`
@@ -241,13 +332,6 @@ impl Sheet {
     /// In both cases the wasm instance keeps running and any prior formula on
     /// this cell is cleared.
     ///
-    /// **EAGER (vs LAZY_FORMULA_EVAL.md)**: this path still pre-creates atoms
-    /// for every referenced cell (`ensure_refs`) and runs the formula closure
-    /// once at create-time (inside `Store::create_derived`). The lazy plan
-    /// (Step 2) replaces both: refs are tracked in `cell_dependents`/
-    /// `range_dependents` without materializing atoms, and computation is
-    /// deferred until `get_cell` reads the formula. Until that lands,
-    /// importing N formulas costs N evals + N×deps cell atoms.
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         let expr = match parse_formula(formula_str) {
@@ -265,45 +349,22 @@ impl Sheet {
             return false;
         }
 
-        self.ensure_refs(&expr);
-
-        // set_formula always swaps to a freshly-created derived atom, so we
-        // always go through `with_remap` — the inner mutation is suppressed
-        // from firing this cell's fanout, then we fire exactly once.
         self.with_remap(addr, move |sheet| {
-            // Primitive atom id — needed for propagate_force below so that
-            // dependents that captured this id recompute against the new
-            // readable map and naturally retarget to the new derived (B.1).
-            let prim_id = sheet.ensure_cell(addr);
-            let old_derived = sheet.formula_cells.get(&addr).copied();
-
             let expr = Rc::new(expr);
-            let readable = sheet.readable.clone();
-            let expr_for_closure = expr.clone();
-            let derived_id = sheet.store.create_derived(move |get| {
-                let map = readable.borrow();
-                eval_expr(&expr_for_closure, get, &*map)
-            });
-
-            sheet.formula_cells.insert(addr, derived_id);
-            sheet.formula_exprs.insert(addr, expr);
-            sheet.formula_texts.insert(addr, formula_str.to_string());
-            sheet.readable.borrow_mut().insert(addr, derived_id);
-
-            let mut roots = vec![prim_id];
-            if let Some(old) = old_derived {
-                roots.push(old);
-            }
-            sheet.store.propagate_force(&roots);
-
-            // Destroy the old derived atom (B.4 — without this, repeated
-            // set_formula on the same cell leaks atoms forever in the store).
-            if let Some(old) = old_derived {
-                if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
-                    sheet.store.destroy_atom(old);
+            let deps = Sheet::formula_deps_for(&expr);
+            sheet.remove_formula_record(addr);
+            if let Some(prim) = sheet.cells.remove(&addr) {
+                if sheet.store.has_atom(prim) && !sheet.store.has_dependents(prim) {
+                    sheet.store.destroy_atom(prim);
                 }
             }
+            let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+            sheet.add_formula_deps(addr, &deps);
+            sheet.formula_cells.insert(addr, record);
+            sheet.formula_exprs.insert(addr, expr);
+            sheet.formula_texts.insert(addr, formula_str.to_string());
         });
+        self.mark_dependents_dirty(addr);
         true
     }
 
@@ -312,25 +373,16 @@ impl Sheet {
         let had_formula = self.formula_cells.contains_key(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
-                let old_derived = sheet.formula_cells.remove(&addr);
-                sheet.formula_exprs.remove(&addr);
-                sheet.formula_texts.remove(&addr);
+                sheet.remove_formula_record(addr);
                 let id = sheet.ensure_cell(addr);
-                sheet.readable.borrow_mut().insert(addr, id);
                 sheet.store.set(id, Value::Error(err));
-                if let Some(old) = old_derived {
-                    sheet.store.propagate_force(&[old]);
-                    if sheet.store.has_atom(old) && !sheet.store.has_dependents(old) {
-                        sheet.store.destroy_atom(old);
-                    }
-                }
             });
         } else {
             let id = self.ensure_cell(addr);
-            self.readable.borrow_mut().insert(addr, id);
             self.attach_address_sub(addr);
             self.store.set(id, Value::Error(err));
         }
+        self.mark_dependents_dirty(addr);
     }
 
     /// Static cycle detection (B.2). Walks the AST of the new formula,
@@ -367,14 +419,54 @@ impl Sheet {
     /// `Value::Null` for cells that haven't been touched. Used by the
     /// Workbook layer (cross-sheet read) so it can stay `&self`.
     pub fn peek_value(&self, addr: CellAddress) -> Value {
-        let id = match self.current_readable_atom(addr) {
-            Some(id) => id,
-            None => return Value::Null,
-        };
-        if !self.store.has_atom(id) {
-            return Value::Null;
+        let provider = SheetEvalProvider { sheet: self };
+        self.peek_value_with_provider(addr, &provider)
+    }
+
+    pub(crate) fn peek_value_with_provider(
+        &self,
+        addr: CellAddress,
+        provider: &dyn EvalProvider,
+    ) -> Value {
+        if self.formula_cells.contains_key(&addr) {
+            return self.eval_formula_at_with_provider(addr, provider);
         }
-        self.store.get(id)
+        self.cells
+            .get(&addr)
+            .filter(|id| self.store.has_atom(**id))
+            .map(|&id| self.store.get(id))
+            .unwrap_or(Value::Null)
+    }
+
+    fn primitive_value_at(&self, addr: CellAddress) -> Value {
+        self.cells
+            .get(&addr)
+            .filter(|id| self.store.has_atom(**id))
+            .map(|&id| self.store.get(id))
+            .unwrap_or(Value::Null)
+    }
+
+    fn eval_formula_at_with_provider(&self, addr: CellAddress, provider: &dyn EvalProvider) -> Value {
+        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+            return self.primitive_value_at(addr);
+        };
+
+        match record.cache.borrow().clone() {
+            FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
+            FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
+            FormulaCache::Clean(_) | FormulaCache::Dirty => {}
+        }
+
+        *record.cache.borrow_mut() = FormulaCache::Computing;
+        let deps = Rc::new(RefCell::new(HashSet::new()));
+        let tracking = TrackingEvalProvider {
+            inner: provider,
+            deps: deps.clone(),
+        };
+        let value = eval_expr_with_provider(&record.expr, &tracking);
+        *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
+        self.replace_formula_deps(addr, &record, deps.borrow().clone());
+        value
     }
 
     /// Get the AtomId for a cell (creating if needed).
@@ -389,28 +481,20 @@ impl Sheet {
     /// should prefer `recompute_cross_sheet_formulas_reachable_from(addr)`,
     /// which scopes the work to formulas on the dep chain of `addr`.
     pub fn recompute_cross_sheet_formulas(&mut self) {
-        let mut roots: Vec<AtomId> = Vec::new();
         for (addr, expr) in &self.formula_exprs {
             if expr_has_sheet_ref(expr) {
-                if let Some(&id) = self.formula_cells.get(addr) {
-                    roots.push(id);
+                if let Some(record) = self.formula_cells.get(addr) {
+                    *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
-        }
-        if !roots.is_empty() {
-            // Silent because Workbook::get_cell is a read path: it refreshes
-            // cached derived values against the live TLS resolver without
-            // turning the read itself into a subscriber event.
-            self.store.force_recompute_derived_silent(&roots);
         }
     }
 
     /// Targeted version of `recompute_cross_sheet_formulas`: BFS over
-    /// `formula_exprs` starting at `target`, collect every formula reached
-    /// whose AST contains a `SheetRef`, then `force_recompute_derived_silent`
-    /// the union. `Store::recompute_derived_tree` then handles the
-    /// topological cascade to dependents (including non-cross-sheet formulas
-    /// like `=B1*2` whose `B1` is a cross-sheet formula).
+    /// `formula_exprs` starting at `target` and mark reached cross-sheet
+    /// formulas dirty. The Workbook lazy provider now does live recursive
+    /// evaluation, so this remains mostly as an explicit cache-invalidation
+    /// utility for older callers.
     ///
     /// Worst-case cost is the size of the dep closure of `target` in
     /// `formula_exprs` — orders of magnitude smaller than the whole-sheet
@@ -420,8 +504,6 @@ impl Sheet {
     pub fn recompute_cross_sheet_formulas_reachable_from(&mut self, target: CellAddress) {
         let mut visited: HashSet<CellAddress> = HashSet::new();
         let mut to_visit: Vec<CellAddress> = vec![target];
-        let mut roots: Vec<AtomId> = Vec::new();
-
         while let Some(addr) = to_visit.pop() {
             if !visited.insert(addr) {
                 continue;
@@ -430,8 +512,8 @@ impl Sheet {
                 continue;
             };
             if expr_has_sheet_ref(expr) {
-                if let Some(&id) = self.formula_cells.get(&addr) {
-                    roots.push(id);
+                if let Some(record) = self.formula_cells.get(&addr) {
+                    *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
             // Queue only addresses that themselves have a formula — a leaf
@@ -442,17 +524,12 @@ impl Sheet {
             collect_formula_refs_into(expr, &self.formula_exprs, &mut to_visit);
         }
 
-        if !roots.is_empty() {
-            self.store.force_recompute_derived_silent(&roots);
-        }
     }
 
     // === LAZY_FORMULA_EVAL Step 0 — debug counters ===
     //
-    // These exist so future lazy-formula work has measurable gating points
-    // (e.g. "100k set_formula calls produce 0 evals", "subscribe to empty
-    // cell creates 0 atoms"). They reflect the *current* eager state today;
-    // when Step 2 lands the same APIs report against the new graph.
+    // These expose the lazy formula graph's materialization behavior for
+    // tests / benches / dev tooling.
     //
     // All `#[doc(hidden)]` — not part of the public API surface, intended
     // for tests / benches / dev tooling.
@@ -466,27 +543,24 @@ impl Sheet {
         self.cells.len()
     }
 
-    /// Number of formula cells. With the eager backend this also equals the
-    /// number of derived atoms in the store; under lazy this would diverge
-    /// (formulas exist as records, derived atoms vanish).
+    /// Number of formula cells. Formulas are Sheet-level lazy records, not
+    /// core derived atoms.
     #[doc(hidden)]
     pub fn debug_formula_count(&self) -> usize {
         self.formula_cells.len()
     }
 
-    /// Number of *atom* dependents on the cell at `addr`. Today this only
-    /// covers cells whose primitive/derived atom has tracked back_deps —
-    /// cells referenced by a formula via `ensure_refs`. Under lazy this
-    /// will switch to counting `cell_dependents[addr]` directly.
+    /// Number of formulas that currently depend on the cell at `addr`.
     #[doc(hidden)]
     pub fn debug_dependents_count(&self, addr_str: &str) -> usize {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return 0;
         };
-        let Some(&id) = self.cells.get(&addr) else {
-            return 0;
-        };
-        self.store.debug_dependent_count(id)
+        self.cell_dependents
+            .borrow()
+            .get(&addr)
+            .map(|deps| deps.len())
+            .unwrap_or(0)
     }
 
     /// Total live atoms (primitive + derived). Useful as a gross "did
@@ -637,8 +711,8 @@ impl Sheet {
     /// Run a structural edit (row/col insert/delete) so that subscribers are
     /// notified at most once per address, only when the displayed value at
     /// that address actually changed. Detaches every fanout for the duration
-    /// of the edit so internal `store.set` / `propagate_force` calls don't
-    /// fan out partial intermediate states; reattaches at the end.
+    /// of the edit so internal `store.set` calls don't fan out partial
+    /// intermediate states; reattaches at the end.
     fn with_structural_edit(&mut self, f: impl FnOnce(&mut Self)) {
         let addrs: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
         let mut pre: Vec<(CellAddress, Value)> = Vec::with_capacity(addrs.len());
@@ -668,14 +742,7 @@ impl Sheet {
                     self.store.destroy_atom(prim);
                 }
             }
-            if let Some(derived) = self.formula_cells.remove(&addr) {
-                if self.store.has_atom(derived) && !self.store.has_dependents(derived) {
-                    self.store.destroy_atom(derived);
-                }
-            }
-            self.formula_exprs.remove(&addr);
-            self.formula_texts.remove(&addr);
-            self.readable.borrow_mut().remove(&addr);
+            self.remove_formula_record(addr);
             // Fanout reattach + per-address fire are handled by the enclosing
             // `with_structural_edit`; nothing to do here.
         }
@@ -689,7 +756,7 @@ impl Sheet {
             .into_iter()
             .map(|(addr, id)| (f(addr), id))
             .collect();
-        let new_formula_cells: HashMap<CellAddress, AtomId> =
+        let new_formula_cells: HashMap<CellAddress, Rc<FormulaRecord>> =
             std::mem::take(&mut self.formula_cells)
                 .into_iter()
                 .map(|(addr, id)| (f(addr), id))
@@ -704,18 +771,11 @@ impl Sheet {
                 .into_iter()
                 .map(|(addr, text)| (f(addr), text))
                 .collect();
-        let new_readable: HashMap<CellAddress, AtomId> = self
-            .readable
-            .borrow()
-            .iter()
-            .map(|(addr, id)| (f(*addr), *id))
-            .collect();
-
         self.cells = new_cells;
         self.formula_cells = new_formula_cells;
         self.formula_exprs = new_formula_exprs;
         self.formula_texts = new_formula_texts;
-        *self.readable.borrow_mut() = new_readable;
+        self.rebuild_all_formula_dependents();
     }
 
     /// Apply an address-mapping function to every CellRef inside every
@@ -737,11 +797,11 @@ impl Sheet {
             let new_expr_rc = Rc::new(new_expr);
             self.formula_exprs.insert(addr, new_expr_rc.clone());
             let rendered = crate::shift::render_formula(&new_expr_rc);
-            self.rebuild_formula_derived(addr, rendered);
+            self.rebuild_formula_lazy(addr, rendered);
         }
     }
 
-    fn rebuild_formula_derived(&mut self, addr: CellAddress, formula_str: String) {
+    fn rebuild_formula_lazy(&mut self, addr: CellAddress, formula_str: String) {
         let expr = match crate::formula::parse_formula(&formula_str) {
             Some(e) => Rc::new(e),
             None => {
@@ -751,83 +811,23 @@ impl Sheet {
                 return;
             }
         };
-        self.formula_exprs.insert(addr, expr.clone());
+        let deps = Sheet::formula_deps_for(&expr);
+        self.remove_formula_record(addr);
+        let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+        self.add_formula_deps(addr, &deps);
+        self.formula_cells.insert(addr, record);
+        self.formula_exprs.insert(addr, expr);
         self.formula_texts.insert(addr, formula_str);
-
-        // Destroy old derived if present.
-        let old_derived = self.formula_cells.remove(&addr);
-
-        let prim_id = self.ensure_cell(addr);
-        let readable = self.readable.clone();
-        let expr_for_closure = expr.clone();
-
-        let derived_id = self.store.create_derived(move |get| {
-            let map = readable.borrow();
-            eval_expr(&expr_for_closure, get, &*map)
-        });
-
-        self.formula_cells.insert(addr, derived_id);
-        self.readable.borrow_mut().insert(addr, derived_id);
         // Fanout reattach + per-address fire are handled by the enclosing
         // `with_structural_edit` (this is only ever called from
         // `retarget_formula_refs` during a structural edit).
-        let mut roots = vec![prim_id];
-        if let Some(old) = old_derived {
-            roots.push(old);
-        }
-        self.store.propagate_force(&roots);
-        if let Some(old) = old_derived {
-            if self.store.has_atom(old) && !self.store.has_dependents(old) {
-                self.store.destroy_atom(old);
-            }
-        }
-    }
-
-    /// Walk AST and ensure all referenced cells exist.
-    fn ensure_refs(&mut self, expr: &Expr) {
-        match expr {
-            Expr::CellRef(addr) => {
-                self.ensure_cell(*addr);
-            }
-            Expr::Range { start, end } => {
-                let min_row = start.row.min(end.row);
-                let max_row = start.row.max(end.row);
-                let min_col = start.col.min(end.col);
-                let max_col = start.col.max(end.col);
-                for row in min_row..=max_row {
-                    for col in min_col..=max_col {
-                        self.ensure_cell(CellAddress::new(row, col));
-                    }
-                }
-            }
-            Expr::BinOp { left, right, .. } => {
-                self.ensure_refs(left);
-                self.ensure_refs(right);
-            }
-            Expr::Negate(inner) => self.ensure_refs(inner),
-            Expr::FuncCall { args, .. } => {
-                for arg in args {
-                    self.ensure_refs(arg);
-                }
-            }
-            // Cross-sheet refs are resolved by the workbook layer; the
-            // current sheet doesn't pre-create cells for them.
-            Expr::SheetRef { .. } => {}
-            Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
-        }
     }
 
     /// Set multiple cells at once, with a single propagation pass.
     ///
     /// Like `set_cell`, this also clears any existing formula on each target
-    /// cell — formula derived atoms are destroyed and `readable` is restored
-    /// to the primitive atom (B.12). Without this, batched writes would read
-    /// the stale formula result on subsequent `get_cell` calls.
-    ///
-    /// Subscribers fire at most once per affected address: addresses being
-    /// written go through the same detach-mutate-reattach dance as `set_cell`,
-    /// and other subscribed addresses fire only if `propagate_force` causes
-    /// their displayed value to actually change.
+    /// cell. Formula dependents are dirtied after the batch without eagerly
+    /// computing them.
     pub fn batch_set(&mut self, updates: &[(&str, Value)]) {
         // Snapshot pre-state for *every* subscribed address so we can fire
         // exactly once per actual value change at the end. The subset of
@@ -844,21 +844,16 @@ impl Sheet {
         }
 
         let mut atom_values: Vec<(AtomId, Value)> = Vec::with_capacity(updates.len());
-        let mut old_deriveds: Vec<AtomId> = Vec::new();
+        let mut written_addrs: Vec<CellAddress> = Vec::with_capacity(updates.len());
 
         for (addr_str, value) in updates {
             let addr = CellAddress::parse(addr_str).expect("invalid cell address");
 
-            if let Some(old_derived) = self.formula_cells.remove(&addr) {
-                old_deriveds.push(old_derived);
-            }
-            self.formula_exprs.remove(&addr);
-            self.formula_texts.remove(&addr);
+            self.remove_formula_record(addr);
 
             let id = self.ensure_cell(addr);
-            // Restore readable to primitive in case it pointed at a formula.
-            self.readable.borrow_mut().insert(addr, id);
             atom_values.push((id, value.clone()));
+            written_addrs.push(addr);
         }
 
         self.store.batch(|store| {
@@ -866,20 +861,18 @@ impl Sheet {
                 store.set(id, value);
             }
         });
-        if !old_deriveds.is_empty() {
-            self.store.propagate_force(&old_deriveds);
-        }
-
-        for old in old_deriveds {
-            if self.store.has_atom(old) && !self.store.has_dependents(old) {
-                self.store.destroy_atom(old);
-            }
+        let mut dirty_notified = HashSet::new();
+        for addr in written_addrs {
+            dirty_notified.extend(self.mark_dependents_dirty(addr));
         }
 
         for addr in &subscribed {
             self.attach_address_sub(*addr);
         }
         for (addr, pre_val) in pre {
+            if dirty_notified.contains(&addr) {
+                continue;
+            }
             let post_val = self.peek_value(addr);
             if pre_val != post_val {
                 self.notify_address_subscribers(addr);
@@ -997,6 +990,40 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
             false
         }
+    }
+}
+
+struct SheetEvalProvider<'a> {
+    sheet: &'a Sheet,
+}
+
+impl<'a> EvalProvider for SheetEvalProvider<'a> {
+    fn cell(&self, addr: CellAddress) -> Value {
+        self.sheet.peek_value(addr)
+    }
+
+    fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        Value::Error(ValueError::InvalidRef)
+    }
+}
+
+struct TrackingEvalProvider<'a> {
+    inner: &'a dyn EvalProvider,
+    deps: Rc<RefCell<HashSet<CellAddress>>>,
+}
+
+impl<'a> EvalProvider for TrackingEvalProvider<'a> {
+    fn cell(&self, addr: CellAddress) -> Value {
+        self.deps.borrow_mut().insert(addr);
+        self.inner.cell(addr)
+    }
+
+    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        self.inner.sheet_cell(sheet, addr)
+    }
+
+    fn force_formula_recompute(&self) -> bool {
+        self.inner.force_formula_recompute()
     }
 }
 
@@ -1240,12 +1267,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_counters_reflect_eager_baseline() {
-        // These assertions document the *current* eager backend's behavior.
-        // When LAZY_FORMULA_EVAL Step 2 lands, the formula-import case
-        // should change: dep cells no longer materialize, derived atom
-        // count drops to 0. Update this test then — the divergence is the
-        // signal that Step 2 actually delivered.
+    fn debug_counters_reflect_lazy_formula_baseline() {
         let mut sheet = Sheet::new();
         assert_eq!(sheet.debug_primitive_atom_count(), 0);
         assert_eq!(sheet.debug_formula_count(), 0);
@@ -1255,24 +1277,17 @@ mod tests {
         assert_eq!(sheet.debug_primitive_atom_count(), 1);
         assert_eq!(sheet.debug_total_atom_count(), 1);
 
-        // EAGER: =A1+Z99 materializes (a) Z99 (ensure_refs on missing
-        // CellRef), (b) B1's own primitive (set_formula keeps a primitive
-        // for propagate_force after a later set_cell rewrite). A1 already
-        // existed. So primitives go 1 → 3, derived count goes 0 → 1,
-        // total atoms 1 → 4.
         sheet.set_formula("B1", "=A1+Z99");
-        assert_eq!(
-            sheet.debug_primitive_atom_count(),
-            3,
-            "A1 (existing) + Z99 (ensure_refs) + B1 primitive (set_formula scaffold)"
-        );
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
         assert_eq!(sheet.debug_formula_count(), 1);
-        assert_eq!(sheet.debug_total_atom_count(), 4, "3 primitive + 1 derived");
+        assert_eq!(sheet.debug_total_atom_count(), 1);
 
-        // EAGER: A1 has B1's derived as a dependent.
         assert_eq!(sheet.debug_dependents_count("A1"), 1);
-        // Z99 also got tracked (it was read in the initial eager eval).
         assert_eq!(sheet.debug_dependents_count("Z99"), 1);
+
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+        assert_eq!(sheet.debug_primitive_atom_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 1);
     }
 
     #[test]
@@ -1380,31 +1395,27 @@ mod tests {
     }
 
     #[test]
-    fn set_formula_releases_old_derived() {
-        // B.4: re-setting a formula on the same cell should not leak the
-        // previous derived atom in the store.
+    fn set_formula_replaces_lazy_record_without_store_growth() {
         let mut sheet = Sheet::new();
         sheet.set_cell("A1", Value::Number(10.0));
         sheet.set_formula("B1", "=A1*2");
-        let first_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
         assert_eq!(sheet.get_cell("B1"), Value::Number(20.0));
+        let atoms_after_first = sheet.debug_total_atom_count();
 
-        // Replace the formula. Old derived should be destroyed.
         sheet.set_formula("B1", "=A1*3");
-        let second_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
-        assert_ne!(first_derived, second_derived);
-        assert!(
-            !sheet.store.has_atom(first_derived),
-            "old derived must be destroyed"
-        );
         assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            atoms_after_first,
+            "formula replacement must not create core atoms"
+        );
 
-        // Many replacements in a row should not grow the store.
         for n in 1..=20 {
             sheet.set_formula("B1", &format!("=A1+{}", n));
         }
-        // Final formula = A1 + 20 = 30.
         assert_eq!(sheet.get_cell("B1"), Value::Number(30.0));
+        assert_eq!(sheet.debug_formula_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), atoms_after_first);
     }
 
     #[test]
@@ -1527,18 +1538,15 @@ mod tests {
     }
 
     #[test]
-    fn set_cell_releases_old_derived() {
+    fn set_cell_releases_old_formula_record() {
         let mut sheet = Sheet::new();
         sheet.set_cell("A1", Value::Number(10.0));
         sheet.set_formula("B1", "=A1*2");
-        let old_derived = *sheet.formula_cells.get(&CellAddress::new(0, 1)).unwrap();
+        assert_eq!(sheet.debug_formula_count(), 1);
 
         sheet.set_cell("B1", Value::Number(5.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(5.0));
-        assert!(
-            !sheet.store.has_atom(old_derived),
-            "old formula derived must be destroyed after set_cell"
-        );
+        assert_eq!(sheet.debug_formula_count(), 0);
     }
 
     #[test]

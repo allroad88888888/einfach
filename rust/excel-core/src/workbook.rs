@@ -1,17 +1,17 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use einfach_core::Value;
 
 use crate::cell::CellAddress;
-use crate::eval::{with_cross_resolver_for_sheet, CrossSheetResolver};
+use crate::eval::EvalProvider;
 use crate::sheet::Sheet;
 
 /// A workbook is an ordered collection of named sheets. Phase 4 backend.
 ///
-/// Cross-sheet references (`=Sheet2!A1`) resolve through a temporary
-/// read-time resolver. This is still an eager-derived bridge: simple
-/// cross-sheet reads work, but workbook-wide lazy formula evaluation is the
-/// long-term path for chained refs, subscriptions, and cycle handling.
+/// Cross-sheet references (`=Sheet2!A1`) resolve through a Workbook
+/// `EvalProvider`. Formula nodes stay lazy: reads evaluate the reachable
+/// formula chain, writes only mark local dependents dirty.
 pub struct Workbook {
     sheets: Vec<Sheet>,
     names: Vec<String>,
@@ -91,13 +91,9 @@ impl Workbook {
     /// Read a cell from a named sheet. Cross-sheet references in formulas
     /// resolve through this path.
     ///
-    /// Implementation note: formula derived atoms cache the value computed
-    /// at `set_formula` time, where no cross-sheet resolver is in scope —
-    /// any `=Other!A1` therefore caches as `#REF!`. Reading through the
-    /// workbook installs the resolver in TLS and force-recomputes any
-    /// formula on the target sheet whose AST contains a `SheetRef`, so
-    /// callers see live values. Same-sheet formulas keep their existing
-    /// cached value (cheap).
+    /// Workbook reads bypass formula cache so cross-sheet sources are always
+    /// observed live. Plain `Sheet::get_cell` keeps using per-formula dirty
+    /// cache for same-sheet formulas.
     pub fn get_cell(&mut self, sheet_name: &str, addr_str: &str) -> Value {
         let idx = match self.index_of(sheet_name) {
             Some(i) => i,
@@ -108,28 +104,11 @@ impl Workbook {
             None => return Value::Null,
         };
 
-        // Split self.sheets so the resolver borrows every non-target sheet
-        // immutably while we refresh the target sheet's cached derived values.
-        let by_name = &self.by_name;
-        let (left, mid_right) = self.sheets.split_at_mut(idx);
-        let (target_slice, right) = mid_right.split_at_mut(1);
-        let target = &mut target_slice[0];
-
-        let resolver = SplitWorkbookResolver {
-            left,
-            right,
-            by_name,
-            skip_idx: idx,
+        let provider = WorkbookEvalProvider {
+            wb: self,
+            current: Cell::new(idx),
         };
-
-        with_cross_resolver_for_sheet(sheet_name, &resolver, || {
-            // Targeted: only refresh formulas on the dep chain of `addr`,
-            // not every cross-sheet formula on the sheet. Whole-sheet sweep
-            // (`recompute_cross_sheet_formulas`) is preserved on Sheet for
-            // explicit "rebuild" callers but not used on the read path.
-            target.recompute_cross_sheet_formulas_reachable_from(addr);
-            target.peek_value(addr)
-        })
+        self.sheets[idx].peek_value_with_provider(addr, &provider)
     }
 
     /// Remove a sheet by index. Returns the removed sheet so callers can
@@ -158,47 +137,35 @@ impl Default for Workbook {
     }
 }
 
-/// Resolver used by `Workbook::get_cell` while the target sheet is held
-/// mutably. Sees every sheet except the target; refs like `Sheet1!A1` on
-/// Sheet1 are handled earlier by eval's current-sheet context and use the
-/// normal same-sheet getter.
-struct SplitWorkbookResolver<'a> {
-    left: &'a [Sheet],
-    right: &'a [Sheet],
-    by_name: &'a HashMap<String, usize>,
-    skip_idx: usize,
+struct WorkbookEvalProvider<'a> {
+    wb: &'a Workbook,
+    current: Cell<usize>,
 }
 
-impl<'a> SplitWorkbookResolver<'a> {
-    fn sheet_at(&self, idx: usize) -> Option<&Sheet> {
-        if idx == self.skip_idx {
-            None
-        } else if idx < self.skip_idx {
-            self.left.get(idx)
-        } else {
-            self.right.get(idx - self.skip_idx - 1)
-        }
+impl<'a> WorkbookEvalProvider<'a> {
+    fn with_current(&self, idx: usize, f: impl FnOnce() -> Value) -> Value {
+        let prev = self.current.replace(idx);
+        let value = f();
+        self.current.set(prev);
+        value
     }
 }
 
-impl<'a> CrossSheetResolver for SplitWorkbookResolver<'a> {
-    fn resolve(&self, sheet: &str, addr: CellAddress) -> Value {
-        let idx = match self.by_name.get(sheet) {
-            Some(&i) => i,
-            None => return Value::Null,
+impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
+    fn cell(&self, addr: CellAddress) -> Value {
+        let idx = self.current.get();
+        self.wb.sheets[idx].peek_value_with_provider(addr, self)
+    }
+
+    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        let Some(idx) = self.wb.by_name.get(sheet).copied() else {
+            return Value::Null;
         };
-        match self.sheet_at(idx) {
-            // peek_value reads the cached formula value. If the referenced
-            // sheet's formula also contains cross-sheet refs back to *its*
-            // peers, those caches may be stale — see "已知遗留" in the
-            // LAZY_FORMULA_EVAL doc; chained cross-sheet refs need the
-            // lazy formula rewrite to land for full correctness.
-            Some(s) => s.peek_value(addr),
-            // If this happens, the caller referenced the target sheet by a
-            // name that is not the current eval sheet. The lazy formula path
-            // will replace this resolver bridge.
-            None => Value::Null,
-        }
+        self.with_current(idx, || self.wb.sheets[idx].peek_value_with_provider(addr, self))
+    }
+
+    fn force_formula_recompute(&self) -> bool {
+        true
     }
 }
 
@@ -278,8 +245,7 @@ mod tests {
         // Sheet1!B1 = =Data!A1 * 2 — formula sits on Sheet1 but reads Data.
         wb.sheet_mut(0).unwrap().set_formula("B1", "=Data!A1*2");
 
-        // wb.get_cell installs the resolver in TLS and force-recomputes
-        // any formula on the target sheet whose AST contains SheetRef.
+        // wb.get_cell evaluates through WorkbookEvalProvider.
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(100.0));
 
         // Updating the cross-sheet source and re-reading should see the
@@ -356,12 +322,12 @@ mod tests {
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(20.0));
         let after = wb.sheet(0).unwrap().debug_recompute_count();
 
-        // Reading B1 should force exactly one derived recompute (B1 itself).
-        // The whole-sheet variant would force 3.
+        // Lazy formulas no longer use core derived recompute. Reading B1
+        // should compute through Sheet formula records only.
         assert_eq!(
             after - before,
-            1,
-            "reading B1 must only force B1's derived; D1/E1 untouched"
+            0,
+            "reading B1 must not force core derived recomputes"
         );
     }
 
