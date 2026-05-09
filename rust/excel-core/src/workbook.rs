@@ -173,9 +173,7 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         let Some(idx) = self.wb.by_name.get(sheet).copied() else {
             return Value::Null;
         };
-        self.with_current(idx, || {
-            self.wb.sheets[idx].peek_value_with_provider(addr, self)
-        })
+        self.with_current(idx, || self.wb.sheets[idx].peek_value_with_provider(addr, self))
     }
 
     fn force_formula_recompute(&self) -> bool {

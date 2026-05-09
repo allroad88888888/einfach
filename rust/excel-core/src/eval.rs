@@ -38,17 +38,16 @@ impl<'a> EvalProvider for AtomEvalProvider<'a> {
     }
 
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
-        let is_current_sheet = CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet));
+        let is_current_sheet =
+            CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet));
         if is_current_sheet {
             return self
                 .cell_map
                 .get(&addr)
-                .map(
-                    |&id| match catch_unwind(AssertUnwindSafe(|| (self.get)(id))) {
-                        Ok(value) => value,
-                        Err(_) => Value::Error(ValueError::CyclicRef),
-                    },
-                )
+                .map(|&id| match catch_unwind(AssertUnwindSafe(|| (self.get)(id))) {
+                    Ok(value) => value,
+                    Err(_) => Value::Error(ValueError::CyclicRef),
+                })
                 .unwrap_or(Value::Null);
         }
 
@@ -432,14 +431,21 @@ fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)>
 }
 
 /// Collect values from a function argument, expanding ranges.
-fn collect_arg_values(arg: &Expr, provider: &dyn EvalProvider) -> Vec<Value> {
+fn collect_arg_values(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Vec<Value> {
     match arg {
         Expr::Range { start, end } => collect_range_values(start, end, provider),
         _ => vec![eval_expr_with_provider(arg, provider)],
     }
 }
 
-fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
+fn eval_func(
+    name: &str,
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> Value {
     match name {
         "SUM" => {
             let mut total = 0.0;
@@ -614,17 +620,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         // === Math ===
         "ABS" => unary_number(args, provider, |n| n.abs()),
-        "SQRT" => unary_number(
-            args,
-            provider,
-            |n| {
-                if n < 0.0 {
-                    f64::NAN
-                } else {
-                    n.sqrt()
-                }
-            },
-        ),
+        "SQRT" => unary_number(args, provider, |n| {
+            if n < 0.0 {
+                f64::NAN
+            } else {
+                n.sqrt()
+            }
+        }),
         "ROUND" => {
             // ROUND(value, digits)
             if args.len() != 2 {
@@ -1009,7 +1011,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
 }
 
-fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
+fn collect_numbers(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> Vec<f64> {
     let mut out = Vec::new();
     for arg in args {
         for v in collect_arg_values(arg, provider) {
@@ -1122,7 +1127,11 @@ fn coerce_to_bool(v: &Value) -> Option<bool> {
     }
 }
 
-fn unary_number(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64) -> f64) -> Value {
+fn unary_number(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(f64) -> f64,
+) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
@@ -1143,7 +1152,11 @@ fn unary_number(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64) -> f
     }
 }
 
-fn text_unary(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(&str) -> String) -> Value {
+fn text_unary(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(&str) -> String,
+) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
