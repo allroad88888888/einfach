@@ -1,4 +1,6 @@
 import { createSignal } from 'solid-js'
+import { addrToCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
+import { shiftFormulaRefs } from './formula-shift'
 import type { ISheet, CellValue } from './types'
 
 /**
@@ -15,23 +17,41 @@ import type { ISheet, CellValue } from './types'
  * changes. No more refreshAll across the whole table on every set (D.3).
  */
 
-/** What a cell holds before / after an undoable operation. */
-interface CellSnapshot {
-  addr: string
-  /** Original formula source if any; empty string when the cell holds a value. */
-  formula: string
-  /** Display value (used as the input for setCellInput on restore). */
-  display: string
-  type: CellValue['type']
-}
+/**
+ * What a cell holds before / after an undoable operation.
+ *
+ * Encoded as a tagged union so restore can dispatch on the actual cell
+ * kind without round-tripping through the display string. The display
+ * round-trip used to lose precision on numbers ("0.1+0.2" cases) and
+ * coerce error/boolean values into text on undo.
+ */
+type CellSnapshot =
+  | { addr: string; kind: 'formula'; formula: string }
+  | { addr: string; kind: 'null' }
+  | { addr: string; kind: 'number'; value: number }
+  | { addr: string; kind: 'boolean'; value: boolean }
+  | { addr: string; kind: 'error'; value: string }
+  | { addr: string; kind: 'text'; value: string }
 
 /** A clipboard "cells" payload. Top-left of the source range is at (0,0). */
 export interface ClipboardData {
   /** Row-major grid. Each entry is the raw input string (formula or value). */
   cells: string[][]
+  /**
+   * Top-left address of the source range (e.g. "B2"). Required to compute
+   * the (drow, dcol) shift applied to relative refs in pasted formulas
+   * — without this, `=A1+B1` copied from B2 stays `=A1+B1` when pasted
+   * to D5 instead of becoming `=C4+D4`.
+   */
+  originAddr: string
 }
 
 export function createSheetStore(sheet: ISheet) {
+  // === Selection ===
+  // Owned by the store so FormulaBar / Table / future right-click menus
+  // / keyboard handlers can all read & write a single source of truth.
+  const [selection, setSelectionRaw] = createSignal<CellCoord>({ row: 0, col: 0 })
+
   type CellHandle = {
     tick: () => number
     bump: (n: number) => number
@@ -71,30 +91,39 @@ export function createSheetStore(sheet: ISheet) {
   let pendingAddrs: Set<string> | null = null
 
   function snapshot(addr: string): CellSnapshot {
-    const cv = readCell(addr)
-    return {
-      addr,
-      formula: sheet.get_formula(addr),
-      display: cv.display,
-      type: cv.type,
-    }
+    const formula = sheet.get_formula(addr)
+    if (formula !== '') return { addr, kind: 'formula', formula }
+    const type = sheet.get_type(addr)
+    if (type === 'null') return { addr, kind: 'null' }
+    if (type === 'number') return { addr, kind: 'number', value: sheet.get_number(addr) }
+    if (type === 'boolean') return { addr, kind: 'boolean', value: sheet.get_display(addr) === 'TRUE' }
+    if (type === 'error') return { addr, kind: 'error', value: sheet.get_display(addr) }
+    return { addr, kind: 'text', value: sheet.get_display(addr) }
   }
 
   /** Restore a cell to a snapshot's state. */
   function restore(snap: CellSnapshot) {
-    if (snap.formula !== '') {
-      sheet.set_formula(snap.addr, snap.formula)
-    } else if (snap.type === 'null' && snap.display === '') {
-      sheet.clear_cell(snap.addr)
-    } else if (snap.type === 'number') {
-      const n = Number(snap.display)
-      if (!isNaN(n)) {
-        sheet.set_number(snap.addr, n)
-      } else {
-        sheet.set_text(snap.addr, snap.display)
-      }
-    } else {
-      sheet.set_text(snap.addr, snap.display)
+    switch (snap.kind) {
+      case 'formula':
+        sheet.set_formula(snap.addr, snap.formula)
+        return
+      case 'null':
+        sheet.clear_cell(snap.addr)
+        return
+      case 'number':
+        sheet.set_number(snap.addr, snap.value)
+        return
+      case 'boolean':
+        if (sheet.set_boolean) sheet.set_boolean(snap.addr, snap.value)
+        else sheet.set_text(snap.addr, snap.value ? 'TRUE' : 'FALSE')
+        return
+      case 'error':
+        if (sheet.set_error) sheet.set_error(snap.addr, snap.value)
+        else sheet.set_text(snap.addr, snap.value)
+        return
+      case 'text':
+        sheet.set_text(snap.addr, snap.value)
+        return
     }
   }
 
@@ -116,6 +145,15 @@ export function createSheetStore(sheet: ISheet) {
   }
 
   return {
+    /** Currently selected cell. Reactive — driven by Table & FormulaBar. */
+    selection,
+
+    /** Selection setter. Use `setSelection({ row, col })` from any component. */
+    setSelection: setSelectionRaw,
+
+    /** Convenience accessor — selection's address form. */
+    selectionAddr: () => coordToAddr(selection()),
+
     getCell(addr: string): CellValue {
       getHandle(addr).tick()
       return readCell(addr)
@@ -223,14 +261,13 @@ export function createSheetStore(sheet: ISheet) {
     // === Clipboard ===
     /**
      * Build a clipboard payload from a rectangular range of cell addresses.
-     * Each cell's source (formula or display) is captured as a string so
-     * paste can re-create the same cell type.
-     *
-     * Caller passes the addresses; computing the rectangle from a
-     * Selection is left to the UI layer.
+     * `addrs[0][0]` is treated as the source origin so paste can compute
+     * the (drow, dcol) shift for relative refs.
      */
     copy(addrs: string[][]): ClipboardData {
+      const originAddr = addrs[0]?.[0] ?? 'A1'
       return {
+        originAddr,
         cells: addrs.map((row) =>
           row.map((addr) => {
             const f = sheet.get_formula(addr)
@@ -240,17 +277,27 @@ export function createSheetStore(sheet: ISheet) {
       }
     },
 
-    /** Paste a clipboard payload starting at `originAddr` (top-left). */
-    paste(originAddr: string, data: ClipboardData) {
-      const m = originAddr.match(/^([A-Za-z]+)(\d+)$/)
-      if (!m) return
-      const startCol = lettersToCol(m[1])
-      const startRow = parseInt(m[2], 10) - 1
+    /**
+     * Paste a clipboard payload starting at `pasteAddr` (top-left of the
+     * destination). Formulas in the payload have their cell references
+     * shifted by (paste - copy origin), matching Excel's relative-ref
+     * paste semantics.
+     */
+    paste(pasteAddr: string, data: ClipboardData) {
+      const start = addrToCoord(pasteAddr)
+      if (!start) return
+      const origin = addrToCoord(data.originAddr) ?? { row: 0, col: 0 }
+      const drow = start.row - origin.row
+      const dcol = start.col - origin.col
       this.beginEdit()
       data.cells.forEach((row, dr) => {
         row.forEach((field, dc) => {
-          const addr = colToLetters(startCol + dc) + (startRow + dr + 1)
-          this.setCellInput(addr, field)
+          const addr = colToLetter(start.col + dc) + (start.row + dr + 1)
+          // Only shift if the field is a formula. Plain values pass through.
+          const out = field.startsWith('=')
+            ? shiftFormulaRefs(field, drow, dcol)
+            : field
+          this.setCellInput(addr, out)
         })
       })
       this.endEdit()
@@ -267,24 +314,6 @@ export function createSheetStore(sheet: ISheet) {
      */
     raw: sheet,
   }
-}
-
-function colToLetters(col: number): string {
-  let result = ''
-  let c = col
-  do {
-    result = String.fromCharCode(65 + (c % 26)) + result
-    c = Math.floor(c / 26) - 1
-  } while (c >= 0)
-  return result
-}
-
-function lettersToCol(letters: string): number {
-  let col = 0
-  for (const ch of letters.toUpperCase()) {
-    col = col * 26 + (ch.charCodeAt(0) - 64)
-  }
-  return col - 1
 }
 
 export type SheetStore = ReturnType<typeof createSheetStore>

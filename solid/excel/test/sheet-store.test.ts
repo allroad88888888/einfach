@@ -157,6 +157,23 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('undo preserves float precision (no stringify-parse roundtrip)', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        // A value whose decimal expansion round-trips exactly through
+        // Number↔String, but where future precision-sensitive callers
+        // would notice if we ever stored snap as display string.
+        const tricky = 0.1 + 0.2 // 0.30000000000000004
+        store.setNumber('A1', tricky)
+        store.setNumber('A1', 1)
+        store.undo()
+        // raw IEEE-754 bits should be identical, not just toString-equal.
+        const got = (store.raw as unknown as { get_number: (a: string) => number }).get_number('A1')
+        expect(got).toBe(tricky)
+        dispose()
+      })
+    })
+
     it('undo restores formula source', () => {
       createRoot((dispose) => {
         const store = createTestStore()
@@ -167,6 +184,30 @@ describe('createSheetStore', () => {
         store.setNumber('B1', 99)
         store.undo()
         expect(store.getFormula('B1')).toBe('=A1*2')
+        dispose()
+      })
+    })
+
+    it('undo preserves primitive error cells', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.raw.set_error?.('A1', '#REF!')
+        store.setNumber('A1', 1)
+        store.undo()
+        expect(store.getCell('A1').type).toBe('error')
+        expect(store.getCell('A1').display).toBe('#REF!')
+        dispose()
+      })
+    })
+
+    it('undo preserves primitive boolean cells', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.raw.set_boolean?.('A1', true)
+        store.setText('A1', 'x')
+        store.undo()
+        expect(store.getCell('A1').type).toBe('boolean')
+        expect(store.getCell('A1').display).toBe('TRUE')
         dispose()
       })
     })
@@ -227,16 +268,52 @@ describe('createSheetStore', () => {
       })
     })
 
-    it('paste preserves formulas', () => {
+    it('paste captures formula source, not the result', () => {
       createRoot((dispose) => {
         const store = createTestStore()
         store.setNumber('A1', 10)
         store.setFormula('B1', '=A1*2')
         const data = store.copy([['B1']])
-        // The clipboard captures the formula source, not the result.
         expect(data.cells[0][0]).toBe('=A1*2')
-        store.paste('D1', data)
-        expect(store.getFormula('D1')).toBe('=A1*2')
+        // Paste at the same location — no shift, formula identical.
+        store.paste('B1', data)
+        expect(store.getFormula('B1')).toBe('=A1*2')
+        dispose()
+      })
+    })
+
+    it('paste shifts relative cell refs by (paste - copy origin)', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 10)
+        store.setFormula('B1', '=A1*2')
+        const data = store.copy([['B1']])
+        // B1 → D5 = +2 cols, +4 rows. A1 ref shifts to C5.
+        store.paste('D5', data)
+        expect(store.getFormula('D5')).toBe('=C5*2')
+        dispose()
+      })
+    })
+
+    it('paste shifts cross-sheet refs but keeps sheet name', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setFormula('B2', '=Data!A1+1')
+        const data = store.copy([['B2']])
+        // B2 → C3 = +1 col, +1 row. Data!A1 → Data!B2.
+        store.paste('C3', data)
+        expect(store.getFormula('C3')).toBe('=Data!B2+1')
+        dispose()
+      })
+    })
+
+    it('paste leaves non-formula values unshifted', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 42)
+        const data = store.copy([['A1']])
+        store.paste('D5', data)
+        expect(store.getCell('D5').display).toBe('42')
         dispose()
       })
     })
@@ -275,6 +352,26 @@ describe('createSheetStore', () => {
       expect(store.raw).toBeDefined()
       expect(typeof store.raw.set_number).toBe('function')
       dispose()
+    })
+  })
+
+  describe('selection', () => {
+    it('starts at A1', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        expect(store.selection()).toEqual({ row: 0, col: 0 })
+        expect(store.selectionAddr()).toBe('A1')
+        dispose()
+      })
+    })
+
+    it('updates and exposes the address form', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelection({ row: 4, col: 2 })
+        expect(store.selectionAddr()).toBe('C5')
+        dispose()
+      })
     })
   })
 })

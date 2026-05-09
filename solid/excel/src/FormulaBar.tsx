@@ -4,8 +4,12 @@ import type { SheetStore } from './sheet-store'
 
 export interface FormulaBarProps {
   store: SheetStore
-  /** Currently selected cell address, or null when nothing is selected. */
-  activeAddr: () => string | null
+  /**
+   * Optional override for the active cell address. If omitted, FormulaBar
+   * reads the selection from `store.selectionAddr()` (the default and
+   * recommended path).
+   */
+  activeAddr?: () => string | null
   /** Called after the user commits a value (Enter / blur). */
   onCommit?: () => void
 }
@@ -22,28 +26,32 @@ export function FormulaBar(props: FormulaBarProps) {
   const [draft, setDraft] = createSignal<string>('')
   const [focused, setFocused] = createSignal(false)
 
+  /** The address to edit — prop override wins, else the store's selection. */
+  const addr = (): string | null =>
+    props.activeAddr ? props.activeAddr() : props.store.selectionAddr()
+
   // Sync draft from the active cell whenever the selection changes or the
   // cell value changes externally — but only when the input isn't focused
   // (otherwise we'd clobber the user's typing).
   createEffect(() => {
-    const addr = props.activeAddr()
+    const a = addr()
     if (focused()) return
-    if (addr === null) {
+    if (a === null) {
       setDraft('')
       return
     }
-    const formula = props.store.getFormula(addr)
+    const formula = props.store.getFormula(a)
     if (formula !== '') {
       setDraft(formula)
     } else {
-      setDraft(props.store.getCell(addr).display)
+      setDraft(props.store.getCell(a).display)
     }
   })
 
   function commit() {
-    const addr = props.activeAddr()
-    if (addr === null) return
-    props.store.setCellInput(addr, draft())
+    const a = addr()
+    if (a === null) return
+    props.store.setCellInput(a, draft())
     props.onCommit?.()
   }
 
@@ -53,11 +61,10 @@ export function FormulaBar(props: FormulaBarProps) {
       commit()
       ;(e.currentTarget as HTMLInputElement).blur()
     } else if (e.key === 'Escape') {
-      // Reset draft from the active cell.
-      const addr = props.activeAddr()
-      if (addr !== null) {
-        const formula = props.store.getFormula(addr)
-        setDraft(formula !== '' ? formula : props.store.getCell(addr).display)
+      const a = addr()
+      if (a !== null) {
+        const formula = props.store.getFormula(a)
+        setDraft(formula !== '' ? formula : props.store.getCell(a).display)
       }
       ;(e.currentTarget as HTMLInputElement).blur()
     }
@@ -65,7 +72,7 @@ export function FormulaBar(props: FormulaBarProps) {
 
   return (
     <div class="formula-bar">
-      <span class="formula-bar-addr">{props.activeAddr() ?? ''}</span>
+      <span class="formula-bar-addr">{addr() ?? ''}</span>
       <input
         class="formula-bar-input"
         type="text"
@@ -77,7 +84,7 @@ export function FormulaBar(props: FormulaBarProps) {
           commit()
         }}
         onKeyDown={onKeyDown}
-        disabled={props.activeAddr() === null}
+        disabled={addr() === null}
       />
     </div>
   )

@@ -1,5 +1,5 @@
 
-import { For, Show, createSignal } from 'solid-js'
+import { For, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { FormulaBar } from './FormulaBar'
 import { clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
@@ -9,13 +9,6 @@ export interface TableProps {
   store: SheetStore
   rows?: number
   cols?: number
-  /**
-   * Optional controlled selection. If provided, Table reads selection
-   * from it and reports changes via `onSelectionChange`. If omitted,
-   * Table maintains its own selection internally.
-   */
-  selected?: () => CellCoord
-  onSelectionChange?: (next: CellCoord) => void
   /** Render an Excel-style formula bar above the grid. */
   formulaBar?: boolean
 }
@@ -32,16 +25,12 @@ export function Table(props: TableProps) {
   const rowIndices = () => Array.from({ length: rows() }, (_, i) => i)
   const colIndices = () => Array.from({ length: cols() }, (_, i) => i)
 
-  const [internalSel, setInternalSel] = createSignal<CellCoord>({ row: 0, col: 0 })
-  const selected = () => (props.selected ? props.selected() : internalSel())
+  // Selection lives on the store so FormulaBar / future copy-paste / right-
+  // click menus all read & write the same source of truth.
+  const selected = () => props.store.selection()
 
   function selectCoord(next: CellCoord) {
-    const clamped = clampCoord(next, rows(), cols())
-    if (props.onSelectionChange) {
-      props.onSelectionChange(clamped)
-    } else {
-      setInternalSel(clamped)
-    }
+    props.store.setSelection(clampCoord(next, rows(), cols()))
   }
 
   function move(drow: number, dcol: number) {
@@ -115,10 +104,7 @@ export function Table(props: TableProps) {
       onKeyDown={onKeyDown}
     >
       <Show when={props.formulaBar}>
-        <FormulaBar
-          store={props.store}
-          activeAddr={() => coordToAddr(selected())}
-        />
+        <FormulaBar store={props.store} />
       </Show>
       <table class="excel-table">
         <thead>
