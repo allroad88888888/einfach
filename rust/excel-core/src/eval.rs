@@ -466,7 +466,10 @@ fn eval_func(
                     }
                 }
             }
-            min.map_or(Value::Number(0.0), Value::Number)
+            // Empty set: Excel returns 0 if there are no numeric arguments
+            // at all — but #NUM! in some versions. We prefer #VALUE! over a
+            // misleading 0 (B.6). Callers wanting "0 default" should pass it.
+            min.map_or(Value::Error(ValueError::InvalidValue), Value::Number)
         }
 
         "MAX" => {

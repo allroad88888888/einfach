@@ -145,7 +145,9 @@ impl Sheet {
             // Borrow the current readable map (B.1: not a snapshot — picks up
             // any later set_formula / set_cell that retargets a cell).
             let map = readable.borrow();
-            eval_expr(&expr_for_closure, &|id| get(id), &*map)
+            // Pass `get` straight through — wrapping it in `&|id| get(id)`
+            // (the previous shape) was a no-op tier (B.8 cleanup).
+            eval_expr(&expr_for_closure, get, &*map)
         });
 
         self.formula_cells.insert(addr, derived_id);
@@ -435,7 +437,7 @@ impl Sheet {
 
         let derived_id = self.store.create_derived(move |get| {
             let map = readable.borrow();
-            eval_expr(&expr_for_closure, &|id| get(id), &*map)
+            eval_expr(&expr_for_closure, get, &*map)
         });
 
         self.formula_cells.insert(addr, derived_id);

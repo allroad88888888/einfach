@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use crate::atom::{AtomId, Value};
@@ -530,21 +530,25 @@ impl Store {
             }
         }
 
-        let mut queue: Vec<AtomId> = in_degree
+        // FIFO via VecDeque so notification order tracks the order atoms
+        // entered the ready queue — stable across runs given identical
+        // dependency graphs (A.7). LIFO produced topologically-correct but
+        // unpredictable ordering.
+        let mut queue: VecDeque<AtomId> = in_degree
             .iter()
             .filter(|(_, &deg)| deg == 0)
             .map(|(&id, _)| id)
             .collect();
         let mut result = Vec::new();
 
-        while let Some(id) = queue.pop() {
+        while let Some(id) = queue.pop_front() {
             result.push(id);
             if let Some(backs) = self.back_deps.get(&id) {
                 for &back in backs {
                     if let Some(deg) = in_degree.get_mut(&back) {
                         *deg -= 1;
                         if *deg == 0 {
-                            queue.push(back);
+                            queue.push_back(back);
                         }
                     }
                 }

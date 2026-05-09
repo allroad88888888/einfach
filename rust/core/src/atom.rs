@@ -80,6 +80,12 @@ impl Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            // All NaN values compare equal regardless of bit pattern. Without
+            // this fallback, two #DIV/0!-induced NaNs from different code
+            // paths (quiet vs signaling, different payloads) would be
+            // considered different and trigger spurious downstream
+            // recompute + notify (A.3).
+            (Value::Number(a), Value::Number(b)) if a.is_nan() && b.is_nan() => true,
             (Value::Number(a), Value::Number(b)) => a.to_bits() == b.to_bits(),
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
@@ -116,6 +122,16 @@ mod tests {
     #[test]
     fn nan_equality_bitwise() {
         assert_eq!(Value::Number(f64::NAN), Value::Number(f64::NAN));
+    }
+
+    #[test]
+    fn nan_equality_across_different_payloads() {
+        // Construct two distinct NaN bit patterns. Both should compare equal
+        // — without the is_nan fallback they'd differ by bits.
+        let a = f64::NAN;
+        let b = f64::from_bits(0x7ff8_0000_0000_0001);
+        assert_ne!(a.to_bits(), b.to_bits(), "test setup: bits should differ");
+        assert_eq!(Value::Number(a), Value::Number(b));
     }
 
     #[test]
