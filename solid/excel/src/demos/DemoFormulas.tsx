@@ -1,14 +1,49 @@
 
+import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
-import { createSheetStore } from '../sheet-store'
-import { createJSSheet } from '../js-sheet'
+import { createSheetStore, type SheetStore } from '../sheet-store'
+import { createWasmSheet } from '../wasm-sheet'
 
 /**
  * Demo 2: 公式演示 — 展示各种公式能力
+ *
+ * Uses the real Rust + WASM backend so SUM / AVERAGE / COUNT / MIN / MAX /
+ * IF render real numbers on first paint. The other demos still use
+ * `createJSSheet` (which has only a subset of the formula evaluator);
+ * switching them is a one-line swap of the factory below.
  */
 export function DemoFormulas() {
-  const store = createSheetStore(createJSSheet())
+  const [storeRes] = createResource<SheetStore>(async () => {
+    const sheet = await createWasmSheet()
+    const store = createSheetStore(sheet)
+    seed(store)
+    return store
+  })
 
+  return (
+    <Show
+      when={storeRes()}
+      fallback={<div class="demo-page"><p>Loading WASM backend…</p></div>}
+    >
+      {(store) => (
+        <div class="demo-page">
+          <div class="demo-header">
+            <h3>Formula Showcase</h3>
+            <p class="demo-desc">
+              Try changing the <strong>blue numbers</strong> — all formulas update automatically.
+              Cell E4 shows <code>#DIV/0!</code> (division by zero).
+              The chain F8→G8→H8→I8 propagates through 4 levels.
+            </p>
+          </div>
+          <Table store={store()} rows={18} cols={10} formulaBar />
+        </div>
+      )}
+    </Show>
+  )
+}
+
+/** Seed the demo grid. Split out so the loading branch stays tiny. */
+function seed(store: SheetStore) {
   // --- Section 1: 基础算术 ---
   store.setText('A1', 'Arithmetic')
   store.setText('A2', 'a')
@@ -81,18 +116,4 @@ export function DemoFormulas() {
   store.setFormula('G8', '=F8*2')
   store.setFormula('H8', '=G8+10')
   store.setFormula('I8', '=H8*3')
-
-  return (
-    <div class="demo-page">
-      <div class="demo-header">
-        <h3>Formula Showcase</h3>
-        <p class="demo-desc">
-          Try changing the <strong>blue numbers</strong> — all formulas update automatically.
-          Cell E4 shows <code>#DIV/0!</code> (division by zero).
-          The chain F8→G8→H8→I8 propagates through 4 levels.
-        </p>
-      </div>
-      <Table store={store} rows={18} cols={10} formulaBar />
-    </div>
-  )
 }

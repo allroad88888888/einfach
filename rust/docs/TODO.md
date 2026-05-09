@@ -63,14 +63,12 @@
 - **路径**：要么记录全 sheet 快照（贵），要么记录 reverse op（insert_row 的 reverse 是 delete_row + 把删的内容放回）
 - **判断**：等 lazy formula 切换后，formula 不再持有 derived atom，sheet 的状态量级变小，全快照才可控
 
-### 1.7 □ Solid demo 实际加载 WASM
-- **现状**：所有 demo 都 `createSheetStore(createJSSheet())`
-- **后果**：DemoFormulas 首屏 SUM(A,B,C) / AVERAGE / COUNT / MIN / MAX / IF 全 `#ERROR!`（playwright 已验证）
-- **依赖**：
-  - `wasm-pack build --target web rust/wasm`
-  - `vite-plugin-wasm` + `vite-plugin-top-level-await` 或 `?init` 内联
-  - 写 `createWasmSheet()` 工厂返回 ISheet
-- **注意**：JS mock 现在跟 Rust 在公式 ref 重定位上对齐了，但 `evalFormula` 仍是子集；DemoFormulas 走 SUM/IF 等还是 #ERROR!，必须切 WASM 才彻底好
+### 1.7 ✅ Solid demo 实际加载 WASM — DemoFormulas 已切
+- **DemoFormulas**：已通过 `createWasmSheet()` 工厂加载 Rust WASM 后端，SUM / AVERAGE / COUNT / MIN / MAX / IF 在首屏渲染真实数值
+- **plumbing**：`solid/excel/vite.config.ts` 加了 `vite-plugin-wasm` + `vite-plugin-top-level-await`；`solid/excel/src/wasm-sheet.ts` 包 wasm-pack 输出（`./wasm-pkg/`，`.gitignore` 已忽略）；`build:wasm` script 跑 `wasm-pack build --target web --out-dir ./wasm-pkg ../../rust/wasm`
+- **其他 demo（Blank/Budget/Grades/Sales）**：仍用 `createJSSheet`（评估器子集足够）。切换是单行替换 `createSheetStore` 入参
+- **构建前置**：`rustup target add wasm32-unknown-unknown` + `cargo install wasm-pack`；`Cargo.toml` 关掉了 `wasm-opt`（GitHub binaryen 下载在受限网络里挂；`opt-level = "s"` + lto 已经够）
+- **测试影响**：jest 仍走 JS mock（339 用例不变），`createWasmSheet` 只在浏览器/dev server 跑
 
 ### 1.8 □ 格式化 UI
 - **代码**：`CellFormat` + `apply_rules` + `ConditionalRule` 后端齐全

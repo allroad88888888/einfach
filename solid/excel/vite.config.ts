@@ -1,8 +1,13 @@
 import { defineConfig } from 'vite'
 import solidPlugin from 'vite-plugin-solid'
+import wasm from 'vite-plugin-wasm'
+import topLevelAwait from 'vite-plugin-top-level-await'
 
 export default defineConfig({
-  plugins: [solidPlugin()],
+  // Order matters: wasm() rewrites .wasm imports, then solidPlugin transforms
+  // .tsx, then topLevelAwait() rewrites the resulting top-level `await`s into
+  // an async IIFE so the bundle is loadable on browsers without TLA support.
+  plugins: [wasm(), topLevelAwait(), solidPlugin()],
   build: {
     target: 'esnext',
   },
