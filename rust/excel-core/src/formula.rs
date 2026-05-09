@@ -20,10 +20,7 @@ pub enum Expr {
     /// Unary negation: -expr
     Negate(Box<Expr>),
     /// Function call: name(arg1, arg2, ...)
-    FuncCall {
-        name: String,
-        args: Vec<Expr>,
-    },
+    FuncCall { name: String, args: Vec<Expr> },
     /// Cell range: A1:B3 (for function args)
     Range {
         start: CellAddress,
@@ -31,10 +28,7 @@ pub enum Expr {
     },
     /// Cross-sheet reference: `Sheet1!A1`. Resolution requires a Workbook
     /// scope at eval time; standalone Sheet eval treats it as #REF!.
-    SheetRef {
-        sheet: String,
-        addr: CellAddress,
-    },
+    SheetRef { sheet: String, addr: CellAddress },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,10 +374,7 @@ impl Parser {
             }
             let addr_str: String = self.chars[addr_start..self.pos].iter().collect();
             let addr = CellAddress::parse(&addr_str)?;
-            return Some(Expr::SheetRef {
-                sheet: ident,
-                addr,
-            });
+            return Some(Expr::SheetRef { sheet: ident, addr });
         }
 
         // Check if it's a cell reference (with possible range)
@@ -625,7 +616,6 @@ mod tests {
         );
     }
 
-    #[test]
     #[test]
     fn parse_cross_sheet_ref() {
         let result = parse_formula("=Sheet2!A1").unwrap();

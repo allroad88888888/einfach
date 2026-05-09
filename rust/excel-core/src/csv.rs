@@ -184,19 +184,11 @@ mod tests {
     #[test]
     fn import_export_through_sheet() {
         let mut sheet = Sheet::new();
-        import_csv(
-            &mut sheet,
-            "1,2,3\n4,5,6\n",
-            CellAddress::new(0, 0),
-        );
+        import_csv(&mut sheet, "1,2,3\n4,5,6\n", CellAddress::new(0, 0));
         assert_eq!(sheet.get_cell("A1"), Value::Number(1.0));
         assert_eq!(sheet.get_cell("C2"), Value::Number(6.0));
 
-        let exported = export_csv(
-            &mut sheet,
-            CellAddress::new(0, 0),
-            CellAddress::new(1, 2),
-        );
+        let exported = export_csv(&mut sheet, CellAddress::new(0, 0), CellAddress::new(1, 2));
         assert_eq!(exported, "1,2,3\n4,5,6");
     }
 

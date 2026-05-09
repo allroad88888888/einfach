@@ -54,12 +54,8 @@ impl CellFormat {
     pub fn format_number(&self, n: f64) -> String {
         match &self.number_format {
             NumberFormat::General => default_number_string(n),
-            NumberFormat::Decimal { digits, thousands } => {
-                format_fixed(n, *digits, *thousands, "")
-            }
-            NumberFormat::Percent { digits } => {
-                format_fixed(n * 100.0, *digits, false, "%")
-            }
+            NumberFormat::Decimal { digits, thousands } => format_fixed(n, *digits, *thousands, ""),
+            NumberFormat::Percent { digits } => format_fixed(n * 100.0, *digits, false, "%"),
             NumberFormat::Currency { symbol, digits } => {
                 let body = format_fixed(n, *digits, true, "");
                 format!("{}{}", symbol, body)

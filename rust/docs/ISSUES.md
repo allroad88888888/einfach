@@ -83,7 +83,7 @@
 
 ### 新增（review 之外完成的功能）
 - ✅ 跨 sheet 引用 parser (`Name!A1`) — c4057ce
-- ✅ Workbook 跨 sheet eval (TLS resolver) — 99f8528
+- ✅ Workbook 跨 sheet eval (TLS resolver，单层 read-time 刷新；链式缓存仍 deferred) — 99f8528
 - ✅ TODAY / NOW (chrono wasmbind) — f92f142
 - ✅ 条件格式后端 (ConditionalRule + apply_rules) — ce973f2
 - ✅ undo / redo + clipboard copy/paste TS API — 2267c54
@@ -555,5 +555,3 @@ ROADMAP 第一期目标"WASM 订阅接通"完成后这个矛盾自动消失，�
 - A.2（unsafe）当前路径正确所以没翻车
 
 整体方向对，**当前是一个好的 PoC** —— 但要进一期实质开发前，必修项必须先解决。
-
-

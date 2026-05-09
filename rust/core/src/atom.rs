@@ -12,11 +12,11 @@ impl AtomId {
 /// Error types that can occur in cell formulas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueError {
-    DivisionByZero,  // #DIV/0!
-    InvalidRef,      // #REF!
-    InvalidValue,    // #VALUE!
-    InvalidName,     // #NAME?
-    CyclicRef,       // #CYCLE!
+    DivisionByZero, // #DIV/0!
+    InvalidRef,     // #REF!
+    InvalidValue,   // #VALUE!
+    InvalidName,    // #NAME?
+    CyclicRef,      // #CYCLE!
 }
 
 impl std::fmt::Display for ValueError {
