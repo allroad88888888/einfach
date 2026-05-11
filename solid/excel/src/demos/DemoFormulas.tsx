@@ -1,5 +1,5 @@
 
-import { Show, createResource } from 'solid-js'
+import { Show, createResource, onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
@@ -17,6 +17,7 @@ export function DemoFormulas() {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
     seed(store)
+    exposeStoreForDebug(store)
     return store
   })
 
@@ -40,6 +41,31 @@ export function DemoFormulas() {
       )}
     </Show>
   )
+}
+
+/**
+ * Debug-only: stash the WASM-backed SheetStore on `window.__einfachStore`
+ * when the URL has `?debug=1` (or `?debug=render`). Mirrors DemoBlank's
+ * exposure but here it's a WasmSheet underneath, so e2e specs can call
+ * `store.raw.__debugPanicNextCallback()` for the panic regression test.
+ * Cleared on demo unmount.
+ */
+declare global {
+  interface Window {
+    __einfachStore?: SheetStore
+  }
+}
+
+function exposeStoreForDebug(store: SheetStore) {
+  if (typeof window === 'undefined') return
+  const debug = new URLSearchParams(window.location.search).get('debug')
+  if (debug !== '1' && debug !== 'render') return
+  window.__einfachStore = store
+  onCleanup(() => {
+    if (window.__einfachStore === store) {
+      delete window.__einfachStore
+    }
+  })
 }
 
 /** Seed the demo grid. Split out so the loading branch stays tiny. */

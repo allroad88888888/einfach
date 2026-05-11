@@ -1,5 +1,6 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{CellSubscription, Sheet, Workbook};
+use std::cell::Cell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
@@ -10,6 +11,19 @@ use wasm_bindgen::JsCast;
 fn install_panic_hook() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
+}
+
+thread_local! {
+    /// One-shot debug knob: when true, the next `JsCallbackListener::on_change`
+    /// fires panic!() inside its microtask. Used by the regression e2e
+    /// (`solid/excel/e2e/regression.spec.ts`) to verify two things in the
+    /// real browser:
+    ///   1. `console_error_panic_hook` actually surfaces the panic to
+    ///      `console.error` (C.10).
+    ///   2. The wasm instance survives — the panicking microtask aborts but
+    ///      subsequent `set_*` / `get_*` calls keep working.
+    /// Cleared on consume so a single arming triggers exactly one panic.
+    static PANIC_NEXT_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Adapter listener that bridges core change events to a JS callback.
@@ -31,6 +45,20 @@ impl CellListener for JsCallbackListener {
         {
             let callback = self.callback.clone();
             let task = Closure::once_into_js(move || {
+                // Debug knob — see PANIC_NEXT_CALLBACK comment above. Checked
+                // inside the microtask so the panic happens AFTER the
+                // wasm-bindgen &mut borrow has released, matching real
+                // listener panic semantics.
+                let should_panic = PANIC_NEXT_CALLBACK.with(|c| {
+                    let was = c.get();
+                    if was {
+                        c.set(false);
+                    }
+                    was
+                });
+                if should_panic {
+                    panic!("[__debug_panic_next_callback] injected panic for regression test");
+                }
                 let _ = callback.call0(&JsValue::undefined());
             });
             let queued =
@@ -202,6 +230,18 @@ impl WasmSheet {
         if let Some(sub) = self.subscriptions.remove(&token) {
             self.sheet.unsubscribe_cell(sub);
         }
+    }
+
+    /// Debug-only panic injection — arms a one-shot flag so the next
+    /// JsCallbackListener fire panics inside its microtask. After consumption
+    /// the flag clears, so subsequent fires behave normally. Used by
+    /// `regression.spec.ts` (Discovered #E.2) to verify console_error_panic_hook
+    /// surfaces the panic to console.error AND the wasm instance keeps
+    /// working for subsequent set_/get_ calls. Not part of the production
+    /// API surface — naming with `__` prefix to flag.
+    #[wasm_bindgen(js_name = "__debugPanicNextCallback")]
+    pub fn debug_panic_next_callback(&self) {
+        PANIC_NEXT_CALLBACK.with(|c| c.set(true));
     }
 
     /// Return a cell's original formula text, or empty string for cells

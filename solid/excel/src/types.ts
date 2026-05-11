@@ -38,6 +38,13 @@ export interface ISheet {
   delete_row?(at: number, count: number): void
   insert_col?(at: number, count: number): void
   delete_col?(at: number, count: number): void
+  /**
+   * Debug-only (WasmSheet only): arm a one-shot panic in the next
+   * subscriber callback. Used by `regression.spec.ts` (Discovered #E.2)
+   * to verify console_error_panic_hook surfaces panics without taking
+   * down the wasm instance. Absent on JS mock.
+   */
+  __debugPanicNextCallback?(): void
 }
 
 export type CellValue = {

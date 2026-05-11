@@ -1,0 +1,89 @@
+name: e2e
+
+# Solid Excel browser tests. Separate from `ci.yml` (jest + build) so
+# e2e flake doesn't block the unit-test signal while the suite settles in.
+#
+# Policy (per `solid/excel/docs/E2E_TEST_PLAN.md` "CI Gate Policy"):
+#   - Advisory for the first 2 weeks of green runs (no PR merge gate).
+#   - Failures upload `playwright-report/` + `test-results/` for triage.
+#   - Promote to PR-blocking once stable.
+#
+# Local equivalent:
+#   NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when new pushes land on the same PR — no point
+# burning compute on stale commits.
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('rust/**/Cargo.lock', 'rust/**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-e2e-
+
+      - name: Install wasm-pack
+        run: |
+          if ! command -v wasm-pack >/dev/null; then
+            curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          fi
+          wasm-pack --version
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build WASM bundle
+        run: npm run build:wasm -w @einfach/solid-excel
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run e2e
+        run: npm run e2e -w @einfach/solid-excel
+        # Advisory mode for the first 2 weeks. Flip `continue-on-error` to
+        # false (or just delete the line) once the suite is stable to make
+        # this a PR-blocking gate.
+        continue-on-error: true
+
+      - name: Upload Playwright report on failure
+        if: failure() || always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            solid/excel/playwright-report/
+            solid/excel/test-results/
+          retention-days: 14
+          if-no-files-found: ignore

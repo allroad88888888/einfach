@@ -246,15 +246,65 @@ test.describe('Solid Excel regression pins', () => {
     )
   })
 
-  test.skip('JsCallbackListener panic surfaces without taking down the wasm instance', async () => {
-    // Pinned in Rust at:
-    //   rust/wasm/src/lib.rs (panic-injection variant under #[cfg(test)])
+  test('JsCallbackListener panic surfaces without taking down the wasm instance', async ({
+    page,
+  }) => {
+    // C.10: console_error_panic_hook surfaces panics to console.error,
+    // and the wasm instance keeps working after a listener panic. Browser
+    // verification path uses the `__debugPanicNextCallback` knob added on
+    // WasmSheet — arms a one-shot flag, the next subscriber-callback
+    // microtask panics, the next set_/get_ on the same sheet still works.
     //
-    // The browser can't easily trigger a controlled panic inside the JS
-    // callback path without a special test build that exposes a "panic
-    // here on next call" hook. Building one is non-trivial (wasm-pack
-    // currently produces a single release bundle). The Rust test exists,
-    // and a manual smoke pass after any wasm-bindgen upgrade is the
-    // current safety net.
+    // Uses DemoFormulas (only WASM-backed demo whose store we expose on
+    // window for debug). Allowlist the panic message so the
+    // guardConsoleErrors at the top of this file doesn't immediately fail
+    // the test on the very thing we're verifying gets logged.
+    const offConsole = guardConsoleErrors(page, [
+      /injected panic for regression test/,
+      /panicked at/, // wasm-bindgen panic stack header
+      /RuntimeError: unreachable/, // wasm trap when panic propagates
+    ])
+
+    const panicMessages: string[] = []
+    page.on('console', (msg) => {
+      if (msg.type() !== 'error') return
+      const text = msg.text()
+      if (text.includes('injected panic for regression test')) {
+        panicMessages.push(text)
+      }
+    })
+
+    await gotoDemo(page, 'Formulas', 'debug=1')
+
+    // Subscribe to a cell by reading it (Cell mounts → SheetStore.subscribe
+    // fires) — we picked an arithmetic cell that's already in the seed.
+    await expect(cellDisplay(page, 'C3')).toHaveText('13')
+
+    // Arm the panic. Next subscriber callback fire panics inside its
+    // microtask. Setting A3 mutates a value that C3 (=A3+B3) depends on,
+    // which fires the C3 subscriber.
+    const armed = await page.evaluate(() => {
+      const store = window.__einfachStore
+      const raw = store?.raw as { __debugPanicNextCallback?: () => void } | undefined
+      if (!raw?.__debugPanicNextCallback) return false
+      raw.__debugPanicNextCallback()
+      return true
+    })
+    expect(armed).toBe(true)
+
+    await typeIntoCell(page, 'A3', '20')
+
+    // The panic happens in a queued microtask. Wait for the console
+    // signal to land before asserting wasm survival.
+    await expect.poll(() => panicMessages.length, { timeout: 2000 }).toBeGreaterThan(0)
+
+    // Wasm instance is still alive — another set + dependent re-eval works.
+    // (Pre-fix behavior would be either a stuck UI or wasm-instance death
+    //  causing every subsequent op to throw.)
+    await typeIntoCell(page, 'A3', '5')
+    // C3 = A3 + B3 = 5 + 3 = 8.
+    await expect(cellDisplay(page, 'C3')).toHaveText('8')
+
+    offConsole()
   })
 })

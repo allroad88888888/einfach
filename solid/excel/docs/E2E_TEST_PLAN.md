@@ -14,7 +14,7 @@ worktrees. Status of each plan section:
 | P0.0.1 cache state badge | ✅ | `DemoCrossSheetChain.tsx:43` `data-cache-state="Sheet2!C5"` |
 | P0.0.2 lazy console probe | ✅ | `wasm-workbook-store.ts:106` `[lazy-demo] computed Sheet2!C5` |
 | P0.1 build:wasm in webServer | ✅ | `playwright.config.ts:41` |
-| P0.2 CI wiring | □ | No `.github/workflows`. Next priority. |
+| P0.2 CI wiring | ✅ | `.github/workflows/e2e.yml` advisory mode. Workflow runs build:wasm + playwright + uploads report on failure |
 | P0.3 fix double commit | ✅ | `Cell.tsx::commitEdit` + `FormulaBar.tsx::commit` guards |
 | P0 Workbook Chain spec | ✅ | `workbook-chain.spec.ts` (7 tests) |
 | P0 Existing Blank flows | ✅ | `smoke.spec.ts` retained, helpers extracted |
@@ -24,7 +24,7 @@ worktrees. Status of each plan section:
 | P1 MultiSheet UI | ⚠️ | `multisheet-ui.spec.ts` (8 tests). Plan's prompt-on-`+` model was wrong; agent corrected (see Discovered #C) |
 | P1 Other Demo Smoke (Budget/Grades/Sales) | □ | Decision still pending |
 | P1 Render Counter | ⚠️ | `render-counter.spec.ts` (6 tests, 3 strict-delta). **Probe broken in source**, MutationObserver workaround in spec (see Discovered #A) |
-| Regression Spec | ⚠️ | `regression.spec.ts` (5 tests, **2 .skip** — see Discovered #E) |
+| Regression Spec | ✅ | `regression.spec.ts` (6 tests, all passing — Discovered #E.1 + #E.2 both landed) |
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
@@ -109,18 +109,23 @@ suite fails confusingly.
 `NO_PROXY=localhost,127.0.0.1` before `npm run e2e`. Add to
 `solid/excel/README.md` if not already there. CI is unaffected.
 
-### E. Skipped regression entries — 1 of 2 now active
+### E. Skipped regression entries — both now active ✅
 
 - ✅ **subscribe-then-set_formula fires once** — landed via
   `SheetStore.subscriberFireCount(addr)` debug accessor + `DemoBlank`
   conditional `window.__einfachStore` exposure on `?debug=1`.
-  `regression.spec.ts` queries fire counts directly through
-  `page.evaluate`. Counter goes 0 → 0 (write to unrelated A1) → 1
-  (set_formula on the previously-empty subscribed B1). Strict.
-- ⏳ **JsCallbackListener panic** still `.skip`. Needs a
-  `?debug=panic-next` query knob in `wasm-sheet.ts` to inject a single
-  panic. Currently pinned by `cargo test`. The fix lifts JS↔Rust
-  panic propagation observability; treat as its own ticket.
+  `regression.spec.ts` queries fire counts through `page.evaluate`.
+  Counter goes 0 → 0 (unrelated A1 write) → 1 (set_formula on the
+  previously-empty subscribed B1). Strict equality.
+- ✅ **JsCallbackListener panic** — landed via
+  `WasmSheet::__debugPanicNextCallback` one-shot flag + `DemoFormulas`
+  exposing its WASM-backed store on `window.__einfachStore` in `?debug=1`.
+  The arming method sets a thread-local `PANIC_NEXT_CALLBACK` cell;
+  `JsCallbackListener::on_change`'s queueMicrotask closure checks +
+  consumes it, panicking inside the microtask if armed.
+  `regression.spec.ts` arms the flag, mutates a dependency cell,
+  asserts the panic message lands on `console.error` AND a subsequent
+  set/get on the same WasmSheet still works (the wasm instance survives).
 
 ## Goals
 
@@ -618,21 +623,26 @@ next ticket. Forward order, post-landing:
 5. ✅ Add clipboard permission setup and clipboard tests.
 6. ✅ Add `formulas-wasm.spec.ts`.
 7. ✅ Add FormulaBar and MultiSheet specs.
-8. □ Wire e2e into CI (template in P0.2 above).
+8. ✅ Wire e2e into CI — `.github/workflows/e2e.yml` landed in advisory
+   mode (continue-on-error). Promote to blocking once 2 weeks of green
+   runs prove out.
 9. ✅ Close 3 outstanding gaps from Done Criteria:
    a. ✅ Fix `Cell.tsx::renderCountAttr` (Discovered #A) → MutationObserver
       workaround removed; `render-counter.spec.ts` now uses the probe
       directly across 6 strict-delta scenarios.
    b. ✅ Cross-sheet-name preservation scenario landed
       (`selection-clipboard.spec.ts`).
-   c. ⚠️ 1 of 2 source-side debug shims (Discovered #E.1
-      `subscriberFireCount`) landed → 1 `.skip` removed. The remaining
-      panic-injection knob (#E.2) is a separate ticket.
+   c. ✅ Both source-side debug shims landed:
+      - #E.1 `SheetStore.subscriberFireCount` + DemoBlank exposure
+      - #E.2 `WasmSheet.__debugPanicNextCallback` + DemoFormulas exposure
+      Both `.skip`s in `regression.spec.ts` flipped to active assertions.
 10. □ Decide on the "Other Demo Smoke" (Budget / Grades / Sales) question.
-    Discovered #B is now fixed, so the WASM-migration option is unblocked.
+    Discovered #B is fixed, so the WASM-migration option is unblocked.
 11. ✅ Discovered #B fixed (microtask defer in `JsCallbackListener`).
-    Chain propagation tests un-skipped, all passing. wasm-bindgen-test
-    coverage still TODO.
+    Chain propagation tests un-skipped, all passing.
+12. ⏳ Promote e2e CI gate from advisory → PR-blocking after 2 weeks of
+    green runs. Single-line edit: delete `continue-on-error: true` in
+    `.github/workflows/e2e.yml`.
 
 ## Default Commands
 
@@ -666,11 +676,11 @@ Reality check against the plan's hard numbers:
 |---|---|---|
 | ≥ 8 spec files | ✅ | 10 actual |
 | ≥ 50 test() blocks pass locally | ✅ | 74 active (+ 4 .skip) |
-| regression.spec.ts pins ≥ 5 | ⚠️ | 5 entries, 1 `.skip` remaining (JsCallbackListener panic). 4 actively running after Discovered #E.1 landed |
+| regression.spec.ts pins ≥ 5 | ✅ | 6 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |
 | render-counter ≥ 3 strict toBe (no `>=`) | ✅ | 6 strict-delta paths after Discovered #A fix |
-| CI runs e2e with artifact upload, advisory→blocking | ❌ | P0.2 not done. Workflow template now in P0.2 above |
+| CI runs e2e with artifact upload, advisory→blocking | ⚠️ | `.github/workflows/e2e.yml` landed in advisory mode. Promote to PR-blocking by deleting `continue-on-error: true` after 2 weeks of green runs |
 | Helpers expose the full API | ✅ | All 13 helpers in helpers.ts (see Helper API table) |
 | No `// TODO: workaround` for fixed bugs | ✅ | grep clean across e2e/ |
 
