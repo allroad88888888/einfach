@@ -56,10 +56,14 @@ export function ContextMenu(props: ContextMenuProps) {
   const [pos, setPos] = createSignal({ x: props.x, y: props.y })
   let menuEl: HTMLDivElement | undefined
 
-  // After mount, measure the menu and clamp it into the viewport so the
-  // right/bottom edges don't get clipped. Done as an effect so the layout
-  // pass has run.
-  onMount(() => {
+  /** Measure the rendered menu and pin its top-left so right/bottom edges
+   * never overflow the viewport. Called after layout (onMount + every time
+   * the trigger coords change). The previous version of the second
+   * effect just re-applied the raw (props.x, props.y), which silently
+   * wiped onMount's clamp and let bottom-of-page triggers (sheet-tab
+   * right-click) push the menu off-screen — fixed by routing both code
+   * paths through this single function. */
+  function clampToViewport() {
     if (!menuEl) return
     const rect = menuEl.getBoundingClientRect()
     const vw = typeof window !== 'undefined' ? window.innerWidth : rect.right
@@ -70,12 +74,17 @@ export function ContextMenu(props: ContextMenuProps) {
     if (nx + rect.width + PAD > vw) nx = Math.max(PAD, vw - rect.width - PAD)
     if (ny + rect.height + PAD > vh) ny = Math.max(PAD, vh - rect.height - PAD)
     setPos({ x: nx, y: ny })
-  })
+  }
+
+  onMount(clampToViewport)
 
   // Re-clamp when x/y change while the menu is open (rare — the host
   // usually unmounts + remounts on a new right-click, but cheap to handle).
   createEffect(() => {
-    setPos({ x: props.x, y: props.y })
+    // Read both deps so Solid tracks them.
+    void props.x
+    void props.y
+    clampToViewport()
   })
 
   function activate(idx: number) {

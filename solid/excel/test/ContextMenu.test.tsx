@@ -4,7 +4,17 @@ import { describe, it, expect, afterEach, jest } from '@jest/globals'
 import { render, cleanup, fireEvent } from '@solidjs/testing-library'
 import { ContextMenu, type ContextMenuItem } from '../src/ContextMenu'
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  // Solid `Portal` renders into `document.body` directly, and after the
+  // solid-js 1.9.12 bump `@solidjs/testing-library`'s `cleanup` no longer
+  // disposes the portaled subtree between tests. Without this hand-clean,
+  // later tests that query `.context-menu` get the stale node from an
+  // earlier `render()` and read wrong button text / style values.
+  document.body
+    .querySelectorAll('.context-menu')
+    .forEach((el) => el.remove())
+})
 
 /**
  * Helper — find the portaled menu root anywhere in document.body. ContextMenu
