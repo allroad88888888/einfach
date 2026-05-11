@@ -2,12 +2,14 @@
 
 > 目标：公式结果必须按需计算。导入、批量写入、订阅空白 viewport 都不能把整张表提前算热或提前创建 atom。
 >
-> 当前状态：Step 1/2 主体已落地。`Sheet::set_formula` 不再调用
-> `Store::create_derived`，公式记录为 Sheet 层 `FormulaRecord`；
-> `Workbook::get_cell` 走 `WorkbookEvalProvider` 递归读取跨 sheet 公式。
-> 仍未完成：BulkLoader、range dependency interval index、workbook-wide
-> 跨 sheet 订阅/反向依赖图、primitive atom GC。TLS resolver 仅保留为旧
-> `eval_expr(get, cell_map)` 兼容入口。
+> 当前状态：Step 1–4 + Step 6 已落地，Step 5（range dependency
+> interval index）保留作 benchmark 驱动的后续工作。
+> `Sheet::set_formula` 不再调用 `Store::create_derived`；formula 以
+> Sheet 层 `FormulaRecord (Rc)` + `FormulaCache` 状态机存储；
+> `Workbook::get_cell` 走 `WorkbookEvalProvider` 递归读取跨 sheet
+> 公式；`bulk_load` 提供 RAII 大批量导入；range 函数走 sparse
+> streaming（`for_each_range_cell`），SUM/AVG/COUNT/MIN/MAX/COUNTIF/
+> SUMIF 都已无 Vec 分配。Legacy TLS resolver 完全移除。
 
 ## 背景
 
@@ -601,16 +603,26 @@ range formula 数量起来后再做：
 
 门禁：10 万 range formula 时单 cell 写入的 range dirty 查找不能线性扫全表。
 
-### Step 6：feature flag 拆除 + 旧路径删除
+### Step 6：feature flag 拆除 + 旧路径删除（✅ 完成）
 
-- 删除旧 `formula_cells: HashMap<CellAddress, AtomId>` 形态；当前 `formula_cells`
-  已是 `HashMap<CellAddress, Rc<FormulaRecord>>`
-- 删除 sheet 公式路径上的 `Store::create_derived` 调用（已完成）
-- 删除 sheet 公式路径上的 `Store::propagate_force` 调用（已完成）
-- 删除 `with_remap` 的 formula→primitive 分支（不再有 derived atom 需要 swap）
+- ✅ `formula_cells` 已是 `HashMap<CellAddress, Rc<FormulaRecord>>`，
+  不再持 `AtomId`
+- ✅ sheet 公式路径不再调用 `Store::create_derived` / `Store::propagate_force`
+  （`grep create_derived rust/excel-core/src/*.rs` == 0）
+- ✅ `with_remap` 的 formula→primitive 分支已删除 —— 当前 `with_remap`
+  是通用 detach/mutate/attach/notify，对 formula 和 primitive 一视同仁
+  （formula cell 的 `current_readable_atom` 返回 `None`，detach 和
+  attach 都自然 no-op）
+- ✅ `current_readable_atom` 是判断公式 vs primitive 的唯一入口
 
-验收：sheet 公式路径 grep 不再出现 `Store::create_derived` / `Store::propagate_force`；
-`formula_cells` 名称仍可存在，但 value 不能再是 `AtomId`。
+验收 grep 结果（在 `rust/excel-core/src/`）：
+- `create_derived` 0 命中
+- `propagate_force` 0 命中
+- `with_cross_resolver` / `CROSS_RESOLVER` / `CURRENT_SHEET` /
+  `CROSS_SHEET_VISITED` 0 命中
+- `mem::transmute` 0 命中
+
+只剩 Step 5 作为 perf 优化保留（不阻塞功能完整）。
 
 ## 测试清单
 
