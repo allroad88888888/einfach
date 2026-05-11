@@ -1,5 +1,5 @@
 
-import { createSignal, For, Show } from 'solid-js'
+import { createEffect, createSignal, For, on, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { FormatToolbar } from './FormatToolbar'
@@ -20,7 +20,23 @@ export interface TableProps {
   /** Render the Phase 6 format toolbar above the grid (Bold/Italic/Align/
    *  Number-format/Background/Text-color). Opt-in like `formulaBar`. */
   toolbar?: boolean
+  /**
+   * Render only the rows visible inside the scroll viewport (plus a small
+   * overscan). Opt-in — default off keeps the original "render every row"
+   * behavior for tiny tables where the DOM cost is irrelevant and tests
+   * assert on every cell being present. For grids over a few hundred rows
+   * pass `virtualize` so the DOM stays bounded.
+   */
+  virtualize?: boolean
 }
+
+/** Row height in CSS pixels — must match `.excel-table td { height: 26px }`
+ * in styles.css. Used to translate scrollTop ↔ row index for windowing. */
+const ROW_HEIGHT = 26
+
+/** Rows rendered outside the visible viewport on each side. Hides the
+ * "blank flash" during fast scrolls without inflating the DOM. */
+const OVERSCAN = 4
 
 /** Build cell address from row/col: (0,0)→"A1" */
 function cellAddr(row: number, col: number): string {
@@ -31,8 +47,41 @@ export function Table(props: TableProps) {
   const rows = () => props.rows ?? 20
   const cols = () => props.cols ?? 10
 
-  const rowIndices = () => Array.from({ length: rows() }, (_, i) => i)
   const colIndices = () => Array.from({ length: cols() }, (_, i) => i)
+
+  // === Row virtualization ===
+  // `scrollTop` / `viewportH` drive the visible window. Both are 0 until the
+  // wrapper mounts + its first onScroll / measurement; that's fine because
+  // the initial `visibleRowEnd` then falls back to `min(rows, OVERSCAN +
+  // initial_visible)` — see `visibleRange()` below.
+  let wrapperEl: HTMLDivElement | undefined
+  const [scrollTop, setScrollTop] = createSignal(0)
+  const [viewportH, setViewportH] = createSignal(0)
+
+  /** [start, end) window of row indices to render. Inclusive overscan on
+   *  both sides. Falls back to "all rows" when virtualization is off. */
+  function visibleRange(): [number, number] {
+    if (!props.virtualize) return [0, rows()]
+    const top = scrollTop()
+    const h = viewportH() || rows() * ROW_HEIGHT // pre-mount: render all
+    const first = Math.max(0, Math.floor(top / ROW_HEIGHT) - OVERSCAN)
+    const visible = Math.ceil(h / ROW_HEIGHT)
+    const last = Math.min(rows(), first + visible + OVERSCAN * 2)
+    return [first, last]
+  }
+
+  /** The window expanded to an inclusive array of indices for `<For>`. */
+  const rowIndices = () => {
+    const [start, end] = visibleRange()
+    const out = new Array<number>(end - start)
+    for (let i = 0; i < out.length; i++) out[i] = start + i
+    return out
+  }
+
+  /** Heights of the top / bottom spacer rows that keep total scroll height
+   *  equal to `rows * ROW_HEIGHT` even though we only render the window. */
+  const topPad = () => visibleRange()[0] * ROW_HEIGHT
+  const botPad = () => (rows() - visibleRange()[1]) * ROW_HEIGHT
 
   // Selection lives on the store so FormulaBar / future copy-paste / right-
   // click menus all read & write the same source of truth.
@@ -53,6 +102,27 @@ export function Table(props: TableProps) {
     if (extend) extendCoord(next)
     else selectCoord(next)
   }
+
+  /** Keep the focus cell inside the visible window when arrow-keys / paste
+   * push it off-screen. No-op when virtualization is off (the cell is
+   * always in the DOM and the browser's own focus scroll suffices). */
+  createEffect(
+    on(
+      () => selected().row,
+      (row) => {
+        if (!props.virtualize || !wrapperEl) return
+        // Header occupies the top ~ROW_HEIGHT; offset so the focus cell
+        // doesn't land flush under the sticky header.
+        const top = row * ROW_HEIGHT
+        const headerH = ROW_HEIGHT
+        const viewTop = wrapperEl.scrollTop
+        const viewBot = viewTop + wrapperEl.clientHeight - headerH
+        if (top < viewTop) wrapperEl.scrollTop = top
+        else if (top + ROW_HEIGHT > viewBot)
+          wrapperEl.scrollTop = top + ROW_HEIGHT - wrapperEl.clientHeight + headerH
+      },
+    ),
+  )
 
   // Ctrl+C / Ctrl+V handlers — extracted from onKeyDown to keep that switch
   // small and to allow direct unit-call from tests if needed later.
@@ -288,11 +358,27 @@ export function Table(props: TableProps) {
     }
   }
 
+  /** Total column count in the body (incl. row-header). Needed by the spacer
+   * `<td colspan>` so the spacer row collapses to a single empty cell that
+   * still spans the table width visually. */
+  const totalBodyCols = () => cols() + 1
+
   return (
     <div
       class="excel-table-wrapper"
       tabIndex={0}
       onKeyDown={onKeyDown}
+      ref={(el) => {
+        wrapperEl = el
+        // Capture initial viewport height; updates flow through onScroll +
+        // a ResizeObserver below.
+        setViewportH(el.clientHeight)
+        if (typeof ResizeObserver !== 'undefined') {
+          const ro = new ResizeObserver(() => setViewportH(el.clientHeight))
+          ro.observe(el)
+        }
+      }}
+      onScroll={(e) => setScrollTop((e.currentTarget as HTMLDivElement).scrollTop)}
     >
       <Show when={props.toolbar}>
         <FormatToolbar store={props.store} />
@@ -317,6 +403,11 @@ export function Table(props: TableProps) {
           </tr>
         </thead>
         <tbody>
+          <Show when={props.virtualize && topPad() > 0}>
+            <tr class="virt-spacer" aria-hidden="true">
+              <td colSpan={totalBodyCols()} style={{ height: `${topPad()}px`, padding: 0 }} />
+            </tr>
+          </Show>
           <For each={rowIndices()}>
             {(row) => (
               <tr>
@@ -366,6 +457,11 @@ export function Table(props: TableProps) {
               </tr>
             )}
           </For>
+          <Show when={props.virtualize && botPad() > 0}>
+            <tr class="virt-spacer" aria-hidden="true">
+              <td colSpan={totalBodyCols()} style={{ height: `${botPad()}px`, padding: 0 }} />
+            </tr>
+          </Show>
         </tbody>
       </table>
       <Show when={menu()}>

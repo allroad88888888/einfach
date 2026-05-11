@@ -95,4 +95,48 @@ describe('Table', () => {
     expect(colHeaders[0].textContent).toBe('A')
     expect(colHeaders[1].textContent).toBe('B')
   })
+
+  describe('row virtualization (7B)', () => {
+    it('without virtualize, renders every row (1000 rows = 1000 row-headers)', () => {
+      const store = createTestStore()
+      const { container } = render(() => (
+        <Table store={store} rows={1000} cols={3} />
+      ))
+      expect(container.querySelectorAll('tbody td.row-header').length).toBe(1000)
+      expect(container.querySelectorAll('tr.virt-spacer').length).toBe(0)
+    })
+
+    it('with virtualize on 1000 rows, renders far fewer rows + spacer rows', () => {
+      // jsdom reports clientHeight = 0 by default — visibleRange() falls back
+      // to "render all" pre-mount. Override the wrapper height after mount so
+      // the windowing actually kicks in. We do this by stubbing
+      // Element.prototype.clientHeight for the duration of this test.
+      const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'clientHeight')
+      Object.defineProperty(Element.prototype, 'clientHeight', {
+        configurable: true,
+        get() {
+          // 10 rows tall (26 * 10 = 260) so windowing renders ~10 + 2*overscan.
+          return 260
+        },
+      })
+      try {
+        const store = createTestStore()
+        const { container } = render(() => (
+          <Table store={store} rows={1000} cols={3} virtualize />
+        ))
+        const rowHeaders = container.querySelectorAll('tbody td.row-header')
+        // 10 visible + 2*4 overscan = 18 max, plus the spacer rows. We just
+        // assert the DOM is bounded — orders of magnitude smaller than 1000.
+        expect(rowHeaders.length).toBeLessThan(50)
+        expect(rowHeaders.length).toBeGreaterThan(0)
+        // At least one bottom spacer (we start at row 0 → no top spacer).
+        const spacers = container.querySelectorAll('tr.virt-spacer')
+        expect(spacers.length).toBeGreaterThanOrEqual(1)
+        // First rendered row header is row 1 (we're at scrollTop 0).
+        expect(rowHeaders[0].textContent).toBe('1')
+      } finally {
+        if (desc) Object.defineProperty(Element.prototype, 'clientHeight', desc)
+      }
+    })
+  })
 })

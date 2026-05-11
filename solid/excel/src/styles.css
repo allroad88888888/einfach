@@ -140,6 +140,16 @@ body {
   max-width: 200px;
 }
 
+/* Row-virtualization spacer rows — invisible, but their height pads the
+ * total scroll height so scrollbars track the real (un-windowed) row count.
+ * No border, no padding, transparent so the wrapper background shows through. */
+.virt-spacer,
+.virt-spacer td {
+  border: 0;
+  padding: 0;
+  background: transparent;
+}
+
 /* Headers */
 
 .col-header,

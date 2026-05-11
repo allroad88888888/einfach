@@ -8,6 +8,7 @@ import { DemoGrades } from './demos/DemoGrades'
 import { DemoSales } from './demos/DemoSales'
 import { MultiSheet } from './demos/MultiSheet'
 import { DemoCrossSheetChain } from './demos/DemoCrossSheetChain'
+import { DemoLarge } from './demos/DemoLarge'
 import './styles.css'
 
 interface DemoTab {
@@ -24,6 +25,7 @@ const demos: DemoTab[] = [
   { id: 'sales',    label: 'Sales Dashboard', component: DemoSales },
   { id: 'multi',    label: 'Multi-Sheet',    component: MultiSheet },
   { id: 'cross',    label: '3-Sheet Chain',  component: DemoCrossSheetChain },
+  { id: 'large',    label: 'Large Grid',     component: DemoLarge },
 ]
 
 export function App() {
