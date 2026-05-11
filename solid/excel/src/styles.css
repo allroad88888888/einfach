@@ -69,6 +69,16 @@ body {
   border-bottom-color: #1a73e8;
 }
 
+/* Thin vertical rule between demo groups in the tab bar — visually clusters
+ * basics / apps / workbook / perf without forcing a second row. */
+.nav-group-sep {
+  display: inline-block;
+  width: 1px;
+  align-self: stretch;
+  background: #d8d8d8;
+  margin: 6px 6px 6px 6px;
+}
+
 /* === Demo Page === */
 
 .demo-page {
