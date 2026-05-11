@@ -134,7 +134,12 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
   // the source of truth for "this address changed". This keeps the
   // ordering deterministic: every visible change to a cell is exactly
   // one worker push.
-  worker.addEventListener('message', (e: MessageEvent) => {
+  //
+  // The listener is captured into a named ref so `dispose()` can detach
+  // it on teardown — an anonymous arrow would leave the worker holding
+  // a callback into a now-stale closure (cache map, listenersByAddr,
+  // etc.) and keep the proxy alive for GC.
+  const onWorkerMessage = (e: MessageEvent) => {
     const msg = (e.data ?? {}) as { event?: string; [k: string]: unknown }
     if (msg.event === 'change') {
       const a = String(msg.addr).toUpperCase()
@@ -146,7 +151,8 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
       })
       fireListeners(a)
     }
-  })
+  }
+  worker.addEventListener('message', onWorkerMessage)
 
   function post(cmd: string, payload: Record<string, unknown>) {
     worker.postMessage({ cmd, ...payload })
@@ -328,6 +334,26 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
         if (c.type !== 'null' || c.formula !== '') out.push(addr)
       }
       return out
+    },
+
+    /**
+     * Terminate the worker and drop every retained reference. After
+     * `dispose` the proxy is unusable — calling any other method is a
+     * silent no-op against an empty cache.
+     *
+     * Reproduces the in-process backends' "the host GCs me" lifecycle
+     * for the worker case: without this, repeatedly mounting / unmounting
+     * `DemoWorker` (e.g. tabbing between demos) leaks one Worker thread
+     * per visit, since the message listener captures the cache + lookup
+     * maps and keeps the worker reachable.
+     */
+    dispose() {
+      worker.removeEventListener('message', onWorkerMessage)
+      cache.clear()
+      requested.clear()
+      tokenToAddr.clear()
+      listenersByAddr.clear()
+      worker.terminate()
     },
   }
 }

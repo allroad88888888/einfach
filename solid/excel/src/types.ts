@@ -66,6 +66,15 @@ export interface ISheet {
    * the number-format formatter.
    */
   formatted_display?(addr: string): string
+
+  /**
+   * Optional teardown. The in-process backends (WasmSheet, createJSSheet)
+   * have nothing to clean up — JS GC handles them once the sheet falls
+   * out of scope — but the worker proxy needs an explicit termination:
+   * remove the message listener, clear the address/subscription maps,
+   * and call `worker.terminate()`. `SheetStore.dispose` forwards here.
+   */
+  dispose?(): void
 }
 
 export type CellValue = {

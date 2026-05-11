@@ -1,5 +1,5 @@
 
-import { createEffect, createSignal, For, on, Show } from 'solid-js'
+import { createEffect, createSignal, For, on, onCleanup, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { FormatToolbar } from './FormatToolbar'
@@ -376,6 +376,11 @@ export function Table(props: TableProps) {
         if (typeof ResizeObserver !== 'undefined') {
           const ro = new ResizeObserver(() => setViewportH(el.clientHeight))
           ro.observe(el)
+          // Without disconnect, tabbing between demos leaves the observer
+          // attached to a detached element; the callback keeps a closure
+          // over `setViewportH` (and through it the whole Table state),
+          // so GC can't collect either side.
+          onCleanup(() => ro.disconnect())
         }
       }}
       onScroll={(e) => setScrollTop((e.currentTarget as HTMLDivElement).scrollTop)}

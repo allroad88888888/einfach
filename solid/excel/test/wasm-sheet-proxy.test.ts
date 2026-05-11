@@ -12,13 +12,19 @@ interface FakeWorker extends WorkerLike {
   sent: unknown[]
   /** Drop a message onto the main side's listeners — simulates worker push. */
   _emit(msg: unknown): void
+  /** Live listener count — used by dispose tests to assert the proxy
+   *  detached its handler before terminating. */
+  _listenerCount(): number
+  /** Number of times `terminate()` was called — the dispose contract. */
+  _terminateCount: number
 }
 
 function makeFakeWorker(): FakeWorker {
   const listeners = new Set<(e: MessageEvent) => void>()
   const sent: unknown[] = []
-  return {
+  const fake: FakeWorker = {
     sent,
+    _terminateCount: 0,
     postMessage(msg) {
       sent.push(msg)
     },
@@ -29,13 +35,18 @@ function makeFakeWorker(): FakeWorker {
       listeners.delete(listener)
     },
     terminate() {
+      fake._terminateCount += 1
       listeners.clear()
     },
     _emit(msg) {
       const ev = { data: msg } as MessageEvent
       for (const l of listeners) l(ev)
     },
+    _listenerCount() {
+      return listeners.size
+    },
   }
+  return fake
 }
 
 describe('wasm-sheet-proxy (7C Step 1)', () => {
@@ -374,4 +385,52 @@ describe('wasm-sheet-proxy (7C Step 1)', () => {
     )
     expect(initials).toHaveLength(2)
   })
+
+  describe('dispose (worker teardown)', () => {
+    it('terminates the worker, detaches the message listener, clears caches', () => {
+      const fake = makeFakeWorker()
+      const sheet = createWorkerSheet({ workerFactory: () => fake })
+      // Prime some state so we can verify the dispose actually cleared it.
+      sheet.set_number('A1', 7)
+      const cb = jest.fn()
+      sheet.subscribe('A1', cb)
+      expect(fake._listenerCount()).toBe(1)
+      expect(fake._terminateCount).toBe(0)
+
+      sheet.dispose!()
+
+      expect(fake._terminateCount).toBe(1)
+      // The message-port listener is gone — a worker-side push must not
+      // hit the (now-disposed) cache.
+      expect(fake._listenerCount()).toBe(0)
+      // Post-dispose, the cache reads return empties (cells were cleared).
+      expect(sheet.get_display('A1')).toBe('')
+      // And a stale push that somehow leaks through won't fire the
+      // pre-dispose listener.
+      fake._emit({ event: 'change', addr: 'A1', display: '99', type: 'number' })
+      expect(cb).not.toHaveBeenCalled()
+    })
+
+    it('SheetStore.dispose forwards to sheet.dispose', async () => {
+      // Co-tests the contract from sheet-store.ts: the store's own
+      // dispose must call through so a `<DemoWorker>` unmount actually
+      // terminates the underlying Worker thread.
+      const fake = makeFakeWorker()
+      const sheet = createWorkerSheet({ workerFactory: () => fake })
+      const { createSheetStore } = await import('../src/sheet-store')
+      const store = createSheetStore(sheet)
+      store.observeCell('A1') // give the store a live handle to release.
+      expect(fake._terminateCount).toBe(0)
+
+      store.dispose()
+
+      expect(fake._terminateCount).toBe(1)
+      expect(fake._listenerCount()).toBe(0)
+    })
+  })
 })
+
+// jest provides `jest` globally via @types/jest; keep it nominal for the
+// strict TS config above (the `import { describe, ... } from '@jest/globals'`
+// already pulls in the namespace).
+declare const jest: typeof import('@jest/globals').jest

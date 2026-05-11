@@ -1,5 +1,5 @@
 
-import { createSignal, createEffect } from 'solid-js'
+import { createSignal, createEffect, onCleanup } from 'solid-js'
 import type { SheetStore } from './sheet-store'
 
 export interface FormulaBarProps {
@@ -33,6 +33,12 @@ export function FormulaBar(props: FormulaBarProps) {
   // Sync draft from the active cell whenever the selection changes or the
   // cell value changes externally — but only when the input isn't focused
   // (otherwise we'd clobber the user's typing).
+  //
+  // The cell branch uses `observeCell(a)` and registers an inner
+  // `onCleanup` so the subscription is released both when the selection
+  // moves to a different addr (effect re-runs) and on component
+  // teardown. Without this the formula bar would leak one
+  // `sheet.subscribe` per cell the user ever selected.
   createEffect(() => {
     const a = addr()
     if (focused()) return
@@ -43,9 +49,11 @@ export function FormulaBar(props: FormulaBarProps) {
     const formula = props.store.getFormula(a)
     if (formula !== '') {
       setDraft(formula)
-    } else {
-      setDraft(props.store.getCell(a).display)
+      return
     }
+    const obs = props.store.observeCell(a)
+    onCleanup(obs.dispose)
+    setDraft(obs.value().display)
   })
 
   // Guards against the Enter→commit→blur→commit double-fire (same shape as

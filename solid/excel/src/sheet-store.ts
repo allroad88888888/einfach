@@ -129,6 +129,14 @@ export function createSheetStore(sheet: ISheet) {
     tick: () => number
     bump: (n: number) => number
     token: number
+    /**
+     * Number of outstanding `observeCell(addr)` subscriptions. Bumped on
+     * acquire, decremented on dispose. The underlying `sheet.subscribe`
+     * is allocated on 0→1 and torn down on 1→0, so the proxy talks to
+     * the backend at most once per actively-observed address regardless
+     * of how many Cell/FormulaBar consumers are reading.
+     */
+    refCount: number
   }
   const handles = new Map<string, CellHandle>()
 
@@ -145,17 +153,50 @@ export function createSheetStore(sheet: ISheet) {
    */
   const fireCounts = new Map<string, number>()
 
-  function getHandle(addr: string): CellHandle {
+  /**
+   * Acquire a subscription handle for `addr` (refcount++). Allocates the
+   * underlying `sheet.subscribe` exactly once per address — subsequent
+   * acquires share the same tick signal. Callers must pair each acquire
+   * with a `releaseHandle(addr)` once they no longer need reactive
+   * updates, otherwise the backend keeps firing for ghost observers.
+   *
+   * Used by `observeCell`; not exported on its own — the {value, dispose}
+   * pair is the user-facing contract.
+   */
+  function acquireHandle(addr: string): CellHandle {
     let h = handles.get(addr)
-    if (h) return h
+    if (h) {
+      h.refCount += 1
+      return h
+    }
     const [tick, bump] = createSignal(0)
     const token = sheet.subscribe(addr, () => {
       fireCounts.set(addr, (fireCounts.get(addr) ?? 0) + 1)
       bump((t) => t + 1)
     })
-    h = { tick, bump, token }
+    h = { tick, bump, token, refCount: 1 }
     handles.set(addr, h)
     return h
+  }
+
+  /**
+   * Release one subscription handle for `addr`. The underlying
+   * `sheet.unsubscribe` only fires when the last observer drops; until
+   * then other observers (e.g. a still-mounted FormulaBar) keep getting
+   * tick fires.
+   *
+   * Idempotent against over-release: a release on an addr with no live
+   * handle is a no-op (defensive against double-dispose, which can
+   * happen when a parent unmount and an explicit `onCleanup(dispose)`
+   * race on tab teardown).
+   */
+  function releaseHandle(addr: string): void {
+    const h = handles.get(addr)
+    if (!h) return
+    h.refCount -= 1
+    if (h.refCount > 0) return
+    sheet.unsubscribe(h.token)
+    handles.delete(addr)
   }
 
   function readCell(addr: string): CellValue {
@@ -392,16 +433,27 @@ export function createSheetStore(sheet: ISheet) {
 
     /**
      * Debug-only: how many times has this address's subscriber callback
-     * fired since `getHandle(addr)` was first created (i.e. since the
+     * fired since `acquireHandle(addr)` was first created (i.e. since the
      * first reactive read of this cell)? 0 for addresses that were never
      * touched. Used by `regression.spec.ts` to pin the
      * "subscribe-then-set_formula fires exactly once" contract — without
      * this, the spec couldn't observe fire counts from the browser side.
      *
      * Counter bumps before `bump((t) => t + 1)`, so the count == number
-     * of distinct sheet notifications, not Solid render passes.
+     * of distinct sheet notifications, not Solid render passes. The
+     * count persists across handle release (cumulative since first
+     * acquire), so a re-acquire after dispose doesn't reset it.
      */
     subscriberFireCount: (addr: string) => fireCounts.get(addr) ?? 0,
+
+    /**
+     * Debug-only: how many addresses currently hold at least one live
+     * `observeCell` subscription. Used by tests to verify that
+     * virtualized Cells release on unmount — if a Large-Grid demo
+     * scrolls past 900 rows, we expect this to track the viewport
+     * (handful of cells), not the cumulative touched-once count.
+     */
+    activeSubscriptionCount: () => handles.size,
 
     /**
      * The current rectangular selection: `anchor` is where the range
@@ -455,9 +507,48 @@ export function createSheetStore(sheet: ISheet) {
       return out
     },
 
+    /**
+     * One-shot, non-reactive read of a cell's current value. Does NOT
+     * subscribe — call sites that need re-renders on backend change
+     * must go through `observeCell`. Cheap; safe to call from anywhere
+     * (tests, copy/paste, undo recording, etc).
+     */
     getCell(addr: string): CellValue {
-      getHandle(addr).tick()
       return readCell(addr)
+    },
+
+    /**
+     * Reactive observer for a single cell. Returns:
+     *
+     *   - `value()`  — Solid accessor; reading it inside a JSX expr or
+     *     effect subscribes the caller to per-cell change notifications
+     *     from the backend.
+     *   - `dispose()` — release the underlying subscription. Required:
+     *     long-lived consumers (e.g. `<Cell>`) must call `dispose` on
+     *     unmount, otherwise the backend keeps firing callbacks for
+     *     scrolled-out cells (row virtualization regression risk).
+     *
+     * Multiple `observeCell(addr)` calls on the same address share one
+     * `sheet.subscribe` under the hood (refcounted in `acquireHandle`),
+     * so e.g. a Cell + a FormulaBar observing the same selected cell
+     * cost one backend wire.
+     *
+     * `dispose` is idempotent; calling it twice is a no-op.
+     */
+    observeCell(addr: string): { value: () => CellValue; dispose: () => void } {
+      const handle = acquireHandle(addr)
+      let disposed = false
+      return {
+        value: () => {
+          handle.tick() // dep — reactivity hook for Solid
+          return readCell(addr)
+        },
+        dispose: () => {
+          if (disposed) return
+          disposed = true
+          releaseHandle(addr)
+        },
+      }
     },
 
     getFormula(addr: string): string {
@@ -673,9 +764,19 @@ export function createSheetStore(sheet: ISheet) {
       this.endEdit()
     },
 
+    /**
+     * Tear down the store. Unsubscribes every still-live cell handle and
+     * forwards to the backend's optional `dispose` (worker proxy uses
+     * this to terminate its Worker; the in-process WASM / JS sheets are
+     * a no-op).
+     *
+     * After `dispose` it is unsafe to call any other method on the
+     * returned store — the underlying sheet may no longer respond.
+     */
     dispose() {
       for (const h of handles.values()) sheet.unsubscribe(h.token)
       handles.clear()
+      sheet.dispose?.()
     },
 
     /**

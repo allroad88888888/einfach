@@ -1,5 +1,5 @@
 
-import { createSignal, Show } from 'solid-js'
+import { createSignal, onCleanup, Show } from 'solid-js'
 import type { SheetStore } from './sheet-store'
 
 /**
@@ -51,7 +51,14 @@ export function Cell(props: CellProps) {
     return renderCount
   }
 
-  const cellValue = () => props.store.getCell(props.addr)
+  // Reactive cell observation — retain on mount, release on unmount.
+  // Row virtualization unmounts Cells when they scroll out of view; the
+  // matching `onCleanup` is what makes the backend `sheet.subscribe`
+  // count track the live viewport instead of the cumulative
+  // ever-rendered set.
+  const observer = props.store.observeCell(props.addr)
+  onCleanup(observer.dispose)
+  const cellValue = observer.value
   const isSelected = () => (props.selected ? props.selected() : false)
   const isInRange = () => (props.inRange ? props.inRange() : false)
   // Reading cellValue() here is the load-bearing line: it subscribes this

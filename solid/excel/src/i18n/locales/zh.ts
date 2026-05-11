@@ -2,11 +2,12 @@
  * Chinese catalog. Same keyspace as en.ts; missing keys fall back to the
  * raw msgId via `@lingui/core` (matches the lingui default behavior).
  *
- * `nav.*` labels stay in English because the e2e suite drives demo
- * navigation via `gotoDemo(page, '<English name>')` and we keep the
- * default locale as `en`. If a future change defaults to `zh`, the e2e
- * helpers will need to switch back via `setLocale('en')` before the
- * `gotoDemo` call.
+ * The `nav.*` labels are translated (空白 / 公式 / …) — only the EN
+ * catalog keeps the original English literals. e2e specs still pass
+ * because the default locale is `en` and the suite never flips it
+ * before calling `gotoDemo(page, '<English name>')`. If a future
+ * change defaults to `zh`, helpers will need to either translate their
+ * `gotoDemo` argument or call `setLocale('en')` first.
  */
 export const messages: Record<string, string> = {
   // App chrome
