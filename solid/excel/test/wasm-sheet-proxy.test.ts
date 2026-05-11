@@ -166,4 +166,130 @@ describe('wasm-sheet-proxy (7C Step 1)', () => {
     expect(sheet.get_display('A1')).toBe('7')
     expect(sheet.get_display('a1')).toBe('7')
   })
+
+  // === Step 2: subscribe / unsubscribe via worker push ===
+
+  it('subscribe posts subscribe cmd; worker push fires the callback', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    let fires = 0
+    const token = sheet.subscribe('A1', () => {
+      fires += 1
+    })
+    expect(token).toBeGreaterThan(0)
+    expect(fake.sent).toContainEqual({ cmd: 'subscribe', addr: 'A1' })
+
+    // Worker pushes a change for A1 — listener must fire exactly once.
+    fake._emit({
+      event: 'change',
+      addr: 'A1',
+      display: '42',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    expect(fires).toBe(1)
+    expect(sheet.get_display('A1')).toBe('42')
+  })
+
+  it('two listeners on the same addr only result in one worker subscribe', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    let aFires = 0
+    let bFires = 0
+    sheet.subscribe('A1', () => {
+      aFires += 1
+    })
+    sheet.subscribe('A1', () => {
+      bFires += 1
+    })
+
+    // Only ONE subscribe message reached the worker.
+    const subMsgs = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'subscribe',
+    )
+    expect(subMsgs).toHaveLength(1)
+
+    fake._emit({
+      event: 'change',
+      addr: 'A1',
+      display: '7',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    expect(aFires).toBe(1)
+    expect(bFires).toBe(1)
+  })
+
+  it('unsubscribe drops the callback; worker unsubscribe only when last listener leaves', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    let aFires = 0
+    let bFires = 0
+    const tokA = sheet.subscribe('A1', () => {
+      aFires += 1
+    })
+    const tokB = sheet.subscribe('A1', () => {
+      bFires += 1
+    })
+
+    sheet.unsubscribe(tokA)
+    // Removing one of two listeners must NOT send an unsubscribe to the worker.
+    let unsubs = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'unsubscribe',
+    )
+    expect(unsubs).toHaveLength(0)
+
+    fake._emit({
+      event: 'change',
+      addr: 'A1',
+      display: '1',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    expect(aFires).toBe(0)
+    expect(bFires).toBe(1)
+
+    sheet.unsubscribe(tokB)
+    // Last listener gone — worker is told to drop the subscription.
+    unsubs = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'unsubscribe',
+    )
+    expect(unsubs).toEqual([{ cmd: 'unsubscribe', addr: 'A1' }])
+  })
+
+  it('optimistic set does not fire main listeners — only worker push does', () => {
+    // Contract: a `set_number` posts to the worker and updates the cache,
+    // but the *callback* fires only when the worker pushes back. Otherwise
+    // each write would fire twice (once optimistically, once on
+    // confirmation) which would double-trigger Solid signals.
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    let fires = 0
+    sheet.subscribe('A1', () => {
+      fires += 1
+    })
+    sheet.set_number('A1', 42)
+    expect(fires).toBe(0)
+    // Worker eventually pushes back.
+    fake._emit({
+      event: 'change',
+      addr: 'A1',
+      display: '42',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    expect(fires).toBe(1)
+  })
+
+  it('unsubscribe with an unknown token is a no-op', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    // Should not throw, should not post anything.
+    sheet.unsubscribe(9999)
+    expect(fake.sent.filter((m) => (m as { cmd: string }).cmd === 'unsubscribe')).toHaveLength(0)
+  })
 })

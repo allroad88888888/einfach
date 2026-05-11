@@ -8,16 +8,17 @@
 //                { type: 'module' })`
 // which Vite bundles separately at build time.
 //
-// Protocol (this commit, Step 1):
+// Protocol (Step 2):
 //   Main → Worker  { cmd: 'set_number' | 'set_text' | 'set_boolean'
 //                    | 'set_error' | 'set_formula' | 'clear_cell'
 //                    | 'insert_row' | 'delete_row' | 'insert_col'
-//                    | 'delete_col', ...payload }
-//   Worker → Main  (none yet — Step 2 adds 'change' / 'reply' pushes)
-//
-// Optimistic cache on the main side handles sync reads until the matching
-// 'change' push arrives, so Step 1 alone is enough to demonstrate the
-// `set → read same value` round-trip even without subscribe wiring.
+//                    | 'delete_col' | 'subscribe' | 'unsubscribe',
+//                    ...payload }
+//   Worker → Main  { event: 'change', addr, display, type, isError,
+//                    formula } whenever a subscribed address's value
+//                  changes. The worker ref-counts subscribes per addr so
+//                  the underlying `WasmSheet.subscribe` only runs once
+//                  even when multiple main-side listeners share an addr.
 
 import init, { WasmSheet } from '../wasm-pkg/einfach_wasm.js'
 
@@ -32,6 +33,51 @@ async function ensureSheet(): Promise<WasmSheet> {
   await initPromise
   if (!sheet) sheet = new WasmSheet()
   return sheet
+}
+
+/**
+ * Per-address subscription bookkeeping. The underlying `WasmSheet.subscribe`
+ * runs at most once per addr regardless of how many main-side listeners
+ * register for the same cell — we ref-count and only unwire when the count
+ * hits zero. The token is whatever `WasmSheet.subscribe` returns.
+ */
+const subRefs = new Map<string, { token: number; count: number }>()
+
+function pushChange(s: WasmSheet, addr: string) {
+  const display = s.get_display(addr)
+  const type = s.get_type(addr)
+  const isError = s.is_error(addr)
+  const formula = s.get_formula(addr)
+  ctx.postMessage({
+    event: 'change',
+    addr,
+    display,
+    type,
+    isError,
+    formula,
+  })
+}
+
+function subscribeAddr(s: WasmSheet, addr: string) {
+  const a = addr.toUpperCase()
+  const existing = subRefs.get(a)
+  if (existing) {
+    existing.count += 1
+    return
+  }
+  const token = s.subscribe(a, () => pushChange(s, a))
+  subRefs.set(a, { token, count: 1 })
+}
+
+function unsubscribeAddr(s: WasmSheet, addr: string) {
+  const a = addr.toUpperCase()
+  const ref = subRefs.get(a)
+  if (!ref) return
+  ref.count -= 1
+  if (ref.count <= 0) {
+    s.unsubscribe(ref.token)
+    subRefs.delete(a)
+  }
 }
 
 ctx.addEventListener('message', async (e: MessageEvent) => {
@@ -70,9 +116,15 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
       case 'delete_col':
         s.delete_col(msg.at as number, msg.count as number)
         break
+      case 'subscribe':
+        subscribeAddr(s, msg.addr as string)
+        break
+      case 'unsubscribe':
+        unsubscribeAddr(s, msg.addr as string)
+        break
       default:
-        // Unknown command — ignored. Step 2 will add subscribe / reply
-        // commands and a sentinel reply for unknown cmds.
+        // Unknown command — ignored. Step 3 will add a 'read_initial'
+        // reply command for lazy cache hydration.
         break
     }
   } catch (err) {

@@ -94,18 +94,41 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
     cache.set(a, { ...cur, ...patch })
   }
 
-  // Worker → main pushes. Step 1 only handles 'change' so that tests
-  // exercising the push path can flow. Step 2 will add 'reply' for
-  // sync-style round-trips (e.g. set_formula's boolean result).
+  // === Subscriptions ===
+  // Listener bookkeeping mirrors the worker's: at most one
+  // `WasmSheet.subscribe` per addr, ref-counted so multiple Solid signals
+  // on the same cell share the worker-side wire. Tokens are allocated
+  // here and routed via the addr lookup; the worker never sees the
+  // token, only `{cmd:'subscribe',addr}` / `{cmd:'unsubscribe',addr}`
+  // when the per-addr count enters or exits zero.
+  let nextToken = 1
+  const tokenToAddr = new Map<number, string>()
+  const listenersByAddr = new Map<string, Map<number, () => void>>()
+
+  function fireListeners(addr: string) {
+    const map = listenersByAddr.get(addr)
+    if (!map) return
+    for (const cb of map.values()) cb()
+  }
+
+  // Worker → main pushes. A 'change' event is the canonical signal — it
+  // updates the cache AND fires per-addr listeners. Main-side optimistic
+  // writes do NOT fire listeners on their own; the worker's
+  // `WasmSheet.subscribe` callback (running inside the worker thread) is
+  // the source of truth for "this address changed". This keeps the
+  // ordering deterministic: every visible change to a cell is exactly
+  // one worker push.
   worker.addEventListener('message', (e: MessageEvent) => {
     const msg = (e.data ?? {}) as { event?: string; [k: string]: unknown }
     if (msg.event === 'change') {
-      writeCache(String(msg.addr), {
+      const a = String(msg.addr).toUpperCase()
+      writeCache(a, {
         display: String(msg.display ?? ''),
         type: (msg.type as CellType) ?? 'null',
         isError: !!msg.isError,
         formula: String(msg.formula ?? ''),
       })
+      fireListeners(a)
     }
   })
 
@@ -224,14 +247,36 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
       post('delete_col', { at, count })
     },
 
-    subscribe(_addr, _cb) {
-      // Step 2 will register on main, post a 'subscribe' cmd, and route
-      // worker 'change' pushes to the callback. Step 1 returns a stub
-      // token so callers don't crash.
-      return 0
+    subscribe(addr, cb) {
+      const a = addr.toUpperCase()
+      const tok = nextToken++
+      tokenToAddr.set(tok, a)
+      let map = listenersByAddr.get(a)
+      if (!map) {
+        map = new Map()
+        listenersByAddr.set(a, map)
+        // First listener on this addr — wire it through to the worker.
+        // Worker ref-counts internally so a second subscribe(addr,_) on
+        // main would still only result in one underlying WasmSheet
+        // subscriber, but we short-circuit here to avoid even the
+        // wire-traffic.
+        post('subscribe', { addr: a })
+      }
+      map.set(tok, cb)
+      return tok
     },
-    unsubscribe(_token) {
-      // Mirrors subscribe — stub until Step 2.
+
+    unsubscribe(token) {
+      const a = tokenToAddr.get(token)
+      if (!a) return
+      tokenToAddr.delete(token)
+      const map = listenersByAddr.get(a)
+      if (!map) return
+      map.delete(token)
+      if (map.size === 0) {
+        listenersByAddr.delete(a)
+        post('unsubscribe', { addr: a })
+      }
     },
 
     non_empty_addrs() {
