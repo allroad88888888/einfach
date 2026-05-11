@@ -1,5 +1,5 @@
 use einfach_core::{CellListener, Value, ValueError};
-use einfach_excel_core::{CellSubscription, Sheet};
+use einfach_excel_core::{CellSubscription, Sheet, Workbook};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
@@ -178,6 +178,160 @@ impl WasmSheet {
     }
 }
 
+/// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
+/// evaluate formulas through workbook context, including cross-sheet refs.
+#[wasm_bindgen]
+pub struct WasmWorkbook {
+    workbook: Workbook,
+}
+
+#[wasm_bindgen]
+impl WasmWorkbook {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        install_panic_hook();
+        WasmWorkbook {
+            workbook: Workbook::new(),
+        }
+    }
+
+    pub fn sheet_count(&self) -> u32 {
+        self.workbook.sheet_count() as u32
+    }
+
+    pub fn sheet_name(&self, idx: u32) -> String {
+        self.workbook
+            .name(idx as usize)
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+
+    pub fn add_sheet(&mut self, name: &str) -> u32 {
+        self.workbook.add_sheet(name) as u32
+    }
+
+    pub fn rename_sheet(&mut self, idx: u32, name: &str) -> bool {
+        self.workbook.rename_sheet(idx as usize, name)
+    }
+
+    pub fn remove_sheet(&mut self, idx: u32) -> bool {
+        self.workbook.remove_sheet(idx as usize).is_some()
+    }
+
+    pub fn set_number(&mut self, sheet_idx: u32, addr: &str, value: f64) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.set_cell(addr, Value::Number(value));
+        }
+    }
+
+    pub fn set_text(&mut self, sheet_idx: u32, addr: &str, value: &str) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.set_cell(addr, Value::Text(value.to_string()));
+        }
+    }
+
+    pub fn set_boolean(&mut self, sheet_idx: u32, addr: &str, value: bool) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.set_cell(addr, Value::Boolean(value));
+        }
+    }
+
+    pub fn set_error(&mut self, sheet_idx: u32, addr: &str, value: &str) {
+        let err = match value {
+            "#DIV/0!" => ValueError::DivisionByZero,
+            "#REF!" => ValueError::InvalidRef,
+            "#NAME?" => ValueError::InvalidName,
+            "#CYCLE!" => ValueError::CyclicRef,
+            _ => ValueError::InvalidValue,
+        };
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.set_cell(addr, Value::Error(err));
+        }
+    }
+
+    pub fn set_formula(&mut self, sheet_idx: u32, addr: &str, formula: &str) -> bool {
+        self.workbook.set_formula(sheet_idx as usize, addr, formula)
+    }
+
+    pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.clear_cell(addr);
+        }
+    }
+
+    pub fn insert_row(&mut self, sheet_idx: u32, at: u32, count: u32) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.insert_row(at, count);
+        }
+    }
+
+    pub fn delete_row(&mut self, sheet_idx: u32, at: u32, count: u32) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.delete_row(at, count);
+        }
+    }
+
+    pub fn insert_col(&mut self, sheet_idx: u32, at: u32, count: u32) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.insert_col(at, count);
+        }
+    }
+
+    pub fn delete_col(&mut self, sheet_idx: u32, at: u32, count: u32) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
+            sheet.delete_col(at, count);
+        }
+    }
+
+    pub fn get_display(&self, sheet_idx: u32, addr: &str) -> String {
+        let val = self.workbook_value(sheet_idx, addr);
+        value_to_display(&val)
+    }
+
+    pub fn get_number(&self, sheet_idx: u32, addr: &str) -> f64 {
+        match self.workbook_value(sheet_idx, addr) {
+            Value::Number(n) => n,
+            _ => f64::NAN,
+        }
+    }
+
+    pub fn get_type(&self, sheet_idx: u32, addr: &str) -> String {
+        match self.workbook_value(sheet_idx, addr) {
+            Value::Number(_) => "number".into(),
+            Value::Text(_) => "text".into(),
+            Value::Boolean(_) => "boolean".into(),
+            Value::Null => "null".into(),
+            Value::Error(_) => "error".into(),
+        }
+    }
+
+    pub fn is_error(&self, sheet_idx: u32, addr: &str) -> bool {
+        self.workbook_value(sheet_idx, addr).is_error()
+    }
+
+    pub fn get_formula(&self, sheet_idx: u32, addr: &str) -> String {
+        self.workbook
+            .sheet(sheet_idx as usize)
+            .and_then(|sheet| sheet.get_formula(addr))
+            .unwrap_or_default()
+    }
+
+    pub fn debug_formula_cache_state(&self, sheet_idx: u32, addr: &str) -> String {
+        self.workbook
+            .debug_formula_cache_state(sheet_idx as usize, addr)
+            .to_string()
+    }
+}
+
+impl WasmWorkbook {
+    fn workbook_value(&self, sheet_idx: u32, addr: &str) -> Value {
+        let Some(name) = self.workbook.name(sheet_idx as usize) else {
+            return Value::Null;
+        };
+        self.workbook.get_cell(name, addr)
+    }
+}
+
 fn value_to_display(val: &Value) -> String {
     match val {
         Value::Number(n) => {
@@ -277,5 +431,44 @@ mod tests {
         sheet.set_number("A3", 3.0);
         sheet.set_formula("A4", "=SUM(A1,A2,A3)");
         assert_eq!(sheet.get_number("A4"), 6.0);
+    }
+
+    #[test]
+    fn wasm_workbook_three_sheet_chain() {
+        let mut wb = WasmWorkbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+
+        wb.set_number(0, "B4", 10.0);
+        assert!(wb.set_formula(2, "B2", "=Sheet1!B4+1"));
+        assert!(wb.set_formula(1, "B2", "=Sheet3!B2+1"));
+        assert!(wb.set_formula(0, "B2", "=Sheet2!B2+1"));
+
+        assert_eq!(wb.get_number(2, "B2"), 11.0);
+        assert_eq!(wb.get_number(1, "B2"), 12.0);
+        assert_eq!(wb.get_number(0, "B2"), 13.0);
+
+        wb.set_number(0, "B4", 20.0);
+        assert_eq!(wb.get_number(0, "B2"), 23.0);
+    }
+
+    #[test]
+    fn wasm_workbook_independent_formula_stays_dirty_until_read() {
+        let mut wb = WasmWorkbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+
+        wb.set_number(0, "B4", 10.0);
+        wb.set_number(2, "B4", 100.0);
+        assert!(wb.set_formula(2, "C2", "=Sheet1!B4+1"));
+        assert!(wb.set_formula(1, "C2", "=Sheet3!C2+1"));
+        assert!(wb.set_formula(0, "C2", "=Sheet2!C2+1"));
+        assert!(wb.set_formula(1, "C5", "=Sheet3!B4+5"));
+
+        assert_eq!(wb.get_number(0, "C2"), 13.0);
+        assert_eq!(wb.debug_formula_cache_state(1, "C5"), "dirty");
+
+        assert_eq!(wb.get_number(1, "C5"), 105.0);
+        assert_eq!(wb.debug_formula_cache_state(1, "C5"), "clean");
     }
 }

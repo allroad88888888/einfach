@@ -7,6 +7,7 @@ import { DemoBudget } from './demos/DemoBudget'
 import { DemoGrades } from './demos/DemoGrades'
 import { DemoSales } from './demos/DemoSales'
 import { MultiSheet } from './demos/MultiSheet'
+import { DemoCrossSheetChain } from './demos/DemoCrossSheetChain'
 import './styles.css'
 
 interface DemoTab {
@@ -22,10 +23,11 @@ const demos: DemoTab[] = [
   { id: 'grades',   label: 'Grade Calc',     component: DemoGrades },
   { id: 'sales',    label: 'Sales Dashboard', component: DemoSales },
   { id: 'multi',    label: 'Multi-Sheet',    component: MultiSheet },
+  { id: 'cross',    label: '3-Sheet Chain',  component: DemoCrossSheetChain },
 ]
 
 export function App() {
-  const [activeTab, setActiveTab] = createSignal('formulas')
+  const [activeTab, setActiveTab] = createSignal('cross')
 
   const activeDemo = () => demos.find((d) => d.id === activeTab())
 

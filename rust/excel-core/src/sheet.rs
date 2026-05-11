@@ -630,6 +630,22 @@ impl Sheet {
             .unwrap_or(0)
     }
 
+    /// Formula cache state without evaluating the formula.
+    #[doc(hidden)]
+    pub fn debug_formula_cache_state(&self, addr_str: &str) -> &'static str {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return "invalid";
+        };
+        let Some(record) = self.formula_cells.get(&addr) else {
+            return "none";
+        };
+        match &*record.cache.borrow() {
+            FormulaCache::Dirty => "dirty",
+            FormulaCache::Computing => "computing",
+            FormulaCache::Clean(_) => "clean",
+        }
+    }
+
     /// Total live core atoms. Formulas are not core atoms anymore. Useful as
     /// a gross "did anything materialize?" signal in tests.
     #[doc(hidden)]

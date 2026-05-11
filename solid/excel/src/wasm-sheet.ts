@@ -1,5 +1,49 @@
 import type { ISheet } from './types'
 
+export interface WasmWorkbookApi {
+  sheet_count(): number
+  sheet_name(idx: number): string
+  add_sheet(name: string): number
+  rename_sheet(idx: number, name: string): boolean
+  remove_sheet(idx: number): boolean
+  set_number(sheetIdx: number, addr: string, value: number): void
+  set_text(sheetIdx: number, addr: string, value: string): void
+  set_boolean(sheetIdx: number, addr: string, value: boolean): void
+  set_error(sheetIdx: number, addr: string, value: string): void
+  set_formula(sheetIdx: number, addr: string, formula: string): boolean
+  clear_cell(sheetIdx: number, addr: string): void
+  insert_row(sheetIdx: number, at: number, count: number): void
+  delete_row(sheetIdx: number, at: number, count: number): void
+  insert_col(sheetIdx: number, at: number, count: number): void
+  delete_col(sheetIdx: number, at: number, count: number): void
+  get_display(sheetIdx: number, addr: string): string
+  get_number(sheetIdx: number, addr: string): number
+  get_type(sheetIdx: number, addr: string): string
+  is_error(sheetIdx: number, addr: string): boolean
+  get_formula(sheetIdx: number, addr: string): string
+  debug_formula_cache_state(sheetIdx: number, addr: string): string
+}
+
+interface WasmModule {
+  default: () => Promise<void>
+  WasmSheet: new () => unknown
+  WasmWorkbook: new () => WasmWorkbookApi
+}
+
+let wasmModulePromise: Promise<WasmModule> | undefined
+
+async function loadWasmModule(): Promise<WasmModule> {
+  if (!wasmModulePromise) {
+    wasmModulePromise = (async () => {
+      const wasm = await import('../wasm-pkg/einfach_wasm.js')
+      const mod = wasm as unknown as WasmModule
+      await mod.default()
+      return mod
+    })()
+  }
+  return wasmModulePromise
+}
+
 /**
  * Real Rust + WASM backend for the Excel demos.
  *
@@ -25,10 +69,11 @@ import type { ISheet } from './types'
  * needs the WASM toolchain and a browser-ish environment.
  */
 export async function createWasmSheet(): Promise<ISheet> {
-  const wasm = await import('../wasm-pkg/einfach_wasm.js')
-  // wasm-pack `--target web` exports an async default `init()`. It must be
-  // awaited before the first WasmSheet construction or the wasm memory is
-  // not yet bound to the JS class.
-  await wasm.default()
+  const wasm = await loadWasmModule()
   return new wasm.WasmSheet() as unknown as ISheet
+}
+
+export async function createWasmWorkbook(): Promise<WasmWorkbookApi> {
+  const wasm = await loadWasmModule()
+  return new wasm.WasmWorkbook()
 }

@@ -112,6 +112,14 @@ impl Workbook {
         self.sheets[idx].peek_value_with_provider(addr, &provider)
     }
 
+    #[doc(hidden)]
+    pub fn debug_formula_cache_state(&self, sheet_idx: usize, addr_str: &str) -> &'static str {
+        self.sheets
+            .get(sheet_idx)
+            .map(|sheet| sheet.debug_formula_cache_state(addr_str))
+            .unwrap_or("missing-sheet")
+    }
+
     /// Workbook-aware variant of `Sheet::set_formula`. Performs a
     /// **cross-sheet** static cycle check before installing the formula:
     /// references like `=Sheet2!A1` are followed across sheet boundaries so
