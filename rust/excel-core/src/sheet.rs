@@ -7,6 +7,7 @@ use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueErro
 use crate::cell::CellAddress;
 use crate::eval::{eval_expr_with_provider, EvalProvider};
 use crate::formula::{parse_formula, Expr};
+use crate::range::CellRange;
 
 type ListenerRc = Rc<dyn CellListener>;
 type ListenerList = Rc<RefCell<Vec<(u64, ListenerRc)>>>;
@@ -487,6 +488,49 @@ impl Sheet {
     pub fn peek_value(&self, addr: CellAddress) -> Value {
         let provider = SheetEvalProvider { sheet: self };
         self.peek_value_with_provider(addr, &provider)
+    }
+
+    /// Sparse iteration over this sheet's cells inside `range`.
+    /// `value_resolver` is called for each present address; for primitive
+    /// cells we read the store directly, for formula cells we route
+    /// through `value_resolver` so the caller can pass its own provider
+    /// (so cross-sheet formula deps still resolve correctly when called
+    /// from `WorkbookEvalProvider`). Used as the building block for
+    /// `SheetEvalProvider::for_each_range_cell` and the Workbook variant.
+    pub(crate) fn for_each_sparse_cell_with(
+        &self,
+        range: CellRange,
+        value_resolver: &dyn Fn(&Sheet, CellAddress) -> Value,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        let n = range.normalize();
+        for (addr, &id) in &self.cells {
+            if addr.row >= n.start.row
+                && addr.row <= n.end.row
+                && addr.col >= n.start.col
+                && addr.col <= n.end.col
+            {
+                if self.formula_cells.contains_key(addr) {
+                    continue;
+                }
+                let v = if self.store.has_atom(id) {
+                    self.store.get(id)
+                } else {
+                    Value::Null
+                };
+                f(*addr, v);
+            }
+        }
+        for addr in self.formula_cells.keys() {
+            if addr.row >= n.start.row
+                && addr.row <= n.end.row
+                && addr.col >= n.start.col
+                && addr.col <= n.end.col
+            {
+                let v = value_resolver(self, *addr);
+                f(*addr, v);
+            }
+        }
     }
 
     pub(crate) fn peek_value_with_provider(
@@ -1296,6 +1340,22 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
         Value::Error(ValueError::InvalidRef)
     }
+
+    /// Sparse override: iterate only addresses that actually have a
+    /// primitive or formula record, intersected with `range`. Lets
+    /// `SUM(A:A)` walk the dozen real cells in column A instead of
+    /// expanding the nominal column extent.
+    ///
+    /// Formula cells are read via `Sheet::peek_value` (single-sheet
+    /// context, no cross-sheet resolution).
+    fn for_each_range_cell(
+        &self,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        self.sheet
+            .for_each_sparse_cell_with(range, &|sheet, addr| sheet.peek_value(addr), f);
+    }
 }
 
 struct TrackingEvalProvider<'a> {
@@ -1315,6 +1375,22 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
 
     fn force_formula_recompute(&self) -> bool {
         self.inner.force_formula_recompute()
+    }
+
+    /// Tracking wrapper: record every address the inner provider yields
+    /// as a formula dep. This lets `IF`-style dynamic-branch deps stay
+    /// accurate even when the eval went through `for_each_range_cell`
+    /// instead of explicit per-cell `cell()` calls.
+    fn for_each_range_cell(
+        &self,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        let deps = self.deps.clone();
+        self.inner.for_each_range_cell(range, &mut |addr, v| {
+            deps.borrow_mut().insert(addr);
+            f(addr, v);
+        });
     }
 }
 
@@ -2277,5 +2353,109 @@ mod tests {
         // And reading the subscribed cell still gets the bulk value.
         assert_eq!(sheet.get_cell("A1"), Value::Number(7.0));
         assert_eq!(sheet.get_cell("Z99"), Value::Number(99.0));
+    }
+
+    // === LAZY Step 4: SheetEvalProvider sparse range streaming ===
+
+    #[test]
+    fn sum_full_column_walks_sparse() {
+        // Two real cells in a column with huge nominal extent. The
+        // SheetEvalProvider sparse override drives `SUM(A1:A100000)` to
+        // visit only the two real addresses, not 100_000.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(5.0));
+        sheet.set_cell("A100000", Value::Number(10.0));
+
+        let before_atoms = sheet.debug_primitive_atom_count();
+        sheet.set_formula("B1", "=SUM(A1:A100000)");
+        let v = sheet.get_cell("B1");
+        let after_atoms = sheet.debug_primitive_atom_count();
+
+        assert_eq!(v, Value::Number(15.0));
+        // The two original primitive cells; SUM didn't create a third.
+        assert_eq!(before_atoms, 2);
+        assert_eq!(after_atoms, 2);
+    }
+
+    #[test]
+    fn sum_stateless_no_atoms_materialized() {
+        // 5 primitive cells across a huge range. SUM doesn't grow the
+        // primitive atom count — no temp Vec, no atom-per-empty-cell.
+        let mut sheet = Sheet::new();
+        for (addr, val) in [
+            ("A1", 1.0),
+            ("A10", 2.0),
+            ("A100", 3.0),
+            ("A1000", 4.0),
+            ("A10000", 5.0),
+        ] {
+            sheet.set_cell(addr, Value::Number(val));
+        }
+        let before = sheet.debug_primitive_atom_count();
+        assert_eq!(before, 5);
+
+        sheet.set_formula("B1", "=SUM(A1:A100000)");
+        let v = sheet.get_cell("B1");
+        assert_eq!(v, Value::Number(15.0));
+
+        let after = sheet.debug_primitive_atom_count();
+        assert_eq!(
+            after, before,
+            "SUM(huge range) must not materialize cell atoms (before={}, after={})",
+            before, after
+        );
+    }
+
+    #[test]
+    fn median_stateful_still_works_via_sheet_provider() {
+        // MEDIAN keeps its temp Vec but routes through the sparse range
+        // streaming path. A1..A5 = 1..5 → MEDIAN = 3. No atoms beyond
+        // the 5 primitives we set.
+        let mut sheet = Sheet::new();
+        for (i, n) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            sheet.set_cell(&format!("A{}", i + 1), Value::Number(*n));
+        }
+        let before = sheet.debug_primitive_atom_count();
+        sheet.set_formula("B1", "=MEDIAN(A1:A5)");
+        let v = sheet.get_cell("B1");
+        let after = sheet.debug_primitive_atom_count();
+
+        assert_eq!(v, Value::Number(3.0));
+        assert_eq!(after, before, "MEDIAN must not materialize cell atoms");
+    }
+
+    #[test]
+    fn average_streaming_matches_eager_via_sheet_provider() {
+        // Random-ish integer values + an empty hole. AVERAGE should
+        // match (sum / count) of only the real numeric cells; the hole
+        // is skipped, no atom created.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(10.0));
+        sheet.set_cell("A2", Value::Number(20.0));
+        // A3 left empty intentionally
+        sheet.set_cell("A4", Value::Number(40.0));
+        sheet.set_cell("A5", Value::Number(50.0));
+
+        let before = sheet.debug_primitive_atom_count();
+        sheet.set_formula("B1", "=AVERAGE(A1:A5)");
+        let v = sheet.get_cell("B1");
+        let after = sheet.debug_primitive_atom_count();
+
+        // Expected: AVERAGE skips Null (empty cell). Sum=120, count=4.
+        assert_eq!(v, Value::Number(30.0));
+        assert_eq!(after, before, "AVERAGE must not materialize cell atoms");
+    }
+
+    #[test]
+    fn count_range_with_holes_via_sheet_provider() {
+        // A1=1, A3=2, A5=3 — A2/A4 empty. COUNT(A1:A5) = 3 (Excel's
+        // contract: numeric values only, holes skipped).
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("A3", Value::Number(2.0));
+        sheet.set_cell("A5", Value::Number(3.0));
+
+        sheet.set_formula("B1", "=COUNT(A1:A5)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
     }
 }

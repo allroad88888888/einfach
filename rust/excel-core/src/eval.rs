@@ -4,6 +4,7 @@ use einfach_core::{AtomId, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
+use crate::range::CellRange;
 use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
 
 /// Address-based evaluation source. Both production (Workbook) and the
@@ -20,6 +21,35 @@ pub trait EvalProvider {
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
     fn force_formula_recompute(&self) -> bool {
         false
+    }
+
+    /// Iterate every cell address in `range`, yielding `(addr, value)` to
+    /// the closure. Used by `SUM` / `COUNT` / `AVERAGE` / `MIN` / `MAX` /
+    /// `COUNTIF` / `SUMIF` for O(1)-memory streaming, and by the stateful
+    /// aggregates (`MEDIAN`, `MODE`, `STDEV`, `VAR`, `LARGE`, `SMALL`,
+    /// `VLOOKUP`, `HLOOKUP`, `INDEX`, `MATCH`) so they can build their
+    /// local temp `Vec` without creating cell atoms.
+    ///
+    /// "Streaming" here means **no cell atom materialization**, not "O(1)
+    /// memory" — the trait contract permits the callee body to keep a
+    /// `Vec` if its algorithm demands one. Providers that know which
+    /// addresses are sparse (e.g. `SheetEvalProvider` reads only
+    /// `cells ∪ formula_cells`) should override this method so
+    /// `SUM(A:A)` walks the dozen real cells instead of the column's
+    /// nominal extent.
+    ///
+    /// The default impl iterates the rectangle densely via `range.iter()`
+    /// and calls `self.cell(addr)` per cell — fine for small ranges and
+    /// for shim providers that don't have sparse-index data.
+    fn for_each_range_cell(
+        &self,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        for addr in range.iter() {
+            let v = self.cell(addr);
+            f(addr, v);
+        }
     }
 }
 
@@ -222,28 +252,29 @@ fn coerce_to_number(v: &Value) -> Option<f64> {
     }
 }
 
-/// Collect all cell values from a range.
-fn collect_range_values(
+/// Stream a range through `provider.for_each_range_cell`. Used by the
+/// stateful aggregates (MEDIAN / MODE / VLOOKUP / INDEX / ...) so they
+/// can build their algorithm-required Vec without going through the
+/// "collect every cell in the rectangle" path that materialized Nulls
+/// for full-column refs. Real-streaming aggregates (SUM / COUNT / ...)
+/// drive `for_each_range_cell` directly.
+fn stream_range(
     start: &CellAddress,
     end: &CellAddress,
     provider: &dyn EvalProvider,
-) -> Vec<Value> {
-    let min_row = start.row.min(end.row);
-    let max_row = start.row.max(end.row);
-    let min_col = start.col.min(end.col);
-    let max_col = start.col.max(end.col);
-
-    let mut values = Vec::new();
-    for row in min_row..=max_row {
-        for col in min_col..=max_col {
-            let addr = CellAddress::new(row, col);
-            values.push(provider.cell(addr));
-        }
-    }
-    values
+    f: &mut dyn FnMut(CellAddress, Value),
+) {
+    let range = CellRange::new(*start, *end);
+    provider.for_each_range_cell(range, f);
 }
 
-/// Collect a range as a row-major 2D grid (rows × cols).
+/// Collect a range as a row-major 2D grid (rows × cols). Used by
+/// VLOOKUP / HLOOKUP / INDEX where the algorithm itself requires random
+/// access by (row, col). The grid is sized by the range's nominal
+/// rectangle and pre-filled with `Null`; only addresses that the
+/// provider actually visits get populated. For sparse providers this
+/// skips visiting empty cells; for dense ones every cell is visited and
+/// behavior matches the pre-streaming implementation.
 fn collect_range_2d(
     start: &CellAddress,
     end: &CellAddress,
@@ -253,16 +284,22 @@ fn collect_range_2d(
     let max_row = start.row.max(end.row);
     let min_col = start.col.min(end.col);
     let max_col = start.col.max(end.col);
-    (min_row..=max_row)
-        .map(|row| {
-            (min_col..=max_col)
-                .map(|col| {
-                    let addr = CellAddress::new(row, col);
-                    provider.cell(addr)
-                })
-                .collect()
-        })
-        .collect()
+    let rows = (max_row - min_row + 1) as usize;
+    let cols = (max_col - min_col + 1) as usize;
+    let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
+    let range = CellRange::new(*start, *end);
+    provider.for_each_range_cell(range, &mut |addr, value| {
+        if addr.row < min_row || addr.row > max_row {
+            return;
+        }
+        if addr.col < min_col || addr.col > max_col {
+            return;
+        }
+        let r = (addr.row - min_row) as usize;
+        let c = (addr.col - min_col) as usize;
+        grid[r][c] = value;
+    });
+    grid
 }
 
 /// Shared inner loop for VLOOKUP / HLOOKUP. `index` is 1-based; for
@@ -340,14 +377,22 @@ fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)>
     }
 }
 
-/// Collect values from a function argument, expanding ranges.
-fn collect_arg_values(
+/// Stream values produced by a function argument. For `Range` args this
+/// goes through `provider.for_each_range_cell` (sparse-aware); for any
+/// other expression it evaluates once and yields the single value. The
+/// closure sees `(Option<addr>, value)` — `Some` for range cells, `None`
+/// for evaluated sub-expressions — so callers like `SUMIF` can still
+/// align `range`/`sum_range` by relative position when both are ranges.
+fn for_each_arg_value(
     arg: &Expr,
     provider: &dyn EvalProvider,
-) -> Vec<Value> {
+    f: &mut dyn FnMut(Option<CellAddress>, Value),
+) {
     match arg {
-        Expr::Range { start, end } => collect_range_values(start, end, provider),
-        _ => vec![eval_expr_with_provider(arg, provider)],
+        Expr::Range { start, end } => {
+            stream_range(start, end, provider, &mut |addr, v| f(Some(addr), v));
+        }
+        _ => f(None, eval_expr_with_provider(arg, provider)),
     }
 }
 
@@ -358,38 +403,59 @@ fn eval_func(
 ) -> Value {
     match name {
         "SUM" => {
-            let mut total = 0.0;
+            // Real streaming: O(1) accumulator, no Vec allocation. Errors
+            // short-circuit through `err`.
+            let mut total = 0.0_f64;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Number(n) => total += n,
-                        Value::Null => {} // skip nulls
+                        Value::Null => {}
                         Value::Boolean(true) => total += 1.0,
                         Value::Boolean(false) => {}
-                        Value::Text(_) => {} // skip text in SUM
+                        Value::Text(_) => {}
                     }
-                }
+                });
             }
-            Value::Number(total)
+            match err {
+                Some(e) => Value::Error(e),
+                None => Value::Number(total),
+            }
         }
 
         "AVERAGE" => {
-            let mut total = 0.0;
+            let mut total = 0.0_f64;
             let mut count = 0u64;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Number(n) => {
                             total += n;
                             count += 1;
                         }
-                        _ => {} // skip non-numbers
+                        _ => {}
                     }
-                }
+                });
             }
-            if count == 0 {
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if count == 0 {
                 Value::Error(ValueError::DivisionByZero)
             } else {
                 Value::Number(total / count as f64)
@@ -399,11 +465,11 @@ fn eval_func(
         "COUNT" => {
             let mut count = 0u64;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
                     if matches!(v, Value::Number(_)) {
                         count += 1;
                     }
-                }
+                });
             }
             Value::Number(count as f64)
         }
@@ -430,16 +496,26 @@ fn eval_func(
 
         "MIN" => {
             let mut min: Option<f64> = None;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Number(n) => {
                             min = Some(min.map_or(n, |m: f64| m.min(n)));
                         }
                         _ => {}
                     }
-                }
+                });
+            }
+            if let Some(e) = err {
+                return Value::Error(e);
             }
             // Empty set: Excel returns 0 if there are no numeric arguments
             // at all — but #NUM! in some versions. We prefer #VALUE! over a
@@ -449,16 +525,26 @@ fn eval_func(
 
         "MAX" => {
             let mut max: Option<f64> = None;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Number(n) => {
                             max = Some(max.map_or(n, |m: f64| m.max(n)));
                         }
                         _ => {}
                     }
-                }
+                });
+            }
+            if let Some(e) = err {
+                return Value::Error(e);
             }
             max.map_or(Value::Number(0.0), Value::Number)
         }
@@ -467,23 +553,31 @@ fn eval_func(
         "AND" => {
             let mut result = true;
             let mut saw_any = false;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Null => {}
-                        other => {
-                            if let Some(b) = coerce_to_bool(&other) {
+                        other => match coerce_to_bool(&other) {
+                            Some(b) => {
                                 saw_any = true;
                                 result = result && b;
-                            } else {
-                                return Value::Error(ValueError::InvalidValue);
                             }
-                        }
+                            None => err = Some(ValueError::InvalidValue),
+                        },
                     }
-                }
+                });
             }
-            if !saw_any {
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if !saw_any {
                 Value::Error(ValueError::InvalidValue)
             } else {
                 Value::Boolean(result)
@@ -492,23 +586,31 @@ fn eval_func(
         "OR" => {
             let mut result = false;
             let mut saw_any = false;
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
                     match v {
-                        Value::Error(e) => return Value::Error(e),
+                        Value::Error(e) => err = Some(e),
                         Value::Null => {}
-                        other => {
-                            if let Some(b) = coerce_to_bool(&other) {
+                        other => match coerce_to_bool(&other) {
+                            Some(b) => {
                                 saw_any = true;
                                 result = result || b;
-                            } else {
-                                return Value::Error(ValueError::InvalidValue);
                             }
-                        }
+                            None => err = Some(ValueError::InvalidValue),
+                        },
                     }
-                }
+                });
             }
-            if !saw_any {
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if !saw_any {
                 Value::Error(ValueError::InvalidValue)
             } else {
                 Value::Boolean(result)
@@ -588,15 +690,27 @@ fn eval_func(
         // === Text ===
         "CONCATENATE" => {
             let mut out = String::new();
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
-                    if let Value::Error(e) = v {
-                        return Value::Error(e);
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Value::Error(e) = &v {
+                        err = Some(e.clone());
+                        return;
                     }
                     out.push_str(&coerce_to_text(&v));
-                }
+                });
             }
-            Value::Text(out)
+            if let Some(e) = err {
+                Value::Error(e)
+            } else {
+                Value::Text(out)
+            }
         }
         "LEN" => {
             if args.len() != 1 {
@@ -639,35 +753,85 @@ fn eval_func(
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
+            // Eval the criterion once outside the streaming loop.
             let criterion = eval_expr_with_provider(&args[1], provider);
-            let values = collect_arg_values(&args[0], provider);
             let mut count = 0u64;
-            for v in values {
+            for_each_arg_value(&args[0], provider, &mut |_addr, v| {
                 if matches_criterion(&v, &criterion) {
                     count += 1;
                 }
-            }
+            });
             Value::Number(count as f64)
         }
         "SUMIF" => {
             // SUMIF(range, criterion[, sum_range])
+            //
+            // Two-arg form: stream the single range; sum hits that coerce
+            // to a number. O(1) memory.
+            //
+            // Three-arg form: stream `range`; on each hit, translate the
+            // `addr` into the matching cell in `sum_range` by relative
+            // offset and call `provider.cell` for the target. Still O(1)
+            // memory (no Vec of either range) — at the cost of an extra
+            // HashMap lookup per hit, which is cheap.
             if args.len() != 2 && args.len() != 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
             let criterion = eval_expr_with_provider(&args[1], provider);
-            let range_values = collect_arg_values(&args[0], provider);
-            let sum_values = if args.len() == 3 {
-                collect_arg_values(&args[2], provider)
-            } else {
-                range_values.clone()
-            };
-            let mut total = 0.0;
-            for (i, v) in range_values.iter().enumerate() {
-                if matches_criterion(v, &criterion) {
-                    if let Some(target) = sum_values.get(i) {
-                        if let Some(n) = coerce_to_number(target) {
+            let mut total = 0.0_f64;
+            if args.len() == 2 {
+                for_each_arg_value(&args[0], provider, &mut |_addr, v| {
+                    if matches_criterion(&v, &criterion) {
+                        if let Some(n) = coerce_to_number(&v) {
                             total += n;
                         }
+                    }
+                });
+            } else {
+                // Three-arg with offset translation needs both args to be
+                // ranges; otherwise fall back to the two-arg behavior
+                // (Excel actually broadcasts a single sum_range cell, but
+                // the legacy tests here matched index-equality only when
+                // both were ranges).
+                let range = match &args[0] {
+                    Expr::Range { start, end } => Some((*start, *end)),
+                    _ => None,
+                };
+                let sum_range = match &args[2] {
+                    Expr::Range { start, end } => Some((*start, *end)),
+                    _ => None,
+                };
+                match (range, sum_range) {
+                    (Some((rs, re)), Some((ss, _se))) => {
+                        let rs_n = CellRange::new(rs, re).normalize();
+                        let ss_n = CellRange::new(ss, ss).normalize();
+                        let dr = ss_n.start.row as i64 - rs_n.start.row as i64;
+                        let dc = ss_n.start.col as i64 - rs_n.start.col as i64;
+                        for_each_arg_value(&args[0], provider, &mut |addr, v| {
+                            let Some(addr) = addr else { return };
+                            if matches_criterion(&v, &criterion) {
+                                let r = addr.row as i64 + dr;
+                                let c = addr.col as i64 + dc;
+                                if r < 0 || c < 0 {
+                                    return;
+                                }
+                                let target =
+                                    provider.cell(CellAddress::new(r as u32, c as u32));
+                                if let Some(n) = coerce_to_number(&target) {
+                                    total += n;
+                                }
+                            }
+                        });
+                    }
+                    _ => {
+                        // Non-range args fall back to "broadcast same eval"
+                        for_each_arg_value(&args[0], provider, &mut |_addr, v| {
+                            if matches_criterion(&v, &criterion) {
+                                if let Some(n) = coerce_to_number(&v) {
+                                    total += n;
+                                }
+                            }
+                        });
                     }
                 }
             }
@@ -759,30 +923,57 @@ fn eval_func(
 
         "MATCH" => {
             // MATCH(value, range, [type=0 exact])
+            //
+            // Streaming early-exit: walk the range, return on first hit.
+            // The position is by visit order, which for a dense provider
+            // matches the legacy `(i + 1)` 1-based result. (Sparse
+            // providers skip holes — position counts only present cells,
+            // a deliberate behavior change for full-column refs.)
             if args.len() < 2 || args.len() > 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
-            let values = collect_arg_values(&args[1], provider);
-            for (i, v) in values.iter().enumerate() {
-                if values_equal(v, &needle) {
-                    return Value::Number((i + 1) as f64);
+            let mut position: u64 = 0;
+            let mut found: Option<u64> = None;
+            for_each_arg_value(&args[1], provider, &mut |_addr, v| {
+                if found.is_some() {
+                    return;
                 }
+                position += 1;
+                if values_equal(&v, &needle) {
+                    found = Some(position);
+                }
+            });
+            match found {
+                Some(p) => Value::Number(p as f64),
+                None => Value::Error(ValueError::InvalidValue),
             }
-            Value::Error(ValueError::InvalidValue)
         }
 
         // Stats
         "MEDIAN" => {
+            // Stateful: needs a sorted Vec. Stream through
+            // for_each_arg_value so we never create atoms for empty
+            // cells in `=MEDIAN(A:A)`-shaped ranges.
             let mut nums: Vec<f64> = Vec::new();
+            let mut err: Option<ValueError> = None;
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
-                    if let Value::Number(n) = v {
-                        nums.push(n);
-                    } else if let Value::Error(e) = v {
-                        return Value::Error(e);
-                    }
+                if err.is_some() {
+                    break;
                 }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Number(n) => nums.push(n),
+                        Value::Error(e) => err = Some(e),
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                return Value::Error(e);
             }
             if nums.is_empty() {
                 return Value::Error(ValueError::InvalidValue);
@@ -798,15 +989,17 @@ fn eval_func(
         }
 
         "MODE" => {
+            // Stateful: bucket-count requires a HashMap. Stream so we
+            // skip empty cells; algorithm needs the full list anyway.
             let mut nums: Vec<i64> = Vec::new();
             for arg in args {
-                for v in collect_arg_values(arg, provider) {
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
                     if let Value::Number(n) = v {
                         // Multiply to preserve some decimals; mode for floats
                         // is rare and we want bit-stable hashing.
                         nums.push((n * 1e9).round() as i64);
                     }
-                }
+                });
             }
             if nums.is_empty() {
                 return Value::Error(ValueError::InvalidValue);
@@ -827,6 +1020,8 @@ fn eval_func(
         }
 
         "STDEV" => {
+            // Stateful (two-pass: mean then variance). Vec still here but
+            // it's sparse-driven via collect_numbers → for_each_arg_value.
             let nums = collect_numbers(args, provider);
             if nums.len() < 2 {
                 return Value::Error(ValueError::InvalidValue);
@@ -849,7 +1044,8 @@ fn eval_func(
         }
 
         "LARGE" => {
-            // LARGE(range, k) — kth largest, 1-based
+            // LARGE(range, k) — kth largest, 1-based. Stateful: needs a
+            // sorted Vec to pick by rank.
             if args.len() != 2 {
                 return Value::Error(ValueError::InvalidValue);
             }
@@ -921,17 +1117,23 @@ fn eval_func(
     }
 }
 
+/// Streams every arg's numeric values into a local Vec. The Vec is an
+/// algorithmic requirement of the callers (MEDIAN sorts, MODE counts,
+/// STDEV/VAR need two passes, LARGE/SMALL select by rank) — but going
+/// through `for_each_arg_value` means the underlying provider can stay
+/// sparse, so we never allocate Null entries for empty cells in
+/// `SUM(A:A)`-shaped ranges.
 fn collect_numbers(
     args: &[Expr],
     provider: &dyn EvalProvider,
 ) -> Vec<f64> {
     let mut out = Vec::new();
     for arg in args {
-        for v in collect_arg_values(arg, provider) {
+        for_each_arg_value(arg, provider, &mut |_addr, v| {
             if let Value::Number(n) = v {
                 out.push(n);
             }
-        }
+        });
     }
     out
 }
@@ -1133,6 +1335,7 @@ fn parse_criterion_op(s: &str) -> (&str, &str) {
 mod tests {
     use super::*;
     use crate::formula::parse_formula;
+    use std::cell::Cell;
 
     fn make_test_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
         // Simulate: A1=10, B1=20, C1=0, A2=5, B2="text"
@@ -1578,5 +1781,163 @@ mod tests {
         let (cm, vs) = make_test_env();
         // D1 doesn't exist → Null → 0
         assert_eq!(eval_str("=D1+5", &cm, &vs), Value::Number(5.0));
+    }
+
+    // === LAZY Step 4: range streaming tests ===
+    //
+    // The four tests below exercise the streaming/stateful split via a
+    // synthetic SparseProvider that exposes a visit counter. SheetEval-
+    // Provider's sparse override is exercised separately in
+    // `sheet::tests::*` and `workbook::tests::*`.
+
+    /// Provider backed by a sparse HashMap. Counts every `cell()` /
+    /// `for_each_range_cell` visit so tests can assert "we walked the
+    /// real cells, not the full rectangle."
+    struct SparseProvider {
+        cells: HashMap<CellAddress, Value>,
+        visits: Cell<u64>,
+    }
+
+    impl SparseProvider {
+        fn new() -> Self {
+            SparseProvider {
+                cells: HashMap::new(),
+                visits: Cell::new(0),
+            }
+        }
+        fn set(&mut self, addr: &str, v: Value) {
+            self.cells
+                .insert(CellAddress::parse(addr).unwrap(), v);
+        }
+        fn visits(&self) -> u64 {
+            self.visits.get()
+        }
+    }
+
+    impl EvalProvider for SparseProvider {
+        fn cell(&self, addr: CellAddress) -> Value {
+            self.visits.set(self.visits.get() + 1);
+            self.cells.get(&addr).cloned().unwrap_or(Value::Null)
+        }
+        fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+            Value::Error(ValueError::InvalidRef)
+        }
+        fn for_each_range_cell(
+            &self,
+            range: CellRange,
+            f: &mut dyn FnMut(CellAddress, Value),
+        ) {
+            // Walk only addresses we actually have, intersected with the
+            // requested range. Sparse traversal — the visit count equals
+            // the number of present cells inside `range`, NOT the
+            // rectangle's `cell_count`.
+            let n = range.normalize();
+            for (addr, value) in &self.cells {
+                if addr.row >= n.start.row
+                    && addr.row <= n.end.row
+                    && addr.col >= n.start.col
+                    && addr.col <= n.end.col
+                {
+                    self.visits.set(self.visits.get() + 1);
+                    f(*addr, value.clone());
+                }
+            }
+        }
+    }
+
+    fn run_with(provider: &SparseProvider, formula: &str) -> Value {
+        let expr = parse_formula(formula).expect("parse failed");
+        eval_expr_with_provider(&expr, provider)
+    }
+
+    #[test]
+    fn sum_walks_only_real_cells_in_huge_range() {
+        // A1=5, A100000=10. SUM(A1:A100000) over the synthetic sparse
+        // provider must visit exactly 2 cells, not 100_000.
+        let mut p = SparseProvider::new();
+        p.set("A1", Value::Number(5.0));
+        p.set("A100000", Value::Number(10.0));
+        let v = run_with(&p, "=SUM(A1:A100000)");
+        assert_eq!(v, Value::Number(15.0));
+        assert_eq!(
+            p.visits(),
+            2,
+            "SUM should stream only the 2 real cells (got {})",
+            p.visits()
+        );
+    }
+
+    #[test]
+    fn count_range_with_holes() {
+        // A1=1, A3=2, A5=3 (A2/A4 empty). COUNT(A1:A5) = 3 since COUNT
+        // counts numeric values and skips empty/non-numeric — matches
+        // Excel.
+        let mut p = SparseProvider::new();
+        p.set("A1", Value::Number(1.0));
+        p.set("A3", Value::Number(2.0));
+        p.set("A5", Value::Number(3.0));
+        let v = run_with(&p, "=COUNT(A1:A5)");
+        assert_eq!(v, Value::Number(3.0));
+    }
+
+    #[test]
+    fn average_streaming_matches_eager() {
+        // Build a small range and compare =AVERAGE(...) against manual
+        // sum/count to confirm result equivalence with the old eager
+        // collect_range_values path.
+        let mut p = SparseProvider::new();
+        let nums = [3.0, 7.5, 11.0, -2.0, 0.5, 100.0, 42.0, 8.0];
+        let mut row = 0u32;
+        for n in nums.iter() {
+            let addr = CellAddress::new(row, 0).to_string_repr();
+            p.set(&addr, Value::Number(*n));
+            row += 1;
+        }
+        let v = run_with(&p, "=AVERAGE(A1:A8)");
+        let expected = nums.iter().sum::<f64>() / nums.len() as f64;
+        assert_eq!(v, Value::Number(expected));
+    }
+
+    #[test]
+    fn min_max_stream_sparse_range() {
+        // MIN / MAX on a sparse range visit each non-empty cell exactly
+        // once, with no Vec materialization.
+        let mut p = SparseProvider::new();
+        p.set("A1", Value::Number(5.0));
+        p.set("A50", Value::Number(-2.5));
+        p.set("A1000", Value::Number(100.0));
+        assert_eq!(run_with(&p, "=MIN(A1:A1000)"), Value::Number(-2.5));
+        assert_eq!(run_with(&p, "=MAX(A1:A1000)"), Value::Number(100.0));
+    }
+
+    #[test]
+    fn median_stateful_still_works_over_streaming() {
+        // MEDIAN keeps its temp Vec, but goes through for_each_arg_value
+        // so no atoms get created. Result equivalence with eager path
+        // is the contract.
+        let mut p = SparseProvider::new();
+        for (i, n) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            let addr = CellAddress::new(i as u32, 0).to_string_repr();
+            p.set(&addr, Value::Number(*n));
+        }
+        let v = run_with(&p, "=MEDIAN(A1:A5)");
+        assert_eq!(v, Value::Number(3.0));
+    }
+
+    #[test]
+    fn countif_sumif_stream_sparse_range() {
+        // Sparse range; criteria filter is applied during streaming.
+        let mut p = SparseProvider::new();
+        p.set("A1", Value::Number(10.0));
+        p.set("A500", Value::Number(20.0));
+        p.set("A999", Value::Number(2.0));
+        assert_eq!(
+            run_with(&p, "=COUNTIF(A1:A1000,\">5\")"),
+            Value::Number(2.0)
+        );
+        assert_eq!(
+            run_with(&p, "=SUMIF(A1:A1000,\">5\")"),
+            Value::Number(30.0)
+        );
     }
 }

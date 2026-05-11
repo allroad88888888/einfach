@@ -6,6 +6,7 @@ use einfach_core::{Value, ValueError};
 use crate::cell::CellAddress;
 use crate::eval::EvalProvider;
 use crate::formula::{parse_formula, Expr};
+use crate::range::CellRange;
 use crate::sheet::Sheet;
 
 /// A workbook is an ordered collection of named sheets. Phase 4 backend.
@@ -335,6 +336,25 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
 
     fn force_formula_recompute(&self) -> bool {
         true
+    }
+
+    /// Sparse override for the workbook context. Routes the formula-cell
+    /// read through `peek_value_with_provider` so cross-sheet references
+    /// inside formulas in the iterated range can still resolve through
+    /// the workbook chain (the single-sheet `peek_value` would return
+    /// `#REF!` for `Sheet2!A1`).
+    fn for_each_range_cell(
+        &self,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        let idx = self.current.get();
+        let sheet = &self.wb.sheets[idx];
+        sheet.for_each_sparse_cell_with(
+            range,
+            &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+            f,
+        );
     }
 }
 

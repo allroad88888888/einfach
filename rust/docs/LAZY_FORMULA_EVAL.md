@@ -562,13 +562,33 @@ flush 的 BFS：O(T + D)，T = `touched.len()`，D = 从 touched 出发可达的
   source。如果 bulk 期间通过 set_cell→set_formula→set_cell 反复切 cell 类型，
   fanout detach/attach 会跑多次 —— 实际影响只是常数倍，没有正确性问题
 
-### Step 4：range streaming 改造
+### Step 4：range streaming 改造（✅ 完成）
 
-把现有 `collect_range_values` 的 `Vec<Value>` 收集改成 ctx-driven：
+- ✅ `EvalProvider::for_each_range_cell(range, &mut FnMut(addr, value))` 落地，default impl 走密集 `range.iter()`；`SheetEvalProvider` / `WorkbookEvalProvider` 覆盖为 sparse —— 只遍历 `cells ∪ formula_cells` 与 range 的交集
+- ✅ `TrackingEvalProvider` 也覆盖了 `for_each_range_cell`，把每个 visit 的地址塞进当前 record 的动态 deps，保持 IF-style dynamic dep 收集正确
+- ✅ 内部统一的 `for_each_arg_value(arg, provider, &mut |Option<addr>, value| {...})`，range args 走流式，其他 args 走单次 eval
+- ✅ 旧 `collect_range_values` 被删；旧 `collect_arg_values` 重写为流式 helper
 
-- `SUM/COUNT/AVERAGE/MIN/MAX/COUNTIF/SUMIF` 走 `for_each_range_cell` 的真 streaming（O(1) 累加状态）
-- `VLOOKUP/HLOOKUP/INDEX/MATCH/MEDIAN/MODE/STDEV/VAR/LARGE/SMALL` 仍允许临时 Vec（算法本身要求），但**不能创建 cell atom**
-- 整列引用 `SUM(A:A)` 在 ctx 内按 sparse 实际存在的 cell 遍历，不展开
+**Streaming vs stateful 切分**（在文档里讲死，免得后来者误以为 stateful 还在创建 atom）：
+
+| 类别 | 函数 | 内存特征 |
+|---|---|---|
+| 真 streaming | `SUM` / `COUNT` / `AVERAGE` / `MIN` / `MAX` / `COUNTIF` / `SUMIF` / `MATCH` | O(1) 累加器（sum + count + min/max running state），没有 Vec / Box / Rc clone per cell |
+| 流式 + 算法要求的局部 Vec | `MEDIAN` / `MODE` / `STDEV` / `VAR` / `LARGE` / `SMALL` | Vec 是算法本身需要（排序、bucket count、两遍均值方差、按 rank 选）；不创建 cell atom |
+| 流式 + 局部 2D 网格 | `VLOOKUP` / `HLOOKUP` / `INDEX` | 算法要求按 (row, col) 随机访问；grid 用 Null 预填，sparse provider 只 visit 实存 cell |
+| 单值（不走 range） | `AND` / `OR` / `CONCATENATE` 等也都改用 `for_each_arg_value`，单值 arg 等价于一次 eval |
+
+**整列引用 `SUM(A:A)`**：当前 parser 不识别 `A:A` 形式（CellAddress::parse 要求 row 数字），但等同形式 `SUM(A1:A1048576)` 已能用 sparse —— `SheetEvalProvider` 只 visit 实际有的 cell，验证测试 `sum_full_column_walks_sparse` 钉死了"两个真 cell → 2 次 visit，非 100k"。Parser 升级到接受 `A:A` 留到 Step 5（与 range index 一起）。
+
+**没有 Vec 分配的热路径**（review 时人工验过）：
+
+- `SUM` / `COUNT` / `AVERAGE` / `MIN` / `MAX` / `COUNTIF` 体内只声明 `f64` / `u64` / `Option<f64>` / `Option<ValueError>` 累加状态 + closure 捕获
+- `SUMIF` 两 arg 形态同上；三 arg 形态多一个 `provider.cell` 调用以查 sum_range 对应 cell（仍 O(1) 内存）
+
+**已知约束**（不属于本步骤）：
+
+- 行号 0（`A0`）不可解析（1-based）—— 不影响 sparse traversal 的语义
+- 跨 sheet range 的 sparse 遍历用 `peek_value_with_provider`，确保 range 内 formula cell 的跨 sheet ref 还能走 workbook chain
 
 ### Step 5：range dependency index 升级
 
