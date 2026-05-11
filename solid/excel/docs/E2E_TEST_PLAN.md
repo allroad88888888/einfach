@@ -4,10 +4,10 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
-## Current Status (2026-05-11)
+## Current Status (2026-05-11, post-batch 2)
 
-10 spec files / 74 active `test()` blocks landed across three parallel agent
-worktrees. Status of each plan section:
+**13 spec files / 98 active `test()` / 0 skipped** locally green. Status of each
+plan section:
 
 | Section | Status | Spec / Notes |
 |---|---|---|
@@ -18,19 +18,19 @@ worktrees. Status of each plan section:
 | P0.3 fix double commit | ✅ | `Cell.tsx::commitEdit` + `FormulaBar.tsx::commit` guards |
 | P0 Workbook Chain spec | ✅ | `workbook-chain.spec.ts` (7 tests) |
 | P0 Existing Blank flows | ✅ | `smoke.spec.ts` retained, helpers extracted |
-| P0 Clipboard | ⚠️ | `selection-clipboard.spec.ts` (8 tests). Cross-sheet name preservation NOT covered (gap vs Done Criteria) |
+| P0 Clipboard | ✅ | `selection-clipboard.spec.ts` (9 tests including cross-sheet name preservation) |
 | P1 WASM Formula Showcase | ✅ | `formulas-wasm.spec.ts` (14 tests, all passing — Discovered #B fixed) |
 | P1 FormulaBar | ✅ | `formula-bar.spec.ts` (8 tests) |
 | P1 MultiSheet UI | ⚠️ | `multisheet-ui.spec.ts` (8 tests). Plan's prompt-on-`+` model was wrong; agent corrected (see Discovered #C) |
-| P1 Other Demo Smoke (Budget/Grades/Sales) | □ | Decision still pending |
-| P1 Render Counter | ⚠️ | `render-counter.spec.ts` (6 tests, 3 strict-delta). **Probe broken in source**, MutationObserver workaround in spec (see Discovered #A) |
+| P1 Other Demo Smoke (Budget/Grades/Sales) | ✅ | `demo-budget.spec.ts` (6) + `demo-grades.spec.ts` (6) + `demo-sales.spec.ts` (8) — option A (WASM migration) landed |
+| P1 Render Counter | ✅ | `render-counter.spec.ts` (6 strict-delta tests). MutationObserver workaround removed after Discovered #A fix |
 | Regression Spec | ✅ | `regression.spec.ts` (6 tests, all passing — Discovered #E.1 + #E.2 both landed) |
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 9 feature spec files + smoke = 10. 74 active `test()` + 4 `.skip` = 78
-total blocks. Local `npm run e2e` green from a clean checkout (modulo the
-proxy caveat in Discovered #D).
+Counts: smoke + 9 feature + 3 demo-smoke = 13 spec files. 98 active `test()`
++ 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
+checkout green (proxy caveat per Discovered #D).
 
 ## Discovered During Implementation
 
@@ -76,8 +76,8 @@ unchanged.
 - `formulas-wasm.spec.ts` chain propagation tests un-skipped, all 14
   scenarios green locally (`F8 7 → G8 14 → H8 28 → I8 84`,
   `A3 10 → C3 100 / D3 300 / E3 -200 / F3 220`).
-- Full e2e suite: 75 passed + 2 skipped (the 2 .skip are the unrelated
-  regression entries from Discovered #E).
+- Full e2e suite at landing time of the fix: 75 passed + 2 skipped. After
+  subsequent batches: 98 passed + 0 skipped (current).
 
 **Caveat — resolved**: the WASM-side microtask defer is now pinned by
 `rust/wasm/tests/web.rs` (5 `#[wasm_bindgen_test]`, see TODO 2.3 ✅).
@@ -141,21 +141,24 @@ suite fails confusingly.
 
 ## Current Coverage
 
-10 spec files, 74 active `test()` blocks + 4 `.skip`. All landed via three
-parallel agent worktrees + P0 prerequisite work.
+13 spec files, 98 active `test()` blocks + 0 `.skip`. Landed across two
+agent batches plus follow-up cleanup work.
 
 | Spec file | Tests | Backend |
 |---|---|---|
 | `smoke.spec.ts` | 7 | JS mock |
 | `workbook-chain.spec.ts` | 7 | WASM workbook (`3-Sheet Chain` demo) |
-| `formulas-wasm.spec.ts` | 12 (2 .skip) | WASM single sheet (`Formulas` demo) |
+| `formulas-wasm.spec.ts` | 14 | WASM single sheet (`Formulas` demo) |
 | `formula-bar.spec.ts` | 8 | mixed |
-| `selection-clipboard.spec.ts` | 8 | JS mock (`Blank`) |
+| `selection-clipboard.spec.ts` | 9 | JS mock (`Blank`) |
 | `multisheet-ui.spec.ts` | 8 | JS mock workbook (`Multi-Sheet` demo) |
 | `range-ops.spec.ts` | 4 | JS mock |
 | `undo-redo.spec.ts` | 9 | JS mock |
 | `render-counter.spec.ts` | 6 | JS mock + `?debug=1` |
-| `regression.spec.ts` | 5 (2 .skip) | mixed |
+| `regression.spec.ts` | 6 | mixed |
+| `demo-budget.spec.ts` | 6 | WASM |
+| `demo-grades.spec.ts` | 6 | WASM |
+| `demo-sales.spec.ts` | 8 | WASM |
 
 Playwright setup:
 
@@ -678,7 +681,7 @@ Reality check against the plan's hard numbers:
 | Criterion | Status | Notes |
 |---|---|---|
 | ≥ 8 spec files | ✅ | 10 actual |
-| ≥ 50 test() blocks pass locally | ✅ | 74 active (+ 4 .skip) |
+| ≥ 50 test() blocks pass locally | ✅ | 98 active, 0 skip |
 | regression.spec.ts pins ≥ 5 | ✅ | 6 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |
