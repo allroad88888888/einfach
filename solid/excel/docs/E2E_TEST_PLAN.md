@@ -4,6 +4,121 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
+## Current Status (2026-05-11)
+
+10 spec files / 74 active `test()` blocks landed across three parallel agent
+worktrees. Status of each plan section:
+
+| Section | Status | Spec / Notes |
+|---|---|---|
+| P0.0.1 cache state badge | ✅ | `DemoCrossSheetChain.tsx:43` `data-cache-state="Sheet2!C5"` |
+| P0.0.2 lazy console probe | ✅ | `wasm-workbook-store.ts:106` `[lazy-demo] computed Sheet2!C5` |
+| P0.1 build:wasm in webServer | ✅ | `playwright.config.ts:41` |
+| P0.2 CI wiring | □ | No `.github/workflows`. Next priority. |
+| P0.3 fix double commit | ✅ | `Cell.tsx::commitEdit` + `FormulaBar.tsx::commit` guards |
+| P0 Workbook Chain spec | ✅ | `workbook-chain.spec.ts` (7 tests) |
+| P0 Existing Blank flows | ✅ | `smoke.spec.ts` retained, helpers extracted |
+| P0 Clipboard | ⚠️ | `selection-clipboard.spec.ts` (8 tests). Cross-sheet name preservation NOT covered (gap vs Done Criteria) |
+| P1 WASM Formula Showcase | ⚠️ | `formulas-wasm.spec.ts` (12 tests, **2 .skip** — see Discovered #B) |
+| P1 FormulaBar | ✅ | `formula-bar.spec.ts` (8 tests) |
+| P1 MultiSheet UI | ⚠️ | `multisheet-ui.spec.ts` (8 tests). Plan's prompt-on-`+` model was wrong; agent corrected (see Discovered #C) |
+| P1 Other Demo Smoke (Budget/Grades/Sales) | □ | Decision still pending |
+| P1 Render Counter | ⚠️ | `render-counter.spec.ts` (6 tests, 3 strict-delta). **Probe broken in source**, MutationObserver workaround in spec (see Discovered #A) |
+| Regression Spec | ⚠️ | `regression.spec.ts` (5 tests, **2 .skip** — see Discovered #E) |
+| P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
+| P2 Performance / lazy viewport | □ | Correctly deferred |
+
+Counts: 9 feature spec files + smoke = 10. 74 active `test()` + 4 `.skip` = 78
+total blocks. Local `npm run e2e` green from a clean checkout (modulo the
+proxy caveat in Discovered #D).
+
+## Discovered During Implementation
+
+Real issues surfaced during agent work that the original plan didn't
+anticipate. Each is actionable with a known fix or follow-up.
+
+### A. Render-counter probe doesn't tick on dependency-driven updates
+
+`Cell.tsx::renderCountAttr()` doesn't read any reactive signal, so Solid
+never re-evaluates the attribute binding when `cellValue()` changes. The
+probe sits frozen at 1 even though the display text mutates.
+
+`render-counter.spec.ts` works around this via an `addInitScript`
+MutationObserver counting `[data-cell-addr]` text mutations. That gives
+useful numbers but measures DOM patches, not Cell renders — semantically
+slightly different.
+
+**Fix** (1-line, recommended):
+
+```tsx
+const renderCountAttr = () => {
+  cellValue() // tracking dep — without this Solid never re-runs the attribute
+  return RENDER_COUNT_DEBUG ? String(nextRenderCount()) : undefined
+}
+```
+
+After the fix, drop the MutationObserver in `render-counter.spec.ts` and
+use `helpers.ts::renderCount(page, addr)` directly.
+
+### B. Single-sheet WasmSheet doesn't propagate dependents on source writes
+
+Agent α writing `formulas-wasm.spec.ts` discovered: setting `F8 = 7`
+through `WasmSheet::set_number` does NOT cause `G8/H8/I8` (formulas
+referencing F8) to recompute. `get_display(G8)` returns the stale
+pre-write value.
+
+Cross-sheet path through `WasmWorkbookStore` works because of coarse
+fanout; single-sheet path is the broken one.
+
+This is a real Rust-side bug, not a test issue. Two `.skip` tests in
+`formulas-wasm.spec.ts` (`changing F8 propagates through G8 / H8 / I8`,
+`changing A3 updates C3-F3`) document it. Likely related to the lazy
+formula `cell_dependents` not being walked on primitive writes outside
+the workbook scope.
+
+**Fix priority**: P0 source bug. DemoFormulas demo's storytelling about
+formula chains is broken without it.
+
+### C. MultiSheet UI dialog flow differs from plan
+
+The plan assumed `+` opens a `prompt` for the new sheet name. Reality:
+`+` auto-picks the next default name via `pickDefaultName()` (no
+prompt). Rename / delete go through `SheetTabs.onContextMenu` as a
+chained native prompt sequence (action verb prompt → either rename
+prompt or delete confirm). Trying to delete the last sheet surfaces a
+`window.alert`.
+
+Agent β handled this with an inline `queueDialogs(page, [...])` helper.
+
+**Follow-up**: lift `queueDialogs` into `helpers.ts` so future specs
+don't reinvent it.
+
+### D. Local proxy interferes with Playwright webServer
+
+If your shell has `http_proxy=http://127.0.0.1:7897` (or similar),
+Playwright's webServer health-check probe gets a 502 from the proxy
+intercepting localhost — it skips its own server start and the entire
+suite fails confusingly.
+
+**Workaround**: `unset http_proxy https_proxy all_proxy` or set
+`NO_PROXY=localhost,127.0.0.1` before `npm run e2e`. Add to
+`solid/excel/README.md` if not already there. CI is unaffected.
+
+### E. Skipped regression entries
+
+`regression.spec.ts` has two `.skip`s linked to their Rust unit-test
+counterparts:
+
+- **subscribe-then-set_formula fires once**: needs SheetStore to expose
+  a debug `subscriberFireCount(addr)` accessor. Currently pinned by Rust
+  unit test `subscribe_empty_cell_then_set_formula_fires_once`.
+- **JsCallbackListener panic**: needs a `?debug=panic-next` query knob
+  in `wasm-sheet.ts` to inject a single panic. Currently pinned by
+  cargo test.
+
+Both require source-side debug shims. Until then the e2e gate is
+effectively `cargo test` for these invariants.
+
 ## Goals
 
 - Protect the real user flows that unit tests cannot cover: focus, keyboard,
@@ -16,43 +131,48 @@
 
 ## Current Coverage
 
-Existing file:
+10 spec files, 74 active `test()` blocks + 4 `.skip`. All landed via three
+parallel agent worktrees + P0 prerequisite work.
 
-- `solid/excel/e2e/smoke.spec.ts`
+| Spec file | Tests | Backend |
+|---|---|---|
+| `smoke.spec.ts` | 7 | JS mock |
+| `workbook-chain.spec.ts` | 7 | WASM workbook (`3-Sheet Chain` demo) |
+| `formulas-wasm.spec.ts` | 12 (2 .skip) | WASM single sheet (`Formulas` demo) |
+| `formula-bar.spec.ts` | 8 | mixed |
+| `selection-clipboard.spec.ts` | 8 | JS mock (`Blank`) |
+| `multisheet-ui.spec.ts` | 8 | JS mock workbook (`Multi-Sheet` demo) |
+| `range-ops.spec.ts` | 4 | JS mock |
+| `undo-redo.spec.ts` | 9 | JS mock |
+| `render-counter.spec.ts` | 6 | JS mock + `?debug=1` |
+| `regression.spec.ts` | 5 (2 .skip) | mixed |
 
-Existing scenarios, all on the `Blank` demo backed by `createJSSheet()`:
-
-- cell edit and Enter commit
-- simple formula commit
-- same-sheet dependency propagation
-- undo / redo
-- FormulaBar shows formula source for a selected formula cell
-- Arrow / Tab / Shift+Tab selection movement
-
-Current Playwright setup:
+Playwright setup:
 
 - `solid/excel/playwright.config.ts`
-- Chromium only
-- one worker
-- Vite web server on port `5174`
-- trace on first retry
-- `npm run e2e` in `@einfach/solid-excel`
+- Chromium only, one worker, port `5174`
+- Trace on first retry; failure screenshots
+- webServer prepends `npm run build:wasm` (handles clean checkouts)
+- `npm run e2e -w @einfach/solid-excel`
 
-## Current Gaps
+## Remaining Gaps
 
-- CI does not run Playwright e2e.
-- `build:wasm` is not part of e2e startup, so WASM demos can fail on a clean
-  checkout without `solid/excel/wasm-pkg`.
-- Existing smoke coverage uses JS mock only; it does not cover real WASM formula
-  evaluation or `WasmWorkbook`.
-- Clipboard e2e is missing, including browser permission setup.
-- Range selection is not covered.
-- `MultiSheet` tab UI is not covered.
-- `3-Sheet Chain` lazy workbook demo is not covered.
-- Row/col structural edits have backend/store support but no user-facing UI
-  entry, so browser e2e should wait until a toolbar/context menu exists.
-- Known bug: Enter commit plus input blur creates duplicate undo entries. Current
-  e2e works around this by pressing undo/redo twice.
+These are now-known-not-yet-done items (everything in the plan body is
+either ✅ or has a Discovered # entry above):
+
+- **CI wiring (P0.2)**. No `.github/workflows/` runs e2e on push.
+- **Cross-sheet name preservation in clipboard**. `selection-clipboard.spec.ts`
+  doesn't assert that copying `=Sheet1!A1` from one cell and pasting elsewhere
+  preserves the sheet name. Covered in jest, missing from e2e.
+- **Other Demo Smoke (Budget / Grades / Sales Dashboard)**. Decision still
+  punted: do these demos migrate to WASM, or do we lower assertions on
+  JS-mock-induced `#ERROR!` cells? Depends on the dep-tracking bug fix
+  (Discovered #B) since several seeded formulas only resolve correctly
+  through the WASM path.
+- **Render-counter probe needs the 1-line source fix** (Discovered #A) so
+  the spec can use the official helper instead of MutationObserver.
+- **2 regression entries** (subscribe-once + panic) await source-side
+  debug shims (Discovered #E).
 
 ## Test Principles
 
@@ -64,58 +184,53 @@ Current Playwright setup:
 6. Lazy cache assertions must read cache state before reading the formula cell.
 7. Clipboard tests must explicitly grant clipboard permissions.
 
-## Proposed File Layout
+## Actual File Layout
 
 ```text
 solid/excel/e2e/
-  helpers.ts
-  smoke.spec.ts
-  workbook-chain.spec.ts
-  formulas-wasm.spec.ts
-  formula-bar.spec.ts
-  selection-clipboard.spec.ts
-  multisheet-ui.spec.ts
+  helpers.ts                   # cell/cellDisplay/cellInput/gotoDemo/selectSheet/
+                               # typeIntoCell/selectCell/expectDisplay/renderCount/
+                               # grantClipboard/acceptDialog/guardConsoleErrors/
+                               # expectNoConsoleErrors
+  smoke.spec.ts                # 7 baseline scenarios on Blank
+  workbook-chain.spec.ts       # WASM workbook + lazy-not-read
+  formulas-wasm.spec.ts        # WASM single-sheet function showcase
+  formula-bar.spec.ts          # FormulaBar source display + edit + parse error
+  selection-clipboard.spec.ts  # Shift+Arrow range + Ctrl+C/V/X
+  multisheet-ui.spec.ts        # tab switch / + / contextMenu rename+delete
+  range-ops.spec.ts            # Delete/Backspace clears range as one undo step
+  undo-redo.spec.ts            # float precision + formula source + grouping
+  render-counter.spec.ts       # precise subscription proofs (?debug=1)
+  regression.spec.ts           # known-fixed bugs pinned in browser
 ```
+
+Diff vs original "Proposed File Layout": added `range-ops`, `undo-redo`,
+`render-counter`, `regression` (4 spec files surfaced during coverage
+mapping that the original plan didn't enumerate).
 
 ## Helper API
 
-Create `solid/excel/e2e/helpers.ts`:
+Implemented in `solid/excel/e2e/helpers.ts`. Exports:
 
-```ts
-import { expect, type Page } from '@playwright/test'
+| Helper | Purpose |
+|---|---|
+| `cell(page, addr)` | `<td class="cell" data-cell-addr=…>` locator |
+| `cellDisplay(page, addr)` | `.cell-display` span inside cell |
+| `cellInput(page, addr)` | `.cell-input` (only present in edit mode) |
+| `gotoDemo(page, name, query?)` | Open a demo by exact button name; `query` for `?debug=1` |
+| `selectSheet(page, name)` | Click a sheet tab in workbook demos |
+| `typeIntoCell(page, addr, value)` | Double-click → fill → Enter → wait for unmount |
+| `selectCell(page, addr)` | Click + wait for `cell-selected` class |
+| `expectDisplay(page, addr, expected)` | Assert `cell-display` text |
+| `renderCount(page, addr)` | Read `data-render-count` attr (needs `?debug=1`) |
+| `grantClipboard(context)` | Grant `clipboard-read` + `clipboard-write` |
+| `acceptDialog(page, text?)` | One-shot dialog handler (text=null dismisses) |
+| `guardConsoleErrors(page, extraAllow?)` | Install console.error listener; allowlist `^[vite]` / `^[lazy-demo] ` / React-DevTools nag by default |
+| `expectNoConsoleErrors(page)` | Assert no unallowed errors leaked through |
 
-export function cell(page: Page, addr: string) {
-  return page.locator(`td.cell[data-cell-addr="${addr}"]`)
-}
-
-export function cellDisplay(page: Page, addr: string) {
-  return cell(page, addr).locator('.cell-display')
-}
-
-export function cellInput(page: Page, addr: string) {
-  return cell(page, addr).locator('.cell-input')
-}
-
-export async function gotoDemo(page: Page, name: string) {
-  await page.goto('/')
-  await page.getByRole('button', { name }).click()
-  await expect(cell(page, 'A1')).toBeVisible()
-}
-
-export async function typeIntoCell(page: Page, addr: string, value: string) {
-  await cell(page, addr).dblclick()
-  const input = cellInput(page, addr)
-  await expect(input).toBeVisible()
-  await input.fill(value)
-  await input.press('Enter')
-  await expect(input).toHaveCount(0)
-}
-
-export async function selectSheet(page: Page, name: string) {
-  await page.getByRole('tab', { name }).click()
-  await expect(cell(page, 'A1')).toBeVisible()
-}
-```
+**Helper gap noted in Discovered #C**: `queueDialogs(page, [...])` is
+inlined in `multisheet-ui.spec.ts` for the contextMenu chained-prompt
+flow. Lift to helpers.ts when a second spec needs it.
 
 ## P0.0: Demo Observability Prerequisites
 
@@ -176,20 +291,45 @@ Acceptance:
   dependencies are installed.
 - WASM-backed demos do not hang on loading because `wasm-pkg` is missing.
 
-### P0.2 CI Wiring
+### P0.2 CI Wiring (□ NEXT PRIORITY)
 
-Add CI steps:
+Currently no `.github/workflows/`. Concrete next step is a single workflow
+file that runs e2e on push + PR:
 
-```bash
-npm run build:wasm -w @einfach/solid-excel
-npx playwright install --with-deps chromium
-npm run e2e -w @einfach/solid-excel
+```yaml
+# .github/workflows/e2e.yml
+name: e2e
+on: [push, pull_request]
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20', cache: 'pnpm' }
+      - uses: pnpm/action-setup@v3
+        with: { version: 9 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: wasm32-unknown-unknown }
+      - run: cargo install wasm-pack --version 0.13.1
+      - run: pnpm install --frozen-lockfile
+      - run: npm run build:wasm -w @einfach/solid-excel
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e -w @einfach/solid-excel
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: solid/excel/playwright-report/
+          retention-days: 14
 ```
 
 Acceptance:
 
-- CI uploads Playwright traces/screenshots on failure.
-- E2E can be run independently from unit tests.
+- Push triggers the workflow; failure uploads
+  `playwright-report/` and `test-results/` (traces + screenshots).
+- E2E can run independently from unit tests (separate job).
+- See "CI Gate Policy" below for advisory-vs-blocking timing.
 
 ### P0.3 Fix Double Commit Before Expanding Undo Tests
 
@@ -362,27 +502,35 @@ Risk:
 - FormulaBar and Table share `store.selection`; sheet remounting can expose stale
   selection bugs.
 
-## P1: MultiSheet JS Workbook UI
+## P1: MultiSheet JS Workbook UI ✅ (with corrections)
 
-Create `solid/excel/e2e/multisheet-ui.spec.ts`.
+Implemented in `solid/excel/e2e/multisheet-ui.spec.ts`. Original plan
+assumed `+` triggers a `prompt`; **reality** (per agent β):
 
-Scenarios:
+- `+` button is `getByRole('button', { name: 'Add sheet' })`. It auto-picks
+  the next default name via `pickDefaultName()`. NO prompt fires.
+- Rename / delete are reached via `onContextMenu` on a sheet tab. The menu
+  fires a chained sequence of native dialogs: action verb prompt → either
+  rename prompt OR delete confirm.
+- Trying to delete the last remaining sheet triggers `window.alert`.
 
-- Open `Multi-Sheet`.
-- Switch `Sheet1`, `Expenses`, `Notes` and assert each sheet's seeded content.
-- Edit `Sheet1!A1`, switch to `Expenses`, edit `A1`, switch back and assert
-  both sheets kept independent state.
-- Click `+`, assert new sheet name and active tab.
-- Use dialog handlers for native prompt/confirm:
-  - rename sheet
-  - duplicate name alert
-  - delete current sheet
-  - cannot delete last sheet
+Inline `queueDialogs(page, [...])` helper in the spec handles the chained
+sequence. **Lift to `helpers.ts`** when a second spec needs it (Discovered #C).
 
-Explicit non-goal:
+Scenarios actually covered:
 
-- Do not assert cross-sheet formula evaluation in this JS mock demo. That is
-  covered by `3-Sheet Chain`.
+- Switch Sheet1 / Expenses / Notes, assert each sheet's seed content.
+- Edit Sheet1!A1, switch to Expenses, edit A1, switch back. Independence
+  preserved.
+- Click `+`, assert "Sheet4" tab appears and is active.
+- ContextMenu rename: chained prompts handled by queueDialogs.
+- ContextMenu delete (non-last sheet): chained confirm handled.
+- Delete-last-sheet rejection: alert dialog accepted; sheet count stays ≥ 1.
+
+Explicit non-goal (unchanged):
+
+- No cross-sheet formula evaluation here — JS mock can't do it. Covered
+  by `3-Sheet Chain` workbook-chain spec.
 
 ## P1: Other Demo Smoke
 
@@ -457,14 +605,29 @@ stable.
 
 ## Suggested Execution Order
 
-1. Extract e2e helpers and keep existing smoke green.
-2. Fix double commit and simplify undo/redo smoke.
-3. Add `build:wasm` to e2e startup.
-4. Add `workbook-chain.spec.ts`.
-5. Add clipboard permission setup and clipboard tests.
-6. Add `formulas-wasm.spec.ts`.
-7. Add FormulaBar and MultiSheet specs.
-8. Wire e2e into CI.
+Original ordering (1–8) is now ✅ through step 7. Step 8 (CI) is the
+next ticket. Forward order, post-landing:
+
+1. ✅ Extract e2e helpers and keep existing smoke green.
+2. ✅ Fix double commit and simplify undo/redo smoke.
+3. ✅ Add `build:wasm` to e2e startup.
+4. ✅ Add `workbook-chain.spec.ts`.
+5. ✅ Add clipboard permission setup and clipboard tests.
+6. ✅ Add `formulas-wasm.spec.ts`.
+7. ✅ Add FormulaBar and MultiSheet specs.
+8. □ Wire e2e into CI (template in P0.2 above).
+9. □ Close 3 outstanding gaps from Done Criteria:
+   a. Fix `Cell.tsx::renderCountAttr` (Discovered #A) → drop MutationObserver
+      workaround in `render-counter.spec.ts`.
+   b. Add cross-sheet-name preservation scenario to
+      `selection-clipboard.spec.ts`.
+   c. Add the 2 source-side debug shims (Discovered #E) so the regression
+      spec's two `.skip`s can become real tests.
+10. □ Decide on the "Other Demo Smoke" (Budget / Grades / Sales) question.
+    Probably blocked on the dep-tracking fix (Discovered #B).
+11. □ Fix the dep-tracking bug (Discovered #B). DemoFormulas's chain
+    storytelling is broken without it — this is a P0 source bug, not just
+    an e2e gap.
 
 ## Default Commands
 
@@ -490,26 +653,30 @@ npm run build:wasm -w @einfach/solid-excel
 npm run e2e -w @einfach/solid-excel
 ```
 
-## Done Criteria
+## Done Criteria — Live Checklist
 
-Hard numbers (so "done" is unambiguous):
+Reality check against the plan's hard numbers:
 
-- ≥ 8 spec files exist under `solid/excel/e2e/` (smoke + workbook-chain +
-  formulas-wasm + formula-bar + selection-clipboard + multisheet-ui +
-  render-counter + regression).
-- ≥ 50 individual `test(...)` blocks pass locally on a clean checkout.
-- `regression.spec.ts` pins ≥ 5 already-fixed bugs (see Regression Spec
-  Scope above).
-- `workbook-chain.spec.ts` includes ≥ 1 lazy-not-read assertion that
-  fails if the cache is read prematurely.
-- `selection-clipboard.spec.ts` includes ≥ 1 cross-sheet-name preservation
-  assertion via real `navigator.clipboard`.
-- `render-counter.spec.ts` has hard `expect(...).toBe(N)` (not `>=`)
-  assertions on at least 3 distinct subscription paths.
-- CI runs e2e with Chromium, uploads failure artifacts, advisory mode for
-  the first 2 weeks then PR-blocking.
-- Helpers expose `gotoDemo`, `cell`, `cellDisplay`, `cellInput`,
-  `selectSheet`, `typeIntoCell`, `grantClipboard`, `acceptDialog`,
-  `guardConsoleErrors`.
-- No spec contains a `// TODO: workaround` comment for a fixed bug
-  (regression spec entries pin the bugs, working code paths use the fix).
+| Criterion | Status | Notes |
+|---|---|---|
+| ≥ 8 spec files | ✅ | 10 actual |
+| ≥ 50 test() blocks pass locally | ✅ | 74 active (+ 4 .skip) |
+| regression.spec.ts pins ≥ 5 | ⚠️ | 5 entries, but 2 are `.skip` pending source-side debug shims (Discovered #E). 3 actively running |
+| workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
+| selection-clipboard ≥ 1 cross-sheet-name preservation | ❌ | Not covered. Jest pins it, e2e doesn't. Add scenario: `=Sheet1!A1` copy + paste preserves sheet name in result |
+| render-counter ≥ 3 strict toBe (no `>=`) | ✅ | 3 distinct strict-delta paths |
+| CI runs e2e with artifact upload, advisory→blocking | ❌ | P0.2 not done. Workflow template now in P0.2 above |
+| Helpers expose the full API | ✅ | All 13 helpers in helpers.ts (see Helper API table) |
+| No `// TODO: workaround` for fixed bugs | ✅ | grep clean across e2e/ |
+
+**Outstanding to flip remaining ❌ → ✅**:
+
+1. Add cross-sheet-name preservation scenario to `selection-clipboard.spec.ts`
+   (one new `test()` block, ~15 lines).
+2. Land `.github/workflows/e2e.yml` per P0.2 template above.
+3. (Optional, to recover the 2 regression `.skip`s) add two source-side
+   debug shims per Discovered #E.
+
+After (1) and (2) the only ⚠️ remaining is the regression `.skip` pair,
+which is honestly tracked rather than papered over — leave as-is until
+the shims land.
