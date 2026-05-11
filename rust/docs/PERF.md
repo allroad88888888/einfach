@@ -61,6 +61,23 @@ significant regressions. Use this for any LAZY step that claims a perf win.
 | `sheet/bulk_set_cell/set_10k_numbers` | Throughput of `Sheet::set_cell` for 10k primitive values, no formulas, no subscribers. Captures the cost of address parsing + `ensure_cell` + `store.set`. | Floor for the sheet write path. Any LAZY step that restructures `Sheet` internals (e.g. adding lazy flags per cell) must not regress this. |
 | `sheet/sum_range_eval/sum_a1_a10000` | Per-call cost of `get_cell("B1")` where `B1 = SUM(A1:A10000)`. Today the derived atom value is cached after the first eval, so this measures the cached-read path — not the SUM walk itself. | LAZY Step 4 (range streaming / lazy SUM aggregator) lives here. Once Step 4 lands, this bench should be expanded to also measure the *cold* path (first read after invalidation), since the cached-read number alone won't tell you whether the streaming aggregator works. |
 | `sheet/lazy_import_no_eval/import_10k_formulas` | Throughput of importing 10k formulas via `set_formula` without reading any of them. | LAZY Step 2 (deferred formula eval). When Step 2 lands, the bench should also assert `Store::debug_recompute_count() == 0` after import — failing loudly if any formula evaluated eagerly. The `assert_eq!` is staged as a comment in the bench source; un-comment it once the `#[doc(hidden)] debug_recompute_count` accessor exists. |
+| `sheet/range_dep_registration/{10,100,1000}` | `set_formula(=SUM(A1:A1000))` N times, measure time. Each call expands the range into 1000 `cell_dependents` entries; total work is O(N × range size). | LAZY Step 5 (range dependency interval index). Today registration is roughly constant per-formula (~100 µs) since each expansion is 1000 HashMap inserts; Step 5 should make this O(1) per formula and rely on interval lookup at dirty time. |
+| `sheet/range_dirty_lookup/{10,100,1000}` | After registering N range formulas that all contain A1, time `set_cell("A1", …)`. Measures the fan-out cost when a hotspot cell wakes many range deps. | Same Step 5 gate. Today this scales linearly with N (≈ 50 µs at N = 1000); Step 5's interval tree should keep cost bounded by *intervals-containing-A1*, not total range-formula count. |
+
+#### Step 5 deferral note
+
+The two `range_*` benches above are the empirical justification for *not*
+landing Step 5 yet:
+
+- **Registration**: ~100 µs / formula. Even 1000 range formulas (a heavy
+  dashboard) costs ~100 ms once on load.
+- **Dirty lookup**: 50 µs / cell-write at N = 1000. Imperceptible for
+  interactive editing.
+
+Step 5 becomes urgent if a future workload pushes N range formulas past
+~10k (the doc's stated "10 万" gate from `LAZY_FORMULA_EVAL.md` Step 5).
+The benches will catch the regression — re-run them when adding any
+demo or feature that bulk-creates range formulas.
 
 ## Workflow for LAZY refactor steps
 
