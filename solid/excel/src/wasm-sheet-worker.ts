@@ -8,17 +8,22 @@
 //                { type: 'module' })`
 // which Vite bundles separately at build time.
 //
-// Protocol (Step 2):
+// Protocol (Step 3):
 //   Main → Worker  { cmd: 'set_number' | 'set_text' | 'set_boolean'
 //                    | 'set_error' | 'set_formula' | 'clear_cell'
 //                    | 'insert_row' | 'delete_row' | 'insert_col'
-//                    | 'delete_col' | 'subscribe' | 'unsubscribe',
+//                    | 'delete_col' | 'subscribe' | 'unsubscribe'
+//                    | 'read_initial',
 //                    ...payload }
 //   Worker → Main  { event: 'change', addr, display, type, isError,
 //                    formula } whenever a subscribed address's value
-//                  changes. The worker ref-counts subscribes per addr so
-//                  the underlying `WasmSheet.subscribe` only runs once
-//                  even when multiple main-side listeners share an addr.
+//                  changes. Also fired:
+//                    - immediately after a `subscribe` on a fresh addr
+//                      (initial backfill — primes the main-side cache so
+//                      seed values become visible after the proxy
+//                      subscribes),
+//                    - once per `read_initial` request (cache hydration
+//                      for ad-hoc reads without a permanent subscription).
 
 import init, { WasmSheet } from '../wasm-pkg/einfach_wasm.js'
 
@@ -63,10 +68,18 @@ function subscribeAddr(s: WasmSheet, addr: string) {
   const existing = subRefs.get(a)
   if (existing) {
     existing.count += 1
+    // Second+ subscribe on the same addr: don't re-push. The first
+    // subscribe already hydrated main's cache, and the second listener
+    // (on main) is sharing the same cache entry — no replay needed.
     return
   }
   const token = s.subscribe(a, () => pushChange(s, a))
   subRefs.set(a, { token, count: 1 })
+  // Initial backfill: push the cell's current state so the proxy's
+  // cache hydrates immediately after subscribe. Without this, a seed
+  // sheet (preloaded with values before the main side ever subscribed)
+  // would only become visible the next time those cells change.
+  pushChange(s, a)
 }
 
 function unsubscribeAddr(s: WasmSheet, addr: string) {
@@ -122,9 +135,14 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
       case 'unsubscribe':
         unsubscribeAddr(s, msg.addr as string)
         break
+      case 'read_initial':
+        // One-shot push without registering a subscription. Used by the
+        // proxy for ad-hoc reads (e.g. formula-bar inspection, structural-
+        // undo's `non_empty_addrs` walk) where a permanent subscriber
+        // would be wasteful.
+        pushChange(s, (msg.addr as string).toUpperCase())
+        break
       default:
-        // Unknown command — ignored. Step 3 will add a 'read_initial'
-        // reply command for lazy cache hydration.
         break
     }
   } catch (err) {

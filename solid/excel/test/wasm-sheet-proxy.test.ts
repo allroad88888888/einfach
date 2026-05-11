@@ -292,4 +292,86 @@ describe('wasm-sheet-proxy (7C Step 1)', () => {
     sheet.unsubscribe(9999)
     expect(fake.sent.filter((m) => (m as { cmd: string }).cmd === 'unsubscribe')).toHaveLength(0)
   })
+
+  // === Step 3: lazy cache hydration ===
+
+  it('first read of an untouched addr posts read_initial', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    const got = sheet.get_display('A1')
+    expect(got).toBe('') // cache miss returns empty
+    expect(fake.sent).toContainEqual({ cmd: 'read_initial', addr: 'A1' })
+  })
+
+  it('read_initial fires at most once per addr across multiple reads', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.get_display('A1')
+    sheet.get_type('A1')
+    sheet.is_error('A1')
+    sheet.get_formula('A1')
+    sheet.get_number('A1')
+    const initials = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'read_initial',
+    )
+    expect(initials).toHaveLength(1)
+    expect(initials[0]).toEqual({ cmd: 'read_initial', addr: 'A1' })
+  })
+
+  it('worker push after read_initial populates the cache + future reads skip the request', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.get_display('A1')
+    fake._emit({
+      event: 'change',
+      addr: 'A1',
+      display: '99',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    expect(sheet.get_display('A1')).toBe('99')
+    // Reading again must not re-issue read_initial.
+    const initials = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'read_initial',
+    )
+    expect(initials).toHaveLength(1)
+  })
+
+  it('subscribe marks the addr hydrated (no separate read_initial)', () => {
+    // Worker auto-pushes the current value when a fresh subscribe lands,
+    // so the proxy must NOT ALSO send read_initial for the same addr.
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.subscribe('A1', () => {})
+    sheet.get_display('A1')
+    const initials = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'read_initial',
+    )
+    expect(initials).toHaveLength(0)
+  })
+
+  it('local write marks the addr hydrated (no read_initial after set_number)', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.set_number('A1', 42)
+    sheet.get_display('A1')
+    const initials = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'read_initial',
+    )
+    expect(initials).toHaveLength(0)
+  })
+
+  it('structural edit clears the hydration set so reads can re-hydrate', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.get_display('A1')
+    sheet.insert_row!(0, 1)
+    sheet.get_display('A1')
+    // First read pre-insert + first read post-insert = two read_initials.
+    const initials = fake.sent.filter(
+      (m) => (m as { cmd: string }).cmd === 'read_initial',
+    )
+    expect(initials).toHaveLength(2)
+  })
 })

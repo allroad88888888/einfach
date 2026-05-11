@@ -94,6 +94,22 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
     cache.set(a, { ...cur, ...patch })
   }
 
+  // === Hydration ===
+  // First-time reads of an addr we've never subscribed to or written to
+  // post a `read_initial` cmd so the worker pushes back the current
+  // value. Tracked per-addr so we issue the request at most once. Both
+  // `subscribe` (which triggers the worker's auto-backfill) and any
+  // local write also flip the addr into `requested`, so the read-side
+  // path never double-fires.
+  const requested = new Set<string>()
+
+  function ensureHydration(addr: string) {
+    const a = addr.toUpperCase()
+    if (requested.has(a)) return
+    requested.add(a)
+    post('read_initial', { addr: a })
+  }
+
   // === Subscriptions ===
   // Listener bookkeeping mirrors the worker's: at most one
   // `WasmSheet.subscribe` per addr, ref-counted so multiple Solid signals
@@ -150,6 +166,7 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
 
   return {
     set_number(addr, value) {
+      requested.add(addr.toUpperCase())
       writeCache(addr, {
         display: optimisticNumberDisplay(value),
         type: 'number',
@@ -160,6 +177,7 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
     },
 
     set_text(addr, value) {
+      requested.add(addr.toUpperCase())
       writeCache(addr, {
         display: value,
         // Empty text and explicit set_text('') collapse to 'null' on the
@@ -172,6 +190,7 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
     },
 
     set_boolean(addr, value) {
+      requested.add(addr.toUpperCase())
       writeCache(addr, {
         display: value ? 'TRUE' : 'FALSE',
         type: 'boolean',
@@ -182,6 +201,7 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
     },
 
     set_error(addr, value) {
+      requested.add(addr.toUpperCase())
       writeCache(addr, {
         display: value,
         type: 'error',
@@ -198,52 +218,65 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
       // once it computes. Cycle detection happens on the worker too;
       // Step 1 returns `true` unconditionally and a Step 2 reply path
       // will surface the real bool when needed by undo bookkeeping.
+      requested.add(addr.toUpperCase())
       writeCache(addr, { formula })
       post('set_formula', { addr, formula })
       return true
     },
 
     clear_cell(addr) {
+      requested.add(addr.toUpperCase())
       cache.delete(addr.toUpperCase())
       post('clear_cell', { addr })
     },
 
     get_display(addr) {
+      ensureHydration(addr)
       return readCache(addr).display
     },
     get_number(addr) {
+      ensureHydration(addr)
       const c = readCache(addr)
       if (c.type !== 'number') return 0
       const n = Number(c.display)
       return Number.isFinite(n) ? n : 0
     },
     get_type(addr) {
+      ensureHydration(addr)
       return readCache(addr).type
     },
     is_error(addr) {
+      ensureHydration(addr)
       return readCache(addr).isError
     },
     get_formula(addr) {
+      ensureHydration(addr)
       return readCache(addr).formula
     },
 
     insert_row(at, count) {
       // Cache invalidation: row inserts move every cell at-or-below; we
-      // don't know which ones from the proxy. Step 2's push channel will
-      // re-hydrate touched addrs. For Step 1 we drop the lot.
+      // don't know which ones from the proxy. Subsequent reads will
+      // re-trigger `read_initial` so the cache repopulates lazily as
+      // cells come back into view. Active subscribers also see fresh
+      // pushes via the worker's own subscription bookkeeping.
       cache.clear()
+      requested.clear()
       post('insert_row', { at, count })
     },
     delete_row(at, count) {
       cache.clear()
+      requested.clear()
       post('delete_row', { at, count })
     },
     insert_col(at, count) {
       cache.clear()
+      requested.clear()
       post('insert_col', { at, count })
     },
     delete_col(at, count) {
       cache.clear()
+      requested.clear()
       post('delete_col', { at, count })
     },
 
@@ -261,6 +294,10 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
         // subscriber, but we short-circuit here to avoid even the
         // wire-traffic.
         post('subscribe', { addr: a })
+        // The worker auto-pushes the current value after subscribing,
+        // so we don't also need a `read_initial`. Mark the addr hydrated
+        // so a subsequent `get_display` doesn't fire a redundant request.
+        requested.add(a)
       }
       map.set(tok, cb)
       return tok
