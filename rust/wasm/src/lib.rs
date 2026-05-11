@@ -2,6 +2,8 @@ use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{CellSubscription, Sheet, Workbook};
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
 
 /// Initialize the panic hook once per module load. Called automatically from
 /// every `WasmSheet::new()`; idempotent thanks to `set_once`. C.10.
@@ -20,15 +22,47 @@ struct JsCallbackListener {
 
 impl CellListener for JsCallbackListener {
     fn on_change(&self) {
-        // Best-effort fire. If JS throws inside the callback we swallow the
-        // error to keep the propagation pass moving — a single bad listener
-        // shouldn't take down every other listener for the same change.
-        // NOTE on reentrancy: this fires synchronously inside store.notify,
-        // which itself runs inside &mut self on WasmSheet. JS callbacks
-        // that re-enter WasmSheet methods will hit wasm-bindgen's borrow
-        // panic. JS-side users should wrap re-entrant work in
-        // `queueMicrotask` until a proper async fire is added.
-        let _ = self.callback.call0(&JsValue::undefined());
+        // Best-effort fire. Queue the JS callback so Solid can re-read the
+        // sheet after the current &mut WasmSheet call has returned. Firing
+        // synchronously lets reactive subscribers re-enter get_display while
+        // set_number/set_formula is still borrowed by wasm-bindgen, which
+        // drops the notification on the floor.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let callback = self.callback.clone();
+            let task = Closure::once_into_js(move || {
+                let _ = callback.call0(&JsValue::undefined());
+            });
+            let queued =
+                js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("queueMicrotask"))
+                    .ok()
+                    .and_then(|value| value.dyn_into::<js_sys::Function>().ok())
+                    .and_then(|queue_microtask| {
+                        queue_microtask.call1(&JsValue::undefined(), &task).ok()
+                    })
+                    .is_some();
+            if !queued {
+                let delayed =
+                    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("setTimeout"))
+                        .ok()
+                        .and_then(|value| value.dyn_into::<js_sys::Function>().ok())
+                        .and_then(|set_timeout| {
+                            set_timeout
+                                .call2(&JsValue::undefined(), &task, &JsValue::from_f64(0.0))
+                                .ok()
+                        })
+                        .is_some();
+                if !delayed {
+                    let _ = self.callback.call0(&JsValue::undefined());
+                }
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native tests do not exercise JS subscriptions, but keep the
+            // implementation direct for non-wasm builds.
+            let _ = self.callback.call0(&JsValue::undefined());
+        }
     }
 }
 

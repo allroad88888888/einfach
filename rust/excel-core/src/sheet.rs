@@ -1570,6 +1570,35 @@ mod tests {
     }
 
     #[test]
+    fn formula_subscriber_dirty_notified_for_same_source_value_writes() {
+        // D1 lazy contract: source writes dirty dependent formulas even when
+        // the primitive source value is unchanged. Consumers subscribe to the
+        // formula cell and re-read on dirty notification.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(7.0));
+        sheet.set_formula("B1", "=A1*2");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(14.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        for _ in 0..3 {
+            sheet.set_cell("A1", Value::Number(7.0));
+        }
+
+        assert_eq!(
+            *count.borrow(),
+            3,
+            "same-value source writes must still dirty-notify formula subscribers"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(14.0));
+    }
+
+    #[test]
     fn structural_edit_only_fires_for_addresses_whose_value_changed() {
         // insert_row should not wake subscribers on cells whose displayed
         // value didn't actually change.

@@ -19,7 +19,7 @@ worktrees. Status of each plan section:
 | P0 Workbook Chain spec | ✅ | `workbook-chain.spec.ts` (7 tests) |
 | P0 Existing Blank flows | ✅ | `smoke.spec.ts` retained, helpers extracted |
 | P0 Clipboard | ⚠️ | `selection-clipboard.spec.ts` (8 tests). Cross-sheet name preservation NOT covered (gap vs Done Criteria) |
-| P1 WASM Formula Showcase | ⚠️ | `formulas-wasm.spec.ts` (12 tests, **2 .skip** — see Discovered #B) |
+| P1 WASM Formula Showcase | ✅ | `formulas-wasm.spec.ts` (14 tests, all passing — Discovered #B fixed) |
 | P1 FormulaBar | ✅ | `formula-bar.spec.ts` (8 tests) |
 | P1 MultiSheet UI | ⚠️ | `multisheet-ui.spec.ts` (8 tests). Plan's prompt-on-`+` model was wrong; agent corrected (see Discovered #C) |
 | P1 Other Demo Smoke (Budget/Grades/Sales) | □ | Decision still pending |
@@ -60,24 +60,40 @@ const renderCountAttr = () => {
 After the fix, drop the MutationObserver in `render-counter.spec.ts` and
 use `helpers.ts::renderCount(page, addr)` directly.
 
-### B. Single-sheet WasmSheet doesn't propagate dependents on source writes
+### B. Single-sheet WasmSheet doesn't propagate dependents on source writes ✅ FIXED
 
-Agent α writing `formulas-wasm.spec.ts` discovered: setting `F8 = 7`
-through `WasmSheet::set_number` does NOT cause `G8/H8/I8` (formulas
-referencing F8) to recompute. `get_display(G8)` returns the stale
-pre-write value.
+**Root cause turned out to be at the JS↔Rust boundary, not the lazy
+formula machinery itself**. `JsCallbackListener::on_change` was calling
+`self.callback.call0(...)` synchronously inside the `&mut WasmSheet`
+borrow. Solid signal bumps fired, but downstream reactive reads via
+`get_display` either hit wasm-bindgen's borrow protection or read stale
+values before the borrow released — looked exactly like "dep tracking
+missing" from the e2e side.
 
-Cross-sheet path through `WasmWorkbookStore` works because of coarse
-fanout; single-sheet path is the broken one.
+**Fix** (`rust/wasm/src/lib.rs`): defer the JS callback to a microtask
+on `wasm32` targets:
 
-This is a real Rust-side bug, not a test issue. Two `.skip` tests in
-`formulas-wasm.spec.ts` (`changing F8 propagates through G8 / H8 / I8`,
-`changing A3 updates C3-F3`) document it. Likely related to the lazy
-formula `cell_dependents` not being walked on primitive writes outside
-the workbook scope.
+```rust
+queueMicrotask(callback)   // primary
+  → setTimeout(callback, 0) // fallback
+  → callback()              // sync fallback (last resort)
+```
 
-**Fix priority**: P0 source bug. DemoFormulas demo's storytelling about
-formula chains is broken without it.
+`Closure::once_into_js` wraps the callback (FnOnce semantics, GC-friendly).
+Native target keeps the synchronous path so `cargo test` semantics are
+unchanged.
+
+**Validation**:
+- `formulas-wasm.spec.ts` chain propagation tests un-skipped, all 14
+  scenarios green locally (`F8 7 → G8 14 → H8 28 → I8 84`,
+  `A3 10 → C3 100 / D3 300 / E3 -200 / F3 220`).
+- Full e2e suite: 75 passed + 2 skipped (the 2 .skip are the unrelated
+  regression entries from Discovered #E).
+
+**Caveat**: the WASM-side microtask defer has zero unit-test coverage.
+Native `cargo test` only exercises the sync fallback. A
+`wasm-bindgen-test --headless --chrome` test would pin the new behavior
+but requires `wasm-pack test` infra not yet wired (TODO 2.3).
 
 ### C. MultiSheet UI dialog flow differs from plan
 
@@ -166,9 +182,9 @@ either ✅ or has a Discovered # entry above):
   preserves the sheet name. Covered in jest, missing from e2e.
 - **Other Demo Smoke (Budget / Grades / Sales Dashboard)**. Decision still
   punted: do these demos migrate to WASM, or do we lower assertions on
-  JS-mock-induced `#ERROR!` cells? Depends on the dep-tracking bug fix
-  (Discovered #B) since several seeded formulas only resolve correctly
-  through the WASM path.
+  JS-mock-induced `#ERROR!` cells? Discovered #B is fixed so the WASM
+  migration path is unblocked; pick that direction or write loose
+  assertions, but make a call.
 - **Render-counter probe needs the 1-line source fix** (Discovered #A) so
   the spec can use the official helper instead of MutationObserver.
 - **2 regression entries** (subscribe-once + panic) await source-side
@@ -624,10 +640,10 @@ next ticket. Forward order, post-landing:
    c. Add the 2 source-side debug shims (Discovered #E) so the regression
       spec's two `.skip`s can become real tests.
 10. □ Decide on the "Other Demo Smoke" (Budget / Grades / Sales) question.
-    Probably blocked on the dep-tracking fix (Discovered #B).
-11. □ Fix the dep-tracking bug (Discovered #B). DemoFormulas's chain
-    storytelling is broken without it — this is a P0 source bug, not just
-    an e2e gap.
+    Discovered #B is now fixed, so the WASM-migration option is unblocked.
+11. ✅ Discovered #B fixed (microtask defer in `JsCallbackListener`).
+    Chain propagation tests un-skipped, all passing. wasm-bindgen-test
+    coverage still TODO.
 
 ## Default Commands
 

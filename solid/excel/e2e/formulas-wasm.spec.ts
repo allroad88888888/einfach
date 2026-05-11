@@ -94,24 +94,11 @@ test.describe('WASM formulas — chain propagation', () => {
   })
 
   /**
-   * KNOWN BUG (gating these tests on `.skip`): single-sheet `WasmSheet`
-   * does not re-evaluate dependents when a source cell changes. In the
-   * Formulas demo, editing F8 = 5 → 7 leaves G8 = `=F8*2` showing the
-   * stale 10 (verified manually — `get_display(G8)` returns "10" after
-   * the edit; even forcing a re-render via click doesn't refresh).
-   *
-   * The cross-sheet variant (workbook-chain.spec.ts) works because
-   * `WasmWorkbookStore` does a coarse fanout — every adapter notifies
-   * every signal on any change. The single-sheet path needs the Rust
-   * evaluator to re-run dependents on `set_*`, which it currently
-   * doesn't (or doesn't fire the per-cell `subscribe` callback for
-   * dependents).
-   *
-   * Re-enable both tests once the Rust dep-tracking lands. Until then
-   * the source-cell edit is covered by the smoke suite (JS mock) and
-   * cross-sheet propagation is covered by workbook-chain.spec.ts.
+   * Regression: single-sheet WasmSheet must dirty transitive formula
+   * dependents when a source cell changes. Workbook-chain has a coarse
+   * fanout fallback; this pins the precise single-sheet path.
    */
-  test.skip('changing F8 propagates through G8 / H8 / I8 (BUG: WasmSheet dep tracking)', async ({
+  test('changing F8 propagates through G8 / H8 / I8', async ({
     page,
   }) => {
     await gotoDemo(page, DEMO)
@@ -131,7 +118,7 @@ test.describe('WASM formulas — chain propagation', () => {
     await expectDisplay(page, 'I8', '72')
   })
 
-  test.skip('changing A3 updates C3, D3, E3, F3 in place (BUG: WasmSheet dep tracking)', async ({
+  test('changing A3 updates C3, D3, E3, F3 in place', async ({
     page,
   }) => {
     await gotoDemo(page, DEMO)
@@ -152,9 +139,9 @@ test.describe('WASM formulas — chain propagation', () => {
   })
 
   /**
-   * Source-cell commit still works even though dependents don't refresh
-   * — that's the part of the chain story that's actually exercisable in
-   * e2e today. Pin it so we know the source-cell write path stays alive.
+   * Keep the source-cell write path pinned separately from formula
+   * propagation so failures identify whether commit or dependency refresh
+   * regressed.
    */
   test('source-cell edit commits the new value to F8', async ({ page }) => {
     await gotoDemo(page, DEMO)
