@@ -283,10 +283,14 @@ trait 形状、归属、为什么 `&self`、为什么 `Rc<FormulaRecord>` ——
 - `MEDIAN/MODE/STDEV/VAR/LARGE/SMALL/VLOOKUP/HLOOKUP/INDEX/MATCH` 仍需临时 `Vec<Value>` 或 2D `Vec<Vec<Value>>`，但这只是 N 个 Value 的栈临时数据，不会污染 store。
 - 整列引用 `SUM(A:A)` 在 range index 升级前先按 sparse range 处理（只遍历真实存在的 cell）。
 
-**TLS resolver 的清算**：`eval.rs::with_cross_resolver` 仍用
-`unsafe { mem::transmute }` 把 `&dyn CrossSheetResolver` 强转成 `'static` 走
-thread_local，是历史遗留兼容入口。Workbook 读路径已改走
-`WorkbookEvalProvider`；下一步可以删除 legacy `with_cross_resolver` 通道。
+**TLS resolver 的清算**：✅ 已完成。`with_cross_resolver` 函数族、
+`CROSS_RESOLVER` / `CURRENT_SHEET` / `CROSS_SHEET_VISITED` 三个
+thread_local、`CrossSheetResolver` trait、`unsafe { mem::transmute }`
+全部从 `excel-core` 删除。grep `with_cross_resolver` / `thread_local!`
+/ `mem::transmute` 在 `rust/excel-core/src/` 现在 0 命中。跨 sheet 通道
+唯一路径是 `WorkbookEvalProvider`；legacy `eval_expr` 调 `AtomEvalProvider`
+处理 single-sheet，`sheet_cell` 直接返 `#REF!`（没有 workbook 上下文也
+无意义）。`Sheet`/`Workbook` 测试覆盖未减少。
 
 ## 写入与 dirty 传播
 
@@ -443,21 +447,22 @@ bulk load 期间：
 - 公式引用空白 cell 后，primitive atom count 不增加
 - 后续写入这个空白 cell → 依赖公式 cache 状态从 `Clean` / `Uncomputed` 变 `Dirty`
 
-### Step 1：抽出 EvalProvider + Workbook provider（主体已完成）
+### Step 1：抽出 EvalProvider + Workbook provider（✅ 完成）
 
 把求值入口拆成两层：保留旧 `eval_expr(expr, get, cell_map)` 兼容 API，
 新增 `eval_expr_with_provider(expr, provider: &dyn EvalProvider)`：
 
-- 已实现 `EvalProvider`，让求值器按地址读取 cell，而不是要求每个引用都有 `AtomId`
-- 已实现 `Sheet` 默认 provider 和 `WorkbookEvalProvider`
-- `Workbook::get_cell` 已替代旧 resolver scope + silent derived recompute bridge
-- 未完成：删除 `eval.rs::with_cross_resolver` 和 thread_local legacy 通道
+- ✅ `EvalProvider` trait 落地，求值器按地址读取 cell，不要求每个引用都有 `AtomId`
+- ✅ `Sheet` 默认 `SheetEvalProvider` + `WorkbookEvalProvider` 两实现
+- ✅ `Workbook::get_cell` 走 provider 链递归，已替代旧 resolver scope + silent derived recompute bridge
+- ✅ `eval.rs::with_cross_resolver` / `CrossSheetResolver` trait / 3 个 thread_local / `unsafe mem::transmute` 全部从 excel-core 删除
+- ✅ legacy `AtomEvalProvider::sheet_cell` 简化为永返 `#REF!`（无 workbook 上下文也无意义）
 
 验收：
 
-- 现有公式测试全过（包括跨 sheet）
-- Workbook 读路径不再触发 core derived recompute
-- legacy 清理时再要求 `with_cross_resolver` / thread_local grep 为 0
+- ✅ 现有公式测试全过（包括跨 sheet 8 条 cycle / 4 条 workbook lazy / 3-sheet chain demo）
+- ✅ Workbook 读路径不再触发 core derived recompute
+- ✅ grep `with_cross_resolver` / `CrossSheetResolver` / `thread_local!` / `mem::transmute` / `CROSS_RESOLVER` / `CURRENT_SHEET` / `CROSS_SHEET_VISITED` 在 `rust/excel-core/src/` 均 0 命中
 
 ### Step 2：lazy formula 主体（主体已完成，无 feature flag）
 
@@ -594,8 +599,8 @@ range formula 数量起来后再做：
 | 公式依赖空 cell 后写入能 dirty | 写 Z99 后 `debug_cache_state(fid) == Dirty` |
 | range 依赖不通过展开空 atom | `set_formula("=SUM(A1:A100000)")` 后 atom count 不增加 |
 | viewport 是计算边界 | 只读 viewport 后 `debug_formula_eval_count == viewport size` |
-| Workbook 读路径不走 TLS resolver | `Workbook::get_cell` 使用 `WorkbookEvalProvider`，不调用 `with_cross_resolver` |
-| Legacy TLS resolver 已删除 | 后续 cleanup：grep `with_cross_resolver` / `thread_local!` in excel-core == 0 |
+| Workbook 读路径不走 TLS resolver | ✅ `Workbook::get_cell` 用 `WorkbookEvalProvider` |
+| Legacy TLS resolver 已删除 | ✅ grep `with_cross_resolver` / `thread_local!` / `mem::transmute` / `CrossSheetResolver` / `CROSS_RESOLVER` / `CURRENT_SHEET` / `CROSS_SHEET_VISITED` 在 `rust/excel-core/src/` 均 0 命中 |
 | 旧 derived 路径已删除 | sheet 公式路径不调用 `Store::create_derived` / `Store::propagate_force`；`formula_cells` value 不是 `AtomId` |
 | EvalContext 用 `&self`，cache 用 `RefCell` per-record | grep `&mut dyn EvalContext` / `EvalContext for .*&mut` 在 excel-core == 0 |
 | FormulaRecord 用 Rc 包装 | type alias 形如 `Rc<FormulaRecord>` 在 sheet 内可见 |

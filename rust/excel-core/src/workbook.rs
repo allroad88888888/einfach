@@ -670,14 +670,10 @@ mod tests {
     fn cross_sheet_runtime_guard_returns_cycle_when_static_bypassed() {
         // Build a cycle by going through Sheet::set_formula directly, which
         // does NOT have workbook-level cycle detection. Then read through
-        // Workbook::get_cell — the TLS CROSS_SHEET_VISITED guard in eval.rs
-        // must short-circuit instead of either looping or returning a stale
-        // value.
-        //
-        // Note: in the current resolver, peek_value already returns the
-        // cached value (no recursion), so the guard's role is defensive for
-        // future resolver changes. We still verify it doesn't *incorrectly*
-        // engage (i.e. acyclic chains keep working).
+        // Workbook::get_cell — the lazy FormulaCache::Computing state must
+        // short-circuit instead of either looping or returning a stale
+        // value. (Pre-lazy this required a separate TLS visited-set guard;
+        // the Computing state covers it natively now.)
         let mut wb = Workbook::new();
         wb.add_sheet("Sheet2");
         wb.sheet_mut(0).unwrap().set_formula("A1", "=Sheet2!A1");

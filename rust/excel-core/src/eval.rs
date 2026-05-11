@@ -1,6 +1,4 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::collections::HashMap;
 
 use einfach_core::{AtomId, Value, ValueError};
 
@@ -8,14 +6,15 @@ use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
 use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
 
-/// Legacy cross-sheet resolver for the AtomId-based `eval_expr` wrapper.
-/// Workbook reads now use `EvalProvider` directly.
-pub trait CrossSheetResolver {
-    fn resolve(&self, sheet: &str, addr: CellAddress) -> Value;
-}
-
-/// Address-based evaluation source used by the lazy formula path. It avoids
-/// requiring every referenced cell to have a materialized AtomId.
+/// Address-based evaluation source. Both production (Workbook) and the
+/// legacy `eval_expr(get, cell_map)` shim route through this trait.
+///
+/// `Sheet`/`Workbook` use their own implementations (`SheetEvalProvider`,
+/// `WorkbookEvalProvider`) to handle cross-sheet refs without ever
+/// touching a thread-local. The legacy `AtomEvalProvider` below treats
+/// any `SheetRef` as `#REF!` — it's a single-sheet shim used only by the
+/// in-file eval tests + `eval_expr` callers that don't carry workbook
+/// context.
 pub trait EvalProvider {
     fn cell(&self, addr: CellAddress) -> Value;
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
@@ -37,114 +36,12 @@ impl<'a> EvalProvider for AtomEvalProvider<'a> {
             .unwrap_or(Value::Null)
     }
 
-    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
-        let is_current_sheet =
-            CURRENT_SHEET.with(|c| c.borrow().as_deref() == Some(sheet));
-        if is_current_sheet {
-            return self
-                .cell_map
-                .get(&addr)
-                .map(|&id| match catch_unwind(AssertUnwindSafe(|| (self.get)(id))) {
-                    Ok(value) => value,
-                    Err(_) => Value::Error(ValueError::CyclicRef),
-                })
-                .unwrap_or(Value::Null);
-        }
-
-        CROSS_RESOLVER.with(|c| {
-            if let Some(ptr) = *c.borrow() {
-                // SAFETY: the guard in with_cross_resolver clears this pointer
-                // before the resolver's stack frame returns.
-                unsafe { (*ptr).resolve(sheet, addr) }
-            } else {
-                Value::Error(ValueError::InvalidRef)
-            }
-        })
+    fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        // Legacy shim has no workbook context — cross-sheet refs are
+        // out of scope. Production cross-sheet eval lives on
+        // `WorkbookEvalProvider`.
+        Value::Error(ValueError::InvalidRef)
     }
-}
-
-thread_local! {
-    /// Active cross-sheet resolver during eval. Set by `with_cross_resolver`,
-    /// read by the SheetRef arm. Raw pointer because the resolver's lifetime
-    /// is bound to the calling stack frame, not 'static — the guard's Drop
-    /// clears it before the frame returns.
-    static CROSS_RESOLVER: RefCell<Option<*const dyn CrossSheetResolver>> =
-        RefCell::new(None);
-    /// Name of the sheet whose formula is currently being evaluated through a
-    /// Workbook. Lets `Sheet1!A1` on Sheet1 use the normal same-sheet getter
-    /// path instead of round-tripping through the cross-sheet resolver.
-    static CURRENT_SHEET: RefCell<Option<String>> = RefCell::new(None);
-    /// Runtime guard for cross-sheet cycles. Each entry is a `(sheet_name,
-    /// addr)` we are currently resolving across the cross-sheet boundary; if
-    /// the SheetRef arm is asked to resolve an entry already in the set, it
-    /// short-circuits with `Value::Error(CyclicRef)` instead of recursing.
-    /// This complements the static `Workbook::set_formula` check by catching
-    /// any cycle that slipped past it (different code path, dynamic
-    /// IF-driven cycles, future resolver implementations that re-enter eval).
-    static CROSS_SHEET_VISITED: RefCell<HashSet<(String, CellAddress)>> =
-        RefCell::new(HashSet::new());
-}
-
-/// Run `f` with `resolver` installed as the active cross-sheet resolver.
-/// Restores the previous resolver on return (panic-safe via Drop).
-///
-/// Workbook eval typically does:
-/// ```ignore
-/// with_cross_resolver(&workbook_ctx, || sheet.get_cell("A1"));
-/// ```
-///
-/// SAFETY note: the implementation transmutes the borrowed resolver to a
-/// `'static` trait object so it can sit in a thread_local. The Drop guard
-/// clears the slot before this function returns, so the dangling pointer
-/// is never observable outside `f`'s execution.
-pub fn with_cross_resolver<R>(resolver: &dyn CrossSheetResolver, f: impl FnOnce() -> R) -> R {
-    with_cross_resolver_inner(None, resolver, f)
-}
-
-/// Run `f` with both a cross-sheet resolver and the current sheet name
-/// installed. `SheetRef`s that point back at `sheet_name` are evaluated through
-/// the current formula's cell map/getter, matching plain same-sheet refs.
-pub fn with_cross_resolver_for_sheet<R>(
-    sheet_name: &str,
-    resolver: &dyn CrossSheetResolver,
-    f: impl FnOnce() -> R,
-) -> R {
-    with_cross_resolver_inner(Some(sheet_name), resolver, f)
-}
-
-fn with_cross_resolver_inner<R>(
-    current_sheet: Option<&str>,
-    resolver: &dyn CrossSheetResolver,
-    f: impl FnOnce() -> R,
-) -> R {
-    struct Restore(Option<*const (dyn CrossSheetResolver + 'static)>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            CROSS_RESOLVER.with(|c| *c.borrow_mut() = self.0);
-        }
-    }
-    struct RestoreSheet(Option<String>);
-    impl Drop for RestoreSheet {
-        fn drop(&mut self) {
-            CURRENT_SHEET.with(|c| *c.borrow_mut() = self.0.take());
-        }
-    }
-    // Erase the resolver's lifetime to 'static. Sound because the guard
-    // below pops the TLS entry before this stack frame returns.
-    let resolver_static: &'static dyn CrossSheetResolver = unsafe { std::mem::transmute(resolver) };
-    let prev = CROSS_RESOLVER.with(|c| {
-        let p = *c.borrow();
-        *c.borrow_mut() = Some(resolver_static as *const _);
-        p
-    });
-    let _restore = Restore(prev);
-    let prev_sheet = CURRENT_SHEET.with(|c| {
-        let prev = c.borrow().clone();
-        *c.borrow_mut() = current_sheet.map(str::to_string);
-        prev
-    });
-    let _restore_sheet = RestoreSheet(prev_sheet);
-    f()
 }
 
 /// Evaluate an AST expression using a getter function for cell values.
@@ -201,9 +98,8 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             }
             // Lazy formula's FormulaCache::Computing state already protects
             // against cross-sheet cycles at runtime — recursing back into a
-            // cell already on the eval stack returns CyclicRef. The earlier
-            // CROSS_SHEET_VISITED TLS guard from the eager era is now
-            // redundant and was dropped in favor of provider dispatch.
+            // cell already on the eval stack returns CyclicRef. No TLS
+            // guard needed; provider dispatch is the canonical path.
             provider.sheet_cell(sheet, *addr)
         }
     }

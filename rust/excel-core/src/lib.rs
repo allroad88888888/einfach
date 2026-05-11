@@ -11,7 +11,7 @@ pub mod workbook;
 
 pub use cell::CellAddress;
 pub use csv::{export_csv, import_csv, parse_csv, to_csv};
-pub use eval::{eval_expr, with_cross_resolver, CrossSheetResolver};
+pub use eval::{eval_expr, EvalProvider};
 pub use format::{
     apply_rules, Align, CellFormat, Condition, ConditionalRule, NumberFormat, StyleOverrides,
 };
