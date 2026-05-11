@@ -9,8 +9,11 @@ const jestConfig = {
   transform: {
     // 为 Solid.js 的 TSX 文件使用特定的 Babel 配置
     'solid/.*\\.tsx?$': ['babel-jest'],
-    // 其他文件保持现有的 SWC 配置
-    '^(?!solid/).*\\.(t|j)sx?$': ['@swc/jest', { ...config }],
+    // 其他文件保持现有的 SWC 配置。Includes `.mjs` / `.cjs` so ESM-only
+    // dependencies (e.g. @lingui/core 6.x and its message-utils helper)
+    // get re-emitted as CJS once they're whitelisted from
+    // transformIgnorePatterns below.
+    '^(?!solid/).*\\.(tsx?|jsx?|mjs|cjs)$': ['@swc/jest', { ...config }],
   },
   extensionsToTreatAsEsm: ['.ts', '.tsx'],
   /**
@@ -52,5 +55,20 @@ const jestConfig = {
     '^@einfach/solid$': '<rootDir>/solid/solid/src',
     '^@einfach/solid-form$': '<rootDir>/solid/form/src',
   },
+
+  /**
+   * `@lingui/core` (6.x) ships ESM-only (`"type": "module"`,
+   * `exports: { ".": "./dist/index.mjs" }`) and pulls in
+   * `@lingui/message-utils` + `@messageformat/*` the same way. Jest's
+   * default behavior is to skip transforming `node_modules`, which
+   * leaves the `import` syntax in place and trips the runtime CommonJS
+   * parser. Whitelist the entire chain so SWC transforms them.
+   *
+   * pnpm hoists into `node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>`,
+   * so the negative lookahead must match the pnpm-flat path too.
+   */
+  transformIgnorePatterns: [
+    '/node_modules/(?!(\\.pnpm/)?(@lingui|@messageformat)[+/])',
+  ],
 }
 export default jestConfig

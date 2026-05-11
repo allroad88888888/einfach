@@ -13,6 +13,7 @@
   },
   "sideEffects": false,
   "dependencies": {
+    "@lingui/core": "^6.0.1",
     "solid-js": "^1.9.12"
   },
   "devDependencies": {

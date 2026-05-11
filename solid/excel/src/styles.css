@@ -37,6 +37,42 @@ body {
   font-weight: 400;
 }
 
+/* EN / 中 toggle in the app header — pushes itself to the right via margin-
+ * left:auto so title + subtitle stay clustered on the left. */
+.locale-switcher {
+  margin-left: auto;
+  display: inline-flex;
+  border: 1px solid #d8d8d8;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.locale-btn {
+  border: 0;
+  padding: 4px 12px;
+  background: #fff;
+  color: #555;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.locale-btn:hover {
+  background: #f4f4f4;
+}
+.locale-btn-active {
+  background: #1a73e8;
+  color: #fff;
+}
+.locale-btn-active:hover {
+  background: #1a73e8;
+}
+.locale-btn + .locale-btn {
+  border-left: 1px solid #d8d8d8;
+}
+.locale-btn-active + .locale-btn,
+.locale-btn + .locale-btn-active {
+  border-left-color: transparent;
+}
+
 /* === Tab Bar === */
 
 .tab-bar {

@@ -10,6 +10,7 @@ import { MultiSheet } from './demos/MultiSheet'
 import { DemoCrossSheetChain } from './demos/DemoCrossSheetChain'
 import { DemoLarge } from './demos/DemoLarge'
 import { DemoWorker } from './demos/DemoWorker'
+import { LocaleSwitcher } from './LocaleSwitcher'
 import './styles.css'
 
 interface DemoTab {
@@ -71,6 +72,7 @@ export function App() {
       <header class="app-header">
         <h1 class="app-title">Einfach Excel</h1>
         <span class="app-subtitle">Rust + WASM + SolidJS</span>
+        <LocaleSwitcher />
       </header>
 
       <nav class="tab-bar">
