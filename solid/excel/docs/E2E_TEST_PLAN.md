@@ -79,10 +79,12 @@ unchanged.
 - Full e2e suite: 75 passed + 2 skipped (the 2 .skip are the unrelated
   regression entries from Discovered #E).
 
-**Caveat**: the WASM-side microtask defer has zero unit-test coverage.
-Native `cargo test` only exercises the sync fallback. A
-`wasm-bindgen-test --headless --chrome` test would pin the new behavior
-but requires `wasm-pack test` infra not yet wired (TODO 2.3).
+**Caveat — resolved**: the WASM-side microtask defer is now pinned by
+`rust/wasm/tests/web.rs` (5 `#[wasm_bindgen_test]`, see TODO 2.3 ✅).
+`wasm-pack test --headless --chrome rust/wasm` exercises the
+`queueMicrotask` defer path AND the panic-inject knob (C.10) end-to-end
+in a real browser; `wasm-pack test --node rust/wasm` is the fallback
+when no chromedriver is available locally.
 
 ### C. MultiSheet UI dialog flow differs from plan
 

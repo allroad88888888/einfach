@@ -20,6 +20,10 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# Needed by `tests/web.rs` to await JS Promises (microtask drain) inside
+# `#[wasm_bindgen_test]` async fns. wasm-bindgen pulls a private copy via
+# its `futures` feature, but `JsFuture` lives in the public crate.
+wasm-bindgen-futures = "0.4"
 
 [profile.release]
 opt-level = "s"

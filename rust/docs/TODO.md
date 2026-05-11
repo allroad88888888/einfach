@@ -110,10 +110,16 @@
 - **现状**：rollup.config.mjs 用 `fs.existsSync(p+'/src/index.ts')` filter
 - **更好做法**：在每个 demo 应用的 package.json 加 `"private": true`，rollup 读 package.json 跳过 private（跟 npm 语义一致）
 
-### 2.3 □ wasm-bindgen-test 端到端
-- **现状**：`cargo test` 跑的是原生 target；wasm32 行为没验证
-- **依赖**：`wasm-pack test --headless --chrome`
-- **必须覆盖**：subscribe/unsubscribe 跨 JS↔Rust 边界、重入保护、JsCallbackListener panic 不挂 wasm 实例
+### 2.3 ✅ wasm-bindgen-test 端到端 — 已落地
+- **落地**：`rust/wasm/tests/web.rs` + `wasm-bindgen-futures` dev-dep
+- **覆盖**（5 个 `#[wasm_bindgen_test]`）：
+  - `wasm_sheet_subscribe_fires_callback_async` — queueMicrotask 路径异步 fire（计数 == 1）
+  - `wasm_sheet_subscribe_does_not_fire_synchronously` — 同步帧内 callback 未触发（验证微任务 defer）
+  - `wasm_sheet_panic_inject_surfaces_and_survives` — `__debugPanicNextCallback` 注入 + 后续 set/get 仍工作（C.10 单元级 pin；node 下因为未捕获微任务异常杀进程会跳过，只在 `--chrome` 完整跑）
+  - `wasm_workbook_cross_sheet_eval_in_browser` — 跨 sheet 公式实跑
+  - `wasm_workbook_chain_dirty_until_read` — lazy formula 在读之前保持 dirty
+- **跑法**：`wasm-pack test --headless --chrome rust/wasm`（或 `--node` 作 fallback，详见 `rust/wasm/README.md`）
+- **后续**：unsubscribe 跨边界 / 订阅风暴重入保护可在同一 harness 继续加测，已留 hook
 
 ### 2.4 ⚠️ playwright e2e 套件
 - **现状**：`solid/excel/e2e/smoke.spec.ts` 落地，覆盖 cell 编辑提交 / 公式提交 / 依赖传播 / undo / redo / FormulaBar 公式源同步 / 键盘导航（Arrow+Tab+Shift+Tab），共 7 个测试。`@playwright/test` 已加入 devDependencies；`solid/excel` 下 `npm run e2e` 启动 vite dev server + 跑测试
