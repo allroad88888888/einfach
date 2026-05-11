@@ -46,4 +46,54 @@ test.describe('Row virtualization', () => {
     expect(totalH).toBeGreaterThan(25000)
     expect(totalH).toBeLessThan(28000)
   })
+
+  test('viewport churn — subscriptions track the viewport, not scroll history', async ({
+    page,
+  }) => {
+    // Regression guard for the Cell retain/release fix. Before the fix
+    // each scrolled-past row added ~27 subscriptions to the store
+    // that were never released; scrolling through 500 rows would
+    // permanently retain ~13k handles even though those cells were
+    // unmounted from the DOM. Now <Cell> registers `onCleanup(dispose)`
+    // so the active set follows the live viewport.
+    //
+    // The probe is `store.activeSubscriptionCount()`, exposed via
+    // `window.__einfachStore` under `?debug=1` (same shim as
+    // regression.spec.ts uses for `subscriberFireCount`).
+    await gotoDemo(page, 'Large Grid', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible()
+
+    const probe = () =>
+      page.evaluate(() => window.__einfachStore?.activeSubscriptionCount() ?? -1)
+
+    const initial = await probe()
+    // Initial viewport: a handful of rows × 27 cols (cols + row-header)
+    // plus 1 for the FormulaBar observing the selected cell. Under
+    // virtualization that's well under 2000; a broken release path
+    // would already be at ~27000 if every row stayed subscribed.
+    expect(initial).toBeGreaterThan(0)
+    expect(initial).toBeLessThan(2000)
+
+    // Scroll deep — Cells for rows ~0–20 unmount, Cells for rows
+    // ~470–510 mount. If the unmounted handles weren't released, this
+    // tick would push the count up by hundreds.
+    await page.locator('.excel-table-wrapper').evaluate((el) => {
+      el.scrollTop = 13000
+    })
+    await expect(cell(page, 'A500')).toBeVisible()
+
+    // Scroll back — symmetric. After the round trip the active set
+    // should be at most the initial viewport again (give a small
+    // slack for selection / overscan boundary effects).
+    await page.locator('.excel-table-wrapper').evaluate((el) => {
+      el.scrollTop = 0
+    })
+    await expect(cell(page, 'A1')).toBeVisible()
+
+    const after = await probe()
+    // The load-bearing assertion: the count is bounded by viewport
+    // shape, NOT by cumulative scroll distance. Without the fix this
+    // would be `initial + ~520 rows × 27 cols` ≈ initial + 14000.
+    expect(after).toBeLessThanOrEqual(initial + 100)
+  })
 })

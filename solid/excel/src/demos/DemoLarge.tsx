@@ -1,5 +1,5 @@
 
-import { Show, createResource } from 'solid-js'
+import { Show, createResource, onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
@@ -16,12 +16,38 @@ import { useT } from '../i18n'
  * WASM-backed so the seeded `=A1+1` chain demonstrates lazy formula eval —
  * formulas in unscrolled rows stay Dirty until their cell scrolls into view.
  */
+
+/**
+ * Debug-only: when `?debug=1`, stash the active SheetStore on
+ * `window.__einfachStore` so the virtualize e2e can probe
+ * `activeSubscriptionCount()` from the browser side. Matches the pattern
+ * used in DemoBlank / DemoFormulas. Off otherwise — no observable cost.
+ */
+declare global {
+  interface Window {
+    __einfachStore?: SheetStore
+  }
+}
+
+function exposeStoreForDebug(store: SheetStore) {
+  if (typeof window === 'undefined') return
+  const debug = new URLSearchParams(window.location.search).get('debug')
+  if (debug !== '1' && debug !== 'render') return
+  window.__einfachStore = store
+  onCleanup(() => {
+    if (window.__einfachStore === store) {
+      delete window.__einfachStore
+    }
+  })
+}
+
 export function DemoLarge() {
   const t = useT()
   const [storeRes] = createResource<SheetStore>(async () => {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
     seed(store)
+    exposeStoreForDebug(store)
     return store
   })
 
