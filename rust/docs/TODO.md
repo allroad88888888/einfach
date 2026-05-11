@@ -199,7 +199,11 @@
 - 未做：`range_dependents` interval index、`BulkLoader`、更完整的 eval/debug 计数
 - 验收硬门禁：跑 Solid demo 5 页 + DemoFormulas 无可见回归
 
-### 4.4 □ Step 3 — bulk import API（CSV/JSON/xlsx 接入路径）
+### 4.4 ✅ Step 3 — bulk import API（CSV/JSON/xlsx 接入路径）
+- `Sheet::bulk_load(|loader| { ... })` RAII 闭包上线；`BulkLoader::set_cell` / `set_formula` 在 bulk 期间跳过 dirty 传播 + subscriber notify，闭包返回时单次 BFS 标 dirty + 每订阅地址 ≤1 次 notify
+- `csv.rs::import_csv` 已切到 bulk_load
+- 5 条新增 sheet 测试覆盖：100 公式 0-eval-count / 5 订阅 ≤1 次 fire / 公式首次读才 clean / bulk 内静态环检测保留 / 无订阅地址不触发任何工作
+- 仍未做：10 万 import 的 criterion benchmark（属 TODO 2.5）；JSON/xlsx import 走 bulk_load 的接入（目前仅 CSV 路径，JSON/xlsx 没有 import 实现）
 ### 4.5 □ Step 4 — range streaming 改造
 ### 4.6 □ Step 5 — range dependency interval index
 ### 4.7 □ Step 6 — feature flag 拆除 + 旧路径删除

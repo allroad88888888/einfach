@@ -961,6 +961,215 @@ impl Sheet {
             }
         }
     }
+
+    // === LAZY_FORMULA_EVAL Step 3 — bulk import API ===
+
+    /// Run `f` inside a bulk-load session. Writes performed through the
+    /// `BulkLoader` skip per-cell dirty propagation and subscriber notification;
+    /// when the closure returns, the loader's `flush` walks the touched set
+    /// once, dirties transitive formula dependents, and notifies each
+    /// currently-subscribed address at most once.
+    ///
+    /// Use for CSV / JSON / xlsx import paths that write thousands of cells:
+    /// the per-cell notify cost would dominate, and we want to defer formula
+    /// evaluation entirely to first read.
+    ///
+    /// RAII shape: `BulkLoader` is not exposed outside the closure, so the
+    /// flush always runs (no begin/end pair to forget).
+    pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut BulkLoader<'_>) -> R) -> R {
+        let mut loader = BulkLoader::new(self);
+        let result = f(&mut loader);
+        loader.flush();
+        result
+    }
+}
+
+/// In-progress bulk-load session. Writes go directly into the sheet's
+/// formula/primitive state but skip the normal dirty-mark + subscriber-notify
+/// fan-out; the deferred work runs in `flush`.
+///
+/// Only constructable inside `Sheet::bulk_load` (RAII), so the lifetime stays
+/// bound to `&mut Sheet` and `flush` is guaranteed to run on the closure exit.
+pub struct BulkLoader<'a> {
+    sheet: &'a mut Sheet,
+    /// Addresses written during this bulk load. At `flush()` we walk these to
+    /// dirty downstream formulas + notify currently-subscribed addresses ONCE.
+    touched: HashSet<CellAddress>,
+}
+
+impl<'a> BulkLoader<'a> {
+    fn new(sheet: &'a mut Sheet) -> Self {
+        BulkLoader {
+            sheet,
+            touched: HashSet::new(),
+        }
+    }
+
+    /// Write a primitive value at `addr`. Skips dirty propagation and
+    /// subscriber notification — both deferred to `flush`. Equivalent to
+    /// `Sheet::set_cell` outside the bulk-load contract; the address is
+    /// recorded in `touched` for the post-flush sweep.
+    pub fn set_cell(&mut self, addr_str: &str, value: Value) {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        let is_null = matches!(value, Value::Null);
+
+        // Detach the fanout for this address so the store-level `set` below
+        // does not synchronously fire subscribers. `flush` will reattach and
+        // notify exactly once per subscribed touched/dirty address.
+        self.sheet.detach_address_sub(addr);
+
+        if self.sheet.formula_cells.contains_key(&addr) {
+            // Formula → primitive transition. Drop the formula record (and
+            // its reverse dep entries) but no notify; primitive scaffold is
+            // re-established below.
+            self.sheet.remove_formula_record(addr);
+            // The pre-existing primitive atom from formula→primitive remap may
+            // still be present; ensure_cell + store.set covers both branches.
+            let id = self.sheet.ensure_cell(addr);
+            self.sheet.store.set(id, value);
+        } else {
+            let id = self.sheet.ensure_cell(addr);
+            self.sheet.store.set(id, value);
+        }
+
+        // 3.10 — same Null-release contract as the normal path so bulk-load
+        // does not leak primitive scaffolds when callers write Null. The
+        // fanout was already detached above; release just drops the atom and
+        // bookkeeping. The bucket (if any) stays for the flush reattach.
+        if is_null {
+            self.sheet.try_release_primitive(addr);
+        }
+
+        self.touched.insert(addr);
+    }
+
+    /// Write a formula at `addr`. Parses, runs the same-sheet static cycle
+    /// check (B.2), and stores the record with cache state Dirty. Does not
+    /// evaluate the formula, does not notify any subscriber. Returns the same
+    /// `bool` contract as `Sheet::set_formula`: `false` on parse failure or
+    /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
+    pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+
+        let expr = match parse_formula(formula_str) {
+            Some(e) => e,
+            None => {
+                // Inline equivalent of `write_error(addr, InvalidValue)` minus
+                // the dirty-mark + notify fanout. The error value still lands
+                // in the primitive scaffold so future reads observe `#VALUE!`.
+                self.write_error_no_notify(addr, ValueError::InvalidValue);
+                self.touched.insert(addr);
+                return false;
+            }
+        };
+
+        // Static cycle check still runs inside bulk_load — incremental cycle
+        // protection isn't worth dropping for perf, and the cost is bounded by
+        // the dep closure of the new formula.
+        if self.sheet.would_create_cycle(addr, &expr) {
+            self.write_error_no_notify(addr, ValueError::CyclicRef);
+            self.touched.insert(addr);
+            return false;
+        }
+
+        // Detach fanout so any primitive scaffold teardown below does not fire.
+        self.sheet.detach_address_sub(addr);
+
+        let expr = Rc::new(expr);
+        let deps = Sheet::formula_deps_for(&expr);
+        // Drop any prior formula record (no notify) and any primitive scaffold
+        // that no longer has dependents — mirrors `Sheet::set_formula` minus
+        // the `with_remap` listener fire.
+        self.sheet.remove_formula_record(addr);
+        if let Some(prim) = self.sheet.cells.remove(&addr) {
+            if self.sheet.store.has_atom(prim) && !self.sheet.store.has_dependents(prim) {
+                self.sheet.store.destroy_atom(prim);
+            }
+        }
+        let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+        self.sheet.add_formula_deps(addr, &deps);
+        self.sheet.formula_cells.insert(addr, record);
+        self.sheet.formula_exprs.insert(addr, expr);
+        self.sheet
+            .formula_texts
+            .insert(addr, formula_str.to_string());
+
+        self.touched.insert(addr);
+        true
+    }
+
+    /// Inline `write_error` minus the dirty-mark + subscriber notify. Used by
+    /// the parse-failure and cycle paths in bulk-mode `set_formula`.
+    fn write_error_no_notify(&mut self, addr: CellAddress, err: ValueError) {
+        self.sheet.detach_address_sub(addr);
+        if self.sheet.formula_cells.contains_key(&addr) {
+            self.sheet.remove_formula_record(addr);
+        }
+        let id = self.sheet.ensure_cell(addr);
+        self.sheet.store.set(id, Value::Error(err));
+    }
+
+    /// Drain the touched set, dirty all transitively-downstream formulas,
+    /// reattach fanouts on touched primitive addresses, and notify each
+    /// currently-subscribed address at most once.
+    ///
+    /// Complexity: O(T + D) where T = touched count, D = size of transitive
+    /// formula closure reachable from `touched` through `cell_dependents`.
+    /// Notify dedup is O(1) per visited address via the `notified` HashSet.
+    fn flush(&mut self) {
+        // 1. BFS through cell_dependents starting at every touched address.
+        //    Collect the set of transitively-dirty formula addresses, and as a
+        //    side effect flip their FormulaCache to Dirty.
+        let mut dirty: HashSet<CellAddress> = HashSet::new();
+        let mut stack: Vec<CellAddress> = Vec::new();
+        for &addr in &self.touched {
+            let next = self
+                .sheet
+                .cell_dependents
+                .borrow()
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+            stack.extend(next);
+        }
+        while let Some(addr) = stack.pop() {
+            if !dirty.insert(addr) {
+                continue;
+            }
+            if let Some(record) = self.sheet.formula_cells.get(&addr) {
+                *record.cache.borrow_mut() = FormulaCache::Dirty;
+            }
+            let next = self
+                .sheet
+                .cell_dependents
+                .borrow()
+                .get(&addr)
+                .cloned()
+                .unwrap_or_default();
+            stack.extend(next);
+        }
+
+        // 2. Reattach fanouts on touched addresses so future writes notify
+        //    normally. Reattach is a no-op when the address has no
+        //    subscription bucket or no readable atom.
+        for &addr in &self.touched {
+            self.sheet.attach_address_sub(addr);
+        }
+
+        // 3. Notify each currently-subscribed address in (touched ∪ dirty)
+        //    exactly once. Subscribers on addresses that weren't touched and
+        //    have no dirty formula dependents are skipped — the "lazy"
+        //    extreme: no listener fires for cells nobody is watching.
+        let mut notify_targets: HashSet<CellAddress> =
+            HashSet::with_capacity(self.touched.len() + dirty.len());
+        notify_targets.extend(self.touched.iter().copied());
+        notify_targets.extend(dirty.iter().copied());
+        for addr in notify_targets {
+            if self.sheet.has_address_subscribers(addr) {
+                self.sheet.notify_address_subscribers(addr);
+            }
+        }
+    }
 }
 
 /// Walk the AST and append every referenced cell address into `out`.
@@ -1900,5 +2109,173 @@ mod tests {
         assert_eq!(sheet.get_cell("B1"), Value::Null);
         assert_eq!(sheet.get_cell("A1"), Value::Number(2.0));
         assert_eq!(sheet.get_formula("B1"), None);
+    }
+
+    // === LAZY_FORMULA_EVAL Step 3 — bulk_load tests ===
+
+    #[test]
+    fn bulk_load_set_formula_zero_eval_count() {
+        // 100 formulas through bulk_load must not trigger a single core
+        // recompute. With lazy formulas the only way recompute_count can
+        // increment is if a code path calls Store::recompute on a derived
+        // atom, which the lazy path never does. The acceptance bar is "0",
+        // not "small N".
+        let mut sheet = Sheet::new();
+        // Seed A1 so the formulas have something to reference; primitive
+        // store.set does not bump recompute_count.
+        sheet.set_cell("A1", Value::Number(1.0));
+        let before = sheet.debug_recompute_count();
+
+        sheet.bulk_load(|loader| {
+            for n in 0..100u32 {
+                // Row 0 col (n+1) avoids overwriting A1.
+                let addr = CellAddress::new(0, n + 1).to_string_repr();
+                let ok = loader.set_formula(&addr, "=A1+1");
+                assert!(ok, "formula {} must parse + pass cycle check", addr);
+            }
+        });
+
+        let after = sheet.debug_recompute_count();
+        assert_eq!(
+            after - before,
+            0,
+            "bulk_load with set_formula only must not trigger any core recompute"
+        );
+        assert_eq!(sheet.debug_formula_count(), 100);
+        // All formula caches are still Dirty — no read happened.
+        assert_eq!(
+            sheet.debug_formula_cache_state("B1"),
+            "dirty",
+            "first bulk-loaded formula must remain dirty until read"
+        );
+    }
+
+    #[test]
+    fn bulk_load_notifies_subscribers_once() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        // Five subscribed addresses. Each gets its own counter so a missing
+        // fire on one is visible.
+        let counters: Vec<Rc<RefCell<u32>>> = (0..5).map(|_| Rc::new(RefCell::new(0u32))).collect();
+        let addrs = ["A1", "B1", "C1", "D1", "E1"];
+        for (i, addr) in addrs.iter().enumerate() {
+            let c = counters[i].clone();
+            sheet.subscribe_cell(addr, move || *c.borrow_mut() += 1);
+        }
+
+        // Bulk-load: write to all five subscribed addresses, plus some
+        // unrelated ones, plus formulas whose downstream touches the
+        // subscribed cells. Each subscribed address must fire exactly once.
+        sheet.bulk_load(|loader| {
+            for addr in &addrs {
+                loader.set_cell(addr, Value::Number(1.0));
+            }
+            // Unrelated writes — should not bump any subscribed counter.
+            loader.set_cell("Z10", Value::Number(42.0));
+            loader.set_cell("Z11", Value::Number(43.0));
+            // Formulas referencing A1 multiple times — without dedup A1's
+            // listener could fire once per dirty downstream BFS pass.
+            loader.set_formula("F1", "=A1+A1");
+            loader.set_formula("F2", "=A1*2");
+            loader.set_formula("F3", "=A1-1");
+        });
+
+        for (i, addr) in addrs.iter().enumerate() {
+            assert_eq!(
+                *counters[i].borrow(),
+                1,
+                "subscriber on {} must fire exactly once across the bulk_load",
+                addr
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_load_skips_eval_until_first_read() {
+        let mut sheet = Sheet::new();
+        sheet.bulk_load(|loader| {
+            loader.set_cell("A1", Value::Number(5.0));
+            loader.set_formula("B1", "=A1*2");
+        });
+
+        // Pre-read: B1's cache is Dirty (formula was bulk-loaded, never
+        // evaluated). The flush sweep only marks downstream cells of
+        // touched addresses dirty — B1 itself is `touched` and starts Dirty
+        // from `FormulaRecord::new`.
+        assert_eq!(
+            sheet.debug_formula_cache_state("B1"),
+            "dirty",
+            "bulk-loaded formula must stay dirty until first read"
+        );
+
+        // First read computes and caches.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
+        assert_eq!(
+            sheet.debug_formula_cache_state("B1"),
+            "clean",
+            "first get_cell on a bulk-loaded formula must compute and cache"
+        );
+    }
+
+    #[test]
+    fn bulk_load_cycle_check_still_runs() {
+        // Static cycle protection (B.2) is preserved inside bulk_load — the
+        // task's contract: "cycle protection isn't worth dropping for perf".
+        // The second formula closes a self-cycle and must be rejected with
+        // false; no panic, no stack overflow on subsequent read.
+        let mut sheet = Sheet::new();
+        let mut a_ok = true;
+        let mut b_ok = true;
+        sheet.bulk_load(|loader| {
+            a_ok = loader.set_formula("A1", "=B1+1");
+            b_ok = loader.set_formula("B1", "=A1+1");
+        });
+        assert!(a_ok, "first formula has no cycle yet — must accept");
+        assert!(
+            !b_ok,
+            "second formula closes the cycle — bulk_load must reject"
+        );
+        // B1 holds the cycle error; reading it must not stack-overflow.
+        assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::CyclicRef));
+    }
+
+    #[test]
+    fn bulk_load_unsubscribed_addresses_not_notified() {
+        // Lazy-extreme contract: only currently-subscribed addresses get
+        // notified at flush. We verify by writing to a subscribed A1 and an
+        // unsubscribed Z99, then confirming (a) A1's subscriber fires
+        // exactly once and (b) the bulk write itself does not recompute
+        // anything — `debug_recompute_count` doesn't move even for Z99's
+        // (empty) downstream set.
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("A1", move || *cc.borrow_mut() += 1);
+
+        let before = sheet.debug_recompute_count();
+        sheet.bulk_load(|loader| {
+            loader.set_cell("A1", Value::Number(7.0));
+            loader.set_cell("Z99", Value::Number(99.0));
+        });
+        let after = sheet.debug_recompute_count();
+
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "subscribed A1 must fire exactly once at flush"
+        );
+        assert_eq!(
+            after - before,
+            0,
+            "writing to unsubscribed Z99 must not trigger any recompute"
+        );
+        // And reading the subscribed cell still gets the bulk value.
+        assert_eq!(sheet.get_cell("A1"), Value::Number(7.0));
+        assert_eq!(sheet.get_cell("Z99"), Value::Number(99.0));
     }
 }

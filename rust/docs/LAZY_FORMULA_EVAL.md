@@ -490,14 +490,77 @@ bulk load 期间：
 - `IF(A1>0, B1, C1)` 动态依赖切换：A1 从正变负后写 B1 不再触发本公式 dirty
 - 跑一遍 Solid demo 5 页 + DemoFormulas，无可见回归
 
-### Step 3：bulk import API
+### Step 3：bulk import API ✅
 
 `bulk_load(|loader| { ... })` 上线，CSV/JSON/xlsx 导入接入。
 
-验收：
+#### 落地 API 形态（RAII，非 begin/end）
 
-- 导入 10 万公式耗时主要由 parse 决定（profile：eval 时间 < 5%）
-- bulk load 结束后只通知 bulk 期间确实有订阅的地址
+最终选了 RAII 闭包，原始草稿讨论过 `begin_bulk` / `end_bulk` 但被否：begin/end
+要求 caller 配对，错过 end 就把 sheet 永远卡在 quiesced 状态。RAII 闭包让
+borrow checker 替我们守门 —— `BulkLoader` 不暴露出 `bulk_load` 闭包外，flush
+保证执行。
+
+```rust
+impl Sheet {
+    pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut BulkLoader<'_>) -> R) -> R;
+}
+
+pub struct BulkLoader<'a> {
+    sheet: &'a mut Sheet,
+    touched: HashSet<CellAddress>,
+}
+
+impl BulkLoader<'_> {
+    pub fn set_cell(&mut self, addr: &str, value: Value);
+    pub fn set_formula(&mut self, addr: &str, text: &str) -> bool;
+    // flush() 私有，由 bulk_load 在闭包返回后自动调
+}
+```
+
+#### 行为契约
+
+bulk 期间：
+- `set_cell` / `set_formula` 把地址记进 `touched`，写入 primitive atom / formula
+  record / 静态依赖索引
+- 不做 D2 的 BFS 标 dirty，不通知任何订阅者
+- 写入前 `detach_address_sub(addr)`，让底层 `store.set` 不通过 fanout 同步触发；
+  flush 时再 `attach_address_sub` 重连
+- `set_formula` 仍跑 same-sheet 静态环检测 (B.2 `would_create_cycle`) —— 增量
+  cycle protection 不值得为 perf 放掉，且代价仅 O(新公式依赖闭包)
+- 解析失败 / 静态环命中：cell 写 `#VALUE!` / `#CYCLE!`，返回 `false`，**不通知**
+
+flush 时：
+- BFS 通过 `cell_dependents` 从每个 `touched` 出发，收集传递下游公式集合 `dirty`
+- 对 `dirty` 中每个 formula record 把 `cache` 置 `Dirty`
+- 重连每个 `touched` 地址的 fanout
+- 对 `touched ∪ dirty` 中**当前有订阅**的地址 `notify_address_subscribers`，
+  每地址恰好一次；无订阅的地址直接跳过（lazy 极致：没人看就一直不算）
+
+#### 复杂度
+
+flush 的 BFS：O(T + D)，T = `touched.len()`，D = 从 touched 出发可达的下游
+公式闭包大小。通知去重 O(1) per address via HashSet。空集快速路径不分配。
+
+#### CSV 导入接入
+
+`csv.rs::import_csv` 已迁移到 `sheet.bulk_load(|loader| ...)`；每个字段调
+`loader.set_cell` / `loader.set_formula`，不再走每 cell notify path。
+
+#### 验收
+
+- ✅ `bulk_load_set_formula_zero_eval_count`：100 公式 bulk 后 `debug_recompute_count` delta 为 0
+- ✅ `bulk_load_notifies_subscribers_once`：5 个订阅地址各触发恰好 1 次
+- ✅ `bulk_load_skips_eval_until_first_read`：bulk 后 `debug_formula_cache_state("B1") == "dirty"`，首次 `get_cell` 后变 `clean`
+- ✅ `bulk_load_cycle_check_still_runs`：bulk 内 set_formula 命中环返回 false，读取返回 `#CYCLE!` 不栈溢出
+- ✅ `bulk_load_unsubscribed_addresses_not_notified`：写无订阅地址不触发 recompute / notify
+
+#### 已知遗留 / 后续路线
+
+- 10 万公式 import 的 wall-clock benchmark 还没在仓库里钉死（criterion harness 是 TODO 2.5）
+- bulk_load 同地址多次写入会被多次记入 touched，但 HashSet dedup 后只算一次 notify
+  source。如果 bulk 期间通过 set_cell→set_formula→set_cell 反复切 cell 类型，
+  fanout detach/attach 会跑多次 —— 实际影响只是常数倍，没有正确性问题
 
 ### Step 4：range streaming 改造
 
