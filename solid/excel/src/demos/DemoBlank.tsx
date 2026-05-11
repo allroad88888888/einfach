@@ -3,6 +3,7 @@ import { onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createJSSheet } from '../js-sheet'
+import { useT } from '../i18n'
 
 /**
  * Debug-only: when the page URL has `?debug=1`, stash the active
@@ -33,16 +34,19 @@ function exposeStoreForDebug(store: SheetStore) {
  * Demo 1: 空白表格
  */
 export function DemoBlank() {
+  const t = useT()
   const store = createSheetStore(createJSSheet())
   exposeStoreForDebug(store)
 
   return (
     <div class="demo-page">
       <div class="demo-header">
-        <h3>Blank Spreadsheet</h3>
+        <h3>{t('demo.blank.title')}</h3>
         <p class="demo-desc">
-          Double-click any cell to edit. Type a number, text, or formula (start with <code>=</code>).
-          Press <kbd>Enter</kbd> to confirm, <kbd>Esc</kbd> to cancel.
+          {t('demo.blank.desc.beforeCode')} <code>=</code>
+          {t('demo.blank.desc.beforeEnter')} <kbd>Enter</kbd>{' '}
+          {t('demo.blank.desc.beforeEsc')} <kbd>Esc</kbd>{' '}
+          {t('demo.blank.desc.afterEsc')}
         </p>
       </div>
       <Table store={store} rows={20} cols={10} formulaBar toolbar />

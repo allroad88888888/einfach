@@ -3,6 +3,7 @@ import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
+import { useT } from '../i18n'
 
 /**
  * Demo 3: 月度预算模板
@@ -12,6 +13,7 @@ import { createWasmSheet } from '../wasm-sheet'
  * actually compute.
  */
 export function DemoBudget() {
+  const t = useT()
   const [storeRes] = createResource<SheetStore>(async () => {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
@@ -27,12 +29,8 @@ export function DemoBudget() {
       {(store) => (
         <div class="demo-page">
           <div class="demo-header">
-            <h3>Monthly Budget</h3>
-            <p class="demo-desc">
-              Edit the <strong>Budget</strong> (B) and <strong>Actual</strong> (C) columns.
-              The <strong>Diff</strong> column and summary rows update automatically.
-              Positive diff = under budget, negative = over budget.
-            </p>
+            <h3>{t('demo.budget.title')}</h3>
+            <p class="demo-desc">{t('demo.budget.desc')}</p>
           </div>
           <Table store={store()} rows={17} cols={8} formulaBar />
         </div>

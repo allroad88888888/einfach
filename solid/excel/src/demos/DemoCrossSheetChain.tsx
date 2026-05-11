@@ -4,8 +4,10 @@ import {
   createThreeSheetChainWorkbookStore,
   type WasmWorkbookStore,
 } from '../wasm-workbook-store'
+import { useT } from '../i18n'
 
 export function DemoCrossSheetChain() {
+  const t = useT()
   const [lazyProbeState, setLazyProbeState] = createSignal('pending')
   const [workbookRes] = createResource<WasmWorkbookStore>(async () => {
     const workbook = await createThreeSheetChainWorkbookStore()
@@ -33,14 +35,15 @@ export function DemoCrossSheetChain() {
       {(workbook) => (
         <div class="demo-page">
           <div class="demo-header">
-            <h3>3-Sheet Dependency Chain</h3>
+            <h3>{t('demo.cross.title')}</h3>
             <p class="demo-desc">
               <code>Sheet1!C2</code> → <code>Sheet2!C2</code> →{' '}
               <code>Sheet3!C2</code> → <code>Sheet1!B4</code>
             </p>
             <p class="demo-desc">
-              Lazy probe: <code>Sheet2!C5</code> = <code>Sheet3!B4+5</code>,
-              cache <code data-cache-state="Sheet2!C5">{lazyProbeState()}</code>
+              {t('demo.cross.desc.lazyProbe')} <code>Sheet2!C5</code> ={' '}
+              <code>Sheet3!B4+5</code>{t('demo.cross.desc.cache')}{' '}
+              <code data-cache-state="Sheet2!C5">{lazyProbeState()}</code>
             </p>
           </div>
 

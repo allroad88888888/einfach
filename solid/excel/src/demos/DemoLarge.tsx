@@ -3,6 +3,7 @@ import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
+import { useT } from '../i18n'
 
 /**
  * Demo: 1000-row grid with row virtualization (7B).
@@ -16,6 +17,7 @@ import { createWasmSheet } from '../wasm-sheet'
  * formulas in unscrolled rows stay Dirty until their cell scrolls into view.
  */
 export function DemoLarge() {
+  const t = useT()
   const [storeRes] = createResource<SheetStore>(async () => {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
@@ -31,13 +33,8 @@ export function DemoLarge() {
       {(store) => (
         <div class="demo-page">
           <div class="demo-header">
-            <h3>Large Grid — Row Virtualization</h3>
-            <p class="demo-desc">
-              1000 rows × 26 columns. Only the visible window plus a small
-              overscan is in the DOM — scroll to see new rows hydrate on
-              demand. Arrow-keys past the bottom of the viewport auto-scroll
-              the focus cell back into view.
-            </p>
+            <h3>{t('demo.large.title')}</h3>
+            <p class="demo-desc">{t('demo.large.desc')}</p>
           </div>
           <Table store={store()} rows={1000} cols={26} virtualize formulaBar />
         </div>

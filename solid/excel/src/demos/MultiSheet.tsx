@@ -3,6 +3,7 @@ import { Show } from 'solid-js'
 import { Table } from '../Table'
 import { SheetTabs } from '../SheetTabs'
 import { createWorkbookStore } from '../workbook-store'
+import { useT } from '../i18n'
 
 /**
  * Demo 6: Multi-sheet workbook with a tab bar.
@@ -18,6 +19,7 @@ import { createWorkbookStore } from '../workbook-store'
  * the WASM workbook binding lands. See `rust/docs/TODO.md` 1.5.
  */
 export function MultiSheet() {
+  const t = useT()
   const wb = createWorkbookStore()
 
   // Seed the default sheet with sample data.
@@ -65,11 +67,10 @@ export function MultiSheet() {
   return (
     <div class="demo-page">
       <div class="demo-header">
-        <h3>Multi-Sheet Workbook</h3>
+        <h3>{t('demo.multi.title')}</h3>
         <p class="demo-desc">
-          Click a tab to switch sheets. Click <code>+</code> to add a new
-          sheet. Right-click a tab for rename / delete. Each sheet has
-          independent state, undo, and selection.
+          {t('demo.multi.desc.beforePlus')} <code>+</code>{' '}
+          {t('demo.multi.desc.afterPlus')}
         </p>
       </div>
       {/*

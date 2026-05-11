@@ -3,6 +3,7 @@ import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
+import { useT } from '../i18n'
 
 /**
  * Demo 4: 学生成绩计算器
@@ -12,6 +13,7 @@ import { createWasmSheet } from '../wasm-sheet'
  * numbers on first paint.
  */
 export function DemoGrades() {
+  const t = useT()
   const [storeRes] = createResource<SheetStore>(async () => {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
@@ -27,12 +29,8 @@ export function DemoGrades() {
       {(store) => (
         <div class="demo-page">
           <div class="demo-header">
-            <h3>Grade Calculator</h3>
-            <p class="demo-desc">
-              Edit any score — <strong>Average</strong>, <strong>Max</strong>, <strong>Min</strong>,
-              and class statistics all recalculate instantly.
-              Each student's row uses <code>AVERAGE</code>, <code>MAX</code>, <code>MIN</code>.
-            </p>
+            <h3>{t('demo.grades.title')}</h3>
+            <p class="demo-desc">{t('demo.grades.desc')}</p>
           </div>
           <Table store={store()} rows={14} cols={8} formulaBar />
         </div>

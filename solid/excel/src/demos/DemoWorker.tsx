@@ -4,6 +4,7 @@ import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWorkerSheet } from '../wasm-sheet-proxy'
 import { defaultWorkerFactory } from '../wasm-sheet-worker-factory'
+import { useT } from '../i18n'
 
 /**
  * 7C — Web Worker–backed sheet.
@@ -21,6 +22,7 @@ import { defaultWorkerFactory } from '../wasm-sheet-worker-factory'
  * thread, so scrolling / keyboard input stay smooth.
  */
 export function DemoWorker() {
+  const t = useT()
   const sheet = createWorkerSheet({ workerFactory: defaultWorkerFactory })
   const store = createSheetStore(sheet)
   onCleanup(() => store.dispose())
@@ -30,13 +32,8 @@ export function DemoWorker() {
   return (
     <div class="demo-page">
       <div class="demo-header">
-        <h3>Worker-backed Sheet (7C)</h3>
-        <p class="demo-desc">
-          WASM runs in a Web Worker; the main thread only ferries diffs.
-          Type into cells, create formulas — same Excel demo, just with
-          the compute on a separate thread. Useful for very heavy
-          recompute workloads (the UI stays responsive).
-        </p>
+        <h3>{t('demo.worker.title')}</h3>
+        <p class="demo-desc">{t('demo.worker.desc')}</p>
       </div>
       <Table store={store} rows={10} cols={6} formulaBar />
     </div>

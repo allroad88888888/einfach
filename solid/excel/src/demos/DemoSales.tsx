@@ -3,6 +3,7 @@ import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
 import { createSheetStore, type SheetStore } from '../sheet-store'
 import { createWasmSheet } from '../wasm-sheet'
+import { useT } from '../i18n'
 
 /**
  * Demo 5: 销售数据仪表盘
@@ -12,6 +13,7 @@ import { createWasmSheet } from '../wasm-sheet'
  * numbers on first paint.
  */
 export function DemoSales() {
+  const t = useT()
   const [storeRes] = createResource<SheetStore>(async () => {
     const sheet = await createWasmSheet()
     const store = createSheetStore(sheet)
@@ -27,11 +29,10 @@ export function DemoSales() {
       {(store) => (
         <div class="demo-page">
           <div class="demo-header">
-            <h3>Sales Dashboard</h3>
+            <h3>{t('demo.sales.title')}</h3>
             <p class="demo-desc">
-              Quarterly sales report with automatic totals, averages, and KPI calculations.
-              Edit any sales figure — the dashboard updates in real time.
-              Growth rates are computed as <code>(new-old)/old*100</code>.
+              {t('demo.sales.desc.before')} <code>(new-old)/old*100</code>
+              {t('demo.sales.desc.after')}
             </p>
           </div>
           <Table store={store()} rows={11} cols={9} formulaBar />
