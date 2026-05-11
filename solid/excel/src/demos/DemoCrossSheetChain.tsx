@@ -40,7 +40,7 @@ export function DemoCrossSheetChain() {
             </p>
             <p class="demo-desc">
               Lazy probe: <code>Sheet2!C5</code> = <code>Sheet3!B4+5</code>,
-              cache <code>{lazyProbeState()}</code>
+              cache <code data-cache-state="Sheet2!C5">{lazyProbeState()}</code>
             </p>
           </div>
 

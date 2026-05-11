@@ -32,9 +32,15 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npm run dev -- --port ${PORT} --strictPort`,
+    // build:wasm prepends so DemoFormulas / DemoCrossSheetChain don't render
+    // "Loading WASM…" forever on a clean checkout (no `solid/excel/wasm-pkg/`
+    // yet). Local re-runs are fast — wasm-pack short-circuits when nothing
+    // in rust/wasm changed.
+    command: `npm run build:wasm && npm run dev -- --port ${PORT} --strictPort`,
     url: BASE_URL,
     reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
+    // Bumped: cold wasm-pack on a fresh machine can take ~30s before vite
+    // even starts.
+    timeout: 180_000,
   },
 })

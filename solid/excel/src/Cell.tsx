@@ -2,6 +2,23 @@
 import { createSignal, Show } from 'solid-js'
 import type { SheetStore } from './sheet-store'
 
+/**
+ * Render-count probe gate. When the page URL has `?debug=1` (or
+ * `?debug=render` for clarity), Cells emit a `data-render-count` attribute
+ * incremented every time the display path runs. Used by render-counter
+ * e2e to assert "writing A1 made B1 re-render exactly once". Off in
+ * production / normal demo use — no observable runtime cost when the
+ * query param is absent (the JSX still wraps a span but the attr stays
+ * undefined, so Solid emits no DOM mutation for it).
+ *
+ * Computed once per page load — the URL doesn't change without a reload.
+ */
+const RENDER_COUNT_DEBUG = (() => {
+  if (typeof window === 'undefined') return false
+  const debug = new URLSearchParams(window.location.search).get('debug')
+  return debug === '1' || debug === 'render'
+})()
+
 export interface CellProps {
   addr: string
   store: SheetStore
@@ -23,9 +40,20 @@ export function Cell(props: CellProps) {
   const [editing, setEditing] = createSignal(false)
   const [editValue, setEditValue] = createSignal('')
 
+  // Render-counter probe state. Bumped on every cellValue() read, which
+  // matches Solid's JSX re-evaluation cadence for this Cell. Closure-local
+  // (one counter per Cell instance, not shared).
+  let renderCount = 0
+  function nextRenderCount() {
+    renderCount += 1
+    return renderCount
+  }
+
   const cellValue = () => props.store.getCell(props.addr)
   const isSelected = () => (props.selected ? props.selected() : false)
   const isInRange = () => (props.inRange ? props.inRange() : false)
+  const renderCountAttr = () =>
+    RENDER_COUNT_DEBUG ? String(nextRenderCount()) : undefined
 
   function startEditing() {
     // For formula cells, edit the source formula (`=A1*2`) instead of the
@@ -37,11 +65,18 @@ export function Cell(props: CellProps) {
   }
 
   function commitEdit() {
+    // Enter handler calls commit + sets editing=false → unmounts the input,
+    // which fires onBlur, which would call commit a second time. Guard with
+    // an editing-state check so the second call is a no-op. Fixes TODO 1.2.1
+    // (each user keystroke produces one undo entry, not two).
+    if (!editing()) return
     props.store.setCellInput(props.addr, editValue())
     setEditing(false)
   }
 
   function cancelEdit() {
+    // Same blur-after-unmount race: set editing=false BEFORE the input loses
+    // focus so the onBlur handler's commitEdit short-circuits.
     setEditing(false)
   }
 
@@ -86,7 +121,11 @@ export function Cell(props: CellProps) {
     >
       <Show
         when={editing()}
-        fallback={<span class="cell-display">{cellValue().display}</span>}
+        fallback={
+          <span class="cell-display" data-render-count={renderCountAttr()}>
+            {cellValue().display}
+          </span>
+        }
       >
         <input
           class="cell-input"

@@ -48,9 +48,20 @@ export function FormulaBar(props: FormulaBarProps) {
     }
   })
 
+  // Guards against the Enter→commit→blur→commit double-fire (same shape as
+  // Cell.commitEdit, see TODO 1.2.1). Set true right after a programmatic
+  // commit; the immediately-following onBlur skips its own commit and
+  // resets the flag.
+  let justCommitted = false
+
   function commit() {
     const a = addr()
     if (a === null) return
+    if (justCommitted) {
+      justCommitted = false
+      return
+    }
+    justCommitted = true
     props.store.setCellInput(a, draft())
     props.onCommit?.()
   }
@@ -66,6 +77,9 @@ export function FormulaBar(props: FormulaBarProps) {
         const formula = props.store.getFormula(a)
         setDraft(formula !== '' ? formula : props.store.getCell(a).display)
       }
+      // Same as Enter — the upcoming blur() must not commit the (now
+      // reverted) draft. Set the flag before blur fires.
+      justCommitted = true
       ;(e.currentTarget as HTMLInputElement).blur()
     }
   }
