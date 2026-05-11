@@ -159,10 +159,32 @@ export function createSheetStore(sheet: ISheet) {
 
   // === Undo / redo ===
   // Each entry records before+after snapshots for a contiguous batch of
-  // cell mutations. Undo restores the `before` set; redo replays `after`.
-  // `before` snapshot is captured before any mutation in the entry runs;
-  // `after` is captured at commit time (endEdit / single-mutation).
-  type UndoEntry = { before: CellSnapshot[]; after: CellSnapshot[] }
+  // cell mutations OR the parameters of a structural edit. Undo restores
+  // the `before` state; redo replays `after`. See
+  // `docs/STRUCTURAL_UNDO.md` for the structural-entry contract and the
+  // op-inverse fallback used when the sheet is too dense to snapshot.
+  type CellsUndoEntry = {
+    kind: 'cells'
+    before: CellSnapshot[]
+    after: CellSnapshot[]
+  }
+  type StructuralOp = 'insertRow' | 'deleteRow' | 'insertCol' | 'deleteCol'
+  type StructuralUndoEntry = {
+    kind: 'structural'
+    op: StructuralOp
+    at: number
+    count: number
+    /** Null when the sheet was too dense to snapshot — falls back to op
+     * inverse (which loses content for delete-row/-col but at least keeps
+     * the grid shape). */
+    snapshot: { before: CellSnapshot[]; after: CellSnapshot[] } | null
+  }
+  type UndoEntry = CellsUndoEntry | StructuralUndoEntry
+
+  /** Above this non-empty count, structural snapshots are skipped and we
+   * fall back to op inverse. See `docs/STRUCTURAL_UNDO.md#threshold`. */
+  const STRUCTURAL_SNAPSHOT_MAX = 2000
+
   const undoStack: UndoEntry[] = []
   const redoStack: UndoEntry[] = []
 
@@ -220,8 +242,84 @@ export function createSheetStore(sheet: ISheet) {
       return
     }
     const after = [snapshot(addr)]
-    undoStack.push({ before, after })
+    undoStack.push({ kind: 'cells', before, after })
     redoStack.length = 0
+  }
+
+  /** Snapshot every non-empty cell, or `null` when over the threshold. */
+  function snapshotAllNonEmpty(): CellSnapshot[] | null {
+    const list = sheet.non_empty_addrs?.()
+    if (!list) {
+      // Backend doesn't expose the iterator — fall back to op inverse.
+      return null
+    }
+    if (list.length > STRUCTURAL_SNAPSHOT_MAX) return null
+    return list.map(snapshot)
+  }
+
+  /** Run a structural edit and push its undo entry. Flushes any pending
+   * value-edit batch first so the two entry kinds never interleave (see
+   * `docs/STRUCTURAL_UNDO.md#coalescing-with-value-edits`). */
+  function structuralEdit(
+    op: StructuralOp,
+    at: number,
+    count: number,
+    apply: () => void,
+  ) {
+    // Flush an open beginEdit so the structural entry is its own frame.
+    if (pendingBefore !== null) {
+      const before = pendingBefore
+      const after = before.map((s) => snapshot(s.addr))
+      pendingBefore = null
+      pendingAddrs = null
+      if (before.length > 0) {
+        undoStack.push({ kind: 'cells', before, after })
+        redoStack.length = 0
+      }
+    }
+
+    const before = snapshotAllNonEmpty()
+    apply()
+    const after = before === null ? null : snapshotAllNonEmpty()
+    // If the post-edit snapshot crossed the threshold we degrade this
+    // entry to op-inverse only — keeping a partial snapshot would be a
+    // lie about what undo can restore.
+    const snap =
+      before !== null && after !== null ? { before, after } : null
+    if (snap === null && before !== null) {
+      // We had a before snapshot but went over budget after. Warn so the
+      // dev knows undo is degraded.
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[einfach] structural ${op} crossed snapshot threshold ${STRUCTURAL_SNAPSHOT_MAX}; undo will use op-inverse only`,
+      )
+    }
+    undoStack.push({ kind: 'structural', op, at, count, snapshot: snap })
+    redoStack.length = 0
+  }
+
+  /** Inverse op used when a structural entry has no snapshot. */
+  function applyStructural(op: StructuralOp, at: number, count: number) {
+    if (op === 'insertRow') sheet.insert_row?.(at, count)
+    else if (op === 'deleteRow') sheet.delete_row?.(at, count)
+    else if (op === 'insertCol') sheet.insert_col?.(at, count)
+    else if (op === 'deleteCol') sheet.delete_col?.(at, count)
+  }
+
+  function inverseOp(op: StructuralOp): StructuralOp {
+    if (op === 'insertRow') return 'deleteRow'
+    if (op === 'deleteRow') return 'insertRow'
+    if (op === 'insertCol') return 'deleteCol'
+    return 'insertCol'
+  }
+
+  /** Restore a list of snapshots verbatim. Used by structural undo /
+   * redo. We don't reset cleared cells back to null first because every
+   * non-empty address is in `snaps`, and addresses outside it are
+   * expected to already be empty (the structural inverse already shifted
+   * them out of the affected band). */
+  function restoreAll(snaps: CellSnapshot[]) {
+    for (const s of snaps) restore(s)
   }
 
   return {
@@ -336,21 +434,28 @@ export function createSheetStore(sheet: ISheet) {
 
     /**
      * Insert `count` empty rows at index `at`. Existing data shifts down;
-     * formula references retarget. Currently NOT undoable — structural
-     * edits don't capture per-cell snapshots (would explode for large
-     * sheets); see TODO A.6 for the full sheet-snapshot approach.
+     * formula references retarget. Undoable — see
+     * `docs/STRUCTURAL_UNDO.md` for the snapshot + threshold strategy.
      */
     insertRow(at: number, count = 1) {
-      sheet.insert_row?.(at, count)
+      structuralEdit('insertRow', at, count, () =>
+        sheet.insert_row?.(at, count),
+      )
     },
     deleteRow(at: number, count = 1) {
-      sheet.delete_row?.(at, count)
+      structuralEdit('deleteRow', at, count, () =>
+        sheet.delete_row?.(at, count),
+      )
     },
     insertCol(at: number, count = 1) {
-      sheet.insert_col?.(at, count)
+      structuralEdit('insertCol', at, count, () =>
+        sheet.insert_col?.(at, count),
+      )
     },
     deleteCol(at: number, count = 1) {
-      sheet.delete_col?.(at, count)
+      structuralEdit('deleteCol', at, count, () =>
+        sheet.delete_col?.(at, count),
+      )
     },
 
     setCellInput(addr: string, input: string) {
@@ -387,7 +492,7 @@ export function createSheetStore(sheet: ISheet) {
       pendingAddrs = null
       if (before.length === 0) return
       const after = before.map((s) => snapshot(s.addr))
-      undoStack.push({ before, after })
+      undoStack.push({ kind: 'cells', before, after })
       redoStack.length = 0
     },
 
@@ -397,14 +502,28 @@ export function createSheetStore(sheet: ISheet) {
     undo() {
       const entry = undoStack.pop()
       if (!entry) return
-      for (const s of entry.before) restore(s)
+      if (entry.kind === 'cells') {
+        restoreAll(entry.before)
+      } else {
+        // Structural inverse first (puts the grid back in shape), then
+        // restore any deleted content from the snapshot. Order matters:
+        // restoring rows that don't exist yet would either silently shift
+        // out or land on the wrong addresses.
+        applyStructural(inverseOp(entry.op), entry.at, entry.count)
+        if (entry.snapshot !== null) restoreAll(entry.snapshot.before)
+      }
       redoStack.push(entry)
     },
 
     redo() {
       const entry = redoStack.pop()
       if (!entry) return
-      for (const s of entry.after) restore(s)
+      if (entry.kind === 'cells') {
+        restoreAll(entry.after)
+      } else {
+        applyStructural(entry.op, entry.at, entry.count)
+        if (entry.snapshot !== null) restoreAll(entry.snapshot.after)
+      }
       undoStack.push(entry)
     },
 

@@ -6,6 +6,7 @@ use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueErro
 
 use crate::cell::CellAddress;
 use crate::eval::{eval_expr_with_provider, EvalProvider};
+use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr};
 use crate::range::CellRange;
 
@@ -90,6 +91,12 @@ pub struct Sheet {
     /// cell address → formula cells that depend on it.
     cell_dependents: RefCell<HashMap<CellAddress, HashSet<CellAddress>>>,
     next_cell_sub_id: u64,
+    /// Per-cell formatting (Phase 6). Independent of the dep graph; format
+    /// changes never trigger formula recompute. Entry absent → default.
+    formats: HashMap<CellAddress, CellFormat>,
+    /// Sheet-wide conditional formatting rules. Applied in order on top of
+    /// each cell's base format at display time (first match wins).
+    conditional_rules: Vec<ConditionalRule>,
 }
 
 impl Sheet {
@@ -103,6 +110,8 @@ impl Sheet {
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
             next_cell_sub_id: 0,
+            formats: HashMap::new(),
+            conditional_rules: Vec::new(),
         }
     }
 
@@ -716,6 +725,35 @@ impl Sheet {
         self.formula_texts.get(&addr).cloned()
     }
 
+    /// Iterate every address that has a primitive value or a formula. Empty
+    /// addresses are skipped. Used by structural-undo to snapshot only the
+    /// cells that actually need restoring (see `solid/excel/docs/STRUCTURAL_UNDO.md`).
+    ///
+    /// An address can appear in both `cells` and `formula_cells` during the
+    /// brief Computing window when a formula write created a primitive slot
+    /// that was then upgraded; the formula entry dominates, so we union the
+    /// keys and skip duplicates.
+    pub fn for_each_non_empty(&self, mut f: impl FnMut(CellAddress)) {
+        for addr in self.formula_cells.keys() {
+            f(*addr);
+        }
+        for addr in self.cells.keys() {
+            if self.formula_cells.contains_key(addr) {
+                continue;
+            }
+            f(*addr);
+        }
+    }
+
+    /// Collect every non-empty address as an `"A1"`-style string. Cheap
+    /// convenience wrapper around `for_each_non_empty` for wasm exposure.
+    pub fn non_empty_addrs(&self) -> Vec<String> {
+        let mut out =
+            Vec::with_capacity(self.formula_cells.len() + self.cells.len());
+        self.for_each_non_empty(|addr| out.push(addr.to_string()));
+        out
+    }
+
     /// Subscribe to changes on a single cell address. The returned token is
     /// stable across primitive/formula remaps for this address.
     pub fn subscribe_cell(
@@ -774,6 +812,78 @@ impl Sheet {
         self.attach_address_sub(addr);
 
         CellSubscription { addr, listener_id }
+    }
+
+    // === Phase 6: cell formatting ===
+
+    /// Set or clear the format for a cell. Passing the default `CellFormat`
+    /// removes the entry, keeping the formats map sparse for empty styles.
+    /// Format changes don't dirty the dep graph but DO fire the address
+    /// listener so views can re-style without recomputing the value.
+    pub fn set_format(&mut self, addr_str: &str, fmt: CellFormat) {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        if fmt == CellFormat::default() {
+            self.formats.remove(&addr);
+        } else {
+            self.formats.insert(addr, fmt);
+        }
+        if self.has_address_subscribers(addr) {
+            self.notify_address_subscribers(addr);
+        }
+    }
+
+    /// Read the base format for a cell. Returns the default when no
+    /// explicit format has been set. Does not apply conditional rules —
+    /// use `effective_format` for that.
+    pub fn get_format(&self, addr_str: &str) -> CellFormat {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        self.formats.get(&addr).cloned().unwrap_or_default()
+    }
+
+    /// Compute the effective format for a cell: base format with any
+    /// conditional rule overrides applied to the cell's current value.
+    pub fn effective_format(&self, addr_str: &str) -> CellFormat {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        let base = self.formats.get(&addr).cloned().unwrap_or_default();
+        if self.conditional_rules.is_empty() {
+            return base;
+        }
+        let value = self.peek_value(addr);
+        apply_rules(&base, &self.conditional_rules, &value)
+    }
+
+    /// Replace the sheet-wide conditional rule list. First match wins per
+    /// cell; pass an empty Vec to clear all rules. Fires every subscribed
+    /// address since the effective format of any cell may have changed.
+    pub fn set_conditional_rules(&mut self, rules: Vec<ConditionalRule>) {
+        self.conditional_rules = rules;
+        let addrs: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
+        for addr in addrs {
+            self.notify_address_subscribers(addr);
+        }
+    }
+
+    /// Read-only access to the conditional rule list.
+    pub fn conditional_rules(&self) -> &[ConditionalRule] {
+        &self.conditional_rules
+    }
+
+    /// Format a cell's value using its effective format. Numeric cells go
+    /// through `CellFormat::format_number`; non-numeric cells fall back to
+    /// the default display path (matches `value_to_display` behavior).
+    pub fn formatted_display(&self, addr_str: &str) -> String {
+        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        let value = self.peek_value(addr);
+        match &value {
+            Value::Number(n) => {
+                let fmt = self.effective_format(addr_str);
+                fmt.format_number(*n)
+            }
+            Value::Text(s) => s.clone(),
+            Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
+            Value::Null => String::new(),
+            Value::Error(e) => format!("{}", e),
+        }
     }
 
     // === Phase 4: structural edits ===
@@ -872,6 +982,15 @@ impl Sheet {
             // Fanout reattach + per-address fire are handled by the enclosing
             // `with_structural_edit`; nothing to do here.
         }
+        // Phase 6 — formats shift alongside cells. Drop formats whose
+        // addresses fall inside the deleted band; survivors are relocated by
+        // `relocate_cells`. Done as a separate sweep so the existing cell
+        // logic stays unchanged.
+        let fmt_drop: Vec<CellAddress> =
+            self.formats.keys().copied().filter(|a| pred(*a)).collect();
+        for addr in fmt_drop {
+            self.formats.remove(&addr);
+        }
     }
 
     /// Move every (still-present) cell entry to its new address per `f`.
@@ -897,10 +1016,29 @@ impl Sheet {
                 .into_iter()
                 .map(|(addr, text)| (f(addr), text))
                 .collect();
+        // Phase 6 — formats follow the same shift as cells so a format set
+        // on A1 survives a row insert above and re-emerges on A2. Entries
+        // mapped onto the invalid sentinel (deleted band) are dropped; for
+        // delete_row/delete_col `drop_cells_in` already removed them, but
+        // we filter defensively here too in case `f` produces a sentinel.
+        let new_formats: HashMap<CellAddress, CellFormat> = std::mem::take(&mut self.formats)
+            .into_iter()
+            .filter_map(|(addr, fmt)| {
+                let next = f(addr);
+                if next.row == crate::shift::REF_INVALID_ROW
+                    || next.col == crate::shift::REF_INVALID_COL
+                {
+                    None
+                } else {
+                    Some((next, fmt))
+                }
+            })
+            .collect();
         self.cells = new_cells;
         self.formula_cells = new_formula_cells;
         self.formula_exprs = new_formula_exprs;
         self.formula_texts = new_formula_texts;
+        self.formats = new_formats;
         self.rebuild_all_formula_dependents();
     }
 
@@ -2031,6 +2169,119 @@ mod tests {
         assert_eq!(sheet.get_cell("C1"), Value::Number(5.0));
     }
 
+    // === Phase 6 — cell format tests ===
+
+    #[test]
+    fn set_get_format_roundtrip() {
+        use crate::format::{Align, NumberFormat};
+        let mut sheet = Sheet::new();
+        let fmt = CellFormat {
+            number_format: NumberFormat::Percent { digits: 0 },
+            bold: true,
+            align: Align::Center,
+            ..Default::default()
+        };
+        sheet.set_format("A1", fmt.clone());
+        assert_eq!(sheet.get_format("A1"), fmt);
+        // Unset cells return default.
+        assert_eq!(sheet.get_format("B2"), CellFormat::default());
+        // Setting default removes the entry.
+        sheet.set_format("A1", CellFormat::default());
+        assert_eq!(sheet.get_format("A1"), CellFormat::default());
+    }
+
+    #[test]
+    fn formatted_display_uses_number_format() {
+        use crate::format::NumberFormat;
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(0.5));
+        // General → "0.5".
+        assert_eq!(sheet.formatted_display("A1"), "0.5");
+        sheet.set_format(
+            "A1",
+            CellFormat {
+                number_format: NumberFormat::Percent { digits: 0 },
+                ..Default::default()
+            },
+        );
+        assert_eq!(sheet.formatted_display("A1"), "50%");
+    }
+
+    #[test]
+    fn effective_format_applies_conditional_rules() {
+        use crate::format::{Condition, ConditionalRule, StyleOverrides};
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(150.0));
+        sheet.set_conditional_rules(vec![ConditionalRule {
+            condition: Condition::GreaterThan(100.0),
+            overrides: StyleOverrides {
+                color: Some("#ff0000".into()),
+                ..Default::default()
+            },
+        }]);
+        let eff = sheet.effective_format("A1");
+        assert_eq!(eff.color, Some("#ff0000".into()));
+        // Below the threshold → base format passes through.
+        sheet.set_cell("A1", Value::Number(50.0));
+        let eff = sheet.effective_format("A1");
+        assert_eq!(eff.color, None);
+    }
+
+    #[test]
+    fn format_survives_row_insert() {
+        let mut sheet = Sheet::new();
+        let fmt = CellFormat {
+            bold: true,
+            ..Default::default()
+        };
+        sheet.set_cell("A5", Value::Number(1.0));
+        sheet.set_format("A5", fmt.clone());
+        sheet.insert_row(2, 1);
+        // A5 → A6.
+        assert_eq!(sheet.get_format("A6"), fmt);
+        assert_eq!(sheet.get_format("A5"), CellFormat::default());
+    }
+
+    #[test]
+    fn format_survives_col_insert() {
+        let mut sheet = Sheet::new();
+        let fmt = CellFormat {
+            italic: true,
+            ..Default::default()
+        };
+        sheet.set_format("C1", fmt.clone());
+        sheet.insert_col(1, 1);
+        // C1 → D1.
+        assert_eq!(sheet.get_format("D1"), fmt);
+        assert_eq!(sheet.get_format("C1"), CellFormat::default());
+    }
+
+    #[test]
+    fn format_dropped_on_row_delete() {
+        let mut sheet = Sheet::new();
+        let fmt = CellFormat {
+            bold: true,
+            ..Default::default()
+        };
+        sheet.set_format("A5", fmt);
+        // Delete row index 4 (= row 5 in 1-based).
+        sheet.delete_row(4, 1);
+        assert_eq!(sheet.get_format("A5"), CellFormat::default());
+        assert_eq!(sheet.get_format("A4"), CellFormat::default());
+    }
+
+    #[test]
+    fn format_dropped_on_col_delete() {
+        let mut sheet = Sheet::new();
+        let fmt = CellFormat {
+            italic: true,
+            ..Default::default()
+        };
+        sheet.set_format("C1", fmt);
+        sheet.delete_col(2, 1);
+        assert_eq!(sheet.get_format("C1"), CellFormat::default());
+    }
+
     // === 3.10 — primitive atom GC on clear / set-Null ===
 
     #[test]
@@ -2457,5 +2708,38 @@ mod tests {
 
         sheet.set_formula("B1", "=COUNT(A1:A5)");
         assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+    }
+
+    #[test]
+    fn non_empty_addrs_skips_empties_and_unions_kinds() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("B2", Value::Text("hi".into()));
+        sheet.set_formula("C3", "=A1+1");
+        // D4 left untouched — must NOT appear.
+        let mut got = sheet.non_empty_addrs();
+        got.sort();
+        assert_eq!(got, vec!["A1", "B2", "C3"]);
+    }
+
+    #[test]
+    fn non_empty_addrs_dedups_primitive_under_formula() {
+        // When the same address holds a formula, it must not appear twice
+        // even if a stale primitive slot was created before the upgrade.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(99.0));
+        sheet.set_formula("A1", "=2+2");
+        let got = sheet.non_empty_addrs();
+        assert_eq!(got, vec!["A1"]);
+    }
+
+    #[test]
+    fn non_empty_addrs_drops_cleared() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("B1", Value::Number(2.0));
+        sheet.clear_cell("A1");
+        let got = sheet.non_empty_addrs();
+        assert_eq!(got, vec!["B1"]);
     }
 }

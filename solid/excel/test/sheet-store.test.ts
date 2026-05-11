@@ -348,6 +348,113 @@ describe('createSheetStore', () => {
         dispose()
       })
     })
+
+    // === Structural undo ===
+    // See docs/STRUCTURAL_UNDO.md for the snapshot + inverse-op contract.
+    it('insertRow is undoable — content shifts back', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('A2', 2)
+        store.setNumber('A3', 3)
+        store.insertRow(1, 1)
+        expect(store.getCell('A1').display).toBe('1')
+        expect(store.getCell('A2').type).toBe('null')
+        expect(store.getCell('A3').display).toBe('2')
+        store.undo()
+        expect(store.getCell('A1').display).toBe('1')
+        expect(store.getCell('A2').display).toBe('2')
+        expect(store.getCell('A3').display).toBe('3')
+        dispose()
+      })
+    })
+
+    it('deleteRow is undoable — deleted content comes back', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setText('A2', 'deleted')
+        store.setNumber('A3', 3)
+        store.deleteRow(1, 1)
+        expect(store.getCell('A2').display).toBe('3')
+        store.undo()
+        expect(store.getCell('A1').display).toBe('1')
+        expect(store.getCell('A2').display).toBe('deleted')
+        expect(store.getCell('A3').display).toBe('3')
+        dispose()
+      })
+    })
+
+    it('deleteRow with a formula in deleted band restores formula source', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 10)
+        store.setNumber('A3', 5)
+        store.setFormula('A2', '=A1+A3')
+        expect(store.getCell('A2').display).toBe('15')
+        store.deleteRow(1, 1)
+        // After: A1=10, A2 now holds the old A3 value (5)
+        expect(store.getCell('A2').display).toBe('5')
+        store.undo()
+        // Formula at A2 should be restored to its original source.
+        expect(store.getFormula('A2')).toBe('=A1+A3')
+        expect(store.getCell('A2').display).toBe('15')
+        dispose()
+      })
+    })
+
+    it('insertCol then redo round-trips', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        store.insertCol(1, 1)
+        expect(store.getCell('B1').type).toBe('null')
+        expect(store.getCell('C1').display).toBe('2')
+        store.undo()
+        expect(store.getCell('B1').display).toBe('2')
+        store.redo()
+        expect(store.getCell('B1').type).toBe('null')
+        expect(store.getCell('C1').display).toBe('2')
+        dispose()
+      })
+    })
+
+    it('deleteCol is undoable — deleted column content comes back', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        store.setNumber('C1', 3)
+        store.deleteCol(1, 1)
+        expect(store.getCell('B1').display).toBe('3')
+        store.undo()
+        expect(store.getCell('A1').display).toBe('1')
+        expect(store.getCell('B1').display).toBe('2')
+        expect(store.getCell('C1').display).toBe('3')
+        dispose()
+      })
+    })
+
+    it('structural edit flushes an open beginEdit batch first', () => {
+      // Both should be undoable independently: structural is its own frame.
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.beginEdit()
+        store.setNumber('A1', 99)
+        // No endEdit — structural should flush the pending batch.
+        store.insertRow(0, 1)
+        expect(store.getCell('A2').display).toBe('99')
+        // First undo reverses the insertRow.
+        store.undo()
+        expect(store.getCell('A1').display).toBe('99')
+        // Second undo reverses the value edit.
+        store.undo()
+        expect(store.getCell('A1').display).toBe('1')
+        dispose()
+      })
+    })
   })
 
   it('raw property exposes underlying sheet', () => {

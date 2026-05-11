@@ -1,10 +1,153 @@
 use einfach_core::{CellListener, Value, ValueError};
-use einfach_excel_core::{CellSubscription, Sheet, Workbook};
+use einfach_excel_core::{
+    Align, CellFormat, CellSubscription, NumberFormat, Sheet, Workbook,
+};
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
+
+/// Wire format for `CellFormat` over wasm-bindgen. Mirrors `CellFormat` /
+/// `NumberFormat` / `Align` but tagged-by-string so the JS side can build
+/// these from plain object literals (`{ numberFormat: { kind: 'percent',
+/// digits: 0 }, bold: true }`) without learning Rust's serde tags.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CellFormatJSON {
+    #[serde(default, rename = "numberFormat")]
+    number_format: Option<NumberFormatJSON>,
+    #[serde(default)]
+    bold: Option<bool>,
+    #[serde(default)]
+    italic: Option<bool>,
+    #[serde(default)]
+    align: Option<String>,
+    #[serde(default, rename = "fontSize")]
+    font_size: Option<u32>,
+    #[serde(default, rename = "fgColor", alias = "color")]
+    fg_color: Option<String>,
+    #[serde(default, rename = "bgColor", alias = "background")]
+    bg_color: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NumberFormatJSON {
+    /// One of "general" | "decimal" | "percent" | "currency" | "date".
+    kind: String,
+    #[serde(default)]
+    digits: Option<u8>,
+    /// Currency symbol — used when `kind == "currency"`.
+    #[serde(default)]
+    symbol: Option<String>,
+    /// Strftime-style pattern — used when `kind == "date"`.
+    #[serde(default)]
+    pattern: Option<String>,
+    /// Render thousands separators for `decimal`.
+    #[serde(default)]
+    thousands: Option<bool>,
+}
+
+impl CellFormatJSON {
+    fn into_format(self) -> CellFormat {
+        let number_format = self
+            .number_format
+            .map(|nf| nf.into_number_format())
+            .unwrap_or_default();
+        let align = match self.align.as_deref() {
+            Some("left") => Align::Left,
+            Some("center") => Align::Center,
+            Some("right") => Align::Right,
+            _ => Align::Default,
+        };
+        CellFormat {
+            number_format,
+            bold: self.bold.unwrap_or(false),
+            italic: self.italic.unwrap_or(false),
+            align,
+            font_size: self.font_size,
+            color: self.fg_color,
+            background: self.bg_color,
+        }
+    }
+
+    fn from_format(fmt: &CellFormat) -> Self {
+        CellFormatJSON {
+            number_format: Some(NumberFormatJSON::from_number_format(&fmt.number_format)),
+            bold: Some(fmt.bold),
+            italic: Some(fmt.italic),
+            align: Some(match fmt.align {
+                Align::Default => "default".into(),
+                Align::Left => "left".into(),
+                Align::Center => "center".into(),
+                Align::Right => "right".into(),
+            }),
+            font_size: fmt.font_size,
+            fg_color: fmt.color.clone(),
+            bg_color: fmt.background.clone(),
+        }
+    }
+}
+
+impl NumberFormatJSON {
+    fn into_number_format(self) -> NumberFormat {
+        match self.kind.as_str() {
+            "decimal" => NumberFormat::Decimal {
+                digits: self.digits.unwrap_or(2),
+                thousands: self.thousands.unwrap_or(false),
+            },
+            "percent" => NumberFormat::Percent {
+                digits: self.digits.unwrap_or(0),
+            },
+            "currency" => NumberFormat::Currency {
+                symbol: self.symbol.unwrap_or_else(|| "$".into()),
+                digits: self.digits.unwrap_or(2),
+            },
+            "date" => NumberFormat::Date(self.pattern.unwrap_or_else(|| "yyyy-mm-dd".into())),
+            _ => NumberFormat::General,
+        }
+    }
+
+    fn from_number_format(nf: &NumberFormat) -> Self {
+        match nf {
+            NumberFormat::General => NumberFormatJSON {
+                kind: "general".into(),
+                digits: None,
+                symbol: None,
+                pattern: None,
+                thousands: None,
+            },
+            NumberFormat::Decimal { digits, thousands } => NumberFormatJSON {
+                kind: "decimal".into(),
+                digits: Some(*digits),
+                symbol: None,
+                pattern: None,
+                thousands: Some(*thousands),
+            },
+            NumberFormat::Percent { digits } => NumberFormatJSON {
+                kind: "percent".into(),
+                digits: Some(*digits),
+                symbol: None,
+                pattern: None,
+                thousands: None,
+            },
+            NumberFormat::Currency { symbol, digits } => NumberFormatJSON {
+                kind: "currency".into(),
+                digits: Some(*digits),
+                symbol: Some(symbol.clone()),
+                pattern: None,
+                thousands: None,
+            },
+            NumberFormat::Date(p) => NumberFormatJSON {
+                kind: "date".into(),
+                digits: None,
+                symbol: None,
+                pattern: Some(p.clone()),
+                thousands: None,
+            },
+        }
+    }
+}
 
 /// Initialize the panic hook once per module load. Called automatically from
 /// every `WasmSheet::new()`; idempotent thanks to `set_once`. C.10.
@@ -249,6 +392,52 @@ impl WasmSheet {
     /// users edit `=A1*2` instead of the displayed result `20` (D.11).
     pub fn get_formula(&self, addr: &str) -> String {
         self.sheet.get_formula(addr).unwrap_or_default()
+    }
+
+    /// Every non-empty address on this sheet, as `"A1"`-style strings.
+    /// Empty cells are skipped; an address holding both a primitive slot
+    /// and a formula appears once (formula dominates). Used by
+    /// structural-undo to snapshot only what needs restoring — see
+    /// `solid/excel/docs/STRUCTURAL_UNDO.md`.
+    pub fn non_empty_addrs(&self) -> Vec<String> {
+        self.sheet.non_empty_addrs()
+    }
+
+    /// Phase 6 — set the format for a cell. `fmt` is a plain JS object
+    /// matching `CellFormatJSON` (numberFormat, bold, italic, align,
+    /// bgColor, fgColor). Passing `null` / `undefined` / `{}` removes any
+    /// non-default format.
+    pub fn set_format(&mut self, addr: &str, fmt: JsValue) -> Result<(), JsValue> {
+        let parsed: CellFormatJSON = if fmt.is_undefined() || fmt.is_null() {
+            CellFormatJSON::default()
+        } else {
+            serde_wasm_bindgen::from_value(fmt)
+                .map_err(|e| JsValue::from_str(&format!("invalid CellFormat: {e}")))?
+        };
+        self.sheet.set_format(addr, parsed.into_format());
+        Ok(())
+    }
+
+    /// Read the base format for a cell (no conditional rules applied).
+    pub fn get_format(&self, addr: &str) -> JsValue {
+        let fmt = self.sheet.get_format(addr);
+        serde_wasm_bindgen::to_value(&CellFormatJSON::from_format(&fmt))
+            .unwrap_or(JsValue::UNDEFINED)
+    }
+
+    /// Read the effective format for a cell (base + first matching
+    /// conditional rule override).
+    pub fn get_effective_format(&self, addr: &str) -> JsValue {
+        let fmt = self.sheet.effective_format(addr);
+        serde_wasm_bindgen::to_value(&CellFormatJSON::from_format(&fmt))
+            .unwrap_or(JsValue::UNDEFINED)
+    }
+
+    /// Format a cell's value using its effective format. Numeric cells go
+    /// through `CellFormat::format_number`; non-numeric cells fall back to
+    /// the default display path.
+    pub fn formatted_display(&self, addr: &str) -> String {
+        self.sheet.formatted_display(addr)
     }
 }
 

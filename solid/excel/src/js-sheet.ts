@@ -273,6 +273,22 @@ export function createJSSheet(): ISheet {
       recalcAll()
       fireChanges(before)
     },
+
+    /**
+     * Every address with a primitive value or a formula. Empty cells are
+     * skipped. The Rust backend's `non_empty_addrs()` parity — used by
+     * structural-undo (see `docs/STRUCTURAL_UNDO.md`).
+     *
+     * Formula and value entries can both exist on the same address during
+     * a brief upgrade window, but `cells` is cleared in that path before
+     * the formula entry is written, so we never see duplicates here.
+     */
+    non_empty_addrs(): string[] {
+      const out = new Set<string>()
+      for (const a of cells.keys()) out.add(a)
+      for (const a of formulas.keys()) out.add(a)
+      return Array.from(out)
+    },
   }
 
   /**

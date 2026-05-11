@@ -45,6 +45,12 @@ export interface ISheet {
    * down the wasm instance. Absent on JS mock.
    */
   __debugPanicNextCallback?(): void
+  /**
+   * Every address with either a primitive value or a formula. Empty
+   * cells are skipped. Used by structural-undo (see
+   * `docs/STRUCTURAL_UNDO.md`) to snapshot only what needs restoring.
+   */
+  non_empty_addrs?(): string[]
 }
 
 export type CellValue = {
