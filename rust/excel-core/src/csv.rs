@@ -88,23 +88,30 @@ fn escape_field(s: &str) -> String {
 /// Each field is parsed: bare numbers via `parse::<f64>()`, leading `=`
 /// becomes a formula, otherwise stored as text. Existing cells in the
 /// target rectangle are overwritten.
+///
+/// Uses `Sheet::bulk_load` so the import does not fire per-cell dirty
+/// propagation or subscriber notifications during the loop; the deferred
+/// flush at the end notifies each currently-subscribed address at most
+/// once. Formula cells stay Dirty until first read — LAZY Step 3.
 pub fn import_csv(sheet: &mut Sheet, input: &str, origin: CellAddress) {
     let rows = parse_csv(input);
-    for (r, row) in rows.iter().enumerate() {
-        for (c, field) in row.iter().enumerate() {
-            let addr = CellAddress::new(origin.row + r as u32, origin.col + c as u32);
-            let addr_str = addr.to_string_repr();
-            if field.starts_with('=') {
-                let _ = sheet.set_formula(&addr_str, field);
-            } else if field.is_empty() {
-                // Skip empties so partial CSVs don't blanket-overwrite.
-            } else if let Ok(n) = field.parse::<f64>() {
-                sheet.set_cell(&addr_str, Value::Number(n));
-            } else {
-                sheet.set_cell(&addr_str, Value::Text(field.clone()));
+    sheet.bulk_load(|loader| {
+        for (r, row) in rows.iter().enumerate() {
+            for (c, field) in row.iter().enumerate() {
+                let addr = CellAddress::new(origin.row + r as u32, origin.col + c as u32);
+                let addr_str = addr.to_string_repr();
+                if field.starts_with('=') {
+                    let _ = loader.set_formula(&addr_str, field);
+                } else if field.is_empty() {
+                    // Skip empties so partial CSVs don't blanket-overwrite.
+                } else if let Ok(n) = field.parse::<f64>() {
+                    loader.set_cell(&addr_str, Value::Number(n));
+                } else {
+                    loader.set_cell(&addr_str, Value::Text(field.clone()));
+                }
             }
         }
-    }
+    });
 }
 
 /// Export a rectangular region of the sheet as CSV. Formula cells emit
