@@ -1,7 +1,8 @@
 import { createSignal } from 'solid-js'
 import { addrToCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import { shiftFormulaRefs } from './formula-shift'
-import type { ISheet, CellValue } from './types'
+import type { CellFormatJSON, ISheet, CellValue } from './types'
+import { formatsEqual } from './types'
 
 /**
  * Reactive wrapper around ISheet.
@@ -32,6 +33,14 @@ type CellSnapshot =
   | { addr: string; kind: 'boolean'; value: boolean }
   | { addr: string; kind: 'error'; value: string }
   | { addr: string; kind: 'text'; value: string }
+  /**
+   * Phase 6 — format-only snapshot. Records the base format before/after a
+   * style mutation without touching the cell value. Restored via
+   * `sheet.set_format`. Standalone kind (rather than an optional field on
+   * every value snapshot) so undo of a value edit doesn't accidentally
+   * clobber the cell's format, and vice versa.
+   */
+  | { addr: string; kind: 'format'; format: CellFormatJSON }
 
 /** A clipboard "cells" payload. Top-left of the source range is at (0,0). */
 export interface ClipboardData {
@@ -150,8 +159,14 @@ export function createSheetStore(sheet: ISheet) {
   }
 
   function readCell(addr: string): CellValue {
+    // Prefer the format-aware display path when the backend exposes it
+    // (Phase 6). Falls back to `get_display` for backends without format
+    // support (older JS mocks in test fixtures, etc).
+    const display = sheet.formatted_display
+      ? sheet.formatted_display(addr)
+      : sheet.get_display(addr)
     return {
-      display: sheet.get_display(addr),
+      display,
       type: sheet.get_type(addr) as CellValue['type'],
       isError: sheet.is_error(addr),
     }
@@ -226,6 +241,9 @@ export function createSheetStore(sheet: ISheet) {
       case 'text':
         sheet.set_text(snap.addr, snap.value)
         return
+      case 'format':
+        if (sheet.set_format) sheet.set_format(snap.addr, snap.format)
+        return
     }
   }
 
@@ -243,6 +261,33 @@ export function createSheetStore(sheet: ISheet) {
     }
     const after = [snapshot(addr)]
     undoStack.push({ kind: 'cells', before, after })
+    redoStack.length = 0
+  }
+
+  /**
+   * Phase 6 — record a format-only mutation as a `format` snapshot kind.
+   * Cell value isn't touched, so we don't snapshot it. Inside beginEdit
+   * we still dedup per-address; the snapshot we keep is always the
+   * earliest pre-state of that address within the batch.
+   */
+  function recordFormat(addr: string, mutate: () => void) {
+    const beforeFmt: CellFormatJSON = sheet.get_format ? sheet.get_format(addr) : {}
+    const before: CellSnapshot = { addr, kind: 'format', format: beforeFmt }
+    mutate()
+    if (pendingBefore !== null) {
+      // Distinguish format snapshots from value snapshots so a mixed batch
+      // (value edit + format edit on the same address) still restores both
+      // halves. Key on `${addr}::format` to dedup within a batch.
+      const key = `${addr}::format`
+      if (!pendingAddrs!.has(key)) {
+        pendingBefore.push(before)
+        pendingAddrs!.add(key)
+      }
+      return
+    }
+    const afterFmt: CellFormatJSON = sheet.get_format ? sheet.get_format(addr) : {}
+    const after: CellSnapshot = { addr, kind: 'format', format: afterFmt }
+    undoStack.push({ kind: 'cells', before: [before], after: [after] })
     redoStack.length = 0
   }
 
@@ -269,7 +314,15 @@ export function createSheetStore(sheet: ISheet) {
     // Flush an open beginEdit so the structural entry is its own frame.
     if (pendingBefore !== null) {
       const before = pendingBefore
-      const after = before.map((s) => snapshot(s.addr))
+      const after = before.map((s) =>
+        s.kind === 'format'
+          ? ({
+              addr: s.addr,
+              kind: 'format' as const,
+              format: sheet.get_format ? sheet.get_format(s.addr) : {},
+            } satisfies CellSnapshot)
+          : snapshot(s.addr),
+      )
       pendingBefore = null
       pendingAddrs = null
       if (before.length > 0) {
@@ -458,6 +511,42 @@ export function createSheetStore(sheet: ISheet) {
       )
     },
 
+    // === Phase 6 — cell formatting (undoable) ===
+
+    /**
+     * Apply a format to a cell. Undoable as a `format`-kind snapshot so the
+     * cell's value is untouched on undo. No-op when the backend doesn't
+     * expose `set_format` (older mocks). Equal formats short-circuit so
+     * idle toolbar clicks don't flood the undo stack.
+     */
+    setFormat(addr: string, fmt: CellFormatJSON) {
+      if (!sheet.set_format) return
+      const current = sheet.get_format ? sheet.get_format(addr) : ({} as CellFormatJSON)
+      if (formatsEqual(current, fmt)) return
+      recordFormat(addr, () => sheet.set_format!(addr, fmt))
+    },
+
+    /** Read the base format. Returns `{}` (default) if the backend lacks
+     * format support so callers don't need null-checks for the JS mock. */
+    getFormat(addr: string): CellFormatJSON {
+      return sheet.get_format ? sheet.get_format(addr) : {}
+    },
+
+    /** Read the effective format (base + first matching conditional rule). */
+    getEffectiveFormat(addr: string): CellFormatJSON {
+      if (sheet.get_effective_format) return sheet.get_effective_format(addr)
+      if (sheet.get_format) return sheet.get_format(addr)
+      return {}
+    },
+
+    /** Format-aware display string. Same as `getCell(addr).display` but
+     * available standalone for callers that already know the cell. */
+    formattedDisplay(addr: string): string {
+      return sheet.formatted_display
+        ? sheet.formatted_display(addr)
+        : sheet.get_display(addr)
+    },
+
     setCellInput(addr: string, input: string) {
       const trimmed = input.trim()
       recordSingle(addr, () => {
@@ -491,7 +580,19 @@ export function createSheetStore(sheet: ISheet) {
       pendingBefore = null
       pendingAddrs = null
       if (before.length === 0) return
-      const after = before.map((s) => snapshot(s.addr))
+      // Format snapshots and value snapshots are restored differently — the
+      // "after" needs to match the kind of each "before" entry so undo of a
+      // mixed batch (value edit + format edit on the same cell) still
+      // restores both halves independently.
+      const after = before.map((s) =>
+        s.kind === 'format'
+          ? ({
+              addr: s.addr,
+              kind: 'format' as const,
+              format: sheet.get_format ? sheet.get_format(s.addr) : {},
+            } satisfies CellSnapshot)
+          : snapshot(s.addr),
+      )
       undoStack.push({ kind: 'cells', before, after })
       redoStack.length = 0
     },

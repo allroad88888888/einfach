@@ -2,6 +2,7 @@
 import { createSignal, For, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
+import { FormatToolbar } from './FormatToolbar'
 import { FormulaBar } from './FormulaBar'
 import { addrToCoord, clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import {
@@ -16,6 +17,9 @@ export interface TableProps {
   cols?: number
   /** Render an Excel-style formula bar above the grid. */
   formulaBar?: boolean
+  /** Render the Phase 6 format toolbar above the grid (Bold/Italic/Align/
+   *  Number-format/Background/Text-color). Opt-in like `formulaBar`. */
+  toolbar?: boolean
 }
 
 /** Build cell address from row/col: (0,0)→"A1" */
@@ -290,6 +294,9 @@ export function Table(props: TableProps) {
       tabIndex={0}
       onKeyDown={onKeyDown}
     >
+      <Show when={props.toolbar}>
+        <FormatToolbar store={props.store} />
+      </Show>
       <Show when={props.formulaBar}>
         <FormulaBar store={props.store} />
       </Show>

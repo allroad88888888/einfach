@@ -287,6 +287,88 @@ thead .row-header {
   background: #f6f6f6;
 }
 
+/* === Format Toolbar (Phase 6) ===
+ * Excel ribbon-lite — light borders, gray hover, primary blue on active. */
+
+.format-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  margin-bottom: 6px;
+  border: 1px solid #d0d7de;
+  background: #fafbfc;
+  border-radius: 4px;
+  font-family: -apple-system, sans-serif;
+  font-size: 13px;
+}
+
+.fmt-btn {
+  min-width: 28px;
+  height: 26px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #333;
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  border-radius: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fmt-btn:hover {
+  background: #eef1f4;
+  border-color: #d0d7de;
+}
+
+.fmt-btn-active {
+  background: #e8f0fe;
+  border-color: #1a73e8;
+  color: #1a73e8;
+}
+
+.fmt-sep {
+  width: 1px;
+  height: 20px;
+  background: #d0d7de;
+  margin: 0 4px;
+}
+
+.fmt-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #555;
+}
+
+.fmt-label-text {
+  user-select: none;
+}
+
+.fmt-select {
+  height: 24px;
+  padding: 0 4px;
+  border: 1px solid #d0d7de;
+  border-radius: 3px;
+  background: #fff;
+  font-family: inherit;
+  font-size: 12px;
+}
+
+.fmt-color {
+  width: 28px;
+  height: 24px;
+  border: 1px solid #d0d7de;
+  border-radius: 3px;
+  cursor: pointer;
+  padding: 0;
+  background: #fff;
+}
+
 /* === Sheet Tabs (bottom-of-grid, multi-sheet workbook) === */
 
 .sheet-tabs {

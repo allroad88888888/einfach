@@ -115,6 +115,26 @@ export function Cell(props: CellProps) {
       .join(' ')
   }
 
+  /**
+   * Per-cell inline style — applied to the <td>. Reads the cell's effective
+   * format (base + first matching conditional rule). The leading
+   * `cellValue()` read is load-bearing: it subscribes this accessor to the
+   * per-cell tick signal so style updates flow alongside value updates
+   * (set_format fires the same address listener as set_cell).
+   */
+  function cellStyle() {
+    cellValue() // dep: re-run when value OR format changes for this addr
+    const fmt = props.store.getEffectiveFormat(props.addr)
+    const style: Record<string, string> = {}
+    if (fmt.bgColor) style['background'] = fmt.bgColor
+    if (fmt.fgColor) style['color'] = fmt.fgColor
+    if (fmt.bold) style['font-weight'] = '700'
+    if (fmt.italic) style['font-style'] = 'italic'
+    if (fmt.align && fmt.align !== 'default') style['text-align'] = fmt.align
+    if (fmt.fontSize) style['font-size'] = `${fmt.fontSize}px`
+    return style
+  }
+
   function onClick(e: MouseEvent) {
     if (e.shiftKey && props.onExtendSelect) {
       props.onExtendSelect()
@@ -126,6 +146,7 @@ export function Cell(props: CellProps) {
   return (
     <td
       class={classes()}
+      style={cellStyle()}
       data-cell-addr={props.addr}
       onClick={onClick}
       onDblClick={startEditing}

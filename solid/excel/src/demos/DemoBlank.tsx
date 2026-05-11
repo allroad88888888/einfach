@@ -45,7 +45,7 @@ export function DemoBlank() {
           Press <kbd>Enter</kbd> to confirm, <kbd>Esc</kbd> to cancel.
         </p>
       </div>
-      <Table store={store} rows={20} cols={10} formulaBar />
+      <Table store={store} rows={20} cols={10} formulaBar toolbar />
     </div>
   )
 }

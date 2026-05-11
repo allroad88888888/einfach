@@ -51,10 +51,81 @@ export interface ISheet {
    * `docs/STRUCTURAL_UNDO.md`) to snapshot only what needs restoring.
    */
   non_empty_addrs?(): string[]
+
+  // === Phase 6 — cell formatting ===
+
+  /** Apply a format to a cell. Pass `undefined` / `null` / `{}` to clear. */
+  set_format?(addr: string, fmt: CellFormatJSON | null | undefined): void
+  /** Base format (no conditional rule overrides). */
+  get_format?(addr: string): CellFormatJSON
+  /** Base + first matching conditional rule. */
+  get_effective_format?(addr: string): CellFormatJSON
+  /**
+   * Display string with the effective format applied. Returns the same as
+   * `get_display` for non-numeric cells; numeric cells are routed through
+   * the number-format formatter.
+   */
+  formatted_display?(addr: string): string
 }
 
 export type CellValue = {
   display: string
   type: 'number' | 'text' | 'boolean' | 'null' | 'error'
   isError: boolean
+}
+
+/** Wire-format for a per-cell style. Mirrors the Rust `CellFormatJSON`. */
+export interface CellFormatJSON {
+  numberFormat?: NumberFormatJSON
+  bold?: boolean
+  italic?: boolean
+  align?: 'default' | 'left' | 'center' | 'right'
+  fontSize?: number
+  /** Foreground / text color. */
+  fgColor?: string
+  /** Background color. */
+  bgColor?: string
+}
+
+export interface NumberFormatJSON {
+  kind: 'general' | 'decimal' | 'percent' | 'currency' | 'date'
+  digits?: number
+  symbol?: string
+  pattern?: string
+  thousands?: boolean
+}
+
+/** Empty format → equivalent to the default (no styling, General number). */
+export const EMPTY_FORMAT: CellFormatJSON = {}
+
+/** True when both formats produce identical styling. Order-independent. */
+export function formatsEqual(a: CellFormatJSON, b: CellFormatJSON): boolean {
+  return (
+    !!a.bold === !!b.bold &&
+    !!a.italic === !!b.italic &&
+    (a.align ?? 'default') === (b.align ?? 'default') &&
+    (a.fgColor ?? '') === (b.fgColor ?? '') &&
+    (a.bgColor ?? '') === (b.bgColor ?? '') &&
+    numberFormatsEqual(a.numberFormat, b.numberFormat)
+  )
+}
+
+function numberFormatsEqual(a?: NumberFormatJSON, b?: NumberFormatJSON): boolean {
+  const ak = a?.kind ?? 'general'
+  const bk = b?.kind ?? 'general'
+  if (ak !== bk) return false
+  if (ak === 'decimal') {
+    return (
+      (a?.digits ?? 2) === (b?.digits ?? 2) &&
+      !!a?.thousands === !!b?.thousands
+    )
+  }
+  if (ak === 'percent') return (a?.digits ?? 0) === (b?.digits ?? 0)
+  if (ak === 'currency') {
+    return (a?.digits ?? 2) === (b?.digits ?? 2) && (a?.symbol ?? '$') === (b?.symbol ?? '$')
+  }
+  if (ak === 'date') {
+    return (a?.pattern ?? 'yyyy-mm-dd') === (b?.pattern ?? 'yyyy-mm-dd')
+  }
+  return true
 }

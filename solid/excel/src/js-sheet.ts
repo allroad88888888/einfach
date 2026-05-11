@@ -1,4 +1,5 @@
-import type { ISheet } from './types'
+import type { CellFormatJSON, ISheet } from './types'
+import { formatsEqual } from './types'
 import {
   shiftFormulaForColDelete,
   shiftFormulaForColInsert,
@@ -23,9 +24,52 @@ import { addrToCoord, coordToAddr } from './selection'
 export function createJSSheet(): ISheet {
   const cells = new Map<string, { type: string; value: unknown; formula?: string }>()
   const formulas = new Map<string, string>()
+  const formats = new Map<string, CellFormatJSON>()
   const listeners = new Map<string, Map<number, () => void>>()
   const tokenToAddr = new Map<number, string>()
   let nextToken = 0
+
+  function getFormat(addr: string): CellFormatJSON {
+    return formats.get(addr.toUpperCase()) ?? {}
+  }
+
+  /** Apply a CellFormat's number format to a numeric value. Mirrors a subset
+   *  of `CellFormat::format_number` in Rust — General / Decimal / Percent /
+   *  Currency only. Date falls back to the default rendering. */
+  function formatNumber(n: number, fmt: CellFormatJSON): string {
+    const nf = fmt.numberFormat
+    if (!nf || nf.kind === 'general') {
+      if (n === Math.floor(n) && Math.abs(n) < 1e15) return String(Math.round(n))
+      return String(n)
+    }
+    if (nf.kind === 'percent') {
+      const digits = nf.digits ?? 0
+      return (n * 100).toFixed(digits) + '%'
+    }
+    if (nf.kind === 'decimal') {
+      const digits = nf.digits ?? 2
+      const body = n.toFixed(digits)
+      if (!nf.thousands) return body
+      return insertThousands(body)
+    }
+    if (nf.kind === 'currency') {
+      const digits = nf.digits ?? 2
+      const symbol = nf.symbol ?? '$'
+      return symbol + insertThousands(n.toFixed(digits))
+    }
+    // Date — no JS-side calendar logic; just render the number.
+    if (n === Math.floor(n) && Math.abs(n) < 1e15) return String(Math.round(n))
+    return String(n)
+  }
+
+  function insertThousands(s: string): string {
+    const [intPart, fracPart] = s.split('.')
+    const negative = intPart.startsWith('-')
+    const digits = negative ? intPart.slice(1) : intPart
+    const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+    const head = (negative ? '-' : '') + grouped
+    return fracPart === undefined ? head : `${head}.${fracPart}`
+  }
 
   function parseAddr(addr: string): { col: string; row: number } {
     const match = addr.match(/^([A-Za-z]+)(\d+)$/)
@@ -289,6 +333,48 @@ export function createJSSheet(): ISheet {
       for (const a of formulas.keys()) out.add(a)
       return Array.from(out)
     },
+
+    // === Phase 6 — cell formatting ===
+    set_format(addr: string, fmt: CellFormatJSON | null | undefined) {
+      const a = addr.toUpperCase()
+      const before = snapshotDisplays()
+      if (!fmt || formatsEqual(fmt, {})) {
+        formats.delete(a)
+      } else {
+        formats.set(a, { ...fmt })
+      }
+      // Fire the address listener so views can re-style without a value
+      // change. We don't snapshot styling, so reuse the display-diff sweep
+      // and just force-fire the listener for this address.
+      const map = listeners.get(a)
+      if (map) for (const cb of map.values()) cb()
+      // Other addresses may have changed if conditional rules were active;
+      // we don't keep conditional rules in the JS mock, but the diff sweep
+      // is cheap and consistent with set_cell semantics.
+      fireChanges(before)
+    },
+
+    get_format(addr: string): CellFormatJSON {
+      return getFormat(addr)
+    },
+
+    get_effective_format(addr: string): CellFormatJSON {
+      // JS mock does not track conditional rules; effective == base.
+      return getFormat(addr)
+    },
+
+    formatted_display(addr: string): string {
+      const cell = cells.get(addr.toUpperCase())
+      if (!cell) return ''
+      if (cell.type !== 'number') {
+        // Non-numeric falls back to default display.
+        if (cell.type === 'error') return cell.value as string
+        if (cell.type === 'boolean') return cell.value ? 'TRUE' : 'FALSE'
+        if (cell.type === 'text') return cell.value as string
+        return ''
+      }
+      return formatNumber(cell.value as number, getFormat(addr))
+    },
   }
 
   /**
@@ -324,11 +410,24 @@ export function createJSSheet(): ISheet {
       const nextAddr = coordToAddr(moved)
       newFormulas.set(nextAddr, shiftRefs(f))
     }
+    // Phase 6 — formats shift alongside cells. Entries mapped to `null` are
+    // dropped (delete band), otherwise they move with their cell.
+    const newFormats = new Map<string, CellFormatJSON>()
+    for (const [addr, fmt] of formats) {
+      const c = addrToCoord(addr)
+      if (!c) throw new Error(`Invalid address: ${addr}`)
+      const moved = mapAddr(c)
+      if (moved === null) continue
+      const nextAddr = coordToAddr(moved)
+      newFormats.set(nextAddr, fmt)
+    }
     cells.clear()
     formulas.clear()
+    formats.clear()
     for (const [a, v] of newCells) {
       if (v) cells.set(a, v)
     }
     for (const [a, f] of newFormulas) formulas.set(a, f)
+    for (const [a, fmt] of newFormats) formats.set(a, fmt)
   }
 }

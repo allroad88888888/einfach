@@ -36,7 +36,7 @@ export function DemoFormulas() {
               The chain F8→G8→H8→I8 propagates through 4 levels.
             </p>
           </div>
-          <Table store={store()} rows={18} cols={10} formulaBar />
+          <Table store={store()} rows={18} cols={10} formulaBar toolbar />
         </div>
       )}
     </Show>
