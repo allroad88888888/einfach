@@ -123,11 +123,27 @@ export function createSheetStore(sheet: ISheet) {
   }
   const handles = new Map<string, CellHandle>()
 
+  /**
+   * Per-address subscriber fire counter. Exposed via `subscriberFireCount`
+   * for tests asserting precise subscription contract (e.g. "subscribe to
+   * empty cell, then set_formula on it, fires exactly once"). The
+   * counter is bumped inside the same callback that fires the per-cell
+   * tick signal, so it reflects the address-level subscription
+   * fan-out exactly. Lives at the SheetStore layer because that's where
+   * each address materializes its single sheet.subscribe(addr, …) call.
+   *
+   * Cheap (one integer per touched address); always on.
+   */
+  const fireCounts = new Map<string, number>()
+
   function getHandle(addr: string): CellHandle {
     let h = handles.get(addr)
     if (h) return h
     const [tick, bump] = createSignal(0)
-    const token = sheet.subscribe(addr, () => bump((t) => t + 1))
+    const token = sheet.subscribe(addr, () => {
+      fireCounts.set(addr, (fireCounts.get(addr) ?? 0) + 1)
+      bump((t) => t + 1)
+    })
     h = { tick, bump, token }
     handles.set(addr, h)
     return h
@@ -222,6 +238,19 @@ export function createSheetStore(sheet: ISheet) {
 
     /** Convenience accessor — focus cell's address form. */
     selectionAddr: () => coordToAddr(selection()),
+
+    /**
+     * Debug-only: how many times has this address's subscriber callback
+     * fired since `getHandle(addr)` was first created (i.e. since the
+     * first reactive read of this cell)? 0 for addresses that were never
+     * touched. Used by `regression.spec.ts` to pin the
+     * "subscribe-then-set_formula fires exactly once" contract — without
+     * this, the spec couldn't observe fire counts from the browser side.
+     *
+     * Counter bumps before `bump((t) => t + 1)`, so the count == number
+     * of distinct sheet notifications, not Solid render passes.
+     */
+    subscriberFireCount: (addr: string) => fireCounts.get(addr) ?? 0,
 
     /**
      * The current rectangular selection: `anchor` is where the range

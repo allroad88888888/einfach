@@ -237,4 +237,35 @@ test.describe('Clipboard — copy / paste / cut', () => {
     await expectDisplay(page, 'A2', '7')
     await expectDisplay(page, 'B2', '8')
   })
+
+  test('cross-sheet ref preserves sheet name through copy/paste shift', async ({
+    page,
+  }) => {
+    // Done-criteria gate: when a formula references another sheet via
+    // `Sheet1!A1`, copy/paste's relative-ref shift should rewrite the
+    // address (A1 → C5 at the paste offset) but keep the sheet name
+    // unchanged. The address-shift logic lives in `formula-shift.ts`
+    // and unit tests cover it; this pins the e2e path that wires real
+    // navigator.clipboard through the same shift.
+    //
+    // Runs on the Blank demo (JS mock) — the mock won't actually resolve
+    // `Sheet1!A1` because createJSSheet has no workbook context, so we
+    // only assert on the formula SOURCE in the FormulaBar, not the
+    // computed display. Cross-sheet evaluation correctness is covered
+    // in workbook-chain.spec.ts.
+    await gotoDemo(page, DEMO)
+    await typeIntoCell(page, 'B2', '=Data!A1+1')
+
+    await selectCell(page, 'B2')
+    await pressMeta(page, 'c')
+
+    await selectCell(page, 'C3')
+    await pressMeta(page, 'v')
+
+    // Origin shift is (C3 - B2) = (col +1, row +1), so Data!A1 → Data!B2.
+    // The sheet name "Data" must NOT change.
+    await cell(page, 'C3').click()
+    const bar = page.getByTestId('formula-bar-input')
+    await expect(bar).toHaveValue('=Data!B2+1')
+  })
 })

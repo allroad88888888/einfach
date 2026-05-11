@@ -52,8 +52,17 @@ export function Cell(props: CellProps) {
   const cellValue = () => props.store.getCell(props.addr)
   const isSelected = () => (props.selected ? props.selected() : false)
   const isInRange = () => (props.inRange ? props.inRange() : false)
-  const renderCountAttr = () =>
-    RENDER_COUNT_DEBUG ? String(nextRenderCount()) : undefined
+  // Reading cellValue() here is the load-bearing line: it subscribes this
+  // accessor to the per-cell tick signal so Solid re-runs renderCountAttr
+  // whenever the cell's display would update. Without the dep tracking,
+  // the attribute reads "1" forever even as the visible text mutates,
+  // because Solid's fine-grained reactivity only re-evaluates accessors
+  // that touched a signal.
+  const renderCountAttr = () => {
+    if (!RENDER_COUNT_DEBUG) return undefined
+    cellValue() // dep: re-run on every display update
+    return String(nextRenderCount())
+  }
 
   function startEditing() {
     // For formula cells, edit the source formula (`=A1*2`) instead of the

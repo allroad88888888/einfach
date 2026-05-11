@@ -81,19 +81,54 @@ test.describe('Solid Excel regression pins', () => {
     await expect(cellDisplay(page, 'A1')).toHaveText('')
   })
 
-  test.skip(
-    'subscribe-then-set_formula fires subscriber exactly once',
-    async () => {
-      // Pinned in Rust at:
-      //   rust/excel-core/src/sheet.rs::tests::
-      //     subscribe_empty_cell_then_set_formula_fires_once
-      //
-      // The browser layer can't observe sub-fire counts directly without a
-      // debug shim on the SheetStore. Adding such a shim is a follow-up.
-      // Until then this stays skipped; the Rust unit test is the source
-      // of truth.
-    },
-  )
+  test('subscribe-then-set_formula fires subscriber exactly once', async ({
+    page,
+  }) => {
+    // Browser-level mirror of the Rust unit test
+    //   rust/excel-core/src/sheet.rs::tests::
+    //     subscribe_empty_cell_then_set_formula_fires_once
+    //
+    // The address-level subscription contract: a cell that's been rendered
+    // (Solid's reactive read triggers SheetStore.subscribe for that addr,
+    // even if the cell is empty) must fire its subscriber EXACTLY ONCE
+    // when a formula is first installed on it. Pre-fix, the first
+    // set_formula on an empty subscribed cell silently dropped the
+    // notification (the bucket had listeners but no store_sub because the
+    // empty cell hadn't been atomized yet).
+    //
+    // We use the debug shim `SheetStore.subscriberFireCount(addr)` exposed
+    // via `window.__einfachStore` when `?debug=1`. This is the only way to
+    // observe individual subscriber-fire counts from the browser.
+    await gotoDemo(page, 'Blank', 'debug=1')
+
+    // Force B1 to render as an empty cell — that's what subscribes its
+    // address bucket. (`cellDisplay` reads via Solid which calls into
+    // SheetStore.getCell, materializing the handle.)
+    await expect(cellDisplay(page, 'B1')).toBeVisible()
+    const beforeFires = await page.evaluate(
+      () => window.__einfachStore?.subscriberFireCount('B1') ?? -1,
+    )
+    expect(beforeFires).toBe(0)
+
+    // First set_formula on B1 — this is the path that used to drop the
+    // notification. After the with_remap fix it must fire exactly once.
+    await typeIntoCell(page, 'A1', '5')
+    const fireAfterA1 = await page.evaluate(
+      () => window.__einfachStore?.subscriberFireCount('B1') ?? -1,
+    )
+    // Writing A1 doesn't touch B1 yet (B1 has no formula). So B1 hasn't
+    // fired.
+    expect(fireAfterA1).toBe(0)
+
+    await typeIntoCell(page, 'B1', '=A1*2')
+    await expect(cellDisplay(page, 'B1')).toHaveText('10')
+    const afterSetFormula = await page.evaluate(
+      () => window.__einfachStore?.subscriberFireCount('B1') ?? -1,
+    )
+    // Exactly one fire from the empty → formula transition. The strict
+    // equality is the regression guard — pre-fix this was 0.
+    expect(afterSetFormula).toBe(1)
+  })
 
   test('cross-sheet read does not invalidate cached cells (workbook chain)', async ({
     page,

@@ -37,28 +37,17 @@ proxy caveat in Discovered #D).
 Real issues surfaced during agent work that the original plan didn't
 anticipate. Each is actionable with a known fix or follow-up.
 
-### A. Render-counter probe doesn't tick on dependency-driven updates
+### A. Render-counter probe doesn't tick on dependency-driven updates ✅ FIXED
 
-`Cell.tsx::renderCountAttr()` doesn't read any reactive signal, so Solid
-never re-evaluates the attribute binding when `cellValue()` changes. The
-probe sits frozen at 1 even though the display text mutates.
+`Cell.tsx::renderCountAttr` now reads `cellValue()` before returning,
+so Solid's fine-grained reactivity hooks the accessor into the per-cell
+tick signal. The probe ticks once per display update + once per
+`<Show>` fallback remount (entering/leaving edit mode).
 
-`render-counter.spec.ts` works around this via an `addInitScript`
-MutationObserver counting `[data-cell-addr]` text mutations. That gives
-useful numbers but measures DOM patches, not Cell renders — semantically
-slightly different.
-
-**Fix** (1-line, recommended):
-
-```tsx
-const renderCountAttr = () => {
-  cellValue() // tracking dep — without this Solid never re-runs the attribute
-  return RENDER_COUNT_DEBUG ? String(nextRenderCount()) : undefined
-}
-```
-
-After the fix, drop the MutationObserver in `render-counter.spec.ts` and
-use `helpers.ts::renderCount(page, addr)` directly.
+`render-counter.spec.ts` simplified to single-channel: 50 lines of
+`MutationObserver` `addInitScript` removed, all 6 scenarios now use
+`helpers.ts::renderCount(page, addr)` directly. All strict
+`expect(...).toBe(N)` assertions still hold.
 
 ### B. Single-sheet WasmSheet doesn't propagate dependents on source writes ✅ FIXED
 
@@ -120,20 +109,18 @@ suite fails confusingly.
 `NO_PROXY=localhost,127.0.0.1` before `npm run e2e`. Add to
 `solid/excel/README.md` if not already there. CI is unaffected.
 
-### E. Skipped regression entries
+### E. Skipped regression entries — 1 of 2 now active
 
-`regression.spec.ts` has two `.skip`s linked to their Rust unit-test
-counterparts:
-
-- **subscribe-then-set_formula fires once**: needs SheetStore to expose
-  a debug `subscriberFireCount(addr)` accessor. Currently pinned by Rust
-  unit test `subscribe_empty_cell_then_set_formula_fires_once`.
-- **JsCallbackListener panic**: needs a `?debug=panic-next` query knob
-  in `wasm-sheet.ts` to inject a single panic. Currently pinned by
-  cargo test.
-
-Both require source-side debug shims. Until then the e2e gate is
-effectively `cargo test` for these invariants.
+- ✅ **subscribe-then-set_formula fires once** — landed via
+  `SheetStore.subscriberFireCount(addr)` debug accessor + `DemoBlank`
+  conditional `window.__einfachStore` exposure on `?debug=1`.
+  `regression.spec.ts` queries fire counts directly through
+  `page.evaluate`. Counter goes 0 → 0 (write to unrelated A1) → 1
+  (set_formula on the previously-empty subscribed B1). Strict.
+- ⏳ **JsCallbackListener panic** still `.skip`. Needs a
+  `?debug=panic-next` query knob in `wasm-sheet.ts` to inject a single
+  panic. Currently pinned by `cargo test`. The fix lifts JS↔Rust
+  panic propagation observability; treat as its own ticket.
 
 ## Goals
 
@@ -632,13 +619,15 @@ next ticket. Forward order, post-landing:
 6. ✅ Add `formulas-wasm.spec.ts`.
 7. ✅ Add FormulaBar and MultiSheet specs.
 8. □ Wire e2e into CI (template in P0.2 above).
-9. □ Close 3 outstanding gaps from Done Criteria:
-   a. Fix `Cell.tsx::renderCountAttr` (Discovered #A) → drop MutationObserver
-      workaround in `render-counter.spec.ts`.
-   b. Add cross-sheet-name preservation scenario to
-      `selection-clipboard.spec.ts`.
-   c. Add the 2 source-side debug shims (Discovered #E) so the regression
-      spec's two `.skip`s can become real tests.
+9. ✅ Close 3 outstanding gaps from Done Criteria:
+   a. ✅ Fix `Cell.tsx::renderCountAttr` (Discovered #A) → MutationObserver
+      workaround removed; `render-counter.spec.ts` now uses the probe
+      directly across 6 strict-delta scenarios.
+   b. ✅ Cross-sheet-name preservation scenario landed
+      (`selection-clipboard.spec.ts`).
+   c. ⚠️ 1 of 2 source-side debug shims (Discovered #E.1
+      `subscriberFireCount`) landed → 1 `.skip` removed. The remaining
+      panic-injection knob (#E.2) is a separate ticket.
 10. □ Decide on the "Other Demo Smoke" (Budget / Grades / Sales) question.
     Discovered #B is now fixed, so the WASM-migration option is unblocked.
 11. ✅ Discovered #B fixed (microtask defer in `JsCallbackListener`).
@@ -677,10 +666,10 @@ Reality check against the plan's hard numbers:
 |---|---|---|
 | ≥ 8 spec files | ✅ | 10 actual |
 | ≥ 50 test() blocks pass locally | ✅ | 74 active (+ 4 .skip) |
-| regression.spec.ts pins ≥ 5 | ⚠️ | 5 entries, but 2 are `.skip` pending source-side debug shims (Discovered #E). 3 actively running |
+| regression.spec.ts pins ≥ 5 | ⚠️ | 5 entries, 1 `.skip` remaining (JsCallbackListener panic). 4 actively running after Discovered #E.1 landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
-| selection-clipboard ≥ 1 cross-sheet-name preservation | ❌ | Not covered. Jest pins it, e2e doesn't. Add scenario: `=Sheet1!A1` copy + paste preserves sheet name in result |
-| render-counter ≥ 3 strict toBe (no `>=`) | ✅ | 3 distinct strict-delta paths |
+| selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |
+| render-counter ≥ 3 strict toBe (no `>=`) | ✅ | 6 strict-delta paths after Discovered #A fix |
 | CI runs e2e with artifact upload, advisory→blocking | ❌ | P0.2 not done. Workflow template now in P0.2 above |
 | Helpers expose the full API | ✅ | All 13 helpers in helpers.ts (see Helper API table) |
 | No `// TODO: workaround` for fixed bugs | ✅ | grep clean across e2e/ |
