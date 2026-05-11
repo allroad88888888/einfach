@@ -1,14 +1,47 @@
 
+import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
-import { createSheetStore } from '../sheet-store'
-import { createJSSheet } from '../js-sheet'
+import { createSheetStore, type SheetStore } from '../sheet-store'
+import { createWasmSheet } from '../wasm-sheet'
 
 /**
  * Demo 3: 月度预算模板
+ *
+ * WASM-backed — seed uses SUM / MAX / MIN / AVERAGE which the JS mock
+ * can't evaluate. Migrating to `createWasmSheet` makes the summary rows
+ * actually compute.
  */
 export function DemoBudget() {
-  const store = createSheetStore(createJSSheet())
+  const [storeRes] = createResource<SheetStore>(async () => {
+    const sheet = await createWasmSheet()
+    const store = createSheetStore(sheet)
+    seed(store)
+    return store
+  })
 
+  return (
+    <Show
+      when={storeRes()}
+      fallback={<div class="demo-page"><p>Loading WASM backend…</p></div>}
+    >
+      {(store) => (
+        <div class="demo-page">
+          <div class="demo-header">
+            <h3>Monthly Budget</h3>
+            <p class="demo-desc">
+              Edit the <strong>Budget</strong> (B) and <strong>Actual</strong> (C) columns.
+              The <strong>Diff</strong> column and summary rows update automatically.
+              Positive diff = under budget, negative = over budget.
+            </p>
+          </div>
+          <Table store={store()} rows={17} cols={8} formulaBar />
+        </div>
+      )}
+    </Show>
+  )
+}
+
+function seed(store: SheetStore) {
   // 表头
   store.setText('A1', 'Category')
   store.setText('B1', 'Budget')
@@ -85,18 +118,4 @@ export function DemoBudget() {
   store.setFormula('G4', '=AVERAGE(C8,C9,C10,C11,C12,C13)')
   store.setText('F5', 'Saving Rate')
   store.setFormula('G5', '=C13/C5*100')
-
-  return (
-    <div class="demo-page">
-      <div class="demo-header">
-        <h3>Monthly Budget</h3>
-        <p class="demo-desc">
-          Edit the <strong>Budget</strong> (B) and <strong>Actual</strong> (C) columns.
-          The <strong>Diff</strong> column and summary rows update automatically.
-          Positive diff = under budget, negative = over budget.
-        </p>
-      </div>
-      <Table store={store} rows={17} cols={8} formulaBar />
-    </div>
-  )
 }

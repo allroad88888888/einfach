@@ -1,14 +1,47 @@
 
+import { Show, createResource } from 'solid-js'
 import { Table } from '../Table'
-import { createSheetStore } from '../sheet-store'
-import { createJSSheet } from '../js-sheet'
+import { createSheetStore, type SheetStore } from '../sheet-store'
+import { createWasmSheet } from '../wasm-sheet'
 
 /**
  * Demo 4: 学生成绩计算器
+ *
+ * WASM-backed — seed uses AVERAGE / MAX / MIN / COUNT which the JS mock
+ * doesn't evaluate. Migrated so the row/class statistics render real
+ * numbers on first paint.
  */
 export function DemoGrades() {
-  const store = createSheetStore(createJSSheet())
+  const [storeRes] = createResource<SheetStore>(async () => {
+    const sheet = await createWasmSheet()
+    const store = createSheetStore(sheet)
+    seed(store)
+    return store
+  })
 
+  return (
+    <Show
+      when={storeRes()}
+      fallback={<div class="demo-page"><p>Loading WASM backend…</p></div>}
+    >
+      {(store) => (
+        <div class="demo-page">
+          <div class="demo-header">
+            <h3>Grade Calculator</h3>
+            <p class="demo-desc">
+              Edit any score — <strong>Average</strong>, <strong>Max</strong>, <strong>Min</strong>,
+              and class statistics all recalculate instantly.
+              Each student's row uses <code>AVERAGE</code>, <code>MAX</code>, <code>MIN</code>.
+            </p>
+          </div>
+          <Table store={store()} rows={14} cols={8} formulaBar />
+        </div>
+      )}
+    </Show>
+  )
+}
+
+function seed(store: SheetStore) {
   // 表头
   store.setText('A1', 'Student')
   store.setText('B1', 'Math')
@@ -66,18 +99,4 @@ export function DemoGrades() {
   const countRow = minRow + 1
   store.setText(`A${countRow}`, 'Count')
   store.setFormula(`B${countRow}`, `=COUNT(B2,B3,B4,B5,B6,B7,B8,B9)`)
-
-  return (
-    <div class="demo-page">
-      <div class="demo-header">
-        <h3>Grade Calculator</h3>
-        <p class="demo-desc">
-          Edit any score — <strong>Average</strong>, <strong>Max</strong>, <strong>Min</strong>,
-          and class statistics all recalculate instantly.
-          Each student's row uses <code>AVERAGE</code>, <code>MAX</code>, <code>MIN</code>.
-        </p>
-      </div>
-      <Table store={store} rows={14} cols={8} formulaBar />
-    </div>
-  )
 }

@@ -172,11 +172,11 @@ either ✅ or has a Discovered # entry above):
 - **Cross-sheet name preservation in clipboard**. `selection-clipboard.spec.ts`
   doesn't assert that copying `=Sheet1!A1` from one cell and pasting elsewhere
   preserves the sheet name. Covered in jest, missing from e2e.
-- **Other Demo Smoke (Budget / Grades / Sales Dashboard)**. Decision still
-  punted: do these demos migrate to WASM, or do we lower assertions on
-  JS-mock-induced `#ERROR!` cells? Discovered #B is fixed so the WASM
-  migration path is unblocked; pick that direction or write loose
-  assertions, but make a call.
+- ~~Other Demo Smoke (Budget / Grades / Sales Dashboard)~~ ✅ Resolved
+  via option A: all three demos migrated to `createWasmSheet`. Seed
+  formulas (SUM / AVG / MAX / MIN / COUNT / growth-rate) now render real
+  numbers on first paint. Per-demo smoke tests still TODO but no longer
+  blocked by an architecture decision.
 - **Render-counter probe needs the 1-line source fix** (Discovered #A) so
   the spec can use the official helper instead of MutationObserver.
 - **2 regression entries** (subscribe-once + panic) await source-side
@@ -636,8 +636,9 @@ next ticket. Forward order, post-landing:
       - #E.1 `SheetStore.subscriberFireCount` + DemoBlank exposure
       - #E.2 `WasmSheet.__debugPanicNextCallback` + DemoFormulas exposure
       Both `.skip`s in `regression.spec.ts` flipped to active assertions.
-10. □ Decide on the "Other Demo Smoke" (Budget / Grades / Sales) question.
-    Discovered #B is fixed, so the WASM-migration option is unblocked.
+10. ✅ "Other Demo Smoke" resolved — Budget / Grades / Sales all migrated
+    to `createWasmSheet`. Demo smoke tests per-spec still TODO but
+    unblocked.
 11. ✅ Discovered #B fixed (microtask defer in `JsCallbackListener`).
     Chain propagation tests un-skipped, all passing.
 12. ⏳ Promote e2e CI gate from advisory → PR-blocking after 2 weeks of
