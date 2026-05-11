@@ -1,5 +1,6 @@
 
-import { For } from 'solid-js'
+import { createSignal, For, Show } from 'solid-js'
+import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import type { WorkbookStore } from './workbook-store'
 
 export interface SheetTabsProps {
@@ -10,47 +11,49 @@ export interface SheetTabsProps {
  * Bottom-of-grid tab bar. Each tab switches the active sheet; the right-
  * side `+` button appends a new sheet with an auto-picked name.
  *
- * Right-clicking a tab opens a (very) bare-bones context flow:
- *   - native `confirm("Delete sheet ...?")` for delete
- *   - native `prompt("New name:", ...)` for rename
- *
- * TODO: replace these with a proper popover menu component once one
- * exists in the codebase. The native prompt/confirm is intentional —
- * keeps this PR focused on the multi-sheet *plumbing*, not menu UI.
+ * Right-clicking a tab opens a ContextMenu with Rename / Delete entries.
+ * Rename still falls back to a single `window.prompt()` for the new name
+ * (popup-input UI is out of scope). Delete uses `window.confirm()`.
  */
 export function SheetTabs(props: SheetTabsProps) {
+  const [menu, setMenu] = createSignal<{
+    x: number
+    y: number
+    items: ContextMenuItem[]
+  } | null>(null)
+
   function onAddClick() {
     const idx = props.workbook.addSheet()
     if (idx >= 0) props.workbook.setActiveIdx(idx)
   }
 
+  function doRename(idx: number, currentName: string) {
+    const next = window.prompt(`Rename "${currentName}" to:`, currentName)
+    if (next === null) return
+    const trimmed = next.trim()
+    if (trimmed === '' || trimmed === currentName) return
+    const ok = props.workbook.renameSheet(idx, trimmed)
+    if (!ok) {
+      window.alert(`Cannot rename — name "${trimmed}" is already taken.`)
+    }
+  }
+
+  function doDelete(idx: number, currentName: string) {
+    if (!window.confirm(`Delete sheet "${currentName}"?`)) return
+    const ok = props.workbook.removeSheet(idx)
+    if (!ok) {
+      window.alert('Cannot delete the last remaining sheet.')
+    }
+  }
+
   function onContextMenu(e: MouseEvent, idx: number, currentName: string) {
     e.preventDefault()
-    // Two-step prompt: choose action, then perform it.
-    // We use prompt/confirm directly to avoid pulling in a menu library.
-    const action = window.prompt(
-      `Sheet "${currentName}":\n\n` +
-        `Type "rename" to rename, "delete" to delete, or leave empty to cancel.`,
-      '',
-    )
-    if (!action) return
-    const verb = action.trim().toLowerCase()
-    if (verb === 'rename') {
-      const next = window.prompt(`Rename "${currentName}" to:`, currentName)
-      if (next === null) return
-      const trimmed = next.trim()
-      if (trimmed === '' || trimmed === currentName) return
-      const ok = props.workbook.renameSheet(idx, trimmed)
-      if (!ok) {
-        window.alert(`Cannot rename — name "${trimmed}" is already taken.`)
-      }
-    } else if (verb === 'delete') {
-      if (!window.confirm(`Delete sheet "${currentName}"?`)) return
-      const ok = props.workbook.removeSheet(idx)
-      if (!ok) {
-        window.alert('Cannot delete the last remaining sheet.')
-      }
-    }
+    e.stopPropagation()
+    const items: ContextMenuItem[] = [
+      { label: 'Rename', onSelect: () => doRename(idx, currentName) },
+      { label: 'Delete', onSelect: () => doDelete(idx, currentName) },
+    ]
+    setMenu({ x: e.clientX, y: e.clientY, items })
   }
 
   return (
@@ -81,6 +84,16 @@ export function SheetTabs(props: SheetTabsProps) {
       >
         +
       </button>
+      <Show when={menu()}>
+        {(m) => (
+          <ContextMenu
+            items={m().items}
+            x={m().x}
+            y={m().y}
+            onClose={() => setMenu(null)}
+          />
+        )}
+      </Show>
     </div>
   )
 }

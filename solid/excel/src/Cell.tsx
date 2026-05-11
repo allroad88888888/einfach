@@ -34,6 +34,8 @@ export interface CellProps {
   onSelect?: () => void
   /** Called on shift+click to extend the range to this cell. */
   onExtendSelect?: () => void
+  /** Called on right-click for the cell context menu. */
+  onContextMenu?: (e: MouseEvent) => void
 }
 
 export function Cell(props: CellProps) {
@@ -127,6 +129,7 @@ export function Cell(props: CellProps) {
       data-cell-addr={props.addr}
       onClick={onClick}
       onDblClick={startEditing}
+      onContextMenu={(e) => props.onContextMenu?.(e)}
     >
       <Show
         when={editing()}

@@ -1,8 +1,9 @@
 
-import { For, Show } from 'solid-js'
+import { createSignal, For, Show } from 'solid-js'
 import { Cell } from './Cell'
+import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { FormulaBar } from './FormulaBar'
-import { clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
+import { addrToCoord, clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import {
   parseClipboardTSV,
   serializeClipboardTSV,
@@ -89,6 +90,120 @@ export function Table(props: TableProps) {
       for (const addr of row) props.store.clearCell(addr)
     }
     props.store.endEdit()
+  }
+
+  // === Context menu state ===
+  // Only one menu visible at a time — opening a second context-menu trigger
+  // closes the previous via the same signal slot.
+  const [menu, setMenu] = createSignal<{
+    x: number
+    y: number
+    items: ContextMenuItem[]
+  } | null>(null)
+
+  function openMenu(e: MouseEvent, items: ContextMenuItem[]) {
+    e.preventDefault()
+    e.stopPropagation()
+    setMenu({ x: e.clientX, y: e.clientY, items })
+  }
+
+  function closeMenu() {
+    setMenu(null)
+  }
+
+  // --- Mouse-driven equivalents of handleCopy/handlePaste/handleCut for the
+  // cell menu. Same semantics, just no KeyboardEvent.preventDefault to worry
+  // about. The keyboard handlers stay the source of truth for shortcuts.
+  async function ctxCopy() {
+    const addrs = props.store.selectionAddrs()
+    const data = props.store.copy(addrs)
+    const text = serializeClipboardTSV(data)
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // No clipboard permission — same swallow as the keyboard handler.
+    }
+  }
+
+  async function ctxPaste() {
+    let text = ''
+    try {
+      text = await navigator.clipboard.readText()
+    } catch {
+      return
+    }
+    if (text === '') return
+    const target = coordToAddr(selected())
+    const data = parseClipboardTSV(text, target)
+    props.store.paste(target, data)
+  }
+
+  async function ctxCut() {
+    await ctxCopy()
+    const addrs = props.store.selectionAddrs()
+    props.store.beginEdit()
+    for (const row of addrs) {
+      for (const addr of row) props.store.clearCell(addr)
+    }
+    props.store.endEdit()
+  }
+
+  function ctxClearSelection() {
+    const addrs = props.store.selectionAddrs()
+    props.store.beginEdit()
+    for (const row of addrs) {
+      for (const addr of row) props.store.clearCell(addr)
+    }
+    props.store.endEdit()
+  }
+
+  function clearColumn(col: number) {
+    props.store.beginEdit()
+    for (let r = 0; r < rows(); r++) {
+      props.store.clearCell(coordToAddr({ row: r, col }))
+    }
+    props.store.endEdit()
+  }
+
+  function clearRow(row: number) {
+    props.store.beginEdit()
+    for (let c = 0; c < cols(); c++) {
+      props.store.clearCell(coordToAddr({ row, col: c }))
+    }
+    props.store.endEdit()
+  }
+
+  function colMenuItems(col: number): ContextMenuItem[] {
+    return [
+      { label: 'Insert column before', onSelect: () => props.store.insertCol(col, 1) },
+      { label: 'Insert column after', onSelect: () => props.store.insertCol(col + 1, 1) },
+      { label: 'Delete column', onSelect: () => props.store.deleteCol(col, 1) },
+      { label: 'Clear column', onSelect: () => clearColumn(col) },
+    ]
+  }
+
+  function rowMenuItems(row: number): ContextMenuItem[] {
+    return [
+      { label: 'Insert row above', onSelect: () => props.store.insertRow(row, 1) },
+      { label: 'Insert row below', onSelect: () => props.store.insertRow(row + 1, 1) },
+      { label: 'Delete row', onSelect: () => props.store.deleteRow(row, 1) },
+      { label: 'Clear row', onSelect: () => clearRow(row) },
+    ]
+  }
+
+  function cellMenuItems(addr: string): ContextMenuItem[] {
+    const coord = addrToCoord(addr) ?? { row: 0, col: 0 }
+    return [
+      { label: 'Cut', onSelect: () => void ctxCut() },
+      { label: 'Copy', onSelect: () => void ctxCopy() },
+      { label: 'Paste', onSelect: () => void ctxPaste() },
+      { label: 'Clear', onSelect: () => ctxClearSelection() },
+      { divider: true },
+      { label: 'Insert row above', onSelect: () => props.store.insertRow(coord.row, 1) },
+      { label: 'Insert row below', onSelect: () => props.store.insertRow(coord.row + 1, 1) },
+      { label: 'Insert column before', onSelect: () => props.store.insertCol(coord.col, 1) },
+      { label: 'Insert column after', onSelect: () => props.store.insertCol(coord.col + 1, 1) },
+    ]
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -183,7 +298,14 @@ export function Table(props: TableProps) {
           <tr>
             <th class="row-header"></th>
             <For each={colIndices()}>
-              {(col) => <th class="col-header">{colToLetter(col)}</th>}
+              {(col) => (
+                <th
+                  class="col-header"
+                  onContextMenu={(e) => openMenu(e, colMenuItems(col))}
+                >
+                  {colToLetter(col)}
+                </th>
+              )}
             </For>
           </tr>
         </thead>
@@ -191,7 +313,12 @@ export function Table(props: TableProps) {
           <For each={rowIndices()}>
             {(row) => (
               <tr>
-                <td class="row-header">{row + 1}</td>
+                <td
+                  class="row-header"
+                  onContextMenu={(e) => openMenu(e, rowMenuItems(row))}
+                >
+                  {row + 1}
+                </td>
                 <For each={colIndices()}>
                   {(col) => {
                     const isSelected = () =>
@@ -209,14 +336,22 @@ export function Table(props: TableProps) {
                       const c1 = Math.max(r.anchor.col, r.focus.col)
                       return row >= r0 && row <= r1 && col >= c0 && col <= c1
                     }
+                    const addr = cellAddr(row, col)
                     return (
                       <Cell
-                        addr={cellAddr(row, col)}
+                        addr={addr}
                         store={props.store}
                         selected={isSelected}
                         inRange={isInRange}
                         onSelect={() => selectCoord({ row, col })}
                         onExtendSelect={() => extendCoord({ row, col })}
+                        onContextMenu={(e) => {
+                          // Move selection to this cell first so Cut / Copy
+                          // / Paste / Clear act on what the user right-
+                          // clicked, matching spreadsheet convention.
+                          selectCoord({ row, col })
+                          openMenu(e, cellMenuItems(addr))
+                        }}
                       />
                     )
                   }}
@@ -226,6 +361,16 @@ export function Table(props: TableProps) {
           </For>
         </tbody>
       </table>
+      <Show when={menu()}>
+        {(m) => (
+          <ContextMenu
+            items={m().items}
+            x={m().x}
+            y={m().y}
+            onClose={closeMenu}
+          />
+        )}
+      </Show>
     </div>
   )
 }

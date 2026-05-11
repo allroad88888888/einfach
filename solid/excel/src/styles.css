@@ -345,3 +345,53 @@ thead .row-header {
 .sheet-tab-add:hover {
   background: #e8f0fe;
 }
+
+/* === Context Menu ===
+ * Right-click menu for column headers, row headers, cells, and sheet tabs.
+ * Portaled to <body> so it escapes the table's overflow-scroll clipping.
+ */
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 180px;
+  padding: 4px 0;
+  background: #fff;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13px;
+  user-select: none;
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 6px 14px;
+  border: none;
+  background: transparent;
+  color: #1a1a1a;
+  text-align: left;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.context-menu-item:hover,
+.context-menu-item-highlight {
+  background: #e8f0fe;
+  color: #1a73e8;
+}
+
+.context-menu-item:disabled {
+  color: #aaa;
+  cursor: default;
+  background: transparent;
+}
+
+.context-menu-divider {
+  border: none;
+  border-top: 1px solid #e0e4e8;
+  margin: 4px 0;
+}

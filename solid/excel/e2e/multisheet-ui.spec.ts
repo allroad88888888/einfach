@@ -15,22 +15,17 @@ import {
  * (no WASM). Three seeded sheets at startup: Sheet1 (Quarter / Revenue
  * / Profit), Expenses (Category / Amount), Notes (free-form text).
  *
- * The SheetTabs component uses native `prompt`/`confirm` dialogs for
- * rename and delete (deliberate — keeps the menu PR small, see the
- * comment at the top of `SheetTabs.tsx`). The `+` button does NOT
- * prompt — it calls `addSheet()` with no name and the store auto-picks
- * "Sheet{N}" via `pickDefaultName()`. With three seeded sheets the
- * first auto-add becomes "Sheet4".
+ * The SheetTabs component uses a real ContextMenu now (Rename / Delete).
+ * Rename still falls back to a single native `prompt()` for the new name
+ * and Delete to `confirm()` — the prompt-as-menu hack is gone.
  *
- * Two-step rename/delete flow (see `SheetTabs.onContextMenu`):
- *   1. action prompt — user types "rename" or "delete" or cancels
- *   2a. rename → second prompt for the new name
- *   2b. delete → confirm("Delete sheet ...?")
+ * Trigger flow:
+ *   1. right-click a tab → ContextMenu opens (`.context-menu`)
+ *   2. Click "Rename" → single native prompt for the new name
+ *   2'. Click "Delete" → native confirm("Delete sheet ...?")
  *
- * Each native dialog needs its own `page.once('dialog', ...)` handler
- * registered BEFORE the trigger fires. We don't reuse the helpers'
- * `acceptDialog` for these chained prompts because the chain needs
- * different responses per step (action verb vs. new name vs. confirm).
+ * Each native dialog still needs a `page.on('dialog', ...)` handler
+ * registered BEFORE the menu item that fires it.
  */
 
 const DEMO = 'Multi-Sheet'
@@ -134,28 +129,28 @@ test.describe('Multi-Sheet — add / rename / delete', () => {
     await expect(cell(page, 'A1').locator('.cell-display')).toHaveText('')
   })
 
-  test('right-click → "rename" updates the tab label', async ({ page }) => {
+  test('right-click → "Rename" updates the tab label', async ({ page }) => {
     await gotoDemo(page, DEMO)
 
-    // Two prompts back-to-back: action verb, then new name.
-    queueDialogs(page, ['rename', 'Renamed'])
+    // Single prompt — the menu replaces the action prompt; only the new-
+    // name prompt fires now.
+    queueDialogs(page, ['Renamed'])
     await tabByName(page, 'Notes').click({ button: 'right' })
+    await page.locator('.context-menu').getByRole('menuitem', { name: 'Rename' }).click()
 
     await expect(tabByName(page, 'Renamed')).toBeVisible()
     await expect(tabByName(page, 'Notes')).toHaveCount(0)
   })
 
-  test('right-click → "delete" on a non-active sheet drops the count', async ({
+  test('right-click → "Delete" on a non-active sheet drops the count', async ({
     page,
   }) => {
     await gotoDemo(page, DEMO)
-    // Sheet1 is active by default; deleting Notes (non-active) tests the
-    // "non-active removal doesn't shift active" branch.
-    queueDialogs(page, ['delete', 'yes'])
+    queueDialogs(page, ['yes']) // accept the confirm()
     await tabByName(page, 'Notes').click({ button: 'right' })
+    await page.locator('.context-menu').getByRole('menuitem', { name: 'Delete' }).click()
 
     await expect(tabByName(page, 'Notes')).toHaveCount(0)
-    // Sheet1 + Expenses still visible.
     await expect(tabByName(page, 'Sheet1')).toBeVisible()
     await expect(tabByName(page, 'Expenses')).toBeVisible()
   })
@@ -163,24 +158,26 @@ test.describe('Multi-Sheet — add / rename / delete', () => {
   test('cannot delete the last remaining sheet', async ({ page }) => {
     await gotoDemo(page, DEMO)
 
-    // Delete Notes, then Expenses — leaves only Sheet1. The third delete
-    // should be refused by the workbook store (`removeSheet` returns
-    // false when entries.length <= 1) and surface as a window.alert.
+    // One confirm() per delete attempt, plus an alert() on the last
+    // attempt because removeSheet returns false on the only-sheet case.
     queueDialogs(page, [
-      'delete', 'ok',          // delete Notes
-      'delete', 'ok',          // delete Expenses
-      'delete', 'ok', 'dismiss-alert', // attempted delete + alert
+      'ok', // confirm: delete Notes
+      'ok', // confirm: delete Expenses
+      'ok', // confirm: third (refused)
+      'dismiss-alert', // alert: "Cannot delete the last remaining sheet."
     ])
+
     await tabByName(page, 'Notes').click({ button: 'right' })
+    await page.locator('.context-menu').getByRole('menuitem', { name: 'Delete' }).click()
     await expect(tabByName(page, 'Notes')).toHaveCount(0)
 
     await tabByName(page, 'Expenses').click({ button: 'right' })
+    await page.locator('.context-menu').getByRole('menuitem', { name: 'Delete' }).click()
     await expect(tabByName(page, 'Expenses')).toHaveCount(0)
 
-    // Last delete attempt — Sheet1 must remain.
     await tabByName(page, 'Sheet1').click({ button: 'right' })
+    await page.locator('.context-menu').getByRole('menuitem', { name: 'Delete' }).click()
     await expect(tabByName(page, 'Sheet1')).toBeVisible()
-    // Exactly one tab left in the bar.
     await expect(page.locator('.sheet-tabs button[role="tab"]')).toHaveCount(1)
   })
 })
