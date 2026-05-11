@@ -5,3 +5,10 @@ edition = "2021"
 description = "Lightweight atom-based state management engine"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "store_bench"
+harness = false

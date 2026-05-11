@@ -9,3 +9,10 @@ einfach-core = { path = "../core" }
 # `wasmbind` is required so chrono can read the JS clock when running in
 # the browser; on native targets it falls back to the system clock.
 chrono = { version = "0.4", default-features = false, features = ["wasmbind", "clock"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "sheet_bench"
+harness = false
