@@ -184,9 +184,97 @@ fn bench_sparse_1m_grid_read_window(c: &mut Criterion) {
     group.finish();
 }
 
+// === Bench 3: dirty_lookup_100k_ranges ======================================
+
+/// Phase 2 acceptance probe — measure the wall time of a SINGLE
+/// `set_cell` write on a sheet that has 100 000 registered range-formula
+/// dependents.
+///
+/// Setup (NOT timed): import 100 000 formulas of the form
+/// `=SUM(A{r}:A{r+5})` for r in 1..=100 000, anchored in column A so
+/// each range is 6 rows tall. The ranges overlap heavily near rows
+/// 10..=99 995. `bulk_load.set_formula` populates `range_dependents`
+/// statically from `Expr::Range` corners at import time, so all 100k
+/// entries are in the index even though every formula's
+/// `FormulaCache` stays `Dirty` (no eval). This is the explicit Phase 1
+/// laziness contract — we do NOT warm the full formula set. We do one
+/// `get_cell` on a single formula to force its first eval (proving the
+/// index survives sparse-narrowing, mirroring `range_sparse_then_write`
+/// in tests/scale.rs).
+///
+/// Timed section: one `sheet.set_cell("A50000", Value::Number(_))`.
+///
+/// Without Track E's interval index, `dependents_of(A50000)` does
+/// 100k `CellRange::contains` calls before any dirty-mark work begins,
+/// so the per-write cost is O(N). With Track E, the cost should be
+/// O(matches + log) — A50000 sits inside the ~6 ranges starting at
+/// rows 49 995..=50 000.
+///
+/// `iter_batched` rebuilds the sheet for each iteration so the write
+/// always hits a fresh state (no pre-existing primitive scaffold at
+/// A50000 between iterations). `sample_size(20)` to keep the 100k
+/// per-iter setup from dominating wall-clock.
+fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
+    const N_RANGE_FORMULAS: usize = 100_000;
+
+    // Pre-build the (dest, formula) payload once so the per-iter setup
+    // is just the bulk_load replay, not string formatting.
+    let dest_addrs: Vec<String> = (1..=N_RANGE_FORMULAS)
+        .map(|r| format!("B{}", r))
+        .collect();
+    let formulas: Vec<String> = (1..=N_RANGE_FORMULAS)
+        .map(|r| format!("=SUM(A{}:A{})", r, r + 5))
+        .collect();
+
+    let mut group = c.benchmark_group("scale/dirty_lookup_100k_ranges");
+    // Throughput is per registered range-formula, so the bench reports
+    // "writes per second normalized by N". Phase 1 = O(N); Phase 2's
+    // Track E should make this scale far better.
+    group.throughput(Throughput::Elements(N_RANGE_FORMULAS as u64));
+    // 100k formulas in setup → keep sample count modest so the suite
+    // doesn't dominate `cargo bench` wall time.
+    group.sample_size(20);
+
+    group.bench_function("single_set_cell_after_100k_ranges", |b| {
+        b.iter_batched(
+            // Setup: fresh sheet with 100k range formulas imported. We
+            // explicitly do NOT warm the full formula set — the Phase 1
+            // contract guarantees `bulk_load.set_formula` registers
+            // `range_dependents` from AST corners without computing the
+            // formula. One `get_cell` on a single neighboring formula
+            // exercises the sparse-eval path (the P0 contract from
+            // tests/scale.rs::range_sparse_then_write) so the index
+            // looks like a realistic post-open state.
+            || {
+                let mut sheet = Sheet::new();
+                sheet.bulk_load(|loader| {
+                    for (dest, formula) in dest_addrs.iter().zip(formulas.iter()) {
+                        loader.set_formula(dest, formula);
+                    }
+                });
+                // Optional one-formula warm — does not warm the rest;
+                // remaining 99 999 records stay Dirty.
+                let _ = sheet.get_cell("B49997");
+                sheet
+            },
+            // Timed: a single primitive write inside a known number of
+            // overlapping ranges. dependents_of must scan
+            // range_dependents — Phase 1 = O(N), Phase 2 = O(matches).
+            |mut sheet| {
+                sheet.set_cell("A50000", Value::Number(42.0));
+                black_box(&sheet);
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bulk_load_100k_formulas,
     bench_sparse_1m_grid_read_window,
+    bench_dirty_lookup_100k_ranges,
 );
 criterion_main!(benches);

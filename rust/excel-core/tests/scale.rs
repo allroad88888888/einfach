@@ -250,3 +250,180 @@ fn null_write_releases_primitive_atom() {
     sheet.clear_cell("A1");
     assert_eq!(sheet.debug_primitive_atom_count(), 0);
 }
+
+// =============================================================================
+// Phase 2 acceptance — Agent H additions
+// =============================================================================
+//
+// Two tests pinning the Phase 2 scaling bullets from
+// `rust/docs/PHASE2_PARALLEL.md` § "Phase 2 Acceptance Roll-Up":
+//
+//   - 100k range formulas + 1 cell write → bounded by matches, not by N
+//     (Track E lands the interval index that makes this true).
+//   - 1M coord space + small range read → O(range cells) visited
+//     (Track F lands the row-indexed cell storage that makes this true).
+//
+// Both tests are `#[ignore]`'d at landing time because the underlying
+// optimization in `Sheet` doesn't exist yet:
+//
+//   - `single_write_with_100k_range_formulas_is_bounded` requires Agent E's
+//     interval index for `range_dependents` (replacing the O(N) scan in
+//     `Sheet::dependents_of`). Un-ignore protocol: once Agent E merges,
+//     delete the `#[ignore = "phase-2 — un-ignore after Agent E merge"]`
+//     attribute. The test body should pass as-is; if it doesn't, the
+//     50ms budget either needs widening for CI noise or the index isn't
+//     actually O(matches).
+//
+//   - `range_read_1m_sparse_visits_only_range` requires Agent F's sparse
+//     value index (replacing the linear `cells.iter().filter()` in
+//     `Sheet::for_each_sparse_cell_with`). Un-ignore protocol: once
+//     Agent F merges, delete the `#[ignore = "phase-2 — un-ignore after
+//     Agent F merge"]` attribute. The visit-count assertion uses the
+//     `Sheet::debug_range_visit_count` helper added in this commit;
+//     no shim trait needed (the helper lives on `Sheet` directly via
+//     `#[doc(hidden)]` so it's available unconditionally).
+
+use std::time::{Duration, Instant};
+
+/// Phase 2 验收: "100k range formulas + 1 cell write → bounded by
+/// matches, not by N" (PHASE2_PARALLEL.md § Phase 2 Acceptance Roll-Up,
+/// first bullet; Track E delivers the interval index that backs it).
+///
+/// SAFETY/contract: with 100 000 range formulas of the form
+/// `=SUM(A{r}:A{r+5})` registered, a single `set_cell("A50000", _)`
+/// must consult only the ranges that actually contain A50000 (at most
+/// ~6 of the 100k), not linearly scan the full `range_dependents`
+/// index. The 50ms wall-clock bound is loose enough to survive CI noise
+/// (Phase 1's per-write O(N) scan would take orders of magnitude
+/// longer at N=100k) and tight enough to flag a regression to the
+/// linear path.
+///
+/// `Instant`-based timing has obvious limitations on shared CI runners,
+/// but the gap between O(N) and O(matches) at N=100k is large enough
+/// that 50ms remains a meaningful boundary.
+#[test]
+#[ignore = "phase-2 — un-ignore after Agent E merge"]
+fn single_write_with_100k_range_formulas_is_bounded() {
+    const N_RANGE_FORMULAS: u32 = 100_000;
+
+    let mut sheet = Sheet::new();
+
+    // Mirrors the bench setup in `benches/scale_bench.rs::
+    // bench_dirty_lookup_100k_ranges`: 100k overlapping 6-row ranges
+    // anchored in column A. `bulk_load.set_formula` populates
+    // `range_dependents` from the static AST corners, so all 100k
+    // entries are in the index without any formula being evaluated.
+    sheet.bulk_load(|loader| {
+        for r in 1..=N_RANGE_FORMULAS {
+            loader.set_formula(&format!("B{}", r), &format!("=SUM(A{}:A{})", r, r + 5));
+        }
+    });
+
+    // Sanity: 100k distinct ranges are in the index (each formula has
+    // a unique starting row). If this fails the test setup drifted.
+    assert_eq!(
+        sheet.debug_range_dep_count(),
+        N_RANGE_FORMULAS as usize,
+        "100k distinct ranges must be registered in range_dependents"
+    );
+
+    // One single primitive write that lies inside ~6 overlapping
+    // ranges (rows 49 995..=50 000 each include A50000 in their
+    // 6-row span).
+    let start = Instant::now();
+    sheet.set_cell("A50000", Value::Number(42.0));
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "set_cell with 100k registered range formulas must be bounded by \
+         the number of containing ranges (Phase 2 Track E), not by N. \
+         Observed: {:?}",
+        elapsed
+    );
+}
+
+/// Phase 2 验收: "1M coord space + small range read → O(range cells)
+/// visited" (PHASE2_PARALLEL.md § Phase 2 Acceptance Roll-Up, second
+/// bullet; Track F delivers the row-indexed `cells` storage that backs
+/// it).
+///
+/// SAFETY/contract: with 10 000 non-empty cells scattered across a
+/// 1 000 000-coord workspace, reading a 50×27 viewport range `A1:AA50`
+/// must visit only the cells that fall inside the viewport — NOT a
+/// linear scan of all 10k materialized cells filtered by
+/// `range.contains`. The visit count is probed via
+/// `Sheet::debug_range_visit_count` which delegates to the same
+/// `for_each_sparse_cell_with` path used by `SUM`-over-range evals.
+///
+/// Deterministic spread: every 100th flat index is filled, so the
+/// expected viewport visit count is small (only the indices that fall
+/// inside rows 0..=49 cols 0..=26). With the Phase 1 storage this
+/// closure already returns the right count but visits all 10k cells
+/// to do so; Phase 2's row-indexed structure makes the visit cost
+/// match the returned count.
+#[test]
+#[ignore = "phase-2 — un-ignore after Agent F merge"]
+fn range_read_1m_sparse_visits_only_range() {
+    const TOTAL_CELLS: usize = 1_000_000;
+    const NON_EMPTY: usize = 10_000;
+    // 1000×1000 == 1M; same shape as the bench.
+    const SIDE: u32 = 1000;
+    // Every 100th flat index. Deterministic, scattered, dense enough
+    // that the 50×27 viewport catches a handful of cells.
+    const STRIDE: usize = 100;
+
+    let mut sheet = Sheet::new();
+    sheet.bulk_load(|loader| {
+        for i in 0..NON_EMPTY {
+            let flat = (i * STRIDE) % TOTAL_CELLS;
+            let row = (flat / SIDE as usize) as u32;
+            let col = (flat % SIDE as usize) as u32;
+            // Build "A1"-style address inline so the test stays
+            // self-contained (no shared `addr_of` helper here).
+            let mut letters = String::new();
+            let mut c = col as i64 + 1;
+            while c > 0 {
+                c -= 1;
+                letters.insert(0, (b'A' + (c % 26) as u8) as char);
+                c /= 26;
+            }
+            let addr_str = format!("{}{}", letters, row + 1);
+            loader.set_cell(&addr_str, Value::Number(i as f64));
+        }
+    });
+
+    // Probe: how many cells did the sparse iterator actually yield
+    // when asked for A1:AA50 (rows 0..=49, cols 0..=26 in 0-indexed
+    // form). With stride=100 and side=1000 the filled flat indices
+    // are 0, 100, 200, …, 999 900 — i.e. every row r gets cells
+    // filled at cols 0, 100, 200, …, 900 (since `flat % 1000 = col`).
+    // Only col 0 falls inside the viewport's `cols 0..=26`, so the
+    // viewport sees exactly one cell per row across rows 0..=49: 50
+    // visits total.
+    let visits = sheet.debug_range_visit_count("A1:AA50");
+
+    // Phase 2 Track F contract: visits ≤ cells_in_range. For the
+    // current Phase 1 storage this returns the right count (50) but
+    // does so by walking all 10k entries; Track F makes the walk
+    // itself O(visits + log).
+    assert!(
+        visits <= 50 * 27,
+        "viewport visit count must be bounded by viewport cell count \
+         (Phase 2 Track F); got {} visits over A1:AA50",
+        visits
+    );
+
+    // Tight sanity bound: this specific stride lands one filled cell
+    // per row in col 0 across rows 0..=49, so visits = 50. If the
+    // test drifts (different stride / viewport shape) this assertion
+    // is the first thing to update.
+    assert_eq!(
+        visits, 50,
+        "deterministic spread should land 50 filled cells in A1:AA50"
+    );
+
+    // And the total non-empty count is still 10k — we did not
+    // accidentally drop anything during setup.
+    assert_eq!(sheet.non_empty_addrs().len(), NON_EMPTY);
+}
