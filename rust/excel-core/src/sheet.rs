@@ -49,7 +49,9 @@ impl<V> RowMajorMap<V> {
     }
 
     pub(crate) fn get(&self, addr: &CellAddress) -> Option<&V> {
-        self.by_row.get(&addr.row).and_then(|row| row.get(&addr.col))
+        self.by_row
+            .get(&addr.row)
+            .and_then(|row| row.get(&addr.col))
     }
 
     pub(crate) fn contains_key(&self, addr: &CellAddress) -> bool {
@@ -113,9 +115,9 @@ impl<V> RowMajorMap<V> {
     /// keys are reconstructed `CellAddress`es; safe to `.copied()` /
     /// `.collect()` since `CellAddress: Copy`.
     pub(crate) fn keys(&self) -> impl Iterator<Item = CellAddress> + '_ {
-        self.by_row.iter().flat_map(|(&row, cols)| {
-            cols.keys().map(move |&col| CellAddress::new(row, col))
-        })
+        self.by_row
+            .iter()
+            .flat_map(|(&row, cols)| cols.keys().map(move |&col| CellAddress::new(row, col)))
     }
 
     /// Row-major value iterator (`HashMap::values` analog). Same
@@ -204,11 +206,7 @@ struct FormulaRecord {
 }
 
 impl FormulaRecord {
-    fn new(
-        expr: Rc<Expr>,
-        deps: HashSet<CellAddress>,
-        range_deps: HashSet<CellRange>,
-    ) -> Self {
+    fn new(expr: Rc<Expr>, deps: HashSet<CellAddress>, range_deps: HashSet<CellRange>) -> Self {
         FormulaRecord {
             expr,
             deps: RefCell::new(deps),
@@ -417,8 +415,16 @@ impl RangeDependentIndex {
                 // Intersect the smaller side against the larger — cuts
                 // worst-case work for asymmetric narrow ranges (e.g. one
                 // 6-row column-A range vs a single full-row range).
-                let (small, large) = if rs.len() <= cs.len() { (rs, cs) } else { (cs, rs) };
-                small.iter().filter(|r| large.contains(*r)).copied().collect()
+                let (small, large) = if rs.len() <= cs.len() {
+                    (rs, cs)
+                } else {
+                    (cs, rs)
+                };
+                small
+                    .iter()
+                    .filter(|r| large.contains(*r))
+                    .copied()
+                    .collect()
             }
             _ => Vec::new(),
         };
@@ -647,11 +653,7 @@ impl Sheet {
     /// Each `RangeDependentIndex::add_formula` call also wires the range
     /// into the row / col bucket halves (or `wide_ranges` if oversize) on
     /// its first dependent — see `RangeDependentIndex::register_range`.
-    fn add_formula_range_deps(
-        &self,
-        formula_addr: CellAddress,
-        ranges: &HashSet<CellRange>,
-    ) {
+    fn add_formula_range_deps(&self, formula_addr: CellAddress, ranges: &HashSet<CellRange>) {
         let mut dependents = self.range_dependents.borrow_mut();
         for r in ranges {
             dependents.add_formula(*r, formula_addr);
@@ -662,11 +664,7 @@ impl Sheet {
     /// `remove_formula_deps`. The bucket index entries (row / col / wide)
     /// are dropped automatically when the last dependent goes away, so the
     /// maps stay bounded under formula churn.
-    fn remove_formula_range_deps(
-        &self,
-        formula_addr: CellAddress,
-        ranges: &HashSet<CellRange>,
-    ) {
+    fn remove_formula_range_deps(&self, formula_addr: CellAddress, ranges: &HashSet<CellRange>) {
         let mut dependents = self.range_dependents.borrow_mut();
         for r in ranges {
             dependents.remove_formula(*r, formula_addr);
@@ -1373,8 +1371,7 @@ impl Sheet {
     /// Collect every non-empty address as an `"A1"`-style string. Cheap
     /// convenience wrapper around `for_each_non_empty` for wasm exposure.
     pub fn non_empty_addrs(&self) -> Vec<String> {
-        let mut out =
-            Vec::with_capacity(self.formula_cells.len() + self.cells.len());
+        let mut out = Vec::with_capacity(self.formula_cells.len() + self.cells.len());
         self.for_each_non_empty(|addr| out.push(addr.to_string()));
         out
     }
@@ -2037,6 +2034,7 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         // no deps.
         Expr::CellRef(_)
         | Expr::SheetRef { .. }
+        | Expr::SheetRange { .. }
         | Expr::Number(_)
         | Expr::Text(_)
         | Expr::Bool(_) => {}
@@ -2089,7 +2087,7 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         }
         // Cross-sheet refs are out-of-scope for static cycle detection on
         // this sheet (cross-sheet cycles need workbook-level analysis).
-        Expr::SheetRef { .. } => {}
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
     }
 }
@@ -2121,9 +2119,7 @@ fn collect_formula_refs_into(
             // over when the range is large.
             let cells_in_range = (max_row.saturating_sub(min_row) as usize)
                 .saturating_add(1)
-                .saturating_mul(
-                    (max_col.saturating_sub(min_col) as usize).saturating_add(1),
-                );
+                .saturating_mul((max_col.saturating_sub(min_col) as usize).saturating_add(1));
             // For ranges larger than the formula table, scan formulas and
             // filter; otherwise iterate cells. Avoids `SUM(A:A)` walking
             // a million empty addresses.
@@ -2160,7 +2156,7 @@ fn collect_formula_refs_into(
         }
         // SheetRef points outside this sheet — handled by the resolver, not
         // by local BFS.
-        Expr::SheetRef { .. } => {}
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
     }
 }
@@ -2170,15 +2166,13 @@ fn collect_formula_refs_into(
 /// resolver (the common case).
 fn expr_has_sheet_ref(expr: &Expr) -> bool {
     match expr {
-        Expr::SheetRef { .. } => true,
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => true,
         Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
         Expr::Negate(inner) => expr_has_sheet_ref(inner),
         Expr::FuncCall { args, .. } => args.iter().any(expr_has_sheet_ref),
-        Expr::CellRef(_)
-        | Expr::Range { .. }
-        | Expr::Number(_)
-        | Expr::Text(_)
-        | Expr::Bool(_) => false,
+        Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
+            false
+        }
     }
 }
 
@@ -2202,11 +2196,7 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     ///
     /// Formula cells are read via `Sheet::peek_value` (single-sheet
     /// context, no cross-sheet resolution).
-    fn for_each_range_cell(
-        &self,
-        range: CellRange,
-        f: &mut dyn FnMut(CellAddress, Value),
-    ) {
+    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
         self.sheet
             .for_each_sparse_cell_with(range, &|sheet, addr| sheet.peek_value(addr), f);
     }
@@ -2235,16 +2225,21 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
     /// as a formula dep. This lets `IF`-style dynamic-branch deps stay
     /// accurate even when the eval went through `for_each_range_cell`
     /// instead of explicit per-cell `cell()` calls.
-    fn for_each_range_cell(
-        &self,
-        range: CellRange,
-        f: &mut dyn FnMut(CellAddress, Value),
-    ) {
+    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
         let deps = self.deps.clone();
         self.inner.for_each_range_cell(range, &mut |addr, v| {
             deps.borrow_mut().insert(addr);
             f(addr, v);
         });
+    }
+
+    fn for_each_sheet_range_cell(
+        &self,
+        sheet: &str,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        self.inner.for_each_sheet_range_cell(sheet, range, f);
     }
 }
 
@@ -3705,17 +3700,12 @@ mod tests {
 
         // Target band: 1-based rows 50..=100 ⇒ 0-based rows 49..=99.
         // Seeded rows inside this band: 50, 60, 70, 80, 90 ⇒ 5 hits.
-        let range = CellRange::new(
-            CellAddress::new(49, 0),
-            CellAddress::new(99, 0),
-        );
+        let range = CellRange::new(CellAddress::new(49, 0), CellAddress::new(99, 0));
 
         let mut visited: Vec<CellAddress> = Vec::new();
-        sheet.for_each_sparse_cell_with(
-            range,
-            &|s, addr| s.peek_value(addr),
-            &mut |addr, _v| visited.push(addr),
-        );
+        sheet.for_each_sparse_cell_with(range, &|s, addr| s.peek_value(addr), &mut |addr, _v| {
+            visited.push(addr)
+        });
 
         // Exactly the band cells, nothing else.
         let expected: Vec<CellAddress> = seeded
@@ -3724,7 +3714,8 @@ mod tests {
             .filter(|a| range.contains(*a))
             .collect();
         assert_eq!(
-            visited, expected,
+            visited,
+            expected,
             "for_each_range_cell must visit ONLY cells inside the range \
              (got {} visits for a band overlapping {} seeded cells out of 1000 total)",
             visited.len(),

@@ -31,11 +31,9 @@ sheet 一个 `RangeDependentIndex`、dirty fanout、cycle BFS 分支；测试
 
 ## 架构决策
 
-保持现有 AST 形状，不新增 `SheetRange` enum variant。
-
-跨 sheet range 用已经存在的 `Expr::SheetRef { sheet, addr }` 和
-`Expr::Range { start, end, unbounded }` 组合无法表达，所以本阶段允许扩展
-`Expr::SheetRef`，或者新增最小 variant：
+保持现有 workbook / lazy eval 架构，只新增最小 AST variant。跨 sheet range
+用已经存在的 `Expr::SheetRef { sheet, addr }` 和
+`Expr::Range { start, end, unbounded }` 组合无法表达，因此本阶段采用：
 
 ```rust
 Expr::SheetRange {
@@ -46,7 +44,7 @@ Expr::SheetRange {
 }
 ```
 
-推荐新增 `SheetRange` variant，原因：
+选择 `SheetRange` variant 的原因：
 
 - 不破坏现有 `SheetRef` 单 cell 语义。
 - `collect_cross_sheet_refs` 可以直接映射到 `CrossSheetRef::Range`。
@@ -55,8 +53,8 @@ Expr::SheetRange {
   走已存在 workbook provider range 路径。如果现有 provider 已有等价入口，
   优先复用，不做大重构。
 
-实现时先让 `Sheet2!A1:A100` 通过；whole-col / whole-row 的跨 sheet 形式如果
-会显著扩大 scope，可以作为本阶段 P1，但 bounded cross-sheet range 是 P0。
+实现时先让 `Sheet2!A1:A100` 通过；whole-col / whole-row 的跨 sheet 形式留到
+后续阶段，避免在当前 patch 中扩大 parser grammar 和 unbounded range 风险。
 
 ## Tracks
 

@@ -76,6 +76,15 @@ pub enum Expr {
     /// Cross-sheet reference: `Sheet1!A1`. Resolution requires a Workbook
     /// scope at eval time; standalone Sheet eval treats it as #REF!.
     SheetRef { sheet: String, addr: CellAddress },
+    /// Cross-sheet range: `Sheet1!A1:B3`. Kept distinct from `Range` so
+    /// sheet-local dependency walkers never register the source addresses on
+    /// the formula's own sheet.
+    SheetRange {
+        sheet: String,
+        start: CellAddress,
+        end: CellAddress,
+        unbounded: RangeBounds,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -401,7 +410,11 @@ impl Parser {
         // After the second digit run we must NOT be followed by letters
         // — that would mean the user wrote `1:A1`, which isn't a valid
         // construct in either bounded or unbounded range syntax.
-        if self.peek().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+        if self
+            .peek()
+            .map(|c| c.is_ascii_alphabetic())
+            .unwrap_or(false)
+        {
             self.pos = save;
             return None;
         }
@@ -486,7 +499,8 @@ impl Parser {
             });
         }
 
-        // Check for cross-sheet reference: `Name!A1` (Excel syntax).
+        // Check for cross-sheet reference: `Name!A1` / `Name!A1:B3`
+        // (Excel syntax).
         // The bang `!` unambiguously marks the preceding identifier as a
         // sheet name — it's not a token in any other formula context. The
         // identifier ALWAYS becomes a sheet name when '!' follows, even if
@@ -503,6 +517,27 @@ impl Parser {
             }
             let addr_str: String = self.chars[addr_start..self.pos].iter().collect();
             let addr = CellAddress::parse(&addr_str)?;
+            self.skip_whitespace();
+            if self.peek() == Some(':') {
+                self.advance();
+                self.skip_whitespace();
+                let end_start = self.pos;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_alphanumeric() {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                let end_str: String = self.chars[end_start..self.pos].iter().collect();
+                let end = CellAddress::parse(&end_str)?;
+                return Some(Expr::SheetRange {
+                    sheet: ident,
+                    start: addr,
+                    end,
+                    unbounded: RangeBounds::None,
+                });
+            }
             return Some(Expr::SheetRef { sheet: ident, addr });
         }
 
@@ -555,9 +590,7 @@ impl Parser {
             // cell-address path can try again — though `CellAddress::
             // parse(letters_only)` already returned None above, so the
             // identifier branch will fall through to `None` like before.
-            if !end_letters.is_empty()
-                && self.peek().map(|c| !c.is_ascii_digit()).unwrap_or(true)
-            {
+            if !end_letters.is_empty() && self.peek().map(|c| !c.is_ascii_digit()).unwrap_or(true) {
                 let start_col = CellAddress::parse(&format!("{}1", ident))?.col;
                 let end_col = CellAddress::parse(&format!("{}1", end_letters))?.col;
                 return Some(Expr::Range {
@@ -880,6 +913,28 @@ mod tests {
                 addr: CellAddress::new(0, 0),
             }
         );
+    }
+
+    #[test]
+    fn parse_cross_sheet_range() {
+        let result = parse_formula("=SUM(Sheet2!A1:A100)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::SheetRange {
+                    sheet: "Sheet2".into(),
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(99, 0),
+                    unbounded: RangeBounds::None,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_cross_sheet_range_rejects_missing_end() {
+        assert!(parse_formula("=SUM(Sheet2!A1:)").is_none());
     }
 
     #[test]

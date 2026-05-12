@@ -41,15 +41,26 @@ pub trait EvalProvider {
     /// The default impl iterates the rectangle densely via `range.iter()`
     /// and calls `self.cell(addr)` per cell — fine for small ranges and
     /// for shim providers that don't have sparse-index data.
-    fn for_each_range_cell(
-        &self,
-        range: CellRange,
-        f: &mut dyn FnMut(CellAddress, Value),
-    ) {
+    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
         for addr in range.iter() {
             let v = self.cell(addr);
             f(addr, v);
         }
+    }
+
+    /// Iterate a range on another sheet. Workbook providers override this
+    /// with sparse sheet-aware traversal; single-sheet shims surface #REF!
+    /// without walking the nominal rectangle.
+    fn for_each_sheet_range_cell(
+        &self,
+        _sheet: &str,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        f(
+            range.normalize().start,
+            Value::Error(ValueError::InvalidRef),
+        );
     }
 }
 
@@ -115,7 +126,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
 
         Expr::FuncCall { name, args } => eval_func(name, args, provider),
 
-        Expr::Range { start, end, .. } => {
+        Expr::Range { start, end, .. } | Expr::SheetRange { start, end, .. } => {
             // Ranges should be handled by function evaluators, not standalone
             // If we get here, collect all values into... just return an error
             let _ = (start, end);
@@ -392,15 +403,17 @@ fn for_each_arg_value(
         Expr::Range { start, end, .. } => {
             stream_range(start, end, provider, &mut |addr, v| f(Some(addr), v));
         }
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => {
+            let range = CellRange::new(*start, *end);
+            provider.for_each_sheet_range_cell(sheet, range, &mut |addr, v| f(Some(addr), v));
+        }
         _ => f(None, eval_expr_with_provider(arg, provider)),
     }
 }
 
-fn eval_func(
-    name: &str,
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-) -> Value {
+fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
     match name {
         "SUM" => {
             // Real streaming: O(1) accumulator, no Vec allocation. Errors
@@ -632,13 +645,17 @@ fn eval_func(
 
         // === Math ===
         "ABS" => unary_number(args, provider, |n| n.abs()),
-        "SQRT" => unary_number(args, provider, |n| {
-            if n < 0.0 {
-                f64::NAN
-            } else {
-                n.sqrt()
-            }
-        }),
+        "SQRT" => unary_number(
+            args,
+            provider,
+            |n| {
+                if n < 0.0 {
+                    f64::NAN
+                } else {
+                    n.sqrt()
+                }
+            },
+        ),
         "ROUND" => {
             // ROUND(value, digits)
             if args.len() != 2 {
@@ -815,8 +832,7 @@ fn eval_func(
                                 if r < 0 || c < 0 {
                                     return;
                                 }
-                                let target =
-                                    provider.cell(CellAddress::new(r as u32, c as u32));
+                                let target = provider.cell(CellAddress::new(r as u32, c as u32));
                                 if let Some(n) = coerce_to_number(&target) {
                                     total += n;
                                 }
@@ -1123,10 +1139,7 @@ fn eval_func(
 /// through `for_each_arg_value` means the underlying provider can stay
 /// sparse, so we never allocate Null entries for empty cells in
 /// `SUM(A:A)`-shaped ranges.
-fn collect_numbers(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-) -> Vec<f64> {
+fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
     let mut out = Vec::new();
     for arg in args {
         for_each_arg_value(arg, provider, &mut |_addr, v| {
@@ -1239,11 +1252,7 @@ fn coerce_to_bool(v: &Value) -> Option<bool> {
     }
 }
 
-fn unary_number(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    f: impl Fn(f64) -> f64,
-) -> Value {
+fn unary_number(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64) -> f64) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
@@ -1264,11 +1273,7 @@ fn unary_number(
     }
 }
 
-fn text_unary(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    f: impl Fn(&str) -> String,
-) -> Value {
+fn text_unary(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(&str) -> String) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::InvalidValue);
     }
@@ -1806,8 +1811,7 @@ mod tests {
             }
         }
         fn set(&mut self, addr: &str, v: Value) {
-            self.cells
-                .insert(CellAddress::parse(addr).unwrap(), v);
+            self.cells.insert(CellAddress::parse(addr).unwrap(), v);
         }
         fn visits(&self) -> u64 {
             self.visits.get()
@@ -1822,11 +1826,7 @@ mod tests {
         fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
             Value::Error(ValueError::InvalidRef)
         }
-        fn for_each_range_cell(
-            &self,
-            range: CellRange,
-            f: &mut dyn FnMut(CellAddress, Value),
-        ) {
+        fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
             // Walk only addresses we actually have, intersected with the
             // requested range. Sparse traversal — the visit count equals
             // the number of present cells inside `range`, NOT the
@@ -1842,6 +1842,15 @@ mod tests {
                     f(*addr, value.clone());
                 }
             }
+        }
+
+        fn for_each_sheet_range_cell(
+            &self,
+            _sheet: &str,
+            range: CellRange,
+            f: &mut dyn FnMut(CellAddress, Value),
+        ) {
+            self.for_each_range_cell(range, f);
         }
     }
 
@@ -1863,6 +1872,21 @@ mod tests {
             p.visits(),
             2,
             "SUM should stream only the 2 real cells (got {})",
+            p.visits()
+        );
+    }
+
+    #[test]
+    fn sum_cross_sheet_range_streams_only_real_cells() {
+        let mut p = SparseProvider::new();
+        p.set("A1", Value::Number(5.0));
+        p.set("A100000", Value::Number(10.0));
+        let v = run_with(&p, "=SUM(Sheet2!A1:A100000)");
+        assert_eq!(v, Value::Number(15.0));
+        assert_eq!(
+            p.visits(),
+            2,
+            "cross-sheet SUM should stream only present cells, got {}",
             p.visits()
         );
     }
@@ -1935,9 +1959,6 @@ mod tests {
             run_with(&p, "=COUNTIF(A1:A1000,\">5\")"),
             Value::Number(2.0)
         );
-        assert_eq!(
-            run_with(&p, "=SUMIF(A1:A1000,\">5\")"),
-            Value::Number(30.0)
-        );
+        assert_eq!(run_with(&p, "=SUMIF(A1:A1000,\">5\")"), Value::Number(30.0));
     }
 }

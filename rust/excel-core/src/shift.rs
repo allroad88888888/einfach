@@ -13,6 +13,20 @@ fn is_invalid(addr: CellAddress) -> bool {
     addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL
 }
 
+fn range_has_invalid_ref(start: CellAddress, end: CellAddress, unbounded: RangeBounds) -> bool {
+    let row_invalid = if unbounded.rows_unbounded() {
+        false
+    } else {
+        start.row == REF_INVALID_ROW || end.row == REF_INVALID_ROW
+    };
+    let col_invalid = if unbounded.cols_unbounded() {
+        false
+    } else {
+        start.col == REF_INVALID_COL || end.col == REF_INVALID_COL
+    };
+    row_invalid || col_invalid
+}
+
 /// Returns true if the AST contains any invalid (#REF!) cell reference,
 /// e.g. left over from a row/column delete that took out a cell the
 /// formula was reading.
@@ -23,25 +37,14 @@ pub fn contains_invalid_ref(expr: &Expr) -> bool {
             start,
             end,
             unbounded,
-        } => {
-            // Skip the unbounded axis when checking for #REF! sentinels —
-            // `u32::MAX` on a whole-col / whole-row corner is the
-            // intentional sentinel, NOT a deleted ref. We still check
-            // the bounded axis: if a user wrote `A:A` and then deleted
-            // column A, the column corner becomes invalid.
-            let row_invalid = if unbounded.rows_unbounded() {
-                false
-            } else {
-                start.row == REF_INVALID_ROW || end.row == REF_INVALID_ROW
-            };
-            let col_invalid = if unbounded.cols_unbounded() {
-                false
-            } else {
-                start.col == REF_INVALID_COL || end.col == REF_INVALID_COL
-            };
-            row_invalid || col_invalid
-        }
+        } => range_has_invalid_ref(*start, *end, *unbounded),
         Expr::SheetRef { addr, .. } => is_invalid(*addr),
+        Expr::SheetRange {
+            start,
+            end,
+            unbounded,
+            ..
+        } => range_has_invalid_ref(*start, *end, *unbounded),
         Expr::Negate(inner) => contains_invalid_ref(inner),
         Expr::BinOp { left, right, .. } => {
             contains_invalid_ref(left) || contains_invalid_ref(right)
@@ -123,10 +126,7 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
             }
         }
         // Cross-sheet refs aren't shifted by within-sheet structural edits.
-        Expr::SheetRef { sheet, addr } => Expr::SheetRef {
-            sheet: sheet.clone(),
-            addr: *addr,
-        },
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => expr.clone(),
         Expr::Negate(inner) => Expr::Negate(Box::new(map_addrs(inner, f))),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
@@ -225,10 +225,7 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
         }
         // Cross-sheet refs aren't shifted on copy/paste — they point to a
         // fixed location on a different sheet regardless of paste target.
-        Expr::SheetRef { sheet, addr } => Expr::SheetRef {
-            sheet: sheet.clone(),
-            addr: *addr,
-        },
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => expr.clone(),
         Expr::Negate(inner) => Expr::Negate(Box::new(shift_refs(inner, drow, dcol)?)),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
@@ -336,6 +333,36 @@ fn col_only(mut col: u32) -> String {
     result.chars().rev().collect()
 }
 
+fn render_range_body(
+    start: CellAddress,
+    end: CellAddress,
+    unbounded: RangeBounds,
+    out: &mut String,
+) {
+    match unbounded {
+        RangeBounds::None => {
+            out.push_str(&start.to_string_repr());
+            out.push(':');
+            out.push_str(&end.to_string_repr());
+        }
+        RangeBounds::Rows => {
+            out.push_str(&col_only(start.col));
+            out.push(':');
+            out.push_str(&col_only(end.col));
+        }
+        RangeBounds::Cols => {
+            out.push_str(&format!("{}", start.row + 1));
+            out.push(':');
+            out.push_str(&format!("{}", end.row + 1));
+        }
+        RangeBounds::Both => {
+            out.push_str(&start.to_string_repr());
+            out.push(':');
+            out.push_str(&end.to_string_repr());
+        }
+    }
+}
+
 fn render_into(expr: &Expr, out: &mut String) {
     match expr {
         Expr::Number(n) => {
@@ -367,48 +394,10 @@ fn render_into(expr: &Expr, out: &mut String) {
             // carry a #REF! sentinel. is_invalid() checks BOTH axes, so
             // we'd false-positive on the u32::MAX sentinel. Check the
             // bounded axes explicitly.
-            let bounded_invalid = match unbounded {
-                RangeBounds::None => is_invalid(*start) || is_invalid(*end),
-                RangeBounds::Rows => {
-                    start.col == REF_INVALID_COL || end.col == REF_INVALID_COL
-                }
-                RangeBounds::Cols => {
-                    start.row == REF_INVALID_ROW || end.row == REF_INVALID_ROW
-                }
-                RangeBounds::Both => false,
-            };
-            if bounded_invalid {
+            if range_has_invalid_ref(*start, *end, *unbounded) {
                 out.push_str("#REF!");
             } else {
-                match unbounded {
-                    RangeBounds::None => {
-                        out.push_str(&start.to_string_repr());
-                        out.push(':');
-                        out.push_str(&end.to_string_repr());
-                    }
-                    RangeBounds::Rows => {
-                        // Whole-column range: `A:A` or `A:C`. Render just the
-                        // column letters (round-trip with the parser).
-                        out.push_str(&col_only(start.col));
-                        out.push(':');
-                        out.push_str(&col_only(end.col));
-                    }
-                    RangeBounds::Cols => {
-                        // Whole-row range: `1:1` or `1:3`. Render 1-based row.
-                        out.push_str(&format!("{}", start.row + 1));
-                        out.push(':');
-                        out.push_str(&format!("{}", end.row + 1));
-                    }
-                    RangeBounds::Both => {
-                        // No surface syntax for "everything" yet; render as
-                        // the explicit nominal corners. Round-trip is lossy
-                        // here but no current code path produces RangeBounds::
-                        // Both, so this is just future-proofing.
-                        out.push_str(&start.to_string_repr());
-                        out.push(':');
-                        out.push_str(&end.to_string_repr());
-                    }
-                }
+                render_range_body(*start, *end, *unbounded, out);
             }
         }
         Expr::SheetRef { sheet, addr } => {
@@ -418,6 +407,20 @@ fn render_into(expr: &Expr, out: &mut String) {
                 out.push_str(sheet);
                 out.push('!');
                 out.push_str(&addr.to_string_repr());
+            }
+        }
+        Expr::SheetRange {
+            sheet,
+            start,
+            end,
+            unbounded,
+        } => {
+            if range_has_invalid_ref(*start, *end, *unbounded) {
+                out.push_str("#REF!");
+            } else {
+                out.push_str(sheet);
+                out.push('!');
+                render_range_body(*start, *end, *unbounded, out);
             }
         }
         Expr::Negate(inner) => {

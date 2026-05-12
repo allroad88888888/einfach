@@ -18,12 +18,7 @@ use crate::sheet::{RangeDependentIndex, Sheet};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CrossSheetRef {
     Cell(usize, CellAddress),
-    /// Cross-sheet range edge, e.g. `SUM(Sheet2!A1:A100)`. The parser
-    /// doesn't emit `SheetRef`-qualified ranges yet, but the variant is
-    /// kept so `range_index_per_sheet` + the dirty-fanout path are
-    /// already wired for the moment they appear (`Phase 3 Track L`'s
-    /// `cross_sheet_range_dirty` test depends on this).
-    #[allow(dead_code)]
+    /// Cross-sheet range edge, e.g. `SUM(Sheet2!A1:A100)`.
     Range(usize, CellRange),
 }
 
@@ -40,8 +35,7 @@ pub(crate) struct CrossSheetDeps {
     /// `(src_sheet, src_addr) → set of (formula_sheet, formula_addr)`.
     /// `=Sheet2!A1` on `Sheet1!B1` becomes
     /// `cell_dependents[(2, A1)] = {(1, B1)}`.
-    pub(crate) cell_dependents:
-        HashMap<(usize, CellAddress), HashSet<(usize, CellAddress)>>,
+    pub(crate) cell_dependents: HashMap<(usize, CellAddress), HashSet<(usize, CellAddress)>>,
 
     /// REVERSE edges, range variant. One `RangeDependentIndex` per source
     /// sheet so per-write dirty fanout for that sheet runs the same
@@ -68,12 +62,7 @@ impl CrossSheetDeps {
     /// Insert one outgoing edge under `(formula_sheet, formula_addr)` and
     /// also register the corresponding reverse edge. Used by `Workbook::
     /// set_formula` after the AST walk has produced a `Vec<CrossSheetRef>`.
-    fn add_edge(
-        &mut self,
-        formula_sheet: usize,
-        formula_addr: CellAddress,
-        edge: CrossSheetRef,
-    ) {
+    fn add_edge(&mut self, formula_sheet: usize, formula_addr: CellAddress, edge: CrossSheetRef) {
         // Reverse edge.
         match &edge {
             CrossSheetRef::Cell(src_sheet, src_addr) => {
@@ -113,14 +102,13 @@ impl CrossSheetDeps {
         for edge in edges {
             match edge {
                 CrossSheetRef::Cell(src_sheet, src_addr) => {
-                    let should_remove = if let Some(set) =
-                        self.cell_dependents.get_mut(&(src_sheet, src_addr))
-                    {
-                        set.remove(&(formula_sheet, formula_addr));
-                        set.is_empty()
-                    } else {
-                        false
-                    };
+                    let should_remove =
+                        if let Some(set) = self.cell_dependents.get_mut(&(src_sheet, src_addr)) {
+                            set.remove(&(formula_sheet, formula_addr));
+                            set.is_empty()
+                        } else {
+                            false
+                        };
                     if should_remove {
                         self.cell_dependents.remove(&(src_sheet, src_addr));
                     }
@@ -469,20 +457,13 @@ impl Workbook {
                 dependents.extend(set.iter().copied());
             }
             if let Some(range_idx) = self.cross_sheet.range_index_per_sheet.get(&sheet_idx) {
-                // The range index is keyed by source sheet; its formula
-                // set is `CellAddress`-only. The dependent's sheet is
-                // recovered by looking up `formula_refs` — but we can
-                // skip that by observing that every reverse range edge
-                // emitted by `CrossSheetDeps::add_edge` is paired with a
-                // matching forward `formula_refs` entry. To recover the
-                // target sheet, scan `formula_refs` for any entry whose
-                // outgoing list contains a `Range(sheet_idx, _)` that
-                // covers `addr`. Cheaper alternative: iterate the formula
-                // set directly and reverse-lookup the sheet via the
-                // forward map.
+                // The range index is keyed by source sheet and stores only
+                // formula addresses. Recover every target sheet through the
+                // forward `formula_refs` map so same-address formulas on
+                // different sheets all receive dirty fanout.
                 for target_addr in range_idx.dependents_of(addr) {
-                    if let Some(target_sheet) =
-                        self.find_target_sheet_for_range_dep(target_addr, sheet_idx)
+                    for target_sheet in
+                        self.target_sheets_for_range_dep(target_addr, sheet_idx, addr)
                     {
                         dependents.push((target_sheet, target_addr));
                     }
@@ -503,34 +484,37 @@ impl Workbook {
         }
     }
 
-    /// Recover the formula's sheet index for a range-typed reverse edge.
+    /// Recover every formula sheet index for a range-typed reverse edge.
     /// The per-source-sheet `RangeDependentIndex` stores only
     /// `CellAddress` in its formula set (matching the sheet-local shape);
     /// the corresponding sheet is held in `formula_refs` as the key.
     ///
-    /// Walks the forward map and returns the first key whose
+    /// Walks the forward map and returns every key whose
     /// `formula_addr == target_addr` and whose edge list contains a
-    /// `Range(src_sheet, _)`. Worst case O(F) where F is the total
-    /// formula_refs entries — acceptable for the dirty path, and small
-    /// in practice (only formula cells live here, not data cells).
-    fn find_target_sheet_for_range_dep(
+    /// `Range(src_sheet, range)` covering `src_addr`. Worst case O(F) where
+    /// F is the total formula_refs entries — acceptable for the dirty path,
+    /// and small in practice (only formula cells live here, not data cells).
+    fn target_sheets_for_range_dep(
         &self,
         target_addr: CellAddress,
         src_sheet: usize,
-    ) -> Option<usize> {
+        src_addr: CellAddress,
+    ) -> Vec<usize> {
+        let mut out = Vec::new();
         for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
             if *formula_addr != target_addr {
                 continue;
             }
             for edge in edges {
-                if let CrossSheetRef::Range(s, _) = edge {
-                    if *s == src_sheet {
-                        return Some(*formula_sheet);
+                if let CrossSheetRef::Range(s, range) = edge {
+                    if *s == src_sheet && range.contains(src_addr) {
+                        out.push(*formula_sheet);
+                        break;
                     }
                 }
             }
         }
-        None
+        out
     }
 
     /// BFS the workbook-wide dep graph starting from the references of `expr`
@@ -608,10 +592,6 @@ impl Workbook {
                         // actually live inside the rectangle — same gating
                         // as `collect_formula_refs_into` in sheet.rs so
                         // `SUM(A:A)` doesn't enqueue u32::MAX entries.
-                        // (Range edges aren't emitted by the parser yet
-                        // but the arm keeps the data model forward-
-                        // compatible with Track L's `cross_sheet_range_*`
-                        // tests.)
                         let Some(sheet) = self.sheets.get(*src_sheet) else {
                             continue;
                         };
@@ -706,17 +686,9 @@ impl Workbook {
 /// inside `Sheet::bulk_load`. The owning sheet is the HashMap key in
 /// `ops_by_sheet`, so individual variants don't repeat `sheet_idx`.
 enum WorkbookOp {
-    SetCell {
-        addr_str: String,
-        value: Value,
-    },
-    SetFormula {
-        addr_str: String,
-        source: String,
-    },
-    ClearCell {
-        addr_str: String,
-    },
+    SetCell { addr_str: String, value: Value },
+    SetFormula { addr_str: String, source: String },
+    ClearCell { addr_str: String },
 }
 
 /// In-progress workbook bulk-load session. Buffers operations until
@@ -886,10 +858,7 @@ impl<'a> WorkbookLoader<'a> {
                         WorkbookOp::SetCell { addr_str, value } => {
                             loader.set_cell(&addr_str, value);
                         }
-                        WorkbookOp::SetFormula {
-                            addr_str,
-                            source,
-                        } => {
+                        WorkbookOp::SetFormula { addr_str, source } => {
                             // Whether the workbook layer accepted or
                             // rejected the formula, hand it to the
                             // sheet's bulk loader: it writes `#VALUE!`
@@ -930,8 +899,7 @@ impl<'a> WorkbookLoader<'a> {
             }
             if let Some(range_idx) = wb.cross_sheet.range_index_per_sheet.get(&sheet_idx) {
                 for target_addr in range_idx.dependents_of(addr) {
-                    if let Some(target_sheet) =
-                        wb.find_target_sheet_for_range_dep(target_addr, sheet_idx)
+                    for target_sheet in wb.target_sheets_for_range_dep(target_addr, sheet_idx, addr)
                     {
                         dependents.push((target_sheet, target_addr));
                     }
@@ -965,16 +933,7 @@ impl Default for Workbook {
 /// deliberately skipped — those are owned by `Sheet::set_formula`'s
 /// own `cell_dependents` / `range_dependents` insert paths and would
 /// double-fire if duplicated here.
-///
-/// Cross-sheet ranges (`Sheet2!A1:A100`) aren't produced by the parser
-/// yet, but the function is structured so the `CrossSheetRef::Range`
-/// arm fires automatically once the parser grows that case — keeping
-/// the data model forward-compatible for Phase 3 Track L's range
-/// acceptance test (currently `#[ignore]`'d) and any later refactor.
-fn collect_cross_sheet_refs(
-    expr: &Expr,
-    by_name: &HashMap<String, usize>,
-) -> Vec<CrossSheetRef> {
+fn collect_cross_sheet_refs(expr: &Expr, by_name: &HashMap<String, usize>) -> Vec<CrossSheetRef> {
     let mut out: Vec<CrossSheetRef> = Vec::new();
     collect_cross_sheet_refs_into(expr, by_name, &mut out);
     out
@@ -992,6 +951,17 @@ fn collect_cross_sheet_refs_into(
         Expr::SheetRef { sheet, addr } => {
             if let Some(&idx) = by_name.get(sheet) {
                 out.push(CrossSheetRef::Cell(idx, *addr));
+            }
+            // Unknown sheet → dropped. Read time will surface #REF!.
+        }
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => {
+            if let Some(&idx) = by_name.get(sheet) {
+                out.push(CrossSheetRef::Range(
+                    idx,
+                    CellRange::new(*start, *end).normalize(),
+                ));
             }
             // Unknown sheet → dropped. Read time will surface #REF!.
         }
@@ -1074,6 +1044,28 @@ fn collect_workbook_refs(
             // Unknown sheet name → dropped. Eval will surface #REF! at read
             // time; doesn't participate in cycles.
         }
+        Expr::SheetRange {
+            sheet,
+            start,
+            end,
+            unbounded,
+        } => {
+            let Some(&idx) = by_name.get(sheet) else {
+                return;
+            };
+            if !matches!(unbounded, RangeBounds::None) {
+                return;
+            }
+            let min_row = start.row.min(end.row);
+            let max_row = start.row.max(end.row);
+            let min_col = start.col.min(end.col);
+            let max_col = start.col.max(end.col);
+            for row in min_row..=max_row {
+                for col in min_col..=max_col {
+                    out.push((idx, CellAddress::new(row, col)));
+                }
+            }
+        }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
     }
 }
@@ -1084,7 +1076,7 @@ struct WorkbookEvalProvider<'a> {
 }
 
 impl<'a> WorkbookEvalProvider<'a> {
-    fn with_current(&self, idx: usize, f: impl FnOnce() -> Value) -> Value {
+    fn with_current<T>(&self, idx: usize, f: impl FnOnce() -> T) -> T {
         struct CurrentGuard<'a> {
             current: &'a Cell<usize>,
             prev: usize,
@@ -1114,7 +1106,9 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         let Some(idx) = self.wb.by_name.get(sheet).copied() else {
             return Value::Null;
         };
-        self.with_current(idx, || self.wb.sheets[idx].peek_value_with_provider(addr, self))
+        self.with_current(idx, || {
+            self.wb.sheets[idx].peek_value_with_provider(addr, self)
+        })
     }
 
     fn force_formula_recompute(&self) -> bool {
@@ -1126,11 +1120,7 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
     /// inside formulas in the iterated range can still resolve through
     /// the workbook chain (the single-sheet `peek_value` would return
     /// `#REF!` for `Sheet2!A1`).
-    fn for_each_range_cell(
-        &self,
-        range: CellRange,
-        f: &mut dyn FnMut(CellAddress, Value),
-    ) {
+    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
         let idx = self.current.get();
         let sheet = &self.wb.sheets[idx];
         sheet.for_each_sparse_cell_with(
@@ -1138,6 +1128,29 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             &|sheet, addr| sheet.peek_value_with_provider(addr, self),
             f,
         );
+    }
+
+    fn for_each_sheet_range_cell(
+        &self,
+        sheet: &str,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        let Some(idx) = self.wb.by_name.get(sheet).copied() else {
+            f(
+                range.normalize().start,
+                Value::Error(ValueError::InvalidRef),
+            );
+            return;
+        };
+        self.with_current(idx, || {
+            let target_sheet = &self.wb.sheets[idx];
+            target_sheet.for_each_sparse_cell_with(
+                range,
+                &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+                f,
+            );
+        });
     }
 }
 
@@ -1714,6 +1727,77 @@ mod tests {
         // Writing the NEW source must fire it.
         wb.set_cell(extra_idx, "A1", Value::Number(8.0));
         assert!(*changes.borrow() >= 1);
+    }
+
+    #[test]
+    fn cross_sheet_range_formula_replacement_drops_stale_reverse_edge() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(1.0));
+        assert!(wb.set_formula(s1, "D1", "=SUM(Data!A1:A10)"));
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
+
+        assert!(wb.set_formula(s1, "D1", "=1"));
+        assert_eq!(
+            wb.debug_cross_sheet_reverse_edge_count(),
+            0,
+            "replacing a cross-sheet range formula must remove its range edge"
+        );
+    }
+
+    #[test]
+    fn cross_sheet_range_write_fires_same_addr_dependents_on_multiple_sheets() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let other_idx = wb.add_sheet("Other");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        assert!(wb.set_formula(s1, "D1", "=SUM(Data!A1:A10)"));
+        assert!(wb.set_formula(other_idx, "D1", "=SUM(Data!A1:A10)"));
+
+        let s1_changes = Rc::new(RefCell::new(0u32));
+        let other_changes = Rc::new(RefCell::new(0u32));
+        {
+            let c = s1_changes.clone();
+            wb.sheet_mut(s1)
+                .unwrap()
+                .subscribe_cell("D1", move || *c.borrow_mut() += 1);
+        }
+        {
+            let c = other_changes.clone();
+            wb.sheet_mut(other_idx)
+                .unwrap()
+                .subscribe_cell("D1", move || *c.borrow_mut() += 1);
+        }
+
+        wb.set_cell(data_idx, "A5", Value::Number(10.0));
+
+        assert!(*s1_changes.borrow() >= 1, "Sheet1!D1 must fire for Data!A5");
+        assert!(
+            *other_changes.borrow() >= 1,
+            "Other!D1 must also fire for Data!A5 despite sharing the same address"
+        );
+    }
+
+    #[test]
+    fn cross_sheet_range_cycle_is_rejected_when_source_range_contains_target_reader() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        assert!(wb.set_formula(data_idx, "A2", "=Sheet1!D1"));
+        assert!(
+            !wb.set_formula(s1, "D1", "=SUM(Data!A1:A3)"),
+            "candidate range should see Data!A2's formula edge back to Sheet1!D1"
+        );
+        assert_eq!(
+            wb.get_cell("Sheet1", "D1"),
+            Value::Error(ValueError::CyclicRef)
+        );
     }
 
     /// Workbook-level `bulk_load` collects writes and fires each cross-

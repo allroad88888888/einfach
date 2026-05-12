@@ -14,10 +14,9 @@
 //! and the cross-sheet dirty-propagation BFS that fires subscribers
 //! are in place. Tests #1 and #2 turn green directly.
 //!
-//! Test #3 (`cross_sheet_range_dirty`) stays `#[ignore]`'d pending a
-//! parser-side follow-up: the formula parser doesn't yet accept
-//! `Sheet2!A1:A100`. Track I's `CrossSheetRef::Range` arm is wired
-//! and ready to consume the AST node once parsing lands.
+//! Test #3 (`cross_sheet_range_dirty`) pins the Phase 4A parser/eval
+//! follow-up: `Sheet2!A1:A100` must enter the workbook range-dep graph
+//! and stay sparse/lazy at read time.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -204,17 +203,7 @@ fn cross_sheet_chain_no_eager_eval() {
 /// range_dependents knows about the formula but has no way to notify
 /// Sheet1.
 ///
-/// **DEFERRED**: this test is `#[ignore]`'d because the formula parser
-/// does not yet accept `Sheet2!A1:A100` (cross-sheet range syntax). The
-/// parser today supports `Sheet2!A1` (cross-sheet cell), `A1:A100`
-/// (in-sheet range), and `A:A` (whole-col), but not the cross-sheet
-/// range combination. Track I's `CrossSheetRef::Range` arm is wired
-/// (storage, removal, dirty-fanout via `range_index_per_sheet`) and
-/// ready to consume the AST node once it can be produced. Un-ignore
-/// in the next phase that lands the parser extension; the test body
-/// is correct as-is.
 #[test]
-#[ignore = "needs cross-sheet range parser support (Sheet2!A1:A100); deferred"]
 fn cross_sheet_range_dirty() {
     let mut wb = Workbook::new();
     let s2 = wb.add_sheet("Sheet2");
@@ -262,4 +251,3 @@ fn cross_sheet_range_dirty() {
         "re-read must include the new A50 value: 1 + 10 + 2 = 13"
     );
 }
-
