@@ -50,6 +50,13 @@ type WasmWorkbookRuntime = {
     endRow: number,
     endCol: number,
   ) => CellSnapshotWire[]
+  clear_range?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => number
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_cross_sheet_dependents_count?: () => number
 }
@@ -456,6 +463,24 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           clear.call(wb, Number(msg.sheet), normalizeAddr(msg.addr))
         }
         postResponse(msg.id, true)
+        break
+      case 'clearRange':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const clearRange = assertMethod(wb, 'clear_range')
+          postResponse(
+            msg.id,
+            clearRange.call(
+              wb,
+              range.sheet,
+              range.startRow,
+              range.startCol,
+              range.endRow,
+              range.endCol,
+            ),
+          )
+        }
         break
       case 'beginImport':
         {

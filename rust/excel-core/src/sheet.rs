@@ -1368,6 +1368,21 @@ impl Sheet {
         }
     }
 
+    /// Iterate every non-empty address inside `range` without reading cell
+    /// values. Formula entries are reported by address only, so this does
+    /// not evaluate dirty formula caches.
+    pub fn for_each_non_empty_in_range(&self, range: CellRange, mut f: impl FnMut(CellAddress)) {
+        for (addr, _) in self.formula_cells.range_iter(range) {
+            f(addr);
+        }
+        for (addr, _) in self.cells.range_iter(range) {
+            if self.formula_cells.contains_key(&addr) {
+                continue;
+            }
+            f(addr);
+        }
+    }
+
     /// Collect every non-empty address as an `"A1"`-style string. Cheap
     /// convenience wrapper around `for_each_non_empty` for wasm exposure.
     pub fn non_empty_addrs(&self) -> Vec<String> {
@@ -3560,6 +3575,22 @@ mod tests {
         sheet.clear_cell("A1");
         let got = sheet.non_empty_addrs();
         assert_eq!(got, vec!["B1"]);
+    }
+
+    #[test]
+    fn non_empty_in_range_skips_holes_and_does_not_eval_formulas() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("C3", Value::Number(3.0));
+        sheet.set_formula("B2", "=A1+1");
+
+        let range = CellRange::new(CellAddress::new(0, 0), CellAddress::new(1, 1));
+        let mut got = Vec::new();
+        sheet.for_each_non_empty_in_range(range, |addr| got.push(addr.to_string()));
+
+        got.sort();
+        assert_eq!(got, vec!["A1", "B2"]);
+        assert_eq!(sheet.debug_formula_cache_state("B2"), "dirty");
     }
 
     // === Phase 1 Track A — P0 bug: range dep survives sparse eval ===

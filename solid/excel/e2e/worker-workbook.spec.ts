@@ -82,6 +82,25 @@ test.describe('Worker-backed workbook RPC', () => {
 
     await expectNoConsoleErrors(page)
   })
+
+  test('clears a large sparse range through the worker without expanding cells on main', async ({
+    page,
+  }) => {
+    const result = await runWorkerWorkbookClearRangeScenario(page)
+
+    expect(result.beforeClear.display).toBe('42')
+    expect(result.beforeClearState).toBe('clean')
+    expect(result.cleared).toBe(1)
+    expect(result.afterClearState).toBe('dirty')
+    expect(result.afterNonEmpty).toEqual([
+      { sheet: 0, addr: 'A1' },
+      { sheet: 1, addr: 'K11' },
+    ])
+    expect(result.afterRead.display).toBe('1')
+    expect(result.afterReadState).toBe('clean')
+
+    await expectNoConsoleErrors(page)
+  })
 })
 
 async function runWorkerWorkbookScenario(page: Page): Promise<{
@@ -229,6 +248,61 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         afterSnapshotState,
         rangeRead,
         afterRangeReadState,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookClearRangeScenario(page: Page): Promise<{
+  beforeClear: Snapshot
+  beforeClearState: string
+  cleared: number
+  afterClearState: string
+  afterNonEmpty: DirtyRef[]
+  afterRead: Snapshot
+  afterReadState: string
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import(
+      '/src/wasm-workbook-worker-factory.ts'
+    )
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+        { sheet: 1, row: 10, col: 10, kind: 'number', value: 99 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      await workbook.commitImport(session)
+
+      const [beforeClear] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const beforeClearState = await workbook.debugFormulaCacheState(0, 'A1')
+      const cleared = await workbook.clearRange({
+        sheet: 1,
+        startRow: 0,
+        startCol: 0,
+        endRow: 999_999,
+        endCol: 0,
+      })
+      const afterClearState = await workbook.debugFormulaCacheState(0, 'A1')
+      const afterNonEmpty = await workbook.listNonEmpty()
+      const [afterRead] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const afterReadState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        beforeClear,
+        beforeClearState,
+        cleared,
+        afterClearState,
+        afterNonEmpty,
+        afterRead,
+        afterReadState,
       }
     } finally {
       workbook.dispose()

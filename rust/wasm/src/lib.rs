@@ -1000,6 +1000,24 @@ impl WasmWorkbook {
         serde_wasm_bindgen::to_value(&out)
             .map_err(|err| JsValue::from_str(&format!("serialize sparse range: {err}")))
     }
+
+    /// Clear non-empty cells in a zero-based inclusive range. The Rust
+    /// core scans only sparse entries inside the range and does not
+    /// evaluate formulas while finding cells to clear.
+    pub fn clear_range(
+        &mut self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> u32 {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        self.workbook.clear_range(sheet_idx as usize, range) as u32
+    }
 }
 
 impl Default for WasmWorkbook {

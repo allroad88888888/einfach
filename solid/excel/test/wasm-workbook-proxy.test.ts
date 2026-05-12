@@ -209,8 +209,23 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ok(fake, [snapshot({ sheet: 0, addr: 'A1', display: '42' })])
     await expect(range).resolves.toEqual([snapshot({ sheet: 0, addr: 'A1', display: '42' })])
 
+    const clear = workbook.clearRange({
+      sheet: 1,
+      startRow: 0,
+      startCol: 0,
+      endRow: 999_999,
+      endCol: 999_999,
+    })
+    expect(lastSent(fake)).toEqual({
+      id: 8,
+      cmd: 'clearRange',
+      range: { sheet: 1, startRow: 0, startCol: 0, endRow: 999_999, endCol: 999_999 },
+    })
+    ok(fake, 1)
+    await expect(clear).resolves.toBe(1)
+
     const cancel = workbook.cancelImport(99)
-    expect(lastSent(fake)).toEqual({ id: 8, cmd: 'cancelImport', sessionId: 99 })
+    expect(lastSent(fake)).toEqual({ id: 9, cmd: 'cancelImport', sessionId: 99 })
     ok(fake, false)
     await expect(cancel).resolves.toBe(false)
   })

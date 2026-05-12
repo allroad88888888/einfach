@@ -97,6 +97,7 @@ export interface WorkerWorkbookClient {
   setCell(sheet: number, addr: string, value: CellWire): Promise<boolean>
   setFormula(sheet: number, addr: string, formula: string): Promise<boolean>
   clearCell(sheet: number, addr: string): Promise<boolean>
+  clearRange(range: SparseRangeWire): Promise<number>
   beginImport(sessionId?: number): Promise<number>
   importChunk(sessionId: number, cells: ImportCellWire[]): Promise<number>
   commitImport(sessionId: number): Promise<WorkbookImportStatsWire>
@@ -232,6 +233,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     clearCell(sheet, addr) {
       return request<boolean>('clearCell', { sheet, addr: addr.toUpperCase() })
+    },
+    clearRange(range) {
+      return request<number>('clearRange', { range })
     },
     beginImport(sessionId = nextImportId++) {
       return request<number>('beginImport', { sessionId })

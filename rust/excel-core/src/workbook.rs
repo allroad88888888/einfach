@@ -467,6 +467,27 @@ impl Workbook {
         self.propagate_cross_sheet_dirty(sheet_idx, addr);
     }
 
+    /// Clear every non-empty cell inside a range without materializing
+    /// every address in that range. The metadata scan is sparse and does
+    /// not evaluate formulas; flush still goes through `bulk_load` so
+    /// same-sheet and cross-sheet dirty propagation is consolidated.
+    pub fn clear_range(&mut self, sheet_idx: usize, range: CellRange) -> usize {
+        let Some(sheet) = self.sheets.get(sheet_idx) else {
+            return 0;
+        };
+        let mut addrs = Vec::new();
+        sheet.for_each_non_empty_in_range(range, |addr| {
+            addrs.push(addr.to_string());
+        });
+        let count = addrs.len();
+        self.bulk_load(|loader| {
+            for addr in addrs {
+                loader.clear_cell(sheet_idx, &addr);
+            }
+        });
+        count
+    }
+
     /// Workbook-level BFS dirty propagation across cross-sheet edges.
     ///
     /// Seed: `(src_sheet, src_addr)`. For each popped item, look up its
@@ -1240,6 +1261,28 @@ mod tests {
         );
 
         assert_eq!(got, vec![("B1".to_string(), Value::Number(42.0))]);
+    }
+
+    #[test]
+    fn clear_range_scans_sparse_and_dirties_cross_sheet_dependents() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        wb.set_cell(data_idx, "A1", Value::Number(41.0));
+        wb.set_cell(data_idx, "C3", Value::Number(99.0));
+        assert!(wb.set_formula(0, "B1", "=Data!A1+1"));
+
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(42.0));
+        assert_eq!(wb.debug_formula_cache_state(0, "B1"), "clean");
+
+        let cleared = wb.clear_range(
+            data_idx,
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(1, 1)),
+        );
+
+        assert_eq!(cleared, 1);
+        assert_eq!(wb.debug_formula_cache_state(0, "B1"), "dirty");
+        assert_eq!(wb.sheet(data_idx).unwrap().non_empty_addrs(), vec!["C3"]);
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(1.0));
     }
 
     #[test]
