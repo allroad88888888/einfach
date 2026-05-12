@@ -2742,4 +2742,33 @@ mod tests {
         let got = sheet.non_empty_addrs();
         assert_eq!(got, vec!["B1"]);
     }
+
+    // === Phase 1 Track A — P0 bug: range dep survives sparse eval ===
+    //
+    // `collect_refs` statically expands `Expr::Range` into individual cell
+    // deps at `set_formula` time, so A50 is initially registered as a
+    // dependent of B1. But during the first `get_cell` evaluation the
+    // sparse range iterator only yields non-empty addresses, the tracked
+    // dep set is built from what eval visited, and `replace_formula_deps`
+    // then replaces the formula's dep set with that visited-only set —
+    // discarding A50. Writing A50 later therefore doesn't dirty B1 and
+    // SUM stays stale.
+    //
+    // The fix preserves range deps as ranges across eval (a separate
+    // `range_deps` index that doesn't get rewritten by the tracked eval
+    // set). Until that fix lands, this test must FAIL on the second
+    // assertion (the post-write read still returns 3.0).
+    #[test]
+    fn range_dep_survives_sparse_eval() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("A100", Value::Number(2.0));
+        sheet.set_formula("B1", "=SUM(A1:A100)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        // A50 was empty during the first sparse eval. Writing it must
+        // still dirty B1 — range deps mustn't be collapsed to "visited
+        // cells only".
+        sheet.set_cell("A50", Value::Number(10.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
+    }
 }
