@@ -18,7 +18,7 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use einfach_excel_core::Sheet;
+use einfach_excel_core::{Sheet, Workbook};
 use einfach_core::Value;
 
 // === Sizing knobs ===========================================================
@@ -271,10 +271,113 @@ fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
     group.finish();
 }
 
+// === Bench 4: cross_sheet_dirty_propagation_10k =============================
+
+/// Phase 3 acceptance probe — measure the wall time of a SINGLE
+/// cross-sheet `Workbook::set_cell` write on a workbook with 10 000
+/// cross-sheet formula dependents on `Data`. This is the cross-sheet
+/// twin of `bench_dirty_lookup_100k_ranges`: same shape (one write
+/// against many registered dependents, dirty-mark only, no eager
+/// eval), different topology (cross-sheet pointwise refs through the
+/// workbook-level dep graph that Track I adds).
+///
+/// Setup (NOT timed): two sheets — `Sheet1` + `Data`. 10 000 formulas
+/// in Sheet1 of the form `Sheet1!B{r} = =Data!A{r}` for r in 1..=10 000.
+/// We deliberately DO NOT pre-evaluate any of these formulas: the
+/// purpose of this bench is to time dirty propagation, NOT eval cost.
+/// All 10 000 formulas stay Dirty after setup — the Phase 1 import
+/// laziness contract guarantees `set_formula` registers the formula
+/// record without computing it.
+///
+/// Timed section: one `wb.set_cell(idx_of_Data, "A5000", _)`.
+///
+/// Phase 3 target: only ONE cross-sheet dependent (`Sheet1!B5000`)
+/// references `Data!A5000`, so Track I's `CrossSheetDeps.cell_dependents`
+/// lookup must yield exactly that one (formula_sheet, formula_addr) and
+/// the per-write cost is O(1 + log) — bounded by matches, not by the
+/// 10 000 total registered cross-sheet formulas.
+///
+/// Pre-Track-I behavior: the extension-trait stub in
+/// `tests/cross_sheet.rs` would panic; this bench works around that by
+/// going through the (existing) `Workbook::set_formula` for setup and
+/// then calling `Sheet::set_cell` directly via `sheet_mut`. After
+/// Track I lands, the workbook-level `set_cell` becomes available and
+/// the bench should be retargeted to it — see the closure body.
+///
+/// `iter_batched` rebuilds the workbook for each iteration so the
+/// write always hits a fresh state. `sample_size(15)` keeps the 10k
+/// per-iter setup from dominating wall-clock.
+fn bench_cross_sheet_dirty_propagation_10k(c: &mut Criterion) {
+    const N_CROSS_SHEET_FORMULAS: usize = 10_000;
+
+    // Pre-build (dest, formula) pairs once so per-iter setup is just
+    // the formula installs, not string formatting. Formulas live on
+    // Sheet1, each referencing a unique cell on Data.
+    let dest_addrs: Vec<String> = (1..=N_CROSS_SHEET_FORMULAS)
+        .map(|r| format!("B{}", r))
+        .collect();
+    let formulas: Vec<String> = (1..=N_CROSS_SHEET_FORMULAS)
+        .map(|r| format!("=Data!A{}", r))
+        .collect();
+
+    let mut group = c.benchmark_group("scale/cross_sheet_dirty_propagation_10k");
+    // Throughput per registered cross-sheet formula — bench reports
+    // "writes/sec normalized by N". Pre-Track-I this measures whatever
+    // the no-op-cross-sheet `Sheet::set_cell` costs; post-Track-I it
+    // measures the workbook-level dirty BFS, which should remain
+    // bounded by `matches` (1 for this setup) regardless of N.
+    group.throughput(Throughput::Elements(N_CROSS_SHEET_FORMULAS as u64));
+    group.sample_size(15);
+
+    group.bench_function("single_cross_sheet_set_cell_after_10k_formulas", |b| {
+        b.iter_batched(
+            // Setup: fresh workbook with Sheet1 + Data, plus 10k
+            // cross-sheet formulas. NO pre-eval — we want the cold
+            // dirty-propagation path, mirroring the Phase 2
+            // dirty_lookup_100k_ranges bench's contract.
+            || {
+                let mut wb = Workbook::new();
+                let _data_idx = wb.add_sheet("Data");
+                let s1 = wb.index_of("Sheet1").unwrap();
+                for (dest, formula) in dest_addrs.iter().zip(formulas.iter()) {
+                    // `Workbook::set_formula` already exists on this
+                    // branch; the static AST corners feed the
+                    // per-sheet `range_dependents` index. Track I will
+                    // also feed the workbook-level
+                    // `CrossSheetDeps.cell_dependents` map here.
+                    let ok = wb.set_formula(s1, dest, formula);
+                    debug_assert!(ok);
+                }
+                wb
+            },
+            // Timed: a single cross-sheet primitive write. Track I's
+            // BFS must dirty exactly one cross-sheet dependent
+            // (`Sheet1!B5000`) and fire its subscriber bucket. Pre-
+            // Track-I this still executes — `sheet_mut(data_idx)
+            // .set_cell` is just a single-sheet primitive write that
+            // does NOT propagate, so the bench compiles AND runs but
+            // doesn't have the cross-sheet propagation work to measure.
+            // After Track I lands, swap the body for
+            // `wb.set_cell(data_idx, "A5000", Value::Number(42.0))`.
+            |mut wb| {
+                let data_idx = wb.index_of("Data").unwrap();
+                wb.sheet_mut(data_idx)
+                    .unwrap()
+                    .set_cell("A5000", Value::Number(42.0));
+                black_box(&wb);
+            },
+            criterion::BatchSize::PerIteration,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_bulk_load_100k_formulas,
     bench_sparse_1m_grid_read_window,
     bench_dirty_lookup_100k_ranges,
+    bench_cross_sheet_dirty_propagation_10k,
 );
 criterion_main!(benches);
