@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
@@ -9,6 +9,144 @@ use crate::eval::{eval_expr_with_provider, EvalProvider};
 use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr};
 use crate::range::CellRange;
+
+/// Row-major sparse map over `(row, col) → V`. Wraps a
+/// `BTreeMap<row, BTreeMap<col, V>>` so range scans cost
+/// O(visited cells) instead of O(total entries). Drop-in replacement
+/// for the `HashMap<CellAddress, V>` API the rest of `sheet.rs`
+/// already speaks (`get`, `insert`, `remove`, `contains_key`, `len`,
+/// `keys`, iteration as `(&CellAddress, &V)`), plus a `range_iter`
+/// helper used by `for_each_sparse_cell_with` for O(range) viewport
+/// reads (Phase 2 Track F target).
+///
+/// Stop condition (PHASE2_PARALLEL.md § Stop Conditions): if the
+/// BTreeMap-of-BTreeMap overhead at 1M sparse cells exceeds the
+/// HashMap version by >2×, pivot to a flat
+/// `BTreeMap<(u32, u32), V>` keyed by `(row, col)`. Range scans
+/// still work via `cells.range((min_row, 0)..=(max_row, u32::MAX))`
+/// plus a per-row filter. We start with the nested shape because it
+/// keeps the row-major iter trivial; we have not had to pivot.
+pub(crate) struct RowMajorMap<V> {
+    by_row: BTreeMap<u32, BTreeMap<u32, V>>,
+    len: usize,
+}
+
+impl<V> RowMajorMap<V> {
+    pub(crate) fn new() -> Self {
+        RowMajorMap {
+            by_row: BTreeMap::new(),
+            len: 0,
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn get(&self, addr: &CellAddress) -> Option<&V> {
+        self.by_row.get(&addr.row).and_then(|row| row.get(&addr.col))
+    }
+
+    pub(crate) fn contains_key(&self, addr: &CellAddress) -> bool {
+        self.by_row
+            .get(&addr.row)
+            .map(|row| row.contains_key(&addr.col))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn insert(&mut self, addr: CellAddress, value: V) -> Option<V> {
+        let row = self.by_row.entry(addr.row).or_default();
+        let prev = row.insert(addr.col, value);
+        if prev.is_none() {
+            self.len += 1;
+        }
+        prev
+    }
+
+    pub(crate) fn remove(&mut self, addr: &CellAddress) -> Option<V> {
+        let row = self.by_row.get_mut(&addr.row)?;
+        let removed = row.remove(&addr.col);
+        if removed.is_some() {
+            self.len -= 1;
+            if row.is_empty() {
+                self.by_row.remove(&addr.row);
+            }
+        }
+        removed
+    }
+
+    /// Iterate every `(CellAddress, &V)` in row-major ascending order
+    /// (ascending row, then ascending col within each row). Matches
+    /// the deterministic order callers rely on for snapshots / undo.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (CellAddress, &V)> + '_ {
+        self.by_row.iter().flat_map(|(&row, cols)| {
+            cols.iter()
+                .map(move |(&col, value)| (CellAddress::new(row, col), value))
+        })
+    }
+
+    /// Iterate every present `(CellAddress, &V)` inside `range` —
+    /// the O(cells_in_range) scan that motivates this whole type.
+    /// Visits rows in ascending order, columns ascending within each
+    /// row, matching the dense `CellRange::iter()` order so swapping
+    /// from a dense walk to this one keeps deterministic output
+    /// (e.g. for hash-ordered aggregates / formula dep tracking).
+    pub(crate) fn range_iter(
+        &self,
+        range: CellRange,
+    ) -> impl Iterator<Item = (CellAddress, &V)> + '_ {
+        let n = range.normalize();
+        let (r0, r1) = (n.start.row, n.end.row);
+        let (c0, c1) = (n.start.col, n.end.col);
+        self.by_row.range(r0..=r1).flat_map(move |(&row, cols)| {
+            cols.range(c0..=c1)
+                .map(move |(&col, value)| (CellAddress::new(row, col), value))
+        })
+    }
+
+    /// Row-major key iterator (`HashMap::keys` analog). Returned
+    /// keys are reconstructed `CellAddress`es; safe to `.copied()` /
+    /// `.collect()` since `CellAddress: Copy`.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = CellAddress> + '_ {
+        self.by_row.iter().flat_map(|(&row, cols)| {
+            cols.keys().map(move |&col| CellAddress::new(row, col))
+        })
+    }
+
+    /// Row-major value iterator (`HashMap::values` analog). Same
+    /// ordering as `iter` minus the address — useful for "count
+    /// matching" scans like `debug_dirty_count` that don't care
+    /// where each entry lives.
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> + '_ {
+        self.by_row.values().flat_map(|cols| cols.values())
+    }
+
+    /// Drain into a row-major `(CellAddress, V)` iterator. Used by
+    /// the structural-edit `relocate_cells` path that needs to
+    /// rebuild the index under new keys.
+    pub(crate) fn drain_into_vec(&mut self) -> Vec<(CellAddress, V)> {
+        let mut out = Vec::with_capacity(self.len);
+        let by_row = std::mem::take(&mut self.by_row);
+        self.len = 0;
+        for (row, cols) in by_row {
+            for (col, value) in cols {
+                out.push((CellAddress::new(row, col), value));
+            }
+        }
+        out
+    }
+}
+
+impl<V> Default for RowMajorMap<V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 type ListenerRc = Rc<dyn CellListener>;
 type ListenerList = Rc<RefCell<Vec<(u64, ListenerRc)>>>;
@@ -273,10 +411,18 @@ impl RangeDependentIndex {
 /// A spreadsheet sheet backed by an atom store.
 pub struct Sheet {
     pub(crate) store: Store,
-    pub(crate) cells: HashMap<CellAddress, AtomId>,
+    /// Primitive cell atoms keyed by `(row, col)`. Backed by a row-major
+    /// `RowMajorMap` so range reads (e.g. viewport, `SUM(A1:A100)`) scan
+    /// O(cells_in_range) rather than the full non-empty set — the Phase 2
+    /// Track F target from `PHASE2_PARALLEL.md`. API surface still mimics
+    /// `HashMap` (`get`/`insert`/`remove`/`contains_key`/`len`/`keys`) so
+    /// call sites elsewhere in this file stay unchanged.
+    pub(crate) cells: RowMajorMap<AtomId>,
     /// Formula cells live at the Sheet layer. Formula results are cached here,
-    /// not as core derived atoms, so `set_formula` does not compute.
-    formula_cells: HashMap<CellAddress, Rc<FormulaRecord>>,
+    /// not as core derived atoms, so `set_formula` does not compute. Same
+    /// row-major shape as `cells` so range scans that hit a mix of primitive
+    /// and formula cells stay O(matches).
+    formula_cells: RowMajorMap<Rc<FormulaRecord>>,
     /// AST of each formula cell, used for static cycle detection (B.2).
     formula_exprs: HashMap<CellAddress, Rc<Expr>>,
     /// Original formula text per cell, for `get_formula` so the formula bar
@@ -325,8 +471,8 @@ impl Sheet {
     pub fn new() -> Self {
         Sheet {
             store: Store::new(),
-            cells: HashMap::new(),
-            formula_cells: HashMap::new(),
+            cells: RowMajorMap::new(),
+            formula_cells: RowMajorMap::new(),
             formula_exprs: HashMap::new(),
             formula_texts: HashMap::new(),
             cell_subscriptions: HashMap::new(),
@@ -544,11 +690,11 @@ impl Sheet {
     fn rebuild_all_formula_dependents(&self) {
         self.cell_dependents.borrow_mut().clear();
         self.range_dependents.borrow_mut().clear();
-        for (addr, record) in &self.formula_cells {
+        for (addr, record) in self.formula_cells.iter() {
             let deps = record.deps.borrow().clone();
-            self.add_formula_deps(*addr, &deps);
+            self.add_formula_deps(addr, &deps);
             let range_deps = record.range_deps.borrow().clone();
-            self.add_formula_range_deps(*addr, &range_deps);
+            self.add_formula_range_deps(addr, &range_deps);
         }
     }
 
@@ -806,39 +952,36 @@ impl Sheet {
     /// (so cross-sheet formula deps still resolve correctly when called
     /// from `WorkbookEvalProvider`). Used as the building block for
     /// `SheetEvalProvider::for_each_range_cell` and the Workbook variant.
+    ///
+    /// Phase 2 Track F: visits O(cells_in_range) instead of
+    /// O(total non-empty). Both `cells` and `formula_cells` are
+    /// row-major BTreeMaps, so `range_iter` is a pair of BTreeMap
+    /// `range(min..=max)` calls — no filter sweep over the whole
+    /// sheet. At 1M scattered non-empty cells, a 50×27 viewport read
+    /// visits at most 50 rows × 27 cols, not 1M.
     pub(crate) fn for_each_sparse_cell_with(
         &self,
         range: CellRange,
         value_resolver: &dyn Fn(&Sheet, CellAddress) -> Value,
         f: &mut dyn FnMut(CellAddress, Value),
     ) {
-        let n = range.normalize();
-        for (addr, &id) in &self.cells {
-            if addr.row >= n.start.row
-                && addr.row <= n.end.row
-                && addr.col >= n.start.col
-                && addr.col <= n.end.col
-            {
-                if self.formula_cells.contains_key(addr) {
-                    continue;
-                }
-                let v = if self.store.has_atom(id) {
-                    self.store.get(id)
-                } else {
-                    Value::Null
-                };
-                f(*addr, v);
+        for (addr, &id) in self.cells.range_iter(range) {
+            // Skip primitives that have been upgraded to formulas — the
+            // formula pass below will emit the formula value at this addr.
+            // Address-equality check stays O(1) (BTreeMap point lookup).
+            if self.formula_cells.contains_key(&addr) {
+                continue;
             }
+            let v = if self.store.has_atom(id) {
+                self.store.get(id)
+            } else {
+                Value::Null
+            };
+            f(addr, v);
         }
-        for addr in self.formula_cells.keys() {
-            if addr.row >= n.start.row
-                && addr.row <= n.end.row
-                && addr.col >= n.start.col
-                && addr.col <= n.end.col
-            {
-                let v = value_resolver(self, *addr);
-                f(*addr, v);
-            }
+        for (addr, _record) in self.formula_cells.range_iter(range) {
+            let v = value_resolver(self, addr);
+            f(addr, v);
         }
     }
 
@@ -1112,15 +1255,24 @@ impl Sheet {
     /// brief Computing window when a formula write created a primitive slot
     /// that was then upgraded; the formula entry dominates, so we union the
     /// keys and skip duplicates.
+    ///
+    /// Both backing maps iterate row-major ascending (row, then col), so
+    /// the formula keys come out row-major first, followed by the
+    /// primitive-only keys row-major. Callers that need the union in
+    /// global row-major order (e.g. undo snapshot) must sort the result;
+    /// today's `non_empty_addrs` callers either don't care about order or
+    /// re-sort explicitly (verified in the `non_empty_addrs_*` tests),
+    /// so this two-pass walk preserves the prior HashMap-era contract
+    /// without changing observable behavior.
     pub fn for_each_non_empty(&self, mut f: impl FnMut(CellAddress)) {
-        for addr in self.formula_cells.keys() {
-            f(*addr);
+        for (addr, _) in self.formula_cells.iter() {
+            f(addr);
         }
-        for addr in self.cells.keys() {
-            if self.formula_cells.contains_key(addr) {
+        for (addr, _) in self.cells.iter() {
+            if self.formula_cells.contains_key(&addr) {
                 continue;
             }
-            f(*addr);
+            f(addr);
         }
     }
 
@@ -1350,7 +1502,7 @@ impl Sheet {
     }
 
     fn drop_cells_in(&mut self, pred: impl Fn(CellAddress) -> bool) {
-        let to_drop: Vec<CellAddress> = self.cells.keys().copied().filter(|a| pred(*a)).collect();
+        let to_drop: Vec<CellAddress> = self.cells.keys().filter(|a| pred(*a)).collect();
         for addr in to_drop {
             if let Some(prim) = self.cells.remove(&addr) {
                 if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
@@ -1375,16 +1527,18 @@ impl Sheet {
     /// Move every (still-present) cell entry to its new address per `f`.
     fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
         // Phase A: rebuild each map under new keys. We materialize Vecs first
-        // because mutating a HashMap while iterating its keys would panic.
-        let new_cells: HashMap<CellAddress, AtomId> = std::mem::take(&mut self.cells)
-            .into_iter()
-            .map(|(addr, id)| (f(addr), id))
-            .collect();
-        let new_formula_cells: HashMap<CellAddress, Rc<FormulaRecord>> =
-            std::mem::take(&mut self.formula_cells)
-                .into_iter()
-                .map(|(addr, id)| (f(addr), id))
-                .collect();
+        // because mutating a BTreeMap while iterating its keys would panic.
+        // `drain_into_vec` empties `self.cells` / `self.formula_cells` and
+        // hands back row-major (addr, value) pairs we reinsert under the
+        // shifted addresses.
+        let mut new_cells: RowMajorMap<AtomId> = RowMajorMap::new();
+        for (addr, id) in self.cells.drain_into_vec() {
+            new_cells.insert(f(addr), id);
+        }
+        let mut new_formula_cells: RowMajorMap<Rc<FormulaRecord>> = RowMajorMap::new();
+        for (addr, record) in self.formula_cells.drain_into_vec() {
+            new_formula_cells.insert(f(addr), record);
+        }
         let new_formula_exprs: HashMap<CellAddress, Rc<Expr>> =
             std::mem::take(&mut self.formula_exprs)
                 .into_iter()
