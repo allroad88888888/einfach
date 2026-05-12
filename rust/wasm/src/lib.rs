@@ -1,6 +1,6 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
-    Align, CellFormat, CellSubscription, NumberFormat, Sheet, Workbook,
+    Align, CellAddress, CellFormat, CellSubscription, NumberFormat, Sheet, Workbook,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -476,11 +476,40 @@ impl WasmSheet {
     }
 }
 
+/// Per-cell subscription bookkeeping for `WasmWorkbook`. We carry the
+/// (sheet_idx, addr) tuple alongside the underlying `CellSubscription`
+/// because Track I's cross-sheet dirty BFS will eventually fire JS callbacks
+/// by looking up `(sheet_idx, CellAddress)`. The `CellSubscription` itself
+/// is what the underlying `Sheet` returned from `subscribe_cell_boxed` and
+/// is what we hand back to `Sheet::unsubscribe_cell` on teardown.
+struct WorkbookCellSubscription {
+    #[allow(dead_code)] // read post-merge once Track I owns dirty fanout
+    sheet_idx: usize,
+    #[allow(dead_code)]
+    addr: CellAddress,
+    sub: CellSubscription,
+}
+
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
 /// evaluate formulas through workbook context, including cross-sheet refs.
 #[wasm_bindgen]
 pub struct WasmWorkbook {
     workbook: Workbook,
+    /// Workbook-level per-cell subscriptions. The map is keyed by an opaque
+    /// `u32` token handed back to JS. We keep the map on the workbook (not
+    /// the underlying sheet) so that Track I's cross-sheet dirty BFS — which
+    /// runs at workbook scope — can find the JS callbacks for any
+    /// `(sheet_idx, addr)` it dirties.
+    ///
+    /// Track K first-cut wiring: each entry is registered on the underlying
+    /// `Sheet` via `Sheet::subscribe_cell_boxed`. Same-sheet writes therefore
+    /// fire correctly today through the existing Sheet propagation path.
+    /// Cross-sheet writes do not fire yet — that becomes correct after
+    /// Track I merges `Workbook::set_cell` and the cross-sheet dependency
+    /// graph; the integrator will route fanout through this map at that
+    /// point.
+    subscriptions: HashMap<u32, WorkbookCellSubscription>,
+    next_token: u32,
 }
 
 #[wasm_bindgen]
@@ -490,6 +519,8 @@ impl WasmWorkbook {
         install_panic_hook();
         WasmWorkbook {
             workbook: Workbook::new(),
+            subscriptions: HashMap::new(),
+            next_token: 0,
         }
     }
 
@@ -618,6 +649,181 @@ impl WasmWorkbook {
         self.workbook
             .debug_formula_cache_state(sheet_idx as usize, addr)
             .to_string()
+    }
+
+    // === Phase 3 / Track K — workbook mutators ===
+    //
+    // These mirror `WasmSheet::set_*` / `clear_cell` / `set_formula` but
+    // take an explicit `sheet_idx`. They are the JS-facing entry points
+    // for Phase 3's "writes go through Workbook" architecture (see
+    // `rust/docs/PHASE3_PARALLEL.md` § Architectural Decision).
+    //
+    // First-cut wiring (this commit): each method routes through
+    // `Workbook::sheet_mut(sheet_idx).set_*(...)`. That keeps the JS API
+    // contract stable but only fires *same-sheet* subscribers. Cross-sheet
+    // subscribers do not fire yet — they become correct once Track I
+    // merges `Workbook::set_cell`/`set_formula`/`clear_cell` and the
+    // cross-sheet dep graph.
+    //
+    // Post-merge swap: `self.workbook.sheet_mut(idx).set_cell(...)`
+    //   → `self.workbook.set_cell(idx, addr, value)`
+    // and analogous for the other three. The signature on this side is
+    // already `&mut self`, takes `sheet_idx` and `addr`, so the swap is
+    // a one-line change per method. Track L's cross-sheet acceptance
+    // tests gate the swap.
+
+    /// Set a cell to a numeric value through the workbook.
+    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    pub fn set_cell_number(&mut self, sheet_idx: usize, addr: &str, value: f64) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
+            sheet.set_cell(addr, Value::Number(value));
+        }
+    }
+
+    /// Set a cell to a text value through the workbook.
+    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    pub fn set_cell_text(&mut self, sheet_idx: usize, addr: &str, value: &str) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
+            sheet.set_cell(addr, Value::Text(value.to_string()));
+        }
+    }
+
+    /// Set a cell to a boolean value through the workbook.
+    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    pub fn set_cell_boolean(&mut self, sheet_idx: usize, addr: &str, value: bool) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
+            sheet.set_cell(addr, Value::Boolean(value));
+        }
+    }
+
+    /// Clear a cell through the workbook.
+    /// TODO: switch to `Workbook::clear_cell` once Track I lands.
+    #[wasm_bindgen(js_name = "clearCellAt")]
+    pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str) {
+        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
+            sheet.clear_cell(addr);
+        }
+    }
+
+    /// Set a cell's formula through the workbook. Returns `true` if the
+    /// formula parsed and installed cleanly, `false` if parse failed
+    /// (cell becomes `#VALUE!`) or a cycle was detected (cell becomes
+    /// `#CYCLE!`).
+    ///
+    /// Note: the legacy `WasmWorkbook::set_formula(sheet_idx: u32, ...)`
+    /// already routes through `Workbook::set_formula`, which is the
+    /// Track I target. This `usize`-typed variant is the new Phase 3
+    /// canonical entry; both can coexist during the migration.
+    #[wasm_bindgen(js_name = "setFormulaAt")]
+    pub fn set_formula_at(&mut self, sheet_idx: usize, addr: &str, src: &str) -> bool {
+        self.workbook.set_formula(sheet_idx, addr, src)
+    }
+
+    /// Read a cell's display string through the workbook eval path.
+    /// Convenience wrapper around `get_display(u32, ...)` with `usize`
+    /// for the Phase 3 canonical API shape. The `&mut self` receiver
+    /// future-proofs against `Workbook::get_cell` requiring a mutable
+    /// borrow once cache promotion lands on the workbook eval provider —
+    /// today it is read-only, but flipping the underlying signature
+    /// must not break the JS API.
+    #[wasm_bindgen(js_name = "getCellDisplay")]
+    pub fn get_cell_display(&mut self, sheet_idx: usize, addr: &str) -> String {
+        let Some(name) = self.workbook.name(sheet_idx).map(str::to_string) else {
+            return String::new();
+        };
+        let val = self.workbook.get_cell(&name, addr);
+        value_to_display(&val)
+    }
+
+    /// Subscribe to a cell at `sheet_name!addr`. Returns an opaque
+    /// `u32` token; pass it back to `unsubscribe_cell` to cancel.
+    ///
+    /// First-cut wiring: the JS callback is registered on the underlying
+    /// `Sheet` via `Sheet::subscribe_cell_boxed`, so same-sheet writes
+    /// fire correctly today. The token + `(sheet_idx, addr)` is also
+    /// recorded on the workbook so that once Track I lands the
+    /// cross-sheet dirty BFS, that BFS can look up this map and fire
+    /// JS callbacks for cells that were dirtied via a write on a
+    /// different sheet.
+    pub fn subscribe_cell(
+        &mut self,
+        sheet_name: &str,
+        addr: &str,
+        cb: js_sys::Function,
+    ) -> u32 {
+        let Some(sheet_idx) = self.workbook.index_of(sheet_name) else {
+            // Unknown sheet — hand back a token that is never inserted,
+            // mirroring `unsubscribe_cell`'s idempotent posture. Caller
+            // can `unsubscribe_cell(token)` safely as a no-op.
+            let token = self.next_token;
+            self.next_token = self.next_token.wrapping_add(1);
+            return token;
+        };
+        let parsed_addr = match CellAddress::parse(addr) {
+            Some(a) => a,
+            None => {
+                let token = self.next_token;
+                self.next_token = self.next_token.wrapping_add(1);
+                return token;
+            }
+        };
+
+        let token = self.next_token;
+        self.next_token = self.next_token.wrapping_add(1);
+
+        let listener = JsCallbackListener { callback: cb };
+        let Some(sheet) = self.workbook.sheet_mut(sheet_idx) else {
+            return token;
+        };
+        let sub = sheet.subscribe_cell_boxed(addr, Box::new(listener));
+        self.subscriptions.insert(
+            token,
+            WorkbookCellSubscription {
+                sheet_idx,
+                addr: parsed_addr,
+                sub,
+            },
+        );
+        token
+    }
+
+    /// Cancel a subscription previously returned from `subscribe_cell`.
+    /// Idempotent: unknown / stale tokens are silently ignored.
+    pub fn unsubscribe_cell(&mut self, token: u32) {
+        if let Some(entry) = self.subscriptions.remove(&token) {
+            if let Some(sheet) = self.workbook.sheet_mut(entry.sheet_idx) {
+                sheet.unsubscribe_cell(entry.sub);
+            }
+        }
+    }
+
+    /// Number of cross-sheet dependent edges currently tracked on the
+    /// workbook. Track L's e2e gates fan-out correctness through this
+    /// probe.
+    ///
+    /// First-cut stub: returns `0`. Post-merge wiring (after Track I
+    /// lands `CrossSheetDeps` on `Workbook`):
+    /// `self.workbook.debug_cross_sheet_dependents_count() as u32`.
+    pub fn debug_cross_sheet_dependents_count(&self) -> u32 {
+        // TODO: delegate to `Workbook::debug_cross_sheet_dependents_count()`
+        // once Track I lands the cross-sheet dep graph.
+        0
+    }
+
+    // bulk_load: DEFERRED for Track K.
+    //
+    // The JS-side closure pattern is its own design problem: the Rust
+    // entry point would need to receive a `js_sys::Function` that itself
+    // takes a JS-side `WorkbookLoader` handle, and the loader handle's
+    // mutability must be reconciled with wasm-bindgen's `&mut self`
+    // borrow on the workbook. Until Track I lands the underlying
+    // `Workbook::bulk_load` AND a design for the JS loader handle is
+    // settled, we ship nothing here rather than half-ship a binding.
+}
+
+impl Default for WasmWorkbook {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
