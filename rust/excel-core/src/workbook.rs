@@ -5,7 +5,7 @@ use einfach_core::{Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::EvalProvider;
-use crate::formula::{parse_formula, Expr};
+use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 use crate::sheet::Sheet;
 
@@ -263,7 +263,21 @@ fn collect_workbook_refs(
 ) {
     match expr {
         Expr::CellRef(addr) => out.push((current_idx, *addr)),
-        Expr::Range { start, end } => {
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            // Unbounded ranges aren't expanded — the cross-sheet cycle BFS
+            // gates on `formula_exprs` membership per-sheet, and an
+            // unbounded enumeration here would push the entire coordinate
+            // space (u32::MAX entries). Cross-sheet cycles involving an
+            // unbounded range stay detectable through the in-sheet
+            // range_dependents path, which is consulted at dirty
+            // propagation time.
+            if !matches!(unbounded, RangeBounds::None) {
+                return;
+            }
             let min_row = start.row.min(end.row);
             let max_row = start.row.max(end.row);
             let min_col = start.col.min(end.col);

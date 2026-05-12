@@ -1,5 +1,5 @@
 use crate::cell::CellAddress;
-use crate::formula::{BinOperator, Expr};
+use crate::formula::{BinOperator, Expr, RangeBounds};
 
 /// What to do with a CellRef whose target was deleted by a structural edit.
 ///
@@ -19,7 +19,28 @@ fn is_invalid(addr: CellAddress) -> bool {
 pub fn contains_invalid_ref(expr: &Expr) -> bool {
     match expr {
         Expr::CellRef(addr) => is_invalid(*addr),
-        Expr::Range { start, end } => is_invalid(*start) || is_invalid(*end),
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            // Skip the unbounded axis when checking for #REF! sentinels —
+            // `u32::MAX` on a whole-col / whole-row corner is the
+            // intentional sentinel, NOT a deleted ref. We still check
+            // the bounded axis: if a user wrote `A:A` and then deleted
+            // column A, the column corner becomes invalid.
+            let row_invalid = if unbounded.rows_unbounded() {
+                false
+            } else {
+                start.row == REF_INVALID_ROW || end.row == REF_INVALID_ROW
+            };
+            let col_invalid = if unbounded.cols_unbounded() {
+                false
+            } else {
+                start.col == REF_INVALID_COL || end.col == REF_INVALID_COL
+            };
+            row_invalid || col_invalid
+        }
         Expr::SheetRef { addr, .. } => is_invalid(*addr),
         Expr::Negate(inner) => contains_invalid_ref(inner),
         Expr::BinOp { left, right, .. } => {
@@ -78,14 +99,29 @@ pub fn shift_addr_col_delete(addr: CellAddress, at: u32, count: u32) -> CellAddr
 
 /// Walk an AST applying `f` to every CellRef / Range corner address.
 /// Returns a new AST. Used by row/col insert/delete to retarget formulas.
+///
+/// Whole-column / whole-row ranges are INVARIANT on their unbounded axis:
+/// inserting a row above column A's `A:A` reference doesn't move the
+/// column corner. We apply `f` to a synthesized address that keeps the
+/// unbounded axis at its sentinel, then restore the sentinel after the
+/// shift so any per-axis mutation in `f` (e.g. a `col_insert` shift) is
+/// still seen by the bounded axis.
 pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
     match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(f(*addr)),
-        Expr::Range { start, end } => Expr::Range {
-            start: f(*start),
-            end: f(*end),
-        },
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            let (new_start, new_end) = shift_range_corners(*start, *end, *unbounded, &|a| f(a));
+            Expr::Range {
+                start: new_start,
+                end: new_end,
+                unbounded: *unbounded,
+            }
+        }
         // Cross-sheet refs aren't shifted by within-sheet structural edits.
         Expr::SheetRef { sheet, addr } => Expr::SheetRef {
             sheet: sheet.clone(),
@@ -104,19 +140,89 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
     }
 }
 
+/// Apply `f` only to the bounded axis of a Range corner, leaving the
+/// unbounded axis pinned to its sentinel (`0` on start, `u32::MAX` on
+/// end). Used by `map_addrs` so a row-insert never tries to shift the
+/// sentinel into `u32::MAX + count` (which would overflow).
+fn shift_range_corners(
+    start: CellAddress,
+    end: CellAddress,
+    unbounded: RangeBounds,
+    f: &dyn Fn(CellAddress) -> CellAddress,
+) -> (CellAddress, CellAddress) {
+    if matches!(unbounded, RangeBounds::None) {
+        return (f(start), f(end));
+    }
+    // Build a synthetic "shiftable" CellAddress where the unbounded axis
+    // is replaced by a benign value (row 0 / col 0), apply f, then put
+    // back the sentinel on the unbounded axis.
+    let rows_un = unbounded.rows_unbounded();
+    let cols_un = unbounded.cols_unbounded();
+    let synth_start = CellAddress::new(
+        if rows_un { 0 } else { start.row },
+        if cols_un { 0 } else { start.col },
+    );
+    let synth_end = CellAddress::new(
+        if rows_un { 0 } else { end.row },
+        if cols_un { 0 } else { end.col },
+    );
+    let shifted_start = f(synth_start);
+    let shifted_end = f(synth_end);
+    // If the bounded axis got shifted to the #REF! sentinel, leave it
+    // there (eval will produce #REF!). Otherwise pin the unbounded axis
+    // back to its sentinel.
+    let new_start = CellAddress::new(
+        if rows_un { 0 } else { shifted_start.row },
+        if cols_un { 0 } else { shifted_start.col },
+    );
+    let new_end = CellAddress::new(
+        if rows_un { u32::MAX } else { shifted_end.row },
+        if cols_un { u32::MAX } else { shifted_end.col },
+    );
+    // Propagate #REF! invalidity from the bounded axis: if the shifted
+    // bounded corner came back as REF_INVALID_* (column deletion ate the
+    // referenced column), surface that sentinel on the whole corner so
+    // `contains_invalid_ref` can detect it on the bounded axis.
+    let new_start = if !rows_un && shifted_start.row == REF_INVALID_ROW {
+        CellAddress::new(REF_INVALID_ROW, new_start.col)
+    } else if !cols_un && shifted_start.col == REF_INVALID_COL {
+        CellAddress::new(new_start.row, REF_INVALID_COL)
+    } else {
+        new_start
+    };
+    let new_end = if !rows_un && shifted_end.row == REF_INVALID_ROW {
+        CellAddress::new(REF_INVALID_ROW, new_end.col)
+    } else if !cols_un && shifted_end.col == REF_INVALID_COL {
+        CellAddress::new(new_end.row, REF_INVALID_COL)
+    } else {
+        new_end
+    };
+    (new_start, new_end)
+}
+
 /// Shift every cell reference in an AST by the given (drow, dcol) delta.
 /// Returns Err when a shift would push a reference out of bounds (negative).
 /// Used by copy-paste so `=A1` copied from B1 to B2 becomes `=A2` (drow=1).
 ///
-/// Range references shift both corners by the same delta.
+/// Range references shift both corners by the same delta. For whole-col /
+/// whole-row ranges, only the bounded axis shifts (an `A:A` copied right
+/// becomes `B:B`; shifted down it stays `A:A`).
 pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
     Ok(match expr {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(shift_addr(*addr, drow, dcol)?),
-        Expr::Range { start, end } => Expr::Range {
-            start: shift_addr(*start, drow, dcol)?,
-            end: shift_addr(*end, drow, dcol)?,
-        },
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            let (s, e) = shift_range_corners_delta(*start, *end, *unbounded, drow, dcol)?;
+            Expr::Range {
+                start: s,
+                end: e,
+                unbounded: *unbounded,
+            }
+        }
         // Cross-sheet refs aren't shifted on copy/paste — they point to a
         // fixed location on a different sheet regardless of paste target.
         Expr::SheetRef { sheet, addr } => Expr::SheetRef {
@@ -148,12 +254,86 @@ fn shift_addr(addr: CellAddress, drow: i32, dcol: i32) -> Result<CellAddress, ()
     Ok(CellAddress::new(row as u32, col as u32))
 }
 
+/// Delta-shift the two corners of a Range, honoring the unbounded axes
+/// (those stay pinned at sentinel values; no overflow on `u32::MAX +
+/// drow`).
+fn shift_range_corners_delta(
+    start: CellAddress,
+    end: CellAddress,
+    unbounded: RangeBounds,
+    drow: i32,
+    dcol: i32,
+) -> Result<(CellAddress, CellAddress), ()> {
+    if matches!(unbounded, RangeBounds::None) {
+        return Ok((shift_addr(start, drow, dcol)?, shift_addr(end, drow, dcol)?));
+    }
+    let rows_un = unbounded.rows_unbounded();
+    let cols_un = unbounded.cols_unbounded();
+    // Only shift the bounded axis.
+    let new_start_row = if rows_un {
+        0
+    } else {
+        let r = (start.row as i32) + drow;
+        if r < 0 {
+            return Err(());
+        }
+        r as u32
+    };
+    let new_end_row = if rows_un {
+        u32::MAX
+    } else {
+        let r = (end.row as i32) + drow;
+        if r < 0 {
+            return Err(());
+        }
+        r as u32
+    };
+    let new_start_col = if cols_un {
+        0
+    } else {
+        let c = (start.col as i32) + dcol;
+        if c < 0 {
+            return Err(());
+        }
+        c as u32
+    };
+    let new_end_col = if cols_un {
+        u32::MAX
+    } else {
+        let c = (end.col as i32) + dcol;
+        if c < 0 {
+            return Err(());
+        }
+        c as u32
+    };
+    Ok((
+        CellAddress::new(new_start_row, new_start_col),
+        CellAddress::new(new_end_row, new_end_col),
+    ))
+}
+
 /// Render an AST back to a formula string (for paste-and-store flows that
 /// need text representation). Round-trip: parse(render(parse(s))) == parse(s).
 pub fn render_formula(expr: &Expr) -> String {
     let mut out = String::from("=");
     render_into(expr, &mut out);
     out
+}
+
+/// Render a 0-based column index as letters ("A", "B", ..., "AA", ...).
+/// Mirrors the private helper in `cell.rs`; duplicated here so render_into
+/// doesn't have to instantiate a CellAddress + parse its repr just to drop
+/// the row part.
+fn col_only(mut col: u32) -> String {
+    let mut result = String::new();
+    loop {
+        result.push((b'A' + (col % 26) as u8) as char);
+        if col < 26 {
+            break;
+        }
+        col = col / 26 - 1;
+    }
+    result.chars().rev().collect()
 }
 
 fn render_into(expr: &Expr, out: &mut String) {
@@ -178,13 +358,57 @@ fn render_into(expr: &Expr, out: &mut String) {
                 out.push_str(&addr.to_string_repr());
             }
         }
-        Expr::Range { start, end } => {
-            if is_invalid(*start) || is_invalid(*end) {
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            // For whole-col / whole-row ranges, only the bounded axis can
+            // carry a #REF! sentinel. is_invalid() checks BOTH axes, so
+            // we'd false-positive on the u32::MAX sentinel. Check the
+            // bounded axes explicitly.
+            let bounded_invalid = match unbounded {
+                RangeBounds::None => is_invalid(*start) || is_invalid(*end),
+                RangeBounds::Rows => {
+                    start.col == REF_INVALID_COL || end.col == REF_INVALID_COL
+                }
+                RangeBounds::Cols => {
+                    start.row == REF_INVALID_ROW || end.row == REF_INVALID_ROW
+                }
+                RangeBounds::Both => false,
+            };
+            if bounded_invalid {
                 out.push_str("#REF!");
             } else {
-                out.push_str(&start.to_string_repr());
-                out.push(':');
-                out.push_str(&end.to_string_repr());
+                match unbounded {
+                    RangeBounds::None => {
+                        out.push_str(&start.to_string_repr());
+                        out.push(':');
+                        out.push_str(&end.to_string_repr());
+                    }
+                    RangeBounds::Rows => {
+                        // Whole-column range: `A:A` or `A:C`. Render just the
+                        // column letters (round-trip with the parser).
+                        out.push_str(&col_only(start.col));
+                        out.push(':');
+                        out.push_str(&col_only(end.col));
+                    }
+                    RangeBounds::Cols => {
+                        // Whole-row range: `1:1` or `1:3`. Render 1-based row.
+                        out.push_str(&format!("{}", start.row + 1));
+                        out.push(':');
+                        out.push_str(&format!("{}", end.row + 1));
+                    }
+                    RangeBounds::Both => {
+                        // No surface syntax for "everything" yet; render as
+                        // the explicit nominal corners. Round-trip is lossy
+                        // here but no current code path produces RangeBounds::
+                        // Both, so this is just future-proofing.
+                        out.push_str(&start.to_string_repr());
+                        out.push(':');
+                        out.push_str(&end.to_string_repr());
+                    }
+                }
             }
         }
         Expr::SheetRef { sheet, addr } => {

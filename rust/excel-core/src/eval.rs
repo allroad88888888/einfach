@@ -115,7 +115,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
 
         Expr::FuncCall { name, args } => eval_func(name, args, provider),
 
-        Expr::Range { start, end } => {
+        Expr::Range { start, end, .. } => {
             // Ranges should be handled by function evaluators, not standalone
             // If we get here, collect all values into... just return an error
             let _ = (start, end);
@@ -372,7 +372,7 @@ fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)> {
     match arg {
-        Expr::Range { start, end } => Some((start, end)),
+        Expr::Range { start, end, .. } => Some((start, end)),
         _ => None,
     }
 }
@@ -389,7 +389,7 @@ fn for_each_arg_value(
     f: &mut dyn FnMut(Option<CellAddress>, Value),
 ) {
     match arg {
-        Expr::Range { start, end } => {
+        Expr::Range { start, end, .. } => {
             stream_range(start, end, provider, &mut |addr, v| f(Some(addr), v));
         }
         _ => f(None, eval_expr_with_provider(arg, provider)),
@@ -794,11 +794,11 @@ fn eval_func(
                 // the legacy tests here matched index-equality only when
                 // both were ranges).
                 let range = match &args[0] {
-                    Expr::Range { start, end } => Some((*start, *end)),
+                    Expr::Range { start, end, .. } => Some((*start, *end)),
                     _ => None,
                 };
                 let sum_range = match &args[2] {
-                    Expr::Range { start, end } => Some((*start, *end)),
+                    Expr::Range { start, end, .. } => Some((*start, *end)),
                     _ => None,
                 };
                 match (range, sum_range) {

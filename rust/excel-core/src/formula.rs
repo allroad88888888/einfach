@@ -1,5 +1,48 @@
 use crate::cell::CellAddress;
 
+/// Which axes of an `Expr::Range` are unbounded (Excel-style `A:A`, `1:1`).
+///
+/// Phase 2 Track G: whole-column refs like `A:A` and whole-row refs like
+/// `1:1` need to evaluate without materializing every cell in the
+/// nominal coordinate space. We keep the AST shape as
+/// `Range { start: CellAddress, end: CellAddress }` (so all dense paths
+/// stay unchanged) and carry the unboundedness as a discriminator:
+///
+/// - `None` — fully bounded range, e.g. `A1:B3`. `start` / `end` are the
+///   user-supplied corners.
+/// - `Rows` — whole-column range, e.g. `A:A` or `A:C`. `start.row` and
+///   `end.row` are sentinels (`0` and `u32::MAX`); `start.col` / `end.col`
+///   carry the user-supplied column corners.
+/// - `Cols` — whole-row range, e.g. `1:1` or `1:3`. `start.col` and
+///   `end.col` are sentinels (`0` and `u32::MAX`); `start.row` / `end.row`
+///   carry the user-supplied row corners.
+/// - `Both` — whole-sheet range. Not produced by the parser yet but
+///   reserved so a future `A:XFD` shorthand has a place to land.
+///
+/// `shift::map_addrs` and `shift::shift_refs` are invariant on the
+/// unbounded axis (inserting a row inside column A doesn't move the
+/// `A:A` corners); `render_formula` round-trips the original syntax.
+/// Dependency registration goes through `collect_range_refs`, which
+/// emits a canonical `CellRange` covering the entire sheet on the
+/// unbounded axis — Track E's `RangeDependentIndex` then routes it
+/// into `wide_ranges` (any range > 4096 rows or cols is wide).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RangeBounds {
+    None,
+    Rows,
+    Cols,
+    Both,
+}
+
+impl RangeBounds {
+    pub fn rows_unbounded(self) -> bool {
+        matches!(self, RangeBounds::Rows | RangeBounds::Both)
+    }
+    pub fn cols_unbounded(self) -> bool {
+        matches!(self, RangeBounds::Cols | RangeBounds::Both)
+    }
+}
+
 /// AST node for a formula expression.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
@@ -21,10 +64,14 @@ pub enum Expr {
     Negate(Box<Expr>),
     /// Function call: name(arg1, arg2, ...)
     FuncCall { name: String, args: Vec<Expr> },
-    /// Cell range: A1:B3 (for function args)
+    /// Cell range: `A1:B3` (bounded), `A:A` / `A:C` (whole columns),
+    /// `1:1` / `1:3` (whole rows). For unbounded axes, `start` / `end`
+    /// carry sentinel coordinates (`0` and `u32::MAX`) on that axis —
+    /// see [`RangeBounds`] for details.
     Range {
         start: CellAddress,
         end: CellAddress,
+        unbounded: RangeBounds,
     },
     /// Cross-sheet reference: `Sheet1!A1`. Resolution requires a Workbook
     /// scope at eval time; standalone Sheet eval treats it as #REF!.
@@ -286,10 +333,92 @@ impl Parser {
                 Some(expr)
             }
             '"' => self.parse_string(),
-            c if c.is_ascii_digit() || c == '.' => self.parse_number(),
+            c if c.is_ascii_digit() || c == '.' => {
+                // Disambiguate `<digits>:<digits>` (whole-row range) from a
+                // plain number. We scan a digit run; if the next non-digit
+                // char is ':' followed by another digit run, treat as a
+                // whole-row range. Otherwise fall back to parse_number,
+                // which handles fractional / scientific via '.'.
+                if c.is_ascii_digit() {
+                    if let Some(range) = self.try_parse_whole_row_range() {
+                        return Some(range);
+                    }
+                }
+                self.parse_number()
+            }
             c if c.is_ascii_alphabetic() => self.parse_identifier(),
             _ => None,
         }
+    }
+
+    /// Speculative parse for `<digits>:<digits>` whole-row syntax. On
+    /// success consumes both digit runs and returns the range. On
+    /// failure rolls back to the original position so `parse_number`
+    /// can take over.
+    fn try_parse_whole_row_range(&mut self) -> Option<Expr> {
+        let save = self.pos;
+        // Scan first digit run.
+        let s1 = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == s1 {
+            return None;
+        }
+        let first: String = self.chars[s1..self.pos].iter().collect();
+        // Must see ':' immediately (no whitespace — `1 :1` is intentionally
+        // not the Excel whole-row syntax; this keeps decimals like
+        // `1.5` from accidentally matching when a future change moves
+        // the dispatch).
+        if self.peek() != Some(':') {
+            self.pos = save;
+            return None;
+        }
+        let colon_at = self.pos;
+        self.advance();
+        // Scan second digit run.
+        let s2 = self.pos;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        if self.pos == s2 {
+            // Not `digit:digit` — could be `1:A1` or similar nonsense.
+            // Roll back. Note: the parser doesn't currently accept
+            // anything else starting with `<digits>:`, so this is a
+            // simple failure mode (returns None and parse fails).
+            self.pos = save;
+            return None;
+        }
+        let second: String = self.chars[s2..self.pos].iter().collect();
+        // After the second digit run we must NOT be followed by letters
+        // — that would mean the user wrote `1:A1`, which isn't a valid
+        // construct in either bounded or unbounded range syntax.
+        if self.peek().map(|c| c.is_ascii_alphabetic()).unwrap_or(false) {
+            self.pos = save;
+            return None;
+        }
+
+        let start_row: u32 = first.parse().ok()?;
+        let end_row: u32 = second.parse().ok()?;
+        if start_row == 0 || end_row == 0 {
+            // Excel rows are 1-based; reject `0:0`.
+            self.pos = save;
+            return None;
+        }
+        let _ = colon_at;
+        Some(Expr::Range {
+            start: CellAddress::new(start_row - 1, 0),
+            end: CellAddress::new(end_row - 1, u32::MAX),
+            unbounded: RangeBounds::Cols,
+        })
     }
 
     fn parse_number(&mut self) -> Option<Expr> {
@@ -397,9 +526,49 @@ impl Parser {
                 return Some(Expr::Range {
                     start: addr,
                     end: end_addr,
+                    unbounded: RangeBounds::None,
                 });
             }
             return Some(Expr::CellRef(addr));
+        }
+
+        // Whole-column range: `A:A` / `A:C`. The identifier is all letters
+        // and is followed by ':' + another all-letters identifier. The
+        // column part of `CellAddress::parse("A1")` is what we want, so
+        // we synthesize a `<col>1` string to reuse the parser.
+        if ident.chars().all(|c| c.is_ascii_alphabetic()) && self.peek() == Some(':') {
+            let save = self.pos;
+            self.advance(); // consume ':'
+            self.skip_whitespace();
+            let end_start = self.pos;
+            while let Some(c) = self.peek() {
+                if c.is_ascii_alphabetic() {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+            let end_letters: String = self.chars[end_start..self.pos].iter().collect();
+            // The right side must be ALL letters AND not be followed by a
+            // digit (which would make it a cell address like `B3`). If
+            // either condition fails, roll back so the identifier-as-
+            // cell-address path can try again — though `CellAddress::
+            // parse(letters_only)` already returned None above, so the
+            // identifier branch will fall through to `None` like before.
+            if !end_letters.is_empty()
+                && self.peek().map(|c| !c.is_ascii_digit()).unwrap_or(true)
+            {
+                let start_col = CellAddress::parse(&format!("{}1", ident))?.col;
+                let end_col = CellAddress::parse(&format!("{}1", end_letters))?.col;
+                return Some(Expr::Range {
+                    start: CellAddress::new(0, start_col),
+                    end: CellAddress::new(u32::MAX, end_col),
+                    unbounded: RangeBounds::Rows,
+                });
+            }
+            // Roll back — letters:digits isn't valid here (that's the
+            // already-handled `A1:B2` path).
+            self.pos = save;
         }
 
         None // unknown identifier
@@ -575,9 +744,94 @@ mod tests {
                 args: vec![Expr::Range {
                     start: CellAddress::new(0, 0),
                     end: CellAddress::new(2, 1),
+                    unbounded: RangeBounds::None,
                 }],
             }
         );
+    }
+
+    #[test]
+    fn parse_whole_col_range() {
+        // `A:A` — start row sentinel 0, end row sentinel u32::MAX,
+        // both cols pointing at column A (col index 0).
+        let result = parse_formula("=SUM(A:A)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(u32::MAX, 0),
+                    unbounded: RangeBounds::Rows,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_whole_col_range_multi_col() {
+        // `A:C` — three columns wide, every row.
+        let result = parse_formula("=SUM(A:C)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(u32::MAX, 2),
+                    unbounded: RangeBounds::Rows,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_whole_row_range() {
+        // `1:1` — row 1 (0-based row 0), every column.
+        let result = parse_formula("=SUM(1:1)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(0, u32::MAX),
+                    unbounded: RangeBounds::Cols,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_whole_row_range_multi_row() {
+        // `1:3` — rows 1 through 3, every column.
+        let result = parse_formula("=SUM(1:3)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(2, u32::MAX),
+                    unbounded: RangeBounds::Cols,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_whole_col_range_bare_expr() {
+        // `=A:A` (no wrapper function) is valid range syntax. The
+        // standalone Range expression evaluates to InvalidValue at the
+        // top level (per eval_expr_with_provider), but it must parse.
+        let result = parse_formula("=A:A").unwrap();
+        assert!(matches!(
+            result,
+            Expr::Range {
+                unbounded: RangeBounds::Rows,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueErro
 use crate::cell::CellAddress;
 use crate::eval::{eval_expr_with_provider, EvalProvider};
 use crate::format::{apply_rules, CellFormat, ConditionalRule};
-use crate::formula::{parse_formula, Expr};
+use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 
 /// Row-major sparse map over `(row, col) → V`. Wraps a
@@ -1946,9 +1946,16 @@ fn collect_range_refs(expr: &Expr) -> HashSet<CellRange> {
 
 fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
     match expr {
-        Expr::Range { start, end } => {
+        Expr::Range { start, end, .. } => {
             // Normalize so transposed corners hash to the same entry —
             // a `SUM(A1:B2)` and `SUM(B2:A1)` share one dep entry.
+            //
+            // For whole-col / whole-row ranges the start/end already carry
+            // the sentinel coords (0 and u32::MAX) on the unbounded axis,
+            // so the resulting CellRange spans the entire sheet on that
+            // axis. `RangeDependentIndex::is_wide` flags any range > 4096
+            // rows or cols as wide, which routes whole-col / whole-row
+            // automatically into `wide_ranges` — Track E's contract.
             out.insert(CellRange::new(*start, *end).normalize());
         }
         Expr::BinOp { left, right, .. } => {
@@ -1978,10 +1985,27 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
 /// Walk the AST and append every referenced cell address into `out`.
 /// Used by static cycle detection (B.2). Free function so it can run
 /// without borrowing `&self.formula_exprs`.
+///
+/// Whole-column / whole-row ranges (`A:A`, `1:1`) are NOT expanded into
+/// individual cells here — that would push the entire coordinate space
+/// (`u32::MAX` rows or cols) into the dep vec. Track G's contract: the
+/// unbounded range is tracked via `range_deps` only; the BFS at the
+/// call site (cycle detection, dirty propagation) consults that via the
+/// range_dependents index instead of the point-cell index.
 fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
     match expr {
         Expr::CellRef(addr) => out.push(*addr),
-        Expr::Range { start, end } => {
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            // Skip expansion for unbounded ranges — the row/col bound would
+            // be u32::MAX. Range deps are still tracked through
+            // `collect_range_refs` → `RangeDependentIndex`.
+            if !matches!(unbounded, RangeBounds::None) {
+                return;
+            }
             let min_row = start.row.min(end.row);
             let max_row = start.row.max(end.row);
             let min_col = start.col.min(end.col);
@@ -2024,13 +2048,21 @@ fn collect_formula_refs_into(
                 out.push(*addr);
             }
         }
-        Expr::Range { start, end } => {
+        Expr::Range { start, end, .. } => {
             let min_row = start.row.min(end.row);
             let max_row = start.row.max(end.row);
             let min_col = start.col.min(end.col);
             let max_col = start.col.max(end.col);
-            let cells_in_range = (max_row.saturating_sub(min_row) as usize + 1)
-                * (max_col.saturating_sub(min_col) as usize + 1);
+            // For unbounded ranges (`A:A`, `1:1`) one of the dims is u32::MAX;
+            // `cells_in_range` would overflow if computed as a product. The
+            // existing branch already guards via `>` comparison, so we use a
+            // saturating product and let the "scan formulas" branch take
+            // over when the range is large.
+            let cells_in_range = (max_row.saturating_sub(min_row) as usize)
+                .saturating_add(1)
+                .saturating_mul(
+                    (max_col.saturating_sub(min_col) as usize).saturating_add(1),
+                );
             // For ranges larger than the formula table, scan formulas and
             // filter; otherwise iterate cells. Avoids `SUM(A:A)` walking
             // a million empty addresses.
@@ -2081,9 +2113,11 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
         Expr::Negate(inner) => expr_has_sheet_ref(inner),
         Expr::FuncCall { args, .. } => args.iter().any(expr_has_sheet_ref),
-        Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
-            false
-        }
+        Expr::CellRef(_)
+        | Expr::Range { .. }
+        | Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_) => false,
     }
 }
 
