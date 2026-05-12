@@ -350,20 +350,14 @@ fn bench_cross_sheet_dirty_propagation_10k(c: &mut Criterion) {
                 }
                 wb
             },
-            // Timed: a single cross-sheet primitive write. Track I's
-            // BFS must dirty exactly one cross-sheet dependent
-            // (`Sheet1!B5000`) and fire its subscriber bucket. Pre-
-            // Track-I this still executes — `sheet_mut(data_idx)
-            // .set_cell` is just a single-sheet primitive write that
-            // does NOT propagate, so the bench compiles AND runs but
-            // doesn't have the cross-sheet propagation work to measure.
-            // After Track I lands, swap the body for
-            // `wb.set_cell(data_idx, "A5000", Value::Number(42.0))`.
+            // Timed: a single cross-sheet primitive write via
+            // `Workbook::set_cell`. Track I's BFS dirties exactly one
+            // cross-sheet dependent (`Sheet1!B5000`) and fires its
+            // subscriber bucket — that's the propagation work this
+            // bench measures.
             |mut wb| {
                 let data_idx = wb.index_of("Data").unwrap();
-                wb.sheet_mut(data_idx)
-                    .unwrap()
-                    .set_cell("A5000", Value::Number(42.0));
+                wb.set_cell(data_idx, "A5000", Value::Number(42.0));
                 black_box(&wb);
             },
             criterion::BatchSize::PerIteration,

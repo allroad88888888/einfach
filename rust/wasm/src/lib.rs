@@ -672,37 +672,31 @@ impl WasmWorkbook {
     // a one-line change per method. Track L's cross-sheet acceptance
     // tests gate the swap.
 
-    /// Set a cell to a numeric value through the workbook.
-    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    /// Set a cell to a numeric value through the workbook. Routes
+    /// through `Workbook::set_cell` so cross-sheet dependents dirty
+    /// + fire their subscribers via the workbook's BFS.
     pub fn set_cell_number(&mut self, sheet_idx: usize, addr: &str, value: f64) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
-            sheet.set_cell(addr, Value::Number(value));
-        }
+        self.workbook
+            .set_cell(sheet_idx, addr, Value::Number(value));
     }
 
-    /// Set a cell to a text value through the workbook.
-    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    /// Set a cell to a text value through the workbook. Cross-sheet aware.
     pub fn set_cell_text(&mut self, sheet_idx: usize, addr: &str, value: &str) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
-            sheet.set_cell(addr, Value::Text(value.to_string()));
-        }
+        self.workbook
+            .set_cell(sheet_idx, addr, Value::Text(value.to_string()));
     }
 
-    /// Set a cell to a boolean value through the workbook.
-    /// TODO: switch to `Workbook::set_cell` once Track I lands.
+    /// Set a cell to a boolean value through the workbook. Cross-sheet aware.
     pub fn set_cell_boolean(&mut self, sheet_idx: usize, addr: &str, value: bool) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
-            sheet.set_cell(addr, Value::Boolean(value));
-        }
+        self.workbook
+            .set_cell(sheet_idx, addr, Value::Boolean(value));
     }
 
-    /// Clear a cell through the workbook.
-    /// TODO: switch to `Workbook::clear_cell` once Track I lands.
+    /// Clear a cell through the workbook. Cross-sheet aware — a cleared
+    /// upstream cell still propagates dirty to its dependents.
     #[wasm_bindgen(js_name = "clearCellAt")]
     pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx) {
-            sheet.clear_cell(addr);
-        }
+        self.workbook.clear_cell(sheet_idx, addr);
     }
 
     /// Set a cell's formula through the workbook. Returns `true` if the
@@ -801,13 +795,10 @@ impl WasmWorkbook {
     /// workbook. Track L's e2e gates fan-out correctness through this
     /// probe.
     ///
-    /// First-cut stub: returns `0`. Post-merge wiring (after Track I
-    /// lands `CrossSheetDeps` on `Workbook`):
-    /// `self.workbook.debug_cross_sheet_dependents_count() as u32`.
+    /// Delegates to `Workbook::debug_cross_sheet_reverse_edge_count` —
+    /// counts entries in the workbook's cross-sheet reverse dep index.
     pub fn debug_cross_sheet_dependents_count(&self) -> u32 {
-        // TODO: delegate to `Workbook::debug_cross_sheet_dependents_count()`
-        // once Track I lands the cross-sheet dep graph.
-        0
+        self.workbook.debug_cross_sheet_reverse_edge_count() as u32
     }
 
     // bulk_load: DEFERRED for Track K.

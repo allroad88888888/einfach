@@ -10,20 +10,14 @@
 //!   - Cross-sheet range dep survives sparse eval
 //!     (`cross_sheet_range_dirty`).
 //!
-//! All three are `#[ignore = "phase-3 — un-ignore after Track I merge"]`'d
-//! at landing. Track I (workbook.rs: `CrossSheetDeps`, `set_cell`,
-//! `clear_cell`, plus dirty-propagation BFS that fires cross-sheet
-//! subscribers) is the structural change these tests turn green.
+//! Track I merged: `Workbook::set_cell`, `set_formula`, `clear_cell`,
+//! and the cross-sheet dirty-propagation BFS that fires subscribers
+//! are in place. Tests #1 and #2 turn green directly.
 //!
-//! Removal protocol: once Track I merges on
-//! `claude/rust-core-state-plan-Auzcj` (the inherent methods
-//! `Workbook::set_cell`/`clear_cell` become available; `set_formula`
-//! already exists), delete the `#[ignore = ...]` attributes on each test
-//! below AND delete the `WorkbookMutatorStubs` extension trait at the
-//! bottom of this file. Rust's inherent-before-trait method resolution
-//! silently shadows the stubs while they coexist, so the file compiles
-//! against the current branch and turns green automatically once the
-//! real methods land.
+//! Test #3 (`cross_sheet_range_dirty`) stays `#[ignore]`'d pending a
+//! parser-side follow-up: the formula parser doesn't yet accept
+//! `Sheet2!A1:A100`. Track I's `CrossSheetRef::Range` arm is wired
+//! and ready to consume the AST node once parsing lands.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -46,7 +40,6 @@ use einfach_excel_core::Workbook;
 /// across sheet boundaries (that's by design; the workbook tests
 /// migrate first).
 #[test]
-#[ignore = "phase-3 — un-ignore after Track I merge"]
 fn write_propagates_to_cross_sheet_subscriber() {
     let mut wb = Workbook::new();
     wb.add_sheet("Data");
@@ -66,12 +59,7 @@ fn write_propagates_to_cross_sheet_subscriber() {
     // dep registration that Track I's `CrossSheetDeps` rides on top of.
     wb.set_formula(0, "B1", "=Data!A1*2");
 
-    // Cross-sheet write — Track I's new inherent method. Before Track I
-    // lands, the `WorkbookMutatorStubs` trait stub below provides a
-    // panicking `set_cell` so this file still compiles; the `#[ignore]`
-    // keeps the test from running. After Track I lands and we un-ignore,
-    // the inherent method shadows the stub and the assertions become
-    // meaningful.
+    // Cross-sheet write — Track I's inherent `Workbook::set_cell` method.
     wb.set_cell(1, "A1", Value::Number(5.0));
 
     // Phase 3 contract: the cross-sheet dependent's subscriber must
@@ -110,7 +98,6 @@ fn write_propagates_to_cross_sheet_subscriber() {
 ///      Sheet2!B1), so the combined eval counter for those two sheets
 ///      bumps by 2 — not by the full workbook formula count.
 #[test]
-#[ignore = "phase-3 — un-ignore after Track I merge"]
 fn cross_sheet_chain_no_eager_eval() {
     let mut wb = Workbook::new();
     let s2 = wb.add_sheet("Sheet2");
@@ -216,8 +203,18 @@ fn cross_sheet_chain_no_eager_eval() {
 /// reach the workbook's cross-sheet dependents index — Sheet2's local
 /// range_dependents knows about the formula but has no way to notify
 /// Sheet1.
+///
+/// **DEFERRED**: this test is `#[ignore]`'d because the formula parser
+/// does not yet accept `Sheet2!A1:A100` (cross-sheet range syntax). The
+/// parser today supports `Sheet2!A1` (cross-sheet cell), `A1:A100`
+/// (in-sheet range), and `A:A` (whole-col), but not the cross-sheet
+/// range combination. Track I's `CrossSheetRef::Range` arm is wired
+/// (storage, removal, dirty-fanout via `range_index_per_sheet`) and
+/// ready to consume the AST node once it can be produced. Un-ignore
+/// in the next phase that lands the parser extension; the test body
+/// is correct as-is.
 #[test]
-#[ignore = "phase-3 — un-ignore after Track I merge"]
+#[ignore = "needs cross-sheet range parser support (Sheet2!A1:A100); deferred"]
 fn cross_sheet_range_dirty() {
     let mut wb = Workbook::new();
     let s2 = wb.add_sheet("Sheet2");
@@ -266,45 +263,3 @@ fn cross_sheet_range_dirty() {
     );
 }
 
-// =============================================================================
-// Extension trait stubs — Track I shadowing target
-// =============================================================================
-//
-// Track I (PHASE3_PARALLEL.md § Track I) adds inherent methods
-// `Workbook::set_cell` and `Workbook::clear_cell` (plus the dirty-prop
-// BFS that backs them). `Workbook::set_formula` already exists on the
-// current branch and is unmodified by this stub.
-//
-// Why a stub trait at all: the tests above reference `wb.set_cell(...)`
-// and (potentially future) `wb.clear_cell(...)`. Without these stubs,
-// `cargo test -p einfach-excel-core --test cross_sheet` would not
-// COMPILE on the current branch — and the per-test `#[ignore]`
-// attribute only skips RUNTIME, not compilation. The stub trait gives
-// the compiler a method-name resolution path that panics if anyone
-// actually invokes it (which they won't, because of `#[ignore]`).
-//
-// Once Track I merges, inherent-method-before-trait-method resolution
-// in Rust silently shadows the stubs. At that point this `impl` block
-// becomes dead code; remove the `#[ignore]` attributes on the three
-// tests above AND delete this trait block in the same commit.
-
-#[allow(dead_code)]
-trait WorkbookMutatorStubs {
-    fn set_cell(&mut self, sheet_idx: usize, addr: &str, value: Value);
-    fn clear_cell(&mut self, sheet_idx: usize, addr: &str);
-}
-
-impl WorkbookMutatorStubs for Workbook {
-    fn set_cell(&mut self, _sheet_idx: usize, _addr: &str, _value: Value) {
-        panic!(
-            "Workbook::set_cell stub invoked — Track I hasn't merged yet. \
-             Tests calling this must be #[ignore]'d."
-        );
-    }
-    fn clear_cell(&mut self, _sheet_idx: usize, _addr: &str) {
-        panic!(
-            "Workbook::clear_cell stub invoked — Track I hasn't merged yet. \
-             Tests calling this must be #[ignore]'d."
-        );
-    }
-}
