@@ -61,11 +61,6 @@ struct FormulaRecord {
     /// during eval must not narrow these to the visited subset, otherwise
     /// writing a previously-empty cell inside the range fails to dirty
     /// the formula (the P0 bug from `PHASE1_PARALLEL.md` § Track A).
-    ///
-    /// Consumer wired in the follow-up commit that adds
-    /// `Sheet::range_dependents`; storing the field here in isolation lets
-    /// Step 2's diff stay self-contained.
-    #[allow(dead_code)]
     range_deps: RefCell<HashSet<CellRange>>,
     cache: RefCell<FormulaCache>,
 }
@@ -114,6 +109,15 @@ pub struct Sheet {
     cell_subscriptions: HashMap<CellAddress, AddressSubscriptionBucket>,
     /// cell address → formula cells that depend on it.
     cell_dependents: RefCell<HashMap<CellAddress, HashSet<CellAddress>>>,
+    /// `CellRange` → formula cells whose AST contains that exact range.
+    /// `B1 = SUM(A1:A100)` registers `(A1:A100) → {B1}` here. Dirty
+    /// propagation on a cell write `W` looks up every range that
+    /// contains `W` and adds its dependents to the dirty set; that's
+    /// what keeps range deps alive across sparse-eval narrowing of the
+    /// point `deps` set (P0 from `PHASE1_PARALLEL.md` § Track A).
+    /// Today this is a flat HashMap with `O(range_count)` lookup per
+    /// write; Phase 2 will swap in an interval index.
+    range_dependents: RefCell<HashMap<CellRange, HashSet<CellAddress>>>,
     next_cell_sub_id: u64,
     /// Per-cell formatting (Phase 6). Independent of the dep graph; format
     /// changes never trigger formula recompute. Entry absent → default.
@@ -133,6 +137,7 @@ impl Sheet {
             formula_texts: HashMap::new(),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
+            range_dependents: RefCell::new(HashMap::new()),
             next_cell_sub_id: 0,
             formats: HashMap::new(),
             conditional_rules: Vec::new(),
@@ -269,6 +274,41 @@ impl Sheet {
         }
     }
 
+    /// Insert `formula_addr` as a dependent of every range in `ranges`.
+    /// Companion to `add_formula_deps` for the range-typed dep index.
+    fn add_formula_range_deps(
+        &self,
+        formula_addr: CellAddress,
+        ranges: &HashSet<CellRange>,
+    ) {
+        let mut dependents = self.range_dependents.borrow_mut();
+        for r in ranges {
+            dependents.entry(*r).or_default().insert(formula_addr);
+        }
+    }
+
+    /// Remove `formula_addr` from each range's dependent set. Mirrors
+    /// `remove_formula_deps`. Empty buckets are dropped so the map stays
+    /// bounded under formula churn.
+    fn remove_formula_range_deps(
+        &self,
+        formula_addr: CellAddress,
+        ranges: &HashSet<CellRange>,
+    ) {
+        let mut dependents = self.range_dependents.borrow_mut();
+        for r in ranges {
+            let should_remove = if let Some(set) = dependents.get_mut(r) {
+                set.remove(&formula_addr);
+                set.is_empty()
+            } else {
+                false
+            };
+            if should_remove {
+                dependents.remove(r);
+            }
+        }
+    }
+
     fn replace_formula_deps(
         &self,
         formula_addr: CellAddress,
@@ -284,6 +324,8 @@ impl Sheet {
         let record = self.formula_cells.remove(&addr)?;
         let deps = record.deps.borrow().clone();
         self.remove_formula_deps(addr, &deps);
+        let range_deps = record.range_deps.borrow().clone();
+        self.remove_formula_range_deps(addr, &range_deps);
         self.formula_exprs.remove(&addr);
         self.formula_texts.remove(&addr);
         Some(record)
@@ -291,9 +333,12 @@ impl Sheet {
 
     fn rebuild_all_formula_dependents(&self) {
         self.cell_dependents.borrow_mut().clear();
+        self.range_dependents.borrow_mut().clear();
         for (addr, record) in &self.formula_cells {
             let deps = record.deps.borrow().clone();
             self.add_formula_deps(*addr, &deps);
+            let range_deps = record.range_deps.borrow().clone();
+            self.add_formula_range_deps(*addr, &range_deps);
         }
     }
 
@@ -451,9 +496,10 @@ impl Sheet {
             let record = Rc::new(FormulaRecord::new(
                 expr.clone(),
                 deps.clone(),
-                range_deps,
+                range_deps.clone(),
             ));
             sheet.add_formula_deps(addr, &deps);
+            sheet.add_formula_range_deps(addr, &range_deps);
             sheet.formula_cells.insert(addr, record);
             sheet.formula_exprs.insert(addr, expr);
             sheet.formula_texts.insert(addr, formula_str.to_string());
@@ -1110,9 +1156,10 @@ impl Sheet {
         let record = Rc::new(FormulaRecord::new(
             expr.clone(),
             deps.clone(),
-            range_deps,
+            range_deps.clone(),
         ));
         self.add_formula_deps(addr, &deps);
+        self.add_formula_range_deps(addr, &range_deps);
         self.formula_cells.insert(addr, record);
         self.formula_exprs.insert(addr, expr);
         self.formula_texts.insert(addr, formula_str);
@@ -1306,9 +1353,10 @@ impl<'a> BulkLoader<'a> {
         let record = Rc::new(FormulaRecord::new(
             expr.clone(),
             deps.clone(),
-            range_deps,
+            range_deps.clone(),
         ));
         self.sheet.add_formula_deps(addr, &deps);
+        self.sheet.add_formula_range_deps(addr, &range_deps);
         self.sheet.formula_cells.insert(addr, record);
         self.sheet.formula_exprs.insert(addr, expr);
         self.sheet
