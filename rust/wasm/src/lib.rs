@@ -467,6 +467,13 @@ impl WasmSheet {
     pub fn debug_live_subscription_count(&self) -> u32 {
         self.sheet.debug_live_subscription_count() as u32
     }
+
+    /// Number of distinct `CellRange`s tracked in the range dependents
+    /// index. One entry per range referenced by at least one formula,
+    /// regardless of the range's cell count.
+    pub fn debug_range_dep_count(&self) -> u32 {
+        self.sheet.debug_range_dep_count() as u32
+    }
 }
 
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can

@@ -879,6 +879,20 @@ impl Sheet {
             .count()
     }
 
+    /// Number of distinct `CellRange`s tracked in `range_dependents`. Each
+    /// formula referencing a range (e.g. `SUM(A1:A100)`) contributes one
+    /// entry to the index — independent of how many cells the range spans.
+    /// A single range with N dependent formulas still counts as one.
+    ///
+    /// Phase 1 acceptance: registering a wide range formula adds exactly
+    /// one entry here, not N (the range's cell count). The interval-index
+    /// scale work in Phase 2 will keep this counter API but change the
+    /// underlying storage.
+    #[doc(hidden)]
+    pub fn debug_range_dep_count(&self) -> usize {
+        self.range_dependents.borrow().len()
+    }
+
     /// Return the original formula text for a cell, or `None` if the cell
     /// holds a value rather than a formula. Required by the formula bar /
     /// double-click-to-edit flow so users see `=A1*2` instead of the
@@ -2103,6 +2117,36 @@ mod tests {
         // Drop one A1 listener; bucket survives (still has the second one).
         sheet.unsubscribe_cell(sub_a);
         assert_eq!(sheet.debug_live_subscription_count(), 2);
+    }
+
+    #[test]
+    fn debug_range_dep_count_counts_distinct_ranges() {
+        // Three formulas, two distinct ranges: A1:A10 (twice) and B1:B5
+        // (once). The counter must report 2 ranges, not 3 formulas and
+        // not the 15 cells the ranges nominally span.
+        let mut sheet = Sheet::new();
+        assert_eq!(sheet.debug_range_dep_count(), 0);
+
+        sheet.set_formula("C1", "=SUM(A1:A10)");
+        assert_eq!(sheet.debug_range_dep_count(), 1);
+
+        sheet.set_formula("C2", "=AVERAGE(A1:A10)");
+        // Same range, second consumer — index stays at 1 entry.
+        assert_eq!(sheet.debug_range_dep_count(), 1);
+
+        sheet.set_formula("C3", "=SUM(B1:B5)");
+        assert_eq!(sheet.debug_range_dep_count(), 2);
+
+        // Replacing C2's formula with a non-range one drops it from the
+        // A1:A10 dependents; C1 still references that range, so the
+        // index entry survives.
+        sheet.set_formula("C2", "=A1+1");
+        assert_eq!(sheet.debug_range_dep_count(), 2);
+
+        // Replace C1 too — A1:A10 has no remaining dependents and the
+        // index entry should be removed by remove_formula_range_deps.
+        sheet.set_formula("C1", "=A1+2");
+        assert_eq!(sheet.debug_range_dep_count(), 1);
     }
 
     #[test]
