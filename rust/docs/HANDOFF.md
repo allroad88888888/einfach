@@ -3,15 +3,16 @@
 > Date: 2026-05-12 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Tip at handoff: `74ec264` (Phase 4 doc note)
+> Last verified implementation tip: `2d291c8` (Phase 4A cross-sheet range parser)
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
 
-## What's done — Phase 1 → Phase 4
+## What's done — Phase 1 → Phase 4A
 
-The "百万 cell + 不做协作 + 懒求值" product line. All four executed
-phases land their acceptance contracts; gates all green at this tip.
+The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land their
+acceptance contracts; the implementation tip above is the last verified
+non-doc checkpoint.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -19,13 +20,14 @@ phases land their acceptance contracts; gates all green at this tip.
 | 2 | `rust/docs/PHASE2_PARALLEL.md` | `8aa18aa` | ✅ Interval index for range deps (O(matches)) + sparse value index (`RowMajorMap`) + whole-row/col parser (`A:A` / `1:1`) + 100k range bench |
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + 2D viewport e2e (4 of 5 specs; focus-pin intentionally skipped) |
+| 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
 ```sh
-cd rust/excel-core && cargo test --lib          # 224 / 0 / 0
+cd rust/excel-core && cargo test --lib          # 231 / 0 / 0
 cd rust/excel-core && cargo test --test scale   # 8 / 0 / 0
-cd rust/excel-core && cargo test --test cross_sheet  # 2 / 0 / 1 (range parser deferred)
+cd rust/excel-core && cargo test --test cross_sheet  # 3 / 0 / 0
 cd rust/excel-core && cargo test --test review_repro # 4 / 0 / 0
 cd rust/wasm && cargo build                     # clean
 cd rust/excel-core && cargo bench --no-run      # 3 bench targets clean
@@ -46,10 +48,11 @@ to fix them as part of phase work; they're out of scope.
 
 | Item | Where | Effort | Notes |
 |---|---|---|---|
-| Cross-sheet range parser `Sheet2!A1:A100` | `rust/excel-core/src/formula.rs` parser | ~1 d | Phase 3 wired `CrossSheetRef::Range` end-to-end but parser never emits the AST node. Pinned by `cross_sheet_range_dirty` ignored test in `tests/cross_sheet.rs`. Un-ignore on parse fix. |
+| Worker authoritative workbook RPC | `solid/excel/src/wasm-sheet-worker.ts`, new workbook worker/proxy, `rust/wasm/src/lib.rs` | 2–3 d | Current worker owns one `WasmSheet`, uses fire-and-forget messages, and `set_formula` stays optimistic true. Phase 5 Track A moves product path to worker-owned `WasmWorkbook` + request/reply. |
+| Typed chunk import / sparse snapshot | `rust/wasm/src/lib.rs`, worker import protocol, `sheet-store.ts` integration | 2–3 d | Do not expose Rust `WorkbookLoader<'_>` as a JS closure handle. Use begin/chunk/commit/cancel data protocol, commit through Rust `Workbook::bulk_load`, and source undo/persistence snapshots from worker/Rust. |
+| Range-native UI ops | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Delete/clear/format/copy/export still often materialize address arrays. Million-cell range ops need backend range commands or streaming reads. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
 | Focus-cell DOM pin under 2D virt | `solid/excel/src/Table.tsx` | 0.5 d | `focus_cell_remains_in_dom_under_stay_index` test stays skipped. Native impl uses selection→scroll-into-view (works for keyboard nav). True "pin off-viewport focus in DOM" would need a `stayIndexList`-style escape hatch in the row/col window calc. |
-| WASM `WorkbookLoader::bulk_load` binding | `rust/wasm/src/lib.rs` | 1–2 d | Track K left a documented TODO. Needs design for JS-side closure pattern crossing the wasm boundary (Rust callback receiving a `js_sys::Function` that takes a JS-managed loader handle). |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
 
 ## Hard rules (from user)
@@ -211,30 +214,36 @@ Once agents return:
 
 | Option | What | Effort | Why |
 |---|---|---|---|
-| **A** | Cross-sheet range parser — un-ignore `cross_sheet_range_dirty` | ~1 d | Smallest open Phase-3 thread; complete the parser-side delta and close a deferred item |
-| **B** | Phase 5 plan + agents (worker authoritative RPC + chunked CSV import + persistence + range-native UI ops) | 5–7 d | Next phase in PLAN; preps for production-grade I/O |
+| **A** | Phase 5 Track A — worker-owned `WasmWorkbook` + request/reply RPC | 2–3 d | Required before import/undo/range ops can be authoritative and scalable |
+| **B** | Phase 5 Track B/C/D — chunked import, sparse snapshot, range-native UI, e2e gates | 5–7 d | Productizes data ingress/egress without breaking lazy semantics |
 | **C** | Phase 6 plan + agents (CI gates + formula error model + a11y + perf dashboards) | 4–6 d | Last phase in PLAN; product hardening |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
-Recommended pick if the new window has full autonomy: **A first** (closes
-the smallest open thread cleanly), then **B**. Hold **D** until user
+Recommended pick if the new window has full autonomy: **A first**, using
+`rust/docs/PHASE5_PARALLEL.md` as the scope contract. Hold **D** until user
 green-lights it.
 
 ## File reading order for the next agent
 
 1. This doc (`rust/docs/HANDOFF.md`).
 2. `rust/docs/ONLINE_SPREADSHEET_PLAN.md` — north-star plan.
-3. `rust/docs/PHASE4_PARALLEL.md` (most recent) — current style of
-   phase plans.
-4. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
+3. `rust/docs/PHASE5_PARALLEL.md` — current execution plan.
+4. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
+5. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
    pattern for a P0 bug (good reference if Phase 5 uncovers one).
-5. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is
+6. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is
    the next target if Phase 5 deepens worker-RPC.
-6. `solid/excel/src/Table.tsx` — Phase 4's native 2D-virt
+7. `rust/wasm/src/lib.rs` — `WasmWorkbook` canonical vs legacy mutator
+   split and missing bulk/import bindings.
+8. `solid/excel/src/wasm-sheet-worker.ts` and
+   `solid/excel/src/wasm-sheet-proxy.ts` — current single-sheet worker
+   adapter to replace for product path.
+9. `solid/excel/src/sheet-store.ts` — undo/range/product state boundary.
+10. `solid/excel/src/Table.tsx` — Phase 4's native 2D-virt
    implementation, ~480 LOC, the UI surface for any Phase 5+ frontend
    change.
-7. `~/.claude/projects/-Volumes-work-self-einfach/memory/MEMORY.md`
+11. `~/.claude/projects/-Volumes-work-self-einfach/memory/MEMORY.md`
    — user preferences (codex pattern, no-CI-push rule).
 
 ## What to absolutely NOT do without user permission
