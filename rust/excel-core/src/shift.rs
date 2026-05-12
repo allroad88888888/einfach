@@ -506,4 +506,43 @@ mod tests {
         let reparsed = parse_formula(&rendered).unwrap();
         assert_eq!(parsed, reparsed);
     }
+
+    // === Phase 2 Track G — whole-col / whole-row round-trips ===
+
+    #[test]
+    fn render_whole_col_roundtrip() {
+        for syntax in ["=SUM(A:A)", "=SUM(A:C)", "=A:A", "=SUM(AA:AC)"] {
+            let parsed = parse_formula(syntax).unwrap();
+            let rendered = render_formula(&parsed);
+            let reparsed = parse_formula(&rendered).unwrap();
+            assert_eq!(parsed, reparsed, "round-trip {} -> {}", syntax, rendered);
+        }
+    }
+
+    #[test]
+    fn render_whole_row_roundtrip() {
+        for syntax in ["=SUM(1:1)", "=SUM(1:3)", "=SUM(100:200)"] {
+            let parsed = parse_formula(syntax).unwrap();
+            let rendered = render_formula(&parsed);
+            let reparsed = parse_formula(&rendered).unwrap();
+            assert_eq!(parsed, reparsed, "round-trip {} -> {}", syntax, rendered);
+        }
+    }
+
+    #[test]
+    fn shift_whole_col_invariant_under_row_shift() {
+        // Whole-column ref stays put when shifted down — the column
+        // corner is invariant on the row axis.
+        assert_eq!(shifted("=SUM(A:A)", 5, 0), "=SUM(A:A)");
+        // But shifting right moves the bounded column.
+        assert_eq!(shifted("=SUM(A:A)", 0, 1), "=SUM(B:B)");
+    }
+
+    #[test]
+    fn shift_whole_row_invariant_under_col_shift() {
+        // Whole-row ref stays put when shifted right.
+        assert_eq!(shifted("=SUM(1:1)", 0, 5), "=SUM(1:1)");
+        // But shifting down moves the bounded row.
+        assert_eq!(shifted("=SUM(1:1)", 2, 0), "=SUM(3:3)");
+    }
 }
