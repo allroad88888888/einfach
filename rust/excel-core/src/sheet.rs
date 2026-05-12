@@ -90,6 +90,186 @@ pub struct CellSubscription {
     listener_id: u64,
 }
 
+/// Ranges spanning more than this many rows or columns skip the
+/// per-row / per-col bucket registration and live in `wide_ranges` instead,
+/// which gets a linear scan on lookup. Phase 2 Track E tuning knob — chosen
+/// so that 100k narrow ranges (under a few thousand rows tall) stay in the
+/// fast index but a small handful of "whole sheet" / "whole column 1M" deps
+/// don't blow up registration time / memory.
+const WIDE_RANGE_BUCKET_THRESHOLD: u32 = 4096;
+
+/// Reverse index from `CellRange` to the formula cells that depend on that
+/// exact range. Phase 1 stored only the `formulas: HashMap<CellRange, ...>`
+/// lookup half, which made `Sheet::dependents_of(addr)` an O(range_count)
+/// linear scan per cell write. Phase 2 Track E adds row + col bucket halves
+/// plus a wide-range fallback so candidate-range lookup by address is
+/// O(matches + wide_count) instead.
+///
+/// Invariant: a range `r` is present in EITHER `wide_ranges` OR in every
+/// row in `start.row..=end.row` of `row_buckets` AND every col in
+/// `start.col..=end.col` of `col_buckets`. The choice is decided once at
+/// insert time by comparing `r.rows()` / `r.cols()` to
+/// `WIDE_RANGE_BUCKET_THRESHOLD`. `formulas` is the source of truth for
+/// "does this range still have a dependent" — buckets are kept in sync
+/// with `formulas.contains_key(r)`.
+#[derive(Default)]
+struct RangeDependentIndex {
+    /// `CellRange` → formula cells that depend on it. Mirror of the old
+    /// `range_dependents` map; queried by `dependents_of` once candidate
+    /// ranges have been narrowed by the buckets, and by
+    /// `debug_range_dep_count` for the unchanged Phase 1 counter contract.
+    formulas: HashMap<CellRange, HashSet<CellAddress>>,
+    /// For each row r, the set of *narrow* ranges where
+    /// `normalized.start.row <= r <= normalized.end.row`. Lookup intersects
+    /// this with `col_buckets[addr.col]` to find candidate ranges.
+    row_buckets: HashMap<u32, HashSet<CellRange>>,
+    /// Same shape as `row_buckets` but keyed by column.
+    col_buckets: HashMap<u32, HashSet<CellRange>>,
+    /// Ranges wider than `WIDE_RANGE_BUCKET_THRESHOLD` in rows OR cols.
+    /// Always linearly scanned on lookup — registering them in every row /
+    /// col bucket they span would dominate insert cost. Expected to stay
+    /// small (handful of "whole sheet" deps).
+    wide_ranges: HashSet<CellRange>,
+}
+
+impl RangeDependentIndex {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a range should live in the wide-range fallback bucket.
+    /// Computed from the normalized range so a transposed `(B2:A1)` decides
+    /// the same way as `(A1:B2)`. Wide on EITHER axis is enough — a
+    /// 1-row 1M-col range is just as bucket-hostile as a 1M-row 1-col one.
+    fn is_wide(range: &CellRange) -> bool {
+        let n = range.normalize();
+        let rows = n.end.row.saturating_sub(n.start.row).saturating_add(1);
+        let cols = n.end.col.saturating_sub(n.start.col).saturating_add(1);
+        rows > WIDE_RANGE_BUCKET_THRESHOLD || cols > WIDE_RANGE_BUCKET_THRESHOLD
+    }
+
+    /// Register `range` in the bucket index. No-op if `range` is already
+    /// indexed — caller (`add_formula`) gates this on a fresh `formulas`
+    /// entry to avoid redundant per-row work on repeat dependents.
+    fn register_range(&mut self, range: CellRange) {
+        if Self::is_wide(&range) {
+            self.wide_ranges.insert(range);
+            return;
+        }
+        let n = range.normalize();
+        for r in n.start.row..=n.end.row {
+            self.row_buckets.entry(r).or_default().insert(range);
+        }
+        for c in n.start.col..=n.end.col {
+            self.col_buckets.entry(c).or_default().insert(range);
+        }
+    }
+
+    /// Inverse of `register_range`. Called by `remove_formula` once the
+    /// last formula for this range is gone. Drops emptied bucket entries
+    /// so the maps stay bounded under formula churn.
+    fn unregister_range(&mut self, range: CellRange) {
+        if Self::is_wide(&range) {
+            self.wide_ranges.remove(&range);
+            return;
+        }
+        let n = range.normalize();
+        for r in n.start.row..=n.end.row {
+            if let Some(set) = self.row_buckets.get_mut(&r) {
+                set.remove(&range);
+                if set.is_empty() {
+                    self.row_buckets.remove(&r);
+                }
+            }
+        }
+        for c in n.start.col..=n.end.col {
+            if let Some(set) = self.col_buckets.get_mut(&c) {
+                set.remove(&range);
+                if set.is_empty() {
+                    self.col_buckets.remove(&c);
+                }
+            }
+        }
+    }
+
+    /// Insert `formula_addr` as a dependent of `range`. First-time
+    /// registrations of `range` also wire it into the bucket index.
+    fn add_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
+        let entry = self.formulas.entry(range).or_default();
+        let was_empty = entry.is_empty();
+        entry.insert(formula_addr);
+        if was_empty {
+            self.register_range(range);
+        }
+    }
+
+    /// Remove `formula_addr` from `range`'s dependent set. Drops the
+    /// `formulas` entry and unregisters the range from the bucket index
+    /// when this was its last dependent — keeps `len()` and the buckets
+    /// honest under formula churn.
+    fn remove_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
+        let should_unregister = if let Some(set) = self.formulas.get_mut(&range) {
+            set.remove(&formula_addr);
+            set.is_empty()
+        } else {
+            false
+        };
+        if should_unregister {
+            self.formulas.remove(&range);
+            self.unregister_range(range);
+        }
+    }
+
+    /// Forget everything. Used by `Sheet::rebuild_all_formula_dependents`
+    /// before it walks the formula_cells map and re-adds every record.
+    fn clear(&mut self) {
+        self.formulas.clear();
+        self.row_buckets.clear();
+        self.col_buckets.clear();
+        self.wide_ranges.clear();
+    }
+
+    /// Number of distinct `CellRange`s that currently have at least one
+    /// dependent formula. Backs `Sheet::debug_range_dep_count` — the
+    /// Phase 1 counter contract is unchanged.
+    fn len(&self) -> usize {
+        self.formulas.len()
+    }
+
+    /// Candidate ranges that *might* contain `addr`, before the per-range
+    /// `contains` filter. Combines:
+    ///   - row_buckets[addr.row] ∩ col_buckets[addr.col] for narrow ranges
+    ///   - the full `wide_ranges` set (always scanned linearly)
+    ///
+    /// Net cost: O(min(row_bucket_size, col_bucket_size) + wide_count).
+    /// Caller filters by `range.contains(addr)` and looks each survivor
+    /// up in `formulas`. Returned ranges are unique.
+    fn candidates_for(&self, addr: CellAddress) -> Vec<CellRange> {
+        let row_set = self.row_buckets.get(&addr.row);
+        let col_set = self.col_buckets.get(&addr.col);
+
+        let mut out: Vec<CellRange> = match (row_set, col_set) {
+            (Some(rs), Some(cs)) => {
+                // Intersect the smaller side against the larger — cuts
+                // worst-case work for asymmetric narrow ranges (e.g. one
+                // 6-row column-A range vs a single full-row range).
+                let (small, large) = if rs.len() <= cs.len() { (rs, cs) } else { (cs, rs) };
+                small.iter().filter(|r| large.contains(*r)).copied().collect()
+            }
+            _ => Vec::new(),
+        };
+        out.extend(self.wide_ranges.iter().copied());
+        out
+    }
+
+    /// Lookup the formula set for a candidate range. None when the range
+    /// has no dependents (should not happen for ranges returned by
+    /// `candidates_for`, but the caller treats None as "skip").
+    fn formulas_for(&self, range: &CellRange) -> Option<&HashSet<CellAddress>> {
+        self.formulas.get(range)
+    }
+}
+
 /// A spreadsheet sheet backed by an atom store.
 pub struct Sheet {
     pub(crate) store: Store,
@@ -115,9 +295,12 @@ pub struct Sheet {
     /// contains `W` and adds its dependents to the dirty set; that's
     /// what keeps range deps alive across sparse-eval narrowing of the
     /// point `deps` set (P0 from `PHASE1_PARALLEL.md` § Track A).
-    /// Today this is a flat HashMap with `O(range_count)` lookup per
-    /// write; Phase 2 will swap in an interval index.
-    range_dependents: RefCell<HashMap<CellRange, HashSet<CellAddress>>>,
+    ///
+    /// Phase 2 Track E: this is now a `RangeDependentIndex` with row /
+    /// col bucket halves plus a wide-range fallback, so the address →
+    /// candidates lookup driving `dependents_of` is O(matches + wide)
+    /// instead of O(range_count).
+    range_dependents: RefCell<RangeDependentIndex>,
     next_cell_sub_id: u64,
     /// Per-cell formatting (Phase 6). Independent of the dep graph; format
     /// changes never trigger formula recompute. Entry absent → default.
@@ -148,7 +331,7 @@ impl Sheet {
             formula_texts: HashMap::new(),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
-            range_dependents: RefCell::new(HashMap::new()),
+            range_dependents: RefCell::new(RangeDependentIndex::new()),
             next_cell_sub_id: 0,
             formats: HashMap::new(),
             conditional_rules: Vec::new(),
@@ -289,6 +472,9 @@ impl Sheet {
 
     /// Insert `formula_addr` as a dependent of every range in `ranges`.
     /// Companion to `add_formula_deps` for the range-typed dep index.
+    /// Each `RangeDependentIndex::add_formula` call also wires the range
+    /// into the row / col bucket halves (or `wide_ranges` if oversize) on
+    /// its first dependent — see `RangeDependentIndex::register_range`.
     fn add_formula_range_deps(
         &self,
         formula_addr: CellAddress,
@@ -296,13 +482,14 @@ impl Sheet {
     ) {
         let mut dependents = self.range_dependents.borrow_mut();
         for r in ranges {
-            dependents.entry(*r).or_default().insert(formula_addr);
+            dependents.add_formula(*r, formula_addr);
         }
     }
 
     /// Remove `formula_addr` from each range's dependent set. Mirrors
-    /// `remove_formula_deps`. Empty buckets are dropped so the map stays
-    /// bounded under formula churn.
+    /// `remove_formula_deps`. The bucket index entries (row / col / wide)
+    /// are dropped automatically when the last dependent goes away, so the
+    /// maps stay bounded under formula churn.
     fn remove_formula_range_deps(
         &self,
         formula_addr: CellAddress,
@@ -310,15 +497,7 @@ impl Sheet {
     ) {
         let mut dependents = self.range_dependents.borrow_mut();
         for r in ranges {
-            let should_remove = if let Some(set) = dependents.get_mut(r) {
-                set.remove(&formula_addr);
-                set.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                dependents.remove(r);
-            }
+            dependents.remove_formula(*r, formula_addr);
         }
     }
 
@@ -375,11 +554,14 @@ impl Sheet {
 
     /// Collect every formula address that depends on a write to `addr`,
     /// merging point-cell dependents from `cell_dependents` with any
-    /// range dependents whose range contains `addr`. The range scan is
-    /// `O(range_count)` per call today; Phase 2 will replace the linear
-    /// pass with an interval index. Pulled into a helper so both the
-    /// per-write BFS (`mark_dependents_dirty`) and the bulk-load
-    /// `flush` walk use the same union.
+    /// range dependents whose range contains `addr`. Pulled into a helper
+    /// so both the per-write BFS (`mark_dependents_dirty`) and the
+    /// bulk-load `flush` walk use the same union.
+    ///
+    /// The range half walks only the bucket-narrowed candidate set from
+    /// `RangeDependentIndex::candidates_for` plus the small wide-range
+    /// fallback — O(matches + wide_count) per call, not the Phase 1
+    /// O(range_count) scan.
     fn dependents_of(&self, addr: CellAddress) -> HashSet<CellAddress> {
         let mut out: HashSet<CellAddress> = self
             .cell_dependents
@@ -388,9 +570,11 @@ impl Sheet {
             .cloned()
             .unwrap_or_default();
         let range_dependents = self.range_dependents.borrow();
-        for (range, formulas) in range_dependents.iter() {
+        for range in range_dependents.candidates_for(addr) {
             if range.contains(addr) {
-                out.extend(formulas.iter().copied());
+                if let Some(formulas) = range_dependents.formulas_for(&range) {
+                    out.extend(formulas.iter().copied());
+                }
             }
         }
         out
@@ -891,6 +1075,21 @@ impl Sheet {
     #[doc(hidden)]
     pub fn debug_range_dep_count(&self) -> usize {
         self.range_dependents.borrow().len()
+    }
+
+    /// Debug-only candidate-range probe for the Phase 2 bucket index.
+    /// Returns the count of *candidate* ranges that
+    /// `RangeDependentIndex::candidates_for(addr)` produces — before the
+    /// final `CellRange::contains` filter. Useful for asserting that the
+    /// row × col bucket intersection actually narrows the search instead
+    /// of returning every registered range. Kept `#[doc(hidden)]` because
+    /// it leaks an internal implementation detail of the index.
+    #[doc(hidden)]
+    pub fn debug_range_dep_candidates(&self, addr_str: &str) -> usize {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return 0;
+        };
+        self.range_dependents.borrow().candidates_for(addr).len()
     }
 
     /// Return the original formula text for a cell, or `None` if the cell
@@ -1496,9 +1695,10 @@ impl<'a> BulkLoader<'a> {
     ///
     /// Complexity: O(T + D) where T = touched count, D = size of transitive
     /// formula closure reachable from `touched` through both
-    /// `cell_dependents` and `range_dependents` (the latter scanned
-    /// `O(range_count)` per address; Phase 2 swaps in an interval index).
-    /// Notify dedup is O(1) per visited address via the `notified` HashSet.
+    /// `cell_dependents` and `range_dependents`. The range half is
+    /// O(matches + wide_count) per address via the Phase 2 Track E
+    /// bucket index, not the Phase 1 O(range_count) scan. Notify dedup
+    /// is O(1) per visited address via the `notified` HashSet.
     fn flush(&mut self) {
         // 1. BFS through dependents (point + range) starting at every
         //    touched address. Collect the set of transitively-dirty
