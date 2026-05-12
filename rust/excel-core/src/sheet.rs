@@ -251,7 +251,7 @@ const WIDE_RANGE_BUCKET_THRESHOLD: u32 = 4096;
 /// "does this range still have a dependent" — buckets are kept in sync
 /// with `formulas.contains_key(r)`.
 #[derive(Default)]
-struct RangeDependentIndex {
+pub(crate) struct RangeDependentIndex {
     /// `CellRange` → formula cells that depend on it. Mirror of the old
     /// `range_dependents` map; queried by `dependents_of` once candidate
     /// ranges have been narrowed by the buckets, and by
@@ -271,7 +271,7 @@ struct RangeDependentIndex {
 }
 
 impl RangeDependentIndex {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -332,7 +332,7 @@ impl RangeDependentIndex {
 
     /// Insert `formula_addr` as a dependent of `range`. First-time
     /// registrations of `range` also wire it into the bucket index.
-    fn add_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
+    pub(crate) fn add_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
         let entry = self.formulas.entry(range).or_default();
         let was_empty = entry.is_empty();
         entry.insert(formula_addr);
@@ -345,7 +345,7 @@ impl RangeDependentIndex {
     /// `formulas` entry and unregisters the range from the bucket index
     /// when this was its last dependent — keeps `len()` and the buckets
     /// honest under formula churn.
-    fn remove_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
+    pub(crate) fn remove_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
         let should_unregister = if let Some(set) = self.formulas.get_mut(&range) {
             set.remove(&formula_addr);
             set.is_empty()
@@ -360,7 +360,7 @@ impl RangeDependentIndex {
 
     /// Forget everything. Used by `Sheet::rebuild_all_formula_dependents`
     /// before it walks the formula_cells map and re-adds every record.
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.formulas.clear();
         self.row_buckets.clear();
         self.col_buckets.clear();
@@ -370,8 +370,34 @@ impl RangeDependentIndex {
     /// Number of distinct `CellRange`s that currently have at least one
     /// dependent formula. Backs `Sheet::debug_range_dep_count` — the
     /// Phase 1 counter contract is unchanged.
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.formulas.len()
+    }
+
+    /// Whether the index is empty. Convenience helper for cross-sheet
+    /// dirty-fanout paths that want to short-circuit if a source sheet
+    /// has no range dependents registered yet.
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.formulas.is_empty()
+    }
+
+    /// Union of every formula dependent across every registered range that
+    /// contains `addr`. Workbook-side helper that mirrors the sheet-local
+    /// `Sheet::dependents_of` range half, but returns formula addresses
+    /// directly so callers don't have to walk `candidates_for` +
+    /// `formulas_for` themselves.
+    #[allow(dead_code)]
+    pub(crate) fn dependents_of(&self, addr: CellAddress) -> HashSet<CellAddress> {
+        let mut out: HashSet<CellAddress> = HashSet::new();
+        for range in self.candidates_for(addr) {
+            if range.contains(addr) {
+                if let Some(formulas) = self.formulas.get(&range) {
+                    out.extend(formulas.iter().copied());
+                }
+            }
+        }
+        out
     }
 
     /// Candidate ranges that *might* contain `addr`, before the per-range
@@ -382,7 +408,7 @@ impl RangeDependentIndex {
     /// Net cost: O(min(row_bucket_size, col_bucket_size) + wide_count).
     /// Caller filters by `range.contains(addr)` and looks each survivor
     /// up in `formulas`. Returned ranges are unique.
-    fn candidates_for(&self, addr: CellAddress) -> Vec<CellRange> {
+    pub(crate) fn candidates_for(&self, addr: CellAddress) -> Vec<CellRange> {
         let row_set = self.row_buckets.get(&addr.row);
         let col_set = self.col_buckets.get(&addr.col);
 
@@ -403,7 +429,7 @@ impl RangeDependentIndex {
     /// Lookup the formula set for a candidate range. None when the range
     /// has no dependents (should not happen for ranges returned by
     /// `candidates_for`, but the caller treats None as "skip").
-    fn formulas_for(&self, range: &CellRange) -> Option<&HashSet<CellAddress>> {
+    pub(crate) fn formulas_for(&self, range: &CellRange) -> Option<&HashSet<CellAddress>> {
         self.formulas.get(range)
     }
 }
@@ -724,6 +750,41 @@ impl Sheet {
             }
         }
         out
+    }
+
+    /// Workbook-facing helper: flip the formula cache for `addr` to
+    /// `Dirty` *without* triggering eval. Same internal operation as the
+    /// dirty step inside `mark_dependents_dirty`, exposed so the
+    /// workbook-level cross-sheet propagation (Phase 3 Track I) can mark
+    /// a specific cross-sheet formula stale after a source-sheet write.
+    ///
+    /// No-op when `addr` is not a formula cell on this sheet (the cross-
+    /// sheet reverse index occasionally races formula removal — a
+    /// dangling `(sheet, addr)` entry pointing at a cleared cell just
+    /// becomes a cheap miss instead of a panic).
+    ///
+    /// Intentionally does NOT walk same-sheet dependents — the Sheet's
+    /// own `set_cell` path already did that. This helper is purely the
+    /// "mark this one formula dirty" primitive.
+    pub fn mark_dirty_for_addr(&self, addr: CellAddress) {
+        if let Some(record) = self.formula_cells.get(&addr) {
+            *record.cache.borrow_mut() = FormulaCache::Dirty;
+        }
+    }
+
+    /// Workbook-facing helper: synchronously fire every listener in
+    /// `cell_subscriptions[addr]`. Companion to `mark_dirty_for_addr` —
+    /// the workbook BFS calls `mark_dirty_for_addr` followed by
+    /// `fire_subscribers` so cross-sheet formula listeners see the same
+    /// "value may have changed" signal that a same-sheet write would
+    /// produce via `notify_address_subscribers` from `set_cell`.
+    ///
+    /// No-op when the address has no subscription bucket or no listeners
+    /// — the bucket map is sparse (only `subscribe_cell` populates it).
+    pub fn fire_subscribers(&self, addr: CellAddress) {
+        if self.has_address_subscribers(addr) {
+            self.notify_address_subscribers(addr);
+        }
     }
 
     fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
