@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -125,6 +125,17 @@ pub struct Sheet {
     /// Sheet-wide conditional formatting rules. Applied in order on top of
     /// each cell's base format at display time (first match wins).
     conditional_rules: Vec<ConditionalRule>,
+    /// Cumulative count of formula evaluations performed (cache-miss path in
+    /// `eval_formula_at_with_provider`). Read-only debug counter used by the
+    /// Phase 1 scale tests to assert laziness — `bulk_load` of N formulas
+    /// must keep this at 0 until the first `get_cell`. `Cell` so the counter
+    /// can be bumped from `&self` (eval runs through the immutable reader).
+    formula_eval_count: Cell<usize>,
+    /// Cumulative count of formulas inserted via `BulkLoader::set_formula`.
+    /// Bumped once per successful entry inside `bulk_load`; the plain
+    /// `Sheet::set_formula` path does NOT bump this. Used by the scale
+    /// suite to verify "imported" vs "live-edited" formula provenance.
+    imported_formula_count: Cell<usize>,
 }
 
 impl Sheet {
@@ -141,6 +152,8 @@ impl Sheet {
             next_cell_sub_id: 0,
             formats: HashMap::new(),
             conditional_rules: Vec::new(),
+            formula_eval_count: Cell::new(0),
+            imported_formula_count: Cell::new(0),
         }
     }
 
@@ -689,6 +702,13 @@ impl Sheet {
             inner: provider,
             deps: deps.clone(),
         };
+        // B1 — bump the cache-miss eval counter exactly once per real
+        // recompute. Sits before the eval call so a panic during eval still
+        // shows up in the counter (matches the intent: "evaluations
+        // attempted"). TODO: Agent A's refactor may relocate this when the
+        // typed-dep split lands; keep it boring until then.
+        self.formula_eval_count
+            .set(self.formula_eval_count.get() + 1);
         let value = eval_expr_with_provider(&record.expr, &tracking);
         *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
         self.replace_formula_deps(addr, &record, deps.borrow().clone());
@@ -814,6 +834,49 @@ impl Sheet {
     #[doc(hidden)]
     pub fn debug_recompute_count(&self) -> usize {
         self.store.debug_recompute_count()
+    }
+
+    /// Total formula evaluations performed since the sheet was created.
+    /// Bumped once per cache-miss eval inside `eval_formula_at_with_provider`;
+    /// cache hits are free. Used by the Phase 1 scale suite to assert
+    /// `bulk_load` does no eager eval and viewport reads only evaluate
+    /// visible formulas.
+    #[doc(hidden)]
+    pub fn debug_formula_eval_count(&self) -> usize {
+        self.formula_eval_count.get()
+    }
+
+    /// Number of formula records whose cache is currently dirty (would
+    /// re-compute on next read). Walks `formula_cells` and counts entries
+    /// in the `FormulaCache::Dirty` state. Used by Phase 1 tests to assert
+    /// dirty-propagation correctness without forcing an eval.
+    #[doc(hidden)]
+    pub fn debug_dirty_count(&self) -> usize {
+        self.formula_cells
+            .values()
+            .filter(|record| matches!(*record.cache.borrow(), FormulaCache::Dirty))
+            .count()
+    }
+
+    /// Number of formulas registered via `bulk_load` (cumulative since the
+    /// sheet was created). The plain `Sheet::set_formula` path does NOT
+    /// increment this. Used by the scale suite to verify the import path
+    /// is exercised and to distinguish bulk-loaded from live-edited formulas.
+    #[doc(hidden)]
+    pub fn debug_imported_formula_count(&self) -> usize {
+        self.imported_formula_count.get()
+    }
+
+    /// Number of distinct `CellAddress`es with at least one live listener
+    /// in `cell_subscriptions`. An address whose last listener was removed
+    /// drops out of the map (`unsubscribe_cell`), so this is just the live
+    /// bucket count. Used to verify subscription teardown.
+    #[doc(hidden)]
+    pub fn debug_live_subscription_count(&self) -> usize {
+        self.cell_subscriptions
+            .values()
+            .filter(|bucket| !bucket.listeners.borrow().is_empty())
+            .count()
     }
 
     /// Return the original formula text for a cell, or `None` if the cell
@@ -1391,6 +1454,13 @@ impl<'a> BulkLoader<'a> {
             .formula_texts
             .insert(addr, formula_str.to_string());
 
+        // B1 — bump the imported-formula counter for successfully registered
+        // bulk-load entries. Parse failure / cycle paths return earlier and
+        // do not insert a formula record, so they intentionally don't bump.
+        self.sheet
+            .imported_formula_count
+            .set(self.sheet.imported_formula_count.get() + 1);
+
         self.touched.insert(addr);
         true
     }
@@ -1955,6 +2025,84 @@ mod tests {
             "subscribing to an empty cell must not materialize an atom"
         );
         assert_eq!(sheet.debug_total_atom_count(), 0);
+    }
+
+    // === B1 — counter additions ===
+
+    #[test]
+    fn debug_formula_eval_count_bumps_on_miss_not_on_hit() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=A1");
+        // No read yet — counter must be zero.
+        assert_eq!(sheet.debug_formula_eval_count(), 0);
+
+        // First read: cache miss → exactly one eval.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+        assert_eq!(sheet.debug_formula_eval_count(), 1);
+
+        // Second read: cache hit → no additional eval.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+        assert_eq!(sheet.debug_formula_eval_count(), 1);
+    }
+
+    #[test]
+    fn debug_dirty_count_drops_after_read() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.set_formula("B1", "=A1");
+
+        // Pre-read: formula is dirty.
+        assert_eq!(sheet.debug_dirty_count(), 1);
+
+        // Read clears the dirty bit.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(2.0));
+        assert_eq!(sheet.debug_dirty_count(), 0);
+
+        // Writing a dep flips it back to dirty.
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.debug_dirty_count(), 1);
+    }
+
+    #[test]
+    fn debug_imported_formula_count_counts_bulk_load_only() {
+        let mut sheet = Sheet::new();
+        // Plain set_formula must NOT bump the imported counter.
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=A1");
+        assert_eq!(sheet.debug_imported_formula_count(), 0);
+
+        // bulk_load with 5 formulas + 5 primitives — only the formulas bump.
+        sheet.bulk_load(|loader| {
+            for n in 0..5u32 {
+                let addr = CellAddress::new(0, n + 2).to_string_repr();
+                loader.set_cell(&addr, Value::Number(n as f64));
+            }
+            for n in 0..5u32 {
+                let addr = CellAddress::new(1, n + 2).to_string_repr();
+                let ok = loader.set_formula(&addr, "=A1+1");
+                assert!(ok, "bulk-load formula at {} must register", addr);
+            }
+        });
+        assert_eq!(sheet.debug_imported_formula_count(), 5);
+    }
+
+    #[test]
+    fn debug_live_subscription_count_tracks_buckets() {
+        let mut sheet = Sheet::new();
+        assert_eq!(sheet.debug_live_subscription_count(), 0);
+
+        let sub_a = sheet.subscribe_cell("A1", || {});
+        let _sub_b = sheet.subscribe_cell("B2", || {});
+        assert_eq!(sheet.debug_live_subscription_count(), 2);
+
+        // A second listener on A1 reuses the existing bucket — still 2.
+        let _sub_a2 = sheet.subscribe_cell("A1", || {});
+        assert_eq!(sheet.debug_live_subscription_count(), 2);
+
+        // Drop one A1 listener; bucket survives (still has the second one).
+        sheet.unsubscribe_cell(sub_a);
+        assert_eq!(sheet.debug_live_subscription_count(), 2);
     }
 
     #[test]
