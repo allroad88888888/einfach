@@ -182,8 +182,12 @@ body {
   border: 1px solid #d8d8d8;
   padding: 0;
   height: 26px;
-  min-width: 90px;
-  max-width: 200px;
+  /* Fixed column width — required so 2D virtualization math
+   * (leftPad/rightPad spacers in px) lines up with the actual rendered
+   * column width. `table-layout: fixed` (set on .excel-table) takes the
+   * column widths from cells in the first row; we override per-class
+   * for .row-header below. */
+  width: 100px;
 }
 
 /* Row-virtualization spacer rows — invisible, but their height pads the

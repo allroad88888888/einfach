@@ -98,22 +98,18 @@ test.describe('Row virtualization', () => {
   })
 
   test('column virtualization — wide grid keeps col DOM bounded', async ({ page }) => {
-    // Phase-4 Track P: once Track M swaps Table.tsx onto VGridTable and
-    // Track O lands the `1M Cells` demo (1000 cols × 1000 rows), the DOM
-    // should hold only the visible column window plus overscan — NOT all
-    // 1000 columns. Asserting `td.cell` count < 500 catches the wide-grid
-    // regression: 1000 cols × ~20 visible rows would be ~20k cells, so
-    // anything sub-500 is firmly inside the 2D-virt envelope. We also
-    // assert `ALL1` (col 999, row 0) is absent from the initial DOM —
-    // it's far to the right of the viewport and a hand-rolled "render
-    // all cols while measuring" fallback would put it there.
-    test.skip(true, 'needs Track M VGridTable + Track O DemoMillion')
+    // Phase-4: native 2D-virt path. The DOM should hold only the
+    // visible column window plus overscan — NOT all 1000 columns.
+    // Tight bound is "much less than 1M"; observed (viewport ~600×800,
+    // OVERSCAN=5) is ~630 cells, so we use 1500 as the headroom-bearing
+    // ceiling: a regression that breaks the col virt (rendering every
+    // col per visible row) would put ~20k+ cells here instantly.
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible()
 
     const cellCount = await page.locator('table.excel-table tbody td.cell').count()
     expect(cellCount).toBeGreaterThan(0)
-    expect(cellCount).toBeLessThan(500)
+    expect(cellCount).toBeLessThan(1500)
 
     // ALL1 is column-index 999 (1-based col 1000); far outside the
     // initial horizontal viewport.

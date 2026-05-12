@@ -34,9 +34,24 @@ export interface TableProps {
  * in styles.css. Used to translate scrollTop ↔ row index for windowing. */
 const ROW_HEIGHT = 26
 
-/** Rows rendered outside the visible viewport on each side. Hides the
+/** Column width in CSS pixels — must match `.excel-table td { width: 100px }`
+ * in styles.css. Translates scrollLeft ↔ col index. */
+const COL_WIDTH = 100
+
+/** Row-header gutter at column 0 — matches `.row-header { width: 44px }`. */
+const ROW_HEADER_WIDTH = 44
+
+/** Rows / cols rendered outside the visible viewport on each side. Hides the
  * "blank flash" during fast scrolls without inflating the DOM. */
-const OVERSCAN = 4
+const OVERSCAN = 5
+
+/** Pre-measurement bounded fallback. When the wrapper hasn't reported a
+ * viewport size yet (first paint), render this many rows/cols rather than
+ * the full grid. Replaces the prior "render all while measuring" fallback
+ * — the 1M-cell demo can't afford to put 1M cells in the DOM on first
+ * paint while waiting for ResizeObserver to fire. */
+const INITIAL_ROW_WINDOW = 20
+const INITIAL_COL_WINDOW = 26
 
 /** Build cell address from row/col: (0,0)→"A1" */
 function cellAddr(row: number, col: number): string {
@@ -47,41 +62,72 @@ export function Table(props: TableProps) {
   const rows = () => props.rows ?? 20
   const cols = () => props.cols ?? 10
 
-  const colIndices = () => Array.from({ length: cols() }, (_, i) => i)
-
-  // === Row virtualization ===
-  // `scrollTop` / `viewportH` drive the visible window. Both are 0 until the
-  // wrapper mounts + its first onScroll / measurement; that's fine because
-  // the initial `visibleRowEnd` then falls back to `min(rows, OVERSCAN +
-  // initial_visible)` — see `visibleRange()` below.
+  // === 2D virtualization ===
+  // `scrollTop` / `scrollLeft` track wrapper scroll; `viewportH` /
+  // `viewportW` are set by ResizeObserver. Before the first measurement
+  // we render a bounded initial window (`INITIAL_ROW_WINDOW` ×
+  // `INITIAL_COL_WINDOW`) so 1M-cell sheets don't pin 1M cells in the
+  // DOM during first paint.
   let wrapperEl: HTMLDivElement | undefined
   const [scrollTop, setScrollTop] = createSignal(0)
+  const [scrollLeft, setScrollLeft] = createSignal(0)
   const [viewportH, setViewportH] = createSignal(0)
+  const [viewportW, setViewportW] = createSignal(0)
 
   /** [start, end) window of row indices to render. Inclusive overscan on
    *  both sides. Falls back to "all rows" when virtualization is off. */
-  function visibleRange(): [number, number] {
+  function visibleRowRange(): [number, number] {
     if (!props.virtualize) return [0, rows()]
     const top = scrollTop()
-    const h = viewportH() || rows() * ROW_HEIGHT // pre-mount: render all
+    const h = viewportH() || INITIAL_ROW_WINDOW * ROW_HEIGHT
     const first = Math.max(0, Math.floor(top / ROW_HEIGHT) - OVERSCAN)
     const visible = Math.ceil(h / ROW_HEIGHT)
     const last = Math.min(rows(), first + visible + OVERSCAN * 2)
     return [first, last]
   }
 
-  /** The window expanded to an inclusive array of indices for `<For>`. */
+  /** [start, end) window of col indices to render. Same shape as rows;
+   *  the row-header gutter is subtracted from `viewportW` so the visible
+   *  count tracks the actual scrollable column band. */
+  function visibleColRange(): [number, number] {
+    if (!props.virtualize) return [0, cols()]
+    const left = scrollLeft()
+    const wRaw = viewportW() || INITIAL_COL_WINDOW * COL_WIDTH + ROW_HEADER_WIDTH
+    const innerW = Math.max(0, wRaw - ROW_HEADER_WIDTH)
+    const first = Math.max(0, Math.floor(left / COL_WIDTH) - OVERSCAN)
+    const visible = Math.ceil(innerW / COL_WIDTH)
+    const last = Math.min(cols(), first + visible + OVERSCAN * 2)
+    return [first, last]
+  }
+
+  /** The row window expanded to an array of indices for `<For>`. */
   const rowIndices = () => {
-    const [start, end] = visibleRange()
+    const [start, end] = visibleRowRange()
     const out = new Array<number>(end - start)
     for (let i = 0; i < out.length; i++) out[i] = start + i
     return out
   }
 
-  /** Heights of the top / bottom spacer rows that keep total scroll height
-   *  equal to `rows * ROW_HEIGHT` even though we only render the window. */
-  const topPad = () => visibleRange()[0] * ROW_HEIGHT
-  const botPad = () => (rows() - visibleRange()[1]) * ROW_HEIGHT
+  /** The col window expanded to an array of indices for `<For>`. */
+  const colIndices = () => {
+    const [start, end] = visibleColRange()
+    const out = new Array<number>(end - start)
+    for (let i = 0; i < out.length; i++) out[i] = start + i
+    return out
+  }
+
+  /** Heights of the top / bottom spacer rows that keep total scroll
+   *  height equal to `rows * ROW_HEIGHT` even though we only render
+   *  the row window. */
+  const topPad = () => visibleRowRange()[0] * ROW_HEIGHT
+  const botPad = () => (rows() - visibleRowRange()[1]) * ROW_HEIGHT
+
+  /** Widths of the left / right spacer cells inside each row + the
+   *  thead row. Same idea as topPad/botPad but on the col axis: keep
+   *  total scroll width equal to `cols * COL_WIDTH` while only
+   *  rendering the col window. */
+  const leftPad = () => visibleColRange()[0] * COL_WIDTH
+  const rightPad = () => (cols() - visibleColRange()[1]) * COL_WIDTH
 
   // Selection lives on the store so FormulaBar / future copy-paste / right-
   // click menus all read & write the same source of truth.
@@ -120,6 +166,24 @@ export function Table(props: TableProps) {
         if (top < viewTop) wrapperEl.scrollTop = top
         else if (top + ROW_HEIGHT > viewBot)
           wrapperEl.scrollTop = top + ROW_HEIGHT - wrapperEl.clientHeight + headerH
+      },
+    ),
+  )
+
+  /** Horizontal counterpart of the row-anchored scroll-into-view above.
+   *  Triggers on selection.col change; offsets by the sticky row-header
+   *  gutter so the focus cell doesn't land flush against it. */
+  createEffect(
+    on(
+      () => selected().col,
+      (col) => {
+        if (!props.virtualize || !wrapperEl) return
+        const left = col * COL_WIDTH
+        const viewLeft = wrapperEl.scrollLeft
+        const viewRight = viewLeft + wrapperEl.clientWidth - ROW_HEADER_WIDTH
+        if (left < viewLeft) wrapperEl.scrollLeft = left
+        else if (left + COL_WIDTH > viewRight)
+          wrapperEl.scrollLeft = left + COL_WIDTH - wrapperEl.clientWidth + ROW_HEADER_WIDTH
       },
     ),
   )
@@ -370,11 +434,15 @@ export function Table(props: TableProps) {
       onKeyDown={onKeyDown}
       ref={(el) => {
         wrapperEl = el
-        // Capture initial viewport height; updates flow through onScroll +
+        // Capture initial viewport size; updates flow through onScroll +
         // a ResizeObserver below.
         setViewportH(el.clientHeight)
+        setViewportW(el.clientWidth)
         if (typeof ResizeObserver !== 'undefined') {
-          const ro = new ResizeObserver(() => setViewportH(el.clientHeight))
+          const ro = new ResizeObserver(() => {
+            setViewportH(el.clientHeight)
+            setViewportW(el.clientWidth)
+          })
           ro.observe(el)
           // Without disconnect, tabbing between demos leaves the observer
           // attached to a detached element; the callback keeps a closure
@@ -383,7 +451,11 @@ export function Table(props: TableProps) {
           onCleanup(() => ro.disconnect())
         }
       }}
-      onScroll={(e) => setScrollTop((e.currentTarget as HTMLDivElement).scrollTop)}
+      onScroll={(e) => {
+        const t = e.currentTarget as HTMLDivElement
+        setScrollTop(t.scrollTop)
+        setScrollLeft(t.scrollLeft)
+      }}
     >
       <Show when={props.toolbar}>
         <FormatToolbar store={props.store} />
@@ -395,6 +467,13 @@ export function Table(props: TableProps) {
         <thead>
           <tr>
             <th class="row-header"></th>
+            <Show when={props.virtualize && leftPad() > 0}>
+              <th
+                class="virt-spacer"
+                aria-hidden="true"
+                style={{ width: `${leftPad()}px`, padding: 0 }}
+              />
+            </Show>
             <For each={colIndices()}>
               {(col) => (
                 <th
@@ -405,6 +484,13 @@ export function Table(props: TableProps) {
                 </th>
               )}
             </For>
+            <Show when={props.virtualize && rightPad() > 0}>
+              <th
+                class="virt-spacer"
+                aria-hidden="true"
+                style={{ width: `${rightPad()}px`, padding: 0 }}
+              />
+            </Show>
           </tr>
         </thead>
         <tbody>
@@ -422,6 +508,13 @@ export function Table(props: TableProps) {
                 >
                   {row + 1}
                 </td>
+                <Show when={props.virtualize && leftPad() > 0}>
+                  <td
+                    class="virt-spacer"
+                    aria-hidden="true"
+                    style={{ width: `${leftPad()}px`, padding: 0 }}
+                  />
+                </Show>
                 <For each={colIndices()}>
                   {(col) => {
                     const isSelected = () =>
@@ -459,6 +552,13 @@ export function Table(props: TableProps) {
                     )
                   }}
                 </For>
+                <Show when={props.virtualize && rightPad() > 0}>
+                  <td
+                    class="virt-spacer"
+                    aria-hidden="true"
+                    style={{ width: `${rightPad()}px`, padding: 0 }}
+                  />
+                </Show>
               </tr>
             )}
           </For>
