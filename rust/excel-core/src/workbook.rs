@@ -7,7 +7,160 @@ use crate::cell::CellAddress;
 use crate::eval::EvalProvider;
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
-use crate::sheet::Sheet;
+use crate::sheet::{RangeDependentIndex, Sheet};
+
+/// One outgoing edge from a formula cell to a cross-sheet source.
+///
+/// `Cell` and `Range` mirror the sheet-local distinction between
+/// point-cell deps (`cell_dependents`) and range deps (`range_dependents`).
+/// A single formula can have multiple of each — `=Sheet2!A1 + SUM(Sheet3!B1:B10)`
+/// would produce one `Cell` and one `Range` edge.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CrossSheetRef {
+    Cell(usize, CellAddress),
+    Range(usize, CellRange),
+}
+
+/// Workbook-level cross-sheet dependency graph. Tracks the reverse edges
+/// that let a `Workbook::set_cell(src_sheet, src_addr, _)` find every
+/// formula on every OTHER sheet that needs dirtying — the gap that Sheet-
+/// local `cell_dependents` / `range_dependents` cannot close on its own.
+///
+/// Maintained by `Workbook::set_formula` / `Workbook::clear_cell` and
+/// queried by `Workbook::set_cell` and the BFS underneath it.
+#[derive(Default)]
+pub(crate) struct CrossSheetDeps {
+    /// REVERSE edges, point-cell variant.
+    /// `(src_sheet, src_addr) → set of (formula_sheet, formula_addr)`.
+    /// `=Sheet2!A1` on `Sheet1!B1` becomes
+    /// `cell_dependents[(2, A1)] = {(1, B1)}`.
+    pub(crate) cell_dependents:
+        HashMap<(usize, CellAddress), HashSet<(usize, CellAddress)>>,
+
+    /// REVERSE edges, range variant. One `RangeDependentIndex` per source
+    /// sheet so per-write dirty fanout for that sheet runs the same
+    /// row+col bucket lookup as Phase 2's sheet-local index.
+    ///
+    /// `SUM(Sheet2!A1:A100)` on `Sheet1!D` becomes an entry inside
+    /// `range_index_per_sheet[2]`, where the index value points back at
+    /// `(1, D)` as the dependent formula.
+    pub(crate) range_index_per_sheet: HashMap<usize, RangeDependentIndex>,
+
+    /// FORWARD edges. `(formula_sheet, formula_addr) → its outgoing
+    /// cross-sheet refs`. Needed to undo previous edges when the formula
+    /// is replaced or cleared, and (Track J's future use) to drive
+    /// cross-sheet cycle detection off the same map rather than a
+    /// per-call AST walk.
+    pub(crate) formula_refs: HashMap<(usize, CellAddress), Vec<CrossSheetRef>>,
+}
+
+#[allow(dead_code)]
+impl CrossSheetDeps {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert one outgoing edge under `(formula_sheet, formula_addr)` and
+    /// also register the corresponding reverse edge. Used by `Workbook::
+    /// set_formula` after the AST walk has produced a `Vec<CrossSheetRef>`.
+    fn add_edge(
+        &mut self,
+        formula_sheet: usize,
+        formula_addr: CellAddress,
+        edge: CrossSheetRef,
+    ) {
+        // Reverse edge.
+        match &edge {
+            CrossSheetRef::Cell(src_sheet, src_addr) => {
+                self.cell_dependents
+                    .entry((*src_sheet, *src_addr))
+                    .or_default()
+                    .insert((formula_sheet, formula_addr));
+            }
+            CrossSheetRef::Range(src_sheet, range) => {
+                self.range_index_per_sheet
+                    .entry(*src_sheet)
+                    .or_insert_with(RangeDependentIndex::new)
+                    .add_formula(*range, formula_addr);
+                // NOTE: the per-source-sheet `RangeDependentIndex` keys
+                // its formula set by `CellAddress` only. The formula's
+                // sheet is implicit in the formula_refs forward edge —
+                // the workbook BFS pairs each addr back to its sheet by
+                // looking up `formula_refs[(formula_sheet, addr)]`.
+                let _ = formula_sheet;
+            }
+        }
+        // Forward edge.
+        self.formula_refs
+            .entry((formula_sheet, formula_addr))
+            .or_default()
+            .push(edge);
+    }
+
+    /// Drop every outgoing edge previously installed under
+    /// `(formula_sheet, formula_addr)` and tear down the matching reverse
+    /// edges. Inverse of repeated `add_edge` calls. Idempotent — safe to
+    /// call when no entry exists.
+    fn remove_outgoing(&mut self, formula_sheet: usize, formula_addr: CellAddress) {
+        let Some(edges) = self.formula_refs.remove(&(formula_sheet, formula_addr)) else {
+            return;
+        };
+        for edge in edges {
+            match edge {
+                CrossSheetRef::Cell(src_sheet, src_addr) => {
+                    let should_remove = if let Some(set) =
+                        self.cell_dependents.get_mut(&(src_sheet, src_addr))
+                    {
+                        set.remove(&(formula_sheet, formula_addr));
+                        set.is_empty()
+                    } else {
+                        false
+                    };
+                    if should_remove {
+                        self.cell_dependents.remove(&(src_sheet, src_addr));
+                    }
+                }
+                CrossSheetRef::Range(src_sheet, range) => {
+                    if let Some(index) = self.range_index_per_sheet.get_mut(&src_sheet) {
+                        index.remove_formula(range, formula_addr);
+                        if index.is_empty() {
+                            self.range_index_per_sheet.remove(&src_sheet);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Snapshot view of the currently-installed outgoing edges for
+    /// `(formula_sheet, formula_addr)`. Used by tests and by the rollback
+    /// path in `Workbook::set_formula` (which needs to undo a partially-
+    /// installed edge set if `Sheet::set_formula` rejects the formula).
+    fn outgoing(&self, formula_sheet: usize, formula_addr: CellAddress) -> &[CrossSheetRef] {
+        self.formula_refs
+            .get(&(formula_sheet, formula_addr))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Total reverse-edge count across both cell and range halves. Used
+    /// by the Phase 3 acceptance test to verify the cross-sheet write
+    /// actually exercised the graph. Each point-cell entry contributes
+    /// its dependent set size; each range entry contributes its dependent
+    /// set size; ranges that contain N source cells still count as one
+    /// entry per dependent (not N), preserving the sparse contract.
+    #[doc(hidden)]
+    pub fn debug_reverse_edge_count(&self) -> usize {
+        let cell_edges: usize = self.cell_dependents.values().map(HashSet::len).sum();
+        let range_edges: usize = self
+            .range_index_per_sheet
+            .values()
+            .map(RangeDependentIndex::len)
+            .sum();
+        cell_edges + range_edges
+    }
+}
 
 /// A workbook is an ordered collection of named sheets. Phase 4 backend.
 ///
@@ -19,6 +172,12 @@ pub struct Workbook {
     names: Vec<String>,
     /// name → index lookup; rebuilt whenever sheets are added/renamed.
     by_name: HashMap<String, usize>,
+    /// Cross-sheet reverse dep graph (Phase 3 Track I). Maintained by the
+    /// workbook-routed mutators (`set_cell`, `set_formula`, `clear_cell`,
+    /// `bulk_load`). Empty for workbooks edited exclusively through the
+    /// `Sheet::set_*` direct path — those writes deliberately bypass the
+    /// graph so single-sheet tests stay stable.
+    cross_sheet: CrossSheetDeps,
 }
 
 impl Workbook {
@@ -27,6 +186,7 @@ impl Workbook {
             sheets: Vec::new(),
             names: Vec::new(),
             by_name: HashMap::new(),
+            cross_sheet: CrossSheetDeps::new(),
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -221,6 +381,11 @@ impl Workbook {
 
     /// Remove a sheet by index. Returns the removed sheet so callers can
     /// inspect / dispose of its atoms if needed.
+    ///
+    /// Clears the cross-sheet dep graph as a defensive measure — sheet
+    /// removal shifts indices, and rewriting every `(idx, addr)` key on
+    /// the fly is brittle. The next workbook-routed `set_formula` call
+    /// will repopulate edges from the live formulas.
     pub fn remove_sheet(&mut self, idx: usize) -> Option<Sheet> {
         if idx >= self.sheets.len() {
             return None;
@@ -235,7 +400,22 @@ impl Workbook {
             }
             let _ = n;
         }
+        // Sheet indices shifted; the cross-sheet dep graph is no longer
+        // coherent. Drop it. (Phase 3 callers don't currently mix
+        // `remove_sheet` with cross-sheet subscriptions; if that changes,
+        // a future iteration can rewrite each `(idx, addr)` in place
+        // instead of clearing.)
+        self.cross_sheet = CrossSheetDeps::new();
         Some(sheet)
+    }
+
+    /// Debug-only: total cross-sheet reverse-edge count. Backs the Phase
+    /// 3 acceptance assertion that workbook-routed writes actually
+    /// exercise the dep graph (vs. silently no-oping the way the pre-
+    /// Track-I `Sheet::set_cell`-only path did).
+    #[doc(hidden)]
+    pub fn debug_cross_sheet_reverse_edge_count(&self) -> usize {
+        self.cross_sheet.debug_reverse_edge_count()
     }
 }
 
