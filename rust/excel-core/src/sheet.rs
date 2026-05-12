@@ -3313,4 +3313,50 @@ mod tests {
         sheet.set_cell("A50", Value::Number(10.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
     }
+
+    /// Phase 2 Track E acceptance: the candidate-range lookup driving
+    /// `dependents_of` must be bucketed, not a linear scan over every
+    /// registered range. Registers 1000 disjoint 3-row tall ranges in
+    /// column A (one per formula cell down column C) and asserts that
+    /// for an address (row r, col 0) covered by exactly 3 of them, the
+    /// internal candidate set returned by `RangeDependentIndex::
+    /// candidates_for` contains at most a handful of ranges — NOT all
+    /// 1000. The previous Phase 1 implementation would have returned
+    /// every range here.
+    #[test]
+    fn range_dependents_lookup_is_bucketed() {
+        let mut sheet = Sheet::new();
+        // 1000 ranges, each 3 rows tall, with overlapping but mostly
+        // disjoint coverage. Range i covers rows [i, i+2] of column A.
+        // Probe row r=500 — only ranges i ∈ {498, 499, 500} cover it.
+        const N: u32 = 1000;
+        for i in 0..N {
+            let formula = format!("=SUM(A{}:A{})", i + 1, i + 3);
+            let target = format!("C{}", i + 1);
+            sheet.set_formula(&target, &formula);
+        }
+
+        // All 1000 distinct ranges registered.
+        assert_eq!(sheet.debug_range_dep_count(), N as usize);
+
+        // A501 sits in column A, row 500 (0-indexed). Three ranges
+        // cover it: row 500 ∈ [498, 500], [499, 501], [500, 502].
+        let candidates = sheet.debug_range_dep_candidates("A501");
+
+        // Tight bound: at most a small constant. The previous
+        // O(range_count) scan would walk all N. Using N/10 as a loose
+        // upper bound that still catches regressions if a future
+        // change accidentally registers ranges in every row.
+        assert!(
+            candidates <= (N / 10) as usize,
+            "candidate set should be bucket-narrowed; got {} of {} ranges",
+            candidates,
+            N
+        );
+        assert!(
+            candidates >= 3,
+            "candidate set must contain the 3 covering ranges; got {}",
+            candidates
+        );
+    }
 }
