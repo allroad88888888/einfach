@@ -263,25 +263,13 @@ fn null_write_releases_primitive_atom() {
 //   - 1M coord space + small range read → O(range cells) visited
 //     (Track F lands the row-indexed cell storage that makes this true).
 //
-// Both tests are `#[ignore]`'d at landing time because the underlying
-// optimization in `Sheet` doesn't exist yet:
-//
-//   - `single_write_with_100k_range_formulas_is_bounded` requires Agent E's
-//     interval index for `range_dependents` (replacing the O(N) scan in
-//     `Sheet::dependents_of`). Un-ignore protocol: once Agent E merges,
-//     delete the `#[ignore = "phase-2 — un-ignore after Agent E merge"]`
-//     attribute. The test body should pass as-is; if it doesn't, the
-//     50ms budget either needs widening for CI noise or the index isn't
-//     actually O(matches).
-//
-//   - `range_read_1m_sparse_visits_only_range` requires Agent F's sparse
-//     value index (replacing the linear `cells.iter().filter()` in
-//     `Sheet::for_each_sparse_cell_with`). Un-ignore protocol: once
-//     Agent F merges, delete the `#[ignore = "phase-2 — un-ignore after
-//     Agent F merge"]` attribute. The visit-count assertion uses the
-//     `Sheet::debug_range_visit_count` helper added in this commit;
-//     no shim trait needed (the helper lives on `Sheet` directly via
-//     `#[doc(hidden)]` so it's available unconditionally).
+// Backing implementations:
+//   - `single_write_with_100k_range_formulas_is_bounded` is satisfied by
+//     Agent E's `RangeDependentIndex` (row+col bucket + wide-range
+//     fallback) inside `Sheet::dependents_of`.
+//   - `range_read_1m_sparse_visits_only_range` is satisfied by Agent F's
+//     `RowMajorMap`-backed `cells` storage and the
+//     `Sheet::debug_range_visit_count` probe helper.
 
 use std::time::{Duration, Instant};
 
@@ -302,7 +290,6 @@ use std::time::{Duration, Instant};
 /// but the gap between O(N) and O(matches) at N=100k is large enough
 /// that 50ms remains a meaningful boundary.
 #[test]
-#[ignore = "phase-2 — un-ignore after Agent E merge"]
 fn single_write_with_100k_range_formulas_is_bounded() {
     const N_RANGE_FORMULAS: u32 = 100_000;
 
@@ -363,7 +350,6 @@ fn single_write_with_100k_range_formulas_is_bounded() {
 /// to do so; Phase 2's row-indexed structure makes the visit cost
 /// match the returned count.
 #[test]
-#[ignore = "phase-2 — un-ignore after Agent F merge"]
 fn range_read_1m_sparse_visits_only_range() {
     const TOTAL_CELLS: usize = 1_000_000;
     const NON_EMPTY: usize = 10_000;
