@@ -439,6 +439,34 @@ impl WasmSheet {
     pub fn formatted_display(&self, addr: &str) -> String {
         self.sheet.formatted_display(addr)
     }
+
+    // === B1 — debug counters mirror ===
+    //
+    // Thin wrappers that expose the Sheet-level `debug_*` counters across
+    // the WASM boundary. Each returns `u32` so the JS side gets a plain
+    // number; on 64-bit hosts the counters are `usize` but the values we
+    // expect (eval counts, dirty counts, live sub counts) stay well under
+    // 2^32 for any realistic test. Naming mirrors `debug_*` on `Sheet`.
+
+    /// Total formula evaluations performed since this sheet was created.
+    pub fn debug_formula_eval_count(&self) -> u32 {
+        self.sheet.debug_formula_eval_count() as u32
+    }
+
+    /// Number of formula records currently in the `Dirty` cache state.
+    pub fn debug_dirty_count(&self) -> u32 {
+        self.sheet.debug_dirty_count() as u32
+    }
+
+    /// Number of formulas registered via `bulk_load` (cumulative).
+    pub fn debug_imported_formula_count(&self) -> u32 {
+        self.sheet.debug_imported_formula_count() as u32
+    }
+
+    /// Number of `CellAddress`es with at least one live listener.
+    pub fn debug_live_subscription_count(&self) -> u32 {
+        self.sheet.debug_live_subscription_count() as u32
+    }
 }
 
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
