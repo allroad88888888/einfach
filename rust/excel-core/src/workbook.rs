@@ -114,6 +114,9 @@ impl CrossSheetDeps {
                     }
                 }
                 CrossSheetRef::Range(src_sheet, range) => {
+                    if self.has_remaining_range_edge(src_sheet, range, formula_addr) {
+                        continue;
+                    }
                     if let Some(index) = self.range_index_per_sheet.get_mut(&src_sheet) {
                         index.remove_formula(range, formula_addr);
                         if index.is_empty() {
@@ -123,6 +126,25 @@ impl CrossSheetDeps {
                 }
             }
         }
+    }
+
+    fn has_remaining_range_edge(
+        &self,
+        src_sheet: usize,
+        range: CellRange,
+        formula_addr: CellAddress,
+    ) -> bool {
+        self.formula_refs
+            .iter()
+            .filter(|((_sheet, addr), _edges)| *addr == formula_addr)
+            .any(|(_key, edges)| {
+                edges.iter().any(|edge| {
+                    matches!(
+                        edge,
+                        CrossSheetRef::Range(s, r) if *s == src_sheet && *r == range
+                    )
+                })
+            })
     }
 
     /// Total reverse-edge count across both cell and range halves. Used
@@ -1780,6 +1802,33 @@ mod tests {
         assert!(
             *other_changes.borrow() >= 1,
             "Other!D1 must also fire for Data!A5 despite sharing the same address"
+        );
+    }
+
+    #[test]
+    fn cross_sheet_range_replacement_preserves_other_sheet_same_addr_edge() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let other_idx = wb.add_sheet("Other");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        assert!(wb.set_formula(s1, "D1", "=SUM(Data!A1:A10)"));
+        assert!(wb.set_formula(other_idx, "D1", "=SUM(Data!A1:A10)"));
+        assert!(wb.set_formula(s1, "D1", "=1"));
+
+        let other_changes = Rc::new(RefCell::new(0u32));
+        {
+            let c = other_changes.clone();
+            wb.sheet_mut(other_idx)
+                .unwrap()
+                .subscribe_cell("D1", move || *c.borrow_mut() += 1);
+        }
+
+        wb.set_cell(data_idx, "A5", Value::Number(10.0));
+
+        assert!(
+            *other_changes.borrow() >= 1,
+            "removing Sheet1!D1 must not remove Other!D1's same-address range edge"
         );
     }
 
