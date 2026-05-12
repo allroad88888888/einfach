@@ -171,6 +171,18 @@ pub struct Workbook {
     /// `Sheet::set_*` direct path — those writes deliberately bypass the
     /// graph so single-sheet tests stay stable.
     cross_sheet: CrossSheetDeps,
+    /// Phase 3 Track J probe counter: cumulative count of
+    /// `collect_workbook_refs` AST walks initiated by this workbook's
+    /// `cross_sheet_cycle`. The Track J rewrite calls
+    /// `collect_workbook_refs` exactly once per `set_formula` (for the
+    /// candidate seed) and pulls visited-node edges from the forward
+    /// index. The pre-Track-J shape called `collect_workbook_refs` once
+    /// per VISITED formula too, so a test can assert the new shape by
+    /// checking the delta is 1 per `set_formula`, not N.
+    ///
+    /// Per-workbook (not process-global) so the assertion isn't flaky
+    /// under cargo's parallel test runner.
+    cycle_ast_walk_count: Cell<usize>,
 }
 
 impl Workbook {
@@ -180,6 +192,7 @@ impl Workbook {
             names: Vec::new(),
             by_name: HashMap::new(),
             cross_sheet: CrossSheetDeps::new(),
+            cycle_ast_walk_count: Cell::new(0),
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -524,18 +537,51 @@ impl Workbook {
     /// (treated as if it were already installed at `(target_idx, target)`).
     /// Returns true iff `(target_idx, target)` is reachable.
     ///
-    /// Edges from any visited `(idx, addr)`:
-    ///   - same-sheet `CellRef` / `Range` → `(idx, ref_addr)`
-    ///   - `SheetRef { sheet, addr }` → `(other_idx, addr)` if the sheet name
-    ///     resolves; otherwise dropped
+    /// **Phase 3 Track J**: visited-node edges come from
+    /// `CrossSheetDeps::formula_refs` — the same forward index that
+    /// `Workbook::set_formula` maintains. This avoids the per-visited-node
+    /// AST walk through `collect_workbook_refs` that the pre-Track-J
+    /// implementation used; instead the AST walk runs exactly once, for
+    /// the CANDIDATE expression (which isn't in `formula_refs` yet because
+    /// we're DECIDING whether to install it).
     ///
-    /// Range expansion is gated by `formula_exprs` membership on each sheet
-    /// (mirrors `collect_formula_refs_into` in sheet.rs) so `SUM(A:A)` doesn't
-    /// enqueue a million empty addresses.
+    /// The candidate seed still uses `collect_workbook_refs` because:
+    ///   1. Its edges aren't installed yet at this point in `set_formula`.
+    ///   2. We need to follow BOTH same-sheet and cross-sheet edges
+    ///      *out of the candidate*. Same-sheet edges land at `(target_idx,
+    ///      ref_addr)`, which lets the BFS detect cycles like
+    ///      `Sheet1!A = =Sheet1!B` paired with `Sheet1!B = =Sheet1!A`
+    ///      via the `formula_refs[(target_idx, ref_addr)]` lookup ONLY
+    ///      if `ref_addr` itself has cross-sheet outgoing edges.
+    ///
+    /// `formula_refs` stores ONLY cross-sheet edges (same-sheet refs are
+    /// tracked by `Sheet`'s own `cell_dependents`/`range_dependents`).
+    /// Two consequences:
+    ///   - Pure cross-sheet cycles (the existing 5 tests + the typical
+    ///     `Sheet1!A = =Sheet2!A ↔ Sheet2!A = =Sheet1!A` shape) are caught
+    ///     entirely on the index path — O(F) HashMap lookups per visited
+    ///     node instead of O(AST size).
+    ///   - Cycles that thread through a same-sheet hop in a *visited*
+    ///     formula (e.g. `Sheet1!A = =Sheet2!B`, `Sheet2!B = =Sheet2!C`,
+    ///     `Sheet2!C = =Sheet1!A`) won't be caught here because
+    ///     `formula_refs[(Sheet2, B)]` is empty. Those rely on the
+    ///     runtime fallback: `FormulaCache::Computing` short-circuits with
+    ///     `Value::Error(ValueError::CyclicRef)`. See the
+    ///     `cross_sheet_runtime_guard_returns_cycle_when_static_bypassed`
+    ///     test for the contract.
     fn cross_sheet_cycle(&self, target_idx: usize, target: CellAddress, expr: &Expr) -> bool {
         let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
         let mut to_visit: Vec<(usize, CellAddress)> = Vec::new();
-        // Seed with refs of the candidate expression.
+        // Seed with refs of the candidate expression. `collect_workbook_refs`
+        // is retained for this candidate-only AST walk — the candidate's
+        // edges aren't in `formula_refs` yet (we're deciding whether to
+        // install them), so the only honest source is the parsed `expr`.
+        //
+        // Track J probe: bump the per-workbook counter so tests can verify
+        // the AST walk runs ONCE per `cross_sheet_cycle` call (the
+        // candidate), not N times (the pre-Track-J shape).
+        self.cycle_ast_walk_count
+            .set(self.cycle_ast_walk_count.get() + 1);
         collect_workbook_refs(expr, target_idx, &self.by_name, &mut to_visit);
 
         while let Some((idx, addr)) = to_visit.pop() {
@@ -545,15 +591,38 @@ impl Workbook {
             if !visited.insert((idx, addr)) {
                 continue;
             }
-            // Walk the formula at this node, if any.
-            let Some(sheet) = self.sheets.get(idx) else {
+            // Visited nodes' outgoing edges come from the forward index,
+            // not a per-node AST walk. The index stores only cross-sheet
+            // edges; same-sheet cycles threaded through visited nodes are
+            // caught by `FormulaCache::Computing` at runtime.
+            let Some(edges) = self.cross_sheet.formula_refs.get(&(idx, addr)) else {
                 continue;
             };
-            let exprs = sheet.formula_exprs_iter();
-            let Some(child_expr) = exprs.get(&addr) else {
-                continue;
-            };
-            collect_workbook_refs(child_expr, idx, &self.by_name, &mut to_visit);
+            for edge in edges {
+                match edge {
+                    CrossSheetRef::Cell(src_sheet, src_addr) => {
+                        to_visit.push((*src_sheet, *src_addr));
+                    }
+                    CrossSheetRef::Range(src_sheet, range) => {
+                        // Expand a range edge to the formula cells that
+                        // actually live inside the rectangle — same gating
+                        // as `collect_formula_refs_into` in sheet.rs so
+                        // `SUM(A:A)` doesn't enqueue u32::MAX entries.
+                        // (Range edges aren't emitted by the parser yet
+                        // but the arm keeps the data model forward-
+                        // compatible with Track L's `cross_sheet_range_*`
+                        // tests.)
+                        let Some(sheet) = self.sheets.get(*src_sheet) else {
+                            continue;
+                        };
+                        for cand_addr in sheet.formula_exprs_iter().keys() {
+                            if range.contains(*cand_addr) {
+                                to_visit.push((*src_sheet, *cand_addr));
+                            }
+                        }
+                    }
+                }
+            }
         }
         false
     }
@@ -595,6 +664,17 @@ impl Workbook {
     #[doc(hidden)]
     pub fn debug_cross_sheet_reverse_edge_count(&self) -> usize {
         self.cross_sheet.debug_reverse_edge_count()
+    }
+
+    /// Debug-only: per-workbook count of `collect_workbook_refs` AST walks
+    /// performed by `cross_sheet_cycle`. Used by the Phase 3 Track J test
+    /// to assert that visited-node edges come from
+    /// `CrossSheetDeps::formula_refs` (one AST walk per `set_formula` —
+    /// the candidate only) rather than the pre-Track-J shape (one AST
+    /// walk per visited formula).
+    #[doc(hidden)]
+    pub fn debug_cycle_ast_walk_count(&self) -> usize {
+        self.cycle_ast_walk_count.get()
     }
 
     /// Workbook-level bulk loader (Phase 3 Track I). Collects every
@@ -935,10 +1015,15 @@ fn collect_cross_sheet_refs_into(
 /// `by_name`; unknown sheet names are dropped (eval-time will return
 /// `#REF!`, which doesn't form a cycle).
 ///
-/// Used only by `Workbook::cross_sheet_cycle` — kept free so it doesn't
-/// borrow `self`. Range expansion is naive (every cell in the rectangle)
-/// because the sheet-side BFS gates on `formula_exprs` membership next, so
-/// large empty ranges only cost `Vec` pushes here, not unbounded recursion.
+/// **Phase 3 Track J**: used exclusively for the CANDIDATE expression
+/// inside `Workbook::cross_sheet_cycle`. Visited (already-installed)
+/// formulas pull their edges from `CrossSheetDeps::formula_refs` instead
+/// — that's the whole point of the forward index, and avoids re-walking
+/// each visited formula's AST. Kept free so it doesn't borrow `self`.
+/// Range expansion is naive (every cell in the rectangle) because the
+/// seed list feeds into a BFS that gates on dep-graph membership, so
+/// large empty ranges only cost `Vec` pushes here, not unbounded
+/// recursion.
 fn collect_workbook_refs(
     expr: &Expr,
     current_idx: usize,
@@ -1666,5 +1751,130 @@ mod tests {
             "bulk_load must dedup cross-sheet subscriber fanout"
         );
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(30.0));
+    }
+
+    /// Phase 3 Track J: `cross_sheet_cycle` should expand visited-node
+    /// edges through `CrossSheetDeps::formula_refs`, NOT by re-parsing
+    /// each visited formula's AST. The probe is the per-workbook counter
+    /// `debug_cycle_ast_walk_count`: a third `set_formula` call
+    /// (`Sheet1!C = =Sheet2!B`) that visits an already-installed
+    /// cross-sheet pair must bump the counter by exactly ONE (for the
+    /// candidate seed AST walk), not by `N` for each visited node.
+    #[test]
+    fn cross_sheet_cycle_via_forward_index_no_collect_workbook_refs_on_visited() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let s2 = wb.index_of("Sheet2").unwrap();
+
+        // Install a non-cycle cross-sheet pair so the forward index has
+        // entries the BFS will traverse:
+        //   `Sheet1!A1 = =Sheet2!B1`
+        //   `Sheet2!B1 = =Sheet1!D1`
+        // After this, formula_refs[(s1, A1)] = [(s2, B1)] and
+        // formula_refs[(s2, B1)] = [(s1, D1)].
+        assert!(wb.set_formula(s1, "A1", "=Sheet2!B1"));
+        assert!(wb.set_formula(s2, "B1", "=Sheet1!D1"));
+
+        // Baseline counter before the probed call (already 2: one bump
+        // per cycle check, one per set_formula above).
+        let before = wb.debug_cycle_ast_walk_count();
+
+        // Third formula: `Sheet1!C1 = =Sheet2!B1`. The candidate seed
+        // edges are `[(s2, B1)]`. From there, the BFS consults
+        // `formula_refs[(s2, B1)] = [(s1, D1)]`, then
+        // `formula_refs[(s1, D1)]` (empty → stop). `(s1, C1)` (the
+        // target) is never reached, so this is NOT a cycle.
+        // The candidate AST walk runs exactly once → counter += 1.
+        assert!(
+            wb.set_formula(s1, "C1", "=Sheet2!B1"),
+            "re-reader of an existing cross-sheet source is not a cycle"
+        );
+
+        let after = wb.debug_cycle_ast_walk_count();
+        let delta = after - before;
+        assert_eq!(
+            delta, 1,
+            "cross_sheet_cycle must call collect_workbook_refs exactly once \
+             per set_formula (for the candidate seed). Visited nodes should \
+             pull their edges from formula_refs, not the AST. Got {} \
+             AST walks across this set_formula call.",
+            delta
+        );
+
+        // Sanity: the chain still evaluates correctly.
+        assert!(matches!(
+            wb.get_cell("Sheet1", "C1"),
+            Value::Number(_) | Value::Null
+        ));
+    }
+
+    /// Phase 3 Track J.2: cycles threaded through SAME-sheet hops via
+    /// unqualified `Expr::CellRef` in visited formulas are NOT caught
+    /// by the static `cross_sheet_cycle`. The forward index stores only
+    /// cross-sheet (`Expr::SheetRef`) edges; unqualified same-sheet
+    /// `CellRef`s are owned by `Sheet`'s own `cell_dependents` and
+    /// don't surface in `formula_refs`. The BFS therefore stops at the
+    /// first visited node whose only outgoing edges are same-sheet.
+    ///
+    /// These cases MUST be caught at runtime by `FormulaCache::Computing`
+    /// — recursive eval into a cell already on the stack returns
+    /// `Value::Error(ValueError::CyclicRef)` instead of looping or
+    /// blowing the stack.
+    ///
+    /// Setup (note `=C1` not `=Sheet2!C1` — the unqualified form is what
+    /// makes the cycle invisible to the static workbook check):
+    ///   - `Sheet1!A1 = =Sheet2!B1` — cross-sheet edge.
+    ///   - `Sheet2!B1 = =C1` (set via `Sheet::set_formula` to skip the
+    ///     workbook-level seed; sheet-local check passes because C1 is
+    ///     empty at install time).
+    ///   - `Sheet2!C1 = =Sheet1!A1` — cross-sheet edge. The candidate
+    ///     seed is `(s1, A1)`. From `formula_refs[(s1, A1)] = [(s2, B1)]`,
+    ///     then `formula_refs[(s2, B1)]` is EMPTY (same-sheet refs not
+    ///     indexed). Cycle missed by the static check.
+    ///
+    /// Read at any node of the cycle. The lazy FormulaCache::Computing
+    /// state short-circuits the second re-entry; the cell value is an
+    /// Error (cycle) or Null, never a stale numeric.
+    #[test]
+    fn runtime_cycle_returns_cycle_error_value_through_same_sheet_hop() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        let s2 = wb.index_of("Sheet2").unwrap();
+
+        // Install Sheet1!A1 = =Sheet2!B1 via the workbook path so the
+        // forward index records the cross-sheet edge.
+        assert!(wb.set_formula(s1, "A1", "=Sheet2!B1"));
+
+        // Sheet2!B1 = =C1 (unqualified) via the sheet path — skips
+        // workbook-level seeding so `formula_refs[(s2, B1)]` stays empty.
+        // The sheet-local cycle check passes because C1 is empty.
+        wb.sheet_mut(s2).unwrap().set_formula("B1", "=C1");
+
+        // Sheet2!C1 = =Sheet1!A1 via the workbook path. The static
+        // workbook check seeds at `(s1, A1)`, walks to `(s2, B1)`, then
+        // stops (`formula_refs[(s2, B1)]` is empty — same-sheet `=C1` is
+        // not indexed). So this install IS accepted.
+        assert!(
+            wb.set_formula(s2, "C1", "=Sheet1!A1"),
+            "static check should NOT flag this — same-sheet =C1 hop in B1 \
+             is invisible to formula_refs"
+        );
+
+        // Reading any node of the cycle must terminate and surface an
+        // Error/Null. The runtime FormulaCache::Computing guard returns
+        // `Value::Error(CyclicRef)` on the re-entry attempt.
+        let va = wb.get_cell("Sheet1", "A1");
+        let vb = wb.get_cell("Sheet2", "B1");
+        let vc = wb.get_cell("Sheet2", "C1");
+        for (label, v) in [("A1", &va), ("B1", &vb), ("C1", &vc)] {
+            assert!(
+                matches!(v, Value::Null | Value::Error(_)),
+                "{} must surface cycle as Error/Null, got {:?}",
+                label,
+                v
+            );
+        }
     }
 }
