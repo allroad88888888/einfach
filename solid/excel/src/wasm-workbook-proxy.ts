@@ -26,6 +26,23 @@ export type CellWire =
   | { type: 'error'; value: string }
   | { type: 'null' }
 
+// Zero-based import coordinates: `{ row: 0, col: 0 }` means A1.
+export type ImportCellWire =
+  | { sheet: number; row: number; col: number; kind: 'number'; value: number }
+  | { sheet: number; row: number; col: number; kind: 'text'; value: string }
+  | { sheet: number; row: number; col: number; kind: 'boolean'; value: boolean }
+  | { sheet: number; row: number; col: number; kind: 'error'; value: string }
+  | { sheet: number; row: number; col: number; kind: 'formula'; value: string }
+  | { sheet: number; row: number; col: number; kind: 'null' }
+
+export interface WorkbookImportStatsWire {
+  accepted: number
+  formulas: number
+  rejectedFormulas: number
+  cleared: number
+  errors: number
+}
+
 export interface CellRefWire {
   sheet: number
   addr: string
@@ -65,7 +82,12 @@ export interface WorkerWorkbookClient {
   setCell(sheet: number, addr: string, value: CellWire): Promise<boolean>
   setFormula(sheet: number, addr: string, formula: string): Promise<boolean>
   clearCell(sheet: number, addr: string): Promise<boolean>
+  beginImport(sessionId?: number): Promise<number>
+  importChunk(sessionId: number, cells: ImportCellWire[]): Promise<number>
+  commitImport(sessionId: number): Promise<WorkbookImportStatsWire>
+  cancelImport(sessionId: number): Promise<boolean>
   readCells(cells: CellRefWire[]): Promise<CellSnapshotWire[]>
+  debugFormulaCacheState(sheet: number, addr: string): Promise<string>
   subscribeCells(cells: CellRefWire[], callback: (cells: CellRefWire[]) => void): Promise<number>
   unsubscribeCells(subId: number): Promise<boolean>
   onCellsDirty(callback: (cells: CellRefWire[]) => void): () => void
@@ -103,6 +125,7 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
   const worker = opts.workerFactory()
   let nextId = 1
   let nextSubId = 1
+  let nextImportId = 1
   let disposed = false
   const pending = new Map<number, PendingRequest>()
   const subscribers = new Map<number, Subscriber>()
@@ -192,8 +215,23 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     clearCell(sheet, addr) {
       return request<boolean>('clearCell', { sheet, addr: addr.toUpperCase() })
     },
+    beginImport(sessionId = nextImportId++) {
+      return request<number>('beginImport', { sessionId })
+    },
+    importChunk(sessionId, cells) {
+      return request<number>('importChunk', { sessionId, cells })
+    },
+    commitImport(sessionId) {
+      return request<WorkbookImportStatsWire>('commitImport', { sessionId })
+    },
+    cancelImport(sessionId) {
+      return request<boolean>('cancelImport', { sessionId })
+    },
     readCells(cells) {
       return request<CellSnapshotWire[]>('readCells', { cells: cells.map(normalizeRef) })
+    },
+    debugFormulaCacheState(sheet, addr) {
+      return request<string>('debugFormulaCacheState', { sheet, addr: addr.toUpperCase() })
     },
     async subscribeCells(cells, callback) {
       const subId = nextSubId++

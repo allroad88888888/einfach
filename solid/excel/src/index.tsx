@@ -21,6 +21,8 @@ export type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  ImportCellWire,
   WorkerWorkbookClient,
   WorkerWorkbookOptions,
+  WorkbookImportStatsWire,
 } from './wasm-workbook-proxy'

@@ -149,6 +149,34 @@ impl NumberFormatJSON {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum ImportValueJSON {
+    Number(f64),
+    Boolean(bool),
+    Text(String),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WorkbookImportCellJSON {
+    sheet: usize,
+    row: u32,
+    col: u32,
+    kind: String,
+    #[serde(default)]
+    value: Option<ImportValueJSON>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+struct WorkbookImportStatsJSON {
+    accepted: u32,
+    formulas: u32,
+    #[serde(rename = "rejectedFormulas")]
+    rejected_formulas: u32,
+    cleared: u32,
+    errors: u32,
+}
+
 /// Initialize the panic hook once per module load. Called automatically from
 /// every `WasmSheet::new()`; idempotent thanks to `set_once`. C.10.
 fn install_panic_hook() {
@@ -563,13 +591,7 @@ impl WasmWorkbook {
     }
 
     pub fn set_error(&mut self, sheet_idx: u32, addr: &str, value: &str) {
-        let err = match value {
-            "#DIV/0!" => ValueError::DivisionByZero,
-            "#REF!" => ValueError::InvalidRef,
-            "#NAME?" => ValueError::InvalidName,
-            "#CYCLE!" => ValueError::CyclicRef,
-            _ => ValueError::InvalidValue,
-        };
+        let err = value_error_from_display(value);
         self.workbook
             .set_cell(sheet_idx as usize, addr, Value::Error(err));
     }
@@ -726,12 +748,7 @@ impl WasmWorkbook {
     /// cross-sheet dirty BFS, that BFS can look up this map and fire
     /// JS callbacks for cells that were dirtied via a write on a
     /// different sheet.
-    pub fn subscribe_cell(
-        &mut self,
-        sheet_name: &str,
-        addr: &str,
-        cb: js_sys::Function,
-    ) -> u32 {
+    pub fn subscribe_cell(&mut self, sheet_name: &str, addr: &str, cb: js_sys::Function) -> u32 {
         let Some(sheet_idx) = self.workbook.index_of(sheet_name) else {
             // Unknown sheet — hand back a token that is never inserted,
             // mirroring `unsubscribe_cell`'s idempotent posture. Caller
@@ -788,15 +805,81 @@ impl WasmWorkbook {
         self.workbook.debug_cross_sheet_reverse_edge_count() as u32
     }
 
-    // bulk_load: DEFERRED for Track K.
-    //
-    // The JS-side closure pattern is its own design problem: the Rust
-    // entry point would need to receive a `js_sys::Function` that itself
-    // takes a JS-side `WorkbookLoader` handle, and the loader handle's
-    // mutability must be reconciled with wasm-bindgen's `&mut self`
-    // borrow on the workbook. Until Track I lands the underlying
-    // `Workbook::bulk_load` AND a design for the JS loader handle is
-    // settled, we ship nothing here rather than half-ship a binding.
+    /// Batch import plain JSON cell records through `Workbook::bulk_load`.
+    ///
+    /// Coordinates are zero-based (`row=0, col=0` means A1). Formula cells
+    /// are installed dirty and remain lazy until a read/subscription hydrates
+    /// them through the normal workbook eval path.
+    pub fn bulk_import_cells(&mut self, cells: JsValue) -> Result<JsValue, JsValue> {
+        let cells: Vec<WorkbookImportCellJSON> = serde_wasm_bindgen::from_value(cells)
+            .map_err(|err| JsValue::from_str(&format!("invalid import cells: {err}")))?;
+
+        let mut stats = WorkbookImportStatsJSON::default();
+        let sheet_count = self.workbook.sheet_count();
+        self.workbook.bulk_load(|loader| {
+            for cell in cells {
+                if cell.sheet >= sheet_count {
+                    stats.errors += 1;
+                    continue;
+                }
+                let addr = CellAddress::new(cell.row, cell.col).to_string_repr();
+                match cell.kind.as_str() {
+                    "number" => match cell.value {
+                        Some(ImportValueJSON::Number(n)) => {
+                            loader.set_cell(cell.sheet, &addr, Value::Number(n));
+                            stats.accepted += 1;
+                        }
+                        _ => stats.errors += 1,
+                    },
+                    "text" => match cell.value {
+                        Some(ImportValueJSON::Text(s)) => {
+                            loader.set_cell(cell.sheet, &addr, Value::Text(s));
+                            stats.accepted += 1;
+                        }
+                        _ => stats.errors += 1,
+                    },
+                    "boolean" => match cell.value {
+                        Some(ImportValueJSON::Boolean(b)) => {
+                            loader.set_cell(cell.sheet, &addr, Value::Boolean(b));
+                            stats.accepted += 1;
+                        }
+                        _ => stats.errors += 1,
+                    },
+                    "error" => match cell.value {
+                        Some(ImportValueJSON::Text(s)) => {
+                            loader.set_cell(
+                                cell.sheet,
+                                &addr,
+                                Value::Error(value_error_from_display(&s)),
+                            );
+                            stats.accepted += 1;
+                        }
+                        _ => stats.errors += 1,
+                    },
+                    "formula" => match cell.value {
+                        Some(ImportValueJSON::Text(s)) => {
+                            stats.formulas += 1;
+                            if loader.set_formula(cell.sheet, &addr, &s) {
+                                stats.accepted += 1;
+                            } else {
+                                stats.rejected_formulas += 1;
+                            }
+                        }
+                        _ => stats.errors += 1,
+                    },
+                    "null" => {
+                        loader.clear_cell(cell.sheet, &addr);
+                        stats.accepted += 1;
+                        stats.cleared += 1;
+                    }
+                    _ => stats.errors += 1,
+                }
+            }
+        });
+
+        serde_wasm_bindgen::to_value(&stats)
+            .map_err(|err| JsValue::from_str(&format!("serialize import stats: {err}")))
+    }
 }
 
 impl Default for WasmWorkbook {
@@ -827,6 +910,16 @@ fn value_to_display(val: &Value) -> String {
         Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
         Value::Null => String::new(),
         Value::Error(e) => format!("{}", e),
+    }
+}
+
+fn value_error_from_display(value: &str) -> ValueError {
+    match value {
+        "#DIV/0!" => ValueError::DivisionByZero,
+        "#REF!" => ValueError::InvalidRef,
+        "#NAME?" => ValueError::InvalidName,
+        "#CYCLE!" => ValueError::CyclicRef,
+        _ => ValueError::InvalidValue,
     }
 }
 

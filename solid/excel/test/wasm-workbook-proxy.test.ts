@@ -3,6 +3,7 @@ import {
   createWorkerWorkbook,
   type CellRefWire,
   type CellSnapshotWire,
+  type ImportCellWire,
   type WorkerLike,
 } from '../src/wasm-workbook-proxy'
 
@@ -133,6 +134,56 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     const badFormula = workbook.setFormula(0, 'C1', '=C1+1')
     ok(fake, false)
     await expect(badFormula).resolves.toBe(false)
+  })
+
+  it('sends chunked import sessions and debug cache probes', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const cells: ImportCellWire[] = [
+      { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+      { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+    ]
+
+    const begin = workbook.beginImport()
+    expect(lastSent(fake)).toEqual({ id: 1, cmd: 'beginImport', sessionId: 1 })
+    ok(fake, 1)
+    await expect(begin).resolves.toBe(1)
+
+    const chunk = workbook.importChunk(1, cells)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'importChunk',
+      sessionId: 1,
+      cells,
+    })
+    ok(fake, 2)
+    await expect(chunk).resolves.toBe(2)
+
+    const commit = workbook.commitImport(1)
+    expect(lastSent(fake)).toEqual({ id: 3, cmd: 'commitImport', sessionId: 1 })
+    ok(fake, { accepted: 2, formulas: 1, rejectedFormulas: 0, cleared: 0, errors: 0 })
+    await expect(commit).resolves.toEqual({
+      accepted: 2,
+      formulas: 1,
+      rejectedFormulas: 0,
+      cleared: 0,
+      errors: 0,
+    })
+
+    const debug = workbook.debugFormulaCacheState(0, 'a1')
+    expect(lastSent(fake)).toEqual({
+      id: 4,
+      cmd: 'debugFormulaCacheState',
+      sheet: 0,
+      addr: 'A1',
+    })
+    ok(fake, 'dirty')
+    await expect(debug).resolves.toBe('dirty')
+
+    const cancel = workbook.cancelImport(99)
+    expect(lastSent(fake)).toEqual({ id: 5, cmd: 'cancelImport', sessionId: 99 })
+    ok(fake, false)
+    await expect(cancel).resolves.toBe(false)
   })
 
   it('rejects RPC errors with the worker error code attached', async () => {

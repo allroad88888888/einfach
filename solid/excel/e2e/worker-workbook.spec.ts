@@ -54,6 +54,25 @@ test.describe('Worker-backed workbook RPC', () => {
     expect(result).toBe(false)
     await expectNoConsoleErrors(page)
   })
+
+  test('commits chunked import without hydrating formulas before read', async ({ page }) => {
+    const result = await runWorkerWorkbookImportScenario(page)
+
+    expect(result.cancelled).toBe(true)
+    expect(result.cancelledCell.display).toBe('')
+    expect(result.stats).toEqual({
+      accepted: 2,
+      formulas: 1,
+      rejectedFormulas: 0,
+      cleared: 0,
+      errors: 0,
+    })
+    expect(result.beforeReadState).toBe('dirty')
+    expect(result.afterRead.display).toBe('42')
+    expect(result.afterReadState).toBe('clean')
+
+    await expectNoConsoleErrors(page)
+  })
 })
 
 async function runWorkerWorkbookScenario(page: Page): Promise<{
@@ -122,6 +141,63 @@ async function runWorkerWorkbookScenario(page: Page): Promise<{
         initial,
         after,
         dirtyEvents,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportScenario(page: Page): Promise<{
+  cancelled: boolean
+  cancelledCell: Snapshot
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+  }
+  beforeReadState: string
+  afterRead: Snapshot
+  afterReadState: string
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import(
+      '/src/wasm-workbook-worker-factory.ts'
+    )
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+
+      const cancelSession = await workbook.beginImport()
+      await workbook.importChunk(cancelSession, [
+        { sheet: 0, row: 1, col: 1, kind: 'number', value: 99 },
+      ])
+      const cancelled = await workbook.cancelImport(cancelSession)
+      const [cancelledCell] = await workbook.readCells([{ sheet: 0, addr: 'B2' }])
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+      ])
+      await workbook.importChunk(session, [
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      const stats = await workbook.commitImport(session)
+      const beforeReadState = await workbook.debugFormulaCacheState(0, 'A1')
+      const [afterRead] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const afterReadState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        cancelled,
+        cancelledCell,
+        stats,
+        beforeReadState,
+        afterRead,
+        afterReadState,
       }
     } finally {
       workbook.dispose()

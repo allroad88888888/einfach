@@ -5,8 +5,10 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  ImportCellWire,
   RpcErrorWire,
   RpcResponseWire,
+  WorkbookImportStatsWire,
   WorkbookSheetMeta,
 } from './wasm-workbook-proxy'
 
@@ -36,6 +38,8 @@ type WasmWorkbookRuntime = {
   get_type(sheetIdx: number, addr: string): string
   is_error(sheetIdx: number, addr: string): boolean
   get_formula(sheetIdx: number, addr: string): string
+  bulk_import_cells?: (cells: ImportCellWire[]) => WorkbookImportStatsWire
+  debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_cross_sheet_dependents_count?: () => number
 }
 
@@ -49,6 +53,7 @@ let workbook: WasmWorkbookRuntime | undefined
 let initPromise: Promise<void> | undefined
 
 const subscriptionTokens = new Map<number, number[]>()
+const importSessions = new Map<number, ImportCellWire[]>()
 
 async function ensureInit() {
   if (!initPromise) initPromise = (async () => { await init() })()
@@ -84,6 +89,7 @@ function resetSubscriptions(wb?: WasmWorkbookRuntime) {
 
 function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   resetSubscriptions(workbook)
+  importSessions.clear()
   const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
   if (sheets && sheets.length > 0) {
     wb.rename_sheet(0, sheets[0])
@@ -172,6 +178,126 @@ function setCell(wb: WasmWorkbookRuntime, sheet: number, addr: string, value: Ce
   }
 }
 
+function assertImportSessionId(sessionId: number) {
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    throw Object.assign(new Error(`invalid import session: ${sessionId}`), {
+      code: 'INVALID_IMPORT_SESSION',
+    })
+  }
+}
+
+function normalizeImportCell(cell: ImportCellWire): ImportCellWire {
+  const sheet = Number(cell.sheet)
+  const row = Number(cell.row)
+  const col = Number(cell.col)
+  if (
+    !Number.isInteger(sheet) ||
+    sheet < 0 ||
+    !Number.isInteger(row) ||
+    row < 0 ||
+    !Number.isInteger(col) ||
+    col < 0
+  ) {
+    throw Object.assign(new Error('invalid import cell coordinates'), {
+      code: 'INVALID_IMPORT_CELL',
+    })
+  }
+
+  switch (cell.kind) {
+    case 'number':
+      if (typeof cell.value !== 'number') break
+      return { sheet, row, col, kind: 'number', value: cell.value }
+    case 'text':
+      if (typeof cell.value !== 'string') break
+      return { sheet, row, col, kind: 'text', value: cell.value }
+    case 'boolean':
+      if (typeof cell.value !== 'boolean') break
+      return { sheet, row, col, kind: 'boolean', value: cell.value }
+    case 'error':
+      if (typeof cell.value !== 'string') break
+      return { sheet, row, col, kind: 'error', value: cell.value }
+    case 'formula':
+      if (typeof cell.value !== 'string') break
+      return { sheet, row, col, kind: 'formula', value: cell.value }
+    case 'null':
+      return { sheet, row, col, kind: 'null' }
+    default:
+      break
+  }
+
+  throw Object.assign(new Error('invalid import cell value'), {
+    code: 'INVALID_IMPORT_CELL',
+  })
+}
+
+function fallbackBulkImport(
+  wb: WasmWorkbookRuntime,
+  cells: ImportCellWire[],
+): WorkbookImportStatsWire {
+  const stats: WorkbookImportStatsWire = {
+    accepted: 0,
+    formulas: 0,
+    rejectedFormulas: 0,
+    cleared: 0,
+    errors: 0,
+  }
+
+  for (const cell of cells) {
+    if (cell.sheet >= wb.sheet_count()) {
+      stats.errors += 1
+      continue
+    }
+    const addr = toA1(cell.row, cell.col)
+    try {
+      switch (cell.kind) {
+        case 'number':
+          setCell(wb, cell.sheet, addr, { type: 'number', value: cell.value })
+          stats.accepted += 1
+          break
+        case 'text':
+          setCell(wb, cell.sheet, addr, { type: 'text', value: cell.value })
+          stats.accepted += 1
+          break
+        case 'boolean':
+          setCell(wb, cell.sheet, addr, { type: 'boolean', value: cell.value })
+          stats.accepted += 1
+          break
+        case 'error':
+          setCell(wb, cell.sheet, addr, { type: 'error', value: cell.value })
+          stats.accepted += 1
+          break
+        case 'formula':
+          stats.formulas += 1
+          if ((wb.setFormulaAt ?? wb.set_formula).call(wb, cell.sheet, addr, cell.value)) {
+            stats.accepted += 1
+          } else {
+            stats.rejectedFormulas += 1
+          }
+          break
+        case 'null':
+          setCell(wb, cell.sheet, addr, { type: 'null' })
+          stats.accepted += 1
+          stats.cleared += 1
+          break
+      }
+    } catch {
+      stats.errors += 1
+    }
+  }
+
+  return stats
+}
+
+function toA1(row: number, col: number): string {
+  let n = col
+  let letters = ''
+  do {
+    letters = String.fromCharCode(65 + (n % 26)) + letters
+    n = Math.floor(n / 26) - 1
+  } while (n >= 0)
+  return `${letters}${row + 1}`
+}
+
 function subscribeCells(wb: WasmWorkbookRuntime, subId: number, cells: CellRefWire[]) {
   if (!wb.subscribe_cell) {
     throw Object.assign(new Error('WasmWorkbook.subscribe_cell is not available'), {
@@ -258,12 +384,76 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         }
         postResponse(msg.id, true)
         break
+      case 'beginImport':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertImportSessionId(sessionId)
+          if (importSessions.has(sessionId)) {
+            throw Object.assign(new Error(`import session already exists: ${sessionId}`), {
+              code: 'IMPORT_SESSION_EXISTS',
+            })
+          }
+          importSessions.set(sessionId, [])
+          postResponse(msg.id, sessionId)
+        }
+        break
+      case 'importChunk':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertImportSessionId(sessionId)
+          const session = importSessions.get(sessionId)
+          if (!session) {
+            throw Object.assign(new Error(`missing import session: ${sessionId}`), {
+              code: 'IMPORT_SESSION_MISSING',
+            })
+          }
+          const cells = Array.isArray(msg.cells)
+            ? (msg.cells as ImportCellWire[]).map(normalizeImportCell)
+            : []
+          session.push(...cells)
+          postResponse(msg.id, session.length)
+        }
+        break
+      case 'commitImport':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertImportSessionId(sessionId)
+          const cells = importSessions.get(sessionId)
+          if (!cells) {
+            throw Object.assign(new Error(`missing import session: ${sessionId}`), {
+              code: 'IMPORT_SESSION_MISSING',
+            })
+          }
+          importSessions.delete(sessionId)
+          postResponse(
+            msg.id,
+            wb.bulk_import_cells ? wb.bulk_import_cells(cells) : fallbackBulkImport(wb, cells),
+          )
+        }
+        break
+      case 'cancelImport':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertImportSessionId(sessionId)
+          const existed = importSessions.delete(sessionId)
+          postResponse(msg.id, existed)
+        }
+        break
       case 'readCells':
         postResponse(
           msg.id,
           Array.isArray(msg.cells)
             ? msg.cells.map((cell) => snapshotCell(wb, cell as CellRefWire))
             : [],
+        )
+        break
+      case 'debugFormulaCacheState':
+        assertSheet(wb, Number(msg.sheet))
+        postResponse(
+          msg.id,
+          wb.debug_formula_cache_state
+            ? wb.debug_formula_cache_state(Number(msg.sheet), normalizeAddr(msg.addr))
+            : 'unknown',
         )
         break
       case 'subscribeCells':
