@@ -4,6 +4,7 @@ export { Cell } from './Cell'
 export { FormulaBar } from './FormulaBar'
 export { createSheetStore } from './sheet-store'
 export { createJSSheet } from './js-sheet'
+export { createWorkerWorkbook } from './wasm-workbook-proxy'
 export { App } from './App'
 export { DemoBlank } from './demos/DemoBlank'
 export { DemoFormulas } from './demos/DemoFormulas'
@@ -16,3 +17,10 @@ export type { TableProps } from './Table'
 export type { CellProps } from './Cell'
 export type { FormulaBarProps } from './FormulaBar'
 export type { CellCoord } from './selection'
+export type {
+  CellRefWire,
+  CellSnapshotWire,
+  CellWire,
+  WorkerWorkbookClient,
+  WorkerWorkbookOptions,
+} from './wasm-workbook-proxy'

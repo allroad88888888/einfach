@@ -548,21 +548,18 @@ impl WasmWorkbook {
     }
 
     pub fn set_number(&mut self, sheet_idx: u32, addr: &str, value: f64) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.set_cell(addr, Value::Number(value));
-        }
+        self.workbook
+            .set_cell(sheet_idx as usize, addr, Value::Number(value));
     }
 
     pub fn set_text(&mut self, sheet_idx: u32, addr: &str, value: &str) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.set_cell(addr, Value::Text(value.to_string()));
-        }
+        self.workbook
+            .set_cell(sheet_idx as usize, addr, Value::Text(value.to_string()));
     }
 
     pub fn set_boolean(&mut self, sheet_idx: u32, addr: &str, value: bool) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.set_cell(addr, Value::Boolean(value));
-        }
+        self.workbook
+            .set_cell(sheet_idx as usize, addr, Value::Boolean(value));
     }
 
     pub fn set_error(&mut self, sheet_idx: u32, addr: &str, value: &str) {
@@ -573,9 +570,8 @@ impl WasmWorkbook {
             "#CYCLE!" => ValueError::CyclicRef,
             _ => ValueError::InvalidValue,
         };
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.set_cell(addr, Value::Error(err));
-        }
+        self.workbook
+            .set_cell(sheet_idx as usize, addr, Value::Error(err));
     }
 
     pub fn set_formula(&mut self, sheet_idx: u32, addr: &str, formula: &str) -> bool {
@@ -583,9 +579,7 @@ impl WasmWorkbook {
     }
 
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
-        if let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) {
-            sheet.clear_cell(addr);
-        }
+        self.workbook.clear_cell(sheet_idx as usize, addr);
     }
 
     pub fn insert_row(&mut self, sheet_idx: u32, at: u32, count: u32) {
@@ -658,19 +652,12 @@ impl WasmWorkbook {
     // for Phase 3's "writes go through Workbook" architecture (see
     // `rust/docs/PHASE3_PARALLEL.md` § Architectural Decision).
     //
-    // First-cut wiring (this commit): each method routes through
-    // `Workbook::sheet_mut(sheet_idx).set_*(...)`. That keeps the JS API
-    // contract stable but only fires *same-sheet* subscribers. Cross-sheet
-    // subscribers do not fire yet — they become correct once Track I
-    // merges `Workbook::set_cell`/`set_formula`/`clear_cell` and the
-    // cross-sheet dep graph.
-    //
-    // Post-merge swap: `self.workbook.sheet_mut(idx).set_cell(...)`
-    //   → `self.workbook.set_cell(idx, addr, value)`
-    // and analogous for the other three. The signature on this side is
-    // already `&mut self`, takes `sheet_idx` and `addr`, so the swap is
-    // a one-line change per method. Track L's cross-sheet acceptance
-    // tests gate the swap.
+    // Phase 5 Track A: the legacy JS-facing `set_number` / `set_text` /
+    // `set_boolean` / `set_error` / `clear_cell` methods above now route
+    // through the same workbook-aware mutators as these canonical aliases.
+    // Keep the aliases for new worker code and future generated bindings;
+    // keep the legacy names for existing demos/tests that already compile
+    // against the older wasm-pack surface.
 
     /// Set a cell to a numeric value through the workbook. Routes
     /// through `Workbook::set_cell` so cross-sheet dependents dirty
