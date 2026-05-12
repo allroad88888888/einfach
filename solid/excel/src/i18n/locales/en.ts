@@ -32,6 +32,7 @@ export const messages: Record<string, string> = {
   'nav.cross': '3-Sheet Chain',
   'nav.large': 'Large Grid',
   'nav.worker': 'Worker',
+  'nav.million': '1M Cells',
 
   // Demo headings + descriptions.
   'demo.blank.title': 'Blank Spreadsheet',
@@ -67,4 +68,7 @@ export const messages: Record<string, string> = {
 
   'demo.worker.title': 'Worker-backed Sheet',
   'demo.worker.desc': 'WASM runs in a Web Worker; the main thread only ferries diffs. Type into cells, create formulas — same Excel demo, just with the compute on a separate thread. Useful for very heavy recompute workloads (the UI stays responsive).',
+
+  'demo.million.title': '1M-Cell Worker Demo',
+  'demo.million.desc': '1000 × 1000 = 1,000,000 addressable cells over a Web Worker backend. Only a handful are seeded; the rest stay sparse. Two-dimensional virtualization renders just the viewport.',
 }

@@ -26,6 +26,7 @@ export const messages: Record<string, string> = {
   'nav.cross': '三 Sheet 链',
   'nav.large': '大表格',
   'nav.worker': 'Worker',
+  'nav.million': '百万格',
 
   // Demo headings + descriptions.
   'demo.blank.title': '空白表格',
@@ -61,4 +62,7 @@ export const messages: Record<string, string> = {
 
   'demo.worker.title': 'Worker 后端表格',
   'demo.worker.desc': 'WASM 运行在 Web Worker 里；主线程只负责传递 diff。在格子里输入、写公式 — 行为和其它 demo 一致，只是计算挪到了另一线程。对密集计算负载有用（UI 不卡）。',
+
+  'demo.million.title': '百万格 Worker Demo',
+  'demo.million.desc': '1000 × 1000 = 100 万个可寻址单元格，Web Worker 后端。只播种少量种子，其余保持稀疏。二维虚拟化只渲染视口范围。',
 }
