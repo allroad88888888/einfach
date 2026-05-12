@@ -22,6 +22,8 @@ export type {
   CellSnapshotWire,
   CellWire,
   ImportCellWire,
+  SparseCellWire,
+  SparseRangeWire,
   WorkerWorkbookClient,
   WorkerWorkbookOptions,
   WorkbookImportStatsWire,

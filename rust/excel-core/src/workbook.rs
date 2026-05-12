@@ -289,6 +289,32 @@ impl Workbook {
         self.sheets[idx].peek_value_with_provider(addr, &provider)
     }
 
+    /// Sparse read over one sheet range in workbook context.
+    ///
+    /// Only non-empty primitive/formula cells inside `range` are visited.
+    /// Formula cells are resolved through `WorkbookEvalProvider`, so
+    /// cross-sheet references inside formulas behave the same as
+    /// `Workbook::get_cell`.
+    pub fn for_each_sparse_range_cell(
+        &self,
+        sheet_idx: usize,
+        range: CellRange,
+        mut f: impl FnMut(CellAddress, Value),
+    ) {
+        let Some(sheet) = self.sheets.get(sheet_idx) else {
+            return;
+        };
+        let provider = WorkbookEvalProvider {
+            wb: self,
+            current: Cell::new(sheet_idx),
+        };
+        sheet.for_each_sparse_cell_with(
+            range,
+            &|sheet, addr| sheet.peek_value_with_provider(addr, &provider),
+            &mut f,
+        );
+    }
+
     #[doc(hidden)]
     pub fn debug_formula_cache_state(&self, sheet_idx: usize, addr_str: &str) -> &'static str {
         self.sheets
@@ -1197,6 +1223,23 @@ mod tests {
         let idx = wb.add_sheet("Data");
         assert_eq!(idx, 1);
         assert_eq!(wb.index_of("Data"), Some(1));
+    }
+
+    #[test]
+    fn sparse_range_read_uses_workbook_provider_for_formulas() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        wb.set_cell(data_idx, "A1", Value::Number(41.0));
+        assert!(wb.set_formula(0, "B1", "=Data!A1+1"));
+
+        let mut got = Vec::new();
+        wb.for_each_sparse_range_cell(
+            0,
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(0, 2)),
+            |addr, value| got.push((addr.to_string(), value)),
+        );
+
+        assert_eq!(got, vec![("B1".to_string(), Value::Number(42.0))]);
     }
 
     #[test]

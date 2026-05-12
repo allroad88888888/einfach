@@ -8,6 +8,8 @@ import type {
   ImportCellWire,
   RpcErrorWire,
   RpcResponseWire,
+  SparseCellWire,
+  SparseRangeWire,
   WorkbookImportStatsWire,
   WorkbookSheetMeta,
 } from './wasm-workbook-proxy'
@@ -39,6 +41,15 @@ type WasmWorkbookRuntime = {
   is_error(sheetIdx: number, addr: string): boolean
   get_formula(sheetIdx: number, addr: string): string
   bulk_import_cells?: (cells: ImportCellWire[]) => WorkbookImportStatsWire
+  list_non_empty_cells?: () => CellRefWire[]
+  snapshot_sparse?: () => SparseCellWire[]
+  read_sparse_range?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => CellSnapshotWire[]
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_cross_sheet_dependents_count?: () => number
 }
@@ -110,6 +121,27 @@ function snapshotCell(wb: WasmWorkbookRuntime, ref: CellRefWire): CellSnapshotWi
     isError: wb.is_error(sheet, addr),
     formula: wb.get_formula(sheet, addr),
   }
+}
+
+function normalizeRefWire(ref: CellRefWire): CellRefWire {
+  return {
+    sheet: Number(ref.sheet),
+    addr: normalizeAddr(ref.addr),
+  }
+}
+
+function normalizeSnapshot(cell: CellSnapshotWire): CellSnapshotWire {
+  return {
+    ...cell,
+    addr: normalizeAddr(cell.addr),
+  }
+}
+
+function normalizeSparseCell(cell: SparseCellWire): SparseCellWire {
+  return {
+    ...cell,
+    addr: normalizeAddr(cell.addr),
+  } as SparseCellWire
 }
 
 function postResponse(id: number, result: unknown) {
@@ -298,6 +330,47 @@ function toA1(row: number, col: number): string {
   return `${letters}${row + 1}`
 }
 
+function normalizeSparseRange(range: unknown): SparseRangeWire {
+  const input = (range ?? {}) as Partial<SparseRangeWire>
+  const out: SparseRangeWire = {
+    sheet: Number(input.sheet),
+    startRow: Number(input.startRow),
+    startCol: Number(input.startCol),
+    endRow: Number(input.endRow),
+    endCol: Number(input.endCol),
+  }
+  if (
+    !Number.isInteger(out.sheet) ||
+    out.sheet < 0 ||
+    !Number.isInteger(out.startRow) ||
+    out.startRow < 0 ||
+    !Number.isInteger(out.startCol) ||
+    out.startCol < 0 ||
+    !Number.isInteger(out.endRow) ||
+    out.endRow < 0 ||
+    !Number.isInteger(out.endCol) ||
+    out.endCol < 0
+  ) {
+    throw Object.assign(new Error('invalid sparse range'), {
+      code: 'INVALID_SPARSE_RANGE',
+    })
+  }
+  return out
+}
+
+function assertMethod<T extends keyof WasmWorkbookRuntime>(
+  wb: WasmWorkbookRuntime,
+  method: T,
+): NonNullable<WasmWorkbookRuntime[T]> {
+  const value = wb[method]
+  if (typeof value !== 'function') {
+    throw Object.assign(new Error(`WasmWorkbook.${String(method)} is not available`), {
+      code: 'WASM_METHOD_UNAVAILABLE',
+    })
+  }
+  return value as NonNullable<WasmWorkbookRuntime[T]>
+}
+
 function subscribeCells(wb: WasmWorkbookRuntime, subId: number, cells: CellRefWire[]) {
   if (!wb.subscribe_cell) {
     throw Object.assign(new Error('WasmWorkbook.subscribe_cell is not available'), {
@@ -446,6 +519,38 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
             ? msg.cells.map((cell) => snapshotCell(wb, cell as CellRefWire))
             : [],
         )
+        break
+      case 'listNonEmpty':
+        {
+          const listNonEmpty = assertMethod(wb, 'list_non_empty_cells')
+          postResponse(msg.id, listNonEmpty.call(wb).map(normalizeRefWire))
+        }
+        break
+      case 'snapshotSparse':
+        {
+          const snapshotSparse = assertMethod(wb, 'snapshot_sparse')
+          postResponse(msg.id, snapshotSparse.call(wb).map(normalizeSparseCell))
+        }
+        break
+      case 'readSparseRange':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const readSparseRange = assertMethod(wb, 'read_sparse_range')
+          postResponse(
+            msg.id,
+            readSparseRange
+              .call(
+                wb,
+                range.sheet,
+                range.startRow,
+                range.startCol,
+                range.endRow,
+                range.endCol,
+              )
+              .map(normalizeSnapshot),
+          )
+        }
         break
       case 'debugFormulaCacheState':
         assertSheet(wb, Number(msg.sheet))

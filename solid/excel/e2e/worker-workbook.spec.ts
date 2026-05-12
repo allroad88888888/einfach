@@ -68,8 +68,17 @@ test.describe('Worker-backed workbook RPC', () => {
       errors: 0,
     })
     expect(result.beforeReadState).toBe('dirty')
-    expect(result.afterRead.display).toBe('42')
-    expect(result.afterReadState).toBe('clean')
+    expect(result.nonEmpty).toEqual([
+      { sheet: 0, addr: 'A1' },
+      { sheet: 1, addr: 'A1' },
+    ])
+    expect(result.sparseSnapshot).toEqual([
+      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      { sheet: 1, addr: 'A1', row: 0, col: 0, kind: 'number', value: 41 },
+    ])
+    expect(result.afterSnapshotState).toBe('dirty')
+    expect(result.rangeRead.map((cell) => cell.display)).toEqual(['42'])
+    expect(result.afterRangeReadState).toBe('clean')
 
     await expectNoConsoleErrors(page)
   })
@@ -159,8 +168,18 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
     errors: number
   }
   beforeReadState: string
-  afterRead: Snapshot
-  afterReadState: string
+  nonEmpty: DirtyRef[]
+  sparseSnapshot: Array<{
+    sheet: number
+    addr: string
+    row: number
+    col: number
+    kind: string
+    value: string | number | boolean
+  }>
+  afterSnapshotState: string
+  rangeRead: Snapshot[]
+  afterRangeReadState: string
 }> {
   return page.evaluate(async () => {
     const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
@@ -188,16 +207,28 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
       ])
       const stats = await workbook.commitImport(session)
       const beforeReadState = await workbook.debugFormulaCacheState(0, 'A1')
-      const [afterRead] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
-      const afterReadState = await workbook.debugFormulaCacheState(0, 'A1')
+      const nonEmpty = await workbook.listNonEmpty()
+      const sparseSnapshot = await workbook.snapshotSparse()
+      const afterSnapshotState = await workbook.debugFormulaCacheState(0, 'A1')
+      const rangeRead = await workbook.readSparseRange({
+        sheet: 0,
+        startRow: 0,
+        startCol: 0,
+        endRow: 0,
+        endCol: 0,
+      })
+      const afterRangeReadState = await workbook.debugFormulaCacheState(0, 'A1')
 
       return {
         cancelled,
         cancelledCell,
         stats,
         beforeReadState,
-        afterRead,
-        afterReadState,
+        nonEmpty,
+        sparseSnapshot,
+        afterSnapshotState,
+        rangeRead,
+        afterRangeReadState,
       }
     } finally {
       workbook.dispose()

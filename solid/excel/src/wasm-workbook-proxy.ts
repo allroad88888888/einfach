@@ -43,6 +43,21 @@ export interface WorkbookImportStatsWire {
   errors: number
 }
 
+export type SparseCellWire =
+  | { sheet: number; addr: string; row: number; col: number; kind: 'number'; value: number }
+  | { sheet: number; addr: string; row: number; col: number; kind: 'text'; value: string }
+  | { sheet: number; addr: string; row: number; col: number; kind: 'boolean'; value: boolean }
+  | { sheet: number; addr: string; row: number; col: number; kind: 'error'; value: string }
+  | { sheet: number; addr: string; row: number; col: number; kind: 'formula'; value: string }
+
+export interface SparseRangeWire {
+  sheet: number
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+}
+
 export interface CellRefWire {
   sheet: number
   addr: string
@@ -87,6 +102,9 @@ export interface WorkerWorkbookClient {
   commitImport(sessionId: number): Promise<WorkbookImportStatsWire>
   cancelImport(sessionId: number): Promise<boolean>
   readCells(cells: CellRefWire[]): Promise<CellSnapshotWire[]>
+  listNonEmpty(): Promise<CellRefWire[]>
+  snapshotSparse(): Promise<SparseCellWire[]>
+  readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
   subscribeCells(cells: CellRefWire[], callback: (cells: CellRefWire[]) => void): Promise<number>
   unsubscribeCells(subId: number): Promise<boolean>
@@ -229,6 +247,15 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     readCells(cells) {
       return request<CellSnapshotWire[]>('readCells', { cells: cells.map(normalizeRef) })
+    },
+    listNonEmpty() {
+      return request<CellRefWire[]>('listNonEmpty')
+    },
+    snapshotSparse() {
+      return request<SparseCellWire[]>('snapshotSparse')
+    },
+    readSparseRange(range) {
+      return request<CellSnapshotWire[]>('readSparseRange', { range })
     },
     debugFormulaCacheState(sheet, addr) {
       return request<string>('debugFormulaCacheState', { sheet, addr: addr.toUpperCase() })

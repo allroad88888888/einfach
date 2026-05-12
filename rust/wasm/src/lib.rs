@@ -1,6 +1,6 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
-    Align, CellAddress, CellFormat, CellSubscription, NumberFormat, Sheet, Workbook,
+    Align, CellAddress, CellFormat, CellRange, CellSubscription, NumberFormat, Sheet, Workbook,
 };
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -149,7 +149,7 @@ impl NumberFormatJSON {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum ImportValueJSON {
     Number(f64),
@@ -175,6 +175,35 @@ struct WorkbookImportStatsJSON {
     rejected_formulas: u32,
     cleared: u32,
     errors: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CellRefJSON {
+    sheet: usize,
+    addr: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SparseCellJSON {
+    sheet: usize,
+    addr: String,
+    row: u32,
+    col: u32,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<ImportValueJSON>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CellSnapshotJSON {
+    sheet: usize,
+    addr: String,
+    display: String,
+    #[serde(rename = "type")]
+    cell_type: String,
+    #[serde(rename = "isError")]
+    is_error: bool,
+    formula: String,
 }
 
 /// Initialize the panic hook once per module load. Called automatically from
@@ -880,6 +909,97 @@ impl WasmWorkbook {
         serde_wasm_bindgen::to_value(&stats)
             .map_err(|err| JsValue::from_str(&format!("serialize import stats: {err}")))
     }
+
+    /// List every address that has a primitive value or formula across
+    /// the workbook. This is metadata-only and does not evaluate formulas.
+    pub fn list_non_empty_cells(&self) -> Result<JsValue, JsValue> {
+        let mut out = Vec::new();
+        for sheet_idx in 0..self.workbook.sheet_count() {
+            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+                continue;
+            };
+            sheet.for_each_non_empty(|addr| {
+                out.push(CellRefJSON {
+                    sheet: sheet_idx,
+                    addr: addr.to_string(),
+                });
+            });
+        }
+        serde_wasm_bindgen::to_value(&out)
+            .map_err(|err| JsValue::from_str(&format!("serialize non-empty cells: {err}")))
+    }
+
+    /// Snapshot sparse workbook contents without reading formula values.
+    ///
+    /// Formula cells serialize their source (`kind: "formula"`) and do
+    /// not call the eval path, so dirty formula caches stay dirty.
+    pub fn snapshot_sparse(&self) -> Result<JsValue, JsValue> {
+        let mut out = Vec::new();
+        for sheet_idx in 0..self.workbook.sheet_count() {
+            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+                continue;
+            };
+            sheet.for_each_non_empty(|addr| {
+                let addr_str = addr.to_string();
+                if let Some(formula) = sheet.get_formula(&addr_str) {
+                    out.push(SparseCellJSON {
+                        sheet: sheet_idx,
+                        addr: addr_str,
+                        row: addr.row,
+                        col: addr.col,
+                        kind: "formula".into(),
+                        value: Some(ImportValueJSON::Text(formula)),
+                    });
+                    return;
+                }
+
+                if let Some(cell) = sparse_cell_from_value(sheet_idx, addr, &sheet.peek_value(addr))
+                {
+                    out.push(cell);
+                }
+            });
+        }
+        serde_wasm_bindgen::to_value(&out)
+            .map_err(|err| JsValue::from_str(&format!("serialize sparse snapshot: {err}")))
+    }
+
+    /// Read non-empty cells in a zero-based inclusive range. This is an
+    /// explicit read/export path, so formula cells in the range may be
+    /// evaluated and promoted to clean cache state.
+    pub fn read_sparse_range(
+        &self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<JsValue, JsValue> {
+        let sheet_idx = sheet_idx as usize;
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let mut out = Vec::new();
+        self.workbook
+            .for_each_sparse_range_cell(sheet_idx, range, |addr, value| {
+                let addr_str = addr.to_string();
+                let formula = self
+                    .workbook
+                    .sheet(sheet_idx)
+                    .and_then(|sheet| sheet.get_formula(&addr_str))
+                    .unwrap_or_default();
+                out.push(CellSnapshotJSON {
+                    sheet: sheet_idx,
+                    addr: addr_str,
+                    display: value_to_display(&value),
+                    cell_type: value_to_cell_type(&value),
+                    is_error: value.is_error(),
+                    formula,
+                });
+            });
+        serde_wasm_bindgen::to_value(&out)
+            .map_err(|err| JsValue::from_str(&format!("serialize sparse range: {err}")))
+    }
 }
 
 impl Default for WasmWorkbook {
@@ -911,6 +1031,35 @@ fn value_to_display(val: &Value) -> String {
         Value::Null => String::new(),
         Value::Error(e) => format!("{}", e),
     }
+}
+
+fn value_to_cell_type(val: &Value) -> String {
+    match val {
+        Value::Number(_) => "number",
+        Value::Text(_) => "text",
+        Value::Boolean(_) => "boolean",
+        Value::Null => "null",
+        Value::Error(_) => "error",
+    }
+    .into()
+}
+
+fn sparse_cell_from_value(sheet: usize, addr: CellAddress, val: &Value) -> Option<SparseCellJSON> {
+    let (kind, value) = match val {
+        Value::Number(n) => ("number", Some(ImportValueJSON::Number(*n))),
+        Value::Text(s) => ("text", Some(ImportValueJSON::Text(s.clone()))),
+        Value::Boolean(b) => ("boolean", Some(ImportValueJSON::Boolean(*b))),
+        Value::Error(e) => ("error", Some(ImportValueJSON::Text(format!("{}", e)))),
+        Value::Null => return None,
+    };
+    Some(SparseCellJSON {
+        sheet,
+        addr: addr.to_string(),
+        row: addr.row,
+        col: addr.col,
+        kind: kind.into(),
+        value,
+    })
 }
 
 fn value_error_from_display(value: &str) -> ValueError {

@@ -180,8 +180,37 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ok(fake, 'dirty')
     await expect(debug).resolves.toBe('dirty')
 
+    const list = workbook.listNonEmpty()
+    expect(lastSent(fake)).toEqual({ id: 5, cmd: 'listNonEmpty' })
+    ok(fake, [{ sheet: 0, addr: 'A1' }])
+    await expect(list).resolves.toEqual([{ sheet: 0, addr: 'A1' }])
+
+    const sparse = workbook.snapshotSparse()
+    expect(lastSent(fake)).toEqual({ id: 6, cmd: 'snapshotSparse' })
+    ok(fake, [
+      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+    ])
+    await expect(sparse).resolves.toEqual([
+      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+    ])
+
+    const range = workbook.readSparseRange({
+      sheet: 0,
+      startRow: 0,
+      startCol: 0,
+      endRow: 0,
+      endCol: 0,
+    })
+    expect(lastSent(fake)).toEqual({
+      id: 7,
+      cmd: 'readSparseRange',
+      range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+    })
+    ok(fake, [snapshot({ sheet: 0, addr: 'A1', display: '42' })])
+    await expect(range).resolves.toEqual([snapshot({ sheet: 0, addr: 'A1', display: '42' })])
+
     const cancel = workbook.cancelImport(99)
-    expect(lastSent(fake)).toEqual({ id: 5, cmd: 'cancelImport', sessionId: 99 })
+    expect(lastSent(fake)).toEqual({ id: 8, cmd: 'cancelImport', sessionId: 99 })
     ok(fake, false)
     await expect(cancel).resolves.toBe(false)
   })
@@ -196,6 +225,13 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(promise).rejects.toMatchObject({
       code: 'INVALID_SHEET',
       message: 'invalid sheet index: 9',
+    })
+
+    const sparse = workbook.snapshotSparse()
+    fail(fake, 'WASM_METHOD_UNAVAILABLE', 'WasmWorkbook.snapshot_sparse is not available')
+    await expect(sparse).rejects.toMatchObject({
+      code: 'WASM_METHOD_UNAVAILABLE',
+      message: 'WasmWorkbook.snapshot_sparse is not available',
     })
   })
 
