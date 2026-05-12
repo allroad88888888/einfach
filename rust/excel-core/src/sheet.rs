@@ -3548,4 +3548,73 @@ mod tests {
             candidates
         );
     }
+
+    // === Phase 2 Track F — sparse range read visits O(matches) ===
+
+    /// Scatter 1000 cells across 10000 rows (one cell per even-decade
+    /// row), then read a 51-row band. The callback must fire only for
+    /// the cells inside the band, not for the full 1000 — the whole
+    /// point of switching `cells` to a row-major BTreeMap is that
+    /// `for_each_sparse_cell_with` does `BTreeMap::range`, not a
+    /// `filter` sweep over every non-empty entry.
+    #[test]
+    fn for_each_range_cell_visits_only_overlap() {
+        let mut sheet = Sheet::new();
+
+        // Seed 1000 cells at rows {1, 11, 21, ..., 9991} in column A
+        // (col index 0, row index = 10*k for k in 0..1000 ⇒ row 0,
+        // 10, 20, ..., 9990 in zero-based ⇒ "A1", "A11", "A21", ...,
+        // "A9991" in 1-based labels). Using row stride 10 makes the
+        // expected hit count for the target band exact and obvious.
+        let mut seeded = Vec::with_capacity(1000);
+        for k in 0..1000u32 {
+            let row = k * 10; // 0-based row index
+            let addr = CellAddress::new(row, 0); // column A
+            sheet.set_cell(&addr.to_string_repr(), Value::Number(k as f64));
+            seeded.push(addr);
+        }
+        assert_eq!(sheet.debug_primitive_atom_count(), 1000);
+
+        // Target band: 1-based rows 50..=100 ⇒ 0-based rows 49..=99.
+        // Seeded rows inside this band: 50, 60, 70, 80, 90 ⇒ 5 hits.
+        let range = CellRange::new(
+            CellAddress::new(49, 0),
+            CellAddress::new(99, 0),
+        );
+
+        let mut visited: Vec<CellAddress> = Vec::new();
+        sheet.for_each_sparse_cell_with(
+            range,
+            &|s, addr| s.peek_value(addr),
+            &mut |addr, _v| visited.push(addr),
+        );
+
+        // Exactly the band cells, nothing else.
+        let expected: Vec<CellAddress> = seeded
+            .iter()
+            .copied()
+            .filter(|a| range.contains(*a))
+            .collect();
+        assert_eq!(
+            visited, expected,
+            "for_each_range_cell must visit ONLY cells inside the range \
+             (got {} visits for a band overlapping {} seeded cells out of 1000 total)",
+            visited.len(),
+            expected.len()
+        );
+        assert_eq!(
+            visited.len(),
+            5,
+            "expected 5 hits at rows 50, 60, 70, 80, 90 — got {}",
+            visited.len()
+        );
+        // Most importantly: NOT 1000. The whole acceptance contract
+        // of Track F is that range reads do not pay an O(N) cost.
+        assert!(
+            visited.len() < 1000,
+            "range read scanned the full sheet ({} visits) — \
+             RowMajorMap::range_iter not actually scoping the walk",
+            visited.len()
+        );
+    }
 }
