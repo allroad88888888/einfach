@@ -16,3 +16,7 @@ criterion = "0.5"
 [[bench]]
 name = "sheet_bench"
 harness = false
+
+[[bench]]
+name = "scale_bench"
+harness = false
