@@ -3314,6 +3314,41 @@ mod tests {
         assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
     }
 
+    /// Phase 2 Track E: ranges wider than `WIDE_RANGE_BUCKET_THRESHOLD`
+    /// (4096 rows / cols) take the `wide_ranges` fallback — they're not
+    /// registered into per-row / per-col buckets (registration would
+    /// dominate at 1M rows). The fallback gets a linear scan on lookup,
+    /// but it stays small in practice (a handful of "whole sheet" deps).
+    /// This test exercises that path: a 5000-row range still dirties its
+    /// dependent on a write inside it AND `dependents_of` finds the
+    /// range via `wide_ranges`, not via row_buckets.
+    #[test]
+    fn range_dep_wide_range_uses_wide_fallback() {
+        let mut sheet = Sheet::new();
+        // 5000 rows — above the 4096 threshold. Phase 1 stored it the
+        // same as any other range; Phase 2 routes it into wide_ranges.
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("A5000", Value::Number(2.0));
+        sheet.set_formula("B1", "=SUM(A1:A5000)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+
+        // A write deep inside the wide range must still dirty B1. If
+        // wide_ranges weren't consulted by `dependents_of`, the row
+        // bucket for row 2499 would be empty and the candidate set
+        // would be empty too — B1 stays stale at 3.0.
+        sheet.set_cell("A2500", Value::Number(10.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
+
+        // Candidate set for any address in the range should include
+        // exactly the one wide range — debug_range_dep_count is 1.
+        assert_eq!(sheet.debug_range_dep_count(), 1);
+        assert_eq!(sheet.debug_range_dep_candidates("A2500"), 1);
+        // An address outside the range still surfaces it as a candidate
+        // (wide_ranges is scanned unconditionally) but the
+        // `range.contains` filter in `dependents_of` rejects it.
+        assert_eq!(sheet.debug_range_dep_candidates("Z1"), 1);
+    }
+
     /// Phase 2 Track E acceptance: the candidate-range lookup driving
     /// `dependents_of` must be bucketed, not a linear scan over every
     /// registered range. Registers 1000 disjoint 3-row tall ranges in
