@@ -1,61 +1,16 @@
-//! Phase 1 — Scale acceptance suite (Agent C).
+//! Phase 1 — Scale acceptance suite.
 //!
 //! Six integration tests that pin the engine's "百万 cell" contract from
 //! `rust/docs/ONLINE_SPREADSHEET_PLAN.md` § Phase 1 验收 and the per-case
 //! table in `rust/docs/PHASE1_PARALLEL.md` § Track C. Each test asserts a
-//! single Phase 1 bullet using ONLY the public `Sheet` API.
-//!
-//! Why every test is `#[ignore]`'d at landing time:
-//!
-//! - Cases 1, 2, 4, 5 depend on Agent A's range-dep correctness + lazy
-//!   eval guarantees (no eager compute on `set_formula`, sparse range dep
-//!   survives non-empty cell write).
-//! - Cases 1, 2, 3, 5 reference debug counters that Agent B1 is adding
-//!   (`debug_formula_eval_count`, `debug_dirty_count`,
-//!   `debug_imported_formula_count`, `debug_live_subscription_count`).
-//!   Each call site is marked `// requires Agent B1 counter`. While B1 is
-//!   in flight the `B1Counters` trait below provides zero-returning
-//!   stubs so the suite still compiles cleanly against `main`; once B1
-//!   merges, Rust prefers the inherent methods on `Sheet` and the trait
-//!   stubs are silently shadowed (no test edits required at un-ignore
-//!   time — delete the trait when convenient).
-//!
-//! Removal protocol: once Track A and B1 are merged on `main`, delete
-//! the `#[ignore = "..."]` attribute on each test and remove the
-//! `B1Counters` trait + impl below. No test body edits should be
-//! required; if one is, that's a contract-shape violation we want to
-//! catch in review.
+//! single Phase 1 bullet using ONLY the public `Sheet` API + the
+//! `debug_*` counter family.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use einfach_core::Value;
 use einfach_excel_core::Sheet;
-
-/// Compilation shim for Agent B1's counters. Returns 0 from each method
-/// so the suite compiles against `main` while B1 is in flight. Once B1's
-/// inherent methods land on `Sheet`, Rust's method-resolution rule
-/// (inherent before trait) takes over silently — no test edits needed.
-/// Delete this trait + impl when removing the `#[ignore]` attributes.
-trait B1Counters {
-    // requires Agent B1 counter
-    fn debug_formula_eval_count(&self) -> usize {
-        0
-    }
-    // requires Agent B1 counter
-    fn debug_dirty_count(&self) -> usize {
-        0
-    }
-    // requires Agent B1 counter
-    fn debug_imported_formula_count(&self) -> usize {
-        0
-    }
-    // requires Agent B1 counter
-    fn debug_live_subscription_count(&self) -> usize {
-        0
-    }
-}
-impl B1Counters for Sheet {}
 
 /// Phase 1 验收: "导入公式后 `formula_eval_count == 0`".
 ///
@@ -64,7 +19,6 @@ impl B1Counters for Sheet {}
 /// build a wide sparse pattern so dirty-mark fan-out has actual work to
 /// skip — 100k formulas with one primitive feeder per row.
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn import_100k_formulas_zero_eval() {
     const N: u32 = 100_000;
     let mut sheet = Sheet::new();
@@ -83,19 +37,16 @@ fn import_100k_formulas_zero_eval() {
         N as usize,
         "all 100k formula records must be registered"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_imported_formula_count(),
         N as usize,
         "bulk_load formulas must be counted as imported"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_formula_eval_count(),
         0,
         "import path must not evaluate any formula"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_dirty_count(),
         N as usize,
@@ -109,7 +60,6 @@ fn import_100k_formulas_zero_eval() {
 /// SAFETY/contract: reading a viewport of 100 formula cells must only
 /// evaluate those 100 — the other 900 formulas in the sheet stay Dirty.
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn viewport_read_100_reaches_only_visible() {
     const N: u32 = 1_000;
     const VISIBLE: u32 = 100;
@@ -123,7 +73,6 @@ fn viewport_read_100_reaches_only_visible() {
             loader.set_formula(&format!("B{}", r), &format!("=A{}*2", r));
         }
     });
-    // requires Agent B1 counter
     assert_eq!(sheet.debug_formula_eval_count(), 0);
 
     // Read only the first VISIBLE formula cells.
@@ -131,13 +80,11 @@ fn viewport_read_100_reaches_only_visible() {
         let _ = sheet.get_cell(&format!("B{}", r));
     }
 
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_formula_eval_count(),
         VISIBLE as usize,
         "viewport read must only evaluate visible formulas, not the full sheet"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_dirty_count(),
         (N - VISIBLE) as usize,
@@ -151,7 +98,6 @@ fn viewport_read_100_reaches_only_visible() {
 /// a primitive atom. The first non-Null write materializes; a Null write
 /// must release it again (this also pins case #6, by design).
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn empty_cell_subscribe_no_atom() {
     let mut sheet = Sheet::new();
 
@@ -164,7 +110,6 @@ fn empty_cell_subscribe_no_atom() {
         0,
         "subscribing to an empty cell must not allocate a primitive atom"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_live_subscription_count(),
         1,
@@ -183,7 +128,6 @@ fn empty_cell_subscribe_no_atom() {
         0,
         "Null write must release the primitive atom"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_live_subscription_count(),
         1,
@@ -200,7 +144,6 @@ fn empty_cell_subscribe_no_atom() {
 /// that read — MUST still dirty B1. This is the bug pinned at
 /// PHASE1_PARALLEL.md § "P0 Bug — Pinned" steps 4–6.
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn range_sparse_then_write() {
     let mut sheet = Sheet::new();
     sheet.set_cell("A1", Value::Number(1.0));
@@ -230,7 +173,6 @@ fn range_sparse_then_write() {
 /// subscriber fires (so views can mark themselves dirty), but no eval
 /// happens until the next `get_cell`.
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn dirty_notify_no_eager_compute() {
     let mut sheet = Sheet::new();
     sheet.set_cell("A1", Value::Number(0.0));
@@ -240,16 +182,13 @@ fn dirty_notify_no_eager_compute() {
     let ff = fires.clone();
     let _sub = sheet.subscribe_cell("B1", move || *ff.borrow_mut() += 1);
 
-    // requires Agent B1 counter
     let before = sheet.debug_formula_eval_count();
     sheet.set_formula("B1", "=A1*2");
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_formula_eval_count(),
         before,
         "set_formula must not eagerly evaluate to satisfy a subscriber"
     );
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_dirty_count(),
         1,
@@ -258,7 +197,6 @@ fn dirty_notify_no_eager_compute() {
 
     // Only an explicit read should bump the eval counter.
     assert_eq!(sheet.get_cell("B1"), Value::Number(0.0));
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_formula_eval_count(),
         before + 1,
@@ -266,10 +204,8 @@ fn dirty_notify_no_eager_compute() {
     );
 
     // Dirtying A1 must dirty B1 (subscriber fires) without recomputing.
-    // requires Agent B1 counter
     let eval_after_first_read = sheet.debug_formula_eval_count();
     sheet.set_cell("A1", Value::Number(3.0));
-    // requires Agent B1 counter
     assert_eq!(
         sheet.debug_formula_eval_count(),
         eval_after_first_read,
@@ -288,7 +224,6 @@ fn dirty_notify_no_eager_compute() {
 /// sheets that fill-then-clear must not leak primitive scaffolds. Uses
 /// only existing API; sanity-pick for un-ignored scaffolding probe.
 #[test]
-#[ignore = "phase-1 — un-ignore after Agent A + B1 merge"]
 fn null_write_releases_primitive_atom() {
     let mut sheet = Sheet::new();
     assert_eq!(sheet.debug_primitive_atom_count(), 0);
