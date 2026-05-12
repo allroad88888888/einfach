@@ -23,13 +23,33 @@ subscription set under scroll. Horizontal scroll past a 1000-col
 sheet would let the active subscription set grow with
 `cumulative_visited_cols × viewport_rows`.
 
-## Architectural Decision
+## Architectural Decision — outcome update (2026-05-12)
 
-**Adopt `@grid-table-solidjs/core` as the outer virtualization chrome
-for `solid/excel/src/Table.tsx`.** The library lives at
-`/Volumes/work/self/grid-table/solidjs/core/` (published as
-`@grid-table-solidjs/core@0.1.0`) and ships `VGridTable`, a 2D
-virtualizer with the exact contract Phase 4 needs:
+**Originally planned**: adopt `@grid-table-solidjs/core` as the outer
+virtualization chrome.
+
+**What actually shipped**: native 2D virtualization extension of the
+existing hand-rolled row virt in `Table.tsx`. Codex reviewed the M
+agent's mid-flight work and flagged that `@grid-table-solidjs/core@0.1.0`
+has multiple reactivity bugs (`useAutoSizer` returns plain numbers
+not signals; `useVScroll` captures `props.height` in a `const` at
+setup; the package's dist files import a non-existent
+`solid-js/jsx-runtime` subpath). Working around them required three
+patched library files + a Vite resolve-id plugin + a Solid JSX
+runtime shim — an indefinite implicit fork of the upstream library.
+Codex recommendation: native column virt, salvage M's constants
+(`COL_WIDTH=100`, `ROW_HEADER_WIDTH=44`, `OVERSCAN=5`) + horizontal
+scroll-into-view idea + the un-skipped P specs as regression guards.
+Implemented in commit `eb68f76`. The "original" plan below is kept as
+historical context for the original architectural intent.
+
+---
+
+**Original plan (not taken): adopt `@grid-table-solidjs/core` as the
+outer virtualization chrome for `solid/excel/src/Table.tsx`.** The
+library lives at `/Volumes/work/self/grid-table/solidjs/core/`
+(published as `@grid-table-solidjs/core@0.1.0`) and ships
+`VGridTable`, a 2D virtualizer with the exact contract Phase 4 needs:
 
 - `rowCount` + `rowCalcSize` / `columnCount` + `columnCalcSize` —
   arbitrary per-index sizing.
