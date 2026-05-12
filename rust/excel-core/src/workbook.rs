@@ -596,6 +596,279 @@ impl Workbook {
     pub fn debug_cross_sheet_reverse_edge_count(&self) -> usize {
         self.cross_sheet.debug_reverse_edge_count()
     }
+
+    /// Workbook-level bulk loader (Phase 3 Track I). Collects every
+    /// `set_cell` / `set_formula` / `clear_cell` invocation inside the
+    /// closure, suppresses per-write fanout, then at flush time:
+    ///   1. Replays each sheet's writes inside `Sheet::bulk_load` (so
+    ///      same-sheet dirty + same-sheet subscriber fanout fires AT
+    ///      MOST ONCE per address within that sheet's flush).
+    ///   2. Applies the accumulated `CrossSheetDeps` edge updates.
+    ///   3. Runs one workbook-wide cross-sheet BFS starting at the union
+    ///      of touched `(sheet, addr)` pairs, and notifies each cross-
+    ///      sheet subscriber AT MOST ONCE.
+    ///
+    /// Use this for CSV / xlsx import paths that touch many cells across
+    /// many sheets and where the per-write cross-sheet fanout cost would
+    /// otherwise dominate.
+    ///
+    /// RAII shape mirrors `Sheet::bulk_load`: the loader is not exposed
+    /// outside the closure, so the flush always runs.
+    pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut WorkbookLoader<'_>) -> R) -> R {
+        let mut loader = WorkbookLoader::new(self);
+        let result = f(&mut loader);
+        loader.flush();
+        result
+    }
+}
+
+/// Buffered op recorded by `WorkbookLoader`. Replayed at `flush` time
+/// inside `Sheet::bulk_load`. The owning sheet is the HashMap key in
+/// `ops_by_sheet`, so individual variants don't repeat `sheet_idx`.
+enum WorkbookOp {
+    SetCell {
+        addr_str: String,
+        value: Value,
+    },
+    SetFormula {
+        addr_str: String,
+        source: String,
+    },
+    ClearCell {
+        addr_str: String,
+    },
+}
+
+/// In-progress workbook bulk-load session. Buffers operations until
+/// `flush` runs at the end of `Workbook::bulk_load`. Inside the closure
+/// callers see synchronous returns from `set_formula` (parse / cycle
+/// outcome decided here at queue time) but no subscriber fires and no
+/// dirty fanout — all of that runs in one consolidated `flush`.
+pub struct WorkbookLoader<'a> {
+    wb: &'a mut Workbook,
+    /// Per-sheet ordered op queues so the replay inside each sheet's
+    /// `Sheet::bulk_load` preserves the caller's order.
+    ops_by_sheet: HashMap<usize, Vec<WorkbookOp>>,
+    /// Union of every `(sheet, addr)` that was written during the
+    /// session (across all sheets). The post-flush cross-sheet BFS
+    /// seeds from this set.
+    touched: HashSet<(usize, CellAddress)>,
+}
+
+impl<'a> WorkbookLoader<'a> {
+    fn new(wb: &'a mut Workbook) -> Self {
+        WorkbookLoader {
+            wb,
+            ops_by_sheet: HashMap::new(),
+            touched: HashSet::new(),
+        }
+    }
+
+    /// Queue a primitive write at `(sheet_idx, addr)`. Visible to the
+    /// post-flush workbook BFS as a touched cell.
+    pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
+        if sheet_idx >= self.wb.sheets.len() {
+            return;
+        }
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return;
+        };
+        self.touched.insert((sheet_idx, addr));
+        self.ops_by_sheet
+            .entry(sheet_idx)
+            .or_default()
+            .push(WorkbookOp::SetCell {
+                addr_str: addr_str.to_string(),
+                value,
+            });
+    }
+
+    /// Queue a formula write at `(sheet_idx, addr)`. Returns `false` if
+    /// either the text fails to parse OR the cross-sheet static cycle
+    /// check rejects it. Cross-sheet edges are installed eagerly so
+    /// later ops in the same `bulk_load` see the up-to-date dep graph
+    /// (e.g. for subsequent cycle checks); same-sheet wiring runs
+    /// inside the per-sheet `Sheet::bulk_load` replay at flush time.
+    pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, source: &str) -> bool {
+        if sheet_idx >= self.wb.sheets.len() {
+            return false;
+        }
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return false;
+        };
+
+        // Parse first. Parse failure still records a SetFormula op so
+        // the sheet flush writes `#VALUE!` for us; cross-sheet edge
+        // install is skipped on this branch.
+        let Some(expr) = parse_formula(source) else {
+            self.touched.insert((sheet_idx, addr));
+            // Tear down any previous cross-sheet edges this addr owned
+            // — a #VALUE! cell has no outgoing deps.
+            self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
+            self.ops_by_sheet
+                .entry(sheet_idx)
+                .or_default()
+                .push(WorkbookOp::SetFormula {
+                    addr_str: addr_str.to_string(),
+                    source: source.to_string(),
+                });
+            return false;
+        };
+
+        // Cross-sheet static cycle check. Use the existing pre-Track-J
+        // path (`collect_workbook_refs` + BFS through `formula_exprs_iter`)
+        // — that map is populated only after the per-sheet flush runs,
+        // so cycles introduced WITHIN the bulk_load against another
+        // bulk-loaded formula slip past this check. That matches the
+        // pre-Track-I `Sheet::bulk_load` behavior (its `would_create_
+        // cycle` only sees already-installed formulas, not pending
+        // ones); the static check still catches cycles against any
+        // formula that existed before the bulk_load started.
+        if self.wb.cross_sheet_cycle(sheet_idx, addr, &expr) {
+            self.touched.insert((sheet_idx, addr));
+            self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
+            // Follow-up `SetCell` writes the `#CYCLE!` error after the
+            // sheet bulk_load lands the formula (which the sheet's own
+            // bulk_load may or may not have flagged as a cycle on its
+            // own — workbook-level cycles can slip past the per-sheet
+            // check). The final SetCell op guarantees the cell holds
+            // `Value::Error(CyclicRef)` once flush completes.
+            self.ops_by_sheet
+                .entry(sheet_idx)
+                .or_default()
+                .push(WorkbookOp::SetCell {
+                    addr_str: addr_str.to_string(),
+                    value: Value::Error(ValueError::CyclicRef),
+                });
+            return false;
+        }
+
+        // Install fresh outgoing edges into CrossSheetDeps. Old edges
+        // (if any) are removed first; the new edges go in eagerly so
+        // subsequent `set_formula` calls in the same `bulk_load` see
+        // the up-to-date forward map for their own cycle checks.
+        self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
+        let new_edges = collect_cross_sheet_refs(&expr, &self.wb.by_name);
+        for edge in new_edges {
+            self.wb.cross_sheet.add_edge(sheet_idx, addr, edge);
+        }
+
+        self.touched.insert((sheet_idx, addr));
+        self.ops_by_sheet
+            .entry(sheet_idx)
+            .or_default()
+            .push(WorkbookOp::SetFormula {
+                addr_str: addr_str.to_string(),
+                source: source.to_string(),
+            });
+
+        true
+    }
+
+    /// Queue a clear (=write to Null) at `(sheet_idx, addr)`.
+    pub fn clear_cell(&mut self, sheet_idx: usize, addr_str: &str) {
+        if sheet_idx >= self.wb.sheets.len() {
+            return;
+        }
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return;
+        };
+        self.touched.insert((sheet_idx, addr));
+        self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
+        self.ops_by_sheet
+            .entry(sheet_idx)
+            .or_default()
+            .push(WorkbookOp::ClearCell {
+                addr_str: addr_str.to_string(),
+            });
+    }
+
+    /// Replay queued ops sheet-by-sheet inside each sheet's
+    /// `Sheet::bulk_load` (so same-sheet subscribers fire at most once
+    /// per address per flush), then run one workbook-wide cross-sheet
+    /// BFS that fires each cross-sheet subscriber at most once.
+    fn flush(self) {
+        let WorkbookLoader {
+            wb,
+            ops_by_sheet,
+            touched,
+        } = self;
+
+        // 1. Per-sheet replay inside the existing `Sheet::bulk_load`
+        //    plumbing. This handles same-sheet dirty/fire dedup.
+        for (sheet_idx, ops) in ops_by_sheet {
+            let Some(sheet) = wb.sheets.get_mut(sheet_idx) else {
+                continue;
+            };
+            sheet.bulk_load(|loader| {
+                for op in ops {
+                    match op {
+                        WorkbookOp::SetCell { addr_str, value } => {
+                            loader.set_cell(&addr_str, value);
+                        }
+                        WorkbookOp::SetFormula {
+                            addr_str,
+                            source,
+                        } => {
+                            // Whether the workbook layer accepted or
+                            // rejected the formula, hand it to the
+                            // sheet's bulk loader: it writes `#VALUE!`
+                            // on parse-fail, `#CYCLE!` on same-sheet
+                            // cycle, and the live record otherwise.
+                            // Cross-sheet cycle was already handled by
+                            // the `set_formula` queue path inserting a
+                            // follow-up `SetCell` to override with
+                            // `Value::Error(CyclicRef)`.
+                            loader.set_formula(&addr_str, &source);
+                        }
+                        WorkbookOp::ClearCell { addr_str } => {
+                            loader.set_cell(&addr_str, Value::Null);
+                        }
+                    }
+                }
+            });
+        }
+
+        // 2. Workbook-wide cross-sheet BFS. Seed with the entire touched
+        //    set so EVERY source write contributes to the dirty fanout.
+        //    Within-sheet dependents already fired in step 1; this pass
+        //    is strictly for cross-sheet edges.
+        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
+        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
+        for entry in &touched {
+            queue.push_back(*entry);
+            visited.insert(*entry);
+        }
+        while let Some((sheet_idx, addr)) = queue.pop_front() {
+            // Reverse dependents from the workbook graph (same shape
+            // as `propagate_cross_sheet_dirty`'s inner loop). Visited
+            // dedups so each cross-sheet subscriber fires at most once
+            // across the entire bulk_load.
+            let mut dependents: Vec<(usize, CellAddress)> = Vec::new();
+            if let Some(set) = wb.cross_sheet.cell_dependents.get(&(sheet_idx, addr)) {
+                dependents.extend(set.iter().copied());
+            }
+            if let Some(range_idx) = wb.cross_sheet.range_index_per_sheet.get(&sheet_idx) {
+                for target_addr in range_idx.dependents_of(addr) {
+                    if let Some(target_sheet) =
+                        wb.find_target_sheet_for_range_dep(target_addr, sheet_idx)
+                    {
+                        dependents.push((target_sheet, target_addr));
+                    }
+                }
+            }
+            for (target_sheet, target_addr) in dependents {
+                if !visited.insert((target_sheet, target_addr)) {
+                    continue;
+                }
+                if let Some(sheet) = wb.sheets.get(target_sheet) {
+                    sheet.mark_dirty_for_addr(target_addr);
+                    sheet.fire_subscribers(target_addr);
+                }
+                queue.push_back((target_sheet, target_addr));
+            }
+        }
+    }
 }
 
 impl Default for Workbook {
