@@ -11,6 +11,7 @@
 // Protocol (Step 3):
 //   Main → Worker  { cmd: 'set_number' | 'set_text' | 'set_boolean'
 //                    | 'set_error' | 'set_formula' | 'clear_cell'
+//                    | 'clear_range'
 //                    | 'insert_row' | 'delete_row' | 'insert_col'
 //                    | 'delete_col' | 'subscribe' | 'unsubscribe'
 //                    | 'read_initial',
@@ -116,6 +117,14 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         break
       case 'clear_cell':
         s.clear_cell(msg.addr as string)
+        break
+      case 'clear_range':
+        s.clear_range(
+          msg.startRow as number,
+          msg.startCol as number,
+          msg.endRow as number,
+          msg.endCol as number,
+        )
         break
       case 'insert_row':
         s.insert_row(msg.at as number, msg.count as number)

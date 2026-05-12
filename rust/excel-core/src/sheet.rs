@@ -1383,6 +1383,21 @@ impl Sheet {
         }
     }
 
+    /// Clear every non-empty address inside `range` without materializing
+    /// holes. Uses bulk-load so dependent dirtying and subscriber notify are
+    /// coalesced once after the sparse scan.
+    pub fn clear_range(&mut self, range: CellRange) -> usize {
+        let mut addrs = Vec::new();
+        self.for_each_non_empty_in_range(range, |addr| addrs.push(addr));
+        let cleared = addrs.len();
+        self.bulk_load(|loader| {
+            for addr in addrs {
+                loader.set_cell(&addr.to_string(), Value::Null);
+            }
+        });
+        cleared
+    }
+
     /// Collect every non-empty address as an `"A1"`-style string. Cheap
     /// convenience wrapper around `for_each_non_empty` for wasm exposure.
     pub fn non_empty_addrs(&self) -> Vec<String> {
@@ -3591,6 +3606,24 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["A1", "B2"]);
         assert_eq!(sheet.debug_formula_cache_state("B2"), "dirty");
+    }
+
+    #[test]
+    fn clear_range_clears_sparse_hits_and_dirties_dependents() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("C3", Value::Number(3.0));
+        sheet.set_formula("D1", "=A1+1");
+        assert_eq!(sheet.get_cell("D1"), Value::Number(2.0));
+        assert_eq!(sheet.debug_formula_cache_state("D1"), "clean");
+
+        let range = CellRange::new(CellAddress::new(0, 0), CellAddress::new(1, 1));
+        assert_eq!(sheet.clear_range(range), 1);
+
+        assert_eq!(sheet.get_cell("A1"), Value::Null);
+        assert_eq!(sheet.get_cell("C3"), Value::Number(3.0));
+        assert_eq!(sheet.debug_formula_cache_state("D1"), "dirty");
+        assert_eq!(sheet.get_cell("D1"), Value::Number(1.0));
     }
 
     // === Phase 1 Track A — P0 bug: range dep survives sparse eval ===

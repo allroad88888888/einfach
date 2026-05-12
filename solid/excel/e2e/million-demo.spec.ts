@@ -61,6 +61,54 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(after - before).toBeLessThan(200)
   })
 
+  test('delete_large_selection_uses_range_native_clear', async ({ page }) => {
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    const setup = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          raw: {
+            clear_range?: (...args: number[]) => number | void
+          }
+          selectionAddrs: () => string[][]
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+        }
+        __clearRangeCalls?: number[][]
+      }
+      const store = win.__einfachStore
+      const original = store?.raw.clear_range?.bind(store.raw)
+      if (!store || !original) return { hasClearRange: false }
+      const calls: number[][] = []
+      store.raw.clear_range = (...args: number[]) => {
+        calls.push(args)
+        return original(...args)
+      }
+      store.selectionAddrs = () => {
+        throw new Error('selectionAddrs must not run for range-native clear')
+      }
+      win.__clearRangeCalls = calls
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      return { hasClearRange: true }
+    })
+    expect(setup.hasClearRange).toBe(true)
+
+    await page.locator('.excel-table-wrapper').focus()
+    await page.keyboard.press('Delete')
+
+    await page.waitForFunction(() => {
+      const win = window as unknown as { __clearRangeCalls?: number[][] }
+      return win.__clearRangeCalls?.length === 1
+    })
+    const calls = await page.evaluate(() => {
+      const win = window as unknown as { __clearRangeCalls?: number[][] }
+      return win.__clearRangeCalls
+    })
+    expect(calls).toEqual([[0, 0, 999, 999]])
+  })
+
   test('focus_cell_remains_in_dom_under_stay_index', async ({ page }) => {
     // Track M passes the focus cell's (row, col) as
     // `rowStayIndexList={[focusRow]}` + `columnStayIndexList={[focusCol]}`

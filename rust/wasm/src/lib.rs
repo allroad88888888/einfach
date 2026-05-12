@@ -329,6 +329,22 @@ impl WasmSheet {
         self.sheet.clear_cell(addr);
     }
 
+    /// Clear non-empty cells in a zero-based inclusive range. The core scans
+    /// sparse entries only and coalesces dirty/subscriber propagation.
+    pub fn clear_range(
+        &mut self,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> u32 {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        self.sheet.clear_range(range) as u32
+    }
+
     pub fn insert_row(&mut self, at: u32, count: u32) {
         self.sheet.insert_row(at, count);
     }
@@ -1130,6 +1146,21 @@ mod tests {
 
         sheet.set_number("A1", 100.0);
         assert_eq!(sheet.get_number("B1"), 200.0);
+    }
+
+    #[test]
+    fn wasm_sheet_clear_range_clears_sparse_hits() {
+        let mut sheet = WasmSheet::new();
+        sheet.set_number("A1", 1.0);
+        sheet.set_number("C3", 3.0);
+        sheet.set_formula("D1", "=A1+1");
+        assert_eq!(sheet.get_display("D1"), "2");
+
+        assert_eq!(sheet.clear_range(0, 0, 1, 1), 1);
+
+        assert_eq!(sheet.get_type("A1"), "null");
+        assert_eq!(sheet.get_display("C3"), "3");
+        assert_eq!(sheet.get_display("D1"), "1");
     }
 
     #[test]

@@ -131,6 +131,13 @@ function createWorkbookSheetAdapter(
     clear_cell(addr) {
       mutate(() => workbook.clear_cell(sheetIdx, addr))
     },
+    clear_range(startRow, startCol, endRow, endCol) {
+      let cleared = 0
+      mutate(() => {
+        cleared = workbook.clear_range(sheetIdx, startRow, startCol, endRow, endCol)
+      })
+      return cleared
+    },
     insert_row(at, count) {
       mutate(() => workbook.insert_row(sheetIdx, at, count))
     },

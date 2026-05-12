@@ -222,12 +222,7 @@ export function Table(props: TableProps) {
 
   async function handleCut(e: KeyboardEvent) {
     await handleCopy(e)
-    const addrs = props.store.selectionAddrs()
-    props.store.beginEdit()
-    for (const row of addrs) {
-      for (const addr of row) props.store.clearCell(addr)
-    }
-    props.store.endEdit()
+    props.store.clearSelectionRange()
   }
 
   // === Context menu state ===
@@ -278,37 +273,19 @@ export function Table(props: TableProps) {
 
   async function ctxCut() {
     await ctxCopy()
-    const addrs = props.store.selectionAddrs()
-    props.store.beginEdit()
-    for (const row of addrs) {
-      for (const addr of row) props.store.clearCell(addr)
-    }
-    props.store.endEdit()
+    props.store.clearSelectionRange()
   }
 
   function ctxClearSelection() {
-    const addrs = props.store.selectionAddrs()
-    props.store.beginEdit()
-    for (const row of addrs) {
-      for (const addr of row) props.store.clearCell(addr)
-    }
-    props.store.endEdit()
+    props.store.clearSelectionRange()
   }
 
   function clearColumn(col: number) {
-    props.store.beginEdit()
-    for (let r = 0; r < rows(); r++) {
-      props.store.clearCell(coordToAddr({ row: r, col }))
-    }
-    props.store.endEdit()
+    props.store.clearCellRange({ row: 0, col }, { row: rows() - 1, col })
   }
 
   function clearRow(row: number) {
-    props.store.beginEdit()
-    for (let c = 0; c < cols(); c++) {
-      props.store.clearCell(coordToAddr({ row, col: c }))
-    }
-    props.store.endEdit()
+    props.store.clearCellRange({ row, col: 0 }, { row, col: cols() - 1 })
   }
 
   function colMenuItems(col: number): ContextMenuItem[] {
@@ -406,14 +383,9 @@ export function Table(props: TableProps) {
         break
       case 'Delete':
       case 'Backspace': {
-        // Clear every cell in the selection range. Routed through SheetStore
-        // so undo collapses to one entry via beginEdit/endEdit.
-        const addrs = props.store.selectionAddrs()
-        props.store.beginEdit()
-        for (const row of addrs) {
-          for (const addr of row) props.store.clearCell(addr)
-        }
-        props.store.endEdit()
+        // Routed through SheetStore so large selections can use backend
+        // range-native clear without materializing every address here.
+        props.store.clearSelectionRange()
         e.preventDefault()
         break
       }

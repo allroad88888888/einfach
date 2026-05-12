@@ -18,11 +18,11 @@ import type { CellValue, ISheet } from './types'
  * formatted cell). For formulas, optimism only records the formula
  * source; display stays empty until the worker computes it.
  *
- * Structural edits (`insert_row` / `delete_row` / `insert_col` /
- * `delete_col`) invalidate the entire cache because every cell in the
- * shifted band could move. Step 2's push channel will re-hydrate
- * impacted addresses; until then, post-structural reads return empty
- * until the user touches a cell again.
+ * Range clears and structural edits (`insert_row` / `delete_row` /
+ * `insert_col` / `delete_col`) invalidate the entire cache because every
+ * cell in the shifted band could move. Step 2's push channel will
+ * re-hydrate impacted addresses; until then, post-structural reads return
+ * empty until the user touches a cell again.
  */
 
 type CellType = CellValue['type']
@@ -234,6 +234,12 @@ export function createWorkerSheet(opts: WorkerSheetOptions): ISheet {
       requested.add(addr.toUpperCase())
       cache.delete(addr.toUpperCase())
       post('clear_cell', { addr })
+    },
+
+    clear_range(startRow, startCol, endRow, endCol) {
+      cache.clear()
+      requested.clear()
+      post('clear_range', { startRow, startCol, endRow, endCol })
     },
 
     get_display(addr) {

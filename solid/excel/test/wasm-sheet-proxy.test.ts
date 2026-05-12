@@ -140,6 +140,29 @@ describe('wasm-sheet-proxy (7C Step 1)', () => {
     expect(fake.sent).toContainEqual({ cmd: 'clear_cell', addr: 'A1' })
   })
 
+  it('clear_range invalidates cache and posts one range command', () => {
+    const fake = makeFakeWorker()
+    const sheet = createWorkerSheet({ workerFactory: () => fake })
+    sheet.set_number('A1', 1)
+    sheet.set_number('B2', 2)
+
+    sheet.clear_range!(0, 0, 999, 999)
+
+    expect(sheet.get_display('A1')).toBe('')
+    expect(sheet.get_display('B2')).toBe('')
+    expect(fake.sent).toContainEqual({
+      cmd: 'clear_range',
+      startRow: 0,
+      startCol: 0,
+      endRow: 999,
+      endCol: 999,
+    })
+    const clearCells = fake.sent.filter(
+      (m) => (m as { cmd?: string }).cmd === 'clear_cell',
+    )
+    expect(clearCells).toHaveLength(0)
+  })
+
   it('structural edit invalidates the whole cache', () => {
     const fake = makeFakeWorker()
     const sheet = createWorkerSheet({ workerFactory: () => fake })

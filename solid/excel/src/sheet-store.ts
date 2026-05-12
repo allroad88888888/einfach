@@ -66,6 +66,30 @@ export interface ClipboardData {
  * semantics for foreign clipboard data.
  */
 const CLIPBOARD_ORIGIN_MARKER_PREFIX = '# einfach-clipboard-origin: '
+const RANGE_CLEAR_UNDO_CELL_LIMIT = 10_000
+
+type NormalizedCellRange = {
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+}
+
+function normalizeCellRange(anchor: CellCoord, focus: CellCoord): NormalizedCellRange {
+  return {
+    startRow: Math.min(anchor.row, focus.row),
+    startCol: Math.min(anchor.col, focus.col),
+    endRow: Math.max(anchor.row, focus.row),
+    endCol: Math.max(anchor.col, focus.col),
+  }
+}
+
+function rangeCellCount(range: NormalizedCellRange): number {
+  return (
+    (range.endRow - range.startRow + 1) *
+    (range.endCol - range.startCol + 1)
+  )
+}
 
 /**
  * Serialize a `ClipboardData` to the TSV-with-origin-marker string we
@@ -343,6 +367,29 @@ export function createSheetStore(sheet: ISheet) {
     return list.map(snapshot)
   }
 
+  function commitPendingEdit() {
+    if (pendingBefore === null) return
+    const before = pendingBefore
+    pendingBefore = null
+    pendingAddrs = null
+    if (before.length === 0) return
+    // Format snapshots and value snapshots are restored differently — the
+    // "after" needs to match the kind of each "before" entry so undo of a
+    // mixed batch (value edit + format edit on the same cell) still
+    // restores both halves independently.
+    const after = before.map((s) =>
+      s.kind === 'format'
+        ? ({
+            addr: s.addr,
+            kind: 'format' as const,
+            format: sheet.get_format ? sheet.get_format(s.addr) : {},
+          } satisfies CellSnapshot)
+        : snapshot(s.addr),
+    )
+    undoStack.push({ kind: 'cells', before, after })
+    redoStack.length = 0
+  }
+
   /** Run a structural edit and push its undo entry. Flushes any pending
    * value-edit batch first so the two entry kinds never interleave (see
    * `docs/STRUCTURAL_UNDO.md#coalescing-with-value-edits`). */
@@ -353,24 +400,7 @@ export function createSheetStore(sheet: ISheet) {
     apply: () => void,
   ) {
     // Flush an open beginEdit so the structural entry is its own frame.
-    if (pendingBefore !== null) {
-      const before = pendingBefore
-      const after = before.map((s) =>
-        s.kind === 'format'
-          ? ({
-              addr: s.addr,
-              kind: 'format' as const,
-              format: sheet.get_format ? sheet.get_format(s.addr) : {},
-            } satisfies CellSnapshot)
-          : snapshot(s.addr),
-      )
-      pendingBefore = null
-      pendingAddrs = null
-      if (before.length > 0) {
-        undoStack.push({ kind: 'cells', before, after })
-        redoStack.length = 0
-      }
-    }
+    commitPendingEdit()
 
     const before = snapshotAllNonEmpty()
     apply()
@@ -414,6 +444,51 @@ export function createSheetStore(sheet: ISheet) {
    * them out of the affected band). */
   function restoreAll(snaps: CellSnapshot[]) {
     for (const s of snaps) restore(s)
+  }
+
+  function selectionAddressGrid(): string[][] {
+    const range = normalizeCellRange(anchor(), selection())
+    const out: string[][] = []
+    for (let r = range.startRow; r <= range.endRow; r++) {
+      const row: string[] = []
+      for (let c = range.startCol; c <= range.endCol; c++) {
+        row.push(coordToAddr({ row: r, col: c }))
+      }
+      out.push(row)
+    }
+    return out
+  }
+
+  function clearCellRange(anchorCoord: CellCoord, focusCoord: CellCoord) {
+    const range = normalizeCellRange(anchorCoord, focusCoord)
+    if (
+      sheet.clear_range &&
+      rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT
+    ) {
+      // Large clears are intentionally range-native. We flush any open
+      // small-edit batch first and do not snapshot the full rectangle on
+      // main; large undo becomes a later backend/coarse-transaction task.
+      // Drop prior cell undo entries so Ctrl+Z cannot replay stale
+      // snapshots across this non-undoable destructive range command.
+      commitPendingEdit()
+      sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol)
+      undoStack.length = 0
+      redoStack.length = 0
+      return
+    }
+
+    const ownsBatch = pendingBefore === null
+    if (ownsBatch) {
+      pendingBefore = []
+      pendingAddrs = new Set()
+    }
+    for (let r = range.startRow; r <= range.endRow; r++) {
+      for (let c = range.startCol; c <= range.endCol; c++) {
+        const addr = coordToAddr({ row: r, col: c })
+        recordSingle(addr, () => sheet.clear_cell(addr))
+      }
+    }
+    if (ownsBatch) commitPendingEdit()
   }
 
   return {
@@ -492,19 +567,7 @@ export function createSheetStore(sheet: ISheet) {
      * of anchor) still produce top-left-first addresses.
      */
     selectionAddrs: (): string[][] => {
-      const a = anchor()
-      const f = selection()
-      const r0 = Math.min(a.row, f.row)
-      const r1 = Math.max(a.row, f.row)
-      const c0 = Math.min(a.col, f.col)
-      const c1 = Math.max(a.col, f.col)
-      const out: string[][] = []
-      for (let r = r0; r <= r1; r++) {
-        const row: string[] = []
-        for (let c = c0; c <= c1; c++) row.push(coordToAddr({ row: r, col: c }))
-        out.push(row)
-      }
-      return out
+      return selectionAddressGrid()
     },
 
     /**
@@ -574,6 +637,17 @@ export function createSheetStore(sheet: ISheet) {
     /** Clear a cell back to empty. Undoable. */
     clearCell(addr: string) {
       recordSingle(addr, () => sheet.clear_cell(addr))
+    },
+
+    /** Clear a rectangular range. Small ranges keep per-cell undo; large
+     * backend-capable ranges use `clear_range` without materializing every
+     * address on the main thread. */
+    clearCellRange,
+
+    /** Clear the current selection rectangle without forcing callers to
+     * first build `selectionAddrs()`. */
+    clearSelectionRange() {
+      clearCellRange(anchor(), selection())
     },
 
     /**
@@ -666,26 +740,7 @@ export function createSheetStore(sheet: ISheet) {
     },
 
     endEdit() {
-      if (pendingBefore === null) return
-      const before = pendingBefore
-      pendingBefore = null
-      pendingAddrs = null
-      if (before.length === 0) return
-      // Format snapshots and value snapshots are restored differently — the
-      // "after" needs to match the kind of each "before" entry so undo of a
-      // mixed batch (value edit + format edit on the same cell) still
-      // restores both halves independently.
-      const after = before.map((s) =>
-        s.kind === 'format'
-          ? ({
-              addr: s.addr,
-              kind: 'format' as const,
-              format: sheet.get_format ? sheet.get_format(s.addr) : {},
-            } satisfies CellSnapshot)
-          : snapshot(s.addr),
-      )
-      undoStack.push({ kind: 'cells', before, after })
-      redoStack.length = 0
+      commitPendingEdit()
     },
 
     canUndo: () => undoStack.length > 0,

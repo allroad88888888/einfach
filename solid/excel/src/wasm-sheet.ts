@@ -12,6 +12,13 @@ export interface WasmWorkbookApi {
   set_error(sheetIdx: number, addr: string, value: string): void
   set_formula(sheetIdx: number, addr: string, formula: string): boolean
   clear_cell(sheetIdx: number, addr: string): void
+  clear_range(
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): number
   insert_row(sheetIdx: number, at: number, count: number): void
   delete_row(sheetIdx: number, at: number, count: number): void
   insert_col(sheetIdx: number, at: number, count: number): void

@@ -31,6 +31,17 @@ export interface ISheet {
   /** Clear a cell back to its initial empty / Null state. */
   clear_cell(addr: string): void
   /**
+   * Optional range-native clear. Coordinates are zero-based and inclusive.
+   * Backends that implement this must scan sparse state rather than
+   * expecting the UI to materialize every address in the rectangle.
+   */
+  clear_range?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): number | void
+  /**
    * Structural edits (phase 4 backend). All update referenced formulas to
    * follow the data; references inside the deleted band become #REF!.
    */

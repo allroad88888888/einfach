@@ -334,6 +334,52 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('clearCellRange keeps small ranges as one undoable edit', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setNumber('B1', 2)
+        store.clearCellRange({ row: 0, col: 0 }, { row: 0, col: 1 })
+
+        expect(store.getCell('A1').type).toBe('null')
+        expect(store.getCell('B1').type).toBe('null')
+
+        store.undo()
+        expect(store.getCell('A1').display).toBe('1')
+        expect(store.getCell('B1').display).toBe('2')
+        dispose()
+      })
+    })
+
+    it('clearSelectionRange uses backend clear_range for large rectangles', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet()
+        let clearCellCount = 0
+        let clearRangeArgs: number[] | undefined
+        const clearCell = sheet.clear_cell.bind(sheet)
+        sheet.clear_cell = (addr) => {
+          clearCellCount += 1
+          clearCell(addr)
+        }
+        sheet.clear_range = (startRow, startCol, endRow, endCol) => {
+          clearRangeArgs = [startRow, startCol, endRow, endCol]
+          return 0
+        }
+        const store = createSheetStore(sheet)
+        store.setNumber('A1', 1)
+        expect(store.canUndo()).toBe(true)
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        store.clearSelectionRange()
+
+        expect(clearRangeArgs).toEqual([0, 0, 999, 999])
+        expect(clearCellCount).toBe(0)
+        expect(store.canUndo()).toBe(false)
+        dispose()
+      })
+    })
+
     it('paste is one undo step', () => {
       createRoot((dispose) => {
         const store = createTestStore()
