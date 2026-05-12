@@ -360,16 +360,32 @@ impl Sheet {
         }
     }
 
-    fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
-        let mut notified = HashSet::new();
-        let mut stack: Vec<CellAddress> = self
+    /// Collect every formula address that depends on a write to `addr`,
+    /// merging point-cell dependents from `cell_dependents` with any
+    /// range dependents whose range contains `addr`. The range scan is
+    /// `O(range_count)` per call today; Phase 2 will replace the linear
+    /// pass with an interval index. Pulled into a helper so both the
+    /// per-write BFS (`mark_dependents_dirty`) and the bulk-load
+    /// `flush` walk use the same union.
+    fn dependents_of(&self, addr: CellAddress) -> HashSet<CellAddress> {
+        let mut out: HashSet<CellAddress> = self
             .cell_dependents
             .borrow()
-            .get(&root)
+            .get(&addr)
             .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+            .unwrap_or_default();
+        let range_dependents = self.range_dependents.borrow();
+        for (range, formulas) in range_dependents.iter() {
+            if range.contains(addr) {
+                out.extend(formulas.iter().copied());
+            }
+        }
+        out
+    }
+
+    fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
+        let mut notified = HashSet::new();
+        let mut stack: Vec<CellAddress> = self.dependents_of(root).into_iter().collect();
 
         while let Some(addr) = stack.pop() {
             if !notified.insert(addr) {
@@ -380,13 +396,7 @@ impl Sheet {
             }
             self.notify_address_subscribers(addr);
 
-            let next = self
-                .cell_dependents
-                .borrow()
-                .get(&addr)
-                .cloned()
-                .unwrap_or_default();
-            stack.extend(next);
+            stack.extend(self.dependents_of(addr));
         }
 
         notified
@@ -1401,23 +1411,22 @@ impl<'a> BulkLoader<'a> {
     /// currently-subscribed address at most once.
     ///
     /// Complexity: O(T + D) where T = touched count, D = size of transitive
-    /// formula closure reachable from `touched` through `cell_dependents`.
+    /// formula closure reachable from `touched` through both
+    /// `cell_dependents` and `range_dependents` (the latter scanned
+    /// `O(range_count)` per address; Phase 2 swaps in an interval index).
     /// Notify dedup is O(1) per visited address via the `notified` HashSet.
     fn flush(&mut self) {
-        // 1. BFS through cell_dependents starting at every touched address.
-        //    Collect the set of transitively-dirty formula addresses, and as a
-        //    side effect flip their FormulaCache to Dirty.
+        // 1. BFS through dependents (point + range) starting at every
+        //    touched address. Collect the set of transitively-dirty
+        //    formula addresses, and as a side effect flip their
+        //    FormulaCache to Dirty. `dependents_of` unions
+        //    `cell_dependents[addr]` with every range containing `addr`,
+        //    so an empty cell inside `SUM(A1:A100)` still dirties the
+        //    sum even though it was skipped by sparse eval (P0).
         let mut dirty: HashSet<CellAddress> = HashSet::new();
         let mut stack: Vec<CellAddress> = Vec::new();
         for &addr in &self.touched {
-            let next = self
-                .sheet
-                .cell_dependents
-                .borrow()
-                .get(&addr)
-                .cloned()
-                .unwrap_or_default();
-            stack.extend(next);
+            stack.extend(self.sheet.dependents_of(addr));
         }
         while let Some(addr) = stack.pop() {
             if !dirty.insert(addr) {
@@ -1426,14 +1435,7 @@ impl<'a> BulkLoader<'a> {
             if let Some(record) = self.sheet.formula_cells.get(&addr) {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
-            let next = self
-                .sheet
-                .cell_dependents
-                .borrow()
-                .get(&addr)
-                .cloned()
-                .unwrap_or_default();
-            stack.extend(next);
+            stack.extend(self.sheet.dependents_of(addr));
         }
 
         // 2. Reattach fanouts on touched addresses so future writes notify
