@@ -98,6 +98,39 @@ export async function expectDisplay(page: Page, addr: string, expected: string) 
 }
 
 // ============================================================================
+// Viewport scroll (Phase 4)
+// ============================================================================
+
+/**
+ * Programmatically scroll the table viewport along one axis. `axis` is
+ * `'x'` (sets `scrollLeft`) or `'y'` (sets `scrollTop`); `px` is the
+ * absolute pixel offset, not a delta. Targets the `.excel-table-wrapper`
+ * div that owns the scroll position for both row and column virt.
+ *
+ * Added for the Phase-4 column-virt + 1M-cell e2e suite where tests
+ * need to push the viewport past col 500 (horizontal) or row 10000
+ * (vertical) and re-probe DOM / subscription state. Kept tiny on
+ * purpose — anything fancier (smooth scroll, eased) belongs in the
+ * caller.
+ */
+export async function scrollWrapper(
+  page: Page,
+  axis: 'x' | 'y',
+  px: number,
+): Promise<void> {
+  await page.locator('.excel-table-wrapper').evaluate(
+    (el, args) => {
+      if (args.axis === 'x') {
+        ;(el as HTMLElement).scrollLeft = args.px
+      } else {
+        ;(el as HTMLElement).scrollTop = args.px
+      }
+    },
+    { axis, px },
+  )
+}
+
+// ============================================================================
 // Render-counter probe
 // ============================================================================
 
