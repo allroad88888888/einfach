@@ -1235,6 +1235,39 @@ impl Sheet {
         self.range_dependents.borrow().candidates_for(addr).len()
     }
 
+    /// Count how many cells the sparse range-iterator visits when scanning
+    /// `range_spec` (e.g. `"A1:AA50"`). Probe-only helper used by the
+    /// Phase 2 scale acceptance test `range_read_1m_sparse_visits_only_range`
+    /// — counts every non-empty cell yielded by `for_each_sparse_cell_with`,
+    /// independent of `cells` HashMap total size.
+    ///
+    /// Phase 1 implementation: linear scan of `cells` + `formula_cells`
+    /// filtered by `range.contains`, so this counter == "cells in range".
+    /// Phase 2 (Agent F) swaps `cells` for a row-indexed structure and the
+    /// visit-count contract becomes O(cells in range), not O(total cells).
+    /// Returns 0 for an unparsable `range_spec`.
+    #[doc(hidden)]
+    pub fn debug_range_visit_count(&self, range_spec: &str) -> usize {
+        let mut parts = range_spec.split(':');
+        let (Some(start_s), Some(end_s), None) = (parts.next(), parts.next(), parts.next()) else {
+            return 0;
+        };
+        let (Some(start), Some(end)) = (CellAddress::parse(start_s), CellAddress::parse(end_s))
+        else {
+            return 0;
+        };
+        let range = CellRange::new(start, end);
+        let mut visits: usize = 0;
+        self.for_each_sparse_cell_with(
+            range,
+            &|sheet, addr| sheet.peek_value(addr),
+            &mut |_addr, _v| {
+                visits += 1;
+            },
+        );
+        visits
+    }
+
     /// Return the original formula text for a cell, or `None` if the cell
     /// holds a value rather than a formula. Required by the formula bar /
     /// double-click-to-edit flow so users see `=A1*2` instead of the
