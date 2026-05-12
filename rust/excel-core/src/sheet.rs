@@ -309,6 +309,20 @@ impl Sheet {
         }
     }
 
+    /// Replace this formula's point-cell `deps` with the eval-tracked set
+    /// produced by `TrackingEvalProvider`. The sparse range iterator
+    /// inside eval intentionally narrows this set to addresses that were
+    /// actually visited — `IF`-branch selection drops the unselected
+    /// arm's references, which is correct behavior.
+    ///
+    /// `range_deps` is deliberately untouched: those entries were
+    /// captured statically from `Expr::Range` at `set_formula` time and
+    /// must survive sparse-eval narrowing. Otherwise a write to a
+    /// previously-empty cell inside the range would miss dirty
+    /// propagation (P0 from `PHASE1_PARALLEL.md` § Track A). The
+    /// follow-up dirty-propagation commit consults `range_dependents`
+    /// in addition to `cell_dependents` on each cell write so the
+    /// surviving range entries are honored.
     fn replace_formula_deps(
         &self,
         formula_addr: CellAddress,
@@ -318,6 +332,10 @@ impl Sheet {
         let old_deps = record.deps.replace(new_deps.clone());
         self.remove_formula_deps(formula_addr, &old_deps);
         self.add_formula_deps(formula_addr, &new_deps);
+        // Note: record.range_deps and self.range_dependents are
+        // intentionally NOT touched here. They reflect the static
+        // structure of the formula and only change when `set_formula`
+        // overwrites the cell or `remove_formula_record` drops it.
     }
 
     fn remove_formula_record(&mut self, addr: CellAddress) -> Option<Rc<FormulaRecord>> {
