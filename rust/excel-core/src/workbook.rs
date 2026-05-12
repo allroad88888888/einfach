@@ -85,7 +85,7 @@ impl CrossSheetDeps {
             CrossSheetRef::Range(src_sheet, range) => {
                 self.range_index_per_sheet
                     .entry(*src_sheet)
-                    .or_insert_with(RangeDependentIndex::new)
+                    .or_default()
                     .add_formula(*range, formula_addr);
                 // NOTE: the per-source-sheet `RangeDependentIndex` keys
                 // its formula set by `CellAddress` only. The formula's
@@ -1420,5 +1420,251 @@ mod tests {
         wb.sheet_mut(sd).unwrap().set_cell("A1", Value::Number(7.0));
         assert!(wb.set_formula(s1, "B1", "=Data!A1*3"));
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(21.0));
+    }
+
+    // === Phase 3 Track I — cross-sheet dirty propagation acceptance ===
+
+    /// Inverse of `workbook_get_cell_refreshes_cross_sheet_cache_without_notifying`.
+    ///
+    /// That test exercises the RAW path (`wb.sheet_by_name_mut("Data").
+    /// set_cell(...)`) which deliberately bypasses the workbook dep
+    /// graph — single-sheet edits should continue to work without
+    /// participating in cross-sheet fanout.
+    ///
+    /// THIS test exercises the workbook-routed path: `wb.set_cell(
+    /// data_idx, "A1", ...)` MUST fire the subscriber on `Sheet1!B1`
+    /// (where `B1 = =Data!A1*2`) because the cross-sheet dep graph
+    /// records the reverse edge `(data_idx, A1) → (sheet1_idx, B1)`.
+    #[test]
+    fn cross_sheet_write_fires_dependent_subscriber() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        // Set the cross-sheet source via the raw path — pre-existing
+        // value, not part of what we're measuring.
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(5.0));
+        // Install the cross-sheet formula via the workbook path so the
+        // CrossSheetDeps reverse edge actually lands.
+        assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
+
+        // Sanity: the dep graph holds exactly one reverse edge —
+        // `(data_idx, A1) → (s1, B1)`.
+        assert_eq!(
+            wb.debug_cross_sheet_reverse_edge_count(),
+            1,
+            "set_formula must record one cross-sheet reverse edge"
+        );
+
+        // Subscribe AFTER the formula is installed so we measure only
+        // fanout from the upcoming write.
+        let changes = Rc::new(RefCell::new(0u32));
+        let changes_clone = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("B1", move || {
+            *changes_clone.borrow_mut() += 1;
+        });
+
+        // Workbook-routed write on Data!A1 — this is the path that
+        // SHOULD propagate dirty + fire the cross-sheet subscriber.
+        wb.set_cell(data_idx, "A1", Value::Number(7.0));
+
+        assert!(
+            *changes.borrow() >= 1,
+            "subscriber on Sheet1!B1 must fire when Data!A1 is written via wb.set_cell; got {}",
+            *changes.borrow()
+        );
+        assert_eq!(
+            wb.get_cell("Sheet1", "B1"),
+            Value::Number(14.0),
+            "formula must observe the new cross-sheet value on subsequent read"
+        );
+    }
+
+    /// Confirms the design split: `wb.sheet_mut(idx).set_cell(...)` is
+    /// the "raw" path and is INTENTIONALLY excluded from cross-sheet
+    /// fanout. This complements `cross_sheet_write_fires_dependent_
+    /// subscriber` — if both fired, single-sheet test ergonomics would
+    /// degrade (every sheet-local edit would have to consider the
+    /// workbook graph).
+    #[test]
+    fn raw_sheet_write_does_not_fire_cross_sheet_subscriber() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(5.0));
+        assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
+
+        let changes = Rc::new(RefCell::new(0u32));
+        let changes_clone = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("B1", move || {
+            *changes_clone.borrow_mut() += 1;
+        });
+
+        // RAW path — deliberately bypasses the workbook graph.
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(7.0));
+
+        assert_eq!(
+            *changes.borrow(),
+            0,
+            "raw Sheet::set_cell path must NOT fire cross-sheet subscribers"
+        );
+        // The cached formula result is stale — but the cross-sheet
+        // read path (`wb.get_cell`) still refreshes it on demand via
+        // `WorkbookEvalProvider::force_formula_recompute`.
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
+    }
+
+    /// Chained cross-sheet propagation: `Sheet1!D = =Sheet2!C`,
+    /// `Sheet2!C = =Sheet3!A`. A write to `Sheet3!A` must dirty BOTH
+    /// `Sheet2!C` and `Sheet1!D` (BFS through one cross-sheet hop).
+    #[test]
+    fn cross_sheet_chain_fires_transitive_subscribers() {
+        let mut wb = Workbook::new();
+        let s2 = wb.add_sheet("Sheet2");
+        let s3 = wb.add_sheet("Sheet3");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        wb.sheet_mut(s3).unwrap().set_cell("A1", Value::Number(1.0));
+        assert!(wb.set_formula(s2, "C1", "=Sheet3!A1"));
+        assert!(wb.set_formula(s1, "D1", "=Sheet2!C1"));
+        // Edges: (s3, A1) → (s2, C1) and (s2, C1) → (s1, D1) = 2 reverse edges.
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 2);
+
+        let s1_changes = Rc::new(RefCell::new(0u32));
+        let s2_changes = Rc::new(RefCell::new(0u32));
+        {
+            let s1c = s1_changes.clone();
+            wb.sheet_mut(s1).unwrap().subscribe_cell("D1", move || {
+                *s1c.borrow_mut() += 1;
+            });
+            let s2c = s2_changes.clone();
+            wb.sheet_mut(s2).unwrap().subscribe_cell("C1", move || {
+                *s2c.borrow_mut() += 1;
+            });
+        }
+
+        wb.set_cell(s3, "A1", Value::Number(99.0));
+
+        assert!(
+            *s2_changes.borrow() >= 1,
+            "transitive subscriber on Sheet2!C1 must fire when Sheet3!A1 is written"
+        );
+        assert!(
+            *s1_changes.borrow() >= 1,
+            "transitive subscriber on Sheet1!D1 must fire (BFS through Sheet2!C1)"
+        );
+        assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(99.0));
+    }
+
+    /// `Workbook::clear_cell` propagates dirty fanout the same way as
+    /// writing `Value::Null` — a cleared cross-sheet source must dirty
+    /// downstream formulas.
+    #[test]
+    fn cross_sheet_clear_fires_dependent_subscriber() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(5.0));
+        assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
+
+        let changes = Rc::new(RefCell::new(0u32));
+        let cc = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("B1", move || {
+            *cc.borrow_mut() += 1;
+        });
+
+        wb.clear_cell(data_idx, "A1");
+        assert!(*changes.borrow() >= 1);
+    }
+
+    /// `Workbook::set_formula` clean-up: replacing a formula with one
+    /// that has different cross-sheet refs must remove the stale
+    /// reverse edges so a later write to the old source doesn't fire
+    /// the (now-irrelevant) subscriber.
+    #[test]
+    fn cross_sheet_formula_replacement_drops_stale_reverse_edge() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let extra_idx = wb.add_sheet("Extra");
+        let s1 = wb.index_of("Sheet1").unwrap();
+
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(1.0));
+        wb.sheet_mut(extra_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(100.0));
+        assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
+
+        // Replace with a formula that references Extra instead.
+        assert!(wb.set_formula(s1, "B1", "=Extra!A1*2"));
+        assert_eq!(
+            wb.debug_cross_sheet_reverse_edge_count(),
+            1,
+            "still one reverse edge, but now keyed by Extra!A1"
+        );
+
+        let changes = Rc::new(RefCell::new(0u32));
+        let cc = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("B1", move || {
+            *cc.borrow_mut() += 1;
+        });
+        // Writing the OLD source must NOT fire the subscriber.
+        wb.set_cell(data_idx, "A1", Value::Number(7.0));
+        assert_eq!(
+            *changes.borrow(),
+            0,
+            "stale reverse edge from previous formula was not cleaned up"
+        );
+        // Writing the NEW source must fire it.
+        wb.set_cell(extra_idx, "A1", Value::Number(8.0));
+        assert!(*changes.borrow() >= 1);
+    }
+
+    /// Workbook-level `bulk_load` collects writes and fires each cross-
+    /// sheet subscriber at most once at flush time.
+    #[test]
+    fn bulk_load_dedups_cross_sheet_subscriber_fanout() {
+        let mut wb = Workbook::new();
+        let data_idx = wb.add_sheet("Data");
+        let s1 = wb.index_of("Sheet1").unwrap();
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A1", Value::Number(1.0));
+        wb.sheet_mut(data_idx)
+            .unwrap()
+            .set_cell("A2", Value::Number(2.0));
+        // Formula depends on BOTH Data!A1 and Data!A2 — two cross-sheet
+        // cell edges feed the same target subscriber.
+        assert!(wb.set_formula(s1, "B1", "=Data!A1+Data!A2"));
+
+        let changes = Rc::new(RefCell::new(0u32));
+        let cc = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("B1", move || {
+            *cc.borrow_mut() += 1;
+        });
+
+        wb.bulk_load(|loader| {
+            loader.set_cell(data_idx, "A1", Value::Number(10.0));
+            loader.set_cell(data_idx, "A2", Value::Number(20.0));
+        });
+
+        // Two writes to the same target → ONE subscriber fire.
+        assert_eq!(
+            *changes.borrow(),
+            1,
+            "bulk_load must dedup cross-sheet subscriber fanout"
+        );
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(30.0));
     }
 }
