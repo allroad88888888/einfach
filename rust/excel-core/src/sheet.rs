@@ -47,15 +47,39 @@ enum FormulaCache {
 
 struct FormulaRecord {
     expr: Rc<Expr>,
+    /// Point-cell dependencies (`Expr::CellRef`). Narrowed by eval-time
+    /// tracking — branch-skipped `IF` arms drop out of this set, which is
+    /// the intended behavior. `Expr::Range` references are ALSO expanded
+    /// into this set today (via `collect_refs`) so plain `cell_dependents`
+    /// lookup still works for the first dirty pass; the new
+    /// `range_dependents` index makes survival across sparse-eval
+    /// narrowing the load-bearing guarantee.
     deps: RefCell<HashSet<CellAddress>>,
+    /// Range dependencies (`Expr::Range`), stored as ranges rather than
+    /// expanded cells. Populated at `set_formula` time from
+    /// `collect_range_refs` and preserved across eval — sparse iteration
+    /// during eval must not narrow these to the visited subset, otherwise
+    /// writing a previously-empty cell inside the range fails to dirty
+    /// the formula (the P0 bug from `PHASE1_PARALLEL.md` § Track A).
+    ///
+    /// Consumer wired in the follow-up commit that adds
+    /// `Sheet::range_dependents`; storing the field here in isolation lets
+    /// Step 2's diff stay self-contained.
+    #[allow(dead_code)]
+    range_deps: RefCell<HashSet<CellRange>>,
     cache: RefCell<FormulaCache>,
 }
 
 impl FormulaRecord {
-    fn new(expr: Rc<Expr>, deps: HashSet<CellAddress>) -> Self {
+    fn new(
+        expr: Rc<Expr>,
+        deps: HashSet<CellAddress>,
+        range_deps: HashSet<CellRange>,
+    ) -> Self {
         FormulaRecord {
             expr,
             deps: RefCell::new(deps),
+            range_deps: RefCell::new(range_deps),
             cache: RefCell::new(FormulaCache::Dirty),
         }
     }
@@ -417,13 +441,18 @@ impl Sheet {
         self.with_remap(addr, move |sheet| {
             let expr = Rc::new(expr);
             let deps = Sheet::formula_deps_for(&expr);
+            let range_deps = collect_range_refs(&expr);
             sheet.remove_formula_record(addr);
             if let Some(prim) = sheet.cells.remove(&addr) {
                 if sheet.store.has_atom(prim) && !sheet.store.has_dependents(prim) {
                     sheet.store.destroy_atom(prim);
                 }
             }
-            let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+            let record = Rc::new(FormulaRecord::new(
+                expr.clone(),
+                deps.clone(),
+                range_deps,
+            ));
             sheet.add_formula_deps(addr, &deps);
             sheet.formula_cells.insert(addr, record);
             sheet.formula_exprs.insert(addr, expr);
@@ -1076,8 +1105,13 @@ impl Sheet {
             }
         };
         let deps = Sheet::formula_deps_for(&expr);
+        let range_deps = collect_range_refs(&expr);
         self.remove_formula_record(addr);
-        let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+        let record = Rc::new(FormulaRecord::new(
+            expr.clone(),
+            deps.clone(),
+            range_deps,
+        ));
         self.add_formula_deps(addr, &deps);
         self.formula_cells.insert(addr, record);
         self.formula_exprs.insert(addr, expr);
@@ -1259,6 +1293,7 @@ impl<'a> BulkLoader<'a> {
 
         let expr = Rc::new(expr);
         let deps = Sheet::formula_deps_for(&expr);
+        let range_deps = collect_range_refs(&expr);
         // Drop any prior formula record (no notify) and any primitive scaffold
         // that no longer has dependents — mirrors `Sheet::set_formula` minus
         // the `with_remap` listener fire.
@@ -1268,7 +1303,11 @@ impl<'a> BulkLoader<'a> {
                 self.sheet.store.destroy_atom(prim);
             }
         }
-        let record = Rc::new(FormulaRecord::new(expr.clone(), deps.clone()));
+        let record = Rc::new(FormulaRecord::new(
+            expr.clone(),
+            deps.clone(),
+            range_deps,
+        ));
         self.sheet.add_formula_deps(addr, &deps);
         self.sheet.formula_cells.insert(addr, record);
         self.sheet.formula_exprs.insert(addr, expr);
@@ -1351,6 +1390,49 @@ impl<'a> BulkLoader<'a> {
                 self.sheet.notify_address_subscribers(addr);
             }
         }
+    }
+}
+
+/// Walk the AST and collect every `Expr::Range` as a typed `CellRange`,
+/// without expanding it to individual cells. Mirror of `collect_refs`
+/// that handles only ranges. Used by `set_formula` / `BulkLoader` to
+/// populate `FormulaRecord::range_deps` at registration time so the
+/// sheet-level `range_dependents` index can be rebuilt without losing
+/// range identity across sparse-eval narrowing of the point dep set.
+fn collect_range_refs(expr: &Expr) -> HashSet<CellRange> {
+    let mut out = HashSet::new();
+    collect_range_refs_into(expr, &mut out);
+    out
+}
+
+fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
+    match expr {
+        Expr::Range { start, end } => {
+            // Normalize so transposed corners hash to the same entry —
+            // a `SUM(A1:B2)` and `SUM(B2:A1)` share one dep entry.
+            out.insert(CellRange::new(*start, *end).normalize());
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_range_refs_into(left, out);
+            collect_range_refs_into(right, out);
+        }
+        Expr::Negate(inner) => collect_range_refs_into(inner, out),
+        Expr::FuncCall { args, .. } => {
+            // FuncCall covers `IF` and friends: every branch arg is
+            // descended into so a range hidden inside an unselected
+            // branch still registers as a range dep.
+            for a in args {
+                collect_range_refs_into(a, out);
+            }
+        }
+        // CellRef goes through the point-cell `deps` path; SheetRef is
+        // cross-sheet and tracked at the workbook layer; literals have
+        // no deps.
+        Expr::CellRef(_)
+        | Expr::SheetRef { .. }
+        | Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_) => {}
     }
 }
 
