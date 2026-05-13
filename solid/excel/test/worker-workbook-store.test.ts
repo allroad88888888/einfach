@@ -3,7 +3,7 @@
 import { describe, expect, it } from '@jest/globals'
 import { createRoot } from 'solid-js'
 import { sparseRangeToTSV } from '../src/range-tsv'
-import type { CellFormatJSON } from '../src/types'
+import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
 import { createWorkerWorkbookStore } from '../src/wasm-workbook-store'
 import type {
   CellRefWire,
@@ -37,6 +37,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
     setFormatRange: FormatRangeCall[]
+    snapshotFormatRange: ClearRangeCall[]
+    restoreFormatSnapshot: FormatRangeSnapshot[]
     snapshotRangeSparse: ClearRangeCall[]
     exportRangeTsv: ClearRangeCall[]
     restoreSparse: SparseCellWire[][]
@@ -110,6 +112,8 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     clearCell: [],
     clearRange: [],
     setFormatRange: [],
+    snapshotFormatRange: [],
+    restoreFormatSnapshot: [],
     snapshotRangeSparse: [],
     exportRangeTsv: [],
     restoreSparse: [],
@@ -220,6 +224,22 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async setFormatRange(range, fmt) {
       calls.setFormatRange.push({ ...range, fmt })
+      return 1
+    },
+    async snapshotFormatRange(range) {
+      calls.snapshotFormatRange.push({ ...range })
+      return {
+        sheet: range.sheet,
+        startRow: range.startRow,
+        startCol: range.startCol,
+        endRow: range.endRow,
+        endCol: range.endCol,
+        cellFormats: [],
+        rangeFormats: [],
+      }
+    },
+    async restoreFormatSnapshot(snapshot) {
+      calls.restoreFormatSnapshot.push(snapshot)
       return 1
     },
     async snapshotRangeSparse(_range: SparseRangeWire) {
@@ -515,12 +535,21 @@ describe('createWorkerWorkbookStore', () => {
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
       expect(store.formatSelection((current) => ({ ...current, bold: true }))).toBe(true)
-      await Promise.resolve()
+      await waitFor(() => {
+        expect(store.canUndo()).toBe(true)
+      })
 
+      expect(client.calls.snapshotFormatRange).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      ])
       expect(client.calls.setFormatRange).toEqual([
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999, fmt: { bold: true } },
       ])
-      expect(store.canUndo()).toBe(false)
+      store.undo()
+      await waitFor(() => {
+        expect(client.calls.restoreFormatSnapshot).toHaveLength(1)
+      })
 
       workbook.dispose()
     })

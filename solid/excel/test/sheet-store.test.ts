@@ -503,8 +503,8 @@ describe('createSheetStore', () => {
       })
     })
 
-    it('formatSelection uses set_format_range for oversized ranges when available', () => {
-      createRoot((dispose) => {
+    it('formatSelection uses set_format_range for oversized ranges when available', async () => {
+      await createRoot(async (dispose) => {
         const sheet = createJSSheet() as ReturnType<typeof createJSSheet> & {
           set_format_range: (
             startRow: number,
@@ -541,12 +541,16 @@ describe('createSheetStore', () => {
             bold: true,
           })),
         ).toBe(true)
+        await new Promise((resolve) => setTimeout(resolve, 0))
         expect(setFormatRangeCalls).toEqual([[0, 0, 999, 999, { bold: true }]])
         expect(setFormatCalls).toBe(0)
         expect(getFormatCalls).toBe(0)
-        expect(store.canUndo()).toBe(false)
+        expect(store.canUndo()).toBe(true)
         sheet.set_format = originalSetFormat
         if (originalGetFormat) sheet.get_format = originalGetFormat
+        store.undo()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        expect(store.getFormat('B2').bold).toBeFalsy()
         dispose()
       })
     })

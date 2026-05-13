@@ -58,7 +58,7 @@ as legacy compatibility only.
 | Item | Where | Effort | Notes |
 |---|---|---|---|
 | Bounded import / sparse persistence v1 | `rust/wasm/src/lib.rs`, worker import protocol, persistence docs/tests | 2–4 d | begin/chunk/commit/cancel and sparse snapshot exist. Remaining work: memory/backpressure audit, persistence schema/save-load, import metrics, and round-trip tests that preserve lazy formulas. |
-| Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Large clear undo, copy export, and format are range-native. Remaining work: large format undo via range-format snapshot/restore or transaction, and copy/export streaming instead of one huge TSV string. |
+| Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 1–2 d | Large clear undo, copy export, range format, and large format undo are range-native. Remaining work: copy/export streaming instead of one huge TSV string. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
 
@@ -220,7 +220,7 @@ Once agents return:
 
 | Option | What | Effort | Why |
 |---|---|---|---|
-| **A** | Wave 2 — range format undo + copy/export streaming | 2–4 d | Finishes million-cell range ops without main-thread address expansion or undo-stack loss |
+| **A** | Wave 2 remainder — copy/export streaming | 1–2 d | Finishes million-cell range export without one huge TSV string |
 | **B** | Wave 3 — bounded import + sparse persistence v1 | 3–5 d | Productizes data ingress/egress without breaking lazy semantics |
 | **C** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |

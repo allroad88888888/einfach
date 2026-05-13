@@ -169,6 +169,11 @@ MCP 验收：
 
 ## 波次 2：Range-native undo / format / copy / export
 
+状态：部分完成。large range format 已接入 format metadata snapshot/restore：Rust core
+只快照 range-format layers 和 range 内显式 per-cell formats，不展开空 cell；WASM/worker/
+SheetStore 已接入 undo/redo。剩余项是 copy/export 从一次性 TSV 字符串推进到
+streaming/chunked export。
+
 ### 目标
 
 把“大矩形操作”从“多数已经 range-native”推进到“undo、streaming、持久化合同可产品化”。
@@ -385,11 +390,11 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-下一步执行 **波次 2：Range-native undo / format / copy / export**。
+下一步继续完成 **波次 2：copy/export streaming**。
 
 原因：
 
-- Wave 1 已把 worker-backed 公式写入和公式粘贴收口到 async 权威路径。
-- 当前最大用户可见缺口是 large range format 仍不可 undo；这会在百万格格式化后清空 undo 栈。
-- copy/export 虽然已经避免地址展开，但仍一次性生成 TSV 字符串，下一波应推进 streaming/chunked
-  export。
+- large range format undo 已完成，不再清空 undo 栈。
+- copy/export 虽然已经避免地址展开，但仍一次性生成 TSV 字符串，下一步应推进
+  streaming/chunked export。
+- bounded import / sparse persistence v1 仍在 Wave 3，先不要和 copy/export protocol 混在一轮里。

@@ -110,6 +110,17 @@ export interface ISheet {
     endCol: number,
     fmt: CellFormatJSON | null | undefined,
   ): number | void | Promise<number | void>
+  /** Snapshot sparse formatting metadata for large-range undo. */
+  snapshot_format_range?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): FormatRangeSnapshot | Promise<FormatRangeSnapshot>
+  /** Restore records produced by `snapshot_format_range`. */
+  restore_format_snapshot?(
+    snapshot: FormatRangeSnapshot,
+  ): number | void | Promise<number | void>
   /** Base format (no conditional rule overrides). */
   get_format?(addr: string): CellFormatJSON
   /** Base + first matching conditional rule. */
@@ -143,6 +154,29 @@ export type SparseCellSnapshot =
   | { addr: string; row: number; col: number; kind: 'boolean'; value: boolean }
   | { addr: string; row: number; col: number; kind: 'error'; value: string }
   | { addr: string; row: number; col: number; kind: 'formula'; value: string }
+
+export interface CellFormatSnapshot {
+  addr: string
+  format: CellFormatJSON
+}
+
+export interface RangeFormatLayerSnapshot {
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+  format: CellFormatJSON
+}
+
+export interface FormatRangeSnapshot {
+  sheet?: number
+  startRow: number
+  startCol: number
+  endRow: number
+  endCol: number
+  cellFormats: CellFormatSnapshot[]
+  rangeFormats: RangeFormatLayerSnapshot[]
+}
 
 /** Wire-format for a per-cell style. Mirrors the Rust `CellFormatJSON`. */
 export interface CellFormatJSON {

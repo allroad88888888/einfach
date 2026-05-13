@@ -222,6 +222,19 @@ struct RangeFormat {
     fmt: CellFormat,
 }
 
+#[derive(Clone, Debug)]
+pub struct RangeFormatSnapshotLayer {
+    pub range: CellRange,
+    pub fmt: CellFormat,
+}
+
+#[derive(Clone, Debug)]
+pub struct FormatRangeSnapshot {
+    pub range: CellRange,
+    pub cell_formats: Vec<(CellAddress, CellFormat)>,
+    pub range_formats: Vec<RangeFormatSnapshotLayer>,
+}
+
 /// Token returned by `Sheet::subscribe_cell`. The public subscription is tied
 /// to a cell address, not the current primitive atom. `Sheet` wires the
 /// internal store subscription only while the address has a primitive atom;
@@ -1521,6 +1534,74 @@ impl Sheet {
             range: normalized,
             fmt,
         });
+
+        let mut notified = 0usize;
+        for addr in self.cell_subscriptions.keys().copied() {
+            if normalized.contains(addr) && self.has_address_subscribers(addr) {
+                self.notify_address_subscribers(addr);
+                notified += 1;
+            }
+        }
+        notified
+    }
+
+    /// Snapshot only sparse formatting metadata needed to undo a subsequent
+    /// `set_format_range` over `range`. This does not inspect values or
+    /// materialize empty cells: per-cell formats are sparse, and range format
+    /// layers are metadata.
+    pub fn snapshot_format_range(&self, range: CellRange) -> FormatRangeSnapshot {
+        let normalized = range.normalize();
+        let mut cell_formats: Vec<(CellAddress, CellFormat)> = self
+            .formats
+            .iter()
+            .filter_map(|(addr, fmt)| {
+                if normalized.contains(*addr) {
+                    Some((*addr, fmt.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        cell_formats.sort_by_key(|(addr, _)| (addr.row, addr.col));
+
+        FormatRangeSnapshot {
+            range: normalized,
+            cell_formats,
+            range_formats: self
+                .range_formats
+                .iter()
+                .map(|layer| RangeFormatSnapshotLayer {
+                    range: layer.range,
+                    fmt: layer.fmt.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Restore a formatting snapshot produced by `snapshot_format_range`.
+    /// Only explicit per-cell formats inside the snapshot range are replaced;
+    /// explicit formats outside the range are left alone. Range-format layers
+    /// are metadata-only and are restored as a whole so overlap ordering stays
+    /// exact for undo/redo.
+    pub fn restore_format_range_snapshot(&mut self, snapshot: FormatRangeSnapshot) -> usize {
+        let normalized = snapshot.range.normalize();
+        self.formats
+            .retain(|addr, _| !normalized.contains(*addr));
+        for (addr, fmt) in snapshot.cell_formats {
+            if fmt == CellFormat::default() {
+                self.formats.remove(&addr);
+            } else {
+                self.formats.insert(addr, fmt);
+            }
+        }
+        self.range_formats = snapshot
+            .range_formats
+            .into_iter()
+            .map(|layer| RangeFormat {
+                range: layer.range.normalize(),
+                fmt: layer.fmt,
+            })
+            .collect();
 
         let mut notified = 0usize;
         for addr in self.cell_subscriptions.keys().copied() {
@@ -3194,6 +3275,75 @@ mod tests {
         assert_eq!(sheet.non_empty_addrs().len(), before);
         assert_eq!(sheet.get_cell("A1"), Value::Number(1.0));
         assert_eq!(updated, 0);
+    }
+
+    #[test]
+    fn range_format_snapshot_restore_preserves_sparse_metadata() {
+        let mut sheet = Sheet::new();
+        sheet.set_format_range(
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(2, 2)),
+            CellFormat {
+                italic: true,
+                ..Default::default()
+            },
+        );
+        sheet.set_format(
+            "B2",
+            CellFormat {
+                bold: true,
+                ..Default::default()
+            },
+        );
+        sheet.set_format(
+            "E5",
+            CellFormat {
+                font_size: Some(18),
+                ..Default::default()
+            },
+        );
+
+        let snapshot = sheet.snapshot_format_range(CellRange::new(
+            CellAddress::new(0, 0),
+            CellAddress::new(3, 3),
+        ));
+        sheet.set_format_range(
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(3, 3)),
+            CellFormat {
+                background: Some("#ffeeaa".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            sheet.get_format("B2"),
+            CellFormat {
+                background: Some("#ffeeaa".into()),
+                ..Default::default()
+            }
+        );
+
+        assert_eq!(sheet.restore_format_range_snapshot(snapshot), 0);
+        assert_eq!(
+            sheet.get_format("A1"),
+            CellFormat {
+                italic: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            sheet.get_format("B2"),
+            CellFormat {
+                bold: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(sheet.get_format("D4"), CellFormat::default());
+        assert_eq!(
+            sheet.get_format("E5"),
+            CellFormat {
+                font_size: Some(18),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

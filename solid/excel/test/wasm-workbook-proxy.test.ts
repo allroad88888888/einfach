@@ -399,6 +399,37 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(restoreCount).resolves.toBe(2)
   })
 
+  it('sends format range snapshot/restore commands with expected payloads', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = { sheet: 0, startRow: 5, startCol: 6, endRow: 10, endCol: 11 }
+
+    const snapshotPromise = workbook.snapshotFormatRange(range)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'snapshotFormatRange',
+      range,
+    })
+    const snapshot = {
+      ...range,
+      cellFormats: [{ addr: 'G6', format: { italic: true } }],
+      rangeFormats: [
+        { startRow: 0, startCol: 0, endRow: 1, endCol: 1, format: { bold: true } },
+      ],
+    }
+    ok(fake, snapshot)
+    await expect(snapshotPromise).resolves.toEqual(snapshot)
+
+    const restorePromise = workbook.restoreFormatSnapshot(snapshot)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'restoreFormatSnapshot',
+      snapshot,
+    })
+    ok(fake, 1)
+    await expect(restorePromise).resolves.toBe(1)
+  })
+
   it('sends range TSV export commands with expected payloads', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

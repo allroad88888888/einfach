@@ -2,7 +2,7 @@ import { createSignal } from 'solid-js'
 import { sparseRangeToTSV } from './range-tsv'
 import { createSheetStore, type SheetStore } from './sheet-store'
 import { createWasmWorkbook, type WasmWorkbookApi } from './wasm-sheet'
-import type { CellValue, ISheet, SparseCellSnapshot } from './types'
+import type { CellValue, FormatRangeSnapshot, ISheet, SparseCellSnapshot } from './types'
 import {
   createWorkerWorkbook,
   type CellRefWire,
@@ -300,6 +300,22 @@ function createWorkbookSheetAdapter(
         applied = workbook.set_format_range(sheetIdx, startRow, startCol, endRow, endCol, fmt)
       })
       return applied
+    },
+    snapshot_format_range(startRow, startCol, endRow, endCol) {
+      return workbook.snapshot_format_range(
+        sheetIdx,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+      ) as FormatRangeSnapshot
+    },
+    restore_format_snapshot(snapshot) {
+      let restored = 0
+      mutate(() => {
+        restored = workbook.restore_format_snapshot({ ...snapshot, sheet: sheetIdx })
+      })
+      return restored
     },
     snapshot_range_sparse(startRow, startCol, endRow, endCol) {
       return workbook
@@ -675,6 +691,29 @@ function createWorkerWorkbookSheetAdapter(
       }
       return client
         .setFormatRange(range, fmt)
+        .then((count) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          return count
+        })
+        .catch((err) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          throw err
+        })
+    },
+    snapshot_format_range(startRow, startCol, endRow, endCol) {
+      const range: SparseRangeWire = {
+        sheet: sheetIdx,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+      }
+      return client.snapshotFormatRange(range)
+    },
+    restore_format_snapshot(snapshot) {
+      const visibleAddrs = invalidateCachedStateForRemoteMutation()
+      return client
+        .restoreFormatSnapshot({ ...snapshot, sheet: sheetIdx })
         .then((count) => {
           hydrateVisibleAddrs(visibleAddrs)
           return count

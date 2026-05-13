@@ -1,4 +1,4 @@
-import type { CellFormatJSON, ISheet } from './types'
+import type { CellFormatJSON, FormatRangeSnapshot, ISheet } from './types'
 import { formatsEqual } from './types'
 import {
   shiftFormulaForColDelete,
@@ -404,6 +404,57 @@ export function createJSSheet(): ISheet {
         if (addrInRange(addr, range)) formats.delete(addr)
       }
       rangeFormats.push({ ...range, fmt: fmt && !formatsEqual(fmt, {}) ? { ...fmt } : {} })
+      for (const [addr, map] of listeners) {
+        if (!addrInRange(addr, range)) continue
+        for (const cb of map.values()) cb()
+      }
+      fireChanges(before)
+      return 1
+    },
+
+    snapshot_format_range(startRow, startCol, endRow, endCol): FormatRangeSnapshot {
+      const range = normalizeRange(startRow, startCol, endRow, endCol)
+      return {
+        ...range,
+        cellFormats: [...formats.entries()]
+          .filter(([addr]) => addrInRange(addr, range))
+          .map(([addr, format]) => ({ addr, format: { ...format } }))
+          .sort((a, b) => {
+            const ac = addrToCoord(a.addr)!
+            const bc = addrToCoord(b.addr)!
+            return ac.row - bc.row || ac.col - bc.col
+          }),
+        rangeFormats: rangeFormats.map((layer) => ({
+          startRow: layer.startRow,
+          startCol: layer.startCol,
+          endRow: layer.endRow,
+          endCol: layer.endCol,
+          format: { ...layer.fmt },
+        })),
+      }
+    },
+
+    restore_format_snapshot(snapshot) {
+      const range = normalizeRange(
+        snapshot.startRow,
+        snapshot.startCol,
+        snapshot.endRow,
+        snapshot.endCol,
+      )
+      const before = snapshotDisplays()
+      for (const addr of [...formats.keys()]) {
+        if (addrInRange(addr, range)) formats.delete(addr)
+      }
+      for (const cell of snapshot.cellFormats) {
+        if (!formatsEqual(cell.format, {})) formats.set(cell.addr.toUpperCase(), { ...cell.format })
+      }
+      rangeFormats.length = 0
+      for (const layer of snapshot.rangeFormats) {
+        rangeFormats.push({
+          ...normalizeRange(layer.startRow, layer.startCol, layer.endRow, layer.endCol),
+          fmt: { ...layer.format },
+        })
+      }
       for (const [addr, map] of listeners) {
         if (!addrInRange(addr, range)) continue
         for (const cb of map.values()) cb()

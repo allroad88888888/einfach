@@ -1,5 +1,5 @@
 import { describe, expect, it, jest } from '@jest/globals'
-import type { CellFormatJSON } from '../src/types'
+import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
 import { mergeImportStatsIssues, normalizeImportCells } from '../src/wasm-workbook-worker'
 import type {
   FormulaMutationResultWire,
@@ -75,6 +75,14 @@ type MockWasmWorkbook = {
     endCol: number,
     fmt: CellFormatJSON | null | undefined,
   ) => number
+  snapshot_format_range: (
+    sheet: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => FormatRangeSnapshot
+  restore_format_snapshot: (snapshot: FormatRangeSnapshot) => number
   debug_formula_cache_state: () => string
   debug_formula_eval_count: () => number
   subscribe_cell: () => number
@@ -87,6 +95,8 @@ type MockWasmWorkbook = {
     snapshotRangeSparse: SparseRangeWire[]
     restoreSparse: SparseCellWire[][]
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
+    snapshotFormatRange: SparseRangeWire[]
+    restoreFormatSnapshot: FormatRangeSnapshot[]
   }
 }
 
@@ -121,6 +131,8 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     snapshotRangeSparse: [],
     restoreSparse: [],
     setFormatRange: [],
+    snapshotFormatRange: [],
+    restoreFormatSnapshot: [],
   }
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
@@ -350,6 +362,22 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       calls.setFormatRange.push({ sheet, startRow, startCol, endRow, endCol, fmt })
       return 1
     },
+    snapshot_format_range: (sheet, startRow, startCol, endRow, endCol) => {
+      calls.snapshotFormatRange.push({ sheet, startRow, startCol, endRow, endCol })
+      return {
+        sheet,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+        cellFormats: [],
+        rangeFormats: [],
+      }
+    },
+    restore_format_snapshot: (snapshot) => {
+      calls.restoreFormatSnapshot.push(snapshot)
+      return 1
+    },
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
     subscribe_cell: () => 1,
@@ -432,6 +460,8 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
           workbook.__mockInstanceId === 0 ? [] : (workbook.__mockCalls?.snapshotRangeSparse ?? []),
         ),
       mainSetFormatRange: () => workbooks[0]?.__mockCalls?.setFormatRange ?? [],
+      mainSnapshotFormatRange: () => workbooks[0]?.__mockCalls?.snapshotFormatRange ?? [],
+      mainRestoreFormatSnapshot: () => workbooks[0]?.__mockCalls?.restoreFormatSnapshot ?? [],
     },
     send: <T>(message: Record<string, unknown>) => requestWorkerResponse<T>(responses, message),
     dispose: () => {
@@ -783,6 +813,46 @@ describe('wasm-workbook-worker import session contract', () => {
       expect(harness.calls.mainSetFormatRange()).toEqual([
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999, fmt: { bold: true } },
       ])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes format range snapshot/restore through the wasm workbook API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const snapshot = await harness.send<FormatRangeSnapshot>({
+        id: 2,
+        cmd: 'snapshotFormatRange',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      })
+
+      expect(snapshot).toEqual({
+        sheet: 0,
+        startRow: 0,
+        startCol: 0,
+        endRow: 999,
+        endCol: 999,
+        cellFormats: [],
+        rangeFormats: [],
+      })
+      expect(harness.calls.mainSnapshotFormatRange()).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      ])
+
+      const restored = await harness.send<number>({
+        id: 3,
+        cmd: 'restoreFormatSnapshot',
+        snapshot,
+      })
+      expect(restored).toBe(1)
+      expect(harness.calls.mainRestoreFormatSnapshot()).toEqual([snapshot])
     } finally {
       harness.dispose()
     }

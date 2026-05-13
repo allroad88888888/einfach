@@ -2,7 +2,7 @@
 
 import init, { WasmWorkbook } from '../wasm-pkg/einfach_wasm.js'
 import { sparseRangeToTSV } from './range-tsv'
-import type { CellFormatJSON } from './types'
+import type { CellFormatJSON, FormatRangeSnapshot } from './types'
 import type {
   CellRefWire,
   CellSnapshotWire,
@@ -73,6 +73,14 @@ type WasmWorkbookRuntime = {
     endCol: number,
     fmt: CellFormatJSON | null | undefined,
   ) => number
+  snapshot_format_range?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => FormatRangeSnapshot
+  restore_format_snapshot?: (snapshot: FormatRangeSnapshot) => number
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_formula_eval_count?: (sheetIdx: number) => number
   debug_cross_sheet_dependents_count?: () => number
@@ -650,6 +658,30 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               msg.fmt as CellFormatJSON | null | undefined,
             ),
           )
+        }
+        break
+      case 'snapshotFormatRange':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const snapshotFormatRange = assertMethod(wb, 'snapshot_format_range')
+          postResponse(
+            msg.id,
+            snapshotFormatRange.call(
+              wb,
+              range.sheet,
+              range.startRow,
+              range.startCol,
+              range.endRow,
+              range.endCol,
+            ),
+          )
+        }
+        break
+      case 'restoreFormatSnapshot':
+        {
+          const restoreFormatSnapshot = assertMethod(wb, 'restore_format_snapshot')
+          postResponse(msg.id, restoreFormatSnapshot.call(wb, msg.snapshot as FormatRangeSnapshot))
         }
         break
       case 'beginImport':

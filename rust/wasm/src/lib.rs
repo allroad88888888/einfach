@@ -1,6 +1,7 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
-    Align, CellAddress, CellFormat, CellRange, CellSubscription, NumberFormat, Sheet, Workbook,
+    Align, CellAddress, CellFormat, CellRange, CellSubscription, FormatRangeSnapshot,
+    NumberFormat, RangeFormatSnapshotLayer, Sheet, Workbook,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -86,6 +87,104 @@ impl CellFormatJSON {
             fg_color: fmt.color.clone(),
             bg_color: fmt.background.clone(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CellFormatSnapshotJSON {
+    addr: String,
+    format: CellFormatJSON,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RangeFormatLayerJSON {
+    #[serde(rename = "startRow")]
+    start_row: u32,
+    #[serde(rename = "startCol")]
+    start_col: u32,
+    #[serde(rename = "endRow")]
+    end_row: u32,
+    #[serde(rename = "endCol")]
+    end_col: u32,
+    format: CellFormatJSON,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FormatRangeSnapshotJSON {
+    #[serde(default)]
+    sheet: Option<u32>,
+    #[serde(rename = "startRow")]
+    start_row: u32,
+    #[serde(rename = "startCol")]
+    start_col: u32,
+    #[serde(rename = "endRow")]
+    end_row: u32,
+    #[serde(rename = "endCol")]
+    end_col: u32,
+    #[serde(rename = "cellFormats")]
+    cell_formats: Vec<CellFormatSnapshotJSON>,
+    #[serde(rename = "rangeFormats")]
+    range_formats: Vec<RangeFormatLayerJSON>,
+}
+
+impl FormatRangeSnapshotJSON {
+    fn from_snapshot(snapshot: &FormatRangeSnapshot, sheet: Option<u32>) -> Self {
+        FormatRangeSnapshotJSON {
+            sheet,
+            start_row: snapshot.range.start.row,
+            start_col: snapshot.range.start.col,
+            end_row: snapshot.range.end.row,
+            end_col: snapshot.range.end.col,
+            cell_formats: snapshot
+                .cell_formats
+                .iter()
+                .map(|(addr, fmt)| CellFormatSnapshotJSON {
+                    addr: addr.to_string(),
+                    format: CellFormatJSON::from_format(fmt),
+                })
+                .collect(),
+            range_formats: snapshot
+                .range_formats
+                .iter()
+                .map(|layer| RangeFormatLayerJSON {
+                    start_row: layer.range.start.row,
+                    start_col: layer.range.start.col,
+                    end_row: layer.range.end.row,
+                    end_col: layer.range.end.col,
+                    format: CellFormatJSON::from_format(&layer.fmt),
+                })
+                .collect(),
+        }
+    }
+
+    fn into_snapshot(self) -> Result<FormatRangeSnapshot, JsValue> {
+        let mut cell_formats = Vec::with_capacity(self.cell_formats.len());
+        for cell in self.cell_formats {
+            let addr = CellAddress::parse(&cell.addr)
+                .ok_or_else(|| JsValue::from_str(&format!("invalid cell address: {}", cell.addr)))?;
+            cell_formats.push((addr, cell.format.into_format()));
+        }
+        let range_formats = self
+            .range_formats
+            .into_iter()
+            .map(|layer| RangeFormatSnapshotLayer {
+                range: CellRange::new(
+                    CellAddress::new(layer.start_row, layer.start_col),
+                    CellAddress::new(layer.end_row, layer.end_col),
+                )
+                .normalize(),
+                fmt: layer.format.into_format(),
+            })
+            .collect();
+        Ok(FormatRangeSnapshot {
+            range: CellRange::new(
+                CellAddress::new(self.start_row, self.start_col),
+                CellAddress::new(self.end_row, self.end_col),
+            )
+            .normalize(),
+            cell_formats,
+            range_formats,
+        })
     }
 }
 
@@ -754,6 +853,32 @@ impl WasmSheet {
             CellAddress::new(end_row, end_col),
         );
         Ok(self.sheet.set_format_range(range, parsed.into_format()) as u32)
+    }
+
+    /// Snapshot sparse formatting metadata for undoing a later range-format
+    /// edit. Does not read cell values or materialize empty cells.
+    pub fn snapshot_format_range(
+        &self,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<JsValue, JsValue> {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let snapshot = self.sheet.snapshot_format_range(range);
+        serde_wasm_bindgen::to_value(&FormatRangeSnapshotJSON::from_snapshot(&snapshot, None))
+            .map_err(|err| JsValue::from_str(&format!("serialize format range snapshot: {err}")))
+    }
+
+    /// Restore metadata produced by `snapshot_format_range`.
+    pub fn restore_format_snapshot(&mut self, snapshot: JsValue) -> Result<u32, JsValue> {
+        let snapshot: FormatRangeSnapshotJSON = serde_wasm_bindgen::from_value(snapshot)
+            .map_err(|err| JsValue::from_str(&format!("invalid format range snapshot: {err}")))?;
+        let snapshot = snapshot.into_snapshot()?;
+        Ok(self.sheet.restore_format_range_snapshot(snapshot) as u32)
     }
 
     /// Read the base format for a cell (no conditional rules applied).
@@ -1431,6 +1556,45 @@ impl WasmWorkbook {
             .sheet_mut(sheet_idx as usize)
             .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
         Ok(sheet.set_format_range(range, parsed.into_format()) as u32)
+    }
+
+    /// Snapshot sparse formatting metadata for a workbook sheet. The
+    /// snapshot is metadata-only and safe for lazy formula caches.
+    pub fn snapshot_format_range(
+        &self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<JsValue, JsValue> {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let sheet = self
+            .workbook
+            .sheet(sheet_idx as usize)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
+        let snapshot = sheet.snapshot_format_range(range);
+        serde_wasm_bindgen::to_value(&FormatRangeSnapshotJSON::from_snapshot(
+            &snapshot,
+            Some(sheet_idx),
+        ))
+            .map_err(|err| JsValue::from_str(&format!("serialize format range snapshot: {err}")))
+    }
+
+    /// Restore a formatting snapshot produced by `snapshot_format_range`.
+    pub fn restore_format_snapshot(&mut self, snapshot: JsValue) -> Result<u32, JsValue> {
+        let snapshot: FormatRangeSnapshotJSON = serde_wasm_bindgen::from_value(snapshot)
+            .map_err(|err| JsValue::from_str(&format!("invalid format range snapshot: {err}")))?;
+        let sheet_idx = snapshot.sheet.unwrap_or(0);
+        let snapshot = snapshot.into_snapshot()?;
+        let sheet = self
+            .workbook
+            .sheet_mut(sheet_idx as usize)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
+        Ok(sheet.restore_format_range_snapshot(snapshot) as u32)
     }
 }
 

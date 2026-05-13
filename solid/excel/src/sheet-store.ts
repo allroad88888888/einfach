@@ -1,7 +1,13 @@
 import { createSignal } from 'solid-js'
 import { addrToCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import { shiftFormulaRefs } from './formula-shift'
-import type { CellFormatJSON, ISheet, CellValue, SparseCellSnapshot } from './types'
+import type {
+  CellFormatJSON,
+  FormatRangeSnapshot,
+  ISheet,
+  CellValue,
+  SparseCellSnapshot,
+} from './types'
 import { formatsEqual } from './types'
 
 /**
@@ -266,7 +272,16 @@ export function createSheetStore(sheet: ISheet) {
     range: NormalizedCellRange
     before: SparseCellSnapshot[]
   }
-  type UndoEntry = CellsUndoEntry | StructuralUndoEntry | SparseRangeClearUndoEntry
+  type RangeFormatUndoEntry = {
+    kind: 'rangeFormat'
+    before: FormatRangeSnapshot
+    after: FormatRangeSnapshot
+  }
+  type UndoEntry =
+    | CellsUndoEntry
+    | StructuralUndoEntry
+    | SparseRangeClearUndoEntry
+    | RangeFormatUndoEntry
 
   /** Above this non-empty count, structural snapshots are skipped and we
    * fall back to op inverse. See `docs/STRUCTURAL_UNDO.md#threshold`. */
@@ -485,6 +500,11 @@ export function createSheetStore(sheet: ISheet) {
     }
   }
 
+  function restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<void> | void {
+    if (!sheet.restore_format_snapshot) return
+    return Promise.resolve(sheet.restore_format_snapshot(snapshot)).then(() => {})
+  }
+
   function currentSelectionRange(): NormalizedCellRange {
     return normalizeCellRange(anchor(), selection())
   }
@@ -564,6 +584,35 @@ export function createSheetStore(sheet: ISheet) {
     }
   }
 
+  async function formatLargeCellRange(
+    range: NormalizedCellRange,
+    fmt: CellFormatJSON,
+  ): Promise<boolean> {
+    if (!sheet.set_format_range) return false
+
+    commitPendingEdit()
+    if (sheet.snapshot_format_range && sheet.restore_format_snapshot) {
+      const before = await Promise.resolve(
+        sheet.snapshot_format_range(range.startRow, range.startCol, range.endRow, range.endCol),
+      )
+      await Promise.resolve(setLargeRangeFormat(range, fmt))
+      const after = await Promise.resolve(
+        sheet.snapshot_format_range(range.startRow, range.startCol, range.endRow, range.endCol),
+      )
+      undoStack.push({ kind: 'rangeFormat', before, after })
+      redoStack.length = 0
+      return true
+    }
+
+    await Promise.resolve(setLargeRangeFormat(range, fmt))
+    // Backends without format metadata snapshots still cannot safely undo a
+    // range format layer. Drop prior entries so Ctrl+Z cannot replay stale
+    // assumptions across it.
+    undoStack.length = 0
+    redoStack.length = 0
+    return true
+  }
+
   function formatCellRange(
     anchorCoord: CellCoord,
     focusCoord: CellCoord,
@@ -574,18 +623,13 @@ export function createSheetStore(sheet: ISheet) {
       if (!sheet.set_format_range) return false
       commitPendingEdit()
       const next = patch({})
-      const apply = setLargeRangeFormat(range, next)
-      if (apply && typeof (apply as Promise<void>).catch === 'function') {
-        void (apply as Promise<void>).catch((err) => {
+      const apply = formatLargeCellRange(range, next)
+      if (apply && typeof (apply as Promise<boolean>).catch === 'function') {
+        void (apply as Promise<boolean>).catch((err) => {
           // eslint-disable-next-line no-console
           console.warn('[einfach] large range format failed', err)
         })
       }
-      // No format-range snapshot/restore contract exists yet, so do not
-      // pretend this can be safely undone. This mirrors destructive large
-      // range commands whose backend lacks a precise inverse.
-      undoStack.length = 0
-      redoStack.length = 0
       return true
     }
 
@@ -1002,8 +1046,10 @@ export function createSheetStore(sheet: ISheet) {
         // out or land on the wrong addresses.
         applyStructural(inverseOp(entry.op), entry.at, entry.count)
         if (entry.snapshot !== null) restoreAll(entry.snapshot.before)
-      } else {
+      } else if (entry.kind === 'sparseRangeClear') {
         void restoreSparseSnapshots(entry.before)
+      } else {
+        void restoreFormatSnapshot(entry.before)
       }
       redoStack.push(entry)
     },
@@ -1016,8 +1062,10 @@ export function createSheetStore(sheet: ISheet) {
       } else if (entry.kind === 'structural') {
         applyStructural(entry.op, entry.at, entry.count)
         if (entry.snapshot !== null) restoreAll(entry.snapshot.after)
-      } else {
+      } else if (entry.kind === 'sparseRangeClear') {
         void replaySparseRangeClear(entry.range)
+      } else {
+        void restoreFormatSnapshot(entry.after)
       }
       undoStack.push(entry)
     },

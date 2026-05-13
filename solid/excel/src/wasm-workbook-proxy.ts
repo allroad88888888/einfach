@@ -1,4 +1,4 @@
-import type { CellFormatJSON, CellValue } from './types'
+import type { CellFormatJSON, CellValue, FormatRangeSnapshot } from './types'
 
 type CellType = CellValue['type']
 
@@ -114,6 +114,8 @@ export interface WorkerWorkbookClient {
   clearCell(sheet: number, addr: string): Promise<boolean>
   clearRange(range: SparseRangeWire): Promise<number>
   setFormatRange(range: SparseRangeWire, fmt: CellFormatJSON | null | undefined): Promise<number>
+  snapshotFormatRange(range: SparseRangeWire): Promise<FormatRangeSnapshot>
+  restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<number>
   beginImport(sessionId?: number): Promise<number>
   importChunk(sessionId: number, cells: ImportCellWire[]): Promise<number>
   commitImport(sessionId: number): Promise<WorkbookImportStatsWire>
@@ -266,6 +268,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     setFormatRange(range, fmt) {
       return request<number>('setFormatRange', { range, fmt })
+    },
+    snapshotFormatRange(range) {
+      return request<FormatRangeSnapshot>('snapshotFormatRange', { range })
+    },
+    restoreFormatSnapshot(snapshot) {
+      return request<number>('restoreFormatSnapshot', { snapshot })
     },
     beginImport(sessionId = nextImportId++) {
       return request<number>('beginImport', { sessionId })

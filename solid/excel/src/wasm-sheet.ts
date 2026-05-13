@@ -1,4 +1,4 @@
-import type { CellFormatJSON, ISheet, SparseCellSnapshot } from './types'
+import type { CellFormatJSON, FormatRangeSnapshot, ISheet, SparseCellSnapshot } from './types'
 
 export interface WasmWorkbookApi {
   sheet_count(): number
@@ -27,6 +27,14 @@ export interface WasmWorkbookApi {
     endCol: number,
     fmt: CellFormatJSON | null | undefined,
   ): number
+  snapshot_format_range(
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): FormatRangeSnapshot
+  restore_format_snapshot(snapshot: FormatRangeSnapshot): number
   snapshot_range_sparse(
     sheetIdx: number,
     startRow: number,
