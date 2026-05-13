@@ -183,6 +183,44 @@ test.describe('Worker-backed workbook RPC', () => {
     await expectNoConsoleErrors(page)
   })
 
+  test('commits sparse import without preheating untouched formulas', async ({ page }) => {
+    const result = await runWorkerWorkbookImportTouchedCellsScenario(page)
+
+    expect(result.stats).toMatchObject({
+      accepted: 1,
+      formulas: 0,
+      rejectedFormulas: 0,
+      cleared: 0,
+      errors: 0,
+    })
+
+    expect(result.preImportEvalCount).toBe(result.beforeReadEvalCount)
+    expect(result.preFormulaState).toBe('dirty')
+    expect(result.beforeReadFormulaState).toBe('dirty')
+    expect(result.afterReadFormulaState).toBe('clean')
+
+    expect(result.preNonEmpty).toEqual(expect.arrayContaining([{ sheet: 0, addr: 'A1' }, { sheet: 0, addr: 'B1' }]))
+    expect(result.preNonEmpty).toHaveLength(2)
+    expect(result.finalNonEmpty).toEqual(
+      expect.arrayContaining([
+        { sheet: 0, addr: 'A1' },
+        { sheet: 0, addr: 'B1' },
+        { sheet: 0, addr: 'C1' },
+      ]),
+    )
+    expect(result.finalNonEmpty).toHaveLength(3)
+
+    expect(result.touched.addr).toBe('C1')
+    expect(result.touched.display).toBe('77')
+    expect(result.untouchedNumber.display).toBe('20')
+    expect(result.untouchedFormula.formula).toBe('=A1+1')
+    expect(result.untouchedFormula.display).toBe('21')
+    expect(result.afterReadFormulaState).toBe('clean')
+    expect(result.afterReadEvalCount).toBeGreaterThan(result.beforeReadEvalCount)
+
+    await expectNoConsoleErrors(page)
+  })
+
   test('respects import null final-write order', async ({ page }) => {
     const result = await runWorkerWorkbookImportNullClearScenario(page)
 
@@ -593,6 +631,78 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         rangeRead,
         afterRangeReadEvalCount,
         afterRangeReadState,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportTouchedCellsScenario(page: Page): Promise<{
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+    issues?: ImportIssue[]
+  }
+  preImportEvalCount: number
+  preFormulaState: string
+  beforeReadEvalCount: number
+  beforeReadFormulaState: string
+  afterReadEvalCount: number
+  afterReadFormulaState: string
+  touched: Snapshot
+  untouchedNumber: Snapshot
+  untouchedFormula: Snapshot
+  preNonEmpty: DirtyRef[]
+  finalNonEmpty: DirtyRef[]
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1'])
+
+      await workbook.setCell(0, 'A1', { type: 'number', value: 10 })
+      await workbook.setFormula(0, 'B1', '=A1+1')
+
+      const preImportEvalCount = await workbook.debugFormulaEvalCount(0)
+      const preFormulaState = await workbook.debugFormulaCacheState(0, 'B1')
+      const preNonEmpty = await workbook.listNonEmpty()
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [{ sheet: 0, row: 0, col: 2, kind: 'number', value: 77 }])
+      await workbook.setCell(0, 'A1', { type: 'number', value: 20 })
+      const stats = await workbook.commitImport(session)
+
+      const beforeReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const beforeReadFormulaState = await workbook.debugFormulaCacheState(0, 'B1')
+      const [touched, untouchedNumber, untouchedFormula] = await workbook.readCells([
+        { sheet: 0, addr: 'C1' },
+        { sheet: 0, addr: 'A1' },
+        { sheet: 0, addr: 'B1' },
+      ])
+      const afterReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterReadFormulaState = await workbook.debugFormulaCacheState(0, 'B1')
+      const finalNonEmpty = await workbook.listNonEmpty()
+
+      return {
+        stats,
+        preImportEvalCount,
+        preFormulaState,
+        beforeReadEvalCount,
+        beforeReadFormulaState,
+        afterReadEvalCount,
+        afterReadFormulaState,
+        touched,
+        untouchedNumber,
+        untouchedFormula,
+        preNonEmpty,
+        finalNonEmpty,
       }
     } finally {
       workbook.dispose()

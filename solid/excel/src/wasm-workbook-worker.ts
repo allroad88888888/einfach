@@ -412,6 +412,27 @@ function recordFinalTouches(session: ImportSession, cells: ImportCellWire[]) {
   for (const cell of cells) session.finalTouches.set(importCellKey(cell), cell)
 }
 
+function snapshotFinalImportTouches(session: ImportSession): SparseCellWire[] {
+  const snapshotRangeSparse = assertMethod(session.workbook, 'snapshot_range_sparse')
+  const out: SparseCellWire[] = []
+  for (const cell of session.finalTouches.values()) {
+    if (cell.kind === 'null') continue
+    if (cell.sheet >= session.workbook.sheet_count()) continue
+    out.push(
+      ...snapshotRangeSparse
+        .call(session.workbook, cell.sheet, cell.row, cell.col, cell.row, cell.col)
+        .map(normalizeSparseCell),
+    )
+  }
+  return out
+}
+
+function finalImportClears(session: ImportSession): ImportCellWire[] {
+  return [...session.finalTouches.values()].filter(
+    (cell) => cell.kind === 'null' && cell.sheet < session.workbook.sheet_count(),
+  )
+}
+
 function normalizeSparseRange(range: unknown): SparseRangeWire {
   const input = (range ?? {}) as Partial<SparseRangeWire>
   const out: SparseRangeWire = {
@@ -627,14 +648,11 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
-          const snapshotSparse = assertMethod(session.workbook, 'snapshot_sparse')
           const restoreSparse = assertMethod(wb, 'restore_sparse')
-          const snapshot = snapshotSparse.call(session.workbook).map(normalizeSparseCell)
-          restoreSparse.call(wb, snapshot)
+          const changedCells = snapshotFinalImportTouches(session)
+          if (changedCells.length > 0) restoreSparse.call(wb, changedCells)
 
-          const finalClears = [...session.finalTouches.values()].filter(
-            (cell) => cell.kind === 'null' && cell.sheet < session.workbook.sheet_count(),
-          )
+          const finalClears = finalImportClears(session)
           if (finalClears.length > 0) {
             assertMethod(wb, 'bulk_import_cells').call(wb, finalClears)
           }

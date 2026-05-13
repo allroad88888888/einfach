@@ -1,6 +1,11 @@
 import { describe, expect, it, jest } from '@jest/globals'
 import { mergeImportStatsIssues, normalizeImportCells } from '../src/wasm-workbook-worker'
-import type { ImportCellWire, WorkbookImportStatsWire } from '../src/wasm-workbook-proxy'
+import type {
+  ImportCellWire,
+  SparseCellWire,
+  SparseRangeWire,
+  WorkbookImportStatsWire,
+} from '../src/wasm-workbook-proxy'
 import { WasmWorkbook } from '../wasm-pkg/einfach_wasm.js'
 
 jest.mock('../wasm-pkg/einfach_wasm.js', () => ({
@@ -59,6 +64,9 @@ type MockWasmWorkbook = {
   __mockInstanceId?: number
   __mockCalls?: {
     bulkImportCells: number
+    snapshotSparse: number
+    snapshotRangeSparse: SparseRangeWire[]
+    restoreSparse: SparseCellWire[][]
   }
 }
 
@@ -86,7 +94,12 @@ function parseAddress(addr: string): { row: number; col: number } {
 }
 
 function createMockWasmWorkbook() {
-  const calls = { bulkImportCells: 0 }
+  const calls: NonNullable<MockWasmWorkbook['__mockCalls']> = {
+    bulkImportCells: 0,
+    snapshotSparse: 0,
+    snapshotRangeSparse: [],
+    restoreSparse: [],
+  }
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
 
@@ -246,15 +259,18 @@ function createMockWasmWorkbook() {
       })
       return true
     },
-    snapshot_sparse: () =>
-      [...cells.entries()]
+    snapshot_sparse: () => {
+      calls.snapshotSparse += 1
+      return [...cells.entries()]
         .map(([raw, state]) => {
           const [sheet, addr] = raw.split(':')
           return sparseFromState(Number(sheet), addr, state)
         })
-        .filter((cell) => cell !== null),
-    snapshot_range_sparse: (sheet, startRow, startCol, endRow, endCol) =>
-      [...cells.entries()]
+        .filter((cell) => cell !== null)
+    },
+    snapshot_range_sparse: (sheet, startRow, startCol, endRow, endCol) => {
+      calls.snapshotRangeSparse.push({ sheet, startRow, startCol, endRow, endCol })
+      return [...cells.entries()]
         .map(([raw, state]) => {
           const [cellSheet, addr] = raw.split(':')
           if (Number(cellSheet) !== sheet) return null
@@ -269,14 +285,12 @@ function createMockWasmWorkbook() {
           }
           return sparseFromState(sheet, addr, state)
         })
-        .filter((cell) => cell !== null),
+        .filter((cell) => cell !== null)
+    },
     restore_sparse: (sparseCells) => {
-      for (const cell of sparseCells as Array<{
-        sheet: number
-        addr: string
-        kind: 'number' | 'text' | 'boolean' | 'error' | 'formula'
-        value: string | number | boolean
-      }>) {
+      const cellsIn = sparseCells as SparseCellWire[]
+      calls.restoreSparse.push(cellsIn)
+      for (const cell of cellsIn) {
         if (cell.kind === 'formula') {
           cells.set(key(cell.sheet, cell.addr), {
             type: 'formula',
@@ -288,7 +302,7 @@ function createMockWasmWorkbook() {
           setPrimitive(cell.sheet, cell.addr, cell.kind, cell.value)
         }
       }
-      return sparseCells.length
+      return cellsIn.length
     },
     read_sparse_range: () => [],
     clear_range: () => 0,
@@ -362,6 +376,16 @@ function withMockedWorker() {
       importWorkbooks: () => workbooks.slice(1).length,
       allBulkImportCalls: () =>
         workbooks.reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
+      mainRestoreSparsePayloads: () => workbooks[0]?.__mockCalls?.restoreSparse ?? [],
+      mainSnapshotSparse: () => workbooks[0]?.__mockCalls?.snapshotSparse ?? 0,
+      importSnapshotSparse: () =>
+        workbooks
+          .slice(1)
+          .reduce((sum, workbook) => sum + (workbook.__mockCalls?.snapshotSparse ?? 0), 0),
+      importSnapshotRangeSparse: () =>
+        workbooks.flatMap((workbook) =>
+          workbook.__mockInstanceId === 0 ? [] : (workbook.__mockCalls?.snapshotRangeSparse ?? []),
+        ),
     },
     send: <T>(message: Record<string, unknown>) => requestWorkerResponse<T>(responses, message),
     dispose: () => {
@@ -492,8 +516,99 @@ describe('wasm-workbook-worker import session contract', () => {
       expect(commit.accepted).toBe(3)
       expect(commit.formulas).toBe(0)
       expect(harness.calls.mainWorkbook()).toBe(0)
+      expect(harness.calls.importSnapshotSparse()).toBe(0)
       expect(harness.calls.importWorkbooks()).toBeGreaterThanOrEqual(1)
       expect(harness.calls.allBulkImportCalls()).toBeGreaterThan(0)
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('commits only final touched import cells from staging', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A1',
+        value: { type: 'number', value: 99 },
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+      expect(harness.calls.mainSnapshotSparse()).toBe(1)
+
+      await harness.send({
+        id: 4,
+        cmd: 'importChunk',
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 1, col: 1, kind: 'text', value: 'new' },
+          { sheet: 0, row: 2, col: 2, kind: 'formula', value: '=A1+1' },
+        ],
+      })
+
+      await harness.send({
+        id: 5,
+        cmd: 'commitImport',
+        sessionId: 1,
+      })
+
+      expect(harness.calls.importSnapshotSparse()).toBe(0)
+      expect(harness.calls.importSnapshotRangeSparse()).toEqual([
+        { sheet: 0, startRow: 1, startCol: 1, endRow: 1, endCol: 1 },
+        { sheet: 0, startRow: 2, startCol: 2, endRow: 2, endCol: 2 },
+      ])
+      expect(harness.calls.mainRestoreSparsePayloads()).toEqual([
+        [
+          { sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'text', value: 'new' },
+          { sheet: 0, addr: 'C3', row: 2, col: 2, kind: 'formula', value: '=A1+1' },
+        ],
+      ])
+
+      const cells = await harness.send({
+        id: 6,
+        cmd: 'readCells',
+        cells: [
+          { sheet: 0, addr: 'A1' },
+          { sheet: 0, addr: 'B2' },
+          { sheet: 0, addr: 'C3' },
+        ],
+      })
+      expect(cells).toEqual([
+        {
+          sheet: 0,
+          addr: 'A1',
+          display: '99',
+          type: 'number',
+          isError: false,
+          formula: '',
+        },
+        {
+          sheet: 0,
+          addr: 'B2',
+          display: 'new',
+          type: 'text',
+          isError: false,
+          formula: '',
+        },
+        {
+          sheet: 0,
+          addr: 'C3',
+          display: '',
+          type: 'formula',
+          isError: false,
+          formula: '=A1+1',
+        },
+      ])
     } finally {
       harness.dispose()
     }
