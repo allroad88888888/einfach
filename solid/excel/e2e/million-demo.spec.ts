@@ -132,16 +132,16 @@ test.describe('1M Cells demo (Phase 4)', () => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
-    const setup = await page.evaluate(() => {
+    const setup = await page.evaluate(async () => {
       const win = window as unknown as {
         __einfachStore?: {
           raw: {
-            clear_range?: (...args: number[]) => number | void
+            clear_range?: (...args: number[]) => number | void | Promise<number | void>
           }
           selectionAddrs: () => string[][]
           setSelectionAnchor: (coord: { row: number; col: number }) => void
           extendSelection: (coord: { row: number; col: number }) => void
-          clearSelectionRange: () => void
+          clearSelectionRangeAsync: () => Promise<boolean> | boolean
         }
         __clearRangeCalls?: number[][]
       }
@@ -159,7 +159,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
       win.__clearRangeCalls = calls
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
-      store.clearSelectionRange()
+      await store.clearSelectionRangeAsync()
       return { hasClearRange: true }
     })
     expect(setup.hasClearRange).toBe(true)

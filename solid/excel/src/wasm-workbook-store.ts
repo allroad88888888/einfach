@@ -1,12 +1,13 @@
 import { createSignal } from 'solid-js'
 import { createSheetStore, type SheetStore } from './sheet-store'
 import { createWasmWorkbook, type WasmWorkbookApi } from './wasm-sheet'
-import type { CellValue, ISheet } from './types'
+import type { CellValue, ISheet, SparseCellSnapshot } from './types'
 import {
   createWorkerWorkbook,
   type CellRefWire,
   type CellSnapshotWire,
   type CellWire,
+  type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerWorkbookClient,
@@ -292,6 +293,18 @@ function createWorkbookSheetAdapter(
       })
       return cleared
     },
+    snapshot_range_sparse(startRow, startCol, endRow, endCol) {
+      return workbook
+        .snapshot_range_sparse(sheetIdx, startRow, startCol, endRow, endCol)
+        .map(({ sheet: _sheet, ...cell }) => cell)
+    },
+    restore_sparse(cells) {
+      let restored = 0
+      mutate(() => {
+        restored = workbook.restore_sparse(cells.map((cell) => ({ sheet: sheetIdx, ...cell })))
+      })
+      return restored
+    },
     insert_row(at, count) {
       mutate(() => workbook.insert_row(sheetIdx, at, count))
     },
@@ -557,6 +570,30 @@ function createWorkerWorkbookSheetAdapter(
     return [...listenersByAddr.keys()]
   }
 
+  function invalidateCachedStateForRemoteMutation(): string[] {
+    const visibleAddrs = activeListenerAddrs()
+    for (const addr of visibleAddrs) bumpLocalVersion(addr)
+    cache.clear()
+    requested.clear()
+    for (const addr of visibleAddrs) fireListeners(addr)
+    notifyRevision()
+    return visibleAddrs
+  }
+
+  function hydrateVisibleAddrs(visibleAddrs: string[]) {
+    hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr })))
+  }
+
+  function toLocalSparseCell(cell: SparseCellWire): SparseCellSnapshot | null {
+    if (cell.sheet !== sheetIdx) return null
+    const { sheet: _sheet, ...local } = cell
+    return local as SparseCellSnapshot
+  }
+
+  function toWireSparseCell(cell: SparseCellSnapshot): SparseCellWire {
+    return { sheet: sheetIdx, ...cell } as SparseCellWire
+  }
+
   function unsubscribeToken(token: number) {
     const addr = tokenToAddr.get(token)
     if (!addr) return
@@ -594,11 +631,7 @@ function createWorkerWorkbookSheetAdapter(
       setCell(addr, { type: 'null' })
     },
     clear_range(startRow, startCol, endRow, endCol) {
-      const visibleAddrs = activeListenerAddrs()
-      for (const addr of visibleAddrs) bumpLocalVersion(addr)
-      cache.clear()
-      requested.clear()
-      for (const addr of visibleAddrs) fireListeners(addr)
+      const visibleAddrs = invalidateCachedStateForRemoteMutation()
       const range: SparseRangeWire = {
         sheet: sheetIdx,
         startRow,
@@ -606,10 +639,46 @@ function createWorkerWorkbookSheetAdapter(
         endRow,
         endCol,
       }
-      void client
+      return client
         .clearRange(range)
-        .then(() => hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr }))))
-        .catch(() => hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr }))))
+        .then((count) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          return count
+        })
+        .catch((err) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          throw err
+        })
+    },
+    snapshot_range_sparse(startRow, startCol, endRow, endCol) {
+      const range: SparseRangeWire = {
+        sheet: sheetIdx,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+      }
+      return client.snapshotRangeSparse(range).then((cells) => {
+        const out: SparseCellSnapshot[] = []
+        for (const cell of cells) {
+          const local = toLocalSparseCell(cell)
+          if (local) out.push(local)
+        }
+        return out
+      })
+    },
+    restore_sparse(cells) {
+      const visibleAddrs = invalidateCachedStateForRemoteMutation()
+      return client
+        .restoreSparse(cells.map(toWireSparseCell))
+        .then((count) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          return count
+        })
+        .catch((err) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          throw err
+        })
     },
     get_display(addr) {
       ensureHydration(addr)

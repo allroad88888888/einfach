@@ -424,7 +424,7 @@ struct CellRefJSON {
     addr: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SparseCellJSON {
     sheet: usize,
     addr: String,
@@ -1293,33 +1293,35 @@ impl WasmWorkbook {
     /// Formula cells serialize their source (`kind: "formula"`) and do
     /// not call the eval path, so dirty formula caches stay dirty.
     pub fn snapshot_sparse(&self) -> Result<JsValue, JsValue> {
-        let mut out = Vec::new();
-        for sheet_idx in 0..self.workbook.sheet_count() {
-            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
-                continue;
-            };
-            sheet.for_each_non_empty(|addr| {
-                let addr_str = addr.to_string();
-                if let Some(formula) = sheet.get_formula(&addr_str) {
-                    out.push(SparseCellJSON {
-                        sheet: sheet_idx,
-                        addr: addr_str,
-                        row: addr.row,
-                        col: addr.col,
-                        kind: "formula".into(),
-                        value: Some(ImportValueJSON::Text(formula)),
-                    });
-                    return;
-                }
-
-                if let Some(cell) = sparse_cell_from_value(sheet_idx, addr, &sheet.peek_value(addr))
-                {
-                    out.push(cell);
-                }
-            });
-        }
+        let out = self.snapshot_sparse_cells();
         serde_wasm_bindgen::to_value(&out)
             .map_err(|err| JsValue::from_str(&format!("serialize sparse snapshot: {err}")))
+    }
+
+    /// Snapshot non-empty cells in a zero-based inclusive range without
+    /// reading formula values. Formula cells serialize their source and stay
+    /// dirty/uncomputed, so this is safe for large-range undo.
+    pub fn snapshot_range_sparse(
+        &self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<JsValue, JsValue> {
+        let out =
+            self.snapshot_range_sparse_cells(sheet_idx, start_row, start_col, end_row, end_col);
+        serde_wasm_bindgen::to_value(&out)
+            .map_err(|err| JsValue::from_str(&format!("serialize sparse range snapshot: {err}")))
+    }
+
+    /// Restore sparse cell records produced by `snapshot_sparse` or
+    /// `snapshot_range_sparse`. Uses workbook bulk-load so formulas are
+    /// reinstalled dirty and are not evaluated during restore.
+    pub fn restore_sparse(&mut self, cells: JsValue) -> Result<u32, JsValue> {
+        let cells: Vec<SparseCellJSON> = serde_wasm_bindgen::from_value(cells)
+            .map_err(|err| JsValue::from_str(&format!("invalid sparse cells: {err}")))?;
+        Ok(self.restore_sparse_cells(cells))
     }
 
     /// Read non-empty cells in a zero-based inclusive range. This is an
@@ -1392,6 +1394,103 @@ impl WasmWorkbook {
         };
         self.workbook.get_cell(name, addr)
     }
+
+    fn snapshot_sparse_cells(&self) -> Vec<SparseCellJSON> {
+        let mut out = Vec::new();
+        for sheet_idx in 0..self.workbook.sheet_count() {
+            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+                continue;
+            };
+            sheet.for_each_non_empty(|addr| {
+                if let Some(cell) = sparse_cell_from_sheet_no_eval(sheet_idx, sheet, addr) {
+                    out.push(cell);
+                }
+            });
+        }
+        out
+    }
+
+    fn snapshot_range_sparse_cells(
+        &self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Vec<SparseCellJSON> {
+        let sheet_idx = sheet_idx as usize;
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let mut out = Vec::new();
+        if let Some(sheet) = self.workbook.sheet(sheet_idx) {
+            sheet.for_each_non_empty_in_range(range, |addr| {
+                if let Some(cell) = sparse_cell_from_sheet_no_eval(sheet_idx, sheet, addr) {
+                    out.push(cell);
+                }
+            });
+        }
+        out
+    }
+
+    fn restore_sparse_cells(&mut self, cells: Vec<SparseCellJSON>) -> u32 {
+        let sheet_count = self.workbook.sheet_count();
+        let mut restored = 0u32;
+        self.workbook.bulk_load(|loader| {
+            for cell in cells {
+                if cell.sheet >= sheet_count {
+                    continue;
+                }
+                let addr = CellAddress::new(cell.row, cell.col).to_string_repr();
+                match cell.kind.as_str() {
+                    "number" => {
+                        if let Some(ImportValueJSON::Number(n)) = cell.value {
+                            if n.is_finite() {
+                                loader.set_cell(cell.sheet, &addr, Value::Number(n));
+                                restored += 1;
+                            }
+                        }
+                    }
+                    "text" => {
+                        if let Some(ImportValueJSON::Text(s)) = cell.value {
+                            loader.set_cell(cell.sheet, &addr, Value::Text(s));
+                            restored += 1;
+                        }
+                    }
+                    "boolean" => {
+                        if let Some(ImportValueJSON::Boolean(b)) = cell.value {
+                            loader.set_cell(cell.sheet, &addr, Value::Boolean(b));
+                            restored += 1;
+                        }
+                    }
+                    "error" => {
+                        if let Some(ImportValueJSON::Text(s)) = cell.value {
+                            loader.set_cell(
+                                cell.sheet,
+                                &addr,
+                                Value::Error(value_error_from_display(&s)),
+                            );
+                            restored += 1;
+                        }
+                    }
+                    "formula" => {
+                        if let Some(ImportValueJSON::Text(s)) = cell.value {
+                            if loader.set_formula(cell.sheet, &addr, &s) {
+                                restored += 1;
+                            }
+                        }
+                    }
+                    "null" => {
+                        loader.clear_cell(cell.sheet, &addr);
+                        restored += 1;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        restored
+    }
 }
 
 fn value_to_display(val: &Value) -> String {
@@ -1437,6 +1536,26 @@ fn sparse_cell_from_value(sheet: usize, addr: CellAddress, val: &Value) -> Optio
         kind: kind.into(),
         value,
     })
+}
+
+fn sparse_cell_from_sheet_no_eval(
+    sheet_idx: usize,
+    sheet: &Sheet,
+    addr: CellAddress,
+) -> Option<SparseCellJSON> {
+    let addr_str = addr.to_string();
+    if let Some(formula) = sheet.get_formula(&addr_str) {
+        return Some(SparseCellJSON {
+            sheet: sheet_idx,
+            addr: addr_str,
+            row: addr.row,
+            col: addr.col,
+            kind: "formula".into(),
+            value: Some(ImportValueJSON::Text(formula)),
+        });
+    }
+
+    sparse_cell_from_value(sheet_idx, addr, &sheet.peek_value(addr))
 }
 
 fn value_error_from_display(value: &str) -> ValueError {
@@ -1586,5 +1705,53 @@ mod tests {
 
         assert_eq!(wb.get_number(1, "C5"), 105.0);
         assert_eq!(wb.debug_formula_cache_state(1, "C5"), "clean");
+    }
+
+    #[test]
+    fn wasm_workbook_snapshot_range_sparse_does_not_eval_formula() {
+        let mut wb = WasmWorkbook::new();
+        wb.set_number(0, "A1", 41.0);
+        assert!(wb.set_formula(0, "C5", "=A1+1"));
+
+        assert_eq!(wb.debug_formula_cache_state(0, "C5"), "dirty");
+        assert_eq!(wb.debug_formula_eval_count(0), 0);
+
+        let cells = wb.snapshot_range_sparse_cells(0, 4, 2, 4, 2);
+
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].addr, "C5");
+        assert_eq!(cells[0].kind, "formula");
+        match &cells[0].value {
+            Some(ImportValueJSON::Text(source)) => assert_eq!(source, "=A1+1"),
+            other => panic!("unexpected sparse formula value: {other:?}"),
+        }
+        assert_eq!(wb.debug_formula_cache_state(0, "C5"), "dirty");
+        assert_eq!(wb.debug_formula_eval_count(0), 0);
+    }
+
+    #[test]
+    fn wasm_workbook_restore_sparse_reinstalls_formulas_dirty() {
+        let mut wb = WasmWorkbook::new();
+        wb.set_number(0, "A1", 5.0);
+        wb.set_text(0, "A2", "hello");
+        assert!(wb.set_formula(0, "B2", "=A1+1"));
+
+        let cells = wb.snapshot_range_sparse_cells(0, 0, 0, 1, 1);
+        assert_eq!(cells.len(), 3);
+
+        assert_eq!(wb.clear_range(0, 0, 0, 1, 1), 3);
+        assert_eq!(wb.get_type(0, "A1"), "null");
+        assert_eq!(wb.get_formula(0, "B2"), "");
+
+        assert_eq!(wb.restore_sparse_cells(cells), 3);
+        assert_eq!(wb.get_display(0, "A1"), "5");
+        assert_eq!(wb.get_display(0, "A2"), "hello");
+        assert_eq!(wb.get_formula(0, "B2"), "=A1+1");
+        assert_eq!(wb.debug_formula_cache_state(0, "B2"), "dirty");
+        assert_eq!(wb.debug_formula_eval_count(0), 0);
+
+        assert_eq!(wb.get_display(0, "B2"), "6");
+        assert_eq!(wb.debug_formula_cache_state(0, "B2"), "clean");
+        assert_eq!(wb.debug_formula_eval_count(0), 1);
     }
 }

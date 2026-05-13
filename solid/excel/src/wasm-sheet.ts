@@ -1,4 +1,4 @@
-import type { ISheet } from './types'
+import type { ISheet, SparseCellSnapshot } from './types'
 
 export interface WasmWorkbookApi {
   sheet_count(): number
@@ -19,6 +19,14 @@ export interface WasmWorkbookApi {
     endRow: number,
     endCol: number,
   ): number
+  snapshot_range_sparse(
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): Array<SparseCellSnapshot & { sheet: number }>
+  restore_sparse(cells: Array<SparseCellSnapshot & { sheet: number }>): number
   insert_row(sheetIdx: number, at: number, count: number): void
   delete_row(sheetIdx: number, at: number, count: number): void
   insert_col(sheetIdx: number, at: number, count: number): void

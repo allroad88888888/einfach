@@ -1,7 +1,7 @@
 import { createSignal } from 'solid-js'
 import { addrToCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
 import { shiftFormulaRefs } from './formula-shift'
-import type { CellFormatJSON, ISheet, CellValue } from './types'
+import type { CellFormatJSON, ISheet, CellValue, SparseCellSnapshot } from './types'
 import { formatsEqual } from './types'
 
 /**
@@ -261,7 +261,12 @@ export function createSheetStore(sheet: ISheet) {
      * the grid shape). */
     snapshot: { before: CellSnapshot[]; after: CellSnapshot[] } | null
   }
-  type UndoEntry = CellsUndoEntry | StructuralUndoEntry
+  type SparseRangeClearUndoEntry = {
+    kind: 'sparseRangeClear'
+    range: NormalizedCellRange
+    before: SparseCellSnapshot[]
+  }
+  type UndoEntry = CellsUndoEntry | StructuralUndoEntry | SparseRangeClearUndoEntry
 
   /** Above this non-empty count, structural snapshots are skipped and we
    * fall back to op inverse. See `docs/STRUCTURAL_UNDO.md#threshold`. */
@@ -443,6 +448,43 @@ export function createSheetStore(sheet: ISheet) {
     for (const s of snaps) restore(s)
   }
 
+  function restoreSparseSnapshot(snap: SparseCellSnapshot) {
+    switch (snap.kind) {
+      case 'formula':
+        sheet.set_formula(snap.addr, snap.value)
+        return
+      case 'number':
+        sheet.set_number(snap.addr, snap.value)
+        return
+      case 'boolean':
+        if (sheet.set_boolean) sheet.set_boolean(snap.addr, snap.value)
+        else sheet.set_text(snap.addr, snap.value ? 'TRUE' : 'FALSE')
+        return
+      case 'error':
+        if (sheet.set_error) sheet.set_error(snap.addr, snap.value)
+        else sheet.set_text(snap.addr, snap.value)
+        return
+      case 'text':
+        sheet.set_text(snap.addr, snap.value)
+        return
+    }
+  }
+
+  function restoreSparseSnapshots(cells: SparseCellSnapshot[]): Promise<void> | void {
+    if (sheet.restore_sparse) {
+      return Promise.resolve(sheet.restore_sparse(cells)).then(() => {})
+    }
+    for (const cell of cells) restoreSparseSnapshot(cell)
+  }
+
+  function replaySparseRangeClear(range: NormalizedCellRange): Promise<void> | void {
+    if (sheet.clear_range) {
+      return Promise.resolve(
+        sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol),
+      ).then(() => {})
+    }
+  }
+
   function currentSelectionRange(): NormalizedCellRange {
     return normalizeCellRange(anchor(), selection())
   }
@@ -510,22 +552,7 @@ export function createSheetStore(sheet: ISheet) {
     return true
   }
 
-  function clearCellRange(anchorCoord: CellCoord, focusCoord: CellCoord) {
-    const range = normalizeCellRange(anchorCoord, focusCoord)
-    if (rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) {
-      // Large clears are intentionally range-native. Without backend range
-      // support, refuse the operation instead of expanding a huge rectangle.
-      if (!sheet.clear_range) return false
-      commitPendingEdit()
-      sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol)
-      // Large undo becomes a later backend/coarse-transaction task. Drop
-      // prior cell undo entries so Ctrl+Z cannot replay stale snapshots
-      // across this non-undoable destructive range command.
-      undoStack.length = 0
-      redoStack.length = 0
-      return true
-    }
-
+  function clearSmallCellRange(range: NormalizedCellRange) {
     const ownsBatch = pendingBefore === null
     if (ownsBatch) {
       pendingBefore = []
@@ -539,6 +566,61 @@ export function createSheetStore(sheet: ISheet) {
     }
     if (ownsBatch) commitPendingEdit()
     return true
+  }
+
+  async function clearLargeCellRange(range: NormalizedCellRange): Promise<boolean> {
+    // Large clears are intentionally range-native. Without backend range
+    // support, refuse the operation instead of expanding a huge rectangle.
+    if (!sheet.clear_range) return false
+
+    commitPendingEdit()
+    if (sheet.snapshot_range_sparse && sheet.restore_sparse) {
+      const before = await Promise.resolve(
+        sheet.snapshot_range_sparse(range.startRow, range.startCol, range.endRow, range.endCol),
+      )
+      await Promise.resolve(
+        sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol),
+      )
+      undoStack.push({ kind: 'sparseRangeClear', range, before })
+      redoStack.length = 0
+      return true
+    }
+
+    await Promise.resolve(
+      sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol),
+    )
+    // Backends without sparse restore still cannot safely undo a destructive
+    // range command. Drop prior cell entries so Ctrl+Z cannot replay stale
+    // snapshots across it.
+    undoStack.length = 0
+    redoStack.length = 0
+    return true
+  }
+
+  function clearCellRange(anchorCoord: CellCoord, focusCoord: CellCoord) {
+    const range = normalizeCellRange(anchorCoord, focusCoord)
+    if (rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) {
+      if (!sheet.clear_range) return false
+      if (!sheet.snapshot_range_sparse || !sheet.restore_sparse) {
+        commitPendingEdit()
+        void sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol)
+        undoStack.length = 0
+        redoStack.length = 0
+        return true
+      }
+      void clearLargeCellRange(range)
+      return true
+    }
+    return clearSmallCellRange(range)
+  }
+
+  function clearCellRangeAsync(
+    anchorCoord: CellCoord,
+    focusCoord: CellCoord,
+  ): Promise<boolean> | boolean {
+    const range = normalizeCellRange(anchorCoord, focusCoord)
+    if (rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) return clearLargeCellRange(range)
+    return clearSmallCellRange(range)
   }
 
   return {
@@ -725,11 +807,16 @@ export function createSheetStore(sheet: ISheet) {
      * backend-capable ranges use `clear_range` without materializing every
      * address on the main thread. */
     clearCellRange,
+    clearCellRangeAsync,
 
     /** Clear the current selection rectangle without forcing callers to
      * first build `selectionAddrs()`. */
     clearSelectionRange() {
-      clearCellRange(anchor(), selection())
+      return clearCellRange(anchor(), selection())
+    },
+
+    clearSelectionRangeAsync(): Promise<boolean> | boolean {
+      return clearCellRangeAsync(anchor(), selection())
     },
 
     /**
@@ -836,13 +923,15 @@ export function createSheetStore(sheet: ISheet) {
       if (!entry) return
       if (entry.kind === 'cells') {
         restoreAll(entry.before)
-      } else {
+      } else if (entry.kind === 'structural') {
         // Structural inverse first (puts the grid back in shape), then
         // restore any deleted content from the snapshot. Order matters:
         // restoring rows that don't exist yet would either silently shift
         // out or land on the wrong addresses.
         applyStructural(inverseOp(entry.op), entry.at, entry.count)
         if (entry.snapshot !== null) restoreAll(entry.snapshot.before)
+      } else {
+        void restoreSparseSnapshots(entry.before)
       }
       redoStack.push(entry)
     },
@@ -852,9 +941,11 @@ export function createSheetStore(sheet: ISheet) {
       if (!entry) return
       if (entry.kind === 'cells') {
         restoreAll(entry.after)
-      } else {
+      } else if (entry.kind === 'structural') {
         applyStructural(entry.op, entry.at, entry.count)
         if (entry.snapshot !== null) restoreAll(entry.snapshot.after)
+      } else {
+        void replaySparseRangeClear(entry.range)
       }
       undoStack.push(entry)
     },

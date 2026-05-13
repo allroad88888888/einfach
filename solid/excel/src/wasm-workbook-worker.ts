@@ -41,6 +41,14 @@ type WasmWorkbookRuntime = {
   bulk_import_cells(cells: ImportCellWire[]): WorkbookImportStatsWire
   list_non_empty_cells?: () => CellRefWire[]
   snapshot_sparse?: () => SparseCellWire[]
+  snapshot_range_sparse?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => SparseCellWire[]
+  restore_sparse?: (cells: SparseCellWire[]) => number
   read_sparse_range?: (
     sheetIdx: number,
     startRow: number,
@@ -571,6 +579,28 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         {
           const snapshotSparse = assertMethod(wb, 'snapshot_sparse')
           postResponse(msg.id, snapshotSparse.call(wb).map(normalizeSparseCell))
+        }
+        break
+      case 'snapshotRangeSparse':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const snapshotRangeSparse = assertMethod(wb, 'snapshot_range_sparse')
+          postResponse(
+            msg.id,
+            snapshotRangeSparse
+              .call(wb, range.sheet, range.startRow, range.startCol, range.endRow, range.endCol)
+              .map(normalizeSparseCell),
+          )
+        }
+        break
+      case 'restoreSparse':
+        {
+          const restoreSparse = assertMethod(wb, 'restore_sparse')
+          const cells = Array.isArray(msg.cells)
+            ? (msg.cells as SparseCellWire[]).map(normalizeSparseCell)
+            : []
+          postResponse(msg.id, restoreSparse.call(wb, cells))
         }
         break
       case 'readSparseRange':

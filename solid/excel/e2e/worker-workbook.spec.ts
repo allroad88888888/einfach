@@ -292,6 +292,48 @@ test.describe('Worker-backed workbook RPC', () => {
 
     await expectNoConsoleErrors(page)
   })
+
+  test('worker store undo restores a large sparse clear without preheating formulas', async ({
+    page,
+  }) => {
+    const result = await runWorkerWorkbookStoreLargeClearUndoScenario(page)
+
+    expect(result.beforeState).toBe('dirty')
+    expect(result.beforeEvalCount).toBe(0)
+    expect(result.cleared).toBe(true)
+    expect(result.afterClearNonEmpty).toEqual([])
+    expect(result.canUndoAfterClear).toBe(true)
+
+    expect(result.afterUndoNonEmpty).toEqual(
+      expect.arrayContaining([
+        { sheet: 0, addr: 'A1' },
+        { sheet: 0, addr: 'A2' },
+        { sheet: 0, addr: 'B2' },
+      ]),
+    )
+    expect(result.afterUndoNonEmpty).toHaveLength(3)
+    expect(result.afterUndoState).toBe('dirty')
+    expect(result.afterUndoEvalCount).toBe(0)
+    expect(result.afterUndoSparse).toEqual(
+      expect.arrayContaining([
+        { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'number', value: 10 },
+        { sheet: 0, addr: 'A2', row: 1, col: 0, kind: 'text', value: 'hello' },
+        { sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'formula', value: '=A1+1' },
+      ]),
+    )
+    expect(result.finalRead.display).toBe('11')
+    expect(result.afterFinalReadState).toBe('clean')
+    expect(result.afterFinalReadEvalCount).toBe(1)
+
+    const firstSnapshot = result.calls.indexOf('snapshotRangeSparse')
+    const firstClear = result.calls.indexOf('clearRange')
+    expect(firstSnapshot).toBeGreaterThanOrEqual(0)
+    expect(firstClear).toBe(firstSnapshot + 1)
+    expect(result.calls).toContain('restoreSparse')
+    expect(result.calls).not.toContain('readSparseRange')
+
+    await expectNoConsoleErrors(page)
+  })
 })
 
 async function runWorkerWorkbookScenario(page: Page): Promise<{
@@ -748,6 +790,114 @@ async function runWorkerWorkbookClearRangeScenario(page: Page): Promise<{
         afterNonEmpty,
         afterRead,
         afterReadState,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookStoreLargeClearUndoScenario(page: Page): Promise<{
+  calls: string[]
+  beforeState: string
+  beforeEvalCount: number
+  cleared: boolean
+  afterClearNonEmpty: DirtyRef[]
+  canUndoAfterClear: boolean
+  afterUndoNonEmpty: DirtyRef[]
+  afterUndoState: string
+  afterUndoEvalCount: number
+  afterUndoSparse: SparseCell[]
+  finalRead: Snapshot
+  afterFinalReadState: string
+  afterFinalReadEvalCount: number
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { createWorkerWorkbookStore } = await import('/src/wasm-workbook-store.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const client = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    const calls: string[] = []
+    const instrumentedClient = new Proxy(client, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver)
+        if (typeof prop !== 'string' || typeof value !== 'function') return value
+        return (...args: unknown[]) => {
+          calls.push(prop)
+          return value.apply(target, args)
+        }
+      },
+    })
+
+    const workbook = await createWorkerWorkbookStore({
+      client: instrumentedClient,
+      async afterInit(worker) {
+        await worker.setCell(0, 'A1', { type: 'number', value: 10 })
+        await worker.setCell(0, 'A2', { type: 'text', value: 'hello' })
+        await worker.setFormula(0, 'B2', '=A1+1')
+      },
+    })
+
+    async function waitFor<T>(read: () => Promise<T>, ok: (value: T) => boolean): Promise<T> {
+      const timeoutMs = 3_000
+      const started = performance.now()
+      while (true) {
+        const value = await read()
+        if (ok(value)) return value
+        if (performance.now() - started > timeoutMs) {
+          throw new Error('timed out waiting for worker store sparse undo')
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+    }
+
+    try {
+      const store = workbook.activeStore()
+      const beforeState = await instrumentedClient.debugFormulaCacheState(0, 'B2')
+      const beforeEvalCount = await instrumentedClient.debugFormulaEvalCount(0)
+
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      const cleared = await store.clearSelectionRangeAsync()
+      const afterClearNonEmpty = await instrumentedClient.listNonEmpty()
+      const canUndoAfterClear = store.canUndo()
+
+      store.undo()
+      const afterUndoNonEmpty = await waitFor(
+        () => instrumentedClient.listNonEmpty(),
+        (refs) =>
+          refs.some((ref) => ref.sheet === 0 && ref.addr === 'A1') &&
+          refs.some((ref) => ref.sheet === 0 && ref.addr === 'A2') &&
+          refs.some((ref) => ref.sheet === 0 && ref.addr === 'B2'),
+      )
+      const afterUndoState = await instrumentedClient.debugFormulaCacheState(0, 'B2')
+      const afterUndoEvalCount = await instrumentedClient.debugFormulaEvalCount(0)
+      const afterUndoSparse = await instrumentedClient.snapshotRangeSparse({
+        sheet: 0,
+        startRow: 0,
+        startCol: 0,
+        endRow: 1,
+        endCol: 1,
+      })
+      const [finalRead] = await instrumentedClient.readCells([{ sheet: 0, addr: 'B2' }])
+      const afterFinalReadState = await instrumentedClient.debugFormulaCacheState(0, 'B2')
+      const afterFinalReadEvalCount = await instrumentedClient.debugFormulaEvalCount(0)
+
+      return {
+        calls,
+        beforeState,
+        beforeEvalCount,
+        cleared,
+        afterClearNonEmpty,
+        canUndoAfterClear,
+        afterUndoNonEmpty,
+        afterUndoState,
+        afterUndoEvalCount,
+        afterUndoSparse,
+        finalRead,
+        afterFinalReadState,
+        afterFinalReadEvalCount,
       }
     } finally {
       workbook.dispose()

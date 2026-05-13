@@ -3,6 +3,7 @@ import {
   createWorkerWorkbook,
   type CellRefWire,
   type CellSnapshotWire,
+  type SparseCellWire,
   type ImportCellIssueWire,
   type ImportCellWire,
   type WorkerLike,
@@ -302,6 +303,53 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       code: 'INVALID_SHEET',
       message: 'invalid sheet index: 9',
     })
+  })
+
+  it('sends sparse range snapshot/restore commands with expected payloads', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const rangeSnapshot = workbook.snapshotRangeSparse({
+      sheet: 0,
+      startRow: 5,
+      startCol: 6,
+      endRow: 10,
+      endCol: 11,
+    })
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'snapshotRangeSparse',
+      range: { sheet: 0, startRow: 5, startCol: 6, endRow: 10, endCol: 11 },
+    })
+    const snapshotCells: SparseCellWire[] = [
+      {
+        sheet: 0,
+        addr: 'B2',
+        row: 1,
+        col: 1,
+        kind: 'number',
+        value: 2,
+      },
+      {
+        sheet: 0,
+        addr: 'C3',
+        row: 2,
+        col: 2,
+        kind: 'text',
+        value: 'restored',
+      },
+    ]
+    ok(fake, snapshotCells)
+    await expect(rangeSnapshot).resolves.toEqual(snapshotCells)
+
+    const restoreCount = workbook.restoreSparse(snapshotCells)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'restoreSparse',
+      cells: snapshotCells,
+    })
+    ok(fake, 2)
+    await expect(restoreCount).resolves.toBe(2)
   })
 
   it('dispatches dirty events only to matching sheet+addr subscribers', async () => {

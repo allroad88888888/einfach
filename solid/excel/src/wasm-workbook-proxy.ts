@@ -84,10 +84,7 @@ export interface RpcErrorWire {
   message: string
 }
 
-export type FormulaMutationErrorCode =
-  | 'INVALID_FORMULA'
-  | 'FORMULA_CYCLE'
-  | 'FORMULA_REJECTED'
+export type FormulaMutationErrorCode = 'INVALID_FORMULA' | 'FORMULA_CYCLE' | 'FORMULA_REJECTED'
 
 export type FormulaMutationResultWire =
   | { ok: true }
@@ -123,6 +120,8 @@ export interface WorkerWorkbookClient {
   readCells(cells: CellRefWire[]): Promise<CellSnapshotWire[]>
   listNonEmpty(): Promise<CellRefWire[]>
   snapshotSparse(): Promise<SparseCellWire[]>
+  snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
+  restoreSparse(cells: SparseCellWire[]): Promise<number>
   readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
   debugFormulaEvalCount(sheet: number): Promise<number>
@@ -283,6 +282,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     snapshotSparse() {
       return request<SparseCellWire[]>('snapshotSparse')
+    },
+    snapshotRangeSparse(range) {
+      return request<SparseCellWire[]>('snapshotRangeSparse', { range })
+    },
+    restoreSparse(cells) {
+      return request<number>('restoreSparse', { cells })
     },
     readSparseRange(range) {
       return request<CellSnapshotWire[]>('readSparseRange', { range })

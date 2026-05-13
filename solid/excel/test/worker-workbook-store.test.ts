@@ -8,6 +8,7 @@ import type {
   CellSnapshotWire,
   CellWire,
   ImportCellWire,
+  SparseCellWire,
   SparseRangeWire,
   WorkerWorkbookClient,
   WorkbookImportStatsWire,
@@ -29,6 +30,9 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setFormula: Array<{ sheet: number; addr: string; formula: string }>
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
+    snapshotRangeSparse: ClearRangeCall[]
+    restoreSparse: SparseCellWire[][]
+    readSparseRange: ClearRangeCall[]
     readCells: CellRefWire[][]
     subscribeCells: CellRefWire[][]
     unsubscribeCells: number[]
@@ -41,6 +45,42 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   }
   emitHydrated(cells: CellSnapshotWire[]): void
   setFormulaResult(sheet: number, addr: string, result: boolean): void
+}
+
+function parseCellAddress(addr: string): { row: number; col: number } {
+  const m = addr.toUpperCase().match(/^([A-Z]+)(\d+)$/)
+  if (!m) {
+    return { row: -1, col: -1 }
+  }
+  let col = 0
+  for (let i = 0; i < m[1].length; i++) {
+    col = col * 26 + (m[1].charCodeAt(i) - 64)
+  }
+  return {
+    row: Number(m[2]) - 1,
+    col: col - 1,
+  }
+}
+
+function inRange(
+  addr: string,
+  range: {
+    sheet: number
+    startRow: number
+    startCol: number
+    endRow: number
+    endCol: number
+  },
+) {
+  if (range.sheet < 0) return false
+  const parsed = parseCellAddress(addr)
+  if (parsed.row < 0 || parsed.col < 0) return false
+  return (
+    parsed.row >= range.startRow &&
+    parsed.row <= range.endRow &&
+    parsed.col >= range.startCol &&
+    parsed.col <= range.endCol
+  )
 }
 
 function emptySnapshot(ref: CellRefWire): CellSnapshotWire {
@@ -61,6 +101,9 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setFormula: [],
     clearCell: [],
     clearRange: [],
+    snapshotRangeSparse: [],
+    restoreSparse: [],
+    readSparseRange: [],
     readCells: [],
     subscribeCells: [],
     unsubscribeCells: [],
@@ -158,7 +201,94 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async clearRange(range) {
       calls.clearRange.push({ ...range })
+      for (const [itemKey] of [...cells.entries()]) {
+        const [sheetStr, addr] = itemKey.split(':')
+        if (Number(sheetStr) !== range.sheet) continue
+        if (inRange(addr, range)) cells.delete(itemKey)
+      }
       return 1
+    },
+    async snapshotRangeSparse(_range: SparseRangeWire) {
+      calls.snapshotRangeSparse.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+      })
+      const out: SparseCellWire[] = []
+      for (const [, snapshot] of cells.entries()) {
+        if (snapshot.sheet !== _range.sheet) continue
+        if (!inRange(snapshot.addr, _range)) continue
+        const parsed = parseCellAddress(snapshot.addr)
+        if (snapshot.formula !== '') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'formula',
+            value: snapshot.formula,
+          })
+        } else if (snapshot.type === 'number') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'number',
+            value: Number(snapshot.display),
+          })
+        } else if (snapshot.type === 'text') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'text',
+            value: snapshot.display,
+          })
+        } else if (snapshot.type === 'boolean') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'boolean',
+            value: snapshot.display === 'TRUE',
+          })
+        } else if (snapshot.type === 'error') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'error',
+            value: snapshot.display,
+          })
+        }
+      }
+      return out
+    },
+    async restoreSparse(sparseCells) {
+      calls.restoreSparse.push(
+        sparseCells.map((cell) => ({ ...cell, addr: cell.addr.toUpperCase() })),
+      )
+      for (const cell of sparseCells) {
+        if (cell.kind === 'formula') {
+          cells.set(key(cell.sheet, cell.addr), {
+            sheet: cell.sheet,
+            addr: cell.addr.toUpperCase(),
+            display: '',
+            type: 'null',
+            isError: false,
+            formula: cell.value,
+          })
+        } else {
+          storeCell(cell.sheet, cell.addr, { type: cell.kind, value: cell.value } as CellWire)
+        }
+      }
+      return sparseCells.length
     },
     async beginImport(sessionId = 1) {
       calls.beginImport.push(sessionId)
@@ -198,7 +328,20 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       return []
     },
     async readSparseRange(_range: SparseRangeWire) {
-      return []
+      calls.readSparseRange.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+      })
+      const out: CellSnapshotWire[] = []
+      for (const [, snapshot] of cells.entries()) {
+        if (snapshot.sheet !== _range.sheet) continue
+        if (!inRange(snapshot.addr, _range)) continue
+        out.push(snapshot)
+      }
+      return out
     },
     async debugFormulaCacheState(sheet, addr) {
       calls.debugFormulaCacheState.push({ sheet, addr: addr.toUpperCase() })
@@ -273,12 +416,70 @@ describe('createWorkerWorkbookStore', () => {
 
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
-      store.clearSelectionRange()
+      await store.clearSelectionRangeAsync()
 
+      expect(client.calls.snapshotRangeSparse).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      ])
       expect(client.calls.clearRange).toEqual([
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
       ])
       expect(client.calls.clearCell).toEqual([])
+
+      workbook.dispose()
+    })
+  })
+
+  it('uses backend sparse-range snapshot for large selection clear and restores values + formulas', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      store.setNumber('A1', 10)
+      store.setText('A2', 'hello')
+      store.setFormula('B2', '=A1+1')
+      client.emitHydrated([
+        {
+          sheet: 0,
+          addr: 'B2',
+          display: '11',
+          type: 'number',
+          isError: false,
+          formula: '=A1+1',
+        },
+      ])
+
+      expect(store.getFormula('B2')).toBe('=A1+1')
+
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      await store.clearSelectionRangeAsync()
+
+      expect(client.calls.snapshotRangeSparse).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      ])
+      expect(client.calls.clearRange).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+      ])
+      expect(client.calls.readSparseRange).toEqual([])
+      expect(store.canUndo()).toBe(true)
+
+      await waitFor(() => {
+        expect(store.getCell('A1').type).toBe('null')
+        expect(store.getCell('A2').type).toBe('null')
+        expect(store.getFormula('B2')).toBe('')
+      })
+
+      store.undo()
+      expect(client.calls.restoreSparse).toHaveLength(1)
+
+      await waitFor(() => {
+        expect(store.getCell('A1').display).toBe('10')
+        expect(store.getCell('A2').display).toBe('hello')
+        expect(store.getFormula('B2')).toBe('=A1+1')
+      })
+      expect(store.canRedo()).toBe(true)
 
       workbook.dispose()
     })

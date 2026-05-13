@@ -223,7 +223,7 @@ export function Table(props: TableProps) {
 
   async function handleCut(e: KeyboardEvent) {
     e.preventDefault()
-    if (await writeSelectionToClipboard()) props.store.clearSelectionRange()
+    if (await writeSelectionToClipboard()) await props.store.clearSelectionRangeAsync()
   }
 
   // === Context menu state ===
@@ -266,19 +266,19 @@ export function Table(props: TableProps) {
   }
 
   async function ctxCut() {
-    if (await writeSelectionToClipboard()) props.store.clearSelectionRange()
+    if (await writeSelectionToClipboard()) await props.store.clearSelectionRangeAsync()
   }
 
   function ctxClearSelection() {
-    props.store.clearSelectionRange()
+    void props.store.clearSelectionRangeAsync()
   }
 
   function clearColumn(col: number) {
-    props.store.clearCellRange({ row: 0, col }, { row: rows() - 1, col })
+    void props.store.clearCellRangeAsync({ row: 0, col }, { row: rows() - 1, col })
   }
 
   function clearRow(row: number) {
-    props.store.clearCellRange({ row, col: 0 }, { row, col: cols() - 1 })
+    void props.store.clearCellRangeAsync({ row, col: 0 }, { row, col: cols() - 1 })
   }
 
   function colMenuItems(col: number): ContextMenuItem[] {
@@ -378,7 +378,7 @@ export function Table(props: TableProps) {
       case 'Backspace': {
         // Routed through SheetStore so large selections can use backend
         // range-native clear without materializing every address here.
-        props.store.clearSelectionRange()
+        void props.store.clearSelectionRangeAsync()
         e.preventDefault()
         break
       }

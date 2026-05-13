@@ -47,7 +47,20 @@ export interface ISheet {
     startCol: number,
     endRow: number,
     endCol: number,
-  ): number | void
+  ): number | void | Promise<number | void>
+  /**
+   * Optional no-eval sparse range snapshot. Used for large-range undo so the
+   * UI records only non-empty cells and formula sources without forcing
+   * formula calculation.
+   */
+  snapshot_range_sparse?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): SparseCellSnapshot[] | Promise<SparseCellSnapshot[]>
+  /** Restore records produced by `snapshot_range_sparse`. */
+  restore_sparse?(cells: SparseCellSnapshot[]): number | void | Promise<number | void>
   /**
    * Structural edits (phase 4 backend). All update referenced formulas to
    * follow the data; references inside the deleted band become #REF!.
@@ -101,6 +114,13 @@ export type CellValue = {
   isError: boolean
 }
 
+export type SparseCellSnapshot =
+  | { addr: string; row: number; col: number; kind: 'number'; value: number }
+  | { addr: string; row: number; col: number; kind: 'text'; value: string }
+  | { addr: string; row: number; col: number; kind: 'boolean'; value: boolean }
+  | { addr: string; row: number; col: number; kind: 'error'; value: string }
+  | { addr: string; row: number; col: number; kind: 'formula'; value: string }
+
 /** Wire-format for a per-cell style. Mirrors the Rust `CellFormatJSON`. */
 export interface CellFormatJSON {
   numberFormat?: NumberFormatJSON
@@ -142,10 +162,7 @@ function numberFormatsEqual(a?: NumberFormatJSON, b?: NumberFormatJSON): boolean
   const bk = b?.kind ?? 'general'
   if (ak !== bk) return false
   if (ak === 'decimal') {
-    return (
-      (a?.digits ?? 2) === (b?.digits ?? 2) &&
-      !!a?.thousands === !!b?.thousands
-    )
+    return (a?.digits ?? 2) === (b?.digits ?? 2) && !!a?.thousands === !!b?.thousands
   }
   if (ak === 'percent') return (a?.digits ?? 0) === (b?.digits ?? 0)
   if (ak === 'currency') {
