@@ -352,6 +352,26 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(restoreCount).resolves.toBe(2)
   })
 
+  it('sends range TSV export commands with expected payloads', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const exportText = workbook.exportRangeTsv({
+      sheet: 0,
+      startRow: 1,
+      startCol: 2,
+      endRow: 3,
+      endCol: 4,
+    })
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'exportRangeTsv',
+      range: { sheet: 0, startRow: 1, startCol: 2, endRow: 3, endCol: 4 },
+    })
+    ok(fake, '=Sheet2!A1+1')
+    await expect(exportText).resolves.toBe('=Sheet2!A1+1')
+  })
+
   it('dispatches dirty events only to matching sheet+addr subscribers', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

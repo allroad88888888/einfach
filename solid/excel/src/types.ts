@@ -59,6 +59,17 @@ export interface ISheet {
     endRow: number,
     endCol: number,
   ): SparseCellSnapshot[] | Promise<SparseCellSnapshot[]>
+  /**
+   * Optional range-native clipboard export. Coordinates are zero-based and
+   * inclusive. Implementations should stream/scan sparse backend state and
+   * preserve formula sources without evaluating lazy formulas.
+   */
+  export_range_tsv?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ): string | Promise<string>
   /** Restore records produced by `snapshot_range_sparse`. */
   restore_sparse?(cells: SparseCellSnapshot[]): number | void | Promise<number | void>
   /**

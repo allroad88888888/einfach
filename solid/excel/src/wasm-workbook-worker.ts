@@ -1,6 +1,7 @@
 /// <reference lib="WebWorker" />
 
 import init, { WasmWorkbook } from '../wasm-pkg/einfach_wasm.js'
+import { sparseRangeToTSV } from './range-tsv'
 import type {
   CellRefWire,
   CellSnapshotWire,
@@ -481,6 +482,15 @@ function unsubscribeCells(wb: WasmWorkbookRuntime, subId: number) {
   subscriptionTokens.delete(subId)
 }
 
+function exportRangeTsv(wb: WasmWorkbookRuntime, range: SparseRangeWire): string {
+  assertSheet(wb, range.sheet)
+  const snapshotRangeSparse = assertMethod(wb, 'snapshot_range_sparse')
+  const cells = snapshotRangeSparse
+    .call(wb, range.sheet, range.startRow, range.startCol, range.endRow, range.endCol)
+    .map(normalizeSparseCell)
+  return sparseRangeToTSV(cells, range)
+}
+
 function toRpcError(err: unknown): RpcErrorWire {
   if (err instanceof Error) {
     return {
@@ -672,6 +682,12 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               .call(wb, range.sheet, range.startRow, range.startCol, range.endRow, range.endCol)
               .map(normalizeSparseCell),
           )
+        }
+        break
+      case 'exportRangeTsv':
+        {
+          const range = normalizeSparseRange(msg.range)
+          postResponse(msg.id, exportRangeTsv(wb, range))
         }
         break
       case 'restoreSparse':

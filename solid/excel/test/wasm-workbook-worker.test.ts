@@ -35,14 +35,20 @@ type MockWasmWorkbook = {
   }
   bulk_import_cells: (cells: ImportCellWire[]) => WorkbookImportStatsWire
   list_non_empty_cells: () => { sheet: number; addr: string }[]
-  set_cell_number: (...args: unknown[]) => void
-  set_cell_text: (...args: unknown[]) => void
-  set_cell_boolean: (...args: unknown[]) => void
-  set_cell_error: (...args: unknown[]) => void
-  clearCellAt: (...args: unknown[]) => void
-  setFormulaAt: (...args: unknown[]) => boolean
+  set_cell_number: (sheet: number, addr: string, value: number) => void
+  set_cell_text: (sheet: number, addr: string, value: string) => void
+  set_cell_boolean: (sheet: number, addr: string, value: boolean) => void
+  set_cell_error: (sheet: number, addr: string, value: string) => void
+  clearCellAt: (sheet: number, addr: string) => void
+  setFormulaAt: (sheet: number, addr: string, formula: string) => boolean
   snapshot_sparse: () => unknown[]
-  snapshot_range_sparse: () => unknown[]
+  snapshot_range_sparse: (
+    sheet: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => unknown[]
   restore_sparse: (cells: unknown[]) => number
   read_sparse_range: () => unknown[]
   clear_range: () => number
@@ -71,6 +77,14 @@ function toAddress(col: number, row: number) {
   return `${out}${row + 1}`
 }
 
+function parseAddress(addr: string): { row: number; col: number } {
+  const match = addr.toUpperCase().match(/^([A-Z]+)(\d+)$/)
+  if (!match) return { row: -1, col: -1 }
+  let col = 0
+  for (let i = 0; i < match[1].length; i++) col = col * 26 + (match[1].charCodeAt(i) - 64)
+  return { row: Number(match[2]) - 1, col: col - 1 }
+}
+
 function createMockWasmWorkbook() {
   const calls = { bulkImportCells: 0 }
   const sheets = ['Sheet1']
@@ -78,6 +92,54 @@ function createMockWasmWorkbook() {
 
   function key(sheet: number, addr: string) {
     return `${sheet}:${addr.toUpperCase()}`
+  }
+
+  function setPrimitive(
+    sheet: number,
+    addr: string,
+    type: 'number' | 'text' | 'boolean' | 'error',
+    value: string | number | boolean,
+  ) {
+    cells.set(key(sheet, addr), {
+      type,
+      display: type === 'boolean' ? ((value as boolean) ? 'TRUE' : 'FALSE') : String(value),
+      formula: '',
+      isError: type === 'error',
+    })
+  }
+
+  function sparseFromState(sheet: number, addr: string, state: MockCellState) {
+    const parsed = parseAddress(addr)
+    if (state.type === 'formula') {
+      return { sheet, addr, row: parsed.row, col: parsed.col, kind: 'formula', value: state.formula }
+    }
+    if (state.type === 'number') {
+      return {
+        sheet,
+        addr,
+        row: parsed.row,
+        col: parsed.col,
+        kind: 'number',
+        value: Number(state.display),
+      }
+    }
+    if (state.type === 'boolean') {
+      return {
+        sheet,
+        addr,
+        row: parsed.row,
+        col: parsed.col,
+        kind: 'boolean',
+        value: state.display === 'TRUE',
+      }
+    }
+    if (state.type === 'error') {
+      return { sheet, addr, row: parsed.row, col: parsed.col, kind: 'error', value: state.display }
+    }
+    if (state.type === 'text') {
+      return { sheet, addr, row: parsed.row, col: parsed.col, kind: 'text', value: state.display }
+    }
+    return null
   }
 
   function setFromImport(cellsIn: ImportCellWire[]) {
@@ -164,15 +226,70 @@ function createMockWasmWorkbook() {
         const [sheet, addr] = raw.split(':')
         return { sheet: Number(sheet), addr }
       }),
-    set_cell_number: () => undefined,
-    set_cell_text: () => undefined,
-    set_cell_boolean: () => undefined,
-    set_cell_error: () => undefined,
-    clearCellAt: () => undefined,
-    setFormulaAt: () => true,
-    snapshot_sparse: () => [],
-    snapshot_range_sparse: () => [],
-    restore_sparse: () => 0,
+    set_cell_number: (sheet: number, addr: string, value: number) =>
+      setPrimitive(sheet, addr, 'number', value),
+    set_cell_text: (sheet: number, addr: string, value: string) =>
+      setPrimitive(sheet, addr, 'text', value),
+    set_cell_boolean: (sheet: number, addr: string, value: boolean) =>
+      setPrimitive(sheet, addr, 'boolean', value),
+    set_cell_error: (sheet: number, addr: string, value: string) =>
+      setPrimitive(sheet, addr, 'error', value),
+    clearCellAt: (sheet: number, addr: string) => {
+      cells.delete(key(sheet, addr))
+    },
+    setFormulaAt: (sheet: number, addr: string, formula: string) => {
+      cells.set(key(sheet, addr), {
+        type: 'formula',
+        display: '',
+        formula,
+        isError: false,
+      })
+      return true
+    },
+    snapshot_sparse: () =>
+      [...cells.entries()]
+        .map(([raw, state]) => {
+          const [sheet, addr] = raw.split(':')
+          return sparseFromState(Number(sheet), addr, state)
+        })
+        .filter((cell) => cell !== null),
+    snapshot_range_sparse: (sheet, startRow, startCol, endRow, endCol) =>
+      [...cells.entries()]
+        .map(([raw, state]) => {
+          const [cellSheet, addr] = raw.split(':')
+          if (Number(cellSheet) !== sheet) return null
+          const parsed = parseAddress(addr)
+          if (
+            parsed.row < startRow ||
+            parsed.row > endRow ||
+            parsed.col < startCol ||
+            parsed.col > endCol
+          ) {
+            return null
+          }
+          return sparseFromState(sheet, addr, state)
+        })
+        .filter((cell) => cell !== null),
+    restore_sparse: (sparseCells) => {
+      for (const cell of sparseCells as Array<{
+        sheet: number
+        addr: string
+        kind: 'number' | 'text' | 'boolean' | 'error' | 'formula'
+        value: string | number | boolean
+      }>) {
+        if (cell.kind === 'formula') {
+          cells.set(key(cell.sheet, cell.addr), {
+            type: 'formula',
+            display: '',
+            formula: String(cell.value),
+            isError: false,
+          })
+        } else {
+          setPrimitive(cell.sheet, cell.addr, cell.kind, cell.value)
+        }
+      }
+      return sparseCells.length
+    },
     read_sparse_range: () => [],
     clear_range: () => 0,
     debug_formula_cache_state: () => 'dirty',
@@ -377,6 +494,41 @@ describe('wasm-workbook-worker import session contract', () => {
       expect(harness.calls.mainWorkbook()).toBe(0)
       expect(harness.calls.importWorkbooks()).toBeGreaterThanOrEqual(1)
       expect(harness.calls.allBulkImportCalls()).toBeGreaterThan(0)
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('exports range TSV from sparse snapshots without reading formulas', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1', 'Sheet2'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'setCell',
+        sheet: 1,
+        addr: 'A1',
+        value: { type: 'number', value: 10 },
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'setFormula',
+        sheet: 0,
+        addr: 'A1',
+        formula: '=Sheet2!A1+1',
+      })
+
+      const tsv = await harness.send<string>({
+        id: 4,
+        cmd: 'exportRangeTsv',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      })
+
+      expect(tsv).toBe('=Sheet2!A1+1')
     } finally {
       harness.dispose()
     }

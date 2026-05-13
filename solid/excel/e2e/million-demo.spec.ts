@@ -170,50 +170,69 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(calls).toEqual([[0, 0, 999, 999]])
   })
 
-  test('copy_large_selection_does_not_materialize_selection_grid', async ({ page, context }) => {
-    await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  test('copy_large_selection_does_not_materialize_selection_grid', async ({ page }) => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
-    const setup = await page.evaluate(() => {
+    const result = await page.evaluate(async () => {
       const win = window as unknown as {
         __einfachStore?: {
           selectionAddrs: () => string[][]
           copySelection: () => unknown
+          copySelectionTextAsync: () => Promise<string | null>
           setSelectionAnchor: (coord: { row: number; col: number }) => void
           extendSelection: (coord: { row: number; col: number }) => void
+          raw: {
+            export_range_tsv?: (
+              startRow: number,
+              startCol: number,
+              endRow: number,
+              endCol: number,
+            ) => string | Promise<string>
+          }
         }
-        __copySelectionCalls?: number
       }
       const store = win.__einfachStore
-      if (!store) return { hasStore: false }
-      const originalCopySelection = store.copySelection.bind(store)
-      win.__copySelectionCalls = 0
+      if (!store)
+        return {
+          hasStore: false,
+          hasExportRangeTsv: false,
+          exportRangeTsvCalls: [],
+          textStartsWithMarker: false,
+        }
+      if (!store.raw.export_range_tsv)
+        return {
+          hasStore: true,
+          hasExportRangeTsv: false,
+          exportRangeTsvCalls: [],
+          textStartsWithMarker: false,
+        }
+      const originalExportRangeTsv = store.raw.export_range_tsv.bind(store.raw)
+      const exportRangeTsvCalls: number[][] = []
       store.selectionAddrs = () => {
         throw new Error('selectionAddrs must not run for large copy')
       }
       store.copySelection = () => {
-        win.__copySelectionCalls = (win.__copySelectionCalls ?? 0) + 1
-        return originalCopySelection()
+        throw new Error('copySelection must not run for large copy')
+      }
+      store.raw.export_range_tsv = (startRow, startCol, endRow, endCol) => {
+        exportRangeTsvCalls.push([startRow, startCol, endRow, endCol])
+        return originalExportRangeTsv(startRow, startCol, endRow, endCol)
       }
       store.setSelectionAnchor({ row: 0, col: 0 })
-      store.extendSelection({ row: 999, col: 999 })
-      return { hasStore: true }
+      store.extendSelection({ row: 120, col: 120 })
+      const text = await store.copySelectionTextAsync()
+      return {
+        hasStore: true,
+        hasExportRangeTsv: true,
+        exportRangeTsvCalls,
+        textStartsWithMarker: text?.startsWith('# einfach-clipboard-origin: A1\n') ?? false,
+      }
     })
-    expect(setup.hasStore).toBe(true)
-
-    await page.locator('.excel-table-wrapper').focus()
-    const copyKey = process.platform === 'darwin' ? 'Meta+C' : 'Control+C'
-    await page.keyboard.press(copyKey)
-
-    await expect
-      .poll(() =>
-        page.evaluate(() => {
-          const win = window as unknown as { __copySelectionCalls?: number }
-          return win.__copySelectionCalls ?? 0
-        }),
-      )
-      .toBe(1)
+    expect(result.hasStore).toBe(true)
+    expect(result.hasExportRangeTsv).toBe(true)
+    expect(result.exportRangeTsvCalls).toEqual([[0, 0, 120, 120]])
+    expect(result.textStartsWithMarker).toBe(true)
   })
 
   test('selectionAddrs_large_selection_returns_null_without_materializing', async ({ page }) => {

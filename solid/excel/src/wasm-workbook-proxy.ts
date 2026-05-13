@@ -121,6 +121,7 @@ export interface WorkerWorkbookClient {
   listNonEmpty(): Promise<CellRefWire[]>
   snapshotSparse(): Promise<SparseCellWire[]>
   snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
+  exportRangeTsv(range: SparseRangeWire): Promise<string>
   restoreSparse(cells: SparseCellWire[]): Promise<number>
   readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
@@ -285,6 +286,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     snapshotRangeSparse(range) {
       return request<SparseCellWire[]>('snapshotRangeSparse', { range })
+    },
+    exportRangeTsv(range) {
+      return request<string>('exportRangeTsv', { range })
     },
     restoreSparse(cells) {
       return request<number>('restoreSparse', { cells })

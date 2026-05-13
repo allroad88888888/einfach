@@ -1,4 +1,5 @@
 import { createSignal } from 'solid-js'
+import { sparseRangeToTSV } from './range-tsv'
 import { createSheetStore, type SheetStore } from './sheet-store'
 import { createWasmWorkbook, type WasmWorkbookApi } from './wasm-sheet'
 import type { CellValue, ISheet, SparseCellSnapshot } from './types'
@@ -297,6 +298,12 @@ function createWorkbookSheetAdapter(
       return workbook
         .snapshot_range_sparse(sheetIdx, startRow, startCol, endRow, endCol)
         .map(({ sheet: _sheet, ...cell }) => cell)
+    },
+    export_range_tsv(startRow, startCol, endRow, endCol) {
+      const cells = workbook
+        .snapshot_range_sparse(sheetIdx, startRow, startCol, endRow, endCol)
+        .map(({ sheet: _sheet, ...cell }) => cell)
+      return sparseRangeToTSV(cells, { startRow, startCol, endRow, endCol })
     },
     restore_sparse(cells) {
       let restored = 0
@@ -666,6 +673,9 @@ function createWorkerWorkbookSheetAdapter(
         }
         return out
       })
+    },
+    export_range_tsv(startRow, startCol, endRow, endCol) {
+      return client.exportRangeTsv({ sheet: sheetIdx, startRow, startCol, endRow, endCol })
     },
     restore_sparse(cells) {
       const visibleAddrs = invalidateCachedStateForRemoteMutation()

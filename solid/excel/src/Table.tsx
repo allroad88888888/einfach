@@ -4,7 +4,7 @@ import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { FormatToolbar } from './FormatToolbar'
 import { FormulaBar } from './FormulaBar'
 import { addrToCoord, clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
-import { parseClipboardTSV, serializeClipboardTSV, type SheetStore } from './sheet-store'
+import { parseClipboardTSV, type SheetStore } from './sheet-store'
 
 export interface TableProps {
   store: SheetStore
@@ -186,9 +186,8 @@ export function Table(props: TableProps) {
   // Ctrl+C / Ctrl+V handlers — extracted from onKeyDown to keep that switch
   // small and to allow direct unit-call from tests if needed later.
   async function writeSelectionToClipboard(): Promise<boolean> {
-    const data = props.store.copySelection()
-    if (!data) return false
-    const text = serializeClipboardTSV(data)
+    const text = await props.store.copySelectionTextAsync()
+    if (text === null) return false
     try {
       await navigator.clipboard.writeText(text)
       return true

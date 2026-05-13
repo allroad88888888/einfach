@@ -287,6 +287,22 @@ test.describe('Worker-backed workbook RPC', () => {
     await expectNoConsoleErrors(page)
   })
 
+  test('exports range tsv with formula source and without evaluating formulas', async ({ page }) => {
+    const result = await runWorkerWorkbookExportRangeTsvScenario(page)
+
+    expect(result.tsv).toBe('=Sheet2!A1+1')
+    expect(result.beforeEvalCount).toBe(0)
+    expect(result.beforeCacheState).toBe('dirty')
+    expect(result.beforeEvalCount).toBe(result.afterEvalCount)
+    expect(result.beforeCacheState).toBe(result.afterCacheState)
+    expect(result.sparseSnapshot).toEqual([
+      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      { sheet: 1, addr: 'A1', row: 0, col: 0, kind: 'number', value: 10 },
+    ])
+
+    await expectNoConsoleErrors(page)
+  })
+
   test('clears a large sparse range through the worker without expanding cells on main', async ({
     page,
   }) => {
@@ -804,6 +820,57 @@ async function runWorkerWorkbookSnapshotRoundTripScenario(page: Page): Promise<{
     } finally {
       sourceWorkbook.dispose()
       restoredWorkbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookExportRangeTsvScenario(page: Page): Promise<{
+  tsv: string
+  beforeEvalCount: number
+  beforeCacheState: string
+  afterEvalCount: number
+  afterCacheState: string
+  sparseSnapshot: SparseCell[]
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 10 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      await workbook.commitImport(session)
+
+      const beforeEvalCount = await workbook.debugFormulaEvalCount(0)
+      const beforeCacheState = await workbook.debugFormulaCacheState(0, 'A1')
+      const sparseSnapshot = await workbook.snapshotSparse()
+      const tsv = await workbook.exportRangeTsv({
+        sheet: 0,
+        startRow: 0,
+        startCol: 0,
+        endRow: 0,
+        endCol: 0,
+      })
+      const afterEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterCacheState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        tsv,
+        beforeEvalCount,
+        beforeCacheState,
+        afterEvalCount,
+        afterCacheState,
+        sparseSnapshot,
+      }
+    } finally {
+      workbook.dispose()
     }
   })
 }

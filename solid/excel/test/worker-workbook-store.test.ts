@@ -2,6 +2,7 @@
 
 import { describe, expect, it } from '@jest/globals'
 import { createRoot } from 'solid-js'
+import { sparseRangeToTSV } from '../src/range-tsv'
 import { createWorkerWorkbookStore } from '../src/wasm-workbook-store'
 import type {
   CellRefWire,
@@ -31,6 +32,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
     snapshotRangeSparse: ClearRangeCall[]
+    exportRangeTsv: ClearRangeCall[]
     restoreSparse: SparseCellWire[][]
     readSparseRange: ClearRangeCall[]
     readCells: CellRefWire[][]
@@ -102,6 +104,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     clearCell: [],
     clearRange: [],
     snapshotRangeSparse: [],
+    exportRangeTsv: [],
     restoreSparse: [],
     readSparseRange: [],
     readCells: [],
@@ -270,6 +273,68 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       }
       return out
     },
+    async exportRangeTsv(_range: SparseRangeWire) {
+      calls.exportRangeTsv.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+      })
+      const out: SparseCellWire[] = []
+      for (const [, snapshot] of cells.entries()) {
+        if (snapshot.sheet !== _range.sheet) continue
+        if (!inRange(snapshot.addr, _range)) continue
+        const parsed = parseCellAddress(snapshot.addr)
+        if (snapshot.formula !== '') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'formula',
+            value: snapshot.formula,
+          })
+        } else if (snapshot.type === 'number') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'number',
+            value: Number(snapshot.display),
+          })
+        } else if (snapshot.type === 'text') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'text',
+            value: snapshot.display,
+          })
+        } else if (snapshot.type === 'boolean') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'boolean',
+            value: snapshot.display === 'TRUE',
+          })
+        } else if (snapshot.type === 'error') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'error',
+            value: snapshot.display,
+          })
+        }
+      }
+      return sparseRangeToTSV(out, _range)
+    },
     async restoreSparse(sparseCells) {
       calls.restoreSparse.push(
         sparseCells.map((cell) => ({ ...cell, addr: cell.addr.toUpperCase() })),
@@ -425,6 +490,30 @@ describe('createWorkerWorkbookStore', () => {
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
       ])
       expect(client.calls.clearCell).toEqual([])
+
+      workbook.dispose()
+    })
+  })
+
+  it('routes large selection copy through worker range TSV export', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      store.raw.set_number('A1', 1)
+      store.raw.set_formula('A2', '=A1+1')
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 10_000, col: 0 })
+
+      const text = await store.copySelectionTextAsync()
+
+      expect(text?.startsWith('# einfach-clipboard-origin: A1\n1\n=A1+1\n')).toBe(true)
+      expect(client.calls.exportRangeTsv).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 10_000, endCol: 0 },
+      ])
+      expect(client.calls.readCells).toEqual([])
+      expect(client.calls.snapshotRangeSparse).toEqual([])
 
       workbook.dispose()
     })

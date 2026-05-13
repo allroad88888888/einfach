@@ -520,6 +520,27 @@ export function createSheetStore(sheet: ISheet) {
     }
   }
 
+  async function copySelectionText(): Promise<string | null> {
+    const selectedRange = currentSelectionRange()
+    if (rangeCellCount(selectedRange) <= CLIPBOARD_CELL_LIMIT) {
+      const addrs = addressGridForRange(selectedRange, CLIPBOARD_CELL_LIMIT)
+      const data = addrs ? copyAddressGrid(addrs) : null
+      return data ? serializeClipboardTSV(data) : null
+    }
+    if (!sheet.export_range_tsv) return null
+
+    const body = await Promise.resolve(
+      sheet.export_range_tsv(
+        selectedRange.startRow,
+        selectedRange.startCol,
+        selectedRange.endRow,
+        selectedRange.endCol,
+      ),
+    )
+    const originAddr = coordToAddr({ row: selectedRange.startRow, col: selectedRange.startCol })
+    return `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${originAddr}\n${body}`
+  }
+
   function setFormatInternal(addr: string, fmt: CellFormatJSON) {
     if (!sheet.set_format) return
     const current = sheet.get_format ? sheet.get_format(addr) : ({} as CellFormatJSON)
@@ -713,6 +734,16 @@ export function createSheetStore(sheet: ISheet) {
       if (rangeCellCount(selectedRange) > CLIPBOARD_CELL_LIMIT) return null
       const addrs = addressGridForRange(selectedRange, CLIPBOARD_CELL_LIMIT)
       return addrs ? copyAddressGrid(addrs) : null
+    },
+
+    /**
+     * Clipboard-ready TSV for the current selection. Small ranges preserve
+     * the existing synchronous copy semantics; large ranges use a backend
+     * sparse export when available instead of materializing address grids on
+     * the main thread.
+     */
+    copySelectionTextAsync(): Promise<string | null> {
+      return copySelectionText()
     },
 
     /**
