@@ -157,13 +157,12 @@ test.describe('Worker-backed workbook RPC', () => {
 
     expect(result.cancelled).toBe(true)
     expect(result.cancelledCell.display).toBe('')
-    expect(result.stats).toEqual({
+    expect(result.stats).toMatchObject({
       accepted: 2,
       formulas: 1,
       rejectedFormulas: 0,
       cleared: 0,
       errors: 0,
-      issues: [],
     })
     expect(result.beforeReadEvalCount).toBe(0)
     expect(result.beforeReadState).toBe('dirty')
@@ -180,6 +179,20 @@ test.describe('Worker-backed workbook RPC', () => {
     expect(result.rangeRead.map((cell) => cell.display)).toEqual(['42'])
     expect(result.afterRangeReadEvalCount).toBe(1)
     expect(result.afterRangeReadState).toBe('clean')
+
+    await expectNoConsoleErrors(page)
+  })
+
+  test('respects import null final-write order', async ({ page }) => {
+    const result = await runWorkerWorkbookImportNullClearScenario(page)
+
+    expect(result.stats.accepted).toBe(5)
+    expect(result.stats.formulas).toBe(0)
+    expect(result.setThenNull.type).toBe('null')
+    expect(result.setThenNull.display).toBe('')
+    expect(result.nullThenSet.type).toBe('number')
+    expect(result.nullThenSet.display).toBe('12')
+    expect(result.nonEmpty).toEqual([{ sheet: 0, addr: 'B1' }])
 
     await expectNoConsoleErrors(page)
   })
@@ -564,6 +577,57 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         rangeRead,
         afterRangeReadEvalCount,
         afterRangeReadState,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportNullClearScenario(page: Page): Promise<{
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+    issues?: ImportIssue[]
+  }
+  setThenNull: Snapshot
+  nullThenSet: Snapshot
+  nonEmpty: DirtyRef[]
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1'])
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 0, row: 0, col: 0, kind: 'number', value: 11 },
+        { sheet: 0, row: 0, col: 1, kind: 'number', value: 22 },
+      ])
+      await workbook.importChunk(session, [
+        { sheet: 0, row: 0, col: 0, kind: 'null' },
+        { sheet: 0, row: 0, col: 1, kind: 'null' },
+      ])
+      await workbook.importChunk(session, [{ sheet: 0, row: 0, col: 1, kind: 'number', value: 12 }])
+      const stats = await workbook.commitImport(session)
+
+      const [setThenNull, nullThenSet] = await workbook.readCells([
+        { sheet: 0, addr: 'A1' },
+        { sheet: 0, addr: 'B1' },
+      ])
+      const nonEmpty = await workbook.listNonEmpty()
+
+      return {
+        stats,
+        setThenNull,
+        nullThenSet,
+        nonEmpty,
       }
     } finally {
       workbook.dispose()

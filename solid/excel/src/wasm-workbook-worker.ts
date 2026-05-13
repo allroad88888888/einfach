@@ -75,6 +75,14 @@ type RequestMessage = {
 }
 
 type ImportSession = {
+  workbook: WasmWorkbookRuntime
+  normalizedCount: number
+  stats: WorkbookImportStatsWire
+  normalizationIssues: ImportCellIssueWire[]
+  finalTouches: Map<string, ImportCellWire>
+}
+
+type NormalizedImportChunk = {
   cells: ImportCellWire[]
   issues: ImportCellIssueWire[]
 }
@@ -129,6 +137,20 @@ function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
     for (const name of sheets.slice(1)) wb.add_sheet(name)
   }
   workbook = wb
+  return wb
+}
+
+function createWorkbookLike(source: WasmWorkbookRuntime): WasmWorkbookRuntime {
+  const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
+  if (source.sheet_count() > 0) {
+    wb.rename_sheet(0, source.sheet_name(0))
+    for (let idx = 1; idx < source.sheet_count(); idx++) wb.add_sheet(source.sheet_name(idx))
+  }
+
+  const snapshotSparse = assertMethod(source, 'snapshot_sparse')
+  const restoreSparse = assertMethod(wb, 'restore_sparse')
+  const snapshot = snapshotSparse.call(source).map(normalizeSparseCell)
+  if (snapshot.length > 0) restoreSparse.call(wb, snapshot)
   return wb
 }
 
@@ -336,8 +358,8 @@ function normalizeImportCell(cell: unknown): ImportCellWire | ImportCellIssueWir
   return importCellIssue(input, 'INVALID_IMPORT_CELL_VALUE', 'invalid import cell value')
 }
 
-export function normalizeImportCells(cells: unknown[]): ImportSession {
-  const session: ImportSession = { cells: [], issues: [] }
+export function normalizeImportCells(cells: unknown[]): NormalizedImportChunk {
+  const session: NormalizedImportChunk = { cells: [], issues: [] }
   for (const cell of cells) {
     const normalized = normalizeImportCell(cell)
     if ('message' in normalized) session.issues.push(normalized)
@@ -354,6 +376,39 @@ export function mergeImportStatsIssues(
   return mergedIssues.length > 0
     ? { ...stats, errors: stats.errors + issues.length, issues: mergedIssues }
     : stats
+}
+
+function emptyImportStats(): WorkbookImportStatsWire {
+  return {
+    accepted: 0,
+    formulas: 0,
+    rejectedFormulas: 0,
+    cleared: 0,
+    errors: 0,
+  }
+}
+
+export function mergeImportStats(
+  a: WorkbookImportStatsWire,
+  b: WorkbookImportStatsWire,
+): WorkbookImportStatsWire {
+  const issues = [...(a.issues ?? []), ...(b.issues ?? [])]
+  return {
+    accepted: a.accepted + b.accepted,
+    formulas: a.formulas + b.formulas,
+    rejectedFormulas: a.rejectedFormulas + b.rejectedFormulas,
+    cleared: a.cleared + b.cleared,
+    errors: a.errors + b.errors,
+    ...(issues.length > 0 ? { issues } : {}),
+  }
+}
+
+function importCellKey(cell: Pick<ImportCellWire, 'sheet' | 'row' | 'col'>): string {
+  return `${cell.sheet}:${cell.row}:${cell.col}`
+}
+
+function recordFinalTouches(session: ImportSession, cells: ImportCellWire[]) {
+  for (const cell of cells) session.finalTouches.set(importCellKey(cell), cell)
 }
 
 function normalizeSparseRange(range: unknown): SparseRangeWire {
@@ -516,7 +571,13 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_EXISTS',
             })
           }
-          importSessions.set(sessionId, { cells: [], issues: [] })
+          importSessions.set(sessionId, {
+            workbook: createWorkbookLike(wb),
+            normalizedCount: 0,
+            stats: emptyImportStats(),
+            normalizationIssues: [],
+            finalTouches: new Map(),
+          })
           postResponse(msg.id, sessionId)
         }
         break
@@ -533,9 +594,17 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           const chunk = Array.isArray(msg.cells)
             ? normalizeImportCells(msg.cells as ImportCellWire[])
             : { cells: [], issues: [] }
-          session.cells.push(...chunk.cells)
-          session.issues.push(...chunk.issues)
-          postResponse(msg.id, session.cells.length)
+          if (chunk.cells.length > 0) {
+            const stats = assertMethod(session.workbook, 'bulk_import_cells').call(
+              session.workbook,
+              chunk.cells,
+            )
+            session.stats = mergeImportStats(session.stats, stats)
+            recordFinalTouches(session, chunk.cells)
+            session.normalizedCount += chunk.cells.length
+          }
+          session.normalizationIssues.push(...chunk.issues)
+          postResponse(msg.id, session.normalizedCount)
         }
         break
       case 'commitImport':
@@ -548,9 +617,20 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
+          const snapshotSparse = assertMethod(session.workbook, 'snapshot_sparse')
+          const restoreSparse = assertMethod(wb, 'restore_sparse')
+          const snapshot = snapshotSparse.call(session.workbook).map(normalizeSparseCell)
+          restoreSparse.call(wb, snapshot)
+
+          const finalClears = [...session.finalTouches.values()].filter(
+            (cell) => cell.kind === 'null' && cell.sheet < session.workbook.sheet_count(),
+          )
+          if (finalClears.length > 0) {
+            assertMethod(wb, 'bulk_import_cells').call(wb, finalClears)
+          }
+
           importSessions.delete(sessionId)
-          const stats = assertMethod(wb, 'bulk_import_cells').call(wb, session.cells)
-          postResponse(msg.id, mergeImportStatsIssues(stats, session.issues))
+          postResponse(msg.id, mergeImportStatsIssues(session.stats, session.normalizationIssues))
         }
         break
       case 'cancelImport':
