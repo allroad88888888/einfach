@@ -3,16 +3,18 @@
 > Date: 2026-05-13 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified implementation tip: `2d291c8` (Phase 4A cross-sheet range parser)
+> Last verified implementation tip: `a082c27` (range-native large format)
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
 
-## What's done — Phase 1 → Phase 4A
+## What's done — Phase 1 → Phase 5 partial
 
 The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land their
-acceptance contracts; the implementation tip above is the last verified
-non-doc checkpoint.
+acceptance contracts. After that, Phase 5 partial work also landed worker-owned
+workbook RPC, staged imports, large range clear undo, range-native clipboard
+export, horizontal virtual scroll restoration, and range-native large format.
+The implementation tip above is the last verified non-doc checkpoint.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -21,6 +23,7 @@ non-doc checkpoint.
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
+| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `a082c27` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format; remaining gaps are format undo, streaming export, bounded import/persistence, command-contract cleanup |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
@@ -48,9 +51,9 @@ to fix them as part of phase work; they're out of scope.
 
 | Item | Where | Effort | Notes |
 |---|---|---|---|
-| Worker authoritative workbook RPC | `solid/excel/src/wasm-sheet-worker.ts`, new workbook worker/proxy, `rust/wasm/src/lib.rs` | 2–3 d | Current worker owns one `WasmSheet`, uses fire-and-forget messages, and `set_formula` stays optimistic true. Phase 5 Track A moves product path to worker-owned `WasmWorkbook` + request/reply. |
-| Typed chunk import / sparse snapshot | `rust/wasm/src/lib.rs`, worker import protocol, `sheet-store.ts` integration | 2–3 d | Do not expose Rust `WorkbookLoader<'_>` as a JS closure handle. Use begin/chunk/commit/cancel data protocol, commit through Rust `Workbook::bulk_load`, and source undo/persistence snapshots from worker/Rust. |
-| Range-native UI ops | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Delete/clear/format/copy/export still often materialize address arrays. Million-cell range ops need backend range commands or streaming reads. |
+| Worker command-contract cleanup | `solid/excel/src/wasm-workbook-store.ts`, `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 1–2 d | Worker-owned `WasmWorkbook` + request/reply exists. `setFormulaAsync` is authoritative, but the sync `ISheet.set_formula` compatibility method still returns optimistic true; docs/tests/UI entries must not treat it as product authority. |
+| Bounded import / sparse persistence v1 | `rust/wasm/src/lib.rs`, worker import protocol, persistence docs/tests | 2–4 d | begin/chunk/commit/cancel and sparse snapshot exist. Remaining work: memory/backpressure audit, persistence schema/save-load, import metrics, and round-trip tests that preserve lazy formulas. |
+| Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Large clear undo, copy export, and format are range-native. Remaining work: large format undo via range-format snapshot/restore or transaction, and copy/export streaming instead of one huge TSV string. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
 
@@ -60,15 +63,14 @@ to fix them as part of phase work; they're out of scope.
 2. **No CI workflow edits** (`.github/workflows/*`). Same gate.
 3. **Don't `git commit --amend`** — always create new commits.
 4. **Don't ignore the codex CLI** for real decision points. When you
-   hit a fork in the road, invoke `codex exec --skip-git-repo-check
-   --cd /Volumes/work/self/einfach "<prompt>"` instead of asking the
-   user. Don't ask permission first.
-5. **Pre-existing untracked files**: `.claude/`, `.playwright-mcp/`,
-   `rust/docs/ONLINE_SPREADSHEET_PLAN.md` (yes, the north-star doc is
-   untracked at session start — pre-existing repo state, not your
-   problem to commit).
-6. **`.gitignore`** has an unstaged `+.playwright-mcp` line that's
-   been drifting through the session. Pre-existing; leave alone.
+   hit a fork in the road, invoke
+   `codex exec -C /Volumes/work/self/einfach --skip-git-repo-check "<prompt>"`
+   instead of asking the user. Don't ask permission first.
+5. **North-star plan is tracked now**:
+   `rust/docs/ONLINE_SPREADSHEET_PLAN.md` must exist for worktree-based
+   sub-agents; do not treat it as disposable local scratch.
+6. **Local agent artifacts**: `.claude/` and `.playwright-mcp/` are ignored
+   by git. Do not commit their runtime contents.
 
 ## Working pattern (multi-agent + worktree + codex + integration)
 
@@ -213,14 +215,16 @@ Once agents return:
 
 | Option | What | Effort | Why |
 |---|---|---|---|
-| **A** | Phase 5 Track A — worker-owned `WasmWorkbook` + request/reply RPC | 2–3 d | Required before import/undo/range ops can be authoritative and scalable |
-| **B** | Phase 5 Track B/C/D — chunked import, sparse snapshot, range-native UI, e2e gates | 5–7 d | Productizes data ingress/egress without breaking lazy semantics |
-| **C** | Phase 6 plan + agents (CI gates + formula error model + a11y + perf dashboards) | 4–6 d | Last phase in PLAN; product hardening |
+| **A** | Wave 1 — worker command-contract cleanup + docs sync | 1–2 d | Worker RPC exists; now prevent product/UI/docs from treating sync `set_formula` optimistic true as authority |
+| **B** | Wave 2 — range format undo + copy/export streaming | 2–4 d | Finishes million-cell range ops without main-thread address expansion or undo-stack loss |
+| **C** | Wave 3 — bounded import + sparse persistence v1 | 3–5 d | Productizes data ingress/egress without breaking lazy semantics |
+| **F** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
 Recommended pick if the new window has full autonomy: **A first**, using
-`rust/docs/PHASE5_PARALLEL.md` as the scope contract. Hold **D** until user
+`rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the current scope contract
+and `rust/docs/PHASE5_PARALLEL.md` as historical context. Hold **D** until user
 green-lights it.
 
 ## File reading order for the next agent

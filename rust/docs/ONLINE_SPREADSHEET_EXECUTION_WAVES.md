@@ -9,8 +9,8 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `157c9b5 perf(solid-excel): stream million demo seed chunks` 为准，
-项目已经不是旧 `PHASE5_PARALLEL.md` 里的起点状态。
+以最近提交 `a082c27 feat(solid-excel): range-native large format` 为准，
+项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 已落地的主能力：
 
@@ -20,36 +20,63 @@
 - workbook 级跨 sheet point/range dirty graph、range dependency index、sparse value index、
   bounded cross-sheet range parser 已落地。
 - `WasmWorkbook` 已有 canonical workbook mutator、`bulk_import_cells`、
-  `list_non_empty_cells`、`snapshot_sparse`、`read_sparse_range`、`clear_range`、
+  `list_non_empty_cells`、`snapshot_sparse`、`snapshot_range_sparse`、
+  `restore_sparse`、`read_sparse_range`、`clear_range`、`set_format_range`、
   debug formula eval/cache 探针。
 - `solid/excel` 已有 worker-owned workbook RPC、request id、统一 ok/error envelope、
-  begin/importChunk/commit/cancel import session、sparse snapshot、range clear。
+  begin/importChunk/commit/cancel import session、sparse snapshot、range clear、range format。
 - `DemoMillion` 已走 worker-backed workbook + 2D virtualized table；seed 生成已经按 chunk
   flush，不再在主线程一次性构造完整 seed 数组。
-- 大 selection copy / large clear 已有主线程保护：超阈值时拒绝或走 backend range command，
-  不再盲目展开百万地址。
+- 大 selection clear / copy / format 已有 range-native 或 backend-assisted 路径：
+  large clear 通过 sparse snapshot/restore 支持可 undo；copy 走 backend TSV export；
+  format 走 `set_format_range`，不再盲目展开百万地址。
+- worker-backed store 的产品写公式路径已有 `setFormulaAsync`，可以把 worker/Rust 的
+  parse/cycle 结果回传到 store；同步 `set_formula` 兼容接口仍是 optimistic `true`。
+- worker-backed `formulaCacheState` 已能异步从 worker 探测真实 cache 状态；首次读取前可
+  返回 `unknown`，随后更新。
 
 仍未达到产品目标的地方：
 
-- worker adapter 的 `set_formula` 仍在 `ISheet` 同步接口下返回 optimistic `true`；
-  worker 失败只能事后 hydrate，不能成为用户命令的权威结果。
-- 大 range clear 已 range-native，但 undo 语义是清空 undo/redo 栈；还没有后端 sparse
-  range snapshot + restore/coarse transaction。
-- format/copy/export 仍主要是小范围主线程路径；大范围是拒绝，不是产品化 streaming。
-- worker import session 仍把 chunk 累积在 worker 内存，commit 时一次性进 Rust；
-  还不是严格 bounded streaming/backpressure 模型。
-- `formulaCacheState` 在 worker workbook store 仍返回 `'unknown'`，诊断能力没有接到
-  产品 path。
+- 同步 `ISheet.set_formula` 仍然只能返回 optimistic `true`。产品路径要继续收敛到
+  `setFormulaAsync` / async command facade，文档和 UI 入口不能再把同步兼容层当权威结果。
+- 大 range format 已 range-native，但没有 format-range snapshot/restore 合同；当前会清空
+  undo/redo 栈，不能回滚。
+- copy/export 已避免主线程地址展开，但仍是一次性生成整段 TSV 字符串；还不是 chunked
+  streaming/backpressure 模型。
+- worker import session 已按 chunk 写入 worker 内 staging workbook，但仍需要 bounded memory、
+  backpressure、cancel/commit 可观测指标和持久化合同复核。
 - 稀疏持久化、导出、自动保存尚未形成 v1 合同。
 - 测试覆盖已经很多，但 E2E 文档计数滞后；MCP Playwright/Chrome DevTools 还没有成为
   每波固定验收记录。
 
 ## 总体判断
 
-还剩 **5 波实现 + 1 个发布门禁波**。
+还剩 **4 个产品化实现波 + 1 个发布门禁波**。
 
-前 5 波都可以多 agent 并行推进，但每波必须先冻结接口、分清文件所有权，最后由总架构师
+原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
+formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
+已经落地的 worker skeleton。
+
+后续波次都可以多 agent 并行推进，但每波必须先冻结接口、分清文件所有权，最后由总架构师
 集成验收。子 agent 的“已完成”只表示候选补丁完成，不表示可合入主线。
+
+## 本轮 agent 调度记录
+
+本轮必须显式记录外部/内部 agent，而不是只在口头说“多 agent”：
+
+- Claude Sonnet 已用外部 CLI 只读审查：
+  `claude -p --model sonnet --permission-mode plan --max-budget-usd 1 ...`。
+  结论：旧计划里“只有行虚拟化、range dep 未修、copy/format 仍全量展开”等判断已过期；
+  真实剩余风险集中在 range format undo、copy/export streaming、import/persistence 和
+  MCP 门禁产品化。
+- Codex Spark 已尝试外部 CLI：
+  `codex exec -m gpt-5.3-codex-spark -C /Volumes/work/self/einfach --sandbox read-only ...`。
+  结果：当前账号触发使用限额，提示 `try again at 4:42 PM`。后续同一波如果 Spark 不可用，
+  必须记录失败并降级到便宜模型。
+- 已降级执行 `codex exec -m gpt-5.4-mini ...` 做只读审查；内部子 agent 也使用
+  `gpt-5.4-mini` 复核当前 P0/P1 和下一波拆分。
+- 总架构师仍是唯一集成和验收角色。Claude/Sonnet、Codex Spark、便宜 Codex 子 agent 的
+  输出只能作为候选实现或审查意见，不能替代最终验收。
 
 ## 总控规则
 
@@ -90,27 +117,29 @@
 - 更新本计划的状态或新增 handoff；
 - 只在用户要求时 commit / push。
 
-## 波次 1：权威 worker 命令合同
+## 波次 1：权威 worker 命令收口
 
 ### 目标
 
-把 worker-backed workbook store 从“乐观投影”推进到“用户命令有权威结果”。
+把已落地的 worker-backed workbook store 从“主要路径可权威”收口到“产品入口不再误用同步
+乐观接口”。
 
 必须解决：
 
-- `set_formula` 不能继续同步返回永久 `true`。
-- parse fail、same-sheet cycle、cross-sheet cycle、invalid sheet 必须能回到 UI/store 命令层。
-- worker hydration 不能用旧响应覆盖新 mutation。
-- `formulaCacheState` 要能在 worker store 读到真实 worker/Rust 状态，至少用于 debug/demo/e2e。
+- UI 和 store 的写公式入口必须优先使用 `setFormulaAsync` 或 async command facade。
+- 同步 `ISheet.set_formula` 必须明确是 legacy compatibility，不能被文档或产品路径当作权威成功。
+- parse fail、same-sheet cycle、cross-sheet cycle、invalid sheet 必须有测试证明能回到 UI/store 命令层。
+- worker hydration 不能用旧响应覆盖新 mutation；现有 version guard 要补足回归测试和文档说明。
+- `formulaCacheState` 的 async probe 状态要写入 E2E 文档，避免后续 agent 继续把它当“永远 unknown”。
 
 ### 并行角色
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| A1 Worker 协议 | Claude Sonnet | `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 收紧 ok/error/code 语义；补 mutation version/seq 风险点 |
-| A2 Store 合同 | Codex Spark | `solid/excel/src/wasm-workbook-store.ts`, 必要时 `solid/excel/src/types.ts` | 设计 fallible mutation 接口；保留兼容层但不让产品 path 误判成功 |
-| A3 测试 | Codex Spark | `solid/excel/test/*`, `solid/excel/e2e/worker-workbook.spec.ts` | 先写非法公式/循环/乱序 hydrate 红测，再配合实现转绿 |
-| A4 文档 | Codex Spark | `rust/docs/HANDOFF.md`, `solid/excel/docs/E2E_TEST_PLAN.md` | 同步 worker authority 当前状态 |
+| A1 Worker 协议复核 | Claude Sonnet | `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 只读/小补丁：确认 ok/error/code、request version、hydrate 乱序没有漏测 |
+| A2 Store 合同收口 | Codex Spark | `solid/excel/src/wasm-workbook-store.ts`, 必要时 `solid/excel/src/types.ts` | 清点仍调用同步 `set_formula` 的产品入口；能改则改到 async command facade |
+| A3 测试 | Codex Spark | `solid/excel/test/*`, `solid/excel/e2e/worker-workbook.spec.ts` | 钉非法公式、循环、乱序 hydrate、cache probe 的回归测试 |
+| A4 文档 | Codex Spark 或便宜 Codex | `rust/docs/HANDOFF.md`, `solid/excel/docs/E2E_TEST_PLAN.md`, 本文档 | 同步 worker authority 当前状态和 agent 调度记录 |
 
 ### 验收门禁
 
@@ -130,33 +159,33 @@ MCP 验收：
 
 ### 停止条件
 
-- 如果 `ISheet` 同步接口无法表达 fallible async mutation，不继续硬塞；新增 async command
-  facade 或 product-only workbook command 层。
+- 如果 `ISheet` 同步接口无法表达 fallible async mutation，不继续硬塞；使用 async command
+  facade 或 product-only workbook command 层，并把同步接口标注为兼容层。
 - 如果 rollback 会导致可见 cell 闪烁或旧 hydrate 覆盖新 mutation，先设计 version/seq。
 
 ## 波次 2：Range-native undo / format / copy / export
 
 ### 目标
 
-把“大矩形操作”从“拒绝或不可 undo”推进到“后端稀疏/范围命令可产品化”。
+把“大矩形操作”从“多数已经 range-native”推进到“undo、streaming、持久化合同可产品化”。
 
 必须解决：
 
-- 大 range clear 需要可预测 undo 语义：后端 sparse range snapshot + restore，或明确的
-  coarse transaction。
-- format selection 需要 backend range metadata 或 chunked backend command；不能为了格式化
-  百万格在主线程构造地址。
-- copy/export 要走 worker streaming/chunked read；小范围仍可用现有 clipboard path。
+- 大 range clear 的 backend sparse snapshot/restore 路径已经存在；本波补文档、MCP 验收和
+  fallback 降级说明。
+- format selection 已走 backend range metadata；本波补 format-range snapshot/restore 或明确
+  transaction，使 large format 可 undo，不能继续清空 undo 栈。
+- copy/export 已走 backend TSV export；本波把一次性整段字符串收口为 streaming/chunked read。
 - undo snapshot 来源必须是 Rust/worker sparse iterator，不是主线程 projection cache。
 
 ### 并行角色
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| B1 Rust/WASM snapshot | Claude Sonnet | `rust/excel-core/src/workbook.rs`, `rust/wasm/src/lib.rs` | 补 range no-eval sparse snapshot、restore sparse、必要的 range format API |
-| B2 Worker protocol | Codex Spark | `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 暴露 snapshotRangeSparse/restoreSparse/exportRange chunks |
-| B3 SheetStore range UX | Codex Spark | `solid/excel/src/sheet-store.ts`, `solid/excel/src/Table.tsx` | 接入大 range undo/format/copy/export；维持小范围路径 |
-| B4 E2E/Perf | Codex Spark | `solid/excel/e2e/range-ops.spec.ts`, `solid/excel/e2e/million-demo.spec.ts` | 钉住不展开百万地址、不清空旧 undo 栈、导出只读可控范围 |
+| B1 Rust/WASM range format undo | Claude Sonnet | `rust/excel-core/src/sheet.rs`, `rust/wasm/src/lib.rs` | 设计 range format layer snapshot/restore 或 compaction transaction，不触发公式 eval |
+| B2 Worker streaming export | Codex Spark | `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 从 `exportRangeTsv` 一次性字符串推进到 chunked export |
+| B3 SheetStore range UX | Codex Spark | `solid/excel/src/sheet-store.ts`, `solid/excel/src/Table.tsx` | large format undo、copy/export streaming 接入；维持小范围路径 |
+| B4 E2E/Perf | Codex Spark | `solid/excel/e2e/range-ops.spec.ts`, `solid/excel/e2e/million-demo.spec.ts` | 钉住不展开百万地址、不清空旧 undo 栈、导出按 chunk 读 |
 
 ### 验收门禁
 
@@ -178,7 +207,7 @@ MCP 验收：
 
 - 大 range 操作需要主线程生成 O(range cell count) 地址字符串。
 - undo 需要从 `raw.non_empty_addrs()` 或 projection cache 取事实源。
-- snapshotRange 读取公式结果导致 eval counter 增长。
+- snapshotRange 或 format undo 读取公式结果导致 eval counter 增长。
 
 ## 波次 3：真正 bounded 的导入与稀疏持久化 v1
 
@@ -352,11 +381,11 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-下一步先执行 **波次 1：权威 worker 命令合同**。
+下一步先执行 **波次 1：权威 worker 命令收口**。
 
 原因：
 
 - 它是后续 range undo、导入错误、持久化恢复、UI 回滚的共同前置。
-- 当前代码已有 worker RPC skeleton，修合同的收益最大、冲突面可控。
-- 如果不先解决 `set_formula` optimistic true，后续所有产品命令都会继续绕过真实错误语义。
-
+- 当前代码已有 worker RPC、async formula 和 cache probe，收口合同的收益最大、冲突面可控。
+- 如果不先把产品入口从同步 `set_formula` 迁到 async command，后续 agent 仍会误把兼容层
+  optimistic `true` 当成真实成功。
