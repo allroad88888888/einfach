@@ -113,6 +113,26 @@ export interface WorkbookPersistenceRestoreStatsWire {
   sheets: number
 }
 
+export interface WorkerWorkbookSheetDebugCountersWire {
+  idx: number
+  name: string
+  formulaCount: number
+  formulaEvalCount: number
+  liveSubscriptionCount: number
+}
+
+export interface WorkerWorkbookDebugCountersWire {
+  sheetCount: number
+  crossSheetDependents: number
+  formulaCount: number
+  formulaEvalCountTotal: number
+  liveSubscriptionCount: number
+  workerSubscriptionCount: number
+  importSessionCount: number
+  exportSessionCount: number
+  sheets: WorkerWorkbookSheetDebugCountersWire[]
+}
+
 export type RpcResponseWire =
   | { id: number; ok: true; result?: unknown }
   | { id: number; ok: false; error: RpcErrorWire }
@@ -171,6 +191,7 @@ export interface WorkerWorkbookClient {
   readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
   debugFormulaEvalCount(sheet: number): Promise<number>
+  debugCounters(): Promise<WorkerWorkbookDebugCountersWire>
   subscribeCells(cells: CellRefWire[], callback: (cells: CellRefWire[]) => void): Promise<number>
   unsubscribeCells(subId: number): Promise<boolean>
   onCellsDirty(callback: (cells: CellRefWire[]) => void): () => void
@@ -416,6 +437,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     debugFormulaEvalCount(sheet) {
       return request<number>('debugFormulaEvalCount', { sheet })
+    },
+    debugCounters() {
+      return request<WorkerWorkbookDebugCountersWire>('debugCounters')
     },
     async subscribeCells(cells, callback) {
       const subId = nextSubId++

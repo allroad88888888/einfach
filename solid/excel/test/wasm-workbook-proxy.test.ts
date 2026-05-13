@@ -253,13 +253,54 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ok(fake, 0)
     await expect(evalCount).resolves.toBe(0)
 
+    const counters = workbook.debugCounters()
+    expect(lastSent(fake)).toEqual({ id: 6, cmd: 'debugCounters' })
+    ok(fake, {
+      sheetCount: 1,
+      crossSheetDependents: 0,
+      formulaCount: 1,
+      formulaEvalCountTotal: 0,
+      liveSubscriptionCount: 0,
+      workerSubscriptionCount: 0,
+      importSessionCount: 0,
+      exportSessionCount: 0,
+      sheets: [
+        {
+          idx: 0,
+          name: 'Sheet1',
+          formulaCount: 1,
+          formulaEvalCount: 0,
+          liveSubscriptionCount: 0,
+        },
+      ],
+    })
+    await expect(counters).resolves.toEqual({
+      sheetCount: 1,
+      crossSheetDependents: 0,
+      formulaCount: 1,
+      formulaEvalCountTotal: 0,
+      liveSubscriptionCount: 0,
+      workerSubscriptionCount: 0,
+      importSessionCount: 0,
+      exportSessionCount: 0,
+      sheets: [
+        {
+          idx: 0,
+          name: 'Sheet1',
+          formulaCount: 1,
+          formulaEvalCount: 0,
+          liveSubscriptionCount: 0,
+        },
+      ],
+    })
+
     const list = workbook.listNonEmpty()
-    expect(lastSent(fake)).toEqual({ id: 6, cmd: 'listNonEmpty' })
+    expect(lastSent(fake)).toEqual({ id: 7, cmd: 'listNonEmpty' })
     ok(fake, [{ sheet: 0, addr: 'A1' }])
     await expect(list).resolves.toEqual([{ sheet: 0, addr: 'A1' }])
 
     const sparse = workbook.snapshotSparse()
-    expect(lastSent(fake)).toEqual({ id: 7, cmd: 'snapshotSparse' })
+    expect(lastSent(fake)).toEqual({ id: 8, cmd: 'snapshotSparse' })
     ok(fake, [{ sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' }])
     await expect(sparse).resolves.toEqual([
       { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
@@ -273,7 +314,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       endCol: 0,
     })
     expect(lastSent(fake)).toEqual({
-      id: 8,
+      id: 9,
       cmd: 'readSparseRange',
       range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
     })
@@ -288,7 +329,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       endCol: 999_999,
     })
     expect(lastSent(fake)).toEqual({
-      id: 9,
+      id: 10,
       cmd: 'clearRange',
       range: { sheet: 1, startRow: 0, startCol: 0, endRow: 999_999, endCol: 999_999 },
     })
@@ -306,7 +347,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       { bold: true },
     )
     expect(lastSent(fake)).toEqual({
-      id: 10,
+      id: 11,
       cmd: 'setFormatRange',
       range: { sheet: 1, startRow: 0, startCol: 0, endRow: 999_999, endCol: 999_999 },
       fmt: { bold: true },
@@ -315,7 +356,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(format).resolves.toBe(1)
 
     const cancel = workbook.cancelImport(99)
-    expect(lastSent(fake)).toEqual({ id: 11, cmd: 'cancelImport', sessionId: 99 })
+    expect(lastSent(fake)).toEqual({ id: 12, cmd: 'cancelImport', sessionId: 99 })
     ok(fake, false)
     await expect(cancel).resolves.toBe(false)
   })

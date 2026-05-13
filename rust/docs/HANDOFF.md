@@ -3,8 +3,8 @@
 > Date: 2026-05-13 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified committed tip: `9bf19ed` (Wave 3 plan doc)
-> Current verified worktree: Wave 3 bounded import + sparse persistence v1
+> Last verified committed tip: `6462024` (Wave 3 import/persistence commit), `e73fb9d` (Wave 4 plan commit)
+> Current verified worktree: Wave 4 docs gate in progress; Wave 3 implementation committed
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
@@ -15,12 +15,10 @@ The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land the
 acceptance contracts. After that, Phase 5 partial work also landed worker-owned
 workbook RPC, staged imports, large range clear undo, range-native clipboard
 export, horizontal virtual scroll restoration, range-native large format, and
-large range format undo. Wave 2 chunked TSV export has been committed. Current
-Wave 3 worktree adds bounded worker import sessions and sparse persistence v1
-(Rust/WASM + worker/proxy + tests + MCP verification).
-The implementation tip above is stale; the latest committed checkpoint is
-`9bf19ed docs(rust): plan Wave 3 import persistence`, with current worktree
-holding the Wave 3 implementation.
+large range format undo. Wave 2 chunked TSV export has been committed. Wave 3
+bounded import + sparse persistence v1 implementation is in committed worktree
+(Rust/WASM + worker/proxy + tests + MCP verification). Wave 4 plan commit
+`e73fb9d` is in docs state.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -29,7 +27,7 @@ holding the Wave 3 implementation.
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
-| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `9bf19ed` + current worktree | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; current worktree adds bounded import + sparse persistence v1. Remaining gaps are file-stream import/backpressure UI, perf/observability, and release gates |
+| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `6462024` + current worktree | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; current worktree adds bounded import + sparse persistence v1. Remaining gaps are file-stream import/backpressure UI, perf/observability, and release gates |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
@@ -227,7 +225,7 @@ Once agents return:
 | Option | What | Effort | Why |
 |---|---|---|---|
 | **A** | Commit current Wave 3 bounded import + persistence worktree | <1 d | Locks the Rust/worker/proxy/e2e/MCP verified API contract |
-| **B** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
+| **B** | Wave 4 — perf/observability/MCP gates | 2–4 d（进行中） | `e73fb9d` 已提交计划；文档同步与门禁执行持续推进 |
 | **C** | Product file import/backpressure UI | 2–4 d | Builds on bounded import sessions without changing core lazy semantics |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
@@ -237,6 +235,7 @@ Recommended pick if the new window has full autonomy after the current commit:
 `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the tracker and
 `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md` as the just-finished contract.
 Hold **D** until user green-lights it.
+Push/CI remains explicitly forbidden until the overall arc lands.
 
 ## File reading order for the next agent
 

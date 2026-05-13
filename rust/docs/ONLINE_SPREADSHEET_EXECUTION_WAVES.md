@@ -9,9 +9,15 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `9bf19ed docs(rust): plan Wave 3 import persistence` 加当前 Wave 3
-工作树为准，
+以最近提交 `6462024 (Wave 3 import persistence)` 加当前 Wave 3
+工作树为准；Wave 4 计划提交 `e73fb9d` 已写入并开始执行门禁同步。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
+
+本轮状态更新：
+
+- Wave 3 已提交到 `6462024`（bounded import + sparse persistence v1）。
+- Wave 4 当前进行中（`e73fb9d` 计划提交后，主攻 docs/MCP/Gate 追踪和门禁对齐）。
+- Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
 
@@ -237,7 +243,7 @@ MCP 验收：
 
 ## 波次 3：真正 bounded 的导入与稀疏持久化 v1
 
-状态：实现完成，等待本轮最终提交。执行计划和验收记录已落地到
+状态：已提交（`6462024`），执行计划和验收记录已落地到
 `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md`。本波按多 agent pipeline 执行：
 Codex Spark 负责 worker/proxy persistence 与 E2E，Claude Sonnet 负责只读风险审查，总架构师
 负责 Rust 原子性修正、WASM 重新生成、本地测试与 MCP Playwright 最终验收。
@@ -308,6 +314,13 @@ MCP 验收：
 - persistence round-trip 预热公式 cache。
 
 ## 波次 4：性能、观测和 MCP 门禁产品化
+
+状态：**进行中**。计划提交 `e73fb9d` 已完成写入，当前执行点为：
+
+- Rust/WASM 与 worker/proxy debug counters 已接入；
+- 新增 `observability.spec.ts`，覆盖 1M DOM viewport bound 与 worker lazy eval counters；
+- MCP 可复现门禁记录已补充到 Wave 4 文档；
+- E2E 计数已与真实 `playwright test --list` 对齐：21 spec / 150 tests / 0 skip。
 
 ### 目标
 
@@ -433,7 +446,7 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-下一步进入 **波次 4：性能、观测和 MCP 门禁产品化**。
+当前波次：**波次 4：性能、观测和 MCP 门禁产品化**（执行中）。
 
 原因：
 

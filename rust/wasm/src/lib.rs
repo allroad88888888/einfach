@@ -1155,6 +1155,55 @@ impl WasmWorkbook {
             .to_string()
     }
 
+    /// Total formula evaluations performed across all workbook sheets since
+    /// creation. Uses each sheet's `debug_formula_eval_count` without
+    /// evaluating any formulas.
+    pub fn debug_formula_eval_count_total(&self) -> u32 {
+        let mut total = 0usize;
+        for idx in 0..self.workbook.sheet_count() {
+            total += self.workbook.debug_formula_eval_count(idx);
+        }
+        total as u32
+    }
+
+    /// Total formula records currently registered across all workbook sheets.
+    /// This is a read-only aggregate, not a cell visit across sparse content.
+    pub fn debug_formula_count(&self) -> u32 {
+        (0..self.workbook.sheet_count())
+            .map(|idx| {
+                self.workbook
+                    .sheet(idx)
+                    .map(|sheet| sheet.debug_formula_count())
+                    .unwrap_or(0)
+            })
+            .sum::<usize>() as u32
+    }
+
+    /// Total number of live workbook subscription tokens currently held
+    /// in the workbook bookkeeping map.
+    pub fn debug_live_subscription_count(&self) -> u32 {
+        self.subscriptions.len() as u32
+    }
+
+    /// Number of live `Sheet` listeners for a specific sheet. This
+    /// includes only currently subscribed addresses and maps to the same
+    /// contract as `Sheet::debug_live_subscription_count`.
+    pub fn debug_sheet_live_subscription_count(&self, sheet_idx: u32) -> u32 {
+        self.workbook
+            .sheet(sheet_idx as usize)
+            .map(|sheet| sheet.debug_live_subscription_count())
+            .unwrap_or(0) as u32
+    }
+
+    /// Number of formula records currently registered on one workbook sheet.
+    /// Returns `0` for missing sheet indexes.
+    pub fn debug_sheet_formula_count(&self, sheet_idx: u32) -> u32 {
+        self.workbook
+            .sheet(sheet_idx as usize)
+            .map(|sheet| sheet.debug_formula_count())
+            .unwrap_or(0) as u32
+    }
+
     /// Total formula evaluations performed on one workbook sheet since
     /// creation. Used by worker-backed lazy import/read tests.
     pub fn debug_formula_eval_count(&self, sheet_idx: u32) -> u32 {
@@ -2403,5 +2452,73 @@ mod tests {
         assert_eq!(stats.sheets, 1);
         assert_eq!(wb.next_token, 0);
         assert!(wb.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn wasm_workbook_debug_live_subscription_counters() {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Sheet2");
+        let sub_a = wb
+            .workbook
+            .sheet_mut(0)
+            .unwrap()
+            .subscribe_cell("A1", || {});
+        wb.subscriptions.insert(
+            101,
+            WorkbookCellSubscription {
+                sheet_idx: 0,
+                addr: CellAddress::parse("A1").unwrap(),
+                sub: sub_a,
+            },
+        );
+
+        let sub_b = wb
+            .workbook
+            .sheet_mut(1)
+            .unwrap()
+            .subscribe_cell("B2", || {});
+        wb.subscriptions.insert(
+            202,
+            WorkbookCellSubscription {
+                sheet_idx: 1,
+                addr: CellAddress::parse("B2").unwrap(),
+                sub: sub_b,
+            },
+        );
+
+        assert_eq!(wb.debug_live_subscription_count(), 2);
+        assert_eq!(wb.debug_sheet_live_subscription_count(0), 1);
+        assert_eq!(wb.debug_sheet_live_subscription_count(1), 1);
+        assert_eq!(wb.debug_sheet_live_subscription_count(5), 0);
+
+        wb.unsubscribe_cell(101);
+        assert_eq!(wb.debug_live_subscription_count(), 1);
+        assert_eq!(wb.debug_sheet_live_subscription_count(0), 0);
+        assert_eq!(wb.debug_sheet_live_subscription_count(1), 1);
+    }
+
+    #[test]
+    fn wasm_workbook_debug_formula_counters() {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Sheet2");
+
+        assert_eq!(wb.debug_formula_count(), 0);
+        assert_eq!(wb.debug_sheet_formula_count(0), 0);
+        assert_eq!(wb.debug_sheet_formula_count(1), 0);
+        assert_eq!(wb.debug_formula_eval_count_total(), 0);
+        assert_eq!(wb.debug_formula_eval_count(0), 0);
+
+        assert!(wb.set_formula(0, "A1", "=1"));
+        assert!(wb.set_formula(1, "B1", "=10"));
+        assert_eq!(wb.debug_sheet_formula_count(0), 1);
+        assert_eq!(wb.debug_sheet_formula_count(1), 1);
+        assert_eq!(wb.debug_formula_count(), 2);
+        assert_eq!(wb.debug_formula_eval_count_total(), 0);
+
+        assert_eq!(wb.get_number(0, "A1"), 1.0);
+        assert_eq!(wb.get_number(1, "B1"), 10.0);
+        assert_eq!(wb.debug_formula_eval_count(0), 1);
+        assert_eq!(wb.debug_formula_eval_count(1), 1);
+        assert_eq!(wb.debug_formula_eval_count_total(), 2);
     }
 }

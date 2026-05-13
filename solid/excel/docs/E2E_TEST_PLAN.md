@@ -4,9 +4,9 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
-## Current Status (2026-05-11, post-batch 2)
+## Current Status (2026-05-13, post-Wave 4 门禁对齐)
 
-**20 spec files / 146 active `test()` / 0 skipped** locally green. Status of each
+**21 spec files / 150 active `test()` / 0 skipped** locally green. Status of each
 plan section:
 
 | Section | Status | Spec / Notes |
@@ -28,9 +28,22 @@ plan section:
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 20 spec files. 146 active `test()`
+Counts: 21 spec files. 150 active `test()`
 + 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
 checkout green (proxy caveat per Discovered #D).
+
+Wave 2 / 3 新增覆盖已纳入本计划（本轮核对）：
+
+- **chunked export**：`worker-workbook.spec.ts` 与 `million-demo.spec.ts` 均覆盖
+  `copySelectionTextAsync()` 的 `export_range_tsv_chunks` 路径；
+- **bounded import**：`worker-workbook.spec.ts` 覆盖 import chunk 上限、cancel 与
+  `IMPORT_CHUNK_TOO_LARGE`；
+- **persistence lazy restore**：`worker-workbook.spec.ts` 覆盖
+  `snapshotPersistenceV1()` / `restorePersistenceV1()` 后不预热公式，未读时 `eval` 保持 0；
+- **observability guardrails**：`observability.spec.ts` 覆盖 1M demo DOM viewport 数量和
+  worker `debugCounters()` 的未读公式 eval 计数；
+- **MCP gate**：Wave 2/3 MCP 记录已落地（导入/取消、range copy、持久化还原）并作为
+  本波门禁对齐内容；Wave 4 MCP 记录已补充 DOM/subscription/eval counters。
 
 ## Discovered During Implementation
 
@@ -77,7 +90,8 @@ unchanged.
   scenarios green locally (`F8 7 → G8 14 → H8 28 → I8 84`,
   `A3 10 → C3 100 / D3 300 / E3 -200 / F3 220`).
 - Full e2e suite at landing time of the fix: 75 passed + 2 skipped. After
-  subsequent batches: 98 passed + 0 skipped (current).
+  subsequent batches: 98 passed + 0 skipped（历史快照）。当前统计见文档头部和下文
+  Done Criteria。
 
 **Caveat — resolved**: the WASM-side microtask defer is now pinned by
 `rust/wasm/tests/web.rs` (5 `#[wasm_bindgen_test]`, see TODO 2.3 ✅).
@@ -141,7 +155,7 @@ suite fails confusingly.
 
 ## Current Coverage
 
-20 spec files, 146 active `test()` blocks + 0 `.skip`. Landed across two
+21 spec files, 150 active `test()` blocks + 0 `.skip`. Landed across two
 agent batches plus follow-up cleanup work.
 
 | Spec file | Tests | Backend |
@@ -162,7 +176,8 @@ agent batches plus follow-up cleanup work.
 | `render-counter.spec.ts` | 6 | JS mock + `?debug=1` |
 | `regression.spec.ts` | 6 | mixed |
 | `worker.spec.ts` | 4 | worker-backed sheet |
-| `worker-workbook.spec.ts` | 16 | worker workbook RPC |
+| `worker-workbook.spec.ts` | 18 | worker workbook RPC |
+| `observability.spec.ts` | 2 | mixed |
 | `demo-budget.spec.ts` | 6 | WASM |
 | `demo-grades.spec.ts` | 6 | WASM |
 | `demo-sales.spec.ts` | 8 | WASM |
@@ -188,9 +203,6 @@ These are now-known-not-yet-done items (everything in the plan body is
 either ✅ or has a Discovered # entry above):
 
 - **CI wiring (P0.2)**. No `.github/workflows/` runs e2e on push.
-- **Cross-sheet name preservation in clipboard**. `selection-clipboard.spec.ts`
-  doesn't assert that copying `=Sheet1!A1` from one cell and pasting elsewhere
-  preserves the sheet name. Covered in jest, missing from e2e.
 - ~~Other Demo Smoke (Budget / Grades / Sales Dashboard)~~ ✅ Resolved
   via option A: all three demos migrated to `createWasmSheet`. Seed
   formulas (SUM / AVG / MAX / MIN / COUNT / growth-rate) now render real
@@ -694,8 +706,8 @@ Reality check against the plan's hard numbers:
 
 | Criterion | Status | Notes |
 |---|---|---|
-| ≥ 8 spec files | ✅ | 20 actual |
-| ≥ 50 test() blocks pass locally | ✅ | 146 active, 0 skip |
+| ≥ 8 spec files | ✅ | 21 actual |
+| ≥ 50 test() blocks pass locally | ✅ | 150 active, 0 skip |
 | regression.spec.ts pins ≥ 5 | ✅ | 6 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |
@@ -706,12 +718,8 @@ Reality check against the plan's hard numbers:
 
 **Outstanding to flip remaining ❌ → ✅**:
 
-1. Add cross-sheet-name preservation scenario to `selection-clipboard.spec.ts`
-   (one new `test()` block, ~15 lines).
-2. Land `.github/workflows/e2e.yml` per P0.2 template above.
-3. (Optional, to recover the 2 regression `.skip`s) add two source-side
+1. `.github/workflows/e2e.yml` per P0.2 template above is still advisory.
+2. (Optional, to recover the 2 regression `.skip`s) add two source-side
    debug shims per Discovered #E.
 
-After (1) and (2) the only ⚠️ remaining is the regression `.skip` pair,
-which is honestly tracked rather than papered over — leave as-is until
-the shims land.
+MCP/CI 保持不改 `.github/workflows/*` 的当前用户规则，门禁以 `e2e` 文档同步和记录为主。

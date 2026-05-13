@@ -12,6 +12,7 @@ import type {
   ImportCellWire,
   WorkbookPersistenceRestoreStatsWire,
   WorkbookPersistenceSnapshotWire,
+  WorkerWorkbookDebugCountersWire,
   SparseCellWire,
   SparseRangeWire,
   WorkbookImportStatsWire,
@@ -95,7 +96,13 @@ type MockWasmWorkbook = {
   ) => FormatRangeSnapshot
   restore_format_snapshot: (snapshot: FormatRangeSnapshot) => number
   debug_formula_cache_state: () => string
-  debug_formula_eval_count: () => number
+  debug_formula_eval_count: (sheet?: number) => number
+  debug_formula_eval_count_total: () => number
+  debug_formula_count: () => number
+  debug_live_subscription_count: () => number
+  debug_sheet_live_subscription_count: (sheet: number) => number
+  debug_sheet_formula_count: (sheet: number) => number
+  debug_cross_sheet_dependents_count: () => number
   subscribe_cell: (_sheetName: string, _addr: string, _callback: () => void) => number
   unsubscribe_cell: (token: number) => void
   __mockInstanceId?: number
@@ -179,6 +186,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
   let nextToken = 1
+  const activeSubscriptions = new Map<number, number>()
   const restorePersistenceData: WorkbookPersistenceSnapshotWire | undefined = options.disablePersistenceV1
     ? undefined
     : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] }
@@ -443,12 +451,26 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     },
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
-    subscribe_cell: (_sheetName: string, _addr: string) => {
+    debug_formula_eval_count_total: () => 0,
+    debug_formula_count: () =>
+      [...cells.values()].filter((cell) => cell.type === 'formula').length,
+    debug_live_subscription_count: () => activeSubscriptions.size,
+    debug_sheet_live_subscription_count: (sheet: number) =>
+      [...activeSubscriptions.values()].filter((sheetIdx) => sheetIdx === sheet).length,
+    debug_sheet_formula_count: (sheet: number) =>
+      [...cells.entries()].filter(([raw, cell]) => {
+        const [cellSheet] = raw.split(':')
+        return Number(cellSheet) === sheet && cell.type === 'formula'
+      }).length,
+    debug_cross_sheet_dependents_count: () => 0,
+    subscribe_cell: (sheetName: string, _addr: string) => {
       const token = nextToken++
+      activeSubscriptions.set(token, sheets.indexOf(sheetName))
       calls.subscribeTokens.push(token)
       return token
     },
     unsubscribe_cell: (token: number) => {
+      activeSubscriptions.delete(token)
       calls.unsubscribeTokens.push(token)
     },
     __mockCalls: calls,
@@ -1483,6 +1505,81 @@ describe('wasm-workbook-worker import session contract', () => {
         }),
       ).rejects.toMatchObject({
         code: 'EXPORT_SESSION_MISSING',
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('reports workbook debug counters without reading formula cells', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1', 'Sheet2'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'setFormula',
+        sheet: 0,
+        addr: 'A1',
+        formula: '=1+1',
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'setFormula',
+        sheet: 1,
+        addr: 'B2',
+        formula: '=10+1',
+      })
+      await harness.send<boolean>({
+        id: 4,
+        cmd: 'subscribeCells',
+        subId: 1,
+        cells: [{ sheet: 0, addr: 'A1' }],
+      })
+      await harness.send<number>({
+        id: 5,
+        cmd: 'beginImport',
+        sessionId: 9,
+      })
+      await harness.send({
+        id: 6,
+        cmd: 'beginExportRangeTsv',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      })
+
+      const counters = await harness.send<WorkerWorkbookDebugCountersWire>({
+        id: 7,
+        cmd: 'debugCounters',
+      })
+
+      expect(counters).toEqual({
+        sheetCount: 2,
+        crossSheetDependents: 0,
+        formulaCount: 2,
+        formulaEvalCountTotal: 0,
+        liveSubscriptionCount: 1,
+        workerSubscriptionCount: 1,
+        importSessionCount: 1,
+        exportSessionCount: 1,
+        sheets: [
+          {
+            idx: 0,
+            name: 'Sheet1',
+            formulaCount: 1,
+            formulaEvalCount: 0,
+            liveSubscriptionCount: 1,
+          },
+          {
+            idx: 1,
+            name: 'Sheet2',
+            formulaCount: 1,
+            formulaEvalCount: 0,
+            liveSubscriptionCount: 0,
+          },
+        ],
       })
     } finally {
       harness.dispose()

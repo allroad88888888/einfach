@@ -14,6 +14,7 @@ import type {
   SparseRangeWire,
   WorkerWorkbookClient,
   WorkbookImportStatsWire,
+  WorkerWorkbookDebugCountersWire,
   WorkbookPersistenceRestoreStatsWire,
   WorkbookPersistenceSnapshotWire,
   WorkbookSheetMeta,
@@ -57,6 +58,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     snapshotPersistenceV1: number
     restorePersistenceV1: WorkbookPersistenceSnapshotWire[]
     debugFormulaCacheState: Array<{ sheet: number; addr: string }>
+    debugCounters: number
   }
   emitHydrated(cells: CellSnapshotWire[]): void
   setFormulaResult(sheet: number, addr: string, result: boolean): void
@@ -135,6 +137,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     snapshotPersistenceV1: 0,
     restorePersistenceV1: [],
     debugFormulaCacheState: [],
+    debugCounters: 0,
   }
   const cells = new Map<string, CellSnapshotWire>()
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
@@ -628,6 +631,28 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async debugFormulaEvalCount() {
       return 0
+    },
+    async debugCounters() {
+      calls.debugCounters += 1
+      return {
+        sheetCount: metas.length,
+        crossSheetDependents: 0,
+        formulaCount: [...cells.values()].filter((cell) => cell.formula !== '').length,
+        formulaEvalCountTotal: 0,
+        liveSubscriptionCount: calls.subscribeCells.length - calls.unsubscribeCells.length,
+        workerSubscriptionCount: calls.subscribeCells.length - calls.unsubscribeCells.length,
+        importSessionCount: 0,
+        exportSessionCount: 0,
+        sheets: metas.map((meta) => ({
+          idx: meta.idx,
+          name: meta.name,
+          formulaCount: [...cells.values()].filter(
+            (cell) => cell.sheet === meta.idx && cell.formula !== '',
+          ).length,
+          formulaEvalCount: 0,
+          liveSubscriptionCount: 0,
+        })),
+      } satisfies WorkerWorkbookDebugCountersWire
     },
     async subscribeCells(refs) {
       calls.subscribeCells.push(refs.map((ref) => ({ ...ref, addr: ref.addr.toUpperCase() })))

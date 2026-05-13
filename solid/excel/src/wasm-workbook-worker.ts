@@ -12,6 +12,7 @@ import type {
   ImportCellWire,
   WorkbookPersistenceRestoreStatsWire,
   WorkbookPersistenceSnapshotWire,
+  WorkerWorkbookDebugCountersWire,
   RpcErrorWire,
   RpcResponseWire,
   SparseCellWire,
@@ -89,6 +90,11 @@ type WasmWorkbookRuntime = {
   ) => WorkbookPersistenceRestoreStatsWire
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_formula_eval_count?: (sheetIdx: number) => number
+  debug_formula_eval_count_total?: () => number
+  debug_formula_count?: () => number
+  debug_live_subscription_count?: () => number
+  debug_sheet_live_subscription_count?: (sheetIdx: number) => number
+  debug_sheet_formula_count?: (sheetIdx: number) => number
   debug_cross_sheet_dependents_count?: () => number
 }
 
@@ -182,6 +188,33 @@ function sheetList(wb: WasmWorkbookRuntime): WorkbookSheetMeta[] {
     out.push({ idx, name: wb.sheet_name(idx) })
   }
   return out
+}
+
+function debugCounters(wb: WasmWorkbookRuntime): WorkerWorkbookDebugCountersWire {
+  const sheets = []
+  for (let idx = 0; idx < wb.sheet_count(); idx++) {
+    sheets.push({
+      idx,
+      name: wb.sheet_name(idx),
+      formulaCount: wb.debug_sheet_formula_count?.(idx) ?? 0,
+      formulaEvalCount: wb.debug_formula_eval_count?.(idx) ?? 0,
+      liveSubscriptionCount: wb.debug_sheet_live_subscription_count?.(idx) ?? 0,
+    })
+  }
+  return {
+    sheetCount: wb.sheet_count(),
+    crossSheetDependents: wb.debug_cross_sheet_dependents_count?.() ?? 0,
+    formulaCount:
+      wb.debug_formula_count?.() ?? sheets.reduce((sum, sheet) => sum + sheet.formulaCount, 0),
+    formulaEvalCountTotal:
+      wb.debug_formula_eval_count_total?.() ??
+      sheets.reduce((sum, sheet) => sum + sheet.formulaEvalCount, 0),
+    liveSubscriptionCount: wb.debug_live_subscription_count?.() ?? 0,
+    workerSubscriptionCount: subscriptionTokens.size,
+    importSessionCount: importSessions.size,
+    exportSessionCount: exportSessions.size,
+    sheets,
+  }
 }
 
 function resetSubscriptions(wb?: WasmWorkbookRuntime) {
@@ -1061,10 +1094,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         postResponse(msg.id, true)
         break
       case 'debugCounters':
-        postResponse(msg.id, {
-          sheetCount: wb.sheet_count(),
-          crossSheetDependents: wb.debug_cross_sheet_dependents_count?.() ?? 0,
-        })
+        postResponse(msg.id, debugCounters(wb))
         break
       default:
         throw Object.assign(new Error(`unknown command: ${String(msg.cmd)}`), {
