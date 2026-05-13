@@ -71,8 +71,9 @@ test.describe('1M Cells demo (Phase 4)', () => {
             const log = (window as unknown as { __workerRpcLog?: string[] }).__workerRpcLog ?? []
             return (
               log.includes('initWorkbook') &&
-              log.includes('setCell') &&
-              log.includes('setFormula') &&
+              log.includes('beginImport') &&
+              log.includes('importChunk') &&
+              log.includes('commitImport') &&
               log.includes('subscribeCells')
             )
           }),
@@ -94,6 +95,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(result.backend).toBe('worker-workbook')
     expect(result.commands).not.toContain('read_initial')
     expect(result.commands).not.toContain('set_number')
+    expect(result.commands).not.toContain('set_formula')
     expect(result.commands).not.toContain('subscribe')
   })
 

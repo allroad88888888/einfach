@@ -32,6 +32,10 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     readCells: CellRefWire[][]
     subscribeCells: CellRefWire[][]
     unsubscribeCells: number[]
+    beginImport: number[]
+    importChunk: Array<{ sessionId: number; cells: ImportCellWire[] }>
+    commitImport: number[]
+    cancelImport: number[]
     snapshotSparse: number
   }
   emitHydrated(cells: CellSnapshotWire[]): void
@@ -59,6 +63,10 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     readCells: [],
     subscribeCells: [],
     unsubscribeCells: [],
+    beginImport: [],
+    importChunk: [],
+    commitImport: [],
+    cancelImport: [],
     snapshotSparse: 0,
   }
   const cells = new Map<string, CellSnapshotWire>()
@@ -145,15 +153,29 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       return 1
     },
     async beginImport(sessionId = 1) {
+      calls.beginImport.push(sessionId)
       return sessionId
     },
-    async importChunk(_sessionId: number, _cells: ImportCellWire[]) {
-      return 0
+    async importChunk(sessionId: number, importCells: ImportCellWire[]) {
+      calls.importChunk.push({ sessionId, cells: importCells })
+      for (const cell of importCells) {
+        const addr = `${String.fromCharCode(65 + cell.col)}${cell.row + 1}`
+        if (cell.kind === 'formula') {
+          await this.setFormula(cell.sheet, addr, cell.value)
+        } else if (cell.kind === 'null') {
+          await this.clearCell(cell.sheet, addr)
+        } else {
+          await this.setCell(cell.sheet, addr, { type: cell.kind, value: cell.value } as CellWire)
+        }
+      }
+      return importCells.length
     },
-    async commitImport(_sessionId: number): Promise<WorkbookImportStatsWire> {
+    async commitImport(sessionId: number): Promise<WorkbookImportStatsWire> {
+      calls.commitImport.push(sessionId)
       return { accepted: 0, formulas: 0, rejectedFormulas: 0, cleared: 0, errors: 0 }
     },
-    async cancelImport(_sessionId: number) {
+    async cancelImport(sessionId: number) {
+      calls.cancelImport.push(sessionId)
       return true
     },
     async readCells(refs) {
@@ -259,6 +281,30 @@ describe('createWorkerWorkbookStore', () => {
       await Promise.resolve()
 
       expect(client.calls.setFormula).toEqual([{ sheet: 0, addr: 'B2', formula: '=A1+1' }])
+      expect(client.calls.readCells).toEqual([])
+
+      workbook.dispose()
+    })
+  })
+
+  it('can seed the worker workbook through afterInit before stores mount', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({
+        client,
+        async afterInit(worker) {
+          const session = await worker.beginImport()
+          await worker.importChunk(session, [
+            { sheet: 0, row: 0, col: 0, kind: 'number', value: 41 },
+            { sheet: 0, row: 1, col: 1, kind: 'formula', value: '=A1+1' },
+          ])
+          await worker.commitImport(session)
+        },
+      })
+
+      expect(client.calls.beginImport).toEqual([1])
+      expect(client.calls.importChunk).toHaveLength(1)
+      expect(client.calls.commitImport).toEqual([1])
       expect(client.calls.readCells).toEqual([])
 
       workbook.dispose()

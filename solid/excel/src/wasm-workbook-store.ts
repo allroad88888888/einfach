@@ -40,6 +40,7 @@ export interface WorkerWorkbookStoreOptions {
   client?: WorkerWorkbookClient
   workerFactory?: () => WorkerLike
   sheets?: string[]
+  afterInit?: (client: WorkerWorkbookClient, sheets: WorkbookSheetMeta[]) => Promise<void> | void
 }
 
 type CachedWorkbookCell = {
@@ -68,6 +69,7 @@ export async function createWorkerWorkbookStore(
   }
 
   const sheetMetas = await client.initWorkbook(opts.sheets ?? ['Sheet1'])
+  await opts.afterInit?.(client, sheetMetas)
   const [activeIdx, setActiveIdxRaw] = createSignal(0)
   const [version, setVersion] = createSignal(0)
   const adapters = new Map<number, WorkerWorkbookSheetAdapter>()

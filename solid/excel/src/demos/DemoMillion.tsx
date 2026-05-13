@@ -1,9 +1,9 @@
 import { Show, createResource, onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import type { SheetStore } from '../sheet-store'
+import type { ImportCellWire, WorkerWorkbookClient } from '../wasm-workbook-proxy'
 import { createWorkerWorkbookStore, type WasmWorkbookStore } from '../wasm-workbook-store'
 import { defaultWorkbookWorkerFactory } from '../wasm-workbook-worker-factory'
-import { colToLetter } from '../selection'
 import { useT } from '../i18n'
 
 /**
@@ -78,9 +78,9 @@ export function DemoMillion() {
     const workbook = await createWorkerWorkbookStore({
       workerFactory: defaultWorkbookWorkerFactory,
       sheets: ['Sheet1'],
+      afterInit: seedWorkbook,
     })
     const store = workbook.activeStore()
-    seed(store)
     exposeStoreForDebug(store, workbook)
     return workbook
   })
@@ -125,14 +125,14 @@ export function DemoMillion() {
  *     (col 0, rows 0..49) so we don't clobber the chain.
  *   - 2 far-corner anchors (AAA500, ALL999).
  */
-function seed(store: SheetStore) {
-  const sheet = store.raw
+async function seedWorkbook(client: WorkerWorkbookClient) {
+  const cells: ImportCellWire[] = []
 
   // 1) Numeric base + 49-deep chain in column A. Reading A50 walks 49
   //    levels; reading any cell mid-chain forces incremental lazy eval.
-  sheet.set_number('A1', 1)
+  cells.push({ sheet: 0, row: 0, col: 0, kind: 'number', value: 1 })
   for (let r = 2; r <= 50; r++) {
-    sheet.set_formula(`A${r}`, `=A${r - 1}+1`)
+    cells.push({ sheet: 0, row: r - 1, col: 0, kind: 'formula', value: `=A${r - 1}+1` })
   }
 
   // 2) Scattered numeric cells — every 500th flat address (1,000,000 /
@@ -144,11 +144,34 @@ function seed(store: SheetStore) {
     const row = Math.floor(idx / COLS)
     const col = idx % COLS
     if (col === 0 && row < 50) continue
-    const addr = `${colToLetter(col)}${row + 1}`
-    sheet.set_number(addr, idx)
+    cells.push({ sheet: 0, row, col, kind: 'number', value: idx })
   }
 
   // 3) Far-corner anchors so users see content at the deep corners.
-  sheet.set_text('AAA500', 'You scrolled to AAA500')
-  sheet.set_text('ALL999', 'Bottom-right corner (col ALL, row 999)')
+  cells.push({
+    sheet: 0,
+    row: 499,
+    col: 702,
+    kind: 'text',
+    value: 'You scrolled to AAA500',
+  })
+  cells.push({
+    sheet: 0,
+    row: 998,
+    col: 999,
+    kind: 'text',
+    value: 'Bottom-right corner (col ALL, row 999)',
+  })
+
+  const session = await client.beginImport()
+  try {
+    const chunkSize = 500
+    for (let i = 0; i < cells.length; i += chunkSize) {
+      await client.importChunk(session, cells.slice(i, i + chunkSize))
+    }
+    await client.commitImport(session)
+  } catch (err) {
+    await client.cancelImport(session).catch(() => false)
+    throw err
+  }
 }
