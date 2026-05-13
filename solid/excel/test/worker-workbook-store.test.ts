@@ -35,6 +35,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     snapshotSparse: number
   }
   emitHydrated(cells: CellSnapshotWire[]): void
+  setFormulaResult(sheet: number, addr: string, result: boolean): void
 }
 
 function emptySnapshot(ref: CellRefWire): CellSnapshotWire {
@@ -63,6 +64,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const cells = new Map<string, CellSnapshotWire>()
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
   const dirtyListeners = new Set<(cells: CellRefWire[]) => void>()
+  const formulaResults = new Map<string, boolean>()
   let nextSubId = 1
   let metas: WorkbookSheetMeta[] = []
 
@@ -89,6 +91,9 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     calls,
     emitHydrated(cells) {
       for (const listener of hydratedListeners) listener(cells)
+    },
+    setFormulaResult(sheet, addr, result) {
+      formulaResults.set(key(sheet, addr), result)
     },
     async initWorkbook(sheets = ['Sheet1']) {
       calls.initWorkbook.push([...sheets])
@@ -118,6 +123,8 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async setFormula(sheet, addr, formula) {
       calls.setFormula.push({ sheet, addr: addr.toUpperCase(), formula })
+      const ok = formulaResults.get(key(sheet, addr)) ?? true
+      if (!ok) return false
       cells.set(key(sheet, addr), {
         sheet,
         addr: addr.toUpperCase(),
@@ -197,6 +204,20 @@ function withRoot<T>(fn: () => Promise<T> | T): Promise<T> {
   })
 }
 
+async function waitFor(assertion: () => void): Promise<void> {
+  let lastErr: unknown
+  for (let i = 0; i < 20; i++) {
+    try {
+      assertion()
+      return
+    } catch (err) {
+      lastErr = err
+      await Promise.resolve()
+    }
+  }
+  throw lastErr
+}
+
 describe('createWorkerWorkbookStore', () => {
   it('initializes a single Sheet1 worker workbook by default', async () => {
     await withRoot(async () => {
@@ -265,6 +286,60 @@ describe('createWorkerWorkbookStore', () => {
 
       expect(client.calls.subscribeCells).toEqual([[{ sheet: 0, addr: 'A1' }]])
       expect(observed.value().display).toBe('7')
+
+      observed.dispose()
+      workbook.dispose()
+    })
+  })
+
+  it('rolls back optimistic formula projection when the worker rejects it', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      store.raw.set_number('A1', 7)
+      const observed = store.observeCell('A1')
+      expect(observed.value().display).toBe('7')
+
+      client.setFormulaResult(0, 'A1', false)
+      expect(store.raw.set_formula('A1', '=A1+1')).toBe(true)
+      expect(store.getFormula('A1')).toBe('=A1+1')
+
+      await waitFor(() => {
+        expect(observed.value().display).toBe('7')
+        expect(store.getFormula('A1')).toBe('')
+      })
+
+      expect(client.calls.readCells).toContainEqual([{ sheet: 0, addr: 'A1' }])
+
+      observed.dispose()
+      workbook.dispose()
+    })
+  })
+
+  it('ignores stale subscription hydration after a newer optimistic write', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+      const observed = store.observeCell('A1')
+
+      store.raw.set_number('A1', 9)
+      expect(observed.value().display).toBe('9')
+
+      client.emitHydrated([
+        {
+          sheet: 0,
+          addr: 'A1',
+          display: '1',
+          type: 'number',
+          isError: false,
+          formula: '',
+        },
+      ])
+
+      expect(observed.value().display).toBe('9')
 
       observed.dispose()
       workbook.dispose()

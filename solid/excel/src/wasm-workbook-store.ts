@@ -279,7 +279,9 @@ function createWorkerWorkbookSheetAdapter(
 ): WorkerWorkbookSheetAdapter {
   const cache = new Map<string, CachedWorkbookCell>()
   const requested = new Set<string>()
-  const pendingReads = new Set<string>()
+  const pendingReads = new Map<string, number>()
+  const hydrateVersions = new Map<string, number>()
+  const localVersions = new Map<string, number>()
   const listenersByAddr = new Map<string, Map<number, () => void>>()
   const tokenToAddr = new Map<number, string>()
   const workerSubs = new Map<
@@ -287,6 +289,7 @@ function createWorkerWorkbookSheetAdapter(
     { refCount: number; subId?: number; promise?: Promise<number> }
   >()
   let nextToken = 1
+  let nextLocalVersion = 1
   let disposed = false
 
   function normalizeAddr(addr: string): string {
@@ -313,23 +316,43 @@ function createWorkerWorkbookSheetAdapter(
     return (listenersByAddr.get(normalizeAddr(addr))?.size ?? 0) > 0
   }
 
+  function currentLocalVersion(addr: string): number {
+    return localVersions.get(normalizeAddr(addr)) ?? 0
+  }
+
+  function bumpLocalVersion(addr: string): number {
+    const a = normalizeAddr(addr)
+    const version = nextLocalVersion++
+    localVersions.set(a, version)
+    return version
+  }
+
   function hydrateRefs(refs: CellRefWire[]) {
     if (disposed) return
     const cells: CellRefWire[] = []
+    const requestVersions = new Map<string, number>()
     for (const ref of refs) {
       if (ref.sheet !== sheetIdx) continue
       const addr = normalizeAddr(ref.addr)
-      if (pendingReads.has(addr)) continue
-      pendingReads.add(addr)
+      const version = currentLocalVersion(addr)
+      const pendingVersion = pendingReads.get(addr)
+      if (pendingVersion !== undefined && pendingVersion >= version) continue
+      pendingReads.set(addr, version)
+      hydrateVersions.set(addr, version)
+      requestVersions.set(addr, version)
       cells.push({ sheet: sheetIdx, addr })
     }
     if (cells.length === 0) return
 
     void client
       .readCells(cells)
-      .then((snapshots) => applyHydrated(snapshots))
+      .then((snapshots) => applyHydrated(snapshots, requestVersions))
       .catch(() => {
-        for (const cell of cells) pendingReads.delete(cell.addr)
+        for (const cell of cells) {
+          if (pendingReads.get(cell.addr) === requestVersions.get(cell.addr)) {
+            pendingReads.delete(cell.addr)
+          }
+        }
       })
   }
 
@@ -344,12 +367,14 @@ function createWorkerWorkbookSheetAdapter(
     hydrateAddr(a)
   }
 
-  function applyHydrated(cells: CellSnapshotWire[]) {
+  function applyHydrated(cells: CellSnapshotWire[], requestVersions?: Map<string, number>) {
     let touched = false
     for (const cell of cells) {
       if (cell.sheet !== sheetIdx) continue
       const addr = normalizeAddr(cell.addr)
-      pendingReads.delete(addr)
+      const hydrateVersion = requestVersions?.get(addr) ?? hydrateVersions.get(addr) ?? 0
+      if (pendingReads.get(addr) === hydrateVersion) pendingReads.delete(addr)
+      if (currentLocalVersion(addr) > hydrateVersion) continue
       requested.add(addr)
       cache.set(addr, {
         display: cell.display,
@@ -401,6 +426,7 @@ function createWorkerWorkbookSheetAdapter(
   function setCell(addr: string, value: CellWire) {
     const a = normalizeAddr(addr)
     requested.add(a)
+    bumpLocalVersion(a)
     cache.set(a, optimisticCell(value))
     void client
       .setCell(sheetIdx, a, value)
@@ -425,6 +451,7 @@ function createWorkerWorkbookSheetAdapter(
       promise?: Promise<number>
     }
     workerSubs.set(a, entry)
+    hydrateVersions.set(a, currentLocalVersion(a))
     entry.promise = client
       .subscribeCells([{ sheet: sheetIdx, addr: a }], (cells) => hydrateRefs(cells))
       .then((subId) => {
@@ -493,6 +520,7 @@ function createWorkerWorkbookSheetAdapter(
     set_formula(addr, formula) {
       const a = normalizeAddr(addr)
       requested.add(a)
+      bumpLocalVersion(a)
       writeCache(a, { display: '', type: 'null', isError: false, formula })
       void client
         .setFormula(sheetIdx, a, formula)
@@ -507,6 +535,7 @@ function createWorkerWorkbookSheetAdapter(
     },
     clear_range(startRow, startCol, endRow, endCol) {
       const visibleAddrs = activeListenerAddrs()
+      for (const addr of visibleAddrs) bumpLocalVersion(addr)
       cache.clear()
       requested.clear()
       for (const addr of visibleAddrs) fireListeners(addr)
@@ -576,6 +605,8 @@ function createWorkerWorkbookSheetAdapter(
       cache.clear()
       requested.clear()
       pendingReads.clear()
+      hydrateVersions.clear()
+      localVersions.clear()
       listenersByAddr.clear()
       tokenToAddr.clear()
       workerSubs.clear()
