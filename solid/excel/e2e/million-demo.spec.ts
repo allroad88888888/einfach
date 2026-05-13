@@ -216,6 +216,28 @@ test.describe('1M Cells demo (Phase 4)', () => {
       .toBe(1)
   })
 
+  test('selectionAddrs_large_selection_returns_null_without_materializing', async ({ page }) => {
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    const result = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          selectionAddrs: () => string[][] | null
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+        }
+      }
+      const store = win.__einfachStore
+      if (!store) return { hasStore: false, addrs: undefined }
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      return { hasStore: true, addrs: store.selectionAddrs() }
+    })
+
+    expect(result).toEqual({ hasStore: true, addrs: null })
+  })
+
   test('focus_cell_remains_in_dom_under_stay_index', async ({ page }) => {
     // Track M passes the focus cell's (row, col) as
     // `rowStayIndexList={[focusRow]}` + `columnStayIndexList={[focusCol]}`

@@ -90,6 +90,10 @@ function rangeCellCount(range: NormalizedCellRange): number {
   return (range.endRow - range.startRow + 1) * (range.endCol - range.startCol + 1)
 }
 
+function addressGridCellCount(addrs: string[][]): number {
+  return addrs.reduce((count, row) => count + row.length, 0)
+}
+
 /**
  * Serialize a `ClipboardData` to the TSV-with-origin-marker string we
  * write to the system clipboard. Cells are joined by `\t` per row and rows
@@ -443,7 +447,8 @@ export function createSheetStore(sheet: ISheet) {
     return normalizeCellRange(anchor(), selection())
   }
 
-  function addressGridForRange(range: NormalizedCellRange): string[][] {
+  function addressGridForRange(range: NormalizedCellRange, limit = Infinity): string[][] | null {
+    if (rangeCellCount(range) > limit) return null
     const out: string[][] = []
     for (let r = range.startRow; r <= range.endRow; r++) {
       const row: string[] = []
@@ -455,11 +460,12 @@ export function createSheetStore(sheet: ISheet) {
     return out
   }
 
-  function selectionAddressGrid(): string[][] {
-    return addressGridForRange(currentSelectionRange())
+  function selectionAddressGrid(limit = CLIPBOARD_CELL_LIMIT): string[][] | null {
+    return addressGridForRange(currentSelectionRange(), limit)
   }
 
-  function copyAddressGrid(addrs: string[][]): ClipboardData {
+  function copyAddressGrid(addrs: string[][]): ClipboardData | null {
+    if (addressGridCellCount(addrs) > CLIPBOARD_CELL_LIMIT) return null
     const originAddr = addrs[0]?.[0] ?? 'A1'
     return {
       originAddr,
@@ -506,17 +512,18 @@ export function createSheetStore(sheet: ISheet) {
 
   function clearCellRange(anchorCoord: CellCoord, focusCoord: CellCoord) {
     const range = normalizeCellRange(anchorCoord, focusCoord)
-    if (sheet.clear_range && rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) {
-      // Large clears are intentionally range-native. We flush any open
-      // small-edit batch first and do not snapshot the full rectangle on
-      // main; large undo becomes a later backend/coarse-transaction task.
-      // Drop prior cell undo entries so Ctrl+Z cannot replay stale
-      // snapshots across this non-undoable destructive range command.
+    if (rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) {
+      // Large clears are intentionally range-native. Without backend range
+      // support, refuse the operation instead of expanding a huge rectangle.
+      if (!sheet.clear_range) return false
       commitPendingEdit()
       sheet.clear_range(range.startRow, range.startCol, range.endRow, range.endCol)
+      // Large undo becomes a later backend/coarse-transaction task. Drop
+      // prior cell undo entries so Ctrl+Z cannot replay stale snapshots
+      // across this non-undoable destructive range command.
       undoStack.length = 0
       redoStack.length = 0
-      return
+      return true
     }
 
     const ownsBatch = pendingBefore === null
@@ -531,6 +538,7 @@ export function createSheetStore(sheet: ISheet) {
       }
     }
     if (ownsBatch) commitPendingEdit()
+    return true
   }
 
   return {
@@ -606,10 +614,11 @@ export function createSheetStore(sheet: ISheet) {
      * Row-major grid of addresses covered by the current selection
      * rectangle. For a single-cell selection returns `[['A1']]`. The
      * rectangle is normalized so reverse selections (focus above/left
-     * of anchor) still produce top-left-first addresses.
+     * of anchor) still produce top-left-first addresses. Oversized
+     * selections return null instead of materializing a huge grid on main.
      */
-    selectionAddrs: (): string[][] => {
-      return selectionAddressGrid()
+    selectionAddrs: (limit = CLIPBOARD_CELL_LIMIT): string[][] | null => {
+      return selectionAddressGrid(limit)
     },
 
     /**
@@ -620,7 +629,8 @@ export function createSheetStore(sheet: ISheet) {
     copySelection(): ClipboardData | null {
       const selectedRange = currentSelectionRange()
       if (rangeCellCount(selectedRange) > CLIPBOARD_CELL_LIMIT) return null
-      return copyAddressGrid(addressGridForRange(selectedRange))
+      const addrs = addressGridForRange(selectedRange, CLIPBOARD_CELL_LIMIT)
+      return addrs ? copyAddressGrid(addrs) : null
     },
 
     /**
@@ -828,8 +838,10 @@ export function createSheetStore(sheet: ISheet) {
      * Build a clipboard payload from a rectangular range of cell addresses.
      * `addrs[0][0]` is treated as the source origin so paste can compute
      * the (drow, dcol) shift for relative refs.
+     * Deprecated for large ranges: callers should prefer `copySelection`,
+     * which can reject oversized selections before address materialization.
      */
-    copy(addrs: string[][]): ClipboardData {
+    copy(addrs: string[][]): ClipboardData | null {
       return copyAddressGrid(addrs)
     },
 

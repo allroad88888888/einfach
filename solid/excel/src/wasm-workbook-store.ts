@@ -592,13 +592,6 @@ function createWorkerWorkbookSheetAdapter(
     unsubscribe(token) {
       unsubscribeToken(token)
     },
-    non_empty_addrs() {
-      const out: string[] = []
-      for (const [addr, cell] of cache) {
-        if (cell.type !== 'null' || cell.formula !== '') out.push(addr)
-      }
-      return out
-    },
     applyHydrated,
     dispose() {
       if (disposed) return

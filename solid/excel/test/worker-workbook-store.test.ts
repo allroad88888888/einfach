@@ -275,6 +275,18 @@ describe('createWorkerWorkbookStore', () => {
     })
   })
 
+  it('does not expose cache-derived non_empty_addrs as worker authority', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      expect(store.raw.non_empty_addrs).toBeUndefined()
+
+      workbook.dispose()
+    })
+  })
+
   it('does not hydrate formula results for unobserved raw seed formulas', async () => {
     await withRoot(async () => {
       const client = makeFakeWorkerWorkbookClient()

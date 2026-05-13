@@ -253,7 +253,7 @@ describe('createSheetStore', () => {
         const data = store.copy([
           ['A1', 'B1'],
           ['A2', 'B2'],
-        ])
+        ])!
         expect(data.cells).toEqual([
           ['1', '2'],
           ['3', '4'],
@@ -273,7 +273,7 @@ describe('createSheetStore', () => {
         const store = createTestStore()
         store.setNumber('A1', 10)
         store.setFormula('B1', '=A1*2')
-        const data = store.copy([['B1']])
+        const data = store.copy([['B1']])!
         expect(data.cells[0][0]).toBe('=A1*2')
         // Paste at the same location — no shift, formula identical.
         store.paste('B1', data)
@@ -287,7 +287,7 @@ describe('createSheetStore', () => {
         const store = createTestStore()
         store.setNumber('A1', 10)
         store.setFormula('B1', '=A1*2')
-        const data = store.copy([['B1']])
+        const data = store.copy([['B1']])!
         // B1 → D5 = +2 cols, +4 rows. A1 ref shifts to C5.
         store.paste('D5', data)
         expect(store.getFormula('D5')).toBe('=C5*2')
@@ -332,11 +332,29 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('copy rejects oversized explicit address grids without reading cells', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet()
+        const getDisplay = sheet.get_display.bind(sheet)
+        let displayReads = 0
+        sheet.get_display = (addr) => {
+          displayReads += 1
+          return getDisplay(addr)
+        }
+        const store = createSheetStore(sheet)
+        const addrs = Array.from({ length: 10_001 }, (_, row) => [`A${row + 1}`])
+
+        expect(store.copy(addrs)).toBeNull()
+        expect(displayReads).toBe(0)
+        dispose()
+      })
+    })
+
     it('paste shifts cross-sheet refs but keeps sheet name', () => {
       createRoot((dispose) => {
         const store = createTestStore()
         store.setFormula('B2', '=Data!A1+1')
-        const data = store.copy([['B2']])
+        const data = store.copy([['B2']])!
         // B2 → C3 = +1 col, +1 row. Data!A1 → Data!B2.
         store.paste('C3', data)
         expect(store.getFormula('C3')).toBe('=Data!B2+1')
@@ -348,7 +366,7 @@ describe('createSheetStore', () => {
       createRoot((dispose) => {
         const store = createTestStore()
         store.setNumber('A1', 42)
-        const data = store.copy([['A1']])
+        const data = store.copy([['A1']])!
         store.paste('D5', data)
         expect(store.getCell('D5').display).toBe('42')
         dispose()
@@ -413,6 +431,28 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('clearSelectionRange rejects large rectangles when backend lacks clear_range', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet()
+        let clearCellCount = 0
+        const clearCell = sheet.clear_cell.bind(sheet)
+        sheet.clear_cell = (addr) => {
+          clearCellCount += 1
+          clearCell(addr)
+        }
+        const store = createSheetStore(sheet)
+        store.setNumber('A1', 1)
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        store.clearSelectionRange()
+
+        expect(clearCellCount).toBe(0)
+        expect(store.getCell('A1').display).toBe('1')
+        dispose()
+      })
+    })
+
     it('formatSelection applies small ranges as one undoable edit', () => {
       createRoot((dispose) => {
         const store = createTestStore()
@@ -455,7 +495,7 @@ describe('createSheetStore', () => {
         const store = createTestStore()
         store.setNumber('A1', 1)
         store.setNumber('B1', 2)
-        const data = store.copy([['A1', 'B1']])
+        const data = store.copy([['A1', 'B1']])!
         store.paste('D1', data)
         expect(store.getCell('D1').display).toBe('1')
         store.undo()
@@ -661,6 +701,17 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('selectionAddrs returns null for oversized ranges by default', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        expect(store.selectionAddrs()).toBeNull()
+        dispose()
+      })
+    })
+
     it('setSelection after extendSelection collapses again', () => {
       createRoot((dispose) => {
         const store = createTestStore()
@@ -749,7 +800,7 @@ describe('createSheetStore', () => {
           ['B3', 'C3', 'D3'],
         ])
 
-        const data = store.copy(addrs)
+        const data = store.copy(addrs!)!
         expect(data.originAddr).toBe('B2')
         expect(data.cells).toEqual([
           ['1', '2', '3'],
@@ -759,7 +810,7 @@ describe('createSheetStore', () => {
         // Now wipe and re-paste at the same origin — formula stays
         // unchanged (no shift) and values come back.
         store.beginEdit()
-        for (const row of addrs) for (const a of row) store.clearCell(a)
+        for (const row of addrs!) for (const a of row) store.clearCell(a)
         store.endEdit()
         expect(store.getCell('B2').type).toBe('null')
 
@@ -779,7 +830,7 @@ describe('createSheetStore', () => {
         store.setNumber('A1', 5)
         store.setNumber('B1', 6)
         store.setFormula('C1', '=A1+B1')
-        const data = store.copy([['A1', 'B1', 'C1']])
+        const data = store.copy([['A1', 'B1', 'C1']])!
         const text = serializeClipboardTSV(data)
         // Simulate a paste at D5: parser recovers A1 origin from marker.
         const parsed = parseClipboardTSV(text, 'D5')
