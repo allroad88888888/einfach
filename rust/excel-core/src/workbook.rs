@@ -323,6 +323,14 @@ impl Workbook {
             .unwrap_or("missing-sheet")
     }
 
+    #[doc(hidden)]
+    pub fn debug_formula_eval_count(&self, sheet_idx: usize) -> usize {
+        self.sheets
+            .get(sheet_idx)
+            .map(|sheet| sheet.debug_formula_eval_count())
+            .unwrap_or(0)
+    }
+
     /// Workbook-aware variant of `Sheet::set_formula`. Performs a
     /// **cross-sheet** static cycle check before installing the formula:
     /// references like `=Sheet2!A1` are followed across sheet boundaries so
@@ -1588,6 +1596,21 @@ mod tests {
             wb.get_cell("Sheet1", "A1"),
             Value::Error(ValueError::InvalidValue),
         );
+    }
+
+    #[test]
+    fn workbook_debug_formula_eval_count_stays_zero_until_read() {
+        let mut wb = Workbook::new();
+        let data = wb.add_sheet("Data");
+        wb.set_cell(data, "A1", Value::Number(41.0));
+        assert!(wb.set_formula(0, "A1", "=Data!A1+1"));
+
+        assert_eq!(wb.debug_formula_eval_count(0), 0);
+        assert_eq!(wb.debug_formula_cache_state(0, "A1"), "dirty");
+
+        assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(42.0));
+        assert_eq!(wb.debug_formula_eval_count(0), 1);
+        assert_eq!(wb.debug_formula_cache_state(0, "A1"), "clean");
     }
 
     #[test]

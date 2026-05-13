@@ -4,14 +4,8 @@ type CellType = CellValue['type']
 
 export interface WorkerLike {
   postMessage(msg: unknown): void
-  addEventListener(
-    type: 'message',
-    listener: (e: MessageEvent) => void,
-  ): void
-  removeEventListener(
-    type: 'message',
-    listener: (e: MessageEvent) => void,
-  ): void
+  addEventListener(type: 'message', listener: (e: MessageEvent) => void): void
+  removeEventListener(type: 'message', listener: (e: MessageEvent) => void): void
   terminate(): void
 }
 
@@ -107,6 +101,7 @@ export interface WorkerWorkbookClient {
   snapshotSparse(): Promise<SparseCellWire[]>
   readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
+  debugFormulaEvalCount(sheet: number): Promise<number>
   subscribeCells(cells: CellRefWire[], callback: (cells: CellRefWire[]) => void): Promise<number>
   unsubscribeCells(subId: number): Promise<boolean>
   onCellsDirty(callback: (cells: CellRefWire[]) => void): () => void
@@ -203,7 +198,7 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
       return
     }
     if (msg.event === 'cellsHydrated') {
-      handleHydrated(Array.isArray(msg.cells) ? msg.cells as CellSnapshotWire[] : [])
+      handleHydrated(Array.isArray(msg.cells) ? (msg.cells as CellSnapshotWire[]) : [])
     }
   }
 
@@ -263,6 +258,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     debugFormulaCacheState(sheet, addr) {
       return request<string>('debugFormulaCacheState', { sheet, addr: addr.toUpperCase() })
+    },
+    debugFormulaEvalCount(sheet) {
+      return request<number>('debugFormulaEvalCount', { sheet })
     },
     async subscribeCells(cells, callback) {
       const subId = nextSubId++

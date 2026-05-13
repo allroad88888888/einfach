@@ -180,16 +180,23 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ok(fake, 'dirty')
     await expect(debug).resolves.toBe('dirty')
 
+    const evalCount = workbook.debugFormulaEvalCount(0)
+    expect(lastSent(fake)).toEqual({
+      id: 5,
+      cmd: 'debugFormulaEvalCount',
+      sheet: 0,
+    })
+    ok(fake, 0)
+    await expect(evalCount).resolves.toBe(0)
+
     const list = workbook.listNonEmpty()
-    expect(lastSent(fake)).toEqual({ id: 5, cmd: 'listNonEmpty' })
+    expect(lastSent(fake)).toEqual({ id: 6, cmd: 'listNonEmpty' })
     ok(fake, [{ sheet: 0, addr: 'A1' }])
     await expect(list).resolves.toEqual([{ sheet: 0, addr: 'A1' }])
 
     const sparse = workbook.snapshotSparse()
-    expect(lastSent(fake)).toEqual({ id: 6, cmd: 'snapshotSparse' })
-    ok(fake, [
-      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
-    ])
+    expect(lastSent(fake)).toEqual({ id: 7, cmd: 'snapshotSparse' })
+    ok(fake, [{ sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' }])
     await expect(sparse).resolves.toEqual([
       { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
     ])
@@ -202,7 +209,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       endCol: 0,
     })
     expect(lastSent(fake)).toEqual({
-      id: 7,
+      id: 8,
       cmd: 'readSparseRange',
       range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
     })
@@ -217,7 +224,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       endCol: 999_999,
     })
     expect(lastSent(fake)).toEqual({
-      id: 8,
+      id: 9,
       cmd: 'clearRange',
       range: { sheet: 1, startRow: 0, startCol: 0, endRow: 999_999, endCol: 999_999 },
     })
@@ -225,7 +232,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(clear).resolves.toBe(1)
 
     const cancel = workbook.cancelImport(99)
-    expect(lastSent(fake)).toEqual({ id: 9, cmd: 'cancelImport', sessionId: 99 })
+    expect(lastSent(fake)).toEqual({ id: 10, cmd: 'cancelImport', sessionId: 99 })
     ok(fake, false)
     await expect(cancel).resolves.toBe(false)
   })

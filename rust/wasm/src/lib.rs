@@ -706,10 +706,42 @@ impl WasmWorkbook {
             .unwrap_or_default()
     }
 
+    /// Snapshot display/type/error/formula for a single cell with one
+    /// workbook read. Worker hydration uses this to avoid evaluating a dirty
+    /// formula once for display, again for type, and again for error state.
+    #[wasm_bindgen(js_name = "snapshotCell")]
+    pub fn snapshot_cell(&self, sheet_idx: u32, addr: &str) -> Result<JsValue, JsValue> {
+        let sheet_idx_usize = sheet_idx as usize;
+        let value = self.workbook_value(sheet_idx, addr);
+        let formula = self
+            .workbook
+            .sheet(sheet_idx_usize)
+            .and_then(|sheet| sheet.get_formula(addr))
+            .unwrap_or_default();
+        let addr = CellAddress::parse(addr)
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| addr.to_ascii_uppercase());
+        serde_wasm_bindgen::to_value(&CellSnapshotJSON {
+            sheet: sheet_idx_usize,
+            addr,
+            display: value_to_display(&value),
+            cell_type: value_to_cell_type(&value),
+            is_error: value.is_error(),
+            formula,
+        })
+        .map_err(|err| JsValue::from_str(&format!("serialize cell snapshot: {err}")))
+    }
+
     pub fn debug_formula_cache_state(&self, sheet_idx: u32, addr: &str) -> String {
         self.workbook
             .debug_formula_cache_state(sheet_idx as usize, addr)
             .to_string()
+    }
+
+    /// Total formula evaluations performed on one workbook sheet since
+    /// creation. Used by worker-backed lazy import/read tests.
+    pub fn debug_formula_eval_count(&self, sheet_idx: u32) -> u32 {
+        self.workbook.debug_formula_eval_count(sheet_idx as usize) as u32
     }
 
     // === Phase 3 / Track K — workbook mutators ===

@@ -195,6 +195,9 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async debugFormulaCacheState() {
       return 'dirty'
     },
+    async debugFormulaEvalCount() {
+      return 0
+    },
     async subscribeCells(refs) {
       calls.subscribeCells.push(refs.map((ref) => ({ ...ref, addr: ref.addr.toUpperCase() })))
       return nextSubId++

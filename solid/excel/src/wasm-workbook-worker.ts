@@ -35,6 +35,7 @@ type WasmWorkbookRuntime = {
   get_type(sheetIdx: number, addr: string): string
   is_error(sheetIdx: number, addr: string): boolean
   get_formula(sheetIdx: number, addr: string): string
+  snapshotCell(sheetIdx: number, addr: string): CellSnapshotWire
   bulk_import_cells(cells: ImportCellWire[]): WorkbookImportStatsWire
   list_non_empty_cells?: () => CellRefWire[]
   snapshot_sparse?: () => SparseCellWire[]
@@ -53,6 +54,7 @@ type WasmWorkbookRuntime = {
     endCol: number,
   ) => number
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
+  debug_formula_eval_count?: (sheetIdx: number) => number
   debug_cross_sheet_dependents_count?: () => number
 }
 
@@ -118,14 +120,7 @@ function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
 function snapshotCell(wb: WasmWorkbookRuntime, ref: CellRefWire): CellSnapshotWire {
   const addr = normalizeAddr(ref.addr)
   const sheet = ref.sheet
-  return {
-    sheet,
-    addr,
-    display: wb.get_display(sheet, addr),
-    type: wb.get_type(sheet, addr) as CellSnapshotWire['type'],
-    isError: wb.is_error(sheet, addr),
-    formula: wb.get_formula(sheet, addr),
-  }
+  return normalizeSnapshot(assertMethod(wb, 'snapshotCell').call(wb, sheet, addr))
 }
 
 function normalizeRefWire(ref: CellRefWire): CellRefWire {
@@ -492,6 +487,13 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           wb.debug_formula_cache_state
             ? wb.debug_formula_cache_state(Number(msg.sheet), normalizeAddr(msg.addr))
             : 'unknown',
+        )
+        break
+      case 'debugFormulaEvalCount':
+        assertSheet(wb, Number(msg.sheet))
+        postResponse(
+          msg.id,
+          wb.debug_formula_eval_count ? wb.debug_formula_eval_count(Number(msg.sheet)) : 0,
         )
         break
       case 'subscribeCells':

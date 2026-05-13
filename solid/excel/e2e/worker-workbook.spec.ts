@@ -15,6 +15,15 @@ type DirtyRef = {
   addr: string
 }
 
+type SparseCell = {
+  sheet: number
+  addr: string
+  row: number
+  col: number
+  kind: string
+  value: string | number | boolean
+}
+
 test.describe('Worker-backed workbook RPC', () => {
   test.beforeEach(async ({ page }) => {
     guardConsoleErrors(page)
@@ -86,6 +95,7 @@ test.describe('Worker-backed workbook RPC', () => {
       cleared: 0,
       errors: 0,
     })
+    expect(result.beforeReadEvalCount).toBe(0)
     expect(result.beforeReadState).toBe('dirty')
     expect(result.nonEmpty).toEqual([
       { sheet: 0, addr: 'A1' },
@@ -95,9 +105,33 @@ test.describe('Worker-backed workbook RPC', () => {
       { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
       { sheet: 1, addr: 'A1', row: 0, col: 0, kind: 'number', value: 41 },
     ])
+    expect(result.afterSnapshotEvalCount).toBe(0)
     expect(result.afterSnapshotState).toBe('dirty')
     expect(result.rangeRead.map((cell) => cell.display)).toEqual(['42'])
+    expect(result.afterRangeReadEvalCount).toBe(1)
     expect(result.afterRangeReadState).toBe('clean')
+
+    await expectNoConsoleErrors(page)
+  })
+
+  test('round-trips a sparse snapshot through worker import without preheating formulas', async ({
+    page,
+  }) => {
+    const result = await runWorkerWorkbookSnapshotRoundTripScenario(page)
+
+    expect(result.originalBeforeSnapshotState).toBe('dirty')
+    expect(result.originalBeforeSnapshotEvalCount).toBe(0)
+    expect(result.originalAfterSnapshotState).toBe('dirty')
+    expect(result.originalAfterSnapshotEvalCount).toBe(0)
+    expect(result.sparseSnapshot).toEqual([
+      { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      { sheet: 1, addr: 'A1', row: 0, col: 0, kind: 'number', value: 41 },
+    ])
+    expect(result.restoredBeforeReadState).toBe('dirty')
+    expect(result.restoredBeforeReadEvalCount).toBe(0)
+    expect(result.restoredRead.display).toBe('42')
+    expect(result.restoredAfterReadState).toBe('clean')
+    expect(result.restoredAfterReadEvalCount).toBe(1)
 
     await expectNoConsoleErrors(page)
   })
@@ -204,6 +238,7 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
     errors: number
   }
   beforeReadState: string
+  beforeReadEvalCount: number
   nonEmpty: DirtyRef[]
   sparseSnapshot: Array<{
     sheet: number
@@ -214,8 +249,10 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
     value: string | number | boolean
   }>
   afterSnapshotState: string
+  afterSnapshotEvalCount: number
   rangeRead: Snapshot[]
   afterRangeReadState: string
+  afterRangeReadEvalCount: number
 }> {
   return page.evaluate(async () => {
     const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
@@ -238,9 +275,11 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
       ])
       const stats = await workbook.commitImport(session)
+      const beforeReadEvalCount = await workbook.debugFormulaEvalCount(0)
       const beforeReadState = await workbook.debugFormulaCacheState(0, 'A1')
       const nonEmpty = await workbook.listNonEmpty()
       const sparseSnapshot = await workbook.snapshotSparse()
+      const afterSnapshotEvalCount = await workbook.debugFormulaEvalCount(0)
       const afterSnapshotState = await workbook.debugFormulaCacheState(0, 'A1')
       const rangeRead = await workbook.readSparseRange({
         sheet: 0,
@@ -249,21 +288,135 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         endRow: 0,
         endCol: 0,
       })
+      const afterRangeReadEvalCount = await workbook.debugFormulaEvalCount(0)
       const afterRangeReadState = await workbook.debugFormulaCacheState(0, 'A1')
 
       return {
         cancelled,
         cancelledCell,
         stats,
+        beforeReadEvalCount,
         beforeReadState,
         nonEmpty,
         sparseSnapshot,
+        afterSnapshotEvalCount,
         afterSnapshotState,
         rangeRead,
+        afterRangeReadEvalCount,
         afterRangeReadState,
       }
     } finally {
       workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookSnapshotRoundTripScenario(page: Page): Promise<{
+  originalBeforeSnapshotState: string
+  originalBeforeSnapshotEvalCount: number
+  originalAfterSnapshotState: string
+  originalAfterSnapshotEvalCount: number
+  sparseSnapshot: SparseCell[]
+  restoredBeforeReadState: string
+  restoredBeforeReadEvalCount: number
+  restoredRead: Snapshot
+  restoredAfterReadState: string
+  restoredAfterReadEvalCount: number
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const sourceWorkbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    const restoredWorkbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+
+    try {
+      await sourceWorkbook.initWorkbook(['Sheet1', 'Sheet2'])
+      const sourceSession = await sourceWorkbook.beginImport()
+      await sourceWorkbook.importChunk(sourceSession, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      await sourceWorkbook.commitImport(sourceSession)
+
+      const originalBeforeSnapshotState = await sourceWorkbook.debugFormulaCacheState(0, 'A1')
+      const originalBeforeSnapshotEvalCount = await sourceWorkbook.debugFormulaEvalCount(0)
+      const sparseSnapshot = await sourceWorkbook.snapshotSparse()
+      const originalAfterSnapshotState = await sourceWorkbook.debugFormulaCacheState(0, 'A1')
+      const originalAfterSnapshotEvalCount = await sourceWorkbook.debugFormulaEvalCount(0)
+
+      await restoredWorkbook.initWorkbook(['Sheet1', 'Sheet2'])
+      const restoreSession = await restoredWorkbook.beginImport()
+      const restoredImportCells = sparseSnapshot.map((cell) => {
+        switch (cell.kind) {
+          case 'number':
+            return {
+              sheet: cell.sheet,
+              row: cell.row,
+              col: cell.col,
+              kind: 'number',
+              value: cell.value,
+            }
+          case 'text':
+            return {
+              sheet: cell.sheet,
+              row: cell.row,
+              col: cell.col,
+              kind: 'text',
+              value: cell.value,
+            }
+          case 'boolean':
+            return {
+              sheet: cell.sheet,
+              row: cell.row,
+              col: cell.col,
+              kind: 'boolean',
+              value: cell.value,
+            }
+          case 'error':
+            return {
+              sheet: cell.sheet,
+              row: cell.row,
+              col: cell.col,
+              kind: 'error',
+              value: cell.value,
+            }
+          case 'formula':
+            return {
+              sheet: cell.sheet,
+              row: cell.row,
+              col: cell.col,
+              kind: 'formula',
+              value: cell.value,
+            }
+          default:
+            return { sheet: cell.sheet, row: cell.row, col: cell.col, kind: 'null' }
+        }
+      })
+      await restoredWorkbook.importChunk(restoreSession, restoredImportCells)
+      await restoredWorkbook.commitImport(restoreSession)
+
+      const restoredBeforeReadState = await restoredWorkbook.debugFormulaCacheState(0, 'A1')
+      const restoredBeforeReadEvalCount = await restoredWorkbook.debugFormulaEvalCount(0)
+      const [restoredRead] = await restoredWorkbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const restoredAfterReadState = await restoredWorkbook.debugFormulaCacheState(0, 'A1')
+      const restoredAfterReadEvalCount = await restoredWorkbook.debugFormulaEvalCount(0)
+
+      return {
+        originalBeforeSnapshotState,
+        originalBeforeSnapshotEvalCount,
+        originalAfterSnapshotState,
+        originalAfterSnapshotEvalCount,
+        sparseSnapshot,
+        restoredBeforeReadState,
+        restoredBeforeReadEvalCount,
+        restoredRead,
+        restoredAfterReadState,
+        restoredAfterReadEvalCount,
+      }
+    } finally {
+      sourceWorkbook.dispose()
+      restoredWorkbook.dispose()
     }
   })
 }
