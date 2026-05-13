@@ -12,6 +12,13 @@ export interface ISheet {
   set_error?(addr: string, value: string): void
   /** Returns false if the formula failed to parse or would cycle. */
   set_formula(addr: string, formula: string): boolean
+  /**
+   * Optional authoritative formula mutation. Worker-backed sheets use this
+   * to surface parse/cycle rejection after the worker reply instead of
+   * permanently reporting optimistic success through the synchronous
+   * compatibility method.
+   */
+  set_formula_async?(addr: string, formula: string): Promise<boolean>
   get_display(addr: string): string
   get_number(addr: string): number
   get_type(addr: string): string

@@ -68,23 +68,66 @@ export async function createWorkerWorkbookStore(
     throw new Error('createWorkerWorkbookStore requires client or workerFactory')
   }
 
-  const sheetMetas = await client.initWorkbook(opts.sheets ?? ['Sheet1'])
-  await opts.afterInit?.(client, sheetMetas)
+  const workerClient: WorkerWorkbookClient = client
+
+  const sheetMetas = await workerClient.initWorkbook(opts.sheets ?? ['Sheet1'])
+  await opts.afterInit?.(workerClient, sheetMetas)
   const [activeIdx, setActiveIdxRaw] = createSignal(0)
   const [version, setVersion] = createSignal(0)
   const adapters = new Map<number, WorkerWorkbookSheetAdapter>()
   const stores = new Map<number, SheetStore>()
+  const formulaStateCache = new Map<string, string>()
+  const formulaStatePending = new Set<string>()
   let disposed = false
 
   const bumpRevision = () => setVersion((v) => v + 1)
 
+  function formulaStateKey(sheetIdx: number, addr: string): string {
+    return `${sheetIdx}:${addr.toUpperCase()}`
+  }
+
+  function invalidateFormulaStates(cells: CellRefWire[]) {
+    let touched = false
+    for (const cell of cells) {
+      const key = formulaStateKey(cell.sheet, cell.addr)
+      if (formulaStateCache.get(key) === 'dirty') continue
+      formulaStateCache.set(key, 'dirty')
+      touched = true
+    }
+    if (touched) bumpRevision()
+  }
+
+  function formulaCacheState(sheetIdx: number, addr: string): string {
+    version()
+    const key = formulaStateKey(sheetIdx, addr)
+    const cached = formulaStateCache.get(key) ?? 'unknown'
+    if (!formulaStatePending.has(key)) {
+      formulaStatePending.add(key)
+      void workerClient
+        .debugFormulaCacheState(sheetIdx, addr.toUpperCase())
+        .then((state) => {
+          if (disposed) return
+          if (formulaStateCache.get(key) !== state) {
+            formulaStateCache.set(key, state)
+            bumpRevision()
+          }
+        })
+        .catch(() => {
+          if (disposed) return
+          if (!formulaStateCache.has(key)) formulaStateCache.set(key, 'unknown')
+        })
+        .finally(() => formulaStatePending.delete(key))
+    }
+    return cached
+  }
+
   for (const meta of sheetMetas) {
-    const adapter = createWorkerWorkbookSheetAdapter(client, meta.idx, bumpRevision)
+    const adapter = createWorkerWorkbookSheetAdapter(workerClient, meta.idx, bumpRevision)
     adapters.set(meta.idx, adapter)
     stores.set(meta.idx, createSheetStore(adapter))
   }
 
-  const offHydrated = client.onCellsHydrated((cells) => {
+  const offHydrated = workerClient.onCellsHydrated((cells) => {
     const bySheet = new Map<number, CellSnapshotWire[]>()
     for (const cell of cells) {
       const group = bySheet.get(cell.sheet) ?? []
@@ -95,6 +138,7 @@ export async function createWorkerWorkbookStore(
       adapters.get(sheetIdx)?.applyHydrated(group)
     }
   })
+  const offDirty = workerClient.onCellsDirty(invalidateFormulaStates)
 
   function setActiveIdx(idx: number) {
     if (!stores.has(idx)) return
@@ -118,13 +162,16 @@ export async function createWorkerWorkbookStore(
     setActiveIdx,
     activeStore,
     sheetAt: (idx) => stores.get(idx),
-    formulaCacheState: () => 'unknown',
+    formulaCacheState,
     dispose: () => {
       if (disposed) return
       disposed = true
       for (const store of stores.values()) store.dispose()
       offHydrated()
-      client.dispose()
+      offDirty()
+      formulaStateCache.clear()
+      formulaStatePending.clear()
+      workerClient.dispose()
       bumpRevision()
     },
   }
@@ -438,6 +485,23 @@ function createWorkerWorkbookSheetAdapter(
       .catch(() => hydrateAddr(a))
   }
 
+  function setFormula(addr: string, formula: string): Promise<boolean> {
+    const a = normalizeAddr(addr)
+    requested.add(a)
+    bumpLocalVersion(a)
+    writeCache(a, { display: '', type: 'null', isError: false, formula })
+    return client
+      .setFormula(sheetIdx, a, formula)
+      .then((ok) => {
+        if (hasListeners(a) || !ok) hydrateAddr(a)
+        return ok
+      })
+      .catch(() => {
+        hydrateAddr(a)
+        return false
+      })
+  }
+
   function startWorkerSubscription(addr: string) {
     const a = normalizeAddr(addr)
     const existing = workerSubs.get(a)
@@ -520,17 +584,11 @@ function createWorkerWorkbookSheetAdapter(
       setCell(addr, { type: 'error', value })
     },
     set_formula(addr, formula) {
-      const a = normalizeAddr(addr)
-      requested.add(a)
-      bumpLocalVersion(a)
-      writeCache(a, { display: '', type: 'null', isError: false, formula })
-      void client
-        .setFormula(sheetIdx, a, formula)
-        .then((ok) => {
-          if (hasListeners(a) || !ok) hydrateAddr(a)
-        })
-        .catch(() => hydrateAddr(a))
+      void setFormula(addr, formula)
       return true
+    },
+    set_formula_async(addr, formula) {
+      return setFormula(addr, formula)
     },
     clear_cell(addr) {
       setCell(addr, { type: 'null' })

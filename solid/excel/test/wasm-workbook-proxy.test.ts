@@ -135,6 +135,27 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     const badFormula = workbook.setFormula(0, 'C1', '=C1+1')
     ok(fake, false)
     await expect(badFormula).resolves.toBe(false)
+
+    const detailedFormula = workbook.setFormulaDetailed(0, 'D1', '=D1+1')
+    expect(lastSent(fake)).toMatchObject({
+      id: 3,
+      cmd: 'setFormulaDetailed',
+      sheet: 0,
+      addr: 'D1',
+      formula: '=D1+1',
+    })
+    ok(fake, {
+      ok: false,
+      code: 'FORMULA_CYCLE',
+      message: 'formula would create a cycle',
+      display: '#CYCLE!',
+    })
+    await expect(detailedFormula).resolves.toEqual({
+      ok: false,
+      code: 'FORMULA_CYCLE',
+      message: 'formula would create a cycle',
+      display: '#CYCLE!',
+    })
   })
 
   it('sends chunked import sessions and debug cache probes', async () => {
@@ -273,6 +294,13 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(sparse).rejects.toMatchObject({
       code: 'WASM_METHOD_UNAVAILABLE',
       message: 'WasmWorkbook.snapshot_sparse is not available',
+    })
+
+    const formula = workbook.setFormula(9, 'A1', '=1')
+    fail(fake, 'INVALID_SHEET', 'invalid sheet index: 9')
+    await expect(formula).rejects.toMatchObject({
+      code: 'INVALID_SHEET',
+      message: 'invalid sheet index: 9',
     })
   })
 

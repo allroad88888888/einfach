@@ -70,7 +70,7 @@ export function FormulaBar(props: FormulaBarProps) {
       return
     }
     justCommitted = true
-    props.store.setCellInput(a, draft())
+    void props.store.setCellInputAsync(a, draft())
     props.onCommit?.()
   }
 

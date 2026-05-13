@@ -10,6 +10,13 @@ type Snapshot = {
   formula: string
 }
 
+type FormulaFailureScenario = {
+  baseline: Snapshot
+  optimistic: Snapshot
+  accepted: boolean
+  hydrated: Snapshot
+}
+
 type DirtyRef = {
   sheet: number
   addr: string
@@ -61,13 +68,21 @@ test.describe('Worker-backed workbook RPC', () => {
       const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
       try {
         await workbook.initWorkbook(['Sheet1'])
-        return await workbook.setFormula(0, 'A1', '=A1+1')
+        const accepted = await workbook.setFormula(0, 'A1', '=A1+1')
+        const detail = await workbook.setFormulaDetailed(0, 'B1', '=B1+1')
+        return { accepted, detail }
       } finally {
         workbook.dispose()
       }
     })
 
-    expect(result).toBe(false)
+    expect(result.accepted).toBe(false)
+    expect(result.detail).toEqual({
+      ok: false,
+      code: 'FORMULA_CYCLE',
+      message: 'formula would create a cycle',
+      display: '#CYCLE!',
+    })
     await expectNoConsoleErrors(page)
   })
 
@@ -79,16 +94,61 @@ test.describe('Worker-backed workbook RPC', () => {
       try {
         await workbook.initWorkbook(['Sheet1'])
         const accepted = await workbook.setFormula(0, 'A1', '=garbage((')
+        const detail = await workbook.setFormulaDetailed(0, 'B1', '=garbage((')
         const [cell] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
-        return { accepted, cell }
+        return { accepted, detail, cell }
       } finally {
         workbook.dispose()
       }
     })
 
     expect(result.accepted).toBe(false)
+    expect(result.detail).toEqual({
+      ok: false,
+      code: 'INVALID_FORMULA',
+      message: 'formula could not be parsed or installed',
+      display: '#VALUE!',
+    })
     expect(result.cell.isError).toBe(true)
     expect(result.cell.display).toMatch(/^#/)
+    await expectNoConsoleErrors(page)
+  })
+
+  test('worker workbook store rolls back malformed formula after hydration', async ({ page }) => {
+    const result = await runWorkerWorkbookStoreFormulaFailureScenario(page, {
+      formula: '=garbage((',
+      address: 'A1',
+    })
+
+    expect(result.baseline.display).toBe('')
+    expect(result.baseline.formula).toBe('')
+    expect(result.accepted).toBe(false)
+    expect(result.optimistic.formula).toBe('=garbage((')
+    expect(result.optimistic.isError).toBe(false)
+    expect(result.hydrated.isError).toBe(true)
+    expect(result.hydrated.formula).toBe('')
+    expect(result.hydrated.type).toBe('error')
+    expect(result.hydrated.display).toMatch(/^#/)
+    await expectNoConsoleErrors(page)
+  })
+
+  test('worker workbook store rolls back circular formulas after hydration', async ({ page }) => {
+    const result = await runWorkerWorkbookStoreFormulaFailureScenario(page, {
+      formula: '=A1+1',
+      address: 'A1',
+      kind: 'cycle',
+    })
+
+    expect(result.baseline.display).toBe('')
+    expect(result.baseline.formula).toBe('')
+    expect(result.accepted).toBe(false)
+    expect(result.optimistic.formula).toBe('=A1+1')
+    expect(result.optimistic.isError).toBe(false)
+    expect(result.optimistic.type).toBe('null')
+    expect(result.hydrated.formula).toBe('')
+    expect(result.hydrated.type).toBe('error')
+    expect(result.hydrated.isError).toBe(true)
+    expect(result.hydrated.display.toUpperCase()).toContain('CYCLE')
     await expectNoConsoleErrors(page)
   })
 
@@ -303,6 +363,85 @@ async function runWorkerWorkbookScenario(page: Page): Promise<{
       workbook.dispose()
     }
   })
+}
+
+async function runWorkerWorkbookStoreFormulaFailureScenario(
+  page: Page,
+  config: {
+    address: string
+    formula: string
+    kind?: 'invalid' | 'cycle'
+  },
+): Promise<FormulaFailureScenario> {
+  return page.evaluate(async (args) => {
+    const { createWorkerWorkbookStore } = await import('/src/wasm-workbook-store.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = await createWorkerWorkbookStore({
+      workerFactory: defaultWorkbookWorkerFactory,
+    })
+
+    const sheet = workbook.activeStore()
+    const address = args.address.toUpperCase()
+    const kind = args.kind ?? 'invalid'
+
+    const baseline = {
+      sheet: 0,
+      addr: address,
+      ...sheet.getCell(address),
+      formula: sheet.getFormula(address),
+    } as Snapshot
+
+    const acceptedPromise = sheet.setFormulaAsync(address, args.formula)
+
+    const optimistic = {
+      sheet: 0,
+      addr: address,
+      ...sheet.getCell(address),
+      formula: sheet.getFormula(address),
+    } as Snapshot
+    const accepted = await acceptedPromise
+
+    async function waitFor(authoritative: (cell: Snapshot) => boolean): Promise<Snapshot> {
+      const timeoutMs = 3_000
+      const started = performance.now()
+      while (true) {
+        const cell = {
+          sheet: 0,
+          addr: address,
+          ...sheet.getCell(address),
+          formula: sheet.getFormula(address),
+        } as Snapshot
+        if (authoritative(cell)) return cell
+        if (performance.now() - started > timeoutMs) {
+          throw new Error('timed out waiting for worker-backed formula failure hydration')
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+    }
+
+    const hydrated = await waitFor((cell) => {
+      if (kind === 'cycle') {
+        return (
+          cell.formula === '' &&
+          cell.isError &&
+          cell.type === 'error' &&
+          cell.display.toUpperCase().includes('CYCLE')
+        )
+      }
+
+      return cell.formula === '' && cell.isError && cell.type === 'error'
+    })
+
+    workbook.dispose()
+
+    return {
+      baseline,
+      optimistic,
+      accepted,
+      hydrated,
+    }
+  }, config)
 }
 
 async function runWorkerWorkbookImportScenario(page: Page): Promise<{

@@ -37,6 +37,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     commitImport: number[]
     cancelImport: number[]
     snapshotSparse: number
+    debugFormulaCacheState: Array<{ sheet: number; addr: string }>
   }
   emitHydrated(cells: CellSnapshotWire[]): void
   setFormulaResult(sheet: number, addr: string, result: boolean): void
@@ -68,6 +69,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     commitImport: [],
     cancelImport: [],
     snapshotSparse: 0,
+    debugFormulaCacheState: [],
   }
   const cells = new Map<string, CellSnapshotWire>()
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
@@ -143,6 +145,12 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       })
       return true
     },
+    async setFormulaDetailed(sheet, addr, formula) {
+      const ok = await this.setFormula(sheet, addr, formula)
+      return ok
+        ? { ok: true }
+        : { ok: false, code: 'FORMULA_REJECTED', message: 'formula was rejected' }
+    },
     async clearCell(sheet, addr) {
       calls.clearCell.push({ sheet, addr: addr.toUpperCase() })
       cells.delete(key(sheet, addr))
@@ -192,7 +200,8 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async readSparseRange(_range: SparseRangeWire) {
       return []
     },
-    async debugFormulaCacheState() {
+    async debugFormulaCacheState(sheet, addr) {
+      calls.debugFormulaCacheState.push({ sheet, addr: addr.toUpperCase() })
       return 'dirty'
     },
     async debugFormulaEvalCount() {
@@ -365,6 +374,7 @@ describe('createWorkerWorkbookStore', () => {
 
       client.setFormulaResult(0, 'A1', false)
       expect(store.raw.set_formula('A1', '=A1+1')).toBe(true)
+      expect(client.calls.setFormula).toEqual([{ sheet: 0, addr: 'A1', formula: '=A1+1' }])
       expect(store.getFormula('A1')).toBe('=A1+1')
 
       await waitFor(() => {
@@ -375,6 +385,53 @@ describe('createWorkerWorkbookStore', () => {
       expect(client.calls.readCells).toContainEqual([{ sheet: 0, addr: 'A1' }])
 
       observed.dispose()
+      workbook.dispose()
+    })
+  })
+
+  it('surfaces authoritative formula rejection through setFormulaAsync without an undo entry', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      client.setFormulaResult(0, 'A1', false)
+      const result = store.setFormulaAsync('A1', '=A1+1')
+
+      expect(store.getFormula('A1')).toBe('=A1+1')
+      await expect(result).resolves.toBe(false)
+      await waitFor(() => {
+        expect(store.getFormula('A1')).toBe('')
+      })
+      expect(store.canUndo()).toBe(false)
+
+      workbook.dispose()
+    })
+  })
+
+  it('returns unknown immediately for formula cache state then updates from worker probe', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      let resolveProbe: (value: string) => void
+      const pendingProbe = new Promise<string>((resolve) => {
+        resolveProbe = resolve
+      })
+      client.debugFormulaCacheState = async (sheet, addr) => {
+        client.calls.debugFormulaCacheState.push({ sheet, addr: addr.toUpperCase() })
+        return pendingProbe
+      }
+
+      const workbook = await createWorkerWorkbookStore({ client })
+      expect(workbook.formulaCacheState(0, 'a1')).toBe('unknown')
+      expect(workbook.formulaCacheState(0, 'a1')).toBe('unknown')
+      expect(client.calls.debugFormulaCacheState).toEqual([{ sheet: 0, addr: 'A1' }])
+
+      resolveProbe!('clean')
+      await waitFor(() => {
+        expect(workbook.formulaCacheState(0, 'a1')).toBe('clean')
+      })
+      expect(client.calls.debugFormulaCacheState).toHaveLength(1)
+
       workbook.dispose()
     })
   })

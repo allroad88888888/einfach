@@ -25,6 +25,8 @@ export type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  FormulaMutationErrorCode,
+  FormulaMutationResultWire,
   ImportCellWire,
   SparseCellWire,
   SparseRangeWire,

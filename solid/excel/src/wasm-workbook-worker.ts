@@ -5,6 +5,7 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  FormulaMutationResultWire,
   ImportCellIssueWire,
   ImportCellWire,
   RpcErrorWire,
@@ -177,6 +178,54 @@ function assertSheet(wb: WasmWorkbookRuntime, sheet: number) {
       code: 'INVALID_SHEET',
     })
   }
+}
+
+function assertFormulaSource(formula: unknown): string {
+  if (typeof formula !== 'string') {
+    throw Object.assign(new Error('formula must be a string'), {
+      code: 'INVALID_FORMULA',
+    })
+  }
+  return formula
+}
+
+function formulaFailureFromSnapshot(cell: CellSnapshotWire): FormulaMutationResultWire {
+  const display = cell.display.toUpperCase()
+  if (display.includes('CYCLE')) {
+    return {
+      ok: false,
+      code: 'FORMULA_CYCLE',
+      message: 'formula would create a cycle',
+      display: cell.display,
+    }
+  }
+  if (cell.isError) {
+    return {
+      ok: false,
+      code: 'INVALID_FORMULA',
+      message: 'formula could not be parsed or installed',
+      display: cell.display,
+    }
+  }
+  return {
+    ok: false,
+    code: 'FORMULA_REJECTED',
+    message: 'formula was rejected',
+    display: cell.display,
+  }
+}
+
+function setFormulaDetailed(
+  wb: WasmWorkbookRuntime,
+  sheet: number,
+  addr: string,
+  formula: unknown,
+): FormulaMutationResultWire {
+  assertSheet(wb, sheet)
+  const source = assertFormulaSource(formula)
+  const ok = assertMethod(wb, 'setFormulaAt').call(wb, sheet, addr, source)
+  if (ok) return { ok: true }
+  return formulaFailureFromSnapshot(snapshotCell(wb, { sheet, addr }))
 }
 
 function setCell(wb: WasmWorkbookRuntime, sheet: number, addr: string, value: CellWire) {
@@ -417,8 +466,14 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
             wb,
             Number(msg.sheet),
             normalizeAddr(msg.addr),
-            String(msg.formula ?? ''),
+            assertFormulaSource(msg.formula),
           ),
+        )
+        break
+      case 'setFormulaDetailed':
+        postResponse(
+          msg.id,
+          setFormulaDetailed(wb, Number(msg.sheet), normalizeAddr(msg.addr), msg.formula),
         )
         break
       case 'clearCell':

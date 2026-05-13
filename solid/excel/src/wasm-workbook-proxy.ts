@@ -84,6 +84,15 @@ export interface RpcErrorWire {
   message: string
 }
 
+export type FormulaMutationErrorCode =
+  | 'INVALID_FORMULA'
+  | 'FORMULA_CYCLE'
+  | 'FORMULA_REJECTED'
+
+export type FormulaMutationResultWire =
+  | { ok: true }
+  | { ok: false; code: FormulaMutationErrorCode; message: string; display?: string }
+
 export type RpcResponseWire =
   | { id: number; ok: true; result?: unknown }
   | { id: number; ok: false; error: RpcErrorWire }
@@ -100,6 +109,11 @@ export interface WorkerWorkbookClient {
   removeSheet(sheet: number): Promise<boolean>
   setCell(sheet: number, addr: string, value: CellWire): Promise<boolean>
   setFormula(sheet: number, addr: string, formula: string): Promise<boolean>
+  setFormulaDetailed(
+    sheet: number,
+    addr: string,
+    formula: string,
+  ): Promise<FormulaMutationResultWire>
   clearCell(sheet: number, addr: string): Promise<boolean>
   clearRange(range: SparseRangeWire): Promise<number>
   beginImport(sessionId?: number): Promise<number>
@@ -235,6 +249,13 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     setFormula(sheet, addr, formula) {
       return request<boolean>('setFormula', { sheet, addr: addr.toUpperCase(), formula })
+    },
+    setFormulaDetailed(sheet, addr, formula) {
+      return request<FormulaMutationResultWire>('setFormulaDetailed', {
+        sheet,
+        addr: addr.toUpperCase(),
+        formula,
+      })
     },
     clearCell(sheet, addr) {
       return request<boolean>('clearCell', { sheet, addr: addr.toUpperCase() })

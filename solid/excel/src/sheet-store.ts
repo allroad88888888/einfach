@@ -697,6 +697,25 @@ export function createSheetStore(sheet: ISheet) {
       return ok
     },
 
+    /**
+     * Authoritative formula commit path for worker-backed sheets. The
+     * legacy synchronous `setFormula` remains for in-process backends and
+     * old call sites, but UI commits should prefer this method so worker
+     * parse/cycle rejection can be observed instead of treated as a
+     * permanent optimistic success.
+     */
+    async setFormulaAsync(addr: string, formula: string): Promise<boolean> {
+      if (!sheet.set_formula_async) return this.setFormula(addr, formula)
+
+      const before = [snapshot(addr)]
+      const ok = await sheet.set_formula_async(addr, formula)
+      if (!ok) return false
+      const after = [snapshot(addr)]
+      undoStack.push({ kind: 'cells', before, after })
+      redoStack.length = 0
+      return true
+    },
+
     /** Clear a cell back to empty. Undoable. */
     clearCell(addr: string) {
       recordSingle(addr, () => sheet.clear_cell(addr))
@@ -785,6 +804,13 @@ export function createSheetStore(sheet: ISheet) {
           }
         }
       })
+    },
+
+    async setCellInputAsync(addr: string, input: string): Promise<boolean> {
+      const trimmed = input.trim()
+      if (trimmed.startsWith('=')) return this.setFormulaAsync(addr, trimmed)
+      this.setCellInput(addr, input)
+      return true
     },
 
     /**

@@ -88,7 +88,7 @@ export function Cell(props: CellProps) {
     // an editing-state check so the second call is a no-op. Fixes TODO 1.2.1
     // (each user keystroke produces one undo entry, not two).
     if (!editing()) return
-    props.store.setCellInput(props.addr, editValue())
+    void props.store.setCellInputAsync(props.addr, editValue())
     setEditing(false)
   }
 
