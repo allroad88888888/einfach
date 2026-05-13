@@ -732,6 +732,30 @@ impl WasmSheet {
         Ok(())
     }
 
+    /// Phase 6 — set the format for a rectangular range.
+    /// `fmt` follows the same wire shape as `set_format`; `null` / `undefined` / `{}` clears
+    /// any non-default range style by storing the default style as a layer.
+    pub fn set_format_range(
+        &mut self,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+        fmt: JsValue,
+    ) -> Result<u32, JsValue> {
+        let parsed: CellFormatJSON = if fmt.is_undefined() || fmt.is_null() {
+            CellFormatJSON::default()
+        } else {
+            serde_wasm_bindgen::from_value(fmt)
+                .map_err(|e| JsValue::from_str(&format!("invalid CellFormat: {e}")))?
+        };
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        Ok(self.sheet.set_format_range(range, parsed.into_format()) as u32)
+    }
+
     /// Read the base format for a cell (no conditional rules applied).
     pub fn get_format(&self, addr: &str) -> JsValue {
         let fmt = self.sheet.get_format(addr);
@@ -1378,6 +1402,35 @@ impl WasmWorkbook {
             CellAddress::new(end_row, end_col),
         );
         self.workbook.clear_range(sheet_idx as usize, range) as u32
+    }
+
+    /// Set a range format without materializing empty cells. The core stores
+    /// a sparse range-format layer and only notifies addresses that are
+    /// already subscribed.
+    pub fn set_format_range(
+        &mut self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+        fmt: JsValue,
+    ) -> Result<u32, JsValue> {
+        let parsed: CellFormatJSON = if fmt.is_undefined() || fmt.is_null() {
+            CellFormatJSON::default()
+        } else {
+            serde_wasm_bindgen::from_value(fmt)
+                .map_err(|e| JsValue::from_str(&format!("invalid CellFormat: {e}")))?
+        };
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let sheet = self
+            .workbook
+            .sheet_mut(sheet_idx as usize)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
+        Ok(sheet.set_format_range(range, parsed.into_format()) as u32)
     }
 }
 

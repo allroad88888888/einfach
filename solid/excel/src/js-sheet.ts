@@ -25,12 +25,55 @@ export function createJSSheet(): ISheet {
   const cells = new Map<string, { type: string; value: unknown; formula?: string }>()
   const formulas = new Map<string, string>()
   const formats = new Map<string, CellFormatJSON>()
+  const rangeFormats: Array<{
+    startRow: number
+    startCol: number
+    endRow: number
+    endCol: number
+    fmt: CellFormatJSON
+  }> = []
   const listeners = new Map<string, Map<number, () => void>>()
   const tokenToAddr = new Map<number, string>()
   let nextToken = 0
 
   function getFormat(addr: string): CellFormatJSON {
-    return formats.get(addr.toUpperCase()) ?? {}
+    const a = addr.toUpperCase()
+    const explicit = formats.get(a)
+    if (explicit) return explicit
+    const coord = addrToCoord(a)
+    if (!coord) return {}
+    for (let i = rangeFormats.length - 1; i >= 0; i--) {
+      const layer = rangeFormats[i]
+      if (
+        coord.row >= layer.startRow &&
+        coord.row <= layer.endRow &&
+        coord.col >= layer.startCol &&
+        coord.col <= layer.endCol
+      ) {
+        return layer.fmt
+      }
+    }
+    return {}
+  }
+
+  function normalizeRange(startRow: number, startCol: number, endRow: number, endCol: number) {
+    return {
+      startRow: Math.min(startRow, endRow),
+      startCol: Math.min(startCol, endCol),
+      endRow: Math.max(startRow, endRow),
+      endCol: Math.max(startCol, endCol),
+    }
+  }
+
+  function addrInRange(addr: string, range: ReturnType<typeof normalizeRange>): boolean {
+    const coord = addrToCoord(addr)
+    if (!coord) return false
+    return (
+      coord.row >= range.startRow &&
+      coord.row <= range.endRow &&
+      coord.col >= range.startCol &&
+      coord.col <= range.endCol
+    )
   }
 
   /** Apply a CellFormat's number format to a numeric value. Mirrors a subset
@@ -354,6 +397,21 @@ export function createJSSheet(): ISheet {
       fireChanges(before)
     },
 
+    set_format_range(startRow, startCol, endRow, endCol, fmt) {
+      const range = normalizeRange(startRow, startCol, endRow, endCol)
+      const before = snapshotDisplays()
+      for (const addr of [...formats.keys()]) {
+        if (addrInRange(addr, range)) formats.delete(addr)
+      }
+      rangeFormats.push({ ...range, fmt: fmt && !formatsEqual(fmt, {}) ? { ...fmt } : {} })
+      for (const [addr, map] of listeners) {
+        if (!addrInRange(addr, range)) continue
+        for (const cb of map.values()) cb()
+      }
+      fireChanges(before)
+      return 1
+    },
+
     get_format(addr: string): CellFormatJSON {
       return getFormat(addr)
     },
@@ -421,13 +479,25 @@ export function createJSSheet(): ISheet {
       const nextAddr = coordToAddr(moved)
       newFormats.set(nextAddr, fmt)
     }
+    const newRangeFormats: typeof rangeFormats = []
+    for (const layer of rangeFormats) {
+      const start = mapAddr({ row: layer.startRow, col: layer.startCol })
+      const end = mapAddr({ row: layer.endRow, col: layer.endCol })
+      if (start === null || end === null) continue
+      newRangeFormats.push({
+        ...normalizeRange(start.row, start.col, end.row, end.col),
+        fmt: layer.fmt,
+      })
+    }
     cells.clear()
     formulas.clear()
     formats.clear()
+    rangeFormats.length = 0
     for (const [a, v] of newCells) {
       if (v) cells.set(a, v)
     }
     for (const [a, f] of newFormulas) formulas.set(a, f)
     for (const [a, fmt] of newFormats) formats.set(a, fmt)
+    rangeFormats.push(...newRangeFormats)
   }
 }

@@ -548,15 +548,48 @@ export function createSheetStore(sheet: ISheet) {
     recordFormat(addr, () => sheet.set_format!(addr, fmt))
   }
 
+  function setLargeRangeFormat(
+    range: NormalizedCellRange,
+    fmt: CellFormatJSON,
+  ): Promise<void> | void {
+    const result = sheet.set_format_range!(
+      range.startRow,
+      range.startCol,
+      range.endRow,
+      range.endCol,
+      fmt,
+    )
+    if (result && typeof (result as Promise<unknown>).then === 'function') {
+      return Promise.resolve(result).then(() => {})
+    }
+  }
+
   function formatCellRange(
     anchorCoord: CellCoord,
     focusCoord: CellCoord,
     patch: (current: CellFormatJSON) => CellFormatJSON,
   ): boolean {
-    if (!sheet.set_format) return false
     const range = normalizeCellRange(anchorCoord, focusCoord)
-    if (rangeCellCount(range) > FORMAT_CELL_LIMIT) return false
+    if (rangeCellCount(range) > FORMAT_CELL_LIMIT) {
+      if (!sheet.set_format_range) return false
+      commitPendingEdit()
+      const next = patch({})
+      const apply = setLargeRangeFormat(range, next)
+      if (apply && typeof (apply as Promise<void>).catch === 'function') {
+        void (apply as Promise<void>).catch((err) => {
+          // eslint-disable-next-line no-console
+          console.warn('[einfach] large range format failed', err)
+        })
+      }
+      // No format-range snapshot/restore contract exists yet, so do not
+      // pretend this can be safely undone. This mirrors destructive large
+      // range commands whose backend lacks a precise inverse.
+      undoStack.length = 0
+      redoStack.length = 0
+      return true
+    }
 
+    if (!sheet.set_format) return false
     const ownsBatch = pendingBefore === null
     if (ownsBatch) {
       pendingBefore = []
@@ -882,8 +915,9 @@ export function createSheetStore(sheet: ISheet) {
 
     /**
      * Apply a format patch to the current selection. Large rectangles are
-     * rejected until backend range-format metadata is available; this keeps
-     * toolbar clicks from materializing massive address arrays.
+     * routed through the optional backend range-format API. Without that
+     * capability we still reject instead of materializing massive address
+     * arrays on the main thread.
      */
     formatSelection(patch: (current: CellFormatJSON) => CellFormatJSON): boolean {
       return formatCellRange(anchor(), selection(), patch)

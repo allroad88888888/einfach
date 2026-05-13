@@ -294,6 +294,13 @@ function createWorkbookSheetAdapter(
       })
       return cleared
     },
+    set_format_range(startRow, startCol, endRow, endCol, fmt) {
+      let applied = 0
+      mutate(() => {
+        applied = workbook.set_format_range(sheetIdx, startRow, startCol, endRow, endCol, fmt)
+      })
+      return applied
+    },
     snapshot_range_sparse(startRow, startCol, endRow, endCol) {
       return workbook
         .snapshot_range_sparse(sheetIdx, startRow, startCol, endRow, endCol)
@@ -648,6 +655,26 @@ function createWorkerWorkbookSheetAdapter(
       }
       return client
         .clearRange(range)
+        .then((count) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          return count
+        })
+        .catch((err) => {
+          hydrateVisibleAddrs(visibleAddrs)
+          throw err
+        })
+    },
+    set_format_range(startRow, startCol, endRow, endCol, fmt) {
+      const visibleAddrs = invalidateCachedStateForRemoteMutation()
+      const range: SparseRangeWire = {
+        sheet: sheetIdx,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+      }
+      return client
+        .setFormatRange(range, fmt)
         .then((count) => {
           hydrateVisibleAddrs(visibleAddrs)
           return count

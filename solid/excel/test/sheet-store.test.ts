@@ -503,14 +503,69 @@ describe('createSheetStore', () => {
       })
     })
 
-    it('formatSelection rejects oversized ranges without probing per-cell formats', () => {
+    it('formatSelection uses set_format_range for oversized ranges when available', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet() as ReturnType<typeof createJSSheet> & {
+          set_format_range: (
+            startRow: number,
+            startCol: number,
+            endRow: number,
+            endCol: number,
+            fmt: Record<string, unknown>,
+          ) => unknown
+        }
+        const originalSetFormat = sheet.set_format?.bind(sheet)
+        const originalGetFormat = sheet.get_format?.bind(sheet)
+        let setFormatCalls = 0
+        let getFormatCalls = 0
+        const setFormatRangeCalls: unknown[][] = []
+
+        sheet.set_format = () => {
+          setFormatCalls += 1
+        }
+        sheet.get_format = (addr) => {
+          getFormatCalls += 1
+          return originalGetFormat ? originalGetFormat(addr) : {}
+        }
+        sheet.set_format_range = (startRow, startCol, endRow, endCol, fmt) => {
+          setFormatRangeCalls.push([startRow, startCol, endRow, endCol, fmt])
+        }
+
+        const store = createSheetStore(sheet)
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        expect(
+          store.formatSelection((cur) => ({
+            ...cur,
+            bold: true,
+          })),
+        ).toBe(true)
+        expect(setFormatRangeCalls).toEqual([[0, 0, 999, 999, { bold: true }]])
+        expect(setFormatCalls).toBe(0)
+        expect(getFormatCalls).toBe(0)
+        expect(store.canUndo()).toBe(false)
+        sheet.set_format = originalSetFormat
+        if (originalGetFormat) sheet.get_format = originalGetFormat
+        dispose()
+      })
+    })
+
+    it('formatSelection rejects oversized ranges when no range-native set_format_range API exists', () => {
       createRoot((dispose) => {
         const sheet = createJSSheet()
+        sheet.set_format_range = undefined
         const getFormat = sheet.get_format!.bind(sheet)
+        const setFormat = sheet.set_format!.bind(sheet)
         let formatReads = 0
+        let setFormatWrites = 0
         sheet.get_format = (addr) => {
           formatReads += 1
           return getFormat(addr)
+        }
+        sheet.set_format = (addr, fmt) => {
+          setFormatWrites += 1
+          setFormat(addr, fmt)
         }
         const store = createSheetStore(sheet)
         store.setSelectionAnchor({ row: 0, col: 0 })
@@ -518,6 +573,7 @@ describe('createSheetStore', () => {
 
         expect(store.formatSelection((cur) => ({ ...cur, bold: true }))).toBe(false)
         expect(formatReads).toBe(0)
+        expect(setFormatWrites).toBe(0)
         expect(store.canUndo()).toBe(false)
         dispose()
       })

@@ -1,4 +1,5 @@
 import { describe, expect, it, jest } from '@jest/globals'
+import type { CellFormatJSON } from '../src/types'
 import { mergeImportStatsIssues, normalizeImportCells } from '../src/wasm-workbook-worker'
 import type {
   ImportCellWire,
@@ -57,6 +58,14 @@ type MockWasmWorkbook = {
   restore_sparse: (cells: unknown[]) => number
   read_sparse_range: () => unknown[]
   clear_range: () => number
+  set_format_range: (
+    sheet: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+    fmt: CellFormatJSON | null | undefined,
+  ) => number
   debug_formula_cache_state: () => string
   debug_formula_eval_count: () => number
   subscribe_cell: () => number
@@ -68,6 +77,7 @@ type MockWasmWorkbook = {
     snapshotSparse: number
     snapshotRangeSparse: SparseRangeWire[]
     restoreSparse: SparseCellWire[][]
+    setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
   }
 }
 
@@ -101,6 +111,7 @@ function createMockWasmWorkbook() {
     snapshotSparse: 0,
     snapshotRangeSparse: [],
     restoreSparse: [],
+    setFormatRange: [],
   }
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
@@ -126,7 +137,14 @@ function createMockWasmWorkbook() {
   function sparseFromState(sheet: number, addr: string, state: MockCellState) {
     const parsed = parseAddress(addr)
     if (state.type === 'formula') {
-      return { sheet, addr, row: parsed.row, col: parsed.col, kind: 'formula', value: state.formula }
+      return {
+        sheet,
+        addr,
+        row: parsed.row,
+        col: parsed.col,
+        kind: 'formula',
+        value: state.formula,
+      }
     }
     if (state.type === 'number') {
       return {
@@ -309,6 +327,10 @@ function createMockWasmWorkbook() {
     },
     read_sparse_range: () => [],
     clear_range: () => 0,
+    set_format_range: (sheet, startRow, startCol, endRow, endCol, fmt) => {
+      calls.setFormatRange.push({ sheet, startRow, startCol, endRow, endCol, fmt })
+      return 1
+    },
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
     subscribe_cell: () => 1,
@@ -390,6 +412,7 @@ function withMockedWorker() {
         workbooks.flatMap((workbook) =>
           workbook.__mockInstanceId === 0 ? [] : (workbook.__mockCalls?.snapshotRangeSparse ?? []),
         ),
+      mainSetFormatRange: () => workbooks[0]?.__mockCalls?.setFormatRange ?? [],
     },
     send: <T>(message: Record<string, unknown>) => requestWorkerResponse<T>(responses, message),
     dispose: () => {
@@ -657,6 +680,31 @@ describe('wasm-workbook-worker import session contract', () => {
       })
 
       expect(tsv).toBe('=Sheet2!A1+1')
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes setFormatRange to the wasm workbook range-format API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const count = await harness.send<number>({
+        id: 2,
+        cmd: 'setFormatRange',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
+        fmt: { bold: true },
+      })
+
+      expect(count).toBe(1)
+      expect(harness.calls.mainSetFormatRange()).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999, fmt: { bold: true } },
+      ])
     } finally {
       harness.dispose()
     }

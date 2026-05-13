@@ -95,6 +95,11 @@ test.describe('Format toolbar', () => {
       const win = window as unknown as {
         __einfachStore?: {
           selectionAddrs: () => string[][]
+          raw: {
+            set_format_range?: (...args: Array<unknown>) => unknown
+            set_format?: (...args: Array<unknown>) => unknown
+            get_format?: (...args: Array<unknown>) => unknown
+          }
           formatSelection: (
             patch: (current: Record<string, unknown>) => Record<string, unknown>,
           ) => boolean
@@ -102,6 +107,7 @@ test.describe('Format toolbar', () => {
           extendSelection: (coord: { row: number; col: number }) => void
         }
         __formatSelectionCalls?: number
+        __setFormatRangeCalls?: Array<Array<unknown>>
       }
       const store = win.__einfachStore
       if (!store) return { hasStore: false }
@@ -110,17 +116,37 @@ test.describe('Format toolbar', () => {
       store.selectionAddrs = () => {
         throw new Error('selectionAddrs must not run for large formatting')
       }
+      store.raw.set_format = () => {
+        throw new Error('set_format must not run for range-native formatting')
+      }
+      store.raw.get_format = () => {
+        throw new Error('get_format must not run for range-native formatting')
+      }
+      const calls: Array<Array<unknown>> = []
+      store.raw.set_format_range = (...args: Array<unknown>) => {
+        calls.push(args)
+      }
       store.formatSelection = (patch) => {
         win.__formatSelectionCalls = (win.__formatSelectionCalls ?? 0) + 1
         return originalFormatSelection(patch)
       }
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
-      return { hasStore: true }
+
+      const ok = store.formatSelection((current) => ({ ...current, bold: true }))
+      win.__setFormatRangeCalls = calls
+      return { hasStore: true, ok }
     })
     expect(setup.hasStore).toBe(true)
+    expect(setup.ok).toBe(true)
 
-    await page.getByRole('button', { name: 'Bold' }).click()
+    const calls = await page.evaluate(() => {
+      const win = window as unknown as {
+        __setFormatRangeCalls?: Array<Array<unknown>>
+      }
+      return win.__setFormatRangeCalls
+    })
+    expect(calls).toEqual([[0, 0, 999, 999, { bold: true }]])
 
     await expect
       .poll(() =>
@@ -130,5 +156,67 @@ test.describe('Format toolbar', () => {
         }),
       )
       .toBe(1)
+  })
+
+  test('large formatting returns false when range-native set_format_range API is unavailable', async ({
+    page,
+  }) => {
+    await gotoBlankDebug(page)
+
+    const setup = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          selectionAddrs: () => string[][]
+          raw: {
+            set_format_range?: (...args: Array<unknown>) => unknown
+            set_format?: (...args: Array<unknown>) => unknown
+            get_format?: (...args: Array<unknown>) => unknown
+          }
+          formatSelection: (
+            patch: (current: Record<string, unknown>) => Record<string, unknown>,
+          ) => boolean
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+        }
+        __formatSelectionResult?: boolean
+        __formatSelectionCalls?: number
+      }
+      const store = win.__einfachStore
+      if (!store) return { hasStore: false }
+      ;(store.raw as { set_format_range?: (...args: Array<unknown>) => unknown }).set_format_range =
+        undefined
+
+      let setFormatCalls = 0
+      let getFormatCalls = 0
+      if (store.raw.set_format) {
+        store.raw.set_format = () => {
+          setFormatCalls += 1
+        }
+      }
+      if (store.raw.get_format) {
+        store.raw.get_format = () => {
+          getFormatCalls += 1
+          return {}
+        }
+      }
+
+      store.selectionAddrs = () => {
+        throw new Error('selectionAddrs must not run for oversized formatting')
+      }
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      const ok = store.formatSelection((current) => ({ ...current, bold: true }))
+      return {
+        hasStore: true,
+        ok,
+        setFormatCalls,
+        getFormatCalls,
+      }
+    })
+
+    expect(setup.hasStore).toBe(true)
+    expect(setup.ok).toBe(false)
+    expect(setup.setFormatCalls).toBe(0)
+    expect(setup.getFormatCalls).toBe(0)
   })
 })

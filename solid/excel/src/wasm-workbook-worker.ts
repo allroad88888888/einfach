@@ -2,6 +2,7 @@
 
 import init, { WasmWorkbook } from '../wasm-pkg/einfach_wasm.js'
 import { sparseRangeToTSV } from './range-tsv'
+import type { CellFormatJSON } from './types'
 import type {
   CellRefWire,
   CellSnapshotWire,
@@ -63,6 +64,14 @@ type WasmWorkbookRuntime = {
     startCol: number,
     endRow: number,
     endCol: number,
+  ) => number
+  set_format_range?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+    fmt: CellFormatJSON | null | undefined,
   ) => number
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_formula_eval_count?: (sheetIdx: number) => number
@@ -620,6 +629,25 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               range.startCol,
               range.endRow,
               range.endCol,
+            ),
+          )
+        }
+        break
+      case 'setFormatRange':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const setFormatRange = assertMethod(wb, 'set_format_range')
+          postResponse(
+            msg.id,
+            setFormatRange.call(
+              wb,
+              range.sheet,
+              range.startRow,
+              range.startCol,
+              range.endRow,
+              range.endCol,
+              msg.fmt as CellFormatJSON | null | undefined,
             ),
           )
         }

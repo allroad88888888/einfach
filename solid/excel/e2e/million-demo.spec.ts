@@ -164,6 +164,56 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(calls).toEqual([[0, 0, 999, 999]])
   })
 
+  test('format_large_selection_uses_range_native_format', async ({ page }) => {
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    const result = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          raw: {
+            set_format_range?: (...args: Array<unknown>) => unknown
+            set_format?: (...args: Array<unknown>) => unknown
+          }
+          selectionAddrs: () => string[][]
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+          formatSelection: (
+            patch: (current: Record<string, unknown>) => Record<string, unknown>,
+          ) => boolean
+          canUndo: () => boolean
+        }
+        __formatRangeCalls?: Array<Array<unknown>>
+      }
+      const store = win.__einfachStore
+      const original = store?.raw.set_format_range?.bind(store.raw)
+      if (!store || !original) return { hasFormatRange: false, ok: false, canUndo: false }
+      const calls: Array<Array<unknown>> = []
+      store.raw.set_format_range = (...args: Array<unknown>) => {
+        calls.push(args)
+        return original(...args)
+      }
+      store.raw.set_format = () => {
+        throw new Error('set_format must not run for range-native format')
+      }
+      store.selectionAddrs = () => {
+        throw new Error('selectionAddrs must not run for range-native format')
+      }
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      const ok = store.formatSelection((current) => ({ ...current, bold: true }))
+      win.__formatRangeCalls = calls
+      return { hasFormatRange: true, ok, canUndo: store.canUndo() }
+    })
+
+    expect(result).toEqual({ hasFormatRange: true, ok: true, canUndo: false })
+    const calls = await page.evaluate(() => {
+      const win = window as unknown as { __formatRangeCalls?: Array<Array<unknown>> }
+      return win.__formatRangeCalls
+    })
+    expect(calls).toEqual([[0, 0, 999, 999, { bold: true }]])
+  })
+
   test('copy_large_selection_does_not_materialize_selection_grid', async ({ page }) => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
@@ -251,9 +301,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(result).toEqual({ hasStore: true, addrs: null })
   })
 
-  test('selection restores the selected cell into the virtualized DOM', async ({
-    page,
-  }) => {
+  test('selection restores the selected cell into the virtualized DOM', async ({ page }) => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 

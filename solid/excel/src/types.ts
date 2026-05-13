@@ -98,6 +98,18 @@ export interface ISheet {
 
   /** Apply a format to a cell. Pass `undefined` / `null` / `{}` to clear. */
   set_format?(addr: string, fmt: CellFormatJSON | null | undefined): void
+  /**
+   * Optional range-native format. Coordinates are zero-based and inclusive.
+   * Implementations must keep this sparse/range-backed and must not require
+   * callers to materialize every address in a large rectangle.
+   */
+  set_format_range?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+    fmt: CellFormatJSON | null | undefined,
+  ): number | void | Promise<number | void>
   /** Base format (no conditional rule overrides). */
   get_format?(addr: string): CellFormatJSON
   /** Base + first matching conditional rule. */

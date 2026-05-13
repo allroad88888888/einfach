@@ -272,8 +272,27 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ok(fake, 1)
     await expect(clear).resolves.toBe(1)
 
+    const format = workbook.setFormatRange(
+      {
+        sheet: 1,
+        startRow: 0,
+        startCol: 0,
+        endRow: 999_999,
+        endCol: 999_999,
+      },
+      { bold: true },
+    )
+    expect(lastSent(fake)).toEqual({
+      id: 10,
+      cmd: 'setFormatRange',
+      range: { sheet: 1, startRow: 0, startCol: 0, endRow: 999_999, endCol: 999_999 },
+      fmt: { bold: true },
+    })
+    ok(fake, 1)
+    await expect(format).resolves.toBe(1)
+
     const cancel = workbook.cancelImport(99)
-    expect(lastSent(fake)).toEqual({ id: 10, cmd: 'cancelImport', sessionId: 99 })
+    expect(lastSent(fake)).toEqual({ id: 11, cmd: 'cancelImport', sessionId: 99 })
     ok(fake, false)
     await expect(cancel).resolves.toBe(false)
   })

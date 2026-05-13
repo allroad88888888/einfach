@@ -3,6 +3,7 @@
 import { describe, expect, it } from '@jest/globals'
 import { createRoot } from 'solid-js'
 import { sparseRangeToTSV } from '../src/range-tsv'
+import type { CellFormatJSON } from '../src/types'
 import { createWorkerWorkbookStore } from '../src/wasm-workbook-store'
 import type {
   CellRefWire,
@@ -24,6 +25,10 @@ type ClearRangeCall = {
   endCol: number
 }
 
+type FormatRangeCall = ClearRangeCall & {
+  fmt: CellFormatJSON | null | undefined
+}
+
 type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   calls: {
     initWorkbook: string[][]
@@ -31,6 +36,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setFormula: Array<{ sheet: number; addr: string; formula: string }>
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
+    setFormatRange: FormatRangeCall[]
     snapshotRangeSparse: ClearRangeCall[]
     exportRangeTsv: ClearRangeCall[]
     restoreSparse: SparseCellWire[][]
@@ -103,6 +109,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setFormula: [],
     clearCell: [],
     clearRange: [],
+    setFormatRange: [],
     snapshotRangeSparse: [],
     exportRangeTsv: [],
     restoreSparse: [],
@@ -209,6 +216,10 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         if (Number(sheetStr) !== range.sheet) continue
         if (inRange(addr, range)) cells.delete(itemKey)
       }
+      return 1
+    },
+    async setFormatRange(range, fmt) {
+      calls.setFormatRange.push({ ...range, fmt })
       return 1
     },
     async snapshotRangeSparse(_range: SparseRangeWire) {
@@ -490,6 +501,26 @@ describe('createWorkerWorkbookStore', () => {
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
       ])
       expect(client.calls.clearCell).toEqual([])
+
+      workbook.dispose()
+    })
+  })
+
+  it('routes large selection formats through worker setFormatRange without expanding cells', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      expect(store.formatSelection((current) => ({ ...current, bold: true }))).toBe(true)
+      await Promise.resolve()
+
+      expect(client.calls.setFormatRange).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999, fmt: { bold: true } },
+      ])
+      expect(store.canUndo()).toBe(false)
 
       workbook.dispose()
     })
