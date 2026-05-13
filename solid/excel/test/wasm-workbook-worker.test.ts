@@ -64,6 +64,7 @@ type MockWasmWorkbook = {
   __mockInstanceId?: number
   __mockCalls?: {
     bulkImportCells: number
+    bulkImportPayloads: ImportCellWire[][]
     snapshotSparse: number
     snapshotRangeSparse: SparseRangeWire[]
     restoreSparse: SparseCellWire[][]
@@ -96,6 +97,7 @@ function parseAddress(addr: string): { row: number; col: number } {
 function createMockWasmWorkbook() {
   const calls: NonNullable<MockWasmWorkbook['__mockCalls']> = {
     bulkImportCells: 0,
+    bulkImportPayloads: [],
     snapshotSparse: 0,
     snapshotRangeSparse: [],
     restoreSparse: [],
@@ -225,6 +227,7 @@ function createMockWasmWorkbook() {
     },
     bulk_import_cells: (cellsIn: ImportCellWire[]) => {
       calls.bulkImportCells += 1
+      calls.bulkImportPayloads.push(cellsIn)
       setFromImport(cellsIn)
       return {
         accepted: cellsIn.length,
@@ -373,6 +376,7 @@ function withMockedWorker() {
   return {
     calls: {
       mainWorkbook: () => workbooks[0]?.__mockCalls?.bulkImportCells ?? 0,
+      mainBulkImportPayloads: () => workbooks[0]?.__mockCalls?.bulkImportPayloads ?? [],
       importWorkbooks: () => workbooks.slice(1).length,
       allBulkImportCalls: () =>
         workbooks.reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
@@ -481,7 +485,7 @@ describe('wasm-workbook-worker import normalization', () => {
 })
 
 describe('wasm-workbook-worker import session contract', () => {
-  it('should not commit import chunks as one giant bulk_import_cells payload', async () => {
+  it('stages import chunks off main and commits only final writes', async () => {
     const harness = withMockedWorker()
     try {
       const begin = await harness.send<number>({
@@ -515,7 +519,15 @@ describe('wasm-workbook-worker import session contract', () => {
 
       expect(commit.accepted).toBe(3)
       expect(commit.formulas).toBe(0)
-      expect(harness.calls.mainWorkbook()).toBe(0)
+      expect(harness.calls.mainSnapshotSparse()).toBe(0)
+      expect(harness.calls.mainWorkbook()).toBe(1)
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([
+        [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, row: 1, col: 1, kind: 'text', value: 'hello' },
+          { sheet: 0, row: 2, col: 2, kind: 'number', value: 3 },
+        ],
+      ])
       expect(harness.calls.importSnapshotSparse()).toBe(0)
       expect(harness.calls.importWorkbooks()).toBeGreaterThanOrEqual(1)
       expect(harness.calls.allBulkImportCalls()).toBeGreaterThan(0)
@@ -544,7 +556,7 @@ describe('wasm-workbook-worker import session contract', () => {
         cmd: 'beginImport',
         sessionId: 1,
       })
-      expect(harness.calls.mainSnapshotSparse()).toBe(1)
+      expect(harness.calls.mainSnapshotSparse()).toBe(0)
 
       await harness.send({
         id: 4,
@@ -567,10 +579,11 @@ describe('wasm-workbook-worker import session contract', () => {
         { sheet: 0, startRow: 1, startCol: 1, endRow: 1, endCol: 1 },
         { sheet: 0, startRow: 2, startCol: 2, endRow: 2, endCol: 2 },
       ])
-      expect(harness.calls.mainRestoreSparsePayloads()).toEqual([
+      expect(harness.calls.mainRestoreSparsePayloads()).toEqual([])
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([
         [
-          { sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'text', value: 'new' },
-          { sheet: 0, addr: 'C3', row: 2, col: 2, kind: 'formula', value: '=A1+1' },
+          { sheet: 0, row: 1, col: 1, kind: 'text', value: 'new' },
+          { sheet: 0, row: 2, col: 2, kind: 'formula', value: '=A1+1' },
         ],
       ])
 

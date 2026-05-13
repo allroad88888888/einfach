@@ -141,17 +141,12 @@ function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   return wb
 }
 
-function createWorkbookLike(source: WasmWorkbookRuntime): WasmWorkbookRuntime {
+function createWorkbookShell(source: WasmWorkbookRuntime): WasmWorkbookRuntime {
   const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
   if (source.sheet_count() > 0) {
     wb.rename_sheet(0, source.sheet_name(0))
     for (let idx = 1; idx < source.sheet_count(); idx++) wb.add_sheet(source.sheet_name(idx))
   }
-
-  const snapshotSparse = assertMethod(source, 'snapshot_sparse')
-  const restoreSparse = assertMethod(wb, 'restore_sparse')
-  const snapshot = snapshotSparse.call(source).map(normalizeSparseCell)
-  if (snapshot.length > 0) restoreSparse.call(wb, snapshot)
   return wb
 }
 
@@ -433,6 +428,42 @@ function finalImportClears(session: ImportSession): ImportCellWire[] {
   )
 }
 
+function sparseCellToImportCell(cell: SparseCellWire): ImportCellWire {
+  switch (cell.kind) {
+    case 'number':
+      return { sheet: cell.sheet, row: cell.row, col: cell.col, kind: 'number', value: cell.value }
+    case 'text':
+      return { sheet: cell.sheet, row: cell.row, col: cell.col, kind: 'text', value: cell.value }
+    case 'boolean':
+      return {
+        sheet: cell.sheet,
+        row: cell.row,
+        col: cell.col,
+        kind: 'boolean',
+        value: cell.value,
+      }
+    case 'error':
+      return { sheet: cell.sheet, row: cell.row, col: cell.col, kind: 'error', value: cell.value }
+    case 'formula':
+      return { sheet: cell.sheet, row: cell.row, col: cell.col, kind: 'formula', value: cell.value }
+  }
+}
+
+function mergeFinalCommitStats(
+  sessionStats: WorkbookImportStatsWire,
+  finalStats: WorkbookImportStatsWire,
+): WorkbookImportStatsWire {
+  const issues = [...(sessionStats.issues ?? []), ...(finalStats.issues ?? [])]
+  const rejectedFormulas = sessionStats.rejectedFormulas + finalStats.rejectedFormulas
+  return {
+    ...sessionStats,
+    accepted: Math.max(0, sessionStats.accepted - finalStats.rejectedFormulas),
+    rejectedFormulas,
+    errors: sessionStats.errors + finalStats.errors,
+    ...(issues.length > 0 ? { issues } : {}),
+  }
+}
+
 function normalizeSparseRange(range: unknown): SparseRangeWire {
   const input = (range ?? {}) as Partial<SparseRangeWire>
   const out: SparseRangeWire = {
@@ -603,7 +634,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
             })
           }
           importSessions.set(sessionId, {
-            workbook: createWorkbookLike(wb),
+            workbook: createWorkbookShell(wb),
             normalizedCount: 0,
             stats: emptyImportStats(),
             normalizationIssues: [],
@@ -648,17 +679,17 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
-          const restoreSparse = assertMethod(wb, 'restore_sparse')
           const changedCells = snapshotFinalImportTouches(session)
-          if (changedCells.length > 0) restoreSparse.call(wb, changedCells)
-
           const finalClears = finalImportClears(session)
-          if (finalClears.length > 0) {
-            assertMethod(wb, 'bulk_import_cells').call(wb, finalClears)
+          const finalWrites = [...changedCells.map(sparseCellToImportCell), ...finalClears]
+          let stats = session.stats
+          if (finalWrites.length > 0) {
+            const finalStats = assertMethod(wb, 'bulk_import_cells').call(wb, finalWrites)
+            stats = mergeFinalCommitStats(stats, finalStats)
           }
 
           importSessions.delete(sessionId)
-          postResponse(msg.id, mergeImportStatsIssues(session.stats, session.normalizationIssues))
+          postResponse(msg.id, mergeImportStatsIssues(stats, session.normalizationIssues))
         }
         break
       case 'cancelImport':

@@ -221,6 +221,53 @@ test.describe('Worker-backed workbook RPC', () => {
     await expectNoConsoleErrors(page)
   })
 
+  test('imports a formula that depends on an existing workbook cell', async ({ page }) => {
+    const result = await runWorkerWorkbookImportFormulaAgainstExistingCellScenario(page)
+
+    expect(result.stats).toMatchObject({
+      accepted: 1,
+      formulas: 1,
+      rejectedFormulas: 0,
+      cleared: 0,
+      errors: 0,
+    })
+    expect(result.beforeReadEvalCount).toBe(0)
+    expect(result.beforeReadFormulaState).toBe('dirty')
+    expect(result.formula.display).toBe('42')
+    expect(result.formula.formula).toBe('=Sheet2!A1+1')
+    expect(result.source.display).toBe('41')
+    expect(result.afterReadFormulaState).toBe('clean')
+    expect(result.afterReadEvalCount).toBe(1)
+
+    await expectNoConsoleErrors(page)
+  })
+
+  test('reports final workbook formula rejection after shell-staged import', async ({ page }) => {
+    const result = await runWorkerWorkbookImportFinalRejectionScenario(page)
+
+    expect(result.stats).toMatchObject({
+      accepted: 0,
+      formulas: 1,
+      rejectedFormulas: 1,
+      cleared: 0,
+      errors: 0,
+    })
+    expect(result.stats.issues ?? []).toEqual([
+      expect.objectContaining({
+        sheet: 0,
+        row: 0,
+        col: 0,
+        kind: 'formula',
+        code: 'FORMULA_REJECTED',
+      }),
+    ])
+    expect(result.cell.type).toBe('error')
+    expect(result.cell.isError).toBe(true)
+    expect(result.cell.display.toUpperCase()).toContain('CYCLE')
+
+    await expectNoConsoleErrors(page)
+  })
+
   test('respects import null final-write order', async ({ page }) => {
     const result = await runWorkerWorkbookImportNullClearScenario(page)
 
@@ -704,6 +751,95 @@ async function runWorkerWorkbookImportTouchedCellsScenario(page: Page): Promise<
         preNonEmpty,
         finalNonEmpty,
       }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportFormulaAgainstExistingCellScenario(page: Page): Promise<{
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+    issues?: ImportIssue[]
+  }
+  beforeReadEvalCount: number
+  beforeReadFormulaState: string
+  afterReadEvalCount: number
+  afterReadFormulaState: string
+  formula: Snapshot
+  source: Snapshot
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+      await workbook.setCell(1, 'A1', { type: 'number', value: 41 })
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      const stats = await workbook.commitImport(session)
+
+      const beforeReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const beforeReadFormulaState = await workbook.debugFormulaCacheState(0, 'A1')
+      const [formula, source] = await workbook.readCells([
+        { sheet: 0, addr: 'A1' },
+        { sheet: 1, addr: 'A1' },
+      ])
+      const afterReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterReadFormulaState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        stats,
+        beforeReadEvalCount,
+        beforeReadFormulaState,
+        afterReadEvalCount,
+        afterReadFormulaState,
+        formula,
+        source,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportFinalRejectionScenario(page: Page): Promise<{
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+    issues?: ImportIssue[]
+  }
+  cell: Snapshot
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+      await workbook.setFormula(1, 'A1', '=Sheet1!A1+1')
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      const stats = await workbook.commitImport(session)
+      const [cell] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
+
+      return { stats, cell }
     } finally {
       workbook.dispose()
     }
