@@ -20,6 +20,8 @@ cjs
 
 coverage
 .idea
+.claude/
+.playwright-mcp/
 .tmp
 .rush
 *.tsbuildinfo
