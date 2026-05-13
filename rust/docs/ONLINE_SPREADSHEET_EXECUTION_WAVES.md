@@ -9,14 +9,15 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `6462024 (Wave 3 import persistence)` 加当前 Wave 3
-工作树为准；Wave 4 计划提交 `e73fb9d` 已写入并开始执行门禁同步。
+以最近提交 `f456dd7 (Wave 4 observability gates)` 为准；Wave 5
+文件导入/backpressure UI 计划已经开始。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 本轮状态更新：
 
 - Wave 3 已提交到 `6462024`（bounded import + sparse persistence v1）。
-- Wave 4 当前进行中（`e73fb9d` 计划提交后，主攻 docs/MCP/Gate 追踪和门禁对齐）。
+- Wave 4 已提交到 `f456dd7`（debug counters + observability e2e + MCP 记录）。
+- Wave 5 当前启动：正式文件导入 / backpressure UI。
 - Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
@@ -53,12 +54,12 @@
   合同、稳定错误码和 cancel/commit 测试。
 - 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
   或公式结果。正式文件流导入、backpressure UI、自动保存仍未做。
-- 测试覆盖已经很多，但 E2E 文档计数滞后；MCP Playwright/Chrome DevTools 还没有成为
-  每波固定验收记录。
+- 测试覆盖已经很多，E2E 文档计数已经在 Wave 4 对齐到 21 spec / 150 tests / 0 skip。
+  MCP Playwright 验证记录已经进入 Wave 4 文档，后续每波继续固定记录。
 
 ## 总体判断
 
-还剩 **3 个产品化实现波 + 1 个发布门禁波**。
+还剩 **2 个产品化实现波 + 1 个发布门禁波**。
 
 原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
 formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
@@ -315,7 +316,7 @@ MCP 验收：
 
 ## 波次 4：性能、观测和 MCP 门禁产品化
 
-状态：**进行中**。计划提交 `e73fb9d` 已完成写入，当前执行点为：
+状态：**已完成并提交**，提交 `f456dd7 feat(solid-excel): add observability gates`。本波输出：
 
 - Rust/WASM 与 worker/proxy debug counters 已接入；
 - 新增 `observability.spec.ts`，覆盖 1M DOM viewport bound 与 worker lazy eval counters；
@@ -364,7 +365,53 @@ MCP 验收：
 - 性能测试需要改业务代码才能通过，但没有明确产品原因。
 - 指标只做截图观察，没有可重复的脚本或断言。
 
-## 波次 5：产品硬化与 Excel 兼容缺口
+## 波次 5：文件导入与 Backpressure UI
+
+状态：**启动中**。计划文档：`rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md`。
+
+### 目标
+
+把已有 worker import session 从 API 合同推进到用户可操作的文件导入链路：
+
+- CSV/TSV 通过 `File.stream()` 增量读取，禁止 `file.text()` 一次性读全量。
+- parser/helper 负责 begin/importChunk/commit/cancel 和 backpressure。
+- UI 展示进度、统计、错误和取消按钮，但不复制 workbook 数据。
+- 导入公式后未读取前 eval counter 保持 0。
+- MCP 验证导入、取消、session count、console 和 lazy eval。
+
+### 并行角色
+
+| 角色 | 推荐模型 | 文件所有权 | 任务 |
+|---|---|---|---|
+| E1 流式 parser/helper | Codex Spark | `solid/excel/src/file-import.ts`, `solid/excel/test/file-import.test.ts` | stream parser、chunk flush、abort/cancel、progress 测试 |
+| E2 导入 UI | 总架构师 + Codex Spark | `DemoMillion.tsx`, `styles.css`, i18n | 1M worker demo 文件导入控件、进度、取消、统计 |
+| E3 E2E/MCP | Codex Spark | `solid/excel/e2e/file-import.spec.ts` | 导入/取消/lazy eval/console 验收 |
+| E4 架构复核/文档 | Claude Sonnet + 总架构师 | docs | backpressure/lazy/state 边界复核 |
+
+### 验收门禁
+
+```sh
+cd /Volumes/work/self/einfach && npx tsc -p solid/excel/tsconfig.json --noEmit
+cd /Volumes/work/self/einfach && npx jest solid/excel/test/file-import.test.ts solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/wasm-workbook-worker.test.ts --runInBand
+cd /Volumes/work/self/einfach && npm run build -w @einfach/solid-excel
+cd /Volumes/work/self/einfach/solid/excel && npm run e2e -- e2e/file-import.spec.ts e2e/observability.spec.ts
+```
+
+MCP 验收：
+
+- 打开 `http://localhost:5174/?debug=1`；
+- 在 1M worker demo 导入一个包含公式的 CSV/TSV；
+- 读公式前 eval count 不增长，读公式后才增长；
+- 取消导入后 `debugCounters().importSessionCount = 0`；
+- console warning/error 为 0。
+
+### 停止条件
+
+- 实现需要一次性读取整个文件或一次性构造全量 cell 数组。
+- UI 为展示结果读取全表。
+- cancel 后 import session 泄漏。
+
+## 波次 6：产品硬化与 Excel 兼容缺口
 
 ### 目标
 
@@ -446,12 +493,12 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-当前波次：**波次 4：性能、观测和 MCP 门禁产品化**（执行中）。
+当前波次：**波次 5：文件导入与 Backpressure UI**（启动中）。
 
 原因：
 
 - large range format undo、copy/export streaming、bounded import、sparse persistence v1 都已完成
   本轮实现和验证。
-- 剩余最大风险不再是单个功能缺口，而是规模行为是否可重复证明：eval/cache/import/worker queue
-  counters、MCP 验收脚本、真实 e2e 文档计数和 skip 治理。
-- 正式文件流导入/backpressure UI 可以作为 Wave 4 后的产品功能波，不应阻塞当前核心状态合同收口。
+- Wave 4 已经把规模行为做成可查询 counters 和 e2e/MCP 门禁。
+- 正式文件流导入/backpressure UI 是当前离 MVP 使用闭环最近的产品缺口，且能复用 Wave 3
+  bounded import session 与 Wave 4 observability counters。
