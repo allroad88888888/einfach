@@ -59,6 +59,14 @@ const EMPTY_WORKBOOK_CELL: CachedWorkbookCell = {
   formula: '',
 }
 
+const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
+
+function clampRowsPerExportChunk(rowsPerChunk: number | undefined): number {
+  const normalized = Math.floor(Number(rowsPerChunk))
+  if (!Number.isFinite(normalized) || normalized < 1) return 1
+  return Math.min(normalized, 10_000)
+}
+
 export async function createWorkerWorkbookStore(
   opts: WorkerWorkbookStoreOptions,
 ): Promise<WasmWorkbookStore> {
@@ -327,6 +335,31 @@ function createWorkbookSheetAdapter(
         .snapshot_range_sparse(sheetIdx, startRow, startCol, endRow, endCol)
         .map(({ sheet: _sheet, ...cell }) => cell)
       return sparseRangeToTSV(cells, { startRow, startCol, endRow, endCol })
+    },
+    export_range_tsv_chunks(
+      startRow,
+      startCol,
+      endRow,
+      endCol,
+      rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK,
+    ) {
+      const chunks: string[] = []
+      const step = clampRowsPerExportChunk(rowsPerChunk)
+      for (let row = startRow; row <= endRow; row += step) {
+        const chunkEndRow = Math.min(endRow, row + step - 1)
+        const cells = workbook
+          .snapshot_range_sparse(sheetIdx, row, startCol, chunkEndRow, endCol)
+          .map(({ sheet: _sheet, ...cell }) => cell)
+        chunks.push(
+          sparseRangeToTSV(cells, {
+            startRow: row,
+            startCol,
+            endRow: chunkEndRow,
+            endCol,
+          }),
+        )
+      }
+      return chunks
     },
     restore_sparse(cells) {
       let restored = 0
@@ -742,6 +775,18 @@ function createWorkerWorkbookSheetAdapter(
     },
     export_range_tsv(startRow, startCol, endRow, endCol) {
       return client.exportRangeTsv({ sheet: sheetIdx, startRow, startCol, endRow, endCol })
+    },
+    export_range_tsv_chunks(
+      startRow,
+      startCol,
+      endRow,
+      endCol,
+      rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK,
+    ) {
+      return client.exportRangeTsvChunks(
+        { sheet: sheetIdx, startRow, startCol, endRow, endCol },
+        rowsPerChunk,
+      )
     },
     restore_sparse(cells) {
       const visibleAddrs = invalidateCachedStateForRemoteMutation()

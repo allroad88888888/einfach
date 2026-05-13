@@ -41,6 +41,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     restoreFormatSnapshot: FormatRangeSnapshot[]
     snapshotRangeSparse: ClearRangeCall[]
     exportRangeTsv: ClearRangeCall[]
+    exportRangeTsvChunks: Array<ClearRangeCall & { rowsPerChunk?: number }>
     restoreSparse: SparseCellWire[][]
     readSparseRange: ClearRangeCall[]
     readCells: CellRefWire[][]
@@ -116,6 +117,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     restoreFormatSnapshot: [],
     snapshotRangeSparse: [],
     exportRangeTsv: [],
+    exportRangeTsvChunks: [],
     restoreSparse: [],
     readSparseRange: [],
     readCells: [],
@@ -133,6 +135,7 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const dirtyListeners = new Set<(cells: CellRefWire[]) => void>()
   const formulaResults = new Map<string, boolean>()
   let nextSubId = 1
+  let nextExportId = 1
   let metas: WorkbookSheetMeta[] = []
 
   function key(sheet: number, addr: string) {
@@ -366,6 +369,109 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       }
       return sparseRangeToTSV(out, _range)
     },
+    async beginExportRangeTsv(_range: SparseRangeWire, rowsPerChunk = 2048) {
+      calls.exportRangeTsvChunks.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+        rowsPerChunk,
+      })
+      return {
+        sessionId: nextExportId++,
+        totalRows: _range.endRow - _range.startRow + 1,
+        rowsPerChunk,
+      }
+    },
+    async nextExportRangeTsvChunk(sessionId: number) {
+      return {
+        sessionId,
+        startRow: 0,
+        endRow: 0,
+        chunk: '',
+        done: true,
+      }
+    },
+    async cancelExport() {
+      return true
+    },
+    async exportRangeTsvChunks(_range: SparseRangeWire, rowsPerChunk = 2048) {
+      calls.exportRangeTsvChunks.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+        rowsPerChunk,
+      })
+      const chunks: string[] = []
+      const step = Math.max(1, Math.floor(rowsPerChunk))
+      for (let row = _range.startRow; row <= _range.endRow; row += step) {
+        const endRow = Math.min(_range.endRow, row + step - 1)
+        const out: SparseCellWire[] = []
+        for (const [, snapshot] of cells.entries()) {
+          if (snapshot.sheet !== _range.sheet) continue
+          if (!inRange(snapshot.addr, { ..._range, startRow: row, endRow })) continue
+          const parsed = parseCellAddress(snapshot.addr)
+          if (snapshot.formula !== '') {
+            out.push({
+              sheet: snapshot.sheet,
+              addr: snapshot.addr,
+              row: parsed.row,
+              col: parsed.col,
+              kind: 'formula',
+              value: snapshot.formula,
+            })
+          } else if (snapshot.type === 'number') {
+            out.push({
+              sheet: snapshot.sheet,
+              addr: snapshot.addr,
+              row: parsed.row,
+              col: parsed.col,
+              kind: 'number',
+              value: Number(snapshot.display),
+            })
+          } else if (snapshot.type === 'text') {
+            out.push({
+              sheet: snapshot.sheet,
+              addr: snapshot.addr,
+              row: parsed.row,
+              col: parsed.col,
+              kind: 'text',
+              value: snapshot.display,
+            })
+          } else if (snapshot.type === 'boolean') {
+            out.push({
+              sheet: snapshot.sheet,
+              addr: snapshot.addr,
+              row: parsed.row,
+              col: parsed.col,
+              kind: 'boolean',
+              value: snapshot.display === 'TRUE',
+            })
+          } else if (snapshot.type === 'error') {
+            out.push({
+              sheet: snapshot.sheet,
+              addr: snapshot.addr,
+              row: parsed.row,
+              col: parsed.col,
+              kind: 'error',
+              value: snapshot.display,
+            })
+          }
+        }
+        chunks.push(
+          sparseRangeToTSV(out, {
+            startRow: row,
+            startCol: _range.startCol,
+            endRow,
+            endCol: _range.endCol,
+          }),
+        )
+      }
+      return chunks
+    },
     async restoreSparse(sparseCells) {
       calls.restoreSparse.push(
         sparseCells.map((cell) => ({ ...cell, addr: cell.addr.toUpperCase() })),
@@ -555,7 +661,7 @@ describe('createWorkerWorkbookStore', () => {
     })
   })
 
-  it('routes large selection copy through worker range TSV export', async () => {
+  it('routes large selection copy through worker chunked range TSV export', async () => {
     await withRoot(async () => {
       const client = makeFakeWorkerWorkbookClient()
       const workbook = await createWorkerWorkbookStore({ client })
@@ -569,9 +675,10 @@ describe('createWorkerWorkbookStore', () => {
       const text = await store.copySelectionTextAsync()
 
       expect(text?.startsWith('# einfach-clipboard-origin: A1\n1\n=A1+1\n')).toBe(true)
-      expect(client.calls.exportRangeTsv).toEqual([
-        { sheet: 0, startRow: 0, startCol: 0, endRow: 10_000, endCol: 0 },
+      expect(client.calls.exportRangeTsvChunks).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 10_000, endCol: 0, rowsPerChunk: 2048 },
       ])
+      expect(client.calls.exportRangeTsv).toEqual([])
       expect(client.calls.readCells).toEqual([])
       expect(client.calls.snapshotRangeSparse).toEqual([])
 

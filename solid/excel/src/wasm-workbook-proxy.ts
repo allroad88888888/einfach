@@ -1,6 +1,9 @@
 import type { CellFormatJSON, CellValue, FormatRangeSnapshot } from './types'
 
 type CellType = CellValue['type']
+const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
+const MIN_EXPORT_ROWS_PER_CHUNK = 1
+const MAX_EXPORT_ROWS_PER_CHUNK = 10_000
 
 export interface WorkerLike {
   postMessage(msg: unknown): void
@@ -125,6 +128,21 @@ export interface WorkerWorkbookClient {
   snapshotSparse(): Promise<SparseCellWire[]>
   snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
   exportRangeTsv(range: SparseRangeWire): Promise<string>
+  beginExportRangeTsv(
+    range: SparseRangeWire,
+    rowsPerChunk?: number,
+  ): Promise<{ sessionId: number; totalRows: number; rowsPerChunk: number }>
+  nextExportRangeTsvChunk(
+    sessionId: number,
+  ): Promise<{
+    sessionId: number
+    startRow: number
+    endRow: number
+    chunk: string
+    done: boolean
+  }>
+  cancelExport(sessionId: number): Promise<boolean>
+  exportRangeTsvChunks(range: SparseRangeWire, rowsPerChunk?: number): Promise<string[]>
   restoreSparse(cells: SparseCellWire[]): Promise<number>
   readSparseRange(range: SparseRangeWire): Promise<CellSnapshotWire[]>
   debugFormulaCacheState(sheet: number, addr: string): Promise<string>
@@ -231,6 +249,14 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
 
   worker.addEventListener('message', onWorkerMessage)
 
+  function clampRowsPerChunk(rowsPerChunk: number | undefined): number {
+    const normalized = Math.floor(Number(rowsPerChunk))
+    if (!Number.isFinite(normalized) || normalized < MIN_EXPORT_ROWS_PER_CHUNK)
+      return MIN_EXPORT_ROWS_PER_CHUNK
+    if (normalized > MAX_EXPORT_ROWS_PER_CHUNK) return MAX_EXPORT_ROWS_PER_CHUNK
+    return normalized
+  }
+
   return {
     initWorkbook(sheets) {
       return request<WorkbookSheetMeta[]>('initWorkbook', { sheets })
@@ -301,6 +327,53 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     exportRangeTsv(range) {
       return request<string>('exportRangeTsv', { range })
+    },
+    beginExportRangeTsv(range, rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK) {
+      return request<{ sessionId: number; totalRows: number; rowsPerChunk: number }>(
+        'beginExportRangeTsv',
+        { range, rowsPerChunk: clampRowsPerChunk(rowsPerChunk) },
+      )
+    },
+    nextExportRangeTsvChunk(sessionId) {
+      return request<{
+        sessionId: number
+        startRow: number
+        endRow: number
+        chunk: string
+        done: boolean
+      }>('nextExportRangeTsvChunk', { sessionId })
+    },
+    cancelExport(sessionId) {
+      return request<boolean>('cancelExport', { sessionId })
+    },
+    async exportRangeTsvChunks(range, rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK) {
+      const session = await request<{ sessionId: number; totalRows: number; rowsPerChunk: number }>(
+        'beginExportRangeTsv',
+        {
+          range,
+          rowsPerChunk: clampRowsPerChunk(rowsPerChunk),
+        },
+      )
+      const chunks: string[] = []
+      let done = false
+      try {
+        while (true) {
+          const chunk = await request<{
+            sessionId: number
+            startRow: number
+            endRow: number
+            chunk: string
+            done: boolean
+          }>('nextExportRangeTsvChunk', { sessionId: session.sessionId })
+          chunks.push(chunk.chunk)
+          if (chunk.done) break
+        }
+        done = true
+        return chunks
+      } finally {
+        if (!done)
+          await request<boolean>('cancelExport', { sessionId: session.sessionId }).catch(() => {})
+      }
     },
     restoreSparse(cells) {
       return request<number>('restoreSparse', { cells })

@@ -450,6 +450,78 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(exportText).resolves.toBe('=Sheet2!A1+1')
   })
 
+  it('sends chunked TSV export session commands and aggregates chunks', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = {
+      sheet: 0,
+      startRow: 0,
+      startCol: 0,
+      endRow: 3,
+      endCol: 1,
+    }
+
+    const beginPromise = workbook.beginExportRangeTsv(range, 2)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'beginExportRangeTsv',
+      range,
+      rowsPerChunk: 2,
+    })
+    ok(fake, { sessionId: 7, totalRows: 4, rowsPerChunk: 2 })
+    await expect(beginPromise).resolves.toEqual({
+      sessionId: 7,
+      totalRows: 4,
+      rowsPerChunk: 2,
+    })
+
+    const next1 = workbook.nextExportRangeTsvChunk(7)
+    expect(lastSent(fake)).toEqual({ id: 2, cmd: 'nextExportRangeTsvChunk', sessionId: 7 })
+    ok(fake, { sessionId: 7, startRow: 0, endRow: 1, chunk: '1\t2', done: false })
+    await expect(next1).resolves.toEqual({
+      sessionId: 7,
+      startRow: 0,
+      endRow: 1,
+      chunk: '1\t2',
+      done: false,
+    })
+
+    const cancel = workbook.cancelExport(7)
+    expect(lastSent(fake)).toMatchObject({ id: 3, cmd: 'cancelExport', sessionId: 7 })
+    ok(fake, true)
+    await expect(cancel).resolves.toBe(true)
+  })
+
+  it('aggregates chunked TSV exports with clamped row chunk sizes', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = {
+      sheet: 0,
+      startRow: 0,
+      startCol: 0,
+      endRow: 0,
+      endCol: 0,
+    }
+
+    const chunksPromise = workbook.exportRangeTsvChunks(range, 0)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'beginExportRangeTsv',
+      range,
+      rowsPerChunk: 1,
+    })
+    ok(fake, { sessionId: 9, totalRows: 1, rowsPerChunk: 1 })
+    await Promise.resolve()
+
+    ok(fake, { sessionId: 9, startRow: 0, endRow: 0, chunk: '=Sheet2!A1+1', done: true })
+
+    await expect(chunksPromise).resolves.toEqual(['=Sheet2!A1+1'])
+    expect(fake.sent).toEqual([
+      { id: 1, cmd: 'beginExportRangeTsv', range, rowsPerChunk: 1 },
+      { id: 2, cmd: 'nextExportRangeTsvChunk', sessionId: 9 },
+    ])
+  })
+
   it('dispatches dirty events only to matching sheet+addr subscribers', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

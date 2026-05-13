@@ -365,6 +365,45 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('copySelectionTextAsync prefers chunked backend TSV export for oversized ranges', async () => {
+      await new Promise<void>((resolve, reject) => {
+        createRoot((dispose) => {
+          Promise.resolve()
+            .then(async () => {
+              const sheet = createJSSheet()
+              const getDisplay = sheet.get_display.bind(sheet)
+              let displayReads = 0
+              const chunkCalls: number[][] = []
+              const legacyCalls: number[][] = []
+              sheet.get_display = (addr) => {
+                displayReads += 1
+                return getDisplay(addr)
+              }
+              sheet.export_range_tsv_chunks = (startRow, startCol, endRow, endCol) => {
+                chunkCalls.push([startRow, startCol, endRow, endCol])
+                return ['1\n=A1+1', '']
+              }
+              sheet.export_range_tsv = (startRow, startCol, endRow, endCol) => {
+                legacyCalls.push([startRow, startCol, endRow, endCol])
+                return 'legacy'
+              }
+              const store = createSheetStore(sheet)
+              store.setSelectionAnchor({ row: 0, col: 0 })
+              store.extendSelection({ row: 10_000, col: 0 })
+
+              await expect(store.copySelectionTextAsync()).resolves.toBe(
+                '# einfach-clipboard-origin: A1\n1\n=A1+1\n',
+              )
+              expect(chunkCalls).toEqual([[0, 0, 10_000, 0]])
+              expect(legacyCalls).toEqual([])
+              expect(displayReads).toBe(0)
+            })
+            .then(resolve, reject)
+            .finally(dispose)
+        })
+      })
+    })
+
     it('copy rejects oversized explicit address grids without reading cells', () => {
       createRoot((dispose) => {
         const sheet = createJSSheet()

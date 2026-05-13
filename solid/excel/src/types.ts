@@ -70,6 +70,19 @@ export interface ISheet {
     endRow: number,
     endCol: number,
   ): string | Promise<string>
+  /**
+   * Optional chunked TSV export. Chunks are row-aligned and should be
+   * concatenated with a single "\n" between adjacent chunks. This is a
+   * non-transactional read unless the backend explicitly freezes writes
+   * for the export session.
+   */
+  export_range_tsv_chunks?(
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+    rowsPerChunk?: number,
+  ): string[] | Promise<string[]>
   /** Restore records produced by `snapshot_range_sparse`. */
   restore_sparse?(cells: SparseCellSnapshot[]): number | void | Promise<number | void>
   /**

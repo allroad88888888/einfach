@@ -6,7 +6,7 @@
 
 ## Current Status (2026-05-11, post-batch 2)
 
-**13 spec files / 98 active `test()` / 0 skipped** locally green. Status of each
+**20 spec files / 146 active `test()` / 0 skipped** locally green. Status of each
 plan section:
 
 | Section | Status | Spec / Notes |
@@ -28,7 +28,7 @@ plan section:
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: smoke + 9 feature + 3 demo-smoke = 13 spec files. 98 active `test()`
+Counts: 20 spec files. 146 active `test()`
 + 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
 checkout green (proxy caveat per Discovered #D).
 
@@ -141,7 +141,7 @@ suite fails confusingly.
 
 ## Current Coverage
 
-13 spec files, 98 active `test()` blocks + 0 `.skip`. Landed across two
+20 spec files, 146 active `test()` blocks + 0 `.skip`. Landed across two
 agent batches plus follow-up cleanup work.
 
 | Spec file | Tests | Backend |
@@ -150,15 +150,29 @@ agent batches plus follow-up cleanup work.
 | `workbook-chain.spec.ts` | 7 | WASM workbook (`3-Sheet Chain` demo) |
 | `formulas-wasm.spec.ts` | 14 | WASM single sheet (`Formulas` demo) |
 | `formula-bar.spec.ts` | 8 | mixed |
+| `context-menu.spec.ts` | 4 | JS mock |
+| `format.spec.ts` | 5 | JS mock |
+| `i18n.spec.ts` | 5 | mixed |
 | `selection-clipboard.spec.ts` | 9 | JS mock (`Blank`) |
 | `multisheet-ui.spec.ts` | 8 | JS mock workbook (`Multi-Sheet` demo) |
+| `million-demo.spec.ts` | 9 | worker workbook + 2D virtualized table |
 | `range-ops.spec.ts` | 4 | JS mock |
 | `undo-redo.spec.ts` | 9 | JS mock |
+| `virtualize.spec.ts` | 5 | JS mock + virtualization |
 | `render-counter.spec.ts` | 6 | JS mock + `?debug=1` |
 | `regression.spec.ts` | 6 | mixed |
+| `worker.spec.ts` | 4 | worker-backed sheet |
+| `worker-workbook.spec.ts` | 16 | worker workbook RPC |
 | `demo-budget.spec.ts` | 6 | WASM |
 | `demo-grades.spec.ts` | 6 | WASM |
 | `demo-sales.spec.ts` | 8 | WASM |
+
+Current 1M coverage includes large clear/format/copy range-native paths. The
+large copy spec now asserts `copySelectionTextAsync()` uses
+`export_range_tsv_chunks` when the worker-backed sheet exposes it, and that the
+legacy one-shot `export_range_tsv` fallback is not called in that path.
+`worker-workbook.spec.ts` also checks chunked TSV export preserves formula
+source and does not evaluate lazy formulas.
 
 Playwright setup:
 
@@ -680,8 +694,8 @@ Reality check against the plan's hard numbers:
 
 | Criterion | Status | Notes |
 |---|---|---|
-| ≥ 8 spec files | ✅ | 10 actual |
-| ≥ 50 test() blocks pass locally | ✅ | 98 active, 0 skip |
+| ≥ 8 spec files | ✅ | 20 actual |
+| ≥ 50 test() blocks pass locally | ✅ | 146 active, 0 skip |
 | regression.spec.ts pins ≥ 5 | ✅ | 6 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |

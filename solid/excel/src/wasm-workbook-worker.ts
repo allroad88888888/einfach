@@ -105,11 +105,24 @@ type NormalizedImportChunk = {
   issues: ImportCellIssueWire[]
 }
 
+type ExportSession = {
+  range: SparseRangeWire
+  rowsPerChunk: number
+  totalRows: number
+  nextRow: number
+}
+
 let workbook: WasmWorkbookRuntime | undefined
 let initPromise: Promise<void> | undefined
 
 const subscriptionTokens = new Map<number, number[]>()
 const importSessions = new Map<number, ImportSession>()
+const exportSessions = new Map<number, ExportSession>()
+let nextExportId = 1
+
+const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
+const MIN_EXPORT_ROWS_PER_CHUNK = 1
+const MAX_EXPORT_ROWS_PER_CHUNK = 10_000
 
 async function ensureInit() {
   if (!initPromise)
@@ -149,6 +162,8 @@ function resetSubscriptions(wb?: WasmWorkbookRuntime) {
 function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   resetSubscriptions(workbook)
   importSessions.clear()
+  exportSessions.clear()
+  nextExportId = 1
   const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
   if (sheets && sheets.length > 0) {
     wb.rename_sheet(0, sheets[0])
@@ -302,6 +317,26 @@ function assertImportSessionId(sessionId: number) {
       code: 'INVALID_IMPORT_SESSION',
     })
   }
+}
+
+function assertExportSessionId(sessionId: number) {
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    throw Object.assign(new Error(`invalid export session: ${sessionId}`), {
+      code: 'INVALID_EXPORT_SESSION',
+    })
+  }
+}
+
+function clampRowsPerChunk(rowsPerChunk: unknown, fallback = DEFAULT_EXPORT_ROWS_PER_CHUNK): number {
+  const normalized = Math.floor(Number(rowsPerChunk))
+  if (!Number.isFinite(normalized)) return fallback
+  if (normalized < MIN_EXPORT_ROWS_PER_CHUNK) return MIN_EXPORT_ROWS_PER_CHUNK
+  if (normalized > MAX_EXPORT_ROWS_PER_CHUNK) return MAX_EXPORT_ROWS_PER_CHUNK
+  return normalized
+}
+
+function rangeTotalRows(range: SparseRangeWire): number {
+  return Math.max(0, range.endRow - range.startRow + 1)
 }
 
 function importCellIssue(
@@ -560,6 +595,41 @@ function exportRangeTsv(wb: WasmWorkbookRuntime, range: SparseRangeWire): string
   return sparseRangeToTSV(cells, range)
 }
 
+function exportRangeTsvChunk(
+  wb: WasmWorkbookRuntime,
+  session: ExportSession,
+): { startRow: number; endRow: number; chunk: string; done: boolean } {
+  const range = session.range
+  if (session.totalRows === 0 || session.nextRow > range.endRow) {
+    return {
+      startRow: range.startRow,
+      endRow: range.startRow - 1,
+      chunk: '',
+      done: true,
+    }
+  }
+
+  const startRow = session.nextRow
+  const endRow = Math.min(range.endRow, startRow + session.rowsPerChunk - 1)
+  const snapshotRangeSparse = assertMethod(wb, 'snapshot_range_sparse')
+  const chunkCells = snapshotRangeSparse
+    .call(wb, range.sheet, startRow, range.startCol, endRow, range.endCol)
+    .map(normalizeSparseCell)
+  session.nextRow = endRow + 1
+
+  return {
+    startRow,
+    endRow,
+    chunk: sparseRangeToTSV(chunkCells, {
+      startRow,
+      startCol: range.startCol,
+      endRow,
+      endCol: range.endCol,
+    }),
+    done: session.nextRow > range.endRow,
+  }
+}
+
 function toRpcError(err: unknown): RpcErrorWire {
   if (err instanceof Error) {
     return {
@@ -703,6 +773,25 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           postResponse(msg.id, sessionId)
         }
         break
+      case 'beginExportRangeTsv':
+        {
+          const range = normalizeSparseRange(msg.range)
+          assertSheet(wb, range.sheet)
+          const rowsPerChunk = clampRowsPerChunk(msg.rowsPerChunk)
+          const sessionId = nextExportId++
+          exportSessions.set(sessionId, {
+            range,
+            rowsPerChunk,
+            totalRows: rangeTotalRows(range),
+            nextRow: range.startRow,
+          })
+          postResponse(msg.id, {
+            sessionId,
+            totalRows: rangeTotalRows(range),
+            rowsPerChunk,
+          })
+        }
+        break
       case 'importChunk':
         {
           const sessionId = Number(msg.sessionId)
@@ -729,6 +818,24 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           postResponse(msg.id, session.normalizedCount)
         }
         break
+      case 'nextExportRangeTsvChunk':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertExportSessionId(sessionId)
+          const session = exportSessions.get(sessionId)
+          if (!session) {
+            throw Object.assign(new Error(`missing export session: ${sessionId}`), {
+              code: 'EXPORT_SESSION_MISSING',
+            })
+          }
+          const chunk = exportRangeTsvChunk(wb, session)
+          if (chunk.done) exportSessions.delete(sessionId)
+          postResponse(msg.id, {
+            sessionId,
+            ...chunk,
+          })
+        }
+        break
       case 'commitImport':
         {
           const sessionId = Number(msg.sessionId)
@@ -750,6 +857,14 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
 
           importSessions.delete(sessionId)
           postResponse(msg.id, mergeImportStatsIssues(stats, session.normalizationIssues))
+        }
+        break
+      case 'cancelExport':
+        {
+          const sessionId = Number(msg.sessionId)
+          assertExportSessionId(sessionId)
+          const existed = exportSessions.delete(sessionId)
+          postResponse(msg.id, existed)
         }
         break
       case 'cancelImport':

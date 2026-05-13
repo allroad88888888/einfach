@@ -227,6 +227,13 @@ test.describe('1M Cells demo (Phase 4)', () => {
           setSelectionAnchor: (coord: { row: number; col: number }) => void
           extendSelection: (coord: { row: number; col: number }) => void
           raw: {
+            export_range_tsv_chunks?: (
+              startRow: number,
+              startCol: number,
+              endRow: number,
+              endCol: number,
+              rowsPerChunk?: number,
+            ) => string[] | Promise<string[]>
             export_range_tsv?: (
               startRow: number,
               startCol: number,
@@ -240,42 +247,45 @@ test.describe('1M Cells demo (Phase 4)', () => {
       if (!store)
         return {
           hasStore: false,
-          hasExportRangeTsv: false,
-          exportRangeTsvCalls: [],
+          hasChunkedExport: false,
+          exportRangeTsvChunkCalls: [],
           textStartsWithMarker: false,
         }
-      if (!store.raw.export_range_tsv)
+      if (!store.raw.export_range_tsv_chunks)
         return {
           hasStore: true,
-          hasExportRangeTsv: false,
-          exportRangeTsvCalls: [],
+          hasChunkedExport: false,
+          exportRangeTsvChunkCalls: [],
           textStartsWithMarker: false,
         }
-      const originalExportRangeTsv = store.raw.export_range_tsv.bind(store.raw)
-      const exportRangeTsvCalls: number[][] = []
+      const originalExportRangeTsvChunks = store.raw.export_range_tsv_chunks.bind(store.raw)
+      const exportRangeTsvChunkCalls: number[][] = []
       store.selectionAddrs = () => {
         throw new Error('selectionAddrs must not run for large copy')
       }
       store.copySelection = () => {
         throw new Error('copySelection must not run for large copy')
       }
-      store.raw.export_range_tsv = (startRow, startCol, endRow, endCol) => {
-        exportRangeTsvCalls.push([startRow, startCol, endRow, endCol])
-        return originalExportRangeTsv(startRow, startCol, endRow, endCol)
+      store.raw.export_range_tsv = () => {
+        throw new Error('legacy export_range_tsv must not run when chunked export exists')
+      }
+      store.raw.export_range_tsv_chunks = (startRow, startCol, endRow, endCol, rowsPerChunk) => {
+        exportRangeTsvChunkCalls.push([startRow, startCol, endRow, endCol])
+        return originalExportRangeTsvChunks(startRow, startCol, endRow, endCol, rowsPerChunk)
       }
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 120, col: 120 })
       const text = await store.copySelectionTextAsync()
       return {
         hasStore: true,
-        hasExportRangeTsv: true,
-        exportRangeTsvCalls,
+        hasChunkedExport: true,
+        exportRangeTsvChunkCalls,
         textStartsWithMarker: text?.startsWith('# einfach-clipboard-origin: A1\n') ?? false,
       }
     })
     expect(result.hasStore).toBe(true)
-    expect(result.hasExportRangeTsv).toBe(true)
-    expect(result.exportRangeTsvCalls).toEqual([[0, 0, 120, 120]])
+    expect(result.hasChunkedExport).toBe(true)
+    expect(result.exportRangeTsvChunkCalls).toEqual([[0, 0, 120, 120]])
     expect(result.textStartsWithMarker).toBe(true)
   })
 

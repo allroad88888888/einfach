@@ -451,6 +451,7 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
         workbooks.reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
       mainRestoreSparsePayloads: () => workbooks[0]?.__mockCalls?.restoreSparse ?? [],
       mainSnapshotSparse: () => workbooks[0]?.__mockCalls?.snapshotSparse ?? 0,
+      mainSnapshotRangeSparse: () => workbooks[0]?.__mockCalls?.snapshotRangeSparse ?? [],
       importSnapshotSparse: () =>
         workbooks
           .slice(1)
@@ -729,6 +730,142 @@ describe('wasm-workbook-worker import session contract', () => {
       })
 
       expect(tsv).toBe('=Sheet2!A1+1')
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('streams range TSV exports in row chunks and only snapshots current chunk', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A1',
+        value: { type: 'number', value: 1 },
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'setFormula',
+        sheet: 0,
+        addr: 'A2',
+        formula: '=A1+1',
+      })
+      await harness.send({
+        id: 4,
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A3',
+        value: { type: 'text', value: '3' },
+      })
+
+      const begin = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 5,
+        cmd: 'beginExportRangeTsv',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 2, endCol: 0 },
+        rowsPerChunk: 2,
+      })
+      expect(begin).toEqual({
+        sessionId: 1,
+        totalRows: 3,
+        rowsPerChunk: 2,
+      })
+
+      const chunk1 = await harness.send<{
+        sessionId: number
+        startRow: number
+        endRow: number
+        chunk: string
+        done: boolean
+      }>({
+        id: 6,
+        cmd: 'nextExportRangeTsvChunk',
+        sessionId: begin.sessionId,
+      })
+      expect(chunk1).toEqual({
+        sessionId: 1,
+        startRow: 0,
+        endRow: 1,
+        chunk: '1\n=A1+1',
+        done: false,
+      })
+
+      const chunk2 = await harness.send<{
+        sessionId: number
+        startRow: number
+        endRow: number
+        chunk: string
+        done: boolean
+      }>({
+        id: 7,
+        cmd: 'nextExportRangeTsvChunk',
+        sessionId: begin.sessionId,
+      })
+      expect(chunk2).toEqual({
+        sessionId: 1,
+        startRow: 2,
+        endRow: 2,
+        chunk: '3',
+        done: true,
+      })
+
+      expect(harness.calls.mainSnapshotRangeSparse()).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
+        { sheet: 0, startRow: 2, startCol: 0, endRow: 2, endCol: 0 },
+      ])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('cancels export sessions and rejects chunk reads afterward', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const begin = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 2,
+        cmd: 'beginExportRangeTsv',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+        rowsPerChunk: 0,
+      })
+      expect(begin.rowsPerChunk).toBe(1)
+
+      const cancelled = await harness.send<boolean>({
+        id: 3,
+        cmd: 'cancelExport',
+        sessionId: begin.sessionId,
+      })
+      expect(cancelled).toBe(true)
+
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'nextExportRangeTsvChunk',
+          sessionId: begin.sessionId,
+        }),
+      ).rejects.toMatchObject({
+        code: 'EXPORT_SESSION_MISSING',
+        message: `missing export session: ${begin.sessionId}`,
+      })
     } finally {
       harness.dispose()
     }

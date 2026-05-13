@@ -3,7 +3,7 @@
 > Date: 2026-05-13 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified implementation tip: `a082c27` (range-native large format)
+> Last verified implementation tip: `7a71e1a` (large range format undo)
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
@@ -13,8 +13,10 @@
 The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land their
 acceptance contracts. After that, Phase 5 partial work also landed worker-owned
 workbook RPC, staged imports, large range clear undo, range-native clipboard
-export, horizontal virtual scroll restoration, and range-native large format.
-The implementation tip above is the last verified non-doc checkpoint.
+export, horizontal virtual scroll restoration, range-native large format, and
+large range format undo. Current Wave 2 worktree additionally adds worker
+chunked TSV export sessions for large copy/export.
+The implementation tip above is the last committed verified non-doc checkpoint.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -23,7 +25,7 @@ The implementation tip above is the last verified non-doc checkpoint.
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
-| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `a082c27` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format; remaining gaps are format undo, streaming export, bounded import/persistence, command-contract cleanup |
+| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `7a71e1a` + current worktree | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo; current worktree adds chunked copy export. Remaining gaps are bounded import/persistence, perf/observability, and release gates |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
@@ -58,7 +60,7 @@ as legacy compatibility only.
 | Item | Where | Effort | Notes |
 |---|---|---|---|
 | Bounded import / sparse persistence v1 | `rust/wasm/src/lib.rs`, worker import protocol, persistence docs/tests | 2–4 d | begin/chunk/commit/cancel and sparse snapshot exist. Remaining work: memory/backpressure audit, persistence schema/save-load, import metrics, and round-trip tests that preserve lazy formulas. |
-| Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 1–2 d | Large clear undo, copy export, range format, and large format undo are range-native. Remaining work: copy/export streaming instead of one huge TSV string. |
+| Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | done after current Wave 2 commit | Large clear undo, range format, large format undo, and chunked worker copy export are range-native. Browser clipboard still needs a final string, but worker snapshot/read/postMessage is chunked. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
 
@@ -220,16 +222,16 @@ Once agents return:
 
 | Option | What | Effort | Why |
 |---|---|---|---|
-| **A** | Wave 2 remainder — copy/export streaming | 1–2 d | Finishes million-cell range export without one huge TSV string |
+| **A** | Commit current Wave 2 chunked export after Playwright/MCP gates | <1 d | Finishes million-cell range export without one huge worker TSV payload |
 | **B** | Wave 3 — bounded import + sparse persistence v1 | 3–5 d | Productizes data ingress/egress without breaking lazy semantics |
 | **C** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
-Recommended pick if the new window has full autonomy: **A first**, using
-`rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the current scope contract
-and `rust/docs/PHASE5_PARALLEL.md` as historical context. Hold **D** until user
-green-lights it.
+Recommended pick if the new window has full autonomy after the current commit:
+**B first**, using `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the
+current scope contract and `rust/docs/PHASE5_PARALLEL.md` as historical context.
+Hold **D** until user green-lights it.
 
 ## File reading order for the next agent
 

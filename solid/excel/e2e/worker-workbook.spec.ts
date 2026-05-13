@@ -388,6 +388,19 @@ test.describe('Worker-backed workbook RPC', () => {
     await expectNoConsoleErrors(page)
   })
 
+  test('exports range tsv chunks without evaluating formulas', async ({ page }) => {
+    const result = await runWorkerWorkbookExportRangeTsvChunksScenario(page)
+
+    expect(result.chunks).toEqual(['=Sheet2!A1+1\n', 'tail'])
+    expect(result.body).toBe('=Sheet2!A1+1\n\ntail')
+    expect(result.beforeEvalCount).toBe(0)
+    expect(result.beforeCacheState).toBe('dirty')
+    expect(result.beforeEvalCount).toBe(result.afterEvalCount)
+    expect(result.beforeCacheState).toBe(result.afterCacheState)
+
+    await expectNoConsoleErrors(page)
+  })
+
   test('clears a large sparse range through the worker without expanding cells on main', async ({
     page,
   }) => {
@@ -1114,6 +1127,60 @@ async function runWorkerWorkbookExportRangeTsvScenario(page: Page): Promise<{
         afterEvalCount,
         afterCacheState,
         sparseSnapshot,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookExportRangeTsvChunksScenario(page: Page): Promise<{
+  chunks: string[]
+  body: string
+  beforeEvalCount: number
+  beforeCacheState: string
+  afterEvalCount: number
+  afterCacheState: string
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+
+      const session = await workbook.beginImport()
+      await workbook.importChunk(session, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 10 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+        { sheet: 0, row: 2, col: 0, kind: 'text', value: 'tail' },
+      ])
+      await workbook.commitImport(session)
+
+      const beforeEvalCount = await workbook.debugFormulaEvalCount(0)
+      const beforeCacheState = await workbook.debugFormulaCacheState(0, 'A1')
+      const chunks = await workbook.exportRangeTsvChunks(
+        {
+          sheet: 0,
+          startRow: 0,
+          startCol: 0,
+          endRow: 2,
+          endCol: 0,
+        },
+        2,
+      )
+      const afterEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterCacheState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        chunks,
+        body: chunks.join('\n'),
+        beforeEvalCount,
+        beforeCacheState,
+        afterEvalCount,
+        afterCacheState,
       }
     } finally {
       workbook.dispose()

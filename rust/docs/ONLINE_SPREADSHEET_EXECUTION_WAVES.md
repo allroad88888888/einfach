@@ -9,7 +9,8 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `a082c27 feat(solid-excel): range-native large format` 为准，
+以最近提交 `7a71e1a feat(solid-excel): undo large range formats` 加当前 Wave 2
+工作树为准，
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 已落地的主能力：
@@ -28,8 +29,9 @@
 - `DemoMillion` 已走 worker-backed workbook + 2D virtualized table；seed 生成已经按 chunk
   flush，不再在主线程一次性构造完整 seed 数组。
 - 大 selection clear / copy / format 已有 range-native 或 backend-assisted 路径：
-  large clear 通过 sparse snapshot/restore 支持可 undo；copy 走 backend TSV export；
-  format 走 `set_format_range`，不再盲目展开百万地址。
+  large clear 通过 sparse snapshot/restore 支持可 undo；copy 优先走 worker chunked TSV
+  export session；format 走 `set_format_range` + format snapshot/restore undo，不再盲目
+  展开百万地址。
 - worker-backed store 的产品写公式路径已有 `setFormulaAsync`，可以把 worker/Rust 的
   parse/cycle 结果回传到 store；同步 `set_formula` 兼容接口仍是 optimistic `true`。
 - worker-backed `formulaCacheState` 已能异步从 worker 探测真实 cache 状态；首次读取前可
@@ -39,10 +41,8 @@
 
 - 同步 `ISheet.set_formula` 仍然只能返回 optimistic `true`。产品路径要继续收敛到
   `setFormulaAsync` / async command facade，文档和 UI 入口不能再把同步兼容层当权威结果。
-- 大 range format 已 range-native，但没有 format-range snapshot/restore 合同；当前会清空
-  undo/redo 栈，不能回滚。
-- copy/export 已避免主线程地址展开，但仍是一次性生成整段 TSV 字符串；还不是 chunked
-  streaming/backpressure 模型。
+- 浏览器剪贴板写入仍需要最终字符串；当前已把 worker 侧 range export 改成按行块读取和
+  postMessage，后续文件导出/持久化可复用 chunk 合同继续做真正 sink streaming。
 - worker import session 已按 chunk 写入 worker 内 staging workbook，但仍需要 bounded memory、
   backpressure、cancel/commit 可观测指标和持久化合同复核。
 - 稀疏持久化、导出、自动保存尚未形成 v1 合同。
@@ -51,7 +51,7 @@
 
 ## 总体判断
 
-还剩 **4 个产品化实现波 + 1 个发布门禁波**。
+还剩 **3 个产品化实现波 + 1 个发布门禁波**。
 
 原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
 formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
@@ -75,6 +75,9 @@ formula cache probe 都在主线。现在的波次 1 改为“权威命令收口
   必须记录失败并降级到便宜模型。
 - 已降级执行 `codex exec -m gpt-5.4-mini ...` 做只读审查；内部子 agent 也使用
   `gpt-5.4-mini` 复核当前 P0/P1 和下一波拆分。
+- Wave 2 copy/export streaming 使用内部 `gpt-5.3-codex-spark` 子 agent 执行
+  worker/proxy 协议候选补丁；Claude Sonnet 同步做只读架构审查。总架构师在主线集成
+  SheetStore、worker store、E2E 和文档，并以本地测试/MCP 为最终验收。
 - 总架构师仍是唯一集成和验收角色。Claude/Sonnet、Codex Spark、便宜 Codex 子 agent 的
   输出只能作为候选实现或审查意见，不能替代最终验收。
 
@@ -169,10 +172,22 @@ MCP 验收：
 
 ## 波次 2：Range-native undo / format / copy / export
 
-状态：部分完成。large range format 已接入 format metadata snapshot/restore：Rust core
-只快照 range-format layers 和 range 内显式 per-cell formats，不展开空 cell；WASM/worker/
-SheetStore 已接入 undo/redo。剩余项是 copy/export 从一次性 TSV 字符串推进到
-streaming/chunked export。
+状态：实现完成，等待本轮最终提交。large range format 已接入 format metadata
+snapshot/restore：Rust core 只快照 range-format layers 和 range 内显式 per-cell
+formats，不展开空 cell；WASM/worker/SheetStore 已接入 undo/redo。copy/export 已从
+一次性 worker TSV 字符串推进到 worker export session + row chunks，SheetStore 大范围复制
+优先走 `export_range_tsv_chunks`，legacy `export_range_tsv` 保留为兼容回退。
+
+本轮验收记录：
+
+- Codex Spark 子 agent：实现 worker/proxy chunked TSV export 协议候选补丁，并自跑 proxy /
+  worker Jest。
+- Claude Sonnet：只读审查，指出非事务快照语义、session 泄漏、chunk 拼接边界和 MCP 测试点。
+- 总架构师集成：补 `ISheet.export_range_tsv_chunks`、worker workbook store、SheetStore 优先
+  chunked copy、1M/worker E2E 和文档。
+- MCP Playwright：在 `http://localhost:5174/?debug=1` 打开 1M Cells，验证 121×121 大选择
+  `copySelectionTextAsync()` 调用 `export_range_tsv_chunks(0,0,120,120)`，未调用 legacy
+  `export_range_tsv` / `selectionAddrs` / `copySelection`，console 只有 favicon 404。
 
 ### 目标
 
@@ -184,7 +199,7 @@ streaming/chunked export。
   fallback 降级说明。
 - format selection 已走 backend range metadata；本波补 format-range snapshot/restore 或明确
   transaction，使 large format 可 undo，不能继续清空 undo 栈。
-- copy/export 已走 backend TSV export；本波把一次性整段字符串收口为 streaming/chunked read。
+- copy/export 已走 backend TSV export；本波把一次性整段字符串收口为 worker chunked read。
 - undo snapshot 来源必须是 Rust/worker sparse iterator，不是主线程 projection cache。
 
 ### 并行角色
@@ -217,6 +232,7 @@ MCP 验收：
 - 大 range 操作需要主线程生成 O(range cell count) 地址字符串。
 - undo 需要从 `raw.non_empty_addrs()` 或 projection cache 取事实源。
 - snapshotRange 或 format undo 读取公式结果导致 eval counter 增长。
+- chunked export 会在 worker 内一次性 snapshot 整个范围，而不是按当前 row chunk 读取。
 
 ## 波次 3：真正 bounded 的导入与稀疏持久化 v1
 

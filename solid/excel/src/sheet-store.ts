@@ -547,16 +547,27 @@ export function createSheetStore(sheet: ISheet) {
       const data = addrs ? copyAddressGrid(addrs) : null
       return data ? serializeClipboardTSV(data) : null
     }
-    if (!sheet.export_range_tsv) return null
+    if (!sheet.export_range_tsv_chunks && !sheet.export_range_tsv) return null
 
-    const body = await Promise.resolve(
-      sheet.export_range_tsv(
-        selectedRange.startRow,
-        selectedRange.startCol,
-        selectedRange.endRow,
-        selectedRange.endCol,
-      ),
-    )
+    const body = sheet.export_range_tsv_chunks
+      ? (
+          await Promise.resolve(
+            sheet.export_range_tsv_chunks(
+              selectedRange.startRow,
+              selectedRange.startCol,
+              selectedRange.endRow,
+              selectedRange.endCol,
+            ),
+          )
+        ).join('\n')
+      : await Promise.resolve(
+          sheet.export_range_tsv!(
+            selectedRange.startRow,
+            selectedRange.startCol,
+            selectedRange.endRow,
+            selectedRange.endCol,
+          ),
+        )
     const originAddr = coordToAddr({ row: selectedRange.startRow, col: selectedRange.startCol })
     return `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${originAddr}\n${body}`
   }
