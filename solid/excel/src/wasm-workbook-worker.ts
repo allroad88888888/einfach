@@ -5,6 +5,7 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  ImportCellIssueWire,
   ImportCellWire,
   RpcErrorWire,
   RpcResponseWire,
@@ -64,11 +65,16 @@ type RequestMessage = {
   [key: string]: unknown
 }
 
+type ImportSession = {
+  cells: ImportCellWire[]
+  issues: ImportCellIssueWire[]
+}
+
 let workbook: WasmWorkbookRuntime | undefined
 let initPromise: Promise<void> | undefined
 
 const subscriptionTokens = new Map<number, number[]>()
-const importSessions = new Map<number, ImportCellWire[]>()
+const importSessions = new Map<number, ImportSession>()
 
 async function ensureInit() {
   if (!initPromise)
@@ -206,10 +212,33 @@ function assertImportSessionId(sessionId: number) {
   }
 }
 
-function normalizeImportCell(cell: ImportCellWire): ImportCellWire {
+function importCellIssue(
+  cell: Partial<ImportCellWire>,
+  code: string,
+  message: string,
+): ImportCellIssueWire {
   const sheet = Number(cell.sheet)
   const row = Number(cell.row)
   const col = Number(cell.col)
+  return {
+    ...(Number.isFinite(sheet) ? { sheet } : {}),
+    ...(Number.isFinite(row) ? { row } : {}),
+    ...(Number.isFinite(col) ? { col } : {}),
+    ...(typeof cell.kind === 'string' ? { kind: cell.kind } : {}),
+    code,
+    message,
+  }
+}
+
+function importCellInput(cell: unknown): Partial<ImportCellWire> {
+  return cell && typeof cell === 'object' ? (cell as Partial<ImportCellWire>) : {}
+}
+
+function normalizeImportCell(cell: unknown): ImportCellWire | ImportCellIssueWire {
+  const input = importCellInput(cell)
+  const sheet = Number(input.sheet)
+  const row = Number(input.row)
+  const col = Number(input.col)
   if (
     !Number.isInteger(sheet) ||
     sheet < 0 ||
@@ -218,36 +247,56 @@ function normalizeImportCell(cell: ImportCellWire): ImportCellWire {
     !Number.isInteger(col) ||
     col < 0
   ) {
-    throw Object.assign(new Error('invalid import cell coordinates'), {
-      code: 'INVALID_IMPORT_CELL',
-    })
+    return importCellIssue(
+      input,
+      'INVALID_IMPORT_CELL_COORDINATES',
+      'invalid import cell coordinates',
+    )
   }
 
-  switch (cell.kind) {
+  switch (input.kind) {
     case 'number':
-      if (typeof cell.value !== 'number') break
-      return { sheet, row, col, kind: 'number', value: cell.value }
+      if (typeof input.value !== 'number' || !Number.isFinite(input.value)) break
+      return { sheet, row, col, kind: 'number', value: input.value }
     case 'text':
-      if (typeof cell.value !== 'string') break
-      return { sheet, row, col, kind: 'text', value: cell.value }
+      if (typeof input.value !== 'string') break
+      return { sheet, row, col, kind: 'text', value: input.value }
     case 'boolean':
-      if (typeof cell.value !== 'boolean') break
-      return { sheet, row, col, kind: 'boolean', value: cell.value }
+      if (typeof input.value !== 'boolean') break
+      return { sheet, row, col, kind: 'boolean', value: input.value }
     case 'error':
-      if (typeof cell.value !== 'string') break
-      return { sheet, row, col, kind: 'error', value: cell.value }
+      if (typeof input.value !== 'string') break
+      return { sheet, row, col, kind: 'error', value: input.value }
     case 'formula':
-      if (typeof cell.value !== 'string') break
-      return { sheet, row, col, kind: 'formula', value: cell.value }
+      if (typeof input.value !== 'string') break
+      return { sheet, row, col, kind: 'formula', value: input.value }
     case 'null':
       return { sheet, row, col, kind: 'null' }
     default:
-      break
+      return importCellIssue(input, 'INVALID_IMPORT_CELL_KIND', 'invalid import cell kind')
   }
 
-  throw Object.assign(new Error('invalid import cell value'), {
-    code: 'INVALID_IMPORT_CELL',
-  })
+  return importCellIssue(input, 'INVALID_IMPORT_CELL_VALUE', 'invalid import cell value')
+}
+
+export function normalizeImportCells(cells: unknown[]): ImportSession {
+  const session: ImportSession = { cells: [], issues: [] }
+  for (const cell of cells) {
+    const normalized = normalizeImportCell(cell)
+    if ('message' in normalized) session.issues.push(normalized)
+    else session.cells.push(normalized)
+  }
+  return session
+}
+
+export function mergeImportStatsIssues(
+  stats: WorkbookImportStatsWire,
+  issues: ImportCellIssueWire[],
+): WorkbookImportStatsWire {
+  const mergedIssues = [...(stats.issues ?? []), ...issues]
+  return mergedIssues.length > 0
+    ? { ...stats, errors: stats.errors + issues.length, issues: mergedIssues }
+    : stats
 }
 
 function normalizeSparseRange(range: unknown): SparseRangeWire {
@@ -404,7 +453,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_EXISTS',
             })
           }
-          importSessions.set(sessionId, [])
+          importSessions.set(sessionId, { cells: [], issues: [] })
           postResponse(msg.id, sessionId)
         }
         break
@@ -418,25 +467,27 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
-          const cells = Array.isArray(msg.cells)
-            ? (msg.cells as ImportCellWire[]).map(normalizeImportCell)
-            : []
-          session.push(...cells)
-          postResponse(msg.id, session.length)
+          const chunk = Array.isArray(msg.cells)
+            ? normalizeImportCells(msg.cells as ImportCellWire[])
+            : { cells: [], issues: [] }
+          session.cells.push(...chunk.cells)
+          session.issues.push(...chunk.issues)
+          postResponse(msg.id, session.cells.length)
         }
         break
       case 'commitImport':
         {
           const sessionId = Number(msg.sessionId)
           assertImportSessionId(sessionId)
-          const cells = importSessions.get(sessionId)
-          if (!cells) {
+          const session = importSessions.get(sessionId)
+          if (!session) {
             throw Object.assign(new Error(`missing import session: ${sessionId}`), {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
           importSessions.delete(sessionId)
-          postResponse(msg.id, assertMethod(wb, 'bulk_import_cells').call(wb, cells))
+          const stats = assertMethod(wb, 'bulk_import_cells').call(wb, session.cells)
+          postResponse(msg.id, mergeImportStatsIssues(stats, session.issues))
         }
         break
       case 'cancelImport':

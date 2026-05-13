@@ -3,6 +3,7 @@ import {
   createWorkerWorkbook,
   type CellRefWire,
   type CellSnapshotWire,
+  type ImportCellIssueWire,
   type ImportCellWire,
   type WorkerLike,
 } from '../src/wasm-workbook-proxy'
@@ -161,13 +162,31 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
 
     const commit = workbook.commitImport(1)
     expect(lastSent(fake)).toEqual({ id: 3, cmd: 'commitImport', sessionId: 1 })
-    ok(fake, { accepted: 2, formulas: 1, rejectedFormulas: 0, cleared: 0, errors: 0 })
+    const issues: ImportCellIssueWire[] = [
+      {
+        sheet: 0,
+        row: -1,
+        col: 0,
+        kind: 'number',
+        code: 'INVALID_IMPORT_CELL_COORDINATES',
+        message: 'invalid import cell coordinates',
+      },
+    ]
+    ok(fake, {
+      accepted: 2,
+      formulas: 1,
+      rejectedFormulas: 0,
+      cleared: 0,
+      errors: 0,
+      issues,
+    })
     await expect(commit).resolves.toEqual({
       accepted: 2,
       formulas: 1,
       rejectedFormulas: 0,
       cleared: 0,
       errors: 0,
+      issues,
     })
 
     const debug = workbook.debugFormulaCacheState(0, 'a1')

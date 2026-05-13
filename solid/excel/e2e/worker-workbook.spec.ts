@@ -24,6 +24,15 @@ type SparseCell = {
   value: string | number | boolean
 }
 
+type ImportIssue = {
+  sheet?: number
+  row?: number
+  col?: number
+  kind?: string
+  code: string
+  message: string
+}
+
 test.describe('Worker-backed workbook RPC', () => {
   test.beforeEach(async ({ page }) => {
     guardConsoleErrors(page)
@@ -94,6 +103,7 @@ test.describe('Worker-backed workbook RPC', () => {
       rejectedFormulas: 0,
       cleared: 0,
       errors: 0,
+      issues: [],
     })
     expect(result.beforeReadEvalCount).toBe(0)
     expect(result.beforeReadState).toBe('dirty')
@@ -110,6 +120,74 @@ test.describe('Worker-backed workbook RPC', () => {
     expect(result.rangeRead.map((cell) => cell.display)).toEqual(['42'])
     expect(result.afterRangeReadEvalCount).toBe(1)
     expect(result.afterRangeReadState).toBe('clean')
+
+    await expectNoConsoleErrors(page)
+  })
+
+  test('commits import issues without preheating valid formulas', async ({ page }) => {
+    const result = await runWorkerWorkbookImportIssuesScenario(page)
+
+    expect(result.chunkLength).toBe(4)
+    expect(result.stats).toMatchObject({
+      accepted: 2,
+      formulas: 2,
+      rejectedFormulas: 1,
+      cleared: 0,
+      errors: 3,
+    })
+    expect(result.stats.issues ?? []).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          sheet: 99,
+          row: 0,
+          col: 0,
+          kind: 'text',
+          code: 'SHEET_OUT_OF_RANGE',
+        }),
+        expect.objectContaining({
+          sheet: 0,
+          row: 1,
+          col: 1,
+          kind: 'formula',
+          code: 'FORMULA_REJECTED',
+        }),
+        expect.objectContaining({
+          sheet: 0,
+          row: -1,
+          col: 0,
+          kind: 'number',
+          code: 'INVALID_IMPORT_CELL_COORDINATES',
+        }),
+        expect.objectContaining({
+          sheet: 0,
+          row: 2,
+          col: 0,
+          kind: 'number',
+          code: 'INVALID_IMPORT_CELL_VALUE',
+        }),
+      ]),
+    )
+    expect(result.stats.issues ?? []).toHaveLength(4)
+
+    expect(result.beforeReadEvalCount).toBe(0)
+    expect(result.beforeReadState).toBe('dirty')
+    expect(result.sparseSnapshot).toEqual(
+      expect.arrayContaining([
+        { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+        { sheet: 1, addr: 'A1', row: 0, col: 0, kind: 'number', value: 41 },
+      ]),
+    )
+    expect(result.sparseSnapshot).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sheet: 0, addr: 'A3' }),
+        expect.objectContaining({ sheet: 99 }),
+      ]),
+    )
+    expect(result.afterSnapshotEvalCount).toBe(0)
+    expect(result.afterSnapshotState).toBe('dirty')
+    expect(result.validFormula.display).toBe('42')
+    expect(result.afterReadEvalCount).toBe(1)
+    expect(result.afterReadState).toBe('clean')
 
     await expectNoConsoleErrors(page)
   })
@@ -236,6 +314,7 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
     rejectedFormulas: number
     cleared: number
     errors: number
+    issues: ImportIssue[]
   }
   beforeReadState: string
   beforeReadEvalCount: number
@@ -304,6 +383,69 @@ async function runWorkerWorkbookImportScenario(page: Page): Promise<{
         rangeRead,
         afterRangeReadEvalCount,
         afterRangeReadState,
+      }
+    } finally {
+      workbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportIssuesScenario(page: Page): Promise<{
+  chunkLength: number
+  stats: {
+    accepted: number
+    formulas: number
+    rejectedFormulas: number
+    cleared: number
+    errors: number
+    issues?: ImportIssue[]
+  }
+  beforeReadState: string
+  beforeReadEvalCount: number
+  sparseSnapshot: SparseCell[]
+  afterSnapshotState: string
+  afterSnapshotEvalCount: number
+  validFormula: Snapshot
+  afterReadState: string
+  afterReadEvalCount: number
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1', 'Sheet2'])
+      const session = await workbook.beginImport()
+      const chunkLength = await workbook.importChunk(session, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+        { sheet: 0, row: -1, col: 0, kind: 'number', value: 9 },
+        { sheet: 99, row: 0, col: 0, kind: 'text', value: 'missing sheet' },
+        { sheet: 0, row: 1, col: 1, kind: 'formula', value: '=garbage((' },
+        { sheet: 0, row: 2, col: 0, kind: 'number', value: 'bad value' },
+      ])
+      const stats = await workbook.commitImport(session)
+      const beforeReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const beforeReadState = await workbook.debugFormulaCacheState(0, 'A1')
+      const sparseSnapshot = await workbook.snapshotSparse()
+      const afterSnapshotEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterSnapshotState = await workbook.debugFormulaCacheState(0, 'A1')
+      const [validFormula] = await workbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const afterReadEvalCount = await workbook.debugFormulaEvalCount(0)
+      const afterReadState = await workbook.debugFormulaCacheState(0, 'A1')
+
+      return {
+        chunkLength,
+        stats,
+        beforeReadEvalCount,
+        beforeReadState,
+        sparseSnapshot,
+        afterSnapshotEvalCount,
+        afterSnapshotState,
+        validFormula,
+        afterReadEvalCount,
+        afterReadState,
       }
     } finally {
       workbook.dispose()

@@ -2,7 +2,7 @@ use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, CellAddress, CellFormat, CellRange, CellSubscription, NumberFormat, Sheet, Workbook,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
@@ -157,14 +157,241 @@ enum ImportValueJSON {
     Text(String),
 }
 
+#[derive(Clone, Debug)]
+enum BulkImportKindJSON {
+    Text(String),
+    Invalid,
+}
+
+impl Default for BulkImportKindJSON {
+    fn default() -> Self {
+        BulkImportKindJSON::Invalid
+    }
+}
+
+impl<'de> Deserialize<'de> for BulkImportKindJSON {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = BulkImportKindJSON;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a string import kind")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Text(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Text(value))
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: de::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                while let Some(de::IgnoredAny) = seq.next_element()? {}
+                Ok(BulkImportKindJSON::Invalid)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                while let Some((de::IgnoredAny, de::IgnoredAny)) = map.next_entry()? {}
+                Ok(BulkImportKindJSON::Invalid)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum BulkImportValueJSON {
+    Number(f64),
+    Boolean(bool),
+    Text(String),
+    Invalid,
+}
+
+impl<'de> Deserialize<'de> for BulkImportValueJSON {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = BulkImportValueJSON;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a primitive import value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Text(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Text(value))
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Boolean(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Number(value as f64))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Number(value as f64))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Number(value))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Invalid)
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(BulkImportValueJSON::Invalid)
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: de::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                while let Some(de::IgnoredAny) = seq.next_element()? {}
+                Ok(BulkImportValueJSON::Invalid)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                while let Some((de::IgnoredAny, de::IgnoredAny)) = map.next_entry()? {}
+                Ok(BulkImportValueJSON::Invalid)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 struct WorkbookImportCellJSON {
     sheet: usize,
     row: u32,
     col: u32,
-    kind: String,
     #[serde(default)]
-    value: Option<ImportValueJSON>,
+    kind: BulkImportKindJSON,
+    #[serde(default)]
+    value: Option<BulkImportValueJSON>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WorkbookImportIssueJSON {
+    sheet: usize,
+    row: u32,
+    col: u32,
+    kind: String,
+    code: String,
+    message: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -175,6 +402,20 @@ struct WorkbookImportStatsJSON {
     rejected_formulas: u32,
     cleared: u32,
     errors: u32,
+    issues: Vec<WorkbookImportIssueJSON>,
+}
+
+impl WorkbookImportStatsJSON {
+    fn push_issue(&mut self, cell: &WorkbookImportCellJSON, kind: &str, code: &str, message: &str) {
+        self.issues.push(WorkbookImportIssueJSON {
+            sheet: cell.sheet,
+            row: cell.row,
+            col: cell.col,
+            kind: kind.to_string(),
+            code: code.to_string(),
+            message: message.to_string(),
+        });
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -901,61 +1142,125 @@ impl WasmWorkbook {
         let sheet_count = self.workbook.sheet_count();
         self.workbook.bulk_load(|loader| {
             for cell in cells {
+                let kind = match &cell.kind {
+                    BulkImportKindJSON::Text(kind) => kind.clone(),
+                    BulkImportKindJSON::Invalid => {
+                        stats.errors += 1;
+                        stats.push_issue(&cell, "", "INVALID_KIND", "cell kind must be a string");
+                        continue;
+                    }
+                };
+                let kind = kind.as_str();
                 if cell.sheet >= sheet_count {
                     stats.errors += 1;
+                    stats.push_issue(
+                        &cell,
+                        kind,
+                        "SHEET_OUT_OF_RANGE",
+                        "cell sheet index is outside the workbook",
+                    );
                     continue;
                 }
                 let addr = CellAddress::new(cell.row, cell.col).to_string_repr();
-                match cell.kind.as_str() {
-                    "number" => match cell.value {
-                        Some(ImportValueJSON::Number(n)) => {
-                            loader.set_cell(cell.sheet, &addr, Value::Number(n));
+                match kind {
+                    "number" => match &cell.value {
+                        Some(BulkImportValueJSON::Number(n)) if n.is_finite() => {
+                            loader.set_cell(cell.sheet, &addr, Value::Number(*n));
                             stats.accepted += 1;
                         }
-                        _ => stats.errors += 1,
+                        _ => {
+                            stats.errors += 1;
+                            stats.push_issue(
+                                &cell,
+                                kind,
+                                "INVALID_VALUE",
+                                "number cells require a numeric value",
+                            );
+                        }
                     },
-                    "text" => match cell.value {
-                        Some(ImportValueJSON::Text(s)) => {
-                            loader.set_cell(cell.sheet, &addr, Value::Text(s));
+                    "text" => match &cell.value {
+                        Some(BulkImportValueJSON::Text(s)) => {
+                            loader.set_cell(cell.sheet, &addr, Value::Text(s.clone()));
                             stats.accepted += 1;
                         }
-                        _ => stats.errors += 1,
+                        _ => {
+                            stats.errors += 1;
+                            stats.push_issue(
+                                &cell,
+                                kind,
+                                "INVALID_VALUE",
+                                "text cells require a string value",
+                            );
+                        }
                     },
-                    "boolean" => match cell.value {
-                        Some(ImportValueJSON::Boolean(b)) => {
-                            loader.set_cell(cell.sheet, &addr, Value::Boolean(b));
+                    "boolean" => match &cell.value {
+                        Some(BulkImportValueJSON::Boolean(b)) => {
+                            loader.set_cell(cell.sheet, &addr, Value::Boolean(*b));
                             stats.accepted += 1;
                         }
-                        _ => stats.errors += 1,
+                        _ => {
+                            stats.errors += 1;
+                            stats.push_issue(
+                                &cell,
+                                kind,
+                                "INVALID_VALUE",
+                                "boolean cells require a boolean value",
+                            );
+                        }
                     },
-                    "error" => match cell.value {
-                        Some(ImportValueJSON::Text(s)) => {
+                    "error" => match &cell.value {
+                        Some(BulkImportValueJSON::Text(s)) => {
                             loader.set_cell(
                                 cell.sheet,
                                 &addr,
-                                Value::Error(value_error_from_display(&s)),
+                                Value::Error(value_error_from_display(s)),
                             );
                             stats.accepted += 1;
                         }
-                        _ => stats.errors += 1,
+                        _ => {
+                            stats.errors += 1;
+                            stats.push_issue(
+                                &cell,
+                                kind,
+                                "INVALID_VALUE",
+                                "error cells require a string value",
+                            );
+                        }
                     },
-                    "formula" => match cell.value {
-                        Some(ImportValueJSON::Text(s)) => {
+                    "formula" => match &cell.value {
+                        Some(BulkImportValueJSON::Text(s)) => {
                             stats.formulas += 1;
-                            if loader.set_formula(cell.sheet, &addr, &s) {
+                            if loader.set_formula(cell.sheet, &addr, s) {
                                 stats.accepted += 1;
                             } else {
                                 stats.rejected_formulas += 1;
+                                stats.push_issue(
+                                    &cell,
+                                    kind,
+                                    "FORMULA_REJECTED",
+                                    "formula was rejected by the workbook",
+                                );
                             }
                         }
-                        _ => stats.errors += 1,
+                        _ => {
+                            stats.errors += 1;
+                            stats.push_issue(
+                                &cell,
+                                kind,
+                                "INVALID_VALUE",
+                                "formula cells require a string value",
+                            );
+                        }
                     },
                     "null" => {
                         loader.clear_cell(cell.sheet, &addr);
                         stats.accepted += 1;
                         stats.cleared += 1;
                     }
-                    _ => stats.errors += 1,
+                    _ => {
+                        stats.errors += 1;
+                        stats.push_issue(&cell, kind, "INVALID_KIND", "cell kind is not supported");
+                    }
                 }
             }
         });

@@ -29,12 +29,22 @@ export type ImportCellWire =
   | { sheet: number; row: number; col: number; kind: 'formula'; value: string }
   | { sheet: number; row: number; col: number; kind: 'null' }
 
+export interface ImportCellIssueWire {
+  sheet?: number
+  row?: number
+  col?: number
+  kind?: string
+  code: string
+  message: string
+}
+
 export interface WorkbookImportStatsWire {
   accepted: number
   formulas: number
   rejectedFormulas: number
   cleared: number
   errors: number
+  issues?: ImportCellIssueWire[]
 }
 
 export type SparseCellWire =
