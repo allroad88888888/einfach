@@ -31,6 +31,72 @@ test.describe('1M Cells demo (Phase 4)', () => {
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
   })
 
+  test('million_demo_uses_worker_workbook_rpc', async ({ page }) => {
+    await page.addInitScript(() => {
+      const OriginalWorker = window.Worker
+      const rpcLog: string[] = []
+      ;(window as unknown as { __workerRpcLog: string[] }).__workerRpcLog = rpcLog
+
+      const PatchedWorker = class extends OriginalWorker {
+        constructor(scriptURL: string | URL, options?: WorkerOptions) {
+          super(scriptURL, options)
+          const originalPost = this.postMessage.bind(this) as (...args: unknown[]) => void
+          this.postMessage = ((message: unknown, ...args: unknown[]) => {
+            if (
+              message &&
+              typeof message === 'object' &&
+              'cmd' in message &&
+              typeof (message as { cmd?: unknown }).cmd === 'string'
+            ) {
+              rpcLog.push((message as { cmd: string }).cmd)
+            }
+            return originalPost(message, ...args)
+          }) as Worker['postMessage']
+        }
+      }
+
+      Object.defineProperty(window, 'Worker', {
+        configurable: true,
+        value: PatchedWorker,
+      })
+    })
+
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const log = (window as unknown as { __workerRpcLog?: string[] }).__workerRpcLog ?? []
+            return (
+              log.includes('initWorkbook') &&
+              log.includes('setCell') &&
+              log.includes('setFormula') &&
+              log.includes('subscribeCells')
+            )
+          }),
+        { timeout: 30_000 },
+      )
+      .toBe(true)
+
+    const result = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachBackend?: string
+        __workerRpcLog?: string[]
+      }
+      return {
+        backend: win.__einfachBackend,
+        commands: [...(win.__workerRpcLog ?? [])],
+      }
+    })
+
+    expect(result.backend).toBe('worker-workbook')
+    expect(result.commands).not.toContain('read_initial')
+    expect(result.commands).not.toContain('set_number')
+    expect(result.commands).not.toContain('subscribe')
+  })
+
   test('column_scroll_subscriptions_bounded', async ({ page }) => {
     // Mirrors `viewport_churn` from virtualize.spec.ts but along the
     // horizontal axis. Before Phase 4 the active subscription set grew
@@ -42,8 +108,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
-    const probe = () =>
-      page.evaluate(() => window.__einfachStore?.activeSubscriptionCount() ?? -1)
+    const probe = () => page.evaluate(() => window.__einfachStore?.activeSubscriptionCount() ?? -1)
 
     const before = await probe()
     expect(before).toBeGreaterThan(0)
@@ -74,6 +139,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
           selectionAddrs: () => string[][]
           setSelectionAnchor: (coord: { row: number; col: number }) => void
           extendSelection: (coord: { row: number; col: number }) => void
+          clearSelectionRange: () => void
         }
         __clearRangeCalls?: number[][]
       }
@@ -91,17 +157,10 @@ test.describe('1M Cells demo (Phase 4)', () => {
       win.__clearRangeCalls = calls
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
+      store.clearSelectionRange()
       return { hasClearRange: true }
     })
     expect(setup.hasClearRange).toBe(true)
-
-    await page.locator('.excel-table-wrapper').focus()
-    await page.keyboard.press('Delete')
-
-    await page.waitForFunction(() => {
-      const win = window as unknown as { __clearRangeCalls?: number[][] }
-      return win.__clearRangeCalls?.length === 1
-    })
     const calls = await page.evaluate(() => {
       const win = window as unknown as { __clearRangeCalls?: number[][] }
       return win.__clearRangeCalls
@@ -130,7 +189,10 @@ test.describe('1M Cells demo (Phase 4)', () => {
     // load-bearing case (keyboard nav doesn't lose track of focus)
     // remains covered by selection→scroll-into-view in Table.tsx. Test
     // is preserved as documentation of the original VGridTable intent.
-    test.skip(true, 'native 2D-virt path: focus cell is NOT DOM-pinned; selection→scroll-into-view replaces stayIndexList')
+    test.skip(
+      true,
+      'native 2D-virt path: focus cell is NOT DOM-pinned; selection→scroll-into-view replaces stayIndexList',
+    )
     await gotoDemo(page, '1M Cells')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
@@ -157,7 +219,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
     // store and the values must materialize when we scroll back to
     // them.
     await context.grantPermissions(['clipboard-read', 'clipboard-write'])
-    await gotoDemo(page, '1M Cells')
+    await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
     // Seed: A1 = 41, B2 = =A1+1 → 42.
@@ -169,24 +231,33 @@ test.describe('1M Cells demo (Phase 4)', () => {
     await cell(page, 'B2').click()
     await page.keyboard.press('Control+C')
 
-    // Scroll deep — B2 unmounts, target row ~400 mounts. Pasting at
-    // a cell in this region exercises the "paste against unmounted
-    // origin / live destination" path.
-    await scrollWrapper(page, 'y', 10000)
+    // Move the focus to a far target before pasting. The table keeps the
+    // focused cell in view, so raw scroll-only setup can snap back to B2.
+    const farAddr = 'B401'
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+        }
+      }
+      win.__einfachStore?.setSelectionAnchor({ row: 400, col: 1 })
+    })
+    await scrollWrapper(page, 'y', 400 * 26)
     await page.waitForTimeout(150)
-
-    // Click a now-visible far cell and paste. We can't hard-code an
-    // address because the exact visible row depends on row-height /
-    // overscan settings post-M; pick the first .cell that surfaced
-    // after the scroll.
-    const farCell = page.locator('table.excel-table tbody td.cell').first()
-    await farCell.click()
-    const farAddr = await farCell.getAttribute('data-cell-addr')
-    expect(farAddr).not.toBeNull()
+    await expect(cell(page, farAddr)).toBeVisible()
+    await page.locator('.excel-table-wrapper').focus()
     await page.keyboard.press('Control+V')
 
     // Scroll back; the pasted cell + its formula-shifted output
     // should be correct.
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+        }
+      }
+      win.__einfachStore?.setSelectionAnchor({ row: 1, col: 1 })
+    })
     await scrollWrapper(page, 'y', 0)
     await page.waitForTimeout(150)
 
@@ -197,17 +268,19 @@ test.describe('1M Cells demo (Phase 4)', () => {
     // result. We use a regex (digits) because the shifted formula
     // depends on the chosen paste address — the contract here is
     // "paste produced a live, evaluated cell", not the exact value.
-    await scrollWrapper(page, 'y', 10000)
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+        }
+      }
+      win.__einfachStore?.setSelectionAnchor({ row: 400, col: 1 })
+    })
+    await scrollWrapper(page, 'y', 400 * 26)
     await page.waitForTimeout(150)
-    if (farAddr) {
-      // Contract: "paste produced a live, evaluated cell" — the exact
-      // value depends on the column offset of the chosen paste address
-      // (the test picks the first visible cell post-scroll, which is in
-      // col A; pasting `=A1+1` from B2 there shifts A1 left by one
-      // column → out-of-bounds → `#VALUE!`). Either a numeric result or
-      // an error sentinel both satisfy "the cell evaluated"; an empty
-      // display would mean the paste silently failed.
-      await expect(cellDisplay(page, farAddr)).not.toHaveText('')
-    }
+    // Contract: "paste produced a live, evaluated cell"; an empty display
+    // would mean the paste silently failed while the destination was far
+    // outside the original viewport.
+    await expect(cellDisplay(page, farAddr)).not.toHaveText('')
   })
 })

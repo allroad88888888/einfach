@@ -1,10 +1,13 @@
-
 export { Table } from './Table'
 export { Cell } from './Cell'
 export { FormulaBar } from './FormulaBar'
 export { createSheetStore } from './sheet-store'
 export { createJSSheet } from './js-sheet'
 export { createWorkerWorkbook } from './wasm-workbook-proxy'
+export {
+  createWorkerWorkbookStore,
+  createThreeSheetChainWorkbookStore,
+} from './wasm-workbook-store'
 export { App } from './App'
 export { DemoBlank } from './demos/DemoBlank'
 export { DemoFormulas } from './demos/DemoFormulas'
@@ -13,6 +16,7 @@ export { DemoGrades } from './demos/DemoGrades'
 export { DemoSales } from './demos/DemoSales'
 export type { ISheet, CellValue } from './types'
 export type { SheetStore } from './sheet-store'
+export type { WasmWorkbookStore, WorkerWorkbookStoreOptions } from './wasm-workbook-store'
 export type { TableProps } from './Table'
 export type { CellProps } from './Cell'
 export type { FormulaBarProps } from './FormulaBar'

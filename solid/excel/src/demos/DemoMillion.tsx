@@ -1,9 +1,8 @@
-
 import { Show, createResource, onCleanup } from 'solid-js'
 import { Table } from '../Table'
-import { createSheetStore, type SheetStore } from '../sheet-store'
-import { createWorkerSheet } from '../wasm-sheet-proxy'
-import { defaultWorkerFactory } from '../wasm-sheet-worker-factory'
+import type { SheetStore } from '../sheet-store'
+import { createWorkerWorkbookStore, type WasmWorkbookStore } from '../wasm-workbook-store'
+import { defaultWorkbookWorkerFactory } from '../wasm-workbook-worker-factory'
 import { colToLetter } from '../selection'
 import { useT } from '../i18n'
 
@@ -11,7 +10,7 @@ import { useT } from '../i18n'
  * Phase 4 Track O — 1M-cell worker-backed demo.
  *
  * 1000 × 1000 = 1,000,000 addressable cells. The engine lives on a Web
- * Worker (same plumbing as `DemoWorker`) and only ~2000 cells are
+ * Worker-owned workbook and only ~2000 cells are
  * actually seeded; the rest of the coord space stays sparse. Lazy
  * formula eval + two-dimensional viewport virtualization mean the main
  * thread never has to touch the unseeded ~99.8% of cells.
@@ -37,6 +36,8 @@ import { useT } from '../i18n'
 declare global {
   interface Window {
     __einfachStore?: SheetStore
+    __einfachWorkbookStore?: WasmWorkbookStore
+    __einfachBackend?: string
   }
 }
 
@@ -46,16 +47,26 @@ declare global {
  * probe `activeSubscriptionCount()` from the browser side. Matches the
  * pattern used by DemoBlank / DemoFormulas / DemoLarge. Off otherwise.
  */
-function exposeStoreForDebug(store: SheetStore) {
+function exposeStoreForDebug(store: SheetStore, workbook: WasmWorkbookStore) {
   if (typeof window === 'undefined') return
   const debug = new URLSearchParams(window.location.search).get('debug')
   if (debug !== '1' && debug !== 'render') return
   window.__einfachStore = store
-  onCleanup(() => {
-    if (window.__einfachStore === store) {
-      delete window.__einfachStore
-    }
-  })
+  window.__einfachWorkbookStore = workbook
+  window.__einfachBackend = 'worker-workbook'
+}
+
+function clearStoreForDebug(store: SheetStore, workbook: WasmWorkbookStore) {
+  if (typeof window === 'undefined') return
+  if (window.__einfachStore === store) {
+    delete window.__einfachStore
+  }
+  if (window.__einfachWorkbookStore === workbook) {
+    delete window.__einfachWorkbookStore
+  }
+  if (window.__einfachBackend === 'worker-workbook') {
+    delete window.__einfachBackend
+  }
 }
 
 const ROWS = 1000
@@ -63,26 +74,40 @@ const COLS = 1000
 
 export function DemoMillion() {
   const t = useT()
-  const [storeRes] = createResource<SheetStore>(async () => {
-    const sheet = createWorkerSheet({ workerFactory: defaultWorkerFactory })
-    const store = createSheetStore(sheet)
+  const [workbookRes] = createResource<WasmWorkbookStore>(async () => {
+    const workbook = await createWorkerWorkbookStore({
+      workerFactory: defaultWorkbookWorkerFactory,
+      sheets: ['Sheet1'],
+    })
+    const store = workbook.activeStore()
     seed(store)
-    exposeStoreForDebug(store)
-    return store
+    exposeStoreForDebug(store, workbook)
+    return workbook
+  })
+  onCleanup(() => {
+    const workbook = workbookRes()
+    if (!workbook) return
+    const store = workbook.activeStore()
+    clearStoreForDebug(store, workbook)
+    workbook.dispose()
   })
 
   return (
     <Show
-      when={storeRes()}
-      fallback={<div class="demo-page"><p>Loading worker backend…</p></div>}
+      when={workbookRes()}
+      fallback={
+        <div class="demo-page">
+          <p>Loading worker backend…</p>
+        </div>
+      }
     >
-      {(store) => (
+      {(workbook) => (
         <div class="demo-page">
           <div class="demo-header">
             <h3>{t('demo.million.title')}</h3>
             <p class="demo-desc">{t('demo.million.desc')}</p>
           </div>
-          <Table store={store()} rows={ROWS} cols={COLS} virtualize formulaBar />
+          <Table store={workbook().activeStore()} rows={ROWS} cols={COLS} virtualize formulaBar />
         </div>
       )}
     </Show>
@@ -101,11 +126,13 @@ export function DemoMillion() {
  *   - 2 far-corner anchors (AAA500, ALL999).
  */
 function seed(store: SheetStore) {
+  const sheet = store.raw
+
   // 1) Numeric base + 49-deep chain in column A. Reading A50 walks 49
   //    levels; reading any cell mid-chain forces incremental lazy eval.
-  store.setNumber('A1', 1)
+  sheet.set_number('A1', 1)
   for (let r = 2; r <= 50; r++) {
-    store.setFormula(`A${r}`, `=A${r - 1}+1`)
+    sheet.set_formula(`A${r}`, `=A${r - 1}+1`)
   }
 
   // 2) Scattered numeric cells — every 500th flat address (1,000,000 /
@@ -118,10 +145,10 @@ function seed(store: SheetStore) {
     const col = idx % COLS
     if (col === 0 && row < 50) continue
     const addr = `${colToLetter(col)}${row + 1}`
-    store.setNumber(addr, idx)
+    sheet.set_number(addr, idx)
   }
 
   // 3) Far-corner anchors so users see content at the deep corners.
-  store.setText('AAA500', 'You scrolled to AAA500')
-  store.setText('ALL999', 'Bottom-right corner (col ALL, row 999)')
+  sheet.set_text('AAA500', 'You scrolled to AAA500')
+  sheet.set_text('ALL999', 'Bottom-right corner (col ALL, row 999)')
 }

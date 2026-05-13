@@ -1,10 +1,23 @@
 import { createSignal } from 'solid-js'
 import { createSheetStore, type SheetStore } from './sheet-store'
 import { createWasmWorkbook, type WasmWorkbookApi } from './wasm-sheet'
-import type { ISheet } from './types'
+import type { CellValue, ISheet } from './types'
+import {
+  createWorkerWorkbook,
+  type CellRefWire,
+  type CellSnapshotWire,
+  type CellWire,
+  type SparseRangeWire,
+  type WorkerLike,
+  type WorkerWorkbookClient,
+} from './wasm-workbook-proxy'
 
 interface WorkbookSheetAdapter extends ISheet {
   notifySubscribers(): void
+}
+
+interface WorkerWorkbookSheetAdapter extends ISheet {
+  applyHydrated(cells: CellSnapshotWire[]): void
 }
 
 export interface WorkbookSheetMeta {
@@ -21,6 +34,98 @@ export interface WasmWorkbookStore {
   sheetAt: (idx: number) => SheetStore | undefined
   formulaCacheState: (sheetIdx: number, addr: string) => string
   dispose: () => void
+}
+
+export interface WorkerWorkbookStoreOptions {
+  client?: WorkerWorkbookClient
+  workerFactory?: () => WorkerLike
+  sheets?: string[]
+}
+
+type CachedWorkbookCell = {
+  display: string
+  type: CellValue['type']
+  isError: boolean
+  formula: string
+}
+
+const EMPTY_WORKBOOK_CELL: CachedWorkbookCell = {
+  display: '',
+  type: 'null',
+  isError: false,
+  formula: '',
+}
+
+export async function createWorkerWorkbookStore(
+  opts: WorkerWorkbookStoreOptions,
+): Promise<WasmWorkbookStore> {
+  const client =
+    opts.client ??
+    (opts.workerFactory ? createWorkerWorkbook({ workerFactory: opts.workerFactory }) : null)
+
+  if (!client) {
+    throw new Error('createWorkerWorkbookStore requires client or workerFactory')
+  }
+
+  const sheetMetas = await client.initWorkbook(opts.sheets ?? ['Sheet1'])
+  const [activeIdx, setActiveIdxRaw] = createSignal(0)
+  const [version, setVersion] = createSignal(0)
+  const adapters = new Map<number, WorkerWorkbookSheetAdapter>()
+  const stores = new Map<number, SheetStore>()
+  let disposed = false
+
+  const bumpRevision = () => setVersion((v) => v + 1)
+
+  for (const meta of sheetMetas) {
+    const adapter = createWorkerWorkbookSheetAdapter(client, meta.idx, bumpRevision)
+    adapters.set(meta.idx, adapter)
+    stores.set(meta.idx, createSheetStore(adapter))
+  }
+
+  const offHydrated = client.onCellsHydrated((cells) => {
+    const bySheet = new Map<number, CellSnapshotWire[]>()
+    for (const cell of cells) {
+      const group = bySheet.get(cell.sheet) ?? []
+      group.push(cell)
+      bySheet.set(cell.sheet, group)
+    }
+    for (const [sheetIdx, group] of bySheet) {
+      adapters.get(sheetIdx)?.applyHydrated(group)
+    }
+  })
+
+  function setActiveIdx(idx: number) {
+    if (!stores.has(idx)) return
+    setActiveIdxRaw(idx)
+  }
+
+  function activeStore(): SheetStore {
+    version()
+    const store = stores.get(activeIdx()) ?? stores.values().next().value
+    if (!store) throw new Error('worker workbook has no sheets')
+    return store
+  }
+
+  return {
+    sheets: () => {
+      version()
+      return sheetMetas.map((sheet) => ({ idx: sheet.idx, name: sheet.name }))
+    },
+    activeIdx,
+    revision: version,
+    setActiveIdx,
+    activeStore,
+    sheetAt: (idx) => stores.get(idx),
+    formulaCacheState: () => 'unknown',
+    dispose: () => {
+      if (disposed) return
+      disposed = true
+      for (const store of stores.values()) store.dispose()
+      offHydrated()
+      client.dispose()
+      bumpRevision()
+    },
+  }
 }
 
 export async function createThreeSheetChainWorkbookStore(): Promise<WasmWorkbookStore> {
@@ -164,5 +269,316 @@ function createWorkbookSheetAdapter(
       listeners.delete(token)
     },
     notifySubscribers,
+  }
+}
+
+function createWorkerWorkbookSheetAdapter(
+  client: WorkerWorkbookClient,
+  sheetIdx: number,
+  notifyRevision: () => void,
+): WorkerWorkbookSheetAdapter {
+  const cache = new Map<string, CachedWorkbookCell>()
+  const requested = new Set<string>()
+  const pendingReads = new Set<string>()
+  const listenersByAddr = new Map<string, Map<number, () => void>>()
+  const tokenToAddr = new Map<number, string>()
+  const workerSubs = new Map<
+    string,
+    { refCount: number; subId?: number; promise?: Promise<number> }
+  >()
+  let nextToken = 1
+  let disposed = false
+
+  function normalizeAddr(addr: string): string {
+    return addr.toUpperCase()
+  }
+
+  function readCache(addr: string): CachedWorkbookCell {
+    return cache.get(normalizeAddr(addr)) ?? EMPTY_WORKBOOK_CELL
+  }
+
+  function writeCache(addr: string, patch: Partial<CachedWorkbookCell>) {
+    const a = normalizeAddr(addr)
+    const cur = cache.get(a) ?? EMPTY_WORKBOOK_CELL
+    cache.set(a, { ...cur, ...patch })
+  }
+
+  function fireListeners(addr: string) {
+    const listeners = listenersByAddr.get(normalizeAddr(addr))
+    if (!listeners) return
+    for (const callback of listeners.values()) callback()
+  }
+
+  function hasListeners(addr: string): boolean {
+    return (listenersByAddr.get(normalizeAddr(addr))?.size ?? 0) > 0
+  }
+
+  function hydrateRefs(refs: CellRefWire[]) {
+    if (disposed) return
+    const cells: CellRefWire[] = []
+    for (const ref of refs) {
+      if (ref.sheet !== sheetIdx) continue
+      const addr = normalizeAddr(ref.addr)
+      if (pendingReads.has(addr)) continue
+      pendingReads.add(addr)
+      cells.push({ sheet: sheetIdx, addr })
+    }
+    if (cells.length === 0) return
+
+    void client
+      .readCells(cells)
+      .then((snapshots) => applyHydrated(snapshots))
+      .catch(() => {
+        for (const cell of cells) pendingReads.delete(cell.addr)
+      })
+  }
+
+  function hydrateAddr(addr: string) {
+    hydrateRefs([{ sheet: sheetIdx, addr: normalizeAddr(addr) }])
+  }
+
+  function ensureHydration(addr: string) {
+    const a = normalizeAddr(addr)
+    if (requested.has(a)) return
+    requested.add(a)
+    hydrateAddr(a)
+  }
+
+  function applyHydrated(cells: CellSnapshotWire[]) {
+    let touched = false
+    for (const cell of cells) {
+      if (cell.sheet !== sheetIdx) continue
+      const addr = normalizeAddr(cell.addr)
+      pendingReads.delete(addr)
+      requested.add(addr)
+      cache.set(addr, {
+        display: cell.display,
+        type: cell.type,
+        isError: cell.isError,
+        formula: cell.formula,
+      })
+      fireListeners(addr)
+      touched = true
+    }
+    if (touched) notifyRevision()
+  }
+
+  function optimisticCell(value: CellWire): CachedWorkbookCell {
+    switch (value.type) {
+      case 'number':
+        return {
+          display: String(value.value),
+          type: 'number',
+          isError: false,
+          formula: '',
+        }
+      case 'text':
+        return {
+          display: value.value,
+          type: value.value === '' ? 'null' : 'text',
+          isError: false,
+          formula: '',
+        }
+      case 'boolean':
+        return {
+          display: value.value ? 'TRUE' : 'FALSE',
+          type: 'boolean',
+          isError: false,
+          formula: '',
+        }
+      case 'error':
+        return {
+          display: value.value,
+          type: 'error',
+          isError: true,
+          formula: '',
+        }
+      case 'null':
+        return EMPTY_WORKBOOK_CELL
+    }
+  }
+
+  function setCell(addr: string, value: CellWire) {
+    const a = normalizeAddr(addr)
+    requested.add(a)
+    cache.set(a, optimisticCell(value))
+    void client
+      .setCell(sheetIdx, a, value)
+      .then((ok) => {
+        if (hasListeners(a) || !ok) hydrateAddr(a)
+      })
+      .catch(() => hydrateAddr(a))
+  }
+
+  function startWorkerSubscription(addr: string) {
+    const a = normalizeAddr(addr)
+    const existing = workerSubs.get(a)
+    if (existing) {
+      existing.refCount += 1
+      return
+    }
+
+    requested.add(a)
+    const entry = { refCount: 1 } as {
+      refCount: number
+      subId?: number
+      promise?: Promise<number>
+    }
+    workerSubs.set(a, entry)
+    entry.promise = client
+      .subscribeCells([{ sheet: sheetIdx, addr: a }], (cells) => hydrateRefs(cells))
+      .then((subId) => {
+        if (!workerSubs.has(a) || entry.refCount <= 0) {
+          void client.unsubscribeCells(subId).catch(() => {})
+          return subId
+        }
+        entry.subId = subId
+        return subId
+      })
+      .catch(() => {
+        if (workerSubs.get(a) === entry) workerSubs.delete(a)
+        return -1
+      })
+  }
+
+  function stopWorkerSubscription(addr: string) {
+    const a = normalizeAddr(addr)
+    const entry = workerSubs.get(a)
+    if (!entry) return
+    entry.refCount -= 1
+    if (entry.refCount > 0) return
+    workerSubs.delete(a)
+    if (entry.subId !== undefined) {
+      void client.unsubscribeCells(entry.subId).catch(() => {})
+      return
+    }
+    void entry.promise
+      ?.then((subId) => {
+        if (subId > 0) return client.unsubscribeCells(subId)
+        return false
+      })
+      .catch(() => {})
+  }
+
+  function activeListenerAddrs(): string[] {
+    return [...listenersByAddr.keys()]
+  }
+
+  function unsubscribeToken(token: number) {
+    const addr = tokenToAddr.get(token)
+    if (!addr) return
+    tokenToAddr.delete(token)
+    const listeners = listenersByAddr.get(addr)
+    if (!listeners) return
+    listeners.delete(token)
+    if (listeners.size === 0) {
+      listenersByAddr.delete(addr)
+      stopWorkerSubscription(addr)
+    }
+  }
+
+  return {
+    set_number(addr, value) {
+      setCell(addr, { type: 'number', value })
+    },
+    set_text(addr, value) {
+      setCell(addr, { type: 'text', value })
+    },
+    set_boolean(addr, value) {
+      setCell(addr, { type: 'boolean', value })
+    },
+    set_error(addr, value) {
+      setCell(addr, { type: 'error', value })
+    },
+    set_formula(addr, formula) {
+      const a = normalizeAddr(addr)
+      requested.add(a)
+      writeCache(a, { display: '', type: 'null', isError: false, formula })
+      void client
+        .setFormula(sheetIdx, a, formula)
+        .then((ok) => {
+          if (hasListeners(a) || !ok) hydrateAddr(a)
+        })
+        .catch(() => hydrateAddr(a))
+      return true
+    },
+    clear_cell(addr) {
+      setCell(addr, { type: 'null' })
+    },
+    clear_range(startRow, startCol, endRow, endCol) {
+      const visibleAddrs = activeListenerAddrs()
+      cache.clear()
+      requested.clear()
+      for (const addr of visibleAddrs) fireListeners(addr)
+      const range: SparseRangeWire = {
+        sheet: sheetIdx,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+      }
+      void client
+        .clearRange(range)
+        .then(() => hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr }))))
+        .catch(() => hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr }))))
+    },
+    get_display(addr) {
+      ensureHydration(addr)
+      return readCache(addr).display
+    },
+    get_number(addr) {
+      ensureHydration(addr)
+      const cell = readCache(addr)
+      if (cell.type !== 'number') return 0
+      const value = Number(cell.display)
+      return Number.isFinite(value) ? value : 0
+    },
+    get_type(addr) {
+      ensureHydration(addr)
+      return readCache(addr).type
+    },
+    is_error(addr) {
+      ensureHydration(addr)
+      return readCache(addr).isError
+    },
+    get_formula(addr) {
+      ensureHydration(addr)
+      return readCache(addr).formula
+    },
+    subscribe(addr, callback) {
+      const a = normalizeAddr(addr)
+      const token = nextToken++
+      let listeners = listenersByAddr.get(a)
+      if (!listeners) {
+        listeners = new Map()
+        listenersByAddr.set(a, listeners)
+        startWorkerSubscription(a)
+      }
+      listeners.set(token, callback)
+      tokenToAddr.set(token, a)
+      return token
+    },
+    unsubscribe(token) {
+      unsubscribeToken(token)
+    },
+    non_empty_addrs() {
+      const out: string[] = []
+      for (const [addr, cell] of cache) {
+        if (cell.type !== 'null' || cell.formula !== '') out.push(addr)
+      }
+      return out
+    },
+    applyHydrated,
+    dispose() {
+      if (disposed) return
+      disposed = true
+      for (const token of [...tokenToAddr.keys()]) unsubscribeToken(token)
+      cache.clear()
+      requested.clear()
+      pendingReads.clear()
+      listenersByAddr.clear()
+      tokenToAddr.clear()
+      workerSubs.clear()
+    },
   }
 }
