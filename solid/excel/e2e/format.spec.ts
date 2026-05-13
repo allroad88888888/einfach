@@ -29,6 +29,13 @@ async function gotoBlank(page: Page) {
   await expect(page.locator('.format-toolbar')).toBeVisible()
 }
 
+async function gotoBlankDebug(page: Page) {
+  await page.goto('/?debug=1')
+  await page.getByRole('button', { name: 'Blank' }).click()
+  await expect(cell(page, 'A1')).toBeVisible()
+  await expect(page.locator('.format-toolbar')).toBeVisible()
+}
+
 async function typeIntoCell(page: Page, addr: string, value: string) {
   await cell(page, addr).dblclick()
   const input = cellInput(page, addr)
@@ -79,5 +86,49 @@ test.describe('Format toolbar', () => {
     await page.keyboard.press(undoKey)
 
     await expect(cellDisplay(page, 'A1')).toHaveText('0.5')
+  })
+
+  test('large selection formatting does not materialize the address grid', async ({ page }) => {
+    await gotoBlankDebug(page)
+
+    const setup = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          selectionAddrs: () => string[][]
+          formatSelection: (
+            patch: (current: Record<string, unknown>) => Record<string, unknown>,
+          ) => boolean
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+        }
+        __formatSelectionCalls?: number
+      }
+      const store = win.__einfachStore
+      if (!store) return { hasStore: false }
+      const originalFormatSelection = store.formatSelection.bind(store)
+      win.__formatSelectionCalls = 0
+      store.selectionAddrs = () => {
+        throw new Error('selectionAddrs must not run for large formatting')
+      }
+      store.formatSelection = (patch) => {
+        win.__formatSelectionCalls = (win.__formatSelectionCalls ?? 0) + 1
+        return originalFormatSelection(patch)
+      }
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      return { hasStore: true }
+    })
+    expect(setup.hasStore).toBe(true)
+
+    await page.getByRole('button', { name: 'Bold' }).click()
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const win = window as unknown as { __formatSelectionCalls?: number }
+          return win.__formatSelectionCalls ?? 0
+        }),
+      )
+      .toBe(1)
   })
 })

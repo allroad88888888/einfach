@@ -1,15 +1,10 @@
-
 import { createEffect, createSignal, For, on, onCleanup, Show } from 'solid-js'
 import { Cell } from './Cell'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import { FormatToolbar } from './FormatToolbar'
 import { FormulaBar } from './FormulaBar'
 import { addrToCoord, clampCoord, colToLetter, coordToAddr, type CellCoord } from './selection'
-import {
-  parseClipboardTSV,
-  serializeClipboardTSV,
-  type SheetStore,
-} from './sheet-store'
+import { parseClipboardTSV, serializeClipboardTSV, type SheetStore } from './sheet-store'
 
 export interface TableProps {
   store: SheetStore
@@ -190,18 +185,24 @@ export function Table(props: TableProps) {
 
   // Ctrl+C / Ctrl+V handlers — extracted from onKeyDown to keep that switch
   // small and to allow direct unit-call from tests if needed later.
-  async function handleCopy(e: KeyboardEvent) {
-    e.preventDefault()
-    const addrs = props.store.selectionAddrs()
-    const data = props.store.copy(addrs)
+  async function writeSelectionToClipboard(): Promise<boolean> {
+    const data = props.store.copySelection()
+    if (!data) return false
     const text = serializeClipboardTSV(data)
     try {
       await navigator.clipboard.writeText(text)
+      return true
     } catch {
       // No clipboard permission / not in a secure context. Silently swallow
       // — there's nothing user-actionable we can surface from here, and a
       // thrown error would crash the keydown handler.
+      return false
     }
+  }
+
+  async function handleCopy(e: KeyboardEvent) {
+    e.preventDefault()
+    await writeSelectionToClipboard()
   }
 
   async function handlePaste(e: KeyboardEvent) {
@@ -221,8 +222,8 @@ export function Table(props: TableProps) {
   }
 
   async function handleCut(e: KeyboardEvent) {
-    await handleCopy(e)
-    props.store.clearSelectionRange()
+    e.preventDefault()
+    if (await writeSelectionToClipboard()) props.store.clearSelectionRange()
   }
 
   // === Context menu state ===
@@ -248,14 +249,7 @@ export function Table(props: TableProps) {
   // cell menu. Same semantics, just no KeyboardEvent.preventDefault to worry
   // about. The keyboard handlers stay the source of truth for shortcuts.
   async function ctxCopy() {
-    const addrs = props.store.selectionAddrs()
-    const data = props.store.copy(addrs)
-    const text = serializeClipboardTSV(data)
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      // No clipboard permission — same swallow as the keyboard handler.
-    }
+    await writeSelectionToClipboard()
   }
 
   async function ctxPaste() {
@@ -272,8 +266,7 @@ export function Table(props: TableProps) {
   }
 
   async function ctxCut() {
-    await ctxCopy()
-    props.store.clearSelectionRange()
+    if (await writeSelectionToClipboard()) props.store.clearSelectionRange()
   }
 
   function ctxClearSelection() {
@@ -448,10 +441,7 @@ export function Table(props: TableProps) {
             </Show>
             <For each={colIndices()}>
               {(col) => (
-                <th
-                  class="col-header"
-                  onContextMenu={(e) => openMenu(e, colMenuItems(col))}
-                >
+                <th class="col-header" onContextMenu={(e) => openMenu(e, colMenuItems(col))}>
                   {colToLetter(col)}
                 </th>
               )}
@@ -474,10 +464,7 @@ export function Table(props: TableProps) {
           <For each={rowIndices()}>
             {(row) => (
               <tr>
-                <td
-                  class="row-header"
-                  onContextMenu={(e) => openMenu(e, rowMenuItems(row))}
-                >
+                <td class="row-header" onContextMenu={(e) => openMenu(e, rowMenuItems(row))}>
                   {row + 1}
                 </td>
                 <Show when={props.virtualize && leftPad() > 0}>
@@ -489,8 +476,7 @@ export function Table(props: TableProps) {
                 </Show>
                 <For each={colIndices()}>
                   {(col) => {
-                    const isSelected = () =>
-                      selected().row === row && selected().col === col
+                    const isSelected = () => selected().row === row && selected().col === col
                     // Cheap rectangle hit-test against the normalized
                     // anchor/focus rect. Recomputed per access — the
                     // surrounding `range()` accessor is the signal
@@ -542,14 +528,7 @@ export function Table(props: TableProps) {
         </tbody>
       </table>
       <Show when={menu()}>
-        {(m) => (
-          <ContextMenu
-            items={m().items}
-            x={m().x}
-            y={m().y}
-            onClose={closeMenu}
-          />
-        )}
+        {(m) => <ContextMenu items={m().items} x={m().x} y={m().y} onClose={closeMenu} />}
       </Show>
     </div>
   )

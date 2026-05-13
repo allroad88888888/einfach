@@ -67,6 +67,8 @@ export interface ClipboardData {
  */
 const CLIPBOARD_ORIGIN_MARKER_PREFIX = '# einfach-clipboard-origin: '
 const RANGE_CLEAR_UNDO_CELL_LIMIT = 10_000
+const CLIPBOARD_CELL_LIMIT = 10_000
+const FORMAT_CELL_LIMIT = 10_000
 
 type NormalizedCellRange = {
   startRow: number
@@ -85,10 +87,7 @@ function normalizeCellRange(anchor: CellCoord, focus: CellCoord): NormalizedCell
 }
 
 function rangeCellCount(range: NormalizedCellRange): number {
-  return (
-    (range.endRow - range.startRow + 1) *
-    (range.endCol - range.startCol + 1)
-  )
+  return (range.endRow - range.startRow + 1) * (range.endCol - range.startCol + 1)
 }
 
 /**
@@ -115,8 +114,7 @@ export function parseClipboardTSV(text: string, fallbackOrigin: string): Clipboa
   let body = normalized
   if (normalized.startsWith(CLIPBOARD_ORIGIN_MARKER_PREFIX)) {
     const newlineIdx = normalized.indexOf('\n')
-    const markerLine =
-      newlineIdx === -1 ? normalized : normalized.slice(0, newlineIdx)
+    const markerLine = newlineIdx === -1 ? normalized : normalized.slice(0, newlineIdx)
     origin = markerLine.slice(CLIPBOARD_ORIGIN_MARKER_PREFIX.length).trim() || fallbackOrigin
     body = newlineIdx === -1 ? '' : normalized.slice(newlineIdx + 1)
   }
@@ -278,7 +276,8 @@ export function createSheetStore(sheet: ISheet) {
     const type = sheet.get_type(addr)
     if (type === 'null') return { addr, kind: 'null' }
     if (type === 'number') return { addr, kind: 'number', value: sheet.get_number(addr) }
-    if (type === 'boolean') return { addr, kind: 'boolean', value: sheet.get_display(addr) === 'TRUE' }
+    if (type === 'boolean')
+      return { addr, kind: 'boolean', value: sheet.get_display(addr) === 'TRUE' }
     if (type === 'error') return { addr, kind: 'error', value: sheet.get_display(addr) }
     return { addr, kind: 'text', value: sheet.get_display(addr) }
   }
@@ -393,12 +392,7 @@ export function createSheetStore(sheet: ISheet) {
   /** Run a structural edit and push its undo entry. Flushes any pending
    * value-edit batch first so the two entry kinds never interleave (see
    * `docs/STRUCTURAL_UNDO.md#coalescing-with-value-edits`). */
-  function structuralEdit(
-    op: StructuralOp,
-    at: number,
-    count: number,
-    apply: () => void,
-  ) {
+  function structuralEdit(op: StructuralOp, at: number, count: number, apply: () => void) {
     // Flush an open beginEdit so the structural entry is its own frame.
     commitPendingEdit()
 
@@ -408,8 +402,7 @@ export function createSheetStore(sheet: ISheet) {
     // If the post-edit snapshot crossed the threshold we degrade this
     // entry to op-inverse only — keeping a partial snapshot would be a
     // lie about what undo can restore.
-    const snap =
-      before !== null && after !== null ? { before, after } : null
+    const snap = before !== null && after !== null ? { before, after } : null
     if (snap === null && before !== null) {
       // We had a before snapshot but went over budget after. Warn so the
       // dev knows undo is degraded.
@@ -446,8 +439,11 @@ export function createSheetStore(sheet: ISheet) {
     for (const s of snaps) restore(s)
   }
 
-  function selectionAddressGrid(): string[][] {
-    const range = normalizeCellRange(anchor(), selection())
+  function currentSelectionRange(): NormalizedCellRange {
+    return normalizeCellRange(anchor(), selection())
+  }
+
+  function addressGridForRange(range: NormalizedCellRange): string[][] {
     const out: string[][] = []
     for (let r = range.startRow; r <= range.endRow; r++) {
       const row: string[] = []
@@ -459,12 +455,58 @@ export function createSheetStore(sheet: ISheet) {
     return out
   }
 
+  function selectionAddressGrid(): string[][] {
+    return addressGridForRange(currentSelectionRange())
+  }
+
+  function copyAddressGrid(addrs: string[][]): ClipboardData {
+    const originAddr = addrs[0]?.[0] ?? 'A1'
+    return {
+      originAddr,
+      cells: addrs.map((row) =>
+        row.map((addr) => {
+          const f = sheet.get_formula(addr)
+          return f !== '' ? f : sheet.get_display(addr)
+        }),
+      ),
+    }
+  }
+
+  function setFormatInternal(addr: string, fmt: CellFormatJSON) {
+    if (!sheet.set_format) return
+    const current = sheet.get_format ? sheet.get_format(addr) : ({} as CellFormatJSON)
+    if (formatsEqual(current, fmt)) return
+    recordFormat(addr, () => sheet.set_format!(addr, fmt))
+  }
+
+  function formatCellRange(
+    anchorCoord: CellCoord,
+    focusCoord: CellCoord,
+    patch: (current: CellFormatJSON) => CellFormatJSON,
+  ): boolean {
+    if (!sheet.set_format) return false
+    const range = normalizeCellRange(anchorCoord, focusCoord)
+    if (rangeCellCount(range) > FORMAT_CELL_LIMIT) return false
+
+    const ownsBatch = pendingBefore === null
+    if (ownsBatch) {
+      pendingBefore = []
+      pendingAddrs = new Set()
+    }
+    for (let r = range.startRow; r <= range.endRow; r++) {
+      for (let c = range.startCol; c <= range.endCol; c++) {
+        const addr = coordToAddr({ row: r, col: c })
+        const current = sheet.get_format ? sheet.get_format(addr) : {}
+        setFormatInternal(addr, patch(current))
+      }
+    }
+    if (ownsBatch) commitPendingEdit()
+    return true
+  }
+
   function clearCellRange(anchorCoord: CellCoord, focusCoord: CellCoord) {
     const range = normalizeCellRange(anchorCoord, focusCoord)
-    if (
-      sheet.clear_range &&
-      rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT
-    ) {
+    if (sheet.clear_range && rangeCellCount(range) > RANGE_CLEAR_UNDO_CELL_LIMIT) {
       // Large clears are intentionally range-native. We flush any open
       // small-edit batch first and do not snapshot the full rectangle on
       // main; large undo becomes a later backend/coarse-transaction task.
@@ -571,6 +613,17 @@ export function createSheetStore(sheet: ISheet) {
     },
 
     /**
+     * Copy the current selection when it is small enough to represent as a
+     * browser clipboard payload. Oversized selections return null instead of
+     * constructing a huge address grid on the main thread.
+     */
+    copySelection(): ClipboardData | null {
+      const selectedRange = currentSelectionRange()
+      if (rangeCellCount(selectedRange) > CLIPBOARD_CELL_LIMIT) return null
+      return copyAddressGrid(addressGridForRange(selectedRange))
+    },
+
+    /**
      * One-shot, non-reactive read of a cell's current value. Does NOT
      * subscribe — call sites that need re-renders on backend change
      * must go through `observeCell`. Cheap; safe to call from anywhere
@@ -656,24 +709,16 @@ export function createSheetStore(sheet: ISheet) {
      * `docs/STRUCTURAL_UNDO.md` for the snapshot + threshold strategy.
      */
     insertRow(at: number, count = 1) {
-      structuralEdit('insertRow', at, count, () =>
-        sheet.insert_row?.(at, count),
-      )
+      structuralEdit('insertRow', at, count, () => sheet.insert_row?.(at, count))
     },
     deleteRow(at: number, count = 1) {
-      structuralEdit('deleteRow', at, count, () =>
-        sheet.delete_row?.(at, count),
-      )
+      structuralEdit('deleteRow', at, count, () => sheet.delete_row?.(at, count))
     },
     insertCol(at: number, count = 1) {
-      structuralEdit('insertCol', at, count, () =>
-        sheet.insert_col?.(at, count),
-      )
+      structuralEdit('insertCol', at, count, () => sheet.insert_col?.(at, count))
     },
     deleteCol(at: number, count = 1) {
-      structuralEdit('deleteCol', at, count, () =>
-        sheet.delete_col?.(at, count),
-      )
+      structuralEdit('deleteCol', at, count, () => sheet.delete_col?.(at, count))
     },
 
     // === Phase 6 — cell formatting (undoable) ===
@@ -685,10 +730,16 @@ export function createSheetStore(sheet: ISheet) {
      * idle toolbar clicks don't flood the undo stack.
      */
     setFormat(addr: string, fmt: CellFormatJSON) {
-      if (!sheet.set_format) return
-      const current = sheet.get_format ? sheet.get_format(addr) : ({} as CellFormatJSON)
-      if (formatsEqual(current, fmt)) return
-      recordFormat(addr, () => sheet.set_format!(addr, fmt))
+      setFormatInternal(addr, fmt)
+    },
+
+    /**
+     * Apply a format patch to the current selection. Large rectangles are
+     * rejected until backend range-format metadata is available; this keeps
+     * toolbar clicks from materializing massive address arrays.
+     */
+    formatSelection(patch: (current: CellFormatJSON) => CellFormatJSON): boolean {
+      return formatCellRange(anchor(), selection(), patch)
     },
 
     /** Read the base format. Returns `{}` (default) if the backend lacks
@@ -707,9 +758,7 @@ export function createSheetStore(sheet: ISheet) {
     /** Format-aware display string. Same as `getCell(addr).display` but
      * available standalone for callers that already know the cell. */
     formattedDisplay(addr: string): string {
-      return sheet.formatted_display
-        ? sheet.formatted_display(addr)
-        : sheet.get_display(addr)
+      return sheet.formatted_display ? sheet.formatted_display(addr) : sheet.get_display(addr)
     },
 
     setCellInput(addr: string, input: string) {
@@ -781,16 +830,7 @@ export function createSheetStore(sheet: ISheet) {
      * the (drow, dcol) shift for relative refs.
      */
     copy(addrs: string[][]): ClipboardData {
-      const originAddr = addrs[0]?.[0] ?? 'A1'
-      return {
-        originAddr,
-        cells: addrs.map((row) =>
-          row.map((addr) => {
-            const f = sheet.get_formula(addr)
-            return f !== '' ? f : sheet.get_display(addr)
-          })
-        ),
-      }
+      return copyAddressGrid(addrs)
     },
 
     /**
@@ -810,9 +850,7 @@ export function createSheetStore(sheet: ISheet) {
         row.forEach((field, dc) => {
           const addr = colToLetter(start.col + dc) + (start.row + dr + 1)
           // Only shift if the field is a formula. Plain values pass through.
-          const out = field.startsWith('=')
-            ? shiftFormulaRefs(field, drow, dcol)
-            : field
+          const out = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
           this.setCellInput(addr, out)
         })
       })

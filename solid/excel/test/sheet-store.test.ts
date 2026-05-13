@@ -2,11 +2,7 @@
 
 import { describe, it, expect } from '@jest/globals'
 import { createRoot } from 'solid-js'
-import {
-  createSheetStore,
-  parseClipboardTSV,
-  serializeClipboardTSV,
-} from '../src/sheet-store'
+import { createSheetStore, parseClipboardTSV, serializeClipboardTSV } from '../src/sheet-store'
 import { createJSSheet } from '../src/js-sheet'
 
 function createTestStore() {
@@ -299,6 +295,43 @@ describe('createSheetStore', () => {
       })
     })
 
+    it('copySelection copies small ranges without callers materializing addresses', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setNumber('A1', 1)
+        store.setFormula('B1', '=A1+1')
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 0, col: 1 })
+
+        const data = store.copySelection()
+
+        expect(data).toEqual({
+          originAddr: 'A1',
+          cells: [['1', '=A1+1']],
+        })
+        dispose()
+      })
+    })
+
+    it('copySelection rejects oversized ranges without reading cells', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet()
+        const getDisplay = sheet.get_display.bind(sheet)
+        let displayReads = 0
+        sheet.get_display = (addr) => {
+          displayReads += 1
+          return getDisplay(addr)
+        }
+        const store = createSheetStore(sheet)
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        expect(store.copySelection()).toBeNull()
+        expect(displayReads).toBe(0)
+        dispose()
+      })
+    })
+
     it('paste shifts cross-sheet refs but keeps sheet name', () => {
       createRoot((dispose) => {
         const store = createTestStore()
@@ -375,6 +408,43 @@ describe('createSheetStore', () => {
 
         expect(clearRangeArgs).toEqual([0, 0, 999, 999])
         expect(clearCellCount).toBe(0)
+        expect(store.canUndo()).toBe(false)
+        dispose()
+      })
+    })
+
+    it('formatSelection applies small ranges as one undoable edit', () => {
+      createRoot((dispose) => {
+        const store = createTestStore()
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 0, col: 1 })
+
+        expect(store.formatSelection((cur) => ({ ...cur, bold: true }))).toBe(true)
+        expect(store.getFormat('A1').bold).toBe(true)
+        expect(store.getFormat('B1').bold).toBe(true)
+
+        store.undo()
+        expect(store.getFormat('A1').bold).toBeFalsy()
+        expect(store.getFormat('B1').bold).toBeFalsy()
+        dispose()
+      })
+    })
+
+    it('formatSelection rejects oversized ranges without probing per-cell formats', () => {
+      createRoot((dispose) => {
+        const sheet = createJSSheet()
+        const getFormat = sheet.get_format!.bind(sheet)
+        let formatReads = 0
+        sheet.get_format = (addr) => {
+          formatReads += 1
+          return getFormat(addr)
+        }
+        const store = createSheetStore(sheet)
+        store.setSelectionAnchor({ row: 0, col: 0 })
+        store.extendSelection({ row: 999, col: 999 })
+
+        expect(store.formatSelection((cur) => ({ ...cur, bold: true }))).toBe(false)
+        expect(formatReads).toBe(0)
         expect(store.canUndo()).toBe(false)
         dispose()
       })

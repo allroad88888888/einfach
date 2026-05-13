@@ -63,14 +63,7 @@ export function FormatToolbar(props: FormatToolbarProps) {
   }
 
   function applyToSelection(patch: (current: CellFormatJSON) => CellFormatJSON) {
-    const cells = props.store.selectionAddrs().flat()
-    if (cells.length === 0) return
-    props.store.beginEdit()
-    for (const addr of cells) {
-      const current = props.store.getFormat(addr)
-      props.store.setFormat(addr, patch(current))
-    }
-    props.store.endEdit()
+    props.store.formatSelection(patch)
   }
 
   function toggleBold() {
@@ -164,9 +157,7 @@ export function FormatToolbar(props: FormatToolbarProps) {
           value={numberFormatId(focusFormat().numberFormat)}
           onChange={(e) => setNumberFormatById(e.currentTarget.value)}
         >
-          <For each={NUMBER_FORMAT_PRESETS}>
-            {(p) => <option value={p.id}>{p.label}</option>}
-          </For>
+          <For each={NUMBER_FORMAT_PRESETS}>{(p) => <option value={p.id}>{p.label}</option>}</For>
         </select>
       </label>
 

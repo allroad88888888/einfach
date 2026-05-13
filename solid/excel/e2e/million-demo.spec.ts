@@ -170,6 +170,52 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(calls).toEqual([[0, 0, 999, 999]])
   })
 
+  test('copy_large_selection_does_not_materialize_selection_grid', async ({ page, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    const setup = await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          selectionAddrs: () => string[][]
+          copySelection: () => unknown
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+          extendSelection: (coord: { row: number; col: number }) => void
+        }
+        __copySelectionCalls?: number
+      }
+      const store = win.__einfachStore
+      if (!store) return { hasStore: false }
+      const originalCopySelection = store.copySelection.bind(store)
+      win.__copySelectionCalls = 0
+      store.selectionAddrs = () => {
+        throw new Error('selectionAddrs must not run for large copy')
+      }
+      store.copySelection = () => {
+        win.__copySelectionCalls = (win.__copySelectionCalls ?? 0) + 1
+        return originalCopySelection()
+      }
+      store.setSelectionAnchor({ row: 0, col: 0 })
+      store.extendSelection({ row: 999, col: 999 })
+      return { hasStore: true }
+    })
+    expect(setup.hasStore).toBe(true)
+
+    await page.locator('.excel-table-wrapper').focus()
+    const copyKey = process.platform === 'darwin' ? 'Meta+C' : 'Control+C'
+    await page.keyboard.press(copyKey)
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const win = window as unknown as { __copySelectionCalls?: number }
+          return win.__copySelectionCalls ?? 0
+        }),
+      )
+      .toBe(1)
+  })
+
   test('focus_cell_remains_in_dom_under_stay_index', async ({ page }) => {
     // Track M passes the focus cell's (row, col) as
     // `rowStayIndexList={[focusRow]}` + `columnStayIndexList={[focusCol]}`
