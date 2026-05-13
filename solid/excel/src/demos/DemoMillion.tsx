@@ -126,49 +126,60 @@ export function DemoMillion() {
  *   - 2 far-corner anchors (AAA500, ALL999).
  */
 async function seedWorkbook(client: WorkerWorkbookClient) {
-  const cells: ImportCellWire[] = []
-
-  // 1) Numeric base + 49-deep chain in column A. Reading A50 walks 49
-  //    levels; reading any cell mid-chain forces incremental lazy eval.
-  cells.push({ sheet: 0, row: 0, col: 0, kind: 'number', value: 1 })
-  for (let r = 2; r <= 50; r++) {
-    cells.push({ sheet: 0, row: r - 1, col: 0, kind: 'formula', value: `=A${r - 1}+1` })
-  }
-
-  // 2) Scattered numeric cells — every 500th flat address (1,000,000 /
-  //    500 ≈ 2000 cells). Flat address encoding: idx = row * COLS + col.
-  //    Skip the chain region (col 0, rows 0..49) so the formulas stay
-  //    intact — that's ~50 skipped, net ~1950 scattered.
-  const TOTAL = ROWS * COLS
-  for (let idx = 0; idx < TOTAL; idx += 500) {
-    const row = Math.floor(idx / COLS)
-    const col = idx % COLS
-    if (col === 0 && row < 50) continue
-    cells.push({ sheet: 0, row, col, kind: 'number', value: idx })
-  }
-
-  // 3) Far-corner anchors so users see content at the deep corners.
-  cells.push({
-    sheet: 0,
-    row: 499,
-    col: 702,
-    kind: 'text',
-    value: 'You scrolled to AAA500',
-  })
-  cells.push({
-    sheet: 0,
-    row: 998,
-    col: 999,
-    kind: 'text',
-    value: 'Bottom-right corner (col ALL, row 999)',
-  })
-
   const session = await client.beginImport()
+  const chunkSize = 500
+  let chunk: ImportCellWire[] = []
+
+  async function pushCell(cell: ImportCellWire) {
+    chunk.push(cell)
+    if (chunk.length < chunkSize) return
+    await client.importChunk(session, chunk)
+    chunk = []
+  }
+
+  async function flushChunk() {
+    if (chunk.length === 0) return
+    await client.importChunk(session, chunk)
+    chunk = []
+  }
+
   try {
-    const chunkSize = 500
-    for (let i = 0; i < cells.length; i += chunkSize) {
-      await client.importChunk(session, cells.slice(i, i + chunkSize))
+    // 1) Numeric base + 49-deep chain in column A. Reading A50 walks 49
+    //    levels; reading any cell mid-chain forces incremental lazy eval.
+    await pushCell({ sheet: 0, row: 0, col: 0, kind: 'number', value: 1 })
+    for (let r = 2; r <= 50; r++) {
+      await pushCell({ sheet: 0, row: r - 1, col: 0, kind: 'formula', value: `=A${r - 1}+1` })
     }
+
+    // 2) Scattered numeric cells — every 500th flat address (1,000,000 /
+    //    500 ≈ 2000 cells). Flat address encoding: idx = row * COLS + col.
+    //    Skip the chain region (col 0, rows 0..49) so the formulas stay
+    //    intact — that's ~50 skipped, net ~1950 scattered.
+    const TOTAL = ROWS * COLS
+    for (let idx = 0; idx < TOTAL; idx += 500) {
+      const row = Math.floor(idx / COLS)
+      const col = idx % COLS
+      if (col === 0 && row < 50) continue
+      await pushCell({ sheet: 0, row, col, kind: 'number', value: idx })
+    }
+
+    // 3) Far-corner anchors so users see content at the deep corners.
+    await pushCell({
+      sheet: 0,
+      row: 499,
+      col: 702,
+      kind: 'text',
+      value: 'You scrolled to AAA500',
+    })
+    await pushCell({
+      sheet: 0,
+      row: 998,
+      col: 999,
+      kind: 'text',
+      value: 'Bottom-right corner (col ALL, row 999)',
+    })
+
+    await flushChunk()
     await client.commitImport(session)
   } catch (err) {
     await client.cancelImport(session).catch(() => false)
