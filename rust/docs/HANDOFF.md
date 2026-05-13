@@ -49,9 +49,14 @@ to fix them as part of phase work; they're out of scope.
 
 ## What's deferred (explicit gaps)
 
+Worker command-contract cleanup is no longer deferred: `setFormulaAsync` is the
+authoritative product formula path, worker-backed paste formulas route through
+the async command, and proxy/worker/store tests cover parse fail, cycle,
+invalid sheet, rollback, and undo batching. Sync `ISheet.set_formula` remains
+as legacy compatibility only.
+
 | Item | Where | Effort | Notes |
 |---|---|---|---|
-| Worker command-contract cleanup | `solid/excel/src/wasm-workbook-store.ts`, `solid/excel/src/wasm-workbook-proxy.ts`, `solid/excel/src/wasm-workbook-worker.ts` | 1–2 d | Worker-owned `WasmWorkbook` + request/reply exists. `setFormulaAsync` is authoritative, but the sync `ISheet.set_formula` compatibility method still returns optimistic true; docs/tests/UI entries must not treat it as product authority. |
 | Bounded import / sparse persistence v1 | `rust/wasm/src/lib.rs`, worker import protocol, persistence docs/tests | 2–4 d | begin/chunk/commit/cancel and sparse snapshot exist. Remaining work: memory/backpressure audit, persistence schema/save-load, import metrics, and round-trip tests that preserve lazy formulas. |
 | Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Large clear undo, copy export, and format are range-native. Remaining work: large format undo via range-format snapshot/restore or transaction, and copy/export streaming instead of one huge TSV string. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
@@ -215,10 +220,9 @@ Once agents return:
 
 | Option | What | Effort | Why |
 |---|---|---|---|
-| **A** | Wave 1 — worker command-contract cleanup + docs sync | 1–2 d | Worker RPC exists; now prevent product/UI/docs from treating sync `set_formula` optimistic true as authority |
-| **B** | Wave 2 — range format undo + copy/export streaming | 2–4 d | Finishes million-cell range ops without main-thread address expansion or undo-stack loss |
-| **C** | Wave 3 — bounded import + sparse persistence v1 | 3–5 d | Productizes data ingress/egress without breaking lazy semantics |
-| **F** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
+| **A** | Wave 2 — range format undo + copy/export streaming | 2–4 d | Finishes million-cell range ops without main-thread address expansion or undo-stack loss |
+| **B** | Wave 3 — bounded import + sparse persistence v1 | 3–5 d | Productizes data ingress/egress without breaking lazy semantics |
+| **C** | Wave 4 — perf/observability/MCP gates | 2–4 d | Makes scale behavior reproducible and keeps Playwright/MCP verification mandatory |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 

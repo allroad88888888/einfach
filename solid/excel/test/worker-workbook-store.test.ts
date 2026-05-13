@@ -730,6 +730,52 @@ describe('createWorkerWorkbookStore', () => {
     })
   })
 
+  it('routes setCellInputAsync formula rejection through the authoritative worker command', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      client.setFormulaResult(0, 'A1', false)
+      await expect(store.setCellInputAsync('A1', '=A1+1')).resolves.toBe(false)
+
+      expect(client.calls.setFormula).toEqual([{ sheet: 0, addr: 'A1', formula: '=A1+1' }])
+      await waitFor(() => {
+        expect(store.getFormula('A1')).toBe('')
+      })
+      expect(store.canUndo()).toBe(false)
+
+      workbook.dispose()
+    })
+  })
+
+  it('pastes formula cells through the authoritative async formula path and keeps undo coherent', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      const data = {
+        originAddr: 'B1',
+        cells: [['=A1+1', '7']],
+      }
+
+      await Promise.resolve(store.paste('D5', data))
+
+      expect(client.calls.setFormula).toEqual([{ sheet: 0, addr: 'D5', formula: '=C5+1' }])
+      expect(store.getFormula('D5')).toBe('=C5+1')
+      expect(store.getCell('E5').display).toBe('7')
+      expect(store.canUndo()).toBe(true)
+
+      store.undo()
+      expect(store.getFormula('D5')).toBe('')
+      expect(store.getCell('D5').type).toBe('null')
+      expect(store.getCell('E5').type).toBe('null')
+
+      workbook.dispose()
+    })
+  })
+
   it('returns unknown immediately for formula cache state then updates from worker probe', async () => {
     await withRoot(async () => {
       const client = makeFakeWorkerWorkbookClient()

@@ -157,6 +157,27 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       message: 'formula would create a cycle',
       display: '#CYCLE!',
     })
+
+    const parseFail = workbook.setFormulaDetailed(0, 'E1', '=garbage((')
+    expect(lastSent(fake)).toMatchObject({
+      id: 4,
+      cmd: 'setFormulaDetailed',
+      sheet: 0,
+      addr: 'E1',
+      formula: '=garbage((',
+    })
+    ok(fake, {
+      ok: false,
+      code: 'INVALID_FORMULA',
+      message: 'formula could not be parsed or installed',
+      display: '#VALUE!',
+    })
+    await expect(parseFail).resolves.toEqual({
+      ok: false,
+      code: 'INVALID_FORMULA',
+      message: 'formula could not be parsed or installed',
+      display: '#VALUE!',
+    })
   })
 
   it('sends chunked import sessions and debug cache probes', async () => {
@@ -319,6 +340,13 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     const formula = workbook.setFormula(9, 'A1', '=1')
     fail(fake, 'INVALID_SHEET', 'invalid sheet index: 9')
     await expect(formula).rejects.toMatchObject({
+      code: 'INVALID_SHEET',
+      message: 'invalid sheet index: 9',
+    })
+
+    const detailed = workbook.setFormulaDetailed(9, 'A1', '=1')
+    fail(fake, 'INVALID_SHEET', 'invalid sheet index: 9')
+    await expect(detailed).rejects.toMatchObject({
       code: 'INVALID_SHEET',
       message: 'invalid sheet index: 9',
     })

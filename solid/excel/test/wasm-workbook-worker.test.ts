@@ -2,6 +2,7 @@ import { describe, expect, it, jest } from '@jest/globals'
 import type { CellFormatJSON } from '../src/types'
 import { mergeImportStatsIssues, normalizeImportCells } from '../src/wasm-workbook-worker'
 import type {
+  FormulaMutationResultWire,
   ImportCellWire,
   SparseCellWire,
   SparseRangeWire,
@@ -20,6 +21,14 @@ type MockCellState = {
   display: string
   formula: string
   isError: boolean
+}
+
+type MockFormulaFailure = {
+  display: string
+}
+
+type MockWasmWorkbookOptions = {
+  formulaFailuresByFormula?: Record<string, MockFormulaFailure>
 }
 
 type MockWasmWorkbook = {
@@ -104,7 +113,7 @@ function parseAddress(addr: string): { row: number; col: number } {
   return { row: Number(match[2]) - 1, col: col - 1 }
 }
 
-function createMockWasmWorkbook() {
+function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const calls: NonNullable<MockWasmWorkbook['__mockCalls']> = {
     bulkImportCells: 0,
     bulkImportPayloads: [],
@@ -272,6 +281,16 @@ function createMockWasmWorkbook() {
       cells.delete(key(sheet, addr))
     },
     setFormulaAt: (sheet: number, addr: string, formula: string) => {
+      const failure = options.formulaFailuresByFormula?.[formula]
+      if (failure) {
+        cells.set(key(sheet, addr), {
+          type: 'error',
+          display: failure.display,
+          formula: '',
+          isError: true,
+        })
+        return false
+      }
       cells.set(key(sheet, addr), {
         type: 'formula',
         display: '',
@@ -381,7 +400,7 @@ function requestWorkerResponse<T>(
   })
 }
 
-function withMockedWorker() {
+function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
   const workbooks: MockWasmWorkbook[] = []
   const responses: MockWorkerResponse[] = []
   const postMessageSpy = jest.spyOn(self, 'postMessage').mockImplementation((message) => {
@@ -389,7 +408,7 @@ function withMockedWorker() {
   })
   const constructorMock = WasmWorkbook as unknown as jest.Mock
   constructorMock.mockImplementation(() => {
-    const { workbook } = createMockWasmWorkbook()
+    const { workbook } = createMockWasmWorkbook(options)
     workbook.__mockInstanceId = workbooks.length
     workbooks.push(workbook)
     return workbook
@@ -680,6 +699,65 @@ describe('wasm-workbook-worker import session contract', () => {
       })
 
       expect(tsv).toBe('=Sheet2!A1+1')
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('returns authoritative detailed formula failures and invalid-sheet errors', async () => {
+    const harness = withMockedWorker({
+      formulaFailuresByFormula: {
+        '=garbage((': { display: '#VALUE!' },
+        '=A1+1': { display: '#CYCLE!' },
+      },
+    })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const parseFail = await harness.send<FormulaMutationResultWire>({
+        id: 2,
+        cmd: 'setFormulaDetailed',
+        sheet: 0,
+        addr: 'A1',
+        formula: '=garbage((',
+      })
+      expect(parseFail).toEqual({
+        ok: false,
+        code: 'INVALID_FORMULA',
+        message: 'formula could not be parsed or installed',
+        display: '#VALUE!',
+      })
+
+      const cycle = await harness.send<FormulaMutationResultWire>({
+        id: 3,
+        cmd: 'setFormulaDetailed',
+        sheet: 0,
+        addr: 'A1',
+        formula: '=A1+1',
+      })
+      expect(cycle).toEqual({
+        ok: false,
+        code: 'FORMULA_CYCLE',
+        message: 'formula would create a cycle',
+        display: '#CYCLE!',
+      })
+
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'setFormulaDetailed',
+          sheet: 9,
+          addr: 'A1',
+          formula: '=1',
+        }),
+      ).rejects.toMatchObject({
+        code: 'INVALID_SHEET',
+        message: 'invalid sheet index: 9',
+      })
     } finally {
       harness.dispose()
     }

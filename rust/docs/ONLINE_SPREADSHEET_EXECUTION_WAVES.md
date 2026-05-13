@@ -119,6 +119,10 @@ formula cache probe 都在主线。现在的波次 1 改为“权威命令收口
 
 ## 波次 1：权威 worker 命令收口
 
+状态：已完成。`setFormulaAsync` 已作为 worker-backed 产品公式提交路径使用；worker-backed
+粘贴公式也改走 async 公式命令，不再依赖同步 `set_formula` 的 optimistic `true`。proxy /
+worker / store 测试已钉住 parse fail、cycle、invalid sheet、失败回滚、undo 批次一致性。
+
 ### 目标
 
 把已落地的 worker-backed workbook store 从“主要路径可权威”收口到“产品入口不再误用同步
@@ -381,11 +385,11 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-下一步先执行 **波次 1：权威 worker 命令收口**。
+下一步执行 **波次 2：Range-native undo / format / copy / export**。
 
 原因：
 
-- 它是后续 range undo、导入错误、持久化恢复、UI 回滚的共同前置。
-- 当前代码已有 worker RPC、async formula 和 cache probe，收口合同的收益最大、冲突面可控。
-- 如果不先把产品入口从同步 `set_formula` 迁到 async command，后续 agent 仍会误把兼容层
-  optimistic `true` 当成真实成功。
+- Wave 1 已把 worker-backed 公式写入和公式粘贴收口到 async 权威路径。
+- 当前最大用户可见缺口是 large range format 仍不可 undo；这会在百万格格式化后清空 undo 栈。
+- copy/export 虽然已经避免地址展开，但仍一次性生成 TSV 字符串，下一波应推进 streaming/chunked
+  export。

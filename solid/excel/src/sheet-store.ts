@@ -856,9 +856,16 @@ export function createSheetStore(sheet: ISheet) {
       const before = [snapshot(addr)]
       const ok = await sheet.set_formula_async(addr, formula)
       if (!ok) return false
-      const after = [snapshot(addr)]
-      undoStack.push({ kind: 'cells', before, after })
-      redoStack.length = 0
+      if (pendingBefore !== null) {
+        if (!pendingAddrs!.has(addr)) {
+          pendingBefore.push(before[0])
+          pendingAddrs!.add(addr)
+        }
+      } else {
+        const after = [snapshot(addr)]
+        undoStack.push({ kind: 'cells', before, after })
+        redoStack.length = 0
+      }
       return true
     },
 
@@ -1039,16 +1046,34 @@ export function createSheetStore(sheet: ISheet) {
       const origin = addrToCoord(data.originAddr) ?? { row: 0, col: 0 }
       const drow = start.row - origin.row
       const dcol = start.col - origin.col
-      this.beginEdit()
-      data.cells.forEach((row, dr) => {
-        row.forEach((field, dc) => {
-          const addr = colToLetter(start.col + dc) + (start.row + dr + 1)
-          // Only shift if the field is a formula. Plain values pass through.
-          const out = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
-          this.setCellInput(addr, out)
+      if (!sheet.set_formula_async) {
+        this.beginEdit()
+        data.cells.forEach((row, dr) => {
+          row.forEach((field, dc) => {
+            const addr = colToLetter(start.col + dc) + (start.row + dr + 1)
+            // Only shift if the field is a formula. Plain values pass through.
+            const out = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
+            this.setCellInput(addr, out)
+          })
         })
-      })
-      this.endEdit()
+        this.endEdit()
+        return
+      }
+
+      return (async () => {
+        this.beginEdit()
+        try {
+          for (const [dr, row] of data.cells.entries()) {
+            for (const [dc, field] of row.entries()) {
+              const addr = colToLetter(start.col + dc) + (start.row + dr + 1)
+              const out = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
+              await this.setCellInputAsync(addr, out)
+            }
+          }
+        } finally {
+          this.endEdit()
+        }
+      })()
     },
 
     /**
