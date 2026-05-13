@@ -746,6 +746,12 @@ impl WasmWorkbook {
             .set_cell(sheet_idx, addr, Value::Boolean(value));
     }
 
+    /// Set a cell to an error value through the workbook. Cross-sheet aware.
+    pub fn set_cell_error(&mut self, sheet_idx: usize, addr: &str, value: &str) {
+        let err = value_error_from_display(value);
+        self.workbook.set_cell(sheet_idx, addr, Value::Error(err));
+    }
+
     /// Clear a cell through the workbook. Cross-sheet aware — a cleared
     /// upstream cell still propagates dirty to its dependents.
     #[wasm_bindgen(js_name = "clearCellAt")]

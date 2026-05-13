@@ -22,17 +22,12 @@ type WasmWorkbookRuntime = {
   add_sheet(name: string): number
   rename_sheet(idx: number, name: string): boolean
   remove_sheet(idx: number): boolean
-  set_number(sheetIdx: number, addr: string, value: number): void
-  set_text(sheetIdx: number, addr: string, value: string): void
-  set_boolean(sheetIdx: number, addr: string, value: boolean): void
-  set_error(sheetIdx: number, addr: string, value: string): void
-  set_formula(sheetIdx: number, addr: string, formula: string): boolean
-  clear_cell(sheetIdx: number, addr: string): void
-  set_cell_number?: (sheetIdx: number, addr: string, value: number) => void
-  set_cell_text?: (sheetIdx: number, addr: string, value: string) => void
-  set_cell_boolean?: (sheetIdx: number, addr: string, value: boolean) => void
-  clearCellAt?: (sheetIdx: number, addr: string) => void
-  setFormulaAt?: (sheetIdx: number, addr: string, formula: string) => boolean
+  set_cell_number(sheetIdx: number, addr: string, value: number): void
+  set_cell_text(sheetIdx: number, addr: string, value: string): void
+  set_cell_boolean(sheetIdx: number, addr: string, value: boolean): void
+  set_cell_error(sheetIdx: number, addr: string, value: string): void
+  clearCellAt(sheetIdx: number, addr: string): void
+  setFormulaAt(sheetIdx: number, addr: string, formula: string): boolean
   subscribe_cell?: (sheetName: string, addr: string, callback: () => void) => number
   unsubscribe_cell?: (token: number) => void
   get_display(sheetIdx: number, addr: string): string
@@ -40,7 +35,7 @@ type WasmWorkbookRuntime = {
   get_type(sheetIdx: number, addr: string): string
   is_error(sheetIdx: number, addr: string): boolean
   get_formula(sheetIdx: number, addr: string): string
-  bulk_import_cells?: (cells: ImportCellWire[]) => WorkbookImportStatsWire
+  bulk_import_cells(cells: ImportCellWire[]): WorkbookImportStatsWire
   list_non_empty_cells?: () => CellRefWire[]
   snapshot_sparse?: () => SparseCellWire[]
   read_sparse_range?: (
@@ -74,7 +69,10 @@ const subscriptionTokens = new Map<number, number[]>()
 const importSessions = new Map<number, ImportCellWire[]>()
 
 async function ensureInit() {
-  if (!initPromise) initPromise = (async () => { await init() })()
+  if (!initPromise)
+    initPromise = (async () => {
+      await init()
+    })()
   await initPromise
 }
 
@@ -184,31 +182,19 @@ function setCell(wb: WasmWorkbookRuntime, sheet: number, addr: string, value: Ce
   assertSheet(wb, sheet)
   switch (value.type) {
     case 'number':
-      {
-        const write = wb.set_cell_number ?? wb.set_number
-        write.call(wb, sheet, addr, value.value)
-      }
+      assertMethod(wb, 'set_cell_number').call(wb, sheet, addr, value.value)
       return true
     case 'text':
-      {
-        const write = wb.set_cell_text ?? wb.set_text
-        write.call(wb, sheet, addr, value.value)
-      }
+      assertMethod(wb, 'set_cell_text').call(wb, sheet, addr, value.value)
       return true
     case 'boolean':
-      {
-        const write = wb.set_cell_boolean ?? wb.set_boolean
-        write.call(wb, sheet, addr, value.value)
-      }
+      assertMethod(wb, 'set_cell_boolean').call(wb, sheet, addr, value.value)
       return true
     case 'error':
-      wb.set_error(sheet, addr, value.value)
+      assertMethod(wb, 'set_cell_error').call(wb, sheet, addr, value.value)
       return true
     case 'null':
-      {
-        const clear = wb.clearCellAt ?? wb.clear_cell
-        clear.call(wb, sheet, addr)
-      }
+      assertMethod(wb, 'clearCellAt').call(wb, sheet, addr)
       return true
     default:
       throw Object.assign(new Error('unsupported cell wire value'), {
@@ -269,74 +255,6 @@ function normalizeImportCell(cell: ImportCellWire): ImportCellWire {
   })
 }
 
-function fallbackBulkImport(
-  wb: WasmWorkbookRuntime,
-  cells: ImportCellWire[],
-): WorkbookImportStatsWire {
-  const stats: WorkbookImportStatsWire = {
-    accepted: 0,
-    formulas: 0,
-    rejectedFormulas: 0,
-    cleared: 0,
-    errors: 0,
-  }
-
-  for (const cell of cells) {
-    if (cell.sheet >= wb.sheet_count()) {
-      stats.errors += 1
-      continue
-    }
-    const addr = toA1(cell.row, cell.col)
-    try {
-      switch (cell.kind) {
-        case 'number':
-          setCell(wb, cell.sheet, addr, { type: 'number', value: cell.value })
-          stats.accepted += 1
-          break
-        case 'text':
-          setCell(wb, cell.sheet, addr, { type: 'text', value: cell.value })
-          stats.accepted += 1
-          break
-        case 'boolean':
-          setCell(wb, cell.sheet, addr, { type: 'boolean', value: cell.value })
-          stats.accepted += 1
-          break
-        case 'error':
-          setCell(wb, cell.sheet, addr, { type: 'error', value: cell.value })
-          stats.accepted += 1
-          break
-        case 'formula':
-          stats.formulas += 1
-          if ((wb.setFormulaAt ?? wb.set_formula).call(wb, cell.sheet, addr, cell.value)) {
-            stats.accepted += 1
-          } else {
-            stats.rejectedFormulas += 1
-          }
-          break
-        case 'null':
-          setCell(wb, cell.sheet, addr, { type: 'null' })
-          stats.accepted += 1
-          stats.cleared += 1
-          break
-      }
-    } catch {
-      stats.errors += 1
-    }
-  }
-
-  return stats
-}
-
-function toA1(row: number, col: number): string {
-  let n = col
-  let letters = ''
-  do {
-    letters = String.fromCharCode(65 + (n % 26)) + letters
-    n = Math.floor(n / 26) - 1
-  } while (n >= 0)
-  return `${letters}${row + 1}`
-}
-
 function normalizeSparseRange(range: unknown): SparseRangeWire {
   const input = (range ?? {}) as Partial<SparseRangeWire>
   const out: SparseRangeWire = {
@@ -393,7 +311,10 @@ function subscribeCells(wb: WasmWorkbookRuntime, subId: number, cells: CellRefWi
     tokens.push(token)
   }
   subscriptionTokens.set(subId, tokens)
-  postHydrated(cells.map((cell) => snapshotCell(wb, cell)), subId)
+  postHydrated(
+    cells.map((cell) => snapshotCell(wb, cell)),
+    subId,
+  )
 }
 
 function unsubscribeCells(wb: WasmWorkbookRuntime, subId: number) {
@@ -448,7 +369,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         assertSheet(wb, Number(msg.sheet))
         postResponse(
           msg.id,
-          (wb.setFormulaAt ?? wb.set_formula).call(
+          assertMethod(wb, 'setFormulaAt').call(
             wb,
             Number(msg.sheet),
             normalizeAddr(msg.addr),
@@ -458,10 +379,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         break
       case 'clearCell':
         assertSheet(wb, Number(msg.sheet))
-        {
-          const clear = wb.clearCellAt ?? wb.clear_cell
-          clear.call(wb, Number(msg.sheet), normalizeAddr(msg.addr))
-        }
+        assertMethod(wb, 'clearCellAt').call(wb, Number(msg.sheet), normalizeAddr(msg.addr))
         postResponse(msg.id, true)
         break
       case 'clearRange':
@@ -523,10 +441,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
             })
           }
           importSessions.delete(sessionId)
-          postResponse(
-            msg.id,
-            wb.bulk_import_cells ? wb.bulk_import_cells(cells) : fallbackBulkImport(wb, cells),
-          )
+          postResponse(msg.id, assertMethod(wb, 'bulk_import_cells').call(wb, cells))
         }
         break
       case 'cancelImport':
@@ -565,14 +480,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
           postResponse(
             msg.id,
             readSparseRange
-              .call(
-                wb,
-                range.sheet,
-                range.startRow,
-                range.startCol,
-                range.endRow,
-                range.endCol,
-              )
+              .call(wb, range.sheet, range.startRow, range.startCol, range.endRow, range.endCol)
               .map(normalizeSnapshot),
           )
         }
@@ -590,7 +498,7 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
         subscribeCells(
           wb,
           Number(msg.subId),
-          Array.isArray(msg.cells) ? msg.cells as CellRefWire[] : [],
+          Array.isArray(msg.cells) ? (msg.cells as CellRefWire[]) : [],
         )
         postResponse(msg.id, true)
         break
