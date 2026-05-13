@@ -144,6 +144,18 @@ export function Table(props: TableProps) {
     else selectCoord(next)
   }
 
+  function scrollWrapperTopTo(top: number) {
+    if (!wrapperEl) return
+    wrapperEl.scrollTop = top
+    setScrollTop(wrapperEl.scrollTop)
+  }
+
+  function scrollWrapperLeftTo(left: number) {
+    if (!wrapperEl) return
+    wrapperEl.scrollLeft = left
+    setScrollLeft(wrapperEl.scrollLeft)
+  }
+
   /** Keep the focus cell inside the visible window when arrow-keys / paste
    * push it off-screen. No-op when virtualization is off (the cell is
    * always in the DOM and the browser's own focus scroll suffices). */
@@ -158,9 +170,9 @@ export function Table(props: TableProps) {
         const headerH = ROW_HEIGHT
         const viewTop = wrapperEl.scrollTop
         const viewBot = viewTop + wrapperEl.clientHeight - headerH
-        if (top < viewTop) wrapperEl.scrollTop = top
+        if (top < viewTop) scrollWrapperTopTo(top)
         else if (top + ROW_HEIGHT > viewBot)
-          wrapperEl.scrollTop = top + ROW_HEIGHT - wrapperEl.clientHeight + headerH
+          scrollWrapperTopTo(top + ROW_HEIGHT - wrapperEl.clientHeight + headerH)
       },
     ),
   )
@@ -176,9 +188,9 @@ export function Table(props: TableProps) {
         const left = col * COL_WIDTH
         const viewLeft = wrapperEl.scrollLeft
         const viewRight = viewLeft + wrapperEl.clientWidth - ROW_HEADER_WIDTH
-        if (left < viewLeft) wrapperEl.scrollLeft = left
+        if (left < viewLeft) scrollWrapperLeftTo(left)
         else if (left + COL_WIDTH > viewRight)
-          wrapperEl.scrollLeft = left + COL_WIDTH - wrapperEl.clientWidth + ROW_HEADER_WIDTH
+          scrollWrapperLeftTo(left + COL_WIDTH - wrapperEl.clientWidth + ROW_HEADER_WIDTH)
       },
     ),
   )
@@ -390,6 +402,7 @@ export function Table(props: TableProps) {
    * `<td colspan>` so the spacer row collapses to a single empty cell that
    * still spans the table width visually. */
   const totalBodyCols = () => cols() + 1
+  const totalTableWidth = () => ROW_HEADER_WIDTH + cols() * COL_WIDTH
 
   return (
     <div
@@ -427,7 +440,10 @@ export function Table(props: TableProps) {
       <Show when={props.formulaBar}>
         <FormulaBar store={props.store} />
       </Show>
-      <table class="excel-table">
+      <table
+        class="excel-table"
+        style={props.virtualize ? { width: `${totalTableWidth()}px` } : undefined}
+      >
         <thead>
           <tr>
             <th class="row-header"></th>

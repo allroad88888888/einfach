@@ -4,21 +4,15 @@ import { cell, cellDisplay, gotoDemo, scrollWrapper, typeIntoCell } from './help
 /**
  * Phase 4 — `1M Cells` demo (Track O) under 2D virtualization (Track M).
  *
- * The four specs below pin the post-Phase-4 contract end-to-end:
+ * The specs below pin the post-Phase-4 contract end-to-end:
  *
  *  - smoke load (worker + virt scaffolding survive 1M cells),
  *  - column-axis subscription bound (mirrors the row `viewport_churn`
  *    test in virtualize.spec.ts but along the `x` axis),
- *  - focus-cell pinning via VGridTable's `rowStayIndexList` /
- *    `columnStayIndexList` (the keyboard / selection accuracy guard),
+ *  - keyboard / selection accuracy under native 2D virtualization,
  *  - paste-outside-viewport round-trip (verifies that clipboard +
  *    formula state work when the destination cells are unmounted at
  *    paste time and only re-hydrate after scroll-back).
- *
- * All four `test.skip(true, ...)` at landing: Track M (VGridTable
- * adoption) and Track O (`DemoMillion.tsx`) merge after this spec
- * file. The integrator removes the `test.skip` lines once both M and O
- * are in.
  */
 test.describe('1M Cells demo (Phase 4)', () => {
   test('million_demo_loads_and_a1_visible', async ({ page }) => {
@@ -257,47 +251,29 @@ test.describe('1M Cells demo (Phase 4)', () => {
     expect(result).toEqual({ hasStore: true, addrs: null })
   })
 
-  test('focus_cell_remains_in_dom_under_stay_index', async ({ page }) => {
-    // Track M passes the focus cell's (row, col) as
-    // `rowStayIndexList={[focusRow]}` + `columnStayIndexList={[focusCol]}`
-    // to VGridTable so it stays in the DOM under arbitrary scroll.
-    // This is the keyboard-nav accuracy guard: arrow-key driven
-    // movement reads the focus cell's DOM box to scroll-into-view, so
-    // unmounting the focus cell would break selection ergonomics.
-    //
-    // If Track M can't deliver `rowStayIndexList` semantics (e.g. the
-    // upstream library only highlights pinned indices instead of
-    // keeping them mounted), this is the test to weaken first: either
-    // assert formula-bar still shows `A1` instead of asserting the
-    // `<td>` is present, or remove the assertion entirely. The
-    // PHASE4_PARALLEL.md § "M Stop Conditions" caveat covers this.
-    //
-    // INTEGRATION NOTE: the native 2D-virt path doesn't pin the focus
-    // cell — it scrolls-into-view on selection change but does NOT keep
-    // an off-viewport cell mounted just because it's the focus. The
-    // load-bearing case (keyboard nav doesn't lose track of focus)
-    // remains covered by selection→scroll-into-view in Table.tsx. Test
-    // is preserved as documentation of the original VGridTable intent.
-    test.skip(
-      true,
-      'native 2D-virt path: focus cell is NOT DOM-pinned; selection→scroll-into-view replaces stayIndexList',
-    )
-    await gotoDemo(page, '1M Cells')
+  test('selection restores the selected cell into the virtualized DOM', async ({
+    page,
+  }) => {
+    await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
-    // Make A1 the focus cell.
     await cell(page, 'A1').click()
     await expect(cell(page, 'A1')).toHaveClass(/cell-selected/)
 
-    // Scroll the wrapper deep along both axes — A1 would normally
-    // fall well outside the visible window + overscan.
-    await scrollWrapper(page, 'y', 20000)
-    await scrollWrapper(page, 'x', 20000)
-    await page.waitForTimeout(150)
+    await page.evaluate(() => {
+      const win = window as unknown as {
+        __einfachStore?: {
+          setSelectionAnchor: (coord: { row: number; col: number }) => void
+        }
+      }
+      win.__einfachStore?.setSelectionAnchor({ row: 50, col: 30 })
+    })
 
-    // The load-bearing assertion: A1 is STILL in the DOM. Pinned by
-    // VGridTable's stay-index lists.
-    await expect(cell(page, 'A1')).toHaveCount(1)
+    await expect(cell(page, 'AE51')).toBeVisible()
+    await expect(cell(page, 'AE51')).toHaveClass(/cell-selected/)
+
+    const cellCount = await page.locator('table.excel-table tbody td.cell').count()
+    expect(cellCount).toBeLessThan(1500)
   })
 
   test('paste_outside_viewport_round_trip', async ({ page, context }) => {

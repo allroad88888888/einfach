@@ -301,9 +301,9 @@ cd solid/excel && npx playwright test e2e/workbook-chain.spec.ts
 
 ### 当前测试基线
 
-本地现状有 19 个 Playwright spec 文件；`million-demo.spec.ts` 里仍保留一个
-`focus_cell_remains_in_dom_under_stay_index` 的 intentional skip。不要在 Phase 5
-误把这个历史 skip 当成新失败，也不要新增无解释 skip。
+本地现状有 19 个 Playwright spec 文件；`million-demo.spec.ts` 的历史 focus-pin
+skip 已改成 native 2D 虚拟化下的 selection scroll-into-view 断言。不要新增无
+解释 skip；如果确实需要跳过，必须写 owner、原因和恢复条件。
 
 ### 新增测试清单
 

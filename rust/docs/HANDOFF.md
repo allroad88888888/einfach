@@ -1,6 +1,6 @@
 # Einfach — Multi-Phase Handoff
 
-> Date: 2026-05-12 (last update)
+> Date: 2026-05-13 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
 > Last verified implementation tip: `2d291c8` (Phase 4A cross-sheet range parser)
@@ -19,7 +19,7 @@ non-doc checkpoint.
 | 1 | `rust/docs/PHASE1_PARALLEL.md` | `c048776` | ✅ Range-dep correctness fix (P0) + typed dep split + debug counters + scale tests + benches |
 | 2 | `rust/docs/PHASE2_PARALLEL.md` | `8aa18aa` | ✅ Interval index for range deps (O(matches)) + sparse value index (`RowMajorMap`) + whole-row/col parser (`A:A` / `1:1`) + 100k range bench |
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
-| 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + 2D viewport e2e (4 of 5 specs; focus-pin intentionally skipped) |
+| 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
@@ -35,7 +35,7 @@ cd /Volumes/work/self/einfach && npx jest       # 58 suites / 418 tests
 # Playwright needs a dev server. Boot:
 cd solid/excel && npm run dev -- --port 5174 --strictPort > /tmp/dev.log 2>&1 &
 sleep 8
-cd solid/excel && npx playwright test           # 122 / 1 (focus-pin)
+cd solid/excel && npx playwright test           # focus-pin skip removed; current active count is tracked in E2E_TEST_PLAN
 pkill -f "vite.*5174"
 ```
 
@@ -52,7 +52,6 @@ to fix them as part of phase work; they're out of scope.
 | Typed chunk import / sparse snapshot | `rust/wasm/src/lib.rs`, worker import protocol, `sheet-store.ts` integration | 2–3 d | Do not expose Rust `WorkbookLoader<'_>` as a JS closure handle. Use begin/chunk/commit/cancel data protocol, commit through Rust `Workbook::bulk_load`, and source undo/persistence snapshots from worker/Rust. |
 | Range-native UI ops | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | 2–4 d | Delete/clear/format/copy/export still often materialize address arrays. Million-cell range ops need backend range commands or streaming reads. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
-| Focus-cell DOM pin under 2D virt | `solid/excel/src/Table.tsx` | 0.5 d | `focus_cell_remains_in_dom_under_stay_index` test stays skipped. Native impl uses selection→scroll-into-view (works for keyboard nav). True "pin off-viewport focus in DOM" would need a `stayIndexList`-style escape hatch in the row/col window calc. |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
 
 ## Hard rules (from user)

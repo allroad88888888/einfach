@@ -55,9 +55,9 @@ library lives at `/Volumes/work/self/grid-table/solidjs/core/`
   arbitrary per-index sizing.
 - `overscanCount` + auto-doubled overscan after settle (matches the
   pattern Cell.tsx already relies on).
-- `rowStayIndexList` / `columnStayIndexList` — pin selected indices
-  even when scrolled out of view (useful for keeping the focus cell
-  in the DOM while we move selection programmatically).
+- The library had a selected-index pinning API; the final native
+  implementation instead uses selection-driven scroll-into-view and
+  does not keep off-viewport focus cells mounted.
 - `useAutoSizer` — bundled ResizeObserver-disconnect-safe sizing.
 - `renderTheadCell` / `renderTbodyCell` callbacks return JSX — our
   existing `<Cell>` slots in untouched.
@@ -161,14 +161,13 @@ What stays:
 | Manual thead with `<For each={colIndices()}>` | `renderTheadCell` + `theadRowCount={1}` + `theadRowCalcSize={() => 24}` |
 | `wrapperEl` + scroll capture | inside VGridTable (uses `useAutoSizer`) |
 
-### Selection cell pinning
+### Selection Scroll-Into-View
 
-When the user moves selection beyond the current viewport (e.g.
-Arrow Down with focus at row 50 in a 100k sheet), the selection
-needs the focus cell to remain in the DOM for keyboard accuracy.
-Pass the focus cell's `(row, col)` as `rowStayIndexList={[focusRow]}`
-and `columnStayIndexList={[focusCol]}` so VGridTable keeps it
-rendered.
+When the user moves selection beyond the current viewport, the native
+Table adjusts `scrollTop` / `scrollLeft` and synchronizes the matching
+Solid scroll signals so the selected cell enters the virtual window.
+The focus cell is not DOM-pinned while off viewport; it is rendered
+again when selection or explicit scrolling brings it into range.
 
 ### Bounded initial render
 
@@ -200,10 +199,9 @@ needed.
   demos expect (multi-row header?), keep the manual thead as-is
   and only swap the tbody virt. Tbody-only is still 2D virt because
   VGridTable's body row/col virt are independent of header.
-- If `rowStayIndexList` doesn't smoothly handle scroll-to-focus
-  during keyboard navigation, fall back to programmatic
-  `scrollTop` / `scrollLeft` adjustment in the keyboard handler
-  (the current code already does this for rows; extend to cols).
+- If selection-driven scroll-to-focus drifts out of sync with the
+  virtual window, update both the DOM scroll offset and the Solid
+  scroll signals in the same path.
 - If `pnpm add` resolves to a different `@grid-table-solidjs/core`
   version, pin to `0.1.0` exactly via `pnpm add @grid-table-solidjs/core@0.1.0`.
 
@@ -282,10 +280,9 @@ column virtualization, against both the existing Large Grid demo
    500, assert `activeSubscriptionCount()` stays bounded similar to
    the existing row test in `virtualize.spec.ts`.
 
-3. `focus_cell_remains_in_dom_under_virt` — set selection to row
-   500, col 500, then scroll the viewport such that 500-500 would
-   normally fall outside the DOM. Assert the focus cell stays
-   renderable via `rowStayIndexList`/`columnStayIndexList`.
+3. `selection_restores_selected_cell_into_virtualized_dom` — set
+   selection to an off-window row/col and assert the selected cell is
+   scrolled into the DOM while total rendered cell count stays bounded.
 
 4. `keyboard_nav_across_virtualized_window` — start at A1, press
    Arrow Down 100 times. Assert the focus tracks correctly and the
@@ -303,10 +300,9 @@ column virtualization, against both the existing Large Grid demo
 
 ### P Stop Conditions
 
-- If the `rowStayIndexList` API of VGridTable doesn't actually
-  keep the cell in DOM (only highlights), document the gap and
-  remove the `focus_cell_remains_in_dom_under_virt` test or weaken
-  its assertion to "the formula bar still shows the focus addr".
+- If selection scroll-into-view cannot keep the focus cell renderable,
+  document the gap and weaken the test only to the user-visible focus
+  address contract.
 - If column-virt makes existing specs flaky (e.g. by changing the
   DOM order of `cellDisplay` reads), pin the affected specs to
   `column virt enabled` test cases with explicit setup.
@@ -315,8 +311,8 @@ column virtualization, against both the existing Large Grid demo
 
 - ✅ Two-dimensional virtualization (Track M).
 - ✅ No "render all while measuring" fallback (Track M deletes it).
-- ✅ Stable cell measurement and scroll anchoring (VGridTable's
-  `useAutoSizer` + `rowStayIndexList`).
+- ✅ Stable cell measurement and scroll anchoring (native viewport
+  measurement + selection-driven scroll-into-view).
 - ✅ Bounded `activeSubscriptionCount` under 2D scroll (Track P
   e2e).
 - ✅ 1M-cell demo runs on worker backend (Track O).

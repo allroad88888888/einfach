@@ -13,11 +13,9 @@ import {
  * browser-level guard. Each entry maps to a numbered item in
  * `solid/excel/docs/E2E_TEST_PLAN.md::Regression Spec Scope`.
  *
- * Some entries are `.skip` because they need infrastructure not yet in
- * place (a debug shim exposing internal counters, a panic-injecting wasm
- * build, etc.). Those skips link the Rust unit test that already covers
- * the same invariant so the regression isn't unmonitored — it's just not
- * monitored in the browser layer yet.
+ * Current policy: regression entries stay active. Debug shims and browser
+ * panic probes now exist, so this file should not add `test.skip` without
+ * a fresh owner and stop condition.
  */
 
 const isMac = process.platform === 'darwin'
