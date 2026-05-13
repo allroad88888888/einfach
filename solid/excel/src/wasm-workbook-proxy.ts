@@ -93,6 +93,26 @@ export type FormulaMutationResultWire =
   | { ok: true }
   | { ok: false; code: FormulaMutationErrorCode; message: string; display?: string }
 
+export interface WorkbookPersistenceSheetWire {
+  idx: number
+  name: string
+  rowCount?: number
+  colCount?: number
+}
+
+export interface WorkbookPersistenceSnapshotWire {
+  version: 1
+  sheets: WorkbookPersistenceSheetWire[]
+  cells: SparseCellWire[]
+  formats?: FormatRangeSnapshot[]
+}
+
+export interface WorkbookPersistenceRestoreStatsWire {
+  restored_cells: number
+  restored_formats: number
+  sheets: number
+}
+
 export type RpcResponseWire =
   | { id: number; ok: true; result?: unknown }
   | { id: number; ok: false; error: RpcErrorWire }
@@ -127,6 +147,10 @@ export interface WorkerWorkbookClient {
   listNonEmpty(): Promise<CellRefWire[]>
   snapshotSparse(): Promise<SparseCellWire[]>
   snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
+  snapshotPersistenceV1(): Promise<WorkbookPersistenceSnapshotWire>
+  restorePersistenceV1(
+    snapshot: WorkbookPersistenceSnapshotWire,
+  ): Promise<WorkbookPersistenceRestoreStatsWire>
   exportRangeTsv(range: SparseRangeWire): Promise<string>
   beginExportRangeTsv(
     range: SparseRangeWire,
@@ -324,6 +348,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     snapshotRangeSparse(range) {
       return request<SparseCellWire[]>('snapshotRangeSparse', { range })
+    },
+    snapshotPersistenceV1() {
+      return request<WorkbookPersistenceSnapshotWire>('snapshotPersistenceV1')
+    },
+    restorePersistenceV1(snapshot) {
+      return request<WorkbookPersistenceRestoreStatsWire>('restorePersistenceV1', { snapshot })
     },
     exportRangeTsv(range) {
       return request<string>('exportRangeTsv', { range })

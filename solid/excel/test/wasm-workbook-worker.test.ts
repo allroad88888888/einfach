@@ -1,9 +1,17 @@
 import { describe, expect, it, jest } from '@jest/globals'
 import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
-import { mergeImportStatsIssues, normalizeImportCells } from '../src/wasm-workbook-worker'
+import {
+  MAX_IMPORT_CHUNK_CELLS,
+  __resetImportLimitsForTest,
+  __setImportLimitsForTest,
+  mergeImportStatsIssues,
+  normalizeImportCells,
+} from '../src/wasm-workbook-worker'
 import type {
   FormulaMutationResultWire,
   ImportCellWire,
+  WorkbookPersistenceRestoreStatsWire,
+  WorkbookPersistenceSnapshotWire,
   SparseCellWire,
   SparseRangeWire,
   WorkbookImportStatsWire,
@@ -29,6 +37,7 @@ type MockFormulaFailure = {
 
 type MockWasmWorkbookOptions = {
   formulaFailuresByFormula?: Record<string, MockFormulaFailure>
+  disablePersistenceV1?: boolean
 }
 
 type MockWasmWorkbook = {
@@ -65,6 +74,8 @@ type MockWasmWorkbook = {
     endCol: number,
   ) => unknown[]
   restore_sparse: (cells: unknown[]) => number
+  snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
+  restore_persistence_v1?: (snapshot: WorkbookPersistenceSnapshotWire) => WorkbookPersistenceRestoreStatsWire
   read_sparse_range: () => unknown[]
   clear_range: () => number
   set_format_range: (
@@ -85,8 +96,8 @@ type MockWasmWorkbook = {
   restore_format_snapshot: (snapshot: FormatRangeSnapshot) => number
   debug_formula_cache_state: () => string
   debug_formula_eval_count: () => number
-  subscribe_cell: () => number
-  unsubscribe_cell: () => void
+  subscribe_cell: (_sheetName: string, _addr: string, _callback: () => void) => number
+  unsubscribe_cell: (token: number) => void
   __mockInstanceId?: number
   __mockCalls?: {
     bulkImportCells: number
@@ -94,9 +105,13 @@ type MockWasmWorkbook = {
     snapshotSparse: number
     snapshotRangeSparse: SparseRangeWire[]
     restoreSparse: SparseCellWire[][]
+    snapshotPersistenceV1: number
+    restorePersistenceV1: WorkbookPersistenceSnapshotWire[]
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
     restoreFormatSnapshot: FormatRangeSnapshot[]
+    subscribeTokens: number[]
+    unsubscribeTokens: number[]
   }
 }
 
@@ -123,6 +138,29 @@ function parseAddress(addr: string): { row: number; col: number } {
   return { row: Number(match[2]) - 1, col: col - 1 }
 }
 
+function makeNumberCell(index: number, sheet = 0): ImportCellWire {
+  return {
+    sheet,
+    row: Math.floor(index / 2),
+    col: index % 2,
+    kind: 'number',
+    value: index,
+  }
+}
+
+function makeInvalidIssueCell(index: number) {
+  return {
+    sheet: 0,
+    row: Math.floor(index / 1000),
+    col: index % 1000,
+    kind: 'not-a-kind',
+  } as unknown
+}
+
+function makeNumberCells(count: number) {
+  return Array.from({ length: count }, (_value, index) => makeNumberCell(index))
+}
+
 function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const calls: NonNullable<MockWasmWorkbook['__mockCalls']> = {
     bulkImportCells: 0,
@@ -130,12 +168,25 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     snapshotSparse: 0,
     snapshotRangeSparse: [],
     restoreSparse: [],
+    snapshotPersistenceV1: 0,
+    restorePersistenceV1: [],
     setFormatRange: [],
     snapshotFormatRange: [],
     restoreFormatSnapshot: [],
+    subscribeTokens: [],
+    unsubscribeTokens: [],
   }
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
+  let nextToken = 1
+  const restorePersistenceData: WorkbookPersistenceSnapshotWire | undefined = options.disablePersistenceV1
+    ? undefined
+    : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] }
+  const restorePersistenceDefaultReturn: WorkbookPersistenceRestoreStatsWire = {
+    restored_cells: 0,
+    restored_formats: 0,
+    sheets: 1,
+  }
 
   function key(sheet: number, addr: string) {
     return `${sheet}:${addr.toUpperCase()}`
@@ -356,6 +407,18 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       }
       return cellsIn.length
     },
+    ...(restorePersistenceData
+      ? {
+          snapshot_persistence_v1: () => {
+            calls.snapshotPersistenceV1 += 1
+            return restorePersistenceData
+          },
+          restore_persistence_v1: (snapshot: WorkbookPersistenceSnapshotWire) => {
+            calls.restorePersistenceV1.push(snapshot)
+            return restorePersistenceDefaultReturn
+          },
+        }
+      : {}),
     read_sparse_range: () => [],
     clear_range: () => 0,
     set_format_range: (sheet, startRow, startCol, endRow, endCol, fmt) => {
@@ -380,8 +443,14 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     },
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
-    subscribe_cell: () => 1,
-    unsubscribe_cell: () => undefined,
+    subscribe_cell: (_sheetName: string, _addr: string) => {
+      const token = nextToken++
+      calls.subscribeTokens.push(token)
+      return token
+    },
+    unsubscribe_cell: (token: number) => {
+      calls.unsubscribeTokens.push(token)
+    },
     __mockCalls: calls,
   }
 
@@ -463,6 +532,10 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       mainSetFormatRange: () => workbooks[0]?.__mockCalls?.setFormatRange ?? [],
       mainSnapshotFormatRange: () => workbooks[0]?.__mockCalls?.snapshotFormatRange ?? [],
       mainRestoreFormatSnapshot: () => workbooks[0]?.__mockCalls?.restoreFormatSnapshot ?? [],
+      mainSnapshotPersistenceV1: () => workbooks[0]?.__mockCalls?.snapshotPersistenceV1 ?? 0,
+      mainRestorePersistenceV1: () => workbooks[0]?.__mockCalls?.restorePersistenceV1 ?? [],
+      mainSubscribeTokens: () => workbooks[0]?.__mockCalls?.subscribeTokens ?? [],
+      mainUnsubscribeTokens: () => workbooks[0]?.__mockCalls?.unsubscribeTokens ?? [],
     },
     send: <T>(message: Record<string, unknown>) => requestWorkerResponse<T>(responses, message),
     dispose: () => {
@@ -696,6 +769,283 @@ describe('wasm-workbook-worker import session contract', () => {
         },
       ])
     } finally {
+      harness.dispose()
+    }
+  })
+
+  it('rejects oversized chunks before mutating import session state', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+
+      const oversizedChunk = makeNumberCells(MAX_IMPORT_CHUNK_CELLS + 1)
+      await expect(
+        harness.send<number>({
+          id: 3,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: oversizedChunk as unknown as ImportCellWire[],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_CHUNK_TOO_LARGE',
+        message: `import chunk too large: ${oversizedChunk.length}`,
+      })
+
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([])
+      await expect(
+        harness.send<number>({
+          id: 4,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [{ sheet: 0, row: 0, col: 0, kind: 'number', value: 1 }],
+        }),
+      ).resolves.toBe(1)
+      expect(harness.calls.importWorkbooks()).toBeGreaterThanOrEqual(1)
+
+      const cancelled = await harness.send<boolean>({
+        id: 5,
+        cmd: 'cancelImport',
+        sessionId: 1,
+      })
+      expect(cancelled).toBe(true)
+      await expect(
+        harness.send({
+          id: 6,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [{ sheet: 0, row: 0, col: 0, kind: 'number', value: 2 }],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_SESSION_MISSING',
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('rejects sessions that exceed normalized count with existing partial state preserved', async () => {
+    const harness = withMockedWorker()
+    __setImportLimitsForTest({ normalizedCells: 5, finalTouches: 5 })
+    try {
+      const nearLimit = 4
+      const allCells = makeNumberCells(nearLimit)
+      const extra = [makeNumberCell(nearLimit + 1)]
+
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+
+      let nextId = 3
+      for (let offset = 0; offset < allCells.length; offset += MAX_IMPORT_CHUNK_CELLS) {
+        await harness.send<number>({
+          id: nextId++,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: allCells.slice(offset, offset + MAX_IMPORT_CHUNK_CELLS),
+        })
+      }
+
+      await harness.send<number>({
+        id: nextId++,
+        cmd: 'importChunk',
+        sessionId: 1,
+        cells: extra,
+      })
+      await expect(
+        harness.send<number>({
+          id: nextId++,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [makeNumberCell(nearLimit + 1)],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: nextId++,
+        cmd: 'commitImport',
+        sessionId: 1,
+      })
+      expect(commit.accepted).toBe(5)
+      expect(harness.calls.mainBulkImportPayloads()).toHaveLength(1)
+      expect(harness.calls.mainBulkImportPayloads()[0]).toHaveLength(5)
+      expect(harness.calls.mainBulkImportPayloads()[0][4]).toMatchObject(extra[0])
+    } finally {
+      __resetImportLimitsForTest()
+      harness.dispose()
+    }
+  })
+
+  it('rejects sessions when final touch limit is exceeded while normalized count stays within bounds', async () => {
+    const harness = withMockedWorker()
+    __setImportLimitsForTest({
+      normalizedCells: 10,
+      finalTouches: 2,
+      chunkCells: 10_000,
+    })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+
+      await expect(
+        harness.send<number>({
+          id: 3,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [
+            { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+            { sheet: 0, row: 0, col: 1, kind: 'number', value: 2 },
+          ],
+        }),
+      ).resolves.toBe(2)
+
+      await expect(
+        harness.send<number>({
+          id: 4,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [{ sheet: 0, row: 1, col: 0, kind: 'number', value: 3 }],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: 5,
+        cmd: 'commitImport',
+        sessionId: 1,
+      })
+      expect(commit.accepted).toBe(2)
+      expect(harness.calls.mainBulkImportPayloads()[0]).toHaveLength(2)
+    } finally {
+      __resetImportLimitsForTest()
+      harness.dispose()
+    }
+  })
+
+  it('rejects sessions that exceed final touch limits without applying the overflow chunk', async () => {
+    const harness = withMockedWorker()
+    __setImportLimitsForTest({ normalizedCells: 10, finalTouches: 2 })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+      await expect(
+        harness.send<number>({
+          id: 3,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [makeNumberCell(0), makeNumberCell(1)],
+        }),
+      ).resolves.toBe(2)
+      await expect(
+        harness.send<number>({
+          id: 4,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [makeNumberCell(2)],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: 5,
+        cmd: 'commitImport',
+        sessionId: 1,
+      })
+      expect(commit.accepted).toBe(2)
+      expect(harness.calls.mainBulkImportPayloads()[0]).toHaveLength(2)
+    } finally {
+      __resetImportLimitsForTest()
+      harness.dispose()
+    }
+  })
+
+  it('rejects sessions that exceed issue limits without partial import writes', async () => {
+    const harness = withMockedWorker()
+    __setImportLimitsForTest({ issues: 3 })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 1,
+      })
+
+      const firstIssues = [makeInvalidIssueCell(0), makeInvalidIssueCell(1)]
+      const secondIssues = [makeInvalidIssueCell(2)]
+      const overflowIssue = makeInvalidIssueCell(3)
+
+      await harness.send<number>({
+        id: 3,
+        cmd: 'importChunk',
+        sessionId: 1,
+        cells: firstIssues as ImportCellWire[],
+      })
+      await harness.send<number>({
+        id: 4,
+        cmd: 'importChunk',
+        sessionId: 1,
+        cells: secondIssues as ImportCellWire[],
+      })
+      await expect(
+        harness.send<number>({
+          id: 5,
+          cmd: 'importChunk',
+          sessionId: 1,
+          cells: [overflowIssue],
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_ISSUES_LIMIT_EXCEEDED',
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: 6,
+        cmd: 'commitImport',
+        sessionId: 1,
+      })
+      expect(commit.accepted).toBe(0)
+      expect(commit.issues).toHaveLength(3)
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([])
+    } finally {
+      __resetImportLimitsForTest()
       harness.dispose()
     }
   })
@@ -990,6 +1340,180 @@ describe('wasm-workbook-worker import session contract', () => {
       })
       expect(restored).toBe(1)
       expect(harness.calls.mainRestoreFormatSnapshot()).toEqual([snapshot])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes persistence v1 snapshot and restore through the wasm API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      const snapshot = await harness.send<WorkbookPersistenceSnapshotWire>({
+        id: 2,
+        cmd: 'snapshotPersistenceV1',
+      })
+      expect(snapshot).toEqual({
+        version: 1,
+        sheets: [{ idx: 0, name: 'Sheet1' }],
+        cells: [],
+        formats: [],
+      })
+      expect(harness.calls.mainSnapshotPersistenceV1()).toBe(1)
+
+      const restorePayload: WorkbookPersistenceSnapshotWire = {
+        version: 1,
+        sheets: [{ idx: 0, name: 'Sheet1' }],
+        cells: [
+          { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=1+1' },
+        ],
+        formats: [],
+      }
+      const restore = await harness.send<WorkbookPersistenceRestoreStatsWire>({
+        id: 3,
+        cmd: 'restorePersistenceV1',
+        snapshot: restorePayload,
+      })
+      expect(restore).toEqual({ restored_cells: 0, restored_formats: 0, sheets: 1 })
+      expect(harness.calls.mainRestorePersistenceV1()).toEqual([restorePayload])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('clears existing subscription tokens before restoring persistence v1', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<boolean>({
+        id: 2,
+        cmd: 'subscribeCells',
+        subId: 1,
+        cells: [{ sheet: 0, addr: 'A1' }],
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'restorePersistenceV1',
+        snapshot: {
+          version: 1,
+          sheets: [{ idx: 0, name: 'Sheet1' }],
+          cells: [
+            { sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'formula', value: '=1+1' },
+          ],
+          formats: [],
+        },
+      })
+
+      expect(harness.calls.mainSubscribeTokens()).toEqual([1])
+      expect(harness.calls.mainUnsubscribeTokens()).toEqual([1])
+
+      await harness.send<boolean>({
+        id: 4,
+        cmd: 'unsubscribeCells',
+        subId: 1,
+      })
+      expect(harness.calls.mainUnsubscribeTokens()).toEqual([1])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('clears active import and export sessions after restoring persistence v1', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 7,
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'importChunk',
+        sessionId: 7,
+        cells: [{ sheet: 0, row: 0, col: 0, kind: 'number', value: 1 }],
+      })
+      const exportSession = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 4,
+        cmd: 'beginExportRangeTsv',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      })
+
+      await harness.send({
+        id: 5,
+        cmd: 'restorePersistenceV1',
+        snapshot: {
+          version: 1,
+          sheets: [{ idx: 0, name: 'Sheet1' }],
+          cells: [],
+          formats: [],
+        },
+      })
+
+      await expect(
+        harness.send({
+          id: 6,
+          cmd: 'commitImport',
+          sessionId: 7,
+        }),
+      ).rejects.toMatchObject({
+        code: 'IMPORT_SESSION_MISSING',
+      })
+      await expect(
+        harness.send({
+          id: 7,
+          cmd: 'nextExportRangeTsvChunk',
+          sessionId: exportSession.sessionId,
+        }),
+      ).rejects.toMatchObject({
+        code: 'EXPORT_SESSION_MISSING',
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('predictably errors when persistence v1 APIs are unavailable in wasm', async () => {
+    const harness = withMockedWorker({ disablePersistenceV1: true })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await expect(
+        harness.send({ id: 2, cmd: 'snapshotPersistenceV1' }),
+      ).rejects.toMatchObject({
+        code: 'WASM_METHOD_UNAVAILABLE',
+        message: 'WasmWorkbook.snapshot_persistence_v1 is not available',
+      })
+
+      await expect(
+        harness.send({
+          id: 3,
+          cmd: 'restorePersistenceV1',
+          snapshot: { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] },
+        }),
+      ).rejects.toMatchObject({
+        code: 'WASM_METHOD_UNAVAILABLE',
+        message: 'WasmWorkbook.restore_persistence_v1 is not available',
+      })
     } finally {
       harness.dispose()
     }

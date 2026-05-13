@@ -1,11 +1,11 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
-    Align, CellAddress, CellFormat, CellRange, CellSubscription, FormatRangeSnapshot,
-    NumberFormat, RangeFormatSnapshotLayer, Sheet, Workbook,
+    Align, CellAddress, CellFormat, CellRange, CellSubscription, FormatRangeSnapshot, NumberFormat,
+    RangeFormatSnapshotLayer, Sheet, Workbook,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
@@ -160,8 +160,9 @@ impl FormatRangeSnapshotJSON {
     fn into_snapshot(self) -> Result<FormatRangeSnapshot, JsValue> {
         let mut cell_formats = Vec::with_capacity(self.cell_formats.len());
         for cell in self.cell_formats {
-            let addr = CellAddress::parse(&cell.addr)
-                .ok_or_else(|| JsValue::from_str(&format!("invalid cell address: {}", cell.addr)))?;
+            let addr = CellAddress::parse(&cell.addr).ok_or_else(|| {
+                JsValue::from_str(&format!("invalid cell address: {}", cell.addr))
+            })?;
             cell_formats.push((addr, cell.format.into_format()));
         }
         let range_formats = self
@@ -544,6 +545,32 @@ struct CellSnapshotJSON {
     #[serde(rename = "isError")]
     is_error: bool,
     formula: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkbookPersistenceSheetMetaJSON {
+    idx: u32,
+    name: String,
+    #[serde(rename = "rowCount", default, skip_serializing_if = "Option::is_none")]
+    row_count: Option<u32>,
+    #[serde(rename = "colCount", default, skip_serializing_if = "Option::is_none")]
+    col_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkbookPersistenceV1JSON {
+    version: u32,
+    sheets: Vec<WorkbookPersistenceSheetMetaJSON>,
+    cells: Vec<SparseCellJSON>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    formats: Vec<FormatRangeSnapshotJSON>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WorkbookPersistenceRestoreStatsJSON {
+    restored_cells: u32,
+    restored_formats: u32,
+    sheets: u32,
 }
 
 /// Initialize the panic hook once per module load. Called automatically from
@@ -1581,7 +1608,7 @@ impl WasmWorkbook {
             &snapshot,
             Some(sheet_idx),
         ))
-            .map_err(|err| JsValue::from_str(&format!("serialize format range snapshot: {err}")))
+        .map_err(|err| JsValue::from_str(&format!("serialize format range snapshot: {err}")))
     }
 
     /// Restore a formatting snapshot produced by `snapshot_format_range`.
@@ -1595,6 +1622,31 @@ impl WasmWorkbook {
             .sheet_mut(sheet_idx as usize)
             .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
         Ok(sheet.restore_format_range_snapshot(snapshot) as u32)
+    }
+
+    /// Snapshot workbook state as persistence-v1 sparse envelope.
+    ///
+    /// Format metadata includes range-format and in-range cell formats from each
+    /// sheet snapshot, but does not serialize any dense grid materialization.
+    /// Formula cells are serialized using their source (`=...`), preserving lazy
+    /// evaluation contracts during restore.
+    pub fn snapshot_persistence_v1(&self) -> Result<JsValue, JsValue> {
+        serde_wasm_bindgen::to_value(&self.snapshot_persistence_v1_json())
+            .map_err(|err| JsValue::from_str(&format!("serialize persistence v1 snapshot: {err}")))
+    }
+
+    /// Restore a persistence-v1 sparse envelope into this workbook.
+    ///
+    /// Returns simple restore stats for quick assertions.
+    pub fn restore_persistence_v1(&mut self, value: JsValue) -> Result<JsValue, JsValue> {
+        let payload: WorkbookPersistenceV1JSON = serde_wasm_bindgen::from_value(value)
+            .map_err(|err| JsValue::from_str(&format!("invalid persistence payload: {err}")))?;
+        let stats = self
+            .restore_persistence_v1_json(payload)
+            .map_err(|err| JsValue::from_str(&err))?;
+        serde_wasm_bindgen::to_value(&stats).map_err(|err| {
+            JsValue::from_str(&format!("serialize persistence restore stats: {err}"))
+        })
     }
 }
 
@@ -1610,6 +1662,124 @@ impl WasmWorkbook {
             return Value::Null;
         };
         self.workbook.get_cell(name, addr)
+    }
+
+    fn snapshot_persistence_v1_json(&self) -> WorkbookPersistenceV1JSON {
+        let mut sheets = Vec::with_capacity(self.workbook.sheet_count());
+        let mut formats = Vec::with_capacity(self.workbook.sheet_count());
+
+        for sheet_idx in 0..self.workbook.sheet_count() {
+            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+                continue;
+            };
+
+            let (row_count, col_count) = self.sheet_sparse_bounds(sheet_idx);
+            let name = self
+                .workbook
+                .name(sheet_idx)
+                .map(str::to_string)
+                .unwrap_or_default();
+            sheets.push(WorkbookPersistenceSheetMetaJSON {
+                idx: sheet_idx as u32,
+                name,
+                row_count,
+                col_count,
+            });
+
+            let snapshot = sheet.snapshot_format_range(Self::full_sheet_range());
+            formats.push(FormatRangeSnapshotJSON::from_snapshot(
+                &snapshot,
+                Some(sheet_idx as u32),
+            ));
+        }
+
+        WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets,
+            cells: self.snapshot_sparse_cells(),
+            formats,
+        }
+    }
+
+    fn restore_persistence_v1_json(
+        &mut self,
+        payload: WorkbookPersistenceV1JSON,
+    ) -> Result<WorkbookPersistenceRestoreStatsJSON, String> {
+        if payload.version != 1 {
+            return Err(format!(
+                "unsupported persistence version: {}",
+                payload.version
+            ));
+        }
+
+        if payload.sheets.is_empty() {
+            return Err("persistence payload has no sheets".into());
+        }
+
+        let mut seen_names = HashSet::new();
+        for (idx, sheet) in payload.sheets.iter().enumerate() {
+            if sheet.idx != idx as u32 {
+                return Err(format!(
+                    "sheet indices are not contiguous from 0: expected {idx}, got {}",
+                    sheet.idx
+                ));
+            }
+            if !seen_names.insert(sheet.name.clone()) {
+                return Err(format!("duplicate sheet name in payload: {}", sheet.name));
+            }
+        }
+
+        let sheet_count = payload.sheets.len();
+        let mut format_snapshots = Vec::with_capacity(payload.formats.len());
+        for snapshot in payload.formats {
+            let sheet_idx = snapshot
+                .sheet
+                .ok_or_else(|| "format snapshot is missing sheet index".to_string())?
+                as usize;
+            if sheet_idx >= sheet_count {
+                return Err(format!(
+                    "format snapshot references missing sheet: {sheet_idx}"
+                ));
+            }
+            let snapshot = snapshot
+                .into_snapshot()
+                .map_err(|_| "invalid format snapshot".to_string())?;
+            format_snapshots.push((sheet_idx, snapshot));
+        }
+
+        let mut workbook = Workbook::new();
+        let first_name = payload.sheets[0].name.clone();
+        let first_sheet_already_named = workbook.name(0) == Some(first_name.as_str());
+        if !first_sheet_already_named && !workbook.rename_sheet(0, &first_name) {
+            return Err(format!(
+                "failed to initialize first sheet name: {}",
+                first_name
+            ));
+        }
+        for sheet in payload.sheets.iter().skip(1) {
+            workbook.add_sheet(&sheet.name);
+        }
+
+        self.subscriptions.clear();
+        self.next_token = 0;
+        self.workbook = workbook;
+
+        let restored_cells = self.restore_sparse_cells(payload.cells);
+        let mut restored_formats = 0u32;
+        for (sheet_idx, snapshot) in format_snapshots {
+            let sheet = self
+                .workbook
+                .sheet_mut(sheet_idx)
+                .ok_or_else(|| format!("invalid sheet index: {sheet_idx}"))?;
+            restored_formats += sheet.restore_format_range_snapshot(snapshot) as u32;
+        }
+
+        let stats = WorkbookPersistenceRestoreStatsJSON {
+            restored_cells,
+            restored_formats,
+            sheets: payload.sheets.len() as u32,
+        };
+        Ok(stats)
     }
 
     fn snapshot_sparse_cells(&self) -> Vec<SparseCellJSON> {
@@ -1649,6 +1819,32 @@ impl WasmWorkbook {
             });
         }
         out
+    }
+
+    fn sheet_sparse_bounds(&self, sheet_idx: usize) -> (Option<u32>, Option<u32>) {
+        let mut max_row = 0u32;
+        let mut max_col = 0u32;
+        let mut found = false;
+
+        let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+            return (None, None);
+        };
+        sheet.for_each_non_empty(|addr| {
+            found = true;
+            max_row = max_row.max(addr.row);
+            max_col = max_col.max(addr.col);
+        });
+        if !found {
+            return (None, None);
+        }
+        (
+            Some(max_row.saturating_add(1)),
+            Some(max_col.saturating_add(1)),
+        )
+    }
+
+    fn full_sheet_range() -> CellRange {
+        CellRange::new(CellAddress::new(0, 0), CellAddress::new(u32::MAX, u32::MAX))
     }
 
     fn restore_sparse_cells(&mut self, cells: Vec<SparseCellJSON>) -> u32 {
@@ -1970,5 +2166,242 @@ mod tests {
         assert_eq!(wb.get_display(0, "B2"), "6");
         assert_eq!(wb.debug_formula_cache_state(0, "B2"), "clean");
         assert_eq!(wb.debug_formula_eval_count(0), 1);
+    }
+
+    #[test]
+    fn wasm_workbook_snapshot_persistence_v1_roundtrip_sparse_formula_and_formats() {
+        let mut source = WasmWorkbook::new();
+        assert!(source.rename_sheet(0, "Data"));
+        let _ = source.add_sheet("Calc");
+
+        source.set_number(0, "A1", 10.0);
+        source.set_text(0, "B2", "hello");
+        assert!(source.set_formula(0, "C3", "=A1+1"));
+        source.set_number(1, "A1", 100.0);
+
+        let number_fmt = CellFormatJSON {
+            number_format: Some(NumberFormatJSON {
+                kind: "decimal".into(),
+                digits: Some(2),
+                symbol: None,
+                pattern: None,
+                thousands: Some(true),
+            }),
+            bold: None,
+            italic: None,
+            align: None,
+            font_size: None,
+            fg_color: None,
+            bg_color: None,
+        };
+        source.workbook.sheet_mut(0).unwrap().set_format_range(
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(2, 0)),
+            number_fmt.clone().into_format(),
+        );
+
+        assert_eq!(source.debug_formula_cache_state(0, "C3"), "dirty");
+        assert_eq!(source.debug_formula_eval_count(0), 0);
+
+        let envelope = source.snapshot_persistence_v1_json();
+
+        assert_eq!(envelope.version, 1);
+        assert_eq!(envelope.sheets.len(), 2);
+        assert_eq!(envelope.sheets[0].idx, 0);
+        assert_eq!(envelope.sheets[0].name, "Data");
+        assert_eq!(envelope.sheets[0].row_count, Some(3));
+        assert_eq!(envelope.sheets[0].col_count, Some(3));
+        assert_eq!(envelope.sheets[1].name, "Calc");
+        assert_eq!(envelope.sheets[1].row_count, Some(1));
+        assert_eq!(envelope.sheets[1].col_count, Some(1));
+
+        let formula_cell = envelope
+            .cells
+            .iter()
+            .find(|cell| cell.sheet == 0 && cell.addr == "C3")
+            .expect("formula cell should be included");
+        assert_eq!(formula_cell.kind, "formula");
+        match &formula_cell.value {
+            Some(ImportValueJSON::Text(source)) => assert_eq!(source, "=A1+1"),
+            other => panic!("expected formula source in persistence payload: {other:?}"),
+        }
+
+        assert_eq!(envelope.formats.len(), 2);
+
+        let mut restored = WasmWorkbook::new();
+        let stats = restored.restore_persistence_v1_json(envelope).unwrap();
+
+        assert_eq!(stats.sheets, 2);
+        assert_eq!(stats.restored_cells, 4);
+
+        assert_eq!(restored.sheet_name(0), "Data");
+        assert_eq!(restored.sheet_name(1), "Calc");
+        assert_eq!(restored.get_number(0, "A1"), 10.0);
+        assert_eq!(restored.get_display(0, "B2"), "hello");
+        assert_eq!(restored.get_formula(0, "C3"), "=A1+1");
+        assert_eq!(restored.debug_formula_cache_state(0, "C3"), "dirty");
+        assert_eq!(restored.debug_formula_eval_count(0), 0);
+        assert_eq!(restored.get_number(0, "C3"), 11.0);
+        assert_eq!(restored.debug_formula_cache_state(0, "C3"), "clean");
+        assert_eq!(restored.debug_formula_eval_count(0), 1);
+        assert_eq!(restored.get_number(1, "A1"), 100.0);
+
+        let restored_fmt =
+            restored
+                .workbook
+                .sheet(0)
+                .unwrap()
+                .snapshot_format_range(CellRange::new(
+                    CellAddress::new(0, 0),
+                    CellAddress::new(2, 0),
+                ));
+        assert_eq!(restored_fmt.range_formats.len(), 1);
+        assert!(matches!(
+            restored_fmt.range_formats[0].fmt.number_format,
+            NumberFormat::Decimal {
+                digits: 2,
+                thousands: true
+            }
+        ));
+    }
+
+    #[test]
+    fn wasm_workbook_snapshot_persistence_v1_uses_sparse_dimensions_only() {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("FormatOnly");
+        let fmt = CellFormatJSON {
+            number_format: Some(NumberFormatJSON {
+                kind: "percent".into(),
+                digits: Some(0),
+                symbol: None,
+                pattern: None,
+                thousands: None,
+            }),
+            bold: None,
+            italic: None,
+            align: None,
+            font_size: None,
+            fg_color: None,
+            bg_color: None,
+        };
+        wb.workbook.sheet_mut(1).unwrap().set_format_range(
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(4, 4)),
+            fmt.into_format(),
+        );
+
+        let envelope = wb.snapshot_persistence_v1_json();
+        assert_eq!(envelope.sheets.len(), 2);
+        assert_eq!(envelope.sheets[0].row_count, None);
+        assert_eq!(envelope.sheets[0].col_count, None);
+        assert_eq!(envelope.sheets[1].row_count, None);
+        assert_eq!(envelope.sheets[1].col_count, None);
+        assert_eq!(envelope.formats[1].range_formats.len(), 1);
+    }
+
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_rejects_unsupported_version() {
+        let mut wb = WasmWorkbook::new();
+        let payload = WorkbookPersistenceV1JSON {
+            version: 2,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Sheet1".into(),
+                row_count: None,
+                col_count: None,
+            }],
+            cells: vec![],
+            formats: vec![],
+        };
+        assert!(wb.restore_persistence_v1_json(payload).is_err());
+    }
+
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_accepts_default_sheet_name() {
+        let mut wb = WasmWorkbook::new();
+        assert!(wb.rename_sheet(0, "Old"));
+
+        let payload = WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Sheet1".into(),
+                row_count: None,
+                col_count: None,
+            }],
+            cells: vec![SparseCellJSON {
+                sheet: 0,
+                addr: "A1".into(),
+                row: 0,
+                col: 0,
+                kind: "number".into(),
+                value: Some(ImportValueJSON::Number(42.0)),
+            }],
+            formats: vec![],
+        };
+
+        let stats = wb.restore_persistence_v1_json(payload).unwrap();
+        assert_eq!(stats.restored_cells, 1);
+        assert_eq!(wb.sheet_name(0), "Sheet1");
+        assert_eq!(wb.get_number(0, "A1"), 42.0);
+    }
+
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_rejects_bad_format_without_mutating_workbook() {
+        let mut wb = WasmWorkbook::new();
+        assert!(wb.rename_sheet(0, "Keep"));
+        wb.set_number(0, "A1", 7.0);
+
+        let payload = WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Loaded".into(),
+                row_count: None,
+                col_count: None,
+            }],
+            cells: vec![SparseCellJSON {
+                sheet: 0,
+                addr: "A1".into(),
+                row: 0,
+                col: 0,
+                kind: "number".into(),
+                value: Some(ImportValueJSON::Number(99.0)),
+            }],
+            formats: vec![FormatRangeSnapshotJSON {
+                sheet: Some(1),
+                start_row: 0,
+                start_col: 0,
+                end_row: 0,
+                end_col: 0,
+                cell_formats: vec![],
+                range_formats: vec![],
+            }],
+        };
+
+        assert!(wb.restore_persistence_v1_json(payload).is_err());
+        assert_eq!(wb.sheet_name(0), "Keep");
+        assert_eq!(wb.get_number(0, "A1"), 7.0);
+    }
+
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_resets_subscription_tokens() {
+        let mut wb = WasmWorkbook::new();
+        wb.next_token = 42;
+
+        let payload = WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Loaded".into(),
+                row_count: None,
+                col_count: None,
+            }],
+            cells: vec![],
+            formats: vec![],
+        };
+
+        let stats = wb.restore_persistence_v1_json(payload).unwrap();
+        assert_eq!(stats.sheets, 1);
+        assert_eq!(wb.next_token, 0);
+        assert!(wb.subscriptions.is_empty());
     }
 }

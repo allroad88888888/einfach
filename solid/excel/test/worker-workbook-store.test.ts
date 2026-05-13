@@ -14,6 +14,8 @@ import type {
   SparseRangeWire,
   WorkerWorkbookClient,
   WorkbookImportStatsWire,
+  WorkbookPersistenceRestoreStatsWire,
+  WorkbookPersistenceSnapshotWire,
   WorkbookSheetMeta,
 } from '../src/wasm-workbook-proxy'
 
@@ -52,6 +54,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     commitImport: number[]
     cancelImport: number[]
     snapshotSparse: number
+    snapshotPersistenceV1: number
+    restorePersistenceV1: WorkbookPersistenceSnapshotWire[]
     debugFormulaCacheState: Array<{ sheet: number; addr: string }>
   }
   emitHydrated(cells: CellSnapshotWire[]): void
@@ -128,6 +132,8 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     commitImport: [],
     cancelImport: [],
     snapshotSparse: 0,
+    snapshotPersistenceV1: 0,
+    restorePersistenceV1: [],
     debugFormulaCacheState: [],
   }
   const cells = new Map<string, CellSnapshotWire>()
@@ -527,7 +533,78 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async snapshotSparse() {
       calls.snapshotSparse += 1
-      return []
+      const out: SparseCellWire[] = []
+      for (const [, snapshot] of cells.entries()) {
+        const parsed = parseCellAddress(snapshot.addr)
+        if (snapshot.formula !== '') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'formula',
+            value: snapshot.formula,
+          })
+        } else if (snapshot.type === 'number') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'number',
+            value: Number(snapshot.display),
+          })
+        } else if (snapshot.type === 'text') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'text',
+            value: snapshot.display,
+          })
+        } else if (snapshot.type === 'boolean') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'boolean',
+            value: snapshot.display === 'TRUE',
+          })
+        } else if (snapshot.type === 'error') {
+          out.push({
+            sheet: snapshot.sheet,
+            addr: snapshot.addr,
+            row: parsed.row,
+            col: parsed.col,
+            kind: 'error',
+            value: snapshot.display,
+          })
+        }
+      }
+      return out
+    },
+    async snapshotPersistenceV1() {
+      calls.snapshotPersistenceV1 += 1
+      const sparseCells = await this.snapshotSparse()
+      return {
+        version: 1,
+        sheets: metas,
+        cells: sparseCells,
+        formats: [],
+      }
+    },
+    async restorePersistenceV1(snapshot: WorkbookPersistenceSnapshotWire) {
+      calls.restorePersistenceV1.push(snapshot)
+      metas = snapshot.sheets.map((sheet) => ({ idx: sheet.idx, name: sheet.name }))
+      cells.clear()
+      await this.restoreSparse(snapshot.cells)
+      return {
+        restored_cells: snapshot.cells.length,
+        restored_formats: snapshot.formats?.length ?? 0,
+        sheets: snapshot.sheets.length,
+      } satisfies WorkbookPersistenceRestoreStatsWire
     },
     async readSparseRange(_range: SparseRangeWire) {
       calls.readSparseRange.push({

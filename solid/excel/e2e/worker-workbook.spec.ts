@@ -372,6 +372,33 @@ test.describe('Worker-backed workbook RPC', () => {
     await expectNoConsoleErrors(page)
   })
 
+  test('round-trips persistence v1 snapshot through worker import without preheating formulas', async ({
+    page,
+  }) => {
+    const result = await runWorkerWorkbookPersistenceSnapshotScenario(page)
+
+    expect(result.importStateBeforeSnapshot).toBe('dirty')
+    expect(result.importEvalCountBeforeSnapshot).toBe(0)
+    expect(result.afterSnapshotState).toBe('dirty')
+    expect(result.afterSnapshotEvalCount).toBe(0)
+    expect(result.restoredBeforeReadState).toBe('dirty')
+    expect(result.restoredBeforeReadEvalCount).toBe(0)
+    expect(result.restoredFormula.display).toBe('42')
+    expect(result.restoredAfterReadState).toBe('clean')
+    expect(result.restoredAfterReadEvalCount).toBeGreaterThan(result.restoredBeforeReadEvalCount)
+
+    await expectNoConsoleErrors(page)
+  })
+
+  test('returns import session limit error for oversized import chunk', async ({ page }) => {
+    const result = await runWorkerWorkbookImportTooLargeChunkScenario(page)
+
+    expect(result.errorCode).toBe('IMPORT_CHUNK_TOO_LARGE')
+    expect(result.cancelled).toBe(true)
+
+    await expectNoConsoleErrors(page)
+  })
+
   test('exports range tsv with formula source and without evaluating formulas', async ({ page }) => {
     const result = await runWorkerWorkbookExportRangeTsvScenario(page)
 
@@ -1079,6 +1106,107 @@ async function runWorkerWorkbookSnapshotRoundTripScenario(page: Page): Promise<{
     } finally {
       sourceWorkbook.dispose()
       restoredWorkbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookPersistenceSnapshotScenario(page: Page): Promise<{
+  importStateBeforeSnapshot: string
+  importEvalCountBeforeSnapshot: number
+  afterSnapshotState: string
+  afterSnapshotEvalCount: number
+  restoredBeforeReadState: string
+  restoredBeforeReadEvalCount: number
+  restoredFormula: Snapshot
+  restoredAfterReadState: string
+  restoredAfterReadEvalCount: number
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const sourceWorkbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    const restoredWorkbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+
+    try {
+      await sourceWorkbook.initWorkbook(['Sheet1', 'Sheet2'])
+      const sourceSession = await sourceWorkbook.beginImport()
+      await sourceWorkbook.importChunk(sourceSession, [
+        { sheet: 1, row: 0, col: 0, kind: 'number', value: 41 },
+        { sheet: 0, row: 0, col: 0, kind: 'formula', value: '=Sheet2!A1+1' },
+      ])
+      await sourceWorkbook.commitImport(sourceSession)
+
+      const importStateBeforeSnapshot = await sourceWorkbook.debugFormulaCacheState(0, 'A1')
+      const importEvalCountBeforeSnapshot = await sourceWorkbook.debugFormulaEvalCount(0)
+
+      const snapshot = await sourceWorkbook.snapshotPersistenceV1()
+      const afterSnapshotState = await sourceWorkbook.debugFormulaCacheState(0, 'A1')
+      const afterSnapshotEvalCount = await sourceWorkbook.debugFormulaEvalCount(0)
+
+      await restoredWorkbook.initWorkbook(['Sheet1', 'Sheet2'])
+      await restoredWorkbook.restorePersistenceV1(snapshot)
+
+      const restoredBeforeReadState = await restoredWorkbook.debugFormulaCacheState(0, 'A1')
+      const restoredBeforeReadEvalCount = await restoredWorkbook.debugFormulaEvalCount(0)
+      const [restoredFormula] = await restoredWorkbook.readCells([{ sheet: 0, addr: 'A1' }])
+      const restoredAfterReadState = await restoredWorkbook.debugFormulaCacheState(0, 'A1')
+      const restoredAfterReadEvalCount = await restoredWorkbook.debugFormulaEvalCount(0)
+
+      return {
+        importStateBeforeSnapshot,
+        importEvalCountBeforeSnapshot,
+        afterSnapshotState,
+        afterSnapshotEvalCount,
+        restoredBeforeReadState,
+        restoredBeforeReadEvalCount,
+        restoredFormula,
+        restoredAfterReadState,
+        restoredAfterReadEvalCount,
+      }
+    } finally {
+      sourceWorkbook.dispose()
+      restoredWorkbook.dispose()
+    }
+  })
+}
+
+async function runWorkerWorkbookImportTooLargeChunkScenario(page: Page): Promise<{
+  errorCode: string
+  cancelled: boolean
+}> {
+  return page.evaluate(async () => {
+    const { createWorkerWorkbook } = await import('/src/wasm-workbook-proxy.ts')
+    const { defaultWorkbookWorkerFactory } = await import('/src/wasm-workbook-worker-factory.ts')
+
+    const workbook = createWorkerWorkbook({ workerFactory: defaultWorkbookWorkerFactory })
+    try {
+      await workbook.initWorkbook(['Sheet1'])
+
+      const session = await workbook.beginImport()
+      const oversizedChunk = Array.from({ length: 10_001 }, (_, row) => ({
+        sheet: 0,
+        row,
+        col: 0,
+        kind: 'number' as const,
+        value: row,
+      }))
+
+      let errorCode = 'NO_ERROR'
+      try {
+        await workbook.importChunk(session, oversizedChunk)
+      } catch (error: unknown) {
+        errorCode =
+          typeof error === 'object' && error !== null && 'code' in error
+            ? String((error as { code: unknown }).code)
+            : 'UNKNOWN'
+      }
+
+      const cancelled = await workbook.cancelImport(session)
+
+      return { errorCode, cancelled }
+    } finally {
+      workbook.dispose()
     }
   })
 }

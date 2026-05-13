@@ -3,6 +3,8 @@ import {
   createWorkerWorkbook,
   type CellRefWire,
   type CellSnapshotWire,
+  type WorkbookPersistenceRestoreStatsWire,
+  type WorkbookPersistenceSnapshotWire,
   type SparseCellWire,
   type ImportCellIssueWire,
   type ImportCellWire,
@@ -318,6 +320,41 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(cancel).resolves.toBe(false)
   })
 
+  it('surfaces import limit errors and keeps the request channel usable', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const begin = workbook.beginImport(12)
+    expect(lastSent(fake)).toEqual({ id: 1, cmd: 'beginImport', sessionId: 12 })
+    ok(fake, 12)
+    await expect(begin).resolves.toBe(12)
+
+    const oversizedCells = Array.from({ length: 10_001 }, (_, row) => ({
+      sheet: 0,
+      row,
+      col: 0,
+      kind: 'number' as const,
+      value: row,
+    }))
+    const oversizeChunk = workbook.importChunk(12, oversizedCells as ImportCellWire[])
+    expect(lastSent(fake)).toMatchObject({
+      id: 2,
+      cmd: 'importChunk',
+      sessionId: 12,
+      cells: oversizedCells,
+    })
+    fail(fake, 'IMPORT_CHUNK_TOO_LARGE', 'import chunk too large: 10001')
+    await expect(oversizeChunk).rejects.toMatchObject({
+      code: 'IMPORT_CHUNK_TOO_LARGE',
+      message: 'import chunk too large: 10001',
+    })
+
+    const cancel = workbook.cancelImport(12)
+    expect(lastSent(fake)).toMatchObject({ id: 3, cmd: 'cancelImport', sessionId: 12 })
+    ok(fake, true)
+    await expect(cancel).resolves.toBe(true)
+  })
+
   it('rejects RPC errors with the worker error code attached', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })
@@ -335,6 +372,29 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(sparse).rejects.toMatchObject({
       code: 'WASM_METHOD_UNAVAILABLE',
       message: 'WasmWorkbook.snapshot_sparse is not available',
+    })
+
+    const persistenceSnapshot = workbook.snapshotPersistenceV1()
+    fail(
+      fake,
+      'WASM_METHOD_UNAVAILABLE',
+      'WasmWorkbook.snapshot_persistence_v1 is not available',
+    )
+    await expect(persistenceSnapshot).rejects.toMatchObject({
+      code: 'WASM_METHOD_UNAVAILABLE',
+      message: 'WasmWorkbook.snapshot_persistence_v1 is not available',
+    })
+
+    const persistenceRestore = workbook.restorePersistenceV1({
+      version: 1,
+      sheets: [{ idx: 0, name: 'Sheet1' }],
+      cells: [],
+      formats: [],
+    })
+    fail(fake, 'WASM_METHOD_UNAVAILABLE', 'WasmWorkbook.restore_persistence_v1 is not available')
+    await expect(persistenceRestore).rejects.toMatchObject({
+      code: 'WASM_METHOD_UNAVAILABLE',
+      message: 'WasmWorkbook.restore_persistence_v1 is not available',
     })
 
     const formula = workbook.setFormula(9, 'A1', '=1')
@@ -397,6 +457,44 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     })
     ok(fake, 2)
     await expect(restoreCount).resolves.toBe(2)
+  })
+
+  it('sends persistence snapshot/restore commands with expected payloads', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const snapshot = workbook.snapshotPersistenceV1()
+    expect(lastSent(fake)).toEqual({ id: 1, cmd: 'snapshotPersistenceV1' })
+    const snapshotPayload: WorkbookPersistenceSnapshotWire = {
+      version: 1,
+      sheets: [{ idx: 0, name: 'Sheet1' }],
+      cells: [
+        {
+          sheet: 0,
+          addr: 'A1',
+          row: 0,
+          col: 0,
+          kind: 'formula',
+          value: '=1+1',
+        },
+      ],
+      formats: [],
+    }
+    ok(fake, snapshotPayload)
+    await expect(snapshot).resolves.toEqual(snapshotPayload)
+
+    const restore = workbook.restorePersistenceV1(snapshotPayload)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'restorePersistenceV1',
+      snapshot: snapshotPayload,
+    })
+    const restoreStats: WorkbookPersistenceRestoreStatsWire = {
+      restored_cells: 1,
+      restored_formats: 0,
+      sheets: 1,
+    }
+    ok(fake, restoreStats)
+    await expect(restore).resolves.toEqual(restoreStats)
   })
 
   it('sends format range snapshot/restore commands with expected payloads', async () => {

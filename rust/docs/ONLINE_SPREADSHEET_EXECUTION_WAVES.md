@@ -9,7 +9,7 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `7a71e1a feat(solid-excel): undo large range formats` 加当前 Wave 2
+以最近提交 `9bf19ed docs(rust): plan Wave 3 import persistence` 加当前 Wave 3
 工作树为准，
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
@@ -43,9 +43,10 @@
   `setFormulaAsync` / async command facade，文档和 UI 入口不能再把同步兼容层当权威结果。
 - 浏览器剪贴板写入仍需要最终字符串；当前已把 worker 侧 range export 改成按行块读取和
   postMessage，后续文件导出/持久化可复用 chunk 合同继续做真正 sink streaming。
-- worker import session 已按 chunk 写入 worker 内 staging workbook，但仍需要 bounded memory、
-  backpressure、cancel/commit 可观测指标和持久化合同复核。
-- 稀疏持久化、导出、自动保存尚未形成 v1 合同。
+- worker import session 已按 chunk 写入 worker 内 staging workbook，并补上 bounded memory
+  合同、稳定错误码和 cancel/commit 测试。
+- 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
+  或公式结果。正式文件流导入、backpressure UI、自动保存仍未做。
 - 测试覆盖已经很多，但 E2E 文档计数滞后；MCP Playwright/Chrome DevTools 还没有成为
   每波固定验收记录。
 
@@ -236,8 +237,10 @@ MCP 验收：
 
 ## 波次 3：真正 bounded 的导入与稀疏持久化 v1
 
-执行计划已落地到 `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md`。本波开始前先提交计划文档，
-再并行启动 import runtime、persistence schema、store/demo 接线和测试/MCP 角色。
+状态：实现完成，等待本轮最终提交。执行计划和验收记录已落地到
+`rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md`。本波按多 agent pipeline 执行：
+Codex Spark 负责 worker/proxy persistence 与 E2E，Claude Sonnet 负责只读风险审查，总架构师
+负责 Rust 原子性修正、WASM 重新生成、本地测试与 MCP Playwright 最终验收。
 
 ### 目标
 
@@ -245,20 +248,22 @@ MCP 验收：
 
 必须解决：
 
-- worker import session 不能无限累积所有 chunk。
-- CSV/JSON 解析和 backpressure 策略要明确。
-- commit 必须走 Rust `Workbook::bulk_load`；导入公式后 `debug_formula_eval_count == 0`。
-- sparse persistence v1 保存 sheet name、dimension、primitive、formula、format；不保存 dense grid。
-- cancel 后 workbook 不可见任何 session 内容。
+- worker import session 不能无限累积所有 chunk：已用 chunk/normalized/final-touch/issues 上界收口。
+- CSV/JSON 解析和 backpressure 策略要明确：本波不做正式文件 parser/UI，先固定 worker 合同和错误码。
+- commit 必须走 Rust `Workbook::bulk_load`；导入公式后 `debug_formula_eval_count == 0`：已由
+  worker e2e 和 MCP 验证。
+- sparse persistence v1 保存 sheet name、dimension、primitive、formula、format；不保存 dense grid：
+  已由 Rust/WASM API、worker/proxy API 和 e2e 验证。
+- cancel 后 workbook 不可见任何 session 内容：已由 MCP 和 worker/import 测试验证。
 
 ### 并行角色
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| C1 Import runtime | Claude Sonnet | `solid/excel/src/wasm-workbook-worker.ts`, `rust/wasm/src/lib.rs` | bounded session、chunk flush、cancel/commit 错误语义 |
-| C2 Persistence schema | Codex Spark | `rust/wasm/src/lib.rs`, 新增 docs/test fixture | sparse persistence v1 schema + round-trip |
-| C3 Demo/import UI | Codex Spark | `solid/excel/src/demos/DemoMillion.tsx`, 可能新增 import helper | 大导入进度、取消、issue 展示入口 |
-| C4 Tests | Codex Spark | `solid/excel/test/wasm-workbook-worker.test.ts`, `solid/excel/e2e/worker-workbook.spec.ts` | 100k import lazy、cancel、issues、round-trip |
+| C1 Import runtime | Codex Spark + 总架构师 | `solid/excel/src/wasm-workbook-worker.ts`, tests | bounded session、错误码、cancel/commit 语义 |
+| C2 Persistence schema | Codex Spark + 总架构师 | `rust/wasm/src/lib.rs`, `wasm-workbook-proxy/worker` | sparse persistence v1 schema + worker API + round-trip |
+| C3 Demo/import UI | 后续 | `solid/excel/src/demos/DemoMillion.tsx` | 正式文件导入进度 UI 延后，不阻塞本波 API 合同 |
+| C4 Tests/MCP | Codex Spark + 总架构师 | `solid/excel/test/*`, `solid/excel/e2e/worker-workbook.spec.ts` | lazy import、cancel、limit、persistence round-trip、MCP |
 
 ### 验收门禁
 
@@ -271,11 +276,30 @@ cd /Volumes/work/self/einfach && npx jest solid/excel/test/wasm-workbook-worker.
 cd solid/excel && npx playwright test e2e/worker-workbook.spec.ts e2e/million-demo.spec.ts
 ```
 
+本轮实际已跑：
+
+```sh
+cd rust/wasm && cargo test --quiet                           # 21 passed
+cd /Volumes/work/self/einfach && npx tsc -p solid/excel/tsconfig.json --noEmit
+cd /Volumes/work/self/einfach && npx jest solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand  # 50 passed
+cd /Volumes/work/self/einfach && npm run build:wasm -w @einfach/solid-excel
+cd /Volumes/work/self/einfach && npm run build -w @einfach/solid-excel
+cd solid/excel && npm run e2e -- e2e/worker-workbook.spec.ts --grep "persistence|import"  # 9 passed
+```
+
 MCP 验收：
 
 - 在浏览器触发大导入或模拟导入；
 - 验证进度、取消、issue 统计；
 - 导入后不读公式时 eval counter 保持 0。
+
+本轮 MCP Playwright 已在 `http://localhost:5174/?debug=1` 验证：
+
+- cancel import 后主 workbook 不可见 session 内容；
+- 10001 cell chunk 返回 `IMPORT_CHUNK_TOO_LARGE`，并且 session 可 cancel；
+- persistence snapshot/restore 不预热公式，读公式前 eval count 为 0，读后得到 `42` 且 eval
+  count 变为 1；
+- 当前导航后的 console warning/error 为 0。
 
 ### 停止条件
 
@@ -409,11 +433,12 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-下一步继续完成 **波次 2：copy/export streaming**。
+下一步进入 **波次 4：性能、观测和 MCP 门禁产品化**。
 
 原因：
 
-- large range format undo 已完成，不再清空 undo 栈。
-- copy/export 虽然已经避免地址展开，但仍一次性生成 TSV 字符串，下一步应推进
-  streaming/chunked export。
-- bounded import / sparse persistence v1 仍在 Wave 3，先不要和 copy/export protocol 混在一轮里。
+- large range format undo、copy/export streaming、bounded import、sparse persistence v1 都已完成
+  本轮实现和验证。
+- 剩余最大风险不再是单个功能缺口，而是规模行为是否可重复证明：eval/cache/import/worker queue
+  counters、MCP 验收脚本、真实 e2e 文档计数和 skip 治理。
+- 正式文件流导入/backpressure UI 可以作为 Wave 4 后的产品功能波，不应阻塞当前核心状态合同收口。

@@ -10,6 +10,8 @@ import type {
   FormulaMutationResultWire,
   ImportCellIssueWire,
   ImportCellWire,
+  WorkbookPersistenceRestoreStatsWire,
+  WorkbookPersistenceSnapshotWire,
   RpcErrorWire,
   RpcResponseWire,
   SparseCellWire,
@@ -81,6 +83,10 @@ type WasmWorkbookRuntime = {
     endCol: number,
   ) => FormatRangeSnapshot
   restore_format_snapshot?: (snapshot: FormatRangeSnapshot) => number
+  snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
+  restore_persistence_v1?: (
+    snapshot: WorkbookPersistenceSnapshotWire,
+  ) => WorkbookPersistenceRestoreStatsWire
   debug_formula_cache_state?: (sheetIdx: number, addr: string) => string
   debug_formula_eval_count?: (sheetIdx: number) => number
   debug_cross_sheet_dependents_count?: () => number
@@ -123,6 +129,34 @@ let nextExportId = 1
 const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
 const MIN_EXPORT_ROWS_PER_CHUNK = 1
 const MAX_EXPORT_ROWS_PER_CHUNK = 10_000
+export const MAX_IMPORT_CHUNK_CELLS = 10_000
+export const MAX_IMPORT_SESSION_NORMALIZED_CELLS = 200_000
+export const MAX_IMPORT_SESSION_FINAL_TOUCHES = 200_000
+export const MAX_IMPORT_SESSION_ISSUES = 25_000
+
+type ImportLimits = {
+  chunkCells: number
+  normalizedCells: number
+  finalTouches: number
+  issues: number
+}
+
+const DEFAULT_IMPORT_LIMITS: ImportLimits = {
+  chunkCells: MAX_IMPORT_CHUNK_CELLS,
+  normalizedCells: MAX_IMPORT_SESSION_NORMALIZED_CELLS,
+  finalTouches: MAX_IMPORT_SESSION_FINAL_TOUCHES,
+  issues: MAX_IMPORT_SESSION_ISSUES,
+}
+
+let importLimits: ImportLimits = { ...DEFAULT_IMPORT_LIMITS }
+
+export function __setImportLimitsForTest(limits: Partial<ImportLimits>) {
+  importLimits = { ...DEFAULT_IMPORT_LIMITS, ...limits }
+}
+
+export function __resetImportLimitsForTest() {
+  importLimits = { ...DEFAULT_IMPORT_LIMITS }
+}
 
 async function ensureInit() {
   if (!initPromise)
@@ -414,6 +448,47 @@ export function normalizeImportCells(cells: unknown[]): NormalizedImportChunk {
     else session.cells.push(normalized)
   }
   return session
+}
+
+function ensureImportChunkSize(cells: unknown[]) {
+  if (cells.length > importLimits.chunkCells) {
+    throw Object.assign(new Error(`import chunk too large: ${cells.length}`), {
+      code: 'IMPORT_CHUNK_TOO_LARGE',
+    })
+  }
+}
+
+function projectedFinalTouches(session: ImportSession, cells: ImportCellWire[]): number {
+  if (cells.length === 0) return session.finalTouches.size
+  const next = session.finalTouches.size
+  const uniqueNewTouches = new Set<string>()
+  for (const cell of cells) {
+    uniqueNewTouches.add(importCellKey(cell))
+  }
+  let projected = next
+  for (const key of uniqueNewTouches) {
+    if (!session.finalTouches.has(key)) projected += 1
+  }
+  return projected
+}
+
+function ensureImportSessionLimits(session: ImportSession, chunk: NormalizedImportChunk) {
+  if (session.normalizedCount + chunk.cells.length > importLimits.normalizedCells) {
+    throw Object.assign(new Error('import session exceeded normalized cell limit'), {
+      code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
+    })
+  }
+  const nextFinalTouches = projectedFinalTouches(session, chunk.cells)
+  if (nextFinalTouches > importLimits.finalTouches) {
+    throw Object.assign(new Error('import session exceeded final touch limit'), {
+      code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
+    })
+  }
+  if (session.normalizationIssues.length + chunk.issues.length > importLimits.issues) {
+    throw Object.assign(new Error('import session exceeded issue limit'), {
+      code: 'IMPORT_ISSUES_LIMIT_EXCEEDED',
+    })
+  }
 }
 
 export function mergeImportStatsIssues(
@@ -802,9 +877,10 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               code: 'IMPORT_SESSION_MISSING',
             })
           }
-          const chunk = Array.isArray(msg.cells)
-            ? normalizeImportCells(msg.cells as ImportCellWire[])
-            : { cells: [], issues: [] }
+          const rawCells = Array.isArray(msg.cells) ? msg.cells : []
+          ensureImportChunkSize(rawCells)
+          const chunk = normalizeImportCells(rawCells as ImportCellWire[])
+          ensureImportSessionLimits(session, chunk)
           if (chunk.cells.length > 0) {
             const stats = assertMethod(session.workbook, 'bulk_import_cells').call(
               session.workbook,
@@ -906,6 +982,26 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               .call(wb, range.sheet, range.startRow, range.startCol, range.endRow, range.endCol)
               .map(normalizeSparseCell),
           )
+        }
+        break
+      case 'snapshotPersistenceV1':
+        {
+          const snapshotPersistenceV1 = assertMethod(wb, 'snapshot_persistence_v1')
+          postResponse(msg.id, snapshotPersistenceV1.call(wb))
+        }
+        break
+      case 'restorePersistenceV1':
+        {
+          const restorePersistenceV1 = assertMethod(wb, 'restore_persistence_v1')
+          const stats = restorePersistenceV1.call(
+            wb,
+            msg.snapshot as WorkbookPersistenceSnapshotWire,
+          )
+          resetSubscriptions(wb)
+          importSessions.clear()
+          exportSessions.clear()
+          nextExportId = 1
+          postResponse(msg.id, stats)
         }
         break
       case 'exportRangeTsv':
