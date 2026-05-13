@@ -236,6 +236,9 @@ MCP 验收：
 
 ## 波次 3：真正 bounded 的导入与稀疏持久化 v1
 
+执行计划已落地到 `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md`。本波开始前先提交计划文档，
+再并行启动 import runtime、persistence schema、store/demo 接线和测试/MCP 角色。
+
 ### 目标
 
 把“worker chunk API”推进到“内存有上界、可取消、可持久化、保持 lazy”的产品导入/保存链路。

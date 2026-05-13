@@ -229,17 +229,20 @@ Once agents return:
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
 Recommended pick if the new window has full autonomy after the current commit:
-**B first**, using `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the
-current scope contract and `rust/docs/PHASE5_PARALLEL.md` as historical context.
-Hold **D** until user green-lights it.
+**B first**, using `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md` and
+`rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` as the current scope contract,
+with `rust/docs/PHASE5_PARALLEL.md` as historical context. Hold **D** until
+user green-lights it.
 
 ## File reading order for the next agent
 
 1. This doc (`rust/docs/HANDOFF.md`).
 2. `rust/docs/ONLINE_SPREADSHEET_PLAN.md` — north-star plan.
-3. `rust/docs/PHASE5_PARALLEL.md` — current execution plan.
-4. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
-5. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
+3. `rust/docs/WAVE3_IMPORT_PERSISTENCE_PLAN.md` — current Wave 3 plan.
+4. `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` — overall wave tracker.
+5. `rust/docs/PHASE5_PARALLEL.md` — historical worker/range plan.
+6. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
+7. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
    pattern for a P0 bug (good reference if Phase 5 uncovers one).
 6. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is
    the next target if Phase 5 deepens worker-RPC.
