@@ -23,6 +23,6 @@ Owns drag selection, fill handle, row/column resize, and autoscroll in-progress 
   row/column size arrays.
 - Tests:
   - drag selection boundaries and autoscroll state
-  - fill handle preview cloning without range expansion
+  - fill handle preview/write-range/source-coordinate helpers without range expansion
   - row/column resize commit intents
   - cancel/commit convergence back to idle

@@ -45,6 +45,31 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(cell(page, 'A1')).not.toHaveClass(/cell-active/)
   })
 
+  test('fill handle copies a visible cell through range backend command', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await cell(page, 'A1').click()
+    const handle = page.getByTestId('fill-handle-A1')
+    await expect(handle).toBeVisible()
+    const handleBox = await handle.boundingBox()
+    const targetBox = await cell(page, 'A3').boundingBox()
+    expect(handleBox).not.toBeNull()
+    expect(targetBox).not.toBeNull()
+
+    await page.mouse.move(
+      handleBox!.x + handleBox!.width / 2,
+      handleBox!.y + handleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(targetBox!.x + targetBox!.width / 2, targetBox!.y + targetBox!.height / 2)
+    await page.mouse.up()
+
+    await expect(cellDisplay(page, 'A2')).toHaveText('Alpha')
+    await expect(cellDisplay(page, 'A3')).toHaveText('Alpha')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
+
   test('double-click edit commits the cell value', async ({ page }) => {
     await gotoVNextDemo(page)
 

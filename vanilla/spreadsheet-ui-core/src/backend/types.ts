@@ -10,6 +10,7 @@ export type ProjectionRequestReason =
   | 'keyboard'
   | 'formula-bar'
   | 'clipboard'
+  | 'fill-handle'
   | 'toolbar'
   | 'diagnostics'
   | 'test'
@@ -140,6 +141,17 @@ export interface SetFormatRangeRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export type SpreadsheetFillDirection = 'up' | 'down' | 'left' | 'right'
+
+export interface FillRangeRequest extends SheetRef {
+  kind: 'fill-range'
+  sourceRange: CellRange
+  targetRange: CellRange
+  direction: SpreadsheetFillDirection
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -198,6 +210,7 @@ export interface SpreadsheetBackend {
   insertColumns?(request: InsertColumnsRequest): Promise<BackendMutationResult>
   deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
   setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
+  fillRange?(request: FillRangeRequest): Promise<BackendMutationResult>
   addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>
   renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
   deleteSheet?(request: DeleteSheetRequest): Promise<SheetMutationResult>

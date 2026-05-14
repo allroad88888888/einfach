@@ -6,8 +6,10 @@ This folder must not import worker, WASM, DOM, Solid, or React code. It only
 defines request/response contracts used by commands in the UI core.
 
 Backend ports are range based. A host adapter can read a visible window or an
-explicit user range, but the UI core must not ask for a workbook snapshot,
-formula cache, dependency graph, or sparse sheet dump.
+explicit user range, and can execute compact range commands such as clear,
+format, structural row/column edits, and fill handle copy. The UI core must not
+ask for a workbook snapshot, formula cache, dependency graph, or sparse sheet
+dump.
 
 ## State Decision Template
 

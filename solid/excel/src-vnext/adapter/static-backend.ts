@@ -2,6 +2,7 @@ import type {
   DeleteColumnsRequest,
   DeleteRowsRequest,
   DisplayCell,
+  FillRangeRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
   ProjectionRevision,
@@ -16,6 +17,10 @@ import type {
   SpreadsheetSheetMetadata,
   VisibleProjectionRequest,
   VisibleProjectionResult,
+} from '@einfach/spreadsheet-ui-core'
+import {
+  getFillHandleSourceCoord,
+  getFillHandleWriteRange,
 } from '@einfach/spreadsheet-ui-core'
 import type {
   StaticProjectionRequest,
@@ -474,6 +479,60 @@ function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest)
   return cleared
 }
 
+function applyFillRange(state: StaticBackendState, request: FillRangeRequest): number {
+  const writeRange = getFillHandleWriteRange(
+    request.sourceRange,
+    request.targetRange,
+    request.direction,
+  )
+  if (writeRange === null) {
+    return 0
+  }
+
+  const sourceCells = new Map<string, DisplayCell>()
+  for (const cell of state.cells.values()) {
+    if (isCellInsideRange(cell, request.sourceRange)) {
+      sourceCells.set(keyFor(cell.row, cell.col), cloneCell(cell))
+    }
+  }
+
+  let changed = 0
+  for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
+    for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
+      const sourceCoord = getFillHandleSourceCoord(request.sourceRange, { row, col })
+      const sourceKey = keyFor(sourceCoord.row, sourceCoord.col)
+      const sourceCell = sourceCells.get(sourceKey)
+      const targetKey = keyFor(row, col)
+
+      if (sourceCell) {
+        state.cells.set(targetKey, {
+          ...cloneCell(sourceCell),
+          row,
+          col,
+        })
+      } else {
+        state.cells.delete(targetKey)
+      }
+
+      const sourceFormat = getEffectiveFormat(
+        sourceCoord.row,
+        sourceCoord.col,
+        state.cellFormats,
+        state.rangeFormats,
+      )
+      if (sourceFormat) {
+        state.cellFormats.set(targetKey, sourceFormat)
+      } else {
+        state.cellFormats.delete(targetKey)
+      }
+
+      changed += 1
+    }
+  }
+
+  return changed
+}
+
 function clearCellFormatsInRange(
   cellFormats: Map<string, SpreadsheetCellFormat>,
   range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
@@ -788,6 +847,22 @@ export function createStaticSpreadsheetBackend(
           rowEnd: request.range.rowEnd,
           colStart: request.range.colStart,
           colEnd: request.range.colEnd,
+        },
+      }
+    },
+    async fillRange(request) {
+      applyFillRange(state, request)
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        affectedRange: {
+          rowStart: request.targetRange.rowStart,
+          rowEnd: request.targetRange.rowEnd,
+          colStart: request.targetRange.colStart,
+          colEnd: request.targetRange.colEnd,
         },
       }
     },

@@ -5,6 +5,7 @@ import { createStore } from '@einfach/core'
 import { render, cleanup, fireEvent, waitFor } from '@solidjs/testing-library'
 import type {
   DisplayCell,
+  FillRangeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -423,6 +424,75 @@ describe('vNext SpreadsheetGrid', () => {
     })
 
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+  })
+
+  it('commits fill handle drag as a compact backend fillRange request', async () => {
+    const store = createStore()
+    const fillRangeRequests: FillRangeRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.fillRange = async (request) => {
+      fillRangeRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        affectedRange: request.targetRange,
+      }
+    }
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(6)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    const targetCell = container.querySelector('[data-cell-addr="A3"]') as HTMLElement
+    const originalElementFromPoint = document.elementFromPoint
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: () => targetCell,
+    })
+
+    try {
+      dispatchPointerEvent(getByTestId('fill-handle-A1'), 'pointerdown', {
+        clientX: 1,
+        clientY: 1,
+      })
+      dispatchPointerEvent(window, 'pointermove', { clientX: 1, clientY: 3 })
+      dispatchPointerEvent(window, 'pointerup', { clientX: 1, clientY: 3 })
+
+      await waitFor(() => {
+        expect(fillRangeRequests).toHaveLength(1)
+      })
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      })
+    }
+
+    expect(fillRangeRequests[0]).toEqual({
+      kind: 'fill-range',
+      sheetId: 'sheet-1',
+      sourceRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      targetRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 0 },
+      direction: 'down',
+    })
   })
 
   it('supports ctrl boundary movement and context menu intents', async () => {

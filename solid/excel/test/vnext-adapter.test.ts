@@ -493,6 +493,50 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('fills ranges through static backend without UI-side cell expansion contracts', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 5,
+      matrix: [
+        ['A1', 'B1'],
+        ['A2', 'B2'],
+      ],
+    })
+
+    const mutation = await backend.fillRange?.({
+      kind: 'fill-range',
+      sheetId: 'sheet-1',
+      requestId: 11,
+      sourceRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      targetRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+      direction: 'down',
+    })
+
+    expect(mutation).toMatchObject({
+      sheetId: 'sheet-1',
+      requestId: 11,
+      revision: 6,
+      affectedRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 12,
+        range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+        reason: 'test',
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 0, col: 1, displayValue: 'B1', valueKind: 'string' },
+      { row: 1, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 1, col: 1, displayValue: 'B1', valueKind: 'string' },
+      { row: 2, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 2, col: 1, displayValue: 'B1', valueKind: 'string' },
+    ])
+  })
+
   it('supports sparse seed helpers directly', () => {
     const cells = sparseCellsToDisplayCells([
       { row: 2, col: 2, displayValue: 'C3' },

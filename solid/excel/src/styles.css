@@ -404,6 +404,10 @@ thead .row-header {
   height: 24px;
 }
 
+.spreadsheet-grid-cell {
+  position: relative;
+}
+
 .spreadsheet-grid-col-header,
 .spreadsheet-grid-cell {
   width: 96px;
@@ -488,6 +492,23 @@ thead .row-header {
   color: inherit;
   font: inherit;
   text-align: left;
+}
+
+.spreadsheet-grid-fill-handle {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  z-index: 3;
+  width: 7px;
+  height: 7px;
+  border: 1px solid #fff;
+  padding: 0;
+  background: #1a73e8;
+  cursor: crosshair;
+}
+
+.cell-fill-preview {
+  box-shadow: inset 0 0 0 1px #1a73e8;
 }
 
 /* Range cell highlight (every cell in the rectangle EXCEPT the focus cell).

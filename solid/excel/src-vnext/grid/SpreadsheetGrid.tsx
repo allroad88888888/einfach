@@ -3,15 +3,19 @@ import {
   cancelPointerAtom,
   commitPointerAtom,
   commitEditingAtom,
+  createFillHandlePreview,
   createVisibleProjectionRequest,
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
   getAdjacentSheetId,
+  getFillHandleSourceCoord,
+  getFillHandleWriteRange,
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
   openMenuAtom,
+  pointerSessionAtom,
   selectionSnapshotAtom,
   selectAllAtom,
   selectCellAtom,
@@ -26,7 +30,10 @@ import {
   startPointerAtom,
   startEditingAtom,
   updatePointerAtom,
+  type CellCoord,
+  type CellRange,
   type DisplayCell,
+  type PointerFillHandleCommitIntent,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportSizeOverridesAtom,
@@ -89,14 +96,35 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   return style
 }
 
+function getRangeCellCount(range: CellRange): number {
+  return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+}
+
+function isCoordInRange(row: number, col: number, range: CellRange): boolean {
+  return (
+    row >= range.rowStart &&
+    row <= range.rowEnd &&
+    col >= range.colStart &&
+    col <= range.colEnd
+  )
+}
+
+function getCellInputForFill(cell: DisplayCell | undefined): string {
+  return cell?.formula ?? cell?.displayValue ?? ''
+}
+
+const MAX_UI_FILL_FALLBACK_CELLS = 200
+
 export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const [renderTick, setRenderTick] = createSignal(0)
   let gridRoot: HTMLDivElement | undefined
   let activeResizeCleanup: (() => void) | null = null
+  let activeFillCleanup: (() => void) | null = null
   let unsubscribeProjection: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
+  let unsubscribePointer: (() => void) | null = null
 
   function bumpRender() {
     setRenderTick((value) => value + 1)
@@ -203,6 +231,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   onMount(() => {
     unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
+    unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     store.setter(setViewportMetricsAtom, props.viewport)
     store.setter(setSelectionBoundsAtom, {
       rowCount: props.viewport.rowCount,
@@ -215,7 +244,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   onCleanup(() => {
     unsubscribeProjection?.()
     unsubscribeSizes?.()
+    unsubscribePointer?.()
     activeResizeCleanup?.()
+    activeFillCleanup?.()
     store.setter(cancelPointerAtom)
   })
 
@@ -420,6 +451,102 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return { kind: 'cell', row, col }
   }
 
+  function getCellCoordFromPoint(event: PointerEvent): CellCoord | null {
+    const element = document.elementFromPoint(event.clientX, event.clientY)
+    const cell = element?.closest?.('td.spreadsheet-grid-cell') as HTMLElement | null
+    if (!cell || !gridRoot?.contains(cell)) {
+      return null
+    }
+
+    const row = Number(cell.dataset.row)
+    const col = Number(cell.dataset.col)
+    if (!Number.isInteger(row) || !Number.isInteger(col)) {
+      return null
+    }
+
+    return { row, col }
+  }
+
+  function getFillPreviewRange(): CellRange | null {
+    const session = store.getter(pointerSessionAtom)
+    if (
+      session.status !== 'active' ||
+      session.interaction?.kind !== 'fill-handle' ||
+      session.interaction.sheetId !== props.sheetId
+    ) {
+      return null
+    }
+
+    return session.interaction.previewRange
+  }
+
+  function isFillPreviewCell(row: number, col: number) {
+    const previewRange = getFillPreviewRange()
+    return previewRange ? isCoordInRange(row, col, previewRange) : false
+  }
+
+  async function fallbackFillHandle(intent: PointerFillHandleCommitIntent, writeRange: CellRange) {
+    if (getRangeCellCount(writeRange) > MAX_UI_FILL_FALLBACK_CELLS) {
+      return
+    }
+
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const sourceProjection = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: intent.sheetId,
+      requestId,
+      reason: 'fill-handle',
+      range: intent.sourceRange,
+    })
+    const sourceCells = new Map<string, DisplayCell>()
+    for (const cell of sourceProjection.cells) {
+      sourceCells.set(makeCellKey(cell.row, cell.col), cell)
+    }
+
+    for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
+      for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
+        const sourceCoord = getFillHandleSourceCoord(intent.sourceRange, { row, col })
+        const sourceCell = sourceCells.get(makeCellKey(sourceCoord.row, sourceCoord.col))
+        await backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId: intent.sheetId,
+          row,
+          col,
+          input: getCellInputForFill(sourceCell),
+        })
+      }
+    }
+  }
+
+  async function executeFillHandle(intent: PointerFillHandleCommitIntent) {
+    if (intent.direction === null) {
+      return
+    }
+
+    const writeRange = getFillHandleWriteRange(
+      intent.sourceRange,
+      intent.targetRange,
+      intent.direction,
+    )
+    if (writeRange === null) {
+      return
+    }
+
+    if (backend.fillRange) {
+      await backend.fillRange({
+        kind: 'fill-range',
+        sheetId: intent.sheetId,
+        sourceRange: intent.sourceRange,
+        targetRange: intent.targetRange,
+        direction: intent.direction,
+      })
+    } else {
+      await fallbackFillHandle(intent, writeRange)
+    }
+
+    await loadProjection(requestProjection())
+  }
+
   function selectRow(row: number, extend: boolean) {
     const selection = selectionSnapshot().selection
     const rowAnchor =
@@ -543,10 +670,72 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
   }
 
+  function startFillHandle(event: PointerEvent) {
+    event.preventDefault()
+    event.stopPropagation()
+    activeFillCleanup?.()
+    activeResizeCleanup?.()
+
+    const selection = selectionSnapshot()
+    if (selection.selection.sheetId !== props.sheetId) {
+      return
+    }
+
+    const sourceRange = selection.range
+    const preview = createFillHandlePreview(sourceRange, selection.activeCell)
+    store.setter(startPointerAtom, {
+      kind: 'fill-handle',
+      sheetId: props.sheetId,
+      sourceRange,
+      focus: selection.activeCell,
+      previewRange: preview.previewRange,
+      direction: preview.direction,
+      source: 'pointer',
+    })
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const focus = getCellCoordFromPoint(moveEvent)
+      if (!focus) {
+        return
+      }
+
+      const nextPreview = createFillHandlePreview(sourceRange, focus)
+      store.setter(updatePointerAtom, {
+        kind: 'fill-handle',
+        focus,
+        previewRange: nextPreview.previewRange,
+        direction: nextPreview.direction,
+      })
+      bumpRender()
+    }
+
+    const onPointerUp = () => {
+      const intent = store.setter(commitPointerAtom)
+      cleanupFill()
+      if (intent?.type === 'pointer.fill-handle.commit') {
+        void executeFillHandle(intent)
+      }
+      bumpRender()
+    }
+
+    const cleanupFill = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+      store.setter(cancelPointerAtom)
+      activeFillCleanup = null
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp, { once: true })
+    activeFillCleanup = cleanupFill
+    bumpRender()
+  }
+
   function startColumnResize(event: PointerEvent, col: number) {
     event.preventDefault()
     event.stopPropagation()
     activeResizeCleanup?.()
+    activeFillCleanup?.()
 
     const startClientX = event.clientX
     const startSize = getRenderedColumnWidth(col)
@@ -604,6 +793,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     event.preventDefault()
     event.stopPropagation()
     activeResizeCleanup?.()
+    activeFillCleanup?.()
 
     const startClientY = event.clientY
     const startSize = getRenderedRowHeight(row)
@@ -772,6 +962,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             selected() ? 'is-selected cell-in-range' : ''
                           } ${
                             active() ? 'cell-active' : ''
+                          } ${
+                            isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
                           } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
                           data-row={row}
                           data-col={col}
@@ -846,6 +1038,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   void commitCellEdit()
                                 }
                               }}
+                            />
+                          </Show>
+                          <Show when={active() && !editing()}>
+                            <button
+                              type="button"
+                              class="spreadsheet-grid-fill-handle"
+                              data-testid={`fill-handle-${addr}`}
+                              aria-label={`Fill from ${addr}`}
+                              onPointerDown={startFillHandle}
                             />
                           </Show>
                         </td>

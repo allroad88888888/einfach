@@ -3,6 +3,9 @@ import { describe, expect, test } from '@jest/globals'
 import {
   cancelPointerAtom,
   commitPointerAtom,
+  createFillHandlePreview,
+  getFillHandleSourceCoord,
+  getFillHandleWriteRange,
   pointerIntentAtom,
   pointerIsActiveAtom,
   pointerSessionAtom,
@@ -229,5 +232,42 @@ describe('pointer core', () => {
     })
     expect(store.getter(pointerIntentAtom)).toBeNull()
     expect(store.setter(commitPointerAtom)).toBeNull()
+  })
+
+  test('computes fill handle preview and write ranges without expanding cells', () => {
+    const sourceRange = { rowStart: 1, rowEnd: 2, colStart: 3, colEnd: 4 }
+
+    expect(createFillHandlePreview(sourceRange, { row: 5, col: 4 })).toEqual({
+      previewRange: { rowStart: 1, rowEnd: 5, colStart: 3, colEnd: 4 },
+      direction: 'down',
+    })
+    expect(getFillHandleWriteRange(sourceRange, {
+      rowStart: 1,
+      rowEnd: 5,
+      colStart: 3,
+      colEnd: 4,
+    }, 'down')).toEqual({
+      rowStart: 3,
+      rowEnd: 5,
+      colStart: 3,
+      colEnd: 4,
+    })
+    expect(createFillHandlePreview(sourceRange, { row: 0, col: 4 })).toEqual({
+      previewRange: { rowStart: 0, rowEnd: 2, colStart: 3, colEnd: 4 },
+      direction: 'up',
+    })
+    expect(createFillHandlePreview(sourceRange, { row: 2, col: 7 })).toEqual({
+      previewRange: { rowStart: 1, rowEnd: 2, colStart: 3, colEnd: 7 },
+      direction: 'right',
+    })
+    expect(createFillHandlePreview(sourceRange, { row: 2, col: 1 })).toEqual({
+      previewRange: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 4 },
+      direction: 'left',
+    })
+    expect(getFillHandleWriteRange(sourceRange, sourceRange, null)).toBeNull()
+    expect(getFillHandleSourceCoord(sourceRange, { row: 5, col: 4 })).toEqual({
+      row: 1,
+      col: 4,
+    })
   })
 })
