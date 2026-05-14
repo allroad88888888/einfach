@@ -7,6 +7,7 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  SparseCellWire,
   SparseRangeWire,
   WorkerWorkbookClient,
   WorkbookSheetMeta,
@@ -25,6 +26,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   calls: {
     initWorkbook: string[][]
     readSparseRange: SparseRangeWire[]
+    snapshotRangeSparse: SparseRangeWire[]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
     setFormulaDetailed: Array<{ sheet: number; addr: string; formula: string }>
     clearCell: Array<{ sheet: number; addr: string }>
@@ -51,6 +53,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const calls: FakeWorkerWorkbookClient['calls'] = {
     initWorkbook: [],
     readSparseRange: [],
+    snapshotRangeSparse: [],
     setCell: [],
     setFormulaDetailed: [],
     clearCell: [],
@@ -124,6 +127,63 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       ...cell,
       addr: cell.addr.toUpperCase(),
     })
+  }
+
+  function snapshotToSparseCell(cell: CellSnapshotWire): SparseCellWire | null {
+    const coord = parseCellAddress(cell.addr)
+    if (coord.row < 0 || coord.col < 0) return null
+
+    if (cell.formula) {
+      return {
+        sheet: cell.sheet,
+        addr: cell.addr.toUpperCase(),
+        row: coord.row,
+        col: coord.col,
+        kind: 'formula',
+        value: cell.formula,
+      }
+    }
+
+    switch (cell.type) {
+      case 'number':
+        return {
+          sheet: cell.sheet,
+          addr: cell.addr.toUpperCase(),
+          row: coord.row,
+          col: coord.col,
+          kind: 'number',
+          value: Number(cell.display),
+        }
+      case 'boolean':
+        return {
+          sheet: cell.sheet,
+          addr: cell.addr.toUpperCase(),
+          row: coord.row,
+          col: coord.col,
+          kind: 'boolean',
+          value: cell.display === 'TRUE',
+        }
+      case 'error':
+        return {
+          sheet: cell.sheet,
+          addr: cell.addr.toUpperCase(),
+          row: coord.row,
+          col: coord.col,
+          kind: 'error',
+          value: cell.display,
+        }
+      case 'text':
+        return {
+          sheet: cell.sheet,
+          addr: cell.addr.toUpperCase(),
+          row: coord.row,
+          col: coord.col,
+          kind: 'text',
+          value: cell.display,
+        }
+      default:
+        return null
+    }
   }
 
   function shiftCells(
@@ -318,8 +378,12 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async snapshotSparse() {
       throw new Error('not used')
     },
-    async snapshotRangeSparse() {
-      throw new Error('not used')
+    async snapshotRangeSparse(range) {
+      calls.snapshotRangeSparse.push({ ...range })
+      return [...cells.values()]
+        .filter((cell) => insideRange(cell, range))
+        .map(snapshotToSparseCell)
+        .filter((cell): cell is SparseCellWire => cell !== null)
     },
     async snapshotPersistenceV1() {
       throw new Error('not used')
@@ -850,6 +914,72 @@ describe('vnext adapter', () => {
         formula: '=Sheet1!A1+1',
       },
     ])
+
+    backend.dispose()
+  })
+
+  it('resolves worker workbook data-edge movement through sparse snapshots only', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    await backend.ready()
+    client.putCell({
+      sheet: 0,
+      addr: 'B2',
+      display: '12',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'C2',
+      display: '18',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'D2',
+      display: '',
+      type: 'null',
+      isError: false,
+      formula: '=B2+C2',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'E2',
+      display: 'ready',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+
+    const result = await backend.resolveDataEdge?.({
+      kind: 'resolve-data-edge',
+      sheetId: 'sheet-1',
+      requestId: 18,
+      from: { row: 1, col: 1 },
+      direction: 'right',
+      bounds: { rowCount: 20, colCount: 10 },
+    })
+
+    expect(result).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 18,
+      revision: 6,
+      target: { row: 1, col: 4 },
+    })
+    expect(client.calls.snapshotRangeSparse).toEqual([
+      { sheet: 0, startRow: 1, endRow: 1, startCol: 0, endCol: 9 },
+    ])
+    expect(client.calls.readSparseRange).toEqual([])
+    expect(client.calls.snapshotFormatRange).toEqual([])
 
     backend.dispose()
   })

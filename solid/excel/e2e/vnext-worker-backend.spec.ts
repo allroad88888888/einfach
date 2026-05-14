@@ -40,4 +40,20 @@ test.describe('Solid Excel vNext worker backend', () => {
 
     await expectNoConsoleErrors(page)
   })
+
+  test('resolves data-aware ctrl arrow movement through the Rust worker backend', async ({
+    page,
+  }) => {
+    await gotoVNextWorkerDemo(page)
+
+    await cell(page, 'A4').click()
+    await page.keyboard.press('Control+ArrowRight')
+
+    await expect(page.getByTestId('formula-bar-addr')).toHaveText('C4')
+    await expect(page.getByTestId('status-active-cell')).toHaveText('C4')
+    await expect(cell(page, 'C4')).toHaveClass(/cell-active/)
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+    await expectNoConsoleErrors(page)
+  })
 })

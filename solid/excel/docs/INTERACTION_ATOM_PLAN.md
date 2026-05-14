@@ -429,6 +429,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   `readRangeProjection` 或整行/整列 projection。Grid adapter 仅在 backend 支持该 port
   时拦截 Ctrl/Meta+Arrow 并更新 selection；不支持的 backend 继续走原 sheet-boundary
   fallback。该行为不创建 per-cell atom，也不读取整张 sheet。
+- PC-6 第十六段：worker/Rust workbook backend adapter 已接 `resolveDataEdge`。Worker
+  adapter 使用 `snapshotRangeSparse` 读取目标行或列的非空 cell facts，公式 cell 作为
+  已占用事实参与边界判断，但不读取 display value、不调用 `readSparseRange`、不调用
+  `snapshotFormatRange`，因此不会为了导航触发公式求值或格式投影物化。vNext Worker
+  demo 已覆盖 `Ctrl+ArrowRight` 的真实 Rust worker 路径。
 
 PC-6 第一段验收记录：
 
@@ -618,6 +623,21 @@ PC-6 第十五段验收记录：
   当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为 `Ready`、
   console error 为 0。
 
+PC-6 第十六段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext Worker` demo，点击
+  `A4` 后按 `Ctrl+ArrowRight`；验证 active/formula address 到 `C4`、`C4=source`
+  且 active、当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为
+  `Ready`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -629,8 +649,8 @@ PC-6 第十五段验收记录：
   大范围 streaming clipboard port 仍未接。
 - FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
   但还没有接 sheet reorder mutation。
-- 数据区域感知的 Ctrl+Arrow 已有 optional backend port 和 static backend 第一版；
-  worker/Rust backend 尚未接 `resolveDataEdge`，当前会 fallback 到 sheet-boundary。
+- 数据区域感知的 Ctrl+Arrow 已有 optional backend port，static backend 和 worker/Rust
+  backend adapter 均已接入；后续可继续补更完整的 Excel 空白/非空边界细节测试。
 - Excel 级交互仍缺：row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 

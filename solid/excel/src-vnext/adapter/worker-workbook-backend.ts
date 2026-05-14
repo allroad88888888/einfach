@@ -10,6 +10,8 @@ import type {
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  ResolveDataEdgeRequest,
+  ResolveDataEdgeResult,
   SetCellInputRequest,
   SetFormatRangeRequest,
   SheetMutationResult,
@@ -25,6 +27,7 @@ import {
   createWorkerWorkbook,
   type CellSnapshotWire,
   type CellWire,
+  type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerWorkbookClient,
@@ -392,6 +395,64 @@ function createBackendError(code: string, message: string): Error {
   return Object.assign(new Error(message), { code })
 }
 
+function normalizeCount(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1
+  }
+  return Math.max(1, Math.trunc(value))
+}
+
+function clampIndex(value: number, count: number): number {
+  if (!Number.isFinite(value)) {
+    return 0
+  }
+  return Math.max(0, Math.min(Math.trunc(value), normalizeCount(count) - 1))
+}
+
+function resolveLineDataEdge(
+  fromIndex: number,
+  occupiedIndexes: readonly number[],
+  maxIndex: number,
+  direction: -1 | 1,
+): number {
+  const occupied = new Set(occupiedIndexes)
+  const currentIsNonBlank = occupied.has(fromIndex)
+
+  if (direction > 0) {
+    if (currentIsNonBlank && occupied.has(fromIndex + 1)) {
+      let index = fromIndex + 1
+      while (index < maxIndex && occupied.has(index + 1)) {
+        index += 1
+      }
+      return index
+    }
+
+    const next = occupiedIndexes.find((index) => index > fromIndex)
+    return next ?? maxIndex
+  }
+
+  if (currentIsNonBlank && occupied.has(fromIndex - 1)) {
+    let index = fromIndex - 1
+    while (index > 0 && occupied.has(index - 1)) {
+      index -= 1
+    }
+    return index
+  }
+
+  for (let index = occupiedIndexes.length - 1; index >= 0; index -= 1) {
+    const occupiedIndex = occupiedIndexes[index]
+    if (occupiedIndex < fromIndex) {
+      return occupiedIndex
+    }
+  }
+
+  return 0
+}
+
+function uniqueSortedIndexes(indexes: readonly number[]): number[] {
+  return [...new Set(indexes)].sort((left, right) => left - right)
+}
+
 export function createWorkerWorkbookSpreadsheetBackend(
   options: WorkerWorkbookSpreadsheetBackendOptions,
 ): WorkerWorkbookSpreadsheetBackend {
@@ -495,6 +556,70 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return {
       cells: mergeFormatsIntoCells(cells, range, formatSnapshot),
       revision: requestRevision ?? revision,
+    }
+  }
+
+  async function resolveWorkerDataEdge(
+    request: ResolveDataEdgeRequest,
+  ): Promise<ResolveDataEdgeResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const rowCount = normalizeCount(request.bounds.rowCount)
+    const colCount = normalizeCount(request.bounds.colCount)
+    const from = {
+      row: clampIndex(request.from.row, rowCount),
+      col: clampIndex(request.from.col, colCount),
+    }
+
+    if (request.direction === 'left' || request.direction === 'right') {
+      const cells = await client.snapshotRangeSparse({
+        sheet: sheet.idx,
+        startRow: from.row,
+        endRow: from.row,
+        startCol: 0,
+        endCol: colCount - 1,
+      })
+      const occupiedCols = uniqueSortedIndexes(
+        cells.map((cell: SparseCellWire) => clampIndex(cell.col, colCount)),
+      )
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? revision,
+        target: {
+          row: from.row,
+          col: resolveLineDataEdge(
+            from.col,
+            occupiedCols,
+            colCount - 1,
+            request.direction === 'right' ? 1 : -1,
+          ),
+        },
+      }
+    }
+
+    const cells = await client.snapshotRangeSparse({
+      sheet: sheet.idx,
+      startRow: 0,
+      endRow: rowCount - 1,
+      startCol: from.col,
+      endCol: from.col,
+    })
+    const occupiedRows = uniqueSortedIndexes(
+      cells.map((cell: SparseCellWire) => clampIndex(cell.row, rowCount)),
+    )
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? revision,
+      target: {
+        row: resolveLineDataEdge(
+          from.row,
+          occupiedRows,
+          rowCount - 1,
+          request.direction === 'down' ? 1 : -1,
+        ),
+        col: from.col,
+      },
     }
   }
 
@@ -629,6 +754,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
           colEnd: request.range.colEnd,
         },
       }
+    },
+
+    async resolveDataEdge(request: ResolveDataEdgeRequest): Promise<ResolveDataEdgeResult> {
+      return resolveWorkerDataEdge(request)
     },
 
     async addSheet(request): Promise<SheetMutationResult> {
