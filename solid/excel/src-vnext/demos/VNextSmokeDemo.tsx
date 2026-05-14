@@ -13,8 +13,15 @@ import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
 import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
+const sheets = [
+  { id: 'sheet-1', name: 'Sheet1' },
+  { id: 'sheet-2', name: 'Sheet2' },
+  { id: 'sheet-3', name: 'Sheet3' },
+]
+
 const backend = createStaticSpreadsheetBackend({
   revision: 1,
+  sheets,
   matrix: [
     ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon'],
     ['North', 12, 18, 30, 'ready'],
@@ -45,12 +52,6 @@ const viewport = {
   overscanRows: 0,
   overscanCols: 0,
 }
-
-const sheets = [
-  { id: 'sheet-1', name: 'Sheet1' },
-  { id: 'sheet-2', name: 'Sheet2' },
-  { id: 'sheet-3', name: 'Sheet3' },
-]
 
 function VNextSmokeWorkbook() {
   const store = useSpreadsheetUiStore()

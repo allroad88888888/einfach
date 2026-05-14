@@ -146,7 +146,49 @@ export interface BackendMutationResult extends SheetRef {
   affectedRange?: CellRange
 }
 
+export interface SpreadsheetSheetMetadata {
+  id: string
+  name: string
+  index: number
+}
+
+export interface SheetListResult {
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  sheets: SpreadsheetSheetMetadata[]
+}
+
+export interface AddSheetRequest {
+  kind: 'add-sheet'
+  name?: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface RenameSheetRequest extends SheetRef {
+  kind: 'rename-sheet'
+  name: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface DeleteSheetRequest extends SheetRef {
+  kind: 'delete-sheet'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface SheetMutationResult {
+  sheetId?: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  sheets?: SpreadsheetSheetMetadata[]
+  activeSheetId?: string | null
+  createdSheet?: SpreadsheetSheetMetadata
+}
+
 export interface SpreadsheetBackend {
+  listSheets?(): Promise<SheetListResult>
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
@@ -156,4 +198,7 @@ export interface SpreadsheetBackend {
   insertColumns?(request: InsertColumnsRequest): Promise<BackendMutationResult>
   deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
   setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
+  addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>
+  renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
+  deleteSheet?(request: DeleteSheetRequest): Promise<SheetMutationResult>
 }

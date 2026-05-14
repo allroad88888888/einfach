@@ -12,8 +12,10 @@ import type {
   RangeProjectionResult,
   SetCellInputRequest,
   SetFormatRangeRequest,
+  SheetMutationResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
+  SpreadsheetSheetMetadata,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
@@ -103,6 +105,60 @@ function buildSheetLookup(
   }
 
   return { sheets, byId }
+}
+
+function buildSheetLookupFromSheets(sheets: WorkerWorkbookBackendSheet[]): SheetLookup {
+  const byId = new Map<string, WorkerWorkbookBackendSheet>()
+
+  for (const sheet of sheets) {
+    byId.set(sheet.id, sheet)
+    byId.set(sheet.name, sheet)
+    byId.set(String(sheet.idx), sheet)
+    byId.set(`sheet-${sheet.idx + 1}`, sheet)
+  }
+
+  return { sheets, byId }
+}
+
+function syncSheetLookup(
+  metas: WorkbookSheetMeta[],
+  existingSheets: readonly WorkerWorkbookBackendSheet[],
+): SheetLookup {
+  const usedIds = new Set<string>()
+  const sheets = metas.map((meta, index) => {
+    const existing =
+      existingSheets.find((sheet) => sheet.name === meta.name) ??
+      existingSheets[index] ??
+      existingSheets.find((sheet) => sheet.idx === meta.idx)
+    let id = existing?.id ?? `sheet-${meta.idx + 1}`
+
+    if (usedIds.has(id)) {
+      let nextIdIndex = meta.idx + 1
+      do {
+        nextIdIndex += 1
+        id = `sheet-${nextIdIndex}`
+      } while (usedIds.has(id))
+    }
+
+    usedIds.add(id)
+    return {
+      id,
+      idx: meta.idx,
+      name: meta.name,
+    }
+  })
+
+  return buildSheetLookupFromSheets(sheets)
+}
+
+function toSheetMetadata(
+  sheets: readonly WorkerWorkbookBackendSheet[],
+): SpreadsheetSheetMetadata[] {
+  return sheets.map((sheet, index) => ({
+    id: sheet.id,
+    name: sheet.name,
+    index,
+  }))
 }
 
 function getColumnLabel(index: number): string {
@@ -371,6 +427,46 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return revision
   }
 
+  async function refreshSheetLookup(
+    existingSheets: readonly WorkerWorkbookBackendSheet[] = lookup.sheets,
+  ): Promise<WorkerWorkbookBackendSheet[]> {
+    await readyPromise
+    const metas = await client.sheetList()
+    lookup = syncSheetLookup(metas, existingSheets)
+    return lookup.sheets
+  }
+
+  function sheetMutationResult(
+    requestId: number | undefined,
+    extra: Partial<SheetMutationResult> = {},
+  ): SheetMutationResult {
+    const { revision: resultRevision, ...rest } = extra
+    return {
+      ...rest,
+      requestId,
+      revision: resultRevision ?? revision,
+      sheets: toSheetMetadata(lookup.sheets),
+    }
+  }
+
+  function normalizeSheetName(name: string | undefined, fallback: string): string {
+    const normalized = name?.trim() ?? ''
+    return normalized.length > 0 ? normalized : fallback
+  }
+
+  function nextSheetName(): string {
+    const used = new Set(lookup.sheets.map((sheet) => sheet.name))
+    let index = lookup.sheets.length + 1
+    let name = `Sheet${index}`
+
+    while (used.has(name)) {
+      index += 1
+      name = `Sheet${index}`
+    }
+
+    return name
+  }
+
   async function resolveSheet(sheetId: string): Promise<WorkerWorkbookBackendSheet> {
     await readyPromise
     const sheet = lookup.byId.get(sheetId)
@@ -403,6 +499,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
   }
 
   return {
+    async listSheets() {
+      await refreshSheetLookup()
+      return {
+        revision,
+        sheets: toSheetMetadata(lookup.sheets),
+      }
+    },
+
     async readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult> {
       const result = await readRange(
         request.sheetId,
@@ -525,6 +629,79 @@ export function createWorkerWorkbookSpreadsheetBackend(
           colEnd: request.range.colEnd,
         },
       }
+    },
+
+    async addSheet(request): Promise<SheetMutationResult> {
+      await readyPromise
+      const name = normalizeSheetName(request.name, nextSheetName())
+      const addedIdx = await client.addSheet(name)
+      const nextRevision = bumpRevision()
+      await refreshSheetLookup(lookup.sheets)
+      const createdSheet =
+        lookup.sheets.find((sheet) => sheet.idx === addedIdx) ?? lookup.sheets.at(-1)
+      const createdIndex = createdSheet
+        ? lookup.sheets.findIndex((sheet) => sheet.id === createdSheet.id)
+        : -1
+      const createdMetadata = createdSheet
+        ? { id: createdSheet.id, name: createdSheet.name, index: Math.max(createdIndex, 0) }
+        : undefined
+
+      return sheetMutationResult(request.requestId, {
+        sheetId: createdMetadata?.id,
+        activeSheetId: createdMetadata?.id ?? null,
+        revision: request.revision ?? nextRevision,
+        createdSheet: createdMetadata,
+      })
+    },
+
+    async renameSheet(request): Promise<SheetMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      const name = normalizeSheetName(request.name, '')
+
+      if (name.length === 0) {
+        throw createBackendError('INVALID_SHEET_NAME', 'sheet name cannot be empty')
+      }
+
+      const ok = await client.renameSheet(sheet.idx, name)
+      if (!ok) {
+        throw createBackendError('SHEET_RENAME_FAILED', `cannot rename sheet to: ${name}`)
+      }
+
+      const nextRevision = bumpRevision()
+      const optimisticSheets = lookup.sheets.map((item) =>
+        item.id === request.sheetId ? { ...item, name } : item,
+      )
+      await refreshSheetLookup(optimisticSheets)
+
+      return sheetMutationResult(request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId: request.sheetId,
+        revision: request.revision ?? nextRevision,
+      })
+    },
+
+    async deleteSheet(request): Promise<SheetMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+
+      if (lookup.sheets.length <= 1) {
+        throw createBackendError('SHEET_DELETE_FAILED', 'cannot delete the last sheet')
+      }
+
+      const ok = await client.removeSheet(sheet.idx)
+      if (!ok) {
+        throw createBackendError('SHEET_DELETE_FAILED', `cannot delete sheet: ${request.sheetId}`)
+      }
+
+      const nextRevision = bumpRevision()
+      const remainingSheets = lookup.sheets.filter((item) => item.id !== request.sheetId)
+      await refreshSheetLookup(remainingSheets)
+      const activeSheetId = lookup.sheets[Math.min(sheet.idx, lookup.sheets.length - 1)]?.id ?? null
+
+      return sheetMutationResult(request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId,
+        revision: request.revision ?? nextRevision,
+      })
     },
 
     ready() {

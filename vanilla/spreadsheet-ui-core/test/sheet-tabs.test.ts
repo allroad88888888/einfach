@@ -11,7 +11,9 @@ import {
   createUpdateSheetTabRenameIntent,
   dispatchSheetTabIntentAtom,
   normalizeSheetTabDraftName,
+  setSheetTabsSheetsAtom,
   sheetTabsAtom,
+  sheetTabsSheetsAtom,
 } from '../src/sheet-tabs'
 
 describe('sheet tabs core', () => {
@@ -111,5 +113,24 @@ describe('sheet tabs core', () => {
     expect(createCommitSheetTabRenameIntent({ sheetId: 'sheet-1', name: '   ' })).toBeNull()
 
     expect(applySheetTabIntent(initialState, { type: 'sheet-tab.rename.cancel', sheetId: 'x', reason: 'escape' })).toBe(initialState)
+  })
+
+  test('stores normalized workbook sheet metadata without materializing cell state', () => {
+    const store = createStore()
+
+    store.setter(setSheetTabsSheetsAtom, {
+      revision: 3,
+      sheets: [
+        { id: ' sheet-1 ', name: ' Sheet1 ', index: 7 },
+        { id: 'sheet-2', name: 'Sheet2', index: 1 },
+        { id: 'sheet-2', name: 'Duplicate id', index: 2 },
+        { id: '', name: 'Bad', index: 3 },
+      ],
+    })
+
+    expect(store.getter(sheetTabsSheetsAtom)).toEqual([
+      { id: 'sheet-1', name: 'Sheet1', index: 7 },
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+    ])
   })
 })

@@ -11,8 +11,11 @@ import type {
   RangeProjectionResult,
   SetCellInputRequest,
   SetFormatRangeRequest,
+  SheetListResult,
+  SheetMutationResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
+  SpreadsheetSheetMetadata,
   SpreadsheetNumberFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -26,8 +29,14 @@ export type StaticSeedCells = readonly DisplayCell[]
 
 export interface StaticSpreadsheetSeed {
   revision?: ProjectionRevision
+  sheets?: readonly (string | StaticSpreadsheetSheetInput)[]
   matrix?: StaticSeedMatrix
   cells?: StaticSeedCells
+}
+
+export interface StaticSpreadsheetSheetInput {
+  id?: string
+  name: string
 }
 
 export type StaticSpreadsheetSeedInput = StaticSeedMatrix | StaticSeedCells | StaticSpreadsheetSeed
@@ -41,6 +50,7 @@ export type StaticProjectionResult =
   | RangeProjectionResult
 
 export type StaticSpreadsheetMutationResult = BackendMutationResult
+export type StaticSpreadsheetSheetMutationResult = SheetMutationResult
 
 export type {
   BackendMutationResult,
@@ -55,8 +65,11 @@ export type {
   RangeProjectionResult,
   SetCellInputRequest,
   SetFormatRangeRequest,
+  SheetListResult,
+  SheetMutationResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
+  SpreadsheetSheetMetadata,
   SpreadsheetNumberFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,

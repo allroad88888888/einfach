@@ -35,6 +35,9 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
+    addSheet: string[]
+    renameSheet: Array<{ sheet: number; name: string }>
+    removeSheet: number[]
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -58,6 +61,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     deleteColumns: [],
     setFormatRange: [],
     snapshotFormatRange: [],
+    addSheet: [],
+    renameSheet: [],
+    removeSheet: [],
   }
   let metas: WorkbookSheetMeta[] = []
 
@@ -169,14 +175,29 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async sheetList() {
       return metas
     },
-    async addSheet() {
-      throw new Error('not used')
+    async addSheet(name) {
+      calls.addSheet.push(name)
+      const idx = metas.length
+      metas = [...metas, { idx, name }]
+      return idx
     },
-    async renameSheet() {
-      throw new Error('not used')
+    async renameSheet(sheet, name) {
+      calls.renameSheet.push({ sheet, name })
+      if (metas.some((meta) => meta.idx !== sheet && meta.name === name)) {
+        return false
+      }
+      metas = metas.map((meta) => (meta.idx === sheet ? { ...meta, name } : meta))
+      return true
     },
-    async removeSheet() {
-      throw new Error('not used')
+    async removeSheet(sheet) {
+      calls.removeSheet.push(sheet)
+      if (metas.length <= 1) {
+        return false
+      }
+      metas = metas
+        .filter((meta) => meta.idx !== sheet)
+        .map((meta, idx) => ({ ...meta, idx }))
+      return true
     },
     async setCell(sheet, addr, value) {
       calls.setCell.push({ sheet, addr: addr.toUpperCase(), value })
@@ -570,6 +591,41 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('tracks static backend sheet metadata mutations without cell materialization', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+      matrix: [['A1']],
+    })
+
+    expect((await backend.listSheets?.())?.sheets).toEqual([
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+    ])
+
+    const add = await backend.addSheet?.({ kind: 'add-sheet', name: 'Data' })
+    expect(add?.createdSheet).toEqual({ id: 'sheet-3', name: 'Data', index: 2 })
+
+    const rename = await backend.renameSheet?.({
+      kind: 'rename-sheet',
+      sheetId: 'sheet-2',
+      name: 'Inputs',
+    })
+    expect(rename?.sheets?.map((sheet) => sheet.name)).toEqual(['Sheet1', 'Inputs', 'Data'])
+
+    const remove = await backend.deleteSheet?.({
+      kind: 'delete-sheet',
+      sheetId: 'sheet-2',
+    })
+    expect(remove?.activeSheetId).toBe('sheet-3')
+    expect(remove?.sheets).toEqual([
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-3', name: 'Data', index: 1 },
+    ])
+  })
+
   it('projects static backend formats only inside requested windows', async () => {
     const backend = createStaticSpreadsheetBackend({
       cells: [
@@ -954,6 +1010,51 @@ describe('vnext adapter', () => {
       { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
       { row: 2, col: 0, displayValue: 'A2', valueKind: 'string' },
       { row: 2, col: 1, displayValue: 'C2', valueKind: 'string' },
+    ])
+
+    backend.dispose()
+  })
+
+  it('routes worker workbook sheet add, rename, delete through metadata backend port', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+      revision: 20,
+    })
+
+    await backend.ready()
+    expect((await backend.listSheets?.())?.sheets).toEqual([
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+    ])
+
+    const add = await backend.addSheet?.({ kind: 'add-sheet', name: 'Calc' })
+    expect(client.calls.addSheet).toEqual(['Calc'])
+    expect(add).toMatchObject({
+      sheetId: 'sheet-3',
+      activeSheetId: 'sheet-3',
+      revision: 21,
+      createdSheet: { id: 'sheet-3', name: 'Calc', index: 2 },
+    })
+
+    const rename = await backend.renameSheet?.({
+      kind: 'rename-sheet',
+      sheetId: 'sheet-2',
+      name: 'Inputs',
+    })
+    expect(client.calls.renameSheet).toEqual([{ sheet: 1, name: 'Inputs' }])
+    expect(rename?.sheets?.map((sheet) => sheet.name)).toEqual(['Sheet1', 'Inputs', 'Calc'])
+
+    const remove = await backend.deleteSheet?.({ kind: 'delete-sheet', sheetId: 'sheet-2' })
+    expect(client.calls.removeSheet).toEqual([1])
+    expect(remove?.activeSheetId).toBe('sheet-3')
+    expect(remove?.sheets).toEqual([
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-3', name: 'Calc', index: 1 },
     ])
 
     backend.dispose()

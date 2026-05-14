@@ -1,4 +1,5 @@
 import { atom } from '@einfach/core'
+import type { ProjectionRevision, SpreadsheetSheetMetadata } from '../backend'
 
 export type SheetTabInteractionSource = 'pointer' | 'keyboard' | 'context-menu' | 'programmatic'
 
@@ -89,6 +90,16 @@ export interface SheetTabsState {
   lastIntent: SheetTabIntent | null
 }
 
+export interface SheetTabsSheetState {
+  sheets: SpreadsheetSheetMetadata[]
+  revision?: ProjectionRevision
+}
+
+export interface SetSheetTabsSheetsInput {
+  sheets: readonly SpreadsheetSheetMetadata[]
+  revision?: ProjectionRevision
+}
+
 export interface OpenSheetTabContextMenuInput {
   sheetId: string
   x: number
@@ -131,6 +142,11 @@ export const DEFAULT_SHEET_TABS_STATE: SheetTabsState = {
   rename: null,
   reorder: null,
   lastIntent: null,
+}
+
+export const DEFAULT_SHEET_TABS_SHEET_STATE: SheetTabsSheetState = {
+  sheets: [],
+  revision: undefined,
 }
 
 export function normalizeSheetTabDraftName(name: string): string | null {
@@ -384,6 +400,14 @@ export function applySheetTabIntent(
 export const sheetTabsAtom = atom<SheetTabsState>(DEFAULT_SHEET_TABS_STATE)
 sheetTabsAtom.debugLabel = 'spreadsheet.sheetTabs.state'
 
+export const sheetTabsSheetStateAtom = atom<SheetTabsSheetState>(
+  DEFAULT_SHEET_TABS_SHEET_STATE,
+)
+sheetTabsSheetStateAtom.debugLabel = 'spreadsheet.sheetTabs.sheets'
+
+export const sheetTabsSheetsAtom = atom((get) => get(sheetTabsSheetStateAtom).sheets)
+sheetTabsSheetsAtom.debugLabel = 'spreadsheet.sheetTabs.sheetList'
+
 export const dispatchSheetTabIntentAtom = atom(
   (get) => get(sheetTabsAtom),
   (get, set, intent: SheetTabIntent): SheetTabsState => {
@@ -393,6 +417,66 @@ export const dispatchSheetTabIntentAtom = atom(
   },
 )
 dispatchSheetTabIntentAtom.debugLabel = 'spreadsheet.sheetTabs.dispatchIntent'
+
+export const setSheetTabsSheetsAtom = atom(
+  (get) => get(sheetTabsSheetStateAtom),
+  (_get, set, input: SetSheetTabsSheetsInput): SheetTabsSheetState => {
+    const nextState: SheetTabsSheetState = {
+      sheets: normalizeSheetMetadataList(input.sheets),
+      revision: input.revision,
+    }
+    set(sheetTabsSheetStateAtom, nextState)
+    return nextState
+  },
+)
+setSheetTabsSheetsAtom.debugLabel = 'spreadsheet.sheetTabs.setSheets'
+
+export const patchSheetTabsSheetNameAtom = atom(
+  (get) => get(sheetTabsSheetStateAtom),
+  (get, set, input: { sheetId: string; name: string }): SheetTabsSheetState => {
+    const normalizedName = normalizeSheetTabDraftName(input.name)
+    if (normalizedName === null) {
+      return get(sheetTabsSheetStateAtom)
+    }
+
+    const current = get(sheetTabsSheetStateAtom)
+    const nextSheets = current.sheets.map((sheet) =>
+      sheet.id === input.sheetId ? { ...sheet, name: normalizedName } : sheet,
+    )
+    const nextState: SheetTabsSheetState = {
+      ...current,
+      sheets: nextSheets,
+    }
+    set(sheetTabsSheetStateAtom, nextState)
+    return nextState
+  },
+)
+patchSheetTabsSheetNameAtom.debugLabel = 'spreadsheet.sheetTabs.patchSheetName'
+
+function normalizeSheetMetadataList(
+  sheets: readonly SpreadsheetSheetMetadata[],
+): SpreadsheetSheetMetadata[] {
+  const normalized: SpreadsheetSheetMetadata[] = []
+  const seen = new Set<string>()
+
+  sheets.forEach((sheet, index) => {
+    const id = sheet.id.trim()
+    const name = normalizeSheetTabDraftName(sheet.name)
+
+    if (id.length === 0 || name === null || seen.has(id)) {
+      return
+    }
+
+    seen.add(id)
+    normalized.push({
+      id,
+      name,
+      index: Number.isInteger(sheet.index) && sheet.index >= 0 ? sheet.index : index,
+    })
+  })
+
+  return normalized
+}
 
 function normalizeCoordinate(value: number): number {
   if (!Number.isFinite(value)) {

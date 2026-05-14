@@ -398,6 +398,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   再走 backend `clearRange` / 单格 clear；Paste 读取系统剪贴板 TSV 后按目标左上角
   写入 `setCellInput` 并刷新当前可视 projection。无 streaming port 的大范围 clipboard
   先用 10k cell 阈值拦住，避免前端物化百万格。
+- PC-6 第十段：vNext SheetTabs 的 add/rename/delete 已接入 backend workbook metadata
+  mutation。`@einfach/spreadsheet-ui-core` 新增 sheet list snapshot atom 和 sheet metadata
+  backend port；Solid 组件只展示当前 sheet metadata snapshot，真实列表来自 static/worker
+  backend 的 `listSheets` / `addSheet` / `renameSheet` / `deleteSheet`。Sheet tab 仍只创建
+  tab 级 atom 状态，不创建整张 sheet 或 cell atom。
 
 PC-6 第一段验收记录：
 
@@ -510,17 +515,31 @@ PC-6 第九段验收记录：
   当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 状态为 `Ready`、
   console error 为 0。
 
+PC-6 第十段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/sheet-tabs.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-sheet-tabs.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，点击 `+` 新增
+  `Sheet4`，双击改名为 `Report`，右键 `Report` 执行 Delete 并确认；验证
+  `Report` 消失、active tab 回到 `Sheet3`、当前仍只渲染 30 个可视 cell、`J20`
+  offscreen 未挂载、状态栏显示 `30 cells`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
-  public entry 还未切到 vNext，worker adapter 也还没接 sheet rename/reorder/delete 等完整
-  workbook mutation。
+  public entry 还未切到 vNext。sheet add/rename/delete 已接入 vNext backend port；
+  sheet reorder 仍未接 Rust/worker/backend port。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
   mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 已接真实
   range format mutation；ContextMenu Copy/Cut/Paste 已接真实 clipboard executor，但
   大范围 streaming clipboard port 仍未接。
-- FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
-  mutation。
+- FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
+  但还没有接 sheet reorder mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、
   fill handle、row/col resize。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。

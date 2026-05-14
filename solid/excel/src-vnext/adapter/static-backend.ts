@@ -10,8 +10,10 @@ import type {
   ClearRangeRequest,
   SetCellInputRequest,
   SetFormatRangeRequest,
+  SheetMutationResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
+  SpreadsheetSheetMetadata,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
@@ -22,6 +24,7 @@ import type {
   StaticSeedMatrix,
   StaticSeedValue,
   StaticSpreadsheetSeedInput,
+  StaticSpreadsheetSheetInput,
 } from './types'
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -117,6 +120,7 @@ interface StaticBackendState {
   cells: Map<string, DisplayCell>
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
+  sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
 }
 
@@ -162,6 +166,7 @@ function sparseCellsToCells(cells: StaticSeedCells): DisplayCell[] {
 function buildState(
   cells: DisplayCell[],
   revision: ProjectionRevision,
+  sheets: SpreadsheetSheetMetadata[] = normalizeStaticSheets(),
 ): StaticBackendState {
   const cellMap = new Map<string, DisplayCell>()
   const cellFormats = new Map<string, SpreadsheetCellFormat>()
@@ -177,6 +182,7 @@ function buildState(
     cells: cellMap,
     cellFormats,
     rangeFormats: [],
+    sheets,
     revision,
   }
 }
@@ -194,13 +200,120 @@ function normalizeSeed(input: StaticSpreadsheetSeedInput): StaticBackendState {
     cells?: StaticSeedCells
     matrix?: StaticSeedMatrix
     revision?: ProjectionRevision
+    sheets?: readonly (string | StaticSpreadsheetSheetInput)[]
   }
   const cells = [
     ...(seed.matrix ? matrixToCells(seed.matrix) : []),
     ...(seed.cells ? sparseCellsToCells(seed.cells) : []),
   ]
 
-  return buildState(cells, seed.revision ?? 0)
+  return buildState(cells, seed.revision ?? 0, normalizeStaticSheets(seed.sheets))
+}
+
+function normalizeStaticSheets(
+  sheets: readonly (string | StaticSpreadsheetSheetInput)[] | undefined = undefined,
+): SpreadsheetSheetMetadata[] {
+  const input = sheets && sheets.length > 0 ? sheets : ['Sheet1']
+  const normalized: SpreadsheetSheetMetadata[] = []
+  const seenIds = new Set<string>()
+  const seenNames = new Set<string>()
+
+  input.forEach((sheet, index) => {
+    const id = typeof sheet === 'string' ? `sheet-${index + 1}` : sheet.id ?? `sheet-${index + 1}`
+    const name = typeof sheet === 'string' ? sheet : sheet.name
+    const normalizedId = id.trim()
+    const normalizedName = name.trim()
+
+    if (
+      normalizedId.length === 0 ||
+      normalizedName.length === 0 ||
+      seenIds.has(normalizedId) ||
+      seenNames.has(normalizedName)
+    ) {
+      return
+    }
+
+    seenIds.add(normalizedId)
+    seenNames.add(normalizedName)
+    normalized.push({
+      id: normalizedId,
+      name: normalizedName,
+      index: normalized.length,
+    })
+  })
+
+  return normalized.length > 0 ? normalized : [{ id: 'sheet-1', name: 'Sheet1', index: 0 }]
+}
+
+function cloneSheets(sheets: readonly SpreadsheetSheetMetadata[]): SpreadsheetSheetMetadata[] {
+  return sheets.map((sheet, index) => ({
+    id: sheet.id,
+    name: sheet.name,
+    index,
+  }))
+}
+
+function createNextSheetId(sheets: readonly SpreadsheetSheetMetadata[]): string {
+  const used = new Set(sheets.map((sheet) => sheet.id))
+  let index = sheets.length + 1
+  let id = `sheet-${index}`
+
+  while (used.has(id)) {
+    index += 1
+    id = `sheet-${index}`
+  }
+
+  return id
+}
+
+function createNextSheetName(sheets: readonly SpreadsheetSheetMetadata[]): string {
+  const used = new Set(sheets.map((sheet) => sheet.name))
+  let index = sheets.length + 1
+  let name = `Sheet${index}`
+
+  while (used.has(name)) {
+    index += 1
+    name = `Sheet${index}`
+  }
+
+  return name
+}
+
+function normalizeSheetMutationName(
+  name: string | undefined,
+  fallback: string,
+): string {
+  const normalized = name?.trim() ?? ''
+  return normalized.length > 0 ? normalized : fallback
+}
+
+function assertUniqueSheetName(
+  sheets: readonly SpreadsheetSheetMetadata[],
+  name: string,
+  exceptSheetId?: string,
+) {
+  const exists = sheets.some((sheet) => sheet.id !== exceptSheetId && sheet.name === name)
+  if (exists) {
+    throw new Error(`sheet name already exists: ${name}`)
+  }
+}
+
+function reindexSheets(sheets: readonly SpreadsheetSheetMetadata[]): SpreadsheetSheetMetadata[] {
+  return sheets.map((sheet, index) => ({ ...sheet, index }))
+}
+
+function sheetMutationResult(
+  state: StaticBackendState,
+  requestId: number | undefined,
+  extra: Partial<SheetMutationResult> = {},
+): SheetMutationResult {
+  const { revision: resultRevision, ...rest } = extra
+  return {
+    ...rest,
+    requestId,
+    revision: resultRevision ?? state.revision,
+    sheets: cloneSheets(state.sheets),
+  }
 }
 
 function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number }): boolean {
@@ -566,6 +679,12 @@ export function createStaticSpreadsheetBackend(
   const state = normalizeSeed(seed)
 
   return {
+    async listSheets() {
+      return {
+        revision: state.revision,
+        sheets: cloneSheets(state.sheets),
+      }
+    },
     async readVisibleProjection(request) {
       return buildProjectionResult(request, state) as VisibleProjectionResult
     },
@@ -671,6 +790,66 @@ export function createStaticSpreadsheetBackend(
           colEnd: request.range.colEnd,
         },
       }
+    },
+    async addSheet(request) {
+      const name = normalizeSheetMutationName(request.name, createNextSheetName(state.sheets))
+      assertUniqueSheetName(state.sheets, name)
+
+      const createdSheet: SpreadsheetSheetMetadata = {
+        id: createNextSheetId(state.sheets),
+        name,
+        index: state.sheets.length,
+      }
+      state.sheets = [...state.sheets, createdSheet]
+      state.revision = bumpRevision(state.revision)
+
+      return sheetMutationResult(state, request.requestId, {
+        sheetId: createdSheet.id,
+        activeSheetId: createdSheet.id,
+        createdSheet,
+      })
+    },
+    async renameSheet(request) {
+      const name = normalizeSheetMutationName(request.name, '')
+      if (name.length === 0) {
+        throw new Error('sheet name cannot be empty')
+      }
+
+      const sheet = state.sheets.find((item) => item.id === request.sheetId)
+      if (!sheet) {
+        throw new Error(`unknown sheet: ${request.sheetId}`)
+      }
+      assertUniqueSheetName(state.sheets, name, request.sheetId)
+
+      state.sheets = state.sheets.map((item) =>
+        item.id === request.sheetId ? { ...item, name } : item,
+      )
+      state.revision = bumpRevision(state.revision)
+
+      return sheetMutationResult(state, request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId: request.sheetId,
+      })
+    },
+    async deleteSheet(request) {
+      if (state.sheets.length <= 1) {
+        throw new Error('cannot delete the last sheet')
+      }
+
+      const deleteIndex = state.sheets.findIndex((sheet) => sheet.id === request.sheetId)
+      if (deleteIndex < 0) {
+        throw new Error(`unknown sheet: ${request.sheetId}`)
+      }
+
+      const nextSheets = state.sheets.filter((sheet) => sheet.id !== request.sheetId)
+      state.sheets = reindexSheets(nextSheets)
+      state.revision = bumpRevision(state.revision)
+      const activeSheetId = state.sheets[Math.min(deleteIndex, state.sheets.length - 1)]?.id ?? null
+
+      return sheetMutationResult(state, request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId,
+      })
     },
   }
 }

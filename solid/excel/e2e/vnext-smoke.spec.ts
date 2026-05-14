@@ -74,6 +74,30 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(page.getByTestId('vnext-grid')).toBeVisible()
   })
 
+  test('sheet tab add rename and delete mutate workbook metadata', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await page.getByTestId('sheet-tab-add').click()
+    const created = page.getByRole('tab', { name: 'Sheet4' })
+    await expect(created).toHaveAttribute('data-active', 'true')
+
+    await created.dblclick()
+    const editor = page.getByTestId('vnext-sheet-tabs').getByRole('textbox')
+    await editor.fill('Report')
+    await editor.press('Enter')
+    const renamed = page.getByRole('tab', { name: 'Report' })
+    await expect(renamed).toHaveAttribute('data-active', 'true')
+
+    page.once('dialog', async (dialog) => {
+      await dialog.accept()
+    })
+    await renamed.click({ button: 'right' })
+    await page.getByTestId('sheet-tab-menu-delete').click()
+    await expect(page.getByRole('tab', { name: 'Report' })).toHaveCount(0)
+    await expect(page.getByRole('tab', { name: 'Sheet3' })).toHaveAttribute('data-active', 'true')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+  })
+
   test('keyboard boundary movement updates active address without rendering offscreen cells', async ({ page }) => {
     await gotoVNextDemo(page)
 

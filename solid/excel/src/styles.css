@@ -654,6 +654,58 @@ thead .row-header {
   background: #e8f0fe;
 }
 
+.spreadsheet-sheet-tab-item {
+  display: flex;
+  align-items: center;
+}
+
+.spreadsheet-sheet-tab-rename {
+  min-width: 72px;
+  max-width: 160px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid #1a73e8;
+  border-radius: 4px 4px 0 0;
+  background: #fff;
+  font-family: inherit;
+  font-size: 13px;
+  outline: none;
+}
+
+.spreadsheet-sheet-tab-context-menu {
+  position: fixed;
+  z-index: 40;
+  min-width: 128px;
+  padding: 4px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #fff;
+  box-shadow: 0 8px 24px rgb(140 149 159 / 20%);
+}
+
+.spreadsheet-sheet-tab-context-menu button {
+  display: block;
+  width: 100%;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #24292f;
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.spreadsheet-sheet-tab-context-menu button:hover:not(:disabled) {
+  background: #f6f8fa;
+}
+
+.spreadsheet-sheet-tab-context-menu button:disabled {
+  color: #8c959f;
+  cursor: default;
+}
+
 .spreadsheet-status-bar {
   display: flex;
   align-items: center;
