@@ -34,6 +34,7 @@ export const messages: Record<string, string> = {
   'nav.worker': 'Worker',
   'nav.million': '1M Cells',
   'nav.vnext': 'vNext',
+  'nav.vnextWorker': 'vNext Worker',
 
   // Demo headings + descriptions.
   'demo.blank.title': 'Blank Spreadsheet',

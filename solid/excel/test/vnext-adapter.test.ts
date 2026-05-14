@@ -3,13 +3,238 @@ import {
   createRangeProjectionRequest,
   createVisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
+import type {
+  CellRefWire,
+  CellSnapshotWire,
+  CellWire,
+  SparseRangeWire,
+  WorkerWorkbookClient,
+  WorkbookSheetMeta,
+} from '../src/wasm-workbook-proxy'
 import {
   createStaticSpreadsheetBackend,
+  createWorkerWorkbookSpreadsheetBackend,
   matrixToDisplayCells,
   matrixToVisibleProjectionResult,
   sparseCellsToDisplayCells,
   sparseCellsToRangeProjectionResult,
 } from '../src-vnext/adapter'
+
+type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
+  calls: {
+    initWorkbook: string[][]
+    readSparseRange: SparseRangeWire[]
+    setCell: Array<{ sheet: number; addr: string; value: CellWire }>
+    setFormulaDetailed: Array<{ sheet: number; addr: string; formula: string }>
+    clearCell: Array<{ sheet: number; addr: string }>
+  }
+  putCell(cell: CellSnapshotWire): void
+  emitDirty(cells: CellRefWire[]): void
+}
+
+function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
+  const cells = new Map<string, CellSnapshotWire>()
+  const dirtyListeners = new Set<(cells: CellRefWire[]) => void>()
+  const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
+  const calls: FakeWorkerWorkbookClient['calls'] = {
+    initWorkbook: [],
+    readSparseRange: [],
+    setCell: [],
+    setFormulaDetailed: [],
+    clearCell: [],
+  }
+  let metas: WorkbookSheetMeta[] = []
+
+  function key(sheet: number, addr: string) {
+    return `${sheet}:${addr.toUpperCase()}`
+  }
+
+  function parseCellAddress(addr: string): { row: number; col: number } {
+    const match = addr.toUpperCase().match(/^([A-Z]+)(\d+)$/)
+    if (!match) return { row: -1, col: -1 }
+
+    let col = 0
+    for (let index = 0; index < match[1].length; index += 1) {
+      col = col * 26 + (match[1].charCodeAt(index) - 64)
+    }
+    return {
+      row: Number(match[2]) - 1,
+      col: col - 1,
+    }
+  }
+
+  function insideRange(cell: CellSnapshotWire, range: SparseRangeWire) {
+    const coord = parseCellAddress(cell.addr)
+    return (
+      cell.sheet === range.sheet &&
+      coord.row >= range.startRow &&
+      coord.row <= range.endRow &&
+      coord.col >= range.startCol &&
+      coord.col <= range.endCol
+    )
+  }
+
+  function putCell(cell: CellSnapshotWire) {
+    cells.set(key(cell.sheet, cell.addr), {
+      ...cell,
+      addr: cell.addr.toUpperCase(),
+    })
+  }
+
+  const client: FakeWorkerWorkbookClient = {
+    calls,
+    putCell,
+    emitDirty(dirtyCells) {
+      for (const listener of dirtyListeners) listener(dirtyCells)
+    },
+    async initWorkbook(sheets = ['Sheet1']) {
+      calls.initWorkbook.push([...sheets])
+      metas = sheets.map((name, idx) => ({ idx, name }))
+      return metas
+    },
+    async sheetList() {
+      return metas
+    },
+    async addSheet() {
+      throw new Error('not used')
+    },
+    async renameSheet() {
+      throw new Error('not used')
+    },
+    async removeSheet() {
+      throw new Error('not used')
+    },
+    async setCell(sheet, addr, value) {
+      calls.setCell.push({ sheet, addr: addr.toUpperCase(), value })
+      if (value.type === 'null') {
+        cells.delete(key(sheet, addr))
+      } else {
+        putCell({
+          sheet,
+          addr,
+          display: value.type === 'boolean' ? (value.value ? 'TRUE' : 'FALSE') : String(value.value),
+          type: value.type,
+          isError: value.type === 'error',
+          formula: '',
+        })
+      }
+      return true
+    },
+    async setFormula() {
+      throw new Error('not used')
+    },
+    async setFormulaDetailed(sheet, addr, formula) {
+      calls.setFormulaDetailed.push({ sheet, addr: addr.toUpperCase(), formula })
+      putCell({
+        sheet,
+        addr,
+        display: '',
+        type: 'null',
+        isError: false,
+        formula,
+      })
+      return { ok: true }
+    },
+    async clearCell(sheet, addr) {
+      calls.clearCell.push({ sheet, addr: addr.toUpperCase() })
+      cells.delete(key(sheet, addr))
+      return true
+    },
+    async clearRange() {
+      throw new Error('not used')
+    },
+    async setFormatRange() {
+      throw new Error('not used')
+    },
+    async snapshotFormatRange() {
+      throw new Error('not used')
+    },
+    async restoreFormatSnapshot() {
+      throw new Error('not used')
+    },
+    async beginImport() {
+      throw new Error('not used')
+    },
+    async importChunk() {
+      throw new Error('not used')
+    },
+    async commitImport() {
+      throw new Error('not used')
+    },
+    async cancelImport() {
+      throw new Error('not used')
+    },
+    async readCells() {
+      throw new Error('not used')
+    },
+    async listNonEmpty() {
+      throw new Error('not used')
+    },
+    async snapshotSparse() {
+      throw new Error('not used')
+    },
+    async snapshotRangeSparse() {
+      throw new Error('not used')
+    },
+    async snapshotPersistenceV1() {
+      throw new Error('not used')
+    },
+    async restorePersistenceV1() {
+      throw new Error('not used')
+    },
+    async exportRangeTsv() {
+      throw new Error('not used')
+    },
+    async beginExportRangeTsv() {
+      throw new Error('not used')
+    },
+    async nextExportRangeTsvChunk() {
+      throw new Error('not used')
+    },
+    async cancelExport() {
+      throw new Error('not used')
+    },
+    async exportRangeTsvChunks() {
+      throw new Error('not used')
+    },
+    async restoreSparse() {
+      throw new Error('not used')
+    },
+    async readSparseRange(range) {
+      calls.readSparseRange.push({ ...range })
+      return [...cells.values()].filter((cell) => insideRange(cell, range))
+    },
+    async debugFormulaCacheState() {
+      throw new Error('not used')
+    },
+    async debugFormulaEvalCount() {
+      throw new Error('not used')
+    },
+    async debugCounters() {
+      throw new Error('not used')
+    },
+    async subscribeCells() {
+      throw new Error('not used')
+    },
+    async unsubscribeCells() {
+      throw new Error('not used')
+    },
+    onCellsDirty(callback) {
+      dirtyListeners.add(callback)
+      return () => dirtyListeners.delete(callback)
+    },
+    onCellsHydrated(callback) {
+      hydratedListeners.add(callback)
+      return () => hydratedListeners.delete(callback)
+    },
+    dispose() {
+      dirtyListeners.clear()
+      hydratedListeners.clear()
+    },
+  }
+
+  return client
+}
 
 describe('vnext adapter', () => {
   it('converts matrix seeds into bounded visible-window results', () => {
@@ -168,5 +393,157 @@ describe('vnext adapter', () => {
       revision: 11,
     })
     expect(result.cells).toEqual([{ row: 0, col: 0, displayValue: 'A1', valueKind: 'string' }])
+  })
+
+  it('adapts worker workbook sparse reads into visible projections', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+      revision: 4,
+    })
+
+    await backend.ready()
+    client.putCell({
+      sheet: 1,
+      addr: 'B2',
+      display: '42',
+      type: 'number',
+      isError: false,
+      formula: '=Sheet1!A1+1',
+    })
+
+    const result = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 12,
+        window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(client.calls.initWorkbook).toEqual([['Sheet1', 'Sheet2']])
+    expect(client.calls.readSparseRange).toEqual([
+      { sheet: 1, startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+    ])
+    expect(result).toMatchObject({
+      kind: 'visible-window',
+      sheetId: 'sheet-2',
+      requestId: 12,
+      revision: 4,
+      window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+    })
+    expect(result.cells).toEqual([
+      {
+        row: 1,
+        col: 1,
+        displayValue: '42',
+        valueKind: 'number',
+        formula: '=Sheet1!A1+1',
+      },
+    ])
+
+    backend.dispose()
+  })
+
+  it('routes worker workbook mutations through value, formula, and clear commands', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+    })
+
+    await backend.ready()
+
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: '123',
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 1,
+      input: ' text ',
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 2,
+      input: '=A1+1',
+    })
+    const clearResult = await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      requestId: 99,
+      revision: 8,
+      row: 0,
+      col: 0,
+      input: '',
+    })
+
+    expect(client.calls.setCell).toEqual([
+      { sheet: 0, addr: 'A1', value: { type: 'number', value: 123 } },
+      { sheet: 0, addr: 'B1', value: { type: 'text', value: 'text' } },
+    ])
+    expect(client.calls.setFormulaDetailed).toEqual([
+      { sheet: 0, addr: 'C1', formula: '=A1+1' },
+    ])
+    expect(client.calls.clearCell).toEqual([{ sheet: 0, addr: 'A1' }])
+    expect(clearResult).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 99,
+      revision: 8,
+      affectedRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+
+    backend.dispose()
+  })
+
+  it('bumps worker backend projection revision after dirty events and mutations', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 1,
+    })
+
+    await backend.ready()
+    client.emitDirty([{ sheet: 0, addr: 'A1' }])
+
+    const afterDirty = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: '7',
+    })
+    const afterMutation = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 2,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(afterDirty.revision).toBe(2)
+    expect(afterMutation.revision).toBe(3)
+
+    backend.dispose()
   })
 })

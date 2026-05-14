@@ -378,6 +378,9 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   intent 变成 backend mutation，并刷新当前可视 projection。StatusBar 只读 core/projection
   atom，展示 active cell、selection、projection status、visible cell count、loaded value count
   和最近 toolbar/menu command。
+- PC-6 第五段：vNext 新增 worker workbook backend adapter 和 `vNext Worker` demo。vNext UI
+  仍只依赖 `SpreadsheetBackend` port；真实 Rust worker 通过 adapter 提供
+  `readSparseRange` 可视投影和 `setCell` / `setFormulaDetailed` / `clearCell` mutation。
 
 PC-6 第一段验收记录：
 
@@ -427,9 +430,23 @@ PC-6 第四段验收记录：
   右键 `A1` 执行 Delete 后 menu 隐藏、`A1` 为空、loaded count 变为 `29 loaded`、
   console error 为 0。
 
+PC-6 第五段验收记录：
+
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/i18n.test.ts --runInBand`
+- `npx jest solid/excel/test/vnext-*.test* --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- MCP Playwright：打开 `http://127.0.0.1:5173/` 的 `vNext Worker` demo，验证
+  `Sheet1!C2=13`、`Sheet1!B4=10`、30 个可视 cell、`J20` offscreen 未挂载；
+  将 `Sheet1!B4` 改成 `20` 后，`Sheet1!C2=23`、切到 `Sheet2` 后 `C2=22`、
+  切到 `Sheet3` 后 `C2=21`，console error 为 0。
+
 仍未完成：
 
-- vNext adapter 还只是 static backend；尚未接入真实 worker/Rust workbook port。
+- vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
+  public entry 还未切到 vNext，worker adapter 也还没接 sheet rename/reorder/delete 等完整
+  workbook mutation。
 - vNext chrome UI 已有 status bar；Toolbar 仍只产生 intent，ContextMenu 只有 `cell.clear`
   接了真实 mutation，尚未接真实 format / row-column mutation / clipboard command executor。
 - FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
