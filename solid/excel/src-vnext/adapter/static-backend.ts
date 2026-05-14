@@ -5,9 +5,12 @@ import type {
   FillRangeRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
+  CellRange,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  RangeTsvExportRequest,
+  RangeTsvExportResult,
   ClearRangeRequest,
   ReorderSheetRequest,
   ResolveDataEdgeRequest,
@@ -119,6 +122,48 @@ function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
 }
 
+type SparseTsvCell = {
+  row: number
+  col: number
+  kind: 'number' | 'text' | 'boolean' | 'error' | 'formula'
+  value: string | number | boolean
+}
+
+function estimateUtf8Bytes(text: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).length
+  }
+  let bytes = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3
+  }
+  return bytes
+}
+
+function sparseTsvCellField(cell: SparseTsvCell): string {
+  if (cell.kind === 'boolean') return cell.value ? 'TRUE' : 'FALSE'
+  return String(cell.value)
+}
+
+function sparseCellsToTsv(cells: SparseTsvCell[], range: CellRange): string {
+  const fields = new Map<string, string>()
+  for (const cell of cells) {
+    if (!isCoordInsideRange(cell.row, cell.col, range)) continue
+    fields.set(keyFor(cell.row, cell.col), sparseTsvCellField(cell))
+  }
+
+  const rows: string[] = []
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    const fieldsInRow: string[] = []
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      fieldsInRow.push(fields.get(keyFor(row, col)) ?? '')
+    }
+    rows.push(fieldsInRow.join('\t'))
+  }
+  return rows.join('\n')
+}
+
 interface RangeFormatLayer {
   range: {
     rowStart: number
@@ -201,6 +246,88 @@ function buildState(
     colWidthsBySheetId: new Map(),
     sheets,
     revision,
+  }
+}
+
+function toA1(row: number, col: number): string {
+  let current = col + 1
+  let label = ''
+
+  while (current > 0) {
+    const remainder = (current - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    current = Math.floor((current - 1) / 26)
+  }
+
+  return `${label}${row + 1}`
+}
+
+function displayCellToSparseTsvCell(cell: DisplayCell): SparseTsvCell {
+  if (cell.formula !== undefined) {
+    return {
+      row: cell.row,
+      col: cell.col,
+      kind: 'formula',
+      value: cell.formula,
+    }
+  }
+
+  switch (cell.valueKind) {
+    case 'number':
+      return {
+        row: cell.row,
+        col: cell.col,
+        kind: 'number',
+        value: Number(cell.displayValue),
+      }
+    case 'boolean':
+      return {
+        row: cell.row,
+        col: cell.col,
+        kind: 'boolean',
+        value: cell.displayValue === 'TRUE',
+      }
+    case 'error':
+      return {
+        row: cell.row,
+        col: cell.col,
+        kind: 'error',
+        value: cell.displayValue,
+      }
+    default:
+      return {
+        row: cell.row,
+        col: cell.col,
+        kind: 'text',
+        value: cell.displayValue,
+      }
+  }
+}
+
+function exportRangeTsvFromState(
+  state: StaticBackendState,
+  request: RangeTsvExportRequest,
+): RangeTsvExportResult {
+  const cells = [...state.cells.values()]
+    .filter((cell) => isCellInsideRange(cell, request.range))
+    .sort(compareCells)
+    .map(displayCellToSparseTsvCell)
+  const text = sparseCellsToTsv(cells, request.range)
+
+  return {
+    kind: 'range-tsv',
+    sheetId: request.sheetId,
+    requestId: request.requestId,
+    revision: request.revision ?? state.revision,
+    range: {
+      rowStart: request.range.rowStart,
+      rowEnd: request.range.rowEnd,
+      colStart: request.range.colStart,
+      colEnd: request.range.colEnd,
+    },
+    originAddr: toA1(request.range.rowStart, request.range.colStart),
+    text,
+    estimatedBytes: estimateUtf8Bytes(text),
   }
 }
 
@@ -943,6 +1070,9 @@ export function createStaticSpreadsheetBackend(
         revision: state.revision,
         sheets: cloneSheets(state.sheets),
       }
+    },
+    async exportRangeTsv(request) {
+      return exportRangeTsvFromState(state, request)
     },
     async readVisibleProjection(request) {
       return buildProjectionResult(request, state) as VisibleProjectionResult

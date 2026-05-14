@@ -11,6 +11,10 @@ format, structural row/column edits, and fill handle copy. The UI core must not
 ask for a workbook snapshot, formula cache, dependency graph, or sparse sheet
 dump.
 
+Clipboard-style TSV export is also range based. `exportRangeTsv` returns a TSV
+body plus origin metadata for the requested range; the body must not include any
+clipboard marker line.
+
 Data-navigation ports return a single coordinate, not a row/column projection.
 For example, `resolveDataEdge` lets a host adapter answer Ctrl+Arrow movement
 from sparse facts without materializing a full row or column in the UI layer.

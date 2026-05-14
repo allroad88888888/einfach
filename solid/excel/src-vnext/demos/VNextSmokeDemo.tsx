@@ -47,8 +47,8 @@ const viewport = {
   viewportWidth: 480,
   rowHeight: 24,
   colWidth: 96,
-  rowCount: 20,
-  colCount: 10,
+  rowCount: 200,
+  colCount: 100,
   overscanRows: 0,
   overscanCols: 0,
 }

@@ -1,6 +1,7 @@
 import { onCleanup, onMount, For, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
+  CLIPBOARD_ORIGIN_MARKER_PREFIX,
   closeMenuAtom,
   copyClipboardAtom,
   createRangeProjectionRequest,
@@ -16,11 +17,13 @@ import {
   type CellCoord,
   type CellRange,
   type ClipboardTextData,
+  type ClipboardTransferInput,
   type MenuCommandIntent,
   type MenuCommandKind,
   type MenuTarget,
   type MenuTargetKind,
   type RangeProjectionResult,
+  type RangeTsvExportResult,
   type SpreadsheetError,
 } from '@einfach/spreadsheet-ui-core'
 
@@ -103,6 +106,10 @@ function rangeCellCount(range: CellRange): number {
 
 function clipboardTextCellCount(data: ClipboardTextData): number {
   return data.cells.reduce((count, row) => count + row.length, 0)
+}
+
+function addClipboardOriginMarker(text: string, originAddr: string): string {
+  return `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${originAddr}\n${text}`
 }
 
 function targetToRange(target: MenuTarget): CellRange | null {
@@ -250,15 +257,6 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
   }
 
   async function readClipboardSource(sheetId: string, range: CellRange) {
-    const cellCount = rangeCellCount(range)
-    if (cellCount > CLIPBOARD_CELL_LIMIT) {
-      const error = clipboardError(
-        `Clipboard range is too large: ${cellCount} cells. Streaming copy is not wired yet.`,
-      )
-      store.setter(setClipboardErrorAtom, error)
-      return null
-    }
-
     const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
     const request = createRangeProjectionRequest({
       sheetId,
@@ -270,22 +268,66 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     return backend.readRangeProjection(request)
   }
 
+  async function exportClipboardSource(
+    sheetId: string,
+    range: CellRange,
+  ): Promise<RangeTsvExportResult | null> {
+    if (!backend.exportRangeTsv) {
+      const cellCount = rangeCellCount(range)
+      store.setter(
+        setClipboardErrorAtom,
+        clipboardError(
+          `Clipboard range is too large: ${cellCount} cells. Backend streaming export unavailable.`,
+        ),
+      )
+      return null
+    }
+
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    return backend.exportRangeTsv({
+      kind: 'export-range-tsv',
+      sheetId,
+      range,
+      requestId,
+    })
+  }
+
   async function copyRangeToClipboard(
     sheetId: string,
     range: CellRange,
     operation: 'copy' | 'cut' = 'copy',
   ): Promise<boolean> {
-    const result = await readClipboardSource(sheetId, range)
-    if (!result) return false
+    const cellCount = rangeCellCount(range)
+    let text: string
+    let transferInput: ClipboardTransferInput
+    if (cellCount > CLIPBOARD_CELL_LIMIT) {
+      const result = await exportClipboardSource(sheetId, range)
+      if (!result) return false
 
-    const data = resultToClipboardText(result, range)
-    const text = serializeClipboardTsv(data)
-    const transferInput = {
-      source: { sheetId, range },
-      serialization: 'tab-separated' as const,
-      includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
-      includesErrors: result.cells.some((cell) => cell.valueKind === 'error' || !!cell.error),
-      estimatedBytes: text.length,
+      text = addClipboardOriginMarker(result.text, result.originAddr)
+      const data = parseClipboardTsv(text, result.originAddr)
+      transferInput = {
+        source: { sheetId, range },
+        serialization: 'tab-separated' as const,
+        includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
+        includesErrors: false,
+        estimatedBytes: result.estimatedBytes ?? text.length,
+        revision: result.revision ?? undefined,
+      }
+    } else {
+      const result = await readClipboardSource(sheetId, range)
+      if (!result) return false
+
+      const data = resultToClipboardText(result, range)
+      text = serializeClipboardTsv(data)
+      transferInput = {
+        source: { sheetId, range },
+        serialization: 'tab-separated' as const,
+        includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
+        includesErrors: result.cells.some((cell) => cell.valueKind === 'error' || !!cell.error),
+        estimatedBytes: text.length,
+        revision: result.revision ?? undefined,
+      }
     }
     store.setter(operation === 'cut' ? cutClipboardAtom : copyClipboardAtom, transferInput)
 

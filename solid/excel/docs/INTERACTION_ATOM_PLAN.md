@@ -449,6 +449,15 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   static backend 按 `sheetId` 持久化 size metadata，worker adapter 在 JS adapter 层维护 size
   metadata，底层 Rust workbook 暂未持久化 row/col size。该链路不读取 cell projection、
   不创建 row/col atom，也不维护全量尺寸数组。
+- PC-6 第十九段：vNext ContextMenu 已接大范围 TSV streaming clipboard export。
+  `@einfach/spreadsheet-ui-core` 增加可选 backend `exportRangeTsv` port；小范围 copy/cut
+  继续走 bounded `readRangeProjection`，超过 10k cell 的 range copy/cut 优先走
+  backend TSV export，返回 TSV body 和 origin metadata，Solid 侧只补 clipboard marker，
+  不再读取 range projection。static backend 用 sparse state 生成 TSV；worker/Rust adapter
+  优先走 `exportRangeTsvChunks`，再 fallback `exportRangeTsv`，不会调用
+  `readSparseRange`、`snapshotRangeSparse` 或 `snapshotFormatRange`。vNext smoke demo
+  逻辑边界提高到 200x100，e2e 用 `Ctrl+Shift+End` 选 2 万格并验证仍只挂载 30 个可视
+  cell。
 
 PC-6 第一段验收记录：
 
@@ -683,6 +692,22 @@ PC-6 第十八段验收记录：
   `B2` 高度均为 `36px`，当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、
   projection 为 `Ready`、console error 为 0。
 
+PC-6 第十九段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/backend-contract.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-context-menu.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，mock clipboard
+  后点击 `A1` 并派发 `Ctrl+Shift+End`，验证 selection 为 `A1:CV200`；右键
+  `A1` 执行 Copy 后，clipboard 以 `# einfach-clipboard-origin: A1` 开头、
+  共 201 行，当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为
+  `Ready`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -691,8 +716,8 @@ PC-6 第十八段验收记录：
   Rust core/wasm 仍未实现真正的 `move_sheet`。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
   mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 已接真实
-  range format mutation；ContextMenu Copy/Cut/Paste 已接真实 clipboard executor，但
-  大范围 streaming clipboard port 仍未接。
+  range format mutation；ContextMenu Copy/Cut/Paste 已接真实 clipboard executor，
+  大范围 copy/cut 已接 backend TSV streaming export。
 - FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete
   和 metadata reorder mutation；Rust-level sheet order mutation 仍待单独设计。
 - 数据区域感知的 Ctrl+Arrow 已有 optional backend port，static backend 和 worker/Rust

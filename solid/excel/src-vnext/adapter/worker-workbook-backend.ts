@@ -10,6 +10,8 @@ import type {
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  RangeTsvExportRequest,
+  RangeTsvExportResult,
   ReorderSheetRequest,
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
@@ -528,6 +530,18 @@ function uniqueSortedIndexes(indexes: readonly number[]): number[] {
   return [...new Set(indexes)].sort((left, right) => left - right)
 }
 
+function estimateUtf8Bytes(text: string): number {
+  if (typeof TextEncoder !== 'undefined') {
+    return new TextEncoder().encode(text).length
+  }
+  let bytes = 0
+  for (let index = 0; index < text.length; index += 1) {
+    const code = text.charCodeAt(index)
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3
+  }
+  return bytes
+}
+
 export function createWorkerWorkbookSpreadsheetBackend(
   options: WorkerWorkbookSpreadsheetBackendOptions,
 ): WorkerWorkbookSpreadsheetBackend {
@@ -684,6 +698,32 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  async function exportRangeTsv(
+    request: RangeTsvExportRequest,
+  ): Promise<RangeTsvExportResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const sparseRange = toSparseRange(sheet.idx, request.range)
+    let text = ''
+
+    if (typeof client.exportRangeTsvChunks === 'function') {
+      const chunks = await client.exportRangeTsvChunks(sparseRange, request.rowsPerChunk)
+      text = chunks.join('\n')
+    } else {
+      text = await client.exportRangeTsv(sparseRange)
+    }
+
+    return {
+      kind: 'range-tsv',
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? revision,
+      range: { ...request.range },
+      originAddr: toA1(request.range.rowStart, request.range.colStart),
+      text,
+      estimatedBytes: estimateUtf8Bytes(text),
+    }
+  }
+
   async function resolveWorkerDataEdge(
     request: ResolveDataEdgeRequest,
   ): Promise<ResolveDataEdgeResult> {
@@ -789,6 +829,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
         range: { ...request.range },
         cells: result.cells,
       }
+    },
+
+    async exportRangeTsv(request: RangeTsvExportRequest): Promise<RangeTsvExportResult> {
+      return exportRangeTsv(request)
     },
 
     async readViewportSizeProjection(

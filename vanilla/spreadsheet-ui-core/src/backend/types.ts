@@ -85,6 +85,24 @@ export interface RangeProjectionResult extends SheetRef {
   truncated?: boolean
 }
 
+export interface RangeTsvExportRequest extends SheetRef {
+  kind: 'export-range-tsv'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  rowsPerChunk?: number
+}
+
+export interface RangeTsvExportResult extends SheetRef {
+  kind: 'range-tsv'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  originAddr: string
+  text: string
+  estimatedBytes?: number
+}
+
 export interface SetCellInputRequest extends SheetRef {
   kind: 'set-cell-input'
   row: number
@@ -274,6 +292,7 @@ export interface SpreadsheetBackend {
   listSheets?(): Promise<SheetListResult>
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
+  exportRangeTsv?(request: RangeTsvExportRequest): Promise<RangeTsvExportResult>
   readViewportSizeProjection?(
     request: ViewportSizeProjectionRequest,
   ): Promise<ViewportSizeProjectionResult>

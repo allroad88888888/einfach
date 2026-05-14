@@ -37,6 +37,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
+    exportRangeTsv: SparseRangeWire[]
+    exportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     addSheet: string[]
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
@@ -64,6 +66,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     deleteColumns: [],
     setFormatRange: [],
     snapshotFormatRange: [],
+    exportRangeTsv: [],
+    exportRangeTsvChunks: [],
     addSheet: [],
     renameSheet: [],
     removeSheet: [],
@@ -391,11 +395,13 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async restorePersistenceV1() {
       throw new Error('not used')
     },
-    async exportRangeTsv() {
-      throw new Error('not used')
+    async exportRangeTsv(range) {
+      calls.exportRangeTsv.push({ ...range })
+      return 'fallback'
     },
-    async beginExportRangeTsv() {
-      throw new Error('not used')
+    async beginExportRangeTsv(range, rowsPerChunk = 2048) {
+      calls.exportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      return { sessionId: 1, totalRows: 1, rowsPerChunk }
     },
     async nextExportRangeTsvChunk() {
       throw new Error('not used')
@@ -403,8 +409,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async cancelExport() {
       throw new Error('not used')
     },
-    async exportRangeTsvChunks() {
-      throw new Error('not used')
+    async exportRangeTsvChunks(range, rowsPerChunk = 2048) {
+      calls.exportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      return ['chunk-1', 'chunk-2']
     },
     async restoreSparse() {
       throw new Error('not used')
@@ -555,6 +562,36 @@ describe('vnext adapter', () => {
       { row: 1, col: 0, displayValue: 'A2', valueKind: 'string' },
       { row: 1, col: 1, displayValue: 'B2', valueKind: 'string' },
     ])
+  })
+
+  it('exports TSV from static backend with formula source and origin metadata', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 9,
+      cells: [
+        { row: 1, col: 1, displayValue: '42', valueKind: 'number', formula: '=A1+A2' },
+        { row: 1, col: 2, displayValue: 'hello', valueKind: 'string' },
+        { row: 2, col: 1, displayValue: 'TRUE', valueKind: 'boolean' },
+      ],
+    })
+
+    const result = await backend.exportRangeTsv?.({
+      kind: 'export-range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 19,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+    })
+
+    const expectedText = '=A1+A2\thello\nTRUE\t'
+    expect(result).toEqual({
+      kind: 'range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 19,
+      revision: 9,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      originAddr: 'B2',
+      text: expectedText,
+      estimatedBytes: Buffer.byteLength(expectedText, 'utf8'),
+    })
   })
 
   it('fills ranges through static backend without UI-side cell expansion contracts', async () => {
@@ -1041,6 +1078,93 @@ describe('vnext adapter', () => {
       { sheet: 0, startRow: 1, endRow: 1, startCol: 0, endCol: 9 },
     ])
     expect(client.calls.readSparseRange).toEqual([])
+    expect(client.calls.snapshotFormatRange).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('exports TSV through worker workbook chunk export before falling back to plain export', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    await backend.ready()
+    client.exportRangeTsvChunks = async (range, rowsPerChunk) => {
+      client.calls.exportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      return ['A\tB', 'C\tD']
+    }
+
+    const result = await backend.exportRangeTsv?.({
+      kind: 'export-range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 20,
+      revision: 11,
+      rowsPerChunk: 2,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+    })
+
+    expect(result).toEqual({
+      kind: 'range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 20,
+      revision: 11,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      originAddr: 'B2',
+      text: 'A\tB\nC\tD',
+      estimatedBytes: 7,
+    })
+    expect(client.calls.exportRangeTsvChunks).toEqual([
+      { sheet: 0, startRow: 1, startCol: 1, endRow: 2, endCol: 2, rowsPerChunk: 2 },
+    ])
+    expect(client.calls.exportRangeTsv).toEqual([])
+    expect(client.calls.readSparseRange).toEqual([])
+    expect(client.calls.snapshotRangeSparse).toEqual([])
+    expect(client.calls.snapshotFormatRange).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('falls back to worker workbook plain export when chunk export is unavailable', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 8,
+    })
+
+    await backend.ready()
+    client.exportRangeTsvChunks = undefined as unknown as WorkerWorkbookClient['exportRangeTsvChunks']
+    client.exportRangeTsv = async (range) => {
+      client.calls.exportRangeTsv.push({ ...range })
+      return 'fallback-body'
+    }
+
+    const result = await backend.exportRangeTsv?.({
+      kind: 'export-range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+
+    expect(result).toEqual({
+      kind: 'range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 8,
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      originAddr: 'A1',
+      text: 'fallback-body',
+      estimatedBytes: 13,
+    })
+    expect(client.calls.exportRangeTsv).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+    ])
+    expect(client.calls.exportRangeTsvChunks).toEqual([])
+    expect(client.calls.readSparseRange).toEqual([])
+    expect(client.calls.snapshotRangeSparse).toEqual([])
     expect(client.calls.snapshotFormatRange).toEqual([])
 
     backend.dispose()

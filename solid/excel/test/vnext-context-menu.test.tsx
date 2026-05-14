@@ -10,6 +10,8 @@ import type {
   InsertColumnsRequest,
   InsertRowsRequest,
   RangeProjectionRequest,
+  RangeTsvExportRequest,
+  RangeTsvExportResult,
   SetCellInputRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -66,6 +68,7 @@ function createFakeBackend() {
   const deleteColumnsRequests: DeleteColumnsRequest[] = []
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const readRangeRequests: RangeProjectionRequest[] = []
+  const exportRangeTsvRequests: RangeTsvExportRequest[] = []
   const rangeCells = [
     { row: 0, col: 0, displayValue: 'A1' },
     { row: 0, col: 1, displayValue: '2', formula: '=A1+1' },
@@ -99,6 +102,19 @@ function createFakeBackend() {
             cell.col >= request.range.colStart &&
             cell.col <= request.range.colEnd,
         ),
+      }
+    },
+    async exportRangeTsv(request): Promise<RangeTsvExportResult> {
+      exportRangeTsvRequests.push(request)
+      return {
+        kind: 'range-tsv',
+        sheetId: request.sheetId,
+        range: request.range,
+        requestId: request.requestId,
+        revision: request.revision,
+        originAddr: 'A1',
+        text: '1\t2',
+        estimatedBytes: 3,
       }
     },
     async setCellInput(request) {
@@ -168,6 +184,7 @@ function createFakeBackend() {
     deleteColumnsRequests,
     readVisibleRequests,
     readRangeRequests,
+    exportRangeTsvRequests,
   }
 }
 
@@ -429,6 +446,94 @@ describe('vNext SpreadsheetContextMenu', () => {
       },
     })
     await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+  })
+
+  it('copies oversized range targets through backend TSV export without reading cells', async () => {
+    const clipboard = installClipboard()
+    const store = createStore()
+    const { backend, readRangeRequests, exportRangeTsvRequests } = createFakeBackend()
+    const range = { rowStart: 0, rowEnd: 100, colStart: 0, colEnd: 99 }
+
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-clipboard.copy'))
+
+    await waitFor(() => expect(clipboard.writeText).toHaveBeenCalledTimes(1))
+    expect(exportRangeTsvRequests).toEqual([
+      {
+        kind: 'export-range-tsv',
+        sheetId: 'sheet-1',
+        range,
+        requestId: 1,
+      },
+    ])
+    expect(readRangeRequests).toEqual([])
+    expect(clipboard.getText()).toBe('# einfach-clipboard-origin: A1\n1\t2')
+    expect(store.getter(clipboardStateAtom)).toMatchObject({
+      status: 'ready',
+      intent: {
+        type: 'clipboard.copy',
+      },
+      payload: {
+        cellCount: 10_100,
+        serialization: 'tab-separated',
+      },
+    })
+  })
+
+  it('reports unavailable backend streaming export for oversized copy ranges', async () => {
+    const store = createStore()
+    const { backend, readRangeRequests } = createFakeBackend()
+    const range = { rowStart: 0, rowEnd: 100, colStart: 0, colEnd: 99 }
+
+    delete backend.exportRangeTsv
+
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-clipboard.copy'))
+
+    await waitFor(() =>
+      expect(store.getter(clipboardStateAtom)).toMatchObject({
+        status: 'error',
+        error: {
+          code: 'BACKEND_ERROR',
+        },
+      }),
+    )
+    expect(store.getter(clipboardStateAtom).error?.message).toMatch(
+      /backend streaming export unavailable/i,
+    )
+    expect(readRangeRequests).toEqual([])
   })
 
   it('cuts a range target by copying and then clearing through backend clearRange', async () => {

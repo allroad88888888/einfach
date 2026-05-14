@@ -35,6 +35,18 @@ describe('backend contract', () => {
           cells: [{ row: request.range.rowStart, col: request.range.colStart, displayValue: 'A' }],
         }
       },
+      async exportRangeTsv(request) {
+        return {
+          kind: 'range-tsv',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 'r5',
+          range: request.range,
+          originAddr: 'B2',
+          text: 'A\tB\nC\tD',
+          estimatedBytes: 7,
+        }
+      },
       async readViewportSizeProjection(request) {
         return {
           kind: 'viewport-size',
@@ -95,6 +107,12 @@ describe('backend contract', () => {
       requestId: 10,
       window: { rowStart: 2, rowEnd: 3, colStart: 1, colEnd: 2 },
     })
+    const tsvResult = await backend.exportRangeTsv?.({
+      kind: 'export-range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 13,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+    })
     const mutationResult = await backend.setCellInput({
       kind: 'set-cell-input',
       sheetId: 'sheet-1',
@@ -138,6 +156,16 @@ describe('backend contract', () => {
       requestId: 10,
       rowHeights: [{ rowIndex: 2, heightPx: 32 }],
       colWidths: [{ colIndex: 1, widthPx: 128 }],
+    })
+    expect(tsvResult).toMatchObject({
+      kind: 'range-tsv',
+      sheetId: 'sheet-1',
+      requestId: 13,
+      revision: 'r5',
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      originAddr: 'B2',
+      text: 'A\tB\nC\tD',
+      estimatedBytes: 7,
     })
     expect(rowHeightResult).toMatchObject({
       sheetId: 'sheet-1',

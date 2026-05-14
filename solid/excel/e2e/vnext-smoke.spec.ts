@@ -328,4 +328,30 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
     await expect(cell(page, 'J20')).toHaveCount(0)
   })
+
+  test('oversized range copy uses backend TSV export without mounting offscreen cells', async ({
+    page,
+    context,
+  }) => {
+    await grantClipboard(context)
+    await gotoVNextDemo(page)
+
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+Shift+End')
+    await expect(page.getByTestId('status-selection')).toHaveText('A1:CV200')
+
+    await cell(page, 'A1').click({ button: 'right' })
+    const menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await expect(menu).toHaveAttribute('data-menu-target-kind', 'range')
+
+    await page.getByTestId('context-menu-command-clipboard.copy').click()
+    await expect(menu).toHaveCount(0)
+
+    const text = await page.evaluate(() => navigator.clipboard.readText())
+    expect(text.startsWith('# einfach-clipboard-origin: A1\nAlpha\tBeta')).toBe(true)
+    expect(text.split('\n')).toHaveLength(201)
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
 })
