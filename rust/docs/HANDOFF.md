@@ -3,8 +3,8 @@
 > Date: 2026-05-14 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified committed tip: `707da13` (Wave 5 file import plan)
-> Current verified worktree: Wave 5 file import/backpressure implementation complete and locally/MCP verified
+> Last verified committed tip: `4337eb7` (Wave 5 file import/backpressure)
+> Current verified worktree: clean after Wave 5; Wave 6 product hardening starts from worker-backed MultiSheet planning
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
@@ -16,8 +16,8 @@ acceptance contracts. After that, Phase 5 partial work also landed worker-owned
 workbook RPC, staged imports, large range clear undo, range-native clipboard
 export, horizontal virtual scroll restoration, range-native large format, and
 large range format undo. Wave 2 chunked TSV export, Wave 3 bounded import +
-sparse persistence v1, Wave 4 observability gates, and current Wave 5
-file import/backpressure implementation are done locally.
+sparse persistence v1, Wave 4 observability gates, and Wave 5
+file import/backpressure implementation are committed locally.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -26,7 +26,7 @@ file import/backpressure implementation are done locally.
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
-| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `707da13` + current worktree | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; bounded import + sparse persistence v1; observability counters/e2e/MCP gates; file-stream import/backpressure UI. Remaining gaps are product hardening and release gates |
+| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `4337eb7` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; bounded import + sparse persistence v1; observability counters/e2e/MCP gates; file-stream import/backpressure UI. Remaining gaps are product hardening and release gates |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
@@ -60,7 +60,7 @@ as legacy compatibility only.
 
 | Item | Where | Effort | Notes |
 |---|---|---|---|
-| File-stream import / backpressure UI | worker import protocol, demo/import UI, persistence docs/tests | done in current worktree | `file-import.ts`, 1M demo import UI, e2e, and MCP verification landed locally. Optional automatic save/load remains separate. |
+| File-stream import / backpressure UI | worker import protocol, demo/import UI, persistence docs/tests | done in `4337eb7` | `file-import.ts`, 1M demo import UI, e2e, and MCP verification landed locally. Optional automatic save/load remains separate. |
 | Range-native UI ops completion | `solid/excel/src/sheet-store.ts`, `Table.tsx`, worker range APIs | done after current Wave 2 commit | Large clear undo, range format, large format undo, and chunked worker copy export are range-native. Browser clipboard still needs a final string, but worker snapshot/read/postMessage is chunked. |
 | Phase 0 CI gates (Rust unit/clippy, wasm browser, e2e blocking) | `.github/workflows/*` | 1–2 d | Originally scheduled for Phase 0; deferred per user "未完成总的永远不要做 CI" rule. Pick up after the overall arc signs off. |
 | Pre-existing clippy lints | `eval.rs:373/1309`, `format.rs:193`, `shift.rs:112`, `sheet.rs` doc-list | 1 h | Baseline noise; out of scope for phases. |
@@ -225,7 +225,7 @@ Once agents return:
 |---|---|---|---|
 | **A** | Wave 3 bounded import + persistence | done | Rust/worker/proxy/e2e/MCP verified API contract is committed |
 | **B** | Wave 4 — perf/observability/MCP gates | done | `f456dd7` 已提交 counters、observability e2e、MCP 记录 |
-| **C** | Product file import/backpressure UI | done in current worktree | Builds on bounded import sessions without changing core lazy semantics |
+| **C** | Product file import/backpressure UI | done in `4337eb7` | Builds on bounded import sessions without changing core lazy semantics |
 | **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
@@ -239,10 +239,11 @@ Push/CI remains explicitly forbidden until the overall arc lands.
 
 1. This doc (`rust/docs/HANDOFF.md`).
 2. `rust/docs/ONLINE_SPREADSHEET_PLAN.md` — north-star plan.
-3. `rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md` — just-finished Wave 5 plan and record.
-4. `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` — overall wave tracker.
-5. `rust/docs/PHASE5_PARALLEL.md` — historical worker/range plan.
-6. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
+3. `rust/docs/WAVE6_PRODUCT_HARDENING_PLAN.md` — active Wave 6 execution plan.
+4. `rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md` — completed Wave 5 plan and record.
+5. `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` — overall wave tracker.
+6. `rust/docs/PHASE5_PARALLEL.md` — historical worker/range plan.
+7. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
 7. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
    pattern for a P0 bug (good reference if Phase 5 uncovers one).
 6. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is

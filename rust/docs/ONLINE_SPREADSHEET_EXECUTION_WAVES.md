@@ -9,15 +9,15 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `707da13 (Wave 5 plan)` 加当前 Wave 5 实现工作树为准；
-文件导入/backpressure UI 已完成本地与 MCP 验收。
+以最近提交 `4337eb7 feat(solid-excel): add file import backpressure` 为准；
+文件导入/backpressure UI 已完成本地与 MCP 验收，当前工作树进入 Wave 6 产品硬化。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 本轮状态更新：
 
 - Wave 3 已提交到 `6462024`（bounded import + sparse persistence v1）。
 - Wave 4 已提交到 `f456dd7`（debug counters + observability e2e + MCP 记录）。
-- Wave 5 已完成实现与验收：正式文件导入 / backpressure UI。
+- Wave 5 已提交到 `4337eb7`：正式文件导入 / backpressure UI。
 - Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
