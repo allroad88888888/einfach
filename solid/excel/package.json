@@ -13,6 +13,9 @@
   },
   "sideEffects": false,
   "dependencies": {
+    "@einfach/core": "workspace:*",
+    "@einfach/solid": "workspace:*",
+    "@einfach/spreadsheet-ui-core": "workspace:*",
     "@lingui/core": "^6.0.1",
     "solid-js": "^1.9.12"
   },

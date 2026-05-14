@@ -40,6 +40,7 @@ const config = defineConfig({
   external: [
     '@swc/core',
     '@einfach/core',
+    '@einfach/spreadsheet-ui-core',
     '@einfach/react',
     '@einfach/utils',
     '@einfach/solid',

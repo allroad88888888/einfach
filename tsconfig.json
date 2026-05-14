@@ -52,6 +52,9 @@
       "path": "./vanilla/utils/tsconfig.json"
     },
     {
+      "path": "./vanilla/spreadsheet-ui-core/tsconfig.json"
+    },
+    {
       "path": "./react/react/tsconfig.json"
     },
     {

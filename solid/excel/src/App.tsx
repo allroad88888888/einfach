@@ -11,6 +11,7 @@ import { DemoCrossSheetChain } from './demos/DemoCrossSheetChain'
 import { DemoLarge } from './demos/DemoLarge'
 import { DemoWorker } from './demos/DemoWorker'
 import { DemoMillion } from './demos/DemoMillion'
+import { VNextSmokeDemo } from '../src-vnext'
 import { LocaleSwitcher } from './LocaleSwitcher'
 import { useT } from './i18n'
 import './styles.css'
@@ -60,6 +61,12 @@ const demoGroups: DemoGroup[] = [
       { id: 'large',    labelKey: 'nav.large',    component: DemoLarge },
       { id: 'worker',   labelKey: 'nav.worker',   component: DemoWorker },
       { id: 'million',  labelKey: 'nav.million',  component: DemoMillion },
+    ],
+  },
+  {
+    id: 'vnext',
+    demos: [
+      { id: 'vnext', labelKey: 'nav.vnext', component: VNextSmokeDemo },
     ],
   },
 ]

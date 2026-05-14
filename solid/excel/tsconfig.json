@@ -6,5 +6,16 @@
     "jsxImportSource": "solid-js",
     "moduleResolution": "Bundler"
   },
-  "include": ["src/**/*", "test/**/*"]
+  "include": ["src/**/*", "src-vnext/**/*", "test/**/*"],
+  "references": [
+    {
+      "path": "../../vanilla/core"
+    },
+    {
+      "path": "../../solid/solid"
+    },
+    {
+      "path": "../../vanilla/spreadsheet-ui-core"
+    }
+  ]
 }

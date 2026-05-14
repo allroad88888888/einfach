@@ -364,6 +364,92 @@ thead .row-header {
   background: #e8f0fe;
 }
 
+.cell-active {
+  outline: 2px solid #1a73e8;
+  outline-offset: -2px;
+  background: #e8f0fe;
+}
+
+/* === vNext Grid === */
+
+.vnext-demo {
+  overflow: auto;
+}
+
+.spreadsheet-grid {
+  overflow: auto;
+  max-height: 70vh;
+  border: 1px solid #d0d0d0;
+  border-radius: 4px;
+  font-size: 13px;
+  outline: none;
+}
+
+.spreadsheet-grid:focus {
+  border-color: #1a73e8;
+  box-shadow: 0 0 0 1px #1a73e8;
+}
+
+.spreadsheet-grid-table {
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.spreadsheet-grid-corner,
+.spreadsheet-grid-col-header,
+.spreadsheet-grid-row-header,
+.spreadsheet-grid-cell {
+  border: 1px solid #d8d8d8;
+  padding: 0;
+  height: 24px;
+}
+
+.spreadsheet-grid-col-header,
+.spreadsheet-grid-cell {
+  width: 96px;
+}
+
+.spreadsheet-grid-corner,
+.spreadsheet-grid-row-header {
+  width: 44px;
+}
+
+.spreadsheet-grid-col-header,
+.spreadsheet-grid-row-header,
+.spreadsheet-grid-corner {
+  background: #f8f9fa;
+  color: #444;
+  font-weight: 500;
+  text-align: center;
+  user-select: none;
+  font-size: 12px;
+}
+
+.spreadsheet-grid-col-header,
+.spreadsheet-grid-row-header,
+.spreadsheet-grid-corner {
+  cursor: pointer;
+}
+
+.spreadsheet-grid-col-header.is-selected,
+.spreadsheet-grid-row-header.is-selected,
+.spreadsheet-grid-corner[data-selected='true'] {
+  background: #dbeafe;
+  color: #0b57d0;
+}
+
+.spreadsheet-grid-cell-button {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
 /* Range cell highlight (every cell in the rectangle EXCEPT the focus cell).
  * Lighter blue so the focus cell's outline + tint still pop. */
 .cell-in-range {

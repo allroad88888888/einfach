@@ -1,0 +1,115 @@
+import { createStore } from '@einfach/core'
+import { describe, expect, test } from '@jest/globals'
+import {
+  applySheetTabIntent,
+  createBeginSheetTabReorderIntent,
+  createBeginSheetTabRenameIntent,
+  createCommitSheetTabRenameIntent,
+  createCommitSheetTabReorderIntent,
+  createOpenSheetTabContextMenuIntent,
+  createUpdateSheetTabReorderIntent,
+  createUpdateSheetTabRenameIntent,
+  dispatchSheetTabIntentAtom,
+  normalizeSheetTabDraftName,
+  sheetTabsAtom,
+} from '../src/sheet-tabs'
+
+describe('sheet tabs core', () => {
+  test('tracks context menu, rename, and reorder interaction state', () => {
+    const store = createStore()
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createOpenSheetTabContextMenuIntent({
+        sheetId: 'sheet-1',
+        x: 12.9,
+        y: 6.1,
+      }),
+    )
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createBeginSheetTabRenameIntent({
+        sheetId: 'sheet-1',
+        draftName: '  Sales  ',
+      })!,
+    )
+
+    expect(createBeginSheetTabRenameIntent({
+      sheetId: 'sheet-1',
+      draftName: '  Sales  ',
+    })).toMatchObject({
+      type: 'sheet-tab.rename.begin',
+      draftName: '  Sales  ',
+    })
+    expect(createUpdateSheetTabRenameIntent('sheet-1', '  Q1 Sales  ')).toEqual({
+      type: 'sheet-tab.rename.change',
+      sheetId: 'sheet-1',
+      draftName: '  Q1 Sales  ',
+    })
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createUpdateSheetTabRenameIntent('sheet-1', '  Q1 Sales  ')!,
+    )
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createCommitSheetTabRenameIntent({
+        sheetId: 'sheet-1',
+        name: ' Q1 Sales ',
+      })!,
+    )
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createBeginSheetTabReorderIntent({
+        sheetId: 'sheet-1',
+      }),
+    )
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createUpdateSheetTabReorderIntent({
+        sheetId: 'sheet-1',
+        beforeSheetId: 'sheet-3',
+        afterSheetId: null,
+        targetIndex: 2,
+      }),
+    )
+
+    store.setter(
+      dispatchSheetTabIntentAtom,
+      createCommitSheetTabReorderIntent({
+        sheetId: 'sheet-1',
+        beforeSheetId: 'sheet-3',
+        afterSheetId: null,
+        targetIndex: 2,
+      }),
+    )
+
+    expect(store.getter(sheetTabsAtom)).toEqual({
+      contextMenu: null,
+      rename: null,
+      reorder: null,
+      lastIntent: {
+        type: 'sheet-tab.reorder.commit',
+        sheetId: 'sheet-1',
+        beforeSheetId: 'sheet-3',
+        afterSheetId: null,
+        targetIndex: 2,
+      },
+    })
+  })
+
+  test('rejects empty rename drafts and leaves current state unchanged', () => {
+    const store = createStore()
+
+    const initialState = store.getter(sheetTabsAtom)
+    expect(normalizeSheetTabDraftName('   ')).toBeNull()
+    expect(createBeginSheetTabRenameIntent({ sheetId: 'sheet-1', draftName: '   ' })).toBeNull()
+    expect(createCommitSheetTabRenameIntent({ sheetId: 'sheet-1', name: '   ' })).toBeNull()
+
+    expect(applySheetTabIntent(initialState, { type: 'sheet-tab.rename.cancel', sheetId: 'x', reason: 'escape' })).toBe(initialState)
+  })
+})

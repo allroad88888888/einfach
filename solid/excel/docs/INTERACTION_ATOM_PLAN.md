@@ -1,9 +1,13 @@
-# Solid Excel 交互 Atom 化规划
+# Spreadsheet UI Core + Solid Excel 重做规划
 
 > 日期：2026-05-14
 >
-> 目标：在线电子表格交互体验向 Excel 对齐；交互层核心状态使用
-> `@einfach/core` 的 JS atom/store；Rust/WASM/worker 继续作为工作簿事实源。
+> 目标：保留 `@einfach/solid-excel` 包名，但重做内部 UI 架构；先新建一个
+> framework-agnostic spreadsheet UI core 包，核心状态使用 `@einfach/core` 的 JS
+> atom/store；Rust/WASM/worker 继续作为工作簿事实源。
+>
+> 说明：本文暂放在 `solid/excel/docs/`，因为新包尚未创建。PC-1 创建
+> `vanilla/spreadsheet-ui-core/` 后，应把核心架构文档迁到新包 `README.md` 或 `docs/`。
 
 ## 背景
 
@@ -22,37 +26,149 @@
 这能跑，但不利于继续做 Excel 级交互：键盘模式、编辑模式、公式栏、右键菜单、sheet tab
 命令会互相影响；如果继续分散在组件 signal 里，测试和状态回放会越来越难。
 
+因此这里调整方向：`@einfach/solid-excel` 保留包名，但内部实现重做。旧实现冻结为
+legacy/reference，只作为已有 demo、worker/Rust 适配来源和 E2E 对照场。新的交互核心单独
+成包，新的 Solid UI 基于这个 core 重新实现，避免 UI、worker 适配、demo、历史兼容逻辑混在
+一起。
+
+## 总体策略
+
+不是推倒整个项目，而是分层重做：
+
+```text
+Rust/WASM/worker
+  保留：workbook facts、formula、lazy eval、range ops、import/export backend。
+
+@einfach/spreadsheet-ui-core
+  新建：framework-agnostic UI core，只管 viewport / projection / interaction / command。
+
+@einfach/solid-excel
+  保留包名，重做实现：新的 Solid UI 只做绑定、组件、adapter、demo 和 e2e。
+
+legacy solid-excel UI
+  冻结：作为参考和回归对照，不继续扩核心架构。
+```
+
+最终对外仍然交付 `@einfach/solid-excel`，只是内部从 legacy 实现切到 vNext 实现。
+
 ## 架构决定
 
-前端新增一个框架无关的 UI core。它不是 workbook core，也不是 sheet data model；它只管两类
+新建 `@einfach/spreadsheet-ui-core`，建议落在：
+
+```text
+vanilla/spreadsheet-ui-core/
+```
+
+它是 framework-agnostic UI core。它不是 workbook core，也不是 sheet data model；它只管两类
 事情：
 
 - 当前可视区域需要怎么展示。
 - 用户当前正在怎么交互。
 
-目录仍命名为 `interaction/`，但职责包含 viewport window 与 interaction overlay：
+包内目录按功能拆分，职责包含 viewport window、visible projection contract 与 interaction
+overlay：
 
 ```text
-solid/excel/src/interaction/
-  atoms.ts              # primitive / derived / writable atoms
-  viewport.ts           # scroll/size -> visible row/col window
-  projection.ts         # bounded visible projection contract
-  commands.ts           # selection/edit/menu/keyboard/viewport command
-  types.ts              # 交互状态类型
-  createInteraction.ts  # createStore() + 初始状态 + bridge API
-  solid.tsx             # Solid 绑定层，只做 hooks/provider 桥接
+vanilla/spreadsheet-ui-core/
+  package.json
+  tsconfig.json
+  README.md
+  src/
+    index.ts
+    createSpreadsheetUi.ts
+    backend/          # workbook 数据读取/写入 port，不绑定 worker/Rust 实现
+    workspace/
+    viewport/
+    projection/
+    selection/
+    keyboard/
+    editing/
+    formula-bar/
+    pointer/
+    menu/
+    toolbar/
+    clipboard/
+    sheet-tabs/
+    operations/
+    diagnostics/
+    shared/
+  test/
 ```
 
 核心规则：
 
 - UI core 使用 `@einfach/core` 的 `atom`、`createStore`。
-- Solid 组件通过 `@einfach/solid` 或很薄的本地 bridge 读取 atom；组件不再直接保存产品交互状态。
-- `@einfach/solid-excel` 需要声明 workspace 依赖：`@einfach/core` 与 `@einfach/solid`。
+- UI core 不依赖 Solid、React、DOM、worker、wasm-bindgen、CSS 或 Playwright。
+- Solid 组件后续通过 `@einfach/solid-excel` 的 vNext adapter 读取 core atom；组件不再直接
+  保存产品交互状态。
+- `@einfach/solid-excel` 保留包名并重做实现，但不在包内新增第二套核心状态模型。
 - 每个 workbook/view 创建独立 UI store，禁止使用全局 default store 承载产品会话状态。
 - Rust/WASM/worker 仍是 workbook facts 的唯一事实源：cell value、formula、dependency graph、
   formula cache、format metadata、sparse snapshot、import session 都不进入 JS atom。
 - UI atom 只保存“可见什么”和“用户正在怎么操作”：viewport window、selection、edit mode、
   formula draft、menu、keyboard mode、viewport focus、fill handle、row/col resize 等。
+
+## 包边界
+
+### 新包：`@einfach/spreadsheet-ui-core`
+
+负责：
+
+- viewport window 计算。
+- visible projection 请求合同。
+- selection、keyboard、editing、formula bar、menu、toolbar、clipboard、sheet tabs 等交互状态。
+- command model：把 UI intent 转换成 backend port 调用。
+- framework-agnostic 单测。
+
+禁止：
+
+- 直接 import `solid-js` / `@einfach/solid`。
+- 直接 import worker proxy、WASM glue 或 Rust generated package。
+- 直接读写 DOM。
+- 保存 workbook facts、formula cache、dependency graph、sparse snapshot。
+- 为 cell/row/col 建无界 atom。
+
+### `@einfach/solid-excel`
+
+保留包名，拆成两个阶段：
+
+1. **legacy 阶段**：旧实现保留，冻结架构，只做必要 bug fix。
+2. **vNext 阶段**：基于 `@einfach/spreadsheet-ui-core` 重做 Solid UI，验证通过后切换入口。
+
+legacy 短期角色：
+
+- 保留现有 demo、Playwright e2e、MCP 验证入口。
+- 保留 worker/Rust 适配代码，作为新 core backend port 的候选实现来源。
+- 保留现有 UI，作为回归对照和迁移参考。
+
+vNext 目标结构建议：
+
+```text
+solid/excel/src-vnext/
+  index.tsx
+  provider/         # Solid Provider / hooks，连接 @einfach/spreadsheet-ui-core
+  adapter/          # worker/Rust backend port 实现
+  grid/             # viewport grid、headers、cells、overlays
+  formula-bar/
+  toolbar/
+  sheet-tabs/
+  context-menu/
+  status-bar/
+  demos/
+  test-utils/
+```
+
+不再做：
+
+- 不在 `solid/excel/src` 里继续扩张新的核心交互状态架构。
+- 不把 `sheet-store.ts`、`Table.tsx` 继续改成“第二个 core”。
+- 不把 formula cache、workbook facts、visible projection 长期副本塞进 Solid 状态。
+
+最终切换：
+
+- `src-vnext` 的 API、demo、e2e 达到 legacy parity 后，把 package 入口切到 vNext。
+- legacy 目录保留一段时间作为对照，再按独立清理任务删除。
+- 不新建 `@einfach/solid-spreadsheet`，除非未来需要另一个完全不同的产品线。
 
 ## 可视窗口模型
 
@@ -69,7 +185,7 @@ UI core 只维护一个 viewport window：
 
 数据流固定为：
 
-1. DOM scroll / resize 更新 viewport metrics。
+1. 宿主适配层把 DOM scroll / resize 的测量结果传入 viewport metrics。
 2. `visibleWindow` 由 viewport metrics 和尺寸模型推导出来。
 3. UI 用 `sheetId + visibleWindow` 向 worker/Rust 请求当前窗口的 display projection。
 4. Rust 只在读取这块窗口时计算需要展示的 cell；未读取的公式仍保持 lazy。
@@ -139,188 +255,263 @@ selection 移动、右键、sheet tab 切换、toolbar 状态刷新不能触发�
 公式栏同步 draft 时，优先读取公式源码或用户输入源，不为了显示 draft 去读 formula result。
 如果后续做公式引用拾取，也只能写 interaction atom 中的 reference-picking 状态，不能预热整片区域。
 
-## 在线 Excel 功能域拆分
+## 在线 Excel 功能拆分
 
-按在线 Excel 的功能拆域后，大部分能力是“命令 + 派生展示”，不是新状态。第一版 UI core
-只保留 21 个核心 atom：14 个 writable/source atom，7 个 derived atom。
+文档只冻结功能边界和文件夹结构，不在规划阶段拍死 atom 名称或数量。每个功能子 agent 在自己
+负责的文件夹内设计 atom，并提交一份状态决策说明；总架构师验收是否符合 lazy、百万 cell 和
+Einfach 状态唯一来源约束。
 
-| 功能域 | 需要保存的 UI 状态 | 后端 / 命令负责 | 不建 atom 的内容 |
-|---|---|---|---|
-| Sheet 工作区 | 当前 UI 激活的 sheet、视图版本 | workbook store 切 sheet、增删改名 | 全量 sheet 列表 facts、sheet data |
-| Viewport 渲染 | scroll、viewport size、overscan、visible projection | worker/Rust 按 window 取 display projection | offscreen cell、整张表 projection |
-| 行列尺寸 | 默认尺寸、sparse override 的 UI 投影、resize 预览 | 持久化尺寸 metadata、结构操作 | 每行/每列一个 atom、全量尺寸数组 |
-| 选择与导航 | anchor、focus、mode、active cell | 键盘命令、scrollToCell、range command | 展开 range 内所有地址 |
-| Cell 编辑 | 当前编辑地址、draft、commit/cancel 状态 | set value/formula async command | cell value/formula/result 本体 |
-| FormulaBar | focus、draft、diagnostic、引用拾取状态 | 公式解析、cycle 检查、lazy eval | 公式结果 cache |
-| 公式引用拾取 | keyboard/reference-picking mode、临时引用 range | commit 时写公式文本 | 预读引用区域结果 |
-| 右键菜单 | menu open/target/highlight | clear/copy/cut/insert/delete command | 菜单项结果、range 数据 |
-| Toolbar / Ribbon | 打开的 dropdown、color picker、按钮可用性 | apply format/range format command | 单元格格式 facts |
-| Clipboard | copy/cut/paste UI 状态、最近命令状态 | worker chunked export/import、浏览器 clipboard | 大范围 TSV 完整中间数据 |
-| Fill handle / drag | drag 起点、当前点、预览 range | 小范围填充或 range command | 被填充区域每个 cell 状态 |
-| Row/Col 结构 | header selection、resize/insert/delete 交互态 | worker/Rust row/col insert/delete | dense row/col model |
-| Sheet tabs | tab menu、rename/delete 流程 UI | workbook store facts mutation | sheet 内容与依赖图 |
-| Import/Export/Save | 进度、错误、取消中状态 | worker import session、snapshot、file sink | 导入 staging workbook、持久化 snapshot 副本 |
-| Diagnostics / Status | 命令错误、加载状态、轻量 toast | 真实错误码来自 worker/Rust | 错误 cell 的全量索引 |
+### 文件夹结构
 
-## 核心 Atom 清单
+第一版按在线 Excel 的功能拆到新包 `vanilla/spreadsheet-ui-core/src/` 下：
 
-### Writable / Source Atom：14 个
+```text
+vanilla/spreadsheet-ui-core/src/
+  workspace/        # 当前工作区、active sheet UI 视角、view lifecycle
+  viewport/         # scroll/resize -> visible window，row/col 尺寸投影
+  projection/       # visible window 的展示快照、worker/Rust request 合同
+  selection/        # active cell、range、row/col/all selection、name box anchor
+  keyboard/         # navigation/edit/range extend/reference-picking 模式与快捷键
+  editing/          # cell editor、commit/cancel、draft 来源
+  formula-bar/      # formula bar draft、focus、diagnostics、引用拾取接线
+  pointer/          # drag select、fill handle、row/col resize、autoscroll
+  menu/             # cell/header/context menu、target、highlight
+  toolbar/          # ribbon/toolbar UI、dropdown、format command availability
+  clipboard/        # copy/cut/paste UI 状态，worker chunked export/import 接线
+  sheet-tabs/       # tab context menu、rename/delete UI flow
+  operations/       # import/export/save/load 进度、取消、错误提示
+  diagnostics/      # command error、toast/status、debug panel UI
+  shared/           # 共享类型、坐标/range helper、跨模块 command bus
+  backend/          # framework-agnostic workbook backend port
+  createSpreadsheetUi.ts
+  index.ts
+```
 
-这些 atom 是唯一需要直接写入的 UI source state。它们都是 workbook/view 级别，不按 cell、
-row、col 动态创建。
+每个功能文件夹建议保持相同骨架，但子 agent 可以按复杂度裁剪：
 
-| # | Atom | 负责内容 | 典型写入来源 |
-|---|---|---|---|
-| 1 | `activeSheetUiAtom` | 当前 UI 激活 sheet id/name、sheet view version | sheet tab click、workbook init |
-| 2 | `viewportMetricsAtom` | scrollTop、scrollLeft、viewportW/H、overscan | scroll、resize、keyboard scroll |
-| 3 | `dimensionProjectionAtom` | 默认 row/col size、visible/sparse size override | metadata load、resize preview/commit |
-| 4 | `visibleProjectionAtom` | 当前 window 的 display cells、formats、errors、loading/version | worker visible read resolve |
-| 5 | `selectionAtom` | anchor、focus、mode(cell/row/col/all)、lastIntent | click、keyboard、name box |
-| 6 | `editSessionAtom` | editing addr、draft、source、dirty、commit policy | typing、F2、double click、FormulaBar |
-| 7 | `formulaBarAtom` | focused、draft、diagnostic、lastValidatedInput | FormulaBar input、diagnostic response |
-| 8 | `keyboardModeAtom` | navigation/editing/extending/reference-picking | keydown、edit begin/cancel |
-| 9 | `pointerInteractionAtom` | drag-select、fill-handle、resize-row/col、autoscroll | pointer down/move/up |
-| 10 | `contextMenuAtom` | open/closed、target kind/range、position、highlight | right click、keyboard menu |
-| 11 | `toolbarUiAtom` | open dropdown、color picker、pending toolbar command | toolbar click、format picker |
-| 12 | `sheetTabUiAtom` | tab context menu、rename/delete UI flow | tab right click、prompt/confirm |
-| 13 | `clipboardUiAtom` | cut/copy source marker、paste mode、last clipboard error | copy/cut/paste command |
-| 14 | `asyncOperationUiAtom` | import/export/save/load progress、cancel/error/toast | worker operation events |
+```text
+feature-name/
+  README.md         # 功能边界 + atom 决策记录
+  types.ts          # 纯类型
+  atoms.ts          # source/derived atom 定义
+  commands.ts       # command functions 或 writable command atom
+  selectors.ts      # 派生读取；不保存第二份状态
+  index.ts          # 只导出公共 API
+```
 
-### Derived Atom：7 个
+### 功能域边界
 
-这些 atom 只从 source atom 推导，不单独保存第二份状态。
+| 功能域 | 文件夹 | UI core 保存 | worker/Rust 或命令负责 | 不允许保存 |
+|---|---|---|---|---|
+| 工作区 | `workspace/` | 当前 UI 工作区、active sheet UI 视角、view lifecycle | workbook facts、sheet 增删改名 | 全量 sheet data |
+| Viewport | `viewport/` | scroll、viewport size、overscan、row/col 尺寸投影 | 持久化 row/col metadata | 全量尺寸数组、每行/列 atom |
+| 展示投影 | `projection/` | 当前 visible window 的展示快照与请求状态 | display value、format、formula lazy read | offscreen cell cache、sheet snapshot |
+| 选择导航 | `selection/` | active cell、anchor/focus、range/header selection | range command、scrollToCell | 展开 range 地址 |
+| 键盘模式 | `keyboard/` | navigation/edit/extend/reference-picking 模式 | 具体命令分发 | cell data、formula result |
+| Cell 编辑 | `editing/` | editing addr、draft、commit/cancel UI 状态 | set value/formula async command | value/formula/result facts |
+| FormulaBar | `formula-bar/` | bar focus、draft、diagnostic、引用拾取 UI | parser/cycle/lazy eval | formula cache |
+| 指针交互 | `pointer/` | drag/fill/resize 进行中状态 | fill/range/resize commit command | 被拖拽区域 cell 状态 |
+| 菜单 | `menu/` | menu open、target、position、highlight | clear/copy/insert/delete command | 菜单命令结果数据 |
+| Toolbar | `toolbar/` | dropdown、picker、按钮可用性 UI | format/range format command | 单元格格式 facts |
+| Clipboard | `clipboard/` | copy/cut/paste UI 状态、错误 | browser clipboard、worker chunked export/import | 大范围 TSV 中间数据 |
+| Sheet tabs | `sheet-tabs/` | tab menu、rename/delete flow | workbook mutation | sheet 内容、依赖图 |
+| Operations | `operations/` | import/export/save/load progress、cancel/error | worker sessions、file sink | staging workbook、snapshot 副本 |
+| Diagnostics | `diagnostics/` | toast/status/debug panel UI | worker/Rust error code 和 counters | 错误 cell 全量索引 |
+| Backend Port | `backend/` | 不保存状态，只定义端口和 request/response 类型 | solid-excel worker/Rust adapter 实现端口 | 直接绑定 worker/WASM |
 
-| # | Atom | 派生自 | 用途 |
-|---|---|---|---|
-| 15 | `visibleWindowAtom` | `viewportMetricsAtom` + `dimensionProjectionAtom` | 得到 rowStart/rowEnd/colStart/colEnd |
-| 16 | `visibleRequestAtom` | `activeSheetUiAtom` + `visibleWindowAtom` + projection version | 生成 worker/Rust display projection 请求 key |
-| 17 | `selectionRectAtom` | `selectionAtom` | 标准化 selection rectangle，不展开地址 |
-| 18 | `activeCellAddrAtom` | `selectionAtom` + `activeSheetUiAtom` | FormulaBar、name box、active cell overlay |
-| 19 | `gridOverlayAtom` | visible window + selection/edit/pointer/menu | active cell、selection、fill、resize、editor 的 overlay |
-| 20 | `formulaInputViewAtom` | formulaBar + editSession + activeCell | 决定 FormulaBar 展示 draft/source/diagnostic |
-| 21 | `commandAvailabilityAtom` | selection/edit/menu/operation/projection | toolbar/menu/shortcut 是否可用 |
+### Atom 决策交给子 Agent
 
-### 不计入 Atom 的东西
+每个子 agent 在实现某个功能文件夹时，必须在该文件夹 `README.md` 里写清：
 
-命令不是 atom。第一版命令以 function 或 writable command atom 封装写入，但不增加长期状态：
+- 这个功能需要哪些 source atom。
+- 哪些状态是 derived atom，为什么不直接存第二份。
+- 哪些行为是 command，不作为长期状态保存。
+- atom 的数量和命名。
+- 每个 atom 的规模上界：跟 workbook、visible window、selection，还是用户操作会话绑定。
+- 是否会触发 Rust/worker 读取；如果会，是否只限 visible window 或显式用户命令。
+- 为什么不会创建 per-cell/per-row/per-col atom。
+- 相关单测和 Playwright/MCP 验证点。
 
-- `scrollToCell`
-- `selectCell`
-- `selectRange`
-- `extendSelection`
-- `moveSelectionByKeyboard`
-- `beginEdit`
-- `updateEditDraft`
-- `commitEdit`
-- `cancelEdit`
-- `openContextMenu`
-- `closeContextMenu`
-- `copySelection`
-- `pasteAtSelection`
-- `applyFormatToSelection`
-- `beginFillHandle`
-- `beginResizeRowCol`
-- `startImport`
-- `cancelImport`
+总架构师验收时看的是边界，不是预设数量：
 
-visible projection 如果后续需要优化重渲染，可以拆成 bounded window shard atom，但必须满足：
-
-- shard 数量跟 visible window 或 overscan 上限绑定，不能跟 sheet 总 cell 数绑定。
-- shard cache 必须有很小的 max size，例如最近 4 到 8 个 window。
-- shard atom 只保存展示快照，不能保存公式 cache、依赖图或 sparse workbook snapshot。
+- atom 数量越少越好，但不能为了少而把不相关功能塞进一个难以维护的大 atom。
+- 能 derived 的不做 source。
+- 能 command 表达的，不做长期状态。
+- 能由 worker/Rust 作为事实源的，不进 UI atom。
+- 动态 atom 必须 bounded cache，并证明上限跟 visible window 绑定。
 
 ## 分阶段执行
 
-交互 atom 化按 IA-0 到 IA-6 推进：IA-0 是规划冻结，IA-1 到 IA-6 是实现与收口。
-每波都要先有单元测试，再迁 UI；涉及浏览器行为的波次必须跑 Playwright CLI，并补 MCP
-Playwright 验证记录。
+新包和 `@einfach/solid-excel` vNext 按 PC-0 到 PC-7 推进：PC-0 是规划冻结，PC-1 到
+PC-5 做 framework-agnostic core，PC-6 平行重做 Solid UI，PC-7 切换包入口与收口。
+每波都要先有单元测试，再迁 UI；涉及浏览器行为的波次必须跑
+Playwright CLI，并补 MCP Playwright 验证记录。
 
 | 波次 | 目标 | 可并行角色 | 交付物 |
 |---|---|---|---|
-| IA-0 | 固定合同与依赖 | 架构 / 测试 / 审查 | 本文档、状态白名单、`@einfach/core`/`@einfach/solid` 依赖计划 |
-| IA-1 | 建 UI core | Viewport / Atom core / Solid bridge | `interaction/*`、21 个 atom 清单、visible window 单测、无 UI 行为变化 |
-| IA-2 | selection + keyboard 迁移 | Selection / Keyboard / E2E | `sheet-store` selection 改由 UI core 驱动，键盘导航合同测试 |
-| IA-3 | edit + formula bar 迁移 | Edit / FormulaBar / Diagnostics | F2、Enter、Tab、Esc、formula diagnostics 状态归一 |
-| IA-4 | menu + sheet tabs + toolbar 迁移 | ContextMenu / SheetTabs / Toolbar | 右键菜单、tab 菜单、toolbar 可用状态统一进 atom |
-| IA-5 | Excel 交互补齐 | UX / E2E / MCP | row/col 选择、fill handle、resize、range extend、MCP 记录 |
-| IA-6 | 收口与门禁 | Review / Perf / Docs | grep gate、全量 e2e、MCP gate、文档同步 |
+| PC-0 | 固定新包合同 | 架构 / 测试 / 审查 | 本文档、新包边界、legacy 冻结 + vNext 重做规则 |
+| PC-1 | 新包骨架 | Package / Feature folders / Test harness | `vanilla/spreadsheet-ui-core`、功能文件夹、README 决策模板 |
+| PC-2 | Viewport + Projection | Viewport / Backend port / Tests | visible window、projection request、backend port 单测 |
+| PC-3 | Selection + Keyboard | Selection / Keyboard / Adapter | framework-agnostic selection/keyboard command，不接 UI 或只接 demo flag |
+| PC-4 | Editing + FormulaBar | Editing / FormulaBar / Diagnostics | draft/commit/cancel/diagnostic 状态与 backend command 合同 |
+| PC-5 | Menu + Toolbar + Clipboard + Tabs | UI Commands / Range ops | menu/toolbar/clipboard/sheet-tab command core |
+| PC-6 | Solid Excel vNext | Solid UI / Backend adapter / Demos | `solid/excel/src-vnext` 平行实现，旧 UI 不动 |
+| PC-7 | 切入口与收口 | Package entry / E2E / MCP | `@einfach/solid-excel` 入口切到 vNext，legacy 冻结或删除计划 |
+
+### 当前执行记录
+
+2026-05-14 第一批已落地到 `vanilla/spreadsheet-ui-core`：
+
+- PC-1：包骨架、功能文件夹、package/root config、Jest 映射和包边界测试。
+- PC-2：viewport math、visible/range projection contract、backend port contract。
+- PC-3：selection core、keyboard intent core。
+- PC-4：editing core、formula-bar core、diagnostics core。
+- PC-5：pointer、menu、toolbar、clipboard、sheet-tabs、operations intent core。
+- PC-6 第一段：`solid/excel/src-vnext` 已接入 Provider、静态 backend adapter、可视窗口
+  Grid、vNext demo tab 和 smoke e2e；legacy `solid/excel/src` 未被迁移或删除。
+- PC-6 第二段：vNext demo 已挂上 FormulaBar 和 SheetTabs；Grid 已支持行/列头选择、
+  Shift range、键盘移动、Delete 清 active cell，并订阅 projection snapshot 以响应跨组件刷新。
+- PC-6 第三段：vNext demo 已挂上 Toolbar 和 ContextMenu；Grid 右键写入 core menu
+  atom；keyboard core 支持 Ctrl/Cmd+Arrow、Ctrl/Cmd+Home、Ctrl/Cmd+End 的 bounds
+  跳转，不扫描数据区也不触发公式求值。
+
+PC-6 第一段验收记录：
+
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-provider.test.tsx solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npx jest vanilla/spreadsheet-ui-core/test --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- MCP Playwright：打开 `http://localhost:5174/`，验证 vNext grid 只渲染 30 个可视
+  cell、`J20` offscreen 未挂载、`B1` click active、`A1` 双击编辑提交、console error 为 0。
+
+PC-6 第二段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-provider.test.tsx solid/excel/test/vnext-grid.test.tsx solid/excel/test/vnext-formula-bar.test.tsx solid/excel/test/vnext-sheet-tabs.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- MCP Playwright：验证 30 个可视 cell、`J20` offscreen 未挂载、FormulaBar 从 `Alpha`
+  提交到 `A1`、`Shift+ArrowDown` 扩展到 `B2`、行头选择、`Sheet2` tab active、
+  console error 为 0。
+
+PC-6 第三段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test --runInBand`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-provider.test.tsx solid/excel/test/vnext-grid.test.tsx solid/excel/test/vnext-formula-bar.test.tsx solid/excel/test/vnext-sheet-tabs.test.tsx solid/excel/test/vnext-toolbar.test.tsx solid/excel/test/vnext-context-menu.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- MCP Playwright：验证 30 个可视 cell、`J20` offscreen 未挂载、`Ctrl+ArrowRight`
+  让 active address 到 `J2` 但 `J2` 不挂载、Toolbar Bold enabled、右键 `A1`
+  打开 cell context menu、Delete 后 menu 隐藏、console error 为 0。
+
+仍未完成：
+
+- vNext adapter 还只是 static backend；尚未接入真实 worker/Rust workbook port。
+- vNext chrome UI 仍缺：status bar；Toolbar 和 ContextMenu 目前只产生 intent，尚未接真实
+  format / row-column mutation / clipboard command executor。
+- FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
+  mutation。
+- Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、
+  fill handle、row/col resize。
+- PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 
 ## 并行 Agent 计划
 
 总架构师负责接口冻结、集成和最终验收。子 agent 只能提交候选补丁。
 
-### IA-1 建 UI core
+### PC-1 新包骨架
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| A1 Viewport Core | Codex Spark | `solid/excel/src/interaction/viewport.ts`, `types.ts` | scroll/size/overscan 推导 visible window，不碰 UI |
-| A2 Atom Core | Codex Spark | `solid/excel/src/interaction/*` | 定义 atoms、commands、createInteractionStore |
-| A3 Solid Bridge | Codex Spark | `solid/excel/src/interaction/solid.tsx`, `solid/excel/package.json` | 接入 `@einfach/solid` bridge，不迁业务组件 |
-| A4 Tests | Claude Sonnet 或 Codex Mini | `solid/excel/test/interaction*.test.ts` | 纯 store 单测：21 个核心 atom、visible window、selection/edit/menu/derived 状态 |
+| A1 Package Skeleton | Codex Spark | `vanilla/spreadsheet-ui-core/package.json`, `tsconfig.json`, `src/index.ts` | 新建 workspace package，只依赖 `@einfach/core` |
+| A2 Feature Folders | Codex Spark | `vanilla/spreadsheet-ui-core/src/*/README.md`, `shared/*` | 建功能文件夹、公共类型边界、atom 决策模板 |
+| A3 Backend Port | Claude Sonnet | `vanilla/spreadsheet-ui-core/src/backend/*` | 定义 visible read、mutation、range command 的端口类型 |
+| A4 Tests | Codex Mini | `vanilla/spreadsheet-ui-core/test/*` | 新包测试 harness、folder contract、visible window 单测 |
 
 验收：
 
 ```sh
-npx tsc -p solid/excel/tsconfig.json --noEmit
-npx jest solid/excel/test/interaction-core.test.ts
-npm run build -w @einfach/solid-excel
+npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit
+npx jest vanilla/spreadsheet-ui-core/test
+npm run build -w @einfach/spreadsheet-ui-core
 ```
 
-### IA-2 Selection + Keyboard
+### PC-2 Viewport + Projection
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| B1 Selection Adapter | Claude Sonnet | `solid/excel/src/sheet-store.ts`, `solid/excel/src/Table.tsx` | selection/anchor 改接 interaction store |
-| B2 Keyboard | Codex Spark | `solid/excel/src/Table.tsx`, keyboard helpers | Arrow/Shift/Ctrl/Home/End/Page 键行为统一命令层 |
-| B3 E2E | Codex Spark | `solid/excel/e2e/million-demo.spec.ts`, `selection-clipboard.spec.ts` | 键盘跨虚拟视口、range extend、selection 不物化 |
+| B1 Viewport Math | Codex Spark | `viewport/*` | 固定 row/col size、overscan、scroll -> visible window |
+| B2 Projection Contract | Claude Sonnet | `projection/*`, `backend/*` | 定义 display projection request/response、version、cancellation |
+| B3 Tests | Codex Spark | `test/viewport*.test.ts`, `test/projection*.test.ts` | O(1) visible window、bounded projection request 单测 |
 
 验收：
 
 ```sh
-npx jest solid/excel/test/interaction-core.test.ts
-npx tsc -p solid/excel/tsconfig.json --noEmit
-NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/million-demo.spec.ts e2e/selection-clipboard.spec.ts
+npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit
+npx jest vanilla/spreadsheet-ui-core/test/viewport*.test.ts vanilla/spreadsheet-ui-core/test/projection*.test.ts
 ```
 
-MCP：
-
-- 打开 1M demo。
-- 键盘移动到视口外再回来。
-- 验证 selection 正确、DOM cell 数量有界、console 无 warning/error。
-
-### IA-3 Edit + FormulaBar
+### PC-3 Selection + Keyboard
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| C1 Edit Session | Claude Sonnet | `solid/excel/src/Cell.tsx`, `interaction/*` | typing/F2/double click/commit/cancel 状态归一 |
-| C2 FormulaBar | Codex Spark | `solid/excel/src/FormulaBar.tsx` | draft/focus/diagnostic 迁到 atom |
-| C3 Tests | Codex Spark | `formula-bar.spec.ts`, interaction tests | Enter/Tab/Esc/F2、非法公式、cycle diagnostic |
+| C1 Selection Core | Claude Sonnet | `selection/*` | active cell、range、row/col/all selection、normalized range |
+| C2 Keyboard Core | Codex Spark | `keyboard/*` | Arrow/Shift/Ctrl/Home/End/Page command，不依赖 DOM |
+| C3 Tests | Codex Spark | `test/selection*.test.ts`, `test/keyboard*.test.ts` | selection 不展开大 range、keyboard command 合同 |
+
+特别约束：
+
+- selection 只能保存边界和模式，不能生成 range 内地址列表。
+- keyboard command 可以请求 scrollToCell，但不能直接访问 DOM。
+
+### PC-4 Editing + FormulaBar
+
+| 角色 | 推荐模型 | 文件所有权 | 任务 |
+|---|---|---|---|
+| D1 Editing Core | Claude Sonnet | `editing/*` | typing/F2/double click/commit/cancel 状态归一 |
+| D2 FormulaBar Core | Codex Spark | `formula-bar/*` | draft/focus/diagnostic/reference-picking 合同 |
+| D3 Tests | Codex Spark | `test/editing*.test.ts`, `test/formula-bar*.test.ts` | Enter/Tab/Esc/F2、非法公式、cycle diagnostic contract |
 
 特别约束：
 
 - FormulaBar draft 同步不能因为 selection 改变而读取公式结果。
-- commit 仍走 worker-backed async formula command，不能回退到 optimistic sync `set_formula`。
+- commit 只能通过 backend port 的 async formula/value command 表达。
 
-### IA-4 Menu / SheetTabs / Toolbar
+### PC-5 Menu / Toolbar / Clipboard / Tabs
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| D1 Menu | Codex Spark | `ContextMenu.tsx`, `Table.tsx`, `interaction/*` | 菜单打开目标、highlight、关闭状态迁 atom |
-| D2 SheetTabs | Codex Spark | `SheetTabs.tsx`, workbook store bridge | tab menu/rename/delete 流程迁 atom |
-| D3 Toolbar | Claude Sonnet | `FormatToolbar.tsx`, command availability | toolbar command state 只派生，不复制格式事实 |
+| E1 Menu Core | Codex Spark | `menu/*` | menu target、highlight、range-preserving context command |
+| E2 Toolbar Core | Claude Sonnet | `toolbar/*` | command availability、format command，不复制格式 facts |
+| E3 Clipboard Core | Codex Spark | `clipboard/*` | copy/cut/paste UI 状态、chunked backend contract |
+| E4 Sheet Tabs Core | Codex Spark | `sheet-tabs/*` | tab menu、rename/delete flow，不保存 sheet facts |
 
-验收重点：
+### PC-6 Solid Excel vNext 重做
 
-- 右键命中已选 range 时不折叠选区。
-- 大 range Clear/Copy/Format 继续走 range-native worker 路径。
-- tab rename/delete 不污染 workbook facts。
+这一波才开始动 `@einfach/solid-excel` UI。目标不是在旧 `Table.tsx` / `sheet-store.ts`
+上继续修补，而是在 `solid/excel/src-vnext/` 平行实现新的 Solid UI。它面向用户感知，必须用
+MCP 验证。
 
-### IA-5 Excel 交互补齐
+文件所有权：
 
-本波面向用户感知，必须用 MCP 验证。
+| 角色 | 推荐模型 | 文件所有权 | 任务 |
+|---|---|---|---|
+| F1 Solid Provider | Codex Spark | `solid/excel/src-vnext/provider/*` | 连接 `@einfach/spreadsheet-ui-core` store 和 `@einfach/solid` |
+| F2 Backend Adapter | Claude Sonnet | `solid/excel/src-vnext/adapter/*` | 把现有 worker/Rust store 适配到 core backend port |
+| F3 Grid UI | Codex Spark | `solid/excel/src-vnext/grid/*` | 可视窗口 grid、headers、cells、overlay，不保存 workbook facts |
+| F4 Chrome UI | Codex Spark | `src-vnext/formula-bar/*`, `toolbar/*`, `sheet-tabs/*`, `context-menu/*` | FormulaBar、toolbar、tabs、context menu 的新 UI |
+| F5 Demo/E2E | Codex Spark | `solid/excel/src-vnext/demos/*`, `solid/excel/e2e/*` | vNext demo flag、Playwright 和 MCP 验证 |
 
 目标：
 
+- 保留 `@einfach/solid-excel` 包名。
+- 旧 `solid/excel/src` 先不删，作为 legacy/reference。
+- 新实现放在 `solid/excel/src-vnext`，通过 demo flag 或独立 route 验证。
+- vNext 组件只做 Solid binding 和展示，不重新发明核心状态。
 - row header / col header 点击选择整行整列。
 - Shift + 点击扩展 range。
 - Ctrl + Arrow 跳转到区域边界。
@@ -331,6 +522,9 @@ MCP：
 验收：
 
 ```sh
+npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit
+npm run build -w @einfach/spreadsheet-ui-core
+npx tsc -p solid/excel/tsconfig.json --noEmit
 NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel
 ```
 
@@ -341,19 +535,32 @@ MCP：
 - FormulaBar：非法公式和 cycle 显示诊断后可恢复。
 - console 无 warning/error。
 
-### IA-6 收口
+### PC-7 切入口与收口
+
+当 vNext 达到 legacy 关键功能 parity 后，才切 `@einfach/solid-excel` 的 public entry。
+
+切换规则：
+
+- `package.json` 的入口仍是 `@einfach/solid-excel`。
+- 默认 demo / export 指向 vNext。
+- legacy 保留在内部路径或独立 demo route，直到一轮全量回归后删除。
+- 不允许在入口切换时重写 Rust/WASM/worker 核心。
+
+### 最终收口 Gate
 
 收口 gate：
 
 ```sh
-rg -n "createSignal|from 'solid-js/store'|from \"solid-js/store\"" solid/excel/src
+npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit
+npm run build -w @einfach/spreadsheet-ui-core
+npx jest vanilla/spreadsheet-ui-core/test
 npx tsc -p solid/excel/tsconfig.json --noEmit
 npm run build -w @einfach/solid-excel
 NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel
 npm test
 ```
 
-`createSignal` grep 不要求绝对为 0，但必须有白名单：
+`@einfach/solid-excel` 的 `createSignal` grep 不要求绝对为 0，但必须有白名单：
 
 - DOM ref / measurement / animation frame。
 - i18n locale 这类独立基础设施如果暂不迁移，要单独记录。
@@ -364,23 +571,29 @@ npm test
 遇到以下情况必须暂停并重规划：
 
 - 任何实现试图为百万 cell 创建 per-cell atom。
-- 新增第 22 个核心 atom，但无法说明为什么不能放进已有 source atom 或 derived atom。
+- 子 agent 新增 atom 却没有在对应功能 `README.md` 记录 source/derived/command 决策。
+- `@einfach/spreadsheet-ui-core` 直接依赖 Solid、React、DOM、worker、WASM glue 或 Playwright。
+- 新的核心交互逻辑继续堆进 `@einfach/solid-excel` legacy 目录，而不是进入新 core 或 vNext adapter。
+- vNext 组件绕过 `@einfach/spreadsheet-ui-core`，直接用 Solid signal 承载产品交互状态。
 - selection 或 toolbar 派生需要展开大 range 地址列表。
 - viewport/projection 实现会累积 offscreen window 数据，或保留完整 sheet snapshot。
 - 行高/列宽实现需要创建全量 row/col atom 或全量尺寸数组。
 - UI 状态迁移导致公式在 selection 移动时被 eager eval。
 - UI store 保存了 worker snapshot、formula cache 或 dependency graph。
-- Solid bridge 为了方便绕开 `@einfach/core`，重新引入框架本地产品状态。
+- vNext adapter 为了方便绕开 `@einfach/core`，重新引入框架本地产品状态。
 - MCP 无法验证交互变更，但代码已经改了浏览器行为。
 
 ## 完成定义
 
-交互 atom 化完成时，需要同时满足：
+整体完成时，需要同时满足：
 
 - 产品交互状态只由 JS atom/store 承载。
 - UI core 只关心 visible window、bounded visible projection 和 interaction overlay。
-- 第一版核心 atom 数量保持 21 个：14 个 writable/source + 7 个 derived。
+- 每个功能文件夹都有状态决策记录，atom 由子 agent 在功能边界内设计并接受总架构师验收。
 - Rust/WASM/worker 继续是 workbook facts 的唯一事实源。
+- `@einfach/spreadsheet-ui-core` 不依赖 Solid、React、DOM、worker、WASM glue、CSS、Playwright。
+- `@einfach/solid-excel` 保留包名，public entry 切到基于新 core 的 vNext 实现。
+- legacy `solid-excel` 只作为参考/回归对照，不再承载核心架构。
 - selection/edit/menu/formula bar/toolbar/sheet tabs 有可独立运行的 atom 单测。
 - viewport window 有独立单测，证明可见行列范围由 scroll/size 推导，不创建 per-cell 状态。
 - 1M demo 中 selection、keyboard、右键、大 range toolbar 操作不物化百万地址。
