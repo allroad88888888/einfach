@@ -119,6 +119,86 @@ export function parseClipboardTsv(text: string, fallbackOrigin: string): Clipboa
   }
 }
 
+function columnLabelToIndex(letters: string): number {
+  if (letters.length === 0) return -1
+  let col = 0
+  for (let index = 0; index < letters.length; index += 1) {
+    const code = letters.toUpperCase().charCodeAt(index) - 64
+    if (code < 1 || code > 26) return -1
+    col = col * 26 + code
+  }
+  return col - 1
+}
+
+function indexToColumnLabel(col: number): string {
+  let current = col
+  let label = ''
+
+  do {
+    label = String.fromCharCode(65 + (current % 26)) + label
+    current = Math.floor(current / 26) - 1
+  } while (current >= 0)
+
+  return label
+}
+
+function parseFormulaRefCoord(letters: string, digits: string): { row: number; col: number } | null {
+  const col = columnLabelToIndex(letters)
+  const row = Number(digits) - 1
+  if (col < 0 || !Number.isInteger(row) || row < 0) return null
+  return { row, col }
+}
+
+function mapFormulaRefs(
+  formula: string,
+  mapRef: (row: number, col: number) => { row: number; col: number } | null,
+): string {
+  const rewriteSegment = (segment: string): string => {
+    const refPattern = /(?:([A-Za-z_][A-Za-z0-9_]*)!)?([A-Za-z]+)(\d+)/g
+    return segment.replace(refPattern, (full, sheetName, letters, digits) => {
+      const coord = parseFormulaRefCoord(letters, digits)
+      if (!coord) return full
+
+      const moved = mapRef(coord.row, coord.col)
+      if (moved === null || moved.row < 0 || moved.col < 0) return '#REF!'
+
+      const nextAddr = `${indexToColumnLabel(moved.col)}${moved.row + 1}`
+      return sheetName ? `${sheetName}!${nextAddr}` : nextAddr
+    })
+  }
+
+  let output = ''
+  let segment = ''
+  for (let index = 0; index < formula.length; index += 1) {
+    const char = formula[index]
+    if (char !== '"') {
+      segment += char
+      continue
+    }
+
+    output += rewriteSegment(segment)
+    segment = ''
+    const start = index
+    index += 1
+    while (index < formula.length) {
+      if (formula[index] === '"') {
+        if (formula[index + 1] === '"') {
+          index += 2
+          continue
+        }
+        break
+      }
+      index += 1
+    }
+    output += formula.slice(start, Math.min(index + 1, formula.length))
+  }
+  return output + rewriteSegment(segment)
+}
+
+export function shiftFormulaRefs(formula: string, drow: number, dcol: number): string {
+  return mapFormulaRefs(formula, (row, col) => ({ row: row + drow, col: col + dcol }))
+}
+
 export function copyClipboardState(
   state: ClipboardState,
   input: ClipboardTransferInput,

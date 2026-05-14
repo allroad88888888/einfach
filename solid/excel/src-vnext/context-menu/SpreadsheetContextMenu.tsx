@@ -14,6 +14,7 @@ import {
   pasteClipboardAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
+  shiftFormulaRefs,
   type CellCoord,
   type CellRange,
   type ClipboardTextData,
@@ -27,7 +28,6 @@ import {
   type SpreadsheetError,
 } from '@einfach/spreadsheet-ui-core'
 
-import { shiftFormulaRefs } from '../../src/formula-shift'
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
   isVisibleProjectionResult,

@@ -458,6 +458,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   `readSparseRange`、`snapshotRangeSparse` 或 `snapshotFormatRange`。vNext smoke demo
   逻辑边界提高到 200x100，e2e 用 `Ctrl+Shift+End` 选 2 万格并验证仍只挂载 30 个可视
   cell。
+- PC-7 准备第一段：vNext paste 公式引用偏移逻辑已从 legacy `solid/excel/src`
+  下沉到 `@einfach/spreadsheet-ui-core` 的 clipboard core。`SpreadsheetContextMenu`
+  不再 import legacy `formula-shift`；该纯函数仍只处理 clipboard paste 的字符串转换，
+  不读取 backend、不创建 cell atom、不触发公式求值。vNext 剩余 legacy import 主要是
+  worker/Rust adapter 与 worker demo 需要使用现有 WASM worker proxy/types。
 
 PC-6 第一段验收记录：
 
@@ -707,6 +712,20 @@ PC-6 第十九段验收记录：
   `A1` 执行 Copy 后，clipboard 以 `# einfach-clipboard-origin: A1` 开头、
   共 201 行，当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为
   `Ready`、console error 为 0。
+
+PC-7 准备第一段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/clipboard.test.ts solid/excel/test/vnext-context-menu.test.tsx --runInBand`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，mock clipboard
+  后重复 `A1` 到 `A1:CV200` 的大范围 Copy；验证 clipboard marker 存在、共 201 行、
+  当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为 `Ready`、
+  console error 为 0。
 
 仍未完成：
 

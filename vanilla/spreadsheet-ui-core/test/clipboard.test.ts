@@ -11,6 +11,7 @@ import {
   parseClipboardTsv,
   serializeClipboardTsv,
   setClipboardErrorAtom,
+  shiftFormulaRefs,
   type ClipboardState,
 } from '../src/clipboard'
 
@@ -161,6 +162,14 @@ describe('clipboard core', () => {
       originAddr: 'C3',
       cells: [['plain', 'text']],
     })
+  })
+
+  test('shifts formula refs while preserving sheet names and string literals', () => {
+    expect(shiftFormulaRefs('=A1*2', 4, 2)).toBe('=C5*2')
+    expect(shiftFormulaRefs('=Data!A1+SUM(B2:C3)', 1, 1)).toBe(
+      '=Data!B2+SUM(C3:D4)',
+    )
+    expect(shiftFormulaRefs('="A1"&A1&"B2"', 1, 1)).toBe('="A1"&B2&"B2"')
   })
 
   test('stores clipboard errors without payload data', () => {
