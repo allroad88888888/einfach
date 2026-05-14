@@ -23,7 +23,7 @@
 
 ## 当前状态
 
-以 `a082c27 feat(solid-excel): range-native large format` 为当前实现基线。
+以 `0cf1ef3 feat(solid-excel): harden virtualized UX gates` 为当前实现基线。
 
 已经完成：
 
@@ -43,29 +43,25 @@
 - Cell 订阅已经改成 `observeCell(addr)` retain/release；虚拟滚动卸载 Cell 时会释放订阅。
   Worker proxy/store 有显式 `dispose()`。
 - 大 selection clear / copy / format 已有 range-native 或 backend-assisted 路径：
-  large clear 可用 sparse snapshot/restore 做 undo；copy 可走 backend TSV export；
-  format 可走 `set_format_range`，不再展开百万地址。
+  large clear 可用 sparse snapshot/restore 做 undo；copy 优先走 worker chunked TSV
+  export；format 走 `set_format_range` + format snapshot/restore undo，不再展开百万地址。
 - worker-backed store 已有 `setFormulaAsync` 权威公式提交路径和 `formulaCacheState`
   async probe；同步 `set_formula` 仍保留为 legacy compatibility。
+- worker-backed MultiSheet、FormulaBar diagnostics、`TEXT/TODAY/NOW` 浏览器门禁已落地。
+- `DemoMillion` 已接入 `FormatToolbar`；1M 大选区真实 UI 格式化、键盘跨虚拟视口和
+  range 内右键 Clear 均有 e2e + MCP 记录。
 
-仍不足以支撑产品目标：
+仍需发布门禁确认的地方：
 
-- 大 range format 没有 format-range snapshot/restore 合同。当前能 range-native 应用格式，
-  但会清空 undo/redo 栈，不能回滚。
-- copy/export 现在避免了主线程地址展开，但仍一次性生成整段 TSV 字符串；需要
-  streaming/chunked export 和 backpressure。
-- worker import 已按 chunk 进入 worker 内 staging workbook，但 bounded memory、cancel/commit
-  可观测指标、持久化 v1 和 save/load 合同还没产品化。
-- 同步 `ISheet.set_formula` 仍然 optimistic `true`。产品入口必须继续收敛到 async command；
-  文档和测试要避免后续 agent 误用同步兼容层。
+- 同步 `ISheet.set_formula` 仍然是 legacy optimistic compatibility；产品入口必须继续使用
+  `setFormulaAsync` / `setFormulaDetailedAsync`。
+- 浏览器剪贴板写入最终仍需要字符串；文件导出/保存如果产品化，应继续复用 worker
+  export session / chunk 合同对接 sink streaming。
+- 自动保存仍未做；稀疏持久化 v1 已存在，但不包含 autosave 产品策略。
 - Solid 的 in-process workbook adapter / demo adapter 仍有 coarse notify 路径。产品大表路径
   应使用 worker-backed workbook；in-process path 只可作为 demo/test 或需要另补精确订阅。
-- 稀疏持久化、自动保存、导入导出格式合同尚未形成 v1。
-- E2E 文档和 handoff 有状态滞后。后续必须让 `ONLINE_SPREADSHEET_EXECUTION_WAVES.md`
-  成为真实执行状态源，避免 agent 继续执行已完成 gap。
-- CI 还不是完整规模化门禁：JS build/Jest 和 Playwright 已有，但 Rust unit/clippy、
-  wasm browser test、百万 lazy correctness、MCP 验证记录需要变成 blocking 或明确的
-  release gate。
+- CI 还不是完整规模化门禁，且当前用户规则禁止修改 `.github/workflows/*`。发布门禁先以本地
+  Rust/WASM/Jest/Playwright + MCP 记录为准。
 
 ## 架构目标
 
@@ -136,10 +132,11 @@ Solid 只渲染和订阅可见 cell 加 overscan：
 
 - Phase 1～4 的核心能力已经在当前 HEAD 落地：lazy core、range dep/index、workbook dirty graph、
   2D viewport、worker-backed 1M demo 都不是后续待办。
-- Phase 5 已部分落地：worker workbook RPC、chunk import staging、large clear undo、large copy
-  export、large format range-native 都在主线。剩余重点是 format undo、streaming export、
-  bounded import/persistence、权威命令收口。
-- Phase 6 仍是产品硬化和发布门禁阶段。
+- Phase 5 已落地：worker workbook RPC、chunk import staging、large clear undo、large copy
+  export、large format range-native、format undo、streaming export、bounded import/persistence、
+  权威命令收口均在主线。
+- Phase 6 + 6.5 已落地：worker-backed product UI、公式诊断、函数浏览器门禁、虚拟化 UX
+  门禁完成。当前阶段是发布门禁和交付准备。
 
 ### Phase 0：统一状态和门禁
 
@@ -272,18 +269,17 @@ Solid 只渲染和订阅可见 cell 加 overscan：
 - 大导入 undo 有可预测内存上界。
 - 清空/格式化百万 cell 矩形，不在主线程分配百万个 JS 地址字符串。
 
-### Phase 6：产品硬化
+### Phase 6：产品硬化（已完成到 Wave 6.5）
 
 目标：从 demo-grade spreadsheet 走向 product-grade spreadsheet。
 
 交付：
 
-- Rust unit/clippy、wasm-pack browser tests、Jest/TypeScript、Playwright e2e 全部变成
-  blocking CI。
 - Formula error model 和 parser diagnostics 能支撑 UI 展示。
-- 补齐当前 deferred 的 Excel 兼容函数语义。
-- 虚拟化 grid 的 accessibility 和 keyboard 覆盖。
-- Native、WASM、worker、browser e2e 的性能 dashboard。
+- `TEXT/TODAY/NOW` 等当前 MVP 函数已有浏览器门禁。
+- 虚拟化 grid 的 keyboard/context-menu/toolbar 覆盖已进入 e2e + MCP。
+- Rust unit/clippy、wasm-pack browser tests、Jest/TypeScript、Playwright e2e 转成 blocking
+  CI 仍受 no-`.github/workflows/*` 规则限制，应放到发布许可后处理。
 
 验收：
 

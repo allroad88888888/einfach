@@ -354,10 +354,12 @@ Acceptance:
   dependencies are installed.
 - WASM-backed demos do not hang on loading because `wasm-pkg` is missing.
 
-### P0.2 CI Wiring (□ NEXT PRIORITY)
+### P0.2 CI Wiring (Historical / Deferred)
 
-Currently no `.github/workflows/`. Concrete next step is a single workflow
-file that runs e2e on push + PR:
+Historical candidate workflow only. Current user rule forbids editing
+`.github/workflows/*` and forbids push/PR until the overall arc is explicitly
+released, so CI wiring is **not** the active next step. Keep local Playwright
+CLI + MCP records as the blocking gate for this branch.
 
 ```yaml
 # .github/workflows/e2e.yml
@@ -421,12 +423,13 @@ with one line.
 
 ### CI Gate Policy
 
-E2E starts as **advisory only**:
+Historical policy when workflow edits are allowed. It is not active under the
+current no-CI-edit rule.
 
-- CI runs e2e on every push. Failure uploads traces + screenshots.
-- CI does NOT block PR merge on e2e failure for the first 2 weeks.
-- After 2 weeks of stable runs (no flake / no infrastructure failures),
-  promote to PR-blocking.
+- CI may run e2e on every push and upload traces + screenshots.
+- CI can start advisory, then become PR-blocking after stable green runs.
+- Until the user explicitly allows `.github/workflows/*` edits, do not change
+  workflow files.
 
 Locally `npm run e2e` is always blocking — flake should surface to the
 author before push.
@@ -678,9 +681,9 @@ next ticket. Forward order, post-landing:
 5. ✅ Add clipboard permission setup and clipboard tests.
 6. ✅ Add `formulas-wasm.spec.ts`.
 7. ✅ Add FormulaBar and MultiSheet specs.
-8. ✅ Wire e2e into CI — `.github/workflows/e2e.yml` landed in advisory
-   mode (continue-on-error). Promote to blocking once 2 weeks of green
-   runs prove out.
+8. ⏸ Wire e2e into CI — deferred by current user rule forbidding
+   `.github/workflows/*` edits and push/PR. Keep local Playwright CLI + MCP as
+   the active gate.
 9. ✅ Close 3 outstanding gaps from Done Criteria:
    a. ✅ Fix `Cell.tsx::renderCountAttr` (Discovered #A) → MutationObserver
       workaround removed; `render-counter.spec.ts` now uses the probe
@@ -696,9 +699,8 @@ next ticket. Forward order, post-landing:
     unblocked.
 11. ✅ Discovered #B fixed (microtask defer in `JsCallbackListener`).
     Chain propagation tests un-skipped, all passing.
-12. ⏳ Promote e2e CI gate from advisory → PR-blocking after 2 weeks of
-    green runs. Single-line edit: delete `continue-on-error: true` in
-    `.github/workflows/e2e.yml`.
+12. ⏸ Promote e2e CI gate from advisory → PR-blocking only after the user lifts
+    the no-`.github/workflows/*` rule.
 
 ## Default Commands
 
@@ -730,20 +732,19 @@ Reality check against the plan's hard numbers:
 
 | Criterion | Status | Notes |
 |---|---|---|
-| ≥ 8 spec files | ✅ | 21 actual |
-| ≥ 50 test() blocks pass locally | ✅ | 150 active, 0 skip |
-| regression.spec.ts pins ≥ 5 | ✅ | 6 entries, all active after Discovered #E.1 + #E.2 both landed |
+| ≥ 8 spec files | ✅ | 23 actual |
+| ≥ 50 test() blocks pass locally | ✅ | 163 active, 0 skip |
+| regression.spec.ts pins ≥ 5 | ✅ | 7 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |
 | render-counter ≥ 3 strict toBe (no `>=`) | ✅ | 6 strict-delta paths after Discovered #A fix |
-| CI runs e2e with artifact upload, advisory→blocking | ⚠️ | `.github/workflows/e2e.yml` landed in advisory mode. Promote to PR-blocking by deleting `continue-on-error: true` after 2 weeks of green runs |
+| CI runs e2e with artifact upload, advisory→blocking | ⏸ | Deferred by current user rule: do not edit `.github/workflows/*` until release approval |
 | Helpers expose the full API | ✅ | All 13 helpers in helpers.ts (see Helper API table) |
 | No `// TODO: workaround` for fixed bugs | ✅ | grep clean across e2e/ |
 
-**Outstanding to flip remaining ❌ → ✅**:
+**Outstanding**:
 
-1. `.github/workflows/e2e.yml` per P0.2 template above is still advisory.
-2. (Optional, to recover the 2 regression `.skip`s) add two source-side
-   debug shims per Discovered #E.
+1. CI promotion remains intentionally deferred by the current no-push /
+   no-`.github/workflows/*` rule.
 
 MCP/CI 保持不改 `.github/workflows/*` 的当前用户规则，门禁以 `e2e` 文档同步和记录为主。

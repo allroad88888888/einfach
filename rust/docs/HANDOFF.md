@@ -3,22 +3,24 @@
 > Date: 2026-05-14 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified committed tip: `4337eb7` (Wave 5 file import/backpressure)
-> Current verified worktree: Wave 6 product hardening complete through worker-backed MultiSheet,
-> FormulaBar diagnostics, and `TEXT/TODAY/NOW` browser gates; commit pending in current window
+> Last verified committed tip: `0cf1ef3` (`feat(solid-excel): harden virtualized UX gates`)
+> Current verified worktree: clean. Wave 6 product hardening is committed through
+> worker-backed MultiSheet, FormulaBar diagnostics, `TEXT/TODAY/NOW` browser gates,
+> and Wave 6.5 virtualized UX gates.
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
 
-## What's done — Phase 1 → Phase 5 partial
+## What's done — Phase 1 → Wave 6.5
 
 The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land their
 acceptance contracts. After that, Phase 5 partial work also landed worker-owned
 workbook RPC, staged imports, large range clear undo, range-native clipboard
 export, horizontal virtual scroll restoration, range-native large format, and
 large range format undo. Wave 2 chunked TSV export, Wave 3 bounded import +
-sparse persistence v1, Wave 4 observability gates, and Wave 5
-file import/backpressure implementation are committed locally.
+sparse persistence v1, Wave 4 observability gates, Wave 5 file import/backpressure,
+Wave 6 worker-backed product UI hardening, and Wave 6.5 virtualized UX gates are
+committed locally.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -27,7 +29,8 @@ file import/backpressure implementation are committed locally.
 | 3 | `rust/docs/PHASE3_PARALLEL.md` | `8700bd0` | ✅ Workbook-level `CrossSheetDeps` (point + range, reverse + forward) + `Workbook::set_cell/set_formula/clear_cell/bulk_load` + cycle detection on shared graph + WASM mutator/subscribe bindings |
 | 4 | `rust/docs/PHASE4_PARALLEL.md` | `74ec264` | ✅ Native 2D virtualization in `Table.tsx` + bounded initial render + 1M-cell worker demo + active 2D viewport e2e |
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
-| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `4337eb7` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; bounded import + sparse persistence v1; observability counters/e2e/MCP gates; file-stream import/backpressure UI. Remaining gaps are product hardening and release gates |
+| 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `4337eb7` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; bounded import + sparse persistence v1; observability counters/e2e/MCP gates; file-stream import/backpressure UI. Product hardening continued in Wave 6 |
+| 6 + 6.5 | `rust/docs/WAVE6_PRODUCT_HARDENING_PLAN.md` | `0cf1ef3` | ✅ Worker-backed MultiSheet product path, FormulaBar diagnostics, `TEXT/TODAY/NOW` browser gates, 1M toolbar range-native format, keyboard navigation across virtual viewport, and range-preserving context menu clear |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
@@ -38,7 +41,7 @@ cd rust/excel-core && cargo test --test cross_sheet  # 3 / 0 / 0
 cd rust/excel-core && cargo test --test review_repro # 4 / 0 / 0
 cd rust/wasm && cargo build                     # clean
 cd rust/excel-core && cargo bench --no-run      # 3 bench targets clean
-cd /Volumes/work/self/einfach && npx jest       # 58 suites / 418 tests
+cd /Volumes/work/self/einfach && npx jest       # latest commit hook: 62 suites / 496 tests
 # Playwright needs a dev server. Boot:
 cd solid/excel && npm run dev -- --port 5174 --strictPort > /tmp/dev.log 2>&1 &
 sleep 8
@@ -227,38 +230,39 @@ Once agents return:
 | **A** | Wave 3 bounded import + persistence | done | Rust/worker/proxy/e2e/MCP verified API contract is committed |
 | **B** | Wave 4 — perf/observability/MCP gates | done | `f456dd7` 已提交 counters、observability e2e、MCP 记录 |
 | **C** | Product file import/backpressure UI | done in `4337eb7` | Builds on bounded import sessions without changing core lazy semantics |
-| **D** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
-| **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
+| **D** | Release gate wave | 0.5–1 d | Run Rust/WASM/Jest/Solid/Playwright/MCP gates from the current committed tip and record blockers |
+| **E** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
+| **F** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
 Recommended pick if the new window has full autonomy after the current commit:
-**Wave 6 remaining UX/a11y hardening or the release gate wave** (virtualized
-keyboard/context-menu/toolbar sweep, then full release validation), using
-`ONLINE_SPREADSHEET_EXECUTION_WAVES.md`. Hold **D** until user green-lights it.
-Push/CI remains explicitly forbidden until the overall arc lands.
+**release gate wave** using `ONLINE_SPREADSHEET_EXECUTION_WAVES.md`. Wave 6.5
+already covered the virtualized keyboard/context-menu/toolbar sweep. Hold push/PR
+until the user explicitly green-lights it. CI workflow edits remain forbidden.
 
 ## File reading order for the next agent
 
 1. This doc (`rust/docs/HANDOFF.md`).
 2. `rust/docs/ONLINE_SPREADSHEET_PLAN.md` — north-star plan.
-3. `rust/docs/WAVE6_PRODUCT_HARDENING_PLAN.md` — active Wave 6 execution plan.
-4. `rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md` — completed Wave 5 plan and record.
-5. `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` — overall wave tracker.
-6. `rust/docs/PHASE5_PARALLEL.md` — historical worker/range plan.
-7. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
-7. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
+3. `rust/docs/WAVE6_PRODUCT_HARDENING_PLAN.md` — completed Wave 6 / 6.5 execution record.
+4. `rust/docs/RELEASE_GATE_PLAN.md` — current release gate command/blocker checklist.
+5. `rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md` — completed Wave 5 plan and record.
+6. `rust/docs/ONLINE_SPREADSHEET_EXECUTION_WAVES.md` — overall wave tracker.
+7. `rust/docs/PHASE5_PARALLEL.md` — historical worker/range plan.
+8. `rust/docs/PHASE4A_PARALLEL.md` — most recent completed parser plan.
+9. `rust/docs/PHASE1_PARALLEL.md` — has the most thorough trace
    pattern for a P0 bug (good reference if Phase 5 uncovers one).
-6. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is
+10. `rust/excel-core/src/workbook.rs` — touched heavily in Phase 3, is
    the next target if Phase 5 deepens worker-RPC.
-7. `rust/wasm/src/lib.rs` — `WasmWorkbook` canonical vs legacy mutator
+11. `rust/wasm/src/lib.rs` — `WasmWorkbook` canonical vs legacy mutator
    split and missing bulk/import bindings.
-8. `solid/excel/src/wasm-sheet-worker.ts` and
+12. `solid/excel/src/wasm-sheet-worker.ts` and
    `solid/excel/src/wasm-sheet-proxy.ts` — current single-sheet worker
    adapter to replace for product path.
-9. `solid/excel/src/sheet-store.ts` — undo/range/product state boundary.
-10. `solid/excel/src/Table.tsx` — Phase 4's native 2D-virt
+13. `solid/excel/src/sheet-store.ts` — undo/range/product state boundary.
+14. `solid/excel/src/Table.tsx` — Phase 4's native 2D-virt
    implementation, ~480 LOC, the UI surface for any Phase 5+ frontend
    change.
-11. `~/.claude/projects/-Volumes-work-self-einfach/memory/MEMORY.md`
+15. `~/.claude/projects/-Volumes-work-self-einfach/memory/MEMORY.md`
    — user preferences (codex pattern, no-CI-push rule).
 
 ## What to absolutely NOT do without user permission

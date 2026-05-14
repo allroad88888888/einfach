@@ -9,8 +9,9 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `4337eb7 feat(solid-excel): add file import backpressure` 为准；
-文件导入/backpressure UI 已完成本地与 MCP 验收，当前工作树进入 Wave 6 产品硬化。
+以最近提交 `0cf1ef3 feat(solid-excel): harden virtualized UX gates` 为准；
+文件导入/backpressure UI、Wave 6 产品硬化、Wave 6.5 虚拟化 UX 门禁均已完成本地与
+MCP 验收，当前工作树进入发布门禁波。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 本轮状态更新：
@@ -18,6 +19,10 @@
 - Wave 3 已提交到 `6462024`（bounded import + sparse persistence v1）。
 - Wave 4 已提交到 `f456dd7`（debug counters + observability e2e + MCP 记录）。
 - Wave 5 已提交到 `4337eb7`：正式文件导入 / backpressure UI。
+- Wave 6 已提交到 `352df78`：worker-backed MultiSheet、FormulaBar diagnostics、
+  `TEXT/TODAY/NOW` 浏览器门禁。
+- Wave 6.5 已提交到 `0cf1ef3`：1M toolbar range-native format、键盘跨虚拟视口、
+  range 内右键 Clear 与 MCP 记录。
 - Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
@@ -43,6 +48,10 @@
   parse/cycle 结果回传到 store；同步 `set_formula` 兼容接口仍是 optimistic `true`。
 - worker-backed `formulaCacheState` 已能异步从 worker 探测真实 cache 状态；首次读取前可
   返回 `unknown`，随后更新。
+- `DemoMillion` 已接入 `FormatToolbar`；大选区点击真实 Bold 按钮走 range-native
+  `set_format_range`，不展开 `selectionAddrs`。
+- `Table` 右键命中当前 range 时保留选区；context menu 的 Clear/Cut/Copy 可继续作用于
+  已有 range。
 
 仍未达到产品目标的地方：
 
@@ -54,12 +63,12 @@
   合同、稳定错误码和 cancel/commit 测试。
 - 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
   或公式结果。自动保存仍未做。
-- 测试覆盖已经很多，E2E 文档计数已经在 Wave 6 对齐到 23 spec / 160 tests / 0 skip。
-  MCP Playwright 验证记录已经进入 Wave 4/5/6 文档，后续每波继续固定记录。
+- 测试覆盖已经很多，E2E 文档计数已经在 Wave 6.5 对齐到 23 spec / 163 tests / 0 skip。
+  MCP Playwright 验证记录已经进入 Wave 4/5/6/6.5 文档，后续每波继续固定记录。
 
 ## 总体判断
 
-还剩 **1 个产品化实现波 + 1 个发布门禁波**。
+还剩 **1 个发布门禁波**。产品化实现波已完成到 Wave 6.5。
 
 原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
 formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
@@ -419,7 +428,7 @@ MCP 验收：
 - 1M demo 已接入文件导入 UI、取消、统计和 `?debug=1` worker debug client。
 - 可见投影刷新只针对当前订阅窗口，不读取全表。
 - E2E 新增 `file-import.spec.ts` 3 条：CSV、TSV、取消后 session 归零。
-- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 23 spec / 160 tests / 0 skip。
+- `solid/excel/docs/E2E_TEST_PLAN.md` 当前已同步为 23 spec / 163 tests / 0 skip。
 - MCP Playwright 返回：`A1=21`、`B1=mcp-label`、`A120` 读前 dirty / 读后 clean、
   eval delta 1、取消后 `importSessionCount=0`、console warning/error 0。
 
@@ -474,6 +483,8 @@ MCP 验收：
 
 ## 发布门禁波：总验收与交付
 
+详细命令和 blocker 定义见 `rust/docs/RELEASE_GATE_PLAN.md`。
+
 ### 目标
 
 确认主线达到“百万 cell、lazy formula、无协同”的 MVP 交付标准。
@@ -488,10 +499,15 @@ cd rust/excel-core && cargo bench --no-run
 cd rust/wasm && cargo test
 cd rust/wasm && cargo build
 cd rust/wasm && wasm-pack test --headless --chrome .
+cd /Volumes/work/self/einfach && npx tsc -p solid/excel/tsconfig.json --noEmit
 cd /Volumes/work/self/einfach && npm run build -w @einfach/solid-excel
 cd /Volumes/work/self/einfach && npx jest
 cd solid/excel && npm run build:wasm && npx playwright test
 ```
+
+注意：当前 repo 没有统一 root Cargo workspace gate；完整 release gate 应优先按
+`rust/docs/RELEASE_GATE_PLAN.md` 里的 `--manifest-path` 命令执行。`excel-core` clippy 有历史
+baseline，当前作为 advisory，不阻断发布判断。
 
 ### 最终验收清单
 
@@ -509,7 +525,7 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-当前波次：**波次 6：产品硬化与 Excel 兼容缺口**。
+当前波次：**发布门禁波：总验收与交付准备**。
 
 原因：
 
@@ -517,5 +533,5 @@ cd solid/excel && npm run build:wasm && npx playwright test
   file import/backpressure UI 都已完成本轮实现和验证。
 - Wave 4 已经把规模行为做成可查询 counters 和 e2e/MCP 门禁。
 - Wave 5 已经把正式文件流导入/backpressure UI 接到 1M worker demo，并通过 e2e/MCP 验收。
-- 剩余主要缺口转向产品硬化：错误诊断、多 sheet worker product path、虚拟列下交互稳定性、
-  以及最终发布门禁。
+- 错误诊断、多 sheet worker product path、虚拟列下键盘/context menu/toolbar 稳定性已经
+  完成；剩余主要缺口转向最终发布门禁、文档一致性和是否允许 CI/PR 的决策。

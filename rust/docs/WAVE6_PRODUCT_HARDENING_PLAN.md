@@ -9,25 +9,26 @@
 
 ## 当前真实状态
 
-Wave 5 已提交到 `4337eb7 feat(solid-excel): add file import backpressure`。
-文件流导入、backpressure、导入取消、worker import session 计数、懒公式 cache 探针和
-MCP Playwright 验收都已完成。
+Wave 6 + Wave 6.5 已提交到
+`0cf1ef3 feat(solid-excel): harden virtualized UX gates`。本文件现在作为执行记录和
+发布门禁输入，不再是待执行计划。
 
-Wave 6 的重点不再是“底层 lazy 是否存在”，而是把这些能力收进产品 UI 路径：
+已落地：
 
-- `DemoMillion` 已经是 worker-backed workbook + 2D virtualized table。
-- `MultiSheet` 仍使用 `createWorkbookStore()` JS mock，注释和 Notes sheet 还写着
-  cross-sheet formula 不支持。这与当前 worker workbook 能力不一致。
-- `SheetTabs` 当前假设 `addSheet` / `renameSheet` / `removeSheet` 是同步返回；worker
-  workbook 的结构操作是 async RPC。
-- worker-backed store 还没有对外暴露 sheet add/rename/remove/indexOf，所以无法直接替换
-  JS workbook store。
-- 公式失败诊断已经能从 worker 返回 `INVALID_FORMULA` / `FORMULA_CYCLE` 等结果，但 UI 层还
-  没有产品化展示。
-- `TEXT()` / `TODAY()` / `NOW()`、多 sheet worker UI、虚拟列下 toolbar/context menu 的
-  浏览器覆盖还需要补齐为发布门禁。
+- `MultiSheet` 已切到 worker-backed workbook；`SheetTabs` 支持 sync/async workbook
+  结构操作。
+- worker-backed store 已暴露并测试 `addSheet` / `renameSheet` / `removeSheet` /
+  `indexOf`。
+- FormulaBar 已产品化展示 worker/Rust 返回的 `INVALID_FORMULA` / `FORMULA_CYCLE`
+  简洁诊断，并在成功提交或切换 selection 后清理。
+- `TEXT()` / `TODAY()` / `NOW()` 已有真实 WASM browser gate。
+- `DemoMillion` 已是 worker-backed workbook + 2D virtualized table，并接入
+  `FormatToolbar`。
+- 虚拟化 UX 门禁已覆盖：1M 大选区真实 Bold 走 range-native `set_format_range`、键盘跨
+  视口 selection 不丢、右键命中当前 range 时 Clear 不折叠选区。
+- 本波每个 UI 行为变更都有 Playwright CLI + MCP Playwright 验收记录。
 
-## Wave 6 目标
+## Wave 6 目标（已完成）
 
 1. 把 `MultiSheet` demo 切到 worker-backed workbook，跨 sheet formula 在产品 UI 路径可用。
 2. 让 `SheetTabs` 支持 async workbook 结构操作，同时保持 JS mock 兼容。
