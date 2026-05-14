@@ -3,6 +3,7 @@ import type {
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  ClearRangeRequest,
   SetCellInputRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -203,6 +204,19 @@ function updateCell(
   return cell
 }
 
+function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest): number {
+  let cleared = 0
+
+  for (const [key, cell] of [...cells.entries()]) {
+    if (isCellInsideRange(cell, request.range)) {
+      cells.delete(key)
+      cleared += 1
+    }
+  }
+
+  return cleared
+}
+
 export function matrixToDisplayCells(matrix: StaticSeedMatrix): DisplayCell[] {
   return matrixToCells(matrix)
 }
@@ -268,6 +282,22 @@ export function createStaticSpreadsheetBackend(
           rowEnd: request.row,
           colStart: request.col,
           colEnd: request.col,
+        },
+      }
+    },
+    async clearRange(request) {
+      clearRange(state.cells, request)
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        affectedRange: {
+          rowStart: request.range.rowStart,
+          rowEnd: request.range.rowEnd,
+          colStart: request.range.colStart,
+          colEnd: request.range.colEnd,
         },
       }
     },

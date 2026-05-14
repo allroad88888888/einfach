@@ -73,6 +73,13 @@ export interface SetCellInputRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface ClearRangeRequest extends SheetRef {
+  kind: 'clear-range'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -83,4 +90,5 @@ export interface SpreadsheetBackend {
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
+  clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
 }

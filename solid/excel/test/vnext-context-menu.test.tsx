@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
+  ClearRangeRequest,
   SetCellInputRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -16,6 +17,7 @@ afterEach(cleanup)
 
 function createFakeBackend() {
   const setCellInputRequests: SetCellInputRequest[] = []
+  const clearRangeRequests: ClearRangeRequest[] = []
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
@@ -46,9 +48,18 @@ function createFakeBackend() {
         },
       }
     },
+    async clearRange(request) {
+      clearRangeRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        affectedRange: request.range,
+      }
+    },
   }
 
-  return { backend, setCellInputRequests, readVisibleRequests }
+  return { backend, setCellInputRequests, clearRangeRequests, readVisibleRequests }
 }
 
 describe('vNext SpreadsheetContextMenu', () => {
@@ -192,6 +203,69 @@ describe('vNext SpreadsheetContextMenu', () => {
       },
     })
 
+    await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+  })
+
+  it('clears the whole range target when Delete is clicked on a range menu', async () => {
+    const store = createStore()
+    const { backend, clearRangeRequests, readVisibleRequests } = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+    const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 2 }
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          { row: 0, col: 0, displayValue: 'A1' },
+          { row: 1, col: 2, displayValue: 'C2' },
+        ],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-cell.clear'))
+
+    await waitFor(() =>
+      expect(clearRangeRequests).toEqual([
+        {
+          kind: 'clear-range',
+          sheetId: 'sheet-1',
+          range,
+        },
+      ]),
+    )
+    await waitFor(() => expect(readVisibleRequests).toHaveLength(1))
+    expect(readVisibleRequests[0]).toMatchObject({
+      kind: 'visible-window',
+      sheetId: 'sheet-1',
+      window,
+      reason: 'selection',
+    })
     await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
   })
 

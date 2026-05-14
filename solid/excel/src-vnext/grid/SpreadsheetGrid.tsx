@@ -281,6 +281,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     event: MouseEvent,
     target:
       | { kind: 'cell'; row: number; col: number }
+      | { kind: 'range'; row: number; col: number }
       | { kind: 'row'; row: number }
       | { kind: 'column'; col: number }
       | { kind: 'all' },
@@ -292,6 +293,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         sheetId: props.sheetId,
         coord: { row: target.row, col: target.col },
       })
+    } else if (target.kind === 'range') {
+      const selection = selectionSnapshot()
+      if (
+        selection.selection.sheetId !== props.sheetId ||
+        selection.selection.kind !== 'range' ||
+        target.row < selection.range.rowStart ||
+        target.row > selection.range.rowEnd ||
+        target.col < selection.range.colStart ||
+        target.col > selection.range.colEnd
+      ) {
+        store.setter(selectCellAtom, {
+          sheetId: props.sheetId,
+          coord: { row: target.row, col: target.col },
+        })
+      }
     } else if (target.kind === 'row') {
       store.setter(selectRowsAtom, {
         sheetId: props.sheetId,
@@ -309,7 +325,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     store.setter(openMenuAtom, {
-      surface: target.kind === 'cell' ? 'cell' : 'header',
+      surface: target.kind === 'cell' || target.kind === 'range' ? 'cell' : 'header',
       target:
         target.kind === 'cell'
           ? {
@@ -317,6 +333,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
               sheetId: props.sheetId,
               cell: { row: target.row, col: target.col },
             }
+          : target.kind === 'range'
+            ? {
+                kind: 'range',
+                sheetId: props.sheetId,
+                range: selectionSnapshot().range,
+              }
           : target.kind === 'row'
             ? {
                 kind: 'row',
@@ -341,6 +363,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
     bumpRender()
     focusGrid()
+  }
+
+  function getCellContextTarget(row: number, col: number): { kind: 'cell' | 'range'; row: number; col: number } {
+    const selection = selectionSnapshot()
+    if (
+      selection.selection.sheetId === props.sheetId &&
+      selection.selection.kind === 'range' &&
+      row >= selection.range.rowStart &&
+      row <= selection.range.rowEnd &&
+      col >= selection.range.colStart &&
+      col <= selection.range.colEnd
+    ) {
+      return { kind: 'range', row, col }
+    }
+
+    return { kind: 'cell', row, col }
   }
 
   function selectRow(row: number, extend: boolean) {
@@ -532,11 +570,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                           data-selected={selected() ? 'true' : 'false'}
                           data-active={active() ? 'true' : 'false'}
                           aria-selected={selected() ? 'true' : 'false'}
-                          onClick={() => {
+                          onClick={(event) => {
                             store.setter(selectCellAtom, {
                               sheetId: props.sheetId,
                               coord: { row, col },
-                              extend: false,
+                              extend: event.shiftKey,
                             })
                             bumpRender()
                             focusGrid()
@@ -559,7 +597,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             startEditingCell(row, col, 'cell')
                           }}
                           onContextMenu={(event) => {
-                            openContextMenu(event, { kind: 'cell', row, col })
+                            openContextMenu(event, getCellContextTarget(row, col))
                           }}
                         >
                           <Show

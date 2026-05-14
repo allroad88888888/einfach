@@ -1,6 +1,7 @@
 import type {
   BackendMutationResult,
   CellRange,
+  ClearRangeRequest,
   DisplayCell,
   ProjectionRevision,
   RangeProjectionRequest,
@@ -322,6 +323,24 @@ export function createWorkerWorkbookSpreadsheetBackend(
           rowEnd: request.row,
           colStart: request.col,
           colEnd: request.col,
+        },
+      }
+    },
+
+    async clearRange(request: ClearRangeRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.clearRange(toSparseRange(sheet.idx, request.range))
+      const nextRevision = bumpRevision()
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+        affectedRange: {
+          rowStart: request.range.rowStart,
+          rowEnd: request.range.rowEnd,
+          colStart: request.range.colStart,
+          colEnd: request.range.colEnd,
         },
       }
     },

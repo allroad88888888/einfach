@@ -381,6 +381,9 @@ Playwright CLI，并补 MCP Playwright 验证记录。
 - PC-6 第五段：vNext 新增 worker workbook backend adapter 和 `vNext Worker` demo。vNext UI
   仍只依赖 `SpreadsheetBackend` port；真实 Rust worker 通过 adapter 提供
   `readSparseRange` 可视投影和 `setCell` / `setFormulaDetailed` / `clearCell` mutation。
+- PC-6 第六段：backend port 增加可选 `clearRange`，static/worker adapter 已实现；
+  vNext Grid 修正 Shift-click 选区保持，右键选区内 cell 会打开 range target menu，
+  ContextMenu Delete 可通过 backend range clear 清空整个选区。
 
 PC-6 第一段验收记录：
 
@@ -442,13 +445,27 @@ PC-6 第五段验收记录：
   将 `Sheet1!B4` 改成 `20` 后，`Sheet1!C2=23`、切到 `Sheet2` 后 `C2=22`、
   切到 `Sheet3` 后 `C2=21`，console error 为 0。
 
+PC-6 第六段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-context-menu.test.tsx solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npx jest vanilla/spreadsheet-ui-core/test --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- MCP Playwright：打开 `http://127.0.0.1:5173/` 的 `vNext` demo，验证
+  Shift-click 选中 `A1:C2` 后状态栏显示 `A1:C2`，右键 `B2` 打开 `range`
+  target menu；执行 Delete 后 `A1/B1/C1/A2/B2/C2` 清空，`D1` 保持 `Delta`，
+  loaded count 变为 `24 loaded`，console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
   public entry 还未切到 vNext，worker adapter 也还没接 sheet rename/reorder/delete 等完整
   workbook mutation。
-- vNext chrome UI 已有 status bar；Toolbar 仍只产生 intent，ContextMenu 只有 `cell.clear`
-  接了真实 mutation，尚未接真实 format / row-column mutation / clipboard command executor。
+- vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
+  mutation；Toolbar 仍只产生 intent，尚未接真实 format / row-column mutation /
+  clipboard command executor。
 - FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
   mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、

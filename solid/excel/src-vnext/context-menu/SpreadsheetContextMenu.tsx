@@ -139,17 +139,30 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   async function executeCommand(intent: MenuCommandIntent) {
     const target = intent.target
-    if (intent.command !== 'cell.clear' || target.kind !== 'cell') {
+    if (intent.command !== 'cell.clear') {
       return
     }
 
-    await backend.setCellInput({
-      kind: 'set-cell-input',
-      sheetId: target.sheetId,
-      row: target.cell.row,
-      col: target.cell.col,
-      input: '',
-    })
+    if (target.kind === 'cell') {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: target.sheetId,
+        row: target.cell.row,
+        col: target.cell.col,
+        input: '',
+      })
+    } else if (target.kind === 'range') {
+      if (!backend.clearRange) {
+        throw new Error('Range clear is not supported by this spreadsheet backend.')
+      }
+      await backend.clearRange({
+        kind: 'clear-range',
+        sheetId: target.sheetId,
+        range: target.range,
+      })
+    } else {
+      return
+    }
     await refreshProjection(target.sheetId)
   }
 

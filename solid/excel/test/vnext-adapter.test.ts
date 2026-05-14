@@ -27,6 +27,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
     setFormulaDetailed: Array<{ sheet: number; addr: string; formula: string }>
     clearCell: Array<{ sheet: number; addr: string }>
+    clearRange: SparseRangeWire[]
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -42,6 +43,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setCell: [],
     setFormulaDetailed: [],
     clearCell: [],
+    clearRange: [],
   }
   let metas: WorkbookSheetMeta[] = []
 
@@ -140,8 +142,12 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       cells.delete(key(sheet, addr))
       return true
     },
-    async clearRange() {
-      throw new Error('not used')
+    async clearRange(range) {
+      calls.clearRange.push({ ...range })
+      for (const [cellKey, snapshot] of [...cells.entries()]) {
+        if (insideRange(snapshot, range)) cells.delete(cellKey)
+      }
+      return 1
     },
     async setFormatRange() {
       throw new Error('not used')
@@ -371,6 +377,40 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('clears static backend ranges without materializing blank cells', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      matrix: [
+        ['A1', 'B1', 'C1'],
+        ['A2', 'B2', 'C2'],
+      ],
+    })
+
+    const mutation = await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 12,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(mutation?.affectedRange).toEqual({
+      rowStart: 0,
+      rowEnd: 1,
+      colStart: 0,
+      colEnd: 1,
+    })
+    expect(result.cells).toEqual([
+      { row: 0, col: 2, displayValue: 'C1', valueKind: 'string' },
+      { row: 1, col: 2, displayValue: 'C2', valueKind: 'string' },
+    ])
+  })
+
   it('keeps requestId and revision aligned on visible reads', async () => {
     const backend = createStaticSpreadsheetBackend([
       ['A1', 'B1'],
@@ -502,6 +542,63 @@ describe('vnext adapter', () => {
       revision: 8,
       affectedRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
     })
+
+    backend.dispose()
+  })
+
+  it('routes worker workbook range clear through backend clearRange', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+    })
+
+    await backend.ready()
+    client.putCell({
+      sheet: 0,
+      addr: 'A1',
+      display: 'A1',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'C1',
+      display: 'C1',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+
+    const mutation = await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      requestId: 10,
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+    })
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 11,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(client.calls.clearRange).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+    ])
+    expect(mutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 10,
+      revision: 6,
+      affectedRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+    })
+    expect(result.cells).toEqual([
+      { row: 0, col: 2, displayValue: 'C1', valueKind: 'string' },
+    ])
 
     backend.dispose()
   })

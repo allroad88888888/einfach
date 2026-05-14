@@ -1,5 +1,6 @@
 import type {
   BackendMutationResult,
+  ClearRangeRequest,
   DisplayCell,
   ProjectionRevision,
   RangeProjectionRequest,
@@ -36,6 +37,7 @@ export type StaticSpreadsheetMutationResult = BackendMutationResult
 
 export type {
   BackendMutationResult,
+  ClearRangeRequest,
   DisplayCell,
   ProjectionRevision,
   RangeProjectionRequest,

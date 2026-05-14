@@ -98,4 +98,29 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(menu).toHaveCount(0)
     await expect(cellDisplay(page, 'A1')).toHaveText('')
   })
+
+  test('range context menu clear preserves selection and clears the selected range', async ({
+    page,
+  }) => {
+    await gotoVNextDemo(page)
+
+    await cell(page, 'A1').click()
+    await cell(page, 'C2').click({ modifiers: ['Shift'] })
+    await expect(cell(page, 'B2')).toHaveAttribute('data-selected', 'true')
+
+    await cell(page, 'B2').click({ button: 'right' })
+    const menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await expect(menu).toHaveAttribute('data-menu-target-kind', 'range')
+
+    await page.getByTestId('context-menu-command-cell.clear').click()
+    await expect(menu).toHaveCount(0)
+    await expect(cellDisplay(page, 'A1')).toHaveText('')
+    await expect(cellDisplay(page, 'B1')).toHaveText('')
+    await expect(cellDisplay(page, 'C1')).toHaveText('')
+    await expect(cellDisplay(page, 'A2')).toHaveText('')
+    await expect(cellDisplay(page, 'B2')).toHaveText('')
+    await expect(cellDisplay(page, 'C2')).toHaveText('')
+    await expect(cellDisplay(page, 'D1')).toHaveText('Delta')
+  })
 })

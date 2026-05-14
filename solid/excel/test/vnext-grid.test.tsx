@@ -306,4 +306,63 @@ describe('vNext SpreadsheetGrid', () => {
       },
     })
   })
+
+  it('preserves selected range when opening a cell context menu inside it', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="C2"] .spreadsheet-grid-cell-button')!, {
+      shiftKey: true,
+    })
+
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 2 },
+    })
+
+    fireEvent.contextMenu(container.querySelector('[data-cell-addr="B2"]')!, {
+      clientX: 22,
+      clientY: 44,
+    })
+
+    expect(store.getter(menuStateAtom)).toMatchObject({
+      status: 'open',
+      surface: 'cell',
+      target: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        range: {
+          rowStart: 0,
+          rowEnd: 1,
+          colStart: 0,
+          colEnd: 2,
+        },
+      },
+    })
+  })
 })
