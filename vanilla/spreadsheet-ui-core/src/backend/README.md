@@ -19,6 +19,10 @@ Sheet metadata ports return bounded sheet lists only. `reorderSheet` changes the
 displayed sheet metadata order and must not imply any cell snapshot or sheet
 content materialization.
 
+Viewport size metadata ports are window based. `readViewportSizeProjection`
+returns only sparse row heights and column widths for the visible window; resize
+mutations write one row or one column at a time.
+
 ## State Decision Template
 
 - Source atoms: none.

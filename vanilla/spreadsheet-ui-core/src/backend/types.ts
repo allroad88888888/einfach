@@ -141,6 +141,48 @@ export interface SetFormatRangeRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface ViewportSizeProjectionRequest extends SheetRef {
+  kind: 'viewport-size'
+  window: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface ViewportRowHeight {
+  rowIndex: number
+  heightPx: number
+}
+
+export interface ViewportColumnWidth {
+  colIndex: number
+  widthPx: number
+}
+
+export interface ViewportSizeProjectionResult extends SheetRef {
+  kind: 'viewport-size'
+  window: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  rowHeights: ViewportRowHeight[]
+  colWidths: ViewportColumnWidth[]
+}
+
+export interface SetRowHeightRequest extends SheetRef {
+  kind: 'set-row-height'
+  rowIndex: number
+  heightPx: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface SetColumnWidthRequest extends SheetRef {
+  kind: 'set-column-width'
+  colIndex: number
+  widthPx: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export type SpreadsheetFillDirection = 'up' | 'down' | 'left' | 'right'
 
 export interface FillRangeRequest extends SheetRef {
@@ -232,6 +274,9 @@ export interface SpreadsheetBackend {
   listSheets?(): Promise<SheetListResult>
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
+  readViewportSizeProjection?(
+    request: ViewportSizeProjectionRequest,
+  ): Promise<ViewportSizeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
   clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
   insertRows?(request: InsertRowsRequest): Promise<BackendMutationResult>
@@ -239,6 +284,8 @@ export interface SpreadsheetBackend {
   insertColumns?(request: InsertColumnsRequest): Promise<BackendMutationResult>
   deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
   setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
+  setRowHeight?(request: SetRowHeightRequest): Promise<BackendMutationResult>
+  setColumnWidth?(request: SetColumnWidthRequest): Promise<BackendMutationResult>
   fillRange?(request: FillRangeRequest): Promise<BackendMutationResult>
   resolveDataEdge?(request: ResolveDataEdgeRequest): Promise<ResolveDataEdgeResult>
   addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>

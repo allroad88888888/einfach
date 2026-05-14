@@ -441,6 +441,14 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   层维护 sheet id 到 Rust idx 的显示顺序映射，底层 Rust workbook 暂不执行 `move_sheet`，
   避免在 cross-sheet 依赖图按 index 存储的现状下误改内容归属。该链路只移动 sheet
   metadata，不读取或物化任何 cell。
+- PC-6 第十八段：vNext Grid 已接 row/column size backend metadata 第一版。
+  `@einfach/spreadsheet-ui-core` 增加 `readViewportSizeProjection`、`setRowHeight`、
+  `setColumnWidth` 可选 backend port；请求按当前 visible window 返回 sparse row height /
+  column width facts，resize commit 只写单行或单列 metadata。Solid Grid 仍用
+  `viewportSizeOverridesAtom` 做可视渲染桥接，mount 时从 backend hydrate 当前窗口尺寸；
+  static backend 按 `sheetId` 持久化 size metadata，worker adapter 在 JS adapter 层维护 size
+  metadata，底层 Rust workbook 暂未持久化 row/col size。该链路不读取 cell projection、
+  不创建 row/col atom，也不维护全量尺寸数组。
 
 PC-6 第一段验收记录：
 
@@ -660,6 +668,21 @@ PC-6 第十七段验收记录：
   `Sheet3 / Sheet1 / Sheet2`，active 仍为 `Sheet1`，当前仍只渲染 30 个可视 cell、
   `J20` offscreen 未挂载、projection 为 `Ready`、console error 为 0。
 
+PC-6 第十八段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/backend-contract.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/`，分别验证 `vNext` 和 `vNext Worker`
+  demo 中拖拽 B 列和第 2 行；两条路径 B 列 / `B2` 宽度均为 `128px`、第 2 行 /
+  `B2` 高度均为 `36px`，当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、
+  projection 为 `Ready`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -674,7 +697,8 @@ PC-6 第十七段验收记录：
   和 metadata reorder mutation；Rust-level sheet order mutation 仍待单独设计。
 - 数据区域感知的 Ctrl+Arrow 已有 optional backend port，static backend 和 worker/Rust
   backend adapter 均已接入；后续可继续补更完整的 Excel 空白/非空边界细节测试。
-- Excel 级交互仍缺：row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。
+- Excel 级交互仍缺：row/col resize 已接 vNext backend metadata port，但 Rust
+  persistence / reload 后保留 / auto-fit 等完整 Excel 行为仍未实现。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 
 ## 并行 Agent 计划

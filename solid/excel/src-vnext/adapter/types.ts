@@ -14,7 +14,9 @@ import type {
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
+  SetColumnWidthRequest,
   SetFormatRangeRequest,
+  SetRowHeightRequest,
   SheetListResult,
   SheetMutationResult,
   SpreadsheetBackend,
@@ -22,6 +24,8 @@ import type {
   SpreadsheetSheetMetadata,
   SpreadsheetNumberFormat,
   VisibleProjectionRequest,
+  ViewportSizeProjectionRequest,
+  ViewportSizeProjectionResult,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 
@@ -72,7 +76,9 @@ export type {
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
+  SetColumnWidthRequest,
   SetFormatRangeRequest,
+  SetRowHeightRequest,
   SheetListResult,
   SheetMutationResult,
   SpreadsheetBackend,
@@ -80,5 +86,7 @@ export type {
   SpreadsheetSheetMetadata,
   SpreadsheetNumberFormat,
   VisibleProjectionRequest,
+  ViewportSizeProjectionRequest,
+  ViewportSizeProjectionResult,
   VisibleProjectionResult,
 }

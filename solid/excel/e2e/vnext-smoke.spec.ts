@@ -257,7 +257,7 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(cellDisplay(page, 'B1')).toHaveText('Gamma')
   })
 
-  test('row and column resize update only visible UI dimensions', async ({ page }) => {
+  test('row and column resize update viewport size metadata', async ({ page }) => {
     await gotoVNextDemo(page)
 
     const colHeader = page.locator('.spreadsheet-grid-col-header[data-col="1"]')

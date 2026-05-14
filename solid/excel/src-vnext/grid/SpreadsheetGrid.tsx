@@ -228,6 +228,65 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     bumpRender()
   }
 
+  async function hydrateViewportSizeProjection() {
+    if (!backend.readViewportSizeProjection) {
+      return
+    }
+
+    const window = store.getter(visibleWindowAtom)
+    if (window.rowEnd < window.rowStart || window.colEnd < window.colStart) {
+      return
+    }
+
+    const result = await backend.readViewportSizeProjection({
+      kind: 'viewport-size',
+      sheetId: props.sheetId,
+      window,
+    })
+
+    for (const row of result.rowHeights) {
+      store.setter(setViewportRowHeightAtom, {
+        sheetId: props.sheetId,
+        rowIndex: row.rowIndex,
+        heightPx: row.heightPx,
+      })
+    }
+    for (const col of result.colWidths) {
+      store.setter(setViewportColumnWidthAtom, {
+        sheetId: props.sheetId,
+        colIndex: col.colIndex,
+        widthPx: col.widthPx,
+      })
+    }
+    bumpRender()
+  }
+
+  async function persistColumnWidth(colIndex: number, widthPx: number) {
+    if (!backend.setColumnWidth) {
+      return
+    }
+
+    await backend.setColumnWidth({
+      kind: 'set-column-width',
+      sheetId: props.sheetId,
+      colIndex,
+      widthPx,
+    })
+  }
+
+  async function persistRowHeight(rowIndex: number, heightPx: number) {
+    if (!backend.setRowHeight) {
+      return
+    }
+
+    await backend.setRowHeight({
+      kind: 'set-row-height',
+      sheetId: props.sheetId,
+      rowIndex,
+      heightPx,
+    })
+  }
+
   onMount(() => {
     unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
@@ -239,6 +298,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
     bumpRender()
     void loadProjection(requestProjection())
+    void hydrateViewportSizeProjection()
   })
 
   onCleanup(() => {
@@ -831,6 +891,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           colIndex: intent.colIndex,
           widthPx: intent.previewSizePx,
         })
+        void persistColumnWidth(intent.colIndex, intent.previewSizePx).catch(() => undefined)
       }
       cleanupResize()
       bumpRender()
@@ -889,6 +950,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           rowIndex: intent.rowIndex,
           heightPx: intent.previewSizePx,
         })
+        void persistRowHeight(intent.rowIndex, intent.previewSizePx).catch(() => undefined)
       }
       cleanupResize()
       bumpRender()

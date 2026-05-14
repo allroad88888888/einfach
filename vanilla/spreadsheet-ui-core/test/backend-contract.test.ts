@@ -35,6 +35,17 @@ describe('backend contract', () => {
           cells: [{ row: request.range.rowStart, col: request.range.colStart, displayValue: 'A' }],
         }
       },
+      async readViewportSizeProjection(request) {
+        return {
+          kind: 'viewport-size',
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 'r1',
+          window: request.window,
+          rowHeights: [{ rowIndex: request.window.rowStart, heightPx: 32 }],
+          colWidths: [{ colIndex: request.window.colStart, widthPx: 128 }],
+        }
+      },
       async setCellInput(request) {
         return {
           sheetId: request.sheetId,
@@ -46,6 +57,20 @@ describe('backend contract', () => {
             colStart: request.col,
             colEnd: request.col,
           },
+        }
+      },
+      async setRowHeight(request) {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 'r3',
+        }
+      },
+      async setColumnWidth(request) {
+        return {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          revision: 'r4',
         }
       },
     }
@@ -64,6 +89,12 @@ describe('backend contract', () => {
 
     const visibleResult = await backend.readVisibleProjection(visibleRequest)
     const rangeResult = await backend.readRangeProjection(rangeRequest)
+    const sizeResult = await backend.readViewportSizeProjection?.({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 10,
+      window: { rowStart: 2, rowEnd: 3, colStart: 1, colEnd: 2 },
+    })
     const mutationResult = await backend.setCellInput({
       kind: 'set-cell-input',
       sheetId: 'sheet-1',
@@ -71,6 +102,20 @@ describe('backend contract', () => {
       row: 2,
       col: 1,
       input: '=A1+1',
+    })
+    const rowHeightResult = await backend.setRowHeight?.({
+      kind: 'set-row-height',
+      sheetId: 'sheet-1',
+      requestId: 11,
+      rowIndex: 2,
+      heightPx: 32,
+    })
+    const columnWidthResult = await backend.setColumnWidth?.({
+      kind: 'set-column-width',
+      sheetId: 'sheet-1',
+      requestId: 12,
+      colIndex: 1,
+      widthPx: 128,
     })
 
     expect(validateProjectionResult(visibleResult, { request: visibleRequest })).toEqual({
@@ -86,6 +131,23 @@ describe('backend contract', () => {
       requestId: 9,
       revision: 'r2',
       affectedRange: { rowStart: 2, rowEnd: 2, colStart: 1, colEnd: 1 },
+    })
+    expect(sizeResult).toMatchObject({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 10,
+      rowHeights: [{ rowIndex: 2, heightPx: 32 }],
+      colWidths: [{ colIndex: 1, widthPx: 128 }],
+    })
+    expect(rowHeightResult).toMatchObject({
+      sheetId: 'sheet-1',
+      requestId: 11,
+      revision: 'r3',
+    })
+    expect(columnWidthResult).toMatchObject({
+      sheetId: 'sheet-1',
+      requestId: 12,
+      revision: 'r4',
     })
   })
 })

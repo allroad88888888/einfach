@@ -13,12 +13,16 @@ import type {
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
+  SetColumnWidthRequest,
   SetFormatRangeRequest,
+  SetRowHeightRequest,
   SheetMutationResult,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
   VisibleProjectionRequest,
+  ViewportSizeProjectionRequest,
+  ViewportSizeProjectionResult,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
@@ -129,6 +133,8 @@ interface StaticBackendState {
   cells: Map<string, DisplayCell>
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
+  rowHeightsBySheetId: Map<string, Map<number, number>>
+  colWidthsBySheetId: Map<string, Map<number, number>>
   sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
 }
@@ -191,6 +197,8 @@ function buildState(
     cells: cellMap,
     cellFormats,
     rangeFormats: [],
+    rowHeightsBySheetId: new Map(),
+    colWidthsBySheetId: new Map(),
     sheets,
     revision,
   }
@@ -316,6 +324,52 @@ function hasSameSheetOrder(
   right: readonly SpreadsheetSheetMetadata[],
 ): boolean {
   return left.length === right.length && left.every((sheet, index) => sheet.id === right[index]?.id)
+}
+
+function normalizeDimensionSize(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 1
+  }
+  return Math.max(1, Math.round(value))
+}
+
+function shiftDimensionMap(
+  sizes: Map<number, number>,
+  index: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const next = new Map<number, number>()
+  const deleteEnd = index + count - 1
+
+  for (const [sizeIndex, size] of sizes) {
+    if (direction === -1 && sizeIndex >= index && sizeIndex <= deleteEnd) {
+      continue
+    }
+
+    const nextIndex =
+      sizeIndex >= (direction === 1 ? index : deleteEnd + 1)
+        ? sizeIndex + count * direction
+        : sizeIndex
+    if (nextIndex >= 0) {
+      next.set(nextIndex, size)
+    }
+  }
+
+  sizes.clear()
+  for (const [sizeIndex, size] of next) sizes.set(sizeIndex, size)
+}
+
+function getDimensionMap(
+  sizesBySheetId: Map<string, Map<number, number>>,
+  sheetId: string,
+): Map<number, number> {
+  let sizes = sizesBySheetId.get(sheetId)
+  if (!sizes) {
+    sizes = new Map()
+    sizesBySheetId.set(sheetId, sizes)
+  }
+  return sizes
 }
 
 function sheetMutationResult(
@@ -448,6 +502,30 @@ function buildProjectionResult(
     cells: resultCells,
   }
   return result
+}
+
+function buildViewportSizeProjectionResult(
+  request: ViewportSizeProjectionRequest,
+  state: StaticBackendState,
+): ViewportSizeProjectionResult {
+  const rowHeights = [...(state.rowHeightsBySheetId.get(request.sheetId) ?? new Map()).entries()]
+    .filter(([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd)
+    .map(([rowIndex, heightPx]) => ({ rowIndex, heightPx }))
+    .sort((left, right) => left.rowIndex - right.rowIndex)
+  const colWidths = [...(state.colWidthsBySheetId.get(request.sheetId) ?? new Map()).entries()]
+    .filter(([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd)
+    .map(([colIndex, widthPx]) => ({ colIndex, widthPx }))
+    .sort((left, right) => left.colIndex - right.colIndex)
+
+  return {
+    kind: 'viewport-size',
+    sheetId: request.sheetId,
+    window: { ...request.window },
+    requestId: request.requestId,
+    revision: request.revision ?? state.revision,
+    rowHeights,
+    colWidths,
+  }
 }
 
 function bumpRevision(revision: ProjectionRevision): ProjectionRevision {
@@ -872,6 +950,9 @@ export function createStaticSpreadsheetBackend(
     async readRangeProjection(request) {
       return buildProjectionResult(request, state) as RangeProjectionResult
     },
+    async readViewportSizeProjection(request) {
+      return buildViewportSizeProjectionResult(request, state)
+    },
     async setCellInput(request) {
       updateCell(state.cells, request)
       state.revision = bumpRevision(state.revision)
@@ -913,6 +994,12 @@ export function createStaticSpreadsheetBackend(
         request.count,
         1,
       )
+      shiftDimensionMap(
+        getDimensionMap(state.rowHeightsBySheetId, request.sheetId),
+        request.rowIndex,
+        request.count,
+        1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -921,6 +1008,12 @@ export function createStaticSpreadsheetBackend(
         state.cells,
         state.cellFormats,
         state.rangeFormats,
+        request.rowIndex,
+        request.count,
+        -1,
+      )
+      shiftDimensionMap(
+        getDimensionMap(state.rowHeightsBySheetId, request.sheetId),
         request.rowIndex,
         request.count,
         -1,
@@ -937,6 +1030,12 @@ export function createStaticSpreadsheetBackend(
         request.count,
         1,
       )
+      shiftDimensionMap(
+        getDimensionMap(state.colWidthsBySheetId, request.sheetId),
+        request.colIndex,
+        request.count,
+        1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -945,6 +1044,12 @@ export function createStaticSpreadsheetBackend(
         state.cells,
         state.cellFormats,
         state.rangeFormats,
+        request.colIndex,
+        request.count,
+        -1,
+      )
+      shiftDimensionMap(
+        getDimensionMap(state.colWidthsBySheetId, request.sheetId),
         request.colIndex,
         request.count,
         -1,
@@ -970,6 +1075,32 @@ export function createStaticSpreadsheetBackend(
           colStart: request.range.colStart,
           colEnd: request.range.colEnd,
         },
+      }
+    },
+    async setRowHeight(request: SetRowHeightRequest) {
+      getDimensionMap(state.rowHeightsBySheetId, request.sheetId).set(
+        request.rowIndex,
+        normalizeDimensionSize(request.heightPx),
+      )
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
+    async setColumnWidth(request: SetColumnWidthRequest) {
+      getDimensionMap(state.colWidthsBySheetId, request.sheetId).set(
+        request.colIndex,
+        normalizeDimensionSize(request.widthPx),
+      )
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
       }
     },
     async fillRange(request) {
@@ -1043,6 +1174,8 @@ export function createStaticSpreadsheetBackend(
 
       const nextSheets = state.sheets.filter((sheet) => sheet.id !== request.sheetId)
       state.sheets = reindexSheets(nextSheets)
+      state.rowHeightsBySheetId.delete(request.sheetId)
+      state.colWidthsBySheetId.delete(request.sheetId)
       state.revision = bumpRevision(state.revision)
       const activeSheetId = state.sheets[Math.min(deleteIndex, state.sheets.length - 1)]?.id ?? null
 

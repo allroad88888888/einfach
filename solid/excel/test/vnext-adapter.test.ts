@@ -792,6 +792,61 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('stores static backend viewport size metadata sparsely', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      matrix: [['A1']],
+      sheets: ['Sheet1', 'Sheet2'],
+    })
+
+    const rowMutation = await backend.setRowHeight?.({
+      kind: 'set-row-height',
+      sheetId: 'sheet-1',
+      requestId: 30,
+      rowIndex: 1,
+      heightPx: 36.4,
+    })
+    const colMutation = await backend.setColumnWidth?.({
+      kind: 'set-column-width',
+      sheetId: 'sheet-1',
+      requestId: 31,
+      colIndex: 1,
+      widthPx: 128.6,
+    })
+
+    expect(rowMutation).toMatchObject({ sheetId: 'sheet-1', requestId: 30, revision: 1 })
+    expect(colMutation).toMatchObject({ sheetId: 'sheet-1', requestId: 31, revision: 2 })
+
+    const result = await backend.readViewportSizeProjection?.({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 32,
+      window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+    })
+
+    expect(result).toEqual({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 32,
+      revision: 2,
+      window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      rowHeights: [{ rowIndex: 1, heightPx: 36 }],
+      colWidths: [{ colIndex: 1, widthPx: 129 }],
+    })
+
+    await expect(
+      backend.readViewportSizeProjection?.({
+        kind: 'viewport-size',
+        sheetId: 'sheet-2',
+        requestId: 33,
+        window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      }),
+    ).resolves.toMatchObject({
+      sheetId: 'sheet-2',
+      rowHeights: [],
+      colWidths: [],
+    })
+  })
+
   it('projects static backend formats only inside requested windows', async () => {
     const backend = createStaticSpreadsheetBackend({
       cells: [
@@ -1306,6 +1361,54 @@ describe('vnext adapter', () => {
       { id: 'sheet-3', name: 'Calc', index: 0 },
       { id: 'sheet-1', name: 'Sheet1', index: 1 },
     ])
+
+    backend.dispose()
+  })
+
+  it('stores worker workbook viewport size metadata in the adapter without Rust cell reads', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 30,
+    })
+
+    await backend.ready()
+    const rowMutation = await backend.setRowHeight?.({
+      kind: 'set-row-height',
+      sheetId: 'sheet-1',
+      requestId: 40,
+      rowIndex: 1,
+      heightPx: 36.4,
+    })
+    const colMutation = await backend.setColumnWidth?.({
+      kind: 'set-column-width',
+      sheetId: 'sheet-1',
+      requestId: 41,
+      colIndex: 1,
+      widthPx: 128.6,
+    })
+    const result = await backend.readViewportSizeProjection?.({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 42,
+      window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+    })
+
+    expect(rowMutation).toMatchObject({ sheetId: 'sheet-1', requestId: 40, revision: 31 })
+    expect(colMutation).toMatchObject({ sheetId: 'sheet-1', requestId: 41, revision: 32 })
+    expect(result).toEqual({
+      kind: 'viewport-size',
+      sheetId: 'sheet-1',
+      requestId: 42,
+      revision: 32,
+      window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      rowHeights: [{ rowIndex: 1, heightPx: 36 }],
+      colWidths: [{ colIndex: 1, widthPx: 129 }],
+    })
+    expect(client.calls.readSparseRange).toEqual([])
+    expect(client.calls.snapshotRangeSparse).toEqual([])
+    expect(client.calls.snapshotFormatRange).toEqual([])
 
     backend.dispose()
   })

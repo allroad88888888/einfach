@@ -10,6 +10,8 @@ import type {
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
+  ViewportSizeProjectionRequest,
+  ViewportSizeProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
   menuStateAtom,
@@ -60,8 +62,14 @@ function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
   return cells
 }
 
-function createFakeBackend() {
+function createFakeBackend(options: {
+  rowHeights?: ViewportSizeProjectionResult['rowHeights']
+  colWidths?: ViewportSizeProjectionResult['colWidths']
+} = {}) {
   const requests: VisibleProjectionRequest[] = []
+  const sizeRequests: ViewportSizeProjectionRequest[] = []
+  const rowHeightCalls: Array<{ rowIndex: number; heightPx: number }> = []
+  const columnWidthCalls: Array<{ colIndex: number; widthPx: number }> = []
 
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
@@ -79,12 +87,32 @@ function createFakeBackend() {
     async readRangeProjection() {
       throw new Error('not used')
     },
+    async readViewportSizeProjection(request) {
+      sizeRequests.push(request)
+      return {
+        kind: 'viewport-size',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        window: { ...request.window },
+        rowHeights: options.rowHeights ?? [],
+        colWidths: options.colWidths ?? [],
+      }
+    },
     async setCellInput() {
       throw new Error('not used')
     },
+    async setRowHeight(request) {
+      rowHeightCalls.push({ rowIndex: request.rowIndex, heightPx: request.heightPx })
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    },
+    async setColumnWidth(request) {
+      columnWidthCalls.push({ colIndex: request.colIndex, widthPx: request.widthPx })
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    },
   }
 
-  return { backend, requests }
+  return { backend, requests, sizeRequests, rowHeightCalls, columnWidthCalls }
 }
 
 describe('vNext SpreadsheetGrid', () => {
@@ -619,7 +647,7 @@ describe('vNext SpreadsheetGrid', () => {
 
   it('resizes visible rows and columns through sparse viewport atoms', async () => {
     const store = createStore()
-    const { backend } = createFakeBackend()
+    const { backend, rowHeightCalls, columnWidthCalls } = createFakeBackend()
     const viewport = {
       scrollTop: 0,
       scrollLeft: 0,
@@ -663,6 +691,8 @@ describe('vNext SpreadsheetGrid', () => {
         },
       },
     })
+    expect(columnWidthCalls).toEqual([{ colIndex: 1, widthPx: 128 }])
+    expect(rowHeightCalls).toEqual([{ rowIndex: 1, heightPx: 36 }])
     expect(
       (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement).style
         .width,
@@ -677,6 +707,63 @@ describe('vNext SpreadsheetGrid', () => {
     expect((container.querySelector('[data-cell-addr="B2"]') as HTMLElement).style.height).toBe(
       '36px',
     )
+  })
+
+  it('hydrates row and column size metadata from the backend visible window', async () => {
+    const store = createStore()
+    const { backend, sizeRequests } = createFakeBackend({
+      rowHeights: [{ rowIndex: 1, heightPx: 40 }],
+      colWidths: [{ colIndex: 1, widthPx: 132 }],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 48,
+      viewportWidth: 192,
+      rowHeight: 24,
+      colWidth: 96,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(
+        (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement)
+          .style.width,
+      ).toBe('132px')
+    })
+
+    expect(sizeRequests).toHaveLength(1)
+    expect(sizeRequests[0].window).toEqual({
+      rowStart: 0,
+      rowEnd: 1,
+      colStart: 0,
+      colEnd: 1,
+    })
+    expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+      rowHeightsBySheet: {
+        'sheet-1': {
+          '1': 40,
+        },
+      },
+      colWidthsBySheet: {
+        'sheet-1': {
+          '1': 132,
+        },
+      },
+    })
+    expect(
+      (container.querySelector('.spreadsheet-grid-row-header[data-row="1"]') as HTMLElement).style
+        .height,
+    ).toBe('40px')
   })
 
   it('preserves selected range when opening a cell context menu inside it', async () => {
