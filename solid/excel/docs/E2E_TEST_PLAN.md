@@ -6,7 +6,7 @@
 
 ## Current Status (2026-05-14, post-Wave 6.5 virtualized UX hardening)
 
-**23 spec files / 163 active `test()` / 0 skipped**. Wave 6.5 targeted gates are
+**23 spec files / 162 active Playwright tests / 0 skipped**. Wave 6.5 targeted gates are
 locally green. Status of each
 plan section:
 
@@ -31,7 +31,7 @@ plan section:
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 23 spec files. 163 active `test()`
+Counts: 23 spec files. 162 active Playwright tests
 + 0 `.skip`. Wave 6.5 targeted local runs use
 `NO_PROXY=localhost,127.0.0.1 npm run e2e -- e2e/context-menu.spec.ts` and
 `NO_PROXY=localhost,127.0.0.1 npm run e2e -- e2e/million-demo.spec.ts`
@@ -171,7 +171,7 @@ suite fails confusingly.
 
 ## Current Coverage
 
-23 spec files, 163 active `test()` blocks + 0 `.skip`. Landed across the
+23 spec files, 162 active Playwright tests + 0 `.skip`. Landed across the
 Wave 6 product hardening batches plus Wave 6.5 virtualized UX hardening.
 
 | Spec file | Tests | Backend |
@@ -733,7 +733,7 @@ Reality check against the plan's hard numbers:
 | Criterion | Status | Notes |
 |---|---|---|
 | ≥ 8 spec files | ✅ | 23 actual |
-| ≥ 50 test() blocks pass locally | ✅ | 163 active, 0 skip |
+| ≥ 50 Playwright tests pass locally | ✅ | 162 active, 0 skip |
 | regression.spec.ts pins ≥ 5 | ✅ | 7 entries, all active after Discovered #E.1 + #E.2 both landed |
 | workbook-chain ≥ 1 lazy-not-read | ✅ | Asserts cache state + console-message capture before switching to Sheet2 |
 | selection-clipboard ≥ 1 cross-sheet-name preservation | ✅ | `cross-sheet ref preserves sheet name through copy/paste shift` — B2 `=Data!A1+1` → C3 → `=Data!B2+1` |

@@ -35,7 +35,7 @@ NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel
 - `npm run build` 会跑 root TS build + rollup。
 - `npm test` 是全量 Jest + coverage。
 - `solid/excel` 单独 typecheck 防止 Vite build 漏掉类型问题。
-- 全量 e2e 当前基线为 `23 spec / 163 active tests / 0 skip`。
+- 全量 e2e 当前基线为 `23 spec / 162 active Playwright tests / 0 skip`。
 
 ### Rust / WASM
 
@@ -102,3 +102,44 @@ MCP 需要覆盖：
 - worker import cancel 后 session 泄漏。
 - MCP Playwright 不能验证 UI 行为且没有明确失败原因和 CLI 兜底记录。
 
+## 本轮执行记录
+
+> 执行日期：2026-05-14
+>
+> 执行基线：`92bee25 docs(rust): sync release gate handoff`
+
+Blocking gate 结果：
+
+- `cargo test --manifest-path rust/core/Cargo.toml`：65 passed。
+- `cargo test --manifest-path rust/excel-core/Cargo.toml`：lib 241 passed；
+  `cross_sheet` 3 passed；`review_repro` 4 passed；`scale` 8 passed。
+- `cargo test --manifest-path rust/wasm/Cargo.toml`：native 23 passed。
+- `cargo bench --manifest-path rust/excel-core/Cargo.toml --no-run`：3 个 bench target
+  编译通过。
+- `cargo build --manifest-path rust/wasm/Cargo.toml`：通过。
+- `wasm-pack test --headless --chrome rust/wasm`：browser 5 passed。
+- `npx tsc -p solid/excel/tsconfig.json --noEmit`：通过。
+- `npm run build:wasm -w @einfach/solid-excel`：通过。
+- `npm run build -w @einfach/solid-excel`：通过。
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel`：
+  162 passed，0 skipped。
+
+MCP Playwright 结果：
+
+- `1M Cells`：worker backend 为 `worker-workbook`；FormatToolbar 可见；大选区点击
+  Bold 只记录到 `set_format_range(0,0,999,999,{bold:true})`；DOM cell 数 735。
+- `1M Cells`：键盘从 `A1` 跨初始虚拟视口移动到 `S29`，目标 cell 可见且
+  `cell-selected`，DOM cell 数 735。
+- `Blank`：`A1:B2` range 内右键 `B1` 执行 Clear 后四个 cell 均为空。
+- `Multi-Sheet`：backend 为 `worker-workbook`；初始 tabs 为 `Sheet1`、`Expenses`、
+  `Notes`；`Sheet1!B5 = 11700`；`Expenses!C5` 读前 dirty、切到 Expenses 后显示 41 且
+  cache clean；新增 Sheet4、Notes 重命名为 McpNotes、删除 McpNotes 均通过。
+- FormulaBar diagnostics：`=garbage((` 显示 `INVALID_FORMULA / Invalid formula`；
+  `=A1+1` 显示 `FORMULA_CYCLE / Formula cycle`；合法 `=1` 清理诊断并显示 1。
+- console warning/error 为 0。
+
+本轮发现并修正的记录问题：
+
+- 旧文档用 `rg "test("` 粗略统计得到 163；实际 Playwright collection 和全量运行结果为
+  162 tests。`E2E_TEST_PLAN.md`、`ONLINE_SPREADSHEET_EXECUTION_WAVES.md` 和本文档已改为
+  `23 spec / 162 active Playwright tests / 0 skip`。
