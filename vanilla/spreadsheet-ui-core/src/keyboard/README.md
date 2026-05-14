@@ -17,6 +17,8 @@ Owns framework-agnostic keyboard navigation/edit/reference-picking command state
 - Scale bound: stores current mode and one compact intent only. Movement stores target boundaries,
   never a list of cells. `PageUp/PageDown` uses adapter-provided visible row delta;
   `Alt+PageUp/PageDown` uses adapter-provided visible column delta for horizontal paging.
+  `Ctrl/Meta+PageUp/PageDown` emits adjacent sheet activation intent, leaving sheet list lookup to
+  the sheet-tab/workspace layer.
 - Backend reads: none. Ctrl+arrow data-edge scanning is intentionally not implemented here because it
   needs backend facts; this layer can only express UI intents.
 - DOM reads: none. Adapters normalize DOM events into `KeyboardInput`.
@@ -26,4 +28,4 @@ Owns framework-agnostic keyboard navigation/edit/reference-picking command state
   - horizontal `Alt+PageUp/PageDown` movement from `pageColDelta`
   - shift movement extends selection by boundary
   - editing mode returns commit/cancel intents without moving selection
-  - command shortcuts return clipboard/history/select-all intents
+  - command shortcuts return clipboard/history/select-all/sheet-navigation intents

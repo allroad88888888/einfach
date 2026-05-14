@@ -12,8 +12,11 @@ import type {
 import {
   menuStateAtom,
   selectionAtom,
+  setSheetTabsSheetsAtom,
+  setWorkspaceActiveSheetAtom,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
+  workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -371,6 +374,55 @@ describe('vNext SpreadsheetGrid', () => {
       anchor: { row: 1, col: 5 },
       focus: { row: 1, col: 5 },
     })
+  })
+
+  it('maps ctrl page keys to adjacent sheet activation through core atoms', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    store.setter(setSheetTabsSheetsAtom, {
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1', index: 0 },
+        { id: 'sheet-2', name: 'Sheet2', index: 1 },
+        { id: 'sheet-3', name: 'Sheet3', index: 2 },
+      ],
+    })
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-2" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'PageDown',
+      ctrlKey: true,
+    })
+
+    expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-3')
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'PageUp',
+      ctrlKey: true,
+    })
+
+    expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
   })
 
   it('supports ctrl boundary movement and context menu intents', async () => {

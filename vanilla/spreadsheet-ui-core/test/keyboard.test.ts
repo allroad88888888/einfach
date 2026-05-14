@@ -274,6 +274,14 @@ describe('keyboard core', () => {
     expect(store.setter(dispatchKeyboardInputAtom, { key: 'c', ctrlKey: true })).toEqual({
       type: 'clipboard.copy',
     })
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'PageDown', ctrlKey: true })).toEqual({
+      type: 'sheet.activate-adjacent',
+      direction: 'next',
+    })
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'PageUp', metaKey: true })).toEqual({
+      type: 'sheet.activate-adjacent',
+      direction: 'previous',
+    })
     expect(store.setter(dispatchKeyboardInputAtom, { key: 'z', metaKey: true })).toEqual({
       type: 'history.undo',
     })

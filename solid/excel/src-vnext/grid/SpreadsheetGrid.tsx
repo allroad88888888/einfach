@@ -7,6 +7,7 @@ import {
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
+  getAdjacentSheetId,
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
@@ -18,8 +19,10 @@ import {
   selectRowsAtom,
   setViewportColumnWidthAtom,
   setSelectionBoundsAtom,
+  setWorkspaceActiveSheetAtom,
   setViewportRowHeightAtom,
   setViewportMetricsAtom,
+  sheetTabsSheetsAtom,
   startPointerAtom,
   startEditingAtom,
   updatePointerAtom,
@@ -28,6 +31,7 @@ import {
   type ViewportMetrics,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
+  workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
@@ -491,6 +495,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         await clearActiveCell()
         return
+      case 'sheet.activate-adjacent': {
+        event.preventDefault()
+        const nextSheetId = getAdjacentSheetId(
+          store.getter(sheetTabsSheetsAtom),
+          store.getter(workspaceSessionAtom).activeSheetId,
+          intent.direction,
+        )
+        if (nextSheetId) {
+          store.setter(setWorkspaceActiveSheetAtom, { sheetId: nextSheetId })
+        }
+        return
+      }
       default:
         return
     }

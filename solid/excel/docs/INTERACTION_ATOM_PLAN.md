@@ -412,6 +412,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   继续只保存 compact intent，不读取 backend；adapter 把当前 visible column count 作为
   `pageColDelta` 传入，core 用它移动 active cell 或扩展 selection。该行为只更新 selection
   atom，不创建 offscreen cell，不触发 projection 扩大或公式求值。
+- PC-6 第十三段：vNext Grid 已接 `Ctrl/Meta+PageUp/PageDown` 切换相邻 sheet。Keyboard
+  core 只发 `sheet.activate-adjacent` compact intent，不保存或读取 sheet list；Grid adapter
+  用 `sheetTabsSheetsAtom` 的有界 sheet metadata 和 workspace active sheet 计算目标 sheet，
+  再写 `setWorkspaceActiveSheetAtom`。该行为只切换 tab/workspace 状态，不读取整张 sheet、
+  不创建 cell atom，也不触发公式求值。
 
 PC-6 第一段验收记录：
 
@@ -560,6 +565,18 @@ PC-6 第十二段验收记录：
   按 `Alt+PageDown` 后 active/formula address 到 `G2`，`Alt+PageUp` 回到 `B2`；
   `G2` 和 `J20` 均 offscreen 未挂载，当前仍只渲染 30 个可视 cell、console error 为 0。
 
+PC-6 第十三段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/keyboard.test.ts vanilla/spreadsheet-ui-core/test/sheet-tabs.test.ts solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，验证 grid
+  中按 `Ctrl+PageDown` 从 `Sheet1` 切到 `Sheet2` 再切到 `Sheet3`，按
+  `Ctrl+PageUp` 回到 `Sheet2`；当前仍只渲染 30 个可视 cell、`J20` offscreen
+  未挂载、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -571,8 +588,8 @@ PC-6 第十二段验收记录：
   大范围 streaming clipboard port 仍未接。
 - FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
   但还没有接 sheet reorder mutation。
-- Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、Ctrl+PageUp/PageDown 切 sheet、
-  fill handle、row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。
+- Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、fill handle、row/col resize
+  的持久化 metadata / auto-fit 等完整 Excel 行为。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 
 ## 并行 Agent 计划

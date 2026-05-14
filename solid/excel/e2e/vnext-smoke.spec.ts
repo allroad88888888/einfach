@@ -74,6 +74,24 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(page.getByTestId('vnext-grid')).toBeVisible()
   })
 
+  test('ctrl page keys switch adjacent sheet tabs from the grid', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+PageDown')
+    await expect(page.getByRole('tab', { name: 'Sheet2' })).toHaveAttribute('data-active', 'true')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+PageDown')
+    await expect(page.getByRole('tab', { name: 'Sheet3' })).toHaveAttribute('data-active', 'true')
+
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+PageUp')
+    await expect(page.getByRole('tab', { name: 'Sheet2' })).toHaveAttribute('data-active', 'true')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
+
   test('sheet tab add rename and delete mutate workbook metadata', async ({ page }) => {
     await gotoVNextDemo(page)
 

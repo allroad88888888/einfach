@@ -186,6 +186,16 @@ function getCommandShortcutIntent(
       return {
         type: 'history.redo',
       }
+    case 'pageup':
+      return {
+        type: 'sheet.activate-adjacent',
+        direction: 'previous',
+      }
+    case 'pagedown':
+      return {
+        type: 'sheet.activate-adjacent',
+        direction: 'next',
+      }
     default:
       return {
         type: 'none',

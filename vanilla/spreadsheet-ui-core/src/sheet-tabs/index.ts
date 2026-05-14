@@ -155,6 +155,27 @@ export function normalizeSheetTabDraftName(name: string): string | null {
   return normalized.length === 0 ? null : normalized
 }
 
+export function getAdjacentSheetId(
+  sheets: readonly SpreadsheetSheetMetadata[],
+  activeSheetId: string | null,
+  direction: 'previous' | 'next',
+): string | null {
+  if (sheets.length === 0) {
+    return null
+  }
+
+  const activeIndex = activeSheetId
+    ? sheets.findIndex((sheet) => sheet.id === activeSheetId)
+    : -1
+  if (activeIndex < 0) {
+    return sheets[0]?.id ?? null
+  }
+
+  const step = direction === 'previous' ? -1 : 1
+  const nextIndex = (activeIndex + step + sheets.length) % sheets.length
+  return sheets[nextIndex]?.id ?? null
+}
+
 export function createOpenSheetTabContextMenuIntent(
   input: OpenSheetTabContextMenuInput,
 ): SheetTabIntent {

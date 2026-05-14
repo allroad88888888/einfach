@@ -10,6 +10,7 @@ import {
   createUpdateSheetTabReorderIntent,
   createUpdateSheetTabRenameIntent,
   dispatchSheetTabIntentAtom,
+  getAdjacentSheetId,
   normalizeSheetTabDraftName,
   setSheetTabsSheetsAtom,
   sheetTabsAtom,
@@ -132,5 +133,19 @@ describe('sheet tabs core', () => {
       { id: 'sheet-1', name: 'Sheet1', index: 7 },
       { id: 'sheet-2', name: 'Sheet2', index: 1 },
     ])
+  })
+
+  test('resolves adjacent sheet ids in displayed order with wraparound', () => {
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+      { id: 'sheet-3', name: 'Sheet3', index: 2 },
+    ]
+
+    expect(getAdjacentSheetId(sheets, 'sheet-1', 'next')).toBe('sheet-2')
+    expect(getAdjacentSheetId(sheets, 'sheet-1', 'previous')).toBe('sheet-3')
+    expect(getAdjacentSheetId(sheets, 'sheet-3', 'next')).toBe('sheet-1')
+    expect(getAdjacentSheetId(sheets, 'missing', 'next')).toBe('sheet-1')
+    expect(getAdjacentSheetId([], 'sheet-1', 'next')).toBeNull()
   })
 })

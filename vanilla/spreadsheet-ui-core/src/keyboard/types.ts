@@ -55,6 +55,11 @@ export interface KeyboardClipboardIntent {
   type: 'clipboard.copy' | 'clipboard.cut' | 'clipboard.paste'
 }
 
+export interface SheetNavigationIntent {
+  type: 'sheet.activate-adjacent'
+  direction: 'previous' | 'next'
+}
+
 export interface HistoryIntent {
   type: 'history.undo' | 'history.redo'
 }
@@ -75,6 +80,7 @@ export type KeyboardCommandIntent =
   | KeyboardEditingCommitIntent
   | KeyboardEditingCancelIntent
   | KeyboardClipboardIntent
+  | SheetNavigationIntent
   | HistoryIntent
   | ClearCellsIntent
   | NoneKeyboardIntent
