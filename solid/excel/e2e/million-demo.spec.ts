@@ -168,7 +168,7 @@ test.describe('1M Cells demo (Phase 4)', () => {
     await gotoDemo(page, '1M Cells', 'debug=1')
     await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
 
-    const result = await page.evaluate(() => {
+    const setup = await page.evaluate(() => {
       const win = window as unknown as {
         __einfachStore?: {
           raw: {
@@ -178,16 +178,12 @@ test.describe('1M Cells demo (Phase 4)', () => {
           selectionAddrs: () => string[][]
           setSelectionAnchor: (coord: { row: number; col: number }) => void
           extendSelection: (coord: { row: number; col: number }) => void
-          formatSelection: (
-            patch: (current: Record<string, unknown>) => Record<string, unknown>,
-          ) => boolean
-          canUndo: () => boolean
         }
         __formatRangeCalls?: Array<Array<unknown>>
       }
       const store = win.__einfachStore
       const original = store?.raw.set_format_range?.bind(store.raw)
-      if (!store || !original) return { hasFormatRange: false, ok: false, canUndo: false }
+      if (!store || !original) return { hasFormatRange: false }
       const calls: Array<Array<unknown>> = []
       store.raw.set_format_range = (...args: Array<unknown>) => {
         calls.push(args)
@@ -201,17 +197,46 @@ test.describe('1M Cells demo (Phase 4)', () => {
       }
       store.setSelectionAnchor({ row: 0, col: 0 })
       store.extendSelection({ row: 999, col: 999 })
-      const ok = store.formatSelection((current) => ({ ...current, bold: true }))
       win.__formatRangeCalls = calls
-      return { hasFormatRange: true, ok, canUndo: store.canUndo() }
+      return { hasFormatRange: true }
     })
 
-    expect(result).toEqual({ hasFormatRange: true, ok: true, canUndo: false })
-    const calls = await page.evaluate(() => {
-      const win = window as unknown as { __formatRangeCalls?: Array<Array<unknown>> }
-      return win.__formatRangeCalls
-    })
-    expect(calls).toEqual([[0, 0, 999, 999, { bold: true }]])
+    expect(setup.hasFormatRange).toBe(true)
+
+    await page.getByRole('button', { name: 'Bold' }).click()
+
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const win = window as unknown as { __formatRangeCalls?: Array<Array<unknown>> }
+            return win.__formatRangeCalls ?? []
+          }),
+        { timeout: 30_000 },
+      )
+      .toEqual([[0, 0, 999, 999, { bold: true }]])
+  })
+
+  test('keyboard_navigation_crosses_virtual_viewport', async ({ page }) => {
+    await gotoDemo(page, '1M Cells', 'debug=1')
+    await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+
+    await cell(page, 'A1').click()
+    await page.locator('.excel-table-wrapper').focus()
+
+    for (let i = 0; i < 18; i += 1) {
+      await page.keyboard.press('ArrowRight')
+    }
+    for (let i = 0; i < 28; i += 1) {
+      await page.keyboard.press('ArrowDown')
+    }
+
+    const target = 'S29'
+    await expect(cell(page, target)).toBeVisible({ timeout: 10_000 })
+    await expect(cell(page, target)).toHaveClass(/cell-selected/)
+
+    const domCells = await page.locator('td.cell').count()
+    expect(domCells).toBeLessThan(1500)
   })
 
   test('copy_large_selection_does_not_materialize_selection_grid', async ({ page }) => {

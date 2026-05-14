@@ -137,6 +137,15 @@ export function Table(props: TableProps) {
     props.store.extendSelection(clampCoord(next, rows(), cols()))
   }
 
+  function isCoordInSelectionRange(coord: CellCoord) {
+    const r = range()
+    const r0 = Math.min(r.anchor.row, r.focus.row)
+    const r1 = Math.max(r.anchor.row, r.focus.row)
+    const c0 = Math.min(r.anchor.col, r.focus.col)
+    const c1 = Math.max(r.anchor.col, r.focus.col)
+    return coord.row >= r0 && coord.row <= r1 && coord.col >= c0 && coord.col <= c1
+  }
+
   function move(drow: number, dcol: number, extend = false) {
     const cur = selected()
     const next = { row: cur.row + drow, col: cur.col + dcol }
@@ -515,10 +524,12 @@ export function Table(props: TableProps) {
                         onSelect={() => selectCoord({ row, col })}
                         onExtendSelect={() => extendCoord({ row, col })}
                         onContextMenu={(e) => {
-                          // Move selection to this cell first so Cut / Copy
-                          // / Paste / Clear act on what the user right-
-                          // clicked, matching spreadsheet convention.
-                          selectCoord({ row, col })
+                          // Keep an existing range when the user right-clicks
+                          // inside it; otherwise collapse to the clicked cell.
+                          // That lets Cut / Copy / Clear operate on the
+                          // current range instead of folding it first.
+                          const coord = { row, col }
+                          if (!isCoordInSelectionRange(coord)) selectCoord(coord)
                           openMenu(e, cellMenuItems(addr))
                         }}
                       />

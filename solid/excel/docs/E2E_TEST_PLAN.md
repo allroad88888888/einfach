@@ -4,9 +4,10 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
-## Current Status (2026-05-14, post-Wave 6 formula diagnostics hardening)
+## Current Status (2026-05-14, post-Wave 6.5 virtualized UX hardening)
 
-**23 spec files / 160 active `test()` / 0 skipped** locally green. Status of each
+**23 spec files / 163 active `test()` / 0 skipped**. Wave 6.5 targeted gates are
+locally green. Status of each
 plan section:
 
 | Section | Status | Spec / Notes |
@@ -21,17 +22,20 @@ plan section:
 | P0 Clipboard | ✅ | `selection-clipboard.spec.ts` (9 tests including cross-sheet name preservation) |
 | P1 WASM Formula Showcase | ✅ | `formulas-wasm.spec.ts` (14 tests, all passing — Discovered #B fixed) |
 | P1 FormulaBar | ✅ | `formula-bar.spec.ts` (10 tests, includes worker-backed formula diagnostics) |
-| P1 Formula Functions | ✅ | `formula-functions.spec.ts` (3 tests for `TEXT`, `TODAY`, `NOW`) |
+| P1 Formula Functions | ✅ | `formula-functions.spec.ts` (4 tests for `TEXT`, `TODAY`, `NOW`) |
 | P1 MultiSheet UI | ✅ | `multisheet-ui.spec.ts` (10 tests). Worker-backed MultiSheet covers seed, tab structure ops, cross-sheet formula result, and lazy debug probe |
+| P1 Virtualized UX | ✅ | `context-menu.spec.ts` (5) preserves range on right-click Clear; `million-demo.spec.ts` (10) covers 1M toolbar range-native format and keyboard navigation across the virtual viewport |
 | P1 Other Demo Smoke (Budget/Grades/Sales) | ✅ | `demo-budget.spec.ts` (6) + `demo-grades.spec.ts` (6) + `demo-sales.spec.ts` (8) — option A (WASM migration) landed |
 | P1 Render Counter | ✅ | `render-counter.spec.ts` (6 strict-delta tests). MutationObserver workaround removed after Discovered #A fix |
-| Regression Spec | ✅ | `regression.spec.ts` (6 tests, all passing — Discovered #E.1 + #E.2 both landed) |
+| Regression Spec | ✅ | `regression.spec.ts` (7 tests, all passing — Discovered #E.1 + #E.2 both landed) |
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 23 spec files. 160 active `test()`
-+ 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
-checkout green (proxy caveat per Discovered #D).
+Counts: 23 spec files. 163 active `test()`
++ 0 `.skip`. Wave 6.5 targeted local runs use
+`NO_PROXY=localhost,127.0.0.1 npm run e2e -- e2e/context-menu.spec.ts` and
+`NO_PROXY=localhost,127.0.0.1 npm run e2e -- e2e/million-demo.spec.ts`
+(proxy caveat per Discovered #D).
 
 Wave 2 / 3 新增覆盖已纳入本计划（本轮核对）：
 
@@ -48,10 +52,14 @@ Wave 2 / 3 新增覆盖已纳入本计划（本轮核对）：
 - **formula diagnostics/functions**：`formula-bar.spec.ts` 覆盖 worker-backed
   `INVALID_FORMULA` / `FORMULA_CYCLE` 诊断展示与清理；`formula-functions.spec.ts`
   覆盖 `TEXT()`、`TODAY()`、`NOW()` 的真实 WASM UI 路径；
+- **virtualized UX hardening**：`context-menu.spec.ts` 覆盖右键命中已选 range 时不折叠
+  选区，`million-demo.spec.ts` 覆盖 1M demo 真实 toolbar Bold 走 range-native
+  `set_format_range`，以及真实键盘跨虚拟视口后 selection/focus 不丢；
 - **MCP gate**：Wave 2/3 MCP 记录已落地（导入/取消、range copy、持久化还原）并作为
   本波门禁对齐内容；Wave 4 MCP 记录已补充 DOM/subscription/eval counters；Wave 5 MCP
   记录覆盖文件导入、取消和 console 0 warning/error；Wave 6 追加验证公式诊断、
-  `TEXT/TODAY/NOW` 和 console 0 warning/error。
+  `TEXT/TODAY/NOW` 和 console 0 warning/error；Wave 6.5 追加验证 1M toolbar
+  range-native 格式化、虚拟视口键盘导航和 range 内右键 Clear。
 
 ## Discovered During Implementation
 
@@ -163,36 +171,42 @@ suite fails confusingly.
 
 ## Current Coverage
 
-22 spec files, 155 active `test()` blocks + 0 `.skip`. Landed across two
-agent batches plus follow-up cleanup work.
+23 spec files, 163 active `test()` blocks + 0 `.skip`. Landed across the
+Wave 6 product hardening batches plus Wave 6.5 virtualized UX hardening.
 
 | Spec file | Tests | Backend |
 |---|---|---|
 | `smoke.spec.ts` | 7 | JS mock |
 | `workbook-chain.spec.ts` | 7 | WASM workbook (`3-Sheet Chain` demo) |
 | `formulas-wasm.spec.ts` | 14 | WASM single sheet (`Formulas` demo) |
-| `formula-bar.spec.ts` | 8 | mixed |
-| `context-menu.spec.ts` | 4 | JS mock |
+| `formula-bar.spec.ts` | 10 | mixed |
+| `formula-functions.spec.ts` | 4 | WASM single sheet (`Formulas` demo) |
+| `context-menu.spec.ts` | 5 | JS mock |
 | `format.spec.ts` | 5 | JS mock |
 | `i18n.spec.ts` | 5 | mixed |
 | `selection-clipboard.spec.ts` | 9 | JS mock (`Blank`) |
 | `multisheet-ui.spec.ts` | 10 | worker workbook (`Multi-Sheet` demo) |
-| `million-demo.spec.ts` | 9 | worker workbook + 2D virtualized table |
+| `million-demo.spec.ts` | 10 | worker workbook + 2D virtualized table |
 | `range-ops.spec.ts` | 4 | JS mock |
 | `undo-redo.spec.ts` | 9 | JS mock |
 | `virtualize.spec.ts` | 5 | JS mock + virtualization |
 | `render-counter.spec.ts` | 6 | JS mock + `?debug=1` |
-| `regression.spec.ts` | 6 | mixed |
+| `regression.spec.ts` | 7 | mixed |
 | `worker.spec.ts` | 4 | worker-backed sheet |
 | `worker-workbook.spec.ts` | 18 | worker workbook RPC |
 | `observability.spec.ts` | 2 | mixed |
-| `file-import.spec.ts` | 3 | worker workbook + 1M import UI |
+| `file-import.spec.ts` | 2 | worker workbook + 1M import UI |
 | `demo-budget.spec.ts` | 6 | WASM |
 | `demo-grades.spec.ts` | 6 | WASM |
 | `demo-sales.spec.ts` | 8 | WASM |
 
 Current 1M coverage includes large clear/format/copy range-native paths. The
-large copy spec now asserts `copySelectionTextAsync()` uses
+large format spec now clicks the real toolbar Bold button on a 1M selection and
+asserts the worker-backed store uses `set_format_range` without materializing
+`selectionAddrs`. The keyboard spec moves from A1 across the initial virtual
+viewport with native arrow keys and asserts the target cell remains selected
+while DOM cells stay bounded. The large copy spec asserts
+`copySelectionTextAsync()` uses
 `export_range_tsv_chunks` when the worker-backed sheet exposes it, and that the
 legacy one-shot `export_range_tsv` fallback is not called in that path.
 `worker-workbook.spec.ts` also checks chunked TSV export preserves formula

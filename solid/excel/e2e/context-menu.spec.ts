@@ -4,6 +4,7 @@ import {
   expectDisplay,
   gotoDemo,
   guardConsoleErrors,
+  selectCell,
   typeIntoCell,
 } from './helpers'
 
@@ -77,6 +78,31 @@ test.describe('ContextMenu — table operations', () => {
     // A1 is now empty; original content lives in A2.
     await expect(cell(page, 'A1').locator('.cell-display')).toHaveText('')
     await expectDisplay(page, 'A2', 'pushed')
+  })
+
+  test('right-clicking inside A1:B2 keeps the range active for Clear', async ({
+    page,
+  }) => {
+    await gotoDemo(page, DEMO)
+    await typeIntoCell(page, 'A1', 'a1')
+    await typeIntoCell(page, 'B1', 'b1')
+    await typeIntoCell(page, 'A2', 'a2')
+    await typeIntoCell(page, 'B2', 'b2')
+
+    await selectCell(page, 'A1')
+    await page.keyboard.press('Shift+ArrowRight')
+    await page.keyboard.press('Shift+ArrowDown')
+
+    await cell(page, 'B1').click({ button: 'right' })
+    const ctxMenu = page.locator('.context-menu')
+    await expect(ctxMenu).toBeVisible()
+
+    await expect(cell(page, 'B2')).toHaveClass(/cell-selected/)
+    await ctxMenu.getByRole('menuitem', { name: 'Clear' }).click()
+
+    for (const addr of ['A1', 'B1', 'A2', 'B2']) {
+      await expectDisplay(page, addr, '')
+    }
   })
 
   test('Escape closes the menu — no .context-menu in DOM', async ({ page }) => {

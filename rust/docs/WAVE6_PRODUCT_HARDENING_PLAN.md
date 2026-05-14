@@ -160,3 +160,22 @@ MCP 验收必须记录：
   `Invalid formula`，输入 `=I18+1` 得到 `FORMULA_CYCLE` / `Formula cycle`；合法 `=1`
   清理诊断；`Formulas` 中 `TEXT(1234.5,"0.00")=1234.50`，`TODAY()` / `NOW()` 显示本地日
   serial；console warning/error 为 0。
+- Wave 6.5 虚拟化 UX 追补：
+  - `DemoMillion` 的 1M worker-backed table 接入 `FormatToolbar`，真实 UI 上可以直接触发
+    大选区格式化。
+  - `Table` 右键 cell 时，如果命中当前 `selectionRange` 内部则保留 range；只有点到 range
+    外才折叠到单 cell。这样 Cut/Copy/Clear 继续作用在已有大选区上。
+  - `context-menu.spec.ts` 增至 5 条：覆盖 `A1:B2` range 内右键 `B1` 后执行 Clear，
+    四个 cell 都被清空。
+  - `million-demo.spec.ts` 增至 10 条：大选区通过真实 Bold 按钮走 range-native
+    `set_format_range(0,0,999,999,{bold:true})`，并禁止 `selectionAddrs` / 单 cell
+    `set_format` 被调用；键盘从 `A1` 移动到虚拟视口外的 `S29` 后，目标 cell 可见且仍
+    selected，DOM cell 数保持 `<1500`。
+  - 本地门禁：`npx tsc -p solid/excel/tsconfig.json --noEmit`、`npm run build -w
+    @einfach/solid-excel`、`NO_PROXY=localhost,127.0.0.1 npm --prefix solid/excel run e2e --
+    e2e/context-menu.spec.ts`（5/5）、`NO_PROXY=localhost,127.0.0.1 npm --prefix solid/excel
+    run e2e -- e2e/million-demo.spec.ts`（10/10）均通过。
+  - MCP Playwright：`http://localhost:5174/?debug=1` 验证 1M toolbar 可见；点击真实
+    Bold 按钮后记录到唯一 `set_format_range` 调用；键盘事件移动到 `S29` 后
+    `cell-selected`、DOM cell 数 735；Blank 页 range 内右键 Clear 后 `A1/B1/A2/B2`
+    显示为空；console warning/error 为 0。
