@@ -6,7 +6,10 @@ import type {
   ViewportCellAlign,
   ViewportMetrics,
   ViewportScrollPosition,
+  ViewportSizeOverrideState,
   VisibleWindow,
+  SetViewportColumnWidthInput,
+  SetViewportRowHeightInput,
 } from './types'
 
 export const DEFAULT_VIEWPORT_METRICS: ViewportMetrics = {
@@ -20,6 +23,16 @@ export const DEFAULT_VIEWPORT_METRICS: ViewportMetrics = {
   colCount: 0,
   overscanRows: 2,
   overscanCols: 2,
+}
+
+export const MIN_VIEWPORT_ROW_HEIGHT = 16
+export const MAX_VIEWPORT_ROW_HEIGHT = 512
+export const MIN_VIEWPORT_COL_WIDTH = 40
+export const MAX_VIEWPORT_COL_WIDTH = 1024
+
+export const DEFAULT_VIEWPORT_SIZE_OVERRIDES: ViewportSizeOverrideState = {
+  rowHeightsBySheet: {},
+  colWidthsBySheet: {},
 }
 
 function clampIndex(value: number, maxExclusive: number) {
@@ -49,6 +62,42 @@ function normalizeCount(value: number): number {
 
 function normalizePositive(value: number, fallback: number): number {
   return Math.max(1, normalizeNumber(value, fallback))
+}
+
+function normalizeDimension(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) {
+    return min
+  }
+
+  return Math.max(min, Math.min(max, Math.round(value)))
+}
+
+function normalizeRowHeight(value: number): number {
+  return normalizeDimension(value, MIN_VIEWPORT_ROW_HEIGHT, MAX_VIEWPORT_ROW_HEIGHT)
+}
+
+function normalizeColWidth(value: number): number {
+  return normalizeDimension(value, MIN_VIEWPORT_COL_WIDTH, MAX_VIEWPORT_COL_WIDTH)
+}
+
+function normalizeFallbackDimension(value: number, fallback: number): number {
+  return Math.max(1, Math.round(normalizeNumber(value, fallback)))
+}
+
+function normalizeFallbackRowHeight(value: number): number {
+  return normalizeFallbackDimension(value, DEFAULT_VIEWPORT_METRICS.rowHeight)
+}
+
+function normalizeFallbackColWidth(value: number): number {
+  return normalizeFallbackDimension(value, DEFAULT_VIEWPORT_METRICS.colWidth)
+}
+
+function normalizeSparseIndex(value: number): number | null {
+  if (!Number.isInteger(value) || value < 0) {
+    return null
+  }
+
+  return value
 }
 
 function normalizeOverscan(value: number): number {
@@ -182,8 +231,85 @@ export function getViewportScrollForCell(
   }
 }
 
+export function getViewportRowHeight(
+  state: ViewportSizeOverrideState,
+  sheetId: string,
+  rowIndex: number,
+  fallback: number,
+): number {
+  const row = normalizeSparseIndex(rowIndex)
+  if (row === null) {
+    return normalizeFallbackRowHeight(fallback)
+  }
+
+  return state.rowHeightsBySheet[sheetId]?.[String(row)] ?? normalizeFallbackRowHeight(fallback)
+}
+
+export function getViewportColumnWidth(
+  state: ViewportSizeOverrideState,
+  sheetId: string,
+  colIndex: number,
+  fallback: number,
+): number {
+  const col = normalizeSparseIndex(colIndex)
+  if (col === null) {
+    return normalizeFallbackColWidth(fallback)
+  }
+
+  return state.colWidthsBySheet[sheetId]?.[String(col)] ?? normalizeFallbackColWidth(fallback)
+}
+
+export function setViewportRowHeight(
+  state: ViewportSizeOverrideState,
+  input: SetViewportRowHeightInput,
+): ViewportSizeOverrideState {
+  const row = normalizeSparseIndex(input.rowIndex)
+  if (row === null || input.sheetId.length === 0) {
+    return state
+  }
+
+  const sheetRows = state.rowHeightsBySheet[input.sheetId] ?? {}
+  return {
+    ...state,
+    rowHeightsBySheet: {
+      ...state.rowHeightsBySheet,
+      [input.sheetId]: {
+        ...sheetRows,
+        [String(row)]: normalizeRowHeight(input.heightPx),
+      },
+    },
+  }
+}
+
+export function setViewportColumnWidth(
+  state: ViewportSizeOverrideState,
+  input: SetViewportColumnWidthInput,
+): ViewportSizeOverrideState {
+  const col = normalizeSparseIndex(input.colIndex)
+  if (col === null || input.sheetId.length === 0) {
+    return state
+  }
+
+  const sheetCols = state.colWidthsBySheet[input.sheetId] ?? {}
+  return {
+    ...state,
+    colWidthsBySheet: {
+      ...state.colWidthsBySheet,
+      [input.sheetId]: {
+        ...sheetCols,
+        [String(col)]: normalizeColWidth(input.widthPx),
+      },
+    },
+  }
+}
+
 export const viewportMetricsAtom = atom<ViewportMetrics>(DEFAULT_VIEWPORT_METRICS)
 viewportMetricsAtom.debugLabel = 'spreadsheet.viewport.metrics'
+
+export const viewportSizeOverridesAtom = atom<ViewportSizeOverrideState>(
+  DEFAULT_VIEWPORT_SIZE_OVERRIDES,
+)
+viewportSizeOverridesAtom.debugLabel = 'spreadsheet.viewport.sizeOverrides'
 
 export const visibleWindowAtom = atom((get): VisibleWindow => {
   return getVisibleWindow(get(viewportMetricsAtom))
@@ -213,6 +339,26 @@ export const scrollToCellAtom = atom(
   },
 )
 scrollToCellAtom.debugLabel = 'spreadsheet.viewport.scrollToCell'
+
+export const setViewportRowHeightAtom = atom(
+  (get) => get(viewportSizeOverridesAtom),
+  (get, set, input: SetViewportRowHeightInput): ViewportSizeOverrideState => {
+    const nextState = setViewportRowHeight(get(viewportSizeOverridesAtom), input)
+    set(viewportSizeOverridesAtom, nextState)
+    return nextState
+  },
+)
+setViewportRowHeightAtom.debugLabel = 'spreadsheet.viewport.setRowHeight'
+
+export const setViewportColumnWidthAtom = atom(
+  (get) => get(viewportSizeOverridesAtom),
+  (get, set, input: SetViewportColumnWidthInput): ViewportSizeOverrideState => {
+    const nextState = setViewportColumnWidth(get(viewportSizeOverridesAtom), input)
+    set(viewportSizeOverridesAtom, nextState)
+    return nextState
+  },
+)
+setViewportColumnWidthAtom.debugLabel = 'spreadsheet.viewport.setColumnWidth'
 
 function getAlignedScrollOffset(input: {
   align: ViewportCellAlign

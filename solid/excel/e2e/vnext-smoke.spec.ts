@@ -172,6 +172,54 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(cellDisplay(page, 'B1')).toHaveText('Gamma')
   })
 
+  test('row and column resize update only visible UI dimensions', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    const colHeader = page.locator('.spreadsheet-grid-col-header[data-col="1"]')
+    const rowHeader = page.locator('.spreadsheet-grid-row-header[data-row="1"]')
+    const beforeCol = await colHeader.boundingBox()
+    const beforeRow = await rowHeader.boundingBox()
+    expect(beforeCol).not.toBeNull()
+    expect(beforeRow).not.toBeNull()
+
+    const colHandle = page.getByTestId('col-resize-1')
+    const colHandleBox = await colHandle.boundingBox()
+    expect(colHandleBox).not.toBeNull()
+    await page.mouse.move(
+      colHandleBox!.x + colHandleBox!.width / 2,
+      colHandleBox!.y + colHandleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(
+      colHandleBox!.x + colHandleBox!.width / 2 + 32,
+      colHandleBox!.y + colHandleBox!.height / 2,
+    )
+    await page.mouse.up()
+    const afterCol = await colHeader.boundingBox()
+    expect(afterCol).not.toBeNull()
+    expect(afterCol!.width).toBeGreaterThan(beforeCol!.width + 20)
+
+    const rowHandle = page.getByTestId('row-resize-1')
+    const rowHandleBox = await rowHandle.boundingBox()
+    expect(rowHandleBox).not.toBeNull()
+    await page.mouse.move(
+      rowHandleBox!.x + rowHandleBox!.width / 2,
+      rowHandleBox!.y + rowHandleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(
+      rowHandleBox!.x + rowHandleBox!.width / 2,
+      rowHandleBox!.y + rowHandleBox!.height / 2 + 12,
+    )
+    await page.mouse.up()
+    const afterRow = await rowHeader.boundingBox()
+    expect(afterRow).not.toBeNull()
+    expect(afterRow!.height).toBeGreaterThan(beforeRow!.height + 8)
+
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
+
   test('context menu copy and paste mutate through the vNext backend', async ({
     page,
     context,

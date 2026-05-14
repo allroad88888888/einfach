@@ -36,3 +36,20 @@ export interface ScrollToCellInput {
   rowAlign?: ViewportCellAlign
   colAlign?: ViewportCellAlign
 }
+
+export interface ViewportSizeOverrideState {
+  rowHeightsBySheet: Record<string, Record<string, number>>
+  colWidthsBySheet: Record<string, Record<string, number>>
+}
+
+export interface SetViewportRowHeightInput {
+  sheetId: string
+  rowIndex: number
+  heightPx: number
+}
+
+export interface SetViewportColumnWidthInput {
+  sheetId: string
+  colIndex: number
+  widthPx: number
+}

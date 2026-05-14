@@ -2,11 +2,16 @@ import { createStore } from '@einfach/core'
 import { describe, expect, test } from '@jest/globals'
 import {
   getCellViewportRect,
+  getViewportColumnWidth,
+  getViewportRowHeight,
   getViewportScrollForCell,
   getVisibleWindow,
   scrollToCellAtom,
+  setViewportColumnWidthAtom,
   setViewportMetricsAtom,
+  setViewportRowHeightAtom,
   visibleWindowAtom,
+  viewportSizeOverridesAtom,
   type ViewportMetrics,
 } from '../src'
 
@@ -166,5 +171,48 @@ describe('getVisibleWindow', () => {
       colStart: 7,
       colEnd: 9,
     })
+  })
+
+  test('stores row and column size overrides sparsely by sheet', () => {
+    const store = createStore()
+
+    store.setter(setViewportRowHeightAtom, {
+      sheetId: 'sheet-1',
+      rowIndex: 2,
+      heightPx: 36.4,
+    })
+    store.setter(setViewportColumnWidthAtom, {
+      sheetId: 'sheet-1',
+      colIndex: 1,
+      widthPx: 128.6,
+    })
+    store.setter(setViewportColumnWidthAtom, {
+      sheetId: 'sheet-2',
+      colIndex: 1,
+      widthPx: 72,
+    })
+
+    const state = store.getter(viewportSizeOverridesAtom)
+    expect(state).toEqual({
+      rowHeightsBySheet: {
+        'sheet-1': {
+          '2': 36,
+        },
+      },
+      colWidthsBySheet: {
+        'sheet-1': {
+          '1': 129,
+        },
+        'sheet-2': {
+          '1': 72,
+        },
+      },
+    })
+    expect(getViewportRowHeight(state, 'sheet-1', 2, 24)).toBe(36)
+    expect(getViewportRowHeight(state, 'sheet-2', 2, 24)).toBe(24)
+    expect(getViewportRowHeight(state, 'sheet-2', 2, 1)).toBe(1)
+    expect(getViewportColumnWidth(state, 'sheet-1', 1, 96)).toBe(129)
+    expect(getViewportColumnWidth(state, 'sheet-2', 1, 96)).toBe(72)
+    expect(getViewportColumnWidth(state, 'sheet-2', 2, 1)).toBe(1)
   })
 })

@@ -1,10 +1,14 @@
 import {
   cancelEditingAtom,
+  cancelPointerAtom,
+  commitPointerAtom,
   commitEditingAtom,
   createVisibleProjectionRequest,
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
+  getViewportColumnWidth,
+  getViewportRowHeight,
   getSelectionRange,
   openMenuAtom,
   selectionSnapshotAtom,
@@ -12,12 +16,17 @@ import {
   selectCellAtom,
   selectColumnsAtom,
   selectRowsAtom,
+  setViewportColumnWidthAtom,
   setSelectionBoundsAtom,
+  setViewportRowHeightAtom,
   setViewportMetricsAtom,
+  startPointerAtom,
   startEditingAtom,
+  updatePointerAtom,
   type DisplayCell,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
+  viewportSizeOverridesAtom,
   visibleWindowAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
@@ -81,6 +90,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const backend = useSpreadsheetBackend()
   const [renderTick, setRenderTick] = createSignal(0)
   let gridRoot: HTMLDivElement | undefined
+  let activeResizeCleanup: (() => void) | null = null
+  let unsubscribeProjection: (() => void) | null = null
+  let unsubscribeSizes: (() => void) | null = null
 
   function bumpRender() {
     setRenderTick((value) => value + 1)
@@ -109,6 +121,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function editingDraft() {
     renderTick()
     return store.getter(editingDraftAtom)
+  }
+
+  function sizeOverrides() {
+    renderTick()
+    return store.getter(viewportSizeOverridesAtom)
   }
 
   function requestProjection() {
@@ -180,7 +197,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   onMount(() => {
-    const unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
+    unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
+    unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     store.setter(setViewportMetricsAtom, props.viewport)
     store.setter(setSelectionBoundsAtom, {
       rowCount: props.viewport.rowCount,
@@ -188,10 +206,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
     bumpRender()
     void loadProjection(requestProjection())
+  })
 
-    onCleanup(() => {
-      unsubscribeProjection()
-    })
+  onCleanup(() => {
+    unsubscribeProjection?.()
+    unsubscribeSizes?.()
+    activeResizeCleanup?.()
+    store.setter(cancelPointerAtom)
   })
 
   async function commitCellEdit() {
@@ -478,6 +499,147 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return getCellMap().get(makeCellKey(row, col))
   }
 
+  function getRenderedRowHeight(row: number) {
+    return getViewportRowHeight(sizeOverrides(), props.sheetId, row, props.viewport.rowHeight)
+  }
+
+  function getRenderedColumnWidth(col: number) {
+    return getViewportColumnWidth(sizeOverrides(), props.sheetId, col, props.viewport.colWidth)
+  }
+
+  function getColumnStyle(col: number): Record<string, string> {
+    return {
+      width: `${getRenderedColumnWidth(col)}px`,
+    }
+  }
+
+  function getCellBoxStyle(row: number, col: number): Record<string, string> {
+    return {
+      height: `${getRenderedRowHeight(row)}px`,
+      width: `${getRenderedColumnWidth(col)}px`,
+    }
+  }
+
+  function getRowHeaderStyle(row: number): Record<string, string> {
+    return {
+      height: `${getRenderedRowHeight(row)}px`,
+    }
+  }
+
+  function startColumnResize(event: PointerEvent, col: number) {
+    event.preventDefault()
+    event.stopPropagation()
+    activeResizeCleanup?.()
+
+    const startClientX = event.clientX
+    const startSize = getRenderedColumnWidth(col)
+    let previewSize = startSize
+    store.setter(startPointerAtom, {
+      kind: 'column-resize',
+      sheetId: props.sheetId,
+      colIndex: col,
+      startSizePx: startSize,
+      previewSizePx: startSize,
+      source: 'pointer',
+    })
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      previewSize = startSize + moveEvent.clientX - startClientX
+      store.setter(updatePointerAtom, {
+        kind: 'column-resize',
+        previewSizePx: previewSize,
+      })
+      store.setter(setViewportColumnWidthAtom, {
+        sheetId: props.sheetId,
+        colIndex: col,
+        widthPx: previewSize,
+      })
+      bumpRender()
+    }
+
+    const onPointerUp = () => {
+      const intent = store.setter(commitPointerAtom)
+      if (intent?.type === 'pointer.column-resize.commit') {
+        store.setter(setViewportColumnWidthAtom, {
+          sheetId: props.sheetId,
+          colIndex: intent.colIndex,
+          widthPx: intent.previewSizePx,
+        })
+      }
+      cleanupResize()
+      bumpRender()
+    }
+
+    const cleanupResize = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+      store.setter(cancelPointerAtom)
+      activeResizeCleanup = null
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp, { once: true })
+    activeResizeCleanup = cleanupResize
+    bumpRender()
+  }
+
+  function startRowResize(event: PointerEvent, row: number) {
+    event.preventDefault()
+    event.stopPropagation()
+    activeResizeCleanup?.()
+
+    const startClientY = event.clientY
+    const startSize = getRenderedRowHeight(row)
+    let previewSize = startSize
+    store.setter(startPointerAtom, {
+      kind: 'row-resize',
+      sheetId: props.sheetId,
+      rowIndex: row,
+      startSizePx: startSize,
+      previewSizePx: startSize,
+      source: 'pointer',
+    })
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      previewSize = startSize + moveEvent.clientY - startClientY
+      store.setter(updatePointerAtom, {
+        kind: 'row-resize',
+        previewSizePx: previewSize,
+      })
+      store.setter(setViewportRowHeightAtom, {
+        sheetId: props.sheetId,
+        rowIndex: row,
+        heightPx: previewSize,
+      })
+      bumpRender()
+    }
+
+    const onPointerUp = () => {
+      const intent = store.setter(commitPointerAtom)
+      if (intent?.type === 'pointer.row-resize.commit') {
+        store.setter(setViewportRowHeightAtom, {
+          sheetId: props.sheetId,
+          rowIndex: intent.rowIndex,
+          heightPx: intent.previewSizePx,
+        })
+      }
+      cleanupResize()
+      bumpRender()
+    }
+
+    const cleanupResize = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+      store.setter(cancelPointerAtom)
+      activeResizeCleanup = null
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp, { once: true })
+    activeResizeCleanup = cleanupResize
+    bumpRender()
+  }
+
   return (
     <div
       ref={gridRoot}
@@ -521,6 +683,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       class={`spreadsheet-grid-col-header ${selected() ? 'is-selected' : ''}`.trim()}
                       data-col={col}
                       data-selected={selected() ? 'true' : 'false'}
+                      style={getColumnStyle(col)}
                       onClick={(event) => {
                         selectColumn(col, event.shiftKey)
                       }}
@@ -528,7 +691,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                         openContextMenu(event, { kind: 'column', col })
                       }}
                     >
-                      {getColumnLabel(col)}
+                      <span class="spreadsheet-grid-header-label">{getColumnLabel(col)}</span>
+                      <button
+                        type="button"
+                        class="spreadsheet-grid-col-resize-handle"
+                        data-testid={`col-resize-${col}`}
+                        aria-label={`Resize column ${getColumnLabel(col)}`}
+                        onPointerDown={(event) => startColumnResize(event, col)}
+                      />
                     </th>
                   )
                 }}
@@ -555,6 +725,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                         ? 'true'
                         : 'false'
                     }
+                    style={getRowHeaderStyle(row)}
                     onClick={(event) => {
                       selectRow(row, event.shiftKey)
                     }}
@@ -562,7 +733,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       openContextMenu(event, { kind: 'row', row })
                     }}
                   >
-                    {row + 1}
+                    <span class="spreadsheet-grid-header-label">{row + 1}</span>
+                    <button
+                      type="button"
+                      class="spreadsheet-grid-row-resize-handle"
+                      data-testid={`row-resize-${row}`}
+                      aria-label={`Resize row ${row + 1}`}
+                      onPointerDown={(event) => startRowResize(event, row)}
+                    />
                   </th>
                   <For each={getCols()}>
                     {(col) => {
@@ -584,6 +762,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                           data-selected={selected() ? 'true' : 'false'}
                           data-active={active() ? 'true' : 'false'}
                           aria-selected={selected() ? 'true' : 'false'}
+                          style={getCellBoxStyle(row, col)}
                           onClick={(event) => {
                             store.setter(selectCellAtom, {
                               sheetId: props.sheetId,

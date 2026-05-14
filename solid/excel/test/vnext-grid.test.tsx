@@ -9,7 +9,12 @@ import type {
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
-import { menuStateAtom, selectionAtom, visibleWindowAtom } from '@einfach/spreadsheet-ui-core'
+import {
+  menuStateAtom,
+  selectionAtom,
+  viewportSizeOverridesAtom,
+  visibleWindowAtom,
+} from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 
@@ -19,6 +24,21 @@ function flushMicrotasks() {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, 0)
   })
+}
+
+function dispatchPointerEvent(
+  target: EventTarget,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  coordinates: { clientX?: number; clientY?: number },
+) {
+  target.dispatchEvent(
+    new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: coordinates.clientX ?? 0,
+      clientY: coordinates.clientY ?? 0,
+    }),
+  )
 }
 
 function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
@@ -370,6 +390,68 @@ describe('vNext SpreadsheetGrid', () => {
         y: 34,
       },
     })
+  })
+
+  it('resizes visible rows and columns through sparse viewport atoms', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 48,
+      viewportWidth: 192,
+      rowHeight: 24,
+      colWidth: 96,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    dispatchPointerEvent(getByTestId('col-resize-1'), 'pointerdown', { clientX: 100 })
+    dispatchPointerEvent(window, 'pointermove', { clientX: 132 })
+    dispatchPointerEvent(window, 'pointerup', { clientX: 132 })
+
+    dispatchPointerEvent(getByTestId('row-resize-1'), 'pointerdown', { clientY: 30 })
+    dispatchPointerEvent(window, 'pointermove', { clientY: 42 })
+    dispatchPointerEvent(window, 'pointerup', { clientY: 42 })
+
+    expect(store.getter(viewportSizeOverridesAtom)).toEqual({
+      rowHeightsBySheet: {
+        'sheet-1': {
+          '1': 36,
+        },
+      },
+      colWidthsBySheet: {
+        'sheet-1': {
+          '1': 128,
+        },
+      },
+    })
+    expect(
+      (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement).style
+        .width,
+    ).toBe('128px')
+    expect(
+      (container.querySelector('.spreadsheet-grid-row-header[data-row="1"]') as HTMLElement).style
+        .height,
+    ).toBe('36px')
+    expect((container.querySelector('[data-cell-addr="B2"]') as HTMLElement).style.width).toBe(
+      '128px',
+    )
+    expect((container.querySelector('[data-cell-addr="B2"]') as HTMLElement).style.height).toBe(
+      '36px',
+    )
   })
 
   it('preserves selected range when opening a cell context menu inside it', async () => {

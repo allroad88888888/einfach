@@ -403,6 +403,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   backend port；Solid 组件只展示当前 sheet metadata snapshot，真实列表来自 static/worker
   backend 的 `listSheets` / `addSheet` / `renameSheet` / `deleteSheet`。Sheet tab 仍只创建
   tab 级 atom 状态，不创建整张 sheet 或 cell atom。
+- PC-6 第十一段：vNext Grid 已接 row/column resize 第一版。`@einfach/spreadsheet-ui-core`
+  新增按 sheet 分片的稀疏 `viewportSizeOverridesAtom`，只保存用户显式调整过的可视层
+  row height / column width override；Solid Grid 通过 pointer resize intent 写入该 atom，
+  渲染时按当前 visible window 读取尺寸。该状态不写入 Rust cell facts，不创建全量 row/col
+  atom 或数组，也不触发公式求值。
 
 PC-6 第一段验收记录：
 
@@ -529,6 +534,17 @@ PC-6 第十段验收记录：
   `Report` 消失、active tab 回到 `Sheet3`、当前仍只渲染 30 个可视 cell、`J20`
   offscreen 未挂载、状态栏显示 `30 cells`、console error 为 0。
 
+PC-6 第十一段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/viewport.test.ts solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，验证 B 列从
+  `96px` resize 到 `128px`、第 2 行 resize 到 `36px`、`B2` cell 同步为
+  `128x36`，当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -541,7 +557,7 @@ PC-6 第十段验收记录：
 - FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
   但还没有接 sheet reorder mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、
-  fill handle、row/col resize。
+  fill handle、row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 
 ## 并行 Agent 计划
