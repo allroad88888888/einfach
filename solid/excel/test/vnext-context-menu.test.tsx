@@ -5,6 +5,10 @@ import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
   ClearRangeRequest,
+  DeleteColumnsRequest,
+  DeleteRowsRequest,
+  InsertColumnsRequest,
+  InsertRowsRequest,
   SetCellInputRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -18,6 +22,10 @@ afterEach(cleanup)
 function createFakeBackend() {
   const setCellInputRequests: SetCellInputRequest[] = []
   const clearRangeRequests: ClearRangeRequest[] = []
+  const insertRowsRequests: InsertRowsRequest[] = []
+  const deleteRowsRequests: DeleteRowsRequest[] = []
+  const insertColumnsRequests: InsertColumnsRequest[] = []
+  const deleteColumnsRequests: DeleteColumnsRequest[] = []
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
@@ -57,9 +65,50 @@ function createFakeBackend() {
         affectedRange: request.range,
       }
     },
+    async insertRows(request) {
+      insertRowsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+      }
+    },
+    async deleteRows(request) {
+      deleteRowsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+      }
+    },
+    async insertColumns(request) {
+      insertColumnsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+      }
+    },
+    async deleteColumns(request) {
+      deleteColumnsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+      }
+    },
   }
 
-  return { backend, setCellInputRequests, clearRangeRequests, readVisibleRequests }
+  return {
+    backend,
+    setCellInputRequests,
+    clearRangeRequests,
+    insertRowsRequests,
+    deleteRowsRequests,
+    insertColumnsRequests,
+    deleteColumnsRequests,
+    readVisibleRequests,
+  }
 }
 
 describe('vNext SpreadsheetContextMenu', () => {
@@ -78,7 +127,7 @@ describe('vNext SpreadsheetContextMenu', () => {
       source: 'pointer',
     })
 
-    const { getByTestId } = render(() => (
+    const { getByTestId, queryByTestId } = render(() => (
       <SpreadsheetUiProvider backend={backend} store={store}>
         <SpreadsheetContextMenu />
       </SpreadsheetUiProvider>
@@ -92,6 +141,8 @@ describe('vNext SpreadsheetContextMenu', () => {
     expect(menu.getAttribute('data-menu-target-sheet-id')).toBe('sheet-1')
     expect(getByTestId('context-menu-command-clipboard.copy').textContent).toBe('Copy')
     expect(getByTestId('context-menu-command-cell.clear').textContent).toBe('Delete')
+    expect(queryByTestId('context-menu-command-row.insert')).toBeNull()
+    expect(queryByTestId('context-menu-command-column.delete')).toBeNull()
   })
 
   it('dispatches a menu.command intent when Delete is clicked', async () => {
@@ -298,5 +349,86 @@ describe('vNext SpreadsheetContextMenu', () => {
       expect(queryByTestId('spreadsheet-context-menu')).toBeNull()
       expect(store.getter(menuStateAtom).status).toBe('closed')
     })
+  })
+
+  it('executes row and column structural commands through the backend', async () => {
+    const store = createStore()
+    const {
+      backend,
+      insertRowsRequests,
+      deleteColumnsRequests,
+      readVisibleRequests,
+    } = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: {
+        kind: 'row',
+        sheetId: 'sheet-1',
+        rowIndex: 2,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-row.insert'))
+    await waitFor(() =>
+      expect(insertRowsRequests).toEqual([
+        {
+          kind: 'insert-rows',
+          sheetId: 'sheet-1',
+          rowIndex: 2,
+          count: 1,
+        },
+      ]),
+    )
+    await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
+
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: {
+        kind: 'column',
+        sheetId: 'sheet-1',
+        colIndex: 1,
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+    fireEvent.click(getByTestId('context-menu-command-column.delete'))
+
+    await waitFor(() =>
+      expect(deleteColumnsRequests).toEqual([
+        {
+          kind: 'delete-columns',
+          sheetId: 'sheet-1',
+          colIndex: 1,
+          count: 1,
+        },
+      ]),
+    )
+    await waitFor(() => expect(readVisibleRequests).toHaveLength(2))
   })
 })

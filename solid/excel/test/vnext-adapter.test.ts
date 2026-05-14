@@ -28,6 +28,10 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setFormulaDetailed: Array<{ sheet: number; addr: string; formula: string }>
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: SparseRangeWire[]
+    insertRows: Array<{ sheet: number; rowIndex: number; count: number }>
+    deleteRows: Array<{ sheet: number; rowIndex: number; count: number }>
+    insertColumns: Array<{ sheet: number; colIndex: number; count: number }>
+    deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -44,6 +48,10 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setFormulaDetailed: [],
     clearCell: [],
     clearRange: [],
+    insertRows: [],
+    deleteRows: [],
+    insertColumns: [],
+    deleteColumns: [],
   }
   let metas: WorkbookSheetMeta[] = []
 
@@ -65,6 +73,19 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     }
   }
 
+  function toCellAddress(row: number, col: number): string {
+    let value = col + 1
+    let label = ''
+
+    while (value > 0) {
+      const remainder = (value - 1) % 26
+      label = String.fromCharCode(65 + remainder) + label
+      value = Math.floor((value - 1) / 26)
+    }
+
+    return `${label}${row + 1}`
+  }
+
   function insideRange(cell: CellSnapshotWire, range: SparseRangeWire) {
     const coord = parseCellAddress(cell.addr)
     return (
@@ -81,6 +102,41 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       ...cell,
       addr: cell.addr.toUpperCase(),
     })
+  }
+
+  function shiftCells(
+    sheet: number,
+    axis: 'row' | 'column',
+    index: number,
+    count: number,
+    direction: 1 | -1,
+  ) {
+    const next = new Map<string, CellSnapshotWire>()
+    const deleteEnd = index + count - 1
+
+    for (const snapshot of cells.values()) {
+      const coord = parseCellAddress(snapshot.addr)
+      if (snapshot.sheet !== sheet || coord.row < 0 || coord.col < 0) {
+        next.set(key(snapshot.sheet, snapshot.addr), snapshot)
+        continue
+      }
+
+      const current = axis === 'row' ? coord.row : coord.col
+      if (direction === -1 && current >= index && current <= deleteEnd) {
+        continue
+      }
+
+      const shifted = current >= (direction === 1 ? index : deleteEnd + 1)
+        ? current + count * direction
+        : current
+      const row = axis === 'row' ? shifted : coord.row
+      const col = axis === 'column' ? shifted : coord.col
+      const nextSnapshot = { ...snapshot, addr: toCellAddress(row, col) }
+      next.set(key(nextSnapshot.sheet, nextSnapshot.addr), nextSnapshot)
+    }
+
+    cells.clear()
+    for (const [cellKey, snapshot] of next) cells.set(cellKey, snapshot)
   }
 
   const client: FakeWorkerWorkbookClient = {
@@ -148,6 +204,26 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         if (insideRange(snapshot, range)) cells.delete(cellKey)
       }
       return 1
+    },
+    async insertRows(sheet, rowIndex, count) {
+      calls.insertRows.push({ sheet, rowIndex, count })
+      shiftCells(sheet, 'row', rowIndex, count, 1)
+      return true
+    },
+    async deleteRows(sheet, rowIndex, count) {
+      calls.deleteRows.push({ sheet, rowIndex, count })
+      shiftCells(sheet, 'row', rowIndex, count, -1)
+      return true
+    },
+    async insertColumns(sheet, colIndex, count) {
+      calls.insertColumns.push({ sheet, colIndex, count })
+      shiftCells(sheet, 'column', colIndex, count, 1)
+      return true
+    },
+    async deleteColumns(sheet, colIndex, count) {
+      calls.deleteColumns.push({ sheet, colIndex, count })
+      shiftCells(sheet, 'column', colIndex, count, -1)
+      return true
     },
     async setFormatRange() {
       throw new Error('not used')
@@ -411,6 +487,47 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('applies static backend row and column structural edits sparsely', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      matrix: [
+        ['A1', 'B1', 'C1'],
+        ['A2', 'B2', 'C2'],
+        ['A3', 'B3', 'C3'],
+      ],
+    })
+
+    await backend.insertRows?.({
+      kind: 'insert-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 1,
+      count: 1,
+    })
+    await backend.deleteColumns?.({
+      kind: 'delete-columns',
+      sheetId: 'sheet-1',
+      colIndex: 1,
+      count: 1,
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 13,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 0, col: 1, displayValue: 'C1', valueKind: 'string' },
+      { row: 2, col: 0, displayValue: 'A2', valueKind: 'string' },
+      { row: 2, col: 1, displayValue: 'C2', valueKind: 'string' },
+      { row: 3, col: 0, displayValue: 'A3', valueKind: 'string' },
+      { row: 3, col: 1, displayValue: 'C3', valueKind: 'string' },
+    ])
+  })
+
   it('keeps requestId and revision aligned on visible reads', async () => {
     const backend = createStaticSpreadsheetBackend([
       ['A1', 'B1'],
@@ -598,6 +715,84 @@ describe('vnext adapter', () => {
     })
     expect(result.cells).toEqual([
       { row: 0, col: 2, displayValue: 'C1', valueKind: 'string' },
+    ])
+
+    backend.dispose()
+  })
+
+  it('routes worker workbook row and column structural edits through the backend', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 10,
+    })
+
+    await backend.ready()
+    client.putCell({
+      sheet: 0,
+      addr: 'A1',
+      display: 'A1',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'A2',
+      display: 'A2',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+    client.putCell({
+      sheet: 0,
+      addr: 'C2',
+      display: 'C2',
+      type: 'text',
+      isError: false,
+      formula: '',
+    })
+
+    const rowMutation = await backend.insertRows?.({
+      kind: 'insert-rows',
+      sheetId: 'sheet-1',
+      requestId: 20,
+      rowIndex: 1,
+      count: 1,
+    })
+    const colMutation = await backend.deleteColumns?.({
+      kind: 'delete-columns',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      colIndex: 1,
+      count: 1,
+    })
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 22,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(client.calls.insertRows).toEqual([{ sheet: 0, rowIndex: 1, count: 1 }])
+    expect(client.calls.deleteColumns).toEqual([{ sheet: 0, colIndex: 1, count: 1 }])
+    expect(rowMutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 20,
+      revision: 11,
+    })
+    expect(colMutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 12,
+    })
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 2, col: 0, displayValue: 'A2', valueKind: 'string' },
+      { row: 2, col: 1, displayValue: 'C2', valueKind: 'string' },
     ])
 
     backend.dispose()

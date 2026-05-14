@@ -2,7 +2,11 @@ import type {
   BackendMutationResult,
   CellRange,
   ClearRangeRequest,
+  DeleteColumnsRequest,
+  DeleteRowsRequest,
   DisplayCell,
+  InsertColumnsRequest,
+  InsertRowsRequest,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
@@ -144,6 +148,21 @@ function toSparseRange(sheet: number, range: CellRange): SparseRangeWire {
     startCol: range.colStart,
     endRow: range.rowEnd,
     endCol: range.colEnd,
+  }
+}
+
+function structuralMutationResult(
+  request:
+    | InsertRowsRequest
+    | DeleteRowsRequest
+    | InsertColumnsRequest
+    | DeleteColumnsRequest,
+  revision: ProjectionRevision,
+): BackendMutationResult {
+  return {
+    sheetId: request.sheetId,
+    requestId: request.requestId,
+    revision: request.revision ?? revision,
   }
 }
 
@@ -343,6 +362,30 @@ export function createWorkerWorkbookSpreadsheetBackend(
           colEnd: request.range.colEnd,
         },
       }
+    },
+
+    async insertRows(request: InsertRowsRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.insertRows(sheet.idx, request.rowIndex, request.count)
+      return structuralMutationResult(request, bumpRevision())
+    },
+
+    async deleteRows(request: DeleteRowsRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.deleteRows(sheet.idx, request.rowIndex, request.count)
+      return structuralMutationResult(request, bumpRevision())
+    },
+
+    async insertColumns(request: InsertColumnsRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.insertColumns(sheet.idx, request.colIndex, request.count)
+      return structuralMutationResult(request, bumpRevision())
+    },
+
+    async deleteColumns(request: DeleteColumnsRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.deleteColumns(sheet.idx, request.colIndex, request.count)
+      return structuralMutationResult(request, bumpRevision())
     },
 
     ready() {

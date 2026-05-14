@@ -36,26 +36,8 @@ const commandLabels: Record<MenuCommandKind, string> = {
 }
 
 const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
-  cell: [
-    'clipboard.copy',
-    'clipboard.cut',
-    'clipboard.paste',
-    'cell.clear',
-    'row.insert',
-    'row.delete',
-    'column.insert',
-    'column.delete',
-  ],
-  range: [
-    'clipboard.copy',
-    'clipboard.cut',
-    'clipboard.paste',
-    'cell.clear',
-    'row.insert',
-    'row.delete',
-    'column.insert',
-    'column.delete',
-  ],
+  cell: ['clipboard.copy', 'clipboard.cut', 'clipboard.paste', 'cell.clear'],
+  range: ['clipboard.copy', 'clipboard.cut', 'clipboard.paste', 'cell.clear'],
   row: ['row.insert', 'row.delete'],
   column: ['column.insert', 'column.delete'],
   all: ['row.insert', 'row.delete', 'column.insert', 'column.delete'],
@@ -139,29 +121,79 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   async function executeCommand(intent: MenuCommandIntent) {
     const target = intent.target
-    if (intent.command !== 'cell.clear') {
-      return
-    }
-
-    if (target.kind === 'cell') {
-      await backend.setCellInput({
-        kind: 'set-cell-input',
-        sheetId: target.sheetId,
-        row: target.cell.row,
-        col: target.cell.col,
-        input: '',
-      })
-    } else if (target.kind === 'range') {
-      if (!backend.clearRange) {
-        throw new Error('Range clear is not supported by this spreadsheet backend.')
-      }
-      await backend.clearRange({
-        kind: 'clear-range',
-        sheetId: target.sheetId,
-        range: target.range,
-      })
-    } else {
-      return
+    switch (intent.command) {
+      case 'cell.clear':
+        if (target.kind === 'cell') {
+          await backend.setCellInput({
+            kind: 'set-cell-input',
+            sheetId: target.sheetId,
+            row: target.cell.row,
+            col: target.cell.col,
+            input: '',
+          })
+        } else if (target.kind === 'range') {
+          if (!backend.clearRange) {
+            throw new Error('Range clear is not supported by this spreadsheet backend.')
+          }
+          await backend.clearRange({
+            kind: 'clear-range',
+            sheetId: target.sheetId,
+            range: target.range,
+          })
+        } else {
+          return
+        }
+        break
+      case 'row.insert':
+        if (target.kind !== 'row') return
+        if (!backend.insertRows) {
+          throw new Error('Row insert is not supported by this spreadsheet backend.')
+        }
+        await backend.insertRows({
+          kind: 'insert-rows',
+          sheetId: target.sheetId,
+          rowIndex: target.rowIndex,
+          count: 1,
+        })
+        break
+      case 'row.delete':
+        if (target.kind !== 'row') return
+        if (!backend.deleteRows) {
+          throw new Error('Row delete is not supported by this spreadsheet backend.')
+        }
+        await backend.deleteRows({
+          kind: 'delete-rows',
+          sheetId: target.sheetId,
+          rowIndex: target.rowIndex,
+          count: 1,
+        })
+        break
+      case 'column.insert':
+        if (target.kind !== 'column') return
+        if (!backend.insertColumns) {
+          throw new Error('Column insert is not supported by this spreadsheet backend.')
+        }
+        await backend.insertColumns({
+          kind: 'insert-columns',
+          sheetId: target.sheetId,
+          colIndex: target.colIndex,
+          count: 1,
+        })
+        break
+      case 'column.delete':
+        if (target.kind !== 'column') return
+        if (!backend.deleteColumns) {
+          throw new Error('Column delete is not supported by this spreadsheet backend.')
+        }
+        await backend.deleteColumns({
+          kind: 'delete-columns',
+          sheetId: target.sheetId,
+          colIndex: target.colIndex,
+          count: 1,
+        })
+        break
+      default:
+        return
     }
     await refreshProjection(target.sheetId)
   }

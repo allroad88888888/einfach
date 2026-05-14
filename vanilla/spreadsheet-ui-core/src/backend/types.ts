@@ -80,6 +80,38 @@ export interface ClearRangeRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface InsertRowsRequest extends SheetRef {
+  kind: 'insert-rows'
+  rowIndex: number
+  count: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface DeleteRowsRequest extends SheetRef {
+  kind: 'delete-rows'
+  rowIndex: number
+  count: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface InsertColumnsRequest extends SheetRef {
+  kind: 'insert-columns'
+  colIndex: number
+  count: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface DeleteColumnsRequest extends SheetRef {
+  kind: 'delete-columns'
+  colIndex: number
+  count: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -91,4 +123,8 @@ export interface SpreadsheetBackend {
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
   clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
+  insertRows?(request: InsertRowsRequest): Promise<BackendMutationResult>
+  deleteRows?(request: DeleteRowsRequest): Promise<BackendMutationResult>
+  insertColumns?(request: InsertColumnsRequest): Promise<BackendMutationResult>
+  deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
 }

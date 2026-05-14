@@ -44,6 +44,10 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     sheetList: WorkbookSheetMeta[][]
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
+    insertRows: Array<{ sheet: number; rowIndex: number; count: number }>
+    deleteRows: Array<{ sheet: number; rowIndex: number; count: number }>
+    insertColumns: Array<{ sheet: number; colIndex: number; count: number }>
+    deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
     setFormatRange: FormatRangeCall[]
     snapshotFormatRange: ClearRangeCall[]
     restoreFormatSnapshot: FormatRangeSnapshot[]
@@ -136,6 +140,10 @@ function makeFakeWorkerWorkbookClient(
     sheetList: [],
     clearCell: [],
     clearRange: [],
+    insertRows: [],
+    deleteRows: [],
+    insertColumns: [],
+    deleteColumns: [],
     setFormatRange: [],
     snapshotFormatRange: [],
     restoreFormatSnapshot: [],
@@ -268,6 +276,22 @@ function makeFakeWorkerWorkbookClient(
         if (inRange(addr, range)) cells.delete(itemKey)
       }
       return 1
+    },
+    async insertRows(sheet, rowIndex, count) {
+      calls.insertRows.push({ sheet, rowIndex, count })
+      return true
+    },
+    async deleteRows(sheet, rowIndex, count) {
+      calls.deleteRows.push({ sheet, rowIndex, count })
+      return true
+    },
+    async insertColumns(sheet, colIndex, count) {
+      calls.insertColumns.push({ sheet, colIndex, count })
+      return true
+    },
+    async deleteColumns(sheet, colIndex, count) {
+      calls.deleteColumns.push({ sheet, colIndex, count })
+      return true
     },
     async setFormatRange(range, fmt) {
       calls.setFormatRange.push({ ...range, fmt })
@@ -903,6 +927,28 @@ describe('createWorkerWorkbookStore', () => {
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999 },
       ])
       expect(client.calls.clearCell).toEqual([])
+
+      workbook.dispose()
+    })
+  })
+
+  it('routes structural edits through worker workbook RPCs', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      store.insertRow(2, 3)
+      store.deleteRow(4, 1)
+      store.insertCol(5, 2)
+      store.deleteCol(6, 1)
+
+      await waitFor(() => {
+        expect(client.calls.insertRows).toEqual([{ sheet: 0, rowIndex: 2, count: 3 }])
+        expect(client.calls.deleteRows).toEqual([{ sheet: 0, rowIndex: 4, count: 1 }])
+        expect(client.calls.insertColumns).toEqual([{ sheet: 0, colIndex: 5, count: 2 }])
+        expect(client.calls.deleteColumns).toEqual([{ sheet: 0, colIndex: 6, count: 1 }])
+      })
 
       workbook.dispose()
     })

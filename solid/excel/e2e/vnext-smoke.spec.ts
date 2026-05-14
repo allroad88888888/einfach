@@ -123,4 +123,26 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(cellDisplay(page, 'C2')).toHaveText('')
     await expect(cellDisplay(page, 'D1')).toHaveText('Delta')
   })
+
+  test('row and column context menu commands mutate the visible projection', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await page.locator('.spreadsheet-grid-row-header[data-row="1"]').click({ button: 'right' })
+    let menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await expect(menu).toHaveAttribute('data-menu-target-kind', 'row')
+    await page.getByTestId('context-menu-command-row.insert').click()
+    await expect(menu).toHaveCount(0)
+    await expect(cellDisplay(page, 'A2')).toHaveText('')
+    await expect(cellDisplay(page, 'A3')).toHaveText('North')
+
+    await page.locator('.spreadsheet-grid-col-header[data-col="1"]').click({ button: 'right' })
+    menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await expect(menu).toHaveAttribute('data-menu-target-kind', 'column')
+    await page.getByTestId('context-menu-command-column.delete').click()
+    await expect(menu).toHaveCount(0)
+    await expect(cellDisplay(page, 'A1')).toHaveText('Alpha')
+    await expect(cellDisplay(page, 'B1')).toHaveText('Gamma')
+  })
 })

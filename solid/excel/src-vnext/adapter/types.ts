@@ -1,7 +1,11 @@
 import type {
   BackendMutationResult,
   ClearRangeRequest,
+  DeleteColumnsRequest,
+  DeleteRowsRequest,
   DisplayCell,
+  InsertColumnsRequest,
+  InsertRowsRequest,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
@@ -38,7 +42,11 @@ export type StaticSpreadsheetMutationResult = BackendMutationResult
 export type {
   BackendMutationResult,
   ClearRangeRequest,
+  DeleteColumnsRequest,
+  DeleteRowsRequest,
   DisplayCell,
+  InsertColumnsRequest,
+  InsertRowsRequest,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,

@@ -797,6 +797,13 @@ function createWorkerWorkbookSheetAdapter(
     hydrateRefs(visibleAddrs.map((addr) => ({ sheet: sheetIdx, addr })))
   }
 
+  function structuralEdit(run: () => Promise<boolean>) {
+    const visibleAddrs = invalidateCachedStateForRemoteMutation()
+    void run()
+      .then(() => hydrateVisibleAddrs(visibleAddrs))
+      .catch(() => hydrateVisibleAddrs(visibleAddrs))
+  }
+
   function toLocalSparseCell(cell: SparseCellWire): SparseCellSnapshot | null {
     if (cell.sheet !== sheetIdx) return null
     const { sheet: _sheet, ...local } = cell
@@ -865,6 +872,18 @@ function createWorkerWorkbookSheetAdapter(
           hydrateVisibleAddrs(visibleAddrs)
           throw err
         })
+    },
+    insert_row(at, count) {
+      structuralEdit(() => client.insertRows(sheetIdx, at, count))
+    },
+    delete_row(at, count) {
+      structuralEdit(() => client.deleteRows(sheetIdx, at, count))
+    },
+    insert_col(at, count) {
+      structuralEdit(() => client.insertColumns(sheetIdx, at, count))
+    },
+    delete_col(at, count) {
+      structuralEdit(() => client.deleteColumns(sheetIdx, at, count))
     },
     set_format_range(startRow, startCol, endRow, endCol, fmt) {
       const visibleAddrs = invalidateCachedStateForRemoteMutation()

@@ -158,6 +158,10 @@ export interface WorkerWorkbookClient {
   ): Promise<FormulaMutationResultWire>
   clearCell(sheet: number, addr: string): Promise<boolean>
   clearRange(range: SparseRangeWire): Promise<number>
+  insertRows(sheet: number, rowIndex: number, count: number): Promise<boolean>
+  deleteRows(sheet: number, rowIndex: number, count: number): Promise<boolean>
+  insertColumns(sheet: number, colIndex: number, count: number): Promise<boolean>
+  deleteColumns(sheet: number, colIndex: number, count: number): Promise<boolean>
   setFormatRange(range: SparseRangeWire, fmt: CellFormatJSON | null | undefined): Promise<number>
   snapshotFormatRange(range: SparseRangeWire): Promise<FormatRangeSnapshot>
   restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<number>
@@ -338,6 +342,18 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     clearRange(range) {
       return request<number>('clearRange', { range })
+    },
+    insertRows(sheet, rowIndex, count) {
+      return request<boolean>('insertRows', { sheet, rowIndex, count })
+    },
+    deleteRows(sheet, rowIndex, count) {
+      return request<boolean>('deleteRows', { sheet, rowIndex, count })
+    },
+    insertColumns(sheet, colIndex, count) {
+      return request<boolean>('insertColumns', { sheet, colIndex, count })
+    },
+    deleteColumns(sheet, colIndex, count) {
+      return request<boolean>('deleteColumns', { sheet, colIndex, count })
     },
     setFormatRange(range, fmt) {
       return request<number>('setFormatRange', { range, fmt })

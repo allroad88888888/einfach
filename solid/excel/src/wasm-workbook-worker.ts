@@ -35,6 +35,10 @@ type WasmWorkbookRuntime = {
   set_cell_error(sheetIdx: number, addr: string, value: string): void
   clearCellAt(sheetIdx: number, addr: string): void
   setFormulaAt(sheetIdx: number, addr: string, formula: string): boolean
+  insert_row(sheetIdx: number, at: number, count: number): void
+  delete_row(sheetIdx: number, at: number, count: number): void
+  insert_col(sheetIdx: number, at: number, count: number): void
+  delete_col(sheetIdx: number, at: number, count: number): void
   subscribe_cell?: (sheetName: string, addr: string, callback: () => void) => number
   unsubscribe_cell?: (token: number) => void
   get_display(sheetIdx: number, addr: string): string
@@ -652,6 +656,26 @@ function normalizeSparseRange(range: unknown): SparseRangeWire {
   return out
 }
 
+function normalizeStructuralIndex(value: unknown, name: string): number {
+  const index = Number(value)
+  if (!Number.isInteger(index) || index < 0) {
+    throw Object.assign(new Error(`invalid ${name}`), {
+      code: 'INVALID_STRUCTURAL_EDIT',
+    })
+  }
+  return index
+}
+
+function normalizeStructuralCount(value: unknown): number {
+  const count = Number(value)
+  if (!Number.isInteger(count) || count < 1) {
+    throw Object.assign(new Error('invalid structural edit count'), {
+      code: 'INVALID_STRUCTURAL_EDIT',
+    })
+  }
+  return count
+}
+
 function assertMethod<T extends keyof WasmWorkbookRuntime>(
   wb: WasmWorkbookRuntime,
   method: T,
@@ -817,6 +841,46 @@ ctx.addEventListener('message', async (e: MessageEvent) => {
               range.endCol,
             ),
           )
+        }
+        break
+      case 'insertRows':
+        {
+          const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+          const rowIndex = normalizeStructuralIndex(msg.rowIndex, 'row index')
+          const count = normalizeStructuralCount(msg.count)
+          assertSheet(wb, sheet)
+          assertMethod(wb, 'insert_row').call(wb, sheet, rowIndex, count)
+          postResponse(msg.id, true)
+        }
+        break
+      case 'deleteRows':
+        {
+          const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+          const rowIndex = normalizeStructuralIndex(msg.rowIndex, 'row index')
+          const count = normalizeStructuralCount(msg.count)
+          assertSheet(wb, sheet)
+          assertMethod(wb, 'delete_row').call(wb, sheet, rowIndex, count)
+          postResponse(msg.id, true)
+        }
+        break
+      case 'insertColumns':
+        {
+          const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+          const colIndex = normalizeStructuralIndex(msg.colIndex, 'column index')
+          const count = normalizeStructuralCount(msg.count)
+          assertSheet(wb, sheet)
+          assertMethod(wb, 'insert_col').call(wb, sheet, colIndex, count)
+          postResponse(msg.id, true)
+        }
+        break
+      case 'deleteColumns':
+        {
+          const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+          const colIndex = normalizeStructuralIndex(msg.colIndex, 'column index')
+          const count = normalizeStructuralCount(msg.count)
+          assertSheet(wb, sheet)
+          assertMethod(wb, 'delete_col').call(wb, sheet, colIndex, count)
+          postResponse(msg.id, true)
         }
         break
       case 'setFormatRange':

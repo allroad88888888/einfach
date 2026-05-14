@@ -500,6 +500,55 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(restoreCount).resolves.toBe(2)
   })
 
+  it('sends workbook structural edit commands with zero-based indexes', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const insertRows = workbook.insertRows(1, 2, 3)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'insertRows',
+      sheet: 1,
+      rowIndex: 2,
+      count: 3,
+    })
+    ok(fake, true)
+    await expect(insertRows).resolves.toBe(true)
+
+    const deleteRows = workbook.deleteRows(1, 4, 1)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'deleteRows',
+      sheet: 1,
+      rowIndex: 4,
+      count: 1,
+    })
+    ok(fake, true)
+    await expect(deleteRows).resolves.toBe(true)
+
+    const insertColumns = workbook.insertColumns(0, 5, 2)
+    expect(lastSent(fake)).toEqual({
+      id: 3,
+      cmd: 'insertColumns',
+      sheet: 0,
+      colIndex: 5,
+      count: 2,
+    })
+    ok(fake, true)
+    await expect(insertColumns).resolves.toBe(true)
+
+    const deleteColumns = workbook.deleteColumns(0, 6, 1)
+    expect(lastSent(fake)).toEqual({
+      id: 4,
+      cmd: 'deleteColumns',
+      sheet: 0,
+      colIndex: 6,
+      count: 1,
+    })
+    ok(fake, true)
+    await expect(deleteColumns).resolves.toBe(true)
+  })
+
   it('sends persistence snapshot/restore commands with expected payloads', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

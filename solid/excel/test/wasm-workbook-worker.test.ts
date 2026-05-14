@@ -66,6 +66,10 @@ type MockWasmWorkbook = {
   set_cell_error: (sheet: number, addr: string, value: string) => void
   clearCellAt: (sheet: number, addr: string) => void
   setFormulaAt: (sheet: number, addr: string, formula: string) => boolean
+  insert_row: (sheet: number, at: number, count: number) => void
+  delete_row: (sheet: number, at: number, count: number) => void
+  insert_col: (sheet: number, at: number, count: number) => void
+  delete_col: (sheet: number, at: number, count: number) => void
   snapshot_sparse: () => unknown[]
   snapshot_range_sparse: (
     sheet: number,
@@ -117,6 +121,10 @@ type MockWasmWorkbook = {
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
     restoreFormatSnapshot: FormatRangeSnapshot[]
+    insertRows: Array<{ sheet: number; at: number; count: number }>
+    deleteRows: Array<{ sheet: number; at: number; count: number }>
+    insertCols: Array<{ sheet: number; at: number; count: number }>
+    deleteCols: Array<{ sheet: number; at: number; count: number }>
     subscribeTokens: number[]
     unsubscribeTokens: number[]
   }
@@ -180,6 +188,10 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     setFormatRange: [],
     snapshotFormatRange: [],
     restoreFormatSnapshot: [],
+    insertRows: [],
+    deleteRows: [],
+    insertCols: [],
+    deleteCols: [],
     subscribeTokens: [],
     unsubscribeTokens: [],
   }
@@ -370,6 +382,18 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       })
       return true
     },
+    insert_row: (sheet: number, at: number, count: number) => {
+      calls.insertRows.push({ sheet, at, count })
+    },
+    delete_row: (sheet: number, at: number, count: number) => {
+      calls.deleteRows.push({ sheet, at, count })
+    },
+    insert_col: (sheet: number, at: number, count: number) => {
+      calls.insertCols.push({ sheet, at, count })
+    },
+    delete_col: (sheet: number, at: number, count: number) => {
+      calls.deleteCols.push({ sheet, at, count })
+    },
     snapshot_sparse: () => {
       calls.snapshotSparse += 1
       return [...cells.entries()]
@@ -554,6 +578,10 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       mainSetFormatRange: () => workbooks[0]?.__mockCalls?.setFormatRange ?? [],
       mainSnapshotFormatRange: () => workbooks[0]?.__mockCalls?.snapshotFormatRange ?? [],
       mainRestoreFormatSnapshot: () => workbooks[0]?.__mockCalls?.restoreFormatSnapshot ?? [],
+      mainInsertRows: () => workbooks[0]?.__mockCalls?.insertRows ?? [],
+      mainDeleteRows: () => workbooks[0]?.__mockCalls?.deleteRows ?? [],
+      mainInsertCols: () => workbooks[0]?.__mockCalls?.insertCols ?? [],
+      mainDeleteCols: () => workbooks[0]?.__mockCalls?.deleteCols ?? [],
       mainSnapshotPersistenceV1: () => workbooks[0]?.__mockCalls?.snapshotPersistenceV1 ?? 0,
       mainRestorePersistenceV1: () => workbooks[0]?.__mockCalls?.restorePersistenceV1 ?? [],
       mainSubscribeTokens: () => workbooks[0]?.__mockCalls?.subscribeTokens ?? [],
@@ -1322,6 +1350,73 @@ describe('wasm-workbook-worker import session contract', () => {
       expect(harness.calls.mainSetFormatRange()).toEqual([
         { sheet: 0, startRow: 0, startCol: 0, endRow: 999, endCol: 999, fmt: { bold: true } },
       ])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes structural row and column edits to the wasm workbook API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1', 'Sheet2'],
+      })
+
+      await expect(
+        harness.send({
+          id: 2,
+          cmd: 'insertRows',
+          sheet: 1,
+          rowIndex: 2,
+          count: 3,
+        }),
+      ).resolves.toBe(true)
+      await expect(
+        harness.send({
+          id: 3,
+          cmd: 'deleteRows',
+          sheet: 1,
+          rowIndex: 4,
+          count: 1,
+        }),
+      ).resolves.toBe(true)
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'insertColumns',
+          sheet: 0,
+          colIndex: 5,
+          count: 2,
+        }),
+      ).resolves.toBe(true)
+      await expect(
+        harness.send({
+          id: 5,
+          cmd: 'deleteColumns',
+          sheet: 0,
+          colIndex: 6,
+          count: 1,
+        }),
+      ).resolves.toBe(true)
+
+      expect(harness.calls.mainInsertRows()).toEqual([{ sheet: 1, at: 2, count: 3 }])
+      expect(harness.calls.mainDeleteRows()).toEqual([{ sheet: 1, at: 4, count: 1 }])
+      expect(harness.calls.mainInsertCols()).toEqual([{ sheet: 0, at: 5, count: 2 }])
+      expect(harness.calls.mainDeleteCols()).toEqual([{ sheet: 0, at: 6, count: 1 }])
+
+      await expect(
+        harness.send({
+          id: 6,
+          cmd: 'insertRows',
+          sheet: 0,
+          rowIndex: 1,
+          count: 0,
+        }),
+      ).rejects.toMatchObject({
+        code: 'INVALID_STRUCTURAL_EDIT',
+      })
     } finally {
       harness.dispose()
     }

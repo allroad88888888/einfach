@@ -1,5 +1,9 @@
 import type {
+  DeleteColumnsRequest,
+  DeleteRowsRequest,
   DisplayCell,
+  InsertColumnsRequest,
+  InsertRowsRequest,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
@@ -217,6 +221,71 @@ function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest)
   return cleared
 }
 
+function shiftRows(
+  cells: Map<string, DisplayCell>,
+  rowIndex: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const next = new Map<string, DisplayCell>()
+  const deleteEnd = rowIndex + count - 1
+
+  for (const cell of cells.values()) {
+    if (direction === -1 && cell.row >= rowIndex && cell.row <= deleteEnd) {
+      continue
+    }
+    const row =
+      cell.row >= (direction === 1 ? rowIndex : deleteEnd + 1)
+        ? cell.row + count * direction
+        : cell.row
+    const shifted = { ...cloneCell(cell), row }
+    next.set(keyFor(shifted.row, shifted.col), shifted)
+  }
+
+  cells.clear()
+  for (const [key, cell] of next) cells.set(key, cell)
+}
+
+function shiftColumns(
+  cells: Map<string, DisplayCell>,
+  colIndex: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const next = new Map<string, DisplayCell>()
+  const deleteEnd = colIndex + count - 1
+
+  for (const cell of cells.values()) {
+    if (direction === -1 && cell.col >= colIndex && cell.col <= deleteEnd) {
+      continue
+    }
+    const col =
+      cell.col >= (direction === 1 ? colIndex : deleteEnd + 1)
+        ? cell.col + count * direction
+        : cell.col
+    const shifted = { ...cloneCell(cell), col }
+    next.set(keyFor(shifted.row, shifted.col), shifted)
+  }
+
+  cells.clear()
+  for (const [key, cell] of next) cells.set(key, cell)
+}
+
+function structuralMutationResult(
+  request:
+    | InsertRowsRequest
+    | DeleteRowsRequest
+    | InsertColumnsRequest
+    | DeleteColumnsRequest,
+  revision: ProjectionRevision,
+) {
+  return {
+    sheetId: request.sheetId,
+    requestId: request.requestId,
+    revision: request.revision ?? revision,
+  }
+}
+
 export function matrixToDisplayCells(matrix: StaticSeedMatrix): DisplayCell[] {
   return matrixToCells(matrix)
 }
@@ -300,6 +369,26 @@ export function createStaticSpreadsheetBackend(
           colEnd: request.range.colEnd,
         },
       }
+    },
+    async insertRows(request) {
+      shiftRows(state.cells, request.rowIndex, request.count, 1)
+      state.revision = bumpRevision(state.revision)
+      return structuralMutationResult(request, state.revision)
+    },
+    async deleteRows(request) {
+      shiftRows(state.cells, request.rowIndex, request.count, -1)
+      state.revision = bumpRevision(state.revision)
+      return structuralMutationResult(request, state.revision)
+    },
+    async insertColumns(request) {
+      shiftColumns(state.cells, request.colIndex, request.count, 1)
+      state.revision = bumpRevision(state.revision)
+      return structuralMutationResult(request, state.revision)
+    },
+    async deleteColumns(request) {
+      shiftColumns(state.cells, request.colIndex, request.count, -1)
+      state.revision = bumpRevision(state.revision)
+      return structuralMutationResult(request, state.revision)
     },
   }
 }
