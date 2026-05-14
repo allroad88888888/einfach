@@ -2,13 +2,21 @@ import { onCleanup, onMount, For, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   closeMenuAtom,
+  createVisibleProjectionRequest,
   dispatchMenuCommandAtom,
   menuStateAtom,
+  type MenuCommandIntent,
   type MenuCommandKind,
   type MenuTargetKind,
 } from '@einfach/spreadsheet-ui-core'
 
-import { useSpreadsheetUiStore } from '../provider'
+import {
+  advanceSpreadsheetProjectionRequestIdAtom,
+  isVisibleProjectionResult,
+  spreadsheetProjectionSnapshotAtom,
+  useSpreadsheetBackend,
+  useSpreadsheetUiStore,
+} from '../provider'
 
 export interface SpreadsheetContextMenuProps {
   class?: string
@@ -60,6 +68,7 @@ function toInt(value: number) {
 
 export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
   const store = useSpreadsheetUiStore()
+  const backend = useSpreadsheetBackend()
   const menuState = useAtomValue(menuStateAtom)
   let menuRoot: HTMLDivElement | undefined
 
@@ -67,12 +76,105 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     store.setter(closeMenuAtom, reason)
   }
 
+  function getCurrentWindow() {
+    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
+    if (isVisibleProjectionResult(snapshot.result)) {
+      return snapshot.result.window
+    }
+    if (snapshot.request?.kind === 'visible-window') {
+      return snapshot.request.window
+    }
+    return null
+  }
+
+  async function refreshProjection(sheetId: string) {
+    const window = getCurrentWindow()
+    if (!window) {
+      return
+    }
+
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const request = createVisibleProjectionRequest({
+      sheetId,
+      window,
+      requestId,
+      reason: 'selection',
+    })
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'loading',
+      request,
+      result: undefined,
+      error: undefined,
+    })
+
+    try {
+      const result = await backend.readVisibleProjection(request)
+      const current = store.getter(spreadsheetProjectionSnapshotAtom)
+      if (current.request?.requestId !== requestId) {
+        return
+      }
+      store.setter(spreadsheetProjectionSnapshotAtom, {
+        status: 'ready',
+        request,
+        result,
+        error: undefined,
+      })
+    } catch (error: unknown) {
+      const current = store.getter(spreadsheetProjectionSnapshotAtom)
+      if (current.request?.requestId !== requestId) {
+        return
+      }
+      store.setter(spreadsheetProjectionSnapshotAtom, {
+        status: 'error',
+        request,
+        result: undefined,
+        error:
+          error instanceof Error
+            ? { code: 'BACKEND_ERROR', message: error.message }
+            : { code: 'BACKEND_ERROR', message: 'Spreadsheet projection failed.' },
+      })
+    }
+  }
+
+  async function executeCommand(intent: MenuCommandIntent) {
+    const target = intent.target
+    if (intent.command !== 'cell.clear' || target.kind !== 'cell') {
+      return
+    }
+
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: target.sheetId,
+      row: target.cell.row,
+      col: target.cell.col,
+      input: '',
+    })
+    await refreshProjection(target.sheetId)
+  }
+
+  function reportCommandError(error: unknown) {
+    const current = store.getter(spreadsheetProjectionSnapshotAtom)
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      ...current,
+      status: 'error',
+      error:
+        error instanceof Error
+          ? { code: 'BACKEND_ERROR', message: error.message }
+          : { code: 'BACKEND_ERROR', message: 'Spreadsheet command failed.' },
+    })
+  }
+
   function dispatchCommand(command: MenuCommandKind) {
     const intent = store.setter(dispatchMenuCommandAtom, command)
     if (intent) {
-      setTimeout(() => {
-        closeMenu('committed')
-      }, 0)
+      void executeCommand(intent)
+        .catch(reportCommandError)
+        .finally(() => {
+          setTimeout(() => {
+            closeMenu('committed')
+          }, 0)
+        })
     }
   }
 

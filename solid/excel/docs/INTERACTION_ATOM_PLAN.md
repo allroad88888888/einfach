@@ -374,6 +374,10 @@ Playwright CLI，并补 MCP Playwright 验证记录。
 - PC-6 第三段：vNext demo 已挂上 Toolbar 和 ContextMenu；Grid 右键写入 core menu
   atom；keyboard core 支持 Ctrl/Cmd+Arrow、Ctrl/Cmd+Home、Ctrl/Cmd+End 的 bounds
   跳转，不扫描数据区也不触发公式求值。
+- PC-6 第四段：vNext demo 已挂上 StatusBar；ContextMenu 的 `cell.clear` 已从单纯
+  intent 变成 backend mutation，并刷新当前可视 projection。StatusBar 只读 core/projection
+  atom，展示 active cell、selection、projection status、visible cell count、loaded value count
+  和最近 toolbar/menu command。
 
 PC-6 第一段验收记录：
 
@@ -408,11 +412,26 @@ PC-6 第三段验收记录：
   让 active address 到 `J2` 但 `J2` 不挂载、Toolbar Bold enabled、右键 `A1`
   打开 cell context menu、Delete 后 menu 隐藏、console error 为 0。
 
+PC-6 第四段验收记录：
+
+- `npx jest solid/excel/test/vnext-status-bar.test.tsx solid/excel/test/vnext-context-menu.test.tsx --runInBand`
+- `npx jest solid/excel/test/vnext-*.test* --runInBand`
+- `npx jest vanilla/spreadsheet-ui-core/test --runInBand`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- MCP Playwright：打开 `http://127.0.0.1:5173/`，验证 30 个可视 cell、`J20`
+  offscreen 未挂载、状态栏显示 `A1` / `Ready` / `30 cells` / `30 loaded`；
+  点击 `B2` 后 `Ctrl+ArrowRight` 让公式栏和状态栏都到 `J2` 且 `J2` 未挂载；
+  右键 `A1` 执行 Delete 后 menu 隐藏、`A1` 为空、loaded count 变为 `29 loaded`、
+  console error 为 0。
+
 仍未完成：
 
 - vNext adapter 还只是 static backend；尚未接入真实 worker/Rust workbook port。
-- vNext chrome UI 仍缺：status bar；Toolbar 和 ContextMenu 目前只产生 intent，尚未接真实
-  format / row-column mutation / clipboard command executor。
+- vNext chrome UI 已有 status bar；Toolbar 仍只产生 intent，ContextMenu 只有 `cell.clear`
+  接了真实 mutation，尚未接真实 format / row-column mutation / clipboard command executor。
 - FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
   mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、

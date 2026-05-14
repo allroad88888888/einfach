@@ -9,6 +9,7 @@ import { SpreadsheetContextMenu } from '../context-menu'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
+import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
 import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
@@ -72,6 +73,7 @@ function VNextSmokeWorkbook() {
         )}
       </Show>
       <SpreadsheetSheetTabs sheets={sheets} data-testid="vnext-sheet-tabs" />
+      <SpreadsheetStatusBar data-testid="vnext-status-bar" />
       <SpreadsheetContextMenu data-testid="vnext-context-menu" />
     </>
   )

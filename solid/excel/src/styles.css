@@ -654,6 +654,34 @@ thead .row-header {
   background: #e8f0fe;
 }
 
+.spreadsheet-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 1px solid #d0d7de;
+  border-top: none;
+  background: #fafbfc;
+  color: #444;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.2;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.spreadsheet-status-bar-item {
+  display: inline-flex;
+  align-items: center;
+  min-width: max-content;
+}
+
+.spreadsheet-status-bar-item:first-child {
+  color: #0b57d0;
+  font-weight: 600;
+}
+
 /* === Context Menu ===
  * Right-click menu for column headers, row headers, cells, and sheet tabs.
  * Portaled to <body> so it escapes the table's overflow-scroll clipping.

@@ -31,6 +31,9 @@ test.describe('Solid Excel vNext smoke', () => {
     expect(visibleCells).toBeLessThan(80)
     await expect(cell(page, 'A1')).toBeVisible()
     await expect(cell(page, 'J20')).toHaveCount(0)
+    await expect(page.getByTestId('status-active-cell')).toHaveText('A1')
+    await expect(page.getByTestId('status-projection')).toHaveText('Ready')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
   })
 
   test('click selection toggles the active state', async ({ page }) => {
@@ -76,6 +79,7 @@ test.describe('Solid Excel vNext smoke', () => {
     await cell(page, 'B2').click()
     await page.keyboard.press('Control+ArrowRight')
     await expect(page.getByTestId('formula-bar-addr')).toHaveText('J2')
+    await expect(page.getByTestId('status-active-cell')).toHaveText('J2')
     await expect(cell(page, 'J2')).toHaveCount(0)
   })
 
@@ -92,5 +96,6 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(menu).toHaveAttribute('data-menu-target-kind', 'cell')
     await page.getByTestId('context-menu-command-cell.clear').click()
     await expect(menu).toHaveCount(0)
+    await expect(cellDisplay(page, 'A1')).toHaveText('')
   })
 })
