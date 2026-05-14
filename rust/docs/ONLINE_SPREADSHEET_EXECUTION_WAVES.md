@@ -9,9 +9,9 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `0cf1ef3 feat(solid-excel): harden virtualized UX gates` 为准；
+以最近提交 `e5a25d0 docs(rust): record release gate results` 为准；
 文件导入/backpressure UI、Wave 6 产品硬化、Wave 6.5 虚拟化 UX 门禁均已完成本地与
-MCP 验收，当前工作树进入发布门禁波。
+MCP 验收；发布门禁也已完成并记录。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 本轮状态更新：
@@ -23,6 +23,8 @@ MCP 验收，当前工作树进入发布门禁波。
   `TEXT/TODAY/NOW` 浏览器门禁。
 - Wave 6.5 已提交到 `0cf1ef3`：1M toolbar range-native format、键盘跨虚拟视口、
   range 内右键 Clear 与 MCP 记录。
+- 发布门禁已提交到 `e5a25d0`：Rust/WASM/Jest/Solid/Playwright/MCP 全量结果记录到
+  `rust/docs/RELEASE_GATE_PLAN.md`。
 - Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
@@ -69,7 +71,8 @@ MCP 验收，当前工作树进入发布门禁波。
 
 ## 总体判断
 
-还剩 **1 个发布门禁波**。产品化实现波已完成到 Wave 6.5。
+当前实现波和发布门禁波都已完成。剩余不是工程实现问题，而是发布决策问题：
+是否允许 push / PR / CI workflow promotion。
 
 原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
 formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
@@ -483,7 +486,7 @@ MCP 验收：
 - 为了兼容函数语义破坏 lazy/read-on-demand 合同。
 - UI 需要在前端复制 workbook 核心状态。
 
-## 发布门禁波：总验收与交付
+## 发布门禁波：总验收与交付（已完成）
 
 详细命令和 blocker 定义见 `rust/docs/RELEASE_GATE_PLAN.md`。
 
@@ -525,9 +528,21 @@ baseline，当前作为 advisory，不阻断发布判断。
 - Playwright CLI 绿；MCP 验证有记录。
 - 文档状态与真实测试/功能一致。
 
+### 执行记录
+
+本波已在 `e5a25d0` 记录到 `rust/docs/RELEASE_GATE_PLAN.md`：
+
+- Rust core / excel-core / wasm native tests 通过。
+- `cargo bench --manifest-path rust/excel-core/Cargo.toml --no-run` 通过。
+- `wasm-pack test --headless --chrome rust/wasm` 通过。
+- Solid Excel typecheck、WASM build、bundle build 通过。
+- 全量 Playwright e2e：162 passed，0 skipped。
+- MCP Playwright 覆盖 1M toolbar/range-native format、虚拟视口键盘、range 内右键 Clear、
+  Multi-Sheet lazy/add/rename/delete、FormulaBar diagnostics，console warning/error 为 0。
+
 ## 推荐下一步
 
-当前波次：**发布门禁波：总验收与交付准备**。
+当前波次：**发布后决策 checkpoint**。
 
 原因：
 
@@ -535,5 +550,6 @@ baseline，当前作为 advisory，不阻断发布判断。
   file import/backpressure UI 都已完成本轮实现和验证。
 - Wave 4 已经把规模行为做成可查询 counters 和 e2e/MCP 门禁。
 - Wave 5 已经把正式文件流导入/backpressure UI 接到 1M worker demo，并通过 e2e/MCP 验收。
-- 错误诊断、多 sheet worker product path、虚拟列下键盘/context menu/toolbar 稳定性已经
-  完成；剩余主要缺口转向最终发布门禁、文档一致性和是否允许 CI/PR 的决策。
+- 错误诊断、多 sheet worker product path、虚拟列下键盘/context menu/toolbar 稳定性、
+  release gate 和文档一致性已经完成；剩余主要缺口是是否允许 push/PR，以及是否解除
+  `.github/workflows/*` 禁令做 CI promotion。

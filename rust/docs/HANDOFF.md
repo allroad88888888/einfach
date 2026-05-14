@@ -3,15 +3,15 @@
 > Date: 2026-05-14 (last update)
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
-> Last verified committed tip: `0cf1ef3` (`feat(solid-excel): harden virtualized UX gates`)
-> Current verified worktree: clean. Wave 6 product hardening is committed through
-> worker-backed MultiSheet, FormulaBar diagnostics, `TEXT/TODAY/NOW` browser gates,
-> and Wave 6.5 virtualized UX gates.
+> Last verified committed tip: `e5a25d0` (`docs(rust): record release gate results`)
+> Current verified worktree: clean. Release gate is recorded and passed through Rust,
+> WASM browser, Solid build/typecheck, full Playwright e2e, MCP Playwright, and root
+> build/Jest.
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
 
-## What's done — Phase 1 → Wave 6.5
+## What's done — Phase 1 → Release Gate
 
 The "百万 cell + 不做协作 + 懒求值" product line. Phase 1–4A land their
 acceptance contracts. After that, Phase 5 partial work also landed worker-owned
@@ -20,7 +20,7 @@ export, horizontal virtual scroll restoration, range-native large format, and
 large range format undo. Wave 2 chunked TSV export, Wave 3 bounded import +
 sparse persistence v1, Wave 4 observability gates, Wave 5 file import/backpressure,
 Wave 6 worker-backed product UI hardening, and Wave 6.5 virtualized UX gates are
-committed locally.
+committed locally. The release gate result is recorded in `rust/docs/RELEASE_GATE_PLAN.md`.
 
 | Phase | Plan doc | Tip commit | Status |
 |---|---|---|---|
@@ -31,22 +31,24 @@ committed locally.
 | 4A | `rust/docs/PHASE4A_PARALLEL.md` | `2d291c8` | ✅ Bounded cross-sheet range parser (`Sheet2!A1:A100`) + lazy eval/provider integration + same-address range dep preservation |
 | 5 partial | `rust/docs/PHASE5_PARALLEL.md` + `ONLINE_SPREADSHEET_EXECUTION_WAVES.md` | `4337eb7` | ✅ Worker workbook RPC/import staging/sparse snapshot/range clear undo/range copy export/range format/format undo/chunked copy export; bounded import + sparse persistence v1; observability counters/e2e/MCP gates; file-stream import/backpressure UI. Product hardening continued in Wave 6 |
 | 6 + 6.5 | `rust/docs/WAVE6_PRODUCT_HARDENING_PLAN.md` | `0cf1ef3` | ✅ Worker-backed MultiSheet product path, FormulaBar diagnostics, `TEXT/TODAY/NOW` browser gates, 1M toolbar range-native format, keyboard navigation across virtual viewport, and range-preserving context menu clear |
+| Release gate | `rust/docs/RELEASE_GATE_PLAN.md` | `e5a25d0` | ✅ Rust core/excel/wasm, wasm-pack Chrome, bench compile, Solid typecheck/build, full Playwright e2e, MCP Playwright, root build/Jest recorded |
 
 ### Gates (`cd /Volumes/work/self/einfach` first)
 
 ```sh
-cd rust/excel-core && cargo test --lib          # 231 / 0 / 0
-cd rust/excel-core && cargo test --test scale   # 8 / 0 / 0
-cd rust/excel-core && cargo test --test cross_sheet  # 3 / 0 / 0
-cd rust/excel-core && cargo test --test review_repro # 4 / 0 / 0
-cd rust/wasm && cargo build                     # clean
-cd rust/excel-core && cargo bench --no-run      # 3 bench targets clean
-cd /Volumes/work/self/einfach && npx jest       # latest commit hook: 62 suites / 496 tests
-# Playwright needs a dev server. Boot:
-cd solid/excel && npm run dev -- --port 5174 --strictPort > /tmp/dev.log 2>&1 &
-sleep 8
-cd solid/excel && npx playwright test           # focus-pin skip removed; current active count is tracked in E2E_TEST_PLAN
-pkill -f "vite.*5174"
+cd /Volumes/work/self/einfach
+cargo test --manifest-path rust/core/Cargo.toml
+cargo test --manifest-path rust/excel-core/Cargo.toml
+cargo bench --manifest-path rust/excel-core/Cargo.toml --no-run
+cargo test --manifest-path rust/wasm/Cargo.toml
+cargo build --manifest-path rust/wasm/Cargo.toml
+wasm-pack test --headless --chrome rust/wasm
+npx tsc -p solid/excel/tsconfig.json --noEmit
+npm run build:wasm -w @einfach/solid-excel
+npm run build -w @einfach/solid-excel
+NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel
+npm run build
+npm test
 ```
 
 `cargo clippy --lib` on `excel-core` has **6 pre-existing baseline
@@ -230,14 +232,13 @@ Once agents return:
 | **A** | Wave 3 bounded import + persistence | done | Rust/worker/proxy/e2e/MCP verified API contract is committed |
 | **B** | Wave 4 — perf/observability/MCP gates | done | `f456dd7` 已提交 counters、observability e2e、MCP 记录 |
 | **C** | Product file import/backpressure UI | done in `4337eb7` | Builds on bounded import sessions without changing core lazy semantics |
-| **D** | Release gate wave | 0.5–1 d | Run Rust/WASM/Jest/Solid/Playwright/MCP gates from the current committed tip and record blockers |
+| **D** | Release gate wave | done in `e5a25d0` | Rust/WASM/Jest/Solid/Playwright/MCP gates passed and are recorded |
 | **E** | Push branch + open PR(s) | 1–2 d | Only do if user explicitly says "ship" — the no-push rule is still in force as of handoff |
-| **F** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
+| **F** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; current recommended checkpoint |
 
 Recommended pick if the new window has full autonomy after the current commit:
-**release gate wave** using `ONLINE_SPREADSHEET_EXECUTION_WAVES.md`. Wave 6.5
-already covered the virtualized keyboard/context-menu/toolbar sweep. Hold push/PR
-until the user explicitly green-lights it. CI workflow edits remain forbidden.
+**stop and review with the user**. Push/PR only if the user explicitly green-lights
+shipping. CI workflow edits remain forbidden until that rule is lifted.
 
 ## File reading order for the next agent
 

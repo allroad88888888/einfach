@@ -2,7 +2,7 @@
 
 > 日期：2026-05-14
 >
-> 当前基线：`0cf1ef3 feat(solid-excel): harden virtualized UX gates`
+> 当前基线：`e5a25d0 docs(rust): record release gate results`
 >
 > 目标：在不 `git push`、不改 `.github/workflows/*` 的前提下，用本地命令和 MCP
 > Playwright 记录确认在线电子表格 MVP 的发布状态。
@@ -107,6 +107,8 @@ MCP 需要覆盖：
 > 执行日期：2026-05-14
 >
 > 执行基线：`92bee25 docs(rust): sync release gate handoff`
+>
+> 记录提交：`e5a25d0 docs(rust): record release gate results`
 
 Blocking gate 结果：
 

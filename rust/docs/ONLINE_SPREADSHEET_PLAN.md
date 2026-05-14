@@ -23,7 +23,7 @@
 
 ## 当前状态
 
-以 `0cf1ef3 feat(solid-excel): harden virtualized UX gates` 为当前实现基线。
+以 `e5a25d0 docs(rust): record release gate results` 为当前实现基线。
 
 已经完成：
 
@@ -60,8 +60,8 @@
 - 自动保存仍未做；稀疏持久化 v1 已存在，但不包含 autosave 产品策略。
 - Solid 的 in-process workbook adapter / demo adapter 仍有 coarse notify 路径。产品大表路径
   应使用 worker-backed workbook；in-process path 只可作为 demo/test 或需要另补精确订阅。
-- CI 还不是完整规模化门禁，且当前用户规则禁止修改 `.github/workflows/*`。发布门禁先以本地
-  Rust/WASM/Jest/Playwright + MCP 记录为准。
+- CI 还不是完整规模化门禁，且当前用户规则禁止修改 `.github/workflows/*`。本地
+  Rust/WASM/Jest/Playwright + MCP 发布门禁已通过并记录；CI promotion 需要用户单独放开。
 
 ## 架构目标
 
@@ -136,7 +136,9 @@ Solid 只渲染和订阅可见 cell 加 overscan：
   export、large format range-native、format undo、streaming export、bounded import/persistence、
   权威命令收口均在主线。
 - Phase 6 + 6.5 已落地：worker-backed product UI、公式诊断、函数浏览器门禁、虚拟化 UX
-  门禁完成。当前阶段是发布门禁和交付准备。
+  门禁完成。
+- Release gate 已落地：本地 Rust/WASM/Jest/Solid/Playwright + MCP 验收完成并记录到
+  `rust/docs/RELEASE_GATE_PLAN.md`。当前阶段是发布决策 checkpoint。
 
 ### Phase 0：统一状态和门禁
 
