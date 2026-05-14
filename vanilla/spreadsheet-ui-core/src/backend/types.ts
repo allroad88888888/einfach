@@ -26,6 +26,26 @@ export interface DisplayCell {
   formula?: string
   error?: SpreadsheetError
   formatKey?: string
+  format?: SpreadsheetCellFormat
+}
+
+export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
+
+export type SpreadsheetNumberFormat =
+  | { kind: 'general' }
+  | { kind: 'decimal'; digits?: number; thousands?: boolean }
+  | { kind: 'percent'; digits?: number }
+  | { kind: 'currency'; symbol?: string; digits?: number }
+  | { kind: 'date'; pattern?: string }
+
+export interface SpreadsheetCellFormat {
+  numberFormat?: SpreadsheetNumberFormat
+  bold?: boolean
+  italic?: boolean
+  align?: SpreadsheetAlignment
+  fontSize?: number
+  fgColor?: string
+  bgColor?: string
 }
 
 export interface VisibleProjectionRequest extends SheetRef {
@@ -112,6 +132,14 @@ export interface DeleteColumnsRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface SetFormatRangeRequest extends SheetRef {
+  kind: 'set-format-range'
+  range: CellRange
+  format: SpreadsheetCellFormat | null
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -127,4 +155,5 @@ export interface SpreadsheetBackend {
   deleteRows?(request: DeleteRowsRequest): Promise<BackendMutationResult>
   insertColumns?(request: InsertColumnsRequest): Promise<BackendMutationResult>
   deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
+  setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
 }

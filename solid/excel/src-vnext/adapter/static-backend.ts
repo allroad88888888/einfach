@@ -9,7 +9,9 @@ import type {
   RangeProjectionResult,
   ClearRangeRequest,
   SetCellInputRequest,
+  SetFormatRangeRequest,
   SpreadsheetBackend,
+  SpreadsheetCellFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
@@ -46,7 +48,42 @@ function cloneCell(cell: DisplayCell): DisplayCell {
   if (cell.formula !== undefined) clone.formula = cell.formula
   if (cell.error) clone.error = cell.error
   if (cell.formatKey !== undefined) clone.formatKey = cell.formatKey
+  if (cell.format) clone.format = cloneFormat(cell.format)
 
+  return clone
+}
+
+function cloneFormat(format: SpreadsheetCellFormat): SpreadsheetCellFormat {
+  const clone: SpreadsheetCellFormat = { ...format }
+  if (format.numberFormat) clone.numberFormat = { ...format.numberFormat }
+  return clone
+}
+
+function normalizeFormat(
+  format: SpreadsheetCellFormat | null | undefined,
+): SpreadsheetCellFormat | undefined {
+  if (!format || isDefaultFormat(format)) return undefined
+  return cloneFormat(format)
+}
+
+function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
+  const numberFormat = format.numberFormat
+  const numberFormatIsDefault = !numberFormat || numberFormat.kind === 'general'
+
+  return (
+    !format.bold &&
+    !format.italic &&
+    (format.align === undefined || format.align === 'default') &&
+    format.fontSize === undefined &&
+    (format.fgColor === undefined || format.fgColor.length === 0) &&
+    (format.bgColor === undefined || format.bgColor.length === 0) &&
+    numberFormatIsDefault
+  )
+}
+
+function stripCellFormat(cell: DisplayCell): DisplayCell {
+  const clone = cloneCell(cell)
+  delete clone.format
   return clone
 }
 
@@ -54,8 +91,33 @@ function keyFor(row: number, col: number): string {
   return `${row}:${col}`
 }
 
+function parseKey(key: string): { row: number; col: number } | null {
+  const [rowPart, colPart] = key.split(':')
+  const row = Number(rowPart)
+  const col = Number(colPart)
+  if (!Number.isInteger(row) || !Number.isInteger(col)) return null
+  return { row, col }
+}
+
 function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
+}
+
+interface RangeFormatLayer {
+  range: {
+    rowStart: number
+    rowEnd: number
+    colStart: number
+    colEnd: number
+  }
+  format: SpreadsheetCellFormat
+}
+
+interface StaticBackendState {
+  cells: Map<string, DisplayCell>
+  cellFormats: Map<string, SpreadsheetCellFormat>
+  rangeFormats: RangeFormatLayer[]
+  revision: ProjectionRevision
 }
 
 function valueToDisplayCell(row: number, col: number, value: StaticSeedValue): DisplayCell | null {
@@ -97,19 +159,35 @@ function sparseCellsToCells(cells: StaticSeedCells): DisplayCell[] {
     .sort(compareCells)
 }
 
-function normalizeSeed(input: StaticSpreadsheetSeedInput): {
-  cells: Map<string, DisplayCell>
-  revision: ProjectionRevision
-} {
+function buildState(
+  cells: DisplayCell[],
+  revision: ProjectionRevision,
+): StaticBackendState {
+  const cellMap = new Map<string, DisplayCell>()
+  const cellFormats = new Map<string, SpreadsheetCellFormat>()
+
+  for (const cell of cells) {
+    const key = keyFor(cell.row, cell.col)
+    const format = normalizeFormat(cell.format)
+    if (format) cellFormats.set(key, format)
+    cellMap.set(key, stripCellFormat(cell))
+  }
+
+  return {
+    cells: cellMap,
+    cellFormats,
+    rangeFormats: [],
+    revision,
+  }
+}
+
+function normalizeSeed(input: StaticSpreadsheetSeedInput): StaticBackendState {
   if (Array.isArray(input)) {
     const cells = input.length > 0 && input.some((item) => Array.isArray(item))
       ? matrixToCells(input as StaticSeedMatrix)
       : sparseCellsToCells(input as StaticSeedCells)
 
-    return {
-      cells: new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell] as const)),
-      revision: 0,
-    }
+    return buildState(cells, 0)
   }
 
   const seed = input as StaticSpreadsheetSeedInput & {
@@ -122,10 +200,7 @@ function normalizeSeed(input: StaticSpreadsheetSeedInput): {
     ...(seed.cells ? sparseCellsToCells(seed.cells) : []),
   ]
 
-  return {
-    cells: new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell] as const)),
-    revision: seed.revision ?? 0,
-  }
+  return buildState(cells, seed.revision ?? 0)
 }
 
 function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number }): boolean {
@@ -137,23 +212,88 @@ function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd:
   )
 }
 
+function isCoordInsideRange(
+  row: number,
+  col: number,
+  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
+): boolean {
+  return (
+    row >= range.rowStart &&
+    row <= range.rowEnd &&
+    col >= range.colStart &&
+    col <= range.colEnd
+  )
+}
+
+function getEffectiveFormat(
+  row: number,
+  col: number,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
+): SpreadsheetCellFormat | undefined {
+  const cellFormat = cellFormats.get(keyFor(row, col))
+  if (cellFormat) return cloneFormat(cellFormat)
+
+  for (let index = rangeFormats.length - 1; index >= 0; index -= 1) {
+    const layer = rangeFormats[index]
+    if (!isCoordInsideRange(row, col, layer.range)) continue
+    return isDefaultFormat(layer.format) ? undefined : cloneFormat(layer.format)
+  }
+
+  return undefined
+}
+
+function addFormatOnlyCells(
+  resultCells: Map<string, DisplayCell>,
+  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
+) {
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const key = keyFor(row, col)
+      const existing = resultCells.get(key)
+      const format = getEffectiveFormat(row, col, cellFormats, rangeFormats)
+
+      if (existing) {
+        if (format) existing.format = format
+      } else if (format) {
+        resultCells.set(key, {
+          row,
+          col,
+          displayValue: '',
+          valueKind: 'blank',
+          format,
+        })
+      }
+    }
+  }
+}
+
 function buildProjectionResult(
   request: StaticProjectionRequest,
-  cells: Map<string, DisplayCell>,
-  revision: ProjectionRevision,
+  state: StaticBackendState,
 ): StaticProjectionResult {
   const range = request.kind === 'visible-window' ? request.window : request.range
-  const resultCells = [...cells.values()]
-    .filter((cell) => isCellInsideRange(cell, range))
-    .map(cloneCell)
-    .sort(compareCells)
+  const resultCellMap = new Map<string, DisplayCell>()
+
+  for (const cell of state.cells.values()) {
+    if (!isCellInsideRange(cell, range)) continue
+    const clone = cloneCell(cell)
+    const format = getEffectiveFormat(cell.row, cell.col, state.cellFormats, state.rangeFormats)
+    if (format) clone.format = format
+    resultCellMap.set(keyFor(clone.row, clone.col), clone)
+  }
+
+  addFormatOnlyCells(resultCellMap, range, state.cellFormats, state.rangeFormats)
+  const resultCells = [...resultCellMap.values()].sort(compareCells)
 
   if (request.kind === 'visible-window') {
     const result: VisibleProjectionResult = {
       kind: 'visible-window',
       sheetId: request.sheetId,
       requestId: request.requestId,
-      revision: request.revision ?? revision,
+      revision: request.revision ?? state.revision,
       window: {
         rowStart: range.rowStart,
         rowEnd: range.rowEnd,
@@ -169,7 +309,7 @@ function buildProjectionResult(
     kind: 'range',
     sheetId: request.sheetId,
     requestId: request.requestId,
-    revision: request.revision ?? revision,
+    revision: request.revision ?? state.revision,
     range: {
       rowStart: range.rowStart,
       rowEnd: range.rowEnd,
@@ -221,13 +361,28 @@ function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest)
   return cleared
 }
 
+function clearCellFormatsInRange(
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
+) {
+  for (const [key] of [...cellFormats.entries()]) {
+    const coord = parseKey(key)
+    if (coord && isCoordInsideRange(coord.row, coord.col, range)) {
+      cellFormats.delete(key)
+    }
+  }
+}
+
 function shiftRows(
   cells: Map<string, DisplayCell>,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
   rowIndex: number,
   count: number,
   direction: 1 | -1,
 ) {
   const next = new Map<string, DisplayCell>()
+  const nextFormats = new Map<string, SpreadsheetCellFormat>()
   const deleteEnd = rowIndex + count - 1
 
   for (const cell of cells.values()) {
@@ -244,15 +399,36 @@ function shiftRows(
 
   cells.clear()
   for (const [key, cell] of next) cells.set(key, cell)
+
+  for (const [key, format] of cellFormats) {
+    const coord = parseKey(key)
+    if (!coord) continue
+    if (direction === -1 && coord.row >= rowIndex && coord.row <= deleteEnd) {
+      continue
+    }
+    const row =
+      coord.row >= (direction === 1 ? rowIndex : deleteEnd + 1)
+        ? coord.row + count * direction
+        : coord.row
+    nextFormats.set(keyFor(row, coord.col), cloneFormat(format))
+  }
+
+  cellFormats.clear()
+  for (const [key, format] of nextFormats) cellFormats.set(key, format)
+
+  shiftRangeFormats(rangeFormats, 'row', rowIndex, count, direction)
 }
 
 function shiftColumns(
   cells: Map<string, DisplayCell>,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
   colIndex: number,
   count: number,
   direction: 1 | -1,
 ) {
   const next = new Map<string, DisplayCell>()
+  const nextFormats = new Map<string, SpreadsheetCellFormat>()
   const deleteEnd = colIndex + count - 1
 
   for (const cell of cells.values()) {
@@ -269,6 +445,64 @@ function shiftColumns(
 
   cells.clear()
   for (const [key, cell] of next) cells.set(key, cell)
+
+  for (const [key, format] of cellFormats) {
+    const coord = parseKey(key)
+    if (!coord) continue
+    if (direction === -1 && coord.col >= colIndex && coord.col <= deleteEnd) {
+      continue
+    }
+    const col =
+      coord.col >= (direction === 1 ? colIndex : deleteEnd + 1)
+        ? coord.col + count * direction
+        : coord.col
+    nextFormats.set(keyFor(coord.row, col), cloneFormat(format))
+  }
+
+  cellFormats.clear()
+  for (const [key, format] of nextFormats) cellFormats.set(key, format)
+
+  shiftRangeFormats(rangeFormats, 'column', colIndex, count, direction)
+}
+
+function shiftRangeFormats(
+  rangeFormats: RangeFormatLayer[],
+  axis: 'row' | 'column',
+  index: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const startKey = axis === 'row' ? 'rowStart' : 'colStart'
+  const endKey = axis === 'row' ? 'rowEnd' : 'colEnd'
+  const deleteEnd = index + count - 1
+
+  for (const layer of rangeFormats) {
+    const start = layer.range[startKey]
+    const end = layer.range[endKey]
+
+    if (direction === 1) {
+      if (start >= index) {
+        layer.range[startKey] = start + count
+        layer.range[endKey] = end + count
+      } else if (end >= index) {
+        layer.range[endKey] = end + count
+      }
+      continue
+    }
+
+    if (end < index) {
+      continue
+    }
+    if (start > deleteEnd) {
+      layer.range[startKey] = start - count
+      layer.range[endKey] = end - count
+      continue
+    }
+
+    const removed = Math.min(end, deleteEnd) - Math.max(start, index) + 1
+    layer.range[startKey] = start >= index ? index : start
+    layer.range[endKey] = Math.max(layer.range[startKey], end - removed)
+  }
 }
 
 function structuralMutationResult(
@@ -299,7 +533,7 @@ export function matrixToVisibleProjectionResult(
   request: VisibleProjectionRequest,
   revision?: ProjectionRevision,
 ): VisibleProjectionResult {
-  return buildProjectionResult(request, new Map(matrixToCells(matrix).map((cell) => [keyFor(cell.row, cell.col), cell] as const)), revision ?? 0) as VisibleProjectionResult
+  return buildProjectionResult(request, buildState(matrixToCells(matrix), revision ?? 0)) as VisibleProjectionResult
 }
 
 export function matrixToRangeProjectionResult(
@@ -307,7 +541,7 @@ export function matrixToRangeProjectionResult(
   request: RangeProjectionRequest,
   revision?: ProjectionRevision,
 ): RangeProjectionResult {
-  return buildProjectionResult(request, new Map(matrixToCells(matrix).map((cell) => [keyFor(cell.row, cell.col), cell] as const)), revision ?? 0) as RangeProjectionResult
+  return buildProjectionResult(request, buildState(matrixToCells(matrix), revision ?? 0)) as RangeProjectionResult
 }
 
 export function sparseCellsToVisibleProjectionResult(
@@ -315,7 +549,7 @@ export function sparseCellsToVisibleProjectionResult(
   request: VisibleProjectionRequest,
   revision?: ProjectionRevision,
 ): VisibleProjectionResult {
-  return buildProjectionResult(request, new Map(sparseCellsToCells(cells).map((cell) => [keyFor(cell.row, cell.col), cell] as const)), revision ?? 0) as VisibleProjectionResult
+  return buildProjectionResult(request, buildState(sparseCellsToCells(cells), revision ?? 0)) as VisibleProjectionResult
 }
 
 export function sparseCellsToRangeProjectionResult(
@@ -323,7 +557,7 @@ export function sparseCellsToRangeProjectionResult(
   request: RangeProjectionRequest,
   revision?: ProjectionRevision,
 ): RangeProjectionResult {
-  return buildProjectionResult(request, new Map(sparseCellsToCells(cells).map((cell) => [keyFor(cell.row, cell.col), cell] as const)), revision ?? 0) as RangeProjectionResult
+  return buildProjectionResult(request, buildState(sparseCellsToCells(cells), revision ?? 0)) as RangeProjectionResult
 }
 
 export function createStaticSpreadsheetBackend(
@@ -333,10 +567,10 @@ export function createStaticSpreadsheetBackend(
 
   return {
     async readVisibleProjection(request) {
-      return buildProjectionResult(request, state.cells, state.revision) as VisibleProjectionResult
+      return buildProjectionResult(request, state) as VisibleProjectionResult
     },
     async readRangeProjection(request) {
-      return buildProjectionResult(request, state.cells, state.revision) as RangeProjectionResult
+      return buildProjectionResult(request, state) as RangeProjectionResult
     },
     async setCellInput(request) {
       updateCell(state.cells, request)
@@ -371,24 +605,72 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async insertRows(request) {
-      shiftRows(state.cells, request.rowIndex, request.count, 1)
+      shiftRows(
+        state.cells,
+        state.cellFormats,
+        state.rangeFormats,
+        request.rowIndex,
+        request.count,
+        1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
     async deleteRows(request) {
-      shiftRows(state.cells, request.rowIndex, request.count, -1)
+      shiftRows(
+        state.cells,
+        state.cellFormats,
+        state.rangeFormats,
+        request.rowIndex,
+        request.count,
+        -1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
     async insertColumns(request) {
-      shiftColumns(state.cells, request.colIndex, request.count, 1)
+      shiftColumns(
+        state.cells,
+        state.cellFormats,
+        state.rangeFormats,
+        request.colIndex,
+        request.count,
+        1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
     async deleteColumns(request) {
-      shiftColumns(state.cells, request.colIndex, request.count, -1)
+      shiftColumns(
+        state.cells,
+        state.cellFormats,
+        state.rangeFormats,
+        request.colIndex,
+        request.count,
+        -1,
+      )
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
+    },
+    async setFormatRange(request: SetFormatRangeRequest) {
+      clearCellFormatsInRange(state.cellFormats, request.range)
+      state.rangeFormats.push({
+        range: { ...request.range },
+        format: normalizeFormat(request.format) ?? {},
+      })
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        affectedRange: {
+          rowStart: request.range.rowStart,
+          rowEnd: request.range.rowEnd,
+          colStart: request.range.colStart,
+          colEnd: request.range.colEnd,
+        },
+      }
     },
   }
 }

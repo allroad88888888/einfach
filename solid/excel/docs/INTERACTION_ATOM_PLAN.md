@@ -388,6 +388,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   sparse shift，不创建 per-row/per-col atom；workbook worker proxy/RPC 已接 Rust
   `insert_row` / `delete_row` / `insert_col` / `delete_col`；vNext ContextMenu 的行头/列头
   Insert/Delete 已执行真实 backend mutation 并刷新当前可视 projection。
+- PC-6 第八段：backend port 增加可选 `setFormatRange`，`DisplayCell` projection
+  携带有界 `format` metadata；static/worker adapter 都在读取当前可视/range projection
+  时才合并格式，不把整张 sheet 或大选区物化成 cell atom；vNext Toolbar 的 Bold/Italic/
+  Fill/Text/Number format 已执行真实 backend range-format mutation 并刷新当前可视 projection，
+  vNext Grid 按 projection format 渲染基础样式。
 
 PC-6 第一段验收记录：
 
@@ -473,14 +478,28 @@ PC-6 第七段验收记录：
   行执行 Insert row 后第 2 行为空、第 3 行变为 `North`；右键 B 列执行 Delete column
   后 `B1` 从 `Beta` 变为 `Gamma`；console error 为 0。
 
+PC-6 第八段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-grid.test.tsx solid/excel/test/vnext-toolbar.test.tsx --runInBand`
+- `npx jest solid/excel/test/vnext-*.test* --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://127.0.0.1:5173/` 的 `vNext` demo，点击 Toolbar
+  Bold 后验证 `A1` computed `fontWeight=700`、当前仍只渲染 30 个可视 cell、`J20`
+  offscreen 未挂载、projection 状态为 `Ready`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
   public entry 还未切到 vNext，worker adapter 也还没接 sheet rename/reorder/delete 等完整
   workbook mutation。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
-  mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 仍只产生
-  intent，尚未接真实 format / clipboard command executor。
+  mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 已接真实
+  range format mutation，但 clipboard command executor 仍未接。
 - FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
   mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、

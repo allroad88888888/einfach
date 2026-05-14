@@ -11,6 +11,7 @@ import type {
   WorkerWorkbookClient,
   WorkbookSheetMeta,
 } from '../src/wasm-workbook-proxy'
+import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
 import {
   createStaticSpreadsheetBackend,
   createWorkerWorkbookSpreadsheetBackend,
@@ -32,6 +33,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     deleteRows: Array<{ sheet: number; rowIndex: number; count: number }>
     insertColumns: Array<{ sheet: number; colIndex: number; count: number }>
     deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
+    setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
+    snapshotFormatRange: SparseRangeWire[]
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -39,6 +42,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
 
 function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const cells = new Map<string, CellSnapshotWire>()
+  const rangeFormats: Array<SparseRangeWire & { format: CellFormatJSON }> = []
   const dirtyListeners = new Set<(cells: CellRefWire[]) => void>()
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
   const calls: FakeWorkerWorkbookClient['calls'] = {
@@ -52,6 +56,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     deleteRows: [],
     insertColumns: [],
     deleteColumns: [],
+    setFormatRange: [],
+    snapshotFormatRange: [],
   }
   let metas: WorkbookSheetMeta[] = []
 
@@ -94,6 +100,16 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       coord.row <= range.endRow &&
       coord.col >= range.startCol &&
       coord.col <= range.endCol
+    )
+  }
+
+  function rangesIntersect(left: SparseRangeWire, right: SparseRangeWire) {
+    return (
+      left.sheet === right.sheet &&
+      left.startRow <= right.endRow &&
+      left.endRow >= right.startRow &&
+      left.startCol <= right.endCol &&
+      left.endCol >= right.startCol
     )
   }
 
@@ -225,11 +241,37 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       shiftCells(sheet, 'column', colIndex, count, -1)
       return true
     },
-    async setFormatRange() {
-      throw new Error('not used')
+    async setFormatRange(range, fmt) {
+      calls.setFormatRange.push({ ...range, fmt })
+      rangeFormats.push({
+        ...range,
+        format: fmt ? { ...fmt, numberFormat: fmt.numberFormat ? { ...fmt.numberFormat } : undefined } : {},
+      })
+      return 1
     },
-    async snapshotFormatRange() {
-      throw new Error('not used')
+    async snapshotFormatRange(range) {
+      calls.snapshotFormatRange.push({ ...range })
+      const snapshot: FormatRangeSnapshot = {
+        sheet: range.sheet,
+        startRow: range.startRow,
+        startCol: range.startCol,
+        endRow: range.endRow,
+        endCol: range.endCol,
+        cellFormats: [],
+        rangeFormats: rangeFormats
+          .filter((layer) => rangesIntersect(layer, range))
+          .map((layer) => ({
+            startRow: layer.startRow,
+            startCol: layer.startCol,
+            endRow: layer.endRow,
+            endCol: layer.endCol,
+            format: {
+              ...layer.format,
+              numberFormat: layer.format.numberFormat ? { ...layer.format.numberFormat } : undefined,
+            },
+          })),
+      }
+      return snapshot
     },
     async restoreFormatSnapshot() {
       throw new Error('not used')
@@ -528,6 +570,59 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('projects static backend formats only inside requested windows', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'A1',
+          valueKind: 'string',
+          format: { bold: true },
+        },
+      ],
+    })
+
+    const mutation = await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      requestId: 14,
+      range: { rowStart: 1, rowEnd: 999_999, colStart: 1, colEnd: 999_999 },
+      format: { bgColor: '#ffd966' },
+    })
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 15,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(mutation?.affectedRange).toEqual({
+      rowStart: 1,
+      rowEnd: 999_999,
+      colStart: 1,
+      colEnd: 999_999,
+    })
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'A1',
+        valueKind: 'string',
+        format: { bold: true },
+      },
+      {
+        row: 1,
+        col: 1,
+        displayValue: '',
+        valueKind: 'blank',
+        format: { bgColor: '#ffd966' },
+      },
+    ])
+  })
+
   it('keeps requestId and revision aligned on visible reads', async () => {
     const backend = createStaticSpreadsheetBackend([
       ['A1', 'B1'],
@@ -585,6 +680,9 @@ describe('vnext adapter', () => {
     expect(client.calls.readSparseRange).toEqual([
       { sheet: 1, startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
     ])
+    expect(client.calls.snapshotFormatRange).toEqual([
+      { sheet: 1, startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+    ])
     expect(result).toMatchObject({
       kind: 'visible-window',
       sheetId: 'sheet-2',
@@ -599,6 +697,69 @@ describe('vnext adapter', () => {
         displayValue: '42',
         valueKind: 'number',
         formula: '=Sheet1!A1+1',
+      },
+    ])
+
+    backend.dispose()
+  })
+
+  it('routes worker workbook range formats and projects formatted visible blanks', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 2,
+    })
+
+    await backend.ready()
+
+    const mutation = await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      requestId: 16,
+      range: { rowStart: 1, rowEnd: 999_999, colStart: 1, colEnd: 999_999 },
+      format: { bold: true, bgColor: '#ffd966' },
+    })
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 17,
+        reason: 'test',
+        range: { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 },
+      }),
+    )
+
+    expect(client.calls.setFormatRange).toEqual([
+      {
+        sheet: 0,
+        startRow: 1,
+        startCol: 1,
+        endRow: 999_999,
+        endCol: 999_999,
+        fmt: { bold: true, bgColor: '#ffd966' },
+      },
+    ])
+    expect(client.calls.snapshotFormatRange).toEqual([
+      { sheet: 0, startRow: 1, startCol: 1, endRow: 1, endCol: 1 },
+    ])
+    expect(mutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 16,
+      revision: 3,
+      affectedRange: {
+        rowStart: 1,
+        rowEnd: 999_999,
+        colStart: 1,
+        colEnd: 999_999,
+      },
+    })
+    expect(result.cells).toEqual([
+      {
+        row: 1,
+        col: 1,
+        displayValue: '',
+        valueKind: 'blank',
+        format: { bold: true, bgColor: '#ffd966' },
       },
     ])
 

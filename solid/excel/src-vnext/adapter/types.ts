@@ -10,7 +10,10 @@ import type {
   RangeProjectionRequest,
   RangeProjectionResult,
   SetCellInputRequest,
+  SetFormatRangeRequest,
   SpreadsheetBackend,
+  SpreadsheetCellFormat,
+  SpreadsheetNumberFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
@@ -51,7 +54,10 @@ export type {
   RangeProjectionRequest,
   RangeProjectionResult,
   SetCellInputRequest,
+  SetFormatRangeRequest,
   SpreadsheetBackend,
+  SpreadsheetCellFormat,
+  SpreadsheetNumberFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 }

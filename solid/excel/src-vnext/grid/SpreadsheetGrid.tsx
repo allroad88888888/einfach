@@ -16,6 +16,7 @@ import {
   setViewportMetricsAtom,
   startEditingAtom,
   type DisplayCell,
+  type SpreadsheetCellFormat,
   type ViewportMetrics,
   visibleWindowAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -60,6 +61,19 @@ function getColumnLabel(index: number): string {
 
 function getCellAddress(row: number, col: number): string {
   return `${getColumnLabel(col)}${row + 1}`
+}
+
+function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<string, string> {
+  if (!format) return {}
+
+  const style: Record<string, string> = {}
+  if (format.bgColor) style['background'] = format.bgColor
+  if (format.fgColor) style['color'] = format.fgColor
+  if (format.bold) style['font-weight'] = '700'
+  if (format.italic) style['font-style'] = 'italic'
+  if (format.align && format.align !== 'default') style['text-align'] = format.align
+  if (format.fontSize) style['font-size'] = `${format.fontSize}px`
+  return style
 }
 
 export function SpreadsheetGrid(props: SpreadsheetGridProps) {
@@ -604,7 +618,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             when={editing()}
                             fallback={
                               <button type="button" class="spreadsheet-grid-cell-button">
-                                <span class="cell-display">{cell()?.displayValue ?? ''}</span>
+                                <span
+                                  class="cell-display"
+                                  style={getCellFormatStyle(cell()?.format)}
+                                >
+                                  {cell()?.displayValue ?? ''}
+                                </span>
                               </button>
                             }
                           >

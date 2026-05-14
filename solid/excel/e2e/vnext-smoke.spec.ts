@@ -89,6 +89,7 @@ test.describe('Solid Excel vNext smoke', () => {
     const bold = page.getByTestId('toolbar-btn-bold')
     await expect(bold).toBeEnabled()
     await bold.click()
+    await expect(cellDisplay(page, 'A1')).toHaveCSS('font-weight', '700')
 
     await cell(page, 'A1').click({ button: 'right' })
     const menu = page.getByTestId('vnext-context-menu')

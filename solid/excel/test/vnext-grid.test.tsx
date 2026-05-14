@@ -110,6 +110,71 @@ describe('vNext SpreadsheetGrid', () => {
     })
   })
 
+  it('renders projected cell format styles without creating cell atoms', async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Styled',
+              valueKind: 'string',
+              format: {
+                bold: true,
+                italic: true,
+                align: 'right',
+                fgColor: '#ff0000',
+              },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Styled',
+      )
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.fontWeight).toBe('700')
+    expect(display.style.fontStyle).toBe('italic')
+    expect(display.style.textAlign).toBe('right')
+    expect(display.style.color).toBe('rgb(255, 0, 0)')
+  })
+
   it('writes selection clicks back into the core store', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()

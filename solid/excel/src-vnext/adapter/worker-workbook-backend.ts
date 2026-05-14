@@ -11,11 +11,14 @@ import type {
   RangeProjectionRequest,
   RangeProjectionResult,
   SetCellInputRequest,
+  SetFormatRangeRequest,
   SpreadsheetBackend,
+  SpreadsheetCellFormat,
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 
+import type { CellFormatJSON, FormatRangeSnapshot } from '../../src/types'
 import {
   createWorkerWorkbook,
   type CellSnapshotWire,
@@ -166,6 +169,117 @@ function structuralMutationResult(
   }
 }
 
+function cloneFormat(format: SpreadsheetCellFormat): SpreadsheetCellFormat {
+  const clone: SpreadsheetCellFormat = { ...format }
+  if (format.numberFormat) clone.numberFormat = { ...format.numberFormat }
+  return clone
+}
+
+function normalizeFormat(
+  format: SpreadsheetCellFormat | null | undefined,
+): SpreadsheetCellFormat | undefined {
+  if (!format || isDefaultFormat(format)) return undefined
+  return cloneFormat(format)
+}
+
+function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
+  const numberFormat = format.numberFormat
+  const numberFormatIsDefault = !numberFormat || numberFormat.kind === 'general'
+
+  return (
+    !format.bold &&
+    !format.italic &&
+    (format.align === undefined || format.align === 'default') &&
+    format.fontSize === undefined &&
+    (format.fgColor === undefined || format.fgColor.length === 0) &&
+    (format.bgColor === undefined || format.bgColor.length === 0) &&
+    numberFormatIsDefault
+  )
+}
+
+function keyFor(row: number, col: number): string {
+  return `${row}:${col}`
+}
+
+function isCoordInsideRange(
+  row: number,
+  col: number,
+  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
+): boolean {
+  return (
+    row >= range.rowStart &&
+    row <= range.rowEnd &&
+    col >= range.colStart &&
+    col <= range.colEnd
+  )
+}
+
+function snapshotCellFormatKey(snapshot: FormatRangeSnapshot['cellFormats'][number]): string | null {
+  const coord = parseA1(snapshot.addr)
+  if (!coord) return null
+  return keyFor(coord.row, coord.col)
+}
+
+function getEffectiveFormat(
+  row: number,
+  col: number,
+  snapshot: FormatRangeSnapshot,
+): SpreadsheetCellFormat | undefined {
+  for (const cellFormat of snapshot.cellFormats) {
+    const key = snapshotCellFormatKey(cellFormat)
+    if (key === keyFor(row, col)) {
+      return normalizeFormat(cellFormat.format)
+    }
+  }
+
+  for (let index = snapshot.rangeFormats.length - 1; index >= 0; index -= 1) {
+    const layer = snapshot.rangeFormats[index]
+    const layerRange = {
+      rowStart: layer.startRow,
+      rowEnd: layer.endRow,
+      colStart: layer.startCol,
+      colEnd: layer.endCol,
+    }
+    if (!isCoordInsideRange(row, col, layerRange)) continue
+    return isDefaultFormat(layer.format) ? undefined : cloneFormat(layer.format)
+  }
+
+  return undefined
+}
+
+function mergeFormatsIntoCells(
+  cells: DisplayCell[],
+  range: CellRange,
+  snapshot: FormatRangeSnapshot,
+): DisplayCell[] {
+  const cellMap = new Map<string, DisplayCell>()
+
+  for (const cell of cells) {
+    const format = getEffectiveFormat(cell.row, cell.col, snapshot)
+    cellMap.set(keyFor(cell.row, cell.col), format ? { ...cell, format } : cell)
+  }
+
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const key = keyFor(row, col)
+      if (cellMap.has(key)) continue
+      const format = getEffectiveFormat(row, col, snapshot)
+      if (!format) continue
+      cellMap.set(key, {
+        row,
+        col,
+        displayValue: '',
+        valueKind: 'blank',
+        format,
+      })
+    }
+  }
+
+  return [...cellMap.values()].sort((left, right) =>
+    left.row === right.row ? left.col - right.col : left.row - right.row,
+  )
+}
+
 function snapshotToDisplayCell(snapshot: CellSnapshotWire): DisplayCell | null {
   const coord = parseA1(snapshot.addr)
   if (!coord) {
@@ -272,14 +386,18 @@ export function createWorkerWorkbookSpreadsheetBackend(
     requestRevision?: ProjectionRevision,
   ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
     const sheet = await resolveSheet(sheetId)
-    const snapshots = await client.readSparseRange(toSparseRange(sheet.idx, range))
+    const sparseRange = toSparseRange(sheet.idx, range)
+    const [snapshots, formatSnapshot] = await Promise.all([
+      client.readSparseRange(sparseRange),
+      client.snapshotFormatRange(sparseRange),
+    ])
     const cells = snapshots
       .map(snapshotToDisplayCell)
       .filter((cell): cell is DisplayCell => cell !== null)
       .sort((left, right) => (left.row === right.row ? left.col - right.col : left.row - right.row))
 
     return {
-      cells,
+      cells: mergeFormatsIntoCells(cells, range, formatSnapshot),
       revision: requestRevision ?? revision,
     }
   }
@@ -386,6 +504,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const sheet = await resolveSheet(request.sheetId)
       await client.deleteColumns(sheet.idx, request.colIndex, request.count)
       return structuralMutationResult(request, bumpRevision())
+    },
+
+    async setFormatRange(request: SetFormatRangeRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      await client.setFormatRange(
+        toSparseRange(sheet.idx, request.range),
+        request.format as CellFormatJSON | null | undefined,
+      )
+      const nextRevision = bumpRevision()
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+        affectedRange: {
+          rowStart: request.range.rowStart,
+          rowEnd: request.range.rowEnd,
+          colStart: request.range.colStart,
+          colEnd: request.range.colEnd,
+        },
+      }
     },
 
     ready() {
