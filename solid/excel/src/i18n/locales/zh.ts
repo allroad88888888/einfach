@@ -65,4 +65,11 @@ export const messages: Record<string, string> = {
 
   'demo.million.title': '百万格 Worker Demo',
   'demo.million.desc': '1000 × 1000 = 100 万个可寻址单元格，Web Worker 后端。只播种少量种子，其余保持稀疏。二维虚拟化只渲染视口范围。',
+  'demo.million.import.choose': '导入 CSV/TSV',
+  'demo.million.import.cancel': '取消',
+  'demo.million.import.status.running': '导入中',
+  'demo.million.import.status.committed': '导入完成',
+  'demo.million.import.status.cancelled': '导入已取消',
+  'demo.million.import.status.failed': '导入失败',
+  'demo.million.import.stats': '{rows} 行，{cells} 个单元格，{chunks} 个分块，{errors} 个错误',
 }

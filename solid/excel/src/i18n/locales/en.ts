@@ -71,4 +71,11 @@ export const messages: Record<string, string> = {
 
   'demo.million.title': '1M-Cell Worker Demo',
   'demo.million.desc': '1000 × 1000 = 1,000,000 addressable cells over a Web Worker backend. Only a handful are seeded; the rest stay sparse. Two-dimensional virtualization renders just the viewport.',
+  'demo.million.import.choose': 'Import CSV/TSV',
+  'demo.million.import.cancel': 'Cancel',
+  'demo.million.import.status.running': 'Importing',
+  'demo.million.import.status.committed': 'Import complete',
+  'demo.million.import.status.cancelled': 'Import cancelled',
+  'demo.million.import.status.failed': 'Import failed',
+  'demo.million.import.stats': '{rows} rows, {cells} cells, {chunks} chunks, {errors} errors',
 }

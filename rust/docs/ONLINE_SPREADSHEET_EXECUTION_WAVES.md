@@ -1,6 +1,6 @@
 # 在线电子表格剩余执行波次规划
 
-> 日期：2026-05-13
+> 日期：2026-05-14
 >
 > 当前角色：总架构师。
 >
@@ -9,15 +9,15 @@
 
 ## 当前 HEAD 事实
 
-以最近提交 `f456dd7 (Wave 4 observability gates)` 为准；Wave 5
-文件导入/backpressure UI 计划已经开始。
+以最近提交 `707da13 (Wave 5 plan)` 加当前 Wave 5 实现工作树为准；
+文件导入/backpressure UI 已完成本地与 MCP 验收。
 项目已经越过旧 `PHASE5_PARALLEL.md` 和早期 north-star 计划里的起点状态。
 
 本轮状态更新：
 
 - Wave 3 已提交到 `6462024`（bounded import + sparse persistence v1）。
 - Wave 4 已提交到 `f456dd7`（debug counters + observability e2e + MCP 记录）。
-- Wave 5 当前启动：正式文件导入 / backpressure UI。
+- Wave 5 已完成实现与验收：正式文件导入 / backpressure UI。
 - Push / CI 仍禁止，直到用户放开并完成总体上层门禁。
 
 已落地的主能力：
@@ -53,13 +53,13 @@
 - worker import session 已按 chunk 写入 worker 内 staging workbook，并补上 bounded memory
   合同、稳定错误码和 cancel/commit 测试。
 - 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
-  或公式结果。正式文件流导入、backpressure UI、自动保存仍未做。
-- 测试覆盖已经很多，E2E 文档计数已经在 Wave 4 对齐到 21 spec / 150 tests / 0 skip。
-  MCP Playwright 验证记录已经进入 Wave 4 文档，后续每波继续固定记录。
+  或公式结果。自动保存仍未做。
+- 测试覆盖已经很多，E2E 文档计数已经在 Wave 5 对齐到 22 spec / 153 tests / 0 skip。
+  MCP Playwright 验证记录已经进入 Wave 4/5 文档，后续每波继续固定记录。
 
 ## 总体判断
 
-还剩 **2 个产品化实现波 + 1 个发布门禁波**。
+还剩 **1 个产品化实现波 + 1 个发布门禁波**。
 
 原“波次 1 权威 worker 命令合同”已经完成大半：worker workbook RPC、async formula、
 formula cache probe 都在主线。现在的波次 1 改为“权威命令收口 + 文档同步”，不再重复做
@@ -367,7 +367,8 @@ MCP 验收：
 
 ## 波次 5：文件导入与 Backpressure UI
 
-状态：**启动中**。计划文档：`rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md`。
+状态：**已实现并完成本地/MCP 验收**。计划与记录：
+`rust/docs/WAVE5_FILE_IMPORT_BACKPRESSURE_PLAN.md`。
 
 ### 目标
 
@@ -410,6 +411,17 @@ MCP 验收：
 - 实现需要一次性读取整个文件或一次性构造全量 cell 数组。
 - UI 为展示结果读取全表。
 - cancel 后 import session 泄漏。
+
+### 执行记录
+
+- `file-import.ts` helper 已实现 `File.stream()` + `TextDecoder` 增量解析，支持 CSV/TSV、
+  quoted field、abort/cancel、progress 与 worker ack backpressure。
+- 1M demo 已接入文件导入 UI、取消、统计和 `?debug=1` worker debug client。
+- 可见投影刷新只针对当前订阅窗口，不读取全表。
+- E2E 新增 `file-import.spec.ts` 3 条：CSV、TSV、取消后 session 归零。
+- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 22 spec / 153 tests / 0 skip。
+- MCP Playwright 返回：`A1=21`、`B1=mcp-label`、`A120` 读前 dirty / 读后 clean、
+  eval delta 1、取消后 `importSessionCount=0`、console warning/error 0。
 
 ## 波次 6：产品硬化与 Excel 兼容缺口
 
@@ -493,12 +505,13 @@ cd solid/excel && npm run build:wasm && npx playwright test
 
 ## 推荐下一步
 
-当前波次：**波次 5：文件导入与 Backpressure UI**（启动中）。
+当前波次：**波次 6：产品硬化与 Excel 兼容缺口**。
 
 原因：
 
-- large range format undo、copy/export streaming、bounded import、sparse persistence v1 都已完成
-  本轮实现和验证。
+- large range format undo、copy/export streaming、bounded import、sparse persistence v1、
+  file import/backpressure UI 都已完成本轮实现和验证。
 - Wave 4 已经把规模行为做成可查询 counters 和 e2e/MCP 门禁。
-- 正式文件流导入/backpressure UI 是当前离 MVP 使用闭环最近的产品缺口，且能复用 Wave 3
-  bounded import session 与 Wave 4 observability counters。
+- Wave 5 已经把正式文件流导入/backpressure UI 接到 1M worker demo，并通过 e2e/MCP 验收。
+- 剩余主要缺口转向产品硬化：错误诊断、多 sheet worker product path、虚拟列下交互稳定性、
+  以及最终发布门禁。

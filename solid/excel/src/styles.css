@@ -162,6 +162,70 @@ body {
   color: #333;
 }
 
+.import-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.import-file-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #fafbfc;
+  color: #333;
+  cursor: pointer;
+  font-weight: 500;
+}
+
+.import-file-label:hover {
+  background: #eef1f4;
+}
+
+.import-file-input {
+  max-width: 220px;
+  font: inherit;
+}
+
+.import-file-input:disabled {
+  cursor: wait;
+}
+
+.import-cancel-btn {
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid #d0d7de;
+  border-radius: 4px;
+  background: #fff;
+  color: #9a3412;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+}
+
+.import-cancel-btn:hover {
+  background: #fff7ed;
+  border-color: #fdba74;
+}
+
+.import-status,
+.import-stats,
+.import-error {
+  color: #555;
+  line-height: 20px;
+}
+
+.import-error {
+  color: #b42318;
+}
+
 /* === Excel Table === */
 
 .excel-table-wrapper {

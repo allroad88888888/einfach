@@ -1,7 +1,12 @@
-import { Show, createResource, onCleanup } from 'solid-js'
+import { Show, createResource, createSignal, onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import type { SheetStore } from '../sheet-store'
-import type { ImportCellWire, WorkerWorkbookClient } from '../wasm-workbook-proxy'
+import { importDelimitedFileToWorkbook, type ImportProgress } from '../file-import'
+import type {
+  ImportCellWire,
+  WorkerWorkbookClient,
+  WorkbookImportStatsWire,
+} from '../wasm-workbook-proxy'
 import { createWorkerWorkbookStore, type WasmWorkbookStore } from '../wasm-workbook-store'
 import { defaultWorkbookWorkerFactory } from '../wasm-workbook-worker-factory'
 import { useT } from '../i18n'
@@ -37,6 +42,7 @@ declare global {
   interface Window {
     __einfachStore?: SheetStore
     __einfachWorkbookStore?: WasmWorkbookStore
+    __einfachWorkbookDebugClient?: WorkerWorkbookClient
     __einfachBackend?: string
   }
 }
@@ -47,22 +53,34 @@ declare global {
  * probe `activeSubscriptionCount()` from the browser side. Matches the
  * pattern used by DemoBlank / DemoFormulas / DemoLarge. Off otherwise.
  */
-function exposeStoreForDebug(store: SheetStore, workbook: WasmWorkbookStore) {
+function exposeStoreForDebug(
+  store: SheetStore,
+  workbook: WasmWorkbookStore,
+  client: WorkerWorkbookClient,
+) {
   if (typeof window === 'undefined') return
   const debug = new URLSearchParams(window.location.search).get('debug')
   if (debug !== '1' && debug !== 'render') return
   window.__einfachStore = store
   window.__einfachWorkbookStore = workbook
+  window.__einfachWorkbookDebugClient = client
   window.__einfachBackend = 'worker-workbook'
 }
 
-function clearStoreForDebug(store: SheetStore, workbook: WasmWorkbookStore) {
+function clearStoreForDebug(
+  store: SheetStore,
+  workbook: WasmWorkbookStore,
+  client: WorkerWorkbookClient | undefined,
+) {
   if (typeof window === 'undefined') return
   if (window.__einfachStore === store) {
     delete window.__einfachStore
   }
   if (window.__einfachWorkbookStore === workbook) {
     delete window.__einfachWorkbookStore
+  }
+  if (client && window.__einfachWorkbookDebugClient === client) {
+    delete window.__einfachWorkbookDebugClient
   }
   if (window.__einfachBackend === 'worker-workbook') {
     delete window.__einfachBackend
@@ -72,25 +90,140 @@ function clearStoreForDebug(store: SheetStore, workbook: WasmWorkbookStore) {
 const ROWS = 1000
 const COLS = 1000
 
+type ImportUiState = ImportProgress & {
+  fileName: string
+  stats?: WorkbookImportStatsWire
+  error?: string
+}
+
+const EMPTY_IMPORT_STATE: ImportUiState = {
+  fileName: '',
+  rowsRead: 0,
+  cellsQueued: 0,
+  cellsImported: 0,
+  chunks: 0,
+  status: 'running',
+}
+
 export function DemoMillion() {
   const t = useT()
+  const [importState, setImportState] = createSignal<ImportUiState | null>(null)
+  let importClient: WorkerWorkbookClient | undefined
+  let importAbort: AbortController | undefined
+
   const [workbookRes] = createResource<WasmWorkbookStore>(async () => {
     const workbook = await createWorkerWorkbookStore({
       workerFactory: defaultWorkbookWorkerFactory,
       sheets: ['Sheet1'],
-      afterInit: seedWorkbook,
+      afterInit: async (client) => {
+        importClient = client
+        await seedWorkbook(client)
+      },
     })
     const store = workbook.activeStore()
-    exposeStoreForDebug(store, workbook)
+    if (importClient) exposeStoreForDebug(store, workbook, importClient)
     return workbook
   })
   onCleanup(() => {
+    importAbort?.abort()
     const workbook = workbookRes()
     if (!workbook) return
     const store = workbook.activeStore()
-    clearStoreForDebug(store, workbook)
+    clearStoreForDebug(store, workbook, importClient)
     workbook.dispose()
   })
+
+  async function importFile(file: File) {
+    const workbook = workbookRes()
+    if (!workbook || !importClient) return
+
+    importAbort?.abort()
+    const controller = new AbortController()
+    importAbort = controller
+    setImportState({
+      ...EMPTY_IMPORT_STATE,
+      fileName: file.name,
+      status: 'running',
+    })
+
+    try {
+      const result = await importDelimitedFileToWorkbook(importClient, file, {
+        signal: controller.signal,
+        onProgress: (progress) => {
+          setImportState({
+            ...progress,
+            fileName: file.name,
+          })
+        },
+      })
+
+      if (result.status === 'committed') {
+        workbook.refreshVisible()
+      }
+      setImportState({
+        fileName: file.name,
+        rowsRead: result.rowsRead,
+        cellsQueued: result.cellsQueued,
+        cellsImported: result.cellsImported,
+        chunks: result.chunks,
+        status: result.status,
+        stats: result.stats,
+        error: result.error?.message,
+      })
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err)
+      setImportState((prev) => ({
+        ...(prev ?? EMPTY_IMPORT_STATE),
+        fileName: file.name,
+        status: 'failed',
+        error,
+      }))
+    } finally {
+      if (importAbort === controller) importAbort = undefined
+    }
+  }
+
+  function handleImportInput(event: Event) {
+    const input = event.currentTarget as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    void importFile(file).finally(() => {
+      input.value = ''
+    })
+  }
+
+  function cancelImport() {
+    importAbort?.abort()
+  }
+
+  function importStatusText(state: ImportUiState) {
+    switch (state.status) {
+      case 'running':
+      case 'flushing':
+        return t('demo.million.import.status.running')
+      case 'committed':
+        return t('demo.million.import.status.committed')
+      case 'cancelled':
+        return t('demo.million.import.status.cancelled')
+      case 'failed':
+        return t('demo.million.import.status.failed')
+    }
+  }
+
+  function importStatsText(state: ImportUiState) {
+    const accepted = state.stats?.accepted ?? state.cellsImported
+    const errors = state.stats?.errors ?? 0
+    return t('demo.million.import.stats')
+      .replace('{rows}', String(state.rowsRead))
+      .replace('{cells}', String(accepted))
+      .replace('{chunks}', String(state.chunks))
+      .replace('{errors}', String(errors))
+  }
+
+  const importing = () => {
+    const status = importState()?.status
+    return status === 'running' || status === 'flushing'
+  }
 
   return (
     <Show
@@ -106,6 +239,46 @@ export function DemoMillion() {
           <div class="demo-header">
             <h3>{t('demo.million.title')}</h3>
             <p class="demo-desc">{t('demo.million.desc')}</p>
+          </div>
+          <div class="import-toolbar">
+            <label class="import-file-label">
+              <span>{t('demo.million.import.choose')}</span>
+              <input
+                data-testid="million-import-input"
+                class="import-file-input"
+                type="file"
+                accept=".csv,.tsv,.tab,text/csv,text/tab-separated-values"
+                disabled={importing()}
+                onChange={handleImportInput}
+              />
+            </label>
+            <Show when={importing()}>
+              <button
+                data-testid="million-import-cancel"
+                class="import-cancel-btn"
+                type="button"
+                onClick={cancelImport}
+              >
+                {t('demo.million.import.cancel')}
+              </button>
+            </Show>
+            <Show when={importState()}>
+              {(state) => (
+                <>
+                  <span data-testid="million-import-status" class="import-status">
+                    {importStatusText(state())}
+                  </span>
+                  <span data-testid="million-import-stats" class="import-stats">
+                    {importStatsText(state())}
+                  </span>
+                  <Show when={state().status === 'failed' && state().error}>
+                    <span data-testid="million-import-error" class="import-error">
+                      {state().error}
+                    </span>
+                  </Show>
+                </>
+              )}
+            </Show>
           </div>
           <Table store={workbook().activeStore()} rows={ROWS} cols={COLS} virtualize formulaBar />
         </div>

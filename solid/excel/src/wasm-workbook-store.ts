@@ -20,6 +20,7 @@ interface WorkbookSheetAdapter extends ISheet {
 
 interface WorkerWorkbookSheetAdapter extends ISheet {
   applyHydrated(cells: CellSnapshotWire[]): void
+  refreshVisible(): void
 }
 
 export interface WorkbookSheetMeta {
@@ -35,6 +36,7 @@ export interface WasmWorkbookStore {
   activeStore: () => SheetStore
   sheetAt: (idx: number) => SheetStore | undefined
   formulaCacheState: (sheetIdx: number, addr: string) => string
+  refreshVisible: (sheetIdx?: number) => void
   dispose: () => void
 }
 
@@ -173,6 +175,9 @@ export async function createWorkerWorkbookStore(
     activeStore,
     sheetAt: (idx) => stores.get(idx),
     formulaCacheState,
+    refreshVisible: (sheetIdx = activeIdx()) => {
+      adapters.get(sheetIdx)?.refreshVisible()
+    },
     dispose: () => {
       if (disposed) return
       disposed = true
@@ -233,6 +238,10 @@ export async function createThreeSheetChainWorkbookStore(): Promise<WasmWorkbook
     formulaCacheState: (sheetIdx, addr) => {
       version()
       return workbook.debug_formula_cache_state(sheetIdx, addr)
+    },
+    refreshVisible: (sheetIdx = activeIdx()) => {
+      adapters[sheetIdx]?.notifySubscribers()
+      setVersion((v) => v + 1)
     },
     dispose: () => {
       for (const store of stores) store.dispose()
@@ -841,6 +850,9 @@ function createWorkerWorkbookSheetAdapter(
       unsubscribeToken(token)
     },
     applyHydrated,
+    refreshVisible() {
+      hydrateVisibleAddrs(invalidateCachedStateForRemoteMutation())
+    },
     dispose() {
       if (disposed) return
       disposed = true

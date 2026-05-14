@@ -112,3 +112,79 @@ MCP Playwright 验收：
 - 1M demo 文件导入 UI。
 - Playwright e2e + MCP 验收记录。
 - 文档状态更新并提交。
+
+## 执行记录
+
+### 子角色
+
+- E1 `gpt-5.3-codex-spark`：新增 `solid/excel/src/file-import.ts` 与
+  `solid/excel/test/file-import.test.ts`，实现 stream parser/helper 与 backpressure/cancel
+  单测候选。
+- E3 `gpt-5.3-codex-spark`：新增 `solid/excel/e2e/file-import.spec.ts` 候选，先按约定
+  selector/debug 入口写红测。
+- Claude Sonnet 只读复核：指出 backpressure 需要证明“ack 前不读下一个 stream chunk”、
+  worker 抛错也必须 cancel session、以及 lazy 公式 fixture 应放在视口外。
+- 外部 `codex exec -m gpt-5.3-codex-spark` 只读审查：启动较早，看到的基线仍未含本波代码；
+  结论中指出的 helper/UI/e2e 缺口已由本波补齐。
+- 总架构师：主线集成 UI、debug client、可见窗口刷新、docs 和最终验收。
+
+### 已落地
+
+- `file-import.ts`：
+  - `File.stream()` + `TextDecoder` 增量解码；
+  - CSV/TSV delimiter 检测；
+  - quoted field 与 `""` 转义；
+  - 空字段跳过，保持 sparse；
+  - `=...` 导入为 formula source，不读取公式 display；
+  - 每个 chunk `await client.importChunk()` 后才继续推进，形成 backpressure；
+  - abort、worker error、组件 dispose 路径均清理 session。
+- 1M demo：
+  - 新增 CSV/TSV 文件导入控件、进度、统计和取消按钮；
+  - 导入完成只刷新当前可见订阅窗口，不读取全表；
+  - `?debug=1` 下暴露 `window.__einfachWorkbookDebugClient` 供 e2e/MCP 查询 counters。
+- E2E：
+  - 小 CSV / TSV 导入；
+  - 视口外公式 `A120` 导入后保持 dirty，显式 debug read 后才 clean；
+  - 长导入取消后 `debugCounters().importSessionCount = 0`。
+- HTML：
+  - 加 data favicon，清掉浏览器自动请求 `/favicon.ico` 带来的 console 404 噪音。
+
+### 本地验证
+
+```sh
+cd /Volumes/work/self/einfach && npx tsc -p solid/excel/tsconfig.json --noEmit
+cd /Volumes/work/self/einfach && npx jest solid/excel/test/file-import.test.ts solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand
+cd /Volumes/work/self/einfach && npm run build -w @einfach/solid-excel
+cd /Volumes/work/self/einfach/solid/excel && npm run e2e -- e2e/file-import.spec.ts e2e/observability.spec.ts
+cd /Volumes/work/self/einfach/solid/excel && npx playwright test --list
+```
+
+结果：
+
+- TypeScript：通过。
+- Jest：4 suites / 58 tests 通过。
+- Vite build：通过。
+- Playwright targeted：5 tests 通过。
+- Playwright list：22 spec files / 153 tests / 0 skip。
+
+### MCP Playwright 验收
+
+URL：`http://localhost:5174/?debug=1`
+
+返回值：
+
+- `backend = "worker-workbook"`
+- CSV 导入完成状态：`Import complete`
+- 可见导入结果：`A1 = 21`, `B1 = mcp-label`
+- 视口外公式 `A120`：
+  - 读前 cache state：`dirty`
+  - 显式 debug read display：`26`
+  - 读后 cache state：`clean`
+  - eval delta：`1`
+- 取消导入：
+  - 运行中状态：`Importing`
+  - 取消状态：`Import cancelled`
+  - `importSessionCountAfterCancel = 0`
+- DOM cell count：735
+- active subscription count：735
+- console warning/error：0。
