@@ -718,6 +718,67 @@ thead .row-header {
 .spreadsheet-sheet-tab-item {
   display: flex;
   align-items: center;
+  position: relative;
+}
+
+.spreadsheet-sheet-tab-item[data-reorder-active='true'] .sheet-tab {
+  opacity: 0.72;
+}
+
+.spreadsheet-sheet-tab-item[data-reorder-drop='before']::before,
+.spreadsheet-sheet-tab-item[data-reorder-drop='after']::after {
+  content: '';
+  position: absolute;
+  top: 5px;
+  bottom: 1px;
+  width: 2px;
+  background: #1a73e8;
+  border-radius: 1px;
+}
+
+.spreadsheet-sheet-tab-item[data-reorder-drop='before']::before {
+  left: -2px;
+}
+
+.spreadsheet-sheet-tab-item[data-reorder-drop='after']::after {
+  right: -2px;
+}
+
+.spreadsheet-sheet-tab-reorder {
+  width: 14px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-right: 0;
+  border-radius: 4px 0 0 0;
+  background: #eef1f4;
+  color: #6e7781;
+  cursor: grab;
+  font-family: inherit;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.spreadsheet-sheet-tab-reorder:active {
+  cursor: grabbing;
+}
+
+.spreadsheet-sheet-tab-reorder:disabled {
+  color: #b6bec8;
+  cursor: default;
+}
+
+.spreadsheet-sheet-tab-reorder:not(:disabled):hover {
+  background: #e0e6ec;
+  color: #333;
+}
+
+.spreadsheet-sheet-tab-reorder + .sheet-tab {
+  border-top-left-radius: 0;
+}
+
+.spreadsheet-sheet-tab-reorder + .sheet-tab-active {
+  border-left-color: transparent;
 }
 
 .spreadsheet-sheet-tab-rename {

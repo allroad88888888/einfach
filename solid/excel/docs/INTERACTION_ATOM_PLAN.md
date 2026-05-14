@@ -434,6 +434,13 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   已占用事实参与边界判断，但不读取 display value、不调用 `readSparseRange`、不调用
   `snapshotFormatRange`，因此不会为了导航触发公式求值或格式投影物化。vNext Worker
   demo 已覆盖 `Ctrl+ArrowRight` 的真实 Rust worker 路径。
+- PC-6 第十七段：vNext SheetTabs 已接拖拽重排第一版。`@einfach/spreadsheet-ui-core`
+  增加 sheet metadata reorder helper 和可选 backend `reorderSheet` port；Solid UI
+  用独立 drag handle 触发 `sheet-tab.reorder.*` intent，不占用 tab click / double-click /
+  context-menu。static backend 持久化 metadata 顺序；worker/Rust adapter 在 JS adapter
+  层维护 sheet id 到 Rust idx 的显示顺序映射，底层 Rust workbook 暂不执行 `move_sheet`，
+  避免在 cross-sheet 依赖图按 index 存储的现状下误改内容归属。该链路只移动 sheet
+  metadata，不读取或物化任何 cell。
 
 PC-6 第一段验收记录：
 
@@ -638,17 +645,33 @@ PC-6 第十六段验收记录：
   且 active、当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为
   `Ready`、console error 为 0。
 
+PC-6 第十七段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/sheet-tabs.test.ts solid/excel/test/vnext-sheet-tabs.test.tsx solid/excel/test/vnext-adapter.test.ts --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/`，分别验证 `vNext` 和 `vNext Worker`
+  demo 中拖拽 `Sheet3` 到 `Sheet1` 前；两条路径 tab 顺序均为
+  `Sheet3 / Sheet1 / Sheet2`，active 仍为 `Sheet1`，当前仍只渲染 30 个可视 cell、
+  `J20` offscreen 未挂载、projection 为 `Ready`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
   public entry 还未切到 vNext。sheet add/rename/delete 已接入 vNext backend port；
-  sheet reorder 仍未接 Rust/worker/backend port。
+  sheet reorder 已接 vNext metadata backend port 和 worker adapter 显示顺序映射；
+  Rust core/wasm 仍未实现真正的 `move_sheet`。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
   mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 已接真实
   range format mutation；ContextMenu Copy/Cut/Paste 已接真实 clipboard executor，但
   大范围 streaming clipboard port 仍未接。
-- FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
-  但还没有接 sheet reorder mutation。
+- FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete
+  和 metadata reorder mutation；Rust-level sheet order mutation 仍待单独设计。
 - 数据区域感知的 Ctrl+Arrow 已有 optional backend port，static backend 和 worker/Rust
   backend adapter 均已接入；后续可继续补更完整的 Excel 空白/非空边界细节测试。
 - Excel 级交互仍缺：row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。

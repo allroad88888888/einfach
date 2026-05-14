@@ -15,6 +15,10 @@ Data-navigation ports return a single coordinate, not a row/column projection.
 For example, `resolveDataEdge` lets a host adapter answer Ctrl+Arrow movement
 from sparse facts without materializing a full row or column in the UI layer.
 
+Sheet metadata ports return bounded sheet lists only. `reorderSheet` changes the
+displayed sheet metadata order and must not imply any cell snapshot or sheet
+content materialization.
+
 ## State Decision Template
 
 - Source atoms: none.

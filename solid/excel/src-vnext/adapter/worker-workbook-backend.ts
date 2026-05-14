@@ -10,6 +10,7 @@ import type {
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
+  ReorderSheetRequest,
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
@@ -21,6 +22,7 @@ import type {
   VisibleProjectionRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
+import { reorderSheetMetadata } from '@einfach/spreadsheet-ui-core'
 
 import type { CellFormatJSON, FormatRangeSnapshot } from '../../src/types'
 import {
@@ -162,6 +164,41 @@ function toSheetMetadata(
     name: sheet.name,
     index,
   }))
+}
+
+function orderWorkerSheets(
+  sheets: readonly WorkerWorkbookBackendSheet[],
+  orderIds: readonly string[] | null,
+): WorkerWorkbookBackendSheet[] {
+  if (!orderIds) {
+    return sheets.map((sheet) => ({ ...sheet }))
+  }
+
+  const byId = new Map(sheets.map((sheet) => [sheet.id, sheet]))
+  const ordered: WorkerWorkbookBackendSheet[] = []
+  const used = new Set<string>()
+
+  for (const id of orderIds) {
+    const sheet = byId.get(id)
+    if (!sheet || used.has(sheet.id)) continue
+    ordered.push({ ...sheet })
+    used.add(sheet.id)
+  }
+
+  for (const sheet of sheets) {
+    if (used.has(sheet.id)) continue
+    ordered.push({ ...sheet })
+    used.add(sheet.id)
+  }
+
+  return ordered
+}
+
+function hasSameSheetOrder(
+  left: readonly WorkerWorkbookBackendSheet[],
+  right: readonly WorkerWorkbookBackendSheet[],
+): boolean {
+  return left.length === right.length && left.every((sheet, index) => sheet.id === right[index]?.id)
 }
 
 function getColumnLabel(index: number): string {
@@ -468,6 +505,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let lookup: SheetLookup = { sheets: [], byId: new Map() }
   let revision = options.revision ?? 0
   let disposed = false
+  let sheetOrderIds: string[] | null = null
   const client: WorkerWorkbookClient = resolvedClient
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
@@ -493,7 +531,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<WorkerWorkbookBackendSheet[]> {
     await readyPromise
     const metas = await client.sheetList()
-    lookup = syncSheetLookup(metas, existingSheets)
+    const synced = syncSheetLookup(metas, existingSheets)
+    const orderedSheets = orderWorkerSheets(synced.sheets, sheetOrderIds)
+    if (sheetOrderIds) {
+      sheetOrderIds = orderedSheets.map((sheet) => sheet.id)
+    }
+    lookup = buildSheetLookupFromSheets(orderedSheets)
     return lookup.sheets
   }
 
@@ -811,6 +854,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     async deleteSheet(request): Promise<SheetMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
+      const deleteDisplayIndex = lookup.sheets.findIndex((item) => item.id === request.sheetId)
 
       if (lookup.sheets.length <= 1) {
         throw createBackendError('SHEET_DELETE_FAILED', 'cannot delete the last sheet')
@@ -824,12 +868,31 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const nextRevision = bumpRevision()
       const remainingSheets = lookup.sheets.filter((item) => item.id !== request.sheetId)
       await refreshSheetLookup(remainingSheets)
-      const activeSheetId = lookup.sheets[Math.min(sheet.idx, lookup.sheets.length - 1)]?.id ?? null
+      const activeSheetId =
+        lookup.sheets[Math.min(Math.max(deleteDisplayIndex, 0), lookup.sheets.length - 1)]?.id ??
+        null
 
       return sheetMutationResult(request.requestId, {
         sheetId: request.sheetId,
         activeSheetId,
         revision: request.revision ?? nextRevision,
+      })
+    },
+
+    async reorderSheet(request: ReorderSheetRequest): Promise<SheetMutationResult> {
+      await resolveSheet(request.sheetId)
+      const nextSheets = reorderSheetMetadata(toSheetMetadata(lookup.sheets), request)
+      const nextIds = nextSheets.map((sheet) => sheet.id)
+      const orderedSheets = orderWorkerSheets(lookup.sheets, nextIds)
+      const changed = !hasSameSheetOrder(lookup.sheets, orderedSheets)
+
+      sheetOrderIds = nextIds
+      lookup = buildSheetLookupFromSheets(orderedSheets)
+
+      return sheetMutationResult(request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId: request.sheetId,
+        revision: request.revision ?? (changed ? bumpRevision() : revision),
       })
     },
 

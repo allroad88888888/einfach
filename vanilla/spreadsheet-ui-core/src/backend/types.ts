@@ -210,6 +210,15 @@ export interface DeleteSheetRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface ReorderSheetRequest extends SheetRef {
+  kind: 'reorder-sheet'
+  beforeSheetId?: string | null
+  afterSheetId?: string | null
+  targetIndex?: number | null
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface SheetMutationResult {
   sheetId?: string
   requestId?: ProjectionRequestId
@@ -235,4 +244,5 @@ export interface SpreadsheetBackend {
   addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>
   renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
   deleteSheet?(request: DeleteSheetRequest): Promise<SheetMutationResult>
+  reorderSheet?(request: ReorderSheetRequest): Promise<SheetMutationResult>
 }

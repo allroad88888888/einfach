@@ -774,14 +774,21 @@ describe('vnext adapter', () => {
     })
     expect(rename?.sheets?.map((sheet) => sheet.name)).toEqual(['Sheet1', 'Inputs', 'Data'])
 
+    const reorder = await backend.reorderSheet?.({
+      kind: 'reorder-sheet',
+      sheetId: 'sheet-1',
+      afterSheetId: 'sheet-3',
+    })
+    expect(reorder?.sheets?.map((sheet) => sheet.name)).toEqual(['Inputs', 'Data', 'Sheet1'])
+
     const remove = await backend.deleteSheet?.({
       kind: 'delete-sheet',
       sheetId: 'sheet-2',
     })
     expect(remove?.activeSheetId).toBe('sheet-3')
     expect(remove?.sheets).toEqual([
-      { id: 'sheet-1', name: 'Sheet1', index: 0 },
-      { id: 'sheet-3', name: 'Data', index: 1 },
+      { id: 'sheet-3', name: 'Data', index: 0 },
+      { id: 'sheet-1', name: 'Sheet1', index: 1 },
     ])
   })
 
@@ -1274,12 +1281,30 @@ describe('vnext adapter', () => {
     expect(client.calls.renameSheet).toEqual([{ sheet: 1, name: 'Inputs' }])
     expect(rename?.sheets?.map((sheet) => sheet.name)).toEqual(['Sheet1', 'Inputs', 'Calc'])
 
+    const reorder = await backend.reorderSheet?.({
+      kind: 'reorder-sheet',
+      sheetId: 'sheet-1',
+      afterSheetId: 'sheet-3',
+    })
+    expect(reorder).toMatchObject({
+      sheetId: 'sheet-1',
+      activeSheetId: 'sheet-1',
+      revision: 23,
+    })
+    expect(reorder?.sheets?.map((sheet) => sheet.name)).toEqual(['Inputs', 'Calc', 'Sheet1'])
+
+    expect((await backend.listSheets?.())?.sheets.map((sheet) => sheet.name)).toEqual([
+      'Inputs',
+      'Calc',
+      'Sheet1',
+    ])
+
     const remove = await backend.deleteSheet?.({ kind: 'delete-sheet', sheetId: 'sheet-2' })
     expect(client.calls.removeSheet).toEqual([1])
     expect(remove?.activeSheetId).toBe('sheet-3')
     expect(remove?.sheets).toEqual([
-      { id: 'sheet-1', name: 'Sheet1', index: 0 },
-      { id: 'sheet-3', name: 'Calc', index: 1 },
+      { id: 'sheet-3', name: 'Calc', index: 0 },
+      { id: 'sheet-1', name: 'Sheet1', index: 1 },
     ])
 
     backend.dispose()

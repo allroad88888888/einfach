@@ -137,6 +137,13 @@ export interface UpdateSheetTabReorderInput {
 
 export interface CommitSheetTabReorderInput extends UpdateSheetTabReorderInput {}
 
+export interface ReorderSheetMetadataInput {
+  sheetId: string
+  beforeSheetId?: string | null
+  afterSheetId?: string | null
+  targetIndex?: number | null
+}
+
 export const DEFAULT_SHEET_TABS_STATE: SheetTabsState = {
   contextMenu: null,
   rename: null,
@@ -174,6 +181,42 @@ export function getAdjacentSheetId(
   const step = direction === 'previous' ? -1 : 1
   const nextIndex = (activeIndex + step + sheets.length) % sheets.length
   return sheets[nextIndex]?.id ?? null
+}
+
+export function reorderSheetMetadata(
+  sheets: readonly SpreadsheetSheetMetadata[],
+  input: ReorderSheetMetadataInput,
+): SpreadsheetSheetMetadata[] {
+  const normalized = normalizeSheetMetadataList(sheets)
+  const sourceIndex = normalized.findIndex((sheet) => sheet.id === input.sheetId)
+  if (sourceIndex < 0) {
+    return normalized
+  }
+
+  const source = normalized[sourceIndex]
+  const remaining = normalized.filter((sheet) => sheet.id !== input.sheetId)
+  let targetIndex: number | null = null
+
+  if (input.beforeSheetId && input.beforeSheetId !== input.sheetId) {
+    const beforeIndex = remaining.findIndex((sheet) => sheet.id === input.beforeSheetId)
+    targetIndex = beforeIndex >= 0 ? beforeIndex : null
+  } else if (input.afterSheetId && input.afterSheetId !== input.sheetId) {
+    const afterIndex = remaining.findIndex((sheet) => sheet.id === input.afterSheetId)
+    targetIndex = afterIndex >= 0 ? afterIndex + 1 : null
+  } else {
+    targetIndex = normalizeOptionalIndex(input.targetIndex ?? null)
+  }
+
+  if (targetIndex === null) {
+    return reindexSheetMetadata(normalized)
+  }
+
+  const clampedIndex = Math.max(0, Math.min(targetIndex, remaining.length))
+  return reindexSheetMetadata([
+    ...remaining.slice(0, clampedIndex),
+    source,
+    ...remaining.slice(clampedIndex),
+  ])
 }
 
 export function createOpenSheetTabContextMenuIntent(
@@ -497,6 +540,15 @@ function normalizeSheetMetadataList(
   })
 
   return normalized
+}
+
+function reindexSheetMetadata(
+  sheets: readonly SpreadsheetSheetMetadata[],
+): SpreadsheetSheetMetadata[] {
+  return sheets.map((sheet, index) => ({
+    ...sheet,
+    index,
+  }))
 }
 
 function normalizeCoordinate(value: number): number {

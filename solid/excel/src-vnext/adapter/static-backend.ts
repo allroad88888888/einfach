@@ -9,6 +9,7 @@ import type {
   RangeProjectionRequest,
   RangeProjectionResult,
   ClearRangeRequest,
+  ReorderSheetRequest,
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
@@ -23,6 +24,7 @@ import type {
 import {
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
+  reorderSheetMetadata,
 } from '@einfach/spreadsheet-ui-core'
 import type {
   StaticProjectionRequest,
@@ -307,6 +309,13 @@ function assertUniqueSheetName(
 
 function reindexSheets(sheets: readonly SpreadsheetSheetMetadata[]): SpreadsheetSheetMetadata[] {
   return sheets.map((sheet, index) => ({ ...sheet, index }))
+}
+
+function hasSameSheetOrder(
+  left: readonly SpreadsheetSheetMetadata[],
+  right: readonly SpreadsheetSheetMetadata[],
+): boolean {
+  return left.length === right.length && left.every((sheet, index) => sheet.id === right[index]?.id)
 }
 
 function sheetMutationResult(
@@ -1040,6 +1049,23 @@ export function createStaticSpreadsheetBackend(
       return sheetMutationResult(state, request.requestId, {
         sheetId: request.sheetId,
         activeSheetId,
+      })
+    },
+    async reorderSheet(request: ReorderSheetRequest) {
+      const sheet = state.sheets.find((item) => item.id === request.sheetId)
+      if (!sheet) {
+        throw new Error(`unknown sheet: ${request.sheetId}`)
+      }
+
+      const nextSheets = reorderSheetMetadata(state.sheets, request)
+      if (!hasSameSheetOrder(state.sheets, nextSheets)) {
+        state.sheets = nextSheets
+        state.revision = bumpRevision(state.revision)
+      }
+
+      return sheetMutationResult(state, request.requestId, {
+        sheetId: request.sheetId,
+        activeSheetId: request.sheetId,
       })
     },
   }

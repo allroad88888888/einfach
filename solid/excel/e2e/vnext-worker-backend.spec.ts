@@ -56,4 +56,30 @@ test.describe('Solid Excel vNext worker backend', () => {
     await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)
   })
+
+  test('reorders sheet tabs through the Rust worker backend metadata adapter', async ({ page }) => {
+    await gotoVNextWorkerDemo(page)
+
+    const handle = page.getByTestId('sheet-tab-reorder-sheet-3')
+    const firstTab = page.getByRole('tab', { name: 'Sheet1' })
+    const handleBox = await handle.boundingBox()
+    const firstBox = await firstTab.boundingBox()
+    expect(handleBox).not.toBeNull()
+    expect(firstBox).not.toBeNull()
+
+    await page.mouse.move(
+      handleBox!.x + handleBox!.width / 2,
+      handleBox!.y + handleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(firstBox!.x + 2, firstBox!.y + firstBox!.height / 2)
+    await page.mouse.up()
+
+    await expect(page.getByTestId('vnext-worker-sheet-tabs').getByRole('tab').first()).toHaveText(
+      'Sheet3',
+    )
+    await expect(firstTab).toHaveAttribute('data-active', 'true')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expectNoConsoleErrors(page)
+  })
 })

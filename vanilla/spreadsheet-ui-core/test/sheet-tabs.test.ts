@@ -12,6 +12,7 @@ import {
   dispatchSheetTabIntentAtom,
   getAdjacentSheetId,
   normalizeSheetTabDraftName,
+  reorderSheetMetadata,
   setSheetTabsSheetsAtom,
   sheetTabsAtom,
   sheetTabsSheetsAtom,
@@ -147,5 +148,38 @@ describe('sheet tabs core', () => {
     expect(getAdjacentSheetId(sheets, 'sheet-3', 'next')).toBe('sheet-1')
     expect(getAdjacentSheetId(sheets, 'missing', 'next')).toBe('sheet-1')
     expect(getAdjacentSheetId([], 'sheet-1', 'next')).toBeNull()
+  })
+
+  test('reorders sheet metadata by placement hints without materializing cells', () => {
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet1', index: 0 },
+      { id: 'sheet-2', name: 'Sheet2', index: 1 },
+      { id: 'sheet-3', name: 'Sheet3', index: 2 },
+    ]
+
+    expect(
+      reorderSheetMetadata(sheets, {
+        sheetId: 'sheet-3',
+        beforeSheetId: 'sheet-1',
+      }),
+    ).toEqual([
+      { id: 'sheet-3', name: 'Sheet3', index: 0 },
+      { id: 'sheet-1', name: 'Sheet1', index: 1 },
+      { id: 'sheet-2', name: 'Sheet2', index: 2 },
+    ])
+
+    expect(
+      reorderSheetMetadata(sheets, {
+        sheetId: 'sheet-1',
+        afterSheetId: 'sheet-3',
+      }).map((sheet) => sheet.id),
+    ).toEqual(['sheet-2', 'sheet-3', 'sheet-1'])
+
+    expect(
+      reorderSheetMetadata(sheets, {
+        sheetId: 'sheet-2',
+        targetIndex: 0,
+      }).map((sheet) => sheet.id),
+    ).toEqual(['sheet-2', 'sheet-1', 'sheet-3'])
   })
 })

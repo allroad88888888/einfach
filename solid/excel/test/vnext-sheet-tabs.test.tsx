@@ -7,6 +7,7 @@ import {
   sheetTabsAtom,
   sheetTabsSheetsAtom,
   workspaceSessionAtom,
+  reorderSheetMetadata,
 } from '@einfach/spreadsheet-ui-core'
 import type { SpreadsheetBackend, SpreadsheetSheetMetadata } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetSheetTabs } from '../src-vnext/sheet-tabs'
@@ -74,6 +75,16 @@ function createFakeBackend(seedSheets: SpreadsheetSheetMetadata[] = []) {
         sheets,
       }
     },
+    async reorderSheet(request) {
+      revision += 1
+      sheets = reorderSheetMetadata(sheets, request)
+      return {
+        sheetId: request.sheetId,
+        activeSheetId: request.sheetId,
+        revision,
+        sheets,
+      }
+    },
   }
 
   return backend
@@ -83,6 +94,21 @@ async function flushAsyncWork() {
   await Promise.resolve()
   await Promise.resolve()
   await Promise.resolve()
+}
+
+function dispatchPointerEvent(
+  target: EventTarget,
+  type: 'pointerdown' | 'pointermove' | 'pointerup',
+  coordinates: { clientX?: number; clientY?: number },
+) {
+  target.dispatchEvent(
+    new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      clientX: coordinates.clientX ?? 0,
+      clientY: coordinates.clientY ?? 0,
+    }),
+  )
 }
 
 describe('vNext SpreadsheetSheetTabs', () => {
@@ -214,6 +240,56 @@ describe('vNext SpreadsheetSheetTabs', () => {
       window.confirm = originalConfirm
     }
 
+    expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+  })
+
+  it('reorders sheet tabs through pointer drag and preserves the active sheet', async () => {
+    const store = createStore()
+    const sheets = [
+      { id: 'sheet-1', name: 'Sheet One', index: 0 },
+      { id: 'sheet-2', name: 'Sheet Two', index: 1 },
+      { id: 'sheet-3', name: 'Sheet Three', index: 2 },
+    ]
+    const backend = createFakeBackend(sheets)
+
+    const { getByRole, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetSheetTabs sheets={sheets} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushAsyncWork()
+    fireEvent.click(getByRole('tab', { name: 'Sheet Two' }))
+    expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
+
+    const handle = getByTestId('sheet-tab-reorder-sheet-3')
+    const firstTabItem = getByRole('tab', { name: 'Sheet One' }).closest(
+      '[data-sheet-tab-item]',
+    ) as HTMLElement
+    const originalElementFromPoint = document.elementFromPoint
+
+    document.elementFromPoint = () => firstTabItem
+    try {
+      dispatchPointerEvent(handle, 'pointerdown', { clientX: 80, clientY: 20 })
+      await flushAsyncWork()
+      dispatchPointerEvent(window, 'pointermove', { clientX: -1, clientY: 20 })
+      await flushAsyncWork()
+      dispatchPointerEvent(window, 'pointerup', { clientX: -1, clientY: 20 })
+      await flushAsyncWork()
+    } finally {
+      document.elementFromPoint = originalElementFromPoint
+    }
+
+    expect(store.getter(sheetTabsAtom).lastIntent).toMatchObject({
+      type: 'sheet-tab.reorder.commit',
+      sheetId: 'sheet-3',
+      beforeSheetId: 'sheet-1',
+    })
+    expect(store.getter(sheetTabsSheetsAtom).map((sheet) => sheet.name)).toEqual([
+      'Sheet Three',
+      'Sheet One',
+      'Sheet Two',
+    ])
     expect(store.getter(workspaceSessionAtom).activeSheetId).toBe('sheet-2')
   })
 })
