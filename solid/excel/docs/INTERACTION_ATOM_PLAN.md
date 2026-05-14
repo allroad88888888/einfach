@@ -24,12 +24,20 @@
 
 ## 架构决定
 
-交互层新增一个框架无关的 interaction core：
+前端新增一个框架无关的 UI core。它不是 workbook core，也不是 sheet data model；它只管两类
+事情：
+
+- 当前可视区域需要怎么展示。
+- 用户当前正在怎么交互。
+
+目录仍命名为 `interaction/`，但职责包含 viewport window 与 interaction overlay：
 
 ```text
 solid/excel/src/interaction/
   atoms.ts              # primitive / derived / writable atoms
-  commands.ts           # selection/edit/menu/keyboard command
+  viewport.ts           # scroll/size -> visible row/col window
+  projection.ts         # bounded visible projection contract
+  commands.ts           # selection/edit/menu/keyboard/viewport command
   types.ts              # 交互状态类型
   createInteraction.ts  # createStore() + 初始状态 + bridge API
   solid.tsx             # Solid 绑定层，只做 hooks/provider 桥接
@@ -37,20 +45,59 @@ solid/excel/src/interaction/
 
 核心规则：
 
-- interaction core 使用 `@einfach/core` 的 `atom`、`createStore`。
+- UI core 使用 `@einfach/core` 的 `atom`、`createStore`。
 - Solid 组件通过 `@einfach/solid` 或很薄的本地 bridge 读取 atom；组件不再直接保存产品交互状态。
 - `@einfach/solid-excel` 需要声明 workspace 依赖：`@einfach/core` 与 `@einfach/solid`。
-- 每个 workbook/view 创建独立 interaction store，禁止使用全局 default store 承载产品会话状态。
+- 每个 workbook/view 创建独立 UI store，禁止使用全局 default store 承载产品会话状态。
 - Rust/WASM/worker 仍是 workbook facts 的唯一事实源：cell value、formula、dependency graph、
   formula cache、format metadata、sparse snapshot、import session 都不进入 JS atom。
-- interaction atom 只保存“用户正在怎么操作”：selection、edit mode、formula draft、menu、
-  keyboard mode、viewport focus、fill handle、row/col resize 等。
+- UI atom 只保存“可见什么”和“用户正在怎么操作”：viewport window、selection、edit mode、
+  formula draft、menu、keyboard mode、viewport focus、fill handle、row/col resize 等。
+
+## 可视窗口模型
+
+这是跟传统前端表格最大的区别：前端渲染出来的永远只有可视区域，加少量 overscan。百万 cell
+不是百万个 DOM，也不是百万个 atom。
+
+UI core 只维护一个 viewport window：
+
+- `scrollTop` / `scrollLeft`。
+- viewport 宽高。
+- row / col 尺寸模型。
+- overscan 策略。
+- derived `visibleWindow`：`rowStart`、`rowEnd`、`colStart`、`colEnd`。
+
+数据流固定为：
+
+1. DOM scroll / resize 更新 viewport metrics。
+2. `visibleWindow` 由 viewport metrics 和尺寸模型推导出来。
+3. UI 用 `sheetId + visibleWindow` 向 worker/Rust 请求当前窗口的 display projection。
+4. Rust 只在读取这块窗口时计算需要展示的 cell；未读取的公式仍保持 lazy。
+5. UI 渲染 visible cells、headers、selection overlay、active cell、editor、handles。
+6. 窗口滑走后，旧窗口 projection 可以被替换或丢弃，不积累成整张表 cache。
+
+尺寸模型也不能变成百万状态：
+
+- 固定行高/列宽时，用 O(1) 数学从 scroll offset 算 row/col。
+- 后续支持行高/列宽调整时，只保存 sparse override 或区间结构。
+- 正在拖拽 resize 的预览属于 interaction state；真正持久化的 row/col size metadata 属于
+  workbook facts，仍由 worker/Rust 或明确的 workbook metadata 层负责。
+
+visible projection 是有界展示数据，不是核心事实源：
+
+- 可以保存当前窗口的 display values / formats / errors / loading 状态。
+- 必须按 window/version 替换，或最多保留很小的最近窗口缓存。
+- 不能为窗口内每个 cell 创建独立 atom；一个 projection atom 或小量分块 atom 即可。
+- 不能保存完整 sheet、完整 sparse snapshot、公式 cache 或依赖图。
 
 ## 状态边界
 
 必须进 JS atom 的状态：
 
 - 当前 sheet 交互上下文：`activeSheetId` / `activeSheetName` 的 UI 视角。
+- viewport metrics：scroll offset、viewport size、overscan。
+- visible window：当前需要展示的行列范围。
+- visible projection 状态：当前窗口的数据请求状态和有界展示快照。
 - selection：anchor、focus、normalized range、选择模式（cell / row / col / all）。
 - keyboard mode：navigation、range extend、edit、formula reference picking。
 - edit state：正在编辑的地址、输入来源、draft、commit/cancel 意图。
@@ -71,11 +118,14 @@ solid/excel/src/interaction/
 
 - 每个 cell 的 value/formula/result/cache。
 - 每行/每列/每个空 cell 的 atom。
+- 整张 sheet 的 dense matrix。
+- 全量行/列尺寸数组。
 - 公式依赖图或 dirty graph。
 - worker sparse snapshot 的完整副本。
 - 大范围 clipboard/export 的完整中间数据。
 
-原则：交互状态可以“指向”一个 range，但不能物化这个 range 的所有地址。
+原则：UI 状态可以“指向”一个 range，也可以保存当前 visible window 的展示快照，但不能物化整张
+sheet 或把 offscreen cell 变成长期状态。
 
 ## Lazy Formula 约束
 
@@ -94,6 +144,9 @@ selection 移动、右键、sheet tab 切换、toolbar 状态刷新不能触发�
 第一版只建全局交互 atom，不做 per-cell atom：
 
 - `activeSheetAtom`：当前交互 sheet id/name。
+- `viewportMetricsAtom`：scroll offset、viewport size、默认 row/col 尺寸、overscan。
+- `visibleWindowAtom`：derived，当前可见行列范围。
+- `visibleProjectionAtom`：当前窗口展示快照和请求状态，按 window/version 替换。
 - `selectionAtom`：anchor/focus/mode。
 - `selectionRectAtom`：derived，标准化后的矩形，不展开地址列表。
 - `activeCellAddrAtom`：derived，当前 focus 地址。
@@ -130,8 +183,8 @@ Playwright 验证记录。
 | 波次 | 目标 | 可并行角色 | 交付物 |
 |---|---|---|---|
 | IA-0 | 固定合同与依赖 | 架构 / 测试 / 审查 | 本文档、状态白名单、`@einfach/core`/`@einfach/solid` 依赖计划 |
-| IA-1 | 建 interaction core | Atom core / Solid bridge | `interaction/*`、纯 JS atom 单测、无 UI 行为变化 |
-| IA-2 | selection + keyboard 迁移 | Selection / Keyboard / E2E | `sheet-store` selection 改由 interaction core 驱动，键盘导航合同测试 |
+| IA-1 | 建 UI core | Viewport / Atom core / Solid bridge | `interaction/*`、visible window 单测、纯 JS atom 单测、无 UI 行为变化 |
+| IA-2 | selection + keyboard 迁移 | Selection / Keyboard / E2E | `sheet-store` selection 改由 UI core 驱动，键盘导航合同测试 |
 | IA-3 | edit + formula bar 迁移 | Edit / FormulaBar / Diagnostics | F2、Enter、Tab、Esc、formula diagnostics 状态归一 |
 | IA-4 | menu + sheet tabs + toolbar 迁移 | ContextMenu / SheetTabs / Toolbar | 右键菜单、tab 菜单、toolbar 可用状态统一进 atom |
 | IA-5 | Excel 交互补齐 | UX / E2E / MCP | row/col 选择、fill handle、resize、range extend、MCP 记录 |
@@ -141,13 +194,14 @@ Playwright 验证记录。
 
 总架构师负责接口冻结、集成和最终验收。子 agent 只能提交候选补丁。
 
-### IA-1 建 core
+### IA-1 建 UI core
 
 | 角色 | 推荐模型 | 文件所有权 | 任务 |
 |---|---|---|---|
-| A1 Atom Core | Codex Spark | `solid/excel/src/interaction/*` | 定义 atoms、commands、createInteractionStore |
-| A2 Solid Bridge | Codex Spark | `solid/excel/src/interaction/solid.tsx`, `solid/excel/package.json` | 接入 `@einfach/solid` bridge，不迁业务组件 |
-| A3 Tests | Claude Sonnet 或 Codex Mini | `solid/excel/test/interaction*.test.ts` | 纯 store 单测：selection/edit/menu/derived 状态 |
+| A1 Viewport Core | Codex Spark | `solid/excel/src/interaction/viewport.ts`, `types.ts` | scroll/size/overscan 推导 visible window，不碰 UI |
+| A2 Atom Core | Codex Spark | `solid/excel/src/interaction/*` | 定义 atoms、commands、createInteractionStore |
+| A3 Solid Bridge | Codex Spark | `solid/excel/src/interaction/solid.tsx`, `solid/excel/package.json` | 接入 `@einfach/solid` bridge，不迁业务组件 |
+| A4 Tests | Claude Sonnet 或 Codex Mini | `solid/excel/test/interaction*.test.ts` | 纯 store 单测：visible window、selection/edit/menu/derived 状态 |
 
 验收：
 
@@ -256,8 +310,10 @@ npm test
 
 - 任何实现试图为百万 cell 创建 per-cell atom。
 - selection 或 toolbar 派生需要展开大 range 地址列表。
+- viewport/projection 实现会累积 offscreen window 数据，或保留完整 sheet snapshot。
+- 行高/列宽实现需要创建全量 row/col atom 或全量尺寸数组。
 - UI 状态迁移导致公式在 selection 移动时被 eager eval。
-- interaction store 保存了 worker snapshot、formula cache 或 dependency graph。
+- UI store 保存了 worker snapshot、formula cache 或 dependency graph。
 - Solid bridge 为了方便绕开 `@einfach/core`，重新引入框架本地产品状态。
 - MCP 无法验证交互变更，但代码已经改了浏览器行为。
 
@@ -266,8 +322,10 @@ npm test
 交互 atom 化完成时，需要同时满足：
 
 - 产品交互状态只由 JS atom/store 承载。
+- UI core 只关心 visible window、bounded visible projection 和 interaction overlay。
 - Rust/WASM/worker 继续是 workbook facts 的唯一事实源。
 - selection/edit/menu/formula bar/toolbar/sheet tabs 有可独立运行的 atom 单测。
+- viewport window 有独立单测，证明可见行列范围由 scroll/size 推导，不创建 per-cell 状态。
 - 1M demo 中 selection、keyboard、右键、大 range toolbar 操作不物化百万地址。
 - 公式 lazy 约束不回退：导入、设置公式、selection 移动不触发 eager compute。
 - Playwright 全量通过，MCP 记录关键交互和 console 结果。
