@@ -54,7 +54,7 @@
   合同、稳定错误码和 cancel/commit 测试。
 - 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
   或公式结果。自动保存仍未做。
-- 测试覆盖已经很多，E2E 文档计数已经在 Wave 5 对齐到 22 spec / 153 tests / 0 skip。
+- 测试覆盖已经很多，E2E 文档计数已经在 Wave 6 对齐到 22 spec / 155 tests / 0 skip。
   MCP Playwright 验证记录已经进入 Wave 4/5 文档，后续每波继续固定记录。
 
 ## 总体判断
@@ -419,7 +419,7 @@ MCP 验收：
 - 1M demo 已接入文件导入 UI、取消、统计和 `?debug=1` worker debug client。
 - 可见投影刷新只针对当前订阅窗口，不读取全表。
 - E2E 新增 `file-import.spec.ts` 3 条：CSV、TSV、取消后 session 归零。
-- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 22 spec / 153 tests / 0 skip。
+- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 22 spec / 155 tests / 0 skip。
 - MCP Playwright 返回：`A1=21`、`B1=mcp-label`、`A120` 读前 dirty / 读后 clean、
   eval delta 1、取消后 `importSessionCount=0`、console warning/error 0。
 

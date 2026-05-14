@@ -1,10 +1,16 @@
-
 import { createSignal, For, Show } from 'solid-js'
 import { ContextMenu, type ContextMenuItem } from './ContextMenu'
 import type { WorkbookStore } from './workbook-store'
 
+type AsyncOrSync<T> = T | Promise<T>
+type MutatingSheetWorkbook = Omit<WorkbookStore, 'addSheet' | 'renameSheet' | 'removeSheet'> & {
+  addSheet: (name?: string) => AsyncOrSync<number>
+  renameSheet: (idx: number, name: string) => AsyncOrSync<boolean>
+  removeSheet: (idx: number) => AsyncOrSync<boolean>
+}
+
 export interface SheetTabsProps {
-  workbook: WorkbookStore
+  workbook: MutatingSheetWorkbook
 }
 
 /**
@@ -22,25 +28,25 @@ export function SheetTabs(props: SheetTabsProps) {
     items: ContextMenuItem[]
   } | null>(null)
 
-  function onAddClick() {
-    const idx = props.workbook.addSheet()
+  async function onAddClick() {
+    const idx = await Promise.resolve(props.workbook.addSheet())
     if (idx >= 0) props.workbook.setActiveIdx(idx)
   }
 
-  function doRename(idx: number, currentName: string) {
+  async function doRename(idx: number, currentName: string) {
     const next = window.prompt(`Rename "${currentName}" to:`, currentName)
     if (next === null) return
     const trimmed = next.trim()
     if (trimmed === '' || trimmed === currentName) return
-    const ok = props.workbook.renameSheet(idx, trimmed)
+    const ok = await Promise.resolve(props.workbook.renameSheet(idx, trimmed))
     if (!ok) {
       window.alert(`Cannot rename — name "${trimmed}" is already taken.`)
     }
   }
 
-  function doDelete(idx: number, currentName: string) {
+  async function doDelete(idx: number, currentName: string) {
     if (!window.confirm(`Delete sheet "${currentName}"?`)) return
-    const ok = props.workbook.removeSheet(idx)
+    const ok = await Promise.resolve(props.workbook.removeSheet(idx))
     if (!ok) {
       window.alert('Cannot delete the last remaining sheet.')
     }
@@ -85,14 +91,7 @@ export function SheetTabs(props: SheetTabsProps) {
         +
       </button>
       <Show when={menu()}>
-        {(m) => (
-          <ContextMenu
-            items={m().items}
-            x={m().x}
-            y={m().y}
-            onClose={() => setMenu(null)}
-          />
-        )}
+        {(m) => <ContextMenu items={m().items} x={m().x} y={m().y} onClose={() => setMenu(null)} />}
       </Show>
     </div>
   )

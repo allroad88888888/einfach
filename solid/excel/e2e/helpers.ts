@@ -113,11 +113,7 @@ export async function expectDisplay(page: Page, addr: string, expected: string) 
  * purpose — anything fancier (smooth scroll, eased) belongs in the
  * caller.
  */
-export async function scrollWrapper(
-  page: Page,
-  axis: 'x' | 'y',
-  px: number,
-): Promise<void> {
+export async function scrollWrapper(page: Page, axis: 'x' | 'y', px: number): Promise<void> {
   await page.locator('.excel-table-wrapper').evaluate(
     (el, args) => {
       if (args.axis === 'x') {
@@ -175,6 +171,25 @@ export async function acceptDialog(page: Page, text: string | null = null) {
   })
 }
 
+/**
+ * Register handlers for a sequence of native prompts/confirms/alerts.
+ * First dialog consumes `responses[0]`, next consumes `responses[1]`, etc.
+ * `null` or `undefined` dismisses.
+ */
+export function queueDialogs(page: Page, responses: Array<string | null>) {
+  let i = 0
+  page.on('dialog', async (dialog: Dialog) => {
+    const idx = i
+    i += 1
+    const response = responses[idx]
+    if (response === null || response === undefined) {
+      await dialog.dismiss()
+    } else {
+      await dialog.accept(response)
+    }
+  })
+}
+
 // ============================================================================
 // Console error guard
 // ============================================================================
@@ -192,10 +207,7 @@ const DEFAULT_CONSOLE_ALLOWLIST = [
  * scenario needs to opt out (e.g. parse-error specs that expect the
  * UI to log).
  */
-export function guardConsoleErrors(
-  page: Page,
-  extraAllow: RegExp[] = [],
-): () => void {
+export function guardConsoleErrors(page: Page, extraAllow: RegExp[] = []): () => void {
   const allow = [...DEFAULT_CONSOLE_ALLOWLIST, ...extraAllow]
   const errors: string[] = []
   const handler = (msg: import('@playwright/test').ConsoleMessage) => {

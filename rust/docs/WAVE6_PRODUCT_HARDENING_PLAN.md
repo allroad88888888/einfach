@@ -133,3 +133,19 @@ MCP 验收必须记录：
 3. `test(solid-excel): cover worker multisheet product path`
 4. 如公式诊断也落地，单独提交：`feat(solid-excel): surface formula diagnostics`
 
+## 本轮执行记录
+
+- W6-A：`WasmWorkbookStore` 暴露 worker-backed `addSheet` / `renameSheet` /
+  `removeSheet` / `indexOf`。结构操作以 worker RPC + `sheetList()` 回读为权威；
+  remove 后重建 `SheetStore`/adapter 并释放旧订阅；最后一张 sheet 在 store 层拒删。
+- W6-B：`SheetTabs` 支持 sync/async workbook 结构操作；`MultiSheet` 切到
+  `createWorkerWorkbookStore` + worker import session seed；Sheet1!B5 显示
+  `=Expenses!B5` 的结果。
+- W6-C：`multisheet-ui.spec.ts` 扩到 10 条，覆盖 worker-backed seed、add/rename/delete、
+  跨 sheet formula 结果，以及 `Expenses!C5 = Notes!B1+1` 的 lazy debug probe。
+- 集成修复：结构操作重建 store 后，`MultiSheet` table key 改为 active sheet + sheet
+  metadata 指纹，避免 active idx 不变时继续挂旧的 disposed store。
+- MCP Playwright：`http://localhost:5174/?debug=1` 验证 backend 为 `worker-workbook`；
+  Sheet1!B5=11700；打开 Sheet1 时 `Expenses!C5` 为 dirty，切到 Expenses 后显示 41 且
+  cache clean；新增 Sheet4、Notes 重命名为 Renamed、删除 Renamed 均通过；console
+  warning/error 为 0。

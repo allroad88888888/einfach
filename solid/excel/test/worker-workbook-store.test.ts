@@ -37,6 +37,10 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     initWorkbook: string[][]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
     setFormula: Array<{ sheet: number; addr: string; formula: string }>
+    addSheet: string[]
+    renameSheet: Array<{ sheet: number; name: string }>
+    removeSheet: number[]
+    sheetList: WorkbookSheetMeta[][]
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
     setFormatRange: FormatRangeCall[]
@@ -62,6 +66,12 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   }
   emitHydrated(cells: CellSnapshotWire[]): void
   setFormulaResult(sheet: number, addr: string, result: boolean): void
+  behavior?: {
+    failAddSheet?: (name: string) => boolean
+    failRenameSheet?: (sheet: number, name: string) => boolean
+    failRemoveSheet?: (sheet: number) => boolean
+    failSheetList?: () => boolean
+  }
 }
 
 function parseCellAddress(addr: string): { row: number; col: number } {
@@ -111,11 +121,17 @@ function emptySnapshot(ref: CellRefWire): CellSnapshotWire {
   }
 }
 
-function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
+function makeFakeWorkerWorkbookClient(
+  behavior: FakeWorkerWorkbookClient['behavior'] = {},
+): FakeWorkerWorkbookClient {
   const calls: FakeWorkerWorkbookClient['calls'] = {
     initWorkbook: [],
     setCell: [],
     setFormula: [],
+    addSheet: [],
+    renameSheet: [],
+    removeSheet: [],
+    sheetList: [],
     clearCell: [],
     clearRange: [],
     setFormatRange: [],
@@ -180,19 +196,35 @@ function makeFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       return metas
     },
     async sheetList() {
+      calls.sheetList.push([...metas])
+      if (behavior?.failSheetList?.()) {
+        throw new Error('sheetList failed')
+      }
       return metas
     },
     async addSheet(name) {
+      calls.addSheet.push(name)
+      if (behavior?.failAddSheet?.(name)) {
+        throw new Error('addSheet failed')
+      }
       const idx = metas.length
       metas = [...metas, { idx, name }]
       return idx
     },
     async renameSheet(sheet, name) {
+      calls.renameSheet.push({ sheet, name })
+      if (behavior?.failRenameSheet?.(sheet, name)) {
+        return false
+      }
       metas = metas.map((meta) => (meta.idx === sheet ? { ...meta, name } : meta))
       return true
     },
     async removeSheet(sheet) {
-      metas = metas.filter((meta) => meta.idx !== sheet)
+      calls.removeSheet.push(sheet)
+      if (behavior?.failRemoveSheet?.(sheet)) {
+        return false
+      }
+      metas = metas.filter((meta) => meta.idx !== sheet).map((meta, idx) => ({ ...meta, idx }))
       return true
     },
     async setCell(sheet, addr, value) {
@@ -709,6 +741,145 @@ describe('createWorkerWorkbookStore', () => {
       expect(workbook.sheets()).toEqual([{ idx: 0, name: 'Sheet1' }])
 
       workbook.dispose()
+    })
+  })
+
+  it('adds a sheet with default naming and refreshes metadata', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({
+        client,
+        sheets: ['Sheet1', 'Expenses', 'Notes'],
+      })
+
+      const idx = await workbook.addSheet()
+
+      expect(idx).toBe(3)
+      expect(client.calls.addSheet).toEqual(['Sheet4'])
+      expect(client.calls.sheetList).toHaveLength(1)
+      expect(workbook.sheets()).toEqual([
+        { idx: 0, name: 'Sheet1' },
+        { idx: 1, name: 'Expenses' },
+        { idx: 2, name: 'Notes' },
+        { idx: 3, name: 'Sheet4' },
+      ])
+      expect(workbook.indexOf('Sheet4')).toBe(3)
+
+      workbook.dispose()
+    })
+  })
+
+  it('renameSheet refreshes metadata and does not optimistic update on duplicate or failed RPC', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({
+        client,
+        sheets: ['Sheet1', 'Data'],
+      })
+
+      const duplicate = await workbook.renameSheet(0, 'Data')
+      expect(duplicate).toBe(false)
+      expect(client.calls.renameSheet).toEqual([])
+      expect(client.calls.sheetList).toEqual([])
+      expect(workbook.sheets()[0].name).toBe('Sheet1')
+      expect(workbook.indexOf('Sheet1')).toBe(0)
+
+      const failingClient = makeFakeWorkerWorkbookClient({
+        failRenameSheet: () => true,
+      })
+      const failingWorkbook = await createWorkerWorkbookStore({
+        client: failingClient,
+        sheets: ['Sheet1', 'Data'],
+      })
+      const failed = await failingWorkbook.renameSheet(0, 'Summary')
+
+      expect(failed).toBe(false)
+      expect(failingClient.calls.renameSheet).toEqual([{ sheet: 0, name: 'Summary' }])
+      expect(failingClient.calls.sheetList).toEqual([])
+      expect(failingWorkbook.sheets()).toEqual([
+        { idx: 0, name: 'Sheet1' },
+        { idx: 1, name: 'Data' },
+      ])
+
+      const succeeded = await workbook.renameSheet(1, 'Summary')
+      expect(succeeded).toBe(true)
+      expect(workbook.sheets()[1].name).toBe('Summary')
+      expect(workbook.indexOf('Summary')).toBe(1)
+      expect(client.calls.renameSheet).toEqual([{ sheet: 1, name: 'Summary' }])
+      expect(client.calls.sheetList).toHaveLength(1)
+
+      workbook.dispose()
+      failingWorkbook.dispose()
+    })
+  })
+
+  it('removeSheet rebuilds adapters, adjusts activeIdx, and disposes stale subscriptions', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({
+        client,
+        sheets: ['Sheet1', 'A', 'B'],
+      })
+      workbook.setActiveIdx(2)
+      const before = workbook.sheetAt(1)!
+      const observed = before.observeCell('A1')
+
+      expect(workbook.sheets().map((sheet) => sheet.name)).toEqual(['Sheet1', 'A', 'B'])
+      expect(client.calls.subscribeCells).toEqual([[{ sheet: 1, addr: 'A1' }]])
+      expect(workbook.activeIdx()).toBe(2)
+
+      const removed = await workbook.removeSheet(0)
+      expect(removed).toBe(true)
+      expect(workbook.sheets().map((sheet) => sheet.name)).toEqual(['A', 'B'])
+      expect(workbook.activeIdx()).toBe(1)
+      expect(workbook.sheetAt(1)).not.toBe(before)
+
+      await waitFor(() => {
+        expect(client.calls.unsubscribeCells).toHaveLength(1)
+      })
+
+      observed.dispose()
+      workbook.dispose()
+    })
+  })
+
+  it('prevents deleting the last sheet and keeps metadata unchanged', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+
+      const removed = await workbook.removeSheet(0)
+      expect(removed).toBe(false)
+      expect(client.calls.removeSheet).toEqual([])
+      expect(workbook.sheets()).toEqual([{ idx: 0, name: 'Sheet1' }])
+
+      workbook.dispose()
+    })
+  })
+
+  it('keeps sheet metadata when addSheet fails before or after RPC commit', async () => {
+    await withRoot(async () => {
+      const failingAdd = makeFakeWorkerWorkbookClient({
+        failAddSheet: () => true,
+      })
+      const failAddResult = await createWorkerWorkbookStore({ client: failingAdd })
+      expect(await failAddResult.addSheet()).toBe(-1)
+      expect(failingAdd.calls.addSheet).toEqual(['Sheet2'])
+      expect(failingAdd.calls.sheetList).toEqual([])
+      expect(failAddResult.sheets()).toEqual([{ idx: 0, name: 'Sheet1' }])
+      failAddResult.dispose()
+
+      const failingAfterRpc = makeFakeWorkerWorkbookClient({
+        failSheetList: () => true,
+      })
+      const failAfterResult = await createWorkerWorkbookStore({
+        client: failingAfterRpc,
+      })
+      expect(await failAfterResult.addSheet()).toBe(-1)
+      expect(failingAfterRpc.calls.addSheet).toEqual(['Sheet2'])
+      expect(failingAfterRpc.calls.sheetList).toHaveLength(1)
+      expect(failAfterResult.sheets()).toEqual([{ idx: 0, name: 'Sheet1' }])
+      failAfterResult.dispose()
     })
   })
 

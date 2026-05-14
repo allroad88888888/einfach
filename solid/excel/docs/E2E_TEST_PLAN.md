@@ -4,9 +4,9 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
-## Current Status (2026-05-14, post-Wave 5 文件导入)
+## Current Status (2026-05-14, post-Wave 6 MultiSheet hardening)
 
-**22 spec files / 153 active `test()` / 0 skipped** locally green. Status of each
+**22 spec files / 155 active `test()` / 0 skipped** locally green. Status of each
 plan section:
 
 | Section | Status | Spec / Notes |
@@ -21,14 +21,14 @@ plan section:
 | P0 Clipboard | ✅ | `selection-clipboard.spec.ts` (9 tests including cross-sheet name preservation) |
 | P1 WASM Formula Showcase | ✅ | `formulas-wasm.spec.ts` (14 tests, all passing — Discovered #B fixed) |
 | P1 FormulaBar | ✅ | `formula-bar.spec.ts` (8 tests) |
-| P1 MultiSheet UI | ⚠️ | `multisheet-ui.spec.ts` (8 tests). Plan's prompt-on-`+` model was wrong; agent corrected (see Discovered #C) |
+| P1 MultiSheet UI | ✅ | `multisheet-ui.spec.ts` (10 tests). Worker-backed MultiSheet covers seed, tab structure ops, cross-sheet formula result, and lazy debug probe |
 | P1 Other Demo Smoke (Budget/Grades/Sales) | ✅ | `demo-budget.spec.ts` (6) + `demo-grades.spec.ts` (6) + `demo-sales.spec.ts` (8) — option A (WASM migration) landed |
 | P1 Render Counter | ✅ | `render-counter.spec.ts` (6 strict-delta tests). MutationObserver workaround removed after Discovered #A fix |
 | Regression Spec | ✅ | `regression.spec.ts` (6 tests, all passing — Discovered #E.1 + #E.2 both landed) |
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 22 spec files. 153 active `test()`
+Counts: 22 spec files. 155 active `test()`
 + 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
 checkout green (proxy caveat per Discovered #D).
 
@@ -158,7 +158,7 @@ suite fails confusingly.
 
 ## Current Coverage
 
-22 spec files, 153 active `test()` blocks + 0 `.skip`. Landed across two
+22 spec files, 155 active `test()` blocks + 0 `.skip`. Landed across two
 agent batches plus follow-up cleanup work.
 
 | Spec file | Tests | Backend |
@@ -171,7 +171,7 @@ agent batches plus follow-up cleanup work.
 | `format.spec.ts` | 5 | JS mock |
 | `i18n.spec.ts` | 5 | mixed |
 | `selection-clipboard.spec.ts` | 9 | JS mock (`Blank`) |
-| `multisheet-ui.spec.ts` | 8 | JS mock workbook (`Multi-Sheet` demo) |
+| `multisheet-ui.spec.ts` | 10 | worker workbook (`Multi-Sheet` demo) |
 | `million-demo.spec.ts` | 9 | worker workbook + 2D virtualized table |
 | `range-ops.spec.ts` | 4 | JS mock |
 | `undo-redo.spec.ts` | 9 | JS mock |

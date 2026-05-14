@@ -34,6 +34,10 @@ export interface WasmWorkbookStore {
   revision: () => number
   setActiveIdx: (idx: number) => void
   activeStore: () => SheetStore
+  addSheet: (name?: string) => Promise<number>
+  renameSheet: (idx: number, name: string) => Promise<boolean>
+  removeSheet: (idx: number) => Promise<boolean>
+  indexOf: (name: string) => number
   sheetAt: (idx: number) => SheetStore | undefined
   formulaCacheState: (sheetIdx: number, addr: string) => string
   refreshVisible: (sheetIdx?: number) => void
@@ -82,17 +86,81 @@ export async function createWorkerWorkbookStore(
 
   const workerClient: WorkerWorkbookClient = client
 
-  const sheetMetas = await workerClient.initWorkbook(opts.sheets ?? ['Sheet1'])
+  let sheetMetas = await workerClient.initWorkbook(opts.sheets ?? ['Sheet1'])
   await opts.afterInit?.(workerClient, sheetMetas)
   const [activeIdx, setActiveIdxRaw] = createSignal(0)
   const [version, setVersion] = createSignal(0)
-  const adapters = new Map<number, WorkerWorkbookSheetAdapter>()
-  const stores = new Map<number, SheetStore>()
+  let adapters = new Map<number, WorkerWorkbookSheetAdapter>()
+  let stores = new Map<number, SheetStore>()
   const formulaStateCache = new Map<string, string>()
   const formulaStatePending = new Set<string>()
   let disposed = false
 
   const bumpRevision = () => setVersion((v) => v + 1)
+
+  function clampActiveIdx(nextIdx: number, nextCount: number): number {
+    if (nextCount <= 0) return 0
+    if (nextIdx < 0) return 0
+    return Math.min(nextIdx, nextCount - 1)
+  }
+
+  function nameTaken(name: string): boolean {
+    return sheetMetas.some((meta) => meta.name === name)
+  }
+
+  function pickDefaultName(): string {
+    let n = sheetMetas.length + 1
+    while (nameTaken(`Sheet${n}`)) n += 1
+    return `Sheet${n}`
+  }
+
+  function rebuildSheetAdapters(nextMetas: WorkbookSheetMeta[], nextActiveIdx: number) {
+    const nextAdapters = new Map<number, WorkerWorkbookSheetAdapter>()
+    const nextStores = new Map<number, SheetStore>()
+
+    for (const meta of nextMetas) {
+      const adapter = createWorkerWorkbookSheetAdapter(workerClient, meta.idx, bumpRevision)
+      nextAdapters.set(meta.idx, adapter)
+      nextStores.set(meta.idx, createSheetStore(adapter))
+    }
+
+    for (const store of stores.values()) {
+      store.dispose()
+    }
+
+    sheetMetas = nextMetas
+    adapters = nextAdapters
+    stores = nextStores
+    formulaStateCache.clear()
+    formulaStatePending.clear()
+    setActiveIdxRaw(clampActiveIdx(nextActiveIdx, nextMetas.length))
+    bumpRevision()
+  }
+
+  async function refreshFromWorker(
+    nextActiveIdx = activeIdx(),
+  ): Promise<WorkbookSheetMeta[] | undefined> {
+    const nextMetas = await workerClient.sheetList()
+    if (disposed) return undefined
+    rebuildSheetAdapters(nextMetas, nextActiveIdx)
+    return nextMetas
+  }
+
+  async function addSheet(name?: string): Promise<number> {
+    const finalName = name ?? pickDefaultName()
+    if (nameTaken(finalName)) return -1
+
+    const oldActive = activeIdx()
+    try {
+      const addedIdx = await workerClient.addSheet(finalName)
+      const refreshed = await refreshFromWorker(oldActive)
+      if (!refreshed) return -1
+      const idx = refreshed.findIndex((meta) => meta.idx === addedIdx && meta.name === finalName)
+      return idx >= 0 ? idx : -1
+    } catch {
+      return -1
+    }
+  }
 
   function formulaStateKey(sheetIdx: number, addr: string): string {
     return `${sheetIdx}:${addr.toUpperCase()}`
@@ -164,6 +232,43 @@ export async function createWorkerWorkbookStore(
     return store
   }
 
+  async function renameSheet(idx: number, name: string): Promise<boolean> {
+    if (idx < 0 || idx >= sheetMetas.length) return false
+    if (sheetMetas[idx].name === name) return true
+    if (nameTaken(name)) return false
+
+    try {
+      const ok = await workerClient.renameSheet(idx, name)
+      if (!ok) return false
+      const refreshed = await refreshFromWorker(activeIdx())
+      return !!refreshed
+    } catch {
+      return false
+    }
+  }
+
+  async function removeSheet(idx: number): Promise<boolean> {
+    if (idx < 0 || idx >= sheetMetas.length) return false
+    if (sheetMetas.length <= 1) return false
+
+    const oldActive = activeIdx()
+    const oldNextActive =
+      oldActive === idx ? (idx > 0 ? idx - 1 : 0) : oldActive > idx ? oldActive - 1 : oldActive
+
+    try {
+      const ok = await workerClient.removeSheet(idx)
+      if (!ok) return false
+      const refreshed = await refreshFromWorker(oldNextActive)
+      return !!refreshed
+    } catch {
+      return false
+    }
+  }
+
+  function indexOf(name: string): number {
+    return sheetMetas.findIndex((meta) => meta.name === name)
+  }
+
   return {
     sheets: () => {
       version()
@@ -173,6 +278,10 @@ export async function createWorkerWorkbookStore(
     revision: version,
     setActiveIdx,
     activeStore,
+    addSheet,
+    renameSheet,
+    removeSheet,
+    indexOf,
     sheetAt: (idx) => stores.get(idx),
     formulaCacheState,
     refreshVisible: (sheetIdx = activeIdx()) => {
@@ -234,6 +343,10 @@ export async function createThreeSheetChainWorkbookStore(): Promise<WasmWorkbook
     revision: version,
     setActiveIdx,
     activeStore,
+    addSheet: async () => -1,
+    renameSheet: async () => false,
+    removeSheet: async () => false,
+    indexOf: (name) => sheets().findIndex((sheet) => sheet.name === name),
     sheetAt: (idx) => stores[idx],
     formulaCacheState: (sheetIdx, addr) => {
       version()

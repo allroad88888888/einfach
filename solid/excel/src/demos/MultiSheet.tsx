@@ -1,102 +1,239 @@
-
-import { Show } from 'solid-js'
+import { Show, createResource, onCleanup } from 'solid-js'
 import { Table } from '../Table'
 import { SheetTabs } from '../SheetTabs'
-import { createWorkbookStore } from '../workbook-store'
 import { useT } from '../i18n'
+import {
+  type ImportCellWire,
+  type WorkerWorkbookClient as ProxyWorkerClient,
+} from '../wasm-workbook-proxy'
+import { createWorkerWorkbookStore, type WasmWorkbookStore } from '../wasm-workbook-store'
+import { defaultWorkbookWorkerFactory } from '../wasm-workbook-worker-factory'
 
 /**
  * Demo 6: Multi-sheet workbook with a tab bar.
  *
- * Backed by `createWorkbookStore()` — a JS-side mock of the Rust
- * `Workbook` API. The Rust `WasmWorkbook` binding is NOT wired yet;
- * this demo deliberately uses the JS mock so the multi-sheet UI shape
- * can land independent of WASM scope.
- *
- * KNOWN GAP: cross-sheet formulas (e.g. `=Sheet2!A1`) do NOT evaluate.
- * The mock evaluator (`createJSSheet`) is single-sheet — each sheet
- * has no view into the workbook's other sheets. This is fixed when
- * the WASM workbook binding lands. See `rust/docs/TODO.md` 1.5.
+ * Backed by `createWorkerWorkbookStore()` so add/rename/delete and
+ * all sheet lookups run through the worker-owned workbook. This keeps
+ * formula evaluation (including cross-sheet references) on the Rust/WASM
+ * path and avoids JS mock evaluator limitations.
  */
+declare global {
+  interface Window {
+    __einfachBackend?: string
+    __einfachWorkbookDebugClient?: ProxyWorkerClient
+    __einfachDebug?: {
+      backend: 'worker-workbook'
+      store: {
+        sheets: () => Array<{ idx: number; name: string }>
+        activeIdx: () => number
+      }
+      client: ProxyWorkerClient
+      counters: () => Promise<unknown> | unknown
+    }
+  }
+}
+
+type MultiSheetResource = {
+  workbook: WasmWorkbookStore
+  client: ProxyWorkerClient
+}
+
+const IMPORT_CHUNK_SIZE = 128
+
+function exposeDebugState(workbook: WasmWorkbookStore, client: ProxyWorkerClient) {
+  if (typeof window === 'undefined') return
+  const debug = new URLSearchParams(window.location.search).get('debug')
+  if (debug !== '1' && debug !== 'render') return
+
+  window.__einfachBackend = 'worker-workbook'
+  window.__einfachWorkbookDebugClient = client
+  window.__einfachDebug = {
+    backend: 'worker-workbook',
+    store: {
+      sheets: workbook.sheets,
+      activeIdx: workbook.activeIdx,
+    },
+    client,
+    counters: () => client.debugCounters?.(),
+  }
+}
+
+async function seedWorkbook(client: ProxyWorkerClient) {
+  const sessionId = await client.beginImport()
+  const cells: ImportCellWire[] = []
+
+  const flush = async () => {
+    if (cells.length === 0) return
+    await client.importChunk(sessionId, cells.splice(0))
+  }
+
+  const pushCell = async (cell: ImportCellWire) => {
+    cells.push(cell)
+    if (cells.length >= IMPORT_CHUNK_SIZE) {
+      await flush()
+    }
+  }
+
+  try {
+    const sheet1 = 0
+    const sheet2 = 1
+    const sheet3 = 2
+
+    // Sheet1 — base summary with a cross-sheet total formula.
+    await pushCell({ sheet: sheet1, row: 0, col: 0, kind: 'text', value: 'Quarter' })
+    await pushCell({ sheet: sheet1, row: 0, col: 1, kind: 'text', value: 'Revenue' })
+    await pushCell({ sheet: sheet1, row: 0, col: 2, kind: 'text', value: 'Profit' })
+    await pushCell({ sheet: sheet1, row: 1, col: 0, kind: 'text', value: 'Q1' })
+    await pushCell({ sheet: sheet1, row: 1, col: 1, kind: 'number', value: 12000 })
+    await pushCell({ sheet: sheet1, row: 1, col: 2, kind: 'number', value: 3200 })
+    await pushCell({ sheet: sheet1, row: 2, col: 0, kind: 'text', value: 'Q2' })
+    await pushCell({ sheet: sheet1, row: 2, col: 1, kind: 'number', value: 14500 })
+    await pushCell({ sheet: sheet1, row: 2, col: 2, kind: 'number', value: 4100 })
+    await pushCell({ sheet: sheet1, row: 3, col: 0, kind: 'text', value: 'Q3' })
+    await pushCell({ sheet: sheet1, row: 3, col: 1, kind: 'number', value: 11800 })
+    await pushCell({ sheet: sheet1, row: 3, col: 2, kind: 'number', value: 2900 })
+    await pushCell({ sheet: sheet1, row: 4, col: 0, kind: 'text', value: 'Total' })
+    await pushCell({ sheet: sheet1, row: 4, col: 1, kind: 'formula', value: '=Expenses!B5' })
+    await pushCell({ sheet: sheet1, row: 4, col: 2, kind: 'formula', value: '=C2+C3+C4' })
+
+    // Sheet2 — Expenses.
+    await pushCell({ sheet: sheet2, row: 0, col: 0, kind: 'text', value: 'Category' })
+    await pushCell({ sheet: sheet2, row: 0, col: 1, kind: 'text', value: 'Amount' })
+    await pushCell({ sheet: sheet2, row: 1, col: 0, kind: 'text', value: 'Rent' })
+    await pushCell({ sheet: sheet2, row: 1, col: 1, kind: 'number', value: 2500 })
+    await pushCell({ sheet: sheet2, row: 2, col: 0, kind: 'text', value: 'Salaries' })
+    await pushCell({ sheet: sheet2, row: 2, col: 1, kind: 'number', value: 8000 })
+    await pushCell({ sheet: sheet2, row: 3, col: 0, kind: 'text', value: 'Marketing' })
+    await pushCell({ sheet: sheet2, row: 3, col: 1, kind: 'number', value: 1200 })
+    await pushCell({ sheet: sheet2, row: 4, col: 0, kind: 'text', value: 'Total' })
+    await pushCell({ sheet: sheet2, row: 4, col: 1, kind: 'formula', value: '=B2+B3+B4' })
+    await pushCell({ sheet: sheet2, row: 4, col: 2, kind: 'formula', value: '=Notes!B1+1' })
+
+    // Sheet3 — Notes / scratch.
+    await pushCell({
+      sheet: sheet3,
+      row: 0,
+      col: 0,
+      kind: 'text',
+      value: 'Try editing each sheet — switching tabs preserves state.',
+    })
+    await pushCell({ sheet: sheet3, row: 0, col: 1, kind: 'number', value: 40 })
+    await pushCell({
+      sheet: sheet3,
+      row: 1,
+      col: 0,
+      kind: 'text',
+      value: 'Right-click a tab to rename or delete it.',
+    })
+    await pushCell({
+      sheet: sheet3,
+      row: 2,
+      col: 0,
+      kind: 'text',
+      value: 'Click + to add a new sheet.',
+    })
+    await pushCell({
+      sheet: sheet3,
+      row: 3,
+      col: 0,
+      kind: 'text',
+      value: 'Cross-sheet formulas work here, e.g. =Expenses!B5.',
+    })
+
+    await flush()
+    await client.commitImport(sessionId)
+  } catch (error) {
+    await client.cancelImport(sessionId).catch(() => false)
+    throw error
+  }
+}
+
 export function MultiSheet() {
   const t = useT()
-  const wb = createWorkbookStore()
+  const [resource] = createResource<MultiSheetResource>(async () => {
+    let initClient: ProxyWorkerClient | undefined
+    const workbook = await createWorkerWorkbookStore({
+      workerFactory: defaultWorkbookWorkerFactory,
+      sheets: ['Sheet1', 'Expenses', 'Notes'],
+      afterInit: async (client) => {
+        initClient = client
+        await seedWorkbook(client)
+      },
+    })
 
-  // Seed the default sheet with sample data.
-  const sheet1 = wb.activeStore()
-  sheet1.setText('A1', 'Quarter')
-  sheet1.setText('B1', 'Revenue')
-  sheet1.setText('C1', 'Profit')
-  sheet1.setText('A2', 'Q1')
-  sheet1.setNumber('B2', 12000)
-  sheet1.setNumber('C2', 3200)
-  sheet1.setText('A3', 'Q2')
-  sheet1.setNumber('B3', 14500)
-  sheet1.setNumber('C3', 4100)
-  sheet1.setText('A4', 'Q3')
-  sheet1.setNumber('B4', 11800)
-  sheet1.setNumber('C4', 2900)
-  sheet1.setText('A5', 'Total')
-  sheet1.setFormula('B5', '=B2+B3+B4')
-  sheet1.setFormula('C5', '=C2+C3+C4')
+    if (!initClient) {
+      throw new Error('MultiSheet initialization missing worker client')
+    }
 
-  // Sheet 2 — Expenses.
-  const idx2 = wb.addSheet('Expenses')
-  const sheet2 = wb.sheetAt(idx2)!
-  sheet2.setText('A1', 'Category')
-  sheet2.setText('B1', 'Amount')
-  sheet2.setText('A2', 'Rent')
-  sheet2.setNumber('B2', 2500)
-  sheet2.setText('A3', 'Salaries')
-  sheet2.setNumber('B3', 8000)
-  sheet2.setText('A4', 'Marketing')
-  sheet2.setNumber('B4', 1200)
-  sheet2.setText('A5', 'Total')
-  sheet2.setFormula('B5', '=B2+B3+B4')
+    exposeDebugState(workbook, initClient)
+    return { workbook, client: initClient }
+  })
 
-  // Sheet 3 — Notes / scratch.
-  const idx3 = wb.addSheet('Notes')
-  const sheet3 = wb.sheetAt(idx3)!
-  sheet3.setText('A1', 'Try editing each sheet — switching tabs preserves state.')
-  sheet3.setText('A2', 'Right-click a tab to rename or delete it.')
-  sheet3.setText('A3', 'Click + to add a new sheet.')
-  sheet3.setText('A5', 'Note: cross-sheet formulas (e.g. =Expenses!B5) do NOT')
-  sheet3.setText('A6', 'work yet — the JS mock is single-sheet. WASM workbook')
-  sheet3.setText('A7', 'binding is the next step. See rust/docs/TODO.md 1.5.')
+  onCleanup(() => {
+    const loaded = resource()
+    if (!loaded) return
+    loaded.workbook.dispose()
+    if (window.__einfachWorkbookDebugClient === loaded.client) {
+      delete window.__einfachWorkbookDebugClient
+    }
+    if (window.__einfachDebug?.client === loaded.client) {
+      delete window.__einfachDebug
+    }
+    if (window.__einfachBackend === 'worker-workbook') {
+      delete window.__einfachBackend
+    }
+  })
 
   return (
-    <div class="demo-page">
-      <div class="demo-header">
-        <h3>{t('demo.multi.title')}</h3>
-        <p class="demo-desc">
-          {t('demo.multi.desc.beforePlus')} <code>+</code>{' '}
-          {t('demo.multi.desc.afterPlus')}
-        </p>
-      </div>
-      {/*
-        Re-mount Table when the active sheet changes. Two reasons we
-        prefer keyed re-mount over a live prop swap here:
-          1. Cell components hold local edit state (editing / editValue
-             signals). Swapping the store under them would leak edit
-             state across sheets — the user would see "currently typing
-             into A1 of Sheet1" when they hit the Expenses tab.
-          2. Each SheetStore has its own per-cell signal handles; a
-             clean re-mount lets old Cell computations dispose and new
-             ones subscribe to the active sheet's signals fresh, which
-             is the simplest correctness story.
-        The previous SheetStore stays alive (the workbook holds it), so
-        switching back is cheap — just a fresh Table component tree.
-      */}
-      {/*
-        keyed on the +1-shifted active idx so idx 0 is still truthy AND
-        the key changes by value equality on every active-sheet swap.
-        Solid's `<Show keyed>` re-mounts children whenever the `when`
-        value changes — for primitives that's value equality.
-      */}
-      <Show when={wb.activeIdx() + 1} keyed>
-        {(_key) => <Table store={wb.activeStore()} rows={20} cols={10} formulaBar />}
-      </Show>
-      <SheetTabs workbook={wb} />
-    </div>
+    <Show
+      when={resource()}
+      fallback={
+        <div class="demo-page">
+          <p>Loading worker workbook…</p>
+        </div>
+      }
+    >
+      {(loaded) => {
+        const { workbook } = loaded()
+        const tableKey = () =>
+          `${workbook.activeIdx()}|${workbook
+            .sheets()
+            .map((sheet) => `${sheet.idx}:${sheet.name}`)
+            .join('|')}`
+        return (
+          <div class="demo-page">
+            <div class="demo-header">
+              <h3>{t('demo.multi.title')}</h3>
+              <p class="demo-desc">
+                {t('demo.multi.desc.beforePlus')} <code>+</code> {t('demo.multi.desc.afterPlus')}
+              </p>
+            </div>
+            {/*
+            Re-mount Table when the active sheet changes. Two reasons we
+            prefer keyed re-mount over a live prop swap here:
+              1. Cell components hold local edit state (editing / editValue
+                 signals). Swapping the store under them would leak edit
+                 state across sheets — the user would see "currently typing
+                 into A1 of Sheet1" when they hit the Expenses tab.
+              2. Each SheetStore has its own per-cell signal handles; a
+                 clean re-mount lets old Cell computations dispose and new
+                 ones subscribe to the active sheet's signals fresh, which
+                 is the simplest correctness story.
+            The previous SheetStore stays alive (the workbook holds it), so
+            switching back is cheap — just a fresh Table component tree.
+          */}
+            {/*
+            keyed on active sheet plus sheet metadata. Worker-backed structure
+            mutations rebuild all SheetStore instances, so active-idx alone is
+            not enough when deleting a non-active sheet.
+          */}
+            <Show when={tableKey()} keyed>
+              {(_key) => <Table store={workbook.activeStore()} rows={20} cols={10} formulaBar />}
+            </Show>
+            <SheetTabs workbook={workbook} />
+          </div>
+        )
+      }}
+    </Show>
   )
 }
