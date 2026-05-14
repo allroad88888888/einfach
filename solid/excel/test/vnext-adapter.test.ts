@@ -537,6 +537,57 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('resolves static data-edge movement from sparse cells without projecting full rows', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 7,
+      matrix: [
+        ['H1', 'H2', 'H3', null, 'H5'],
+        ['R2', 12, 18, 30, 'ready'],
+        ['R3', null, null, null, 'tail'],
+      ],
+    })
+
+    await expect(
+      backend.resolveDataEdge?.({
+        kind: 'resolve-data-edge',
+        sheetId: 'sheet-1',
+        requestId: 13,
+        from: { row: 1, col: 1 },
+        direction: 'right',
+        bounds: { rowCount: 20, colCount: 10 },
+      }),
+    ).resolves.toEqual({
+      sheetId: 'sheet-1',
+      requestId: 13,
+      revision: 7,
+      target: { row: 1, col: 4 },
+    })
+
+    await expect(
+      backend.resolveDataEdge?.({
+        kind: 'resolve-data-edge',
+        sheetId: 'sheet-1',
+        from: { row: 2, col: 1 },
+        direction: 'right',
+        bounds: { rowCount: 20, colCount: 10 },
+      }),
+    ).resolves.toMatchObject({
+      target: { row: 2, col: 4 },
+    })
+
+    await expect(
+      backend.resolveDataEdge?.({
+        kind: 'resolve-data-edge',
+        sheetId: 'sheet-1',
+        from: { row: 0, col: 0 },
+        direction: 'down',
+        bounds: { rowCount: 20, colCount: 10 },
+      }),
+    ).resolves.toMatchObject({
+      target: { row: 2, col: 0 },
+    })
+  })
+
   it('supports sparse seed helpers directly', () => {
     const cells = sparseCellsToDisplayCells([
       { row: 2, col: 2, displayValue: 'C3' },

@@ -423,6 +423,12 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   渲染一个 fill handle，拖拽时提交 source/target range；static backend 已实现复制，缺少
   `fillRange` 的 backend 只允许小上限可视 fallback。该链路不创建 per-cell atom，不读取整张
   sheet，也不触发公式求值。
+- PC-6 第十五段：vNext Grid 已接数据感知 `Ctrl/Meta+Arrow` 第一版。Backend port
+  增加可选 `resolveDataEdge`，请求只包含 active cell、方向和 sheet bounds，结果只返回
+  一个目标坐标；static backend 在 sparse cell facts 上计算连续数据边界，不走
+  `readRangeProjection` 或整行/整列 projection。Grid adapter 仅在 backend 支持该 port
+  时拦截 Ctrl/Meta+Arrow 并更新 selection；不支持的 backend 继续走原 sheet-boundary
+  fallback。该行为不创建 per-cell atom，也不读取整张 sheet。
 
 PC-6 第一段验收记录：
 
@@ -597,6 +603,21 @@ PC-6 第十四段验收记录：
   后拖拽 `fill-handle-A1` 到 `A3`；验证 `A2/A3=Alpha`、当前仍只渲染 30
   个可视 cell、`J20` offscreen 未挂载、projection 为 `Ready`、console error 为 0。
 
+PC-6 第十五段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest solid/excel/test/vnext-adapter.test.ts solid/excel/test/vnext-grid.test.tsx --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- `npm run build`
+- `npm test`
+- MCP Playwright：打开 `http://localhost:5174/` 的 `vNext` demo，点击 `B2`
+  后按 `Ctrl+ArrowRight`；验证 active/formula address 到 `E2`、`E2` active、
+  当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为 `Ready`、
+  console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -608,8 +629,9 @@ PC-6 第十四段验收记录：
   大范围 streaming clipboard port 仍未接。
 - FormulaBar 已接可视 cell mutation；SheetTabs 已接真实 workbook sheet add/rename/delete，
   但还没有接 sheet reorder mutation。
-- Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、row/col resize
-  的持久化 metadata / auto-fit 等完整 Excel 行为。
+- 数据区域感知的 Ctrl+Arrow 已有 optional backend port 和 static backend 第一版；
+  worker/Rust backend 尚未接 `resolveDataEdge`，当前会 fallback 到 sheet-boundary。
+- Excel 级交互仍缺：row/col resize 的持久化 metadata / auto-fit 等完整 Excel 行为。
 - PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
 
 ## 并行 Agent 计划

@@ -590,9 +590,69 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     bumpRender()
   }
 
+  function getDataEdgeDirection(key: string): 'up' | 'down' | 'left' | 'right' | null {
+    switch (key) {
+      case 'ArrowUp':
+        return 'up'
+      case 'ArrowDown':
+        return 'down'
+      case 'ArrowLeft':
+        return 'left'
+      case 'ArrowRight':
+        return 'right'
+      default:
+        return null
+    }
+  }
+
+  async function moveSelectionToDataEdge(
+    event: KeyboardEvent,
+    direction: 'up' | 'down' | 'left' | 'right',
+  ): Promise<boolean> {
+    const snapshot = selectionSnapshot()
+    if (snapshot.selection.sheetId !== props.sheetId) {
+      return false
+    }
+
+    event.preventDefault()
+    const result = await backend.resolveDataEdge!({
+      kind: 'resolve-data-edge',
+      sheetId: props.sheetId,
+      from: {
+        row: snapshot.activeCell.row,
+        col: snapshot.activeCell.col,
+      },
+      direction,
+      bounds: {
+        rowCount: props.viewport.rowCount,
+        colCount: props.viewport.colCount,
+      },
+    })
+
+    store.setter(selectCellAtom, {
+      sheetId: props.sheetId,
+      coord: result.target,
+      extend: event.shiftKey,
+    })
+    bumpRender()
+    return true
+  }
+
   async function handleGridKeyDown(event: KeyboardEvent) {
     if (event.defaultPrevented) {
       return
+    }
+
+    const dataEdgeDirection = getDataEdgeDirection(event.key)
+    if (
+      dataEdgeDirection &&
+      !event.altKey &&
+      (event.ctrlKey || event.metaKey) &&
+      backend.resolveDataEdge
+    ) {
+      if (await moveSelectionToDataEdge(event, dataEdgeDirection)) {
+        return
+      }
     }
 
     const intent = store.setter(dispatchKeyboardInputAtom, {

@@ -141,14 +141,16 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
   })
 
-  test('keyboard boundary movement updates active address without rendering offscreen cells', async ({ page }) => {
+  test('data-aware ctrl arrow movement stops at the visible data edge', async ({ page }) => {
     await gotoVNextDemo(page)
 
     await cell(page, 'B2').click()
     await page.keyboard.press('Control+ArrowRight')
-    await expect(page.getByTestId('formula-bar-addr')).toHaveText('J2')
-    await expect(page.getByTestId('status-active-cell')).toHaveText('J2')
-    await expect(cell(page, 'J2')).toHaveCount(0)
+    await expect(page.getByTestId('formula-bar-addr')).toHaveText('E2')
+    await expect(page.getByTestId('status-active-cell')).toHaveText('E2')
+    await expect(cell(page, 'E2')).toHaveClass(/cell-active/)
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
   })
 
   test('alt page keys move horizontally by the visible column window', async ({ page }) => {

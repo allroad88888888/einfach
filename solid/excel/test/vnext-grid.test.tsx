@@ -6,6 +6,7 @@ import { render, cleanup, fireEvent, waitFor } from '@solidjs/testing-library'
 import type {
   DisplayCell,
   FillRangeRequest,
+  ResolveDataEdgeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
   VisibleProjectionResult,
@@ -493,6 +494,68 @@ describe('vNext SpreadsheetGrid', () => {
       targetRange: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 0 },
       direction: 'down',
     })
+  })
+
+  it('uses backend data-edge resolution for ctrl arrow movement when available', async () => {
+    const store = createStore()
+    const resolveRequests: ResolveDataEdgeRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.resolveDataEdge = async (request) => {
+      resolveRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        target: { row: request.from.row, col: 4 },
+      }
+    }
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 5,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(20)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'ArrowRight',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(store.getter(selectionAtom)).toEqual({
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 1, col: 4 },
+        focus: { row: 1, col: 4 },
+      })
+    })
+
+    expect(resolveRequests).toEqual([
+      {
+        kind: 'resolve-data-edge',
+        sheetId: 'sheet-1',
+        from: { row: 1, col: 1 },
+        direction: 'right',
+        bounds: { rowCount: 10, colCount: 10 },
+      },
+    ])
   })
 
   it('supports ctrl boundary movement and context menu intents', async () => {

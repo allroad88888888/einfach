@@ -1,4 +1,4 @@
-import type { CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -152,6 +152,26 @@ export interface FillRangeRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export type SpreadsheetDataEdgeDirection = 'up' | 'down' | 'left' | 'right'
+
+export interface ResolveDataEdgeRequest extends SheetRef {
+  kind: 'resolve-data-edge'
+  from: CellCoord
+  direction: SpreadsheetDataEdgeDirection
+  bounds: {
+    rowCount: number
+    colCount: number
+  }
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface ResolveDataEdgeResult extends SheetRef {
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  target: CellCoord
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -211,6 +231,7 @@ export interface SpreadsheetBackend {
   deleteColumns?(request: DeleteColumnsRequest): Promise<BackendMutationResult>
   setFormatRange?(request: SetFormatRangeRequest): Promise<BackendMutationResult>
   fillRange?(request: FillRangeRequest): Promise<BackendMutationResult>
+  resolveDataEdge?(request: ResolveDataEdgeRequest): Promise<ResolveDataEdgeResult>
   addSheet?(request: AddSheetRequest): Promise<SheetMutationResult>
   renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
   deleteSheet?(request: DeleteSheetRequest): Promise<SheetMutationResult>
