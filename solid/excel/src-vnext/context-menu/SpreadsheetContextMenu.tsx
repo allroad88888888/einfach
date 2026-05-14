@@ -2,14 +2,29 @@ import { onCleanup, onMount, For, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   closeMenuAtom,
+  copyClipboardAtom,
+  createRangeProjectionRequest,
   createVisibleProjectionRequest,
+  cutClipboardAtom,
   dispatchMenuCommandAtom,
+  markClipboardReadyAtom,
   menuStateAtom,
+  parseClipboardTsv,
+  pasteClipboardAtom,
+  serializeClipboardTsv,
+  setClipboardErrorAtom,
+  type CellCoord,
+  type CellRange,
+  type ClipboardTextData,
   type MenuCommandIntent,
   type MenuCommandKind,
+  type MenuTarget,
   type MenuTargetKind,
+  type RangeProjectionResult,
+  type SpreadsheetError,
 } from '@einfach/spreadsheet-ui-core'
 
+import { shiftFormulaRefs } from '../../src/formula-shift'
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
   isVisibleProjectionResult,
@@ -44,8 +59,123 @@ const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
   'sheet-tab': [],
 }
 
+const CLIPBOARD_CELL_LIMIT = 10_000
+
 function toInt(value: number) {
   return Math.trunc(value)
+}
+
+function getColumnLabel(index: number): string {
+  let value = index + 1
+  let label = ''
+
+  while (value > 0) {
+    const remainder = (value - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    value = Math.floor((value - 1) / 26)
+  }
+
+  return label
+}
+
+function toA1(coord: CellCoord): string {
+  return `${getColumnLabel(coord.col)}${coord.row + 1}`
+}
+
+function parseA1(addr: string): CellCoord | null {
+  const match = addr.trim().toUpperCase().match(/^([A-Z]+)(\d+)$/)
+  if (!match) return null
+
+  let col = 0
+  for (let index = 0; index < match[1].length; index += 1) {
+    col = col * 26 + (match[1].charCodeAt(index) - 64)
+  }
+
+  const row = Number(match[2]) - 1
+  if (!Number.isInteger(row) || row < 0) return null
+  return { row, col: col - 1 }
+}
+
+function rangeCellCount(range: CellRange): number {
+  if (range.rowEnd < range.rowStart || range.colEnd < range.colStart) return 0
+  return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+}
+
+function clipboardTextCellCount(data: ClipboardTextData): number {
+  return data.cells.reduce((count, row) => count + row.length, 0)
+}
+
+function targetToRange(target: MenuTarget): CellRange | null {
+  switch (target.kind) {
+    case 'cell':
+      return {
+        rowStart: target.cell.row,
+        rowEnd: target.cell.row,
+        colStart: target.cell.col,
+        colEnd: target.cell.col,
+      }
+    case 'range':
+      return { ...target.range }
+    default:
+      return null
+  }
+}
+
+function dataRangeFromOrigin(origin: CellCoord, data: ClipboardTextData): CellRange {
+  const rowCount = Math.max(1, data.cells.length)
+  const colCount = Math.max(1, ...data.cells.map((row) => row.length))
+  return {
+    rowStart: origin.row,
+    rowEnd: origin.row + rowCount - 1,
+    colStart: origin.col,
+    colEnd: origin.col + colCount - 1,
+  }
+}
+
+function resultToClipboardText(result: RangeProjectionResult, range: CellRange): ClipboardTextData {
+  const cellsByKey = new Map<string, RangeProjectionResult['cells'][number]>()
+  for (const cell of result.cells) {
+    cellsByKey.set(`${cell.row}:${cell.col}`, cell)
+  }
+
+  const cells: string[][] = []
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    const fields: string[] = []
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const cell = cellsByKey.get(`${row}:${col}`)
+      fields.push(cell?.formula ?? cell?.displayValue ?? '')
+    }
+    cells.push(fields)
+  }
+
+  return {
+    originAddr: toA1({ row: range.rowStart, col: range.colStart }),
+    cells,
+  }
+}
+
+async function writeClipboardText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function readClipboardText(): Promise<string | null> {
+  try {
+    return await navigator.clipboard.readText()
+  } catch {
+    return null
+  }
+}
+
+function clipboardError(message: string): SpreadsheetError {
+  return {
+    code: 'BACKEND_ERROR',
+    message,
+  }
 }
 
 export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
@@ -119,9 +249,160 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
   }
 
+  async function readClipboardSource(sheetId: string, range: CellRange) {
+    const cellCount = rangeCellCount(range)
+    if (cellCount > CLIPBOARD_CELL_LIMIT) {
+      const error = clipboardError(
+        `Clipboard range is too large: ${cellCount} cells. Streaming copy is not wired yet.`,
+      )
+      store.setter(setClipboardErrorAtom, error)
+      return null
+    }
+
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const request = createRangeProjectionRequest({
+      sheetId,
+      requestId,
+      reason: 'clipboard',
+      range,
+    })
+
+    return backend.readRangeProjection(request)
+  }
+
+  async function copyRangeToClipboard(
+    sheetId: string,
+    range: CellRange,
+    operation: 'copy' | 'cut' = 'copy',
+  ): Promise<boolean> {
+    const result = await readClipboardSource(sheetId, range)
+    if (!result) return false
+
+    const data = resultToClipboardText(result, range)
+    const text = serializeClipboardTsv(data)
+    const transferInput = {
+      source: { sheetId, range },
+      serialization: 'tab-separated' as const,
+      includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
+      includesErrors: result.cells.some((cell) => cell.valueKind === 'error' || !!cell.error),
+      estimatedBytes: text.length,
+    }
+    store.setter(operation === 'cut' ? cutClipboardAtom : copyClipboardAtom, transferInput)
+
+    if (!(await writeClipboardText(text))) {
+      store.setter(setClipboardErrorAtom, clipboardError('Clipboard write failed.'))
+      return false
+    }
+
+    store.setter(markClipboardReadyAtom)
+    return true
+  }
+
+  async function clearClipboardSource(sheetId: string, range: CellRange) {
+    if (rangeCellCount(range) === 1) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId,
+        row: range.rowStart,
+        col: range.colStart,
+        input: '',
+      })
+      return
+    }
+
+    if (!backend.clearRange) {
+      throw new Error('Range clear is not supported by this spreadsheet backend.')
+    }
+    await backend.clearRange({
+      kind: 'clear-range',
+      sheetId,
+      range,
+    })
+  }
+
+  async function pasteClipboardText(sheetId: string, targetRange: CellRange) {
+    const text = await readClipboardText()
+    if (text === null || text.length === 0) {
+      store.setter(setClipboardErrorAtom, clipboardError('Clipboard read failed.'))
+      return
+    }
+
+    const targetOrigin = { row: targetRange.rowStart, col: targetRange.colStart }
+    const targetAddr = toA1(targetOrigin)
+    const data = parseClipboardTsv(text, targetAddr)
+    const cellCount = clipboardTextCellCount(data)
+    if (cellCount > CLIPBOARD_CELL_LIMIT) {
+      store.setter(
+        setClipboardErrorAtom,
+        clipboardError(
+          `Clipboard paste is too large: ${cellCount} cells. Streaming paste is not wired yet.`,
+        ),
+      )
+      return
+    }
+
+    const origin = parseA1(data.originAddr) ?? targetOrigin
+    const drow = targetOrigin.row - origin.row
+    const dcol = targetOrigin.col - origin.col
+    const sourceRange = dataRangeFromOrigin(origin, data)
+    const pasteRange = dataRangeFromOrigin(targetOrigin, data)
+
+    store.setter(pasteClipboardAtom, {
+      source: { sheetId, range: sourceRange },
+      target: { sheetId, range: pasteRange },
+      serialization: 'tab-separated',
+      includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
+      estimatedBytes: text.length,
+    })
+
+    for (const [rowOffset, row] of data.cells.entries()) {
+      for (const [colOffset, field] of row.entries()) {
+        const input = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
+        await backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId,
+          row: targetOrigin.row + rowOffset,
+          col: targetOrigin.col + colOffset,
+          input,
+        })
+      }
+    }
+
+    store.setter(markClipboardReadyAtom)
+    await refreshProjection(sheetId)
+  }
+
+  async function executeClipboardCommand(intent: MenuCommandIntent) {
+    const range = targetToRange(intent.target)
+    if (!range) return
+
+    switch (intent.command) {
+      case 'clipboard.copy':
+        await copyRangeToClipboard(intent.target.sheetId, range)
+        return
+      case 'clipboard.cut':
+        if (await copyRangeToClipboard(intent.target.sheetId, range, 'cut')) {
+          await clearClipboardSource(intent.target.sheetId, range)
+          store.setter(markClipboardReadyAtom)
+          await refreshProjection(intent.target.sheetId)
+        }
+        return
+      case 'clipboard.paste':
+        await pasteClipboardText(intent.target.sheetId, range)
+        return
+      default:
+        return
+    }
+  }
+
   async function executeCommand(intent: MenuCommandIntent) {
     const target = intent.target
     switch (intent.command) {
+      case 'clipboard.copy':
+      case 'clipboard.cut':
+      case 'clipboard.paste':
+        await executeClipboardCommand(intent)
+        return
       case 'cell.clear':
         if (target.kind === 'cell') {
           await backend.setCellInput({

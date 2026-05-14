@@ -6,11 +6,14 @@ import type {
   ClipboardPayloadInput,
   ClipboardState,
   ClipboardTargetDescriptor,
+  ClipboardTextData,
   ClipboardTransferInput,
   ClipboardTransferRequest,
 } from './types'
 
 export * from './types'
+
+export const CLIPBOARD_ORIGIN_MARKER_PREFIX = '# einfach-clipboard-origin: '
 
 function copyRange(range: ClipboardTargetDescriptor['range']): ClipboardTargetDescriptor['range'] {
   return {
@@ -88,6 +91,31 @@ export function createClipboardIntent(
   return {
     type: `clipboard.${operation}` as ClipboardIntent['type'],
     request: createClipboardTransferRequest(operation, input),
+  }
+}
+
+export function serializeClipboardTsv(data: ClipboardTextData): string {
+  const body = data.cells.map((row) => row.join('\t')).join('\n')
+  return `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${data.originAddr}\n${body}`
+}
+
+export function parseClipboardTsv(text: string, fallbackOrigin: string): ClipboardTextData {
+  const normalized = text.replace(/\r\n?/g, '\n')
+  let originAddr = fallbackOrigin
+  let body = normalized
+
+  if (normalized.startsWith(CLIPBOARD_ORIGIN_MARKER_PREFIX)) {
+    const newlineIndex = normalized.indexOf('\n')
+    const markerLine = newlineIndex === -1 ? normalized : normalized.slice(0, newlineIndex)
+    originAddr = markerLine.slice(CLIPBOARD_ORIGIN_MARKER_PREFIX.length).trim() || fallbackOrigin
+    body = newlineIndex === -1 ? '' : normalized.slice(newlineIndex + 1)
+  }
+
+  if (body.endsWith('\n')) body = body.slice(0, -1)
+
+  return {
+    originAddr,
+    cells: body === '' ? [['']] : body.split('\n').map((row) => row.split('\t')),
   }
 }
 
@@ -217,3 +245,13 @@ export const markClipboardReadyAtom = atom(
   },
 )
 markClipboardReadyAtom.debugLabel = 'spreadsheet.clipboard.ready'
+
+export const setClipboardErrorAtom = atom(
+  (get) => get(clipboardStateAtom),
+  (get, set, error: ClipboardState['error']) => {
+    const nextState = setClipboardErrorState(get(clipboardStateAtom), error)
+    set(clipboardStateAtom, nextState)
+    return nextState
+  },
+)
+setClipboardErrorAtom.debugLabel = 'spreadsheet.clipboard.error'

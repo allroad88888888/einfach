@@ -393,6 +393,11 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   时才合并格式，不把整张 sheet 或大选区物化成 cell atom；vNext Toolbar 的 Bold/Italic/
   Fill/Text/Number format 已执行真实 backend range-format mutation 并刷新当前可视 projection，
   vNext Grid 按 projection format 渲染基础样式。
+- PC-6 第九段：vNext ContextMenu 的 Copy/Cut/Paste 已从 intent 接到真实 executor。
+  Copy/Cut 使用 bounded `readRangeProjection` 生成 TSV-with-origin 写系统剪贴板，Cut
+  再走 backend `clearRange` / 单格 clear；Paste 读取系统剪贴板 TSV 后按目标左上角
+  写入 `setCellInput` 并刷新当前可视 projection。无 streaming port 的大范围 clipboard
+  先用 10k cell 阈值拦住，避免前端物化百万格。
 
 PC-6 第一段验收记录：
 
@@ -492,6 +497,19 @@ PC-6 第八段验收记录：
   Bold 后验证 `A1` computed `fontWeight=700`、当前仍只渲染 30 个可视 cell、`J20`
   offscreen 未挂载、projection 状态为 `Ready`、console error 为 0。
 
+PC-6 第九段验收记录：
+
+- `npm run build -w @einfach/spreadsheet-ui-core`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npx jest vanilla/spreadsheet-ui-core/test/clipboard.test.ts solid/excel/test/vnext-context-menu.test.tsx --runInBand`
+- `npx jest solid/excel/test/vnext-context-menu.test.tsx solid/excel/test/vnext-grid.test.tsx vanilla/spreadsheet-ui-core/test/clipboard.test.ts --runInBand`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/vnext-worker-backend.spec.ts`
+- MCP Playwright：打开 `http://127.0.0.1:5173/` 的 `vNext` demo，授予
+  clipboard read/write 权限；右键 `A1` Copy，再右键 `B3` Paste，验证 `B3=Alpha`、
+  当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 状态为 `Ready`、
+  console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -499,7 +517,8 @@ PC-6 第八段验收记录：
   workbook mutation。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
   mutation，row/column insert/delete 已接真实 backend mutation；Toolbar 已接真实
-  range format mutation，但 clipboard command executor 仍未接。
+  range format mutation；ContextMenu Copy/Cut/Paste 已接真实 clipboard executor，但
+  大范围 streaming clipboard port 仍未接。
 - FormulaBar 和 SheetTabs 仍是最小闭环，还没有接真实 workbook sheet rename / sheet reorder
   mutation。
 - Excel 级交互仍缺：数据区域感知的 Ctrl+Arrow 边界、完整横向 Page/Home/End 行为、

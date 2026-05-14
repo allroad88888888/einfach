@@ -8,6 +8,9 @@ import {
   createClipboardTransferRequest,
   pasteClipboardAtom,
   clearClipboardAtom,
+  parseClipboardTsv,
+  serializeClipboardTsv,
+  setClipboardErrorAtom,
   type ClipboardState,
 } from '../src/clipboard'
 
@@ -134,6 +137,55 @@ describe('clipboard core', () => {
       target: null,
       payload: null,
       error: null,
+    })
+  })
+
+  test('serializes and parses TSV text with an optional origin marker', () => {
+    const serialized = serializeClipboardTsv({
+      originAddr: 'B2',
+      cells: [
+        ['1', '=A1+1'],
+        ['x', ''],
+      ],
+    })
+
+    expect(serialized).toBe('# einfach-clipboard-origin: B2\n1\t=A1+1\nx\t')
+    expect(parseClipboardTsv(serialized.replace(/\n/g, '\r\n'), 'A1')).toEqual({
+      originAddr: 'B2',
+      cells: [
+        ['1', '=A1+1'],
+        ['x', ''],
+      ],
+    })
+    expect(parseClipboardTsv('plain\ttext\n', 'C3')).toEqual({
+      originAddr: 'C3',
+      cells: [['plain', 'text']],
+    })
+  })
+
+  test('stores clipboard errors without payload data', () => {
+    const store = createStore()
+
+    store.setter(copyClipboardAtom, {
+      source: {
+        sheetId: 'sheet-1',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      },
+    })
+    store.setter(setClipboardErrorAtom, {
+      code: 'BACKEND_ERROR',
+      message: 'copy failed',
+    })
+
+    expect(store.getter(clipboardStateAtom)).toMatchObject({
+      status: 'error',
+      error: {
+        code: 'BACKEND_ERROR',
+        message: 'copy failed',
+      },
+      payload: {
+        cellCount: 1,
+      },
     })
   })
 })

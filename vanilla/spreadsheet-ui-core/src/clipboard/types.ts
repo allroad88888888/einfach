@@ -24,6 +24,13 @@ export interface ClipboardPayloadDescriptor {
   includesErrors: boolean
 }
 
+export interface ClipboardTextData {
+  /** Row-major tabular text fields. */
+  cells: string[][]
+  /** A1 address of the copied range top-left. */
+  originAddr: string
+}
+
 export interface ClipboardTargetDescriptor extends SheetRef {
   range: CellRange
 }

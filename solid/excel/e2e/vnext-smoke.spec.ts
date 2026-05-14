@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { grantClipboard } from './helpers'
 
 test.describe('Solid Excel vNext smoke', () => {
   async function gotoVNextDemo(page: Page) {
@@ -145,5 +146,29 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(menu).toHaveCount(0)
     await expect(cellDisplay(page, 'A1')).toHaveText('Alpha')
     await expect(cellDisplay(page, 'B1')).toHaveText('Gamma')
+  })
+
+  test('context menu copy and paste mutate through the vNext backend', async ({
+    page,
+    context,
+  }) => {
+    await grantClipboard(context)
+    await gotoVNextDemo(page)
+
+    await cell(page, 'A1').click({ button: 'right' })
+    let menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await page.getByTestId('context-menu-command-clipboard.copy').click()
+    await expect(menu).toHaveCount(0)
+
+    await cell(page, 'B3').click({ button: 'right' })
+    menu = page.getByTestId('vnext-context-menu')
+    await expect(menu).toBeVisible()
+    await page.getByTestId('context-menu-command-clipboard.paste').click()
+    await expect(menu).toHaveCount(0)
+
+    await expect(cellDisplay(page, 'B3')).toHaveText('Alpha')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
   })
 })
