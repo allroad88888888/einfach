@@ -139,26 +139,72 @@ selection 移动、右键、sheet tab 切换、toolbar 状态刷新不能触发�
 公式栏同步 draft 时，优先读取公式源码或用户输入源，不为了显示 draft 去读 formula result。
 如果后续做公式引用拾取，也只能写 interaction atom 中的 reference-picking 状态，不能预热整片区域。
 
-## Atom 模型草案
+## 在线 Excel 功能域拆分
 
-第一版只建全局交互 atom，不做 per-cell atom：
+按在线 Excel 的功能拆域后，大部分能力是“命令 + 派生展示”，不是新状态。第一版 UI core
+只保留 21 个核心 atom：14 个 writable/source atom，7 个 derived atom。
 
-- `activeSheetAtom`：当前交互 sheet id/name。
-- `viewportMetricsAtom`：scroll offset、viewport size、默认 row/col 尺寸、overscan。
-- `visibleWindowAtom`：derived，当前可见行列范围。
-- `visibleProjectionAtom`：当前窗口展示快照和请求状态，按 window/version 替换。
-- `selectionAtom`：anchor/focus/mode。
-- `selectionRectAtom`：derived，标准化后的矩形，不展开地址列表。
-- `activeCellAddrAtom`：derived，当前 focus 地址。
-- `editSessionAtom`：编辑地址、draft、source、dirty、commit policy。
-- `formulaBarAtom`：focused、draft、diagnostic、lastValidatedInput。
-- `keyboardModeAtom`：navigation/editing/extending/fill/reference-picking。
-- `contextMenuAtom`：closed 或打开状态、坐标、target kind、target range。
-- `dragStateAtom`：drag-select、fill-handle、resize-row、resize-col。
-- `commandAvailabilityAtom`：derived，基于 selection/edit/menu 推导 UI 按钮可用性。
+| 功能域 | 需要保存的 UI 状态 | 后端 / 命令负责 | 不建 atom 的内容 |
+|---|---|---|---|
+| Sheet 工作区 | 当前 UI 激活的 sheet、视图版本 | workbook store 切 sheet、增删改名 | 全量 sheet 列表 facts、sheet data |
+| Viewport 渲染 | scroll、viewport size、overscan、visible projection | worker/Rust 按 window 取 display projection | offscreen cell、整张表 projection |
+| 行列尺寸 | 默认尺寸、sparse override 的 UI 投影、resize 预览 | 持久化尺寸 metadata、结构操作 | 每行/每列一个 atom、全量尺寸数组 |
+| 选择与导航 | anchor、focus、mode、active cell | 键盘命令、scrollToCell、range command | 展开 range 内所有地址 |
+| Cell 编辑 | 当前编辑地址、draft、commit/cancel 状态 | set value/formula async command | cell value/formula/result 本体 |
+| FormulaBar | focus、draft、diagnostic、引用拾取状态 | 公式解析、cycle 检查、lazy eval | 公式结果 cache |
+| 公式引用拾取 | keyboard/reference-picking mode、临时引用 range | commit 时写公式文本 | 预读引用区域结果 |
+| 右键菜单 | menu open/target/highlight | clear/copy/cut/insert/delete command | 菜单项结果、range 数据 |
+| Toolbar / Ribbon | 打开的 dropdown、color picker、按钮可用性 | apply format/range format command | 单元格格式 facts |
+| Clipboard | copy/cut/paste UI 状态、最近命令状态 | worker chunked export/import、浏览器 clipboard | 大范围 TSV 完整中间数据 |
+| Fill handle / drag | drag 起点、当前点、预览 range | 小范围填充或 range command | 被填充区域每个 cell 状态 |
+| Row/Col 结构 | header selection、resize/insert/delete 交互态 | worker/Rust row/col insert/delete | dense row/col model |
+| Sheet tabs | tab menu、rename/delete 流程 UI | workbook store facts mutation | sheet 内容与依赖图 |
+| Import/Export/Save | 进度、错误、取消中状态 | worker import session、snapshot、file sink | 导入 staging workbook、持久化 snapshot 副本 |
+| Diagnostics / Status | 命令错误、加载状态、轻量 toast | 真实错误码来自 worker/Rust | 错误 cell 的全量索引 |
 
-命令通过 writable atom 或 command function 统一写入：
+## 核心 Atom 清单
 
+### Writable / Source Atom：14 个
+
+这些 atom 是唯一需要直接写入的 UI source state。它们都是 workbook/view 级别，不按 cell、
+row、col 动态创建。
+
+| # | Atom | 负责内容 | 典型写入来源 |
+|---|---|---|---|
+| 1 | `activeSheetUiAtom` | 当前 UI 激活 sheet id/name、sheet view version | sheet tab click、workbook init |
+| 2 | `viewportMetricsAtom` | scrollTop、scrollLeft、viewportW/H、overscan | scroll、resize、keyboard scroll |
+| 3 | `dimensionProjectionAtom` | 默认 row/col size、visible/sparse size override | metadata load、resize preview/commit |
+| 4 | `visibleProjectionAtom` | 当前 window 的 display cells、formats、errors、loading/version | worker visible read resolve |
+| 5 | `selectionAtom` | anchor、focus、mode(cell/row/col/all)、lastIntent | click、keyboard、name box |
+| 6 | `editSessionAtom` | editing addr、draft、source、dirty、commit policy | typing、F2、double click、FormulaBar |
+| 7 | `formulaBarAtom` | focused、draft、diagnostic、lastValidatedInput | FormulaBar input、diagnostic response |
+| 8 | `keyboardModeAtom` | navigation/editing/extending/reference-picking | keydown、edit begin/cancel |
+| 9 | `pointerInteractionAtom` | drag-select、fill-handle、resize-row/col、autoscroll | pointer down/move/up |
+| 10 | `contextMenuAtom` | open/closed、target kind/range、position、highlight | right click、keyboard menu |
+| 11 | `toolbarUiAtom` | open dropdown、color picker、pending toolbar command | toolbar click、format picker |
+| 12 | `sheetTabUiAtom` | tab context menu、rename/delete UI flow | tab right click、prompt/confirm |
+| 13 | `clipboardUiAtom` | cut/copy source marker、paste mode、last clipboard error | copy/cut/paste command |
+| 14 | `asyncOperationUiAtom` | import/export/save/load progress、cancel/error/toast | worker operation events |
+
+### Derived Atom：7 个
+
+这些 atom 只从 source atom 推导，不单独保存第二份状态。
+
+| # | Atom | 派生自 | 用途 |
+|---|---|---|---|
+| 15 | `visibleWindowAtom` | `viewportMetricsAtom` + `dimensionProjectionAtom` | 得到 rowStart/rowEnd/colStart/colEnd |
+| 16 | `visibleRequestAtom` | `activeSheetUiAtom` + `visibleWindowAtom` + projection version | 生成 worker/Rust display projection 请求 key |
+| 17 | `selectionRectAtom` | `selectionAtom` | 标准化 selection rectangle，不展开地址 |
+| 18 | `activeCellAddrAtom` | `selectionAtom` + `activeSheetUiAtom` | FormulaBar、name box、active cell overlay |
+| 19 | `gridOverlayAtom` | visible window + selection/edit/pointer/menu | active cell、selection、fill、resize、editor 的 overlay |
+| 20 | `formulaInputViewAtom` | formulaBar + editSession + activeCell | 决定 FormulaBar 展示 draft/source/diagnostic |
+| 21 | `commandAvailabilityAtom` | selection/edit/menu/operation/projection | toolbar/menu/shortcut 是否可用 |
+
+### 不计入 Atom 的东西
+
+命令不是 atom。第一版命令以 function 或 writable command atom 封装写入，但不增加长期状态：
+
+- `scrollToCell`
 - `selectCell`
 - `selectRange`
 - `extendSelection`
@@ -169,10 +215,19 @@ selection 移动、右键、sheet tab 切换、toolbar 状态刷新不能触发�
 - `cancelEdit`
 - `openContextMenu`
 - `closeContextMenu`
+- `copySelection`
+- `pasteAtSelection`
+- `applyFormatToSelection`
 - `beginFillHandle`
 - `beginResizeRowCol`
+- `startImport`
+- `cancelImport`
 
-命令层可以调用现有 `SheetStore` / worker command，但不保存后端数据副本。
+visible projection 如果后续需要优化重渲染，可以拆成 bounded window shard atom，但必须满足：
+
+- shard 数量跟 visible window 或 overscan 上限绑定，不能跟 sheet 总 cell 数绑定。
+- shard cache 必须有很小的 max size，例如最近 4 到 8 个 window。
+- shard atom 只保存展示快照，不能保存公式 cache、依赖图或 sparse workbook snapshot。
 
 ## 分阶段执行
 
@@ -183,7 +238,7 @@ Playwright 验证记录。
 | 波次 | 目标 | 可并行角色 | 交付物 |
 |---|---|---|---|
 | IA-0 | 固定合同与依赖 | 架构 / 测试 / 审查 | 本文档、状态白名单、`@einfach/core`/`@einfach/solid` 依赖计划 |
-| IA-1 | 建 UI core | Viewport / Atom core / Solid bridge | `interaction/*`、visible window 单测、纯 JS atom 单测、无 UI 行为变化 |
+| IA-1 | 建 UI core | Viewport / Atom core / Solid bridge | `interaction/*`、21 个 atom 清单、visible window 单测、无 UI 行为变化 |
 | IA-2 | selection + keyboard 迁移 | Selection / Keyboard / E2E | `sheet-store` selection 改由 UI core 驱动，键盘导航合同测试 |
 | IA-3 | edit + formula bar 迁移 | Edit / FormulaBar / Diagnostics | F2、Enter、Tab、Esc、formula diagnostics 状态归一 |
 | IA-4 | menu + sheet tabs + toolbar 迁移 | ContextMenu / SheetTabs / Toolbar | 右键菜单、tab 菜单、toolbar 可用状态统一进 atom |
@@ -201,7 +256,7 @@ Playwright 验证记录。
 | A1 Viewport Core | Codex Spark | `solid/excel/src/interaction/viewport.ts`, `types.ts` | scroll/size/overscan 推导 visible window，不碰 UI |
 | A2 Atom Core | Codex Spark | `solid/excel/src/interaction/*` | 定义 atoms、commands、createInteractionStore |
 | A3 Solid Bridge | Codex Spark | `solid/excel/src/interaction/solid.tsx`, `solid/excel/package.json` | 接入 `@einfach/solid` bridge，不迁业务组件 |
-| A4 Tests | Claude Sonnet 或 Codex Mini | `solid/excel/test/interaction*.test.ts` | 纯 store 单测：visible window、selection/edit/menu/derived 状态 |
+| A4 Tests | Claude Sonnet 或 Codex Mini | `solid/excel/test/interaction*.test.ts` | 纯 store 单测：21 个核心 atom、visible window、selection/edit/menu/derived 状态 |
 
 验收：
 
@@ -309,6 +364,7 @@ npm test
 遇到以下情况必须暂停并重规划：
 
 - 任何实现试图为百万 cell 创建 per-cell atom。
+- 新增第 22 个核心 atom，但无法说明为什么不能放进已有 source atom 或 derived atom。
 - selection 或 toolbar 派生需要展开大 range 地址列表。
 - viewport/projection 实现会累积 offscreen window 数据，或保留完整 sheet snapshot。
 - 行高/列宽实现需要创建全量 row/col atom 或全量尺寸数组。
@@ -323,6 +379,7 @@ npm test
 
 - 产品交互状态只由 JS atom/store 承载。
 - UI core 只关心 visible window、bounded visible projection 和 interaction overlay。
+- 第一版核心 atom 数量保持 21 个：14 个 writable/source + 7 个 derived。
 - Rust/WASM/worker 继续是 workbook facts 的唯一事实源。
 - selection/edit/menu/formula bar/toolbar/sheet tabs 有可独立运行的 atom 单测。
 - viewport window 有独立单测，证明可见行列范围由 scroll/size 推导，不创建 per-cell 状态。
