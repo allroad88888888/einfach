@@ -1,4 +1,10 @@
-import type { CellFormatJSON, CellValue, FormatRangeSnapshot } from './types'
+import type {
+  CellFormatJSON,
+  CellValue,
+  FormulaMutationResult,
+  FormatRangeSnapshot,
+} from './types'
+export type { FormulaMutationErrorCode, FormulaMutationResult } from './types'
 
 type CellType = CellValue['type']
 const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
@@ -87,11 +93,7 @@ export interface RpcErrorWire {
   message: string
 }
 
-export type FormulaMutationErrorCode = 'INVALID_FORMULA' | 'FORMULA_CYCLE' | 'FORMULA_REJECTED'
-
-export type FormulaMutationResultWire =
-  | { ok: true }
-  | { ok: false; code: FormulaMutationErrorCode; message: string; display?: string }
+export type FormulaMutationResultWire = FormulaMutationResult
 
 export interface WorkbookPersistenceSheetWire {
   idx: number

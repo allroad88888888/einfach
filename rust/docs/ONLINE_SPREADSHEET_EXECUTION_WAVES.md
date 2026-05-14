@@ -46,16 +46,16 @@
 
 仍未达到产品目标的地方：
 
-- 同步 `ISheet.set_formula` 仍然只能返回 optimistic `true`。产品路径要继续收敛到
-  `setFormulaAsync` / async command facade，文档和 UI 入口不能再把同步兼容层当权威结果。
+- 同步 `ISheet.set_formula` 仍然只能返回 optimistic `true`，但产品公式提交路径已经收敛到
+  `setFormulaAsync` / `setFormulaDetailedAsync`；FormulaBar 不再把同步兼容层当权威结果。
 - 浏览器剪贴板写入仍需要最终字符串；当前已把 worker 侧 range export 改成按行块读取和
   postMessage，后续文件导出/持久化可复用 chunk 合同继续做真正 sink streaming。
 - worker import session 已按 chunk 写入 worker 内 staging workbook，并补上 bounded memory
   合同、稳定错误码和 cancel/commit 测试。
 - 稀疏持久化 v1 合同已经形成：sheet meta + sparse cells + format metadata，不保存 dense grid
   或公式结果。自动保存仍未做。
-- 测试覆盖已经很多，E2E 文档计数已经在 Wave 6 对齐到 22 spec / 155 tests / 0 skip。
-  MCP Playwright 验证记录已经进入 Wave 4/5 文档，后续每波继续固定记录。
+- 测试覆盖已经很多，E2E 文档计数已经在 Wave 6 对齐到 23 spec / 160 tests / 0 skip。
+  MCP Playwright 验证记录已经进入 Wave 4/5/6 文档，后续每波继续固定记录。
 
 ## 总体判断
 
@@ -419,11 +419,15 @@ MCP 验收：
 - 1M demo 已接入文件导入 UI、取消、统计和 `?debug=1` worker debug client。
 - 可见投影刷新只针对当前订阅窗口，不读取全表。
 - E2E 新增 `file-import.spec.ts` 3 条：CSV、TSV、取消后 session 归零。
-- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 22 spec / 155 tests / 0 skip。
+- `solid/excel/docs/E2E_TEST_PLAN.md` 已同步为 23 spec / 160 tests / 0 skip。
 - MCP Playwright 返回：`A1=21`、`B1=mcp-label`、`A120` 读前 dirty / 读后 clean、
   eval delta 1、取消后 `importSessionCount=0`、console warning/error 0。
 
 ## 波次 6：产品硬化与 Excel 兼容缺口
+
+状态：MultiSheet worker product path、公式诊断、`TEXT/TODAY/NOW` 浏览器门禁均已落地；
+虚拟列下 keyboard/accessibility/context-menu/toolbar 的完整发布级扫尾仍留给下一产品化小波或
+发布门禁波。
 
 ### 目标
 

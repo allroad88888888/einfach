@@ -4,7 +4,8 @@
 >
 > Branch: `claude/rust-core-state-plan-Auzcj`
 > Last verified committed tip: `4337eb7` (Wave 5 file import/backpressure)
-> Current verified worktree: clean after Wave 5; Wave 6 product hardening starts from worker-backed MultiSheet planning
+> Current verified worktree: Wave 6 product hardening complete through worker-backed MultiSheet,
+> FormulaBar diagnostics, and `TEXT/TODAY/NOW` browser gates; commit pending in current window
 >
 > **Not pushed to origin. CI workflows not touched. Both forbidden by
 > user rule until the overall arc lands.**
@@ -230,9 +231,9 @@ Once agents return:
 | **E** | Stop and review with user | — | Branch is 130+ commits ahead of `main` and accumulating; consider a checkpoint conversation |
 
 Recommended pick if the new window has full autonomy after the current commit:
-**Wave 6 product hardening** (formula diagnostics, worker multi-sheet product
-path, virtualized UX/a11y), using `ONLINE_SPREADSHEET_EXECUTION_WAVES.md`.
-Hold **D** until user green-lights it.
+**Wave 6 remaining UX/a11y hardening or the release gate wave** (virtualized
+keyboard/context-menu/toolbar sweep, then full release validation), using
+`ONLINE_SPREADSHEET_EXECUTION_WAVES.md`. Hold **D** until user green-lights it.
 Push/CI remains explicitly forbidden until the overall arc lands.
 
 ## File reading order for the next agent

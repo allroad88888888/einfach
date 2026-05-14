@@ -764,6 +764,22 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "UPPER" => text_unary(args, provider, |s| s.to_uppercase()),
         "LOWER" => text_unary(args, provider, |s| s.to_lowercase()),
         "TRIM" => text_unary(args, provider, |s| s.trim().to_string()),
+        "TEXT" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let n = eval_expr_with_provider(&args[0], provider);
+            let fmt = coerce_to_text(&eval_expr_with_provider(&args[1], provider));
+            let n = match coerce_to_number(&n) {
+                Some(v) if v.is_finite() => v,
+                Some(_) => return Value::Error(ValueError::InvalidValue),
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            match format_with_text_pattern(n, &fmt) {
+                Some(formatted) => Value::Text(formatted),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
 
         // === Conditional aggregates ===
         "COUNTIF" => {
@@ -1304,6 +1320,41 @@ fn text_slice(
     Value::Text(take(&s, n))
 }
 
+fn format_with_text_pattern(value: f64, pattern: &str) -> Option<String> {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return None;
+    }
+
+    if pattern == "0.00" {
+        return Some(format!("{:.2}", value));
+    }
+
+    if pattern.chars().all(|c| c == '0') {
+        let width = pattern.len();
+        let rounded = format!("{:.0}", value);
+        let (sign, digits) = rounded
+            .strip_prefix('-')
+            .map_or(("", rounded.as_str()), |digits| ("-", digits));
+        return Some(format!("{sign}{}", format!("{:0>width$}", digits)));
+    }
+
+    if pattern.contains('.') {
+        let (left, right) = pattern.split_once('.')?;
+        if left.is_empty()
+            || right.is_empty()
+            || !left.chars().all(|c| c == '0')
+            || !right.chars().all(|c| c == '0')
+        {
+            return None;
+        }
+        let decimals = right.len();
+        return Some(format!("{:.*}", decimals, value));
+    }
+
+    None
+}
+
 /// Match a value against a SUMIF/COUNTIF criterion. Supports:
 /// - Bare values: equality
 /// - Text starting with `>`, `<`, `>=`, `<=`, `<>`, `=` followed by a number
@@ -1568,6 +1619,19 @@ mod tests {
         assert_eq!(
             eval_str("=TRIM(\"  hi  \")", &cm, &vs),
             Value::Text("hi".into())
+        );
+
+        assert_eq!(
+            eval_str("=TEXT(1234.5,\"0.00\")", &cm, &vs),
+            Value::Text("1234.50".into())
+        );
+        assert_eq!(
+            eval_str("=TEXT(7,\"000\")", &cm, &vs),
+            Value::Text("007".into())
+        );
+        assert_eq!(
+            eval_str("=TEXT(\"7\",\"0.00\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
         );
     }
 

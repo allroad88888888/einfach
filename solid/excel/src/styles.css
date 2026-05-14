@@ -397,6 +397,11 @@ thead .row-header {
   display: flex;
   align-items: center;
 }
+.formula-bar-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
 .formula-bar-input {
   flex: 1;
   padding: 6px 12px;
@@ -409,6 +414,17 @@ thead .row-header {
 .formula-bar-input:disabled {
   color: #999;
   background: #f6f6f6;
+}
+
+.formula-bar-error {
+  color: #b42318;
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 2px 12px;
+  min-height: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* === Format Toolbar (Phase 6) ===

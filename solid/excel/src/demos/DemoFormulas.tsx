@@ -22,6 +22,12 @@ export function DemoFormulas() {
     exposeStoreForDebug(store)
     return store
   })
+  onCleanup(() => {
+    const store = storeRes()
+    if (store && window.__einfachStore === store) {
+      delete window.__einfachStore
+    }
+  })
 
   return (
     <Show
@@ -62,11 +68,6 @@ function exposeStoreForDebug(store: SheetStore) {
   const debug = new URLSearchParams(window.location.search).get('debug')
   if (debug !== '1' && debug !== 'render') return
   window.__einfachStore = store
-  onCleanup(() => {
-    if (window.__einfachStore === store) {
-      delete window.__einfachStore
-    }
-  })
 }
 
 /** Seed the demo grid. Split out so the loading branch stays tiny. */

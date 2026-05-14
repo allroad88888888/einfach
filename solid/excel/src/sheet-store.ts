@@ -7,6 +7,8 @@ import type {
   ISheet,
   CellValue,
   SparseCellSnapshot,
+  FormulaMutationResult,
+  FormulaMutationErrorCode,
 } from './types'
 import { formatsEqual } from './types'
 
@@ -898,19 +900,43 @@ export function createSheetStore(sheet: ISheet) {
       return ok
     },
 
-    /**
-     * Authoritative formula commit path for worker-backed sheets. The
-     * legacy synchronous `setFormula` remains for in-process backends and
-     * old call sites, but UI commits should prefer this method so worker
-     * parse/cycle rejection can be observed instead of treated as a
-     * permanent optimistic success.
-     */
-    async setFormulaAsync(addr: string, formula: string): Promise<boolean> {
-      if (!sheet.set_formula_async) return this.setFormula(addr, formula)
-
+    async setFormulaDetailedAsync(
+      addr: string,
+      formula: string,
+    ): Promise<FormulaMutationResult> {
       const before = [snapshot(addr)]
-      const ok = await sheet.set_formula_async(addr, formula)
-      if (!ok) return false
+
+      if (sheet.set_formula_detailed_async) {
+        const result = await sheet.set_formula_detailed_async(addr, formula)
+        if (result.ok) {
+          if (pendingBefore !== null) {
+            if (!pendingAddrs!.has(addr)) {
+              pendingBefore.push(before[0])
+              pendingAddrs!.add(addr)
+            }
+          } else {
+            const after = [snapshot(addr)]
+            undoStack.push({ kind: 'cells', before, after })
+            redoStack.length = 0
+          }
+        }
+        return result
+      }
+
+      let ok = false
+      if (sheet.set_formula_async) {
+        ok = await sheet.set_formula_async(addr, formula)
+      } else {
+        ok = sheet.set_formula(addr, formula)
+      }
+      if (!ok) {
+        return {
+          ok: false,
+          code: 'FORMULA_REJECTED',
+          message: 'formula was rejected',
+        }
+      }
+
       if (pendingBefore !== null) {
         if (!pendingAddrs!.has(addr)) {
           pendingBefore.push(before[0])
@@ -921,7 +947,19 @@ export function createSheetStore(sheet: ISheet) {
         undoStack.push({ kind: 'cells', before, after })
         redoStack.length = 0
       }
-      return true
+
+      return { ok: true }
+    },
+
+    /**
+     * Authoritative formula commit path for worker-backed sheets. The
+     * legacy synchronous `setFormula` remains for in-process backends and
+     * old call sites, but UI commits should prefer this method so worker
+     * parse/cycle rejection can be observed instead of treated as a
+     * permanent optimistic success.
+     */
+    async setFormulaAsync(addr: string, formula: string): Promise<boolean> {
+      return (await this.setFormulaDetailedAsync(addr, formula)).ok
     },
 
     /** Clear a cell back to empty. Undoable. */
@@ -1025,6 +1063,27 @@ export function createSheetStore(sheet: ISheet) {
       if (trimmed.startsWith('=')) return this.setFormulaAsync(addr, trimmed)
       this.setCellInput(addr, input)
       return true
+    },
+
+    async setCellInputDetailedAsync(addr: string, input: string): Promise<FormulaMutationResult> {
+      const trimmed = input.trim()
+      if (!trimmed.startsWith('=')) {
+        this.setCellInput(addr, input)
+        return { ok: true }
+      }
+
+      try {
+        return await this.setFormulaDetailedAsync(addr, trimmed)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'formula validation failed'
+        const code: FormulaMutationErrorCode = 'FORMULA_REJECTED'
+        const out: FormulaMutationResult = {
+          ok: false,
+          code,
+          message,
+        }
+        return out
+      }
     },
 
     /**

@@ -149,3 +149,14 @@ MCP 验收必须记录：
   Sheet1!B5=11700；打开 Sheet1 时 `Expenses!C5` 为 dirty，切到 Expenses 后显示 41 且
   cache clean；新增 Sheet4、Notes 重命名为 Renamed、删除 Renamed 均通过；console
   warning/error 为 0。
+- W6-D 后半段：公式提交增加 detailed result 合同，worker-backed FormulaBar 展示
+  `INVALID_FORMULA` / `FORMULA_CYCLE` 的简洁诊断，成功提交或切换 selection 后清理。
+- W6-D 函数门禁：Rust core 补 MVP `TEXT()`（`0.00`、`000` 等零格式），新增浏览器
+  `formula-functions.spec.ts` 覆盖 `TEXT()`、`TODAY()`、`NOW()` 的真实 WASM UI 路径。
+- 集成修复：FormulaBar 只在 active addr 变化时清理诊断，避免 worker hydration 回来后把同一
+  cell 的错误提示立即抹掉；`DemoFormulas` debug cleanup 挪回组件 owner，MCP console
+  warning/error 为 0。
+- MCP Playwright：手工在 `Multi-Sheet` 输入 `=garbage((` 得到 `INVALID_FORMULA` /
+  `Invalid formula`，输入 `=I18+1` 得到 `FORMULA_CYCLE` / `Formula cycle`；合法 `=1`
+  清理诊断；`Formulas` 中 `TEXT(1234.5,"0.00")=1234.50`，`TODAY()` / `NOW()` 显示本地日
+  serial；console warning/error 为 0。

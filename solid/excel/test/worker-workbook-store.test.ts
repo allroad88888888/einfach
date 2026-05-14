@@ -37,6 +37,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     initWorkbook: string[][]
     setCell: Array<{ sheet: number; addr: string; value: CellWire }>
     setFormula: Array<{ sheet: number; addr: string; formula: string }>
+    setFormulaDetailed: Array<{ sheet: number; addr: string; formula: string }>
     addSheet: string[]
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
@@ -128,6 +129,7 @@ function makeFakeWorkerWorkbookClient(
     initWorkbook: [],
     setCell: [],
     setFormula: [],
+    setFormulaDetailed: [],
     addSheet: [],
     renameSheet: [],
     removeSheet: [],
@@ -247,6 +249,7 @@ function makeFakeWorkerWorkbookClient(
       return true
     },
     async setFormulaDetailed(sheet, addr, formula) {
+      calls.setFormulaDetailed.push({ sheet, addr: addr.toUpperCase(), formula })
       const ok = await this.setFormula(sheet, addr, formula)
       return ok
         ? { ok: true }
@@ -1115,6 +1118,49 @@ describe('createWorkerWorkbookStore', () => {
       expect(client.calls.readCells).toContainEqual([{ sheet: 0, addr: 'A1' }])
 
       observed.dispose()
+      workbook.dispose()
+    })
+  })
+
+  it('surfaces detailed formula rejection without creating an undo entry', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      client.setFormulaResult(0, 'A1', false)
+      const result = await store.setFormulaDetailedAsync('A1', '=A1+1')
+
+      expect(client.calls.setFormulaDetailed).toEqual([
+        { sheet: 0, addr: 'A1', formula: '=A1+1' },
+      ])
+      expect(result).toEqual({ ok: false, code: 'FORMULA_REJECTED', message: 'formula was rejected' })
+      await waitFor(() => {
+        expect(store.getFormula('A1')).toBe('')
+      })
+      expect(store.canUndo()).toBe(false)
+
+      workbook.dispose()
+    })
+  })
+
+  it('pushes undo state for successful setFormulaDetailedAsync', async () => {
+    await withRoot(async () => {
+      const client = makeFakeWorkerWorkbookClient()
+      const workbook = await createWorkerWorkbookStore({ client })
+      const store = workbook.activeStore()
+
+      const result = await store.setFormulaDetailedAsync('A1', '=1')
+
+      expect(result).toEqual({ ok: true })
+      await waitFor(() => {
+        expect(store.canUndo()).toBe(true)
+      })
+      expect(store.getFormula('A1')).toBe('=1')
+
+      store.undo()
+      expect(store.getFormula('A1')).toBe('')
+
       workbook.dispose()
     })
   })

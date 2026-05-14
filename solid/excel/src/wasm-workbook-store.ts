@@ -2,7 +2,13 @@ import { createSignal } from 'solid-js'
 import { sparseRangeToTSV } from './range-tsv'
 import { createSheetStore, type SheetStore } from './sheet-store'
 import { createWasmWorkbook, type WasmWorkbookApi } from './wasm-sheet'
-import type { CellValue, FormatRangeSnapshot, ISheet, SparseCellSnapshot } from './types'
+import type {
+  CellValue,
+  FormulaMutationResult,
+  FormatRangeSnapshot,
+  ISheet,
+  SparseCellSnapshot,
+} from './types'
 import {
   createWorkerWorkbook,
   type CellRefWire,
@@ -700,6 +706,28 @@ function createWorkerWorkbookSheetAdapter(
       })
   }
 
+  function setFormulaDetailed(addr: string, formula: string): Promise<FormulaMutationResult> {
+    const a = normalizeAddr(addr)
+    requested.add(a)
+    bumpLocalVersion(a)
+    writeCache(a, { display: '', type: 'null', isError: false, formula })
+    return client
+      .setFormulaDetailed(sheetIdx, a, formula)
+      .then((result) => {
+        if (hasListeners(a) || !result.ok) hydrateAddr(a)
+        return result
+      })
+      .catch((error) => {
+        hydrateAddr(a)
+        return {
+          ok: false,
+          code: 'FORMULA_REJECTED',
+          message: error instanceof Error ? error.message : 'formula was rejected',
+          display: undefined,
+        }
+      })
+  }
+
   function startWorkerSubscription(addr: string) {
     const a = normalizeAddr(addr)
     const existing = workerSubs.get(a)
@@ -811,6 +839,9 @@ function createWorkerWorkbookSheetAdapter(
     },
     set_formula_async(addr, formula) {
       return setFormula(addr, formula)
+    },
+    set_formula_detailed_async(addr, formula) {
+      return setFormulaDetailed(addr, formula)
     },
     clear_cell(addr) {
       setCell(addr, { type: 'null' })

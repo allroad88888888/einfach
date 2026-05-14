@@ -12,6 +12,11 @@ export interface ISheet {
   set_error?(addr: string, value: string): void
   /** Returns false if the formula failed to parse or would cycle. */
   set_formula(addr: string, formula: string): boolean
+  /** Generalized formula commit result for authoritative backends. */
+  set_formula_detailed_async?(
+    addr: string,
+    formula: string,
+  ): Promise<FormulaMutationResult>
   /**
    * Optional authoritative formula mutation. Worker-backed sheets use this
    * to surface parse/cycle rejection after the worker reply instead of
@@ -154,6 +159,12 @@ export interface ISheet {
    */
   dispose?(): void
 }
+
+export type FormulaMutationErrorCode = 'INVALID_FORMULA' | 'FORMULA_CYCLE' | 'FORMULA_REJECTED'
+
+export type FormulaMutationResult =
+  | { ok: true }
+  | { ok: false; code: FormulaMutationErrorCode; message: string; display?: string }
 
 export type CellValue = {
   display: string

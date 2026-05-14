@@ -35,6 +35,10 @@ function barAddr(page: Page) {
   return page.getByTestId('formula-bar-addr')
 }
 
+function barError(page: Page) {
+  return page.getByTestId('formula-bar-error')
+}
+
 test.describe('FormulaBar — display', () => {
   test.beforeEach(async ({ page }) => {
     guardConsoleErrors(page)
@@ -132,6 +136,44 @@ test.describe('FormulaBar — editing', () => {
     await expect(input).toHaveValue('keep')
   })
 
+  test('invalid formula shows a concise error with code on a worker-backed sheet', async ({
+    page,
+  }) => {
+    await gotoDemo(page, MULTI)
+    await selectCell(page, 'J18')
+
+    const input = bar(page)
+    await input.click()
+    await input.fill('=garbage((')
+    await input.press('Enter')
+
+    await expect(barError(page)).toHaveAttribute('data-code', 'INVALID_FORMULA')
+    await expect(barError(page)).toHaveText('Invalid formula')
+
+    await input.fill('=1')
+    await input.press('Enter')
+    await expect(barError(page)).toHaveCount(0)
+    await expectDisplay(page, 'J18', '1')
+  })
+
+  test('cycle formula shows cycle diagnosis and clears on selection switch', async ({
+    page,
+  }) => {
+    await gotoDemo(page, MULTI)
+    await selectCell(page, 'I18')
+
+    const input = bar(page)
+    await input.click()
+    await input.fill('=I18+1')
+    await input.press('Enter')
+
+    await expect(barError(page)).toHaveAttribute('data-code', 'FORMULA_CYCLE')
+    await expect(barError(page)).toHaveText('Formula cycle')
+
+    await selectCell(page, 'B1')
+    await expect(barError(page)).toHaveCount(0)
+  })
+
   test('parse error from bar (`=foo bar`) renders an error cell without leaking console.error', async ({
     page,
   }) => {
@@ -183,24 +225,18 @@ test.describe('FormulaBar — sheet switch leakage', () => {
     await gotoDemo(page, MULTI)
 
     // Sheet1 (the seeded "Quarter / Revenue / Profit" sheet) has B5 as
-    // a formula cell `=B2+B3+B4`. Select it to populate the bar with
-    // the formula source.
+    // a cross-sheet formula `=Expenses!B5`. Select it to snapshot the
+    // source text from the first sheet.
     await selectCell(page, 'B5')
-    await expect(bar(page)).toHaveValue('=B2+B3+B4')
+    await expect(bar(page)).toHaveValue('=Expenses!B5')
     await expect(barAddr(page)).toHaveText('B5')
 
-    // Switch to Expenses. The Multi-Sheet demo re-mounts Table on sheet
-    // change; the FormulaBar belongs to that new Table tree. The new
-    // FormulaBar must reflect the new sheet's selection (or empty),
-    // NOT carry the old "=B2+B3+B4" source over.
+    // Switch to Expenses. The FormulaBar belongs to the remounted Table for
+    // that sheet. It must not keep the stale "=Expenses!B5" source.
     await selectSheet(page, 'Expenses')
 
     const value = await bar(page).inputValue()
-    // The exact value depends on the new sheet's seeded selection, but
-    // it must not be the Sheet1 formula. Acceptable: a value from the
-    // Expenses sheet (e.g. `2500` if A1/B2 happens to be selected) or
-    // empty. NOT acceptable: carrying =B2+B3+B4 over.
-    expect(value).not.toBe('=B2+B3+B4')
+    expect(value).not.toBe('=Expenses!B5')
 
     // Sanity: re-selecting B5 on Expenses now shows that sheet's B5
     // formula instead (also `=B2+B3+B4` per the seed — same string,

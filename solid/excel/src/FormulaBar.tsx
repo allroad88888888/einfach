@@ -1,6 +1,8 @@
-
-import { createSignal, createEffect, onCleanup } from 'solid-js'
+import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
+import type { FormulaMutationResult } from './types'
 import type { SheetStore } from './sheet-store'
+
+type FormulaErrorResult = Extract<FormulaMutationResult, { ok: false }>
 
 export interface FormulaBarProps {
   store: SheetStore
@@ -23,12 +25,24 @@ export interface FormulaBarProps {
  * stays in sync with the sheet between commits.
  */
 export function FormulaBar(props: FormulaBarProps) {
-  const [draft, setDraft] = createSignal<string>('')
+  const [draft, setDraft] = createSignal('')
   const [focused, setFocused] = createSignal(false)
+  const [formulaError, setFormulaError] = createSignal<FormulaErrorResult | null>(null)
+  let commitSeq = 0
 
   /** The address to edit — prop override wins, else the store's selection. */
   const addr = (): string | null =>
     props.activeAddr ? props.activeAddr() : props.store.selectionAddr()
+
+  const errorMessage = (result: FormulaErrorResult): string => {
+    if (result.code === 'INVALID_FORMULA') return 'Invalid formula'
+    if (result.code === 'FORMULA_CYCLE') return 'Formula cycle'
+    return result.message || 'Formula rejected'
+  }
+
+  function clearFormulaError() {
+    setFormulaError(null)
+  }
 
   // Sync draft from the active cell whenever the selection changes or the
   // cell value changes externally — but only when the input isn't focused
@@ -39,13 +53,19 @@ export function FormulaBar(props: FormulaBarProps) {
   // moves to a different addr (effect re-runs) and on component
   // teardown. Without this the formula bar would leak one
   // `sheet.subscribe` per cell the user ever selected.
+  let syncedAddr: string | null = null
   createEffect(() => {
     const a = addr()
     if (focused()) return
     if (a === null) {
+      syncedAddr = null
       setDraft('')
+      clearFormulaError()
       return
     }
+    const addrChanged = a !== syncedAddr
+    syncedAddr = a
+    if (addrChanged) clearFormulaError()
     const formula = props.store.getFormula(a)
     if (formula !== '') {
       setDraft(formula)
@@ -70,8 +90,26 @@ export function FormulaBar(props: FormulaBarProps) {
       return
     }
     justCommitted = true
-    void props.store.setCellInputAsync(a, draft())
-    props.onCommit?.()
+    const seq = ++commitSeq
+    void props.store
+      .setCellInputDetailedAsync(a, draft())
+      .then((result) => {
+        if (seq !== commitSeq || addr() !== a) return
+        if (!result.ok) {
+          setFormulaError(result)
+          return
+        }
+        clearFormulaError()
+        props.onCommit?.()
+      })
+      .catch((error) => {
+        if (seq !== commitSeq || addr() !== a) return
+        setFormulaError({
+          ok: false,
+          code: 'FORMULA_REJECTED',
+          message: error instanceof Error ? error.message : 'Formula rejected',
+        })
+      })
   }
 
   function onKeyDown(e: KeyboardEvent) {
@@ -85,6 +123,7 @@ export function FormulaBar(props: FormulaBarProps) {
         const formula = props.store.getFormula(a)
         setDraft(formula !== '' ? formula : props.store.getCell(a).display)
       }
+      clearFormulaError()
       // Same as Enter — the upcoming blur() must not commit the (now
       // reverted) draft. Set the flag before blur fires.
       justCommitted = true
@@ -94,21 +133,44 @@ export function FormulaBar(props: FormulaBarProps) {
 
   return (
     <div class="formula-bar" data-testid="formula-bar">
-      <span class="formula-bar-addr" data-testid="formula-bar-addr">{addr() ?? ''}</span>
-      <input
-        class="formula-bar-input"
-        data-testid="formula-bar-input"
-        type="text"
-        value={draft()}
-        onInput={(e) => setDraft(e.currentTarget.value)}
-        onFocus={() => setFocused(true)}
-        onBlur={() => {
-          setFocused(false)
-          commit()
-        }}
-        onKeyDown={onKeyDown}
-        disabled={addr() === null}
-      />
+      <span class="formula-bar-addr" data-testid="formula-bar-addr">
+        {addr() ?? ''}
+      </span>
+      <div class="formula-bar-body">
+        <input
+          class="formula-bar-input"
+          data-testid="formula-bar-input"
+          type="text"
+          value={draft()}
+          onInput={(e) => {
+            commitSeq += 1
+            clearFormulaError()
+            setDraft(e.currentTarget.value)
+          }}
+          onFocus={() => {
+            commitSeq += 1
+            clearFormulaError()
+            setFocused(true)
+          }}
+          onBlur={() => {
+            setFocused(false)
+            commit()
+          }}
+          onKeyDown={onKeyDown}
+          disabled={addr() === null}
+        />
+        <Show when={formulaError()}>
+          {(error) => (
+            <div
+              class="formula-bar-error"
+              data-testid="formula-bar-error"
+              data-code={error().code}
+            >
+              {errorMessage(error())}
+            </div>
+          )}
+        </Show>
+      </div>
     </div>
   )
 }

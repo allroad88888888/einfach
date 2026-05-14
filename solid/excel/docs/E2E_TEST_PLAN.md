@@ -4,9 +4,9 @@
 > This plan folds in two parallel read-only reviews: one focused on current
 > Playwright infrastructure, one focused on feature-to-e2e coverage mapping.
 
-## Current Status (2026-05-14, post-Wave 6 MultiSheet hardening)
+## Current Status (2026-05-14, post-Wave 6 formula diagnostics hardening)
 
-**22 spec files / 155 active `test()` / 0 skipped** locally green. Status of each
+**23 spec files / 160 active `test()` / 0 skipped** locally green. Status of each
 plan section:
 
 | Section | Status | Spec / Notes |
@@ -20,7 +20,8 @@ plan section:
 | P0 Existing Blank flows | ✅ | `smoke.spec.ts` retained, helpers extracted |
 | P0 Clipboard | ✅ | `selection-clipboard.spec.ts` (9 tests including cross-sheet name preservation) |
 | P1 WASM Formula Showcase | ✅ | `formulas-wasm.spec.ts` (14 tests, all passing — Discovered #B fixed) |
-| P1 FormulaBar | ✅ | `formula-bar.spec.ts` (8 tests) |
+| P1 FormulaBar | ✅ | `formula-bar.spec.ts` (10 tests, includes worker-backed formula diagnostics) |
+| P1 Formula Functions | ✅ | `formula-functions.spec.ts` (3 tests for `TEXT`, `TODAY`, `NOW`) |
 | P1 MultiSheet UI | ✅ | `multisheet-ui.spec.ts` (10 tests). Worker-backed MultiSheet covers seed, tab structure ops, cross-sheet formula result, and lazy debug probe |
 | P1 Other Demo Smoke (Budget/Grades/Sales) | ✅ | `demo-budget.spec.ts` (6) + `demo-grades.spec.ts` (6) + `demo-sales.spec.ts` (8) — option A (WASM migration) landed |
 | P1 Render Counter | ✅ | `render-counter.spec.ts` (6 strict-delta tests). MutationObserver workaround removed after Discovered #A fix |
@@ -28,7 +29,7 @@ plan section:
 | P2 Row/Col structural | □ | Correctly deferred (no UI entry) |
 | P2 Performance / lazy viewport | □ | Correctly deferred |
 
-Counts: 22 spec files. 155 active `test()`
+Counts: 23 spec files. 160 active `test()`
 + 0 `.skip`. Local `NO_PROXY=localhost,127.0.0.1 npm run e2e` from a clean
 checkout green (proxy caveat per Discovered #D).
 
@@ -44,9 +45,13 @@ Wave 2 / 3 新增覆盖已纳入本计划（本轮核对）：
   worker `debugCounters()` 的未读公式 eval 计数；
 - **file import/backpressure**：`file-import.spec.ts` 覆盖 1M demo CSV/TSV 文件导入、
   视口外公式 lazy read，以及取消导入后 `importSessionCount = 0`；
+- **formula diagnostics/functions**：`formula-bar.spec.ts` 覆盖 worker-backed
+  `INVALID_FORMULA` / `FORMULA_CYCLE` 诊断展示与清理；`formula-functions.spec.ts`
+  覆盖 `TEXT()`、`TODAY()`、`NOW()` 的真实 WASM UI 路径；
 - **MCP gate**：Wave 2/3 MCP 记录已落地（导入/取消、range copy、持久化还原）并作为
   本波门禁对齐内容；Wave 4 MCP 记录已补充 DOM/subscription/eval counters；Wave 5 MCP
-  记录覆盖文件导入、取消和 console 0 warning/error。
+  记录覆盖文件导入、取消和 console 0 warning/error；Wave 6 追加验证公式诊断、
+  `TEXT/TODAY/NOW` 和 console 0 warning/error。
 
 ## Discovered During Implementation
 
