@@ -472,6 +472,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       altKey: event.altKey,
       isComposing: event.isComposing,
       pageRowDelta: Math.max(1, getRows().length),
+      pageColDelta: Math.max(1, getCols().length),
     })
 
     switch (intent.type) {

@@ -15,13 +15,15 @@ Owns framework-agnostic keyboard navigation/edit/reference-picking command state
     intents and applies selection movement when the intent is selection-owned.
   - `clearKeyboardIntentAtom`: clears the consumed intent.
 - Scale bound: stores current mode and one compact intent only. Movement stores target boundaries,
-  never a list of cells.
+  never a list of cells. `PageUp/PageDown` uses adapter-provided visible row delta;
+  `Alt+PageUp/PageDown` uses adapter-provided visible column delta for horizontal paging.
 - Backend reads: none. Ctrl+arrow data-edge scanning is intentionally not implemented here because it
   needs backend facts; this layer can only express UI intents.
 - DOM reads: none. Adapters normalize DOM events into `KeyboardInput`.
 - Per-cell/per-row/per-col atom risk: forbidden.
 - Tests:
   - arrow/tab/enter/home/page movement intent
+  - horizontal `Alt+PageUp/PageDown` movement from `pageColDelta`
   - shift movement extends selection by boundary
   - editing mode returns commit/cancel intents without moving selection
   - command shortcuts return clipboard/history/select-all intents

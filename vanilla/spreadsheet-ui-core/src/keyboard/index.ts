@@ -85,7 +85,7 @@ export function getKeyboardCommandIntent(
     return commandIntent
   }
 
-  if (input.altKey) {
+  if (input.altKey && !isHorizontalPageInput(input)) {
     return {
       type: 'none',
       reason: 'unhandled',
@@ -217,10 +217,22 @@ function getMovementIntent(
         col: 0,
       })
     case 'PageUp':
+      if (input.altKey) {
+        return createMoveIntent(input, state, 'page', {
+          colDelta: -normalizePageDelta(input.pageColDelta),
+        })
+      }
+
       return createMoveIntent(input, state, 'page', {
         rowDelta: -normalizePageDelta(input.pageRowDelta),
       })
     case 'PageDown':
+      if (input.altKey) {
+        return createMoveIntent(input, state, 'page', {
+          colDelta: normalizePageDelta(input.pageColDelta),
+        })
+      }
+
       return createMoveIntent(input, state, 'page', {
         rowDelta: normalizePageDelta(input.pageRowDelta),
       })
@@ -235,6 +247,10 @@ function getMovementIntent(
         reason: 'unhandled',
       }
   }
+}
+
+function isHorizontalPageInput(input: KeyboardInput): boolean {
+  return input.key === 'PageUp' || input.key === 'PageDown'
 }
 
 function getArrowMovement(

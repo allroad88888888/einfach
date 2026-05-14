@@ -108,6 +108,21 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(cell(page, 'J2')).toHaveCount(0)
   })
 
+  test('alt page keys move horizontally by the visible column window', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await cell(page, 'B2').click()
+    await page.keyboard.press('Alt+PageDown')
+    await expect(page.getByTestId('formula-bar-addr')).toHaveText('G2')
+    await expect(page.getByTestId('status-active-cell')).toHaveText('G2')
+    await expect(cell(page, 'G2')).toHaveCount(0)
+
+    await page.keyboard.press('Alt+PageUp')
+    await expect(page.getByTestId('formula-bar-addr')).toHaveText('B2')
+    await expect(page.getByTestId('status-active-cell')).toHaveText('B2')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+  })
+
   test('toolbar and context menu use vNext interaction atoms', async ({ page }) => {
     await gotoVNextDemo(page)
 

@@ -333,6 +333,46 @@ describe('vNext SpreadsheetGrid', () => {
     })
   })
 
+  it('passes visible column count into horizontal page keyboard movement', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'PageDown',
+      altKey: true,
+    })
+
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 5 },
+      focus: { row: 1, col: 5 },
+    })
+  })
+
   it('supports ctrl boundary movement and context menu intents', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()

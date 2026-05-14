@@ -95,6 +95,74 @@ describe('keyboard core', () => {
     )
   })
 
+  test('alt page movement uses pageColDelta for horizontal paging', () => {
+    const store = createStore()
+
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 8 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 5, col: 1 },
+      focus: { row: 5, col: 1 },
+    })
+
+    expectMoveIntent(
+      store.setter(dispatchKeyboardInputAtom, {
+        key: 'PageDown',
+        altKey: true,
+        pageColDelta: 4,
+      }),
+      {
+        row: 5,
+        col: 5,
+      },
+    )
+    expectMoveIntent(
+      store.setter(dispatchKeyboardInputAtom, {
+        key: 'PageUp',
+        altKey: true,
+        pageColDelta: 10,
+      }),
+      {
+        row: 5,
+        col: 0,
+      },
+    )
+  })
+
+  test('shift alt page extends selection horizontally without expanding cells', () => {
+    const store = createStore()
+
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 8 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 3, col: 2 },
+      focus: { row: 3, col: 2 },
+    })
+
+    const intent = store.setter(dispatchKeyboardInputAtom, {
+      key: 'PageDown',
+      altKey: true,
+      shiftKey: true,
+      pageColDelta: 3,
+    })
+
+    expectMoveIntent(intent, { row: 3, col: 5 })
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'range',
+      sheetId: 'Sheet1',
+      anchor: { row: 3, col: 2 },
+      focus: { row: 3, col: 5 },
+    })
+    expect(store.getter(selectionRangeAtom)).toEqual({
+      rowStart: 3,
+      rowEnd: 3,
+      colStart: 2,
+      colEnd: 5,
+    })
+  })
+
   test('ctrl arrow and ctrl end jump to sheet boundaries without reading cells', () => {
     const store = createStore()
 
