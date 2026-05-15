@@ -292,11 +292,7 @@ function toSparseRange(sheet: number, range: CellRange): SparseRangeWire {
 }
 
 function structuralMutationResult(
-  request:
-    | InsertRowsRequest
-    | DeleteRowsRequest
-    | InsertColumnsRequest
-    | DeleteColumnsRequest,
+  request: InsertRowsRequest | DeleteRowsRequest | InsertColumnsRequest | DeleteColumnsRequest,
   revision: ProjectionRevision,
 ): BackendMutationResult {
   return {
@@ -344,14 +340,13 @@ function isCoordInsideRange(
   range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
 ): boolean {
   return (
-    row >= range.rowStart &&
-    row <= range.rowEnd &&
-    col >= range.colStart &&
-    col <= range.colEnd
+    row >= range.rowStart && row <= range.rowEnd && col >= range.colStart && col <= range.colEnd
   )
 }
 
-function snapshotCellFormatKey(snapshot: FormatRangeSnapshot['cellFormats'][number]): string | null {
+function snapshotCellFormatKey(
+  snapshot: FormatRangeSnapshot['cellFormats'][number],
+): string | null {
   const coord = parseA1(snapshot.addr)
   if (!coord) return null
   return keyFor(coord.row, coord.col)
@@ -636,11 +631,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<ViewportSizeProjectionResult> {
     await resolveSheet(request.sheetId)
     const rowHeights = [...getRowHeights(request.sheetId).entries()]
-      .filter(([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd)
+      .filter(
+        ([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd,
+      )
       .map(([rowIndex, heightPx]) => ({ rowIndex, heightPx }))
       .sort((left, right) => left.rowIndex - right.rowIndex)
     const colWidths = [...getColWidths(request.sheetId).entries()]
-      .filter(([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd)
+      .filter(
+        ([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd,
+      )
       .map(([colIndex, widthPx]) => ({ colIndex, widthPx }))
       .sort((left, right) => left.colIndex - right.colIndex)
 
@@ -699,9 +698,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
-  async function exportRangeTsv(
-    request: RangeTsvExportRequest,
-  ): Promise<RangeTsvExportResult> {
+  async function exportRangeTsv(request: RangeTsvExportRequest): Promise<RangeTsvExportResult> {
     const sheet = await resolveSheet(request.sheetId)
     const sparseRange = toSparseRange(sheet.idx, request.range)
     let text = ''
@@ -798,12 +795,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }
     },
 
-    async readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult> {
-      const result = await readRange(
-        request.sheetId,
-        request.window,
-        request.revision,
-      )
+    async readVisibleProjection(
+      request: VisibleProjectionRequest,
+    ): Promise<VisibleProjectionResult> {
+      const result = await readRange(request.sheetId, request.window, request.revision)
 
       return {
         kind: 'visible-window',
@@ -816,11 +811,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     async readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult> {
-      const result = await readRange(
-        request.sheetId,
-        request.range,
-        request.revision,
-      )
+      const result = await readRange(request.sheetId, request.range, request.revision)
 
       return {
         kind: 'range',
@@ -850,7 +841,8 @@ export function createWorkerWorkbookSpreadsheetBackend(
       if (trimmed === '') {
         await client.clearCell(sheet.idx, addr)
       } else if (trimmed.startsWith('=')) {
-        await client.setFormulaDetailed(sheet.idx, addr, trimmed)
+        const result = await client.setFormulaDetailed(sheet.idx, addr, trimmed)
+        if (!result.ok) throw createBackendError(result.code, result.message)
       } else {
         await client.setCell(sheet.idx, addr, toCellWire(request.input))
       }
@@ -938,10 +930,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     async setRowHeight(request: SetRowHeightRequest): Promise<BackendMutationResult> {
       await resolveSheet(request.sheetId)
-      getRowHeights(request.sheetId).set(
-        request.rowIndex,
-        normalizeDimensionSize(request.heightPx),
-      )
+      getRowHeights(request.sheetId).set(request.rowIndex, normalizeDimensionSize(request.heightPx))
       const nextRevision = bumpRevision()
 
       return {
@@ -953,10 +942,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     async setColumnWidth(request: SetColumnWidthRequest): Promise<BackendMutationResult> {
       await resolveSheet(request.sheetId)
-      getColWidths(request.sheetId).set(
-        request.colIndex,
-        normalizeDimensionSize(request.widthPx),
-      )
+      getColWidths(request.sheetId).set(request.colIndex, normalizeDimensionSize(request.widthPx))
       const nextRevision = bumpRevision()
 
       return {

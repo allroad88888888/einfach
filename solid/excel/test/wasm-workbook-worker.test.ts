@@ -1,13 +1,14 @@
 import { describe, expect, it, jest } from '@jest/globals'
-import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
 import {
   MAX_IMPORT_CHUNK_CELLS,
   __resetImportLimitsForTest,
   __setImportLimitsForTest,
   mergeImportStatsIssues,
   normalizeImportCells,
-} from '../src/wasm-workbook-worker'
+} from '../src-vnext/adapter/worker-runtime'
 import type {
+  CellFormatJSON,
+  FormatRangeSnapshot,
   FormulaMutationResultWire,
   ImportCellWire,
   WorkbookPersistenceRestoreStatsWire,
@@ -80,7 +81,9 @@ type MockWasmWorkbook = {
   ) => unknown[]
   restore_sparse: (cells: unknown[]) => number
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
-  restore_persistence_v1?: (snapshot: WorkbookPersistenceSnapshotWire) => WorkbookPersistenceRestoreStatsWire
+  restore_persistence_v1?: (
+    snapshot: WorkbookPersistenceSnapshotWire,
+  ) => WorkbookPersistenceRestoreStatsWire
   read_sparse_range: () => unknown[]
   clear_range: () => number
   set_format_range: (
@@ -199,9 +202,10 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const cells = new Map<string, MockCellState>()
   let nextToken = 1
   const activeSubscriptions = new Map<number, number>()
-  const restorePersistenceData: WorkbookPersistenceSnapshotWire | undefined = options.disablePersistenceV1
-    ? undefined
-    : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] }
+  const restorePersistenceData: WorkbookPersistenceSnapshotWire | undefined =
+    options.disablePersistenceV1
+      ? undefined
+      : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] }
   const restorePersistenceDefaultReturn: WorkbookPersistenceRestoreStatsWire = {
     restored_cells: 0,
     restored_formats: 0,
@@ -476,8 +480,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
     debug_formula_eval_count_total: () => 0,
-    debug_formula_count: () =>
-      [...cells.values()].filter((cell) => cell.type === 'formula').length,
+    debug_formula_count: () => [...cells.values()].filter((cell) => cell.type === 'formula').length,
     debug_live_subscription_count: () => activeSubscriptions.size,
     debug_sheet_live_subscription_count: (sheet: number) =>
       [...activeSubscriptions.values()].filter((sheetIdx) => sheetIdx === sheet).length,
@@ -1485,9 +1488,7 @@ describe('wasm-workbook-worker import session contract', () => {
       const restorePayload: WorkbookPersistenceSnapshotWire = {
         version: 1,
         sheets: [{ idx: 0, name: 'Sheet1' }],
-        cells: [
-          { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=1+1' },
-        ],
+        cells: [{ sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=1+1' }],
         formats: [],
       }
       const restore = await harness.send<WorkbookPersistenceRestoreStatsWire>({
@@ -1522,9 +1523,7 @@ describe('wasm-workbook-worker import session contract', () => {
         snapshot: {
           version: 1,
           sheets: [{ idx: 0, name: 'Sheet1' }],
-          cells: [
-            { sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'formula', value: '=1+1' },
-          ],
+          cells: [{ sheet: 0, addr: 'B2', row: 1, col: 1, kind: 'formula', value: '=1+1' }],
           formats: [],
         },
       })
@@ -1689,9 +1688,7 @@ describe('wasm-workbook-worker import session contract', () => {
         cmd: 'initWorkbook',
         sheets: ['Sheet1'],
       })
-      await expect(
-        harness.send({ id: 2, cmd: 'snapshotPersistenceV1' }),
-      ).rejects.toMatchObject({
+      await expect(harness.send({ id: 2, cmd: 'snapshotPersistenceV1' })).rejects.toMatchObject({
         code: 'WASM_METHOD_UNAVAILABLE',
         message: 'WasmWorkbook.snapshot_persistence_v1 is not available',
       })

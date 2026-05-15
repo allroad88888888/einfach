@@ -488,6 +488,15 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   暂不从 public barrel 导出，避免 Node/Jest import `@einfach/solid-excel/vnext` 时解析
   worker URL 副作用。真实 worker 实现仍在 legacy `src/wasm-workbook-worker.ts`，下一步
   可单独迁 RPC worker 文件边界。
+- PC-7 准备第七段：真实 worker runtime 已迁到
+  `solid/excel/src-vnext/adapter/worker-runtime.ts`，vNext worker factory 改为指向
+  `./worker-runtime.ts`；legacy `solid/excel/src/wasm-workbook-worker.ts` 只做兼容 shim，
+  显式调用 `installWorkerRuntime()`，避免 build 时被 tree-shake 成空 worker chunk。
+  `range-tsv` helper 同步迁到 vNext adapter，legacy `src/range-tsv.ts` 保留 re-export。
+  `@einfach/solid-excel/vnext` 仍不导出 worker factory，package import 不会触发
+  `import.meta.url` 副作用。顺手修复 worker workbook adapter 忽略
+  `setFormulaDetailed` 的 `{ ok:false }` 的问题：失败公式现在会抛出带 `code/message`
+  的 backend error，而不是返回成功 mutation。
 
 PC-6 第一段验收记录：
 
@@ -807,6 +816,18 @@ PC-7 准备第六段验收记录：
 - MCP Playwright：打开 `http://127.0.0.1:5174/`，切到 `vNext Worker`；验证
   worker grid 已挂载、table body 仍只有 30 个可视 cell、`Sheet1!C2=13`、
   `Sheet1!B4=10`、`J20` 未挂载、状态为 `Ready` / `30 cells`、console error 为 0。
+
+PC-7 准备第七段验收记录：
+
+- `rg -n "\\.\\./\\.\\./src|\\.\\./src|from '../../src|from '../src" solid/excel/src-vnext -g '*.ts' -g '*.tsx'`
+- `npx jest solid/excel/test/package-vnext-subpath.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/`，切到 `vNext Worker`；验证
+  worker grid 已挂载、可视 cell 数为 30、`Sheet1!C2=13`、`Sheet1!B4=10`、
+  `J20` 未挂载、状态为 `Ready` / `30 cells` / `7 loaded`、console error/warning 为 0。
 
 仍未完成：
 

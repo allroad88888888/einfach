@@ -21,9 +21,13 @@
   row/column resize UI metadata、worker backend demo 都已经接入。
 - `@einfach/solid-excel/vnext` 子入口已经存在；root `@einfach/solid-excel` 仍保持
   legacy 默认入口。
-- vNext 还剩一个明确的 legacy 边界：
-  `src-vnext/adapter/worker-factory.ts` 仍通过 `new URL('../../src/wasm-workbook-worker.ts')`
-  指向旧 worker 实现文件。
+- W1 已完成：真实 worker runtime 已迁到
+  `solid/excel/src-vnext/adapter/worker-runtime.ts`，vNext worker factory 指向 vNext
+  runtime；legacy `solid/excel/src/wasm-workbook-worker.ts` 只保留兼容 shim。
+  `range-tsv` helper 也迁到 vNext adapter，legacy 路径保留 re-export。
+- W1 顺手修复：worker workbook adapter 现在会尊重 `setFormulaDetailed` 返回的
+  `{ ok:false }`，抛出带 `code/message` 的 backend error，而不是把失败公式 mutation
+  当作成功。
 - Rust core/wasm 还没有 true `move_sheet`；当前 vNext worker adapter 只维护 JS 层显示顺序。
 - row/column size 只在 vNext JS adapter metadata 中持久化，Rust snapshot/reload/autofit
   还没完成。
@@ -54,12 +58,12 @@
 
 ## 剩余波次总览
 
-还剩 7 波。第 1、2 波先把边界和 lazy 正确性补稳；第 3、4、5 波可以按文件所有权并行开分支
-推进，但合入顺序要由总架构师控制；第 6、7 波是 package cutover 和发布门禁。
+W1 已完成，还剩 6 波。W2 先把 lazy 正确性补稳；W3、W4、W5 可以按文件所有权并行开分支
+推进，但合入顺序要由总架构师控制；W6、W7 是 package cutover 和发布门禁。
 
 | 波次 | 目标 | 可并行 agent | 主要写入边界 | 必须验收 |
 | --- | --- | --- | --- | --- |
-| W1 | vNext worker 实现边界迁移 | Worker Runtime、Worker Tests、Public Surface Review | `solid/excel/src-vnext/adapter/*`、legacy worker shim、worker tests/e2e | vNext 不再指向 legacy worker 实现；Jest worker tests；vNext worker e2e；MCP smoke |
+| W1 | 已完成：vNext worker 实现边界迁移 | Worker Runtime、Worker Tests、Public Surface Review | `solid/excel/src-vnext/adapter/*`、legacy worker shim、worker tests/e2e | vNext 不再指向 legacy worker 实现；Jest worker tests；vNext worker e2e；MCP smoke |
 | W2 | Lazy formula 正确性回归 | Rust Lazy、Wasm Contract、E2E Lazy | `rust/excel-core/*`、`rust/wasm/*`、WASM/JS tests、lazy e2e | 单 sheet dependent 传播修复；dirty notify 契约测试；TLS resolver 清零门禁 |
 | W3 | true sheet reorder | Rust Workbook、Wasm/Worker Adapter、Cross-sheet E2E | workbook sheet order、wasm API、worker protocol、adapter、e2e | 跨 sheet 公式在 reorder/rename/delete 后仍正确；不再只靠 JS display-order 兜底 |
 | W4 | row/column size 持久化和 autofit | Rust Metadata、Adapter Projection、Interaction E2E | Rust sparse metadata、snapshot/reload、adapter、grid resize/autofit tests | 尺寸 metadata 稀疏持久化；reload 后恢复；autofit 不扫描全表 |

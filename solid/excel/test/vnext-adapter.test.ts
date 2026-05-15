@@ -213,9 +213,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         continue
       }
 
-      const shifted = current >= (direction === 1 ? index : deleteEnd + 1)
-        ? current + count * direction
-        : current
+      const shifted =
+        current >= (direction === 1 ? index : deleteEnd + 1) ? current + count * direction : current
       const row = axis === 'row' ? shifted : coord.row
       const col = axis === 'column' ? shifted : coord.col
       const nextSnapshot = { ...snapshot, addr: toCellAddress(row, col) }
@@ -259,9 +258,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       if (metas.length <= 1) {
         return false
       }
-      metas = metas
-        .filter((meta) => meta.idx !== sheet)
-        .map((meta, idx) => ({ ...meta, idx }))
+      metas = metas.filter((meta) => meta.idx !== sheet).map((meta, idx) => ({ ...meta, idx }))
       return true
     },
     async setCell(sheet, addr, value) {
@@ -272,7 +269,8 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         putCell({
           sheet,
           addr,
-          display: value.type === 'boolean' ? (value.value ? 'TRUE' : 'FALSE') : String(value.value),
+          display:
+            value.type === 'boolean' ? (value.value ? 'TRUE' : 'FALSE') : String(value.value),
           type: value.type,
           isError: value.type === 'error',
           formula: '',
@@ -331,7 +329,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       calls.setFormatRange.push({ ...range, fmt })
       rangeFormats.push({
         ...range,
-        format: fmt ? { ...fmt, numberFormat: fmt.numberFormat ? { ...fmt.numberFormat } : undefined } : {},
+        format: fmt
+          ? { ...fmt, numberFormat: fmt.numberFormat ? { ...fmt.numberFormat } : undefined }
+          : {},
       })
       return 1
     },
@@ -353,7 +353,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
             endCol: layer.endCol,
             format: {
               ...layer.format,
-              numberFormat: layer.format.numberFormat ? { ...layer.format.numberFormat } : undefined,
+              numberFormat: layer.format.numberFormat
+                ? { ...layer.format.numberFormat }
+                : undefined,
             },
           })),
       }
@@ -1137,7 +1139,8 @@ describe('vnext adapter', () => {
     })
 
     await backend.ready()
-    client.exportRangeTsvChunks = undefined as unknown as WorkerWorkbookClient['exportRangeTsvChunks']
+    client.exportRangeTsvChunks =
+      undefined as unknown as WorkerWorkbookClient['exportRangeTsvChunks']
     client.exportRangeTsv = async (range) => {
       client.calls.exportRangeTsv.push({ ...range })
       return 'fallback-body'
@@ -1278,9 +1281,7 @@ describe('vnext adapter', () => {
       { sheet: 0, addr: 'A1', value: { type: 'number', value: 123 } },
       { sheet: 0, addr: 'B1', value: { type: 'text', value: 'text' } },
     ])
-    expect(client.calls.setFormulaDetailed).toEqual([
-      { sheet: 0, addr: 'C1', formula: '=A1+1' },
-    ])
+    expect(client.calls.setFormulaDetailed).toEqual([{ sheet: 0, addr: 'C1', formula: '=A1+1' }])
     expect(client.calls.clearCell).toEqual([{ sheet: 0, addr: 'A1' }])
     expect(clearResult).toEqual({
       sheetId: 'sheet-1',
@@ -1288,6 +1289,42 @@ describe('vnext adapter', () => {
       revision: 8,
       affectedRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
     })
+
+    backend.dispose()
+  })
+
+  it('rejects worker workbook formula mutations when the runtime reports a formula error', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+    })
+
+    await backend.ready()
+    client.setFormulaDetailed = async (sheet, addr, formula) => {
+      client.calls.setFormulaDetailed.push({ sheet, addr: addr.toUpperCase(), formula })
+      return {
+        ok: false,
+        code: 'FORMULA_CYCLE',
+        message: 'formula would create a cycle',
+        display: '#CYCLE!',
+      }
+    }
+
+    await expect(
+      backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        requestId: 100,
+        row: 0,
+        col: 0,
+        input: '=A1+1',
+      }),
+    ).rejects.toMatchObject({
+      code: 'FORMULA_CYCLE',
+      message: 'formula would create a cycle',
+    })
+    expect(client.calls.setFormulaDetailed).toEqual([{ sheet: 0, addr: 'A1', formula: '=A1+1' }])
 
     backend.dispose()
   })
@@ -1342,9 +1379,7 @@ describe('vnext adapter', () => {
       revision: 6,
       affectedRange: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
     })
-    expect(result.cells).toEqual([
-      { row: 0, col: 2, displayValue: 'C1', valueKind: 'string' },
-    ])
+    expect(result.cells).toEqual([{ row: 0, col: 2, displayValue: 'C1', valueKind: 'string' }])
 
     backend.dispose()
   })
