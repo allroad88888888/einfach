@@ -1,4 +1,11 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { ValidationOutcome, SetValidationRuleRequest, ClearValidationRuleRequest } from '../data-validation/types'
+import type {
+  ConditionalFormatRulesResult,
+  ListConditionalFormatRulesRequest,
+  RemoveConditionalFormatRuleRequest,
+  SetConditionalFormatRuleRequest,
+} from '../conditional-formatting/types'
 import type {
   DeleteNamedRangeRequest,
   ListNamedRangesRequest,
@@ -21,6 +28,15 @@ export type {
   PostCommentRequest,
   ResolveCommentThreadRequest,
   SetNoteRequest,
+}
+
+export type { ValidationOutcome, SetValidationRuleRequest, ClearValidationRuleRequest }
+
+export type {
+  ConditionalFormatRulesResult,
+  ListConditionalFormatRulesRequest,
+  RemoveConditionalFormatRuleRequest,
+  SetConditionalFormatRuleRequest,
 }
 
 export type ProjectionRequestId = number
@@ -64,6 +80,8 @@ export interface DisplayCell {
   mergeAnchor?: CellCoord
   noteIndicator?: boolean
   commentThreadId?: string
+  validation?: ValidationOutcome
+  conditionalFormat?: SpreadsheetCellFormat
 }
 
 export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
@@ -505,6 +523,13 @@ export interface SpreadsheetBackend {
   postComment?(request: PostCommentRequest): Promise<BackendMutationResult>
   resolveCommentThread?(request: ResolveCommentThreadRequest): Promise<BackendMutationResult>
   deleteComment?(request: DeleteCommentRequest): Promise<BackendMutationResult>
+  // data validation
+  setValidationRule?(request: SetValidationRuleRequest): Promise<BackendMutationResult>
+  clearValidationRule?(request: ClearValidationRuleRequest): Promise<BackendMutationResult>
+  // conditional formatting
+  setConditionalFormatRule?(request: SetConditionalFormatRuleRequest): Promise<BackendMutationResult>
+  removeConditionalFormatRule?(request: RemoveConditionalFormatRuleRequest): Promise<BackendMutationResult>
+  listConditionalFormatRules?(request: ListConditionalFormatRulesRequest): Promise<ConditionalFormatRulesResult>
 }
 
 export interface ViewportFreezeConfig {

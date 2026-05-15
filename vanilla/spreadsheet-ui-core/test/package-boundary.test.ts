@@ -4,6 +4,7 @@ import { describe, expect, test } from '@jest/globals'
 import {
   clipboardStateAtom,
   commentSessionAtom,
+  conditionalFormatEditorAtom,
   diagnosticsAtom,
   editingSessionAtom,
   fillSeriesLocaleAtom,
@@ -18,6 +19,7 @@ import {
   selectionAtom,
   selectionRegionsAtom,
   toolbarUiStateAtom,
+  validationRuleEditorAtom,
   viewportFreezeAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
@@ -70,6 +72,8 @@ describe('package boundary', () => {
     expect(viewportHiddenAtom.debugLabel).toBe('spreadsheet.viewport.hidden')
     expect(commentSessionAtom.debugLabel).toBe('spreadsheet.comments.session')
     expect(fillSeriesLocaleAtom.debugLabel).toBe('spreadsheet.autoFill.locale')
+    expect(validationRuleEditorAtom.debugLabel).toBe('spreadsheet.validation.ruleEditor')
+    expect(conditionalFormatEditorAtom.debugLabel).toBe('spreadsheet.conditionalFormat.editor')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {
