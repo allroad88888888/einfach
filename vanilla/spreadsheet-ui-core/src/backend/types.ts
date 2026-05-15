@@ -339,6 +339,27 @@ export interface SheetMutationResult {
   createdSheet?: SpreadsheetSheetMetadata
 }
 
+export interface UndoTransactionRequest {
+  kind: 'undo-transaction'
+  transactionId: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface RedoTransactionRequest {
+  kind: 'redo-transaction'
+  transactionId: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface HistoryTransactionResult {
+  transactionId: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  affectedRange?: CellRange
+}
+
 export interface SpreadsheetBackend {
   listSheets?(): Promise<SheetListResult>
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
@@ -368,4 +389,6 @@ export interface SpreadsheetBackend {
   renameSheet?(request: RenameSheetRequest): Promise<SheetMutationResult>
   deleteSheet?(request: DeleteSheetRequest): Promise<SheetMutationResult>
   reorderSheet?(request: ReorderSheetRequest): Promise<SheetMutationResult>
+  undoTransaction?(request: UndoTransactionRequest): Promise<HistoryTransactionResult>
+  redoTransaction?(request: RedoTransactionRequest): Promise<HistoryTransactionResult>
 }

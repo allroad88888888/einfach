@@ -6,6 +6,7 @@ import {
   diagnosticsAtom,
   editingSessionAtom,
   formulaBarStateAtom,
+  historyStackAtom,
   keyboardModeAtom,
   menuStateAtom,
   pointerSessionAtom,
@@ -52,6 +53,7 @@ describe('package boundary', () => {
     expect(diagnosticsAtom.debugLabel).toBe('spreadsheet.diagnostics.state')
     expect(viewportMetricsAtom.debugLabel).toBe('spreadsheet.viewport.metrics')
     expect(workspaceSessionAtom.debugLabel).toBe('spreadsheet.workspace.session')
+    expect(historyStackAtom.debugLabel).toBe('spreadsheet.history.stack')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

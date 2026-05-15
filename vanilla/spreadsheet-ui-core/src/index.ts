@@ -1,4 +1,5 @@
 export * from './createSpreadsheetUi'
+export * from './history'
 export * from './backend'
 export * from './clipboard'
 export * from './diagnostics'
