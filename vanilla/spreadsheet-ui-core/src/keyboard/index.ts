@@ -6,6 +6,7 @@ import {
   normalizeSelection,
   selectionAtom,
   selectionBoundsAtom,
+  setPrimaryRegionAtom,
   type ActiveSelectionCell,
   type SelectionBounds,
   type SelectionState,
@@ -49,7 +50,9 @@ export const dispatchKeyboardInputAtom = atom(
       bounds: get(selectionBoundsAtom),
     })
 
-    if (intent.type === 'selection.move' || intent.type === 'selection.selectAll') {
+    if (intent.type === 'selection.move') {
+      set(setPrimaryRegionAtom, intent.selection)
+    } else if (intent.type === 'selection.selectAll') {
       set(selectionAtom, intent.selection)
     }
 

@@ -40,12 +40,29 @@ export interface AllSelection {
   sheetId: string
 }
 
-export type SelectionState =
+export type SelectionRegion =
   | CellSelection
   | RangeSelection
   | RowSelection
   | ColumnSelection
+
+export type SelectionState =
+  | SelectionRegion
   | AllSelection
+
+export interface MultiRangeSelectionState {
+  regions: SelectionState[]
+  primaryIndex: number
+}
+
+export interface AddSelectionRegionInput {
+  region: SelectionRegion
+  makePrimary?: boolean
+}
+
+export interface ClearSelectionRegionsInput {
+  keepPrimary?: boolean
+}
 
 export interface ActiveSelectionCell extends CellCoord {
   sheetId: string

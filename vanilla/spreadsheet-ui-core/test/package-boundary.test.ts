@@ -10,7 +10,9 @@ import {
   keyboardModeAtom,
   menuStateAtom,
   pointerSessionAtom,
+  primarySelectionRegionAtom,
   selectionAtom,
+  selectionRegionsAtom,
   toolbarUiStateAtom,
   viewportMetricsAtom,
   workspaceSessionAtom,
@@ -54,6 +56,8 @@ describe('package boundary', () => {
     expect(viewportMetricsAtom.debugLabel).toBe('spreadsheet.viewport.metrics')
     expect(workspaceSessionAtom.debugLabel).toBe('spreadsheet.workspace.session')
     expect(historyStackAtom.debugLabel).toBe('spreadsheet.history.stack')
+    expect(selectionRegionsAtom.debugLabel).toBe('spreadsheet.selection.regions')
+    expect(primarySelectionRegionAtom.debugLabel).toBe('spreadsheet.selection.primaryRegion')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {
