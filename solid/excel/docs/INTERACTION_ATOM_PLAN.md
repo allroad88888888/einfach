@@ -829,10 +829,15 @@ PC-7 准备第六段验收记录：
   persistence / reload 后保留 / auto-fit 等完整 Excel 行为仍未实现。
 - PC-7 已进入 package surface 准备；`@einfach/solid-excel` default public entry 还没有切到
   vNext。
+- PC-7 后续多批次 agent 执行计划已单独落到
+  `solid/excel/docs/PC7_AGENT_PIPELINE.md`。接下来按该文档的 W1-W7 波次推进，
+  每波由总架构师收口并要求测试 + MCP Playwright 验证。
 
 ## 并行 Agent 计划
 
 总架构师负责接口冻结、集成和最终验收。子 agent 只能提交候选补丁。
+PC-7 后续执行以 `solid/excel/docs/PC7_AGENT_PIPELINE.md` 为准；本节保留为
+`spreadsheet-ui-core` 和 vNext 初始拆包阶段的历史分工记录。
 
 ### PC-1 新包骨架
 
