@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { describe, expect, test } from '@jest/globals'
 import {
   clipboardStateAtom,
+  filterSortStateAtom,
   commentSessionAtom,
   conditionalFormatEditorAtom,
   diagnosticsAtom,
@@ -23,6 +24,7 @@ import {
   printConfigStateAtom,
   selectionAtom,
   selectionRegionsAtom,
+  sheetProtectionAtom,
   toolbarUiStateAtom,
   validationRuleEditorAtom,
   viewportFreezeAtom,
@@ -84,6 +86,8 @@ describe('package boundary', () => {
     expect(printConfigStateAtom.debugLabel).toBe('spreadsheet.print.config')
     expect(findReplaceQueryAtom.debugLabel).toBe('spreadsheet.findReplace.query')
     expect(presenceStateAtom.debugLabel).toBe('spreadsheet.presence.state')
+    expect(filterSortStateAtom.debugLabel).toBe('spreadsheet.filterSort.state')
+    expect(sheetProtectionAtom.debugLabel).toBe('spreadsheet.protection.state')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

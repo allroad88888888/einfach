@@ -1,4 +1,5 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { SetFilterSortRequest } from '../filter-sort/types'
 import type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest } from '../print/types'
 import type { PresenceUpdate } from '../presence/types'
 import type { DisplayCellRichValue } from '../rich-types/types'
@@ -32,6 +33,7 @@ import type {
   ReplaceMatchesRequest,
   ReplaceMatchesResult,
 } from '../find-replace/types'
+import type { SetSheetProtectionRequest, SetRangeLockRequest } from '../protection/types'
 
 export type {
   ClearNoteRequest,
@@ -62,6 +64,9 @@ export type {
 
 // --- print ---
 export type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest }
+
+// --- protection ---
+export type { SetSheetProtectionRequest, SetRangeLockRequest }
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -107,6 +112,11 @@ export interface DisplayCell {
   validation?: ValidationOutcome
   conditionalFormat?: SpreadsheetCellFormat
   richValue?: DisplayCellRichValue
+  /** Backend sets this when filter or sort is active; the renderer keeps using `row` for layout
+   *  while edit round-trips use originalRow. */
+  originalRow?: number
+  /** Locked indicator from a protected sheet; gating logic uses unlockedRanges on the UI side. */
+  locked?: boolean
 }
 
 export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
@@ -508,6 +518,9 @@ export interface HistoryTransactionResult {
   affectedRange?: CellRange
 }
 
+// --- filter-sort ---
+export type { SetFilterSortRequest } from '../filter-sort/types'
+
 export interface SpreadsheetBackend {
   listSheets?(): Promise<SheetListResult>
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
@@ -574,6 +587,11 @@ export interface SpreadsheetBackend {
   // presence
   subscribePresence?(handler: (update: PresenceUpdate) => void): SubscribePresenceUnsubscribe
   publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
+  // filter-sort
+  setFilterSort?(request: SetFilterSortRequest): Promise<BackendMutationResult>
+  // protection
+  setSheetProtection?(request: SetSheetProtectionRequest): Promise<BackendMutationResult>
+  setRangeLock?(request: SetRangeLockRequest): Promise<BackendMutationResult>
 }
 
 export interface ViewportFreezeConfig {

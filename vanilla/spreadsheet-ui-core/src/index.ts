@@ -1,4 +1,6 @@
 export * from './auto-fill'
+export * from './filter-sort'
+export * from './protection'
 export * from './find-replace'
 export * from './presence'
 export * from './print'
