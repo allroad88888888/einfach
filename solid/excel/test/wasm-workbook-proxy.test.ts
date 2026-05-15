@@ -280,6 +280,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       workerSubscriptionCount: 0,
       importSessionCount: 0,
       exportSessionCount: 0,
+      snapshotSessionCount: 0,
       sheets: [
         {
           idx: 0,
@@ -299,6 +300,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
       workerSubscriptionCount: 0,
       importSessionCount: 0,
       exportSessionCount: 0,
+      snapshotSessionCount: 0,
       sheets: [
         {
           idx: 0,

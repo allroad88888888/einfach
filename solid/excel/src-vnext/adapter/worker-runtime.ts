@@ -238,6 +238,7 @@ function debugCounters(wb: WasmWorkbookRuntime): WorkerWorkbookDebugCountersWire
     workerSubscriptionCount: subscriptionTokens.size,
     importSessionCount: importSessions.size,
     exportSessionCount: exportSessions.size,
+    snapshotSessionCount: snapshotSessions.size,
     sheets,
   }
 }

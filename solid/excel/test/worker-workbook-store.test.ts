@@ -796,6 +796,7 @@ function makeFakeWorkerWorkbookClient(
         workerSubscriptionCount: calls.subscribeCells.length - calls.unsubscribeCells.length,
         importSessionCount: 0,
         exportSessionCount: 0,
+        snapshotSessionCount: 0,
         sheets: metas.map((meta) => ({
           idx: meta.idx,
           name: meta.name,

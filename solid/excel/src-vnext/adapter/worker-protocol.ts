@@ -187,6 +187,7 @@ export interface WorkerWorkbookDebugCountersWire {
   workerSubscriptionCount: number
   importSessionCount: number
   exportSessionCount: number
+  snapshotSessionCount: number
   sheets: WorkerWorkbookSheetDebugCountersWire[]
 }
 

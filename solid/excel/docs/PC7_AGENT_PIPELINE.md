@@ -208,6 +208,12 @@ W6、W7 是 package cutover 和发布门禁。
 - 已补 backend `importCells` port 和 vNext context-menu large paste 接线；超过小范围阈值的
   TSV paste 走 worker `beginImport/importChunk/commitImport`，不再由 UI 循环发逐 cell
   mutation RPC。
+- 本轮补齐 W5 回归门禁：Rust wasm 用 1000 个公式验证 `bulk_import_cells` 只标 dirty、
+  显式读取才计算；worker adapter 覆盖 import chunk/commit 失败时必须 `cancelImport` 且
+  不回退逐 cell RPC；worker debug counters 暴露 `snapshotSessionCount`，e2e 验证 sparse
+  snapshot session begin/cancel 后不泄漏。
+- large paste e2e 现在包含离屏公式：从 `D4` 粘贴 10001 行时，最后一行公式导入后仍为
+  dirty，只有显式 `readCells(D10004)` 才计算并把公式引用平移为 `=D4+1`。
 
 并行分工：
 
@@ -224,6 +230,26 @@ W6、W7 是 package cutover 和发布门禁。
 - large range export/copy 走 chunk streaming，不走整块 projection。
 - range dependent dirty propagation 在大 range 下有复杂度回归测试。
 - MCP Playwright 验证大 range 操作后页面仍可交互、可视 cell 数稳定。
+
+本轮交付记录：
+
+- 子 agent：Rust/Wasm Scale（Codex `gpt-5.5` xhigh，写 `rust/wasm/src/lib.rs`）；
+  Worker Import Tests（Codex `gpt-5.5` xhigh，写 `solid/excel/test/vnext-adapter.test.ts`）；
+  Architecture Review（Codex `gpt-5.5` xhigh，只读 review）。
+- 总架构师收口：补 `snapshotSessionCount` worker debug counter，更新 worker protocol/runtime、
+  worker tests、vNext worker e2e 和本文档。
+- 已跑测试：`npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`；
+  `npx jest solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/worker-workbook-store.test.ts solid/excel/test/vnext-adapter.test.ts --runInBand`；
+  `cargo test`（`rust/wasm`）；`wasm-pack test --headless --chrome .`（`rust/wasm`）；
+  `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`；
+  `npm run build -w @einfach/solid-excel`。
+- MCP Playwright：打开 `http://127.0.0.1:4173/?debug=1` 的 vNext Worker demo，验证
+  sparse snapshot session `0 -> 1 -> 0`、large paste 10001 行后 DOM 仍为 30 个可视 cell、
+  `J20` 未挂载、离屏公式 `D10004` 导入后 dirty，显式读取后显示 `2` 且公式文本为
+  `=D4+1`；当前页面 console warning/error 为 0。
+- 剩余风险：large paste 入口仍会在 UI/adapter 层 materialize `ImportCellInput[]`，后续需要把
+  clipboard parse/import 改为 chunk-first；range export helper 仍有字符串聚合 convenience API，
+  大复制/导出路径还要继续去聚合化。
 
 ## W6：package cutover readiness
 

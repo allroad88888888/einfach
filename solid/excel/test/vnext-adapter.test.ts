@@ -1384,6 +1384,98 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
+  it('cancels worker workbook import when a chunk fails without per-cell fallback', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    await backend.ready()
+    client.importChunk = async (sessionId, importCells) => {
+      client.calls.importChunk.push({ sessionId, cells: importCells })
+      throw new Error('import chunk failed')
+    }
+
+    await expect(
+      backend.importCells?.({
+        kind: 'import-cells',
+        sheetId: 'sheet-1',
+        requestId: 22,
+        cellsPerChunk: 2,
+        range: { rowStart: 4, rowEnd: 4, colStart: 3, colEnd: 4 },
+        cells: [
+          { row: 4, col: 3, input: '=A1+1' },
+          { row: 4, col: 4, input: '7' },
+        ],
+      }),
+    ).rejects.toThrow('import chunk failed')
+
+    expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 4, col: 3, kind: 'formula', value: '=A1+1' },
+          { sheet: 0, row: 4, col: 4, kind: 'number', value: 7 },
+        ],
+      },
+    ])
+    expect(client.calls.commitImport).toEqual([])
+    expect(client.calls.cancelImport).toEqual([1])
+    expect(client.calls.setCell).toEqual([])
+    expect(client.calls.setFormulaDetailed).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('cancels worker workbook import when commit fails without per-cell fallback', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    await backend.ready()
+    client.commitImport = async (sessionId) => {
+      client.calls.commitImport.push(sessionId)
+      throw new Error('commit import failed')
+    }
+
+    await expect(
+      backend.importCells?.({
+        kind: 'import-cells',
+        sheetId: 'sheet-1',
+        requestId: 23,
+        cellsPerChunk: 2,
+        range: { rowStart: 4, rowEnd: 4, colStart: 3, colEnd: 4 },
+        cells: [
+          { row: 4, col: 3, input: '=A1+1' },
+          { row: 4, col: 4, input: '7' },
+        ],
+      }),
+    ).rejects.toThrow('commit import failed')
+
+    expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 4, col: 3, kind: 'formula', value: '=A1+1' },
+          { sheet: 0, row: 4, col: 4, kind: 'number', value: 7 },
+        ],
+      },
+    ])
+    expect(client.calls.commitImport).toEqual([1])
+    expect(client.calls.cancelImport).toEqual([1])
+    expect(client.calls.setCell).toEqual([])
+    expect(client.calls.setFormulaDetailed).toEqual([])
+
+    backend.dispose()
+  })
+
   it('falls back to worker workbook plain export when chunk export is unavailable', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({

@@ -9,12 +9,34 @@ import {
   typeIntoCell,
 } from './helpers'
 
+type DebugCounters = {
+  formulaEvalCountTotal: number
+  importSessionCount: number
+  exportSessionCount: number
+  snapshotSessionCount: number
+}
+
 declare global {
   interface Window {
     __einfachWorkbookDebugClient?: {
       sheetList(): Promise<Array<{ idx: number; name: string }>>
       debugFormulaCacheState(sheet: number, addr: string): Promise<string>
       debugFormulaEvalCount(sheet: number): Promise<number>
+      debugCounters(): Promise<DebugCounters>
+      readCells(
+        cells: Array<{ sheet: number; addr: string }>,
+      ): Promise<Array<{ display: string; formula: string }>>
+      beginSnapshotRangeSparse(
+        range: {
+          sheet: number
+          startRow: number
+          startCol: number
+          endRow: number
+          endCol: number
+        },
+        rowsPerChunk?: number,
+      ): Promise<{ sessionId: number; totalRows: number; rowsPerChunk: number }>
+      cancelSnapshot(sessionId: number): Promise<boolean>
       snapshotRangeSparseChunks(
         range: {
           sheet: number
@@ -137,6 +159,30 @@ test.describe('Solid Excel vNext worker backend', () => {
     expect(result.chunkSizes.reduce((sum, size) => sum + size, 0)).toBeGreaterThan(0)
     expect(result.addrs).toEqual(expect.arrayContaining(['A1', 'B4', 'C2']))
     expect(result.visibleCells).toBe(30)
+
+    const sessionCounts = await page.evaluate(async () => {
+      const client = window.__einfachWorkbookDebugClient!
+      const before = await client.debugCounters()
+      const session = await client.beginSnapshotRangeSparse(
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 5000, endCol: 4 },
+        1024,
+      )
+      const during = await client.debugCounters()
+      const cancelled = await client.cancelSnapshot(session.sessionId)
+      const after = await client.debugCounters()
+      return {
+        before: before.snapshotSessionCount,
+        during: during.snapshotSessionCount,
+        cancelled,
+        after: after.snapshotSessionCount,
+      }
+    })
+    expect(sessionCounts).toEqual({
+      before: 0,
+      during: 1,
+      cancelled: true,
+      after: 0,
+    })
     await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)
   })
@@ -148,7 +194,14 @@ test.describe('Solid Excel vNext worker backend', () => {
     await grantClipboard(context)
     await gotoVNextWorkerDemo(page)
 
-    const rows = Array.from({ length: 10_001 }, (_value, index) => `bulk-${index}`)
+    const beforeImportEvalCount = await page.evaluate(async () =>
+      window.__einfachWorkbookDebugClient!.debugFormulaEvalCount(0),
+    )
+    const rows = [
+      '1',
+      ...Array.from({ length: 9_999 }, (_value, index) => `bulk-${index}`),
+      '=A1+1',
+    ]
     await page.evaluate(
       (text) => navigator.clipboard.writeText(text),
       `# einfach-clipboard-origin: A1\n${rows.join('\n')}`,
@@ -160,15 +213,27 @@ test.describe('Solid Excel vNext worker backend', () => {
     await page.getByTestId('context-menu-command-clipboard.paste').click()
     await expect(menu).toHaveCount(0)
 
-    await expect(cellDisplay(page, 'D4')).toHaveText('bulk-0')
+    await expect(cellDisplay(page, 'D4')).toHaveText('1')
     const result = await page.evaluate(async () => {
+      const client = window.__einfachWorkbookDebugClient!
       const chunks = await window.__einfachWorkbookDebugClient!.snapshotRangeSparseChunks(
         { sheet: 0, startRow: 3, startCol: 3, endRow: 10_003, endCol: 3 },
         2048,
       )
+      const afterImportEvalCount = await client.debugFormulaEvalCount(0)
+      const formulaStateBeforeRead = await client.debugFormulaCacheState(0, 'D10004')
+      const [formulaCell] = await client.readCells([{ sheet: 0, addr: 'D10004' }])
+      const afterReadEvalCount = await client.debugFormulaEvalCount(0)
+      const formulaStateAfterRead = await client.debugFormulaCacheState(0, 'D10004')
       return {
         chunkCount: chunks.length,
         importedCells: chunks.flat().length,
+        afterImportEvalCount,
+        formulaStateBeforeRead,
+        formulaDisplay: formulaCell.display,
+        formulaText: formulaCell.formula,
+        afterReadEvalCount,
+        formulaStateAfterRead,
         visibleCells: document.querySelectorAll('[data-testid="vnext-worker-grid"] td.cell')
           .length,
       }
@@ -176,6 +241,13 @@ test.describe('Solid Excel vNext worker backend', () => {
 
     expect(result.chunkCount).toBe(5)
     expect(result.importedCells).toBe(10_001)
+    expect(result.afterImportEvalCount).toBeGreaterThanOrEqual(beforeImportEvalCount)
+    expect(result.afterImportEvalCount).toBeLessThanOrEqual(beforeImportEvalCount + 1)
+    expect(result.formulaStateBeforeRead).toBe('dirty')
+    expect(result.formulaDisplay).toBe('2')
+    expect(result.formulaText).toBe('=D4+1')
+    expect(result.afterReadEvalCount).toBe(result.afterImportEvalCount + 1)
+    expect(result.formulaStateAfterRead).toBe('clean')
     expect(result.visibleCells).toBe(30)
     await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)

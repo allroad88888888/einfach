@@ -1967,9 +1967,14 @@ describe('wasm-workbook-worker import session contract', () => {
         cmd: 'beginExportRangeTsv',
         range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
       })
+      await harness.send({
+        id: 7,
+        cmd: 'beginSnapshotRangeSparse',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      })
 
       const counters = await harness.send<WorkerWorkbookDebugCountersWire>({
-        id: 7,
+        id: 8,
         cmd: 'debugCounters',
       })
 
@@ -1982,6 +1987,7 @@ describe('wasm-workbook-worker import session contract', () => {
         workerSubscriptionCount: 1,
         importSessionCount: 1,
         exportSessionCount: 1,
+        snapshotSessionCount: 1,
         sheets: [
           {
             idx: 0,
