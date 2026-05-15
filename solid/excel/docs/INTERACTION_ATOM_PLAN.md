@@ -454,8 +454,10 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   row/col insert/delete 只移动已有 key；`WasmWorkbook` 增加 window 级
   `snapshot_viewport_sizes` 和单行/单列 resize mutation，persistence v1 通过可选
   `sizes` 字段 round-trip。Solid UI 仍只保留 `viewportSizeOverridesAtom` 作为可视窗口
-  渲染缓存，不创建 per-row/per-col atom，也不把尺寸变成 cell facts。autofit 尚未接入；
-  后续必须基于当前 visible window 或显式有限范围，不能扫描整表。
+  渲染缓存，不创建 per-row/per-col atom，也不把尺寸变成 cell facts。autofit 通过
+  双击 row/column resize handle 触发，只测量当前可视 DOM 的 header/cell 文本，
+  然后复用单行/单列 resize mutation 写回 sparse metadata；不请求 backend 扫描整行、
+  整列或全表。
 - PC-6 第十九段：vNext ContextMenu 已接大范围 TSV streaming clipboard export。
   `@einfach/spreadsheet-ui-core` 增加可选 backend `exportRangeTsv` port；小范围 copy/cut
   继续走 bounded `readRangeProjection`，超过 10k cell 的 range copy/cut 优先走

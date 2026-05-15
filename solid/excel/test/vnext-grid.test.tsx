@@ -65,6 +65,7 @@ function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
 function createFakeBackend(options: {
   rowHeights?: ViewportSizeProjectionResult['rowHeights']
   colWidths?: ViewportSizeProjectionResult['colWidths']
+  cells?: DisplayCell[] | ((window: VisibleProjectionRequest['window']) => DisplayCell[])
 } = {}) {
   const requests: VisibleProjectionRequest[] = []
   const sizeRequests: ViewportSizeProjectionRequest[] = []
@@ -74,13 +75,17 @@ function createFakeBackend(options: {
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
       requests.push(request)
+      const cells =
+        typeof options.cells === 'function'
+          ? options.cells(request.window)
+          : (options.cells ?? buildCells(request.window))
       const result: VisibleProjectionResult = {
         kind: 'visible-window',
         sheetId: request.sheetId,
         window: { ...request.window },
         requestId: request.requestId,
         revision: request.revision,
-        cells: buildCells(request.window),
+        cells,
       }
       return result
     },
@@ -707,6 +712,73 @@ describe('vNext SpreadsheetGrid', () => {
     expect((container.querySelector('[data-cell-addr="B2"]') as HTMLElement).style.height).toBe(
       '36px',
     )
+  })
+
+  it('autofits visible rows and columns through resize handle double-click', async () => {
+    const store = createStore()
+    const { backend, rowHeightCalls, columnWidthCalls } = createFakeBackend({
+      cells: [
+        { row: 0, col: 0, displayValue: 'A1' },
+        {
+          row: 0,
+          col: 1,
+          displayValue: 'A very long visible value that should drive column autofit',
+          valueKind: 'string',
+        },
+        { row: 1, col: 0, displayValue: 'A2' },
+        {
+          row: 1,
+          col: 1,
+          displayValue: 'Tall',
+          valueKind: 'string',
+          format: { fontSize: 32 },
+        },
+      ],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 48,
+      viewportWidth: 192,
+      rowHeight: 24,
+      colWidth: 96,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    fireEvent.dblClick(getByTestId('col-resize-1'))
+    fireEvent.dblClick(getByTestId('row-resize-1'))
+
+    await waitFor(() => {
+      expect(columnWidthCalls).toHaveLength(1)
+      expect(rowHeightCalls).toHaveLength(1)
+    })
+
+    expect(columnWidthCalls[0]).toMatchObject({ colIndex: 1 })
+    expect(columnWidthCalls[0].widthPx).toBeGreaterThan(220)
+    expect(rowHeightCalls[0]).toMatchObject({ rowIndex: 1 })
+    expect(rowHeightCalls[0].heightPx).toBeGreaterThan(36)
+    expect(
+      (container.querySelector('.spreadsheet-grid-col-header[data-col="1"]') as HTMLElement).style
+        .width,
+    ).toBe(`${columnWidthCalls[0].widthPx}px`)
+    expect(
+      (container.querySelector('.spreadsheet-grid-row-header[data-row="1"]') as HTMLElement).style
+        .height,
+    ).toBe(`${rowHeightCalls[0].heightPx}px`)
+    expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
   })
 
   it('hydrates row and column size metadata from the backend visible window', async () => {

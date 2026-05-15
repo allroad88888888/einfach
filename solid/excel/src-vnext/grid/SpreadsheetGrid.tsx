@@ -16,6 +16,10 @@ import {
   getSelectionRange,
   openMenuAtom,
   pointerSessionAtom,
+  MAX_VIEWPORT_COL_WIDTH,
+  MAX_VIEWPORT_ROW_HEIGHT,
+  MIN_VIEWPORT_COL_WIDTH,
+  MIN_VIEWPORT_ROW_HEIGHT,
   selectionSnapshotAtom,
   selectAllAtom,
   selectCellAtom,
@@ -114,6 +118,79 @@ function getCellInputForFill(cell: DisplayCell | undefined): string {
 }
 
 const MAX_UI_FILL_FALLBACK_CELLS = 200
+const AUTO_FIT_CELL_PADDING_PX = 16
+const AUTO_FIT_ROW_PADDING_PX = 4
+
+function clampDimension(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) {
+    return min
+  }
+  return Math.max(min, Math.min(max, Math.round(value)))
+}
+
+function parseCssPx(value: string | null | undefined): number {
+  if (!value) return 0
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function textUnitCount(text: string): number {
+  return Math.max(1, Array.from(text).length)
+}
+
+function fallbackTextWidth(text: string, style: CSSStyleDeclaration): number {
+  const fontSize = parseCssPx(style.fontSize) || 12
+  return textUnitCount(text) * fontSize * 0.62
+}
+
+function measureTextBox(
+  source: HTMLElement,
+  text: string,
+): { width: number; height: number; style: CSSStyleDeclaration } {
+  const style = window.getComputedStyle(source)
+  const probe = document.createElement('span')
+  probe.textContent = text.length > 0 ? text : ' '
+  probe.style.position = 'absolute'
+  probe.style.visibility = 'hidden'
+  probe.style.whiteSpace = 'pre'
+  probe.style.font = style.font
+  probe.style.fontSize = style.fontSize
+  probe.style.fontFamily = style.fontFamily
+  probe.style.fontWeight = style.fontWeight
+  probe.style.fontStyle = style.fontStyle
+  probe.style.letterSpacing = style.letterSpacing
+  document.body.appendChild(probe)
+  const rect = probe.getBoundingClientRect()
+  probe.remove()
+
+  const fontSize = parseCssPx(style.fontSize) || 12
+  const lineHeight = parseCssPx(style.lineHeight)
+  return {
+    width: rect.width > 0 ? rect.width : fallbackTextWidth(text, style),
+    height: rect.height > 0 ? rect.height : Math.max(lineHeight, fontSize * 1.25),
+    style,
+  }
+}
+
+function measureAutoFitWidth(source: HTMLElement): number {
+  const { width, style } = measureTextBox(source, source.textContent ?? '')
+  return (
+    width +
+    parseCssPx(style.paddingLeft) +
+    parseCssPx(style.paddingRight) +
+    AUTO_FIT_CELL_PADDING_PX
+  )
+}
+
+function measureAutoFitHeight(source: HTMLElement): number {
+  const { height, style } = measureTextBox(source, source.textContent ?? '')
+  return (
+    height +
+    parseCssPx(style.paddingTop) +
+    parseCssPx(style.paddingBottom) +
+    AUTO_FIT_ROW_PADDING_PX
+  )
+}
 
 export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const store = useSpreadsheetUiStore()
@@ -285,6 +362,64 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       rowIndex,
       heightPx,
     })
+  }
+
+  function getAutoFitColumnWidth(col: number): number {
+    const headerLabel = gridRoot?.querySelector(
+      `.spreadsheet-grid-col-header[data-col="${col}"] .spreadsheet-grid-header-label`,
+    ) as HTMLElement | null
+    let width = headerLabel ? measureAutoFitWidth(headerLabel) : props.viewport.colWidth
+
+    const cells = gridRoot?.querySelectorAll(
+      `td.spreadsheet-grid-cell[data-col="${col}"] .cell-display`,
+    )
+    cells?.forEach((cell) => {
+      width = Math.max(width, measureAutoFitWidth(cell as HTMLElement))
+    })
+
+    return clampDimension(width, MIN_VIEWPORT_COL_WIDTH, MAX_VIEWPORT_COL_WIDTH)
+  }
+
+  function getAutoFitRowHeight(row: number): number {
+    const rowLabel = gridRoot?.querySelector(
+      `.spreadsheet-grid-row-header[data-row="${row}"] .spreadsheet-grid-header-label`,
+    ) as HTMLElement | null
+    let height = rowLabel ? measureAutoFitHeight(rowLabel) : props.viewport.rowHeight
+
+    const cells = gridRoot?.querySelectorAll(
+      `td.spreadsheet-grid-cell[data-row="${row}"] .cell-display`,
+    )
+    cells?.forEach((cell) => {
+      height = Math.max(height, measureAutoFitHeight(cell as HTMLElement))
+    })
+
+    return clampDimension(height, MIN_VIEWPORT_ROW_HEIGHT, MAX_VIEWPORT_ROW_HEIGHT)
+  }
+
+  async function autoFitColumn(col: number) {
+    activeResizeCleanup?.()
+    activeFillCleanup?.()
+    const widthPx = getAutoFitColumnWidth(col)
+    store.setter(setViewportColumnWidthAtom, {
+      sheetId: props.sheetId,
+      colIndex: col,
+      widthPx,
+    })
+    bumpRender()
+    await persistColumnWidth(col, widthPx)
+  }
+
+  async function autoFitRow(row: number) {
+    activeResizeCleanup?.()
+    activeFillCleanup?.()
+    const heightPx = getAutoFitRowHeight(row)
+    store.setter(setViewportRowHeightAtom, {
+      sheetId: props.sheetId,
+      rowIndex: row,
+      heightPx,
+    })
+    bumpRender()
+    await persistRowHeight(row, heightPx)
   }
 
   onMount(() => {
@@ -1027,6 +1162,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                         data-testid={`col-resize-${col}`}
                         aria-label={`Resize column ${getColumnLabel(col)}`}
                         onPointerDown={(event) => startColumnResize(event, col)}
+                        onDblClick={(event) => {
+                          event.preventDefault()
+                          event.stopPropagation()
+                          void autoFitColumn(col)
+                        }}
                       />
                     </th>
                   )
@@ -1069,6 +1209,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       data-testid={`row-resize-${row}`}
                       aria-label={`Resize row ${row + 1}`}
                       onPointerDown={(event) => startRowResize(event, row)}
+                      onDblClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        void autoFitRow(row)
+                      }}
                     />
                   </th>
                   <For each={getCols()}>

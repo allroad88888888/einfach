@@ -25,7 +25,9 @@ content materialization.
 
 Viewport size metadata ports are window based. `readViewportSizeProjection`
 returns only sparse row heights and column widths for the visible window; resize
-mutations write one row or one column at a time.
+mutations write one row or one column at a time. UI-level autofit must measure
+only the current visible DOM or an explicit finite range, then persist through
+the same one-row/one-column resize mutations.
 
 ## State Decision Template
 
