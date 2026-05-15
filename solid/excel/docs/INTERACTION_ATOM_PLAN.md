@@ -463,6 +463,12 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   不再 import legacy `formula-shift`；该纯函数仍只处理 clipboard paste 的字符串转换，
   不读取 backend、不创建 cell atom、不触发公式求值。vNext 剩余 legacy import 主要是
   worker/Rust adapter 与 worker demo 需要使用现有 WASM worker proxy/types。
+- PC-7 准备第二段：`@einfach/solid-excel` legacy package entry 已显式暴露
+  `vNext` namespace，消费者可以从 root entry 读取 vNext provider/grid/chrome/backend
+  adapter；但 `main` 仍保持 legacy `./src/index.tsx`，不做 breaking cutover。vNext public
+  surface 单独收敛到 `solid/excel/src-vnext/public.ts`，不导出 demo，避免 package entry
+  import 时把 `VNextWorkerDemo` 的 worker factory / `import.meta.url` 副作用带进 Jest 或
+  Node-like 消费环境。demo 入口继续由 `src-vnext/index.tsx` 内部导出给现有 App 使用。
 
 PC-6 第一段验收记录：
 
@@ -727,10 +733,23 @@ PC-7 准备第一段验收记录：
   当前仍只渲染 30 个可视 cell、`J20` offscreen 未挂载、projection 为 `Ready`、
   console error 为 0。
 
+PC-7 准备第二段验收记录：
+
+- `npx jest solid/excel/test/package-entry.test.ts solid/excel/test/vnext-provider.test.tsx --runInBand`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/`，点击 `vNext` demo；验证
+  table body 仍只挂载 30 个可视 cell、页面没有 `J20`、状态栏显示 `Ready` /
+  `30 cells` / `30 loaded`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
-  public entry 还未切到 vNext。sheet add/rename/delete 已接入 vNext backend port；
+  public entry 还未切到 vNext。当前 root entry 只新增 `vNext` namespace 作为兼容迁移入口；
+  `package.json` 的 `main` / `exports` 暂不切，避免断掉 legacy `Table` / `createSheetStore`
+  / worker store 等现有导出。sheet add/rename/delete 已接入 vNext backend port；
   sheet reorder 已接 vNext metadata backend port 和 worker adapter 显示顺序映射；
   Rust core/wasm 仍未实现真正的 `move_sheet`。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
@@ -743,7 +762,8 @@ PC-7 准备第一段验收记录：
   backend adapter 均已接入；后续可继续补更完整的 Excel 空白/非空边界细节测试。
 - Excel 级交互仍缺：row/col resize 已接 vNext backend metadata port，但 Rust
   persistence / reload 后保留 / auto-fit 等完整 Excel 行为仍未实现。
-- PC-7 尚未开始；`@einfach/solid-excel` public entry 还没有切到 vNext。
+- PC-7 已进入 package surface 准备；`@einfach/solid-excel` default public entry 还没有切到
+  vNext。
 
 ## 并行 Agent 计划
 
