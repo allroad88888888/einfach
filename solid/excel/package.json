@@ -4,6 +4,19 @@
   "description": "SolidJS Excel table component powered by Rust WASM engine",
   "type": "module",
   "main": "./src/index.tsx",
+  "exports": {
+    ".": {
+      "types": "./src/index.tsx",
+      "import": "./src/index.tsx",
+      "default": "./src/index.tsx"
+    },
+    "./vnext": {
+      "types": "./src-vnext/public.ts",
+      "import": "./src-vnext/public.ts",
+      "default": "./src-vnext/public.ts"
+    },
+    "./package.json": "./package.json"
+  },
   "license": "MIT",
   "scripts": {
     "dev": "vite",

@@ -472,6 +472,10 @@ Playwright CLI，并补 MCP Playwright 验证记录。
 - PC-7 准备第三段：demo App 首屏默认切到 `vNext`，让本地打开页面时直接进入新
   UI core 路径；legacy demos 仍保留在同一导航里作为对照和旧能力回归。i18n e2e
   明确点击 `Blank` 后再验证 legacy demo 文案，避免继续把首页默认 demo 和翻译测试耦合。
+- PC-7 准备第四段：`@einfach/solid-excel` package exports 增加正式
+  `@einfach/solid-excel/vnext` 子入口，指向 `src-vnext/public.ts`；root `.` 仍指向
+  legacy `src/index.tsx`，所以这一步只增加迁移入口，不把默认 import 切到 vNext。vNext
+  子入口只暴露 provider/grid/chrome/backend adapter 等库级 surface，不导出 demo。
 
 PC-6 第一段验收记录：
 
@@ -757,12 +761,24 @@ PC-7 准备第三段验收记录：
   为 `vNext`、`vnext-grid` 已挂载、table body 仍只有 30 个可视 cell、`J20` 未挂载、
   状态栏包含 `Ready` / `30 cells` / `30 loaded`、console error 为 0。
 
+PC-7 准备第四段验收记录：
+
+- `npx jest solid/excel/test/package-vnext-subpath.test.ts solid/excel/test/package-entry.test.ts --runInBand`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/` 首页；验证 active tab 为
+  `vNext`、`vnext-grid` 已挂载、table body 仍只有 30 个可视 cell、`J20` 未挂载、
+  状态栏包含 `Ready` / `30 cells` / `30 loaded`、console error 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
   public entry 还未切到 vNext。当前 root entry 只新增 `vNext` namespace 作为兼容迁移入口；
-  `package.json` 的 `main` / `exports` 暂不切，避免断掉 legacy `Table` / `createSheetStore`
-  / worker store 等现有导出。sheet add/rename/delete 已接入 vNext backend port；
+  `package.json` 已增加 `./vnext` 子入口，但 root `main` / export `.` 仍保持 legacy，
+  避免断掉 legacy `Table` / `createSheetStore` / worker store 等现有导出。sheet
+  add/rename/delete 已接入 vNext backend port；
   sheet reorder 已接 vNext metadata backend port 和 worker adapter 显示顺序映射；
   Rust core/wasm 仍未实现真正的 `move_sheet`。
 - vNext chrome UI 已有 status bar；ContextMenu 的 `cell.clear` 已接单 cell 和 range
