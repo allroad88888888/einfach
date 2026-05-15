@@ -37,6 +37,11 @@ export interface SelectAllIntent {
   selection: SelectionState
 }
 
+export interface ClearNonPrimarySelectionIntent {
+  type: 'selection.clearNonPrimary'
+  keepPrimary: true
+}
+
 export interface KeyboardEditingStartIntent {
   type: 'editing.start'
   source: 'keyboard'
@@ -79,6 +84,7 @@ export interface NoneKeyboardIntent {
 export type KeyboardCommandIntent =
   | MoveSelectionIntent
   | SelectAllIntent
+  | ClearNonPrimarySelectionIntent
   | KeyboardEditingStartIntent
   | KeyboardEditingCommitIntent
   | KeyboardEditingCancelIntent

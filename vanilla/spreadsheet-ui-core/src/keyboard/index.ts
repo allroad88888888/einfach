@@ -1,11 +1,13 @@
 import { atom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import {
+  clearNonPrimaryRegionsAtom,
   getActiveCell,
   moveSelection,
   normalizeSelection,
   selectionAtom,
   selectionBoundsAtom,
+  selectionRegionsAtom,
   setPrimaryRegionAtom,
   type ActiveSelectionCell,
   type SelectionBounds,
@@ -48,12 +50,15 @@ export const dispatchKeyboardInputAtom = atom(
       mode: get(keyboardModeAtom),
       selection: get(selectionAtom),
       bounds: get(selectionBoundsAtom),
+      selectionRegionCount: get(selectionRegionsAtom).length,
     })
 
     if (intent.type === 'selection.move') {
       set(setPrimaryRegionAtom, intent.selection)
     } else if (intent.type === 'selection.selectAll') {
       set(selectionAtom, intent.selection)
+    } else if (intent.type === 'selection.clearNonPrimary') {
+      set(clearNonPrimaryRegionsAtom, { keepPrimary: true })
     }
 
     set(lastKeyboardIntentAtom, intent)
@@ -66,6 +71,7 @@ export interface KeyboardCommandState {
   mode: KeyboardMode
   selection: SelectionState
   bounds: SelectionBounds
+  selectionRegionCount?: number
 }
 
 export function getKeyboardCommandIntent(
@@ -86,6 +92,13 @@ export function getKeyboardCommandIntent(
   const commandIntent = getCommandShortcutIntent(input, state)
   if (commandIntent.type !== 'none') {
     return commandIntent
+  }
+
+  if (input.key === 'Escape' && (state.selectionRegionCount ?? 1) > 1) {
+    return {
+      type: 'selection.clearNonPrimary',
+      keepPrimary: true,
+    }
   }
 
   if (input.altKey && !isHorizontalPageInput(input)) {

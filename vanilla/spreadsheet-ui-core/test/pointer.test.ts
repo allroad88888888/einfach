@@ -234,6 +234,38 @@ describe('pointer core', () => {
     expect(store.setter(commitPointerAtom)).toBeNull()
   })
 
+  test('carries append mode through drag selection commit intents', () => {
+    const store = createStore()
+
+    store.setter(startPointerAtom, {
+      kind: 'drag-selection',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 2, col: 2 },
+      append: true,
+      source: 'mouse',
+    })
+
+    expect(store.getter(pointerSessionAtom).interaction).toEqual({
+      kind: 'drag-selection',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 2, col: 2 },
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      append: true,
+    })
+
+    expect(store.setter(commitPointerAtom)).toEqual({
+      type: 'pointer.drag-selection.commit',
+      sheetId: 'sheet-1',
+      source: 'mouse',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 2, col: 2 },
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      append: true,
+    })
+  })
+
   test('computes fill handle preview and write ranges without expanding cells', () => {
     const sourceRange = { rowStart: 1, rowEnd: 2, colStart: 3, colEnd: 4 }
 

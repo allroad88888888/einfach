@@ -265,6 +265,7 @@ function buildDragSelectionSession(
     anchor,
     focus,
     range: normalizeCellRange(anchor, focus),
+    ...(input.append ? { append: true } : {}),
   }
 }
 
@@ -423,6 +424,7 @@ export function createPointerCommitIntent(
         anchor: copyCellCoord(state.interaction.anchor),
         focus: copyCellCoord(state.interaction.focus),
         range: copyCellRange(state.interaction.range),
+        ...(state.interaction.append ? { append: true } : {}),
       }
     case 'fill-handle':
       if (state.interaction.previewRange === null) {

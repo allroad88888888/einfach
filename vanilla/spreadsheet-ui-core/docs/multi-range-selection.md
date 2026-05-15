@@ -27,7 +27,7 @@ a wrapper that carries an ordered list of regions plus a `primaryIndex`.
 ```ts
 // new source atom — replaces bare selectionAtom value type
 export interface MultiRangeSelectionState {
-  regions: SelectionRegion[]     // at least one element always
+  regions: readonly SelectionState[] // at least one element always
   primaryIndex: number           // index into regions[]
 }
 ```
@@ -43,7 +43,7 @@ Optional auxiliary atom for debugging:
 
 ```ts
 export const selectionRegionsAtom = atom(
-  (get) => get(selectionAtom).regions,
+  (get) => snapshotRegions(get(selectionAtom).regions),
 )
 selectionRegionsAtom.debugLabel = 'spreadsheet.selection.regions'
 ```
@@ -65,7 +65,7 @@ export type SelectionRegion =
 
 // Updated top-level state
 export interface MultiRangeSelectionState {
-  regions: SelectionRegion[]
+  regions: readonly SelectionState[]
   primaryIndex: number
 }
 
@@ -86,8 +86,10 @@ export interface ExtendPrimaryRegionInput {
 }
 ```
 
-`AllSelection` is excluded from `SelectionRegion` — selecting all replaces
-the multi-region state with a single `all` region in the legacy shape.
+`AllSelection` is excluded from `SelectionRegion`, so callers cannot append
+`all` as one disjoint region. Internally `MultiRangeSelectionState.regions`
+uses `SelectionState` to allow Ctrl/Cmd+A to replace the whole multi-region
+state with a single `all` region.
 
 ## Backend Port
 
@@ -111,12 +113,14 @@ cheap.
 - Shift+Arrow extends the primary region's `focus` (same as today for a
   single selection).
 - Escape with `regions.length > 1`: collapse to primary region only
-  (`clearSelectionRegionsAtom` with `keepPrimary: true`). Escape with
-  a single region: existing behaviour (cancel edit or deselect).
+  (`selection.clearNonPrimary` intent, backed by `clearSelectionRegionsAtom`
+  with `keepPrimary: true`). Escape with a single region: existing behaviour
+  (cancel edit or deselect).
 - Ctrl/Cmd+A: replace all regions with a single `all` region.
 
-`dispatchKeyboardInputAtom` reads `selectionAtom.regions[primaryIndex]`
-for movement logic; no structural change needed to keyboard intent types.
+`dispatchKeyboardInputAtom` reads the primary region for movement logic and
+the region count for Escape collapse. The keyboard intent union includes
+`selection.clearNonPrimary` so adapters can prevent default consistently.
 
 ### Pointer
 
@@ -127,8 +131,9 @@ for movement logic; no structural change needed to keyboard intent types.
   as a new region; set it as primary.
 - Ctrl/Cmd+drag → start a drag-selection session; on pointer-up append the
   dragged range via `addSelectionRegionAtom`.
-- Pointer module exposes a new `pointerMultiSelectSessionAtom` to track
-  the in-progress Ctrl+drag region before commit.
+- Pointer drag-selection start/commit carries `append?: boolean`, so host
+  adapters can keep modifier-key policy in the UI while preserving a precise
+  core pointer contract.
 
 ### Clipboard
 

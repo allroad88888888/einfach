@@ -106,7 +106,10 @@ export function normalizeSelection(
         colFocus: clampIndex(selection.colFocus, normalizedBounds.colCount),
       }
     case 'all':
-      return selection
+      return {
+        kind: 'all',
+        sheetId: selection.sheetId,
+      }
     default:
       return assertNever(selection)
   }
@@ -237,6 +240,50 @@ function getPrimaryRegion(multi: MultiRangeSelectionState): SelectionState {
   return multi.regions[multi.primaryIndex] ?? multi.regions[0]
 }
 
+function copySelection(selection: SelectionState): SelectionState {
+  switch (selection.kind) {
+    case 'cell':
+      return Object.freeze({
+        kind: 'cell',
+        sheetId: selection.sheetId,
+        anchor: Object.freeze({ ...selection.anchor }),
+        focus: Object.freeze({ ...selection.focus }),
+      })
+    case 'range':
+      return Object.freeze({
+        kind: 'range',
+        sheetId: selection.sheetId,
+        anchor: Object.freeze({ ...selection.anchor }),
+        focus: Object.freeze({ ...selection.focus }),
+      })
+    case 'row':
+      return Object.freeze({
+        kind: 'row',
+        sheetId: selection.sheetId,
+        rowAnchor: selection.rowAnchor,
+        rowFocus: selection.rowFocus,
+      })
+    case 'column':
+      return Object.freeze({
+        kind: 'column',
+        sheetId: selection.sheetId,
+        colAnchor: selection.colAnchor,
+        colFocus: selection.colFocus,
+      })
+    case 'all':
+      return Object.freeze({
+        kind: 'all',
+        sheetId: selection.sheetId,
+      })
+    default:
+      return assertNever(selection)
+  }
+}
+
+function copySelectionRegions(regions: readonly SelectionState[]): SelectionState[] {
+  return regions.map(copySelection)
+}
+
 export const selectionBoundsAtom = atom<SelectionBounds>(DEFAULT_SELECTION_BOUNDS)
 selectionBoundsAtom.debugLabel = 'spreadsheet.selection.bounds'
 
@@ -244,7 +291,7 @@ const _multiSelectionAtom = atom<MultiRangeSelectionState>(DEFAULT_MULTI_SELECTI
 _multiSelectionAtom.debugLabel = 'spreadsheet.selection._multi'
 
 export const selectionAtom = atom(
-  (get): SelectionState => getPrimaryRegion(get(_multiSelectionAtom)),
+  (get): SelectionState => copySelection(getPrimaryRegion(get(_multiSelectionAtom))),
   (get, set, state: SelectionState) => {
     set(_multiSelectionAtom, toMultiRange(normalizeSelection(state, get(selectionBoundsAtom))))
   },
@@ -252,12 +299,12 @@ export const selectionAtom = atom(
 selectionAtom.debugLabel = 'spreadsheet.selection.state'
 
 export const selectionRegionsAtom = atom(
-  (get): SelectionState[] => get(_multiSelectionAtom).regions,
+  (get): readonly SelectionState[] => copySelectionRegions(get(_multiSelectionAtom).regions),
 )
 selectionRegionsAtom.debugLabel = 'spreadsheet.selection.regions'
 
 export const primarySelectionRegionAtom = atom(
-  (get): SelectionState => getPrimaryRegion(get(_multiSelectionAtom)),
+  (get): SelectionState => copySelection(getPrimaryRegion(get(_multiSelectionAtom))),
 )
 primarySelectionRegionAtom.debugLabel = 'spreadsheet.selection.primaryRegion'
 
@@ -395,7 +442,7 @@ export const selectAllAtom = atom(
 selectAllAtom.debugLabel = 'spreadsheet.selection.selectAll'
 
 export const setPrimaryRegionAtom = atom(
-  (get) => getPrimaryRegion(get(_multiSelectionAtom)),
+  (get) => copySelection(getPrimaryRegion(get(_multiSelectionAtom))),
   (get, set, state: SelectionState) => {
     const multi = get(_multiSelectionAtom)
     const normalized = normalizeSelection(state, get(selectionBoundsAtom))
@@ -423,7 +470,7 @@ export const clearNonPrimaryRegionsAtom = atom(
   (get) => get(_multiSelectionAtom),
   (get, set, input?: ClearSelectionRegionsInput) => {
     if (input?.keepPrimary) {
-      const primary = getPrimaryRegion(get(_multiSelectionAtom))
+      const primary = copySelection(getPrimaryRegion(get(_multiSelectionAtom)))
       set(_multiSelectionAtom, { regions: [primary], primaryIndex: 0 })
       return
     }

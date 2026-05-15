@@ -30,6 +30,7 @@ export interface PointerSelectionStartInput {
   sheetId: string
   anchor: CellCoord
   focus?: CellCoord
+  append?: boolean
   source?: PointerSource
 }
 
@@ -118,6 +119,7 @@ export interface PointerDragSelectionSession {
   anchor: CellCoord
   focus: CellCoord
   range: CellRange
+  append?: boolean
 }
 
 export interface PointerFillHandleSession {
@@ -167,6 +169,7 @@ export interface PointerDragSelectionCommitIntent {
   anchor: CellCoord
   focus: CellCoord
   range: CellRange
+  append?: boolean
 }
 
 export interface PointerFillHandleCommitIntent {

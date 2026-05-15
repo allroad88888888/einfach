@@ -51,7 +51,7 @@ export type SelectionState =
   | AllSelection
 
 export interface MultiRangeSelectionState {
-  regions: SelectionState[]
+  regions: readonly SelectionState[]
   primaryIndex: number
 }
 

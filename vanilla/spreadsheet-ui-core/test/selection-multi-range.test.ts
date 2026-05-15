@@ -13,6 +13,7 @@ import {
   setSelectionAtom,
   setSelectionBoundsAtom,
 } from '../src/selection'
+import type { SelectionState } from '../src/selection'
 import { dispatchKeyboardInputAtom } from '../src/keyboard'
 
 describe('multi-range selection', () => {
@@ -160,6 +161,65 @@ describe('multi-range selection', () => {
 
     const regionsAfter = store.getter(selectionRegionsAtom)
     expect(regionsAfter[1]).toEqual({ kind: 'cell', sheetId: 'S1', anchor: { row: 7, col: 7 }, focus: { row: 7, col: 7 } })
+  })
+
+  test('Escape collapses multiple regions through the keyboard core intent', () => {
+    const store = createStore()
+
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 10 })
+    store.setter(setSelectionAtom, { kind: 'cell', sheetId: 'S1', anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+    store.setter(addSelectionRegionAtom, {
+      region: { kind: 'cell', sheetId: 'S1', anchor: { row: 3, col: 3 }, focus: { row: 3, col: 3 } },
+    })
+
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Escape' })
+
+    expect(intent).toEqual({ type: 'selection.clearNonPrimary', keepPrimary: true })
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      { kind: 'cell', sheetId: 'S1', anchor: { row: 3, col: 3 }, focus: { row: 3, col: 3 } },
+    ])
+  })
+
+  test('Escape with a single region falls through as unhandled navigation input', () => {
+    const store = createStore()
+
+    store.setter(setSelectionAtom, { kind: 'cell', sheetId: 'S1', anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'Escape' })).toEqual({
+      type: 'none',
+      reason: 'unhandled',
+    })
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      { kind: 'cell', sheetId: 'S1', anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } },
+    ])
+  })
+
+  test('selectionRegionsAtom returns a defensive snapshot', () => {
+    const store = createStore()
+
+    store.setter(setSelectionAtom, { kind: 'cell', sheetId: 'S1', anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 } })
+    store.setter(addSelectionRegionAtom, {
+      region: { kind: 'cell', sheetId: 'S1', anchor: { row: 4, col: 4 }, focus: { row: 4, col: 4 } },
+    })
+
+    const regions = store.getter(selectionRegionsAtom) as SelectionState[]
+    expect(() => {
+      regions.push({ kind: 'cell', sheetId: 'S1', anchor: { row: 9, col: 9 }, focus: { row: 9, col: 9 } })
+    }).toThrow()
+    const firstRegion = regions[0]
+    if (firstRegion.kind !== 'cell') {
+      throw new Error('expected cell region')
+    }
+    try {
+      firstRegion.anchor.row = 99
+    } catch {
+      // Store implementations may freeze atom snapshots in test mode.
+    }
+
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      { kind: 'cell', sheetId: 'S1', anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 } },
+      { kind: 'cell', sheetId: 'S1', anchor: { row: 4, col: 4 }, focus: { row: 4, col: 4 } },
+    ])
   })
 
   test('selectCellAtom replaces all regions with a single cell region', () => {
