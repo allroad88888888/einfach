@@ -1,6 +1,7 @@
 import { createStore } from '@einfach/core'
 import { Provider as SolidProvider } from '@einfach/solid'
 import { createSpreadsheetUi } from '@einfach/spreadsheet-ui-core'
+import { SpreadsheetUiContext } from './context'
 import { spreadsheetBackendAtom } from './atoms'
 import type { SpreadsheetUiProviderProps } from './types'
 
@@ -12,6 +13,8 @@ export function SpreadsheetUiProvider(props: SpreadsheetUiProviderProps) {
   core.store.setter(spreadsheetBackendAtom, props.backend)
 
   return (
-    <SolidProvider store={core.store}>{props.children}</SolidProvider>
+    <SolidProvider store={core.store}>
+      <SpreadsheetUiContext.Provider value={core}>{props.children}</SpreadsheetUiContext.Provider>
+    </SolidProvider>
   )
 }

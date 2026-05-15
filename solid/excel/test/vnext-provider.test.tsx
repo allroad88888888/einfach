@@ -9,6 +9,7 @@ import {
   SpreadsheetUiProvider,
   useSpreadsheetBackend,
   useSpreadsheetUiCore,
+  useSpreadsheetUiCoreContext,
 } from '../src-vnext/provider'
 
 afterEach(cleanup)
@@ -63,6 +64,32 @@ describe('vNext SpreadsheetUiProvider', () => {
     })
     expect(seenStores).toHaveLength(2)
     expect(seenStores[0]).not.toBe(seenStores[1])
+  })
+
+  it('useSpreadsheetUiCoreContext returns { store, backend } without throwing', () => {
+    const backend = {
+      async readVisibleProjection() { throw new Error('not used') },
+      async readRangeProjection() { throw new Error('not used') },
+      async setCellInput() { throw new Error('not used') },
+    }
+
+    let capturedCore: ReturnType<typeof useSpreadsheetUiCoreContext> | undefined
+
+    function Probe() {
+      capturedCore = useSpreadsheetUiCoreContext()
+      return <div data-testid="core">{capturedCore ? 'ok' : 'missing'}</div>
+    }
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend}>
+        <Probe />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(getByTestId('core').textContent).toBe('ok')
+    expect(capturedCore).toBeDefined()
+    expect(capturedCore!.backend).toBe(backend)
+    expect(capturedCore!.store).toBeDefined()
   })
 
   it('exposes the backend through useSpreadsheetBackend', () => {
