@@ -1,4 +1,5 @@
 export * from './auto-fill'
+export * from './rich-types'
 export * from './conditional-formatting'
 export * from './data-validation'
 export * from './createSpreadsheetUi'

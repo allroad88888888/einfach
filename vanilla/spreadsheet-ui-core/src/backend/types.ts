@@ -1,4 +1,5 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { DisplayCellRichValue } from '../rich-types/types'
 import type { ValidationOutcome, SetValidationRuleRequest, ClearValidationRuleRequest } from '../data-validation/types'
 import type {
   ConditionalFormatRulesResult,
@@ -82,6 +83,7 @@ export interface DisplayCell {
   commentThreadId?: string
   validation?: ValidationOutcome
   conditionalFormat?: SpreadsheetCellFormat
+  richValue?: DisplayCellRichValue
 }
 
 export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
@@ -197,6 +199,15 @@ export interface SetCellInputRequest extends SheetRef {
   row: number
   col: number
   input: string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface SetCellRichValueRequest extends SheetRef {
+  kind: 'set-cell-rich-value'
+  row: number
+  col: number
+  value: DisplayCellRichValue
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
@@ -487,6 +498,7 @@ export interface SpreadsheetBackend {
     request: ViewportSizeProjectionRequest,
   ): Promise<ViewportSizeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
+  setCellRichValue?(request: SetCellRichValueRequest): Promise<BackendMutationResult>
   importCells?(request: ImportCellsRequest): Promise<BackendMutationResult>
   importCellChunks?(request: ImportCellChunksRequest): Promise<BackendMutationResult>
   clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
