@@ -17,6 +17,11 @@ clipboard marker line. Host adapters may implement this with worker-side row
 chunks or sparse snapshot chunks, but the UI core still sees only the bounded
 range command result.
 
+Clipboard paste uses `importCells` when a host adapter supports bulk import.
+The UI core still owns only the parsed target coordinates and text/formula
+inputs; worker-backed hosts should map those cells into chunked workbook import
+sessions instead of issuing one mutation RPC per cell.
+
 Data-navigation ports return a single coordinate, not a row/column projection.
 For example, `resolveDataEdge` lets a host adapter answer Ctrl+Arrow movement
 from sparse facts without materializing a full row or column in the UI layer.

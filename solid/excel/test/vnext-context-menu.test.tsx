@@ -7,6 +7,7 @@ import type {
   ClearRangeRequest,
   DeleteColumnsRequest,
   DeleteRowsRequest,
+  ImportCellsRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
   RangeProjectionRequest,
@@ -66,6 +67,7 @@ function createFakeBackend() {
   const deleteRowsRequests: DeleteRowsRequest[] = []
   const insertColumnsRequests: InsertColumnsRequest[] = []
   const deleteColumnsRequests: DeleteColumnsRequest[] = []
+  const importCellsRequests: ImportCellsRequest[] = []
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const readRangeRequests: RangeProjectionRequest[] = []
   const exportRangeTsvRequests: RangeTsvExportRequest[] = []
@@ -131,6 +133,15 @@ function createFakeBackend() {
         },
       }
     },
+    async importCells(request) {
+      importCellsRequests.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        affectedRange: request.range,
+      }
+    },
     async clearRange(request) {
       clearRangeRequests.push(request)
       return {
@@ -182,6 +193,7 @@ function createFakeBackend() {
     deleteRowsRequests,
     insertColumnsRequests,
     deleteColumnsRequests,
+    importCellsRequests,
     readVisibleRequests,
     readRangeRequests,
     exportRangeTsvRequests,
@@ -664,6 +676,76 @@ describe('vNext SpreadsheetContextMenu', () => {
       },
       target: {
         range: { rowStart: 2, rowEnd: 2, colStart: 2, colEnd: 3 },
+      },
+    })
+  })
+
+  it('routes large clipboard paste through backend bulk import', async () => {
+    const rows = ['=B2+1', ...Array.from({ length: 10_000 }, (_value, index) => `row-${index}`)]
+    installClipboard(`# einfach-clipboard-origin: B2\n${rows.join('\n')}`)
+    const store = createStore()
+    const { backend, importCellsRequests, setCellInputRequests, readVisibleRequests } =
+      createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [],
+      },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'cell',
+      target: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        cell: { row: 2, col: 2 },
+      },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-clipboard.paste'))
+
+    await waitFor(() => expect(importCellsRequests).toHaveLength(1))
+    expect(importCellsRequests[0]).toMatchObject({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      range: { rowStart: 2, rowEnd: 10_002, colStart: 2, colEnd: 2 },
+    })
+    expect(importCellsRequests[0].cells).toHaveLength(10_001)
+    expect(importCellsRequests[0].cells[0]).toEqual({
+      row: 2,
+      col: 2,
+      input: '=C3+1',
+    })
+    expect(importCellsRequests[0].cells[10_000]).toEqual({
+      row: 10_002,
+      col: 2,
+      input: 'row-9999',
+    })
+    expect(setCellInputRequests).toEqual([])
+    await waitFor(() => expect(readVisibleRequests).toHaveLength(1))
+    expect(store.getter(clipboardStateAtom)).toMatchObject({
+      status: 'ready',
+      intent: {
+        type: 'clipboard.paste',
       },
     })
   })

@@ -112,6 +112,21 @@ export interface SetCellInputRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+export interface ImportCellInput {
+  row: number
+  col: number
+  input: string
+}
+
+export interface ImportCellsRequest extends SheetRef {
+  kind: 'import-cells'
+  cells: ImportCellInput[]
+  range?: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  cellsPerChunk?: number
+}
+
 export interface ClearRangeRequest extends SheetRef {
   kind: 'clear-range'
   range: CellRange
@@ -297,6 +312,7 @@ export interface SpreadsheetBackend {
     request: ViewportSizeProjectionRequest,
   ): Promise<ViewportSizeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
+  importCells?(request: ImportCellsRequest): Promise<BackendMutationResult>
   clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
   insertRows?(request: InsertRowsRequest): Promise<BackendMutationResult>
   deleteRows?(request: DeleteRowsRequest): Promise<BackendMutationResult>

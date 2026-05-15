@@ -205,6 +205,9 @@ W6、W7 是 package cutover 和发布门禁。
 - 已补 `beginSnapshotRangeSparse` / `nextSnapshotRangeSparseChunk` / `cancelSnapshot` /
   `snapshotRangeSparseChunks`：snapshot sparse range 也能按行段从 worker 流式回传，后续
   大撤销、大 paste staging 和 range-based transfer 可以复用同一模型。
+- 已补 backend `importCells` port 和 vNext context-menu large paste 接线；超过小范围阈值的
+  TSV paste 走 worker `beginImport/importChunk/commitImport`，不再由 UI 循环发逐 cell
+  mutation RPC。
 
 并行分工：
 

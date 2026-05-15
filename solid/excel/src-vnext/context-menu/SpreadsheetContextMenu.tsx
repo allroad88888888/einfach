@@ -19,6 +19,7 @@ import {
   type CellRange,
   type ClipboardTextData,
   type ClipboardTransferInput,
+  type ImportCellInput,
   type MenuCommandIntent,
   type MenuCommandKind,
   type MenuTarget,
@@ -159,6 +160,25 @@ function resultToClipboardText(result: RangeProjectionResult, range: CellRange):
     originAddr: toA1({ row: range.rowStart, col: range.colStart }),
     cells,
   }
+}
+
+function clipboardDataToImportCells(
+  data: ClipboardTextData,
+  targetOrigin: CellCoord,
+  drow: number,
+  dcol: number,
+): ImportCellInput[] {
+  const cells: ImportCellInput[] = []
+  for (const [rowOffset, row] of data.cells.entries()) {
+    for (const [colOffset, field] of row.entries()) {
+      cells.push({
+        row: targetOrigin.row + rowOffset,
+        col: targetOrigin.col + colOffset,
+        input: field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field,
+      })
+    }
+  }
+  return cells
 }
 
 async function writeClipboardText(text: string): Promise<boolean> {
@@ -373,21 +393,21 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     const targetAddr = toA1(targetOrigin)
     const data = parseClipboardTsv(text, targetAddr)
     const cellCount = clipboardTextCellCount(data)
-    if (cellCount > CLIPBOARD_CELL_LIMIT) {
-      store.setter(
-        setClipboardErrorAtom,
-        clipboardError(
-          `Clipboard paste is too large: ${cellCount} cells. Streaming paste is not wired yet.`,
-        ),
-      )
-      return
-    }
-
     const origin = parseA1(data.originAddr) ?? targetOrigin
     const drow = targetOrigin.row - origin.row
     const dcol = targetOrigin.col - origin.col
     const sourceRange = dataRangeFromOrigin(origin, data)
     const pasteRange = dataRangeFromOrigin(targetOrigin, data)
+
+    if (cellCount > CLIPBOARD_CELL_LIMIT && !backend.importCells) {
+      store.setter(
+        setClipboardErrorAtom,
+        clipboardError(
+          `Clipboard paste is too large: ${cellCount} cells. Backend streaming import unavailable.`,
+        ),
+      )
+      return
+    }
 
     store.setter(pasteClipboardAtom, {
       source: { sheetId, range: sourceRange },
@@ -397,15 +417,21 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       estimatedBytes: text.length,
     })
 
-    for (const [rowOffset, row] of data.cells.entries()) {
-      for (const [colOffset, field] of row.entries()) {
-        const input = field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field
+    if (cellCount > CLIPBOARD_CELL_LIMIT && backend.importCells) {
+      await backend.importCells({
+        kind: 'import-cells',
+        sheetId,
+        cells: clipboardDataToImportCells(data, targetOrigin, drow, dcol),
+        range: pasteRange,
+      })
+    } else {
+      for (const cell of clipboardDataToImportCells(data, targetOrigin, drow, dcol)) {
         await backend.setCellInput({
           kind: 'set-cell-input',
           sheetId,
-          row: targetOrigin.row + rowOffset,
-          col: targetOrigin.col + colOffset,
-          input,
+          row: cell.row,
+          col: cell.col,
+          input: cell.input,
         })
       }
     }

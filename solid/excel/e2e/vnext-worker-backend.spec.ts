@@ -3,6 +3,7 @@ import {
   cell,
   cellDisplay,
   expectNoConsoleErrors,
+  grantClipboard,
   guardConsoleErrors,
   selectSheet,
   typeIntoCell,
@@ -135,6 +136,46 @@ test.describe('Solid Excel vNext worker backend', () => {
     expect(result.chunkCount).toBe(5)
     expect(result.chunkSizes.reduce((sum, size) => sum + size, 0)).toBeGreaterThan(0)
     expect(result.addrs).toEqual(expect.arrayContaining(['A1', 'B4', 'C2']))
+    expect(result.visibleCells).toBe(30)
+    await expect(cell(page, 'J20')).toHaveCount(0)
+    await expectNoConsoleErrors(page)
+  })
+
+  test('pastes large clipboard TSV through worker bulk import without expanding the viewport', async ({
+    page,
+    context,
+  }) => {
+    await grantClipboard(context)
+    await gotoVNextWorkerDemo(page)
+
+    const rows = Array.from({ length: 10_001 }, (_value, index) => `bulk-${index}`)
+    await page.evaluate(
+      (text) => navigator.clipboard.writeText(text),
+      `# einfach-clipboard-origin: A1\n${rows.join('\n')}`,
+    )
+
+    await cell(page, 'D4').click({ button: 'right' })
+    const menu = page.getByTestId('vnext-worker-context-menu')
+    await expect(menu).toBeVisible()
+    await page.getByTestId('context-menu-command-clipboard.paste').click()
+    await expect(menu).toHaveCount(0)
+
+    await expect(cellDisplay(page, 'D4')).toHaveText('bulk-0')
+    const result = await page.evaluate(async () => {
+      const chunks = await window.__einfachWorkbookDebugClient!.snapshotRangeSparseChunks(
+        { sheet: 0, startRow: 3, startCol: 3, endRow: 10_003, endCol: 3 },
+        2048,
+      )
+      return {
+        chunkCount: chunks.length,
+        importedCells: chunks.flat().length,
+        visibleCells: document.querySelectorAll('[data-testid="vnext-worker-grid"] td.cell')
+          .length,
+      }
+    })
+
+    expect(result.chunkCount).toBe(5)
+    expect(result.importedCells).toBe(10_001)
     expect(result.visibleCells).toBe(30)
     await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)

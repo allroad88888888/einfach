@@ -7,6 +7,7 @@ import type {
   DisplayCell,
   InsertColumnsRequest,
   InsertRowsRequest,
+  ImportCellsRequest,
   ProjectionRevision,
   RangeProjectionRequest,
   RangeProjectionResult,
@@ -36,10 +37,12 @@ import {
   type CellSnapshotWire,
   type CellWire,
   type FormatRangeSnapshot,
+  type ImportCellWire,
   type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerWorkbookClient,
+  type WorkbookImportStatsWire,
   type WorkbookSheetMeta,
 } from './worker-protocol'
 
@@ -77,6 +80,9 @@ type SheetLookup = {
 }
 
 const DEFAULT_SHEETS = ['Sheet1']
+const DEFAULT_IMPORT_CELLS_PER_CHUNK = 10_000
+const MIN_IMPORT_CELLS_PER_CHUNK = 1
+const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
 
 function normalizeSheetInputs(
   sheets: readonly (string | WorkerWorkbookBackendSheetInput)[] | undefined,
@@ -406,6 +412,42 @@ function toCellWire(input: string): CellWire {
   }
 
   return { type: 'text', value: trimmed }
+}
+
+function toImportCellWire(sheet: number, row: number, col: number, input: string): ImportCellWire {
+  const trimmed = input.trim()
+  if (trimmed === '') {
+    return { sheet, row, col, kind: 'null' }
+  }
+  if (trimmed.startsWith('=')) {
+    return { sheet, row, col, kind: 'formula', value: trimmed }
+  }
+
+  const numeric = Number(trimmed)
+  if (Number.isFinite(numeric)) {
+    return { sheet, row, col, kind: 'number', value: numeric }
+  }
+
+  return { sheet, row, col, kind: 'text', value: trimmed }
+}
+
+function normalizeImportCellsPerChunk(value: number | undefined): number {
+  const normalized = Math.floor(Number(value))
+  if (!Number.isFinite(normalized)) return DEFAULT_IMPORT_CELLS_PER_CHUNK
+  if (normalized < MIN_IMPORT_CELLS_PER_CHUNK) return MIN_IMPORT_CELLS_PER_CHUNK
+  if (normalized > MAX_IMPORT_CELLS_PER_CHUNK) return MAX_IMPORT_CELLS_PER_CHUNK
+  return normalized
+}
+
+function assertImportStatsOk(stats: WorkbookImportStatsWire) {
+  if (stats.errors === 0 && stats.rejectedFormulas === 0) return
+
+  const issue = stats.issues?.[0]
+  const suffix = issue ? `: ${issue.message}` : ''
+  throw createBackendError(
+    issue?.code ?? (stats.rejectedFormulas > 0 ? 'FORMULA_REJECTED' : 'IMPORT_FAILED'),
+    `Workbook import failed${suffix}`,
+  )
 }
 
 function createBackendError(code: string, message: string): Error {
@@ -772,6 +814,35 @@ export function createWorkerWorkbookSpreadsheetBackend(
           colStart: request.col,
           colEnd: request.col,
         },
+      }
+    },
+
+    async importCells(request: ImportCellsRequest): Promise<BackendMutationResult> {
+      const sheet = await resolveSheet(request.sheetId)
+      const cells = request.cells.map((cell) =>
+        toImportCellWire(sheet.idx, cell.row, cell.col, cell.input),
+      )
+      const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
+      const sessionId = await client.beginImport()
+      let committed = false
+
+      try {
+        for (let index = 0; index < cells.length; index += cellsPerChunk) {
+          await client.importChunk(sessionId, cells.slice(index, index + cellsPerChunk))
+        }
+        const stats = await client.commitImport(sessionId)
+        committed = true
+        assertImportStatsOk(stats)
+      } finally {
+        if (!committed) await client.cancelImport(sessionId).catch(() => {})
+      }
+
+      const nextRevision = bumpRevision()
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+        affectedRange: request.range,
       }
     },
 

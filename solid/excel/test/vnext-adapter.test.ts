@@ -9,9 +9,11 @@ import type {
   CellSnapshotWire,
   CellWire,
   FormatRangeSnapshot,
+  ImportCellWire,
   SparseCellWire,
   SparseRangeWire,
   WorkerWorkbookClient,
+  WorkbookImportStatsWire,
   WorkbookSheetMeta,
 } from '../src-vnext/adapter'
 import {
@@ -41,6 +43,10 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     snapshotViewportSizes: SparseRangeWire[]
     setRowHeight: Array<{ sheet: number; rowIndex: number; heightPx: number }>
     setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
+    beginImport: number[]
+    importChunk: Array<{ sessionId: number; cells: ImportCellWire[] }>
+    commitImport: number[]
+    cancelImport: number[]
     exportRangeTsv: SparseRangeWire[]
     exportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     snapshotRangeSparseChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
@@ -77,6 +83,10 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     snapshotViewportSizes: [],
     setRowHeight: [],
     setColumnWidth: [],
+    beginImport: [],
+    importChunk: [],
+    commitImport: [],
+    cancelImport: [],
     exportRangeTsv: [],
     exportRangeTsvChunks: [],
     snapshotRangeSparseChunks: [],
@@ -86,6 +96,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     moveSheet: [],
   }
   let metas: WorkbookSheetMeta[] = []
+  let nextImportId = 1
 
   function key(sheet: number, addr: string) {
     return `${sheet}:${addr.toUpperCase()}`
@@ -481,17 +492,39 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       sizeMap(colWidths, sheet).set(colIndex, widthPx)
       return true
     },
-    async beginImport() {
-      throw new Error('not used')
+    async beginImport(sessionId = nextImportId++) {
+      calls.beginImport.push(sessionId)
+      return sessionId
     },
-    async importChunk() {
-      throw new Error('not used')
+    async importChunk(sessionId, importCells) {
+      calls.importChunk.push({ sessionId, cells: importCells })
+      return importCells.length
     },
-    async commitImport() {
-      throw new Error('not used')
+    async commitImport(sessionId) {
+      calls.commitImport.push(sessionId)
+      return {
+        accepted: calls.importChunk
+          .filter((chunk) => chunk.sessionId === sessionId)
+          .reduce((sum, chunk) => sum + chunk.cells.length, 0),
+        formulas: calls.importChunk
+          .filter((chunk) => chunk.sessionId === sessionId)
+          .reduce(
+            (sum, chunk) => sum + chunk.cells.filter((cell) => cell.kind === 'formula').length,
+            0,
+          ),
+        rejectedFormulas: 0,
+        cleared: calls.importChunk
+          .filter((chunk) => chunk.sessionId === sessionId)
+          .reduce(
+            (sum, chunk) => sum + chunk.cells.filter((cell) => cell.kind === 'null').length,
+            0,
+          ),
+        errors: 0,
+      } satisfies WorkbookImportStatsWire
     },
-    async cancelImport() {
-      throw new Error('not used')
+    async cancelImport(sessionId) {
+      calls.cancelImport.push(sessionId)
+      return true
     },
     async readCells() {
       throw new Error('not used')
@@ -694,6 +727,45 @@ describe('vnext adapter', () => {
       { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
       { row: 0, col: 1, displayValue: 'B1-updated', valueKind: 'string' },
       { row: 1, col: 0, displayValue: 'A2', valueKind: 'string' },
+      { row: 1, col: 1, displayValue: 'B2', valueKind: 'string' },
+    ])
+  })
+
+  it('imports static backend cells as one mutation result', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 3,
+      matrix: [['A1']],
+    })
+
+    const mutation = await backend.importCells?.({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      requestId: 22,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 1 },
+      cells: [
+        { row: 1, col: 1, input: 'B2' },
+        { row: 2, col: 1, input: '' },
+      ],
+    })
+
+    expect(mutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 22,
+      revision: 4,
+      affectedRange: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 1 },
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 23,
+        range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 1 },
+        reason: 'test',
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
       { row: 1, col: 1, displayValue: 'B2', valueKind: 'string' },
     ])
   })
@@ -1257,6 +1329,57 @@ describe('vnext adapter', () => {
     expect(client.calls.readSparseRange).toEqual([])
     expect(client.calls.snapshotRangeSparse).toEqual([])
     expect(client.calls.snapshotFormatRange).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('imports worker workbook cells through chunked bulk import', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    await backend.ready()
+    const result = await backend.importCells?.({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 12,
+      cellsPerChunk: 2,
+      range: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
+      cells: [
+        { row: 4, col: 3, input: '=A1+1' },
+        { row: 4, col: 4, input: '7' },
+        { row: 5, col: 3, input: '' },
+      ],
+    })
+
+    expect(result).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 12,
+      affectedRange: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
+    })
+    expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 4, col: 3, kind: 'formula', value: '=A1+1' },
+          { sheet: 0, row: 4, col: 4, kind: 'number', value: 7 },
+        ],
+      },
+      {
+        sessionId: 1,
+        cells: [{ sheet: 0, row: 5, col: 3, kind: 'null' }],
+      },
+    ])
+    expect(client.calls.commitImport).toEqual([1])
+    expect(client.calls.cancelImport).toEqual([])
+    expect(client.calls.setCell).toEqual([])
+    expect(client.calls.setFormulaDetailed).toEqual([])
 
     backend.dispose()
   })
