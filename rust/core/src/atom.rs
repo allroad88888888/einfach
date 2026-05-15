@@ -17,6 +17,20 @@ pub enum ValueError {
     InvalidValue,   // #VALUE!
     InvalidName,    // #NAME?
     CyclicRef,      // #CYCLE!
+    /// Numeric result is infinite or NaN (e.g. POWER(2, 1e308)). Excel
+    /// surfaces this as #NUM! — we use a distinct variant so callers can
+    /// distinguish a type-coercion failure (#VALUE!) from an out-of-range
+    /// numeric result (#NUM!).
+    Overflow, // #NUM!
+    /// A value of the wrong type was passed to an operator or function that
+    /// required a specific type (e.g., text passed to an arithmetic operator
+    /// that has no numeric coercion path). Distinct from `InvalidValue` which
+    /// is a catch-all; `WrongType` signals specifically a type mismatch.
+    WrongType, // #TYPE!
+    /// A function was called with the wrong number of arguments. Excel shows
+    /// this as a parse/compile error; we surface it at eval time as a
+    /// distinct code so tests can assert precise argument-count checking.
+    WrongArgCount, // #ARGS!
 }
 
 impl std::fmt::Display for ValueError {
@@ -27,6 +41,9 @@ impl std::fmt::Display for ValueError {
             ValueError::InvalidValue => write!(f, "#VALUE!"),
             ValueError::InvalidName => write!(f, "#NAME?"),
             ValueError::CyclicRef => write!(f, "#CYCLE!"),
+            ValueError::Overflow => write!(f, "#NUM!"),
+            ValueError::WrongType => write!(f, "#TYPE!"),
+            ValueError::WrongArgCount => write!(f, "#ARGS!"),
         }
     }
 }

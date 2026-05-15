@@ -120,7 +120,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             match v {
                 Value::Number(n) => Value::Number(-n),
                 Value::Error(e) => Value::Error(e),
-                _ => Value::Error(ValueError::InvalidValue),
+                _ => Value::Error(ValueError::WrongType),
             }
         }
 
@@ -198,13 +198,14 @@ fn eval_binop(op: BinOperator, left: &Value, right: &Value) -> Value {
                 } else if l == 0.0 && r < 0.0 {
                     Value::Error(ValueError::DivisionByZero) // 0^negative
                 } else {
-                    Value::Error(ValueError::InvalidValue)
+                    Value::Error(ValueError::Overflow)
                 }
             }
             // Concat / comparisons handled above
             _ => Value::Error(ValueError::InvalidValue),
         },
-        _ => Value::Error(ValueError::InvalidValue),
+        // Arithmetic op with a non-numeric (non-coercible) operand.
+        _ => Value::Error(ValueError::WrongType),
     }
 }
 
@@ -415,10 +416,21 @@ fn arg_as_range<'a>(arg: &'a Expr) -> Option<(Option<&'a str>, &'a CellAddress, 
 /// or cross-sheet range. Routes through `for_each_sheet_range_cell` for
 /// cross-sheet ranges so the provider resolves cells against the correct
 /// sheet rather than the formula's own sheet.
+///
+/// Also handles dynamic range expressions: if the argument is `OFFSET(...)`,
+/// it is evaluated to a runtime `CellRange` which is then materialised as a
+/// 2D grid — so `VLOOKUP(x, OFFSET(A1,0,0,10,2), 2, FALSE)` works correctly.
 fn collect_range_2d_for_arg(
     arg: &Expr,
     provider: &dyn EvalProvider,
 ) -> Option<Vec<Vec<Value>>> {
+    // Dynamic range via OFFSET.
+    if let Expr::FuncCall { name, args: fn_args } = arg {
+        if name == "OFFSET" {
+            let range = eval_offset_as_range(fn_args, provider)?;
+            return Some(collect_range_2d(&range.start, &range.end, provider));
+        }
+    }
     match arg_as_range(arg)? {
         (None, start, end) => Some(collect_range_2d(start, end, provider)),
         (Some(sheet), start, end) => {
@@ -449,12 +461,60 @@ fn collect_range_2d_for_arg(
     }
 }
 
+/// Evaluate an `OFFSET(ref, row_off, col_off[, height[, width]])` call and
+/// return the resolved `CellRange`, or `None` if arguments are invalid.
+/// `ref` must be a `CellRef` (single-cell anchor); row/col offsets are
+/// applied to produce the top-left corner; height/width (default 1×1) give
+/// the extent. All numeric args must be coercible; otherwise returns `None`.
+fn eval_offset_as_range(args: &[Expr], provider: &dyn EvalProvider) -> Option<CellRange> {
+    if args.len() < 3 || args.len() > 5 {
+        return None;
+    }
+    // First arg must be a cell reference (the anchor).
+    let anchor = match &args[0] {
+        Expr::CellRef(addr) => *addr,
+        _ => return None,
+    };
+    let row_off = coerce_to_number(&eval_expr_with_provider(&args[1], provider))? as i64;
+    let col_off = coerce_to_number(&eval_expr_with_provider(&args[2], provider))? as i64;
+    let height = if args.len() >= 4 {
+        let h = coerce_to_number(&eval_expr_with_provider(&args[3], provider))?;
+        if h < 1.0 {
+            return None;
+        }
+        h as u32
+    } else {
+        1
+    };
+    let width = if args.len() == 5 {
+        let w = coerce_to_number(&eval_expr_with_provider(&args[4], provider))?;
+        if w < 1.0 {
+            return None;
+        }
+        w as u32
+    } else {
+        1
+    };
+    let start_row = anchor.row as i64 + row_off;
+    let start_col = anchor.col as i64 + col_off;
+    if start_row < 0 || start_col < 0 {
+        return None;
+    }
+    let start = CellAddress::new(start_row as u32, start_col as u32);
+    let end = CellAddress::new(start_row as u32 + height - 1, start_col as u32 + width - 1);
+    Some(CellRange::new(start, end))
+}
+
 /// Stream values produced by a function argument. For `Range` args this
 /// goes through `provider.for_each_range_cell` (sparse-aware); for any
 /// other expression it evaluates once and yields the single value. The
 /// closure sees `(Option<addr>, value)` — `Some` for range cells, `None`
 /// for evaluated sub-expressions — so callers like `SUMIF` can still
 /// align `range`/`sum_range` by relative position when both are ranges.
+///
+/// Dynamic range expressions: if the argument is `OFFSET(...)`, it is
+/// evaluated to a runtime `CellRange` and iterated cell-by-cell via the
+/// provider — so `SUM(OFFSET(A1,0,0,5,1))` works like `SUM(A1:A5)`.
 fn for_each_arg_value(
     arg: &Expr,
     provider: &dyn EvalProvider,
@@ -469,6 +529,15 @@ fn for_each_arg_value(
         } => {
             let range = CellRange::new(*start, *end);
             provider.for_each_sheet_range_cell(sheet, range, &mut |addr, v| f(Some(addr), v));
+        }
+        // Dynamic range: OFFSET(...) used in place of a literal range arg.
+        Expr::FuncCall { name, args: fn_args } if name == "OFFSET" => {
+            match eval_offset_as_range(fn_args, provider) {
+                Some(range) => {
+                    provider.for_each_range_cell(range, &mut |addr, v| f(Some(addr), v));
+                }
+                None => f(None, Value::Error(ValueError::InvalidRef)),
+            }
         }
         _ => f(None, eval_expr_with_provider(arg, provider)),
     }
@@ -550,7 +619,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         "IF" => {
             if args.len() < 2 || args.len() > 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let cond = eval_expr_with_provider(&args[0], provider);
             let is_true = match cond {
@@ -644,7 +713,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                                 saw_any = true;
                                 result = result && b;
                             }
-                            None => err = Some(ValueError::InvalidValue),
+                            None => err = Some(ValueError::WrongType),
                         },
                     }
                 });
@@ -652,7 +721,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if let Some(e) = err {
                 Value::Error(e)
             } else if !saw_any {
-                Value::Error(ValueError::InvalidValue)
+                Value::Error(ValueError::WrongArgCount)
             } else {
                 Value::Boolean(result)
             }
@@ -677,7 +746,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                                 saw_any = true;
                                 result = result || b;
                             }
-                            None => err = Some(ValueError::InvalidValue),
+                            None => err = Some(ValueError::WrongType),
                         },
                     }
                 });
@@ -685,42 +754,45 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if let Some(e) = err {
                 Value::Error(e)
             } else if !saw_any {
-                Value::Error(ValueError::InvalidValue)
+                Value::Error(ValueError::WrongArgCount)
             } else {
                 Value::Boolean(result)
             }
         }
         "NOT" => {
             if args.len() != 1 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let v = eval_expr_with_provider(&args[0], provider);
             match coerce_to_bool(&v) {
                 Some(b) => Value::Boolean(!b),
                 None => match v {
                     Value::Error(e) => Value::Error(e),
-                    _ => Value::Error(ValueError::InvalidValue),
+                    _ => Value::Error(ValueError::WrongType),
                 },
             }
         }
 
         // === Math ===
         "ABS" => unary_number(args, provider, |n| n.abs()),
-        "SQRT" => unary_number(
-            args,
-            provider,
-            |n| {
-                if n < 0.0 {
-                    f64::NAN
-                } else {
-                    n.sqrt()
-                }
-            },
-        ),
+        "SQRT" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n < 0.0 => Value::Error(ValueError::Overflow),
+                Some(n) => Value::Number(n.sqrt()),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
         "ROUND" => {
             // ROUND(value, digits)
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let n = eval_expr_with_provider(&args[0], provider);
             let d = eval_expr_with_provider(&args[1], provider);
@@ -729,14 +801,14 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     let factor = 10f64.powi(digits as i32);
                     Value::Number((value * factor).round() / factor)
                 }
-                _ => Value::Error(ValueError::InvalidValue),
+                _ => Value::Error(ValueError::WrongType),
             }
         }
         "CEILING" => unary_number(args, provider, f64::ceil),
         "FLOOR" => unary_number(args, provider, f64::floor),
         "POWER" => {
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let b = eval_expr_with_provider(&args[0], provider);
             let e = eval_expr_with_provider(&args[1], provider);
@@ -746,22 +818,22 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     if r.is_finite() {
                         Value::Number(r)
                     } else {
-                        Value::Error(ValueError::InvalidValue)
+                        Value::Error(ValueError::Overflow)
                     }
                 }
-                _ => Value::Error(ValueError::InvalidValue),
+                _ => Value::Error(ValueError::WrongType),
             }
         }
         "MOD" => {
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let a = eval_expr_with_provider(&args[0], provider);
             let b = eval_expr_with_provider(&args[1], provider);
             match (coerce_to_number(&a), coerce_to_number(&b)) {
                 (Some(_), Some(0.0)) => Value::Error(ValueError::DivisionByZero),
                 (Some(va), Some(vb)) => Value::Number(va.rem_euclid(vb)),
-                _ => Value::Error(ValueError::InvalidValue),
+                _ => Value::Error(ValueError::WrongType),
             }
         }
 
@@ -792,7 +864,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         }
         "LEN" => {
             if args.len() != 1 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let v = eval_expr_with_provider(&args[0], provider);
             if let Value::Error(e) = v {
@@ -808,7 +880,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "MID" => {
             // MID(text, start, length) — start is 1-based
             if args.len() != 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let s = coerce_to_text(&eval_expr_with_provider(&args[0], provider));
             let start_v = eval_expr_with_provider(&args[1], provider);
@@ -819,7 +891,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     let take = len as usize;
                     Value::Text(s.chars().skip(skip).take(take).collect())
                 }
-                _ => Value::Error(ValueError::InvalidValue),
+                _ => Value::Error(ValueError::WrongType),
             }
         }
         "UPPER" => text_unary(args, provider, |s| s.to_uppercase()),
@@ -827,14 +899,14 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "TRIM" => text_unary(args, provider, |s| s.trim().to_string()),
         "TEXT" => {
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let n = eval_expr_with_provider(&args[0], provider);
             let fmt = coerce_to_text(&eval_expr_with_provider(&args[1], provider));
             let n = match coerce_to_number(&n) {
                 Some(v) if v.is_finite() => v,
-                Some(_) => return Value::Error(ValueError::InvalidValue),
-                None => return Value::Error(ValueError::InvalidValue),
+                Some(_) => return Value::Error(ValueError::Overflow),
+                None => return Value::Error(ValueError::WrongType),
             };
             match format_with_text_pattern(n, &fmt) {
                 Some(formatted) => Value::Text(formatted),
@@ -845,7 +917,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // === Conditional aggregates ===
         "COUNTIF" => {
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             // Eval the criterion once outside the streaming loop.
             let criterion = eval_expr_with_provider(&args[1], provider);
@@ -869,7 +941,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // memory (no Vec of either range) — at the cost of an extra
             // HashMap lookup per hit, which is cheap.
             if args.len() != 2 && args.len() != 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let criterion = eval_expr_with_provider(&args[1], provider);
             let mut total = 0.0_f64;
@@ -937,7 +1009,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // range_lookup: TRUE/omitted = approximate (range must be sorted
             // ascending in col 1; finds largest value ≤ needle), FALSE = exact.
             if args.len() < 3 || args.len() > 4 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
             let grid = match collect_range_2d_for_arg(&args[1], provider) {
@@ -946,7 +1018,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             let col_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             let approximate = if args.len() == 4 {
                 coerce_to_bool(&eval_expr_with_provider(&args[3], provider)).unwrap_or(true)
@@ -964,7 +1036,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         "HLOOKUP" => {
             if args.len() < 3 || args.len() > 4 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
             let grid = match collect_range_2d_for_arg(&args[1], provider) {
@@ -973,7 +1045,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             let row_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             let approximate = if args.len() == 4 {
                 coerce_to_bool(&eval_expr_with_provider(&args[3], provider)).unwrap_or(true)
@@ -992,7 +1064,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "INDEX" => {
             // INDEX(range, row, col) — 1-based
             if args.len() != 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let grid = match collect_range_2d_for_arg(&args[0], provider) {
                 Some(g) => g,
@@ -1000,11 +1072,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             let r = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             let c = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             grid.get(r - 1)
                 .and_then(|row| row.get(c - 1).cloned())
@@ -1020,7 +1092,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // providers skip holes — position counts only present cells,
             // a deliberate behavior change for full-column refs.)
             if args.len() < 2 || args.len() > 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
             let mut position: u64 = 0;
@@ -1137,12 +1209,12 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // LARGE(range, k) — kth largest, 1-based. Stateful: needs a
             // sorted Vec to pick by rank.
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let mut nums = collect_numbers(&args[..1], provider);
             let k = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             if k > nums.len() {
                 return Value::Error(ValueError::InvalidValue);
@@ -1153,12 +1225,12 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         "SMALL" => {
             if args.len() != 2 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let mut nums = collect_numbers(&args[..1], provider);
             let k = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
                 Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::InvalidValue),
+                _ => return Value::Error(ValueError::WrongType),
             };
             if k > nums.len() {
                 return Value::Error(ValueError::InvalidValue);
@@ -1187,7 +1259,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // Doesn't handle leap rules of pre-1582 Julian; accurate enough
             // for the demo's range.
             if args.len() != 3 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::WrongArgCount);
             }
             let y = coerce_to_number(&eval_expr_with_provider(&args[0], provider));
             let m = coerce_to_number(&eval_expr_with_provider(&args[1], provider));
@@ -1202,6 +1274,25 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "YEAR" => date_part(args, provider, |y, _, _| y as f64),
         "MONTH" => date_part(args, provider, |_, m, _| m as f64),
         "DAY" => date_part(args, provider, |_, _, d| d as f64),
+
+        // === Dynamic range ===
+        // OFFSET(ref, row_offset, col_offset[, height[, width]])
+        //
+        // When used directly (not as an argument to an aggregate), OFFSET
+        // returns the *value* of the top-left cell of the computed range —
+        // matching Excel's behaviour when the result is a 1×1 region.
+        // When used as a range argument to SUM / COUNT / AVERAGE / VLOOKUP
+        // / etc., `for_each_arg_value` and `collect_range_2d_for_arg` detect
+        // the OFFSET call and iterate the full computed range instead.
+        "OFFSET" => {
+            if args.len() < 3 || args.len() > 5 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            match eval_offset_as_range(args, provider) {
+                Some(range) => provider.cell(range.start),
+                None => Value::Error(ValueError::InvalidRef),
+            }
+        }
 
         _ => Value::Error(ValueError::InvalidName),
     }
@@ -1306,7 +1397,7 @@ fn date_part(
     f: impl Fn(i32, u32, u32) -> f64,
 ) -> Value {
     if args.len() != 1 {
-        return Value::Error(ValueError::InvalidValue);
+        return Value::Error(ValueError::WrongArgCount);
     }
     let v = eval_expr_with_provider(&args[0], provider);
     match coerce_to_number(&v) {
@@ -1314,7 +1405,7 @@ fn date_part(
             let (y, m, d) = date_from_serial(n);
             Value::Number(f(y, m, d))
         }
-        None => Value::Error(ValueError::InvalidValue),
+        None => Value::Error(ValueError::WrongType),
     }
 }
 
@@ -1328,7 +1419,7 @@ fn coerce_to_bool(v: &Value) -> Option<bool> {
 
 fn unary_number(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64) -> f64) -> Value {
     if args.len() != 1 {
-        return Value::Error(ValueError::InvalidValue);
+        return Value::Error(ValueError::WrongArgCount);
     }
     let v = eval_expr_with_provider(&args[0], provider);
     if let Value::Error(e) = v {
@@ -1340,16 +1431,16 @@ fn unary_number(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64) -> f
             if r.is_finite() {
                 Value::Number(r)
             } else {
-                Value::Error(ValueError::InvalidValue)
+                Value::Error(ValueError::Overflow)
             }
         }
-        None => Value::Error(ValueError::InvalidValue),
+        None => Value::Error(ValueError::WrongType),
     }
 }
 
 fn text_unary(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(&str) -> String) -> Value {
     if args.len() != 1 {
-        return Value::Error(ValueError::InvalidValue);
+        return Value::Error(ValueError::WrongArgCount);
     }
     let v = eval_expr_with_provider(&args[0], provider);
     if let Value::Error(e) = v {
@@ -1364,13 +1455,13 @@ fn text_slice(
     take: impl Fn(&str, usize) -> String,
 ) -> Value {
     if args.is_empty() || args.len() > 2 {
-        return Value::Error(ValueError::InvalidValue);
+        return Value::Error(ValueError::WrongArgCount);
     }
     let s = coerce_to_text(&eval_expr_with_provider(&args[0], provider));
     let n = if args.len() == 2 {
         match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
             Some(n) if n >= 0.0 => n as usize,
-            _ => return Value::Error(ValueError::InvalidValue),
+            _ => return Value::Error(ValueError::WrongType),
         }
     } else {
         1
@@ -1530,9 +1621,11 @@ mod tests {
     #[test]
     fn eval_text_arithmetic_is_error() {
         let (cm, vs) = make_test_env();
+        // B2 holds a text value; adding 1 to it cannot coerce → WrongType
+        // (previously InvalidValue, now finer-grained).
         assert_eq!(
             eval_str("=B2+1", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::WrongType)
         );
     }
 
@@ -1689,7 +1782,7 @@ mod tests {
         );
         assert_eq!(
             eval_str("=TEXT(\"7\",\"0.00\")", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::WrongType)
         );
     }
 
