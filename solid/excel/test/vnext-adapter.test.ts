@@ -901,6 +901,57 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('projects static backend merge metadata after merge and unmerge mutations', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['A1', 'B1', 'C1'],
+        ['A2', 'B2', 'C2'],
+        ['A3', 'B3', 'C3'],
+      ],
+    })
+
+    const mutation = await backend.mergeRange?.({
+      kind: 'merge-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+
+    expect(mutation?.affectedRange).toEqual({ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 })
+
+    const merged = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 24,
+        window: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    expect(merged.cells).toEqual(
+      expect.arrayContaining([
+        { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', mergedSpan: { rows: 2, cols: 2 } },
+        { row: 0, col: 1, displayValue: 'B1', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
+        { row: 1, col: 0, displayValue: 'A2', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
+        { row: 1, col: 1, displayValue: 'B2', valueKind: 'string', mergeAnchor: { row: 0, col: 0 } },
+      ]),
+    )
+
+    await backend.unmergeRange?.({
+      kind: 'unmerge-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    const unmerged = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 25,
+        window: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(unmerged.cells.some((cell) => cell.mergedSpan || cell.mergeAnchor)).toBe(false)
+  })
+
   it('exports TSV from static backend with formula source and origin metadata', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 9,

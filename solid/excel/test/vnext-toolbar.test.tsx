@@ -4,8 +4,10 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
+  MergeRangeRequest,
   SetFormatRangeRequest,
   SpreadsheetBackend,
+  UnmergeRangeRequest,
   VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
@@ -37,6 +39,8 @@ function createFakeBackend() {
 
 function createRecordingBackend() {
   const setFormatRangeCalls: SetFormatRangeRequest[] = []
+  const mergeRangeCalls: MergeRangeRequest[] = []
+  const unmergeRangeCalls: UnmergeRangeRequest[] = []
   const readVisibleProjectionCalls: VisibleProjectionRequest[] = []
   const backend: SpreadsheetBackend = {
     async readVisibleProjection(request) {
@@ -73,9 +77,27 @@ function createRecordingBackend() {
         affectedRange: { ...request.range },
       }
     },
+    async mergeRange(request) {
+      mergeRangeCalls.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 2,
+        affectedRange: { ...request.range },
+      }
+    },
+    async unmergeRange(request) {
+      unmergeRangeCalls.push(request)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: 3,
+        affectedRange: { ...request.range },
+      }
+    },
   }
 
-  return { backend, setFormatRangeCalls, readVisibleProjectionCalls }
+  return { backend, setFormatRangeCalls, mergeRangeCalls, unmergeRangeCalls, readVisibleProjectionCalls }
 }
 
 function getButtons(container: HTMLElement) {
@@ -86,6 +108,10 @@ function getButtons(container: HTMLElement) {
     textColor: container.querySelector('[data-testid="toolbar-btn-text-color"]') as HTMLButtonElement,
     numberFormat: container.querySelector(
       '[data-testid="toolbar-btn-number-format"]',
+    ) as HTMLButtonElement,
+    merge: container.querySelector('[data-testid="toolbar-btn-merge-cells"]') as HTMLButtonElement,
+    unmerge: container.querySelector(
+      '[data-testid="toolbar-btn-unmerge-cells"]',
     ) as HTMLButtonElement,
   }
 }
@@ -110,6 +136,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(false)
     expect(buttons.textColor.disabled).toBe(false)
     expect(buttons.numberFormat.disabled).toBe(false)
+    expect(buttons.merge.disabled).toBe(true)
+    expect(buttons.unmerge.disabled).toBe(true)
 
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 2, col: 2 }, extend: true })
 
@@ -118,6 +146,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(false)
     expect(buttons.textColor.disabled).toBe(false)
     expect(buttons.numberFormat.disabled).toBe(false)
+    expect(buttons.merge.disabled).toBe(true)
+    expect(buttons.unmerge.disabled).toBe(true)
   })
 
   it('disables formatting commands while editing is drafting', () => {
@@ -145,6 +175,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(true)
     expect(buttons.textColor.disabled).toBe(true)
     expect(buttons.numberFormat.disabled).toBe(true)
+    expect(buttons.merge.disabled).toBe(true)
+    expect(buttons.unmerge.disabled).toBe(true)
   })
 
   it('dispatches toolbar.format.command intent when bold is clicked', () => {
@@ -232,5 +264,67 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(store.getter(spreadsheetProjectionSnapshotAtom).result?.cells[0]?.format).toEqual({
       bold: true,
     })
+  })
+
+  it('calls backend merge and unmerge ports for the current selection range', async () => {
+    const store = createStore()
+    const { backend, mergeRangeCalls, unmergeRangeCalls, readVisibleProjectionCalls } =
+      createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 1 }, extend: true })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const buttons = getButtons(container)
+    expect(buttons.merge.disabled).toBe(false)
+    expect(buttons.unmerge.disabled).toBe(false)
+
+    fireEvent.click(buttons.merge)
+    await waitFor(() => {
+      expect(mergeRangeCalls).toHaveLength(1)
+    })
+    expect(mergeRangeCalls[0]).toEqual({
+      kind: 'merge-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    await waitFor(() => {
+      expect(readVisibleProjectionCalls).toHaveLength(1)
+    })
+
+    fireEvent.click(getButtons(container).unmerge)
+    await waitFor(() => {
+      expect(unmergeRangeCalls).toHaveLength(1)
+    })
+    expect(unmergeRangeCalls[0]).toEqual({
+      kind: 'unmerge-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    expect(readVisibleProjectionCalls).toHaveLength(2)
   })
 })
