@@ -120,13 +120,26 @@ type RequestMessage = {
   [key: string]: unknown
 }
 
-type ImportSession = {
+type ImportSessionMode = 'atomic' | 'direct'
+
+type AtomicImportSession = {
+  mode: 'atomic'
   workbook: WasmWorkbookRuntime
   normalizedCount: number
   stats: WorkbookImportStatsWire
   normalizationIssues: ImportCellIssueWire[]
   finalTouches: Map<string, ImportCellWire>
 }
+
+type DirectImportSession = {
+  mode: 'direct'
+  workbook: WasmWorkbookRuntime
+  normalizedCount: number
+  stats: WorkbookImportStatsWire
+  normalizationIssues: ImportCellIssueWire[]
+}
+
+type ImportSession = AtomicImportSession | DirectImportSession
 
 type NormalizedImportChunk = {
   cells: ImportCellWire[]
@@ -430,6 +443,15 @@ function assertSnapshotSessionId(sessionId: number) {
   }
 }
 
+function normalizeImportSessionMode(mode: unknown, atomic: unknown): ImportSessionMode {
+  if (mode === undefined || mode === null) return atomic === false ? 'direct' : 'atomic'
+  if (mode === 'atomic') return 'atomic'
+  if (mode === 'direct' || mode === 'non-atomic' || mode === 'nonAtomic') return 'direct'
+  throw Object.assign(new Error(`invalid import mode: ${String(mode)}`), {
+    code: 'INVALID_IMPORT_MODE',
+  })
+}
+
 function clampRowsPerChunk(
   rowsPerChunk: unknown,
   fallback = DEFAULT_EXPORT_ROWS_PER_CHUNK,
@@ -530,7 +552,7 @@ function ensureImportChunkSize(cells: unknown[]) {
   }
 }
 
-function projectedFinalTouches(session: ImportSession, cells: ImportCellWire[]): number {
+function projectedFinalTouches(session: AtomicImportSession, cells: ImportCellWire[]): number {
   if (cells.length === 0) return session.finalTouches.size
   const next = session.finalTouches.size
   const uniqueNewTouches = new Set<string>()
@@ -545,6 +567,13 @@ function projectedFinalTouches(session: ImportSession, cells: ImportCellWire[]):
 }
 
 function ensureImportSessionLimits(session: ImportSession, chunk: NormalizedImportChunk) {
+  if (session.normalizationIssues.length + chunk.issues.length > importLimits.issues) {
+    throw Object.assign(new Error('import session exceeded issue limit'), {
+      code: 'IMPORT_ISSUES_LIMIT_EXCEEDED',
+    })
+  }
+  if (session.mode === 'direct') return
+
   if (session.normalizedCount + chunk.cells.length > importLimits.normalizedCells) {
     throw Object.assign(new Error('import session exceeded normalized cell limit'), {
       code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
@@ -554,11 +583,6 @@ function ensureImportSessionLimits(session: ImportSession, chunk: NormalizedImpo
   if (nextFinalTouches > importLimits.finalTouches) {
     throw Object.assign(new Error('import session exceeded final touch limit'), {
       code: 'IMPORT_SESSION_LIMIT_EXCEEDED',
-    })
-  }
-  if (session.normalizationIssues.length + chunk.issues.length > importLimits.issues) {
-    throw Object.assign(new Error('import session exceeded issue limit'), {
-      code: 'IMPORT_ISSUES_LIMIT_EXCEEDED',
     })
   }
 }
@@ -602,11 +626,11 @@ function importCellKey(cell: Pick<ImportCellWire, 'sheet' | 'row' | 'col'>): str
   return `${cell.sheet}:${cell.row}:${cell.col}`
 }
 
-function recordFinalTouches(session: ImportSession, cells: ImportCellWire[]) {
+function recordFinalTouches(session: AtomicImportSession, cells: ImportCellWire[]) {
   for (const cell of cells) session.finalTouches.set(importCellKey(cell), cell)
 }
 
-function snapshotFinalImportTouches(session: ImportSession): SparseCellWire[] {
+function snapshotFinalImportTouches(session: AtomicImportSession): SparseCellWire[] {
   const snapshotRangeSparse = assertMethod(session.workbook, 'snapshot_range_sparse')
   const out: SparseCellWire[] = []
   for (const cell of session.finalTouches.values()) {
@@ -621,7 +645,7 @@ function snapshotFinalImportTouches(session: ImportSession): SparseCellWire[] {
   return out
 }
 
-function finalImportClears(session: ImportSession): ImportCellWire[] {
+function finalImportClears(session: AtomicImportSession): ImportCellWire[] {
   return [...session.finalTouches.values()].filter(
     (cell) => cell.kind === 'null' && cell.sheet < session.workbook.sheet_count(),
   )
@@ -661,6 +685,34 @@ function mergeFinalCommitStats(
     errors: sessionStats.errors + finalStats.errors,
     ...(issues.length > 0 ? { issues } : {}),
   }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function directImportPartialFailure(err: unknown) {
+  const reason = errorMessage(err)
+  const prefix = 'direct import failed; import is non-atomic and may contain partial writes'
+  return Object.assign(
+    new Error(`${prefix}: ${reason}`),
+    { code: 'DIRECT_IMPORT_PARTIAL_FAILURE' },
+  )
+}
+
+function importCellsIntoSession(
+  session: ImportSession,
+  cells: ImportCellWire[],
+): WorkbookImportStatsWire {
+  const bulkImportCells = assertMethod(session.workbook, 'bulk_import_cells')
+  if (session.mode === 'direct') {
+    try {
+      return bulkImportCells.call(session.workbook, cells)
+    } catch (err) {
+      throw directImportPartialFailure(err)
+    }
+  }
+  return bulkImportCells.call(session.workbook, cells)
 }
 
 function normalizeSparseRange(range: unknown): SparseRangeWire {
@@ -1070,13 +1122,27 @@ export function installWorkerRuntime() {
                 code: 'IMPORT_SESSION_EXISTS',
               })
             }
-            importSessions.set(sessionId, {
-              workbook: createWorkbookShell(wb),
+            const mode = normalizeImportSessionMode(msg.mode, msg.atomic)
+            const baseSession = {
               normalizedCount: 0,
               stats: emptyImportStats(),
               normalizationIssues: [],
-              finalTouches: new Map(),
-            })
+            }
+            importSessions.set(
+              sessionId,
+              mode === 'direct'
+                ? {
+                    ...baseSession,
+                    mode,
+                    workbook: wb,
+                  }
+                : {
+                    ...baseSession,
+                    mode,
+                    workbook: createWorkbookShell(wb),
+                    finalTouches: new Map(),
+                  },
+            )
             postResponse(msg.id, sessionId)
           }
           break
@@ -1133,12 +1199,9 @@ export function installWorkerRuntime() {
             const chunk = normalizeImportCells(rawCells as ImportCellWire[])
             ensureImportSessionLimits(session, chunk)
             if (chunk.cells.length > 0) {
-              const stats = assertMethod(session.workbook, 'bulk_import_cells').call(
-                session.workbook,
-                chunk.cells,
-              )
+              const stats = importCellsIntoSession(session, chunk.cells)
               session.stats = mergeImportStats(session.stats, stats)
-              recordFinalTouches(session, chunk.cells)
+              if (session.mode === 'atomic') recordFinalTouches(session, chunk.cells)
               session.normalizedCount += chunk.cells.length
             }
             session.normalizationIssues.push(...chunk.issues)
@@ -1190,6 +1253,14 @@ export function installWorkerRuntime() {
               throw Object.assign(new Error(`missing import session: ${sessionId}`), {
                 code: 'IMPORT_SESSION_MISSING',
               })
+            }
+            if (session.mode === 'direct') {
+              importSessions.delete(sessionId)
+              postResponse(
+                msg.id,
+                mergeImportStatsIssues(session.stats, session.normalizationIssues),
+              )
+              break
             }
             const changedCells = snapshotFinalImportTouches(session)
             const finalClears = finalImportClears(session)

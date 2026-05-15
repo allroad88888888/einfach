@@ -19,6 +19,8 @@ type DebugCounters = {
 type WorkerMessageProbe = {
   cmd: string
   cellsLength?: number
+  mode?: string
+  atomic?: boolean
 }
 
 declare global {
@@ -207,10 +209,17 @@ test.describe('Solid Excel vNext worker backend', () => {
       const originalPostMessage = Worker.prototype.postMessage
       Worker.prototype.postMessage = function (message: unknown, transferOrOptions?: unknown) {
         if (message && typeof message === 'object' && 'cmd' in message) {
-          const wire = message as { cmd?: unknown; cells?: unknown }
+          const wire = message as {
+            cmd?: unknown
+            cells?: unknown
+            mode?: unknown
+            atomic?: unknown
+          }
           messages.push({
             cmd: String(wire.cmd),
             cellsLength: Array.isArray(wire.cells) ? wire.cells.length : undefined,
+            mode: typeof wire.mode === 'string' ? wire.mode : undefined,
+            atomic: typeof wire.atomic === 'boolean' ? wire.atomic : undefined,
           })
         }
         return originalPostMessage.call(this, message, transferOrOptions as never)
@@ -281,8 +290,10 @@ test.describe('Solid Excel vNext worker backend', () => {
       workerMessageOffset,
     )
     const pasteCommands = pasteWorkerMessages.map((message) => message.cmd)
+    const beginImport = pasteWorkerMessages.find((message) => message.cmd === 'beginImport')
     const importChunks = pasteWorkerMessages.filter((message) => message.cmd === 'importChunk')
     expect(pasteCommands).toContain('beginImport')
+    expect(beginImport).toMatchObject({ mode: 'direct' })
     expect(pasteCommands).toContain('commitImport')
     expect(importChunks.length).toBeGreaterThan(1)
     expect(Math.max(...importChunks.map((message) => message.cellsLength ?? 0))).toBeLessThanOrEqual(

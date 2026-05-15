@@ -379,6 +379,31 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     await expect(cancel).resolves.toBe(false)
   })
 
+  it('sends direct import session mode when requested', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const begin = workbook.beginImport({ mode: 'direct' })
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'beginImport',
+      sessionId: 1,
+      mode: 'direct',
+    })
+    ok(fake, 1)
+    await expect(begin).resolves.toBe(1)
+
+    const explicit = workbook.beginImport(12, { atomic: false })
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'beginImport',
+      sessionId: 12,
+      atomic: false,
+    })
+    ok(fake, 12)
+    await expect(explicit).resolves.toBe(12)
+  })
+
   it('surfaces import limit errors and keeps the request channel usable', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

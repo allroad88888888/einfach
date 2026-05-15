@@ -81,6 +81,13 @@ export interface WorkbookImportStatsWire {
   issues?: ImportCellIssueWire[]
 }
 
+export type ImportSessionModeWire = 'atomic' | 'direct'
+
+export interface BeginImportOptionsWire {
+  mode?: ImportSessionModeWire
+  atomic?: boolean
+}
+
 export type SparseCellWire =
   | { sheet: number; addr: string; row: number; col: number; kind: 'number'; value: number }
   | { sheet: number; addr: string; row: number; col: number; kind: 'text'; value: string }
@@ -222,7 +229,10 @@ export interface WorkerWorkbookClient {
   setFormatRange(range: SparseRangeWire, fmt: CellFormatJSON | null | undefined): Promise<number>
   snapshotFormatRange(range: SparseRangeWire): Promise<FormatRangeSnapshot>
   restoreFormatSnapshot(snapshot: FormatRangeSnapshot): Promise<number>
-  beginImport(sessionId?: number): Promise<number>
+  beginImport(
+    sessionIdOrOptions?: number | BeginImportOptionsWire,
+    options?: BeginImportOptionsWire,
+  ): Promise<number>
   importChunk(sessionId: number, cells: ImportCellWire[]): Promise<number>
   commitImport(sessionId: number): Promise<WorkbookImportStatsWire>
   cancelImport(sessionId: number): Promise<boolean>
@@ -437,8 +447,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     restoreFormatSnapshot(snapshot) {
       return request<number>('restoreFormatSnapshot', { snapshot })
     },
-    beginImport(sessionId = nextImportId++) {
-      return request<number>('beginImport', { sessionId })
+    beginImport(sessionIdOrOptions, options) {
+      const sessionId =
+        typeof sessionIdOrOptions === 'number' ? sessionIdOrOptions : nextImportId++
+      const importOptions =
+        typeof sessionIdOrOptions === 'number' ? options : sessionIdOrOptions
+      return request<number>('beginImport', { sessionId, ...(importOptions ?? {}) })
     },
     importChunk(sessionId, cells) {
       return request<number>('importChunk', { sessionId, cells })

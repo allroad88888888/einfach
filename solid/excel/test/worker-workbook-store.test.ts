@@ -9,6 +9,7 @@ import type {
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  BeginImportOptionsWire,
   ImportCellWire,
   SparseCellWire,
   SparseRangeWire,
@@ -653,7 +654,8 @@ function makeFakeWorkerWorkbookClient(
       }
       return sparseCells.length
     },
-    async beginImport(sessionId = 1) {
+    async beginImport(sessionIdOrOptions?: number | BeginImportOptionsWire) {
+      const sessionId = typeof sessionIdOrOptions === 'number' ? sessionIdOrOptions : 1
       calls.beginImport.push(sessionId)
       return sessionId
     },

@@ -682,7 +682,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
   async function importChunks(request: ImportCellChunksRequest): Promise<BackendMutationResult> {
     const sheet = await resolveSheet(request.sheetId)
     const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
-    const sessionId = await client.beginImport()
+    const sessionId = await client.beginImport({ mode: 'direct' })
     const wireChunk: ImportCellWire[] = []
     let committed = false
 

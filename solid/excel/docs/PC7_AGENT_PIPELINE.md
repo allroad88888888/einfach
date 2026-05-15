@@ -221,6 +221,12 @@ W6、W7 是 package cutover 和发布门禁。
 - vNext worker e2e 已记录 worker RPC，验证 large paste 走
   `beginImport -> importChunk* -> commitImport`，import chunk 数量大于 1，且没有逐 cell
   `setCell` / `setFormulaDetailed` 回退。
+- 本轮补齐 worker runtime direct import：`beginImport` 保持默认 atomic staging，同时支持
+  `{ mode: 'direct' }` / `atomic: false`；vNext worker backend 的 chunk import 明确请求
+  direct mode，chunk ack 后直接写主 workbook，跳过 JS staging workbook、`finalTouches` 和
+  commit 阶段 `finalWrites` 聚合，从而不再受 atomic session 的 200k normalized/final-touch 上限影响。
+- direct import 明确是非原子语义：chunk 成功确认后即可能已写入；失败时返回
+  `DIRECT_IMPORT_PARTIAL_FAILURE`，`cancelImport` 只清理 worker session，不回滚已确认写入。
 
 并行分工：
 
@@ -259,10 +265,15 @@ W6、W7 是 package cutover 和发布门禁。
   `npx jest vanilla/spreadsheet-ui-core/test/clipboard.test.ts solid/excel/test/vnext-context-menu.test.tsx solid/excel/test/vnext-adapter.test.ts --runInBand`、
   `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`、
   `npm run build -w @einfach/solid-excel`。
-- 剩余风险：浏览器 `navigator.clipboard.readText()` 仍一次性给字符串；worker runtime import
-  session 内部仍有 200k normalized/final touches 上限并在 commit 时 materialize final writes，
-  下一波需要设计 direct chunk import 或 Rust 侧事务/rollback；range export helper 仍有字符串聚合
-  convenience API，大复制/导出路径还要继续去聚合化。
+- direct import 追加记录：已跑
+  `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`；
+  `npx jest solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand`；
+  `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`；
+  `npm run build -w @einfach/solid-excel`。
+- 剩余风险：浏览器 `navigator.clipboard.readText()` 仍一次性给字符串；direct mode 已避免
+  JS staging/finalWrites 聚合，但牺牲 atomic rollback；如果后续需要强原子大导入，需要 Rust 侧
+  transaction/rollback journal；range export helper 仍有字符串聚合 convenience API，大复制/导出
+  路径还要继续去聚合化。
 
 ## W6：package cutover readiness
 

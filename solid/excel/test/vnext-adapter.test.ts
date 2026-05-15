@@ -9,6 +9,7 @@ import type {
   CellSnapshotWire,
   CellWire,
   FormatRangeSnapshot,
+  BeginImportOptionsWire,
   ImportCellWire,
   SparseCellWire,
   SparseRangeWire,
@@ -44,6 +45,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setRowHeight: Array<{ sheet: number; rowIndex: number; heightPx: number }>
     setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
     beginImport: number[]
+    beginImportOptions: Array<{ sessionId: number; options?: BeginImportOptionsWire }>
     importChunk: Array<{ sessionId: number; cells: ImportCellWire[] }>
     commitImport: number[]
     cancelImport: number[]
@@ -84,6 +86,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setRowHeight: [],
     setColumnWidth: [],
     beginImport: [],
+    beginImportOptions: [],
     importChunk: [],
     commitImport: [],
     cancelImport: [],
@@ -492,8 +495,13 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       sizeMap(colWidths, sheet).set(colIndex, widthPx)
       return true
     },
-    async beginImport(sessionId = nextImportId++) {
+    async beginImport(sessionIdOrOptions, options) {
+      const sessionId =
+        typeof sessionIdOrOptions === 'number' ? sessionIdOrOptions : nextImportId++
+      const importOptions =
+        typeof sessionIdOrOptions === 'number' ? options : sessionIdOrOptions
       calls.beginImport.push(sessionId)
+      calls.beginImportOptions.push({ sessionId, options: importOptions })
       return sessionId
     },
     async importChunk(sessionId, importCells) {
@@ -1363,6 +1371,7 @@ describe('vnext adapter', () => {
       affectedRange: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
     })
     expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.beginImportOptions).toEqual([{ sessionId: 1, options: { mode: 'direct' } }])
     expect(client.calls.importChunk).toEqual([
       {
         sessionId: 1,
@@ -1419,6 +1428,7 @@ describe('vnext adapter', () => {
       affectedRange: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
     })
     expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.beginImportOptions).toEqual([{ sessionId: 1, options: { mode: 'direct' } }])
     expect(client.calls.importChunk).toEqual([
       {
         sessionId: 1,
@@ -1469,6 +1479,7 @@ describe('vnext adapter', () => {
     ).rejects.toThrow('source failed')
 
     expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.beginImportOptions).toEqual([{ sessionId: 1, options: { mode: 'direct' } }])
     expect(client.calls.importChunk).toEqual([
       {
         sessionId: 1,
@@ -1512,6 +1523,7 @@ describe('vnext adapter', () => {
     ).rejects.toThrow('import chunk failed')
 
     expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.beginImportOptions).toEqual([{ sessionId: 1, options: { mode: 'direct' } }])
     expect(client.calls.importChunk).toEqual([
       {
         sessionId: 1,
@@ -1558,6 +1570,7 @@ describe('vnext adapter', () => {
     ).rejects.toThrow('commit import failed')
 
     expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.beginImportOptions).toEqual([{ sessionId: 1, options: { mode: 'direct' } }])
     expect(client.calls.importChunk).toEqual([
       {
         sessionId: 1,

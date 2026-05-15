@@ -1,6 +1,7 @@
 import { describe, expect, it, jest } from '@jest/globals'
 import {
   MAX_IMPORT_CHUNK_CELLS,
+  MAX_IMPORT_SESSION_NORMALIZED_CELLS,
   __resetImportLimitsForTest,
   __setImportLimitsForTest,
   mergeImportStatsIssues,
@@ -41,6 +42,7 @@ type MockFormulaFailure = {
 type MockWasmWorkbookOptions = {
   formulaFailuresByFormula?: Record<string, MockFormulaFailure>
   disablePersistenceV1?: boolean
+  bulkImportFailureAfterApply?: string
 }
 
 type MockWasmWorkbook = {
@@ -230,6 +232,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     restored_formats: 0,
     sheets: 1,
   }
+  let didFailBulkImportAfterApply = false
 
   function key(sheet: number, addr: string) {
     return `${sheet}:${addr.toUpperCase()}`
@@ -369,6 +372,10 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       calls.bulkImportCells += 1
       calls.bulkImportPayloads.push(cellsIn)
       setFromImport(cellsIn)
+      if (options.bulkImportFailureAfterApply && !didFailBulkImportAfterApply) {
+        didFailBulkImportAfterApply = true
+        throw new Error(options.bulkImportFailureAfterApply)
+      }
       return {
         accepted: cellsIn.length,
         formulas: cellsIn.filter((cell) => cell.kind === 'formula').length,
@@ -869,6 +876,168 @@ describe('wasm-workbook-worker import session contract', () => {
           type: 'formula',
           isError: false,
           formula: '=A1+1',
+        },
+      ])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it(
+    'imports direct chunks over the atomic session limit without staging or final writes',
+    async () => {
+      const harness = withMockedWorker()
+      try {
+        await harness.send({
+          id: 1,
+          cmd: 'initWorkbook',
+          sheets: ['Sheet1'],
+        })
+        await harness.send<number>({
+          id: 2,
+          cmd: 'beginImport',
+          sessionId: 31,
+          mode: 'direct',
+        })
+
+        const activeCounters = await harness.send<WorkerWorkbookDebugCountersWire>({
+          id: 3,
+          cmd: 'debugCounters',
+        })
+        expect(activeCounters.importSessionCount).toBe(1)
+        expect(harness.calls.importWorkbooks()).toBe(0)
+
+        const totalCells = MAX_IMPORT_SESSION_NORMALIZED_CELLS + 1
+        let nextId = 4
+        for (let offset = 0; offset < totalCells; offset += MAX_IMPORT_CHUNK_CELLS) {
+          const count = Math.min(MAX_IMPORT_CHUNK_CELLS, totalCells - offset)
+          const cells = Array.from({ length: count }, (_value, index): ImportCellWire => {
+            const cellIndex = offset + index
+            if (cellIndex === totalCells - 1) {
+              return {
+                sheet: 0,
+                row: cellIndex,
+                col: 0,
+                kind: 'formula',
+                value: '=1+1',
+              }
+            }
+            return {
+              sheet: 0,
+              row: cellIndex,
+              col: 0,
+              kind: 'number',
+              value: cellIndex,
+            }
+          })
+          await expect(
+            harness.send<number>({
+              id: nextId++,
+              cmd: 'importChunk',
+              sessionId: 31,
+              cells,
+            }),
+          ).resolves.toBe(offset + count)
+        }
+
+        const payloadCountBeforeCommit = harness.calls.mainBulkImportPayloads().length
+        const commit = await harness.send<WorkbookImportStatsWire>({
+          id: nextId++,
+          cmd: 'commitImport',
+          sessionId: 31,
+        })
+
+        expect(commit.accepted).toBe(totalCells)
+        expect(commit.formulas).toBe(1)
+        expect(harness.calls.importWorkbooks()).toBe(0)
+        expect(harness.calls.importSnapshotRangeSparse()).toEqual([])
+        expect(harness.calls.mainBulkImportPayloads()).toHaveLength(payloadCountBeforeCommit)
+        expect(
+          harness.calls
+            .mainBulkImportPayloads()
+            .reduce((sum, payload) => sum + payload.length, 0),
+        ).toBe(totalCells)
+
+        await expect(
+          harness.send<number>({
+            id: nextId++,
+            cmd: 'debugFormulaEvalCount',
+            sheet: 0,
+          }),
+        ).resolves.toBe(0)
+        const counters = await harness.send<WorkerWorkbookDebugCountersWire>({
+          id: nextId++,
+          cmd: 'debugCounters',
+        })
+        expect(counters.importSessionCount).toBe(0)
+        expect(counters.formulaEvalCountTotal).toBe(0)
+      } finally {
+        harness.dispose()
+      }
+    },
+    15_000,
+  )
+
+  it('reports direct failures as partial and cancel only clears the session', async () => {
+    const harness = withMockedWorker({ bulkImportFailureAfterApply: 'mock write failure' })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 32,
+        mode: 'direct',
+      })
+
+      await expect(
+        harness.send<number>({
+          id: 3,
+          cmd: 'importChunk',
+          sessionId: 32,
+          cells: [{ sheet: 0, row: 0, col: 0, kind: 'number', value: 42 }],
+        }),
+      ).rejects.toMatchObject({
+        code: 'DIRECT_IMPORT_PARTIAL_FAILURE',
+        message: expect.stringContaining('non-atomic'),
+      })
+      await expect(
+        harness.send<WorkerWorkbookDebugCountersWire>({
+          id: 4,
+          cmd: 'debugCounters',
+        }),
+      ).resolves.toMatchObject({ importSessionCount: 1 })
+
+      await expect(
+        harness.send<boolean>({
+          id: 5,
+          cmd: 'cancelImport',
+          sessionId: 32,
+        }),
+      ).resolves.toBe(true)
+      await expect(
+        harness.send<WorkerWorkbookDebugCountersWire>({
+          id: 6,
+          cmd: 'debugCounters',
+        }),
+      ).resolves.toMatchObject({ importSessionCount: 0 })
+
+      const cells = await harness.send({
+        id: 7,
+        cmd: 'readCells',
+        cells: [{ sheet: 0, addr: 'A1' }],
+      })
+      expect(cells).toEqual([
+        {
+          sheet: 0,
+          addr: 'A1',
+          display: '42',
+          type: 'number',
+          isError: false,
+          formula: '',
         },
       ])
     } finally {
