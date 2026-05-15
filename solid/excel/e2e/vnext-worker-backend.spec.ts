@@ -14,6 +14,27 @@ declare global {
       sheetList(): Promise<Array<{ idx: number; name: string }>>
       debugFormulaCacheState(sheet: number, addr: string): Promise<string>
       debugFormulaEvalCount(sheet: number): Promise<number>
+      snapshotRangeSparseChunks(
+        range: {
+          sheet: number
+          startRow: number
+          startCol: number
+          endRow: number
+          endCol: number
+        },
+        rowsPerChunk?: number,
+      ): Promise<
+        Array<
+          Array<{
+            sheet: number
+            addr: string
+            row: number
+            col: number
+            kind: string
+            value?: unknown
+          }>
+        >
+      >
       snapshotPersistenceV1(): Promise<{
         sizes?: Array<{
           sheet?: number
@@ -88,6 +109,34 @@ test.describe('Solid Excel vNext worker backend', () => {
     await selectSheet(page, 'Sheet3')
     await expect(cellDisplay(page, 'C2')).toHaveText('21')
 
+    await expectNoConsoleErrors(page)
+  })
+
+  test('streams sparse range snapshots through worker chunks without expanding the viewport', async ({
+    page,
+  }) => {
+    await gotoVNextWorkerDemo(page)
+
+    const result = await page.evaluate(async () => {
+      const chunks = await window.__einfachWorkbookDebugClient!.snapshotRangeSparseChunks(
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 5000, endCol: 4 },
+        1024,
+      )
+      const flat = chunks.flat()
+      return {
+        chunkCount: chunks.length,
+        chunkSizes: chunks.map((chunk) => chunk.length),
+        addrs: flat.map((cell) => cell.addr).sort(),
+        visibleCells: document.querySelectorAll('[data-testid="vnext-worker-grid"] td.cell')
+          .length,
+      }
+    })
+
+    expect(result.chunkCount).toBe(5)
+    expect(result.chunkSizes.reduce((sum, size) => sum + size, 0)).toBeGreaterThan(0)
+    expect(result.addrs).toEqual(expect.arrayContaining(['A1', 'B4', 'C2']))
+    expect(result.visibleCells).toBe(30)
+    await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)
   })
 

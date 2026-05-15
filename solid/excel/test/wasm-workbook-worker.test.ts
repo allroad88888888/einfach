@@ -1281,6 +1281,102 @@ describe('wasm-workbook-worker import session contract', () => {
     }
   })
 
+  it('streams sparse range snapshots in row chunks and only snapshots current chunk', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send({
+        id: 2,
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A1',
+        value: { type: 'number', value: 1 },
+      })
+      await harness.send({
+        id: 3,
+        cmd: 'setFormula',
+        sheet: 0,
+        addr: 'A2',
+        formula: '=A1+1',
+      })
+      await harness.send({
+        id: 4,
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A3',
+        value: { type: 'text', value: '3' },
+      })
+
+      const begin = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 5,
+        cmd: 'beginSnapshotRangeSparse',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 2, endCol: 0 },
+        rowsPerChunk: 2,
+      })
+      expect(begin).toEqual({
+        sessionId: 1,
+        totalRows: 3,
+        rowsPerChunk: 2,
+      })
+
+      const chunk1 = await harness.send<{
+        sessionId: number
+        startRow: number
+        endRow: number
+        cells: SparseCellWire[]
+        done: boolean
+      }>({
+        id: 6,
+        cmd: 'nextSnapshotRangeSparseChunk',
+        sessionId: begin.sessionId,
+      })
+      expect(chunk1).toEqual({
+        sessionId: 1,
+        startRow: 0,
+        endRow: 1,
+        cells: [
+          { sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, addr: 'A2', row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+        ],
+        done: false,
+      })
+
+      const chunk2 = await harness.send<{
+        sessionId: number
+        startRow: number
+        endRow: number
+        cells: SparseCellWire[]
+        done: boolean
+      }>({
+        id: 7,
+        cmd: 'nextSnapshotRangeSparseChunk',
+        sessionId: begin.sessionId,
+      })
+      expect(chunk2).toEqual({
+        sessionId: 1,
+        startRow: 2,
+        endRow: 2,
+        cells: [{ sheet: 0, addr: 'A3', row: 2, col: 0, kind: 'text', value: '3' }],
+        done: true,
+      })
+
+      expect(harness.calls.mainSnapshotRangeSparse()).toEqual([
+        { sheet: 0, startRow: 0, startCol: 0, endRow: 1, endCol: 0 },
+        { sheet: 0, startRow: 2, startCol: 0, endRow: 2, endCol: 0 },
+      ])
+    } finally {
+      harness.dispose()
+    }
+  })
+
   it('cancels export sessions and rejects chunk reads afterward', async () => {
     const harness = withMockedWorker()
     try {
@@ -1318,6 +1414,49 @@ describe('wasm-workbook-worker import session contract', () => {
       ).rejects.toMatchObject({
         code: 'EXPORT_SESSION_MISSING',
         message: `missing export session: ${begin.sessionId}`,
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('cancels sparse snapshot sessions and rejects chunk reads afterward', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const begin = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 2,
+        cmd: 'beginSnapshotRangeSparse',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+        rowsPerChunk: 0,
+      })
+      expect(begin.rowsPerChunk).toBe(1)
+
+      const cancelled = await harness.send<boolean>({
+        id: 3,
+        cmd: 'cancelSnapshot',
+        sessionId: begin.sessionId,
+      })
+      expect(cancelled).toBe(true)
+
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'nextSnapshotRangeSparseChunk',
+          sessionId: begin.sessionId,
+        }),
+      ).rejects.toMatchObject({
+        code: 'SNAPSHOT_SESSION_MISSING',
+        message: `missing snapshot session: ${begin.sessionId}`,
       })
     } finally {
       harness.dispose()
@@ -1709,7 +1848,7 @@ describe('wasm-workbook-worker import session contract', () => {
     }
   })
 
-  it('clears active import and export sessions after restoring persistence v1', async () => {
+  it('clears active import, export, and snapshot sessions after restoring persistence v1', async () => {
     const harness = withMockedWorker()
     try {
       await harness.send({
@@ -1737,9 +1876,18 @@ describe('wasm-workbook-worker import session contract', () => {
         cmd: 'beginExportRangeTsv',
         range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
       })
+      const snapshotSession = await harness.send<{
+        sessionId: number
+        totalRows: number
+        rowsPerChunk: number
+      }>({
+        id: 5,
+        cmd: 'beginSnapshotRangeSparse',
+        range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      })
 
       await harness.send({
-        id: 5,
+        id: 6,
         cmd: 'restorePersistenceV1',
         snapshot: {
           version: 1,
@@ -1751,7 +1899,7 @@ describe('wasm-workbook-worker import session contract', () => {
 
       await expect(
         harness.send({
-          id: 6,
+          id: 7,
           cmd: 'commitImport',
           sessionId: 7,
         }),
@@ -1760,12 +1908,21 @@ describe('wasm-workbook-worker import session contract', () => {
       })
       await expect(
         harness.send({
-          id: 7,
+          id: 8,
           cmd: 'nextExportRangeTsvChunk',
           sessionId: exportSession.sessionId,
         }),
       ).rejects.toMatchObject({
         code: 'EXPORT_SESSION_MISSING',
+      })
+      await expect(
+        harness.send({
+          id: 9,
+          cmd: 'nextSnapshotRangeSparseChunk',
+          sessionId: snapshotSession.sessionId,
+        }),
+      ).rejects.toMatchObject({
+        code: 'SNAPSHOT_SESSION_MISSING',
       })
     } finally {
       harness.dispose()

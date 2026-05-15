@@ -43,6 +43,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
     exportRangeTsv: SparseRangeWire[]
     exportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
+    snapshotRangeSparseChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     addSheet: string[]
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
@@ -78,6 +79,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     setColumnWidth: [],
     exportRangeTsv: [],
     exportRangeTsvChunks: [],
+    snapshotRangeSparseChunks: [],
     addSheet: [],
     renameSheet: [],
     removeSheet: [],
@@ -506,6 +508,20 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         .filter((cell) => insideRange(cell, range))
         .map(snapshotToSparseCell)
         .filter((cell): cell is SparseCellWire => cell !== null)
+    },
+    async beginSnapshotRangeSparse(range, rowsPerChunk = 2048) {
+      calls.snapshotRangeSparseChunks.push({ ...range, rowsPerChunk })
+      return { sessionId: 1, totalRows: range.endRow - range.startRow + 1, rowsPerChunk }
+    },
+    async nextSnapshotRangeSparseChunk() {
+      throw new Error('not used')
+    },
+    async cancelSnapshot() {
+      throw new Error('not used')
+    },
+    async snapshotRangeSparseChunks(range, rowsPerChunk = 2048) {
+      calls.snapshotRangeSparseChunks.push({ ...range, rowsPerChunk })
+      return [await this.snapshotRangeSparse(range)]
     },
     async snapshotPersistenceV1() {
       throw new Error('not used')

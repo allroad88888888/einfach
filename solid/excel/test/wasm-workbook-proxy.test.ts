@@ -769,6 +769,116 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ])
   })
 
+  it('sends chunked sparse range snapshot session commands and aggregates chunks', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = {
+      sheet: 0,
+      startRow: 0,
+      startCol: 0,
+      endRow: 2,
+      endCol: 1,
+    }
+
+    const beginPromise = workbook.beginSnapshotRangeSparse(range, 2)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'beginSnapshotRangeSparse',
+      range,
+      rowsPerChunk: 2,
+    })
+    ok(fake, { sessionId: 11, totalRows: 3, rowsPerChunk: 2 })
+    await expect(beginPromise).resolves.toEqual({
+      sessionId: 11,
+      totalRows: 3,
+      rowsPerChunk: 2,
+    })
+
+    const snapshotCell: SparseCellWire = {
+      sheet: 0,
+      addr: 'A1',
+      row: 0,
+      col: 0,
+      kind: 'number',
+      value: 1,
+    }
+    const nextPromise = workbook.nextSnapshotRangeSparseChunk(11)
+    expect(lastSent(fake)).toEqual({ id: 2, cmd: 'nextSnapshotRangeSparseChunk', sessionId: 11 })
+    ok(fake, {
+      sessionId: 11,
+      startRow: 0,
+      endRow: 1,
+      cells: [snapshotCell],
+      done: false,
+    })
+    await expect(nextPromise).resolves.toEqual({
+      sessionId: 11,
+      startRow: 0,
+      endRow: 1,
+      cells: [snapshotCell],
+      done: false,
+    })
+
+    const cancel = workbook.cancelSnapshot(11)
+    expect(lastSent(fake)).toEqual({ id: 3, cmd: 'cancelSnapshot', sessionId: 11 })
+    ok(fake, true)
+    await expect(cancel).resolves.toBe(true)
+  })
+
+  it('aggregates chunked sparse snapshots with clamped row chunk sizes', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = {
+      sheet: 0,
+      startRow: 0,
+      startCol: 0,
+      endRow: 1,
+      endCol: 0,
+    }
+    const snapshotCell: SparseCellWire = {
+      sheet: 0,
+      addr: 'A1',
+      row: 0,
+      col: 0,
+      kind: 'formula',
+      value: '=Sheet2!A1+1',
+    }
+
+    const chunksPromise = workbook.snapshotRangeSparseChunks(range, 0)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'beginSnapshotRangeSparse',
+      range,
+      rowsPerChunk: 1,
+    })
+    ok(fake, { sessionId: 12, totalRows: 2, rowsPerChunk: 1 })
+    await Promise.resolve()
+
+    ok(fake, {
+      sessionId: 12,
+      startRow: 0,
+      endRow: 0,
+      cells: [snapshotCell],
+      done: false,
+    })
+    await Promise.resolve()
+
+    ok(fake, {
+      sessionId: 12,
+      startRow: 1,
+      endRow: 1,
+      cells: [],
+      done: true,
+    })
+
+    await expect(chunksPromise).resolves.toEqual([[snapshotCell], []])
+    expect(fake.sent).toEqual([
+      { id: 1, cmd: 'beginSnapshotRangeSparse', range, rowsPerChunk: 1 },
+      { id: 2, cmd: 'nextSnapshotRangeSparseChunk', sessionId: 12 },
+      { id: 3, cmd: 'nextSnapshotRangeSparseChunk', sessionId: 12 },
+    ])
+  })
+
   it('dispatches dirty events only to matching sheet+addr subscribers', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })

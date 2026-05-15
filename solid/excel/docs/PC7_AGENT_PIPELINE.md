@@ -33,9 +33,11 @@
   sidecar，sheet 顺序以 Rust workbook `sheetList()` 回读为准。
 - W3 顺手修复：worker backend lookup 里稳定 sheet id/name 优先于 `sheet-${idx+1}` 位置别名，
   避免 reorder 后 `sheet-2` 被误解析成“第二个 sheet”。
-- row/column size 只在 vNext JS adapter metadata 中持久化，Rust snapshot/reload/autofit
-  还没完成。
-- bulk load API、range streaming、range interval index 仍是百万级数据面的主要缺口。
+- W4 已完成：row/column size 已进入 Rust sparse metadata，snapshot/reload 与可视 DOM
+  autofit 已接入 vNext worker/backend。
+- W5 已启动：Rust `bulk_load`、range dependent interval index、worker TSV chunk export
+  已有主体；本轮补齐 worker sparse range snapshot chunk protocol，供大撤销、大粘贴和后续
+  range 传输复用，避免一次性返回大数组。
 - W2 已完成：单 sheet dependent 传播、dirty notify 契约和 TLS resolver 清算均已核实；
   vNext Worker demo 增加 `Sheet2!C5` 独立 lazy probe，打开 Sheet1 时保持 dirty，
   切到 Sheet2 后由可视读取计算并输出 console lazy 日志。
@@ -193,6 +195,16 @@ W6、W7 是 package cutover 和发布门禁。
 ## W5：bulk load、range streaming、range interval index
 
 目标：补齐百万级 cell 的数据面，不让导入、copy/export、range 依赖追踪退化为全表操作。
+
+当前进展：
+
+- Rust core 已有 `Sheet::bulk_load` / `Workbook::bulk_load`、lazy formula dirty cache 和
+  `RangeDependentIndex` 复杂度回归测试。
+- WASM/worker 已有 import session 与 TSV export session；TSV copy/export 走 row chunk
+  聚合，不要求 UI core 读取整张 sheet。
+- 已补 `beginSnapshotRangeSparse` / `nextSnapshotRangeSparseChunk` / `cancelSnapshot` /
+  `snapshotRangeSparseChunks`：snapshot sparse range 也能按行段从 worker 流式回传，后续
+  大撤销、大 paste staging 和 range-based transfer 可以复用同一模型。
 
 并行分工：
 

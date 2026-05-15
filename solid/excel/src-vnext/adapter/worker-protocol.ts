@@ -96,6 +96,20 @@ export interface SparseRangeWire {
   endCol: number
 }
 
+export interface SparseRangeSnapshotSessionWire {
+  sessionId: number
+  totalRows: number
+  rowsPerChunk: number
+}
+
+export interface SparseRangeSnapshotChunkWire {
+  sessionId: number
+  startRow: number
+  endRow: number
+  cells: SparseCellWire[]
+  done: boolean
+}
+
 export interface ViewportRowHeightWire {
   rowIndex: number
   heightPx: number
@@ -215,6 +229,16 @@ export interface WorkerWorkbookClient {
   listNonEmpty(): Promise<CellRefWire[]>
   snapshotSparse(): Promise<SparseCellWire[]>
   snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
+  beginSnapshotRangeSparse(
+    range: SparseRangeWire,
+    rowsPerChunk?: number,
+  ): Promise<SparseRangeSnapshotSessionWire>
+  nextSnapshotRangeSparseChunk(sessionId: number): Promise<SparseRangeSnapshotChunkWire>
+  cancelSnapshot(sessionId: number): Promise<boolean>
+  snapshotRangeSparseChunks(
+    range: SparseRangeWire,
+    rowsPerChunk?: number,
+  ): Promise<SparseCellWire[][]>
   snapshotViewportSizes(range: SparseRangeWire): Promise<ViewportSizeSnapshotWire>
   setRowHeight(sheet: number, rowIndex: number, heightPx: number): Promise<boolean>
   setColumnWidth(sheet: number, colIndex: number, widthPx: number): Promise<boolean>
@@ -435,6 +459,43 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     snapshotRangeSparse(range) {
       return request<SparseCellWire[]>('snapshotRangeSparse', { range })
+    },
+    beginSnapshotRangeSparse(range, rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK) {
+      return request<SparseRangeSnapshotSessionWire>('beginSnapshotRangeSparse', {
+        range,
+        rowsPerChunk: clampRowsPerChunk(rowsPerChunk),
+      })
+    },
+    nextSnapshotRangeSparseChunk(sessionId) {
+      return request<SparseRangeSnapshotChunkWire>('nextSnapshotRangeSparseChunk', { sessionId })
+    },
+    cancelSnapshot(sessionId) {
+      return request<boolean>('cancelSnapshot', { sessionId })
+    },
+    async snapshotRangeSparseChunks(range, rowsPerChunk = DEFAULT_EXPORT_ROWS_PER_CHUNK) {
+      const session = await request<SparseRangeSnapshotSessionWire>('beginSnapshotRangeSparse', {
+        range,
+        rowsPerChunk: clampRowsPerChunk(rowsPerChunk),
+      })
+      const chunks: SparseCellWire[][] = []
+      let done = false
+      try {
+        while (true) {
+          const chunk = await request<SparseRangeSnapshotChunkWire>(
+            'nextSnapshotRangeSparseChunk',
+            { sessionId: session.sessionId },
+          )
+          chunks.push(chunk.cells)
+          if (chunk.done) break
+        }
+        done = true
+        return chunks
+      } finally {
+        if (!done)
+          await request<boolean>('cancelSnapshot', { sessionId: session.sessionId }).catch(
+            () => {},
+          )
+      }
     },
     snapshotViewportSizes(range) {
       return request<ViewportSizeSnapshotWire>('snapshotViewportSizes', { range })

@@ -140,13 +140,22 @@ type ExportSession = {
   nextRow: number
 }
 
+type SnapshotSession = {
+  range: SparseRangeWire
+  rowsPerChunk: number
+  totalRows: number
+  nextRow: number
+}
+
 let workbook: WasmWorkbookRuntime | undefined
 let initPromise: Promise<void> | undefined
 
 const subscriptionTokens = new Map<number, number[]>()
 const importSessions = new Map<number, ImportSession>()
 const exportSessions = new Map<number, ExportSession>()
+const snapshotSessions = new Map<number, SnapshotSession>()
 let nextExportId = 1
+let nextSnapshotId = 1
 
 const DEFAULT_EXPORT_ROWS_PER_CHUNK = 2048
 const MIN_EXPORT_ROWS_PER_CHUNK = 1
@@ -246,7 +255,9 @@ function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   resetSubscriptions(workbook)
   importSessions.clear()
   exportSessions.clear()
+  snapshotSessions.clear()
   nextExportId = 1
+  nextSnapshotId = 1
   const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
   if (sheets && sheets.length > 0) {
     wb.rename_sheet(0, sheets[0])
@@ -406,6 +417,14 @@ function assertExportSessionId(sessionId: number) {
   if (!Number.isInteger(sessionId) || sessionId <= 0) {
     throw Object.assign(new Error(`invalid export session: ${sessionId}`), {
       code: 'INVALID_EXPORT_SESSION',
+    })
+  }
+}
+
+function assertSnapshotSessionId(sessionId: number) {
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    throw Object.assign(new Error(`invalid snapshot session: ${sessionId}`), {
+      code: 'INVALID_SNAPSHOT_SESSION',
     })
   }
 }
@@ -787,6 +806,36 @@ function exportRangeTsvChunk(
   }
 }
 
+function snapshotRangeSparseChunk(
+  wb: WasmWorkbookRuntime,
+  session: SnapshotSession,
+): { startRow: number; endRow: number; cells: SparseCellWire[]; done: boolean } {
+  const range = session.range
+  if (session.totalRows === 0 || session.nextRow > range.endRow) {
+    return {
+      startRow: range.startRow,
+      endRow: range.startRow - 1,
+      cells: [],
+      done: true,
+    }
+  }
+
+  const startRow = session.nextRow
+  const endRow = Math.min(range.endRow, startRow + session.rowsPerChunk - 1)
+  const snapshotRangeSparse = assertMethod(wb, 'snapshot_range_sparse')
+  const cells = snapshotRangeSparse
+    .call(wb, range.sheet, startRow, range.startCol, endRow, range.endCol)
+    .map(normalizeSparseCell)
+  session.nextRow = endRow + 1
+
+  return {
+    startRow,
+    endRow,
+    cells,
+    done: session.nextRow > range.endRow,
+  }
+}
+
 function toRpcError(err: unknown): RpcErrorWire {
   if (err instanceof Error) {
     return {
@@ -1049,6 +1098,25 @@ export function installWorkerRuntime() {
             })
           }
           break
+        case 'beginSnapshotRangeSparse':
+          {
+            const range = normalizeSparseRange(msg.range)
+            assertSheet(wb, range.sheet)
+            const rowsPerChunk = clampRowsPerChunk(msg.rowsPerChunk)
+            const sessionId = nextSnapshotId++
+            snapshotSessions.set(sessionId, {
+              range,
+              rowsPerChunk,
+              totalRows: rangeTotalRows(range),
+              nextRow: range.startRow,
+            })
+            postResponse(msg.id, {
+              sessionId,
+              totalRows: rangeTotalRows(range),
+              rowsPerChunk,
+            })
+          }
+          break
         case 'importChunk':
           {
             const sessionId = Number(msg.sessionId)
@@ -1094,6 +1162,24 @@ export function installWorkerRuntime() {
             })
           }
           break
+        case 'nextSnapshotRangeSparseChunk':
+          {
+            const sessionId = Number(msg.sessionId)
+            assertSnapshotSessionId(sessionId)
+            const session = snapshotSessions.get(sessionId)
+            if (!session) {
+              throw Object.assign(new Error(`missing snapshot session: ${sessionId}`), {
+                code: 'SNAPSHOT_SESSION_MISSING',
+              })
+            }
+            const chunk = snapshotRangeSparseChunk(wb, session)
+            if (chunk.done) snapshotSessions.delete(sessionId)
+            postResponse(msg.id, {
+              sessionId,
+              ...chunk,
+            })
+          }
+          break
         case 'commitImport':
           {
             const sessionId = Number(msg.sessionId)
@@ -1122,6 +1208,14 @@ export function installWorkerRuntime() {
             const sessionId = Number(msg.sessionId)
             assertExportSessionId(sessionId)
             const existed = exportSessions.delete(sessionId)
+            postResponse(msg.id, existed)
+          }
+          break
+        case 'cancelSnapshot':
+          {
+            const sessionId = Number(msg.sessionId)
+            assertSnapshotSessionId(sessionId)
+            const existed = snapshotSessions.delete(sessionId)
             postResponse(msg.id, existed)
           }
           break
@@ -1182,7 +1276,9 @@ export function installWorkerRuntime() {
             resetSubscriptions(wb)
             importSessions.clear()
             exportSessions.clear()
+            snapshotSessions.clear()
             nextExportId = 1
+            nextSnapshotId = 1
             postResponse(msg.id, stats)
           }
           break

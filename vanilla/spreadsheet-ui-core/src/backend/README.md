@@ -13,7 +13,9 @@ dump.
 
 Clipboard-style TSV export is also range based. `exportRangeTsv` returns a TSV
 body plus origin metadata for the requested range; the body must not include any
-clipboard marker line.
+clipboard marker line. Host adapters may implement this with worker-side row
+chunks or sparse snapshot chunks, but the UI core still sees only the bounded
+range command result.
 
 Data-navigation ports return a single coordinate, not a row/column projection.
 For example, `resolveDataEdge` lets a host adapter answer Ctrl+Arrow movement

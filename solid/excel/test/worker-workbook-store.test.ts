@@ -56,6 +56,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setRowHeight: Array<{ sheet: number; rowIndex: number; heightPx: number }>
     setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
     snapshotRangeSparse: ClearRangeCall[]
+    snapshotRangeSparseChunks: Array<ClearRangeCall & { rowsPerChunk?: number }>
     exportRangeTsv: ClearRangeCall[]
     exportRangeTsvChunks: Array<ClearRangeCall & { rowsPerChunk?: number }>
     restoreSparse: SparseCellWire[][]
@@ -156,6 +157,7 @@ function makeFakeWorkerWorkbookClient(
     setRowHeight: [],
     setColumnWidth: [],
     snapshotRangeSparse: [],
+    snapshotRangeSparseChunks: [],
     exportRangeTsv: [],
     exportRangeTsvChunks: [],
     restoreSparse: [],
@@ -179,6 +181,7 @@ function makeFakeWorkerWorkbookClient(
   const formulaResults = new Map<string, boolean>()
   let nextSubId = 1
   let nextExportId = 1
+  let nextSnapshotId = 1
   let metas: WorkbookSheetMeta[] = []
 
   function key(sheet: number, addr: string) {
@@ -414,6 +417,56 @@ function makeFakeWorkerWorkbookClient(
         }
       }
       return out
+    },
+    async beginSnapshotRangeSparse(_range: SparseRangeWire, rowsPerChunk = 2048) {
+      calls.snapshotRangeSparseChunks.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+        rowsPerChunk,
+      })
+      return {
+        sessionId: nextSnapshotId++,
+        totalRows: _range.endRow - _range.startRow + 1,
+        rowsPerChunk,
+      }
+    },
+    async nextSnapshotRangeSparseChunk(sessionId: number) {
+      return {
+        sessionId,
+        startRow: 0,
+        endRow: 0,
+        cells: [],
+        done: true,
+      }
+    },
+    async cancelSnapshot() {
+      return true
+    },
+    async snapshotRangeSparseChunks(_range: SparseRangeWire, rowsPerChunk = 2048) {
+      calls.snapshotRangeSparseChunks.push({
+        sheet: _range.sheet,
+        startRow: _range.startRow,
+        startCol: _range.startCol,
+        endRow: _range.endRow,
+        endCol: _range.endCol,
+        rowsPerChunk,
+      })
+      const chunks: SparseCellWire[][] = []
+      const step = Math.max(1, Math.floor(rowsPerChunk))
+      for (let row = _range.startRow; row <= _range.endRow; row += step) {
+        const endRow = Math.min(_range.endRow, row + step - 1)
+        chunks.push(
+          await this.snapshotRangeSparse({
+            ..._range,
+            startRow: row,
+            endRow,
+          }),
+        )
+      }
+      return chunks
     },
     async exportRangeTsv(_range: SparseRangeWire) {
       calls.exportRangeTsv.push({
