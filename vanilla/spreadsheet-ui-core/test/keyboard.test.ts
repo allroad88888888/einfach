@@ -307,6 +307,83 @@ describe('keyboard core', () => {
   })
 })
 
+describe('formula-reference mode', () => {
+  function makeFormulaRefStore() {
+    const store = createStore()
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 10 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 2, col: 3 },
+      focus: { row: 2, col: 3 },
+    })
+    store.setter(keyboardModeAtom, 'formula-reference')
+    return store
+  }
+
+  test('ArrowDown returns formulaReference.arrowPick with rowDelta 1', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'ArrowDown' })
+    expect(intent).toEqual({ type: 'formulaReference.arrowPick', rowDelta: 1, colDelta: 0, extend: false })
+  })
+
+  test('Shift+ArrowRight returns arrowPick with extend: true', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'ArrowRight', shiftKey: true })
+    expect(intent).toEqual({ type: 'formulaReference.arrowPick', rowDelta: 0, colDelta: 1, extend: true })
+  })
+
+  test('Escape returns formulaReference.exit with reason cancel', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Escape' })
+    expect(intent).toEqual({ type: 'formulaReference.exit', reason: 'cancel' })
+  })
+
+  test('Enter returns formulaReference.exit with reason commit', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Enter' })
+    expect(intent).toEqual({ type: 'formulaReference.exit', reason: 'commit' })
+  })
+
+  test(', keystroke returns formulaReference.exit with reason separator-typed', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: ',' })
+    expect(intent).toEqual({ type: 'formulaReference.exit', reason: 'separator-typed' })
+  })
+
+  test(') keystroke returns formulaReference.exit with reason close-paren-typed', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: ')' })
+    expect(intent).toEqual({ type: 'formulaReference.exit', reason: 'close-paren-typed' })
+  })
+
+  test('+ keystroke returns formulaReference.exit with reason operator-typed', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: '+' })
+    expect(intent).toEqual({ type: 'formulaReference.exit', reason: 'operator-typed' })
+  })
+
+  test('alphanumeric key returns none with reason editing-text-navigation', () => {
+    const store = makeFormulaRefStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a' })
+    expect(intent).toEqual({ type: 'none', reason: 'editing-text-navigation' })
+  })
+
+  test('dispatch in formula-reference mode does NOT mutate selectionAtom', () => {
+    const store = makeFormulaRefStore()
+    const selectionBefore = store.getter(selectionAtom)
+    store.setter(dispatchKeyboardInputAtom, { key: 'ArrowDown' })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
+  })
+
+  test('formulaReference.exit dispatch does NOT mutate selectionAtom', () => {
+    const store = makeFormulaRefStore()
+    const selectionBefore = store.getter(selectionAtom)
+    store.setter(dispatchKeyboardInputAtom, { key: 'Escape' })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
+  })
+})
+
 function expectMoveIntent(intent: KeyboardCommandIntent, to: { row: number; col: number }) {
   if (intent.type !== 'selection.move') {
     throw new Error(`Expected selection.move intent, received ${intent.type}`)

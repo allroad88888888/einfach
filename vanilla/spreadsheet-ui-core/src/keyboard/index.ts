@@ -53,12 +53,14 @@ export const dispatchKeyboardInputAtom = atom(
       selectionRegionCount: get(selectionRegionsAtom).length,
     })
 
-    if (intent.type === 'selection.move') {
-      set(setPrimaryRegionAtom, intent.selection)
-    } else if (intent.type === 'selection.selectAll') {
-      set(selectionAtom, intent.selection)
-    } else if (intent.type === 'selection.clearNonPrimary') {
-      set(clearNonPrimaryRegionsAtom, { keepPrimary: true })
+    if (intent.type !== 'formulaReference.arrowPick' && intent.type !== 'formulaReference.exit') {
+      if (intent.type === 'selection.move') {
+        set(setPrimaryRegionAtom, intent.selection)
+      } else if (intent.type === 'selection.selectAll') {
+        set(selectionAtom, intent.selection)
+      } else if (intent.type === 'selection.clearNonPrimary') {
+        set(clearNonPrimaryRegionsAtom, { keepPrimary: true })
+      }
     }
 
     set(lastKeyboardIntentAtom, intent)
@@ -87,6 +89,10 @@ export function getKeyboardCommandIntent(
 
   if (state.mode === 'editing') {
     return getEditingModeIntent(input)
+  }
+
+  if (state.mode === 'formula-reference') {
+    return getFormulaReferenceModeIntent(input)
   }
 
   const commandIntent = getCommandShortcutIntent(input, state)
@@ -158,6 +164,43 @@ function getEditingModeIntent(input: KeyboardInput): KeyboardCommandIntent {
     type: 'none',
     reason: 'editing-text-navigation',
   }
+}
+
+const FORMULA_REF_OPERATORS = new Set(['+', '-', '*', '/', '^', '&', '%', '<', '>', '='])
+
+function getFormulaReferenceModeIntent(input: KeyboardInput): KeyboardCommandIntent {
+  if (input.key === 'Escape') {
+    return { type: 'formulaReference.exit', reason: 'cancel' }
+  }
+
+  if (input.key === 'Enter' || input.key === 'Tab') {
+    return { type: 'formulaReference.exit', reason: 'commit' }
+  }
+
+  switch (input.key) {
+    case 'ArrowUp':
+      return { type: 'formulaReference.arrowPick', rowDelta: -1, colDelta: 0, extend: Boolean(input.shiftKey) }
+    case 'ArrowDown':
+      return { type: 'formulaReference.arrowPick', rowDelta: 1, colDelta: 0, extend: Boolean(input.shiftKey) }
+    case 'ArrowLeft':
+      return { type: 'formulaReference.arrowPick', rowDelta: 0, colDelta: -1, extend: Boolean(input.shiftKey) }
+    case 'ArrowRight':
+      return { type: 'formulaReference.arrowPick', rowDelta: 0, colDelta: 1, extend: Boolean(input.shiftKey) }
+  }
+
+  if (input.key.length === 1) {
+    if (input.key === ')') {
+      return { type: 'formulaReference.exit', reason: 'close-paren-typed' }
+    }
+    if (input.key === ',') {
+      return { type: 'formulaReference.exit', reason: 'separator-typed' }
+    }
+    if (FORMULA_REF_OPERATORS.has(input.key)) {
+      return { type: 'formulaReference.exit', reason: 'operator-typed' }
+    }
+  }
+
+  return { type: 'none', reason: 'editing-text-navigation' }
 }
 
 function getCommandShortcutIntent(

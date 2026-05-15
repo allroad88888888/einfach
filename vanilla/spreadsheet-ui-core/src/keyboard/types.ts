@@ -81,6 +81,18 @@ export interface NoneKeyboardIntent {
   reason: 'unhandled' | 'composing' | 'editing-text-navigation'
 }
 
+export interface FormulaReferenceArrowPickIntent {
+  type: 'formulaReference.arrowPick'
+  rowDelta: number
+  colDelta: number
+  extend: boolean
+}
+
+export interface FormulaReferenceExitIntent {
+  type: 'formulaReference.exit'
+  reason: 'commit' | 'cancel' | 'operator-typed' | 'separator-typed' | 'close-paren-typed'
+}
+
 export type KeyboardCommandIntent =
   | MoveSelectionIntent
   | SelectAllIntent
@@ -92,4 +104,6 @@ export type KeyboardCommandIntent =
   | SheetNavigationIntent
   | HistoryIntent
   | ClearCellsIntent
+  | FormulaReferenceArrowPickIntent
+  | FormulaReferenceExitIntent
   | NoneKeyboardIntent
