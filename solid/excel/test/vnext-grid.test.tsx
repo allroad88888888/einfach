@@ -1,11 +1,14 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it } from '@jest/globals'
+import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { render, cleanup, fireEvent, waitFor } from '@solidjs/testing-library'
 import type {
+  ClearRangeRequest,
   DisplayCell,
   FillRangeRequest,
+  RangeProjectionRequest,
+  RangeProjectionResult,
   ResolveDataEdgeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -14,12 +17,14 @@ import type {
   ViewportSizeProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  clipboardStateAtom,
   menuStateAtom,
   selectionAtom,
   selectionRegionsAtom,
   setSheetTabsSheetsAtom,
   setWorkspaceActiveSheetAtom,
   viewportHiddenAtom,
+  viewportMetricsAtom,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
   workspaceSessionAtom,
@@ -1278,6 +1283,217 @@ describe('vNext SpreadsheetGrid', () => {
           colEnd: 2,
         },
       },
+    })
+  })
+
+  it('PageDown at viewport edge advances scroll position to follow the selection', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A4"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'PageDown' })
+
+    await flushMicrotasks()
+
+    // selection moved by one page (4 rows)
+    expect(store.getter(selectionAtom)).toMatchObject({
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 7, col: 0 },
+    })
+    // viewport scrollTop updated so off-screen cell is visible
+    expect(store.getter(viewportMetricsAtom).scrollTop).toBeGreaterThan(0)
+  })
+
+  it('Ctrl+C in the focused grid invokes the copy path and updates clipboard state', async () => {
+    const store = createStore()
+    const rangeRequests: RangeProjectionRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.readRangeProjection = async (request) => {
+      rangeRequests.push(request)
+      const result: RangeProjectionResult = {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        cells: [{ row: 0, col: 0, displayValue: 'hello' }],
+      }
+      return result
+    }
+
+    const writeText = jest.fn<() => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'c', ctrlKey: true })
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1)
+    })
+
+    expect(rangeRequests).toHaveLength(1)
+    expect(rangeRequests[0].range).toEqual({ rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 })
+    expect(store.getter(clipboardStateAtom).status).toBe('ready')
+    expect(store.getter(clipboardStateAtom).intent?.type).toBe('clipboard.copy')
+  })
+
+  it('Ctrl+V in the focused grid invokes the paste path', async () => {
+    const store = createStore()
+    const setCellInputCalls: Array<{ row: number; col: number; input: string }> = []
+    const { backend } = createFakeBackend()
+    backend.setCellInput = async (request) => {
+      setCellInputCalls.push({ row: request.row, col: request.col, input: request.input })
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    }
+
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        readText: jest.fn<() => Promise<string>>().mockResolvedValue('pasted'),
+      },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!)
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'v', ctrlKey: true })
+
+    await waitFor(() => {
+      expect(setCellInputCalls).toHaveLength(1)
+    })
+
+    expect(setCellInputCalls[0]).toMatchObject({ row: 1, col: 1, input: 'pasted' })
+    expect(store.getter(clipboardStateAtom).status).toBe('ready')
+    expect(store.getter(clipboardStateAtom).intent?.type).toBe('clipboard.paste')
+  })
+
+  it('Delete on a 2x2 range selection calls clearRange with the full range', async () => {
+    const store = createStore()
+    const clearRangeCalls: ClearRangeRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.clearRange = async (request) => {
+      clearRangeCalls.push(request)
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    }
+    backend.setCellInput = async () => {
+      throw new Error('setCellInput should not be called for multi-cell clear')
+    }
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    // select A1:B2 (2x2 range)
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!, {
+      shiftKey: true,
+    })
+
+    expect(store.getter(selectionAtom)).toMatchObject({
+      kind: 'range',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 1 },
+    })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Delete' })
+
+    await waitFor(() => {
+      expect(clearRangeCalls).toHaveLength(1)
+    })
+
+    expect(clearRangeCalls[0]).toMatchObject({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
   })
 })

@@ -3,6 +3,9 @@ import {
   cancelPointerAtom,
   commitPointerAtom,
   commitEditingAtom,
+  copyClipboardAtom,
+  createClipboardTsvPastePlan,
+  cutClipboardAtom,
   createFillHandlePreview,
   createVisibleProjectionRequest,
   dispatchKeyboardInputAtom,
@@ -18,10 +21,14 @@ import {
   getViewportRowHeight,
   getSelectionRange,
   addSelectionRegionAtom,
-  clearNonPrimaryRegionsAtom,
   isMergeCovered,
+  markClipboardReadyAtom,
   openMenuAtom,
+  pasteClipboardAtom,
   pointerSessionAtom,
+  scrollToCellAtom,
+  serializeClipboardTsv,
+  setClipboardErrorAtom,
   MAX_VIEWPORT_COL_WIDTH,
   MAX_VIEWPORT_ROW_HEIGHT,
   MIN_VIEWPORT_COL_WIDTH,
@@ -45,6 +52,7 @@ import {
   updatePointerAtom,
   type CellCoord,
   type CellRange,
+  type ClipboardTransferInput,
   type DisplayCell,
   type DisplayCellRichValue,
   type PointerFillHandleCommitIntent,
@@ -567,19 +575,33 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     await loadProjection(requestProjection())
   }
 
-  async function clearActiveCell() {
+  async function clearSelectionRange(target: 'values' | 'formats' | 'all' = 'all') {
     const selection = selectionSnapshot()
     if (selection.selection.sheetId !== props.sheetId) {
       return
     }
 
-    await backend.setCellInput({
-      kind: 'set-cell-input',
-      sheetId: props.sheetId,
-      row: selection.activeCell.row,
-      col: selection.activeCell.col,
-      input: '',
-    })
+    const range = selection.range
+    const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
+    if (isSingleCell) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: props.sheetId,
+        row: range.rowStart,
+        col: range.colStart,
+        input: '',
+      })
+    } else {
+      if (!backend.clearRange) {
+        return
+      }
+      await backend.clearRange({
+        kind: 'clear-range',
+        sheetId: props.sheetId,
+        range,
+        target,
+      })
+    }
     await loadProjection(requestProjection())
   }
 
@@ -1063,15 +1085,132 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return true
   }
 
-  async function handleGridKeyDown(event: KeyboardEvent) {
-    if (event.defaultPrevented) {
+  async function writeClipboardText(text: string): Promise<boolean> {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  async function readClipboardText(): Promise<string | null> {
+    try {
+      return await navigator.clipboard.readText()
+    } catch {
+      return null
+    }
+  }
+
+  async function copySelectionToClipboard(operation: 'copy' | 'cut' = 'copy') {
+    const selection = selectionSnapshot()
+    if (selection.selection.sheetId !== props.sheetId) {
       return
     }
 
-    if (event.key === 'Escape' && selectionRegions().length > 1) {
-      event.preventDefault()
-      store.setter(clearNonPrimaryRegionsAtom, { keepPrimary: true })
-      bumpRender()
+    const range = selection.range
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const result = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: props.sheetId,
+      requestId,
+      reason: 'clipboard',
+      range,
+    })
+
+    const cells: string[][] = []
+    const cellsByKey = new Map<string, (typeof result.cells)[number]>()
+    for (const cell of result.cells) {
+      cellsByKey.set(`${cell.row}:${cell.col}`, cell)
+    }
+    for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+      const fields: string[] = []
+      for (let col = range.colStart; col <= range.colEnd; col += 1) {
+        const cell = cellsByKey.get(`${row}:${col}`)
+        fields.push(cell?.formula ?? cell?.displayValue ?? '')
+      }
+      cells.push(fields)
+    }
+
+    const text = serializeClipboardTsv({
+      originAddr: `${String.fromCharCode(65 + range.colStart)}${range.rowStart + 1}`,
+      cells,
+    })
+
+    const transferInput: ClipboardTransferInput = {
+      source: { sheetId: props.sheetId, range },
+      serialization: 'tab-separated',
+      includesFormulas: cells.some((row) => row.some((f) => f.startsWith('='))),
+      includesErrors: result.cells.some((c) => c.valueKind === 'error' || !!c.error),
+      estimatedBytes: text.length,
+      revision: result.revision ?? undefined,
+    }
+
+    store.setter(operation === 'cut' ? cutClipboardAtom : copyClipboardAtom, transferInput)
+
+    if (!(await writeClipboardText(text))) {
+      store.setter(setClipboardErrorAtom, { code: 'BACKEND_ERROR', message: 'Clipboard write failed.' })
+      return
+    }
+    store.setter(markClipboardReadyAtom)
+
+    if (operation === 'cut') {
+      await clearSelectionRange()
+    }
+  }
+
+  async function pasteFromClipboard() {
+    const selection = selectionSnapshot()
+    if (selection.selection.sheetId !== props.sheetId) {
+      return
+    }
+
+    const text = await readClipboardText()
+    if (text === null || text.length === 0) {
+      store.setter(setClipboardErrorAtom, { code: 'BACKEND_ERROR', message: 'Clipboard read failed.' })
+      return
+    }
+
+    const targetOrigin = { row: selection.activeCell.row, col: selection.activeCell.col }
+    const plan = createClipboardTsvPastePlan({
+      text,
+      fallbackOriginAddr: `${String.fromCharCode(65 + targetOrigin.col)}${targetOrigin.row + 1}`,
+      targetOrigin,
+    })
+    const pasteRange = plan.estimatedRange
+    const sourceRange = {
+      rowStart: plan.sourceOrigin.row,
+      rowEnd: plan.sourceOrigin.row + plan.rowCount - 1,
+      colStart: plan.sourceOrigin.col,
+      colEnd: plan.sourceOrigin.col + plan.colCount - 1,
+    }
+
+    store.setter(pasteClipboardAtom, {
+      source: { sheetId: props.sheetId, range: sourceRange },
+      target: { sheetId: props.sheetId, range: pasteRange },
+      serialization: 'tab-separated',
+      includesFormulas: plan.includesFormulas,
+      estimatedBytes: plan.estimatedBytes,
+    })
+
+    for (const chunk of plan.chunks()) {
+      for (const cell of chunk.cells) {
+        await backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId: props.sheetId,
+          row: cell.row,
+          col: cell.col,
+          input: cell.input,
+        })
+      }
+    }
+
+    store.setter(markClipboardReadyAtom)
+    await loadProjection(requestProjection())
+  }
+
+  async function handleGridKeyDown(event: KeyboardEvent) {
+    if (event.defaultPrevented) {
       return
     }
 
@@ -1100,7 +1239,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
     switch (intent.type) {
       case 'selection.move':
+        event.preventDefault()
+        if (intent.scroll) {
+          store.setter(scrollToCellAtom, { coord: intent.scroll.target })
+        }
+        bumpRender()
+        return
       case 'selection.selectAll':
+        event.preventDefault()
+        bumpRender()
+        return
+      case 'selection.clearNonPrimary':
         event.preventDefault()
         bumpRender()
         return
@@ -1112,7 +1261,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
       case 'cell.clear':
         event.preventDefault()
-        await clearActiveCell()
+        await clearSelectionRange(intent.target)
+        return
+      case 'clipboard.copy':
+        event.preventDefault()
+        await copySelectionToClipboard('copy')
+        return
+      case 'clipboard.cut':
+        event.preventDefault()
+        await copySelectionToClipboard('cut')
+        return
+      case 'clipboard.paste':
+        event.preventDefault()
+        await pasteFromClipboard()
         return
       case 'sheet.activate-adjacent': {
         event.preventDefault()
