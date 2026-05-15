@@ -27,10 +27,6 @@ function stringToScope(value: string): NamedRangeScope {
   return { sheetId: value }
 }
 
-function defaultRefersTo(): NamedRangeRefersTo {
-  return { kind: 'range', sheetId: '', address: '' }
-}
-
 export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
@@ -53,12 +49,12 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   }
 
   function buildRefersTo(): NamedRangeRefersTo {
-    const value = refersTo()
+    const value = refersTo().trim()
     const sep = value.indexOf('!')
     if (sep !== -1) {
       return { kind: 'range', sheetId: value.slice(0, sep), address: value.slice(sep + 1) }
     }
-    return defaultRefersTo()
+    return { kind: 'constant', value }
   }
 
   function close() {

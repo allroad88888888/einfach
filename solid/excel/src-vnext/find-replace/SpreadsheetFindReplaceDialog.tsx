@@ -1,13 +1,18 @@
 import { Show, createSignal } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
-import type { FindReplaceScope } from '@einfach/spreadsheet-ui-core'
+import type { CellRange, FindReplaceScope } from '@einfach/spreadsheet-ui-core'
 import {
   advanceFindCursorAtom,
   closeFindReplaceAtom,
   commitFindReplaceQueryAtom,
+  EXCEL_MAX_COLS,
+  EXCEL_MAX_ROWS,
   findReplaceCursorAtom,
   findReplaceOpenAtom,
+  selectionSnapshotAtom,
   setFindMatchesAtom,
+  setFindReplaceErrorAtom,
+  workspaceSessionAtom,
   MAX_FIND_PAGE,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
@@ -45,22 +50,42 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     }
   }
 
+  function resolveSearchScope(): { sheetId: string; range: CellRange } {
+    const snapshot = store.getter(selectionSnapshotAtom)
+    const workspace = store.getter(workspaceSessionAtom)
+    const sheetId = snapshot.selection.sheetId || workspace.activeSheetId || ''
+    const fullSheetRange: CellRange = {
+      rowStart: 0,
+      rowEnd: EXCEL_MAX_ROWS - 1,
+      colStart: 0,
+      colEnd: EXCEL_MAX_COLS - 1,
+    }
+    if (scope() === 'current-selection') {
+      return { sheetId, range: snapshot.range }
+    }
+    return { sheetId, range: fullSheetRange }
+  }
+
   async function runSearch() {
     if (!backend.searchRange) return
     const query = buildQuery()
     store.setter(commitFindReplaceQueryAtom, query)
+    const { sheetId, range } = resolveSearchScope()
     try {
       const result = await backend.searchRange({
         kind: 'search-range',
-        sheetId: '',
-        range: { rowStart: 0, rowEnd: 999999, colStart: 0, colEnd: 999999 },
+        sheetId,
+        range,
         query,
         pageStart: 0,
         pageSize: MAX_FIND_PAGE,
       })
       store.setter(setFindMatchesAtom, result)
-    } catch {
-      // no-op on error
+    } catch (err) {
+      store.setter(setFindReplaceErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 
@@ -105,6 +130,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     const c = cursor()
     if (c.status === 'idle') return ''
     if (c.status === 'searching') return 'Searching…'
+    if (c.status === 'error') return 'Search failed'
     if (c.totalCount === 0) return 'No matches'
     return `${c.currentIndex + 1} of ${c.totalCount}`
   }

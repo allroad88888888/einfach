@@ -58,10 +58,15 @@ export function SpreadsheetConditionalFormatDialog(
   const isEditing = () => editor().open
 
   const [selectedKind, setSelectedKind] = createSignal<ConditionalFormatRuleKind>('cell-value')
+  let lastSyncedDraftId: string | undefined
 
   function currentKind(): ConditionalFormatRuleKind {
     const draft = editor().draft
-    if (draft) return draft.rule.kind as ConditionalFormatRuleKind
+    if (draft && draft.id !== lastSyncedDraftId) {
+      lastSyncedDraftId = draft.id
+      setSelectedKind(draft.rule.kind as ConditionalFormatRuleKind)
+    }
+    if (!draft) lastSyncedDraftId = undefined
     return selectedKind()
   }
 
@@ -73,7 +78,8 @@ export function SpreadsheetConditionalFormatDialog(
     if (!backend.setConditionalFormatRule) return
     const draft = editor().draft
     const kind = currentKind()
-    const rule = draft?.rule ?? defaultDraftForKind(kind)
+    const useDraftRule = draft && draft.rule.kind === kind
+    const rule = useDraftRule ? draft.rule : defaultDraftForKind(kind)
     const scope = draft?.scope ?? { range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 } }
     const sheetId = rulesCache().sheetId ?? ''
     await backend.setConditionalFormatRule({
