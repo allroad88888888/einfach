@@ -19,6 +19,7 @@ import {
   selectionRegionsAtom,
   setSheetTabsSheetsAtom,
   setWorkspaceActiveSheetAtom,
+  viewportHiddenAtom,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
   workspaceSessionAtom,
@@ -66,6 +67,8 @@ function buildCells(window: VisibleProjectionRequest['window']): DisplayCell[] {
 function createFakeBackend(options: {
   rowHeights?: ViewportSizeProjectionResult['rowHeights']
   colWidths?: ViewportSizeProjectionResult['colWidths']
+  hiddenRowIndices?: number[]
+  hiddenColIndices?: number[]
   cells?: DisplayCell[] | ((window: VisibleProjectionRequest['window']) => DisplayCell[])
 } = {}) {
   const requests: VisibleProjectionRequest[] = []
@@ -103,6 +106,8 @@ function createFakeBackend(options: {
         window: { ...request.window },
         rowHeights: options.rowHeights ?? [],
         colWidths: options.colWidths ?? [],
+        hiddenRowIndices: options.hiddenRowIndices,
+        hiddenColIndices: options.hiddenColIndices,
       }
     },
     async setCellInput() {
@@ -232,6 +237,111 @@ describe('vNext SpreadsheetGrid', () => {
     expect(display.style.fontStyle).toBe('italic')
     expect(display.style.textAlign).toBe('right')
     expect(display.style.color).toBe('rgb(255, 0, 0)')
+  })
+
+  it('skips rows and columns marked hidden by viewport projection metadata', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend({
+      hiddenRowIndices: [1],
+      hiddenColIndices: [2],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    expect(store.getter(viewportHiddenAtom)).toEqual({
+      rowsBySheet: { 'sheet-1': [1] },
+      colsBySheet: { 'sheet-1': [2] },
+    })
+    expect(container.querySelector('.spreadsheet-grid-row-header[data-row="1"]')).toBeNull()
+    expect(container.querySelector('.spreadsheet-grid-col-header[data-col="2"]')).toBeNull()
+    expect(container.querySelector('[data-cell-addr="A1"]')).not.toBeNull()
+    expect(container.querySelector('[data-cell-addr="A2"]')).toBeNull()
+    expect(container.querySelector('[data-cell-addr="C1"]')).toBeNull()
+  })
+
+  it('renders merged projection cells as one spanned anchor and selects the full merge', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend({
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'Merged',
+          valueKind: 'string',
+          mergedSpan: { rows: 2, cols: 2 },
+        },
+        { row: 0, col: 1, displayValue: '', valueKind: 'blank', mergeAnchor: { row: 0, col: 0 } },
+        { row: 1, col: 0, displayValue: '', valueKind: 'blank', mergeAnchor: { row: 0, col: 0 } },
+        { row: 1, col: 1, displayValue: '', valueKind: 'blank', mergeAnchor: { row: 0, col: 0 } },
+        { row: 0, col: 2, displayValue: 'C1' },
+        { row: 1, col: 2, displayValue: 'C2' },
+        { row: 2, col: 0, displayValue: 'A3' },
+        { row: 2, col: 1, displayValue: 'B3' },
+        { row: 2, col: 2, displayValue: 'C3' },
+      ],
+    })
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Merged',
+      )
+    })
+
+    const anchor = container.querySelector('[data-cell-addr="A1"]') as HTMLTableCellElement
+    expect(anchor.rowSpan).toBe(2)
+    expect(anchor.colSpan).toBe(2)
+    expect(anchor.getAttribute('data-merge-anchor')).toBe('true')
+    expect(container.querySelector('[data-cell-addr="B1"]')).toBeNull()
+    expect(container.querySelector('[data-cell-addr="A2"]')).toBeNull()
+    expect(container.querySelector('[data-cell-addr="B2"]')).toBeNull()
+
+    fireEvent.click(anchor.querySelector('.spreadsheet-grid-cell-button')!)
+
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 0, col: 0 },
+    })
+    expect(anchor.getAttribute('data-selected')).toBe('true')
   })
 
   it('writes selection clicks back into the core store', async () => {

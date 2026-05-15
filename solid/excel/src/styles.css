@@ -408,6 +408,10 @@ thead .row-header {
   position: relative;
 }
 
+.spreadsheet-grid-cell.cell-merge-anchor {
+  overflow: hidden;
+}
+
 .spreadsheet-grid-col-header,
 .spreadsheet-grid-cell {
   width: 96px;

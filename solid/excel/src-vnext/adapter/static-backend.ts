@@ -70,6 +70,8 @@ function cloneCell(cell: DisplayCell): DisplayCell {
   if (cell.error) clone.error = cell.error
   if (cell.formatKey !== undefined) clone.formatKey = cell.formatKey
   if (cell.format) clone.format = cloneFormat(cell.format)
+  if (cell.mergedSpan) clone.mergedSpan = { ...cell.mergedSpan }
+  if (cell.mergeAnchor) clone.mergeAnchor = { ...cell.mergeAnchor }
 
   return clone
 }
@@ -105,6 +107,8 @@ function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
 function stripCellFormat(cell: DisplayCell): DisplayCell {
   const clone = cloneCell(cell)
   delete clone.format
+  delete clone.mergedSpan
+  delete clone.mergeAnchor
   return clone
 }
 
@@ -122,6 +126,108 @@ function parseKey(key: string): { row: number; col: number } | null {
 
 function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
+}
+
+function normalizeRange(range: CellRange): CellRange {
+  return {
+    rowStart: Math.min(range.rowStart, range.rowEnd),
+    rowEnd: Math.max(range.rowStart, range.rowEnd),
+    colStart: Math.min(range.colStart, range.colEnd),
+    colEnd: Math.max(range.colStart, range.colEnd),
+  }
+}
+
+function cloneRange(range: CellRange): CellRange {
+  return {
+    rowStart: range.rowStart,
+    rowEnd: range.rowEnd,
+    colStart: range.colStart,
+    colEnd: range.colEnd,
+  }
+}
+
+function rangesIntersect(left: CellRange, right: CellRange): boolean {
+  return (
+    left.rowStart <= right.rowEnd &&
+    left.rowEnd >= right.rowStart &&
+    left.colStart <= right.colEnd &&
+    left.colEnd >= right.colStart
+  )
+}
+
+function extractMergeRanges(cells: readonly DisplayCell[], sheetId: string): Map<string, CellRange[]> {
+  const ranges: CellRange[] = []
+  for (const cell of cells) {
+    if (!cell.mergedSpan) continue
+    const rows = Math.max(1, Math.trunc(cell.mergedSpan.rows))
+    const cols = Math.max(1, Math.trunc(cell.mergedSpan.cols))
+    if (rows === 1 && cols === 1) continue
+    ranges.push({
+      rowStart: cell.row,
+      rowEnd: cell.row + rows - 1,
+      colStart: cell.col,
+      colEnd: cell.col + cols - 1,
+    })
+  }
+
+  return ranges.length > 0 ? new Map([[sheetId, ranges]]) : new Map()
+}
+
+function getMergeRanges(state: StaticBackendState, sheetId: string): CellRange[] {
+  let ranges = state.mergeRangesBySheetId.get(sheetId)
+  if (!ranges) {
+    ranges = []
+    state.mergeRangesBySheetId.set(sheetId, ranges)
+  }
+  return ranges
+}
+
+function upsertBlankCell(cells: Map<string, DisplayCell>, row: number, col: number): DisplayCell {
+  const key = keyFor(row, col)
+  let cell = cells.get(key)
+  if (!cell) {
+    cell = {
+      row,
+      col,
+      displayValue: '',
+      valueKind: 'blank',
+    }
+    cells.set(key, cell)
+  }
+  return cell
+}
+
+function applyMergeMetadata(
+  cells: Map<string, DisplayCell>,
+  projectionRange: CellRange,
+  mergeRanges: readonly CellRange[],
+) {
+  for (const mergeRange of mergeRanges) {
+    if (!rangesIntersect(mergeRange, projectionRange)) continue
+
+    if (isCoordInsideRange(mergeRange.rowStart, mergeRange.colStart, projectionRange)) {
+      const anchor = upsertBlankCell(cells, mergeRange.rowStart, mergeRange.colStart)
+      delete anchor.mergeAnchor
+      anchor.mergedSpan = {
+        rows: mergeRange.rowEnd - mergeRange.rowStart + 1,
+        cols: mergeRange.colEnd - mergeRange.colStart + 1,
+      }
+    }
+
+    const rowStart = Math.max(mergeRange.rowStart, projectionRange.rowStart)
+    const rowEnd = Math.min(mergeRange.rowEnd, projectionRange.rowEnd)
+    const colStart = Math.max(mergeRange.colStart, projectionRange.colStart)
+    const colEnd = Math.min(mergeRange.colEnd, projectionRange.colEnd)
+
+    for (let row = rowStart; row <= rowEnd; row += 1) {
+      for (let col = colStart; col <= colEnd; col += 1) {
+        if (row === mergeRange.rowStart && col === mergeRange.colStart) continue
+        const covered = upsertBlankCell(cells, row, col)
+        delete covered.mergedSpan
+        covered.mergeAnchor = { row: mergeRange.rowStart, col: mergeRange.colStart }
+      }
+    }
+  }
 }
 
 type SparseTsvCell = {
@@ -180,6 +286,7 @@ interface StaticBackendState {
   cells: Map<string, DisplayCell>
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
+  mergeRangesBySheetId: Map<string, CellRange[]>
   rowHeightsBySheetId: Map<string, Map<number, number>>
   colWidthsBySheetId: Map<string, Map<number, number>>
   sheets: SpreadsheetSheetMetadata[]
@@ -232,6 +339,7 @@ function buildState(
 ): StaticBackendState {
   const cellMap = new Map<string, DisplayCell>()
   const cellFormats = new Map<string, SpreadsheetCellFormat>()
+  const mergeRangesBySheetId = extractMergeRanges(cells, sheets[0]?.id ?? 'sheet-1')
 
   for (const cell of cells) {
     const key = keyFor(cell.row, cell.col)
@@ -244,6 +352,7 @@ function buildState(
     cells: cellMap,
     cellFormats,
     rangeFormats: [],
+    mergeRangesBySheetId,
     rowHeightsBySheetId: new Map(),
     colWidthsBySheetId: new Map(),
     sheets,
@@ -598,6 +707,11 @@ function buildProjectionResult(
   }
 
   addFormatOnlyCells(resultCellMap, range, state.cellFormats, state.rangeFormats)
+  applyMergeMetadata(
+    resultCellMap,
+    range,
+    state.mergeRangesBySheetId.get(request.sheetId) ?? [],
+  )
   const resultCells = [...resultCellMap.values()].sort(compareCells)
 
   if (request.kind === 'visible-window') {
@@ -1021,6 +1135,18 @@ function structuralMutationResult(
   }
 }
 
+function mergeMutationResult(
+  request: { sheetId: string; requestId?: number; revision?: ProjectionRevision; range: CellRange },
+  revision: ProjectionRevision,
+) {
+  return {
+    sheetId: request.sheetId,
+    requestId: request.requestId,
+    revision: request.revision ?? revision,
+    affectedRange: cloneRange(normalizeRange(request.range)),
+  }
+}
+
 export function matrixToDisplayCells(matrix: StaticSeedMatrix): DisplayCell[] {
   return matrixToCells(matrix)
 }
@@ -1274,6 +1400,29 @@ export function createStaticSpreadsheetBackend(
         requestId: request.requestId,
         revision: request.revision ?? state.revision,
       }
+    },
+    async mergeRange(request) {
+      const range = normalizeRange(request.range)
+      const ranges = getMergeRanges(state, request.sheetId)
+      const nextRanges = ranges.filter((candidate) => !rangesIntersect(candidate, range))
+      if (range.rowEnd > range.rowStart || range.colEnd > range.colStart) {
+        nextRanges.push(cloneRange(range))
+      }
+      state.mergeRangesBySheetId.set(request.sheetId, nextRanges)
+      state.revision = bumpRevision(state.revision)
+
+      return mergeMutationResult(request, state.revision)
+    },
+    async unmergeRange(request) {
+      const range = normalizeRange(request.range)
+      const ranges = getMergeRanges(state, request.sheetId)
+      state.mergeRangesBySheetId.set(
+        request.sheetId,
+        ranges.filter((candidate) => !rangesIntersect(candidate, range)),
+      )
+      state.revision = bumpRevision(state.revision)
+
+      return mergeMutationResult(request, state.revision)
     },
     async fillRange(request) {
       applyFillRange(state, request)

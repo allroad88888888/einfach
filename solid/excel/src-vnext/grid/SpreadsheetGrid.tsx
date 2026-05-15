@@ -8,6 +8,8 @@ import {
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
+  getHiddenColumnsForSheet,
+  getHiddenRowsForSheet,
   getAdjacentSheetId,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
@@ -16,6 +18,7 @@ import {
   getSelectionRange,
   addSelectionRegionAtom,
   clearNonPrimaryRegionsAtom,
+  isMergeCovered,
   openMenuAtom,
   pointerSessionAtom,
   MAX_VIEWPORT_COL_WIDTH,
@@ -28,6 +31,8 @@ import {
   selectCellAtom,
   selectColumnsAtom,
   selectRowsAtom,
+  setSelectionAtom,
+  setViewportHiddenAtom,
   setViewportColumnWidthAtom,
   setSelectionBoundsAtom,
   setWorkspaceActiveSheetAtom,
@@ -41,9 +46,11 @@ import {
   type CellRange,
   type DisplayCell,
   type PointerFillHandleCommitIntent,
+  type SelectionRegion,
   type SelectionState,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
+  viewportHiddenAtom,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
   workspaceSessionAtom,
@@ -205,6 +212,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let activeFillCleanup: (() => void) | null = null
   let unsubscribeProjection: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
+  let unsubscribeHidden: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
 
   function bumpRender() {
@@ -244,6 +252,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function sizeOverrides() {
     renderTick()
     return store.getter(viewportSizeOverridesAtom)
+  }
+
+  function hiddenState() {
+    renderTick()
+    return store.getter(viewportHiddenAtom)
   }
 
   function requestProjection() {
@@ -344,6 +357,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         widthPx: col.widthPx,
       })
     }
+    if (result.hiddenRowIndices !== undefined || result.hiddenColIndices !== undefined) {
+      store.setter(setViewportHiddenAtom, {
+        sheetId: props.sheetId,
+        rows: result.hiddenRowIndices,
+        cols: result.hiddenColIndices,
+      })
+    }
     bumpRender()
   }
 
@@ -434,6 +454,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   onMount(() => {
     unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
+    unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     store.setter(setViewportMetricsAtom, props.viewport)
     store.setter(setSelectionBoundsAtom, {
@@ -448,6 +469,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   onCleanup(() => {
     unsubscribeProjection?.()
     unsubscribeSizes?.()
+    unsubscribeHidden?.()
     unsubscribePointer?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
@@ -501,12 +523,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   function getRows() {
     const window = visibleWindow()
-    return getWindowIndexes(window.rowStart, window.rowEnd)
+    const hiddenRows = new Set(getHiddenRowsForSheet(hiddenState(), props.sheetId))
+    return getWindowIndexes(window.rowStart, window.rowEnd).filter((row) => !hiddenRows.has(row))
   }
 
   function getCols() {
     const window = visibleWindow()
-    return getWindowIndexes(window.colStart, window.colEnd)
+    const hiddenCols = new Set(getHiddenColumnsForSheet(hiddenState(), props.sheetId))
+    return getWindowIndexes(window.colStart, window.colEnd).filter((col) => !hiddenCols.has(col))
   }
 
   function getSelectionBounds() {
@@ -573,6 +597,34 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
   }
 
+  function createSelectionForRange(range: CellRange): SelectionRegion {
+    if (range.rowStart === range.rowEnd && range.colStart === range.colEnd) {
+      return {
+        kind: 'cell',
+        sheetId: props.sheetId,
+        anchor: { row: range.rowStart, col: range.colStart },
+        focus: { row: range.rowStart, col: range.colStart },
+      }
+    }
+
+    return {
+      kind: 'range',
+      sheetId: props.sheetId,
+      anchor: { row: range.rowEnd, col: range.colEnd },
+      focus: { row: range.rowStart, col: range.colStart },
+    }
+  }
+
+  function selectCellRange(range: CellRange) {
+    store.setter(setSelectionAtom, createSelectionForRange(range))
+  }
+
+  function appendCellRangeSelection(range: CellRange) {
+    store.setter(addSelectionRegionAtom, {
+      region: createSelectionForRange(range),
+    })
+  }
+
   function appendRangeSelection(row: number, col: number) {
     const snapshot = selectionSnapshot()
     const anchor =
@@ -588,12 +640,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function selectCellFromEvent(row: number, col: number, event: MouseEvent) {
+    const mergeRange = getMergeRangeForCoord(row, col)
     if (event.ctrlKey || event.metaKey) {
       if (event.shiftKey) {
         appendRangeSelection(row, col)
+      } else if (mergeRange) {
+        appendCellRangeSelection(mergeRange)
       } else {
         appendCellSelection(row, col)
       }
+      bumpRender()
+      focusGrid()
+      return
+    }
+
+    if (!event.shiftKey && mergeRange) {
+      selectCellRange(mergeRange)
       bumpRender()
       focusGrid()
       return
@@ -1003,6 +1065,55 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return getCellMap().get(makeCellKey(row, col))
   }
 
+  function getMergeRangeForCell(cell: DisplayCell | undefined): CellRange | null {
+    if (!cell?.mergedSpan) {
+      return null
+    }
+
+    const rows = Math.max(1, Math.trunc(cell.mergedSpan.rows))
+    const cols = Math.max(1, Math.trunc(cell.mergedSpan.cols))
+    return {
+      rowStart: cell.row,
+      rowEnd: cell.row + rows - 1,
+      colStart: cell.col,
+      colEnd: cell.col + cols - 1,
+    }
+  }
+
+  function getMergeRangeForCoord(row: number, col: number): CellRange | null {
+    const cell = getCell(row, col)
+    const directRange = getMergeRangeForCell(cell)
+    if (directRange) return directRange
+
+    if (cell?.mergeAnchor) {
+      const anchorCell = getCell(cell.mergeAnchor.row, cell.mergeAnchor.col)
+      return getMergeRangeForCell(anchorCell)
+    }
+
+    for (const candidate of projectionSnapshot().result?.cells ?? []) {
+      const range = getMergeRangeForCell(candidate)
+      if (!range) continue
+      if (isCoordInRange(row, col, range)) {
+        return range
+      }
+    }
+
+    return null
+  }
+
+  function isCellCoveredByMerge(row: number, col: number) {
+    const cell = getCell(row, col)
+    if (cell && isMergeCovered(cell)) return true
+
+    const range = getMergeRangeForCoord(row, col)
+    return range !== null && (range.rowStart !== row || range.colStart !== col)
+  }
+
+  function isCellMergeAnchor(row: number, col: number) {
+    const range = getMergeRangeForCoord(row, col)
+    return range !== null && range.rowStart === row && range.colStart === col
+  }
+
   function getRenderedRowHeight(row: number) {
     return getViewportRowHeight(sizeOverrides(), props.sheetId, row, props.viewport.rowHeight)
   }
@@ -1018,10 +1129,46 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getCellBoxStyle(row: number, col: number): Record<string, string> {
+    const mergeRange = getMergeRangeForCoord(row, col)
+    if (mergeRange && mergeRange.rowStart === row && mergeRange.colStart === col) {
+      const rows = getRows().filter((index) => index >= row && index <= mergeRange.rowEnd)
+      const cols = getCols().filter((index) => index >= col && index <= mergeRange.colEnd)
+      const height = rows.reduce(
+        (sum, index) => sum + getRenderedRowHeight(index),
+        0,
+      )
+      const width = cols.reduce(
+        (sum, index) => sum + getRenderedColumnWidth(index),
+        0,
+      )
+      return {
+        height: `${Math.max(getRenderedRowHeight(row), height)}px`,
+        width: `${Math.max(getRenderedColumnWidth(col), width)}px`,
+      }
+    }
+
     return {
       height: `${getRenderedRowHeight(row)}px`,
       width: `${getRenderedColumnWidth(col)}px`,
     }
+  }
+
+  function getCellRowSpan(row: number, col: number) {
+    const mergeRange = getMergeRangeForCoord(row, col)
+    if (!mergeRange || mergeRange.rowStart !== row || mergeRange.colStart !== col) {
+      return 1
+    }
+
+    return Math.max(1, getRows().filter((index) => index >= row && index <= mergeRange.rowEnd).length)
+  }
+
+  function getCellColSpan(row: number, col: number) {
+    const mergeRange = getMergeRangeForCoord(row, col)
+    if (!mergeRange || mergeRange.rowStart !== row || mergeRange.colStart !== col) {
+      return 1
+    }
+
+    return Math.max(1, getCols().filter((index) => index >= col && index <= mergeRange.colEnd).length)
   }
 
   function getRowHeaderStyle(row: number): Record<string, string> {
@@ -1308,94 +1455,104 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       const selected = () => isSelected(row, col)
                       const active = () => isActive(row, col)
                       const editing = () => isEditing(row, col)
+                      const mergeAnchor = () => isCellMergeAnchor(row, col)
                       return (
-                        <td
-                          class={`spreadsheet-grid-cell cell ${
-                            selected() ? 'is-selected cell-in-range' : ''
-                          } ${
-                            active() ? 'cell-active' : ''
-                          } ${
-                            isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
-                          } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
-                          data-row={row}
-                          data-col={col}
-                          data-cell-addr={addr}
-                          data-selected={selected() ? 'true' : 'false'}
-                          data-active={active() ? 'true' : 'false'}
-                          aria-selected={selected() ? 'true' : 'false'}
-                          style={getCellBoxStyle(row, col)}
-                          onClick={(event) => {
-                            selectCellFromEvent(row, col, event)
-                          }}
-                          onMouseDown={(event) => {
-                            if (!event.shiftKey || event.ctrlKey || event.metaKey) {
-                              return
-                            }
+                        <Show when={!isCellCoveredByMerge(row, col)}>
+                          <td
+                            class={`spreadsheet-grid-cell cell ${
+                              selected() ? 'is-selected cell-in-range' : ''
+                            } ${
+                              active() ? 'cell-active' : ''
+                            } ${
+                              isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
+                            } ${
+                              mergeAnchor() ? 'cell-merge-anchor' : ''
+                            } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
+                            data-row={row}
+                            data-col={col}
+                            data-cell-addr={addr}
+                            data-selected={selected() ? 'true' : 'false'}
+                            data-active={active() ? 'true' : 'false'}
+                            data-merge-anchor={mergeAnchor() ? 'true' : 'false'}
+                            aria-selected={selected() ? 'true' : 'false'}
+                            rowSpan={getCellRowSpan(row, col)}
+                            colSpan={getCellColSpan(row, col)}
+                            style={getCellBoxStyle(row, col)}
+                            onClick={(event) => {
+                              selectCellFromEvent(row, col, event)
+                            }}
+                            onMouseDown={(event) => {
+                              if (!event.shiftKey || event.ctrlKey || event.metaKey) {
+                                return
+                              }
 
-                            event.preventDefault()
-                            store.setter(selectCellAtom, {
-                              sheetId: props.sheetId,
-                              coord: { row, col },
-                              extend: true,
-                            })
-                            bumpRender()
-                            focusGrid()
-                          }}
-                          onDblClick={() => {
-                            startEditingCell(row, col, 'cell')
-                          }}
-                          onContextMenu={(event) => {
-                            openContextMenu(event, getCellContextTarget(row, col))
-                          }}
-                        >
-                          <Show
-                            when={editing()}
-                            fallback={
-                              <button type="button" class="spreadsheet-grid-cell-button">
-                                <span
-                                  class="cell-display"
-                                  style={getCellFormatStyle(cell()?.format)}
-                                >
-                                  {cell()?.displayValue ?? ''}
-                                </span>
-                              </button>
-                            }
+                              event.preventDefault()
+                              store.setter(selectCellAtom, {
+                                sheetId: props.sheetId,
+                                coord: { row, col },
+                                extend: true,
+                              })
+                              bumpRender()
+                              focusGrid()
+                            }}
+                            onDblClick={() => {
+                              startEditingCell(row, col, 'cell')
+                            }}
+                            onContextMenu={(event) => {
+                              openContextMenu(event, getCellContextTarget(row, col))
+                            }}
                           >
-                            <input
-                              class="cell-input"
-                              value={editingDraft()}
-                              autofocus
-                              onInput={(event) => {
-                                store.setter(editingDraftAtom, { draft: event.currentTarget.value })
-                                bumpRender()
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === 'Enter') {
-                                  event.preventDefault()
-                                  void commitCellEdit()
-                                } else if (event.key === 'Escape') {
-                                  event.preventDefault()
-                                  store.setter(cancelEditingAtom)
+                            <Show
+                              when={editing()}
+                              fallback={
+                                <button type="button" class="spreadsheet-grid-cell-button">
+                                  <span
+                                    class="cell-display"
+                                    style={getCellFormatStyle(cell()?.format)}
+                                  >
+                                    {cell()?.displayValue ?? ''}
+                                  </span>
+                                </button>
+                              }
+                            >
+                              <input
+                                class="cell-input"
+                                value={editingDraft()}
+                                autofocus
+                                onInput={(event) => {
+                                  store.setter(editingDraftAtom, {
+                                    draft: event.currentTarget.value,
+                                  })
                                   bumpRender()
-                                }
-                              }}
-                              onBlur={() => {
-                                if (store.getter(editingSessionAtom).status === 'drafting') {
-                                  void commitCellEdit()
-                                }
-                              }}
-                            />
-                          </Show>
-                          <Show when={active() && !editing()}>
-                            <button
-                              type="button"
-                              class="spreadsheet-grid-fill-handle"
-                              data-testid={`fill-handle-${addr}`}
-                              aria-label={`Fill from ${addr}`}
-                              onPointerDown={startFillHandle}
-                            />
-                          </Show>
-                        </td>
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key === 'Enter') {
+                                    event.preventDefault()
+                                    void commitCellEdit()
+                                  } else if (event.key === 'Escape') {
+                                    event.preventDefault()
+                                    store.setter(cancelEditingAtom)
+                                    bumpRender()
+                                  }
+                                }}
+                                onBlur={() => {
+                                  if (store.getter(editingSessionAtom).status === 'drafting') {
+                                    void commitCellEdit()
+                                  }
+                                }}
+                              />
+                            </Show>
+                            <Show when={active() && !editing()}>
+                              <button
+                                type="button"
+                                class="spreadsheet-grid-fill-handle"
+                                data-testid={`fill-handle-${addr}`}
+                                aria-label={`Fill from ${addr}`}
+                                onPointerDown={startFillHandle}
+                              />
+                            </Show>
+                          </td>
+                        </Show>
                       )
                     }}
                   </For>

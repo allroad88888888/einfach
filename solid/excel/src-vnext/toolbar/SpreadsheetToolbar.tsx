@@ -83,6 +83,11 @@ function numberFormatForValue(value: string | null): SpreadsheetNumberFormat {
   }
 }
 
+function rangeCellCount(range: CellRange): number {
+  if (range.rowEnd < range.rowStart || range.colEnd < range.colStart) return 0
+  return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+}
+
 export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
@@ -213,6 +218,57 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     void executeCommand(intent, range).catch(reportCommandError)
   }
 
+  function getMutationSheetId() {
+    const snapshot = selectionSnapshot()
+    return snapshot.selection.sheetId || availability().sheetId
+  }
+
+  function canMergeSelection() {
+    return (
+      !!backend.mergeRange &&
+      availability().editingMode !== 'drafting' &&
+      getMutationSheetId() !== null &&
+      rangeCellCount(selectionSnapshot().range) > 1
+    )
+  }
+
+  function canUnmergeSelection() {
+    return (
+      !!backend.unmergeRange &&
+      availability().editingMode !== 'drafting' &&
+      getMutationSheetId() !== null &&
+      rangeCellCount(selectionSnapshot().range) > 0
+    )
+  }
+
+  async function mergeSelection() {
+    const sheetId = getMutationSheetId()
+    if (!sheetId || !backend.mergeRange) {
+      return
+    }
+
+    await backend.mergeRange({
+      kind: 'merge-range',
+      sheetId,
+      range: selectionSnapshot().range,
+    })
+    await refreshProjection(sheetId)
+  }
+
+  async function unmergeSelection() {
+    const sheetId = getMutationSheetId()
+    if (!sheetId || !backend.unmergeRange) {
+      return
+    }
+
+    await backend.unmergeRange({
+      kind: 'unmerge-range',
+      sheetId,
+      range: selectionSnapshot().range,
+    })
+    await refreshProjection(sheetId)
+  }
+
   return (
     <div
       class={`format-toolbar spreadsheet-toolbar ${props.class ?? ''}`.trim()}
@@ -247,6 +303,32 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           </button>
         )
       })}
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-merge-cells"
+        title="Merge cells"
+        aria-label="Merge cells"
+        disabled={!canMergeSelection()}
+        onClick={() => {
+          void mergeSelection().catch(reportCommandError)
+        }}
+      >
+        Merge
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-unmerge-cells"
+        title="Unmerge cells"
+        aria-label="Unmerge cells"
+        disabled={!canUnmergeSelection()}
+        onClick={() => {
+          void unmergeSelection().catch(reportCommandError)
+        }}
+      >
+        Unmerge
+      </button>
     </div>
   )
 }
