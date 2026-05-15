@@ -497,6 +497,14 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   `import.meta.url` 副作用。顺手修复 worker workbook adapter 忽略
   `setFormulaDetailed` 的 `{ ok:false }` 的问题：失败公式现在会抛出带 `code/message`
   的 backend error，而不是返回成功 mutation。
+- PC-7 准备第八段：W2 lazy formula 回归门禁已收口。单 sheet WasmSheet
+  transitive chain 增加 Rust wasm unit，`formulas-wasm.spec.ts` 保持 active 覆盖
+  `F8 -> G8 -> H8 -> I8` 传播；dirty notify 精确契约已有
+  `formula_subscriber_dirty_notified_for_same_source_value_writes` 和
+  `dirty_notify_no_eager_compute`。legacy TLS resolver 关键符号在 `excel-core` /
+  `wasm` 生产与测试路径 grep 为 0。vNext Worker demo 新增 `Sheet2!C5` 独立
+  lazy probe：打开 Sheet1 时 `Sheet2!C5` 仍为 dirty，切到 Sheet2 后可视读取计算为
+  `105` 并输出 `[vnext-worker-lazy-demo] computed Sheet2!C5 before=dirty after=clean ...`。
 
 PC-6 第一段验收记录：
 
@@ -829,6 +837,24 @@ PC-7 准备第七段验收记录：
   worker grid 已挂载、可视 cell 数为 30、`Sheet1!C2=13`、`Sheet1!B4=10`、
   `J20` 未挂载、状态为 `Ready` / `30 cells` / `7 loaded`、console error/warning 为 0。
 
+PC-7 准备第八段验收记录：
+
+- `cargo test --manifest-path rust/excel-core/Cargo.toml`
+- `cargo test --manifest-path rust/wasm/Cargo.toml`
+- `wasm-pack test --headless --chrome rust/wasm`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/formulas-wasm.spec.ts`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
+- `rg -n "with_cross_resolver|CrossSheetResolver|mem::transmute|CROSS_RESOLVER|CURRENT_SHEET|CROSS_SHEET_VISITED" rust/excel-core/src rust/wasm/src rust/excel-core/tests rust/wasm/tests`
+- `rg -n "test\\.skip|describe\\.skip|it\\.skip|test\\.only|describe\\.only|it\\.only" solid/excel/e2e solid/excel/test`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/?debug=1`，切到 `vNext Worker`；
+  验证 Sheet1 首屏 30 个可视 cell、`Sheet2!C5` debug cache state 为 `dirty`、
+  切到 Sheet2 后 `C5=105` 且 cache state 为 `clean`，console 输出
+  `[vnext-worker-lazy-demo] computed Sheet2!C5 before=dirty after=clean ...`，
+  console error/warning 为 0。
+
 仍未完成：
 
 - vNext 已有 static backend 和真实 worker/Rust workbook backend adapter；但 default
@@ -851,7 +877,7 @@ PC-7 准备第七段验收记录：
 - PC-7 已进入 package surface 准备；`@einfach/solid-excel` default public entry 还没有切到
   vNext。
 - PC-7 后续多批次 agent 执行计划已单独落到
-  `solid/excel/docs/PC7_AGENT_PIPELINE.md`。接下来按该文档的 W1-W7 波次推进，
+  `solid/excel/docs/PC7_AGENT_PIPELINE.md`。W1-W2 已完成；接下来按该文档的 W3-W7 波次推进，
   每波由总架构师收口并要求测试 + MCP Playwright 验证。
 
 ## 并行 Agent 计划

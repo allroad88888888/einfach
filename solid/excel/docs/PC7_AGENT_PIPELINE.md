@@ -32,8 +32,9 @@
 - row/column size 只在 vNext JS adapter metadata 中持久化，Rust snapshot/reload/autofit
   还没完成。
 - bulk load API、range streaming、range interval index 仍是百万级数据面的主要缺口。
-- Lazy formula 主链路已经存在，但仍需要把单 sheet dependent 传播、dirty notify 契约、
-  TLS resolver 清算等回归门禁补齐。
+- W2 已完成：单 sheet dependent 传播、dirty notify 契约和 TLS resolver 清算均已核实；
+  vNext Worker demo 增加 `Sheet2!C5` 独立 lazy probe，打开 Sheet1 时保持 dirty，
+  切到 Sheet2 后由可视读取计算并输出 console lazy 日志。
 
 ## 执行模型
 
@@ -58,13 +59,13 @@
 
 ## 剩余波次总览
 
-W1 已完成，还剩 6 波。W2 先把 lazy 正确性补稳；W3、W4、W5 可以按文件所有权并行开分支
+W1-W2 已完成，还剩 5 波。W3、W4、W5 可以按文件所有权并行开分支
 推进，但合入顺序要由总架构师控制；W6、W7 是 package cutover 和发布门禁。
 
 | 波次 | 目标 | 可并行 agent | 主要写入边界 | 必须验收 |
 | --- | --- | --- | --- | --- |
 | W1 | 已完成：vNext worker 实现边界迁移 | Worker Runtime、Worker Tests、Public Surface Review | `solid/excel/src-vnext/adapter/*`、legacy worker shim、worker tests/e2e | vNext 不再指向 legacy worker 实现；Jest worker tests；vNext worker e2e；MCP smoke |
-| W2 | Lazy formula 正确性回归 | Rust Lazy、Wasm Contract、E2E Lazy | `rust/excel-core/*`、`rust/wasm/*`、WASM/JS tests、lazy e2e | 单 sheet dependent 传播修复；dirty notify 契约测试；TLS resolver 清零门禁 |
+| W2 | 已完成：Lazy formula 正确性回归 | Rust Lazy、Wasm Contract、E2E Lazy | `rust/excel-core/*`、`rust/wasm/*`、WASM/JS tests、lazy e2e | 单 sheet dependent 传播；dirty notify 契约；TLS resolver 清零；vNext lazy probe + MCP |
 | W3 | true sheet reorder | Rust Workbook、Wasm/Worker Adapter、Cross-sheet E2E | workbook sheet order、wasm API、worker protocol、adapter、e2e | 跨 sheet 公式在 reorder/rename/delete 后仍正确；不再只靠 JS display-order 兜底 |
 | W4 | row/column size 持久化和 autofit | Rust Metadata、Adapter Projection、Interaction E2E | Rust sparse metadata、snapshot/reload、adapter、grid resize/autofit tests | 尺寸 metadata 稀疏持久化；reload 后恢复；autofit 不扫描全表 |
 | W5 | bulk load、range streaming、range interval index | Rust Data Plane、Wasm Streaming、Perf/E2E | bulk API、range chunks、interval index、streaming tests | 大批量导入公式不 eager compute；大 range copy/export 流式；百万级 case 不创建全量 UI 状态 |
@@ -93,7 +94,7 @@ W1 已完成，还剩 6 波。W2 先把 lazy 正确性补稳；W3、W4、W5 可�
 - `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
 - MCP Playwright 打开本地 vNext worker demo，验证页面可编辑、公式链计算、console error 为 0。
 
-## W2：Lazy formula 正确性回归
+## W2：Lazy formula 正确性回归（已完成）
 
 目标：把已经发现的 lazy 真 bug 和契约缺口钉死。
 

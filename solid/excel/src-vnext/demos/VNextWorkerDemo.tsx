@@ -1,4 +1,4 @@
-import { onCleanup, onMount, Show } from 'solid-js'
+import { createEffect, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   setWorkspaceActiveSheetAtom,
@@ -42,10 +42,42 @@ type WorkerWorkbookClient = Parameters<
   NonNullable<WorkerWorkbookSpreadsheetBackendOptions['afterInit']>
 >[0]
 
+type LazyProbe = {
+  client: WorkerWorkbookClient
+  sheetIdx: number
+  beforeState: string
+  beforeEvalCount: number
+  logged: boolean
+}
+
+type VNextWorkerDebugWindow = Window &
+  typeof globalThis & {
+    __einfachWorkbookDebugClient?: WorkerWorkbookClient
+  }
+
+let latestLazyProbe: LazyProbe | undefined
+
+function shouldExposeDebugClient() {
+  return new URLSearchParams(window.location.search).has('debug')
+}
+
+function exposeDebugClient(client: WorkerWorkbookClient) {
+  if (!shouldExposeDebugClient()) return
+  const debugWindow = window as VNextWorkerDebugWindow
+  debugWindow.__einfachWorkbookDebugClient = client
+}
+
+function clearDebugClient() {
+  const debugWindow = window as VNextWorkerDebugWindow
+  delete debugWindow.__einfachWorkbookDebugClient
+}
+
 async function seedWorkerWorkbook(
   client: WorkerWorkbookClient,
   initializedSheets: WorkerWorkbookBackendSheet[],
 ) {
+  exposeDebugClient(client)
+
   const sheet1 = initializedSheets[0].idx
   const sheet2 = initializedSheets[1].idx
   const sheet3 = initializedSheets[2].idx
@@ -62,11 +94,56 @@ async function seedWorkerWorkbook(
   await client.setCell(sheet2, 'A2', { type: 'text', value: 'cell2' })
   await client.setCell(sheet2, 'B2', { type: 'text', value: 'depends on Sheet3' })
   await client.setFormulaDetailed(sheet2, 'C2', '=Sheet3!C2+1')
+  await client.setCell(sheet2, 'A5', { type: 'text', value: 'lazy demo' })
+  await client.setCell(sheet2, 'B5', { type: 'text', value: 'Sheet3!B4+5' })
+  await client.setFormulaDetailed(sheet2, 'C5', '=Sheet3!B4+5')
 
   await client.setCell(sheet3, 'A1', { type: 'text', value: 'Sheet3' })
   await client.setCell(sheet3, 'A2', { type: 'text', value: 'cell3' })
   await client.setCell(sheet3, 'B2', { type: 'text', value: 'depends on Sheet1!B4' })
+  await client.setCell(sheet3, 'B4', { type: 'number', value: 100 })
   await client.setFormulaDetailed(sheet3, 'C2', '=Sheet1!B4+1')
+
+  latestLazyProbe = {
+    client,
+    sheetIdx: sheet2,
+    beforeState: await client.debugFormulaCacheState(sheet2, 'C5'),
+    beforeEvalCount: await client.debugFormulaEvalCount(sheet2),
+    logged: false,
+  }
+}
+
+function VNextWorkerLazyProbeLogger(props: { activeSheetId: () => string }) {
+  function logWhenComputed(probe: LazyProbe, attempt = 0) {
+    window.setTimeout(() => {
+      void Promise.all([
+        probe.client.debugFormulaCacheState(probe.sheetIdx, 'C5'),
+        probe.client.debugFormulaEvalCount(probe.sheetIdx),
+      ]).then(([afterState, afterEvalCount]) => {
+        if (afterState !== 'clean') {
+          if (attempt < 20) {
+            logWhenComputed(probe, attempt + 1)
+          } else {
+            probe.logged = false
+          }
+          return
+        }
+        console.log(
+          `[vnext-worker-lazy-demo] computed Sheet2!C5 before=${probe.beforeState} after=${afterState} beforeEval=${probe.beforeEvalCount} afterEval=${afterEvalCount}`,
+        )
+      })
+    }, 25)
+  }
+
+  createEffect(() => {
+    if (props.activeSheetId() !== 'sheet-2') return
+    const probe = latestLazyProbe
+    if (!probe || probe.logged) return
+    probe.logged = true
+    logWhenComputed(probe)
+  })
+
+  return null
 }
 
 function VNextWorkerWorkbook() {
@@ -86,13 +163,10 @@ function VNextWorkerWorkbook() {
       <SpreadsheetFormulaBar data-testid="vnext-worker-formula-bar" />
       <Show keyed when={activeSheetId()}>
         {(sheetId) => (
-          <SpreadsheetGrid
-            sheetId={sheetId}
-            viewport={viewport}
-            data-testid="vnext-worker-grid"
-          />
+          <SpreadsheetGrid sheetId={sheetId} viewport={viewport} data-testid="vnext-worker-grid" />
         )}
       </Show>
+      <VNextWorkerLazyProbeLogger activeSheetId={activeSheetId} />
       <SpreadsheetSheetTabs sheets={sheets} data-testid="vnext-worker-sheet-tabs" />
       <SpreadsheetStatusBar data-testid="vnext-worker-status-bar" />
       <SpreadsheetContextMenu data-testid="vnext-worker-context-menu" />
@@ -109,6 +183,8 @@ export function VNextWorkerDemo() {
 
   onCleanup(() => {
     backend.dispose()
+    latestLazyProbe = undefined
+    clearDebugClient()
   })
 
   return (

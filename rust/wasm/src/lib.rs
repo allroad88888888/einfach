@@ -2073,6 +2073,18 @@ mod tests {
     }
 
     #[test]
+    fn wasm_sheet_transitive_formula_chain_updates() {
+        let mut sheet = WasmSheet::new();
+        sheet.set_number("A1", 5.0);
+        sheet.set_formula("B1", "=A1*2");
+        sheet.set_formula("C1", "=B1+1");
+        assert_eq!(sheet.get_number("C1"), 11.0);
+
+        sheet.set_number("A1", 7.0);
+        assert_eq!(sheet.get_number("C1"), 15.0);
+    }
+
+    #[test]
     fn wasm_sheet_clear_range_clears_sparse_hits() {
         let mut sheet = WasmSheet::new();
         sheet.set_number("A1", 1.0);

@@ -8,10 +8,19 @@ import {
   typeIntoCell,
 } from './helpers'
 
+declare global {
+  interface Window {
+    __einfachWorkbookDebugClient?: {
+      debugFormulaCacheState(sheet: number, addr: string): Promise<string>
+      debugFormulaEvalCount(sheet: number): Promise<number>
+    }
+  }
+}
+
 test.describe('Solid Excel vNext worker backend', () => {
   async function gotoVNextWorkerDemo(page: Page) {
     guardConsoleErrors(page)
-    await page.goto('/')
+    await page.goto('/?debug=1')
     await page.getByRole('button', { name: 'vNext Worker', exact: true }).click()
     await expect(page.getByTestId('vnext-worker-grid')).toBeVisible({ timeout: 30_000 })
     await expect(cellDisplay(page, 'C2')).toHaveText('13', { timeout: 30_000 })
@@ -29,11 +38,44 @@ test.describe('Solid Excel vNext worker backend', () => {
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
     await expect(cellDisplay(page, 'C2')).toHaveText('13')
 
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () => typeof window.__einfachWorkbookDebugClient?.debugFormulaCacheState === 'function',
+        ),
+      )
+      .toBe(true)
+    const beforeLazyProbe = await page.evaluate(async () => {
+      const client = window.__einfachWorkbookDebugClient!
+      return {
+        state: await client.debugFormulaCacheState(1, 'C5'),
+        evalCount: await client.debugFormulaEvalCount(1),
+      }
+    })
+    expect(beforeLazyProbe.state).toBe('dirty')
+
     await typeIntoCell(page, 'B4', '20')
     await expect(cellDisplay(page, 'C2')).toHaveText('23')
 
+    const lazyLogPromise = page.waitForEvent('console', {
+      predicate: (msg) =>
+        msg.type() === 'log' && msg.text().includes('[vnext-worker-lazy-demo] computed Sheet2!C5'),
+    })
     await selectSheet(page, 'Sheet2')
     await expect(cellDisplay(page, 'C2')).toHaveText('22')
+    await expect(cellDisplay(page, 'C5')).toHaveText('105')
+    const lazyLog = await lazyLogPromise
+    expect(lazyLog.text()).toContain('before=dirty')
+    expect(lazyLog.text()).toContain('after=clean')
+    const afterLazyProbe = await page.evaluate(async () => {
+      const client = window.__einfachWorkbookDebugClient!
+      return {
+        state: await client.debugFormulaCacheState(1, 'C5'),
+        evalCount: await client.debugFormulaEvalCount(1),
+      }
+    })
+    expect(afterLazyProbe.state).toBe('clean')
+    expect(afterLazyProbe.evalCount).toBeGreaterThan(beforeLazyProbe.evalCount)
 
     await selectSheet(page, 'Sheet3')
     await expect(cellDisplay(page, 'C2')).toHaveText('21')
@@ -67,10 +109,7 @@ test.describe('Solid Excel vNext worker backend', () => {
     expect(handleBox).not.toBeNull()
     expect(firstBox).not.toBeNull()
 
-    await page.mouse.move(
-      handleBox!.x + handleBox!.width / 2,
-      handleBox!.y + handleBox!.height / 2,
-    )
+    await page.mouse.move(handleBox!.x + handleBox!.width / 2, handleBox!.y + handleBox!.height / 2)
     await page.mouse.down()
     await page.mouse.move(firstBox!.x + 2, firstBox!.y + firstBox!.height / 2)
     await page.mouse.up()
