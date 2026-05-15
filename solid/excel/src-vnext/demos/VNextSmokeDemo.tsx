@@ -32,6 +32,22 @@ const backend = createStaticSpreadsheetBackend({
   ],
   cells: [
     {
+      row: 3,
+      col: 4,
+      displayValue: 'review',
+      valueKind: 'string',
+      conditionalFormat: {
+        bgColor: '#fde68a',
+        fgColor: '#7f1d1d',
+        bold: true,
+      },
+      validation: {
+        code: 'validation.list_mismatch',
+        severity: 'error',
+        message: 'Expected ready or visible',
+      },
+    },
+    {
       row: 19,
       col: 9,
       displayValue: 'Hidden offscreen',

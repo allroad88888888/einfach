@@ -813,6 +813,49 @@ describe('vnext adapter', () => {
     expect(result.revision).toBe(8)
   })
 
+  it('preserves projected validation and conditional format metadata in static reads', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 2,
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'late',
+          valueKind: 'string',
+          conditionalFormat: { bgColor: '#fde68a', bold: true },
+          validation: {
+            code: 'validation.regex_mismatch',
+            severity: 'error',
+            message: 'Value does not match pattern',
+          },
+        },
+      ],
+    })
+
+    const result = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 18,
+        window: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'late',
+        valueKind: 'string',
+        conditionalFormat: { bgColor: '#fde68a', bold: true },
+        validation: {
+          code: 'validation.regex_mismatch',
+          severity: 'error',
+          message: 'Value does not match pattern',
+        },
+      },
+    ])
+  })
+
   it('keeps setCellInput isolated to the target cell and bumps revision', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 3,

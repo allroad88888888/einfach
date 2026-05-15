@@ -239,6 +239,83 @@ describe('vNext SpreadsheetGrid', () => {
     expect(display.style.color).toBe('rgb(255, 0, 0)')
   })
 
+  it('renders conditional format overlays and validation indicators from projection metadata', async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Flagged',
+              valueKind: 'string',
+              format: {
+                bgColor: '#ffffff',
+                fgColor: '#111111',
+              },
+              conditionalFormat: {
+                bgColor: '#fde68a',
+                fgColor: '#7f1d1d',
+                bold: true,
+              },
+              validation: {
+                code: 'validation.list_mismatch',
+                severity: 'error',
+                message: 'Value must be one of: open, closed',
+              },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Flagged',
+      )
+    })
+
+    const cell = container.querySelector('[data-cell-addr="A1"]') as HTMLElement
+    const display = cell.querySelector('.cell-display') as HTMLElement
+    expect(display.style.background).toBe('rgb(253, 230, 138)')
+    expect(display.style.color).toBe('rgb(127, 29, 29)')
+    expect(display.style.fontWeight).toBe('700')
+    expect(cell.getAttribute('data-has-conditional-format')).toBe('true')
+    expect(cell.getAttribute('data-validation-code')).toBe('validation.list_mismatch')
+    expect(cell.getAttribute('data-validation-severity')).toBe('error')
+    expect(cell.getAttribute('title')).toBe('Value must be one of: open, closed')
+  })
+
   it('skips rows and columns marked hidden by viewport projection metadata', async () => {
     const store = createStore()
     const { backend } = createFakeBackend({
