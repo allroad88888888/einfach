@@ -24,6 +24,16 @@ test.describe('Solid Excel vNext smoke', () => {
     return page.getByTestId('formula-bar-input')
   }
 
+  test('app boots directly into the vNext demo', async ({ page }) => {
+    await page.goto('/')
+    await expect(page.getByRole('button', { name: 'vNext', exact: true })).toHaveClass(
+      /tab-active/,
+    )
+    await expect(page.getByTestId('vnext-grid')).toBeVisible({ timeout: 30_000 })
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
+
   test('renders only the visible window', async ({ page }) => {
     await gotoVNextDemo(page)
 

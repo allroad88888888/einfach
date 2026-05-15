@@ -469,6 +469,9 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   surface 单独收敛到 `solid/excel/src-vnext/public.ts`，不导出 demo，避免 package entry
   import 时把 `VNextWorkerDemo` 的 worker factory / `import.meta.url` 副作用带进 Jest 或
   Node-like 消费环境。demo 入口继续由 `src-vnext/index.tsx` 内部导出给现有 App 使用。
+- PC-7 准备第三段：demo App 首屏默认切到 `vNext`，让本地打开页面时直接进入新
+  UI core 路径；legacy demos 仍保留在同一导航里作为对照和旧能力回归。i18n e2e
+  明确点击 `Blank` 后再验证 legacy demo 文案，避免继续把首页默认 demo 和翻译测试耦合。
 
 PC-6 第一段验收记录：
 
@@ -743,6 +746,16 @@ PC-7 准备第二段验收记录：
 - MCP Playwright：打开 `http://127.0.0.1:5174/`，点击 `vNext` demo；验证
   table body 仍只挂载 30 个可视 cell、页面没有 `J20`、状态栏显示 `Ready` /
   `30 cells` / `30 loaded`、console error 为 0。
+
+PC-7 准备第三段验收记录：
+
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts e2e/i18n.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/` 首页，不点击 demo tab；验证 active tab
+  为 `vNext`、`vnext-grid` 已挂载、table body 仍只有 30 个可视 cell、`J20` 未挂载、
+  状态栏包含 `Ready` / `30 cells` / `30 loaded`、console error 为 0。
 
 仍未完成：
 

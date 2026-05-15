@@ -75,7 +75,7 @@ const demoGroups: DemoGroup[] = [
 const allDemos: DemoTab[] = demoGroups.flatMap((g) => g.demos)
 
 export function App() {
-  const [activeTab, setActiveTab] = createSignal('blank')
+  const [activeTab, setActiveTab] = createSignal('vnext')
   const t = useT()
 
   const activeDemo = () => allDemos.find((d) => d.id === activeTab())

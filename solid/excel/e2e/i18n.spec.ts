@@ -37,7 +37,9 @@ function demoH3(page: Page) {
 
 async function gotoApp(page: Page) {
   await page.goto('/')
-  // Default-active demo is "Blank" — its h3 is the first rendered.
+  // i18n coverage stays on the legacy Blank demo even though the app now
+  // boots into vNext by default.
+  await page.getByRole('button', { name: 'Blank', exact: true }).click()
   await expect(demoH3(page)).toBeVisible()
 }
 
