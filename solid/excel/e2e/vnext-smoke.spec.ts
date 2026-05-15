@@ -210,11 +210,13 @@ test.describe('Solid Excel vNext smoke', () => {
     await page.keyboard.press('Alt+PageDown')
     await expect(page.getByTestId('formula-bar-addr')).toHaveText('G2')
     await expect(page.getByTestId('status-active-cell')).toHaveText('G2')
-    await expect(cell(page, 'G2')).toHaveCount(0)
+    await expect(cell(page, 'G2')).toHaveClass(/cell-active/)
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
 
     await page.keyboard.press('Alt+PageUp')
     await expect(page.getByTestId('formula-bar-addr')).toHaveText('B2')
     await expect(page.getByTestId('status-active-cell')).toHaveText('B2')
+    await expect(cell(page, 'B2')).toHaveClass(/cell-active/)
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
   })
 
@@ -365,7 +367,7 @@ test.describe('Solid Excel vNext smoke', () => {
     await page.keyboard.press('Control+Shift+End')
     await expect(page.getByTestId('status-selection')).toHaveText('A1:CV200')
 
-    await cell(page, 'A1').click({ button: 'right' })
+    await cell(page, 'CV200').click({ button: 'right' })
     const menu = page.getByTestId('vnext-context-menu')
     await expect(menu).toBeVisible()
     await expect(menu).toHaveAttribute('data-menu-target-kind', 'range')

@@ -19,8 +19,8 @@
 
 | 日期 | Owner | Feature | 状态 | 文件边界 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| 2026-05-15 | CC | multi-range-selection | needs review | `src/selection/*`, `src/keyboard/*`, `test/selection-multi-range.test.ts`, `test/package-boundary.test.ts` | 处理下方 review findings 后再接 Solid vNext UI |
-| 2026-05-15 | Codex | multi-range UI integration | done | `solid/excel/src-vnext/grid/SpreadsheetGrid.tsx`, `solid/excel/test/vnext-grid.test.tsx` | 等 CC 处理 core P2 契约后再扩 toolbar/context-menu 多 region 操作 |
+| 2026-05-15 | CC/Codex | multi-range-selection | done | `src/selection/*`, `src/keyboard/*`, `src/pointer/*`, `test/selection-multi-range.test.ts`, `test/pointer.test.ts` | 后续可扩 toolbar/context-menu 多 region 操作 |
+| 2026-05-15 | Codex | multi-range UI integration | done | `solid/excel/src-vnext/grid/SpreadsheetGrid.tsx`, `solid/excel/test/vnext-grid.test.tsx` | Escape 已走 core intent；后续可接多 region command iteration |
 | 2026-05-15 | Codex | collaboration protocol | done | `docs/AGENT_COLLABORATION.md` | 按本文档做后续 review / handoff |
 | 2026-05-15 | CC | rich-types core | done | `src/rich-types/*`, `src/backend/types.ts`, `test/rich-types.test.ts` | Codex 已接 Solid vNext 投影渲染和静态 backend 端口 |
 | 2026-05-15 | Codex | rich-types UI integration | done | `solid/excel/src-vnext/*`, `solid/excel/test/vnext-*`, `solid/excel/e2e/vnext-smoke.spec.ts` | 下一步可接 toolbar/context-menu 的 rich edit 入口 |
@@ -255,10 +255,63 @@ MCP Playwright:
 
 Known risks:
 
-- Core still exposes mutable `selectionRegionsAtom` array by reference; UI integration treats it
-  as read-only.
 - Toolbar/context-menu commands still operate on one target range. Multi-region command iteration
-  should wait until the core contract for `AllSelection` and readonly regions is settled.
+  can build on `selectionRegionsAtom` now that core returns a defensive readonly snapshot.
+
+## Handoff: multi-range core follow-up / 2026-05-15
+
+Owner: Codex
+
+Status: done for review findings.
+
+Touched files:
+
+- `vanilla/spreadsheet-ui-core/src/selection/*`
+- `vanilla/spreadsheet-ui-core/src/keyboard/*`
+- `vanilla/spreadsheet-ui-core/src/pointer/*`
+- `vanilla/spreadsheet-ui-core/test/selection-multi-range.test.ts`
+- `vanilla/spreadsheet-ui-core/test/pointer.test.ts`
+- `vanilla/spreadsheet-ui-core/docs/multi-range-selection.md`
+
+Implemented:
+
+- `selectionRegionsAtom` now returns a copied readonly snapshot and freezes nested cell/range
+  coordinates, so consumers cannot mutate core state outside atom setters.
+- Navigation Escape with multiple regions now emits `selection.clearNonPrimary` from keyboard
+  core and dispatches `clearNonPrimaryRegionsAtom({ keepPrimary: true })`.
+- Pointer drag-selection start/commit carries `append?: boolean` so Ctrl/Cmd drag can use a
+  first-class core contract.
+- Multi-range docs now align with the chosen `SelectionState[]` internal shape for single
+  `all` replacement after Ctrl/Cmd+A.
+
+Tests run:
+
+```bash
+npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit --pretty false
+npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false
+npx jest vanilla/spreadsheet-ui-core/test/selection-multi-range.test.ts \
+  vanilla/spreadsheet-ui-core/test/selection.test.ts \
+  vanilla/spreadsheet-ui-core/test/keyboard.test.ts \
+  vanilla/spreadsheet-ui-core/test/pointer.test.ts \
+  vanilla/spreadsheet-ui-core/test/package-boundary.test.ts \
+  solid/excel/test/vnext-grid.test.tsx --runInBand
+NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-smoke.spec.ts
+```
+
+MCP Playwright:
+
+- URL: `http://127.0.0.1:4173/`
+- Operation: click `A1`, Ctrl-click `C3`, press Escape on the vNext grid.
+- Result before Escape: `A1` and `C3` selected, `C3` active, visible cells `30`, `J20`
+  not mounted.
+- Result after Escape: only `C3` remains selected/active, visible cells `30`, `J20` not mounted.
+- Console: warning/error `0`.
+
+Known risks:
+
+- Multi-region toolbar/context-menu command iteration is still not implemented.
+- `append?: boolean` is exposed in pointer core; Solid vNext currently handles Ctrl/Cmd-click
+  directly and can wire Ctrl/Cmd-drag later.
 
 ## Handoff: rich-types UI integration / 2026-05-15
 
