@@ -1,0 +1,191 @@
+/** @jsxImportSource solid-js */
+
+import { Show, For, createSignal } from 'solid-js'
+import { useAtomValue } from '@einfach/solid'
+import {
+  nameManagerEditorAtom,
+  nameRegistryCacheAtom,
+  closeNameManagerAtom,
+  type NamedRange,
+  type NamedRangeScope,
+  type NamedRangeRefersTo,
+} from '@einfach/spreadsheet-ui-core'
+import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+
+export interface SpreadsheetNameManagerDialogProps {
+  class?: string
+  'data-testid'?: string
+}
+
+function scopeToString(scope: NamedRangeScope): string {
+  if (scope === 'workbook') return 'workbook'
+  return scope.sheetId
+}
+
+function stringToScope(value: string): NamedRangeScope {
+  if (value === 'workbook') return 'workbook'
+  return { sheetId: value }
+}
+
+function defaultRefersTo(): NamedRangeRefersTo {
+  return { kind: 'range', sheetId: '', address: '' }
+}
+
+export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
+  const store = useSpreadsheetUiStore()
+  const backend = useSpreadsheetBackend()
+  const editor = useAtomValue(nameManagerEditorAtom)
+  const registry = useAtomValue(nameRegistryCacheAtom)
+
+  const isOpen = () => editor().status !== 'closed'
+
+  const [name, setName] = createSignal('')
+  const [scope, setScope] = createSignal<string>('workbook')
+  const [refersTo, setRefersTo] = createSignal('')
+  const [selectedEntry, setSelectedEntry] = createSignal<NamedRange | null>(null)
+
+  function populateFromEntry(entry: NamedRange) {
+    setSelectedEntry(entry)
+    setName(entry.name)
+    setScope(scopeToString(entry.scope))
+    const rt = entry.refersTo
+    setRefersTo(rt.kind === 'range' ? `${rt.sheetId}!${rt.address}` : rt.value)
+  }
+
+  function buildRefersTo(): NamedRangeRefersTo {
+    const value = refersTo()
+    const sep = value.indexOf('!')
+    if (sep !== -1) {
+      return { kind: 'range', sheetId: value.slice(0, sep), address: value.slice(sep + 1) }
+    }
+    return defaultRefersTo()
+  }
+
+  function close() {
+    store.setter(closeNameManagerAtom)
+    setSelectedEntry(null)
+    setName('')
+    setScope('workbook')
+    setRefersTo('')
+  }
+
+  async function handleSave() {
+    if (!backend.setNamedRange) return
+    const nameVal = name() || (editor().draft?.name ?? '')
+    await backend.setNamedRange({
+      kind: 'set-named-range',
+      name: nameVal,
+      scope: stringToScope(scope()),
+      refersTo: buildRefersTo(),
+    })
+    close()
+  }
+
+  async function handleDelete() {
+    if (!backend.deleteNamedRange) return
+    const entry = selectedEntry() ?? editor().draft
+    if (!entry) return
+    await backend.deleteNamedRange({
+      kind: 'delete-named-range',
+      name: entry.name,
+      scope: entry.scope,
+    })
+    setSelectedEntry(null)
+  }
+
+  function handleClose() {
+    close()
+  }
+
+  return (
+    <Show when={isOpen()}>
+      <div
+        class={`name-manager-dialog ${props.class ?? ''}`.trim()}
+        data-testid={props['data-testid'] ?? 'name-manager-dialog'}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Name Manager"
+      >
+        <ul data-testid="name-list">
+          <For each={registry()}>
+            {(entry) => (
+              <li
+                data-name={entry.name}
+                onClick={() => {
+                  populateFromEntry(entry)
+                }}
+                style={{ cursor: 'pointer' }}
+              >
+                {entry.name} ({scopeToString(entry.scope)})
+              </li>
+            )}
+          </For>
+        </ul>
+
+        <div class="nm-form">
+          <label for="name-input">Name</label>
+          <input
+            id="name-input"
+            data-testid="name-input"
+            type="text"
+            value={name()}
+            onInput={(e) => {
+              setName(e.currentTarget.value)
+            }}
+          />
+
+          <label for="name-scope-select">Scope</label>
+          <select
+            id="name-scope-select"
+            data-testid="name-scope-select"
+            value={scope()}
+            onChange={(e) => {
+              setScope(e.currentTarget.value)
+            }}
+          >
+            <option value="workbook">Workbook</option>
+          </select>
+
+          <label for="name-refers-to">Refers to</label>
+          <input
+            id="name-refers-to"
+            type="text"
+            value={refersTo()}
+            onInput={(e) => {
+              setRefersTo(e.currentTarget.value)
+            }}
+          />
+        </div>
+
+        <div class="nm-actions">
+          <button
+            type="button"
+            data-testid="name-save-button"
+            onClick={() => {
+              void handleSave()
+            }}
+          >
+            Save
+          </button>
+          <button
+            type="button"
+            data-testid="name-delete-button"
+            disabled={!selectedEntry() && !editor().draft}
+            onClick={() => {
+              void handleDelete()
+            }}
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            data-testid="name-close-button"
+            onClick={handleClose}
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </Show>
+  )
+}
