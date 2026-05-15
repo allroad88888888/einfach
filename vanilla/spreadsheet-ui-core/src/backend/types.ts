@@ -1,4 +1,6 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest } from '../print/types'
+import type { PresenceUpdate } from '../presence/types'
 import type { DisplayCellRichValue } from '../rich-types/types'
 import type { ValidationOutcome, SetValidationRuleRequest, ClearValidationRuleRequest } from '../data-validation/types'
 import type {
@@ -22,6 +24,14 @@ import type {
   ResolveCommentThreadRequest,
   SetNoteRequest,
 } from '../comments/types'
+import type {
+  FindRangeRequest,
+  FindRangeResult,
+  SearchRangeRequest,
+  SearchRangeResult,
+  ReplaceMatchesRequest,
+  ReplaceMatchesResult,
+} from '../find-replace/types'
 
 export type {
   ClearNoteRequest,
@@ -39,6 +49,19 @@ export type {
   RemoveConditionalFormatRuleRequest,
   SetConditionalFormatRuleRequest,
 }
+
+// --- find-replace ---
+export type {
+  FindRangeRequest,
+  FindRangeResult,
+  SearchRangeRequest,
+  SearchRangeResult,
+  ReplaceMatchesRequest,
+  ReplaceMatchesResult,
+}
+
+// --- print ---
+export type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest }
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -542,6 +565,15 @@ export interface SpreadsheetBackend {
   setConditionalFormatRule?(request: SetConditionalFormatRuleRequest): Promise<BackendMutationResult>
   removeConditionalFormatRule?(request: RemoveConditionalFormatRuleRequest): Promise<BackendMutationResult>
   listConditionalFormatRules?(request: ListConditionalFormatRulesRequest): Promise<ConditionalFormatRulesResult>
+  // print config
+  readPrintConfig?(request: ReadPrintConfigRequest): Promise<ReadPrintConfigResult>
+  setPrintConfig?(request: SetPrintConfigRequest): Promise<BackendMutationResult>
+  // find-replace
+  searchRange?(request: SearchRangeRequest): Promise<SearchRangeResult>
+  replaceMatches?(request: ReplaceMatchesRequest): Promise<ReplaceMatchesResult>
+  // presence
+  subscribePresence?(handler: (update: PresenceUpdate) => void): SubscribePresenceUnsubscribe
+  publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
 }
 
 export interface ViewportFreezeConfig {
@@ -568,3 +600,14 @@ export interface SetFreezeConfigRequest extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
+
+// --- presence ---
+
+export interface PublishLocalPresenceRequest extends SheetRef {
+  kind: 'publish-presence'
+  selection: import('../selection/types').SelectionState
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export type SubscribePresenceUnsubscribe = () => void

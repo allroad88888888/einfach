@@ -8,6 +8,7 @@ import {
   diagnosticsAtom,
   editingSessionAtom,
   fillSeriesLocaleAtom,
+  findReplaceQueryAtom,
   formulaBarStateAtom,
   formulaReferenceSessionAtom,
   getDisplayCellText,
@@ -17,7 +18,9 @@ import {
   menuStateAtom,
   nameRegistryCacheAtom,
   pointerSessionAtom,
+  presenceStateAtom,
   primarySelectionRegionAtom,
+  printConfigStateAtom,
   selectionAtom,
   selectionRegionsAtom,
   toolbarUiStateAtom,
@@ -78,6 +81,9 @@ describe('package boundary', () => {
     expect(conditionalFormatEditorAtom.debugLabel).toBe('spreadsheet.conditionalFormat.editor')
     expect(typeof getDisplayCellText).toBe('function')
     expect(typeof isHyperlinkValue).toBe('function')
+    expect(printConfigStateAtom.debugLabel).toBe('spreadsheet.print.config')
+    expect(findReplaceQueryAtom.debugLabel).toBe('spreadsheet.findReplace.query')
+    expect(presenceStateAtom.debugLabel).toBe('spreadsheet.presence.state')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

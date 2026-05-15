@@ -1,4 +1,7 @@
 export * from './auto-fill'
+export * from './find-replace'
+export * from './presence'
+export * from './print'
 export * from './rich-types'
 export * from './conditional-formatting'
 export * from './data-validation'
