@@ -5,11 +5,11 @@ import {
   workspaceSessionAtom,
   type ViewportMetrics,
 } from '@einfach/spreadsheet-ui-core'
-import { defaultWorkbookWorkerFactory } from '../../src/wasm-workbook-worker-factory'
-import type { WorkerWorkbookClient } from '../../src/wasm-workbook-proxy'
+import { defaultVNextWorkbookWorkerFactory } from '../adapter/worker-factory'
 import {
   createWorkerWorkbookSpreadsheetBackend,
   type WorkerWorkbookBackendSheet,
+  type WorkerWorkbookSpreadsheetBackendOptions,
 } from '../adapter'
 import { SpreadsheetContextMenu } from '../context-menu'
 import { SpreadsheetFormulaBar } from '../formula-bar'
@@ -37,6 +37,10 @@ const sheets = [
   { id: 'sheet-2', name: 'Sheet2' },
   { id: 'sheet-3', name: 'Sheet3' },
 ]
+
+type WorkerWorkbookClient = Parameters<
+  NonNullable<WorkerWorkbookSpreadsheetBackendOptions['afterInit']>
+>[0]
 
 async function seedWorkerWorkbook(
   client: WorkerWorkbookClient,
@@ -98,7 +102,7 @@ function VNextWorkerWorkbook() {
 
 export function VNextWorkerDemo() {
   const backend = createWorkerWorkbookSpreadsheetBackend({
-    workerFactory: defaultWorkbookWorkerFactory,
+    workerFactory: defaultVNextWorkbookWorkerFactory,
     sheets,
     afterInit: seedWorkerWorkbook,
   })

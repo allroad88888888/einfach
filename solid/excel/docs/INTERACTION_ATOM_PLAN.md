@@ -476,6 +476,10 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   `@einfach/solid-excel/vnext` 子入口，指向 `src-vnext/public.ts`；root `.` 仍指向
   legacy `src/index.tsx`，所以这一步只增加迁移入口，不把默认 import 切到 vNext。vNext
   子入口只暴露 provider/grid/chrome/backend adapter 等库级 surface，不导出 demo。
+- PC-7 准备第五段：`VNextWorkerDemo` 不再直接 import legacy
+  `wasm-workbook-worker-factory` 或 `wasm-workbook-proxy` type；demo 改用 vNext adapter
+  下的本地 worker factory 和 adapter option 类型推导。真实 Rust worker 文件仍暂时复用
+  legacy `src/wasm-workbook-worker.ts`，因为 worker/RPC 迁移需要单独拆大任务。
 
 PC-6 第一段验收记录：
 
@@ -771,6 +775,17 @@ PC-7 准备第四段验收记录：
 - MCP Playwright：打开 `http://127.0.0.1:5174/` 首页；验证 active tab 为
   `vNext`、`vnext-grid` 已挂载、table body 仍只有 30 个可视 cell、`J20` 未挂载、
   状态栏包含 `Ready` / `30 cells` / `30 loaded`、console error 为 0。
+
+PC-7 准备第五段验收记录：
+
+- `rg -n "\\.\\./\\.\\./src|\\.\\./src|from '../../src|from '../src" solid/excel/src-vnext -g '*.ts' -g '*.tsx'`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/`，切到 `vNext Worker`；验证
+  worker grid 已挂载、table body 仍只有 30 个可视 cell、`Sheet1!C2=13`、
+  `Sheet1!B4=10`、`J20` 未挂载、状态为 `Ready` / `30 cells`、console error 为 0。
 
 仍未完成：
 
