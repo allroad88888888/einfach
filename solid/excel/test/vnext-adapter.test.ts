@@ -2494,4 +2494,98 @@ describe('vnext adapter', () => {
 
     backend.dispose()
   })
+
+  it('isolates static backend cell writes to the target sheet — sheet-2 write does not appear on sheet-1', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+      cells: [{ row: 0, col: 0, displayValue: 'from-seed', valueKind: 'string' }],
+    })
+
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-2',
+      row: 0,
+      col: 0,
+      input: 'only-on-sheet-2',
+    })
+
+    const sheet1 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 101,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+    const sheet2 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 102,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(sheet1.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'from-seed', valueKind: 'string' },
+    ])
+    expect(sheet2.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'only-on-sheet-2', valueKind: 'string' },
+    ])
+  })
+
+  it('isolates static backend mutations — clearRange on sheet-2 does not clear sheet-1 cells', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+    })
+
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'keep-me',
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-2',
+      row: 0,
+      col: 0,
+      input: 'clear-me',
+    })
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-2',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+
+    const sheet1 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 103,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+    const sheet2 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 104,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(sheet1.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'keep-me', valueKind: 'string' },
+    ])
+    expect(sheet2.cells).toEqual([])
+  })
 })

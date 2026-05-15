@@ -303,7 +303,7 @@ interface RangeFormatLayer {
 }
 
 interface StaticBackendState {
-  cells: Map<string, DisplayCell>
+  cellsBySheet: Map<string, Map<string, DisplayCell>>
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
   mergeRangesBySheetId: Map<string, CellRange[]>
@@ -311,6 +311,18 @@ interface StaticBackendState {
   colWidthsBySheetId: Map<string, Map<number, number>>
   sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
+}
+
+function getOrCreateSheetCells(
+  state: StaticBackendState,
+  sheetId: string,
+): Map<string, DisplayCell> {
+  let cells = state.cellsBySheet.get(sheetId)
+  if (!cells) {
+    cells = new Map()
+    state.cellsBySheet.set(sheetId, cells)
+  }
+  return cells
 }
 
 function valueToDisplayCell(row: number, col: number, value: StaticSeedValue): DisplayCell | null {
@@ -357,9 +369,10 @@ function buildState(
   revision: ProjectionRevision,
   sheets: SpreadsheetSheetMetadata[] = normalizeStaticSheets(),
 ): StaticBackendState {
+  const defaultSheetId = sheets[0]?.id ?? 'sheet-1'
   const cellMap = new Map<string, DisplayCell>()
   const cellFormats = new Map<string, SpreadsheetCellFormat>()
-  const mergeRangesBySheetId = extractMergeRanges(cells, sheets[0]?.id ?? 'sheet-1')
+  const mergeRangesBySheetId = extractMergeRanges(cells, defaultSheetId)
 
   for (const cell of cells) {
     const key = keyFor(cell.row, cell.col)
@@ -368,8 +381,11 @@ function buildState(
     cellMap.set(key, stripCellFormat(cell))
   }
 
+  const cellsBySheet = new Map<string, Map<string, DisplayCell>>()
+  cellsBySheet.set(defaultSheetId, cellMap)
+
   return {
-    cells: cellMap,
+    cellsBySheet,
     cellFormats,
     rangeFormats: [],
     mergeRangesBySheetId,
@@ -439,7 +455,8 @@ function exportRangeTsvFromState(
   state: StaticBackendState,
   request: RangeTsvExportRequest,
 ): RangeTsvExportResult {
-  const cells = [...state.cells.values()]
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+  const cells = [...sheetCells.values()]
     .filter((cell) => isCellInsideRange(cell, request.range))
     .sort(compareCells)
     .map(displayCellToSparseTsvCell)
@@ -717,8 +734,9 @@ function buildProjectionResult(
 ): StaticProjectionResult {
   const range = request.kind === 'visible-window' ? request.window : request.range
   const resultCellMap = new Map<string, DisplayCell>()
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
 
-  for (const cell of state.cells.values()) {
+  for (const cell of sheetCells.values()) {
     if (!isCellInsideRange(cell, range)) continue
     const clone = cloneCell(cell)
     const format = getEffectiveFormat(cell.row, cell.col, state.cellFormats, state.rangeFormats)
@@ -871,8 +889,9 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
     return 0
   }
 
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
   const sourceCells = new Map<string, DisplayCell>()
-  for (const cell of state.cells.values()) {
+  for (const cell of sheetCells.values()) {
     if (isCellInsideRange(cell, request.sourceRange)) {
       sourceCells.set(keyFor(cell.row, cell.col), cloneCell(cell))
     }
@@ -887,13 +906,13 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
       const targetKey = keyFor(row, col)
 
       if (sourceCell) {
-        state.cells.set(targetKey, {
+        sheetCells.set(targetKey, {
           ...cloneCell(sourceCell),
           row,
           col,
         })
       } else {
-        state.cells.delete(targetKey)
+        sheetCells.delete(targetKey)
       }
 
       const sourceFormat = getEffectiveFormat(
@@ -983,9 +1002,10 @@ function resolveStaticDataEdge(
     row: clampIndex(request.from.row, rowCount),
     col: clampIndex(request.from.col, colCount),
   }
+  const sheetCells = getOrCreateSheetCells(state, request.sheetId)
 
   if (request.direction === 'left' || request.direction === 'right') {
-    const occupiedCols = [...state.cells.values()]
+    const occupiedCols = [...sheetCells.values()]
       .filter((cell) => cell.row === from.row && isNonBlankCell(cell))
       .map((cell) => clampIndex(cell.col, colCount))
       .sort((left, right) => left - right)
@@ -1005,7 +1025,7 @@ function resolveStaticDataEdge(
     }
   }
 
-  const occupiedRows = [...state.cells.values()]
+  const occupiedRows = [...sheetCells.values()]
     .filter((cell) => cell.col === from.col && isNonBlankCell(cell))
     .map((cell) => clampIndex(cell.row, rowCount))
     .sort((left, right) => left - right)
@@ -1262,7 +1282,7 @@ export function createStaticSpreadsheetBackend(
       return buildViewportSizeProjectionResult(request, state)
     },
     async setCellInput(request) {
-      updateCell(state.cells, request)
+      updateCell(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
       return {
@@ -1278,7 +1298,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async setCellRichValue(request) {
-      updateCellRichValue(state.cells, request)
+      updateCellRichValue(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
       return {
@@ -1294,8 +1314,9 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async importCells(request: ImportCellsRequest) {
+      const cells = getOrCreateSheetCells(state, request.sheetId)
       for (const cell of request.cells) {
-        updateCell(state.cells, {
+        updateCell(cells, {
           kind: 'set-cell-input',
           sheetId: request.sheetId,
           row: cell.row,
@@ -1313,9 +1334,10 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async importCellChunks(request: ImportCellChunksRequest) {
+      const cells = getOrCreateSheetCells(state, request.sheetId)
       for await (const chunk of request.chunks) {
         for (const cell of chunk) {
-          updateCell(state.cells, {
+          updateCell(cells, {
             kind: 'set-cell-input',
             sheetId: request.sheetId,
             row: cell.row,
@@ -1334,7 +1356,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async clearRange(request) {
-      clearRange(state.cells, request)
+      clearRange(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
       return {
@@ -1351,7 +1373,7 @@ export function createStaticSpreadsheetBackend(
     },
     async insertRows(request) {
       shiftRows(
-        state.cells,
+        getOrCreateSheetCells(state, request.sheetId),
         state.cellFormats,
         state.rangeFormats,
         request.rowIndex,
@@ -1369,7 +1391,7 @@ export function createStaticSpreadsheetBackend(
     },
     async deleteRows(request) {
       shiftRows(
-        state.cells,
+        getOrCreateSheetCells(state, request.sheetId),
         state.cellFormats,
         state.rangeFormats,
         request.rowIndex,
@@ -1387,7 +1409,7 @@ export function createStaticSpreadsheetBackend(
     },
     async insertColumns(request) {
       shiftColumns(
-        state.cells,
+        getOrCreateSheetCells(state, request.sheetId),
         state.cellFormats,
         state.rangeFormats,
         request.colIndex,
@@ -1405,7 +1427,7 @@ export function createStaticSpreadsheetBackend(
     },
     async deleteColumns(request) {
       shiftColumns(
-        state.cells,
+        getOrCreateSheetCells(state, request.sheetId),
         state.cellFormats,
         state.rangeFormats,
         request.colIndex,
@@ -1519,6 +1541,7 @@ export function createStaticSpreadsheetBackend(
         index: state.sheets.length,
       }
       state.sheets = [...state.sheets, createdSheet]
+      state.cellsBySheet.set(createdSheet.id, new Map())
       state.revision = bumpRevision(state.revision)
 
       return sheetMutationResult(state, request.requestId, {
@@ -1561,6 +1584,7 @@ export function createStaticSpreadsheetBackend(
 
       const nextSheets = state.sheets.filter((sheet) => sheet.id !== request.sheetId)
       state.sheets = reindexSheets(nextSheets)
+      state.cellsBySheet.delete(request.sheetId)
       state.rowHeightsBySheetId.delete(request.sheetId)
       state.colWidthsBySheetId.delete(request.sheetId)
       state.revision = bumpRevision(state.revision)
