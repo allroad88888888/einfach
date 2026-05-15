@@ -412,6 +412,22 @@ thead .row-header {
   overflow: hidden;
 }
 
+.spreadsheet-grid-cell[data-validation-severity]::after {
+  content: '';
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 0;
+  height: 0;
+  border-top: 7px solid #d97706;
+  border-left: 7px solid transparent;
+  pointer-events: none;
+}
+
+.spreadsheet-grid-cell[data-validation-severity='error']::after {
+  border-top-color: #dc2626;
+}
+
 .spreadsheet-grid-col-header,
 .spreadsheet-grid-cell {
   width: 96px;

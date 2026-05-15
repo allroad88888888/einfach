@@ -111,6 +111,23 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   return style
 }
 
+function getDisplayCellFormat(cell: DisplayCell | undefined): SpreadsheetCellFormat | undefined {
+  if (!cell?.format && !cell?.conditionalFormat) return undefined
+  return {
+    ...(cell.format ?? {}),
+    ...(cell.conditionalFormat ?? {}),
+    numberFormat: cell.conditionalFormat?.numberFormat ?? cell.format?.numberFormat,
+  }
+}
+
+function getCellValidationSeverity(cell: DisplayCell | undefined): string | undefined {
+  return cell?.validation?.severity
+}
+
+function getCellValidationMessage(cell: DisplayCell | undefined): string | undefined {
+  return cell?.validation?.message
+}
+
 function getRangeCellCount(range: CellRange): number {
   return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
 }
@@ -1456,6 +1473,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       const active = () => isActive(row, col)
                       const editing = () => isEditing(row, col)
                       const mergeAnchor = () => isCellMergeAnchor(row, col)
+                      const validationSeverity = () => getCellValidationSeverity(cell())
                       return (
                         <Show when={!isCellCoveredByMerge(row, col)}>
                           <td
@@ -1467,6 +1485,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               isFillPreviewCell(row, col) ? 'cell-fill-preview' : ''
                             } ${
                               mergeAnchor() ? 'cell-merge-anchor' : ''
+                            } ${
+                              validationSeverity()
+                                ? `cell-validation-${validationSeverity()}`
+                                : ''
                             } ${cell()?.valueKind ? `kind-${cell()?.valueKind}` : ''}`.trim()}
                             data-row={row}
                             data-col={col}
@@ -1474,7 +1496,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             data-selected={selected() ? 'true' : 'false'}
                             data-active={active() ? 'true' : 'false'}
                             data-merge-anchor={mergeAnchor() ? 'true' : 'false'}
+                            data-validation-code={cell()?.validation?.code}
+                            data-validation-severity={validationSeverity()}
+                            data-has-conditional-format={
+                              cell()?.conditionalFormat ? 'true' : 'false'
+                            }
                             aria-selected={selected() ? 'true' : 'false'}
+                            title={getCellValidationMessage(cell())}
                             rowSpan={getCellRowSpan(row, col)}
                             colSpan={getCellColSpan(row, col)}
                             style={getCellBoxStyle(row, col)}
@@ -1508,7 +1536,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                 <button type="button" class="spreadsheet-grid-cell-button">
                                   <span
                                     class="cell-display"
-                                    style={getCellFormatStyle(cell()?.format)}
+                                    style={getCellFormatStyle(getDisplayCellFormat(cell()))}
                                   >
                                     {cell()?.displayValue ?? ''}
                                   </span>
