@@ -30,17 +30,18 @@ import type {
 } from '@einfach/spreadsheet-ui-core'
 import { reorderSheetMetadata } from '@einfach/spreadsheet-ui-core'
 
-import type { CellFormatJSON, FormatRangeSnapshot } from '../../src/types'
 import {
   createWorkerWorkbook,
+  type CellFormatJSON,
   type CellSnapshotWire,
   type CellWire,
+  type FormatRangeSnapshot,
   type SparseCellWire,
   type SparseRangeWire,
   type WorkerLike,
   type WorkerWorkbookClient,
   type WorkbookSheetMeta,
-} from '../../src/wasm-workbook-proxy'
+} from './worker-protocol'
 
 export interface WorkerWorkbookBackendSheetInput {
   id?: string

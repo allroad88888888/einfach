@@ -1,9 +1,4 @@
-interface WorkerLike {
-  postMessage(msg: unknown): void
-  addEventListener(type: 'message', listener: (e: MessageEvent) => void): void
-  removeEventListener(type: 'message', listener: (e: MessageEvent) => void): void
-  terminate(): void
-}
+import type { WorkerLike } from './worker-protocol'
 
 export const defaultVNextWorkbookWorkerFactory = (): WorkerLike =>
   new Worker(new URL('../../src/wasm-workbook-worker.ts', import.meta.url), {

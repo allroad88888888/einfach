@@ -4,15 +4,16 @@ import {
   createVisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import type {
+  CellFormatJSON,
   CellRefWire,
   CellSnapshotWire,
   CellWire,
+  FormatRangeSnapshot,
   SparseCellWire,
   SparseRangeWire,
   WorkerWorkbookClient,
   WorkbookSheetMeta,
-} from '../src/wasm-workbook-proxy'
-import type { CellFormatJSON, FormatRangeSnapshot } from '../src/types'
+} from '../src-vnext/adapter'
 import {
   createStaticSpreadsheetBackend,
   createWorkerWorkbookSpreadsheetBackend,

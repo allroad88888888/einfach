@@ -480,6 +480,14 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   `wasm-workbook-worker-factory` 或 `wasm-workbook-proxy` type；demo 改用 vNext adapter
   下的本地 worker factory 和 adapter option 类型推导。真实 Rust worker 文件仍暂时复用
   legacy `src/wasm-workbook-worker.ts`，因为 worker/RPC 迁移需要单独拆大任务。
+- PC-7 准备第六段：worker workbook proxy/protocol 已从 legacy
+  `solid/excel/src/wasm-workbook-proxy.ts` 迁到 vNext adapter 的
+  `solid/excel/src-vnext/adapter/worker-protocol.ts`。legacy 文件现在只 re-export
+  vNext protocol，保留旧 import 路径兼容；`worker-workbook-backend` 也不再 import
+  legacy `src/types` 或 `src/wasm-workbook-proxy`。含 `import.meta.url` 的 worker factory
+  暂不从 public barrel 导出，避免 Node/Jest import `@einfach/solid-excel/vnext` 时解析
+  worker URL 副作用。真实 worker 实现仍在 legacy `src/wasm-workbook-worker.ts`，下一步
+  可单独迁 RPC worker 文件边界。
 
 PC-6 第一段验收记录：
 
@@ -779,6 +787,19 @@ PC-7 准备第四段验收记录：
 PC-7 准备第五段验收记录：
 
 - `rg -n "\\.\\./\\.\\./src|\\.\\./src|from '../../src|from '../src" solid/excel/src-vnext -g '*.ts' -g '*.tsx'`
+- `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
+- `npm run build -w @einfach/solid-excel`
+- `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
+- `git diff --check`
+- MCP Playwright：打开 `http://127.0.0.1:5174/`，切到 `vNext Worker`；验证
+  worker grid 已挂载、table body 仍只有 30 个可视 cell、`Sheet1!C2=13`、
+  `Sheet1!B4=10`、`J20` 未挂载、状态为 `Ready` / `30 cells`、console error 为 0。
+
+PC-7 准备第六段验收记录：
+
+- `rg -n "\\.\\./\\.\\./src|\\.\\./src|from '../../src|from '../src" solid/excel/src-vnext -g '*.ts' -g '*.tsx'`
+- `npx jest solid/excel/test/package-vnext-subpath.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/wasm-workbook-proxy.test.ts --runInBand`
+- `npx jest solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand`
 - `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`
 - `npm run build -w @einfach/solid-excel`
 - `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`
