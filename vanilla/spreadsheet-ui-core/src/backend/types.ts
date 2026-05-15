@@ -6,6 +6,22 @@ import type {
   NamedRangeMutationResult,
   SetNamedRangeRequest,
 } from '../named-ranges/types'
+import type { FillSeriesRequest } from '../auto-fill/types'
+import type {
+  ClearNoteRequest,
+  DeleteCommentRequest,
+  PostCommentRequest,
+  ResolveCommentThreadRequest,
+  SetNoteRequest,
+} from '../comments/types'
+
+export type {
+  ClearNoteRequest,
+  DeleteCommentRequest,
+  PostCommentRequest,
+  ResolveCommentThreadRequest,
+  SetNoteRequest,
+}
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -46,6 +62,8 @@ export interface DisplayCell {
   format?: SpreadsheetCellFormat
   mergedSpan?: MergeSpan
   mergeAnchor?: CellCoord
+  noteIndicator?: boolean
+  commentThreadId?: string
 }
 
 export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
@@ -57,6 +75,17 @@ export type SpreadsheetNumberFormat =
   | { kind: 'currency'; symbol?: string; digits?: number }
   | { kind: 'date'; pattern?: string }
 
+export type SpreadsheetBorderSide = 'top' | 'right' | 'bottom' | 'left'
+
+export type SpreadsheetBorderStyle = 'none' | 'thin' | 'medium' | 'thick' | 'dashed' | 'dotted' | 'double'
+
+export interface SpreadsheetBorderSpec {
+  style: SpreadsheetBorderStyle
+  color?: string
+}
+
+export type SpreadsheetBorders = Partial<Record<SpreadsheetBorderSide, SpreadsheetBorderSpec>>
+
 export interface SpreadsheetCellFormat {
   numberFormat?: SpreadsheetNumberFormat
   bold?: boolean
@@ -65,6 +94,11 @@ export interface SpreadsheetCellFormat {
   fontSize?: number
   fgColor?: string
   bgColor?: string
+  borders?: SpreadsheetBorders
+  underline?: boolean
+  strikethrough?: boolean
+  wrap?: boolean
+  indent?: number
 }
 
 export interface VisibleProjectionRequest extends SheetRef {
@@ -464,6 +498,13 @@ export interface SpreadsheetBackend {
   unhideRows?(request: UnhideRowsRequest): Promise<BackendMutationResult>
   hideColumns?(request: HideColumnsRequest): Promise<BackendMutationResult>
   unhideColumns?(request: UnhideColumnsRequest): Promise<BackendMutationResult>
+  fillSeries?(request: FillSeriesRequest): Promise<BackendMutationResult>
+  // comments & notes
+  setNote?(request: SetNoteRequest): Promise<BackendMutationResult>
+  clearNote?(request: ClearNoteRequest): Promise<BackendMutationResult>
+  postComment?(request: PostCommentRequest): Promise<BackendMutationResult>
+  resolveCommentThread?(request: ResolveCommentThreadRequest): Promise<BackendMutationResult>
+  deleteComment?(request: DeleteCommentRequest): Promise<BackendMutationResult>
 }
 
 export interface ViewportFreezeConfig {

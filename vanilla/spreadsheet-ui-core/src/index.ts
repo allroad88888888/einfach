@@ -1,4 +1,6 @@
+export * from './auto-fill'
 export * from './createSpreadsheetUi'
+export * from './comments'
 export * from './history'
 export * from './backend'
 export * from './clipboard'

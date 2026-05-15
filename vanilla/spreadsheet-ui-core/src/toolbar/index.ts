@@ -70,6 +70,11 @@ export function getToolbarCommandAvailability(
     fillColor: canStyleSelection,
     numberFormat: canFormatSelection,
     alignment: canStyleSelection,
+    underline: canStyleSelection,
+    strikethrough: canStyleSelection,
+    wrap: canStyleSelection,
+    indent: canStyleSelection,
+    border: canStyleSelection,
   }
 }
 
@@ -90,6 +95,17 @@ export function isToolbarFormatCommandAvailable(
       return availability.numberFormat
     case 'alignment':
       return availability.alignment
+    case 'underline':
+      return availability.underline
+    case 'strikethrough':
+      return availability.strikethrough
+    case 'wrap':
+      return availability.wrap
+    case 'indent-increase':
+    case 'indent-decrease':
+      return availability.indent
+    case 'border':
+      return availability.border
     default:
       return false
   }
@@ -210,7 +226,7 @@ export const clearToolbarIntentAtom = atom(
 clearToolbarIntentAtom.debugLabel = 'spreadsheet.toolbar.clearIntent'
 
 export function isToolbarDropdownKind(value: ToolbarActiveSurface['id']): value is ToolbarDropdownKind {
-  return value === 'alignment' || value === 'number-format'
+  return value === 'alignment' || value === 'number-format' || value === 'border'
 }
 
 export function isToolbarPaletteKind(value: ToolbarActiveSurface['id']): value is ToolbarPaletteKind {

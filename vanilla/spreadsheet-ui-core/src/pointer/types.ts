@@ -1,4 +1,5 @@
 import type { CellCoord, CellRange } from '../shared'
+import type { FillSeriesDetectionResult } from '../auto-fill/types'
 
 export type PointerSource =
   | 'pointer'
@@ -126,6 +127,8 @@ export interface PointerFillHandleSession {
   focus: CellCoord | null
   previewRange: CellRange | null
   direction: PointerFillDirection | null
+  copyOnly?: boolean
+  seriesPreview?: FillSeriesDetectionResult | null
 }
 
 export interface PointerRowResizeSession {
@@ -174,6 +177,7 @@ export interface PointerFillHandleCommitIntent {
   targetRange: CellRange
   focus: CellCoord | null
   direction: PointerFillDirection | null
+  copyOnly?: boolean
 }
 
 export interface PointerRowResizeCommitIntent {

@@ -3,8 +3,10 @@ import { join } from 'node:path'
 import { describe, expect, test } from '@jest/globals'
 import {
   clipboardStateAtom,
+  commentSessionAtom,
   diagnosticsAtom,
   editingSessionAtom,
+  fillSeriesLocaleAtom,
   formulaBarStateAtom,
   formulaReferenceSessionAtom,
   historyStackAtom,
@@ -66,6 +68,8 @@ describe('package boundary', () => {
     expect(nameRegistryCacheAtom.debugLabel).toBe('spreadsheet.namedRanges.cache')
     expect(viewportFreezeAtom.debugLabel).toBe('spreadsheet.viewport.freeze')
     expect(viewportHiddenAtom.debugLabel).toBe('spreadsheet.viewport.hidden')
+    expect(commentSessionAtom.debugLabel).toBe('spreadsheet.comments.session')
+    expect(fillSeriesLocaleAtom.debugLabel).toBe('spreadsheet.autoFill.locale')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

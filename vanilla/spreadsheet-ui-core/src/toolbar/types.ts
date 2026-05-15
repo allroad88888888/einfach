@@ -3,7 +3,7 @@ import type { EditingSessionStatus } from '../editing/types'
 
 export type ToolbarSurfaceKind = 'dropdown' | 'palette'
 
-export type ToolbarDropdownKind = 'alignment' | 'number-format'
+export type ToolbarDropdownKind = 'alignment' | 'number-format' | 'border'
 
 export type ToolbarPaletteKind = 'text-color' | 'fill-color'
 
@@ -21,6 +21,12 @@ export type ToolbarFormatCommandKind =
   | 'fill-color'
   | 'number-format'
   | 'alignment'
+  | 'underline'
+  | 'strikethrough'
+  | 'wrap'
+  | 'indent-increase'
+  | 'indent-decrease'
+  | 'border'
 
 export interface ToolbarUiState {
   activeSurface: ToolbarActiveSurface | null
@@ -39,6 +45,11 @@ export interface ToolbarCommandAvailability extends ToolbarAvailabilitySnapshot 
   fillColor: boolean
   numberFormat: boolean
   alignment: boolean
+  underline: boolean
+  strikethrough: boolean
+  wrap: boolean
+  indent: boolean
+  border: boolean
 }
 
 export interface ToolbarSurfaceOpenIntent {

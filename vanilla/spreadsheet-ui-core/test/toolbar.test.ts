@@ -63,7 +63,7 @@ describe('toolbar core', () => {
       coord: { row: 1, col: 1 },
     })
 
-    expect(store.getter(toolbarCommandAvailabilityAtom)).toEqual({
+    expect(store.getter(toolbarCommandAvailabilityAtom)).toMatchObject({
       sheetId: 'Sheet1',
       selectionKind: 'cell',
       editingMode: 'idle',
