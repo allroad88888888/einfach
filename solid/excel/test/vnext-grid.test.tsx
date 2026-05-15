@@ -16,6 +16,7 @@ import type {
 import {
   menuStateAtom,
   selectionAtom,
+  selectionRegionsAtom,
   setSheetTabsSheetsAtom,
   setWorkspaceActiveSheetAtom,
   viewportSizeOverridesAtom,
@@ -271,6 +272,115 @@ describe('vNext SpreadsheetGrid', () => {
       anchor: { row: 1, col: 1 },
       focus: { row: 1, col: 1 },
     })
+  })
+
+  it('renders Ctrl/Cmd-click disjoint cell selections from the core multi-range state', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(9)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!, {
+      ctrlKey: true,
+    })
+
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 0, col: 0 },
+        focus: { row: 0, col: 0 },
+      },
+      {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 2, col: 2 },
+        focus: { row: 2, col: 2 },
+      },
+    ])
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 2 },
+      focus: { row: 2, col: 2 },
+    })
+    expect(container.querySelector('[data-cell-addr="A1"]')?.getAttribute('data-selected')).toBe(
+      'true',
+    )
+    expect(container.querySelector('[data-cell-addr="C3"]')?.getAttribute('data-selected')).toBe(
+      'true',
+    )
+  })
+
+  it('collapses disjoint selections to the primary region on Escape', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 3,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 6,
+      colCount: 6,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(9)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="C3"] .spreadsheet-grid-cell-button')!, {
+      metaKey: true,
+    })
+    expect(store.getter(selectionRegionsAtom)).toHaveLength(2)
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Escape' })
+
+    expect(store.getter(selectionRegionsAtom)).toEqual([
+      {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 2, col: 2 },
+        focus: { row: 2, col: 2 },
+      },
+    ])
+    expect(container.querySelector('[data-cell-addr="A1"]')?.getAttribute('data-selected')).toBe(
+      'false',
+    )
+    expect(container.querySelector('[data-cell-addr="C3"]')?.getAttribute('data-selected')).toBe(
+      'true',
+    )
   })
 
   it('supports row and column header selection without materializing cells', async () => {

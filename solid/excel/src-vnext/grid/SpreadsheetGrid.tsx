@@ -14,6 +14,8 @@ import {
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
+  addSelectionRegionAtom,
+  clearNonPrimaryRegionsAtom,
   openMenuAtom,
   pointerSessionAtom,
   MAX_VIEWPORT_COL_WIDTH,
@@ -21,6 +23,7 @@ import {
   MIN_VIEWPORT_COL_WIDTH,
   MIN_VIEWPORT_ROW_HEIGHT,
   selectionSnapshotAtom,
+  selectionRegionsAtom,
   selectAllAtom,
   selectCellAtom,
   selectColumnsAtom,
@@ -38,6 +41,7 @@ import {
   type CellRange,
   type DisplayCell,
   type PointerFillHandleCommitIntent,
+  type SelectionState,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportSizeOverridesAtom,
@@ -220,6 +224,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function selectionSnapshot() {
     renderTick()
     return store.getter(selectionSnapshotAtom)
+  }
+
+  function selectionRegions() {
+    renderTick()
+    return store.getter(selectionRegionsAtom)
   }
 
   function editingSession() {
@@ -500,23 +509,103 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return getWindowIndexes(window.colStart, window.colEnd)
   }
 
-  function isSelected(row: number, col: number) {
-    const selection = selectionSnapshot()
-    if (selection.selection.sheetId !== props.sheetId) {
-      return false
-    }
-
-    const range = getSelectionRange(selection.selection, {
+  function getSelectionBounds() {
+    return {
       rowCount: props.viewport.rowCount,
       colCount: props.viewport.colCount,
-    })
+    }
+  }
 
-    return (
-      row >= range.rowStart &&
-      row <= range.rowEnd &&
-      col >= range.colStart &&
-      col <= range.colEnd
-    )
+  function getSelectionStateRange(selection: SelectionState): CellRange {
+    return getSelectionRange(selection, getSelectionBounds())
+  }
+
+  function getSelectionRegionsForSheet() {
+    return selectionRegions().filter((selection) => selection.sheetId === props.sheetId)
+  }
+
+  function getSelectionRangeContaining(row: number, col: number): CellRange | null {
+    for (const region of getSelectionRegionsForSheet()) {
+      const range = getSelectionStateRange(region)
+      if (isCoordInRange(row, col, range)) {
+        return range
+      }
+    }
+    return null
+  }
+
+  function isSelected(row: number, col: number) {
+    return getSelectionRangeContaining(row, col) !== null
+  }
+
+  function isRowSelected(row: number) {
+    return getSelectionRegionsForSheet().some((region) => {
+      if (region.kind !== 'row' && region.kind !== 'all') {
+        return false
+      }
+      const range = getSelectionStateRange(region)
+      return row >= range.rowStart && row <= range.rowEnd
+    })
+  }
+
+  function isColumnSelected(col: number) {
+    return getSelectionRegionsForSheet().some((region) => {
+      if (region.kind !== 'column' && region.kind !== 'all') {
+        return false
+      }
+      const range = getSelectionStateRange(region)
+      return col >= range.colStart && col <= range.colEnd
+    })
+  }
+
+  function isAllSelected() {
+    return getSelectionRegionsForSheet().some((region) => region.kind === 'all')
+  }
+
+  function appendCellSelection(row: number, col: number) {
+    store.setter(addSelectionRegionAtom, {
+      region: {
+        kind: 'cell',
+        sheetId: props.sheetId,
+        anchor: { row, col },
+        focus: { row, col },
+      },
+    })
+  }
+
+  function appendRangeSelection(row: number, col: number) {
+    const snapshot = selectionSnapshot()
+    const anchor =
+      snapshot.selection.sheetId === props.sheetId ? snapshot.activeCell : { row, col }
+    store.setter(addSelectionRegionAtom, {
+      region: {
+        kind: 'range',
+        sheetId: props.sheetId,
+        anchor,
+        focus: { row, col },
+      },
+    })
+  }
+
+  function selectCellFromEvent(row: number, col: number, event: MouseEvent) {
+    if (event.ctrlKey || event.metaKey) {
+      if (event.shiftKey) {
+        appendRangeSelection(row, col)
+      } else {
+        appendCellSelection(row, col)
+      }
+      bumpRender()
+      focusGrid()
+      return
+    }
+
+    store.setter(selectCellAtom, {
+      sheetId: props.sheetId,
+      coord: { row, col },
+      extend: event.shiftKey,
+    })
+    bumpRender()
+    focusGrid()
   }
 
   function isActive(row: number, col: number) {
@@ -546,7 +635,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     event: MouseEvent,
     target:
       | { kind: 'cell'; row: number; col: number }
-      | { kind: 'range'; row: number; col: number }
+      | { kind: 'range'; row: number; col: number; range: CellRange }
       | { kind: 'row'; row: number }
       | { kind: 'column'; col: number }
       | { kind: 'all' },
@@ -558,21 +647,6 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         sheetId: props.sheetId,
         coord: { row: target.row, col: target.col },
       })
-    } else if (target.kind === 'range') {
-      const selection = selectionSnapshot()
-      if (
-        selection.selection.sheetId !== props.sheetId ||
-        selection.selection.kind !== 'range' ||
-        target.row < selection.range.rowStart ||
-        target.row > selection.range.rowEnd ||
-        target.col < selection.range.colStart ||
-        target.col > selection.range.colEnd
-      ) {
-        store.setter(selectCellAtom, {
-          sheetId: props.sheetId,
-          coord: { row: target.row, col: target.col },
-        })
-      }
     } else if (target.kind === 'row') {
       store.setter(selectRowsAtom, {
         sheetId: props.sheetId,
@@ -602,7 +676,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             ? {
                 kind: 'range',
                 sheetId: props.sheetId,
-                range: selectionSnapshot().range,
+                range: target.range,
               }
           : target.kind === 'row'
             ? {
@@ -630,17 +704,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     focusGrid()
   }
 
-  function getCellContextTarget(row: number, col: number): { kind: 'cell' | 'range'; row: number; col: number } {
-    const selection = selectionSnapshot()
-    if (
-      selection.selection.sheetId === props.sheetId &&
-      selection.selection.kind === 'range' &&
-      row >= selection.range.rowStart &&
-      row <= selection.range.rowEnd &&
-      col >= selection.range.colStart &&
-      col <= selection.range.colEnd
-    ) {
-      return { kind: 'range', row, col }
+  function getCellContextTarget(
+    row: number,
+    col: number,
+  ): { kind: 'cell'; row: number; col: number } | { kind: 'range'; row: number; col: number; range: CellRange } {
+    const range = getSelectionRangeContaining(row, col)
+    if (range) {
+      return { kind: 'range', row, col, range }
     }
 
     return { kind: 'cell', row, col }
@@ -742,7 +812,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     await loadProjection(requestProjection())
   }
 
-  function selectRow(row: number, extend: boolean) {
+  function selectRow(row: number, extend: boolean, append: boolean) {
+    if (append) {
+      store.setter(addSelectionRegionAtom, {
+        region: {
+          kind: 'row',
+          sheetId: props.sheetId,
+          rowAnchor: row,
+          rowFocus: row,
+        },
+      })
+      bumpRender()
+      focusGrid()
+      return
+    }
+
     const selection = selectionSnapshot().selection
     const rowAnchor =
       extend && selection.sheetId === props.sheetId && selection.kind === 'row'
@@ -758,7 +842,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     focusGrid()
   }
 
-  function selectColumn(col: number, extend: boolean) {
+  function selectColumn(col: number, extend: boolean, append: boolean) {
+    if (append) {
+      store.setter(addSelectionRegionAtom, {
+        region: {
+          kind: 'column',
+          sheetId: props.sheetId,
+          colAnchor: col,
+          colFocus: col,
+        },
+      })
+      bumpRender()
+      focusGrid()
+      return
+    }
+
     const selection = selectionSnapshot().selection
     const colAnchor =
       extend && selection.sheetId === props.sheetId && selection.kind === 'column'
@@ -835,6 +933,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   async function handleGridKeyDown(event: KeyboardEvent) {
     if (event.defaultPrevented) {
+      return
+    }
+
+    if (event.key === 'Escape' && selectionRegions().length > 1) {
+      event.preventDefault()
+      store.setter(clearNonPrimaryRegionsAtom, { keepPrimary: true })
+      bumpRender()
       return
     }
 
@@ -1120,7 +1225,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             <tr>
               <th
                 class="spreadsheet-grid-corner"
-                data-selected={selectionSnapshot().selection.kind === 'all' ? 'true' : 'false'}
+                data-selected={isAllSelected() ? 'true' : 'false'}
                 onClick={() => {
                   store.setter(selectAllAtom, props.sheetId)
                   bumpRender()
@@ -1132,15 +1237,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
               />
               <For each={getCols()}>
                 {(col) => {
-                  const selected = () => {
-                    const snapshot = selectionSnapshot()
-                    return (
-                      snapshot.selection.kind === 'column' &&
-                      snapshot.selection.sheetId === props.sheetId &&
-                      col >= snapshot.range.colStart &&
-                      col <= snapshot.range.colEnd
-                    )
-                  }
+                  const selected = () => isColumnSelected(col)
 
                   return (
                     <th
@@ -1149,7 +1246,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       data-selected={selected() ? 'true' : 'false'}
                       style={getColumnStyle(col)}
                       onClick={(event) => {
-                        selectColumn(col, event.shiftKey)
+                        selectColumn(col, event.shiftKey, event.ctrlKey || event.metaKey)
                       }}
                       onContextMenu={(event) => {
                         openContextMenu(event, { kind: 'column', col })
@@ -1178,25 +1275,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                 <tr class="spreadsheet-grid-row">
                   <th
                     class={`spreadsheet-grid-row-header ${
-                      selectionSnapshot().selection.kind === 'row' &&
-                      selectionSnapshot().selection.sheetId === props.sheetId &&
-                      row >= selectionSnapshot().range.rowStart &&
-                      row <= selectionSnapshot().range.rowEnd
-                        ? 'is-selected'
-                        : ''
+                      isRowSelected(row) ? 'is-selected' : ''
                     }`.trim()}
                     data-row={row}
-                    data-selected={
-                      selectionSnapshot().selection.kind === 'row' &&
-                      selectionSnapshot().selection.sheetId === props.sheetId &&
-                      row >= selectionSnapshot().range.rowStart &&
-                      row <= selectionSnapshot().range.rowEnd
-                        ? 'true'
-                        : 'false'
-                    }
+                    data-selected={isRowSelected(row) ? 'true' : 'false'}
                     style={getRowHeaderStyle(row)}
                     onClick={(event) => {
-                      selectRow(row, event.shiftKey)
+                      selectRow(row, event.shiftKey, event.ctrlKey || event.metaKey)
                     }}
                     onContextMenu={(event) => {
                       openContextMenu(event, { kind: 'row', row })
@@ -1240,16 +1325,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                           aria-selected={selected() ? 'true' : 'false'}
                           style={getCellBoxStyle(row, col)}
                           onClick={(event) => {
-                            store.setter(selectCellAtom, {
-                              sheetId: props.sheetId,
-                              coord: { row, col },
-                              extend: event.shiftKey,
-                            })
-                            bumpRender()
-                            focusGrid()
+                            selectCellFromEvent(row, col, event)
                           }}
                           onMouseDown={(event) => {
-                            if (!event.shiftKey) {
+                            if (!event.shiftKey || event.ctrlKey || event.metaKey) {
                               return
                             }
 
