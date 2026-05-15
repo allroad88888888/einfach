@@ -187,13 +187,11 @@ enum FormulaCache {
 
 struct FormulaRecord {
     expr: Rc<Expr>,
-    /// Point-cell dependencies (`Expr::CellRef`). Narrowed by eval-time
-    /// tracking — branch-skipped `IF` arms drop out of this set, which is
-    /// the intended behavior. `Expr::Range` references are ALSO expanded
-    /// into this set today (via `collect_refs`) so plain `cell_dependents`
-    /// lookup still works for the first dirty pass; the new
-    /// `range_dependents` index makes survival across sparse-eval
-    /// narrowing the load-bearing guarantee.
+    /// Point-cell dependencies (`Expr::CellRef`, plus bounded range cells
+    /// expanded by `collect_refs`). Narrowed by eval-time tracking —
+    /// branch-skipped `IF` arms drop out of this set, which is the intended
+    /// behavior. Durable range identity lives in `range_deps` so sparse
+    /// iteration cannot collapse a range to "visited cells only".
     deps: RefCell<HashSet<CellAddress>>,
     /// Range dependencies (`Expr::Range`), stored as ranges rather than
     /// expanded cells. Populated at `set_formula` time from
@@ -806,9 +804,9 @@ impl Sheet {
     /// must survive sparse-eval narrowing. Otherwise a write to a
     /// previously-empty cell inside the range would miss dirty
     /// propagation (P0 from `PHASE1_PARALLEL.md` § Track A). The
-    /// follow-up dirty-propagation commit consults `range_dependents`
-    /// in addition to `cell_dependents` on each cell write so the
-    /// surviving range entries are honored.
+    /// Dirty propagation consults `range_dependents` in addition to
+    /// `cell_dependents` on each cell write so the surviving range entries
+    /// are honored.
     fn replace_formula_deps(
         &self,
         formula_addr: CellAddress,
