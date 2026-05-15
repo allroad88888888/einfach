@@ -16,7 +16,8 @@
     "eslint": "npx eslint --config rules/.eslintrc --ext=.tsx,.ts --ignore-path ./rules/.eslintignore ./ --fix ",
     "test": "jest --collect-coverage",
     "clearTypes": "node clean.js",
-    "build": "npm run clearTypes&&tsc -build&&npx rollup -c ./rollup.config.mjs",
+    "ensureWasm": "test -f solid/excel/wasm-pkg/einfach_wasm.js || npm run build:wasm -w @einfach/solid-excel",
+    "build": "npm run clearTypes&&npm run ensureWasm&&tsc -build&&npx rollup -c ./rollup.config.mjs",
     "prepare": "husky"
   },
   "keywords": [],
