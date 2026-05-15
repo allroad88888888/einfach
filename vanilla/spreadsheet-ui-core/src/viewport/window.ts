@@ -135,6 +135,10 @@ export function normalizeViewportMetrics(metrics: ViewportMetrics): ViewportMetr
   }
 }
 
+// getVisibleWindow returns the unhidden window math. Callers that
+// need hidden-aware visible windows should use
+// getVisibleWindowWithHidden together with getHiddenRowsForSheet /
+// getHiddenColumnsForSheet.
 export function getVisibleWindow(metrics: ViewportMetrics): VisibleWindow {
   const normalizedMetrics = normalizeViewportMetrics(metrics)
   const rowHeight = normalizedMetrics.rowHeight
@@ -173,6 +177,58 @@ export function getVisibleWindow(metrics: ViewportMetrics): VisibleWindow {
     colStart,
     colEnd,
   }
+}
+
+/** Returns the count of indices in [start, end] that are NOT in hidden (assumed sorted). */
+export function countVisibleIndices(start: number, end: number, hidden: number[]): number {
+  if (start > end) return 0
+  let hiddenCount = 0
+  for (const h of hidden) {
+    if (h < start) continue
+    if (h > end) break
+    hiddenCount++
+  }
+  return end - start + 1 - hiddenCount
+}
+
+/**
+ * Like getVisibleWindow but inflates rowEnd / colEnd to account for hidden rows/cols,
+ * so the window always contains the same number of *visible* indices as the unhidden
+ * window span (base.rowEnd - base.rowStart + 1) would have if no rows were hidden.
+ */
+export function getVisibleWindowWithHidden(
+  metrics: ViewportMetrics,
+  hidden: { rows: number[]; cols: number[] },
+): VisibleWindow {
+  const base = getVisibleWindow(metrics)
+  const m = normalizeViewportMetrics(metrics)
+
+  if (m.rowCount === 0 || m.colCount === 0) return base
+
+  // Target: how many visible rows/cols should the inflated window contain —
+  // same as the unhidden span (base already factors in clamp/overscan).
+  const targetRows = base.rowEnd - base.rowStart + 1
+  const targetCols = base.colEnd - base.colStart + 1
+
+  // Inflate rowEnd: walk from rowStart forward, counting visible (non-hidden)
+  // indices until we've seen targetRows visible ones or hit the last row.
+  let rowEnd = base.rowStart - 1
+  let seenRows = 0
+  for (let r = base.rowStart; r < m.rowCount && seenRows < targetRows; r++) {
+    rowEnd = r
+    if (!hidden.rows.includes(r)) seenRows++
+  }
+  if (rowEnd < base.rowStart) rowEnd = Math.min(base.rowStart, m.rowCount - 1)
+
+  let colEnd = base.colStart - 1
+  let seenCols = 0
+  for (let c = base.colStart; c < m.colCount && seenCols < targetCols; c++) {
+    colEnd = c
+    if (!hidden.cols.includes(c)) seenCols++
+  }
+  if (colEnd < base.colStart) colEnd = Math.min(base.colStart, m.colCount - 1)
+
+  return { rowStart: base.rowStart, rowEnd, colStart: base.colStart, colEnd }
 }
 
 export function isCellInVisibleWindow(coord: CellCoord, visibleWindow: VisibleWindow): boolean {

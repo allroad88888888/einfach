@@ -7,6 +7,7 @@ import {
   closeFilterDropdownAtom,
   filterDropdownAtom,
   filterSortStateAtom,
+  notifyActiveSheetChangedAtom,
   openFilterDropdownAtom,
   setFilterSortAtom,
 } from '../src'
@@ -132,6 +133,36 @@ describe('closeFilterDropdownAtom', () => {
     store.setter(openFilterDropdownAtom, { sheetId: 'X', colIndex: 0 })
     store.setter(closeFilterDropdownAtom)
     expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
+  })
+})
+
+describe('notifyActiveSheetChangedAtom', () => {
+  test('dropdown already closed — stays closed after sheet switch', () => {
+    const store = makeStore()
+    store.setter(notifyActiveSheetChangedAtom, 'B')
+    expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
+  })
+
+  test('dropdown open on sheet A — closes when switching to sheet B', () => {
+    const store = makeStore()
+    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 2 })
+    store.setter(notifyActiveSheetChangedAtom, 'B')
+    expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
+  })
+
+  test('dropdown open on sheet A — stays open when notified with same sheet A', () => {
+    const store = makeStore()
+    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 2 })
+    store.setter(notifyActiveSheetChangedAtom, 'A')
+    expect(store.getter(filterDropdownAtom)).toEqual({ status: 'open', sheetId: 'A', colIndex: 2 })
+  })
+
+  test('filterSortStateAtom is untouched by sheet switch notification', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, { sheetId: 'A', state: emptyState })
+    store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 0 })
+    store.setter(notifyActiveSheetChangedAtom, 'B')
+    expect(store.getter(filterSortStateAtom)['A']).toEqual(emptyState)
   })
 })
 

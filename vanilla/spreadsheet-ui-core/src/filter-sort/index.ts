@@ -65,3 +65,17 @@ export const closeFilterDropdownAtom = atom(
   },
 )
 closeFilterDropdownAtom.debugLabel = 'spreadsheet.filterSort.closeDropdown'
+
+// Host adapter calls this when the workspace active sheet changes so
+// an open dropdown for a now-background sheet closes cleanly.
+// filterSortStateAtom is unaffected (per-sheet state persists).
+export const notifyActiveSheetChangedAtom = atom(
+  (get) => get(filterDropdownAtom),
+  (get, set, nextSheetId: string | null) => {
+    const dropdown = get(filterDropdownAtom)
+    if (dropdown.status === 'open' && dropdown.sheetId !== nextSheetId) {
+      set(filterDropdownAtom, { status: 'closed' })
+    }
+  },
+)
+notifyActiveSheetChangedAtom.debugLabel = 'spreadsheet.filterSort.notifyActiveSheet'
