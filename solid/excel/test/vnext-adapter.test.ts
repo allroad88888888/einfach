@@ -13,11 +13,13 @@ import type {
   ImportCellWire,
   SparseCellWire,
   SparseRangeWire,
+  WorkerLike,
   WorkerWorkbookClient,
   WorkbookImportStatsWire,
   WorkbookSheetMeta,
 } from '../src-vnext/adapter'
 import {
+  createWorkerWorkbook,
   createStaticSpreadsheetBackend,
   createWorkerWorkbookSpreadsheetBackend,
   matrixToDisplayCells,
@@ -50,6 +52,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     commitImport: number[]
     cancelImport: number[]
     exportRangeTsv: SparseRangeWire[]
+    consumeExportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     exportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     snapshotRangeSparseChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     addSheet: string[]
@@ -59,6 +62,46 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
+}
+
+type FakeProtocolWorker = WorkerLike & {
+  sent: unknown[]
+  emit(msg: unknown): void
+}
+
+function createFakeProtocolWorker(): FakeProtocolWorker {
+  const listeners = new Set<(e: MessageEvent) => void>()
+  return {
+    sent: [],
+    postMessage(msg) {
+      this.sent.push(msg)
+    },
+    addEventListener(_type, listener) {
+      listeners.add(listener)
+    },
+    removeEventListener(_type, listener) {
+      listeners.delete(listener)
+    },
+    terminate() {
+      listeners.clear()
+    },
+    emit(msg) {
+      const event = { data: msg } as MessageEvent
+      for (const listener of listeners) listener(event)
+    },
+  }
+}
+
+function lastProtocolMessage(worker: FakeProtocolWorker) {
+  return worker.sent[worker.sent.length - 1] as {
+    id: number
+    cmd: string
+    [key: string]: unknown
+  }
+}
+
+function resolveProtocolMessage(worker: FakeProtocolWorker, result: unknown) {
+  worker.emit({ id: lastProtocolMessage(worker).id, ok: true, result })
 }
 
 function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
@@ -91,6 +134,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     commitImport: [],
     cancelImport: [],
     exportRangeTsv: [],
+    consumeExportRangeTsvChunks: [],
     exportRangeTsvChunks: [],
     snapshotRangeSparseChunks: [],
     addSheet: [],
@@ -584,6 +628,23 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async cancelExport() {
       throw new Error('not used')
     },
+    async consumeExportRangeTsvChunks(range, onChunk, rowsPerChunk = 2048) {
+      calls.consumeExportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      await onChunk({
+        sessionId: 1,
+        startRow: range.startRow,
+        endRow: range.startRow,
+        chunk: 'chunk-1',
+        done: false,
+      })
+      await onChunk({
+        sessionId: 1,
+        startRow: range.startRow + 1,
+        endRow: range.startRow + 1,
+        chunk: 'chunk-2',
+        done: true,
+      })
+    },
     async exportRangeTsvChunks(range, rowsPerChunk = 2048) {
       calls.exportRangeTsvChunks.push({ ...range, rowsPerChunk })
       return ['chunk-1', 'chunk-2']
@@ -628,6 +689,68 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
 }
 
 describe('vnext adapter', () => {
+  it('consumes worker protocol TSV chunks without returning an aggregate array', async () => {
+    const worker = createFakeProtocolWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => worker })
+    const range = { sheet: 0, startRow: 0, startCol: 0, endRow: 2, endCol: 1 }
+    const chunks: string[] = []
+
+    const consumed = workbook.consumeExportRangeTsvChunks!(
+      range,
+      (chunk) => {
+        chunks.push(chunk.chunk)
+      },
+      0,
+    )
+
+    expect(lastProtocolMessage(worker)).toEqual({
+      id: 1,
+      cmd: 'beginExportRangeTsv',
+      range,
+      rowsPerChunk: 1,
+    })
+    resolveProtocolMessage(worker, { sessionId: 7, totalRows: 3, rowsPerChunk: 1 })
+    await Promise.resolve()
+
+    expect(lastProtocolMessage(worker)).toEqual({
+      id: 2,
+      cmd: 'nextExportRangeTsvChunk',
+      sessionId: 7,
+    })
+    resolveProtocolMessage(worker, {
+      sessionId: 7,
+      startRow: 0,
+      endRow: 0,
+      chunk: 'A\tB',
+      done: false,
+    })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(lastProtocolMessage(worker)).toEqual({
+      id: 3,
+      cmd: 'nextExportRangeTsvChunk',
+      sessionId: 7,
+    })
+    resolveProtocolMessage(worker, {
+      sessionId: 7,
+      startRow: 1,
+      endRow: 2,
+      chunk: 'C\tD\nE\tF',
+      done: true,
+    })
+
+    await expect(consumed).resolves.toBeUndefined()
+    expect(chunks).toEqual(['A\tB', 'C\tD\nE\tF'])
+    expect(worker.sent).toEqual([
+      { id: 1, cmd: 'beginExportRangeTsv', range, rowsPerChunk: 1 },
+      { id: 2, cmd: 'nextExportRangeTsvChunk', sessionId: 7 },
+      { id: 3, cmd: 'nextExportRangeTsvChunk', sessionId: 7 },
+    ])
+
+    workbook.dispose()
+  })
+
   it('converts matrix seeds into bounded visible-window results', () => {
     const request = createVisibleProjectionRequest({
       sheetId: 'sheet-1',
@@ -1297,7 +1420,7 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
-  it('exports TSV through worker workbook chunk export before falling back to plain export', async () => {
+  it('exports TSV through worker workbook chunk consumer before falling back to plain export', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -1306,9 +1429,22 @@ describe('vnext adapter', () => {
     })
 
     await backend.ready()
-    client.exportRangeTsvChunks = async (range, rowsPerChunk) => {
-      client.calls.exportRangeTsvChunks.push({ ...range, rowsPerChunk })
-      return ['A\tB', 'C\tD']
+    client.consumeExportRangeTsvChunks = async (range, onChunk, rowsPerChunk) => {
+      client.calls.consumeExportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      await onChunk({
+        sessionId: 1,
+        startRow: 1,
+        endRow: 1,
+        chunk: 'A\tB',
+        done: false,
+      })
+      await onChunk({
+        sessionId: 1,
+        startRow: 2,
+        endRow: 2,
+        chunk: 'C\tD',
+        done: true,
+      })
     }
 
     const result = await backend.exportRangeTsv?.({
@@ -1330,13 +1466,75 @@ describe('vnext adapter', () => {
       text: 'A\tB\nC\tD',
       estimatedBytes: 7,
     })
-    expect(client.calls.exportRangeTsvChunks).toEqual([
+    expect(client.calls.consumeExportRangeTsvChunks).toEqual([
       { sheet: 0, startRow: 1, startCol: 1, endRow: 2, endCol: 2, rowsPerChunk: 2 },
     ])
+    expect(client.calls.exportRangeTsvChunks).toEqual([])
     expect(client.calls.exportRangeTsv).toEqual([])
     expect(client.calls.readSparseRange).toEqual([])
     expect(client.calls.snapshotRangeSparse).toEqual([])
     expect(client.calls.snapshotFormatRange).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('streams TSV through worker workbook backend without aggregate chunk export', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+    const chunks: string[] = []
+
+    await backend.ready()
+    client.consumeExportRangeTsvChunks = async (range, onChunk, rowsPerChunk) => {
+      client.calls.consumeExportRangeTsvChunks.push({ ...range, rowsPerChunk })
+      await onChunk({
+        sessionId: 1,
+        startRow: 1,
+        endRow: 1,
+        chunk: 'A\tB',
+        done: false,
+      })
+      await onChunk({
+        sessionId: 1,
+        startRow: 2,
+        endRow: 2,
+        chunk: 'C\tD',
+        done: true,
+      })
+    }
+
+    const result = await backend.consumeExportRangeTsvChunks?.(
+      {
+        kind: 'export-range-tsv',
+        sheetId: 'sheet-1',
+        requestId: 20,
+        revision: 11,
+        rowsPerChunk: 2,
+        range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      },
+      (chunk) => {
+        chunks.push(chunk.text)
+      },
+    )
+
+    expect(result).toEqual({
+      kind: 'range-tsv-chunks',
+      sheetId: 'sheet-1',
+      requestId: 20,
+      revision: 11,
+      range: { rowStart: 1, rowEnd: 2, colStart: 1, colEnd: 2 },
+      originAddr: 'B2',
+      estimatedBytes: 7,
+    })
+    expect(chunks).toEqual(['A\tB', 'C\tD'])
+    expect(client.calls.consumeExportRangeTsvChunks).toEqual([
+      { sheet: 0, startRow: 1, startCol: 1, endRow: 2, endCol: 2, rowsPerChunk: 2 },
+    ])
+    expect(client.calls.exportRangeTsvChunks).toEqual([])
+    expect(client.calls.exportRangeTsv).toEqual([])
 
     backend.dispose()
   })
@@ -1597,6 +1795,8 @@ describe('vnext adapter', () => {
     })
 
     await backend.ready()
+    client.consumeExportRangeTsvChunks =
+      undefined as unknown as WorkerWorkbookClient['consumeExportRangeTsvChunks']
     client.exportRangeTsvChunks =
       undefined as unknown as WorkerWorkbookClient['exportRangeTsvChunks']
     client.exportRangeTsv = async (range) => {
@@ -1624,6 +1824,7 @@ describe('vnext adapter', () => {
     expect(client.calls.exportRangeTsv).toEqual([
       { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
     ])
+    expect(client.calls.consumeExportRangeTsvChunks).toEqual([])
     expect(client.calls.exportRangeTsvChunks).toEqual([])
     expect(client.calls.readSparseRange).toEqual([])
     expect(client.calls.snapshotRangeSparse).toEqual([])

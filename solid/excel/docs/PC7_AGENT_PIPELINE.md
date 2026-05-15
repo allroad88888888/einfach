@@ -270,10 +270,13 @@ W6、W7 是 package cutover 和发布门禁。
   `npx jest solid/excel/test/wasm-workbook-worker.test.ts solid/excel/test/wasm-workbook-proxy.test.ts solid/excel/test/vnext-adapter.test.ts solid/excel/test/worker-workbook-store.test.ts --runInBand`；
   `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`；
   `npm run build -w @einfach/solid-excel`。
-- 剩余风险：浏览器 `navigator.clipboard.readText()` 仍一次性给字符串；direct mode 已避免
-  JS staging/finalWrites 聚合，但牺牲 atomic rollback；如果后续需要强原子大导入，需要 Rust 侧
-  transaction/rollback journal；range export helper 仍有字符串聚合 convenience API，大复制/导出
-  路径还要继续去聚合化。
+- 后续 range export 追加记录：worker client/backend 已新增 callback 型
+  `consumeExportRangeTsvChunks`，大范围 copy/cut 优先按 chunk 消费 worker export session；
+  旧 `exportRangeTsvChunks` 和 `exportRangeTsv` 保留为兼容 convenience API。
+- 剩余风险：浏览器 `navigator.clipboard.readText()` / `writeText()` 仍一次性给字符串；direct
+  mode 已避免 JS staging/finalWrites 聚合，但牺牲 atomic rollback；如果后续需要强原子大导入，
+  需要 Rust 侧 transaction/rollback journal。大范围复制现在只在 UI clipboard 写入边界拼接
+  TSV 字符串，中间层不再要求 `string[]` 聚合。
 
 ## W6：package cutover readiness
 
@@ -292,6 +295,17 @@ W6、W7 是 package cutover 和发布门禁。
 - package root、`/vnext`、legacy 入口都有 import tests。
 - public barrel 不导出 demo，不导出会触发 worker URL 副作用的 factory。
 - `npm run build -w @einfach/solid-excel`、package tests、核心 e2e 通过。
+
+Package API agent 最小状态记录：
+
+- 本轮不做破坏性 root cutover：`@einfach/solid-excel` 继续指向 legacy
+  `src/index.tsx`，`@einfach/solid-excel/vnext` 继续指向 vNext public barrel。
+- 已新增 `@einfach/solid-excel/legacy` 显式兼容入口，指向当前 legacy public surface，
+  供后续 root 切换前后的消费侧迁移和回归测试使用。
+- root / legacy public barrel 已移除 demo/App 导出，避免普通 package import 触达 demo
+  worker factory / `import.meta.url` 图；demo 统一走显式 `@einfach/solid-excel/demos` 子入口。
+- package import 测试覆盖 root、`/vnext`、`/legacy`、`/demos`、`/package.json`，并验证 public
+  barrel 不暴露 demo 或默认 worker URL factory。
 
 ## W7：发布级回归门禁
 

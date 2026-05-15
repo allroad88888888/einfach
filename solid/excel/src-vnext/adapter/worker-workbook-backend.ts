@@ -10,6 +10,8 @@ import type {
   InsertRowsRequest,
   ImportCellsRequest,
   ProjectionRevision,
+  RangeTsvChunkConsumer,
+  RangeTsvChunkExportResult,
   RangeProjectionRequest,
   RangeProjectionResult,
   RangeTsvExportRequest,
@@ -655,27 +657,67 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
-  async function exportRangeTsv(request: RangeTsvExportRequest): Promise<RangeTsvExportResult> {
+  async function consumeExportRangeTsvChunks(
+    request: RangeTsvExportRequest,
+    onChunk: RangeTsvChunkConsumer,
+  ): Promise<RangeTsvChunkExportResult> {
     const sheet = await resolveSheet(request.sheetId)
     const sparseRange = toSparseRange(sheet.idx, request.range)
-    let text = ''
+    let chunkCount = 0
+    let estimatedBytes = 0
 
-    if (typeof client.exportRangeTsvChunks === 'function') {
-      const chunks = await client.exportRangeTsvChunks(sparseRange, request.rowsPerChunk)
-      text = chunks.join('\n')
+    if (typeof client.consumeExportRangeTsvChunks === 'function') {
+      await client.consumeExportRangeTsvChunks(
+        sparseRange,
+        async (chunk) => {
+          if (chunkCount > 0) estimatedBytes += 1
+          estimatedBytes += estimateUtf8Bytes(chunk.chunk)
+          chunkCount += 1
+          await onChunk({
+            startRow: chunk.startRow,
+            endRow: chunk.endRow,
+            text: chunk.chunk,
+          })
+        },
+        request.rowsPerChunk,
+      )
     } else {
-      text = await client.exportRangeTsv(sparseRange)
+      const text = await client.exportRangeTsv(sparseRange)
+      estimatedBytes = estimateUtf8Bytes(text)
+      await onChunk({
+        startRow: request.range.rowStart,
+        endRow: request.range.rowEnd,
+        text,
+      })
     }
 
     return {
-      kind: 'range-tsv',
+      kind: 'range-tsv-chunks',
       sheetId: request.sheetId,
       requestId: request.requestId,
       revision: request.revision ?? revision,
       range: { ...request.range },
       originAddr: toA1(request.range.rowStart, request.range.colStart),
+      estimatedBytes,
+    }
+  }
+
+  async function exportRangeTsv(request: RangeTsvExportRequest): Promise<RangeTsvExportResult> {
+    const chunks: string[] = []
+    const result = await consumeExportRangeTsvChunks(request, (chunk) => {
+      chunks.push(chunk.text)
+    })
+    const text = chunks.join('\n')
+
+    return {
+      kind: 'range-tsv',
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: result.revision,
+      range: result.range,
+      originAddr: result.originAddr,
       text,
-      estimatedBytes: estimateUtf8Bytes(text),
+      estimatedBytes: result.estimatedBytes ?? estimateUtf8Bytes(text),
     }
   }
 
@@ -818,6 +860,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     async exportRangeTsv(request: RangeTsvExportRequest): Promise<RangeTsvExportResult> {
       return exportRangeTsv(request)
+    },
+
+    async consumeExportRangeTsvChunks(
+      request: RangeTsvExportRequest,
+      onChunk: RangeTsvChunkConsumer,
+    ): Promise<RangeTsvChunkExportResult> {
+      return consumeExportRangeTsvChunks(request, onChunk)
     },
 
     async readViewportSizeProjection(

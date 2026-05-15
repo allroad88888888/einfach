@@ -13,6 +13,7 @@ import type {
   InsertColumnsRequest,
   InsertRowsRequest,
   RangeProjectionRequest,
+  RangeTsvChunkExportResult,
   RangeTsvExportRequest,
   RangeTsvExportResult,
   SetCellInputRequest,
@@ -75,6 +76,7 @@ function createFakeBackend() {
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const readRangeRequests: RangeProjectionRequest[] = []
   const exportRangeTsvRequests: RangeTsvExportRequest[] = []
+  const consumeExportRangeTsvChunksRequests: RangeTsvExportRequest[] = []
   const rangeCells = [
     { row: 0, col: 0, displayValue: 'A1' },
     { row: 0, col: 1, displayValue: '2', formula: '=A1+1' },
@@ -120,6 +122,23 @@ function createFakeBackend() {
         revision: request.revision,
         originAddr: 'A1',
         text: '1\t2',
+        estimatedBytes: 3,
+      }
+    },
+    async consumeExportRangeTsvChunks(request, onChunk): Promise<RangeTsvChunkExportResult> {
+      consumeExportRangeTsvChunksRequests.push(request)
+      await onChunk({
+        startRow: request.range.rowStart,
+        endRow: request.range.rowEnd,
+        text: '1\t2',
+      })
+      return {
+        kind: 'range-tsv-chunks',
+        sheetId: request.sheetId,
+        range: request.range,
+        requestId: request.requestId,
+        revision: request.revision,
+        originAddr: 'A1',
         estimatedBytes: 3,
       }
     },
@@ -215,6 +234,7 @@ function createFakeBackend() {
     readVisibleRequests,
     readRangeRequests,
     exportRangeTsvRequests,
+    consumeExportRangeTsvChunksRequests,
   }
 }
 
@@ -478,10 +498,15 @@ describe('vNext SpreadsheetContextMenu', () => {
     await waitFor(() => expect(store.getter(menuStateAtom).status).toBe('closed'))
   })
 
-  it('copies oversized range targets through backend TSV export without reading cells', async () => {
+  it('copies oversized range targets through backend TSV chunk consumption', async () => {
     const clipboard = installClipboard()
     const store = createStore()
-    const { backend, readRangeRequests, exportRangeTsvRequests } = createFakeBackend()
+    const {
+      backend,
+      readRangeRequests,
+      exportRangeTsvRequests,
+      consumeExportRangeTsvChunksRequests,
+    } = createFakeBackend()
     const range = { rowStart: 0, rowEnd: 100, colStart: 0, colEnd: 99 }
 
     store.setter(openMenuAtom, {
@@ -504,7 +529,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     fireEvent.click(getByTestId('context-menu-command-clipboard.copy'))
 
     await waitFor(() => expect(clipboard.writeText).toHaveBeenCalledTimes(1))
-    expect(exportRangeTsvRequests).toEqual([
+    expect(consumeExportRangeTsvChunksRequests).toEqual([
       {
         kind: 'export-range-tsv',
         sheetId: 'sheet-1',
@@ -512,6 +537,7 @@ describe('vNext SpreadsheetContextMenu', () => {
         requestId: 1,
       },
     ])
+    expect(exportRangeTsvRequests).toEqual([])
     expect(readRangeRequests).toEqual([])
     expect(clipboard.getText()).toBe('# einfach-clipboard-origin: A1\n1\t2')
     expect(store.getter(clipboardStateAtom)).toMatchObject({
@@ -532,6 +558,7 @@ describe('vNext SpreadsheetContextMenu', () => {
     const range = { rowStart: 0, rowEnd: 100, colStart: 0, colEnd: 99 }
 
     delete backend.exportRangeTsv
+    delete backend.consumeExportRangeTsvChunks
 
     store.setter(openMenuAtom, {
       surface: 'cell',

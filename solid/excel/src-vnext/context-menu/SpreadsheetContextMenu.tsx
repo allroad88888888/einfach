@@ -23,6 +23,7 @@ import {
   type MenuTarget,
   type MenuTargetKind,
   type RangeProjectionResult,
+  type RangeTsvChunkExportResult,
   type RangeTsvExportResult,
   type SpreadsheetError,
 } from '@einfach/spreadsheet-ui-core'
@@ -249,10 +250,23 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     return backend.readRangeProjection(request)
   }
 
-  async function exportClipboardSource(
+  async function consumeClipboardSource(
     sheetId: string,
     range: CellRange,
-  ): Promise<RangeTsvExportResult | null> {
+    onChunk: (chunk: string) => void | Promise<void>,
+  ): Promise<RangeTsvChunkExportResult | RangeTsvExportResult | null> {
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    const request = {
+      kind: 'export-range-tsv' as const,
+      sheetId,
+      range,
+      requestId,
+    }
+
+    if (backend.consumeExportRangeTsvChunks) {
+      return backend.consumeExportRangeTsvChunks(request, (chunk) => onChunk(chunk.text))
+    }
+
     if (!backend.exportRangeTsv) {
       const cellCount = rangeCellCount(range)
       store.setter(
@@ -264,13 +278,9 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       return null
     }
 
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    return backend.exportRangeTsv({
-      kind: 'export-range-tsv',
-      sheetId,
-      range,
-      requestId,
-    })
+    const result = await backend.exportRangeTsv(request)
+    await onChunk(result.text)
+    return result
   }
 
   async function copyRangeToClipboard(
@@ -282,10 +292,13 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     let text: string
     let transferInput: ClipboardTransferInput
     if (cellCount > CLIPBOARD_CELL_LIMIT) {
-      const result = await exportClipboardSource(sheetId, range)
+      const clipboardChunks: string[] = []
+      const result = await consumeClipboardSource(sheetId, range, (chunk) => {
+        clipboardChunks.push(chunk)
+      })
       if (!result) return false
 
-      text = addClipboardOriginMarker(result.text, result.originAddr)
+      text = addClipboardOriginMarker(clipboardChunks.join('\n'), result.originAddr)
       const plan = createClipboardTsvPastePlan({
         text,
         fallbackOriginAddr: result.originAddr,

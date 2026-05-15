@@ -103,6 +103,25 @@ export interface RangeTsvExportResult extends SheetRef {
   estimatedBytes?: number
 }
 
+export interface RangeTsvExportChunk {
+  startRow: number
+  endRow: number
+  text: string
+}
+
+export type RangeTsvChunkConsumer = (
+  chunk: RangeTsvExportChunk,
+) => void | Promise<void>
+
+export interface RangeTsvChunkExportResult extends SheetRef {
+  kind: 'range-tsv-chunks'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  originAddr: string
+  estimatedBytes?: number
+}
+
 export interface SetCellInputRequest extends SheetRef {
   kind: 'set-cell-input'
   row: number
@@ -321,6 +340,10 @@ export interface SpreadsheetBackend {
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
   exportRangeTsv?(request: RangeTsvExportRequest): Promise<RangeTsvExportResult>
+  consumeExportRangeTsvChunks?(
+    request: RangeTsvExportRequest,
+    onChunk: RangeTsvChunkConsumer,
+  ): Promise<RangeTsvChunkExportResult>
   readViewportSizeProjection?(
     request: ViewportSizeProjectionRequest,
   ): Promise<ViewportSizeProjectionResult>

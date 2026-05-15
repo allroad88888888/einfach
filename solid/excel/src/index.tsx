@@ -8,12 +8,6 @@ export {
   createWorkerWorkbookStore,
   createThreeSheetChainWorkbookStore,
 } from './wasm-workbook-store'
-export { App } from './App'
-export { DemoBlank } from './demos/DemoBlank'
-export { DemoFormulas } from './demos/DemoFormulas'
-export { DemoBudget } from './demos/DemoBudget'
-export { DemoGrades } from './demos/DemoGrades'
-export { DemoSales } from './demos/DemoSales'
 export * as vNext from '../src-vnext/public'
 export type { ISheet, CellValue } from './types'
 export type { SheetStore } from './sheet-store'
