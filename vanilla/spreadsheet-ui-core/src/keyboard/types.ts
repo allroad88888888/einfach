@@ -64,8 +64,11 @@ export interface HistoryIntent {
   type: 'history.undo' | 'history.redo'
 }
 
+export type ClearCellsTarget = 'values' | 'formats' | 'all'
+
 export interface ClearCellsIntent {
   type: 'cell.clear'
+  target: ClearCellsTarget
 }
 
 export interface NoneKeyboardIntent {

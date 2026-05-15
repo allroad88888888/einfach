@@ -107,6 +107,7 @@ export function getKeyboardCommandIntent(
   if (input.key === 'Delete' || input.key === 'Backspace') {
     return {
       type: 'cell.clear',
+      target: input.ctrlKey || input.metaKey ? 'all' : 'values',
     }
   }
 

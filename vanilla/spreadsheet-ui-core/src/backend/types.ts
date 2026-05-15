@@ -159,9 +159,13 @@ export interface ImportCellChunksRequest extends SheetRef {
   cellsPerChunk?: number
 }
 
+export type ClearRangeTarget = 'values' | 'formats' | 'all'
+
 export interface ClearRangeRequest extends SheetRef {
   kind: 'clear-range'
   range: CellRange
+  /** Defaults to 'all' when omitted. */
+  target?: ClearRangeTarget
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
