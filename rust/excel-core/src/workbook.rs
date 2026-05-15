@@ -1217,7 +1217,7 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
 
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
         let Some(idx) = self.wb.by_name.get(sheet).copied() else {
-            return Value::Null;
+            return Value::Error(ValueError::InvalidRef);
         };
         self.with_current(idx, || {
             self.wb.sheets[idx].peek_value_with_provider(addr, self)

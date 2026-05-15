@@ -286,6 +286,16 @@ fn stream_range(
 /// provider actually visits get populated. For sparse providers this
 /// skips visiting empty cells; for dense ones every cell is visited and
 /// behavior matches the pre-streaming implementation.
+/// Excel maximum dimensions. Full-column (`A:A`) and full-row (`1:1`)
+/// ranges use `u32::MAX` as a sentinel on the unbounded axis. Allocating
+/// a grid of that size would overflow in debug builds and attempt a
+/// multi-billion-cell allocation in release. We reject such ranges with
+/// `#REF!` before any allocation; callers that need streaming over
+/// unbounded ranges should use `for_each_arg_value` / `for_each_range_cell`
+/// instead of `collect_range_2d`.
+const EXCEL_MAX_ROWS: u32 = 1_048_576;
+const EXCEL_MAX_COLS: u32 = 16_384;
+
 fn collect_range_2d(
     start: &CellAddress,
     end: &CellAddress,
@@ -295,6 +305,13 @@ fn collect_range_2d(
     let max_row = start.row.max(end.row);
     let min_col = start.col.min(end.col);
     let max_col = start.col.max(end.col);
+    // Guard against unbounded sentinel coordinates (u32::MAX on either axis
+    // produced by full-column `A:A` or full-row `1:1` range syntax). Such
+    // ranges cannot be materialised as a 2D grid; return an empty sentinel
+    // that lookup_2d will turn into #REF!.
+    if max_row > EXCEL_MAX_ROWS || max_col > EXCEL_MAX_COLS {
+        return vec![];
+    }
     let rows = (max_row - min_row + 1) as usize;
     let cols = (max_col - min_col + 1) as usize;
     let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
@@ -381,10 +398,54 @@ fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-fn arg_as_range<'a>(arg: &'a Expr) -> Option<(&'a CellAddress, &'a CellAddress)> {
+/// Extract the start/end addresses and optional sheet name from a range
+/// argument. Handles both `Expr::Range` (same-sheet) and `Expr::SheetRange`
+/// (cross-sheet) so that VLOOKUP / HLOOKUP / INDEX can accept either form.
+fn arg_as_range<'a>(arg: &'a Expr) -> Option<(Option<&'a str>, &'a CellAddress, &'a CellAddress)> {
     match arg {
-        Expr::Range { start, end, .. } => Some((start, end)),
+        Expr::Range { start, end, .. } => Some((None, start, end)),
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => Some((Some(sheet.as_str()), start, end)),
         _ => None,
+    }
+}
+
+/// Build a 2D grid from an argument expression that is either a same-sheet
+/// or cross-sheet range. Routes through `for_each_sheet_range_cell` for
+/// cross-sheet ranges so the provider resolves cells against the correct
+/// sheet rather than the formula's own sheet.
+fn collect_range_2d_for_arg(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Option<Vec<Vec<Value>>> {
+    match arg_as_range(arg)? {
+        (None, start, end) => Some(collect_range_2d(start, end, provider)),
+        (Some(sheet), start, end) => {
+            let min_row = start.row.min(end.row);
+            let max_row = start.row.max(end.row);
+            let min_col = start.col.min(end.col);
+            let max_col = start.col.max(end.col);
+            if max_row > EXCEL_MAX_ROWS || max_col > EXCEL_MAX_COLS {
+                return Some(vec![]);
+            }
+            let rows = (max_row - min_row + 1) as usize;
+            let cols = (max_col - min_col + 1) as usize;
+            let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
+            let range = CellRange::new(*start, *end);
+            provider.for_each_sheet_range_cell(sheet, range, &mut |addr, value| {
+                if addr.row < min_row || addr.row > max_row {
+                    return;
+                }
+                if addr.col < min_col || addr.col > max_col {
+                    return;
+                }
+                let r = (addr.row - min_row) as usize;
+                let c = (addr.col - min_col) as usize;
+                grid[r][c] = value;
+            });
+            Some(grid)
+        }
     }
 }
 
@@ -879,8 +940,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::InvalidValue);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
-            let (start, end) = match arg_as_range(&args[1]) {
-                Some(r) => r,
+            let grid = match collect_range_2d_for_arg(&args[1], provider) {
+                Some(g) => g,
                 None => return Value::Error(ValueError::InvalidValue),
             };
             let col_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
@@ -892,7 +953,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             } else {
                 true
             };
-            let grid = collect_range_2d(start, end, provider);
             lookup_2d(
                 &grid,
                 &needle,
@@ -907,8 +967,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::InvalidValue);
             }
             let needle = eval_expr_with_provider(&args[0], provider);
-            let (start, end) = match arg_as_range(&args[1]) {
-                Some(r) => r,
+            let grid = match collect_range_2d_for_arg(&args[1], provider) {
+                Some(g) => g,
                 None => return Value::Error(ValueError::InvalidValue),
             };
             let row_idx = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
@@ -920,7 +980,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             } else {
                 true
             };
-            let grid = collect_range_2d(start, end, provider);
             lookup_2d(
                 &grid,
                 &needle,
@@ -935,8 +994,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if args.len() != 3 {
                 return Value::Error(ValueError::InvalidValue);
             }
-            let (start, end) = match arg_as_range(&args[0]) {
-                Some(r) => r,
+            let grid = match collect_range_2d_for_arg(&args[0], provider) {
+                Some(g) => g,
                 None => return Value::Error(ValueError::InvalidValue),
             };
             let r = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
@@ -947,7 +1006,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Some(n) if n >= 1.0 => n as usize,
                 _ => return Value::Error(ValueError::InvalidValue),
             };
-            let grid = collect_range_2d(start, end, provider);
             grid.get(r - 1)
                 .and_then(|row| row.get(c - 1).cloned())
                 .unwrap_or(Value::Error(ValueError::InvalidRef))
