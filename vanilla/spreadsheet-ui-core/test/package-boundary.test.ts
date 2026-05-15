@@ -17,6 +17,7 @@ import {
   selectionRegionsAtom,
   toolbarUiStateAtom,
   viewportFreezeAtom,
+  viewportHiddenAtom,
   viewportMetricsAtom,
   workspaceSessionAtom,
 } from '../src'
@@ -64,6 +65,7 @@ describe('package boundary', () => {
     expect(primarySelectionRegionAtom.debugLabel).toBe('spreadsheet.selection.primaryRegion')
     expect(nameRegistryCacheAtom.debugLabel).toBe('spreadsheet.namedRanges.cache')
     expect(viewportFreezeAtom.debugLabel).toBe('spreadsheet.viewport.freeze')
+    expect(viewportHiddenAtom.debugLabel).toBe('spreadsheet.viewport.hidden')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

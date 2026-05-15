@@ -26,6 +26,15 @@ export interface ProjectionCancelToken {
   readonly cancelled: boolean
 }
 
+export interface MergeSpan {
+  rows: number
+  cols: number
+}
+
+export interface MergeRegion extends SheetRef {
+  range: CellRange
+}
+
 export interface DisplayCell {
   row: number
   col: number
@@ -35,6 +44,8 @@ export interface DisplayCell {
   error?: SpreadsheetError
   formatKey?: string
   format?: SpreadsheetCellFormat
+  mergedSpan?: MergeSpan
+  mergeAnchor?: CellCoord
 }
 
 export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
@@ -241,6 +252,36 @@ export interface ViewportSizeProjectionResult extends SheetRef {
   revision?: ProjectionRevision
   rowHeights: ViewportRowHeight[]
   colWidths: ViewportColumnWidth[]
+  hiddenRowIndices?: number[]
+  hiddenColIndices?: number[]
+}
+
+export interface HideRowsRequest extends SheetRef {
+  kind: 'hide-rows'
+  rowIndices: number[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface UnhideRowsRequest extends SheetRef {
+  kind: 'unhide-rows'
+  rowIndices: number[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface HideColumnsRequest extends SheetRef {
+  kind: 'hide-columns'
+  colIndices: number[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface UnhideColumnsRequest extends SheetRef {
+  kind: 'unhide-columns'
+  colIndices: number[]
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
 }
 
 export interface SetRowHeightRequest extends SheetRef {
@@ -288,6 +329,20 @@ export interface ResolveDataEdgeResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
   target: CellCoord
+}
+
+export interface MergeRangeRequest extends SheetRef {
+  kind: 'merge-range'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface UnmergeRangeRequest extends SheetRef {
+  kind: 'unmerge-range'
+  range: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
 }
 
 export interface BackendMutationResult extends SheetRef {
@@ -401,8 +456,14 @@ export interface SpreadsheetBackend {
   listNamedRanges?(request: ListNamedRangesRequest): Promise<NamedRangeListResult>
   setNamedRange?(request: SetNamedRangeRequest): Promise<NamedRangeMutationResult>
   deleteNamedRange?(request: DeleteNamedRangeRequest): Promise<NamedRangeMutationResult>
+  mergeRange?(request: MergeRangeRequest): Promise<BackendMutationResult>
+  unmergeRange?(request: UnmergeRangeRequest): Promise<BackendMutationResult>
   readFreezeConfig?(request: ReadFreezeConfigRequest): Promise<ReadFreezeConfigResult>
   setFreezeConfig?(request: SetFreezeConfigRequest): Promise<BackendMutationResult>
+  hideRows?(request: HideRowsRequest): Promise<BackendMutationResult>
+  unhideRows?(request: UnhideRowsRequest): Promise<BackendMutationResult>
+  hideColumns?(request: HideColumnsRequest): Promise<BackendMutationResult>
+  unhideColumns?(request: UnhideColumnsRequest): Promise<BackendMutationResult>
 }
 
 export interface ViewportFreezeConfig {

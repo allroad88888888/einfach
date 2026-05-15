@@ -5,8 +5,10 @@ import type {
   FrozenWindows,
   ScrollToCellInput,
   SetViewportFreezeInput,
+  SetViewportHiddenInput,
   ViewportCellAlign,
   ViewportFreezeState,
+  ViewportHiddenState,
   ViewportMetrics,
   ViewportScrollPosition,
   ViewportSizeOverrideState,
@@ -391,6 +393,64 @@ export const setViewportFreezeAtom = atom(
   },
 )
 setViewportFreezeAtom.debugLabel = 'spreadsheet.viewport.setFreeze'
+
+export const DEFAULT_VIEWPORT_HIDDEN_STATE: ViewportHiddenState = {
+  rowsBySheet: {},
+  colsBySheet: {},
+}
+
+function sanitizeIndices(indices: number[]): number[] {
+  const seen = new Set<number>()
+  const result: number[] = []
+  for (const v of indices) {
+    if (Number.isInteger(v) && v >= 0 && !seen.has(v)) {
+      seen.add(v)
+      result.push(v)
+    }
+  }
+  result.sort((a, b) => a - b)
+  return result
+}
+
+export function isRowHidden(state: ViewportHiddenState, sheetId: string, rowIndex: number): boolean {
+  return (state.rowsBySheet[sheetId] ?? []).includes(rowIndex)
+}
+
+export function isColumnHidden(state: ViewportHiddenState, sheetId: string, colIndex: number): boolean {
+  return (state.colsBySheet[sheetId] ?? []).includes(colIndex)
+}
+
+export function getHiddenRowsForSheet(state: ViewportHiddenState, sheetId: string): number[] {
+  return state.rowsBySheet[sheetId] ?? []
+}
+
+export function getHiddenColumnsForSheet(state: ViewportHiddenState, sheetId: string): number[] {
+  return state.colsBySheet[sheetId] ?? []
+}
+
+export const viewportHiddenAtom = atom<ViewportHiddenState>(DEFAULT_VIEWPORT_HIDDEN_STATE)
+viewportHiddenAtom.debugLabel = 'spreadsheet.viewport.hidden'
+
+export const setViewportHiddenAtom = atom(
+  (get) => get(viewportHiddenAtom),
+  (get, set, input: SetViewportHiddenInput) => {
+    if (!input.sheetId || input.sheetId.length === 0) return
+    const state = get(viewportHiddenAtom)
+    const rows =
+      input.rows !== undefined
+        ? sanitizeIndices(input.rows)
+        : (state.rowsBySheet[input.sheetId] ?? [])
+    const cols =
+      input.cols !== undefined
+        ? sanitizeIndices(input.cols)
+        : (state.colsBySheet[input.sheetId] ?? [])
+    set(viewportHiddenAtom, {
+      rowsBySheet: { ...state.rowsBySheet, [input.sheetId]: rows },
+      colsBySheet: { ...state.colsBySheet, [input.sheetId]: cols },
+    })
+  },
+)
+setViewportHiddenAtom.debugLabel = 'spreadsheet.viewport.setHidden'
 
 const EMPTY_WINDOW: VisibleWindow = { rowStart: 0, rowEnd: -1, colStart: 0, colEnd: -1 }
 
