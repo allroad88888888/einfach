@@ -4,6 +4,11 @@ import {
   dispatchToolbarFormatCommandAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
+  activeCellLockedAtom,
+  selectionLockedAtom,
+  findReplaceOpenAtom,
+  printPreviewOpenAtom,
+  togglePrintPreviewAtom,
   type CellRange,
   type SpreadsheetCellFormat,
   type SpreadsheetNumberFormat,
@@ -94,6 +99,14 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const availability = useAtomValue(toolbarCommandAvailabilityAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
+  const activeCellLocked = useAtomValue(activeCellLockedAtom)
+  const selectionLocked = useAtomValue(selectionLockedAtom)
+  const findReplaceOpen = useAtomValue(findReplaceOpenAtom)
+  const printPreviewOpen = useAtomValue(printPreviewOpenAtom)
+
+  function isProtectionGated(): boolean {
+    return activeCellLocked() || selectionLocked() !== 'open'
+  }
 
   function getCurrentWindow() {
     const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
@@ -294,7 +307,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             title={command.title}
             aria-label={command.title}
             aria-pressed={isPressed()}
-            disabled={!command.isEnabled(availability())}
+            disabled={!command.isEnabled(availability()) || isProtectionGated()}
             onClick={() => {
               dispatchCommand(commandValue)
             }}
@@ -309,7 +322,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-merge-cells"
         title="Merge cells"
         aria-label="Merge cells"
-        disabled={!canMergeSelection()}
+        disabled={!canMergeSelection() || isProtectionGated()}
         onClick={() => {
           void mergeSelection().catch(reportCommandError)
         }}
@@ -322,12 +335,38 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-unmerge-cells"
         title="Unmerge cells"
         aria-label="Unmerge cells"
-        disabled={!canUnmergeSelection()}
+        disabled={!canUnmergeSelection() || isProtectionGated()}
         onClick={() => {
           void unmergeSelection().catch(reportCommandError)
         }}
       >
         Unmerge
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-find"
+        title="Find"
+        aria-label="Find"
+        aria-pressed={findReplaceOpen()}
+        onClick={() => {
+          store.setter(findReplaceOpenAtom, true)
+        }}
+      >
+        Find
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-print-preview"
+        title="Print preview"
+        aria-label="Print preview"
+        aria-pressed={printPreviewOpen()}
+        onClick={() => {
+          store.setter(togglePrintPreviewAtom)
+        }}
+      >
+        Print preview
       </button>
     </div>
   )

@@ -15,6 +15,9 @@ import {
   setWorkspaceActiveSheetAtom,
   startEditingAtom,
   toolbarIntentAtom,
+  setSheetProtectionAtom,
+  findReplaceOpenAtom,
+  printPreviewOpenAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetToolbar } from '../src-vnext/toolbar'
@@ -113,6 +116,8 @@ function getButtons(container: HTMLElement) {
     unmerge: container.querySelector(
       '[data-testid="toolbar-btn-unmerge-cells"]',
     ) as HTMLButtonElement,
+    find: container.querySelector('[data-testid="toolbar-btn-find"]') as HTMLButtonElement,
+    printPreview: container.querySelector('[data-testid="toolbar-btn-print-preview"]') as HTMLButtonElement,
   }
 }
 
@@ -326,5 +331,81 @@ describe('vNext SpreadsheetToolbar', () => {
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
     expect(readVisibleProjectionCalls).toHaveLength(2)
+  })
+
+  it('disables format buttons when active cell is locked in a protected sheet', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(setSheetProtectionAtom, {
+      sheetId: 'sheet-1',
+      state: { mode: 'protected', unlockedRanges: [] },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const buttons = getButtons(container)
+    expect(buttons.bold.disabled).toBe(true)
+    expect(buttons.italic.disabled).toBe(true)
+    expect(buttons.fillColor.disabled).toBe(true)
+    expect(buttons.textColor.disabled).toBe(true)
+    expect(buttons.numberFormat.disabled).toBe(true)
+    expect(buttons.merge.disabled).toBe(true)
+    expect(buttons.unmerge.disabled).toBe(true)
+  })
+
+  it('Find button opens findReplaceOpenAtom', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(findReplaceOpenAtom)).toBe(false)
+
+    const buttons = getButtons(container)
+    expect(buttons.find).not.toBeNull()
+    fireEvent.click(buttons.find)
+
+    expect(store.getter(findReplaceOpenAtom)).toBe(true)
+  })
+
+  it('Print preview button toggles printPreviewOpenAtom', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(printPreviewOpenAtom)).toBe(false)
+
+    const buttons = getButtons(container)
+    expect(buttons.printPreview).not.toBeNull()
+    fireEvent.click(buttons.printPreview)
+
+    expect(store.getter(printPreviewOpenAtom)).toBe(true)
+
+    // re-query button in case Solid replaced the DOM node after re-render
+    const buttons2 = getButtons(container)
+    fireEvent.click(buttons2.printPreview)
+    expect(store.getter(printPreviewOpenAtom)).toBe(false)
   })
 })

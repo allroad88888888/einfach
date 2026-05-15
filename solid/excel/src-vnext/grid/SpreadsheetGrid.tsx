@@ -50,6 +50,13 @@ import {
   startPointerAtom,
   startEditingAtom,
   updatePointerAtom,
+  activeCellLockedAtom,
+  findReplaceOpenAtom,
+  filterSortStateAtom,
+  openFilterDropdownAtom,
+  notifyActiveSheetChangedAtom,
+  remoteCursorsAtom,
+  presenceStateAtom,
   type CellCoord,
   type CellRange,
   type ClipboardTransferInput,
@@ -292,6 +299,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
+  let unsubscribePresence: (() => void) | null = null
+  let unsubscribeFilterSort: (() => void) | null = null
+  let lastActiveSheetId: string | null = null
 
   function bumpRender() {
     setRenderTick((value) => value + 1)
@@ -534,6 +544,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
+    unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
+    unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
+
+    lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
+    store.sub(workspaceSessionAtom, () => {
+      const nextSheetId = store.getter(workspaceSessionAtom).activeSheetId
+      if (nextSheetId !== lastActiveSheetId) {
+        lastActiveSheetId = nextSheetId
+        store.setter(notifyActiveSheetChangedAtom, nextSheetId)
+      }
+    })
+
     store.setter(setViewportMetricsAtom, props.viewport)
     store.setter(setSelectionBoundsAtom, {
       rowCount: props.viewport.rowCount,
@@ -549,6 +571,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeSizes?.()
     unsubscribeHidden?.()
     unsubscribePointer?.()
+    unsubscribePresence?.()
+    unsubscribeFilterSort?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
     store.setter(cancelPointerAtom)
@@ -576,32 +600,44 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   async function clearSelectionRange(target: 'values' | 'formats' | 'all' = 'all') {
-    const selection = selectionSnapshot()
-    if (selection.selection.sheetId !== props.sheetId) {
+    const regions = selectionRegions().filter((r) => r.sheetId === props.sheetId)
+    if (regions.length === 0) {
       return
     }
 
-    const range = selection.range
-    const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
-    if (isSingleCell) {
-      await backend.setCellInput({
-        kind: 'set-cell-input',
-        sheetId: props.sheetId,
-        row: range.rowStart,
-        col: range.colStart,
-        input: '',
-      })
-    } else {
-      if (!backend.clearRange) {
+    const bounds = getSelectionBounds()
+    const ranges = regions.map((r) => getSelectionRange(r, bounds))
+
+    if (regions.length === 1) {
+      const range = ranges[0]
+      const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
+      if (isSingleCell) {
+        await backend.setCellInput({
+          kind: 'set-cell-input',
+          sheetId: props.sheetId,
+          row: range.rowStart,
+          col: range.colStart,
+          input: '',
+        })
+        await loadProjection(requestProjection())
         return
       }
-      await backend.clearRange({
-        kind: 'clear-range',
-        sheetId: props.sheetId,
-        range,
-        target,
-      })
     }
+
+    if (!backend.clearRange) {
+      return
+    }
+
+    await Promise.all(
+      ranges.map((range) =>
+        backend.clearRange!({
+          kind: 'clear-range',
+          sheetId: props.sheetId,
+          range,
+          target,
+        }),
+      ),
+    )
     await loadProjection(requestProjection())
   }
 
@@ -1027,6 +1063,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function startEditingCell(row: number, col: number, source: 'keyboard' | 'cell') {
+    if (store.getter(activeCellLockedAtom)) {
+      return
+    }
     const cell = getCell(row, col)
     store.setter(startEditingAtom, {
       sheetId: props.sheetId,
@@ -1211,6 +1250,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   async function handleGridKeyDown(event: KeyboardEvent) {
     if (event.defaultPrevented) {
+      return
+    }
+
+    if ((event.ctrlKey || event.metaKey) && event.key === 'f' && !event.altKey && !event.shiftKey) {
+      event.preventDefault()
+      store.setter(findReplaceOpenAtom, true)
       return
     }
 
@@ -1587,6 +1632,65 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     bumpRender()
   }
 
+  function getFilterRulesForSheet() {
+    renderTick()
+    const state = store.getter(filterSortStateAtom)
+    return state[props.sheetId]?.rules ?? []
+  }
+
+  function colHasFilterRule(col: number): boolean {
+    return getFilterRulesForSheet().some((r) => r.colIndex === col)
+  }
+
+  function getRemoteCursorsForSheet() {
+    renderTick()
+    return store.getter(remoteCursorsAtom).filter((c) => c.sheetId === props.sheetId)
+  }
+
+  function getParticipantColorHint(participantId: string): string | undefined {
+    return store.getter(presenceStateAtom).participants.find((p) => p.id === participantId)?.colorHint
+  }
+
+  function getRemoteCursorStyle(cursor: ReturnType<typeof getRemoteCursorsForSheet>[number]): Record<string, string> {
+    const bounds = getSelectionBounds()
+    const range = getSelectionRange(cursor.selection, bounds)
+    const rows = getRows()
+    const cols = getCols()
+
+    let top = 0
+    for (const r of rows) {
+      if (r >= range.rowStart) break
+      top += getRenderedRowHeight(r)
+    }
+    let left = 0
+    for (const c of cols) {
+      if (c >= range.colStart) break
+      left += getRenderedColumnWidth(c)
+    }
+    let height = 0
+    for (const r of rows) {
+      if (r > range.rowEnd) break
+      if (r >= range.rowStart) height += getRenderedRowHeight(r)
+    }
+    let width = 0
+    for (const c of cols) {
+      if (c > range.colEnd) break
+      if (c >= range.colStart) width += getRenderedColumnWidth(c)
+    }
+
+    const color = getParticipantColorHint(cursor.participantId) ?? '#4f90f0'
+    return {
+      position: 'absolute',
+      top: `${top}px`,
+      left: `${left}px`,
+      height: `${Math.max(height, 1)}px`,
+      width: `${Math.max(width, 1)}px`,
+      border: `2px solid ${color}`,
+      'pointer-events': 'none',
+      'box-sizing': 'border-box',
+    }
+  }
+
   return (
     <div
       ref={gridRoot}
@@ -1631,6 +1735,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       }}
                     >
                       <span class="spreadsheet-grid-header-label">{getColumnLabel(col)}</span>
+                      <Show when={colHasFilterRule(col)}>
+                        <button
+                          type="button"
+                          class="spreadsheet-grid-filter-chevron"
+                          data-testid={`filter-chevron-${col}`}
+                          aria-label={`Filter column ${getColumnLabel(col)}`}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            store.setter(openFilterDropdownAtom, { sheetId: props.sheetId, colIndex: col })
+                            bumpRender()
+                          }}
+                        >
+                          ▾
+                        </button>
+                      </Show>
                       <button
                         type="button"
                         class="spreadsheet-grid-col-resize-handle"
@@ -1806,6 +1925,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           </Show>
         </tbody>
       </table>
+      <For each={getRemoteCursorsForSheet()}>
+        {(cursor) => (
+          <div
+            class="spreadsheet-remote-cursor"
+            data-testid={`remote-cursor-${cursor.participantId}`}
+            style={getRemoteCursorStyle(cursor)}
+          />
+        )}
+      </For>
     </div>
   )
 }

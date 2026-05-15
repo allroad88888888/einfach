@@ -21,6 +21,7 @@ import {
   menuStateAtom,
   selectionAtom,
   selectionRegionsAtom,
+  addSelectionRegionAtom,
   setSheetTabsSheetsAtom,
   setWorkspaceActiveSheetAtom,
   viewportHiddenAtom,
@@ -28,6 +29,12 @@ import {
   viewportSizeOverridesAtom,
   visibleWindowAtom,
   workspaceSessionAtom,
+  setSheetProtectionAtom,
+  editingSessionAtom,
+  findReplaceOpenAtom,
+  setFilterSortAtom,
+  filterDropdownAtom,
+  applyPresenceUpdateAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -1495,5 +1502,282 @@ describe('vNext SpreadsheetGrid', () => {
       sheetId: 'sheet-1',
       range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
     })
+  })
+
+  it('Delete on multi-region selection calls clearRange once per region', async () => {
+    const store = createStore()
+    const clearRangeCalls: ClearRangeRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.clearRange = async (request) => {
+      clearRangeCalls.push(request)
+      return { sheetId: request.sheetId, requestId: request.requestId }
+    }
+    backend.setCellInput = async () => {
+      throw new Error('setCellInput should not be called for multi-region clear')
+    }
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    // Set primary region A1:B2 via click + shift-click
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    fireEvent.click(container.querySelector('[data-cell-addr="B2"] .spreadsheet-grid-cell-button')!, {
+      shiftKey: true,
+    })
+    // Add second region C3:D4 directly via the store atom
+    store.setter(addSelectionRegionAtom, {
+      region: {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: 2, col: 2 },
+        focus: { row: 3, col: 3 },
+      },
+    })
+
+    expect(store.getter(selectionRegionsAtom)).toHaveLength(2)
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Delete' })
+
+    await waitFor(() => {
+      expect(clearRangeCalls).toHaveLength(2)
+    })
+
+    const ranges = clearRangeCalls.map((r) => r.range).sort((a, b) => a.rowStart - b.rowStart)
+    expect(ranges[0]).toMatchObject({ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 })
+    expect(ranges[1]).toMatchObject({ rowStart: 2, rowEnd: 3, colStart: 2, colEnd: 3 })
+  })
+
+  it('blocks edit start on a locked cell in a protected sheet', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    backend.setCellInput = async (request) => ({ sheetId: request.sheetId, requestId: request.requestId })
+
+    // protect the sheet with no unlocked ranges → all cells locked
+    store.setter(setSheetProtectionAtom, { sheetId: 'sheet-1', state: { mode: 'protected', unlockedRanges: [] } })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    fireEvent.click(container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!)
+    // double-click to trigger edit start
+    fireEvent.dblClick(container.querySelector('[data-cell-addr="A1"]')!)
+
+    expect(store.getter(editingSessionAtom).status).toBe('idle')
+  })
+
+  it('Ctrl+F opens find-replace atom', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    expect(store.getter(findReplaceOpenAtom)).toBe(false)
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'f', ctrlKey: true })
+
+    expect(store.getter(findReplaceOpenAtom)).toBe(true)
+  })
+
+  it('filter chevron renders when column has an active filter rule and opens dropdown on click', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 1, value: 'yes' }], directives: [] },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(6)
+    })
+
+    // col 0 has no filter rule
+    expect(container.querySelector('[data-testid="filter-chevron-0"]')).toBeNull()
+    // col 1 has a filter rule
+    const chevron = container.querySelector('[data-testid="filter-chevron-1"]') as HTMLButtonElement
+    expect(chevron).not.toBeNull()
+
+    fireEvent.click(chevron)
+
+    expect(store.getter(filterDropdownAtom)).toMatchObject({ status: 'open', sheetId: 'sheet-1', colIndex: 1 })
+  })
+
+  it('switching active sheet closes an open filter dropdown', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(setSheetTabsSheetsAtom, {
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1', index: 0 },
+        { id: 'sheet-2', name: 'Sheet2', index: 1 },
+      ],
+    })
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: { rules: [{ kind: 'equals', colIndex: 0, value: 'yes' }], directives: [] },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+    })
+
+    const chevron = container.querySelector('[data-testid="filter-chevron-0"]') as HTMLButtonElement
+    fireEvent.click(chevron)
+    expect(store.getter(filterDropdownAtom)).toMatchObject({ status: 'open' })
+
+    // switch active sheet
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+    await flushMicrotasks()
+
+    expect(store.getter(filterDropdownAtom)).toMatchObject({ status: 'closed' })
+  })
+
+  it('renders remote cursor overlay for each presence participant on this sheet', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 4,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(16)
+    })
+
+    expect(container.querySelector('[data-testid="remote-cursor-user-42"]')).toBeNull()
+
+    store.setter(applyPresenceUpdateAtom, {
+      kind: 'join',
+      participant: { id: 'user-42', displayName: 'Alice', colorHint: '#ff0000', lastSeenAt: Date.now() },
+    })
+    store.setter(applyPresenceUpdateAtom, {
+      kind: 'cursor',
+      participantId: 'user-42',
+      sheetId: 'sheet-1',
+      selection: { kind: 'cell', sheetId: 'sheet-1', anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 } },
+    })
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="remote-cursor-user-42"]')).not.toBeNull()
+    })
+
+    const cursorEl = container.querySelector('[data-testid="remote-cursor-user-42"]') as HTMLElement
+    expect(cursorEl.style.border).toContain('#ff0000')
+    expect(cursorEl.style.position).toBe('absolute')
   })
 })
