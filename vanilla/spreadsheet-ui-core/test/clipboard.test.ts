@@ -5,6 +5,7 @@ import {
   copyClipboardAtom,
   cutClipboardAtom,
   createClipboardPayloadDescriptor,
+  createClipboardTsvPastePlan,
   createClipboardTransferRequest,
   pasteClipboardAtom,
   clearClipboardAtom,
@@ -170,6 +171,107 @@ describe('clipboard core', () => {
       '=Data!B2+SUM(C3:D4)',
     )
     expect(shiftFormulaRefs('="A1"&A1&"B2"', 1, 1)).toBe('="A1"&B2&"B2"')
+  })
+
+  test('plans TSV paste chunks from marker origin to target origin', () => {
+    const text = '# einfach-clipboard-origin: B2\r\n=A1\tplain\n=SUM(B2:C3)\t'
+    const plan = createClipboardTsvPastePlan({
+      text,
+      fallbackOriginAddr: 'A1',
+      targetOrigin: { row: 4, col: 3 },
+      rowsPerChunk: 1,
+    })
+
+    expect(plan).toMatchObject({
+      originAddr: 'B2',
+      sourceOrigin: { row: 1, col: 1 },
+      targetOrigin: { row: 4, col: 3 },
+      rowCount: 2,
+      colCount: 2,
+      cellCount: 4,
+      includesFormulas: true,
+      estimatedBytes: text.length,
+      estimatedRange: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
+      rowsPerChunk: 1,
+    })
+
+    expect([...plan.chunks()]).toEqual([
+      {
+        rowStart: 4,
+        rowEnd: 4,
+        rowCount: 1,
+        cells: [
+          { row: 4, col: 3, input: '=C4' },
+          { row: 4, col: 4, input: 'plain' },
+        ],
+      },
+      {
+        rowStart: 5,
+        rowEnd: 5,
+        rowCount: 1,
+        cells: [
+          { row: 5, col: 3, input: '=SUM(D5:E6)' },
+          { row: 5, col: 4, input: '' },
+        ],
+      },
+    ])
+  })
+
+  test('groups TSV paste output by row chunk size', () => {
+    const plan = createClipboardTsvPastePlan({
+      text: 'a\nb\nc',
+      fallbackOriginAddr: 'A1',
+      targetOrigin: { row: 10, col: 2 },
+      rowsPerChunk: 2,
+      shiftFormulas: false,
+    })
+
+    const chunks = [...plan.chunks()]
+
+    expect(chunks.map((chunk) => chunk.rowCount)).toEqual([2, 1])
+    expect(chunks.map((chunk) => chunk.cells)).toEqual([
+      [
+        { row: 10, col: 2, input: 'a' },
+        { row: 11, col: 2, input: 'b' },
+      ],
+      [{ row: 12, col: 2, input: 'c' }],
+    ])
+  })
+
+  test('keeps large TSV paste as chunk iterable instead of a complete cell matrix', () => {
+    const rowCount = 10002
+    const text = Array.from({ length: rowCount }, (_, row) => `=${row + 1}`)
+      .join('\n')
+    const plan = createClipboardTsvPastePlan({
+      text,
+      fallbackOriginAddr: 'A1',
+      targetOrigin: { row: 0, col: 0 },
+      rowsPerChunk: 1000,
+    })
+
+    let chunkCount = 0
+    let maxRowsPerChunk = 0
+    let emittedCellCount = 0
+
+    for (const chunk of plan.chunks()) {
+      chunkCount += 1
+      maxRowsPerChunk = Math.max(maxRowsPerChunk, chunk.rowCount)
+      emittedCellCount += chunk.cells.length
+    }
+
+    expect('cells' in plan).toBe(false)
+    expect(plan.rowCount).toBe(rowCount)
+    expect(plan.cellCount).toBe(rowCount)
+    expect(plan.includesFormulas).toBe(true)
+    expect(plan.estimatedRange).toEqual({
+      rowStart: 0,
+      rowEnd: 10001,
+      colStart: 0,
+      colEnd: 0,
+    })
+    expect(chunkCount).toBe(11)
+    expect(maxRowsPerChunk).toBe(1000)
+    expect(emittedCellCount).toBe(rowCount)
   })
 
   test('stores clipboard errors without payload data', () => {

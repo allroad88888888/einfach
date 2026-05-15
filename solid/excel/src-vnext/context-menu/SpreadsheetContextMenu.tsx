@@ -4,22 +4,20 @@ import {
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
   closeMenuAtom,
   copyClipboardAtom,
+  createClipboardTsvPastePlan,
   createRangeProjectionRequest,
   createVisibleProjectionRequest,
   cutClipboardAtom,
   dispatchMenuCommandAtom,
   markClipboardReadyAtom,
   menuStateAtom,
-  parseClipboardTsv,
   pasteClipboardAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
-  shiftFormulaRefs,
   type CellCoord,
   type CellRange,
   type ClipboardTextData,
   type ClipboardTransferInput,
-  type ImportCellInput,
   type MenuCommandIntent,
   type MenuCommandKind,
   type MenuTarget,
@@ -86,27 +84,9 @@ function toA1(coord: CellCoord): string {
   return `${getColumnLabel(coord.col)}${coord.row + 1}`
 }
 
-function parseA1(addr: string): CellCoord | null {
-  const match = addr.trim().toUpperCase().match(/^([A-Z]+)(\d+)$/)
-  if (!match) return null
-
-  let col = 0
-  for (let index = 0; index < match[1].length; index += 1) {
-    col = col * 26 + (match[1].charCodeAt(index) - 64)
-  }
-
-  const row = Number(match[2]) - 1
-  if (!Number.isInteger(row) || row < 0) return null
-  return { row, col: col - 1 }
-}
-
 function rangeCellCount(range: CellRange): number {
   if (range.rowEnd < range.rowStart || range.colEnd < range.colStart) return 0
   return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
-}
-
-function clipboardTextCellCount(data: ClipboardTextData): number {
-  return data.cells.reduce((count, row) => count + row.length, 0)
 }
 
 function addClipboardOriginMarker(text: string, originAddr: string): string {
@@ -129,14 +109,14 @@ function targetToRange(target: MenuTarget): CellRange | null {
   }
 }
 
-function dataRangeFromOrigin(origin: CellCoord, data: ClipboardTextData): CellRange {
-  const rowCount = Math.max(1, data.cells.length)
-  const colCount = Math.max(1, ...data.cells.map((row) => row.length))
+function dataRangeFromOrigin(origin: CellCoord, rowCount: number, colCount: number): CellRange {
+  const rows = Math.max(1, rowCount)
+  const cols = Math.max(1, colCount)
   return {
     rowStart: origin.row,
-    rowEnd: origin.row + rowCount - 1,
+    rowEnd: origin.row + rows - 1,
     colStart: origin.col,
-    colEnd: origin.col + colCount - 1,
+    colEnd: origin.col + cols - 1,
   }
 }
 
@@ -160,25 +140,6 @@ function resultToClipboardText(result: RangeProjectionResult, range: CellRange):
     originAddr: toA1({ row: range.rowStart, col: range.colStart }),
     cells,
   }
-}
-
-function clipboardDataToImportCells(
-  data: ClipboardTextData,
-  targetOrigin: CellCoord,
-  drow: number,
-  dcol: number,
-): ImportCellInput[] {
-  const cells: ImportCellInput[] = []
-  for (const [rowOffset, row] of data.cells.entries()) {
-    for (const [colOffset, field] of row.entries()) {
-      cells.push({
-        row: targetOrigin.row + rowOffset,
-        col: targetOrigin.col + colOffset,
-        input: field.startsWith('=') ? shiftFormulaRefs(field, drow, dcol) : field,
-      })
-    }
-  }
-  return cells
 }
 
 async function writeClipboardText(text: string): Promise<boolean> {
@@ -325,11 +286,15 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       if (!result) return false
 
       text = addClipboardOriginMarker(result.text, result.originAddr)
-      const data = parseClipboardTsv(text, result.originAddr)
+      const plan = createClipboardTsvPastePlan({
+        text,
+        fallbackOriginAddr: result.originAddr,
+        targetOrigin: { row: range.rowStart, col: range.colStart },
+      })
       transferInput = {
         source: { sheetId, range },
         serialization: 'tab-separated' as const,
-        includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
+        includesFormulas: plan.includesFormulas,
         includesErrors: false,
         estimatedBytes: result.estimatedBytes ?? text.length,
         revision: result.revision ?? undefined,
@@ -391,15 +356,16 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
     const targetOrigin = { row: targetRange.rowStart, col: targetRange.colStart }
     const targetAddr = toA1(targetOrigin)
-    const data = parseClipboardTsv(text, targetAddr)
-    const cellCount = clipboardTextCellCount(data)
-    const origin = parseA1(data.originAddr) ?? targetOrigin
-    const drow = targetOrigin.row - origin.row
-    const dcol = targetOrigin.col - origin.col
-    const sourceRange = dataRangeFromOrigin(origin, data)
-    const pasteRange = dataRangeFromOrigin(targetOrigin, data)
+    const plan = createClipboardTsvPastePlan({
+      text,
+      fallbackOriginAddr: targetAddr,
+      targetOrigin,
+    })
+    const cellCount = plan.cellCount
+    const sourceRange = dataRangeFromOrigin(plan.sourceOrigin, plan.rowCount, plan.colCount)
+    const pasteRange = plan.estimatedRange
 
-    if (cellCount > CLIPBOARD_CELL_LIMIT && !backend.importCells) {
+    if (cellCount > CLIPBOARD_CELL_LIMIT && !backend.importCellChunks) {
       store.setter(
         setClipboardErrorAtom,
         clipboardError(
@@ -413,26 +379,30 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       source: { sheetId, range: sourceRange },
       target: { sheetId, range: pasteRange },
       serialization: 'tab-separated',
-      includesFormulas: data.cells.some((row) => row.some((field) => field.startsWith('='))),
-      estimatedBytes: text.length,
+      includesFormulas: plan.includesFormulas,
+      estimatedBytes: plan.estimatedBytes,
     })
 
-    if (cellCount > CLIPBOARD_CELL_LIMIT && backend.importCells) {
-      await backend.importCells({
-        kind: 'import-cells',
+    if (cellCount > CLIPBOARD_CELL_LIMIT && backend.importCellChunks) {
+      await backend.importCellChunks({
+        kind: 'import-cell-chunks',
         sheetId,
-        cells: clipboardDataToImportCells(data, targetOrigin, drow, dcol),
+        chunks: (function* () {
+          for (const chunk of plan.chunks()) yield chunk.cells
+        })(),
         range: pasteRange,
       })
     } else {
-      for (const cell of clipboardDataToImportCells(data, targetOrigin, drow, dcol)) {
-        await backend.setCellInput({
-          kind: 'set-cell-input',
-          sheetId,
-          row: cell.row,
-          col: cell.col,
-          input: cell.input,
-        })
+      for (const chunk of plan.chunks()) {
+        for (const cell of chunk.cells) {
+          await backend.setCellInput({
+            kind: 'set-cell-input',
+            sheetId,
+            row: cell.row,
+            col: cell.col,
+            input: cell.input,
+          })
+        }
       }
     }
 

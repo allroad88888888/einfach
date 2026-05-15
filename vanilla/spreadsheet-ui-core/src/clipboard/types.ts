@@ -1,5 +1,5 @@
-import type { CellRange, SpreadsheetError, SheetRef } from '../shared'
-import type { ProjectionRevision } from '../backend'
+import type { CellCoord, CellRange, SpreadsheetError, SheetRef } from '../shared'
+import type { ImportCellInput, ProjectionRevision } from '../backend'
 
 export type ClipboardOperation = 'copy' | 'cut' | 'paste'
 
@@ -29,6 +29,35 @@ export interface ClipboardTextData {
   cells: string[][]
   /** A1 address of the copied range top-left. */
   originAddr: string
+}
+
+export interface ClipboardTsvPasteInput {
+  text: string
+  targetOrigin: CellCoord
+  fallbackOriginAddr?: string
+  rowsPerChunk?: number
+  shiftFormulas?: boolean
+}
+
+export interface ClipboardTsvPasteChunk {
+  rowStart: number
+  rowEnd: number
+  rowCount: number
+  cells: ImportCellInput[]
+}
+
+export interface ClipboardTsvPastePlan {
+  originAddr: string
+  sourceOrigin: CellCoord
+  targetOrigin: CellCoord
+  rowCount: number
+  colCount: number
+  cellCount: number
+  includesFormulas: boolean
+  estimatedBytes: number
+  estimatedRange: CellRange
+  rowsPerChunk: number
+  chunks: () => IterableIterator<ClipboardTsvPasteChunk>
 }
 
 export interface ClipboardTargetDescriptor extends SheetRef {

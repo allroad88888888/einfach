@@ -214,6 +214,13 @@ W6、W7 是 package cutover 和发布门禁。
   snapshot session begin/cancel 后不泄漏。
 - large paste e2e 现在包含离屏公式：从 `D4` 粘贴 10001 行时，最后一行公式导入后仍为
   dirty，只有显式 `readCells(D10004)` 才计算并把公式引用平移为 `=D4+1`。
+- 本轮继续推进 large paste chunk-first：`SpreadsheetBackend` 增加 `importCellChunks`，
+  clipboard core 增加 `createClipboardTsvPastePlan`，vNext context menu 大粘贴只传
+  chunk iterable，不再构造完整 `ImportCellInput[]`；worker backend 边消费 source chunks
+  边转 `ImportCellWire` 并发送 `importChunk`，旧 `importCells` 仅作为兼容入口保留。
+- vNext worker e2e 已记录 worker RPC，验证 large paste 走
+  `beginImport -> importChunk* -> commitImport`，import chunk 数量大于 1，且没有逐 cell
+  `setCell` / `setFormulaDetailed` 回退。
 
 并行分工：
 
@@ -247,9 +254,15 @@ W6、W7 是 package cutover 和发布门禁。
   sparse snapshot session `0 -> 1 -> 0`、large paste 10001 行后 DOM 仍为 30 个可视 cell、
   `J20` 未挂载、离屏公式 `D10004` 导入后 dirty，显式读取后显示 `2` 且公式文本为
   `=D4+1`；当前页面 console warning/error 为 0。
-- 剩余风险：large paste 入口仍会在 UI/adapter 层 materialize `ImportCellInput[]`，后续需要把
-  clipboard parse/import 改为 chunk-first；range export helper 仍有字符串聚合 convenience API，
-  大复制/导出路径还要继续去聚合化。
+- 后续追加记录：已跑 `npx tsc -p vanilla/spreadsheet-ui-core/tsconfig.json --noEmit --pretty false`、
+  `npx tsc -p solid/excel/tsconfig.json --noEmit --pretty false`、
+  `npx jest vanilla/spreadsheet-ui-core/test/clipboard.test.ts solid/excel/test/vnext-context-menu.test.tsx solid/excel/test/vnext-adapter.test.ts --runInBand`、
+  `NO_PROXY=localhost,127.0.0.1 npm run e2e -w @einfach/solid-excel -- e2e/vnext-worker-backend.spec.ts`、
+  `npm run build -w @einfach/solid-excel`。
+- 剩余风险：浏览器 `navigator.clipboard.readText()` 仍一次性给字符串；worker runtime import
+  session 内部仍有 200k normalized/final touches 上限并在 commit 时 materialize final writes，
+  下一波需要设计 direct chunk import 或 Rust 侧事务/rollback；range export helper 仍有字符串聚合
+  convenience API，大复制/导出路径还要继续去聚合化。
 
 ## W6：package cutover readiness
 

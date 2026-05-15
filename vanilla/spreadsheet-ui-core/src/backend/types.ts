@@ -118,9 +118,22 @@ export interface ImportCellInput {
   input: string
 }
 
+export type ImportCellChunkSource =
+  | Iterable<readonly ImportCellInput[]>
+  | AsyncIterable<readonly ImportCellInput[]>
+
 export interface ImportCellsRequest extends SheetRef {
   kind: 'import-cells'
   cells: ImportCellInput[]
+  range?: CellRange
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+  cellsPerChunk?: number
+}
+
+export interface ImportCellChunksRequest extends SheetRef {
+  kind: 'import-cell-chunks'
+  chunks: ImportCellChunkSource
   range?: CellRange
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
@@ -313,6 +326,7 @@ export interface SpreadsheetBackend {
   ): Promise<ViewportSizeProjectionResult>
   setCellInput(request: SetCellInputRequest): Promise<BackendMutationResult>
   importCells?(request: ImportCellsRequest): Promise<BackendMutationResult>
+  importCellChunks?(request: ImportCellChunksRequest): Promise<BackendMutationResult>
   clearRange?(request: ClearRangeRequest): Promise<BackendMutationResult>
   insertRows?(request: InsertRowsRequest): Promise<BackendMutationResult>
   deleteRows?(request: DeleteRowsRequest): Promise<BackendMutationResult>

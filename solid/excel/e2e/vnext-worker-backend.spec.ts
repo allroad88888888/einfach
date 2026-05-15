@@ -16,8 +16,14 @@ type DebugCounters = {
   snapshotSessionCount: number
 }
 
+type WorkerMessageProbe = {
+  cmd: string
+  cellsLength?: number
+}
+
 declare global {
   interface Window {
+    __einfachWorkerMessages?: WorkerMessageProbe[]
     __einfachWorkbookDebugClient?: {
       sheetList(): Promise<Array<{ idx: number; name: string }>>
       debugFormulaCacheState(sheet: number, addr: string): Promise<string>
@@ -192,8 +198,29 @@ test.describe('Solid Excel vNext worker backend', () => {
     context,
   }) => {
     await grantClipboard(context)
+    await page.addInitScript(() => {
+      const messages: WorkerMessageProbe[] = []
+      Object.defineProperty(window, '__einfachWorkerMessages', {
+        configurable: true,
+        value: messages,
+      })
+      const originalPostMessage = Worker.prototype.postMessage
+      Worker.prototype.postMessage = function (message: unknown, transferOrOptions?: unknown) {
+        if (message && typeof message === 'object' && 'cmd' in message) {
+          const wire = message as { cmd?: unknown; cells?: unknown }
+          messages.push({
+            cmd: String(wire.cmd),
+            cellsLength: Array.isArray(wire.cells) ? wire.cells.length : undefined,
+          })
+        }
+        return originalPostMessage.call(this, message, transferOrOptions as never)
+      }
+    })
     await gotoVNextWorkerDemo(page)
 
+    const workerMessageOffset = await page.evaluate(
+      () => window.__einfachWorkerMessages?.length ?? 0,
+    )
     const beforeImportEvalCount = await page.evaluate(async () =>
       window.__einfachWorkbookDebugClient!.debugFormulaEvalCount(0),
     )
@@ -249,6 +276,20 @@ test.describe('Solid Excel vNext worker backend', () => {
     expect(result.afterReadEvalCount).toBe(result.afterImportEvalCount + 1)
     expect(result.formulaStateAfterRead).toBe('clean')
     expect(result.visibleCells).toBe(30)
+    const pasteWorkerMessages = await page.evaluate(
+      (offset) => window.__einfachWorkerMessages?.slice(offset) ?? [],
+      workerMessageOffset,
+    )
+    const pasteCommands = pasteWorkerMessages.map((message) => message.cmd)
+    const importChunks = pasteWorkerMessages.filter((message) => message.cmd === 'importChunk')
+    expect(pasteCommands).toContain('beginImport')
+    expect(pasteCommands).toContain('commitImport')
+    expect(importChunks.length).toBeGreaterThan(1)
+    expect(Math.max(...importChunks.map((message) => message.cellsLength ?? 0))).toBeLessThanOrEqual(
+      10_000,
+    )
+    expect(pasteCommands).not.toContain('setCell')
+    expect(pasteCommands).not.toContain('setFormulaDetailed')
     await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)
   })

@@ -3,6 +3,7 @@ import type {
   DeleteRowsRequest,
   DisplayCell,
   FillRangeRequest,
+  ImportCellChunksRequest,
   ImportCellsRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
@@ -1109,6 +1110,27 @@ export function createStaticSpreadsheetBackend(
           col: cell.col,
           input: cell.input,
         })
+      }
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        affectedRange: request.range,
+      }
+    },
+    async importCellChunks(request: ImportCellChunksRequest) {
+      for await (const chunk of request.chunks) {
+        for (const cell of chunk) {
+          updateCell(state.cells, {
+            kind: 'set-cell-input',
+            sheetId: request.sheetId,
+            row: cell.row,
+            col: cell.col,
+            input: cell.input,
+          })
+        }
       }
       state.revision = bumpRevision(state.revision)
 

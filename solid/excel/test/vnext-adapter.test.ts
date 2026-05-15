@@ -1384,6 +1384,105 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
+  it('imports worker workbook cell chunk sources through bounded import chunks', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    async function* chunks() {
+      yield [
+        { row: 4, col: 3, input: '=A1+1' },
+        { row: 4, col: 4, input: '7' },
+        { row: 5, col: 3, input: 'text' },
+      ]
+      yield [{ row: 5, col: 4, input: '' }]
+    }
+
+    await backend.ready()
+    const result = await backend.importCellChunks?.({
+      kind: 'import-cell-chunks',
+      sheetId: 'sheet-1',
+      requestId: 24,
+      revision: 12,
+      cellsPerChunk: 2,
+      range: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
+      chunks: chunks(),
+    })
+
+    expect(result).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 24,
+      revision: 12,
+      affectedRange: { rowStart: 4, rowEnd: 5, colStart: 3, colEnd: 4 },
+    })
+    expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 4, col: 3, kind: 'formula', value: '=A1+1' },
+          { sheet: 0, row: 4, col: 4, kind: 'number', value: 7 },
+        ],
+      },
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 5, col: 3, kind: 'text', value: 'text' },
+          { sheet: 0, row: 5, col: 4, kind: 'null' },
+        ],
+      },
+    ])
+    expect(client.calls.commitImport).toEqual([1])
+    expect(client.calls.cancelImport).toEqual([])
+    expect(client.calls.setCell).toEqual([])
+    expect(client.calls.setFormulaDetailed).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('cancels chunk-first worker import when the source iterator fails', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 6,
+    })
+
+    async function* chunks() {
+      yield [{ row: 4, col: 3, input: '=A1+1' }]
+      throw new Error('source failed')
+    }
+
+    await backend.ready()
+    await expect(
+      backend.importCellChunks?.({
+        kind: 'import-cell-chunks',
+        sheetId: 'sheet-1',
+        requestId: 25,
+        cellsPerChunk: 1,
+        range: { rowStart: 4, rowEnd: 4, colStart: 3, colEnd: 3 },
+        chunks: chunks(),
+      }),
+    ).rejects.toThrow('source failed')
+
+    expect(client.calls.beginImport).toEqual([1])
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [{ sheet: 0, row: 4, col: 3, kind: 'formula', value: '=A1+1' }],
+      },
+    ])
+    expect(client.calls.commitImport).toEqual([])
+    expect(client.calls.cancelImport).toEqual([1])
+    expect(client.calls.setCell).toEqual([])
+    expect(client.calls.setFormulaDetailed).toEqual([])
+
+    backend.dispose()
+  })
+
   it('cancels worker workbook import when a chunk fails without per-cell fallback', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({

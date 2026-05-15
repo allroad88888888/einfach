@@ -5,6 +5,7 @@ import type {
   DeleteColumnsRequest,
   DeleteRowsRequest,
   DisplayCell,
+  ImportCellChunksRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
   ImportCellsRequest,
@@ -678,6 +679,42 @@ export function createWorkerWorkbookSpreadsheetBackend(
     }
   }
 
+  async function importChunks(request: ImportCellChunksRequest): Promise<BackendMutationResult> {
+    const sheet = await resolveSheet(request.sheetId)
+    const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
+    const sessionId = await client.beginImport()
+    const wireChunk: ImportCellWire[] = []
+    let committed = false
+
+    async function flush() {
+      if (wireChunk.length === 0) return
+      await client.importChunk(sessionId, wireChunk.splice(0, wireChunk.length))
+    }
+
+    try {
+      for await (const sourceChunk of request.chunks) {
+        for (const cell of sourceChunk) {
+          wireChunk.push(toImportCellWire(sheet.idx, cell.row, cell.col, cell.input))
+          if (wireChunk.length >= cellsPerChunk) await flush()
+        }
+      }
+      await flush()
+      const stats = await client.commitImport(sessionId)
+      committed = true
+      assertImportStatsOk(stats)
+    } finally {
+      if (!committed) await client.cancelImport(sessionId).catch(() => {})
+    }
+
+    const nextRevision = bumpRevision()
+    return {
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision ?? nextRevision,
+      affectedRange: request.range,
+    }
+  }
+
   async function resolveWorkerDataEdge(
     request: ResolveDataEdgeRequest,
   ): Promise<ResolveDataEdgeResult> {
@@ -818,32 +855,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     async importCells(request: ImportCellsRequest): Promise<BackendMutationResult> {
-      const sheet = await resolveSheet(request.sheetId)
-      const cells = request.cells.map((cell) =>
-        toImportCellWire(sheet.idx, cell.row, cell.col, cell.input),
-      )
-      const cellsPerChunk = normalizeImportCellsPerChunk(request.cellsPerChunk)
-      const sessionId = await client.beginImport()
-      let committed = false
+      return importChunks({
+        ...request,
+        kind: 'import-cell-chunks',
+        chunks: [request.cells],
+      })
+    },
 
-      try {
-        for (let index = 0; index < cells.length; index += cellsPerChunk) {
-          await client.importChunk(sessionId, cells.slice(index, index + cellsPerChunk))
-        }
-        const stats = await client.commitImport(sessionId)
-        committed = true
-        assertImportStatsOk(stats)
-      } finally {
-        if (!committed) await client.cancelImport(sessionId).catch(() => {})
-      }
-
-      const nextRevision = bumpRevision()
-      return {
-        sheetId: request.sheetId,
-        requestId: request.requestId,
-        revision: request.revision ?? nextRevision,
-        affectedRange: request.range,
-      }
+    async importCellChunks(request: ImportCellChunksRequest): Promise<BackendMutationResult> {
+      return importChunks(request)
     },
 
     async clearRange(request: ClearRangeRequest): Promise<BackendMutationResult> {

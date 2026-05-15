@@ -7,6 +7,8 @@ import type {
   ClearRangeRequest,
   DeleteColumnsRequest,
   DeleteRowsRequest,
+  ImportCellChunksRequest,
+  ImportCellInput,
   ImportCellsRequest,
   InsertColumnsRequest,
   InsertRowsRequest,
@@ -68,6 +70,8 @@ function createFakeBackend() {
   const insertColumnsRequests: InsertColumnsRequest[] = []
   const deleteColumnsRequests: DeleteColumnsRequest[] = []
   const importCellsRequests: ImportCellsRequest[] = []
+  const importCellChunksRequests: ImportCellChunksRequest[] = []
+  const importCellChunkBatches: ImportCellInput[][] = []
   const readVisibleRequests: VisibleProjectionRequest[] = []
   const readRangeRequests: RangeProjectionRequest[] = []
   const exportRangeTsvRequests: RangeTsvExportRequest[] = []
@@ -142,6 +146,18 @@ function createFakeBackend() {
         affectedRange: request.range,
       }
     },
+    async importCellChunks(request) {
+      importCellChunksRequests.push(request)
+      for await (const chunk of request.chunks) {
+        importCellChunkBatches.push([...chunk])
+      }
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        affectedRange: request.range,
+      }
+    },
     async clearRange(request) {
       clearRangeRequests.push(request)
       return {
@@ -194,6 +210,8 @@ function createFakeBackend() {
     insertColumnsRequests,
     deleteColumnsRequests,
     importCellsRequests,
+    importCellChunksRequests,
+    importCellChunkBatches,
     readVisibleRequests,
     readRangeRequests,
     exportRangeTsvRequests,
@@ -680,12 +698,18 @@ describe('vNext SpreadsheetContextMenu', () => {
     })
   })
 
-  it('routes large clipboard paste through backend bulk import', async () => {
+  it('streams large clipboard paste through backend cell chunks', async () => {
     const rows = ['=B2+1', ...Array.from({ length: 10_000 }, (_value, index) => `row-${index}`)]
     installClipboard(`# einfach-clipboard-origin: B2\n${rows.join('\n')}`)
     const store = createStore()
-    const { backend, importCellsRequests, setCellInputRequests, readVisibleRequests } =
-      createFakeBackend()
+    const {
+      backend,
+      importCellsRequests,
+      importCellChunksRequests,
+      importCellChunkBatches,
+      setCellInputRequests,
+      readVisibleRequests,
+    } = createFakeBackend()
     const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
 
     store.setter(spreadsheetProjectionSnapshotAtom, {
@@ -723,19 +747,25 @@ describe('vNext SpreadsheetContextMenu', () => {
 
     fireEvent.click(getByTestId('context-menu-command-clipboard.paste'))
 
-    await waitFor(() => expect(importCellsRequests).toHaveLength(1))
-    expect(importCellsRequests[0]).toMatchObject({
-      kind: 'import-cells',
+    await waitFor(() => expect(importCellChunksRequests).toHaveLength(1))
+    expect(importCellsRequests).toEqual([])
+    expect(importCellChunksRequests[0]).toMatchObject({
+      kind: 'import-cell-chunks',
       sheetId: 'sheet-1',
       range: { rowStart: 2, rowEnd: 10_002, colStart: 2, colEnd: 2 },
     })
-    expect(importCellsRequests[0].cells).toHaveLength(10_001)
-    expect(importCellsRequests[0].cells[0]).toEqual({
+    expect('cells' in importCellChunksRequests[0]).toBe(false)
+    expect(importCellChunkBatches.length).toBeGreaterThan(1)
+    expect(Math.max(...importCellChunkBatches.map((chunk) => chunk.length))).toBeLessThanOrEqual(
+      1000,
+    )
+    expect(importCellChunkBatches.reduce((count, chunk) => count + chunk.length, 0)).toBe(10_001)
+    expect(importCellChunkBatches[0][0]).toEqual({
       row: 2,
       col: 2,
       input: '=C3+1',
     })
-    expect(importCellsRequests[0].cells[10_000]).toEqual({
+    expect(importCellChunkBatches.at(-1)?.at(-1)).toEqual({
       row: 10_002,
       col: 2,
       input: 'row-9999',
