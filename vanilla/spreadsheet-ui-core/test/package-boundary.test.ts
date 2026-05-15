@@ -6,6 +6,7 @@ import {
   diagnosticsAtom,
   editingSessionAtom,
   formulaBarStateAtom,
+  formulaReferenceSessionAtom,
   historyStackAtom,
   keyboardModeAtom,
   menuStateAtom,
@@ -49,6 +50,7 @@ describe('package boundary', () => {
     expect(editingSessionAtom.debugLabel).toBe('spreadsheet.editing.session')
     expect(formulaBarStateAtom.debugLabel).toBe('spreadsheet.formulaBar.state')
     expect(clipboardStateAtom.debugLabel).toBe('spreadsheet.clipboard.state')
+    expect(formulaReferenceSessionAtom.debugLabel).toBe('spreadsheet.formulaReference.session')
     expect(pointerSessionAtom.debugLabel).toBe('spreadsheet.pointer.session')
     expect(menuStateAtom.debugLabel).toBe('spreadsheet.menu.state')
     expect(toolbarUiStateAtom.debugLabel).toBe('spreadsheet.toolbar.ui')
