@@ -47,6 +47,21 @@ test.describe('Solid Excel vNext smoke', () => {
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
   })
 
+  test('renders projected rich cells without expanding the visible window', async ({ page }) => {
+    await gotoVNextDemo(page)
+
+    await expect(cellDisplay(page, 'E5')).toHaveText('Docs')
+    await expect(cell(page, 'E5')).toHaveAttribute('data-rich-kind', 'hyperlink')
+    await expect(cell(page, 'E5')).toHaveAttribute(
+      'data-rich-url',
+      'https://example.com/spreadsheet-docs',
+    )
+    await expect(cellDisplay(page, 'D6')).toHaveText('Total 109')
+    await expect(cell(page, 'D6')).toHaveAttribute('data-rich-kind', 'rich-text')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
+  })
+
   test('click selection toggles the active state', async ({ page }) => {
     await gotoVNextDemo(page)
 

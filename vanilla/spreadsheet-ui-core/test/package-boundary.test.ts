@@ -10,7 +10,9 @@ import {
   fillSeriesLocaleAtom,
   formulaBarStateAtom,
   formulaReferenceSessionAtom,
+  getDisplayCellText,
   historyStackAtom,
+  isHyperlinkValue,
   keyboardModeAtom,
   menuStateAtom,
   nameRegistryCacheAtom,
@@ -74,6 +76,8 @@ describe('package boundary', () => {
     expect(fillSeriesLocaleAtom.debugLabel).toBe('spreadsheet.autoFill.locale')
     expect(validationRuleEditorAtom.debugLabel).toBe('spreadsheet.validation.ruleEditor')
     expect(conditionalFormatEditorAtom.debugLabel).toBe('spreadsheet.conditionalFormat.editor')
+    expect(typeof getDisplayCellText).toBe('function')
+    expect(typeof isHyperlinkValue).toBe('function')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

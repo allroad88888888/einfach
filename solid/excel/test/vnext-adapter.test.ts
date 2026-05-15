@@ -856,6 +856,70 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('preserves projected rich values in static reads', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 2,
+      cells: [
+        {
+          row: 0,
+          col: 0,
+          displayValue: 'Fallback',
+          valueKind: 'string',
+          richValue: {
+            kind: 'rich-text',
+            runs: [
+              { text: 'Rich ', format: { bold: true } },
+              { text: 'value', format: { color: '#0f766e' } },
+            ],
+          },
+        },
+      ],
+    })
+
+    const result = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 19,
+        window: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'Fallback',
+        valueKind: 'string',
+        richValue: {
+          kind: 'rich-text',
+          runs: [
+            { text: 'Rich ', format: { bold: true } },
+            { text: 'value', format: { color: '#0f766e' } },
+          ],
+        },
+      },
+    ])
+
+    const projected = result.cells[0].richValue
+    if (projected?.kind !== 'rich-text') throw new Error('expected rich-text projection')
+    projected.runs[0].text = 'mutated'
+
+    const reread = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 20,
+        window: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+    expect(reread.cells[0].richValue).toEqual({
+      kind: 'rich-text',
+      runs: [
+        { text: 'Rich ', format: { bold: true } },
+        { text: 'value', format: { color: '#0f766e' } },
+      ],
+    })
+  })
+
   it('keeps setCellInput isolated to the target cell and bumps revision', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 3,
@@ -902,6 +966,60 @@ describe('vnext adapter', () => {
       { row: 0, col: 1, displayValue: 'B1-updated', valueKind: 'string' },
       { row: 1, col: 0, displayValue: 'A2', valueKind: 'string' },
       { row: 1, col: 1, displayValue: 'B2', valueKind: 'string' },
+    ])
+  })
+
+  it('sets rich cell values through the optional static backend port', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 7 })
+    expect(backend.setCellRichValue).toBeDefined()
+
+    const mutation = await backend.setCellRichValue?.({
+      kind: 'set-cell-rich-value',
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 7,
+      row: 1,
+      col: 1,
+      value: {
+        kind: 'hyperlink',
+        url: 'https://example.com/report',
+        label: 'Report',
+      },
+    })
+
+    expect(mutation).toEqual({
+      sheetId: 'sheet-1',
+      requestId: 21,
+      revision: 7,
+      affectedRange: {
+        rowStart: 1,
+        rowEnd: 1,
+        colStart: 1,
+        colEnd: 1,
+      },
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 22,
+        reason: 'test',
+        range: { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 1,
+        col: 1,
+        displayValue: 'Report',
+        valueKind: 'string',
+        richValue: {
+          kind: 'hyperlink',
+          url: 'https://example.com/report',
+          label: 'Report',
+        },
+      },
     ])
   })
 

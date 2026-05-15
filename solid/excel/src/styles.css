@@ -514,6 +514,16 @@ thead .row-header {
   text-align: left;
 }
 
+.cell-rich-link {
+  color: #0b57d0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.cell-rich-text {
+  display: inline;
+}
+
 .spreadsheet-grid-fill-handle {
   position: absolute;
   right: -3px;

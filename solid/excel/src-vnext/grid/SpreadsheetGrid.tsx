@@ -13,6 +13,7 @@ import {
   getAdjacentSheetId,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
+  getRichValueText,
   getViewportColumnWidth,
   getViewportRowHeight,
   getSelectionRange,
@@ -45,7 +46,9 @@ import {
   type CellCoord,
   type CellRange,
   type DisplayCell,
+  type DisplayCellRichValue,
   type PointerFillHandleCommitIntent,
+  type RichTextRunFormat,
   type SelectionRegion,
   type SelectionState,
   type SpreadsheetCellFormat,
@@ -126,6 +129,56 @@ function getCellValidationSeverity(cell: DisplayCell | undefined): string | unde
 
 function getCellValidationMessage(cell: DisplayCell | undefined): string | undefined {
   return cell?.validation?.message
+}
+
+function getCellRichUrl(cell: DisplayCell | undefined): string | undefined {
+  return cell?.richValue?.kind === 'hyperlink' ? cell.richValue.url : undefined
+}
+
+function getRichRunStyle(format: RichTextRunFormat | undefined): Record<string, string> {
+  if (!format) return {}
+
+  const style: Record<string, string> = {}
+  const textDecoration: string[] = []
+  if (format.bold) style['font-weight'] = '700'
+  if (format.italic) style['font-style'] = 'italic'
+  if (format.underline) textDecoration.push('underline')
+  if (format.strikethrough) textDecoration.push('line-through')
+  if (textDecoration.length > 0) style['text-decoration'] = textDecoration.join(' ')
+  if (format.color) style['color'] = format.color
+  return style
+}
+
+function SpreadsheetCellDisplayValue(props: { cell: DisplayCell | undefined }) {
+  const richValue = () => props.cell?.richValue
+
+  return (
+    <Show when={richValue()} fallback={props.cell?.displayValue ?? ''}>
+      {(value) => {
+        const rich = value() as DisplayCellRichValue
+
+        if (rich.kind === 'hyperlink') {
+          return (
+            <span class="cell-rich-link" data-rich-url={rich.url}>
+              {rich.label}
+            </span>
+          )
+        }
+
+        if (rich.kind === 'rich-text') {
+          return (
+            <span class="cell-rich-text">
+              <For each={rich.runs}>
+                {(run) => <span style={getRichRunStyle(run.format)}>{run.text}</span>}
+              </For>
+            </span>
+          )
+        }
+
+        return getRichValueText(rich)
+      }}
+    </Show>
+  )
 }
 
 function getRangeCellCount(range: CellRange): number {
@@ -1501,6 +1554,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             data-has-conditional-format={
                               cell()?.conditionalFormat ? 'true' : 'false'
                             }
+                            data-rich-kind={cell()?.richValue?.kind}
+                            data-rich-url={getCellRichUrl(cell())}
                             aria-selected={selected() ? 'true' : 'false'}
                             title={getCellValidationMessage(cell())}
                             rowSpan={getCellRowSpan(row, col)}
@@ -1538,7 +1593,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                     class="cell-display"
                                     style={getCellFormatStyle(getDisplayCellFormat(cell()))}
                                   >
-                                    {cell()?.displayValue ?? ''}
+                                    <SpreadsheetCellDisplayValue cell={cell()} />
                                   </span>
                                 </button>
                               }

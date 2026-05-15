@@ -316,6 +316,93 @@ describe('vNext SpreadsheetGrid', () => {
     expect(cell.getAttribute('title')).toBe('Value must be one of: open, closed')
   })
 
+  it('renders rich hyperlink and rich text values from projection metadata', async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Fallback',
+              valueKind: 'string',
+              richValue: {
+                kind: 'hyperlink',
+                url: 'https://example.com/docs',
+                label: 'Docs',
+              },
+            },
+            {
+              row: 0,
+              col: 1,
+              displayValue: 'Plain fallback',
+              valueKind: 'string',
+              richValue: {
+                kind: 'rich-text',
+                runs: [
+                  { text: 'Paid ', format: { bold: true } },
+                  { text: 'invoice', format: { italic: true, color: '#0f766e' } },
+                ],
+              },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Docs',
+      )
+      expect(container.querySelector('[data-cell-addr="B1"] .cell-display')?.textContent).toBe(
+        'Paid invoice',
+      )
+    })
+
+    const hyperlinkCell = container.querySelector('[data-cell-addr="A1"]') as HTMLElement
+    const hyperlink = hyperlinkCell.querySelector('.cell-rich-link') as HTMLElement
+    expect(hyperlinkCell.getAttribute('data-rich-kind')).toBe('hyperlink')
+    expect(hyperlinkCell.getAttribute('data-rich-url')).toBe('https://example.com/docs')
+    expect(hyperlink.getAttribute('data-rich-url')).toBe('https://example.com/docs')
+
+    const richTextCell = container.querySelector('[data-cell-addr="B1"]') as HTMLElement
+    const runs = richTextCell.querySelectorAll('.cell-rich-text span')
+    expect(richTextCell.getAttribute('data-rich-kind')).toBe('rich-text')
+    expect((runs[0] as HTMLElement).style.fontWeight).toBe('700')
+    expect((runs[1] as HTMLElement).style.fontStyle).toBe('italic')
+    expect((runs[1] as HTMLElement).style.color).toBe('rgb(15, 118, 110)')
+  })
+
   it('skips rows and columns marked hidden by viewport projection metadata', async () => {
     const store = createStore()
     const { backend } = createFakeBackend({

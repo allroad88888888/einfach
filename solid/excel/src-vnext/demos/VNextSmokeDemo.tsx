@@ -48,6 +48,30 @@ const backend = createStaticSpreadsheetBackend({
       },
     },
     {
+      row: 4,
+      col: 4,
+      displayValue: 'Docs',
+      valueKind: 'string',
+      richValue: {
+        kind: 'hyperlink',
+        url: 'https://example.com/spreadsheet-docs',
+        label: 'Docs',
+      },
+    },
+    {
+      row: 5,
+      col: 3,
+      displayValue: 'Total 109',
+      valueKind: 'string',
+      richValue: {
+        kind: 'rich-text',
+        runs: [
+          { text: 'Total ', format: { bold: true } },
+          { text: '109', format: { color: '#0f766e' } },
+        ],
+      },
+    },
+    {
       row: 19,
       col: 9,
       displayValue: 'Hidden offscreen',

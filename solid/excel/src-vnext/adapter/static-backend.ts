@@ -2,6 +2,7 @@ import type {
   DeleteColumnsRequest,
   DeleteRowsRequest,
   DisplayCell,
+  DisplayCellRichValue,
   FillRangeRequest,
   ImportCellChunksRequest,
   ImportCellsRequest,
@@ -18,6 +19,7 @@ import type {
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
+  SetCellRichValueRequest,
   SetColumnWidthRequest,
   SetFormatRangeRequest,
   SetRowHeightRequest,
@@ -33,6 +35,7 @@ import type {
 import {
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
+  getRichValueText,
   reorderSheetMetadata,
 } from '@einfach/spreadsheet-ui-core'
 import type {
@@ -72,10 +75,25 @@ function cloneCell(cell: DisplayCell): DisplayCell {
   if (cell.format) clone.format = cloneFormat(cell.format)
   if (cell.conditionalFormat) clone.conditionalFormat = cloneFormat(cell.conditionalFormat)
   if (cell.validation) clone.validation = { ...cell.validation }
+  if (cell.richValue) clone.richValue = cloneRichValue(cell.richValue)
   if (cell.mergedSpan) clone.mergedSpan = { ...cell.mergedSpan }
   if (cell.mergeAnchor) clone.mergeAnchor = { ...cell.mergeAnchor }
 
   return clone
+}
+
+function cloneRichValue(value: DisplayCellRichValue): DisplayCellRichValue {
+  switch (value.kind) {
+    case 'rich-text':
+      return {
+        kind: value.kind,
+        runs: value.runs.map((run) =>
+          run.format ? { text: run.text, format: { ...run.format } } : { text: run.text },
+        ),
+      }
+    default:
+      return { ...value }
+  }
 }
 
 function cloneFormat(format: SpreadsheetCellFormat): SpreadsheetCellFormat {
@@ -800,6 +818,36 @@ function updateCell(
   return cell
 }
 
+function valueKindForRichValue(value: DisplayCellRichValue): DisplayCell['valueKind'] {
+  switch (value.kind) {
+    case 'number':
+      return 'number'
+    case 'boolean':
+      return 'boolean'
+    case 'error':
+      return 'error'
+    default:
+      return 'string'
+  }
+}
+
+function updateCellRichValue(
+  cells: Map<string, DisplayCell>,
+  request: SetCellRichValueRequest,
+): DisplayCell {
+  const richValue = cloneRichValue(request.value)
+  const cell: DisplayCell = {
+    row: request.row,
+    col: request.col,
+    displayValue: getRichValueText(richValue),
+    valueKind: valueKindForRichValue(richValue),
+    richValue,
+  }
+
+  cells.set(keyFor(request.row, request.col), cell)
+  return cell
+}
+
 function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest): number {
   let cleared = 0
 
@@ -1215,6 +1263,22 @@ export function createStaticSpreadsheetBackend(
     },
     async setCellInput(request) {
       updateCell(state.cells, request)
+      state.revision = bumpRevision(state.revision)
+
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+        affectedRange: {
+          rowStart: request.row,
+          rowEnd: request.row,
+          colStart: request.col,
+          colEnd: request.col,
+        },
+      }
+    },
+    async setCellRichValue(request) {
+      updateCellRichValue(state.cells, request)
       state.revision = bumpRevision(state.revision)
 
       return {
