@@ -96,6 +96,21 @@ export interface SparseRangeWire {
   endCol: number
 }
 
+export interface ViewportRowHeightWire {
+  rowIndex: number
+  heightPx: number
+}
+
+export interface ViewportColumnWidthWire {
+  colIndex: number
+  widthPx: number
+}
+
+export interface ViewportSizeSnapshotWire extends SparseRangeWire {
+  rowHeights: ViewportRowHeightWire[]
+  colWidths: ViewportColumnWidthWire[]
+}
+
 export interface CellRefWire {
   sheet: number
   addr: string
@@ -132,6 +147,7 @@ export interface WorkbookPersistenceSnapshotWire {
   sheets: WorkbookPersistenceSheetWire[]
   cells: SparseCellWire[]
   formats?: FormatRangeSnapshot[]
+  sizes?: ViewportSizeSnapshotWire[]
 }
 
 export interface WorkbookPersistenceRestoreStatsWire {
@@ -199,6 +215,9 @@ export interface WorkerWorkbookClient {
   listNonEmpty(): Promise<CellRefWire[]>
   snapshotSparse(): Promise<SparseCellWire[]>
   snapshotRangeSparse(range: SparseRangeWire): Promise<SparseCellWire[]>
+  snapshotViewportSizes(range: SparseRangeWire): Promise<ViewportSizeSnapshotWire>
+  setRowHeight(sheet: number, rowIndex: number, heightPx: number): Promise<boolean>
+  setColumnWidth(sheet: number, colIndex: number, widthPx: number): Promise<boolean>
   snapshotPersistenceV1(): Promise<WorkbookPersistenceSnapshotWire>
   restorePersistenceV1(
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -416,6 +435,15 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     snapshotRangeSparse(range) {
       return request<SparseCellWire[]>('snapshotRangeSparse', { range })
+    },
+    snapshotViewportSizes(range) {
+      return request<ViewportSizeSnapshotWire>('snapshotViewportSizes', { range })
+    },
+    setRowHeight(sheet, rowIndex, heightPx) {
+      return request<boolean>('setRowHeight', { sheet, rowIndex, heightPx })
+    },
+    setColumnWidth(sheet, colIndex, widthPx) {
+      return request<boolean>('setColumnWidth', { sheet, colIndex, widthPx })
     },
     snapshotPersistenceV1() {
       return request<WorkbookPersistenceSnapshotWire>('snapshotPersistenceV1')

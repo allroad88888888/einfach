@@ -189,6 +189,131 @@ impl FormatRangeSnapshotJSON {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ViewportRowHeightJSON {
+    #[serde(rename = "rowIndex")]
+    row_index: u32,
+    #[serde(rename = "heightPx")]
+    height_px: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ViewportColumnWidthJSON {
+    #[serde(rename = "colIndex")]
+    col_index: u32,
+    #[serde(rename = "widthPx")]
+    width_px: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ViewportSizeSnapshotJSON {
+    #[serde(default)]
+    sheet: Option<u32>,
+    #[serde(rename = "startRow")]
+    start_row: u32,
+    #[serde(rename = "startCol")]
+    start_col: u32,
+    #[serde(rename = "endRow")]
+    end_row: u32,
+    #[serde(rename = "endCol")]
+    end_col: u32,
+    #[serde(rename = "rowHeights", default, skip_serializing_if = "Vec::is_empty")]
+    row_heights: Vec<ViewportRowHeightJSON>,
+    #[serde(rename = "colWidths", default, skip_serializing_if = "Vec::is_empty")]
+    col_widths: Vec<ViewportColumnWidthJSON>,
+}
+
+impl ViewportSizeSnapshotJSON {
+    fn from_sheet_range(sheet: &Sheet, range: CellRange, sheet_idx: Option<u32>) -> Self {
+        let range = range.normalize();
+        ViewportSizeSnapshotJSON {
+            sheet: sheet_idx,
+            start_row: range.start.row,
+            start_col: range.start.col,
+            end_row: range.end.row,
+            end_col: range.end.col,
+            row_heights: sheet
+                .row_heights_in_range(range.start.row, range.end.row)
+                .into_iter()
+                .map(|(row_index, height_px)| ViewportRowHeightJSON {
+                    row_index,
+                    height_px,
+                })
+                .collect(),
+            col_widths: sheet
+                .col_widths_in_range(range.start.col, range.end.col)
+                .into_iter()
+                .map(|(col_index, width_px)| ViewportColumnWidthJSON {
+                    col_index,
+                    width_px,
+                })
+                .collect(),
+        }
+    }
+
+    fn from_full_sheet(sheet: &Sheet, sheet_idx: u32) -> Self {
+        ViewportSizeSnapshotJSON {
+            sheet: Some(sheet_idx),
+            start_row: 0,
+            start_col: 0,
+            end_row: u32::MAX,
+            end_col: u32::MAX,
+            row_heights: sheet
+                .all_row_heights()
+                .into_iter()
+                .map(|(row_index, height_px)| ViewportRowHeightJSON {
+                    row_index,
+                    height_px,
+                })
+                .collect(),
+            col_widths: sheet
+                .all_col_widths()
+                .into_iter()
+                .map(|(col_index, width_px)| ViewportColumnWidthJSON {
+                    col_index,
+                    width_px,
+                })
+                .collect(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.row_heights.is_empty() && self.col_widths.is_empty()
+    }
+
+    fn into_size_facts(self) -> Result<(Vec<(u32, u32)>, Vec<(u32, u32)>), String> {
+        let mut row_heights = Vec::with_capacity(self.row_heights.len());
+        for row in self.row_heights {
+            if row.height_px == 0 {
+                return Err(format!("invalid row height at row {}", row.row_index));
+            }
+            if row.row_index < self.start_row || row.row_index > self.end_row {
+                return Err(format!(
+                    "row height outside snapshot range: {}",
+                    row.row_index
+                ));
+            }
+            row_heights.push((row.row_index, row.height_px));
+        }
+
+        let mut col_widths = Vec::with_capacity(self.col_widths.len());
+        for col in self.col_widths {
+            if col.width_px == 0 {
+                return Err(format!("invalid column width at col {}", col.col_index));
+            }
+            if col.col_index < self.start_col || col.col_index > self.end_col {
+                return Err(format!(
+                    "column width outside snapshot range: {}",
+                    col.col_index
+                ));
+            }
+            col_widths.push((col.col_index, col.width_px));
+        }
+
+        Ok((row_heights, col_widths))
+    }
+}
+
 impl NumberFormatJSON {
     fn into_number_format(self) -> NumberFormat {
         match self.kind.as_str() {
@@ -564,6 +689,8 @@ struct WorkbookPersistenceV1JSON {
     cells: Vec<SparseCellJSON>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     formats: Vec<FormatRangeSnapshotJSON>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sizes: Vec<ViewportSizeSnapshotJSON>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1701,6 +1828,59 @@ impl WasmWorkbook {
         Ok(sheet.restore_format_range_snapshot(snapshot) as u32)
     }
 
+    /// Persist a sparse row-height fact on a workbook sheet. Empty rows are not
+    /// materialized; this only updates sheet metadata.
+    pub fn set_row_height(&mut self, sheet_idx: u32, row_index: u32, height_px: u32) -> bool {
+        let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) else {
+            return false;
+        };
+        if height_px == 0 {
+            sheet.clear_row_height(row_index);
+        } else {
+            sheet.set_row_height(row_index, height_px);
+        }
+        true
+    }
+
+    /// Persist a sparse column-width fact on a workbook sheet. Empty columns are
+    /// not materialized; this only updates sheet metadata.
+    pub fn set_col_width(&mut self, sheet_idx: u32, col_index: u32, width_px: u32) -> bool {
+        let Some(sheet) = self.workbook.sheet_mut(sheet_idx as usize) else {
+            return false;
+        };
+        if width_px == 0 {
+            sheet.clear_col_width(col_index);
+        } else {
+            sheet.set_col_width(col_index, width_px);
+        }
+        true
+    }
+
+    /// Snapshot row/column size metadata for the requested visible window.
+    pub fn snapshot_viewport_sizes(
+        &self,
+        sheet_idx: u32,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Result<JsValue, JsValue> {
+        let range = CellRange::new(
+            CellAddress::new(start_row, start_col),
+            CellAddress::new(end_row, end_col),
+        );
+        let sheet = self
+            .workbook
+            .sheet(sheet_idx as usize)
+            .ok_or_else(|| JsValue::from_str(&format!("invalid sheet index: {sheet_idx}")))?;
+        serde_wasm_bindgen::to_value(&ViewportSizeSnapshotJSON::from_sheet_range(
+            sheet,
+            range,
+            Some(sheet_idx),
+        ))
+        .map_err(|err| JsValue::from_str(&format!("serialize viewport size snapshot: {err}")))
+    }
+
     /// Snapshot workbook state as persistence-v1 sparse envelope.
     ///
     /// Format metadata includes range-format and in-range cell formats from each
@@ -1744,6 +1924,7 @@ impl WasmWorkbook {
     fn snapshot_persistence_v1_json(&self) -> WorkbookPersistenceV1JSON {
         let mut sheets = Vec::with_capacity(self.workbook.sheet_count());
         let mut formats = Vec::with_capacity(self.workbook.sheet_count());
+        let mut sizes = Vec::new();
 
         for sheet_idx in 0..self.workbook.sheet_count() {
             let Some(sheet) = self.workbook.sheet(sheet_idx) else {
@@ -1768,6 +1949,11 @@ impl WasmWorkbook {
                 &snapshot,
                 Some(sheet_idx as u32),
             ));
+
+            let size_snapshot = ViewportSizeSnapshotJSON::from_full_sheet(sheet, sheet_idx as u32);
+            if !size_snapshot.is_empty() {
+                sizes.push(size_snapshot);
+            }
         }
 
         WorkbookPersistenceV1JSON {
@@ -1775,6 +1961,7 @@ impl WasmWorkbook {
             sheets,
             cells: self.snapshot_sparse_cells(),
             formats,
+            sizes,
         }
     }
 
@@ -1824,6 +2011,21 @@ impl WasmWorkbook {
             format_snapshots.push((sheet_idx, snapshot));
         }
 
+        let mut size_snapshots = Vec::with_capacity(payload.sizes.len());
+        for snapshot in payload.sizes {
+            let sheet_idx = snapshot
+                .sheet
+                .ok_or_else(|| "size snapshot is missing sheet index".to_string())?
+                as usize;
+            if sheet_idx >= sheet_count {
+                return Err(format!(
+                    "size snapshot references missing sheet: {sheet_idx}"
+                ));
+            }
+            let (row_heights, col_widths) = snapshot.into_size_facts()?;
+            size_snapshots.push((sheet_idx, row_heights, col_widths));
+        }
+
         let mut workbook = Workbook::new();
         let first_name = payload.sheets[0].name.clone();
         let first_sheet_already_named = workbook.name(0) == Some(first_name.as_str());
@@ -1849,6 +2051,18 @@ impl WasmWorkbook {
                 .sheet_mut(sheet_idx)
                 .ok_or_else(|| format!("invalid sheet index: {sheet_idx}"))?;
             restored_formats += sheet.restore_format_range_snapshot(snapshot) as u32;
+        }
+        for (sheet_idx, row_heights, col_widths) in size_snapshots {
+            let sheet = self
+                .workbook
+                .sheet_mut(sheet_idx)
+                .ok_or_else(|| format!("invalid sheet index: {sheet_idx}"))?;
+            for (row_index, height_px) in row_heights {
+                sheet.set_row_height(row_index, height_px);
+            }
+            for (col_index, width_px) in col_widths {
+                sheet.set_col_width(col_index, width_px);
+            }
         }
 
         let stats = WorkbookPersistenceRestoreStatsJSON {
@@ -2412,6 +2626,102 @@ mod tests {
     }
 
     #[test]
+    fn wasm_workbook_viewport_size_facts_roundtrip_without_cells() {
+        let mut source = WasmWorkbook::new();
+        assert!(source.set_row_height(0, 3, 44));
+        assert!(source.set_col_width(0, 2, 128));
+
+        let envelope = source.snapshot_persistence_v1_json();
+        assert_eq!(envelope.cells.len(), 0);
+        assert_eq!(envelope.sheets[0].row_count, None);
+        assert_eq!(envelope.sheets[0].col_count, None);
+        assert_eq!(envelope.sizes.len(), 1);
+        assert_eq!(envelope.sizes[0].row_heights[0].row_index, 3);
+        assert_eq!(envelope.sizes[0].row_heights[0].height_px, 44);
+        assert_eq!(envelope.sizes[0].col_widths[0].col_index, 2);
+        assert_eq!(envelope.sizes[0].col_widths[0].width_px, 128);
+
+        let mut restored = WasmWorkbook::new();
+        let stats = restored.restore_persistence_v1_json(envelope).unwrap();
+        assert_eq!(stats.restored_cells, 0);
+
+        let snapshot = ViewportSizeSnapshotJSON::from_sheet_range(
+            restored.workbook.sheet(0).unwrap(),
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(10, 10)),
+            Some(0),
+        );
+        assert_eq!(snapshot.row_heights.len(), 1);
+        assert_eq!(snapshot.row_heights[0].row_index, 3);
+        assert_eq!(snapshot.row_heights[0].height_px, 44);
+        assert_eq!(snapshot.col_widths.len(), 1);
+        assert_eq!(snapshot.col_widths[0].col_index, 2);
+        assert_eq!(snapshot.col_widths[0].width_px, 128);
+    }
+
+    #[test]
+    fn wasm_workbook_snapshot_viewport_sizes_filters_window() {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Second");
+        assert!(wb.set_row_height(1, 1, 24));
+        assert!(wb.set_row_height(1, 9, 48));
+        assert!(wb.set_col_width(1, 2, 120));
+        assert!(wb.set_col_width(1, 8, 240));
+
+        let snapshot = ViewportSizeSnapshotJSON::from_sheet_range(
+            wb.workbook.sheet(1).unwrap(),
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(4, 4)),
+            Some(1),
+        );
+        assert_eq!(snapshot.sheet, Some(1));
+        assert_eq!(snapshot.row_heights.len(), 1);
+        assert_eq!(snapshot.row_heights[0].row_index, 1);
+        assert_eq!(snapshot.col_widths.len(), 1);
+        assert_eq!(snapshot.col_widths[0].col_index, 2);
+    }
+
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_rejects_bad_size_without_mutating_workbook() {
+        let mut wb = WasmWorkbook::new();
+        assert!(wb.rename_sheet(0, "Keep"));
+        wb.set_number(0, "A1", 7.0);
+
+        let payload = WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Loaded".into(),
+                row_count: None,
+                col_count: None,
+            }],
+            cells: vec![SparseCellJSON {
+                sheet: 0,
+                addr: "A1".into(),
+                row: 0,
+                col: 0,
+                kind: "number".into(),
+                value: Some(ImportValueJSON::Number(99.0)),
+            }],
+            formats: vec![],
+            sizes: vec![ViewportSizeSnapshotJSON {
+                sheet: Some(0),
+                start_row: 0,
+                start_col: 0,
+                end_row: 2,
+                end_col: 2,
+                row_heights: vec![ViewportRowHeightJSON {
+                    row_index: 10,
+                    height_px: 40,
+                }],
+                col_widths: vec![],
+            }],
+        };
+
+        assert!(wb.restore_persistence_v1_json(payload).is_err());
+        assert_eq!(wb.sheet_name(0), "Keep");
+        assert_eq!(wb.get_number(0, "A1"), 7.0);
+    }
+
+    #[test]
     fn wasm_workbook_restore_persistence_v1_rejects_unsupported_version() {
         let mut wb = WasmWorkbook::new();
         let payload = WorkbookPersistenceV1JSON {
@@ -2424,6 +2734,7 @@ mod tests {
             }],
             cells: vec![],
             formats: vec![],
+            sizes: vec![],
         };
         assert!(wb.restore_persistence_v1_json(payload).is_err());
     }
@@ -2450,6 +2761,7 @@ mod tests {
                 value: Some(ImportValueJSON::Number(42.0)),
             }],
             formats: vec![],
+            sizes: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();
@@ -2489,6 +2801,7 @@ mod tests {
                 cell_formats: vec![],
                 range_formats: vec![],
             }],
+            sizes: vec![],
         };
 
         assert!(wb.restore_persistence_v1_json(payload).is_err());
@@ -2511,6 +2824,7 @@ mod tests {
             }],
             cells: vec![],
             formats: vec![],
+            sizes: vec![],
         };
 
         let stats = wb.restore_persistence_v1_json(payload).unwrap();

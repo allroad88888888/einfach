@@ -509,6 +509,10 @@ pub struct Sheet {
     /// Sheet-wide conditional formatting rules. Applied in order on top of
     /// each cell's base format at display time (first match wins).
     conditional_rules: Vec<ConditionalRule>,
+    /// Sparse row heights in physical pixels. Absent means the UI default.
+    row_heights: BTreeMap<u32, u32>,
+    /// Sparse column widths in physical pixels. Absent means the UI default.
+    col_widths: BTreeMap<u32, u32>,
     /// Cumulative count of formula evaluations performed (cache-miss path in
     /// `eval_formula_at_with_provider`). Read-only debug counter used by the
     /// Phase 1 scale tests to assert laziness — `bulk_load` of N formulas
@@ -537,9 +541,105 @@ impl Sheet {
             formats: HashMap::new(),
             range_formats: Vec::new(),
             conditional_rules: Vec::new(),
+            row_heights: BTreeMap::new(),
+            col_widths: BTreeMap::new(),
             formula_eval_count: Cell::new(0),
             imported_formula_count: Cell::new(0),
         }
+    }
+
+    pub fn set_row_height(&mut self, row_index: u32, height_px: u32) -> bool {
+        if height_px == 0 {
+            return self.clear_row_height(row_index);
+        }
+        self.row_heights.insert(row_index, height_px) != Some(height_px)
+    }
+
+    pub fn clear_row_height(&mut self, row_index: u32) -> bool {
+        self.row_heights.remove(&row_index).is_some()
+    }
+
+    pub fn row_height(&self, row_index: u32) -> Option<u32> {
+        self.row_heights.get(&row_index).copied()
+    }
+
+    pub fn row_heights_in_range(&self, start_row: u32, end_row: u32) -> Vec<(u32, u32)> {
+        if end_row < start_row {
+            return Vec::new();
+        }
+        self.row_heights
+            .range(start_row..=end_row)
+            .map(|(row_index, height_px)| (*row_index, *height_px))
+            .collect()
+    }
+
+    pub fn all_row_heights(&self) -> Vec<(u32, u32)> {
+        self.row_heights
+            .iter()
+            .map(|(row_index, height_px)| (*row_index, *height_px))
+            .collect()
+    }
+
+    pub fn set_col_width(&mut self, col_index: u32, width_px: u32) -> bool {
+        if width_px == 0 {
+            return self.clear_col_width(col_index);
+        }
+        self.col_widths.insert(col_index, width_px) != Some(width_px)
+    }
+
+    pub fn clear_col_width(&mut self, col_index: u32) -> bool {
+        self.col_widths.remove(&col_index).is_some()
+    }
+
+    pub fn col_width(&self, col_index: u32) -> Option<u32> {
+        self.col_widths.get(&col_index).copied()
+    }
+
+    pub fn col_widths_in_range(&self, start_col: u32, end_col: u32) -> Vec<(u32, u32)> {
+        if end_col < start_col {
+            return Vec::new();
+        }
+        self.col_widths
+            .range(start_col..=end_col)
+            .map(|(col_index, width_px)| (*col_index, *width_px))
+            .collect()
+    }
+
+    pub fn all_col_widths(&self) -> Vec<(u32, u32)> {
+        self.col_widths
+            .iter()
+            .map(|(col_index, width_px)| (*col_index, *width_px))
+            .collect()
+    }
+
+    fn shift_dimension_insert(dimensions: &mut BTreeMap<u32, u32>, at: u32, count: u32) {
+        let mut shifted = BTreeMap::new();
+        for (index, size_px) in dimensions.iter() {
+            let next_index = if *index >= at {
+                index.saturating_add(count)
+            } else {
+                *index
+            };
+            shifted.insert(next_index, *size_px);
+        }
+        *dimensions = shifted;
+    }
+
+    fn shift_dimension_delete(dimensions: &mut BTreeMap<u32, u32>, at: u32, count: u32) {
+        let delete_end = at.saturating_add(count);
+        let mut shifted = BTreeMap::new();
+        for (index, size_px) in dimensions.iter() {
+            if *index >= at && *index < delete_end {
+                continue;
+            }
+            let next_index = if *index >= delete_end {
+                index.saturating_sub(count)
+            } else {
+                *index
+            };
+            shifted.insert(next_index, *size_px);
+        }
+        *dimensions = shifted;
     }
 
     /// Get or create the primitive atom for a cell address.
@@ -1682,6 +1782,7 @@ impl Sheet {
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_row_insert(addr, at, count)
             });
+            Self::shift_dimension_insert(&mut sheet.row_heights, at, count);
         });
     }
 
@@ -1697,6 +1798,7 @@ impl Sheet {
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_row_delete(addr, at, count)
             });
+            Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
         });
     }
 
@@ -1709,6 +1811,7 @@ impl Sheet {
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_col_insert(addr, at, count)
             });
+            Self::shift_dimension_insert(&mut sheet.col_widths, at, count);
         });
     }
 
@@ -1722,6 +1825,7 @@ impl Sheet {
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_col_delete(addr, at, count)
             });
+            Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
         });
     }
 
@@ -3156,6 +3260,50 @@ mod tests {
         sheet.set_formula("A2", "=C1+1");
         sheet.delete_col(2, 1); // delete column C (index 2)
         assert_eq!(sheet.get_cell("A2"), Value::Error(ValueError::InvalidRef));
+    }
+
+    #[test]
+    fn row_and_col_size_facts_stay_sparse() {
+        let mut sheet = Sheet::new();
+
+        assert_eq!(sheet.row_height(1), None);
+        assert_eq!(sheet.col_width(2), None);
+
+        assert!(sheet.set_row_height(1, 27));
+        assert!(sheet.set_col_width(2, 144));
+        assert_eq!(sheet.row_height(1), Some(27));
+        assert_eq!(sheet.col_width(2), Some(144));
+        assert_eq!(sheet.row_heights_in_range(0, 10), vec![(1, 27)]);
+        assert_eq!(sheet.col_widths_in_range(0, 10), vec![(2, 144)]);
+
+        assert!(sheet.set_row_height(5, 32));
+        assert!(sheet.set_col_width(7, 180));
+        assert_eq!(sheet.row_heights_in_range(2, 10), vec![(5, 32)]);
+        assert_eq!(sheet.col_widths_in_range(3, 10), vec![(7, 180)]);
+
+        assert!(sheet.clear_row_height(1));
+        assert!(sheet.clear_col_width(2));
+        assert_eq!(sheet.all_row_heights(), vec![(5, 32)]);
+        assert_eq!(sheet.all_col_widths(), vec![(7, 180)]);
+    }
+
+    #[test]
+    fn row_and_col_size_facts_shift_with_structural_edits() {
+        let mut sheet = Sheet::new();
+        assert!(sheet.set_row_height(1, 24));
+        assert!(sheet.set_row_height(4, 36));
+        assert!(sheet.set_col_width(1, 120));
+        assert!(sheet.set_col_width(4, 200));
+
+        sheet.insert_row(2, 2);
+        sheet.insert_col(2, 2);
+        assert_eq!(sheet.all_row_heights(), vec![(1, 24), (6, 36)]);
+        assert_eq!(sheet.all_col_widths(), vec![(1, 120), (6, 200)]);
+
+        sheet.delete_row(1, 2);
+        sheet.delete_col(1, 2);
+        assert_eq!(sheet.all_row_heights(), vec![(4, 36)]);
+        assert_eq!(sheet.all_col_widths(), vec![(4, 200)]);
     }
 
     #[test]

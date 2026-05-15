@@ -449,6 +449,13 @@ Playwright CLI，并补 MCP Playwright 验证记录。
   static backend 按 `sheetId` 持久化 size metadata，worker adapter 在 JS adapter 层维护 size
   metadata，底层 Rust workbook 暂未持久化 row/col size。该链路不读取 cell projection、
   不创建 row/col atom，也不维护全量尺寸数组。
+- PC-7 W4 更新：worker/Rust backend 的 row/column size 已下沉到 Rust workbook
+  sparse facts。`Sheet` 只保存用户显式设置过的 row height / column width key，结构化
+  row/col insert/delete 只移动已有 key；`WasmWorkbook` 增加 window 级
+  `snapshot_viewport_sizes` 和单行/单列 resize mutation，persistence v1 通过可选
+  `sizes` 字段 round-trip。Solid UI 仍只保留 `viewportSizeOverridesAtom` 作为可视窗口
+  渲染缓存，不创建 per-row/per-col atom，也不把尺寸变成 cell facts。autofit 尚未接入；
+  后续必须基于当前 visible window 或显式有限范围，不能扫描整表。
 - PC-6 第十九段：vNext ContextMenu 已接大范围 TSV streaming clipboard export。
   `@einfach/spreadsheet-ui-core` 增加可选 backend `exportRangeTsv` port；小范围 copy/cut
   继续走 bounded `readRangeProjection`，超过 10k cell 的 range copy/cut 优先走

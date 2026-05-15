@@ -14,6 +14,13 @@ declare global {
       sheetList(): Promise<Array<{ idx: number; name: string }>>
       debugFormulaCacheState(sheet: number, addr: string): Promise<string>
       debugFormulaEvalCount(sheet: number): Promise<number>
+      snapshotPersistenceV1(): Promise<{
+        sizes?: Array<{
+          sheet?: number
+          rowHeights?: Array<{ rowIndex: number; heightPx: number }>
+          colWidths?: Array<{ colIndex: number; widthPx: number }>
+        }>
+      }>
     }
   }
 }
@@ -137,6 +144,73 @@ test.describe('Solid Excel vNext worker backend', () => {
     await selectSheet(page, 'Sheet1')
     await expect(cellDisplay(page, 'C2')).toHaveText('13')
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expectNoConsoleErrors(page)
+  })
+
+  test('persists row and column size metadata as Rust sparse facts', async ({ page }) => {
+    await gotoVNextWorkerDemo(page)
+
+    const colHeader = page.locator('.spreadsheet-grid-col-header[data-col="1"]')
+    const rowHeader = page.locator('.spreadsheet-grid-row-header[data-row="1"]')
+    const beforeCol = await colHeader.boundingBox()
+    const beforeRow = await rowHeader.boundingBox()
+    expect(beforeCol).not.toBeNull()
+    expect(beforeRow).not.toBeNull()
+
+    const colHandle = page.getByTestId('col-resize-1')
+    const colHandleBox = await colHandle.boundingBox()
+    expect(colHandleBox).not.toBeNull()
+    await page.mouse.move(
+      colHandleBox!.x + colHandleBox!.width / 2,
+      colHandleBox!.y + colHandleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(
+      colHandleBox!.x + colHandleBox!.width / 2 + 34,
+      colHandleBox!.y + colHandleBox!.height / 2,
+    )
+    await page.mouse.up()
+    const afterCol = await colHeader.boundingBox()
+    expect(afterCol).not.toBeNull()
+    expect(afterCol!.width).toBeGreaterThan(beforeCol!.width + 20)
+
+    const rowHandle = page.getByTestId('row-resize-1')
+    const rowHandleBox = await rowHandle.boundingBox()
+    expect(rowHandleBox).not.toBeNull()
+    await page.mouse.move(
+      rowHandleBox!.x + rowHandleBox!.width / 2,
+      rowHandleBox!.y + rowHandleBox!.height / 2,
+    )
+    await page.mouse.down()
+    await page.mouse.move(
+      rowHandleBox!.x + rowHandleBox!.width / 2,
+      rowHandleBox!.y + rowHandleBox!.height / 2 + 14,
+    )
+    await page.mouse.up()
+    const afterRow = await rowHeader.boundingBox()
+    expect(afterRow).not.toBeNull()
+    expect(afterRow!.height).toBeGreaterThan(beforeRow!.height + 8)
+
+    await expect
+      .poll(async () =>
+        page.evaluate(async () => {
+          const snapshot = await window.__einfachWorkbookDebugClient!.snapshotPersistenceV1()
+          const sheetSizes = snapshot.sizes?.find((entry) => entry.sheet === 0)
+          return {
+            rows: sheetSizes?.rowHeights ?? [],
+            cols: sheetSizes?.colWidths ?? [],
+          }
+        }),
+      )
+      .toEqual({
+        rows: expect.arrayContaining([expect.objectContaining({ rowIndex: 1 })]),
+        cols: expect.arrayContaining([expect.objectContaining({ colIndex: 1 })]),
+      })
+
+    await selectSheet(page, 'Sheet2')
+    await selectSheet(page, 'Sheet1')
+    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
+    await expect(cell(page, 'J20')).toHaveCount(0)
     await expectNoConsoleErrors(page)
   })
 })

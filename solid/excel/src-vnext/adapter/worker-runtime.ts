@@ -14,6 +14,7 @@ import type {
   WorkbookPersistenceRestoreStatsWire,
   WorkbookPersistenceSnapshotWire,
   WorkerWorkbookDebugCountersWire,
+  ViewportSizeSnapshotWire,
   RpcErrorWire,
   RpcResponseWire,
   SparseCellWire,
@@ -90,6 +91,15 @@ type WasmWorkbookRuntime = {
     endCol: number,
   ) => FormatRangeSnapshot
   restore_format_snapshot?: (snapshot: FormatRangeSnapshot) => number
+  snapshot_viewport_sizes?: (
+    sheetIdx: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => ViewportSizeSnapshotWire
+  set_row_height?: (sheetIdx: number, rowIndex: number, heightPx: number) => boolean
+  set_col_width?: (sheetIdx: number, colIndex: number, widthPx: number) => boolean
   snapshot_persistence_v1?: () => WorkbookPersistenceSnapshotWire
   restore_persistence_v1?: (
     snapshot: WorkbookPersistenceSnapshotWire,
@@ -681,6 +691,16 @@ function normalizeStructuralCount(value: unknown): number {
   return count
 }
 
+function normalizeDimensionPx(value: unknown, name: string): number {
+  const size = Number(value)
+  if (!Number.isFinite(size) || size <= 0) {
+    throw Object.assign(new Error(`invalid ${name}`), {
+      code: 'INVALID_DIMENSION_SIZE',
+    })
+  }
+  return Math.max(1, Math.round(size))
+}
+
 function assertMethod<T extends keyof WasmWorkbookRuntime>(
   wb: WasmWorkbookRuntime,
   method: T,
@@ -946,6 +966,48 @@ export function installWorkerRuntime() {
             postResponse(
               msg.id,
               restoreFormatSnapshot.call(wb, msg.snapshot as FormatRangeSnapshot),
+            )
+          }
+          break
+        case 'snapshotViewportSizes':
+          {
+            const range = normalizeSparseRange(msg.range)
+            assertSheet(wb, range.sheet)
+            const snapshotViewportSizes = assertMethod(wb, 'snapshot_viewport_sizes')
+            postResponse(
+              msg.id,
+              snapshotViewportSizes.call(
+                wb,
+                range.sheet,
+                range.startRow,
+                range.startCol,
+                range.endRow,
+                range.endCol,
+              ),
+            )
+          }
+          break
+        case 'setRowHeight':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            const rowIndex = normalizeStructuralIndex(msg.rowIndex, 'row index')
+            const heightPx = normalizeDimensionPx(msg.heightPx, 'row height')
+            assertSheet(wb, sheet)
+            postResponse(
+              msg.id,
+              assertMethod(wb, 'set_row_height').call(wb, sheet, rowIndex, heightPx),
+            )
+          }
+          break
+        case 'setColumnWidth':
+          {
+            const sheet = normalizeStructuralIndex(msg.sheet, 'sheet index')
+            const colIndex = normalizeStructuralIndex(msg.colIndex, 'column index')
+            const widthPx = normalizeDimensionPx(msg.widthPx, 'column width')
+            assertSheet(wb, sheet)
+            postResponse(
+              msg.id,
+              assertMethod(wb, 'set_col_width').call(wb, sheet, colIndex, widthPx),
             )
           }
           break

@@ -38,6 +38,9 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     deleteColumns: Array<{ sheet: number; colIndex: number; count: number }>
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
+    snapshotViewportSizes: SparseRangeWire[]
+    setRowHeight: Array<{ sheet: number; rowIndex: number; heightPx: number }>
+    setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
     exportRangeTsv: SparseRangeWire[]
     exportRangeTsvChunks: Array<SparseRangeWire & { rowsPerChunk?: number }>
     addSheet: string[]
@@ -52,6 +55,8 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
 function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const cells = new Map<string, CellSnapshotWire>()
   const rangeFormats: Array<SparseRangeWire & { format: CellFormatJSON }> = []
+  const rowHeights = new Map<number, Map<number, number>>()
+  const colWidths = new Map<number, Map<number, number>>()
   const dirtyListeners = new Set<(cells: CellRefWire[]) => void>()
   const hydratedListeners = new Set<(cells: CellSnapshotWire[]) => void>()
   const calls: FakeWorkerWorkbookClient['calls'] = {
@@ -68,6 +73,9 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     deleteColumns: [],
     setFormatRange: [],
     snapshotFormatRange: [],
+    snapshotViewportSizes: [],
+    setRowHeight: [],
+    setColumnWidth: [],
     exportRangeTsv: [],
     exportRangeTsvChunks: [],
     addSheet: [],
@@ -227,6 +235,37 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     for (const [cellKey, snapshot] of next) cells.set(cellKey, snapshot)
   }
 
+  function sizeMap(root: Map<number, Map<number, number>>, sheet: number) {
+    let sizes = root.get(sheet)
+    if (!sizes) {
+      sizes = new Map()
+      root.set(sheet, sizes)
+    }
+    return sizes
+  }
+
+  function shiftSizeMap(
+    sizes: Map<number, number>,
+    index: number,
+    count: number,
+    direction: 1 | -1,
+  ) {
+    const next = new Map<number, number>()
+    const deleteEnd = index + count - 1
+
+    for (const [sizeIndex, size] of sizes) {
+      if (direction === -1 && sizeIndex >= index && sizeIndex <= deleteEnd) continue
+      const shifted =
+        sizeIndex >= (direction === 1 ? index : deleteEnd + 1)
+          ? sizeIndex + count * direction
+          : sizeIndex
+      if (shifted >= 0) next.set(shifted, size)
+    }
+
+    sizes.clear()
+    for (const [sizeIndex, size] of next) sizes.set(sizeIndex, size)
+  }
+
   function remapSheetIndexAfterMove(idx: number, from: number, to: number): number {
     if (from === to) return idx
     if (idx === from) return to
@@ -255,6 +294,15 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         ...layer,
         sheet: remapSheetIndexAfterMove(layer.sheet, from, to),
       }
+    }
+
+    for (const root of [rowHeights, colWidths]) {
+      const next = new Map<number, Map<number, number>>()
+      for (const [sheet, sizes] of root) {
+        next.set(remapSheetIndexAfterMove(sheet, from, to), new Map(sizes))
+      }
+      root.clear()
+      for (const [sheet, sizes] of next) root.set(sheet, sizes)
     }
   }
 
@@ -349,21 +397,25 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async insertRows(sheet, rowIndex, count) {
       calls.insertRows.push({ sheet, rowIndex, count })
       shiftCells(sheet, 'row', rowIndex, count, 1)
+      shiftSizeMap(sizeMap(rowHeights, sheet), rowIndex, count, 1)
       return true
     },
     async deleteRows(sheet, rowIndex, count) {
       calls.deleteRows.push({ sheet, rowIndex, count })
       shiftCells(sheet, 'row', rowIndex, count, -1)
+      shiftSizeMap(sizeMap(rowHeights, sheet), rowIndex, count, -1)
       return true
     },
     async insertColumns(sheet, colIndex, count) {
       calls.insertColumns.push({ sheet, colIndex, count })
       shiftCells(sheet, 'column', colIndex, count, 1)
+      shiftSizeMap(sizeMap(colWidths, sheet), colIndex, count, 1)
       return true
     },
     async deleteColumns(sheet, colIndex, count) {
       calls.deleteColumns.push({ sheet, colIndex, count })
       shiftCells(sheet, 'column', colIndex, count, -1)
+      shiftSizeMap(sizeMap(colWidths, sheet), colIndex, count, -1)
       return true
     },
     async setFormatRange(range, fmt) {
@@ -404,6 +456,28 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     },
     async restoreFormatSnapshot() {
       throw new Error('not used')
+    },
+    async snapshotViewportSizes(range) {
+      calls.snapshotViewportSizes.push({ ...range })
+      return {
+        ...range,
+        rowHeights: [...(rowHeights.get(range.sheet) ?? new Map()).entries()]
+          .filter(([rowIndex]) => rowIndex >= range.startRow && rowIndex <= range.endRow)
+          .map(([rowIndex, heightPx]) => ({ rowIndex, heightPx })),
+        colWidths: [...(colWidths.get(range.sheet) ?? new Map()).entries()]
+          .filter(([colIndex]) => colIndex >= range.startCol && colIndex <= range.endCol)
+          .map(([colIndex, widthPx]) => ({ colIndex, widthPx })),
+      }
+    },
+    async setRowHeight(sheet, rowIndex, heightPx) {
+      calls.setRowHeight.push({ sheet, rowIndex, heightPx })
+      sizeMap(rowHeights, sheet).set(rowIndex, heightPx)
+      return true
+    },
+    async setColumnWidth(sheet, colIndex, widthPx) {
+      calls.setColumnWidth.push({ sheet, colIndex, widthPx })
+      sizeMap(colWidths, sheet).set(colIndex, widthPx)
+      return true
     },
     async beginImport() {
       throw new Error('not used')
@@ -1571,7 +1645,7 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
-  it('stores worker workbook viewport size metadata in the adapter without Rust cell reads', async () => {
+  it('routes worker workbook viewport size metadata through Rust sparse facts without cell reads', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({
       client,
@@ -1612,6 +1686,11 @@ describe('vnext adapter', () => {
       rowHeights: [{ rowIndex: 1, heightPx: 36 }],
       colWidths: [{ colIndex: 1, widthPx: 129 }],
     })
+    expect(client.calls.setRowHeight).toEqual([{ sheet: 0, rowIndex: 1, heightPx: 36 }])
+    expect(client.calls.setColumnWidth).toEqual([{ sheet: 0, colIndex: 1, widthPx: 129 }])
+    expect(client.calls.snapshotViewportSizes).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 2, endCol: 2 },
+    ])
     expect(client.calls.readSparseRange).toEqual([])
     expect(client.calls.snapshotRangeSparse).toEqual([])
     expect(client.calls.snapshotFormatRange).toEqual([])

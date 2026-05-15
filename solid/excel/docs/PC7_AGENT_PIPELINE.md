@@ -63,15 +63,16 @@
 
 ## 剩余波次总览
 
-W1-W3 已完成，还剩 4 波。W4、W5 可以按文件所有权并行开分支
-推进，但合入顺序要由总架构师控制；W6、W7 是 package cutover 和发布门禁。
+W1-W3 已完成。W4 的 row/column size Rust 稀疏持久化已落地，autofit 仍待补；
+W5 可以继续并行开分支推进，合入顺序要由总架构师控制。W6、W7 是 package
+cutover 和发布门禁。
 
 | 波次 | 目标 | 可并行 agent | 主要写入边界 | 必须验收 |
 | --- | --- | --- | --- | --- |
 | W1 | 已完成：vNext worker 实现边界迁移 | Worker Runtime、Worker Tests、Public Surface Review | `solid/excel/src-vnext/adapter/*`、legacy worker shim、worker tests/e2e | vNext 不再指向 legacy worker 实现；Jest worker tests；vNext worker e2e；MCP smoke |
 | W2 | 已完成：Lazy formula 正确性回归 | Rust Lazy、Wasm Contract、E2E Lazy | `rust/excel-core/*`、`rust/wasm/*`、WASM/JS tests、lazy e2e | 单 sheet dependent 传播；dirty notify 契约；TLS resolver 清零；vNext lazy probe + MCP |
 | W3 | 已完成：true sheet reorder | Rust Workbook、Wasm/Worker Adapter、Cross-sheet E2E | workbook sheet order、wasm API、worker protocol、adapter、e2e | 跨 sheet 公式在 reorder 后仍正确；不再只靠 JS display-order 兜底 |
-| W4 | row/column size 持久化和 autofit | Rust Metadata、Adapter Projection、Interaction E2E | Rust sparse metadata、snapshot/reload、adapter、grid resize/autofit tests | 尺寸 metadata 稀疏持久化；reload 后恢复；autofit 不扫描全表 |
+| W4 | 进行中：row/column size 持久化和 autofit | Rust Metadata、Adapter Projection、Interaction E2E | Rust sparse metadata、snapshot/reload、adapter、grid resize/autofit tests | 尺寸 metadata 稀疏持久化已完成；autofit 待补且不能扫描全表 |
 | W5 | bulk load、range streaming、range interval index | Rust Data Plane、Wasm Streaming、Perf/E2E | bulk API、range chunks、interval index、streaming tests | 大批量导入公式不 eager compute；大 range copy/export 流式；百万级 case 不创建全量 UI 状态 |
 | W6 | package cutover readiness | Package API、Legacy Compatibility、Docs/Migration | `package.json`、public barrels、compat tests、migration docs | 明确 root 是否切 vNext；legacy 有稳定入口；消费侧 import tests 通过 |
 | W7 | 发布级回归门禁 | Test Sweeper、MCP Verifier、Docs Status | e2e specs、docs status、少量 test helper | 无新增 skip；console clean；核心 smoke、worker、interaction、large range、package 全通过 |
@@ -158,6 +159,19 @@ W1-W3 已完成，还剩 4 波。W4、W5 可以按文件所有权并行开分支
 ## W4：row/column size 持久化和 autofit
 
 目标：行高/列宽不再只是 JS adapter 临时 metadata，而是 Rust workbook 稀疏事实。
+
+当前状态：
+
+- 已完成：`Sheet` 保存 sparse `row_heights` / `col_widths` facts；row/col insert/delete
+  只 shift 已存在的 sparse key，不创建全量尺寸数组。
+- 已完成：`WasmWorkbook` 暴露 `snapshot_viewport_sizes`、`set_row_height`、
+  `set_col_width`；persistence v1 兼容扩展可选 `sizes` 字段，空白 sheet 只保存
+  显式设置过的尺寸 metadata。
+- 已完成：vNext worker backend 不再维护 JS row/col size sidecar，`readViewportSizeProjection`
+  读取 Rust window snapshot，resize commit 写 Rust workbook。
+- 已完成：Jest 覆盖 worker protocol/runtime/backend；Playwright worker e2e 覆盖 resize
+  后 persistence `sizes` 稀疏事实和可视 DOM 有界。
+- 待完成：autofit port、当前可视窗口测量策略和对应 MCP 视觉验收。
 
 并行分工：
 

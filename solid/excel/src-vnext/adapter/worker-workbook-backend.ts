@@ -186,33 +186,6 @@ function normalizeDimensionSize(value: number): number {
   return Math.max(1, Math.round(value))
 }
 
-function shiftDimensionMap(
-  sizes: Map<number, number>,
-  index: number,
-  count: number,
-  direction: 1 | -1,
-) {
-  const next = new Map<number, number>()
-  const deleteEnd = index + count - 1
-
-  for (const [sizeIndex, size] of sizes) {
-    if (direction === -1 && sizeIndex >= index && sizeIndex <= deleteEnd) {
-      continue
-    }
-
-    const nextIndex =
-      sizeIndex >= (direction === 1 ? index : deleteEnd + 1)
-        ? sizeIndex + count * direction
-        : sizeIndex
-    if (nextIndex >= 0) {
-      next.set(nextIndex, size)
-    }
-  }
-
-  sizes.clear()
-  for (const [sizeIndex, size] of next) sizes.set(sizeIndex, size)
-}
-
 function getColumnLabel(index: number): string {
   let value = index + 1
   let label = ''
@@ -524,8 +497,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let lookup: SheetLookup = { sheets: [], byId: new Map() }
   let revision = options.revision ?? 0
   let disposed = false
-  const rowHeightsBySheetId = new Map<string, Map<number, number>>()
-  const colWidthsBySheetId = new Map<string, Map<number, number>>()
   const client: WorkerWorkbookClient = resolvedClient
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
@@ -574,40 +545,17 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return normalized.length > 0 ? normalized : fallback
   }
 
-  function getRowHeights(sheetId: string): Map<number, number> {
-    let rows = rowHeightsBySheetId.get(sheetId)
-    if (!rows) {
-      rows = new Map()
-      rowHeightsBySheetId.set(sheetId, rows)
-    }
-    return rows
-  }
-
-  function getColWidths(sheetId: string): Map<number, number> {
-    let cols = colWidthsBySheetId.get(sheetId)
-    if (!cols) {
-      cols = new Map()
-      colWidthsBySheetId.set(sheetId, cols)
-    }
-    return cols
-  }
-
   async function readViewportSizeProjection(
     request: ViewportSizeProjectionRequest,
   ): Promise<ViewportSizeProjectionResult> {
-    await resolveSheet(request.sheetId)
-    const rowHeights = [...getRowHeights(request.sheetId).entries()]
-      .filter(
-        ([rowIndex]) => rowIndex >= request.window.rowStart && rowIndex <= request.window.rowEnd,
-      )
-      .map(([rowIndex, heightPx]) => ({ rowIndex, heightPx }))
-      .sort((left, right) => left.rowIndex - right.rowIndex)
-    const colWidths = [...getColWidths(request.sheetId).entries()]
-      .filter(
-        ([colIndex]) => colIndex >= request.window.colStart && colIndex <= request.window.colEnd,
-      )
-      .map(([colIndex, widthPx]) => ({ colIndex, widthPx }))
-      .sort((left, right) => left.colIndex - right.colIndex)
+    const sheet = await resolveSheet(request.sheetId)
+    const snapshot = await client.snapshotViewportSizes(toSparseRange(sheet.idx, request.window))
+    const rowHeights = [...(snapshot.rowHeights ?? [])].sort(
+      (left, right) => left.rowIndex - right.rowIndex,
+    )
+    const colWidths = [...(snapshot.colWidths ?? [])].sort(
+      (left, right) => left.colIndex - right.colIndex,
+    )
 
     return {
       kind: 'viewport-size',
@@ -848,28 +796,24 @@ export function createWorkerWorkbookSpreadsheetBackend(
     async insertRows(request: InsertRowsRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
       await client.insertRows(sheet.idx, request.rowIndex, request.count)
-      shiftDimensionMap(getRowHeights(request.sheetId), request.rowIndex, request.count, 1)
       return structuralMutationResult(request, bumpRevision())
     },
 
     async deleteRows(request: DeleteRowsRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
       await client.deleteRows(sheet.idx, request.rowIndex, request.count)
-      shiftDimensionMap(getRowHeights(request.sheetId), request.rowIndex, request.count, -1)
       return structuralMutationResult(request, bumpRevision())
     },
 
     async insertColumns(request: InsertColumnsRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
       await client.insertColumns(sheet.idx, request.colIndex, request.count)
-      shiftDimensionMap(getColWidths(request.sheetId), request.colIndex, request.count, 1)
       return structuralMutationResult(request, bumpRevision())
     },
 
     async deleteColumns(request: DeleteColumnsRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
       await client.deleteColumns(sheet.idx, request.colIndex, request.count)
-      shiftDimensionMap(getColWidths(request.sheetId), request.colIndex, request.count, -1)
       return structuralMutationResult(request, bumpRevision())
     },
 
@@ -895,8 +839,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     async setRowHeight(request: SetRowHeightRequest): Promise<BackendMutationResult> {
-      await resolveSheet(request.sheetId)
-      getRowHeights(request.sheetId).set(request.rowIndex, normalizeDimensionSize(request.heightPx))
+      const sheet = await resolveSheet(request.sheetId)
+      await client.setRowHeight(
+        sheet.idx,
+        request.rowIndex,
+        normalizeDimensionSize(request.heightPx),
+      )
       const nextRevision = bumpRevision()
 
       return {
@@ -907,8 +855,12 @@ export function createWorkerWorkbookSpreadsheetBackend(
     },
 
     async setColumnWidth(request: SetColumnWidthRequest): Promise<BackendMutationResult> {
-      await resolveSheet(request.sheetId)
-      getColWidths(request.sheetId).set(request.colIndex, normalizeDimensionSize(request.widthPx))
+      const sheet = await resolveSheet(request.sheetId)
+      await client.setColumnWidth(
+        sheet.idx,
+        request.colIndex,
+        normalizeDimensionSize(request.widthPx),
+      )
       const nextRevision = bumpRevision()
 
       return {
@@ -986,8 +938,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
       const nextRevision = bumpRevision()
       const remainingSheets = lookup.sheets.filter((item) => item.id !== request.sheetId)
-      rowHeightsBySheetId.delete(request.sheetId)
-      colWidthsBySheetId.delete(request.sheetId)
       await refreshSheetLookup(remainingSheets)
       const activeSheetId =
         lookup.sheets[Math.min(Math.max(deleteDisplayIndex, 0), lookup.sheets.length - 1)]?.id ??

@@ -52,6 +52,9 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     setFormatRange: FormatRangeCall[]
     snapshotFormatRange: ClearRangeCall[]
     restoreFormatSnapshot: FormatRangeSnapshot[]
+    snapshotViewportSizes: ClearRangeCall[]
+    setRowHeight: Array<{ sheet: number; rowIndex: number; heightPx: number }>
+    setColumnWidth: Array<{ sheet: number; colIndex: number; widthPx: number }>
     snapshotRangeSparse: ClearRangeCall[]
     exportRangeTsv: ClearRangeCall[]
     exportRangeTsvChunks: Array<ClearRangeCall & { rowsPerChunk?: number }>
@@ -149,6 +152,9 @@ function makeFakeWorkerWorkbookClient(
     setFormatRange: [],
     snapshotFormatRange: [],
     restoreFormatSnapshot: [],
+    snapshotViewportSizes: [],
+    setRowHeight: [],
+    setColumnWidth: [],
     snapshotRangeSparse: [],
     exportRangeTsv: [],
     exportRangeTsvChunks: [],
@@ -324,6 +330,28 @@ function makeFakeWorkerWorkbookClient(
     async restoreFormatSnapshot(snapshot) {
       calls.restoreFormatSnapshot.push(snapshot)
       return 1
+    },
+    async snapshotViewportSizes(range) {
+      calls.snapshotViewportSizes.push({
+        sheet: range.sheet,
+        startRow: range.startRow,
+        startCol: range.startCol,
+        endRow: range.endRow,
+        endCol: range.endCol,
+      })
+      return {
+        ...range,
+        rowHeights: [],
+        colWidths: [],
+      }
+    },
+    async setRowHeight(sheet, rowIndex, heightPx) {
+      calls.setRowHeight.push({ sheet, rowIndex, heightPx })
+      return true
+    },
+    async setColumnWidth(sheet, colIndex, widthPx) {
+      calls.setColumnWidth.push({ sheet, colIndex, widthPx })
+      return true
     },
     async snapshotRangeSparse(_range: SparseRangeWire) {
       calls.snapshotRangeSparse.push({
@@ -667,6 +695,7 @@ function makeFakeWorkerWorkbookClient(
         sheets: metas,
         cells: sparseCells,
         formats: [],
+        sizes: [],
       }
     },
     async restorePersistenceV1(snapshot: WorkbookPersistenceSnapshotWire) {

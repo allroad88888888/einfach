@@ -584,6 +584,7 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
         },
       ],
       formats: [],
+      sizes: [],
     }
     ok(fake, snapshotPayload)
     await expect(snapshot).resolves.toEqual(snapshotPayload)
@@ -632,6 +633,48 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     })
     ok(fake, 1)
     await expect(restorePromise).resolves.toBe(1)
+  })
+
+  it('sends viewport size snapshot and mutation commands with expected payloads', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+    const range = { sheet: 0, startRow: 2, startCol: 3, endRow: 8, endCol: 9 }
+
+    const snapshotPromise = workbook.snapshotViewportSizes(range)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'snapshotViewportSizes',
+      range,
+    })
+    const snapshot = {
+      ...range,
+      rowHeights: [{ rowIndex: 4, heightPx: 36 }],
+      colWidths: [{ colIndex: 5, widthPx: 128 }],
+    }
+    ok(fake, snapshot)
+    await expect(snapshotPromise).resolves.toEqual(snapshot)
+
+    const rowPromise = workbook.setRowHeight(0, 4, 36)
+    expect(lastSent(fake)).toEqual({
+      id: 2,
+      cmd: 'setRowHeight',
+      sheet: 0,
+      rowIndex: 4,
+      heightPx: 36,
+    })
+    ok(fake, true)
+    await expect(rowPromise).resolves.toBe(true)
+
+    const colPromise = workbook.setColumnWidth(0, 5, 128)
+    expect(lastSent(fake)).toEqual({
+      id: 3,
+      cmd: 'setColumnWidth',
+      sheet: 0,
+      colIndex: 5,
+      widthPx: 128,
+    })
+    ok(fake, true)
+    await expect(colPromise).resolves.toBe(true)
   })
 
   it('sends range TSV export commands with expected payloads', async () => {

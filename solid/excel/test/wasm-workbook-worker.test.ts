@@ -14,6 +14,7 @@ import type {
   WorkbookPersistenceRestoreStatsWire,
   WorkbookPersistenceSnapshotWire,
   WorkerWorkbookDebugCountersWire,
+  ViewportSizeSnapshotWire,
   SparseCellWire,
   SparseRangeWire,
   WorkbookImportStatsWire,
@@ -103,6 +104,15 @@ type MockWasmWorkbook = {
     endCol: number,
   ) => FormatRangeSnapshot
   restore_format_snapshot: (snapshot: FormatRangeSnapshot) => number
+  snapshot_viewport_sizes: (
+    sheet: number,
+    startRow: number,
+    startCol: number,
+    endRow: number,
+    endCol: number,
+  ) => ViewportSizeSnapshotWire
+  set_row_height: (sheet: number, rowIndex: number, heightPx: number) => boolean
+  set_col_width: (sheet: number, colIndex: number, widthPx: number) => boolean
   debug_formula_cache_state: () => string
   debug_formula_eval_count: (sheet?: number) => number
   debug_formula_eval_count_total: () => number
@@ -125,6 +135,9 @@ type MockWasmWorkbook = {
     setFormatRange: Array<SparseRangeWire & { fmt: CellFormatJSON | null | undefined }>
     snapshotFormatRange: SparseRangeWire[]
     restoreFormatSnapshot: FormatRangeSnapshot[]
+    snapshotViewportSizes: SparseRangeWire[]
+    setRowHeights: Array<{ sheet: number; rowIndex: number; heightPx: number }>
+    setColWidths: Array<{ sheet: number; colIndex: number; widthPx: number }>
     insertRows: Array<{ sheet: number; at: number; count: number }>
     deleteRows: Array<{ sheet: number; at: number; count: number }>
     insertCols: Array<{ sheet: number; at: number; count: number }>
@@ -193,6 +206,9 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     setFormatRange: [],
     snapshotFormatRange: [],
     restoreFormatSnapshot: [],
+    snapshotViewportSizes: [],
+    setRowHeights: [],
+    setColWidths: [],
     insertRows: [],
     deleteRows: [],
     insertCols: [],
@@ -208,7 +224,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const restorePersistenceData: WorkbookPersistenceSnapshotWire | undefined =
     options.disablePersistenceV1
       ? undefined
-      : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [] }
+      : { version: 1, sheets: [{ idx: 0, name: 'Sheet1' }], cells: [], formats: [], sizes: [] }
   const restorePersistenceDefaultReturn: WorkbookPersistenceRestoreStatsWire = {
     restored_cells: 0,
     restored_formats: 0,
@@ -487,6 +503,26 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       calls.restoreFormatSnapshot.push(snapshot)
       return 1
     },
+    snapshot_viewport_sizes: (sheet, startRow, startCol, endRow, endCol) => {
+      calls.snapshotViewportSizes.push({ sheet, startRow, startCol, endRow, endCol })
+      return {
+        sheet,
+        startRow,
+        startCol,
+        endRow,
+        endCol,
+        rowHeights: [{ rowIndex: startRow, heightPx: 36 }],
+        colWidths: [{ colIndex: startCol, widthPx: 128 }],
+      }
+    },
+    set_row_height: (sheet, rowIndex, heightPx) => {
+      calls.setRowHeights.push({ sheet, rowIndex, heightPx })
+      return true
+    },
+    set_col_width: (sheet, colIndex, widthPx) => {
+      calls.setColWidths.push({ sheet, colIndex, widthPx })
+      return true
+    },
     debug_formula_cache_state: () => 'dirty',
     debug_formula_eval_count: () => 0,
     debug_formula_eval_count_total: () => 0,
@@ -591,6 +627,9 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       mainSetFormatRange: () => workbooks[0]?.__mockCalls?.setFormatRange ?? [],
       mainSnapshotFormatRange: () => workbooks[0]?.__mockCalls?.snapshotFormatRange ?? [],
       mainRestoreFormatSnapshot: () => workbooks[0]?.__mockCalls?.restoreFormatSnapshot ?? [],
+      mainSnapshotViewportSizes: () => workbooks[0]?.__mockCalls?.snapshotViewportSizes ?? [],
+      mainSetRowHeights: () => workbooks[0]?.__mockCalls?.setRowHeights ?? [],
+      mainSetColWidths: () => workbooks[0]?.__mockCalls?.setColWidths ?? [],
       mainInsertRows: () => workbooks[0]?.__mockCalls?.insertRows ?? [],
       mainDeleteRows: () => workbooks[0]?.__mockCalls?.deleteRows ?? [],
       mainInsertCols: () => workbooks[0]?.__mockCalls?.insertCols ?? [],
@@ -1521,6 +1560,76 @@ describe('wasm-workbook-worker import session contract', () => {
     }
   })
 
+  it('routes viewport size snapshot and mutations through the wasm workbook API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+
+      const snapshot = await harness.send<ViewportSizeSnapshotWire>({
+        id: 2,
+        cmd: 'snapshotViewportSizes',
+        range: { sheet: 0, startRow: 2, startCol: 3, endRow: 8, endCol: 9 },
+      })
+
+      expect(snapshot).toEqual({
+        sheet: 0,
+        startRow: 2,
+        startCol: 3,
+        endRow: 8,
+        endCol: 9,
+        rowHeights: [{ rowIndex: 2, heightPx: 36 }],
+        colWidths: [{ colIndex: 3, widthPx: 128 }],
+      })
+      expect(harness.calls.mainSnapshotViewportSizes()).toEqual([
+        { sheet: 0, startRow: 2, startCol: 3, endRow: 8, endCol: 9 },
+      ])
+
+      await expect(
+        harness.send({
+          id: 3,
+          cmd: 'setRowHeight',
+          sheet: 0,
+          rowIndex: 2,
+          heightPx: 37.6,
+        }),
+      ).resolves.toBe(true)
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'setColumnWidth',
+          sheet: 0,
+          colIndex: 3,
+          widthPx: 127.5,
+        }),
+      ).resolves.toBe(true)
+
+      expect(harness.calls.mainSetRowHeights()).toEqual([
+        { sheet: 0, rowIndex: 2, heightPx: 38 },
+      ])
+      expect(harness.calls.mainSetColWidths()).toEqual([
+        { sheet: 0, colIndex: 3, widthPx: 128 },
+      ])
+
+      await expect(
+        harness.send({
+          id: 5,
+          cmd: 'setRowHeight',
+          sheet: 0,
+          rowIndex: 2,
+          heightPx: 0,
+        }),
+      ).rejects.toMatchObject({
+        code: 'INVALID_DIMENSION_SIZE',
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
   it('routes persistence v1 snapshot and restore through the wasm API', async () => {
     const harness = withMockedWorker()
     try {
@@ -1538,6 +1647,7 @@ describe('wasm-workbook-worker import session contract', () => {
         sheets: [{ idx: 0, name: 'Sheet1' }],
         cells: [],
         formats: [],
+        sizes: [],
       })
       expect(harness.calls.mainSnapshotPersistenceV1()).toBe(1)
 
@@ -1546,6 +1656,7 @@ describe('wasm-workbook-worker import session contract', () => {
         sheets: [{ idx: 0, name: 'Sheet1' }],
         cells: [{ sheet: 0, addr: 'A1', row: 0, col: 0, kind: 'formula', value: '=1+1' }],
         formats: [],
+        sizes: [],
       }
       const restore = await harness.send<WorkbookPersistenceRestoreStatsWire>({
         id: 3,
