@@ -266,6 +266,48 @@ impl Workbook {
         true
     }
 
+    fn rebuild_name_lookup(&mut self) {
+        self.by_name.clear();
+        for (idx, name) in self.names.iter().enumerate() {
+            self.by_name.insert(name.clone(), idx);
+        }
+    }
+
+    fn rebuild_cross_sheet_deps(&mut self) {
+        let mut cross_sheet = CrossSheetDeps::new();
+        for (formula_sheet, sheet) in self.sheets.iter().enumerate() {
+            for (&formula_addr, expr) in sheet.formula_exprs_iter() {
+                for edge in collect_cross_sheet_refs(expr.as_ref(), &self.by_name) {
+                    cross_sheet.add_edge(formula_sheet, formula_addr, edge);
+                }
+            }
+        }
+        self.cross_sheet = cross_sheet;
+    }
+
+    /// Move a sheet from `from` to its final index `to`.
+    ///
+    /// Formula ASTs store sheet names, while `CrossSheetDeps` stores the
+    /// current sheet indexes for dirty fanout. Reordering therefore moves the
+    /// sheet/name vectors, rebuilds the name lookup, and then rebuilds the
+    /// cross-sheet dependency graph from the live formula ASTs.
+    pub fn move_sheet(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.sheets.len() || to >= self.sheets.len() {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+
+        let sheet = self.sheets.remove(from);
+        let name = self.names.remove(from);
+        self.sheets.insert(to, sheet);
+        self.names.insert(to, name);
+        self.rebuild_name_lookup();
+        self.rebuild_cross_sheet_deps();
+        true
+    }
+
     /// Read a cell from a named sheet. Cross-sheet references in formulas
     /// resolve through this path.
     ///
@@ -698,13 +740,7 @@ impl Workbook {
         let sheet = self.sheets.remove(idx);
         let name = self.names.remove(idx);
         self.by_name.remove(&name);
-        // Adjust trailing indices.
-        for (n, i) in self.by_name.iter_mut() {
-            if *i > idx {
-                *i -= 1;
-            }
-            let _ = n;
-        }
+        self.rebuild_name_lookup();
         // Sheet indices shifted; the cross-sheet dep graph is no longer
         // coherent. Drop it. (Phase 3 callers don't currently mix
         // `remove_sheet` with cross-sheet subscriptions; if that changes,
@@ -1490,6 +1526,85 @@ mod tests {
         wb.remove_sheet(1);
         assert_eq!(wb.sheet_count(), 2);
         assert_eq!(wb.index_of("C"), Some(1)); // C shifted down
+    }
+
+    #[test]
+    fn move_sheet_updates_order_and_name_lookup() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("B");
+        wb.add_sheet("C");
+
+        assert!(wb.move_sheet(2, 0));
+
+        assert_eq!(wb.sheet_count(), 3);
+        assert_eq!(wb.name(0), Some("C"));
+        assert_eq!(wb.name(1), Some("Sheet1"));
+        assert_eq!(wb.name(2), Some("B"));
+        assert_eq!(wb.index_of("C"), Some(0));
+        assert_eq!(wb.index_of("Sheet1"), Some(1));
+        assert_eq!(wb.index_of("B"), Some(2));
+        assert!(!wb.move_sheet(3, 0));
+        assert!(!wb.move_sheet(0, 3));
+    }
+
+    #[test]
+    fn move_sheet_preserves_cross_sheet_chain_and_dirty_fanout() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+
+        wb.set_cell(0, "B4", Value::Number(10.0));
+        assert!(wb.set_formula(2, "C2", "=Sheet1!B4+1"));
+        assert!(wb.set_formula(1, "C2", "=Sheet3!C2+1"));
+        assert!(wb.set_formula(0, "C2", "=Sheet2!C2+1"));
+
+        assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(13.0));
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 3);
+        assert!(wb.move_sheet(2, 0));
+
+        assert_eq!(wb.name(0), Some("Sheet3"));
+        assert_eq!(wb.name(1), Some("Sheet1"));
+        assert_eq!(wb.name(2), Some("Sheet2"));
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 3);
+        assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(13.0));
+
+        let sheet1 = wb.index_of("Sheet1").unwrap();
+        let sheet2 = wb.index_of("Sheet2").unwrap();
+        let sheet3 = wb.index_of("Sheet3").unwrap();
+        assert_eq!(sheet1, 1);
+        assert_eq!(sheet2, 2);
+        assert_eq!(sheet3, 0);
+
+        assert_eq!(wb.debug_formula_cache_state(sheet1, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(sheet2, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(sheet3, "C2"), "clean");
+
+        wb.set_cell(sheet1, "B4", Value::Number(20.0));
+
+        assert_eq!(wb.debug_formula_cache_state(sheet3, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(sheet2, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(sheet1, "C2"), "dirty");
+        assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(23.0));
+    }
+
+    #[test]
+    fn move_sheet_rebuilds_cross_sheet_range_dependents() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Data");
+        wb.set_cell(1, "A1", Value::Number(1.0));
+        wb.set_cell(1, "A2", Value::Number(2.0));
+        assert!(wb.set_formula(0, "B1", "=SUM(Data!A1:A2)"));
+
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(3.0));
+        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
+        assert!(wb.move_sheet(1, 0));
+
+        let data = wb.index_of("Data").unwrap();
+        let sheet1 = wb.index_of("Sheet1").unwrap();
+        wb.set_cell(data, "A1", Value::Number(10.0));
+
+        assert_eq!(wb.debug_formula_cache_state(sheet1, "B1"), "dirty");
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(12.0));
     }
 
     // === Cross-sheet cycle detection (TODO 3.9) ===

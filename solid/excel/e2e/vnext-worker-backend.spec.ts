@@ -11,6 +11,7 @@ import {
 declare global {
   interface Window {
     __einfachWorkbookDebugClient?: {
+      sheetList(): Promise<Array<{ idx: number; name: string }>>
       debugFormulaCacheState(sheet: number, addr: string): Promise<string>
       debugFormulaEvalCount(sheet: number): Promise<number>
     }
@@ -101,6 +102,7 @@ test.describe('Solid Excel vNext worker backend', () => {
 
   test('reorders sheet tabs through the Rust worker backend metadata adapter', async ({ page }) => {
     await gotoVNextWorkerDemo(page)
+    await expect(cellDisplay(page, 'C2')).toHaveText('13')
 
     const handle = page.getByTestId('sheet-tab-reorder-sheet-3')
     const firstTab = page.getByRole('tab', { name: 'Sheet1' })
@@ -117,7 +119,23 @@ test.describe('Solid Excel vNext worker backend', () => {
     await expect(page.getByTestId('vnext-worker-sheet-tabs').getByRole('tab').first()).toHaveText(
       'Sheet3',
     )
+    await expect
+      .poll(() =>
+        page.evaluate(async () => {
+          const client = window.__einfachWorkbookDebugClient!
+          return (await client.sheetList()).map((sheet) => sheet.name)
+        }),
+      )
+      .toEqual(['Sheet3', 'Sheet1', 'Sheet2'])
     await expect(firstTab).toHaveAttribute('data-active', 'true')
+    await expect(cellDisplay(page, 'C2')).toHaveText('13')
+
+    await selectSheet(page, 'Sheet3')
+    await expect(cellDisplay(page, 'C2')).toHaveText('11')
+    await selectSheet(page, 'Sheet2')
+    await expect(cellDisplay(page, 'C2')).toHaveText('12')
+    await selectSheet(page, 'Sheet1')
+    await expect(cellDisplay(page, 'C2')).toHaveText('13')
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
     await expectNoConsoleErrors(page)
   })

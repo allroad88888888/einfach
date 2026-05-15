@@ -1009,6 +1009,17 @@ MCP：
 - legacy 保留在内部路径或独立 demo route，直到一轮全量回归后删除。
 - 不允许在入口切换时重写 Rust/WASM/worker 核心。
 
+#### PC-7 第九段：true sheet reorder 状态
+
+- Rust workbook 已成为 vNext worker backend 的 sheet 顺序事实来源：`reorderSheet` 只计算一次目标位置，
+  真正变更通过 worker `moveSheet(from, to)` 下沉到 wasm/Rust，再用 `sheetList()` 回读。
+- UI/adapter 不再保存长期 `sheetOrderIds`；前端只保留 sheet tab 交互 intent、active sheet id 和可视投影。
+- Rust `move_sheet` 会重建 name lookup 和 cross-sheet dependency graph，跨 sheet 公式链在 reorder 后继续 lazy
+  读取和 dirty fanout。
+- worker lookup 修正为稳定 id/name 优先，`sheet-${idx+1}` 只作为不冲突时的位置别名，避免 reorder 后 id 被
+  位置别名覆盖。
+- 未做项：rename sheet 后公式文本/AST 同步改写、delete sheet 后公式引用语义，后续需要单独功能拆分。
+
 ### 最终收口 Gate
 
 收口 gate：

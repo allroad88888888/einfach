@@ -30,6 +30,7 @@ type WasmWorkbookRuntime = {
   add_sheet(name: string): number
   rename_sheet(idx: number, name: string): boolean
   remove_sheet(idx: number): boolean
+  move_sheet(from: number, to: number): boolean
   set_cell_number(sheetIdx: number, addr: string, value: number): void
   set_cell_text(sheetIdx: number, addr: string, value: string): void
   set_cell_boolean(sheetIdx: number, addr: string, value: boolean): void
@@ -805,6 +806,15 @@ export function installWorkerRuntime() {
           break
         case 'removeSheet':
           postResponse(msg.id, wb.remove_sheet(Number(msg.sheet)))
+          break
+        case 'moveSheet':
+          {
+            const from = normalizeStructuralIndex(msg.from, 'source sheet index')
+            const to = normalizeStructuralIndex(msg.to, 'target sheet index')
+            assertSheet(wb, from)
+            assertSheet(wb, to)
+            postResponse(msg.id, assertMethod(wb, 'move_sheet').call(wb, from, to))
+          }
           break
         case 'setCell':
           postResponse(

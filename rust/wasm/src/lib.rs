@@ -980,6 +980,22 @@ struct WorkbookCellSubscription {
     sub: CellSubscription,
 }
 
+fn remap_sheet_index_after_move(idx: usize, from: usize, to: usize) -> usize {
+    if from == to {
+        return idx;
+    }
+    if idx == from {
+        return to;
+    }
+    if from < to && idx > from && idx <= to {
+        return idx - 1;
+    }
+    if to < from && idx >= to && idx < from {
+        return idx + 1;
+    }
+    idx
+}
+
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
 /// evaluate formulas through workbook context, including cross-sheet refs.
 #[wasm_bindgen]
@@ -1035,6 +1051,18 @@ impl WasmWorkbook {
 
     pub fn remove_sheet(&mut self, idx: u32) -> bool {
         self.workbook.remove_sheet(idx as usize).is_some()
+    }
+
+    pub fn move_sheet(&mut self, from: u32, to: u32) -> bool {
+        let from = from as usize;
+        let to = to as usize;
+        if !self.workbook.move_sheet(from, to) {
+            return false;
+        }
+        for entry in self.subscriptions.values_mut() {
+            entry.sheet_idx = remap_sheet_index_after_move(entry.sheet_idx, from, to);
+        }
+        true
     }
 
     pub fn set_number(&mut self, sheet_idx: u32, addr: &str, value: f64) {
@@ -2162,6 +2190,31 @@ mod tests {
     }
 
     #[test]
+    fn wasm_workbook_move_sheet_preserves_cross_sheet_chain() {
+        let mut wb = WasmWorkbook::new();
+        wb.add_sheet("Sheet2");
+        wb.add_sheet("Sheet3");
+
+        wb.set_number(0, "B4", 10.0);
+        assert!(wb.set_formula(2, "C2", "=Sheet1!B4+1"));
+        assert!(wb.set_formula(1, "C2", "=Sheet3!C2+1"));
+        assert!(wb.set_formula(0, "C2", "=Sheet2!C2+1"));
+
+        assert_eq!(wb.get_number(0, "C2"), 13.0);
+        assert!(wb.move_sheet(2, 0));
+        assert_eq!(wb.sheet_name(0), "Sheet3");
+        assert_eq!(wb.sheet_name(1), "Sheet1");
+        assert_eq!(wb.sheet_name(2), "Sheet2");
+        assert_eq!(wb.get_number(1, "C2"), 13.0);
+
+        wb.set_number(1, "B4", 20.0);
+        assert_eq!(wb.debug_formula_cache_state(0, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(2, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(1, "C2"), "dirty");
+        assert_eq!(wb.get_number(1, "C2"), 23.0);
+    }
+
+    #[test]
     fn wasm_workbook_independent_formula_stays_dirty_until_read() {
         let mut wb = WasmWorkbook::new();
         wb.add_sheet("Sheet2");
@@ -2507,6 +2560,36 @@ mod tests {
         assert_eq!(wb.debug_live_subscription_count(), 1);
         assert_eq!(wb.debug_sheet_live_subscription_count(0), 0);
         assert_eq!(wb.debug_sheet_live_subscription_count(1), 1);
+    }
+
+    #[test]
+    fn wasm_workbook_move_sheet_remaps_subscription_indices() {
+        let mut wb = WasmWorkbook::new();
+        let _ = wb.add_sheet("Sheet2");
+        let sub = wb
+            .workbook
+            .sheet_mut(1)
+            .unwrap()
+            .subscribe_cell("B2", || {});
+        wb.subscriptions.insert(
+            202,
+            WorkbookCellSubscription {
+                sheet_idx: 1,
+                addr: CellAddress::parse("B2").unwrap(),
+                sub,
+            },
+        );
+
+        assert_eq!(wb.debug_sheet_live_subscription_count(1), 1);
+        assert!(wb.move_sheet(1, 0));
+        assert_eq!(wb.sheet_name(0), "Sheet2");
+        assert_eq!(wb.debug_live_subscription_count(), 1);
+        assert_eq!(wb.debug_sheet_live_subscription_count(0), 1);
+        assert_eq!(wb.debug_sheet_live_subscription_count(1), 0);
+
+        wb.unsubscribe_cell(202);
+        assert_eq!(wb.debug_live_subscription_count(), 0);
+        assert_eq!(wb.debug_sheet_live_subscription_count(0), 0);
     }
 
     #[test]

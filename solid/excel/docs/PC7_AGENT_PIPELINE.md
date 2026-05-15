@@ -28,7 +28,11 @@
 - W1 顺手修复：worker workbook adapter 现在会尊重 `setFormulaDetailed` 返回的
   `{ ok:false }`，抛出带 `code/message` 的 backend error，而不是把失败公式 mutation
   当作成功。
-- Rust core/wasm 还没有 true `move_sheet`；当前 vNext worker adapter 只维护 JS 层显示顺序。
+- W3 已完成：Rust core/wasm 已有 true `move_sheet`，worker protocol/runtime 和 vNext
+  adapter 已接入；vNext worker adapter 不再维护 `sheetOrderIds` 这类长期 JS display-order
+  sidecar，sheet 顺序以 Rust workbook `sheetList()` 回读为准。
+- W3 顺手修复：worker backend lookup 里稳定 sheet id/name 优先于 `sheet-${idx+1}` 位置别名，
+  避免 reorder 后 `sheet-2` 被误解析成“第二个 sheet”。
 - row/column size 只在 vNext JS adapter metadata 中持久化，Rust snapshot/reload/autofit
   还没完成。
 - bulk load API、range streaming、range interval index 仍是百万级数据面的主要缺口。
@@ -59,14 +63,14 @@
 
 ## 剩余波次总览
 
-W1-W2 已完成，还剩 5 波。W3、W4、W5 可以按文件所有权并行开分支
+W1-W3 已完成，还剩 4 波。W4、W5 可以按文件所有权并行开分支
 推进，但合入顺序要由总架构师控制；W6、W7 是 package cutover 和发布门禁。
 
 | 波次 | 目标 | 可并行 agent | 主要写入边界 | 必须验收 |
 | --- | --- | --- | --- | --- |
 | W1 | 已完成：vNext worker 实现边界迁移 | Worker Runtime、Worker Tests、Public Surface Review | `solid/excel/src-vnext/adapter/*`、legacy worker shim、worker tests/e2e | vNext 不再指向 legacy worker 实现；Jest worker tests；vNext worker e2e；MCP smoke |
 | W2 | 已完成：Lazy formula 正确性回归 | Rust Lazy、Wasm Contract、E2E Lazy | `rust/excel-core/*`、`rust/wasm/*`、WASM/JS tests、lazy e2e | 单 sheet dependent 传播；dirty notify 契约；TLS resolver 清零；vNext lazy probe + MCP |
-| W3 | true sheet reorder | Rust Workbook、Wasm/Worker Adapter、Cross-sheet E2E | workbook sheet order、wasm API、worker protocol、adapter、e2e | 跨 sheet 公式在 reorder/rename/delete 后仍正确；不再只靠 JS display-order 兜底 |
+| W3 | 已完成：true sheet reorder | Rust Workbook、Wasm/Worker Adapter、Cross-sheet E2E | workbook sheet order、wasm API、worker protocol、adapter、e2e | 跨 sheet 公式在 reorder 后仍正确；不再只靠 JS display-order 兜底 |
 | W4 | row/column size 持久化和 autofit | Rust Metadata、Adapter Projection、Interaction E2E | Rust sparse metadata、snapshot/reload、adapter、grid resize/autofit tests | 尺寸 metadata 稀疏持久化；reload 后恢复；autofit 不扫描全表 |
 | W5 | bulk load、range streaming、range interval index | Rust Data Plane、Wasm Streaming、Perf/E2E | bulk API、range chunks、interval index、streaming tests | 大批量导入公式不 eager compute；大 range copy/export 流式；百万级 case 不创建全量 UI 状态 |
 | W6 | package cutover readiness | Package API、Legacy Compatibility、Docs/Migration | `package.json`、public barrels、compat tests、migration docs | 明确 root 是否切 vNext；legacy 有稳定入口；消费侧 import tests 通过 |
@@ -114,9 +118,27 @@ W1-W2 已完成，还剩 5 波。W3、W4、W5 可以按文件所有权并行开�
 - MCP Playwright 验证 3-sheet chain：打开 Sheet1 时，只计算可见/被读取链路，console 中有可验证
   lazy read 日志。
 
-## W3：true sheet reorder
+## W3：true sheet reorder（已完成）
 
 目标：让 Rust workbook 成为 sheet order 的事实来源，而不是长期靠 JS adapter display-order 映射兜底。
+
+完成内容：
+
+- `Workbook::move_sheet(from, to)` 移动 `sheets/names` 后重建 `by_name`，并从当前公式 AST
+  重建 `CrossSheetDeps`，避免跨 sheet dirty fanout 继续指向旧 index。
+- `WasmWorkbook::move_sheet` 暴露到 wasm，并 remap workbook subscription token 内部保存的
+  `sheet_idx`，保证 move 后退订仍打到正确 sheet。
+- Worker protocol/runtime 增加 `moveSheet(from, to)`；vNext worker backend 的 `reorderSheet`
+  改为 RPC 到 Rust 后再 `sheetList()` 回读事实顺序。
+- 删除 worker backend 的 `sheetOrderIds` 长期 sidecar；`reorderSheetMetadata` 只保留为一次性
+  计算目标位置的 helper。
+- `vnext-worker-backend.spec.ts` 覆盖拖拽 reorder 后 Rust `sheetList()` 顺序、Sheet1/Sheet2/Sheet3
+  公式值和 console clean。
+
+剩余风险：
+
+- `rename_sheet` 仍未做公式文本/AST 中 sheet 名的同步改写；目前 W3 只收敛 true reorder。
+- `remove_sheet` 仍沿用清空 cross-sheet deps 的防御策略；delete 后公式引用语义后续需要单独规划。
 
 并行分工：
 

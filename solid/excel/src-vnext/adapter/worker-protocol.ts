@@ -174,6 +174,7 @@ export interface WorkerWorkbookClient {
   addSheet(name: string): Promise<number>
   renameSheet(sheet: number, name: string): Promise<boolean>
   removeSheet(sheet: number): Promise<boolean>
+  moveSheet(from: number, to: number): Promise<boolean>
   setCell(sheet: number, addr: string, value: CellWire): Promise<boolean>
   setFormula(sheet: number, addr: string, formula: string): Promise<boolean>
   setFormulaDetailed(
@@ -348,6 +349,9 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     removeSheet(sheet) {
       return request<boolean>('removeSheet', { sheet })
+    },
+    moveSheet(from, to) {
+      return request<boolean>('moveSheet', { from, to })
     },
     setCell(sheet, addr, value) {
       return request<boolean>('setCell', { sheet, addr: addr.toUpperCase(), value })

@@ -43,6 +43,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     addSheet: string[]
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
+    moveSheet: Array<{ from: number; to: number }>
   }
   putCell(cell: CellSnapshotWire): void
   emitDirty(cells: CellRefWire[]): void
@@ -72,6 +73,7 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     addSheet: [],
     renameSheet: [],
     removeSheet: [],
+    moveSheet: [],
   }
   let metas: WorkbookSheetMeta[] = []
 
@@ -225,6 +227,37 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     for (const [cellKey, snapshot] of next) cells.set(cellKey, snapshot)
   }
 
+  function remapSheetIndexAfterMove(idx: number, from: number, to: number): number {
+    if (from === to) return idx
+    if (idx === from) return to
+    if (from < to && idx > from && idx <= to) return idx - 1
+    if (to < from && idx >= to && idx < from) return idx + 1
+    return idx
+  }
+
+  function moveSheetData(from: number, to: number) {
+    const [meta] = metas.splice(from, 1)
+    metas.splice(to, 0, meta)
+    metas = metas.map((item, idx) => ({ ...item, idx }))
+
+    const nextCells = new Map<string, CellSnapshotWire>()
+    for (const snapshot of cells.values()) {
+      const nextSheet = remapSheetIndexAfterMove(snapshot.sheet, from, to)
+      const nextSnapshot = { ...snapshot, sheet: nextSheet }
+      nextCells.set(key(nextSnapshot.sheet, nextSnapshot.addr), nextSnapshot)
+    }
+    cells.clear()
+    for (const [cellKey, snapshot] of nextCells) cells.set(cellKey, snapshot)
+
+    for (let index = 0; index < rangeFormats.length; index += 1) {
+      const layer = rangeFormats[index]
+      rangeFormats[index] = {
+        ...layer,
+        sheet: remapSheetIndexAfterMove(layer.sheet, from, to),
+      }
+    }
+  }
+
   const client: FakeWorkerWorkbookClient = {
     calls,
     putCell,
@@ -259,6 +292,14 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
         return false
       }
       metas = metas.filter((meta) => meta.idx !== sheet).map((meta, idx) => ({ ...meta, idx }))
+      return true
+    },
+    async moveSheet(from, to) {
+      calls.moveSheet.push({ from, to })
+      if (from < 0 || from >= metas.length || to < 0 || to >= metas.length) {
+        return false
+      }
+      moveSheetData(from, to)
       return true
     },
     async setCell(sheet, addr, value) {
@@ -1506,16 +1547,21 @@ describe('vnext adapter', () => {
       activeSheetId: 'sheet-1',
       revision: 23,
     })
-    expect(reorder?.sheets?.map((sheet) => sheet.name)).toEqual(['Inputs', 'Calc', 'Sheet1'])
+    expect(client.calls.moveSheet).toEqual([{ from: 0, to: 2 }])
+    expect(reorder?.sheets).toEqual([
+      { id: 'sheet-2', name: 'Inputs', index: 0 },
+      { id: 'sheet-3', name: 'Calc', index: 1 },
+      { id: 'sheet-1', name: 'Sheet1', index: 2 },
+    ])
 
-    expect((await backend.listSheets?.())?.sheets.map((sheet) => sheet.name)).toEqual([
-      'Inputs',
-      'Calc',
-      'Sheet1',
+    expect((await backend.listSheets?.())?.sheets).toEqual([
+      { id: 'sheet-2', name: 'Inputs', index: 0 },
+      { id: 'sheet-3', name: 'Calc', index: 1 },
+      { id: 'sheet-1', name: 'Sheet1', index: 2 },
     ])
 
     const remove = await backend.deleteSheet?.({ kind: 'delete-sheet', sheetId: 'sheet-2' })
-    expect(client.calls.removeSheet).toEqual([1])
+    expect(client.calls.removeSheet).toEqual([0])
     expect(remove?.activeSheetId).toBe('sheet-3')
     expect(remove?.sheets).toEqual([
       { id: 'sheet-3', name: 'Calc', index: 0 },

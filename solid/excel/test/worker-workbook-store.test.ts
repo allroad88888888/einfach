@@ -41,6 +41,7 @@ type FakeWorkerWorkbookClient = WorkerWorkbookClient & {
     addSheet: string[]
     renameSheet: Array<{ sheet: number; name: string }>
     removeSheet: number[]
+    moveSheet: Array<{ from: number; to: number }>
     sheetList: WorkbookSheetMeta[][]
     clearCell: Array<{ sheet: number; addr: string }>
     clearRange: ClearRangeCall[]
@@ -137,6 +138,7 @@ function makeFakeWorkerWorkbookClient(
     addSheet: [],
     renameSheet: [],
     removeSheet: [],
+    moveSheet: [],
     sheetList: [],
     clearCell: [],
     clearRange: [],
@@ -235,6 +237,16 @@ function makeFakeWorkerWorkbookClient(
         return false
       }
       metas = metas.filter((meta) => meta.idx !== sheet).map((meta, idx) => ({ ...meta, idx }))
+      return true
+    },
+    async moveSheet(from, to) {
+      calls.moveSheet.push({ from, to })
+      if (from < 0 || from >= metas.length || to < 0 || to >= metas.length) {
+        return false
+      }
+      const [meta] = metas.splice(from, 1)
+      metas.splice(to, 0, meta)
+      metas = metas.map((item, idx) => ({ ...item, idx }))
       return true
     },
     async setCell(sheet, addr, value) {

@@ -48,6 +48,7 @@ type MockWasmWorkbook = {
   add_sheet: (name: string) => number
   rename_sheet: (idx: number, name: string) => boolean
   remove_sheet: (idx: number) => boolean
+  move_sheet: (from: number, to: number) => boolean
   snapshotCell: (
     sheet: number,
     addr: string,
@@ -128,6 +129,7 @@ type MockWasmWorkbook = {
     deleteRows: Array<{ sheet: number; at: number; count: number }>
     insertCols: Array<{ sheet: number; at: number; count: number }>
     deleteCols: Array<{ sheet: number; at: number; count: number }>
+    moveSheets: Array<{ from: number; to: number }>
     subscribeTokens: number[]
     unsubscribeTokens: number[]
   }
@@ -195,6 +197,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     deleteRows: [],
     insertCols: [],
     deleteCols: [],
+    moveSheets: [],
     subscribeTokens: [],
     unsubscribeTokens: [],
   }
@@ -316,6 +319,13 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     remove_sheet: (idx: number) => {
       if (idx < 0 || idx >= sheets.length) return false
       sheets.splice(idx, 1)
+      return true
+    },
+    move_sheet: (from: number, to: number) => {
+      calls.moveSheets.push({ from, to })
+      if (from < 0 || from >= sheets.length || to < 0 || to >= sheets.length) return false
+      const [sheet] = sheets.splice(from, 1)
+      sheets.splice(to, 0, sheet)
       return true
     },
     snapshotCell: (sheet: number, addr: string) => {
@@ -585,6 +595,7 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       mainDeleteRows: () => workbooks[0]?.__mockCalls?.deleteRows ?? [],
       mainInsertCols: () => workbooks[0]?.__mockCalls?.insertCols ?? [],
       mainDeleteCols: () => workbooks[0]?.__mockCalls?.deleteCols ?? [],
+      mainMoveSheets: () => workbooks[0]?.__mockCalls?.moveSheets ?? [],
       mainSnapshotPersistenceV1: () => workbooks[0]?.__mockCalls?.snapshotPersistenceV1 ?? 0,
       mainRestorePersistenceV1: () => workbooks[0]?.__mockCalls?.restorePersistenceV1 ?? [],
       mainSubscribeTokens: () => workbooks[0]?.__mockCalls?.subscribeTokens ?? [],
@@ -1419,6 +1430,51 @@ describe('wasm-workbook-worker import session contract', () => {
         }),
       ).rejects.toMatchObject({
         code: 'INVALID_STRUCTURAL_EDIT',
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes sheet moves to the wasm workbook API', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1', 'Sheet2', 'Sheet3'],
+      })
+
+      await expect(
+        harness.send({
+          id: 2,
+          cmd: 'moveSheet',
+          from: 2,
+          to: 0,
+        }),
+      ).resolves.toBe(true)
+      expect(harness.calls.mainMoveSheets()).toEqual([{ from: 2, to: 0 }])
+
+      await expect(
+        harness.send({
+          id: 3,
+          cmd: 'sheetList',
+        }),
+      ).resolves.toEqual([
+        { idx: 0, name: 'Sheet3' },
+        { idx: 1, name: 'Sheet1' },
+        { idx: 2, name: 'Sheet2' },
+      ])
+
+      await expect(
+        harness.send({
+          id: 4,
+          cmd: 'moveSheet',
+          from: 9,
+          to: 0,
+        }),
+      ).rejects.toMatchObject({
+        code: 'INVALID_SHEET',
       })
     } finally {
       harness.dispose()

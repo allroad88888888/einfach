@@ -112,8 +112,11 @@ function buildSheetLookup(
   for (const sheet of sheets) {
     byId.set(sheet.id, sheet)
     byId.set(sheet.name, sheet)
-    byId.set(String(sheet.idx), sheet)
-    byId.set(`sheet-${sheet.idx + 1}`, sheet)
+  }
+
+  for (const sheet of sheets) {
+    if (!byId.has(String(sheet.idx))) byId.set(String(sheet.idx), sheet)
+    if (!byId.has(`sheet-${sheet.idx + 1}`)) byId.set(`sheet-${sheet.idx + 1}`, sheet)
   }
 
   return { sheets, byId }
@@ -125,8 +128,11 @@ function buildSheetLookupFromSheets(sheets: WorkerWorkbookBackendSheet[]): Sheet
   for (const sheet of sheets) {
     byId.set(sheet.id, sheet)
     byId.set(sheet.name, sheet)
-    byId.set(String(sheet.idx), sheet)
-    byId.set(`sheet-${sheet.idx + 1}`, sheet)
+  }
+
+  for (const sheet of sheets) {
+    if (!byId.has(String(sheet.idx))) byId.set(String(sheet.idx), sheet)
+    if (!byId.has(`sheet-${sheet.idx + 1}`)) byId.set(`sheet-${sheet.idx + 1}`, sheet)
   }
 
   return { sheets, byId }
@@ -171,41 +177,6 @@ function toSheetMetadata(
     name: sheet.name,
     index,
   }))
-}
-
-function orderWorkerSheets(
-  sheets: readonly WorkerWorkbookBackendSheet[],
-  orderIds: readonly string[] | null,
-): WorkerWorkbookBackendSheet[] {
-  if (!orderIds) {
-    return sheets.map((sheet) => ({ ...sheet }))
-  }
-
-  const byId = new Map(sheets.map((sheet) => [sheet.id, sheet]))
-  const ordered: WorkerWorkbookBackendSheet[] = []
-  const used = new Set<string>()
-
-  for (const id of orderIds) {
-    const sheet = byId.get(id)
-    if (!sheet || used.has(sheet.id)) continue
-    ordered.push({ ...sheet })
-    used.add(sheet.id)
-  }
-
-  for (const sheet of sheets) {
-    if (used.has(sheet.id)) continue
-    ordered.push({ ...sheet })
-    used.add(sheet.id)
-  }
-
-  return ordered
-}
-
-function hasSameSheetOrder(
-  left: readonly WorkerWorkbookBackendSheet[],
-  right: readonly WorkerWorkbookBackendSheet[],
-): boolean {
-  return left.length === right.length && left.every((sheet, index) => sheet.id === right[index]?.id)
 }
 
 function normalizeDimensionSize(value: number): number {
@@ -553,7 +524,6 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let lookup: SheetLookup = { sheets: [], byId: new Map() }
   let revision = options.revision ?? 0
   let disposed = false
-  let sheetOrderIds: string[] | null = null
   const rowHeightsBySheetId = new Map<string, Map<number, number>>()
   const colWidthsBySheetId = new Map<string, Map<number, number>>()
   const client: WorkerWorkbookClient = resolvedClient
@@ -582,11 +552,7 @@ export function createWorkerWorkbookSpreadsheetBackend(
     await readyPromise
     const metas = await client.sheetList()
     const synced = syncSheetLookup(metas, existingSheets)
-    const orderedSheets = orderWorkerSheets(synced.sheets, sheetOrderIds)
-    if (sheetOrderIds) {
-      sheetOrderIds = orderedSheets.map((sheet) => sheet.id)
-    }
-    lookup = buildSheetLookupFromSheets(orderedSheets)
+    lookup = synced
     return lookup.sheets
   }
 
@@ -1037,17 +1003,31 @@ export function createWorkerWorkbookSpreadsheetBackend(
     async reorderSheet(request: ReorderSheetRequest): Promise<SheetMutationResult> {
       await resolveSheet(request.sheetId)
       const nextSheets = reorderSheetMetadata(toSheetMetadata(lookup.sheets), request)
-      const nextIds = nextSheets.map((sheet) => sheet.id)
-      const orderedSheets = orderWorkerSheets(lookup.sheets, nextIds)
-      const changed = !hasSameSheetOrder(lookup.sheets, orderedSheets)
+      const fromIndex = lookup.sheets.findIndex((sheet) => sheet.id === request.sheetId)
+      const toIndex = nextSheets.findIndex((sheet) => sheet.id === request.sheetId)
+      const changed = fromIndex !== toIndex
 
-      sheetOrderIds = nextIds
-      lookup = buildSheetLookupFromSheets(orderedSheets)
+      if (fromIndex < 0 || toIndex < 0) {
+        throw createBackendError('SHEET_REORDER_FAILED', `cannot reorder sheet: ${request.sheetId}`)
+      }
+
+      let nextRevision = revision
+      if (changed) {
+        const ok = await client.moveSheet(lookup.sheets[fromIndex].idx, toIndex)
+        if (!ok) {
+          throw createBackendError(
+            'SHEET_REORDER_FAILED',
+            `cannot reorder sheet: ${request.sheetId}`,
+          )
+        }
+        nextRevision = bumpRevision()
+        await refreshSheetLookup(lookup.sheets)
+      }
 
       return sheetMutationResult(request.requestId, {
         sheetId: request.sheetId,
         activeSheetId: request.sheetId,
-        revision: request.revision ?? (changed ? bumpRevision() : revision),
+        revision: request.revision ?? nextRevision,
       })
     },
 

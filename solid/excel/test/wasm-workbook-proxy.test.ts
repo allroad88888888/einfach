@@ -83,6 +83,22 @@ describe('wasm-workbook-proxy (Phase 5 Track A)', () => {
     ])
   })
 
+  it('sends sheet move commands with source and target indexes', async () => {
+    const fake = makeFakeWorker()
+    const workbook = createWorkerWorkbook({ workerFactory: () => fake })
+
+    const move = workbook.moveSheet(2, 0)
+    expect(lastSent(fake)).toEqual({
+      id: 1,
+      cmd: 'moveSheet',
+      from: 2,
+      to: 0,
+    })
+
+    ok(fake, true)
+    await expect(move).resolves.toBe(true)
+  })
+
   it('keeps sheet identity in setCell/readCells payloads', async () => {
     const fake = makeFakeWorker()
     const workbook = createWorkerWorkbook({ workerFactory: () => fake })
