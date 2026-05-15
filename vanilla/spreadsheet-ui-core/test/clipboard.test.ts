@@ -173,6 +173,12 @@ describe('clipboard core', () => {
     expect(shiftFormulaRefs('="A1"&A1&"B2"', 1, 1)).toBe('="A1"&B2&"B2"')
   })
 
+  test('leaves bare name tokens unchanged when shifting formula refs', () => {
+    expect(shiftFormulaRefs('=MyName+1', 1, 1)).toBe('=MyName+1')
+    expect(shiftFormulaRefs('=A1+SUM(MyList)', 1, 0)).toBe('=A2+SUM(MyList)')
+    expect(shiftFormulaRefs('=Sheet1!A1+Revenue', 0, 1)).toBe('=Sheet1!B1+Revenue')
+  })
+
   test('plans TSV paste chunks from marker origin to target origin', () => {
     const text = '# einfach-clipboard-origin: B2\r\n=A1\tplain\n=SUM(B2:C3)\t'
     const plan = createClipboardTsvPastePlan({

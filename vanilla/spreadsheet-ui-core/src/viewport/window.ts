@@ -2,8 +2,11 @@ import { atom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import type {
   CellViewportRect,
+  FrozenWindows,
   ScrollToCellInput,
+  SetViewportFreezeInput,
   ViewportCellAlign,
+  ViewportFreezeState,
   ViewportMetrics,
   ViewportScrollPosition,
   ViewportSizeOverrideState,
@@ -359,6 +362,80 @@ export const setViewportColumnWidthAtom = atom(
   },
 )
 setViewportColumnWidthAtom.debugLabel = 'spreadsheet.viewport.setColumnWidth'
+
+export const DEFAULT_VIEWPORT_FREEZE_STATE: ViewportFreezeState = {
+  rowsBySheet: {},
+  colsBySheet: {},
+}
+
+export const viewportFreezeAtom = atom<ViewportFreezeState>(DEFAULT_VIEWPORT_FREEZE_STATE)
+viewportFreezeAtom.debugLabel = 'spreadsheet.viewport.freeze'
+
+export const setViewportFreezeAtom = atom(
+  (get) => get(viewportFreezeAtom),
+  (get, set, input: SetViewportFreezeInput) => {
+    if (!input.sheetId || input.sheetId.length === 0) return
+    const state = get(viewportFreezeAtom)
+    const rows =
+      input.rows !== undefined
+        ? Math.max(0, Math.trunc(normalizeNumber(input.rows, 0)))
+        : (state.rowsBySheet[input.sheetId] ?? 0)
+    const cols =
+      input.cols !== undefined
+        ? Math.max(0, Math.trunc(normalizeNumber(input.cols, 0)))
+        : (state.colsBySheet[input.sheetId] ?? 0)
+    set(viewportFreezeAtom, {
+      rowsBySheet: { ...state.rowsBySheet, [input.sheetId]: rows },
+      colsBySheet: { ...state.colsBySheet, [input.sheetId]: cols },
+    })
+  },
+)
+setViewportFreezeAtom.debugLabel = 'spreadsheet.viewport.setFreeze'
+
+const EMPTY_WINDOW: VisibleWindow = { rowStart: 0, rowEnd: -1, colStart: 0, colEnd: -1 }
+
+export function getFrozenWindows(
+  metrics: ViewportMetrics,
+  freeze: { rows: number; cols: number },
+): FrozenWindows {
+  const m = normalizeViewportMetrics(metrics)
+  const frozenRows = Math.max(0, Math.min(Math.trunc(freeze.rows), m.rowCount))
+  const frozenCols = Math.max(0, Math.min(Math.trunc(freeze.cols), m.colCount))
+
+  const full = getVisibleWindow(metrics)
+
+  const scrollRowStart = Math.max(frozenRows, full.rowStart)
+  const scrollRowEnd = full.rowEnd
+  const scrollColStart = Math.max(frozenCols, full.colStart)
+  const scrollColEnd = full.colEnd
+
+  const hasTopRows = frozenRows > 0
+  const hasLeftCols = frozenCols > 0
+  const hasScrollRows = scrollRowStart <= scrollRowEnd
+  const hasScrollCols = scrollColStart <= scrollColEnd
+
+  const topLeft: VisibleWindow =
+    hasTopRows && hasLeftCols
+      ? { rowStart: 0, rowEnd: frozenRows - 1, colStart: 0, colEnd: frozenCols - 1 }
+      : { ...EMPTY_WINDOW }
+
+  const topRight: VisibleWindow =
+    hasTopRows && hasScrollCols
+      ? { rowStart: 0, rowEnd: frozenRows - 1, colStart: scrollColStart, colEnd: scrollColEnd }
+      : { ...EMPTY_WINDOW }
+
+  const bottomLeft: VisibleWindow =
+    hasScrollRows && hasLeftCols
+      ? { rowStart: scrollRowStart, rowEnd: scrollRowEnd, colStart: 0, colEnd: frozenCols - 1 }
+      : { ...EMPTY_WINDOW }
+
+  const bottomRight: VisibleWindow =
+    hasScrollRows && hasScrollCols
+      ? { rowStart: scrollRowStart, rowEnd: scrollRowEnd, colStart: scrollColStart, colEnd: scrollColEnd }
+      : { ...EMPTY_WINDOW }
+
+  return { topLeft, topRight, bottomLeft, bottomRight }
+}
 
 function getAlignedScrollOffset(input: {
   align: ViewportCellAlign

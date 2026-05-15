@@ -1,4 +1,11 @@
 import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
+import type {
+  DeleteNamedRangeRequest,
+  ListNamedRangesRequest,
+  NamedRangeListResult,
+  NamedRangeMutationResult,
+  SetNamedRangeRequest,
+} from '../named-ranges/types'
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -391,4 +398,34 @@ export interface SpreadsheetBackend {
   reorderSheet?(request: ReorderSheetRequest): Promise<SheetMutationResult>
   undoTransaction?(request: UndoTransactionRequest): Promise<HistoryTransactionResult>
   redoTransaction?(request: RedoTransactionRequest): Promise<HistoryTransactionResult>
+  listNamedRanges?(request: ListNamedRangesRequest): Promise<NamedRangeListResult>
+  setNamedRange?(request: SetNamedRangeRequest): Promise<NamedRangeMutationResult>
+  deleteNamedRange?(request: DeleteNamedRangeRequest): Promise<NamedRangeMutationResult>
+  readFreezeConfig?(request: ReadFreezeConfigRequest): Promise<ReadFreezeConfigResult>
+  setFreezeConfig?(request: SetFreezeConfigRequest): Promise<BackendMutationResult>
+}
+
+export interface ViewportFreezeConfig {
+  rows: number
+  cols: number
+}
+
+export interface ReadFreezeConfigRequest extends SheetRef {
+  kind: 'read-freeze-config'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface ReadFreezeConfigResult extends SheetRef {
+  kind: 'freeze-config'
+  freeze: ViewportFreezeConfig
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface SetFreezeConfigRequest extends SheetRef {
+  kind: 'set-freeze-config'
+  freeze: ViewportFreezeConfig
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
 }

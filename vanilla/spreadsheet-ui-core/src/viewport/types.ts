@@ -53,3 +53,21 @@ export interface SetViewportColumnWidthInput {
   colIndex: number
   widthPx: number
 }
+
+export interface ViewportFreezeState {
+  rowsBySheet: Record<string, number>
+  colsBySheet: Record<string, number>
+}
+
+export interface SetViewportFreezeInput {
+  sheetId: string
+  rows?: number
+  cols?: number
+}
+
+export interface FrozenWindows {
+  topLeft: VisibleWindow
+  topRight: VisibleWindow
+  bottomLeft: VisibleWindow
+  bottomRight: VisibleWindow
+}

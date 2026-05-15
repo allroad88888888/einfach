@@ -10,11 +10,13 @@ import {
   historyStackAtom,
   keyboardModeAtom,
   menuStateAtom,
+  nameRegistryCacheAtom,
   pointerSessionAtom,
   primarySelectionRegionAtom,
   selectionAtom,
   selectionRegionsAtom,
   toolbarUiStateAtom,
+  viewportFreezeAtom,
   viewportMetricsAtom,
   workspaceSessionAtom,
 } from '../src'
@@ -60,6 +62,8 @@ describe('package boundary', () => {
     expect(historyStackAtom.debugLabel).toBe('spreadsheet.history.stack')
     expect(selectionRegionsAtom.debugLabel).toBe('spreadsheet.selection.regions')
     expect(primarySelectionRegionAtom.debugLabel).toBe('spreadsheet.selection.primaryRegion')
+    expect(nameRegistryCacheAtom.debugLabel).toBe('spreadsheet.namedRanges.cache')
+    expect(viewportFreezeAtom.debugLabel).toBe('spreadsheet.viewport.freeze')
   })
 
   test('does not import UI frameworks, DOM runtime, workers, or wasm glue', () => {

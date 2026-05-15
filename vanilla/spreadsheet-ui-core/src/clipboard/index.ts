@@ -167,6 +167,8 @@ function mapFormulaRefs(
   const rewriteSegment = (segment: string): string => {
     const refPattern = /(?:([A-Za-z_][A-Za-z0-9_]*)!)?([A-Za-z]+)(\d+)/g
     return segment.replace(refPattern, (full, sheetName, letters, digits) => {
+      // name tokens (no trailing digits) bypass the rewriter
+      if (!digits || digits.length === 0) return full
       const coord = parseFormulaRefCoord(letters, digits)
       if (!coord) return full
 
