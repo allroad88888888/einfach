@@ -517,7 +517,7 @@ export function SpreadsheetSheetTabs(props: SpreadsheetSheetTabsProps) {
                 onPointerDown={(event) => beginReorder(sheet.id, event)}
                 onPointerCancel={() => cancelReorder(sheet.id)}
               >
-                ::
+                <span class="spreadsheet-sheet-tab-reorder-grip" aria-hidden="true">⠿</span>
               </button>
               <Show
                 when={!isRenaming()}

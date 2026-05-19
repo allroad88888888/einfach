@@ -1200,7 +1200,7 @@ thead .row-header {
   display: inline-flex;
   align-items: center;
   height: 22px;
-  padding: 0 10px;
+  padding: 0 8px;
   border-right: 1px solid var(--border);
   color: var(--text-default);
 }
@@ -1216,16 +1216,17 @@ thead .row-header {
   align-items: center;
   height: 22px;
   gap: 2px;
-  padding: 0 8px;
+  padding: 0 4px;
   border-right: 1px solid var(--border);
 }
 
 .spreadsheet-status-bar .spreadsheet-status-bar-aggregate {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   gap: 4px;
   height: 18px;
-  padding: 0 8px;
+  padding: 0 6px;
   border: 1px solid transparent;
   border-radius: 2px;
   background: transparent;
@@ -1241,8 +1242,7 @@ thead .row-header {
 }
 
 .spreadsheet-status-bar .spreadsheet-status-bar-aggregate[data-enabled='false'] {
-  color: var(--text-muted);
-  opacity: 0.55;
+  display: none;
 }
 
 .spreadsheet-status-bar .spreadsheet-status-bar-aggregate[aria-pressed='true'] {
@@ -1270,15 +1270,16 @@ thead .row-header {
   align-items: center;
   height: 22px;
   gap: 1px;
-  padding: 0 6px;
+  padding: 0 4px;
   border-right: 1px solid var(--border);
 }
 
 .spreadsheet-status-bar .spreadsheet-status-bar-view-mode {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   height: 18px;
-  padding: 0 8px;
+  padding: 0 6px;
   border: 1px solid transparent;
   border-radius: 2px;
   background: transparent;
@@ -1312,6 +1313,7 @@ thead .row-header {
 .spreadsheet-status-bar .spreadsheet-status-bar-zoom-preset {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   height: 18px;
   padding: 0 6px;
   border: 1px solid transparent;
@@ -1329,7 +1331,8 @@ thead .row-header {
 }
 
 .spreadsheet-status-bar .spreadsheet-status-bar-zoom-slider {
-  margin: 0 6px;
+  margin: 0 4px;
+  width: 88px;
   height: 12px;
   cursor: pointer;
 }
@@ -1348,6 +1351,7 @@ thead .row-header {
 .spreadsheet-status-bar .spreadsheet-status-bar-mode-badge {
   display: inline-flex;
   align-items: center;
+  flex-shrink: 0;
   height: 18px;
   padding: 0 8px;
   margin: 0 4px;
@@ -1427,10 +1431,142 @@ thead .row-header {
 }
 
 .spreadsheet-sheet-tabs .spreadsheet-sheet-tab-reorder {
-  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 3px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  background: transparent;
   color: var(--text-muted);
   cursor: grab;
   user-select: none;
+  line-height: 1;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-reorder:not(:disabled):hover {
+  background: var(--hover);
+  color: var(--text-default);
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-reorder:disabled {
+  opacity: 0.3;
+  cursor: default;
+}
+
+.spreadsheet-sheet-tab-reorder-grip {
+  font-size: 13px;
+  letter-spacing: -2px;
+  pointer-events: none;
+}
+
+/* === History timeline panel (demo right-rail) ====================================== */
+
+.spreadsheet-history-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-chrome);
+  font-family: var(--excel-font);
+  font-size: 12px;
+  color: var(--text-default);
+}
+
+.history-timeline-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.history-timeline-btn {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.history-timeline-btn:not(:disabled):hover {
+  background: var(--hover);
+  border-color: var(--border-strong);
+}
+
+.history-timeline-btn:disabled {
+  color: var(--text-muted);
+  background: transparent;
+  cursor: default;
+  opacity: 0.6;
+}
+
+.history-timeline-cursor {
+  margin-left: 4px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.history-timeline-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.history-timeline-entry {
+  display: flex;
+}
+
+.history-timeline-entry-btn {
+  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-timeline-entry-btn:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.history-timeline-entry-current .history-timeline-entry-btn {
+  background: var(--select-bg);
+  border-color: var(--excel-green);
+  color: var(--excel-green);
+  font-weight: 600;
+}
+
+.history-timeline-entry-kind {
+  font-variant-numeric: tabular-nums;
+}
+
+.history-timeline-entry-time {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.history-timeline-empty {
+  padding: 6px 0;
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 /* === E. Button universal states ====================================== */
