@@ -2588,4 +2588,328 @@ describe('vnext adapter', () => {
     ])
     expect(sheet2.cells).toEqual([])
   })
+
+  it('clears only values when static backend clearRange target is values', async () => {
+    const backend = createStaticSpreadsheetBackend([['A1', 'B1']])
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      format: { bold: true },
+    })
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'values',
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 200,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: '', valueKind: 'blank', format: { bold: true } },
+      { row: 0, col: 1, displayValue: '', valueKind: 'blank', format: { bold: true } },
+    ])
+  })
+
+  it('clears only formats when static backend clearRange target is formats', async () => {
+    const backend = createStaticSpreadsheetBackend([['A1', 'B1']])
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      format: { bold: true },
+    })
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'formats',
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 201,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string' },
+      { row: 0, col: 1, displayValue: 'B1', valueKind: 'string' },
+    ])
+  })
+
+  it('clears static backend formats only inside the requested range -- surrounding layer survives outside', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      format: { bgColor: '#abcdef' },
+    })
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 },
+      target: 'formats',
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 205,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 2, colStart: 0, colEnd: 2 },
+      }),
+    )
+
+    // The center cell (1,1) has the format layer punched; the 8 surrounding cells keep the bg color.
+    const formattedCount = result.cells.filter((cell) => cell.format?.bgColor === '#abcdef').length
+    const centerCell = result.cells.find((cell) => cell.row === 1 && cell.col === 1)
+    expect(formattedCount).toBe(8)
+    expect(centerCell).toBeUndefined()
+  })
+
+  it('clears both values and formats when static backend clearRange target is all', async () => {
+    const backend = createStaticSpreadsheetBackend([['A1', 'B1']])
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      format: { bold: true },
+    })
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'all',
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 202,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(result.cells).toEqual([])
+  })
+
+  it('isolates static backend cell formats across sheets -- formatting sheet-1 leaves sheet-2 unformatted', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+      cells: [
+        { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: { bold: true } },
+      ],
+    })
+
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-2',
+      row: 0,
+      col: 0,
+      input: 'on-sheet-2',
+    })
+
+    const sheet1 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 210,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+    const sheet2 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 211,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(sheet1.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'A1', valueKind: 'string', format: { bold: true } },
+    ])
+    expect(sheet2.cells).toEqual([
+      { row: 0, col: 0, displayValue: 'on-sheet-2', valueKind: 'string' },
+    ])
+  })
+
+  it('isolates static backend range formats across sheets -- formatting sheet-1 leaves sheet-2 unformatted blanks', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+    })
+
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 5, colStart: 0, colEnd: 5 },
+      format: { bgColor: '#ffd966' },
+    })
+
+    const sheet1 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 220,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      }),
+    )
+    const sheet2 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 221,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(sheet1.cells).toEqual([
+      { row: 0, col: 0, displayValue: '', valueKind: 'blank', format: { bgColor: '#ffd966' } },
+      { row: 0, col: 1, displayValue: '', valueKind: 'blank', format: { bgColor: '#ffd966' } },
+      { row: 1, col: 0, displayValue: '', valueKind: 'blank', format: { bgColor: '#ffd966' } },
+      { row: 1, col: 1, displayValue: '', valueKind: 'blank', format: { bgColor: '#ffd966' } },
+    ])
+    expect(sheet2.cells).toEqual([])
+  })
+
+  it('keeps static backend structural edits scoped to one sheet -- inserting rows on sheet-1 leaves sheet-2 formats intact', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      sheets: [
+        { id: 'sheet-1', name: 'Sheet1' },
+        { id: 'sheet-2', name: 'Sheet2' },
+      ],
+    })
+
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      format: { bold: true },
+    })
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-2',
+      range: { rowStart: 2, rowEnd: 2, colStart: 0, colEnd: 0 },
+      format: { italic: true },
+    })
+
+    await backend.insertRows?.({
+      kind: 'insert-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 0,
+      count: 1,
+    })
+
+    const sheet2 = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-2',
+        requestId: 230,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    // sheet-2 italic format at row 2 must NOT shift, because the row insert was scoped to sheet-1
+    expect(sheet2.cells).toEqual([
+      { row: 2, col: 0, displayValue: '', valueKind: 'blank', format: { italic: true } },
+    ])
+  })
+
+  it('clears only values when worker backend clearRange target is values', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+    })
+    await backend.ready()
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'values',
+    })
+
+    expect(client.calls.clearRange).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+    ])
+    expect(client.calls.setFormatRange).toEqual([])
+
+    backend.dispose()
+  })
+
+  it('clears only formats when worker backend clearRange target is formats', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+    })
+    await backend.ready()
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'formats',
+    })
+
+    expect(client.calls.clearRange).toEqual([])
+    expect(client.calls.setFormatRange).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1, fmt: null },
+    ])
+
+    backend.dispose()
+  })
+
+  it('clears both values and formats when worker backend clearRange target is all', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+    })
+    await backend.ready()
+
+    await backend.clearRange?.({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 1 },
+      target: 'all',
+    })
+
+    expect(client.calls.clearRange).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+    ])
+    expect(client.calls.setFormatRange).toEqual([
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1, fmt: null },
+    ])
+
+    backend.dispose()
+  })
 })

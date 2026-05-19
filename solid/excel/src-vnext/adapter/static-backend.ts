@@ -304,8 +304,8 @@ interface RangeFormatLayer {
 
 interface StaticBackendState {
   cellsBySheet: Map<string, Map<string, DisplayCell>>
-  cellFormats: Map<string, SpreadsheetCellFormat>
-  rangeFormats: RangeFormatLayer[]
+  cellFormatsBySheetId: Map<string, Map<string, SpreadsheetCellFormat>>
+  rangeFormatsBySheetId: Map<string, RangeFormatLayer[]>
   mergeRangesBySheetId: Map<string, CellRange[]>
   rowHeightsBySheetId: Map<string, Map<number, number>>
   colWidthsBySheetId: Map<string, Map<number, number>>
@@ -323,6 +323,30 @@ function getOrCreateSheetCells(
     state.cellsBySheet.set(sheetId, cells)
   }
   return cells
+}
+
+function getOrCreateCellFormats(
+  state: StaticBackendState,
+  sheetId: string,
+): Map<string, SpreadsheetCellFormat> {
+  let formats = state.cellFormatsBySheetId.get(sheetId)
+  if (!formats) {
+    formats = new Map()
+    state.cellFormatsBySheetId.set(sheetId, formats)
+  }
+  return formats
+}
+
+function getOrCreateRangeFormats(
+  state: StaticBackendState,
+  sheetId: string,
+): RangeFormatLayer[] {
+  let layers = state.rangeFormatsBySheetId.get(sheetId)
+  if (!layers) {
+    layers = []
+    state.rangeFormatsBySheetId.set(sheetId, layers)
+  }
+  return layers
 }
 
 function valueToDisplayCell(row: number, col: number, value: StaticSeedValue): DisplayCell | null {
@@ -383,11 +407,13 @@ function buildState(
 
   const cellsBySheet = new Map<string, Map<string, DisplayCell>>()
   cellsBySheet.set(defaultSheetId, cellMap)
+  const cellFormatsBySheetId = new Map<string, Map<string, SpreadsheetCellFormat>>()
+  cellFormatsBySheetId.set(defaultSheetId, cellFormats)
 
   return {
     cellsBySheet,
-    cellFormats,
-    rangeFormats: [],
+    cellFormatsBySheetId,
+    rangeFormatsBySheetId: new Map(),
     mergeRangesBySheetId,
     rowHeightsBySheetId: new Map(),
     colWidthsBySheetId: new Map(),
@@ -735,16 +761,18 @@ function buildProjectionResult(
   const range = request.kind === 'visible-window' ? request.window : request.range
   const resultCellMap = new Map<string, DisplayCell>()
   const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+  const cellFormats = getOrCreateCellFormats(state, request.sheetId)
+  const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
 
   for (const cell of sheetCells.values()) {
     if (!isCellInsideRange(cell, range)) continue
     const clone = cloneCell(cell)
-    const format = getEffectiveFormat(cell.row, cell.col, state.cellFormats, state.rangeFormats)
+    const format = getEffectiveFormat(cell.row, cell.col, cellFormats, rangeFormats)
     if (format) clone.format = format
     resultCellMap.set(keyFor(clone.row, clone.col), clone)
   }
 
-  addFormatOnlyCells(resultCellMap, range, state.cellFormats, state.rangeFormats)
+  addFormatOnlyCells(resultCellMap, range, cellFormats, rangeFormats)
   applyMergeMetadata(
     resultCellMap,
     range,
@@ -866,14 +894,62 @@ function updateCellRichValue(
   return cell
 }
 
-function clearRange(cells: Map<string, DisplayCell>, request: ClearRangeRequest): number {
+function clearRangeValues(cells: Map<string, DisplayCell>, range: CellRange): number {
   let cleared = 0
 
   for (const [key, cell] of [...cells.entries()]) {
-    if (isCellInsideRange(cell, request.range)) {
+    if (isCellInsideRange(cell, range)) {
       cells.delete(key)
       cleared += 1
     }
+  }
+
+  return cleared
+}
+
+function clearRangeFormats(
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: RangeFormatLayer[],
+  range: CellRange,
+): number {
+  let cleared = 0
+
+  for (const [key] of [...cellFormats.entries()]) {
+    const coord = parseKey(key)
+    if (coord && isCoordInsideRange(coord.row, coord.col, range)) {
+      cellFormats.delete(key)
+      cleared += 1
+    }
+  }
+
+  // Mirror Rust set_format_range(null): drop per-cell overrides inside the
+  // range (above) and push a default-format layer that supersedes underlying
+  // range layers only within the cleared rectangle. Removing layers outright
+  // would also strip formatting from cells outside the requested range when a
+  // layer spans both.
+  const intersects = rangeFormats.some((layer) => rangesIntersect(layer.range, range))
+  if (intersects) {
+    rangeFormats.push({ range: cloneRange(normalizeRange(range)), format: {} })
+    cleared += 1
+  }
+
+  return cleared
+}
+
+function applyClearRange(state: StaticBackendState, request: ClearRangeRequest): number {
+  const target = request.target ?? 'all'
+  let cleared = 0
+
+  if (target === 'values' || target === 'all') {
+    cleared += clearRangeValues(getOrCreateSheetCells(state, request.sheetId), request.range)
+  }
+
+  if (target === 'formats' || target === 'all') {
+    cleared += clearRangeFormats(
+      getOrCreateCellFormats(state, request.sheetId),
+      getOrCreateRangeFormats(state, request.sheetId),
+      request.range,
+    )
   }
 
   return cleared
@@ -890,6 +966,8 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
   }
 
   const sheetCells = getOrCreateSheetCells(state, request.sheetId)
+  const cellFormats = getOrCreateCellFormats(state, request.sheetId)
+  const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
   const sourceCells = new Map<string, DisplayCell>()
   for (const cell of sheetCells.values()) {
     if (isCellInsideRange(cell, request.sourceRange)) {
@@ -918,13 +996,13 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
       const sourceFormat = getEffectiveFormat(
         sourceCoord.row,
         sourceCoord.col,
-        state.cellFormats,
-        state.rangeFormats,
+        cellFormats,
+        rangeFormats,
       )
       if (sourceFormat) {
-        state.cellFormats.set(targetKey, sourceFormat)
+        cellFormats.set(targetKey, sourceFormat)
       } else {
-        state.cellFormats.delete(targetKey)
+        cellFormats.delete(targetKey)
       }
 
       changed += 1
@@ -1356,7 +1434,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async clearRange(request) {
-      clearRange(getOrCreateSheetCells(state, request.sheetId), request)
+      applyClearRange(state, request)
       state.revision = bumpRevision(state.revision)
 
       return {
@@ -1374,8 +1452,8 @@ export function createStaticSpreadsheetBackend(
     async insertRows(request) {
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
-        state.cellFormats,
-        state.rangeFormats,
+        getOrCreateCellFormats(state, request.sheetId),
+        getOrCreateRangeFormats(state, request.sheetId),
         request.rowIndex,
         request.count,
         1,
@@ -1392,8 +1470,8 @@ export function createStaticSpreadsheetBackend(
     async deleteRows(request) {
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
-        state.cellFormats,
-        state.rangeFormats,
+        getOrCreateCellFormats(state, request.sheetId),
+        getOrCreateRangeFormats(state, request.sheetId),
         request.rowIndex,
         request.count,
         -1,
@@ -1410,8 +1488,8 @@ export function createStaticSpreadsheetBackend(
     async insertColumns(request) {
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
-        state.cellFormats,
-        state.rangeFormats,
+        getOrCreateCellFormats(state, request.sheetId),
+        getOrCreateRangeFormats(state, request.sheetId),
         request.colIndex,
         request.count,
         1,
@@ -1428,8 +1506,8 @@ export function createStaticSpreadsheetBackend(
     async deleteColumns(request) {
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
-        state.cellFormats,
-        state.rangeFormats,
+        getOrCreateCellFormats(state, request.sheetId),
+        getOrCreateRangeFormats(state, request.sheetId),
         request.colIndex,
         request.count,
         -1,
@@ -1444,8 +1522,10 @@ export function createStaticSpreadsheetBackend(
       return structuralMutationResult(request, state.revision)
     },
     async setFormatRange(request: SetFormatRangeRequest) {
-      clearCellFormatsInRange(state.cellFormats, request.range)
-      state.rangeFormats.push({
+      const cellFormats = getOrCreateCellFormats(state, request.sheetId)
+      const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
+      clearCellFormatsInRange(cellFormats, request.range)
+      rangeFormats.push({
         range: { ...request.range },
         format: normalizeFormat(request.format) ?? {},
       })
@@ -1542,6 +1622,8 @@ export function createStaticSpreadsheetBackend(
       }
       state.sheets = [...state.sheets, createdSheet]
       state.cellsBySheet.set(createdSheet.id, new Map())
+      state.cellFormatsBySheetId.set(createdSheet.id, new Map())
+      state.rangeFormatsBySheetId.set(createdSheet.id, [])
       state.revision = bumpRevision(state.revision)
 
       return sheetMutationResult(state, request.requestId, {
@@ -1585,6 +1667,9 @@ export function createStaticSpreadsheetBackend(
       const nextSheets = state.sheets.filter((sheet) => sheet.id !== request.sheetId)
       state.sheets = reindexSheets(nextSheets)
       state.cellsBySheet.delete(request.sheetId)
+      state.cellFormatsBySheetId.delete(request.sheetId)
+      state.rangeFormatsBySheetId.delete(request.sheetId)
+      state.mergeRangesBySheetId.delete(request.sheetId)
       state.rowHeightsBySheetId.delete(request.sheetId)
       state.colWidthsBySheetId.delete(request.sheetId)
       state.revision = bumpRevision(state.revision)

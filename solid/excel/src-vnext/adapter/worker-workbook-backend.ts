@@ -917,7 +917,18 @@ export function createWorkerWorkbookSpreadsheetBackend(
 
     async clearRange(request: ClearRangeRequest): Promise<BackendMutationResult> {
       const sheet = await resolveSheet(request.sheetId)
-      await client.clearRange(toSparseRange(sheet.idx, request.range))
+      const target = request.target ?? 'all'
+      const sparseRange = toSparseRange(sheet.idx, request.range)
+
+      if (target === 'values' || target === 'all') {
+        await client.clearRange(sparseRange)
+      }
+      if (target === 'formats' || target === 'all') {
+        // Rust set_format_range drops per-cell overrides inside the range and a
+        // null/default layer makes the rectangle read back as unformatted,
+        // which is the contract for 'formats'/'all' clearing.
+        await client.setFormatRange(sparseRange, null)
+      }
       const nextRevision = bumpRevision()
 
       return {
