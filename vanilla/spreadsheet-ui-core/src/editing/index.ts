@@ -1,4 +1,5 @@
 import { atom } from '@einfach/core'
+import { keyboardModeAtom } from '../keyboard'
 import type { EditingCancelIntent, EditingCommitInput, EditingCommitIntent, EditingDraftInput, EditingIntent, EditingSessionState, EditingStartInput, EditingStartIntent } from './types'
 
 export * from './types'
@@ -160,6 +161,7 @@ export const startEditingAtom = atom(
   (get, set, input: EditingStartInput) => {
     set(editingSessionAtom, startEditingSessionState(get(editingSessionAtom), input))
     set(editingIntentAtom, createEditingStartIntent(input))
+    set(keyboardModeAtom, 'editing')
   },
 )
 startEditingAtom.debugLabel = 'spreadsheet.editing.start'
@@ -175,6 +177,7 @@ export const commitEditingAtom = atom(
 
     set(editingIntentAtom, intent)
     set(editingSessionAtom, commitEditingSessionState(state, input))
+    set(keyboardModeAtom, 'navigation')
     return intent
   },
 )
@@ -191,6 +194,7 @@ export const cancelEditingAtom = atom(
 
     set(editingIntentAtom, intent)
     set(editingSessionAtom, cancelEditingSessionState(state))
+    set(keyboardModeAtom, 'navigation')
     return intent
   },
 )

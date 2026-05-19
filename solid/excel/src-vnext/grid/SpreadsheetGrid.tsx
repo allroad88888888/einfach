@@ -649,11 +649,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     store.setter(cancelPointerAtom)
   })
 
-  async function commitCellEdit() {
+  async function commitCellEdit(
+    move: 'none' | 'down' | 'up' | 'left' | 'right' = 'none',
+  ) {
     const intent = store.setter(commitEditingAtom, {
       input: store.getter(editingDraftAtom),
       source: 'cell',
-      move: 'none',
+      move,
     })
 
     if (!intent) {
@@ -668,6 +670,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       input: intent.input,
     })
     await loadProjection(requestProjection())
+
+    if (move !== 'none') {
+      const bounds = getSelectionBounds()
+      const next = { row: intent.cell.row, col: intent.cell.col }
+      if (move === 'down') next.row = Math.min(bounds.rowCount - 1, next.row + 1)
+      else if (move === 'up') next.row = Math.max(0, next.row - 1)
+      else if (move === 'right') next.col = Math.min(bounds.colCount - 1, next.col + 1)
+      else if (move === 'left') next.col = Math.max(0, next.col - 1)
+      store.setter(selectCellAtom, {
+        sheetId: intent.sheetId,
+        coord: next,
+        extend: false,
+      })
+      bumpRender()
+      focusGrid()
+    }
   }
 
   async function clearSelectionRange(target: 'values' | 'formats' | 'all' = 'all') {
@@ -2099,7 +2117,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               <input
                                 class="cell-input"
                                 value={editingDraft()}
-                                autofocus
+                                ref={(el) => {
+                                  // autofocus is blocked when grid root already
+                                  // has focus; queue an explicit focus + caret
+                                  // placement so subsequent keystrokes land on
+                                  // the input, not on the grid keydown handler.
+                                  if (el) {
+                                    queueMicrotask(() => {
+                                      el.focus()
+                                      const len = el.value.length
+                                      el.setSelectionRange(len, len)
+                                    })
+                                  }
+                                }}
                                 onInput={(event) => {
                                   store.setter(editingDraftAtom, {
                                     draft: event.currentTarget.value,
@@ -2109,7 +2139,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                 onKeyDown={(event) => {
                                   if (event.key === 'Enter') {
                                     event.preventDefault()
-                                    void commitCellEdit()
+                                    void commitCellEdit(event.shiftKey ? 'up' : 'down')
+                                  } else if (event.key === 'Tab') {
+                                    event.preventDefault()
+                                    void commitCellEdit(event.shiftKey ? 'left' : 'right')
                                   } else if (event.key === 'Escape') {
                                     event.preventDefault()
                                     store.setter(cancelEditingAtom)
