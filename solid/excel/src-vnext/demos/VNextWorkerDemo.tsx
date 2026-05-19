@@ -17,9 +17,11 @@ import { SpreadsheetContextMenu } from '../context-menu'
 import { SpreadsheetDataValidationDialog } from '../data-validation'
 import { SpreadsheetFilterDropdown } from '../filter-sort'
 import { SpreadsheetFindReplaceDialog } from '../find-replace'
+import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
@@ -169,6 +171,7 @@ function VNextWorkerWorkbook() {
 
   return (
     <>
+      <SpreadsheetMenuBar data-testid="vnext-worker-menu-bar" />
       <SpreadsheetToolbar data-testid="vnext-worker-toolbar" />
       <SpreadsheetFormulaBar data-testid="vnext-worker-formula-bar" />
       <Show keyed when={activeSheetId()}>
@@ -180,6 +183,7 @@ function VNextWorkerWorkbook() {
       <SpreadsheetSheetTabs sheets={sheets} data-testid="vnext-worker-sheet-tabs" />
       <SpreadsheetStatusBar data-testid="vnext-worker-status-bar" />
       <SpreadsheetContextMenu data-testid="vnext-worker-context-menu" />
+      <SpreadsheetFormatPainter data-testid="vnext-worker-format-painter" />
       <SpreadsheetFindReplaceDialog data-testid="vnext-worker-find-replace" />
       <SpreadsheetFilterDropdown data-testid="vnext-worker-filter-dropdown" />
       <SpreadsheetConditionalFormatDialog data-testid="vnext-worker-conditional-format" />
