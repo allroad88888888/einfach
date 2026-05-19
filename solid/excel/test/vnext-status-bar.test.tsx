@@ -290,6 +290,118 @@ describe('vNext SpreadsheetStatusBar', () => {
     await waitFor(() => expect(getByTestId('status-mode-badge').textContent).toBe('Ready'))
   })
 
+  it('aggregate values round to 2 decimal places (Excel-standard)', async () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+
+    // Values 120, 180, 240 -> avg=180 (integer, no decimals).
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          { row: 0, col: 0, displayValue: '120', valueKind: 'number' },
+          { row: 1, col: 0, displayValue: '180', valueKind: 'number' },
+          { row: 2, col: 0, displayValue: '240', valueKind: 'number' },
+        ],
+      },
+    })
+    store.setter(setSelectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 2, col: 0 },
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetStatusBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() =>
+      expect(getByTestId('status-aggregate-average-value').textContent).toBe('180'),
+    )
+  })
+
+  it('aggregate average rounds 1.234 + 1.567 to two decimals (1.4)', async () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 }
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          { row: 0, col: 0, displayValue: '1.234', valueKind: 'number' },
+          { row: 1, col: 0, displayValue: '1.567', valueKind: 'number' },
+        ],
+      },
+    })
+    store.setter(setSelectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 1, col: 0 },
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetStatusBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() =>
+      expect(getByTestId('status-aggregate-average-value').textContent).toBe('1.4'),
+    )
+  })
+
+  it('aggregate average of a repeating decimal rounds to 2 decimals', async () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 4 }
+
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        window,
+        requestId: 1,
+        cells: [
+          { row: 0, col: 0, displayValue: '1', valueKind: 'number' },
+          { row: 1, col: 0, displayValue: '2', valueKind: 'number' },
+          { row: 2, col: 0, displayValue: '4', valueKind: 'number' },
+        ],
+      },
+    })
+    store.setter(setSelectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 0 },
+      focus: { row: 2, col: 0 },
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetStatusBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    // (1+2+4)/3 = 2.333..., formatted to "2.33"
+    await waitFor(() =>
+      expect(getByTestId('status-aggregate-average-value').textContent).toBe('2.33'),
+    )
+  })
+
   it('aggregates respond to selection changes', async () => {
     const store = createStore()
     const backend = createFakeBackend()

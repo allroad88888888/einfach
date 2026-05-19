@@ -4,13 +4,20 @@ import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render } from '@solidjs/testing-library'
 import {
+  commentSessionAtom,
+  filterSortStateAtom,
   findReplaceOpenAtom,
+  helpOverlayAtom,
   historyStackAtom,
   MENU_BAR_ITEMS,
   openTopMenuAtom,
   printPreviewOpenAtom,
   selectionAtom,
   topMenuOpenAtom,
+  validationRuleEditorAtom,
+  viewportShowFormulaBarAtom,
+  viewportShowGridlinesAtom,
+  viewportShowHeadingsAtom,
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -253,5 +260,195 @@ describe('SpreadsheetMenuBar', () => {
     fireEvent.click(container.querySelector('[data-testid="menu-bar-item-insert.nameManager"]')!)
 
     expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Insert > Comment opens the comment session for the active cell', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(commentSessionAtom)).toBeNull()
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-insert"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-insert.comment"]')!)
+
+    const session = store.getter(commentSessionAtom)
+    expect(session).not.toBeNull()
+    expect(session?.sheetId).toBe('sheet-1')
+    expect(session?.cell.row).toBe(0)
+    expect(session?.cell.col).toBe(0)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Format > Data Validation opens the validation rule editor', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(validationRuleEditorAtom).status).toBe('closed')
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-format"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-format.validation"]')!)
+    expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
+  })
+
+  it('Data > Data Validation also opens the validation rule editor', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.validation"]')!)
+    expect(store.getter(validationRuleEditorAtom).status).toBe('editing')
+  })
+
+  it('Data > Sort Asc writes a sort directive on the active column', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 3 },
+      focus: { row: 2, col: 3 },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.sortAsc"]')!)
+
+    const state = store.getter(filterSortStateAtom)['sheet-1']
+    expect(state).toBeDefined()
+    expect(state!.directives).toEqual([{ colIndex: 3, direction: 'asc' }])
+  })
+
+  it('Data > Sort Desc writes a descending sort directive', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: 'sheet-1',
+      anchor: { row: 0, col: 1 },
+      focus: { row: 0, col: 1 },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-data.sortDesc"]')!)
+
+    const state = store.getter(filterSortStateAtom)['sheet-1']
+    expect(state!.directives).toEqual([{ colIndex: 1, direction: 'desc' }])
+  })
+
+  it('View > Show Gridlines toggles the atom and mirrors aria-checked', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(viewportShowGridlinesAtom)).toBe(true)
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    const item = container.querySelector(
+      '[data-testid="menu-bar-item-view.gridlines"]',
+    ) as HTMLButtonElement
+    expect(item.getAttribute('aria-checked')).toBe('true')
+
+    fireEvent.click(item)
+    expect(store.getter(viewportShowGridlinesAtom)).toBe(false)
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    const item2 = container.querySelector(
+      '[data-testid="menu-bar-item-view.gridlines"]',
+    ) as HTMLButtonElement
+    expect(item2.getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('View > Show Headings + Show Formula Bar both toggle their atoms', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(viewportShowHeadingsAtom)).toBe(true)
+    expect(store.getter(viewportShowFormulaBarAtom)).toBe(true)
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-view.headings"]')!)
+    expect(store.getter(viewportShowHeadingsAtom)).toBe(false)
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-view"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-view.formulaBar"]')!)
+    expect(store.getter(viewportShowFormulaBarAtom)).toBe(false)
+  })
+
+  it('Help > Keyboard Shortcuts opens the shortcuts overlay', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(helpOverlayAtom)).toBe('closed')
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-help"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-help.shortcuts"]')!)
+    expect(store.getter(helpOverlayAtom)).toBe('shortcuts')
+    expect(getByTestId('spreadsheet-help-overlay-shortcuts')).not.toBeNull()
+    expect(getByTestId('spreadsheet-help-overlay-shortcut-list')).not.toBeNull()
+  })
+
+  it('Help > About opens the about overlay and Close dismisses it', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-help"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-help.about"]')!)
+    expect(store.getter(helpOverlayAtom)).toBe('about')
+    expect(getByTestId('spreadsheet-help-overlay-about-body')).not.toBeNull()
+
+    fireEvent.click(getByTestId('spreadsheet-help-overlay-close'))
+    expect(store.getter(helpOverlayAtom)).toBe('closed')
   })
 })
