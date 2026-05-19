@@ -4,7 +4,9 @@ import { Show, createEffect, createSignal } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   closeProtectionUnlockAtom,
+  issueProtectionUnlockSyncTicketAtom,
   protectionUnlockStateAtom,
+  protectionUnlockSyncTicketAtom,
   setProtectionUnlockErrorAtom,
   setProtectionUnlockPendingAtom,
   type CellRange,
@@ -40,6 +42,9 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
   }, false)
 
   function handleClose() {
+    // Advance the ticket so any in-flight unlock resolves into a no-op
+    // instead of writing into a future reopened dialog's state.
+    store.setter(issueProtectionUnlockSyncTicketAtom)
     store.setter(closeProtectionUnlockAtom)
   }
 
@@ -48,7 +53,12 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
     if (!current.isOpen || !current.target) return
     const pwd = password()
 
+    const ticket = store.setter(issueProtectionUnlockSyncTicketAtom) as number
     store.setter(setProtectionUnlockPendingAtom, true)
+
+    function isStale(): boolean {
+      return ticket !== store.getter(protectionUnlockSyncTicketAtom)
+    }
 
     if (props.verifySheetProtection) {
       try {
@@ -57,11 +67,13 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
           range: current.target.range,
           password: pwd,
         })
+        if (isStale()) return
         if (!result.ok) {
           store.setter(setProtectionUnlockErrorAtom, result.message ?? 'Incorrect password')
           return
         }
       } catch (err) {
+        if (isStale()) return
         store.setter(
           setProtectionUnlockErrorAtom,
           err instanceof Error ? err.message : String(err),
@@ -78,7 +90,9 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
           range: current.target.range,
           locked: false,
         })
+        if (isStale()) return
       } catch (err) {
+        if (isStale()) return
         store.setter(
           setProtectionUnlockErrorAtom,
           err instanceof Error ? err.message : String(err),
@@ -87,6 +101,7 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
       }
     }
 
+    if (isStale()) return
     store.setter(closeProtectionUnlockAtom)
   }
 

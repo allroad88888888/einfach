@@ -233,3 +233,18 @@ export const setProtectionUnlockErrorAtom = atom(
   },
 )
 setProtectionUnlockErrorAtom.debugLabel = 'spreadsheet.protection.setUnlockError'
+
+// Sync ticket for guarding async unlock flows against stale resolutions.
+// Mirrors the filterSortSyncTicketAtom shape so each consumer increments
+// the ticket at the start of a request and ignores the resolution if the
+// ticket has advanced (cancel / reopen / re-submit in flight).
+export const protectionUnlockSyncTicketAtom = atom<number>(0)
+protectionUnlockSyncTicketAtom.debugLabel = 'spreadsheet.protection.unlockSyncTicket'
+
+export const issueProtectionUnlockSyncTicketAtom = atom(null, (get, set) => {
+  const next = get(protectionUnlockSyncTicketAtom) + 1
+  set(protectionUnlockSyncTicketAtom, next)
+  return next
+})
+issueProtectionUnlockSyncTicketAtom.debugLabel =
+  'spreadsheet.protection.issueUnlockSyncTicket'

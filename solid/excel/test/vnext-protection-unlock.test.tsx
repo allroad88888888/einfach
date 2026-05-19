@@ -239,4 +239,59 @@ describe('SpreadsheetProtectionUnlockDialog', () => {
     await waitFor(() => expect(queryByTestId('protection-unlock-dialog')).not.toBeNull())
     expect((getByTestId('protection-unlock-password') as HTMLInputElement).value).toBe('')
   })
+
+  it('stale unlock rejection does not overwrite a later success', async () => {
+    const store = createStore()
+    let firstReject: ((err: unknown) => void) | null = null
+    let secondResolve: ((value: { ok: boolean }) => void) | null = null
+    let call = 0
+    const verify = jest.fn(
+      (): Promise<{ ok: boolean; message?: string }> => {
+        call += 1
+        if (call === 1) {
+          return new Promise<{ ok: boolean }>((_resolve, reject) => {
+            firstReject = reject
+          })
+        }
+        return new Promise<{ ok: boolean }>((resolve) => {
+          secondResolve = resolve
+        })
+      },
+    )
+    const unlockSpy = jest.fn(async (req: SetRangeLockRequest): Promise<BackendMutationResult> => ({
+      sheetId: req.sheetId,
+    }))
+    const backend = createUnlockBackend(unlockSpy)
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+
+    const { getByTestId, queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetProtectionUnlockDialog verifySheetProtection={verify} />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.input(getByTestId('protection-unlock-password'), { target: { value: 'first' } })
+    fireEvent.click(getByTestId('protection-unlock-confirm'))
+
+    fireEvent.click(getByTestId('protection-unlock-cancel'))
+    await waitFor(() => expect(queryByTestId('protection-unlock-dialog')).toBeNull())
+    store.setter(openProtectionUnlockAtom, sampleTarget)
+    await waitFor(() => expect(queryByTestId('protection-unlock-dialog')).not.toBeNull())
+
+    fireEvent.input(getByTestId('protection-unlock-password'), { target: { value: 'second' } })
+    fireEvent.click(getByTestId('protection-unlock-confirm'))
+
+    secondResolve!({ ok: true })
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(unlockSpy).toHaveBeenCalledTimes(1)
+    expect(store.getter(protectionUnlockStateAtom).isOpen).toBe(false)
+    expect(store.getter(protectionUnlockStateAtom).error).toBeNull()
+
+    firstReject!(new Error('first failed'))
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(store.getter(protectionUnlockStateAtom).isOpen).toBe(false)
+    expect(store.getter(protectionUnlockStateAtom).error).toBeNull()
+  })
 })
