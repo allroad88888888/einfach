@@ -25,13 +25,17 @@ npm run eslint
 ## Monorepo Structure (pnpm workspaces)
 
 ```
-vanilla/core/     → @einfach/core         # Core atom engine (framework-agnostic)
-vanilla/utils/    → @einfach/utils         # Utility functions (easyGet/Set, memoize, LRU cache)
-react/react/      → @einfach/react         # React hooks (useAtomValue, useSetAtom, useAtom)
-react/form/       → @einfach/react-form    # React form handling with validation
-react/utils/      → @einfach/react-utils   # React utility hooks
-solid/solid/      → @einfach/solid         # Solid.js integration
-solid/form/       → @einfach/solid-form    # Solid.js form handling
+vanilla/core/                  → @einfach/core              # Core atom engine (framework-agnostic)
+vanilla/utils/                 → @einfach/utils             # Utility functions (easyGet/Set, memoize, LRU cache)
+vanilla/spreadsheet-ui-core/   → @einfach/spreadsheet-ui-core  # Framework-agnostic spreadsheet UI atoms + types (vnext)
+react/react/                   → @einfach/react             # React hooks (useAtomValue, useSetAtom, useAtom)
+react/form/                    → @einfach/react-form        # React form handling with validation
+react/utils/                   → @einfach/react-utils       # React utility hooks
+solid/solid/                   → @einfach/solid             # Solid.js integration
+solid/form/                    → @einfach/solid-form        # Solid.js form handling
+solid/excel/                   → @einfach/solid-excel       # Solid.js spreadsheet surface (legacy + vnext)
+rust/excel-core/               → einfach-excel-core         # Rust formula / workbook engine
+rust/wasm/                     → einfach-wasm               # WASM bindings exposed to solid/excel
 ```
 
 ## Architecture
@@ -48,20 +52,72 @@ solid/form/       → @einfach/solid-form    # Solid.js form handling
 
 **Form system** (`react/form/src/core/`, `solid/form/src/core/`): Backs form state (values, errors, validation rules) with atoms via `useForm()`.
 
-### Build Pipeline
+## Architecture: vnext (spreadsheet stack)
+
+The `vnext` arc layers a spreadsheet on top of the existing atom core. It is the active surface for new feature work; the legacy `solid/excel/src/` shell is kept only for parity tests.
+
+### Three-tier layering
+
+```
+vanilla/spreadsheet-ui-core   (atoms, types, projection contracts — no DOM, no worker, no WASM)
+        ↑
+solid/excel/src-vnext         (Solid components, Provider, adapters)
+        ↑
+rust/excel-core + rust/wasm   (formula engine, workbook state) — reached via a worker
+```
+
+Rules: `spreadsheet-ui-core` must not import Solid, React, DOM APIs, worker glue, or WASM glue. Workbook facts (cell values, formulas, dependency graph) live behind the backend port, not in UI atoms.
+
+See `vanilla/spreadsheet-ui-core/docs/ROADMAP.md` for the four-wave feature breakdown and `vanilla/spreadsheet-ui-core/docs/AGENT_COLLABORATION.md` for the multi-agent kanban.
+
+### Backend port (`SpreadsheetBackend`)
+
+The contract between UI core and any data source lives in `vanilla/spreadsheet-ui-core/src/backend/types.ts`. Two methods are required (`readVisibleProjection`, `readRangeProjection`, `setCellInput`); 45+ feature methods are optional. UI core hides a toolbar item, menu entry, or keyboard intent when the host backend omits the relevant port — features degrade without UI core knowing the difference between "host does not implement it" and "feature does not exist".
+
+Two reference implementations ship under `solid/excel/src-vnext/adapter/`:
+
+- `static-backend.ts` — in-memory implementation used by smoke tests and the static demo.
+- `worker-workbook-backend.ts` — RPC to a Web Worker that owns the WASM `Workbook` from `rust/wasm`.
+
+### Atom conventions
+
+- Every atom in `spreadsheet-ui-core` sets `debugLabel = 'spreadsheet.<feature>.<name>'` (e.g. `'spreadsheet.findReplace.cursor'`).
+- Atoms classify as **source**, **derived**, or **command** in each feature's `README.md`. No per-cell, per-row, or per-column atom families — large tables must be served by the visible-window projection or a bounded cache.
+- Bounded caches declare their cap (history 100, named-ranges 500, presence cursors 32, find matches 500, unlocked ranges 256).
+- Mutation requests carry optional `requestId` / `revision` / `cancelToken` so workers can ignore stale work.
+
+### Provider and dialog component pattern
+
+`solid/excel/src-vnext/provider/SpreadsheetUiProvider.tsx` calls `createSpreadsheetUi`, then wraps children in both `@einfach/solid`'s `Provider` (for `useAtomValue` plumbing) and `SpreadsheetUiContext.Provider` (so `useSpreadsheetBackend` and `useSpreadsheetUiStore` resolve).
+
+Every modal under `solid/excel/src-vnext/*/Spreadsheet*Dialog.tsx` follows the same shape:
+
+1. Read an open-atom via `useAtomValue` and a close-setter (e.g. `closeFindReplaceAtom`).
+2. Hold per-instance form state in `createSignal` locals.
+3. Reset signals inside a `createEffect<boolean>` that watches the open-atom and detects a `false → true` edge.
+
+`SpreadsheetFindReplaceDialog.tsx` is the canonical example; the conditional-formatting, data-validation, name-manager, protection-unlock, and comment-thread dialogs all mirror it.
+
+### Known limitation: solid-js 1.9.12 Provider interaction
+
+`solid/excel` resolves `solid-js@1.9.12`, while `solid/solid` resolves `1.9.5`. Under 1.9.12, a consumer component body wrapped in `Provider` re-executes on atom mutations instead of running once. The pinned contract test is `solid/solid/test/provider-remount.test.tsx`. Workaround for now: keep per-instance state in atoms (not `let` locals in the component body) so re-execution does not lose state. Version alignment is tracked as a separate investigation arc; do not refactor around it without coordinating.
+
+## Build Pipeline
 
 - TypeScript composite project with `tsc -build` for declarations
 - Rollup bundles to `cjs/` (.cjs), `esm/` (.mjs), and `dist/`
 - SWC transforms React/Vanilla; Babel transforms Solid.js (for JSX)
 - All packages have `sideEffects: false` for tree-shaking
+- `solid/excel` runs `npm run build:wasm` before `vite build` to refresh `solid/excel/wasm-pkg/` from `rust/wasm`
 
-### Testing
+## Testing
 
 - Jest with jsdom environment
 - SWC for non-Solid tests, Babel for Solid tests
 - `moduleNameMapper` in `jest.config.mjs` resolves `@einfach/*` to source directories
 - React tests use `@testing-library/react` with `renderHook`/`act`
 - Always create a fresh store per test via `createStore()`
+- vnext spreadsheet suites: `npx jest vanilla/spreadsheet-ui-core --no-coverage` and `npx jest solid/excel --no-coverage`
 
 ## Code Style
 
