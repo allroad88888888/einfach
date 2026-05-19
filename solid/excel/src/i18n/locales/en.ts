@@ -35,6 +35,7 @@ export const messages: Record<string, string> = {
   'nav.million': '1M Cells',
   'nav.vnext': 'vNext',
   'nav.vnextWorker': 'vNext Worker',
+  'nav.vnextWave5': 'vNext Wave 5',
 
   // Demo headings + descriptions.
   'demo.blank.title': 'Blank Spreadsheet',

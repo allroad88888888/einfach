@@ -29,6 +29,7 @@ export const messages: Record<string, string> = {
   'nav.million': '百万格',
   'nav.vnext': 'vNext',
   'nav.vnextWorker': 'vNext Worker',
+  'nav.vnextWave5': 'vNext Wave 5',
 
   // Demo headings + descriptions.
   'demo.blank.title': '空白表格',

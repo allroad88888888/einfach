@@ -1,0 +1,162 @@
+import { useAtomValue } from '@einfach/solid'
+import { onMount, Show } from 'solid-js'
+import {
+  setWorkspaceActiveSheetAtom,
+  workspaceSessionAtom,
+} from '@einfach/spreadsheet-ui-core'
+import { createStaticSpreadsheetBackend } from '../adapter'
+import { SpreadsheetCommentThread } from '../comments'
+import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
+import { SpreadsheetContextMenu } from '../context-menu'
+import { SpreadsheetDataValidationDialog } from '../data-validation'
+import { SpreadsheetFilterDropdown } from '../filter-sort'
+import { SpreadsheetFindReplaceDialog } from '../find-replace'
+import { SpreadsheetFormatPainter } from '../format-painter'
+import { SpreadsheetFormulaBar } from '../formula-bar'
+import { SpreadsheetGrid } from '../grid'
+import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetMenuBar } from '../menu-bar'
+import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPresenceOverlay } from '../presence'
+import { SpreadsheetPrintPreviewOverlay } from '../print'
+import { SpreadsheetProtectionUnlockDialog } from '../protection'
+import { SpreadsheetSheetTabs } from '../sheet-tabs'
+import { SpreadsheetStatusBar } from '../status-bar'
+import { SpreadsheetToolbar } from '../toolbar'
+import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
+
+const sheets = [
+  { id: 'sheet-1', name: 'Sales' },
+  { id: 'sheet-2', name: 'Forecast' },
+]
+
+const backend = createStaticSpreadsheetBackend({
+  revision: 1,
+  sheets,
+  matrix: [
+    ['Region', 'Q1', 'Q2', 'Q3', 'Q4', 'Total'],
+    ['North', 120, 180, 240, 300, 840],
+    ['South', 80, 160, 240, 320, 800],
+    ['East', 200, 100, 50, 150, 500],
+    ['West', 140, 110, 250, 175, 675],
+    ['Central', 90, 130, 200, 280, 700],
+    ['Mountain', 65, 95, 130, 210, 500],
+    ['Pacific', 175, 220, 280, 360, 1035],
+    ['Total', 870, 995, 1390, 1795, 5050],
+  ],
+  cells: [
+    {
+      row: 0,
+      col: 0,
+      displayValue: 'Region',
+      valueKind: 'string',
+      conditionalFormat: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
+    },
+    {
+      row: 0,
+      col: 5,
+      displayValue: 'Total',
+      valueKind: 'string',
+      conditionalFormat: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
+    },
+    {
+      row: 8,
+      col: 0,
+      displayValue: 'Total',
+      valueKind: 'string',
+      conditionalFormat: { bgColor: '#94a3b8', fgColor: '#0f172a', bold: true },
+    },
+    {
+      row: 3,
+      col: 4,
+      displayValue: '150',
+      valueKind: 'number',
+      conditionalFormat: { bgColor: '#fef3c7' },
+    },
+    {
+      row: 6,
+      col: 4,
+      displayValue: '210',
+      valueKind: 'number',
+      conditionalFormat: { bgColor: '#fef3c7' },
+    },
+    {
+      row: 7,
+      col: 5,
+      displayValue: '1035',
+      valueKind: 'number',
+      conditionalFormat: { bgColor: '#dcfce7', bold: true },
+    },
+  ],
+})
+
+const viewport = {
+  scrollTop: 0,
+  scrollLeft: 0,
+  viewportHeight: 240,
+  viewportWidth: 720,
+  rowHeight: 24,
+  colWidth: 96,
+  rowCount: 50,
+  colCount: 16,
+  overscanRows: 1,
+  overscanCols: 1,
+}
+
+function VNextWave5Workbook() {
+  const store = useSpreadsheetUiStore()
+  const workspace = useAtomValue(workspaceSessionAtom)
+  const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
+
+  onMount(() => {
+    if (!store.getter(workspaceSessionAtom).activeSheetId) {
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: sheets[0].id })
+    }
+  })
+
+  return (
+    <>
+      <SpreadsheetMenuBar data-testid="wave5-menu-bar" />
+      <SpreadsheetToolbar data-testid="wave5-toolbar" />
+      <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />
+      <Show keyed when={activeSheetId()}>
+        {(sheetId) => (
+          <SpreadsheetGrid sheetId={sheetId} viewport={viewport} data-testid="wave5-grid" />
+        )}
+      </Show>
+      <SpreadsheetSheetTabs sheets={sheets} data-testid="wave5-sheet-tabs" />
+      <SpreadsheetStatusBar data-testid="wave5-status-bar" />
+      <SpreadsheetContextMenu data-testid="wave5-context-menu" />
+      <SpreadsheetFormatPainter data-testid="wave5-format-painter" />
+      <SpreadsheetFindReplaceDialog data-testid="wave5-find-replace" />
+      <SpreadsheetFilterDropdown data-testid="wave5-filter-dropdown" />
+      <SpreadsheetConditionalFormatDialog data-testid="wave5-conditional-format" />
+      <SpreadsheetDataValidationDialog data-testid="wave5-data-validation" />
+      <SpreadsheetNameManagerDialog data-testid="wave5-name-manager" />
+      <SpreadsheetCommentThread data-testid="wave5-comment-thread" />
+      <SpreadsheetPrintPreviewOverlay data-testid="wave5-print-preview" />
+      <SpreadsheetProtectionUnlockDialog data-testid="wave5-protection-unlock" />
+      <SpreadsheetHistoryTimeline data-testid="wave5-history-timeline" />
+      <SpreadsheetPresenceOverlay data-testid="wave5-presence" />
+    </>
+  )
+}
+
+export function VNextWave5Demo() {
+  return (
+    <div class="demo-page vnext-demo" data-testid="wave5-demo">
+      <div class="demo-header">
+        <h3>vNext Wave 5 — Shell + Canvas overlay</h3>
+        <p class="demo-desc">
+          Exercises the menu bar, name box, status bar aggregates (Sum / Average / Count over the
+          selection), zoom slider, format painter, and the canvas decoration overlay. Seeded with a
+          quarterly sales table so selecting B2:E8 surfaces non-trivial aggregates.
+        </p>
+      </div>
+
+      <SpreadsheetUiProvider backend={backend}>
+        <VNextWave5Workbook />
+      </SpreadsheetUiProvider>
+    </div>
+  )
+}
