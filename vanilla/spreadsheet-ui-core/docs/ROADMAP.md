@@ -93,6 +93,36 @@ Feature shell. Depends on the earlier waves but rarely on each other.
 | [print-page-area](./print-page-area.md) | Mostly self-contained |
 | [collab-presence](./collab-presence.md) | Depends on workspace revision metadata and history transaction ids |
 
+## Luckysheet 1:1 push — Waves 5-8
+
+Target reference: Luckysheet (https://github.com/dream-num/Luckysheet). Closes
+the remaining gap between Wave 1-4 coverage (~56% of Luckysheet features) and
+true 1:1 parity. Charts / images / floating objects / xlsx file I/O /
+PivotTable stay excluded per project scope.
+
+| Wave | Doc | Theme |
+|---|---|---|
+| 5 | [wave-5-shell-and-canvas-overlay](./wave-5-shell-and-canvas-overlay.md) | Top menubar (Luckysheet style, not Excel ribbon) + Name Box + Status Bar aggregates + Format Painter + canvas overlay for selection/decorations (DOM stays for cell text) |
+| 6 | [wave-6-cell-format-complete](./wave-6-cell-format-complete.md) | Format Cells 5-tab dialog + text rotation / overflow / wrap + complete Number Format (12 categories + custom strings) |
+| 7 | [wave-7-data-ops-and-navigation](./wave-7-data-ops-and-navigation.md) | Text to Columns + Remove Duplicates + Paste Special + Go To (Ctrl+G) + complete Data Validation |
+| 8 | [wave-8-formula-extension-and-export](./wave-8-formula-extension-and-export.md) | Remote formulas + custom formulas + array/matrix enhancements + range screenshot + copy as HTML/PNG/MD |
+
+**Cross-cutting decisions** (locked before implementation):
+
+- Number Format parser lives in the projection / JS reference layer; the Rust
+  engine continues to store raw values and is not aware of display format.
+- Diagonal cell borders deferred to a later wave; `SpreadsheetBorders` keeps
+  its 4-side shape for Wave 6.
+- `removeDuplicates` equality uses the displayed value (Excel default), not
+  raw cell input.
+- Custom formula execution runs in the trusted host context, no sandbox
+  (matches Luckysheet). A sandboxed variant can be added later if needed.
+- Canvas overlay = the host renderer referenced by Wave 3 conditional
+  formatting for the `@einfach/solid-excel` host. Other hosts may render
+  differently.
+- jsdom tests for canvas overlay use a mockable 2D context abstraction, not
+  the `canvas` npm package.
+
 ## Dependency map
 
 ```
