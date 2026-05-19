@@ -146,11 +146,10 @@ export function VNextWave5Demo() {
   return (
     <div class="demo-page vnext-demo" data-testid="wave5-demo">
       <div class="demo-header">
-        <h3>vNext Wave 5 — Shell + Canvas overlay</h3>
+        <h3>Wave 5 — 完整 Excel 壳 + Canvas 装饰层</h3>
         <p class="demo-desc">
-          Exercises the menu bar, name box, status bar aggregates (Sum / Average / Count over the
-          selection), zoom slider, format painter, and the canvas decoration overlay. Seeded with a
-          quarterly sales table so selecting B2:E8 surfaces non-trivial aggregates.
+          演示菜单条、名称框、状态栏聚合（选区的求和/平均/计数）、缩放滑块、格式刷以及画布
+          装饰层。预置一张季度销售表，选中 B2:E8 即可看到非平凡的聚合结果。
         </p>
       </div>
 

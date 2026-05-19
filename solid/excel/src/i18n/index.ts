@@ -16,7 +16,7 @@ import { messages as zhMessages } from './locales/zh'
 
 export type Locale = 'en' | 'zh'
 
-const DEFAULT_LOCALE: Locale = 'en'
+const DEFAULT_LOCALE: Locale = 'zh'
 
 // Lingui catalog setup happens once at module load. Side effect, but the
 // alternative (caller calls a `setupI18n()` initializer) just moves the same

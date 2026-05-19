@@ -3,7 +3,10 @@ import { test, expect, type Page } from '@playwright/test'
 test.describe('vNext Wave 5 — shell + canvas overlay', () => {
   async function gotoWave5(page: Page) {
     await page.goto('/')
-    await page.getByRole('button', { name: 'vNext Wave 5', exact: true }).click()
+    // Wave 5 is now the default tab, but click the nav anyway to make the
+    // test independent of which default the app ships with. Use the testid
+    // so the test is locale-independent.
+    await page.getByTestId('nav-tab-vnext-wave5').click()
     await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
   }
 

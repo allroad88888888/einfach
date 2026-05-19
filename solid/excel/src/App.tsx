@@ -76,7 +76,7 @@ const demoGroups: DemoGroup[] = [
 const allDemos: DemoTab[] = demoGroups.flatMap((g) => g.demos)
 
 export function App() {
-  const [activeTab, setActiveTab] = createSignal('vnext')
+  const [activeTab, setActiveTab] = createSignal('vnext-wave5')
   const t = useT()
 
   const activeDemo = () => allDemos.find((d) => d.id === activeTab())
@@ -100,6 +100,7 @@ export function App() {
                 {(demo) => (
                   <button
                     class={`tab-btn ${activeTab() === demo.id ? 'tab-active' : ''}`}
+                    data-testid={`nav-tab-${demo.id}`}
                     onClick={() => setActiveTab(demo.id)}
                   >
                     {t(demo.labelKey)}
