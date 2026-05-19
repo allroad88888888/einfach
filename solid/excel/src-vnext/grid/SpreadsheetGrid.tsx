@@ -1513,17 +1513,31 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       estimatedBytes: plan.estimatedBytes,
     })
 
+    let lastRevision = 0
     for (const chunk of plan.chunks()) {
       for (const cell of chunk.cells) {
-        await backend.setCellInput({
+        const r = await backend.setCellInput({
           kind: 'set-cell-input',
           sheetId: props.sheetId,
           row: cell.row,
           col: cell.col,
           input: cell.input,
         })
+        const rev =
+          typeof r?.revision === 'number'
+            ? r.revision
+            : Number(r?.revision ?? 0) || 0
+        if (rev > lastRevision) lastRevision = rev
       }
     }
+
+    store.setter(pushHistoryAtom, {
+      transactionId: nextHistoryTransactionId(),
+      kind: 'cells.import',
+      sheetId: props.sheetId,
+      projectionRevision: lastRevision,
+      affectedRange: pasteRange,
+    })
 
     store.setter(markClipboardReadyAtom)
     await loadProjection(requestProjection())

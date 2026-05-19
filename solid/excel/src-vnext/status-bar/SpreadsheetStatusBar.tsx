@@ -1,6 +1,7 @@
 import { useAtomValue, useSetAtom, useStore } from '@einfach/solid'
 import { createEffect, createMemo, For, onCleanup } from 'solid-js'
 import {
+  clipboardIntentAtom,
   keyboardModeAtom,
   menuCommandIntentAtom,
   resetZoomLevelAtom,
@@ -23,6 +24,7 @@ import {
   type CellRange,
   type DisplayCell,
   type KeyboardMode,
+  type ClipboardIntent,
   type MenuCommandIntent,
   type ProjectionSnapshot,
   type SelectionState,
@@ -158,6 +160,20 @@ function formatMenuIntent(intent: MenuCommandIntent | null): string | null {
   return `Menu ${intent.command}`
 }
 
+function formatClipboardIntent(intent: ClipboardIntent | null): string | null {
+  if (!intent) return null
+  switch (intent.type) {
+    case 'clipboard.copy':
+      return 'Clipboard copy'
+    case 'clipboard.cut':
+      return 'Clipboard cut'
+    case 'clipboard.paste':
+      return 'Clipboard paste'
+    default:
+      return null
+  }
+}
+
 const AGGREGATE_LABEL_KEYS: Record<StatusBarAggregateKey, string> = {
   sum: 'status.aggregate.sum',
   average: 'status.aggregate.average',
@@ -236,6 +252,7 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
   const visibleWindow = useAtomValue(visibleWindowAtom)
   const toolbarIntent = useAtomValue(toolbarIntentAtom)
   const menuCommandIntent = useAtomValue(menuCommandIntentAtom)
+  const clipboardIntent = useAtomValue(clipboardIntentAtom)
   const aggregates = useAtomValue(selectionAggregatesAtom)
   const aggregateConfig = useAtomValue(statusBarAggregateConfigAtom)
   const zoomLevel = useAtomValue(zoomLevelAtom)
@@ -280,7 +297,11 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
   )
   const loadedValuesText = createMemo(() => formatLoadedValues(projectionSnapshot()))
   const commandText = createMemo(
-    () => formatMenuIntent(menuCommandIntent()) ?? formatToolbarIntent(toolbarIntent()) ?? 'Ready',
+    () =>
+      formatClipboardIntent(clipboardIntent()) ??
+      formatMenuIntent(menuCommandIntent()) ??
+      formatToolbarIntent(toolbarIntent()) ??
+      'Ready',
   )
 
   const inputMode = createMemo<StatusBarInputMode>(() => KEYBOARD_MODE_TO_BADGE[keyboardMode()])

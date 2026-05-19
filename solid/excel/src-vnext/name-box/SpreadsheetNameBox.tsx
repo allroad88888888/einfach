@@ -11,6 +11,7 @@ import {
   rangeToA1,
   revertNameBoxAtom,
   selectionSnapshotAtom,
+  workspaceSessionAtom,
   type NameBoxCommitTarget,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
@@ -82,9 +83,17 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
   async function commitCurrent() {
     const raw = store.getter(nameBoxInputAtom)
     const snapshot = store.getter(selectionSnapshotAtom)
+    const workspace = store.getter(workspaceSessionAtom)
+    // Fall back to the workspace's active sheet when the selection has no
+    // sheet bound yet (e.g. immediately after page load, before the user
+    // clicks anywhere). Otherwise a name-box jump silently no-ops.
+    const sheetId =
+      snapshot.selection.sheetId && snapshot.selection.sheetId.length > 0
+        ? snapshot.selection.sheetId
+        : workspace.activeSheetId ?? ''
     const target = store.setter(commitNameBoxAtom, {
       input: raw,
-      sheetId: snapshot.selection.sheetId,
+      sheetId,
     })
     if (target.kind === 'define-name') {
       await maybeDefineName(target)
@@ -102,6 +111,13 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
       event.preventDefault()
       void commitCurrent().then(() => {
         inputRef?.blur()
+        // After committing a name-box jump, return focus to the grid so the
+        // user's next keystroke (Ctrl+C, arrow, F2…) lands on the grid root,
+        // not the body. The grid is the closest spreadsheet-grid ancestor.
+        const grid = inputRef?.closest('.demo-page, [data-testid$="-demo"]')?.querySelector(
+          '.spreadsheet-grid',
+        ) as HTMLElement | null
+        grid?.focus()
       })
       return
     }
