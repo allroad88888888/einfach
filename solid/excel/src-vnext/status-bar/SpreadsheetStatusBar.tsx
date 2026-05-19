@@ -1,14 +1,35 @@
-import { useAtomValue } from '@einfach/solid'
+import { useAtomValue, useSetAtom, useStore } from '@einfach/solid'
+import { createEffect, createMemo, For, onCleanup } from 'solid-js'
 import {
+  keyboardModeAtom,
   menuCommandIntentAtom,
+  resetZoomLevelAtom,
+  selectionAggregatesAtom,
   selectionSnapshotAtom,
+  setViewModeAtom,
+  setZoomLevelAtom,
+  statusBarAggregateConfigAtom,
+  statusBarAggregateTruncatedAtom,
+  statusBarProjectionCellsAtom,
+  toggleStatusBarAggregateAtom,
   toolbarIntentAtom,
+  viewModeAtom,
   visibleWindowAtom,
+  ZOOM_LEVEL_MAX,
+  ZOOM_LEVEL_MIN,
+  ZOOM_LEVEL_PRESETS,
+  zoomLevelAtom,
   type CellCoord,
   type CellRange,
+  type DisplayCell,
+  type KeyboardMode,
   type MenuCommandIntent,
   type ProjectionSnapshot,
   type SelectionState,
+  type StatusBarAggregateConfig,
+  type StatusBarAggregateKey,
+  type StatusBarInputMode,
+  type StatusBarViewMode,
   type ToolbarIntent,
 } from '@einfach/spreadsheet-ui-core'
 
@@ -109,21 +130,167 @@ function formatMenuIntent(intent: MenuCommandIntent | null): string | null {
   return `Menu ${intent.command}`
 }
 
+const AGGREGATE_LABELS: Record<StatusBarAggregateKey, string> = {
+  sum: 'Sum',
+  average: 'Avg',
+  count: 'Count',
+  numericCount: 'Numeric Count',
+  min: 'Min',
+  max: 'Max',
+}
+
+const AGGREGATE_ORDER: readonly StatusBarAggregateKey[] = [
+  'sum',
+  'average',
+  'count',
+  'numericCount',
+  'min',
+  'max',
+]
+
+function formatAggregateValue(key: StatusBarAggregateKey, value: number): string {
+  if (key === 'count' || key === 'numericCount') {
+    return String(value)
+  }
+  if (!Number.isFinite(value)) {
+    return '0'
+  }
+  if (Number.isInteger(value)) {
+    return String(value)
+  }
+  // Trim trailing zeros from up to 6 decimal places
+  const fixed = value.toFixed(6)
+  return fixed.replace(/\.?0+$/, '')
+}
+
+function rangesIntersect(a: CellRange, b: CellRange): boolean {
+  return (
+    a.rowStart <= b.rowEnd &&
+    a.rowEnd >= b.rowStart &&
+    a.colStart <= b.colEnd &&
+    a.colEnd >= b.colStart
+  )
+}
+
+function rangeContains(outer: CellRange, inner: CellRange): boolean {
+  return (
+    outer.rowStart <= inner.rowStart &&
+    outer.rowEnd >= inner.rowEnd &&
+    outer.colStart <= inner.colStart &&
+    outer.colEnd >= inner.colEnd
+  )
+}
+
+const KEYBOARD_MODE_TO_BADGE: Record<KeyboardMode, StatusBarInputMode> = {
+  navigation: 'ready',
+  editing: 'edit',
+  'formula-reference': 'point',
+}
+
+const INPUT_MODE_LABEL: Record<StatusBarInputMode, string> = {
+  ready: 'Ready',
+  edit: 'Edit',
+  enter: 'Enter',
+  point: 'Point',
+}
+
+const VIEW_MODE_BUTTONS: ReadonlyArray<{ value: StatusBarViewMode; label: string }> = [
+  { value: 'normal', label: 'Normal' },
+  { value: 'page-break-preview', label: 'Page Break Preview' },
+  { value: 'page-layout', label: 'Page Layout' },
+]
+
 export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
+  const store = useStore()
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const visibleWindow = useAtomValue(visibleWindowAtom)
   const toolbarIntent = useAtomValue(toolbarIntentAtom)
   const menuCommandIntent = useAtomValue(menuCommandIntentAtom)
+  const aggregates = useAtomValue(selectionAggregatesAtom)
+  const aggregateConfig = useAtomValue(statusBarAggregateConfigAtom)
+  const zoomLevel = useAtomValue(zoomLevelAtom)
+  const viewMode = useAtomValue(viewModeAtom)
+  const keyboardMode = useAtomValue(keyboardModeAtom)
 
-  const activeAddress = () => toA1(selectionSnapshot().activeCell)
-  const selectionText = () =>
-    formatRange(selectionSnapshot().selection, selectionSnapshot().range)
-  const projectionText = () => formatProjectionStatus(projectionSnapshot())
-  const visibleCellsText = () => formatVisibleWindow(projectionSnapshot(), visibleWindow())
-  const loadedValuesText = () => formatLoadedValues(projectionSnapshot())
-  const commandText = () =>
-    formatMenuIntent(menuCommandIntent()) ?? formatToolbarIntent(toolbarIntent()) ?? 'Ready'
+  const toggleAggregate = useSetAtom(toggleStatusBarAggregateAtom)
+  const setZoom = useSetAtom(setZoomLevelAtom)
+  const resetZoom = useSetAtom(resetZoomLevelAtom)
+  const setViewMode = useSetAtom(setViewModeAtom)
+
+  // Mirror projection cells into the vanilla atom so the aggregates derivation
+  // stays host-agnostic. Also surface a `truncated` hint when the selection
+  // exceeds the visible projection window.
+  createEffect(() => {
+    const snapshot = projectionSnapshot()
+    const cells: readonly DisplayCell[] = snapshot.result?.cells ?? []
+    store.setter(statusBarProjectionCellsAtom, cells)
+
+    const range = selectionSnapshot().range
+    const window =
+      snapshot.result?.kind === 'visible-window' ? snapshot.result.window : visibleWindow()
+    const truncated =
+      countRange(range) > 0 && countRange(window) > 0
+        ? !rangeContains(window, range) && rangesIntersect(window, range)
+        : false
+    store.setter(statusBarAggregateTruncatedAtom, truncated)
+  })
+
+  onCleanup(() => {
+    store.setter(statusBarProjectionCellsAtom, [])
+    store.setter(statusBarAggregateTruncatedAtom, false)
+  })
+
+  const activeAddress = createMemo(() => toA1(selectionSnapshot().activeCell))
+  const selectionText = createMemo(() =>
+    formatRange(selectionSnapshot().selection, selectionSnapshot().range),
+  )
+  const projectionText = createMemo(() => formatProjectionStatus(projectionSnapshot()))
+  const visibleCellsText = createMemo(() =>
+    formatVisibleWindow(projectionSnapshot(), visibleWindow()),
+  )
+  const loadedValuesText = createMemo(() => formatLoadedValues(projectionSnapshot()))
+  const commandText = createMemo(
+    () => formatMenuIntent(menuCommandIntent()) ?? formatToolbarIntent(toolbarIntent()) ?? 'Ready',
+  )
+
+  const inputMode = createMemo<StatusBarInputMode>(() => KEYBOARD_MODE_TO_BADGE[keyboardMode()])
+
+  const zoomPercent = createMemo(() => Math.round(zoomLevel() * 100))
+  const zoomSliderValue = createMemo(() => zoomPercent())
+
+  const visibleAggregates = createMemo(() => {
+    const config = aggregateConfig()
+    return AGGREGATE_ORDER.filter((key) => config[key])
+  })
+
+  const aggregateValue = (key: StatusBarAggregateKey): number => {
+    const a = aggregates()
+    switch (key) {
+      case 'sum':
+        return a.sum
+      case 'average':
+        return a.average
+      case 'count':
+        return a.count
+      case 'numericCount':
+        return a.numericCount
+      case 'min':
+        return a.min
+      case 'max':
+        return a.max
+      default:
+        return 0
+    }
+  }
+
+  const handleSliderInput = (event: Event) => {
+    const target = event.currentTarget as HTMLInputElement
+    const value = Number(target.value)
+    if (Number.isFinite(value)) {
+      setZoom(value / 100)
+    }
+  }
 
   return (
     <div
@@ -148,6 +315,113 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
       <span class="spreadsheet-status-bar-item" data-testid="status-last-command">
         {commandText()}
       </span>
+
+      <span
+        class="spreadsheet-status-bar-aggregates"
+        data-testid="status-aggregates"
+        data-truncated={aggregates().truncated ? 'true' : 'false'}
+      >
+        <For each={AGGREGATE_ORDER}>
+          {(key) => {
+            const enabled = () => Boolean(aggregateConfig()[key])
+            return (
+              <button
+                type="button"
+                class="spreadsheet-status-bar-aggregate"
+                data-testid={`status-aggregate-${key}`}
+                data-enabled={enabled() ? 'true' : 'false'}
+                aria-pressed={enabled()}
+                onClick={() => toggleAggregate(key)}
+              >
+                <span class="spreadsheet-status-bar-aggregate-label">
+                  {AGGREGATE_LABELS[key]}
+                </span>
+                {enabled() ? (
+                  <span
+                    class="spreadsheet-status-bar-aggregate-value"
+                    data-testid={`status-aggregate-${key}-value`}
+                  >
+                    {formatAggregateValue(key, aggregateValue(key))}
+                  </span>
+                ) : null}
+              </button>
+            )
+          }}
+        </For>
+        {visibleAggregates().length === 0 ? (
+          <span class="spreadsheet-status-bar-aggregate-empty" data-testid="status-aggregates-empty">
+            No aggregates
+          </span>
+        ) : null}
+      </span>
+
+      <span class="spreadsheet-status-bar-view-modes" data-testid="status-view-modes">
+        <For each={VIEW_MODE_BUTTONS}>
+          {(item) => (
+            <button
+              type="button"
+              class="spreadsheet-status-bar-view-mode"
+              data-testid={`status-view-mode-${item.value}`}
+              data-active={viewMode() === item.value ? 'true' : 'false'}
+              aria-pressed={viewMode() === item.value}
+              onClick={() => setViewMode(item.value)}
+            >
+              {item.label}
+            </button>
+          )}
+        </For>
+      </span>
+
+      <span class="spreadsheet-status-bar-zoom" data-testid="status-zoom">
+        <For each={ZOOM_LEVEL_PRESETS}>
+          {(preset) => (
+            <button
+              type="button"
+              class="spreadsheet-status-bar-zoom-preset"
+              data-testid={`status-zoom-preset-${Math.round(preset * 100)}`}
+              data-active={zoomLevel() === preset ? 'true' : 'false'}
+              aria-pressed={zoomLevel() === preset}
+              onClick={() => setZoom(preset)}
+            >
+              {Math.round(preset * 100)}%
+            </button>
+          )}
+        </For>
+        <input
+          type="range"
+          class="spreadsheet-status-bar-zoom-slider"
+          data-testid="status-zoom-slider"
+          min={Math.round(ZOOM_LEVEL_MIN * 100)}
+          max={Math.round(ZOOM_LEVEL_MAX * 100)}
+          step="1"
+          value={zoomSliderValue()}
+          onInput={handleSliderInput}
+        />
+        <button
+          type="button"
+          class="spreadsheet-status-bar-zoom-value"
+          data-testid="status-zoom-value"
+          aria-label="Reset zoom to 100%"
+          onClick={() => resetZoom()}
+        >
+          {zoomPercent()}%
+        </button>
+      </span>
+
+      <span
+        class="spreadsheet-status-bar-mode-badge"
+        data-testid="status-mode-badge"
+        data-mode={inputMode()}
+      >
+        {INPUT_MODE_LABEL[inputMode()]}
+      </span>
     </div>
   )
+}
+
+export type {
+  StatusBarAggregateConfig,
+  StatusBarAggregateKey,
+  StatusBarInputMode,
+  StatusBarViewMode,
 }
