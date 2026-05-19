@@ -1,11 +1,12 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createSignal } from 'solid-js'
+import { Show, For, createEffect, createSignal } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   nameManagerEditorAtom,
   nameRegistryCacheAtom,
   closeNameManagerAtom,
+  sheetTabsSheetsAtom,
   type NamedRange,
   type NamedRangeScope,
   type NamedRangeRefersTo,
@@ -32,6 +33,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(nameManagerEditorAtom)
   const registry = useAtomValue(nameRegistryCacheAtom)
+  const sheets = useAtomValue(sheetTabsSheetsAtom)
 
   const isOpen = () => editor().status !== 'closed'
 
@@ -39,14 +41,48 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const [scope, setScope] = createSignal<string>('workbook')
   const [refersTo, setRefersTo] = createSignal('')
   const [selectedEntry, setSelectedEntry] = createSignal<NamedRange | null>(null)
+  const [error, setError] = createSignal<string | null>(null)
+
+  function refersToString(rt: NamedRangeRefersTo): string {
+    return rt.kind === 'range' ? `${rt.sheetId}!${rt.address}` : rt.value
+  }
 
   function populateFromEntry(entry: NamedRange) {
     setSelectedEntry(entry)
     setName(entry.name)
     setScope(scopeToString(entry.scope))
-    const rt = entry.refersTo
-    setRefersTo(rt.kind === 'range' ? `${rt.sheetId}!${rt.address}` : rt.value)
+    setRefersTo(refersToString(entry.refersTo))
+    setError(null)
   }
+
+  function resetForm() {
+    setSelectedEntry(null)
+    setName('')
+    setScope('workbook')
+    setRefersTo('')
+    setError(null)
+  }
+
+  let wasOpen = false
+  createEffect(() => {
+    const open = isOpen()
+    if (open && !wasOpen) {
+      const draft = editor().draft
+      if (draft) {
+        setSelectedEntry(draft)
+        setName(draft.name)
+        setScope(scopeToString(draft.scope))
+        setRefersTo(refersToString(draft.refersTo))
+      } else {
+        setSelectedEntry(null)
+        setName('')
+        setScope('workbook')
+        setRefersTo('')
+      }
+      setError(null)
+    }
+    wasOpen = open
+  })
 
   function buildRefersTo(): NamedRangeRefersTo {
     const value = refersTo().trim()
@@ -59,21 +95,31 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
 
   function close() {
     store.setter(closeNameManagerAtom)
-    setSelectedEntry(null)
-    setName('')
-    setScope('workbook')
-    setRefersTo('')
+    resetForm()
   }
 
   async function handleSave() {
     if (!backend.setNamedRange) return
-    const nameVal = name() || (editor().draft?.name ?? '')
-    await backend.setNamedRange({
-      kind: 'set-named-range',
-      name: nameVal,
-      scope: stringToScope(scope()),
-      refersTo: buildRefersTo(),
-    })
+    const nameVal = (name() || (editor().draft?.name ?? '')).trim()
+    if (nameVal.length === 0) {
+      setError('Name is required')
+      return
+    }
+    if (refersTo().trim().length === 0) {
+      setError('Refers to is required')
+      return
+    }
+    try {
+      await backend.setNamedRange({
+        kind: 'set-named-range',
+        name: nameVal,
+        scope: stringToScope(scope()),
+        refersTo: buildRefersTo(),
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return
+    }
     close()
   }
 
@@ -81,12 +127,18 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     if (!backend.deleteNamedRange) return
     const entry = selectedEntry() ?? editor().draft
     if (!entry) return
-    await backend.deleteNamedRange({
-      kind: 'delete-named-range',
-      name: entry.name,
-      scope: entry.scope,
-    })
+    try {
+      await backend.deleteNamedRange({
+        kind: 'delete-named-range',
+        name: entry.name,
+        scope: entry.scope,
+      })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      return
+    }
     setSelectedEntry(null)
+    setError(null)
   }
 
   function handleClose() {
@@ -140,11 +192,15 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             }}
           >
             <option value="workbook">Workbook</option>
+            <For each={sheets()}>
+              {(sheet) => <option value={sheet.id}>{sheet.name}</option>}
+            </For>
           </select>
 
           <label for="name-refers-to">Refers to</label>
           <input
             id="name-refers-to"
+            data-testid="name-refers-to"
             type="text"
             value={refersTo()}
             onInput={(e) => {
@@ -152,6 +208,12 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             }}
           />
         </div>
+
+        <Show when={error()}>
+          <div data-testid="name-error-text" role="alert">
+            {error()}
+          </div>
+        </Show>
 
         <div class="nm-actions">
           <button
