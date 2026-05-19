@@ -314,6 +314,50 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: '' }])
   })
 
+  it('stale apply error does not overwrite a later success', async () => {
+    const store = createStore()
+    let firstReject: ((err: unknown) => void) | null = null
+    let secondResolve: (() => void) | null = null
+    let call = 0
+    const backend = createFakeBackend({
+      setFilterSort(req) {
+        call += 1
+        if (call === 1) {
+          return new Promise<{ sheetId: string; requestId?: undefined; revision: number }>(
+            (_resolve, reject) => {
+              firstReject = reject
+            },
+          )
+        }
+        return new Promise<{ sheetId: string; requestId?: undefined; revision: number }>(
+          (resolve) => {
+            secondResolve = () => resolve({ sheetId: req.sheetId, revision: 2 })
+          },
+        )
+      },
+    })
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-desc"]') as HTMLElement)
+
+    secondResolve!()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
+
+    firstReject!(new Error('stale failure'))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
+  })
+
   it('close button sets dropdown to closed', () => {
     const store = createStore()
     const backend = createFakeBackend()
