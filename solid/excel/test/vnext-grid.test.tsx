@@ -2434,4 +2434,230 @@ describe('vNext SpreadsheetGrid', () => {
     const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
     expect(display.style.whiteSpace).toBe('normal')
   })
+
+  describe('editing flow (Excel parity)', () => {
+    it('single click + printable key starts edit with that key as initial draft', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend({
+        cells: [
+          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
+        ],
+      })
+      backend.setCellInput = async (request) => ({
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+      })
+
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 2,
+        viewportWidth: 2,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 4,
+        colCount: 4,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+      })
+
+      fireEvent.click(
+        container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+      )
+      fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'a' })
+
+      await flushMicrotasks()
+
+      const session = store.getter(editingSessionAtom)
+      expect(session.status).toBe('drafting')
+      expect(session.draft).toBe('a')
+      const input = container.querySelector('input.cell-input') as HTMLInputElement
+      expect(input).not.toBeNull()
+      expect(input.value).toBe('a')
+    })
+
+    it('shift+printable key uses uppercase as initial draft', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      backend.setCellInput = async (request) => ({
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+      })
+
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 2,
+        viewportWidth: 2,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 4,
+        colCount: 4,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+      })
+
+      fireEvent.click(
+        container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+      )
+      fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+        key: 'B',
+        shiftKey: true,
+      })
+
+      await flushMicrotasks()
+
+      expect(store.getter(editingSessionAtom).draft).toBe('B')
+    })
+
+    it('F2 preserves existing cell content as initial draft', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend({
+        cells: [
+          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
+        ],
+      })
+      backend.setCellInput = async (request) => ({
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+      })
+
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 2,
+        viewportWidth: 2,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 4,
+        colCount: 4,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+          'existing',
+        )
+      })
+
+      fireEvent.click(
+        container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+      )
+      fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'F2' })
+
+      await flushMicrotasks()
+
+      expect(store.getter(editingSessionAtom).draft).toBe('existing')
+    })
+
+    it('Backspace clears existing content and enters edit with empty draft', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend({
+        cells: [
+          { row: 0, col: 0, displayValue: 'existing', valueKind: 'string' },
+        ],
+      })
+      backend.setCellInput = async (request) => ({
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+      })
+
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 2,
+        viewportWidth: 2,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 4,
+        colCount: 4,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+          'existing',
+        )
+      })
+
+      fireEvent.click(
+        container.querySelector('[data-cell-addr="A1"] .spreadsheet-grid-cell-button')!,
+      )
+      fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, { key: 'Backspace' })
+
+      await flushMicrotasks()
+
+      const session = store.getter(editingSessionAtom)
+      expect(session.status).toBe('drafting')
+      expect(session.draft).toBe('')
+    })
+
+    it('cell render uses a plain div (not a button) for cell-button wrapper', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 2,
+        viewportWidth: 2,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 4,
+        colCount: 4,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => {
+        expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(4)
+      })
+
+      const wrappers = container.querySelectorAll('.spreadsheet-grid-cell-button')
+      expect(wrappers.length).toBeGreaterThan(0)
+      for (const node of Array.from(wrappers)) {
+        expect(node.tagName.toLowerCase()).toBe('div')
+      }
+    })
+  })
 })

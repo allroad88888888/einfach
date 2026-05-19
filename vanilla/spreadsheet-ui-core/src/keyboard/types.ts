@@ -45,6 +45,8 @@ export interface ClearNonPrimarySelectionIntent {
 export interface KeyboardEditingStartIntent {
   type: 'editing.start'
   source: 'keyboard'
+  initialDraft?: string
+  clearOnStart?: boolean
 }
 
 export interface KeyboardEditingCommitIntent {

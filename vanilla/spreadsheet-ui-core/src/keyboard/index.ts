@@ -126,10 +126,33 @@ export function getKeyboardCommandIntent(
     }
   }
 
-  if (input.key === 'Delete' || input.key === 'Backspace') {
+  if (input.key === 'Backspace') {
+    return {
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: '',
+      clearOnStart: true,
+    }
+  }
+
+  if (input.key === 'Delete') {
     return {
       type: 'cell.clear',
       target: input.ctrlKey || input.metaKey ? 'all' : 'values',
+    }
+  }
+
+  if (
+    input.key.length === 1 &&
+    !input.ctrlKey &&
+    !input.metaKey &&
+    !input.altKey
+  ) {
+    return {
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: input.key,
+      clearOnStart: true,
     }
   }
 

@@ -1134,15 +1134,27 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     focusGrid()
   }
 
-  function startEditingCell(row: number, col: number, source: 'keyboard' | 'cell') {
+  function startEditingCell(
+    row: number,
+    col: number,
+    source: 'keyboard' | 'cell',
+    options?: { initialDraft?: string; clearOnStart?: boolean },
+  ) {
     if (store.getter(activeCellLockedAtom)) {
       return
     }
     const cell = getCell(row, col)
+    const existingDraft = cell?.formula ?? cell?.displayValue ?? ''
+    const draft =
+      options?.clearOnStart === true
+        ? options.initialDraft ?? ''
+        : options?.initialDraft !== undefined
+          ? `${existingDraft}${options.initialDraft}`
+          : existingDraft
     store.setter(startEditingAtom, {
       sheetId: props.sheetId,
       cell: { row, col },
-      draft: cell?.formula ?? cell?.displayValue ?? '',
+      draft,
       source,
     })
     bumpRender()
@@ -1423,7 +1435,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       case 'editing.start': {
         event.preventDefault()
         const active = selectionSnapshot().activeCell
-        startEditingCell(active.row, active.col, 'keyboard')
+        startEditingCell(active.row, active.col, 'keyboard', {
+          initialDraft: intent.initialDraft,
+          clearOnStart: intent.clearOnStart,
+        })
         return
       }
       case 'cell.clear':
@@ -2071,14 +2086,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             <Show
                               when={editing()}
                               fallback={
-                                <button type="button" class="spreadsheet-grid-cell-button">
+                                <div class="spreadsheet-grid-cell-button">
                                   <span
                                     class="cell-display"
                                     style={getCellFormatStyle(getDisplayCellFormat(cell()))}
                                   >
                                     <SpreadsheetCellDisplayValue cell={cell()} />
                                   </span>
-                                </button>
+                                </div>
                               }
                             >
                               <input

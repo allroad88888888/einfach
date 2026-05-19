@@ -103,4 +103,92 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     await page.keyboard.press('Escape')
     await expect(painterButton).toHaveAttribute('data-format-painter-state', 'idle')
   })
+
+  test.describe('editing flow (Excel parity)', () => {
+    function cellInput(page: Page, addr: string) {
+      return cell(page, addr).locator('.cell-input')
+    }
+
+    function cellDisplay(page: Page, addr: string) {
+      return cell(page, addr).locator('.cell-display')
+    }
+
+    test('single-click + type "123" + Enter commits 123', async ({ page }) => {
+      await gotoWave5(page)
+      const target = cell(page, 'F10')
+      await target.click()
+      await expect(target).toHaveAttribute('data-active', 'true')
+
+      await page.keyboard.type('123')
+      await expect(cellInput(page, 'F10')).toBeVisible()
+      await expect(cellInput(page, 'F10')).toHaveValue('123')
+
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F10')).toHaveText('123')
+    })
+
+    test('single-click + type + Tab commits and moves to next cell', async ({ page }) => {
+      await gotoWave5(page)
+      const target = cell(page, 'F11')
+      await target.click()
+      await expect(target).toHaveAttribute('data-active', 'true')
+
+      await page.keyboard.type('hello')
+      await expect(cellInput(page, 'F11')).toHaveValue('hello')
+      await page.keyboard.press('Tab')
+
+      await expect(cellDisplay(page, 'F11')).toHaveText('hello')
+      await expect(cell(page, 'G11')).toHaveAttribute('data-active', 'true')
+    })
+
+    test('F2 + type appends to existing cell content', async ({ page }) => {
+      await gotoWave5(page)
+      const target = cell(page, 'F12')
+      await target.click()
+
+      // First, put a known value into the cell via single-click typing.
+      await page.keyboard.type('abc')
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F12')).toHaveText('abc')
+
+      // F2 preserves existing content.
+      await cell(page, 'F12').click()
+      await page.keyboard.press('F2')
+      await expect(cellInput(page, 'F12')).toHaveValue('abc')
+      await page.keyboard.type('x')
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F12')).toHaveText('abcx')
+    })
+
+    test('Esc cancels the edit and preserves the existing value', async ({ page }) => {
+      await gotoWave5(page)
+      const target = cell(page, 'F13')
+      await target.click()
+      await page.keyboard.type('keep')
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F13')).toHaveText('keep')
+
+      await cell(page, 'F13').click()
+      await page.keyboard.press('F2')
+      await page.keyboard.type('xxx')
+      await page.keyboard.press('Escape')
+      await expect(cellDisplay(page, 'F13')).toHaveText('keep')
+    })
+
+    test('Backspace empties the cell and enters edit mode', async ({ page }) => {
+      await gotoWave5(page)
+      const target = cell(page, 'F14')
+      await target.click()
+      await page.keyboard.type('seed')
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F14')).toHaveText('seed')
+
+      await cell(page, 'F14').click()
+      await page.keyboard.press('Backspace')
+      await expect(cellInput(page, 'F14')).toBeVisible()
+      await expect(cellInput(page, 'F14')).toHaveValue('')
+      await page.keyboard.press('Enter')
+      await expect(cellDisplay(page, 'F14')).toHaveText('')
+    })
+  })
 })

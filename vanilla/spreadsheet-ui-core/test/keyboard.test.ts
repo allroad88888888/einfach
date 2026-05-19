@@ -307,6 +307,145 @@ describe('keyboard core', () => {
   })
 })
 
+describe('editing.start from printable keys (Excel parity)', () => {
+  function makeNavStore() {
+    const store = createStore()
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 1, col: 1 },
+    })
+    return store
+  }
+
+  test('lowercase printable key starts edit with initialDraft and clearOnStart', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: 'a',
+      clearOnStart: true,
+    })
+  })
+
+  test('shift+a yields uppercase A as initialDraft', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'A', shiftKey: true })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: 'A',
+      clearOnStart: true,
+    })
+  })
+
+  test('digit key 5 yields "5" as initialDraft', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: '5' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: '5',
+      clearOnStart: true,
+    })
+  })
+
+  test('space key yields " " as initialDraft', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: ' ' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: ' ',
+      clearOnStart: true,
+    })
+  })
+
+  test('printable key in editing mode does NOT recurse into edit-start', () => {
+    const store = makeNavStore()
+    store.setter(keyboardModeAtom, 'editing')
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a' })
+    expect(intent).toEqual({ type: 'none', reason: 'editing-text-navigation' })
+  })
+
+  test('Ctrl+a remains selection.selectAll, not edit-start', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a', ctrlKey: true })
+    expect(intent).toEqual({
+      type: 'selection.selectAll',
+      selection: {
+        kind: 'all',
+        sheetId: 'Sheet1',
+      },
+    })
+  })
+
+  test('Meta+a remains selection.selectAll, not edit-start', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a', metaKey: true })
+    expect(intent).toEqual({
+      type: 'selection.selectAll',
+      selection: {
+        kind: 'all',
+        sheetId: 'Sheet1',
+      },
+    })
+  })
+
+  test('Alt+a is not an edit-start trigger (returns unhandled)', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a', altKey: true })
+    expect(intent).toEqual({ type: 'none', reason: 'unhandled' })
+  })
+
+  test('F2 still starts edit without initialDraft (preserves existing content)', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'F2' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+    })
+  })
+
+  test('Backspace starts edit with empty draft and clearOnStart', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Backspace' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: '',
+      clearOnStart: true,
+    })
+  })
+
+  test('Delete still maps to cell.clear with target values', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Delete' })
+    expect(intent).toEqual({
+      type: 'cell.clear',
+      target: 'values',
+    })
+  })
+
+  test('Ctrl+Delete maps to cell.clear with target all', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Delete', ctrlKey: true })
+    expect(intent).toEqual({
+      type: 'cell.clear',
+      target: 'all',
+    })
+  })
+
+  test('composing input is ignored even with single-char key', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'a', isComposing: true })
+    expect(intent).toEqual({ type: 'none', reason: 'composing' })
+  })
+})
+
 describe('formula-reference mode', () => {
   function makeFormulaRefStore() {
     const store = createStore()

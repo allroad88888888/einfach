@@ -30,12 +30,17 @@ describe('clear-cells keyboard dispatch', () => {
     expect(intent).toEqual({ type: 'cell.clear', target: 'values' })
   })
 
-  test('Backspace in navigation mode targets values only', () => {
+  test('Backspace in navigation mode enters edit with empty draft (Excel parity)', () => {
     const store = makeStore()
 
     const intent = store.setter(dispatchKeyboardInputAtom, { key: 'Backspace' })
 
-    expect(intent).toEqual({ type: 'cell.clear', target: 'values' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: '',
+      clearOnStart: true,
+    })
   })
 
   test('Ctrl+Delete targets values and formats', () => {
@@ -60,7 +65,7 @@ describe('clear-cells keyboard dispatch', () => {
     expect(intent).toEqual({ type: 'cell.clear', target: 'all' })
   })
 
-  test('Ctrl+Backspace targets values and formats', () => {
+  test('Ctrl+Backspace still enters edit (Backspace consistently opens editor in Excel parity)', () => {
     const store = makeStore()
 
     const intent = store.setter(dispatchKeyboardInputAtom, {
@@ -68,7 +73,12 @@ describe('clear-cells keyboard dispatch', () => {
       ctrlKey: true,
     })
 
-    expect(intent).toEqual({ type: 'cell.clear', target: 'all' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: '',
+      clearOnStart: true,
+    })
   })
 
   test('Delete in editing mode does not emit cell.clear', () => {
