@@ -312,9 +312,9 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    const buttons = getButtons(container)
+    let buttons = getButtons(container)
     expect(buttons.merge.disabled).toBe(false)
-    expect(buttons.unmerge.disabled).toBe(false)
+    expect(buttons.unmerge.disabled).toBe(true)
 
     fireEvent.click(buttons.merge)
     await waitFor(() => {
@@ -329,7 +329,37 @@ describe('vNext SpreadsheetToolbar', () => {
       expect(readVisibleProjectionCalls).toHaveLength(1)
     })
 
-    fireEvent.click(getButtons(container).unmerge)
+    // The fake backend doesn't mutate the projection. Inject a merge anchor at
+    // A1 covering A1:B2 so the unmerge button becomes enabled, then click it.
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 2,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 2,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [
+          {
+            row: 0,
+            col: 0,
+            displayValue: '',
+            mergedSpan: { rows: 2, cols: 2 },
+          },
+        ],
+      },
+      error: undefined,
+    })
+
+    buttons = getButtons(container)
+    expect(buttons.unmerge.disabled).toBe(false)
+    fireEvent.click(buttons.unmerge)
     await waitFor(() => {
       expect(unmergeRangeCalls).toHaveLength(1)
     })

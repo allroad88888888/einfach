@@ -1619,6 +1619,58 @@ export function createStaticSpreadsheetBackend(
 
       return mergeMutationResult(request, state.revision)
     },
+    async searchRange(request) {
+      const range = normalizeRange(request.range)
+      const cells = state.cellsBySheet.get(request.sheetId) ?? new Map()
+      const { needle, options } = request.query
+      const haystackTransform = options.caseSensitive ? (s: string) => s : (s: string) => s.toLowerCase()
+      const target = haystackTransform(needle)
+
+      const matchPredicate = (() => {
+        if (target.length === 0) return () => false
+        if (options.regex) {
+          try {
+            const re = new RegExp(needle, options.caseSensitive ? '' : 'i')
+            return (s: string) => re.test(s)
+          } catch {
+            return () => false
+          }
+        }
+        if (options.wholeMatch) {
+          return (s: string) => haystackTransform(s) === target
+        }
+        return (s: string) => haystackTransform(s).includes(target)
+      })()
+
+      const matches: { coord: { row: number; col: number }; sheetId: string; matchStart: number; matchEnd: number }[] = []
+      for (const cell of cells.values()) {
+        if (cell.row < range.rowStart || cell.row > range.rowEnd) continue
+        if (cell.col < range.colStart || cell.col > range.colEnd) continue
+        const haystack = options.searchFormulas ? cell.formula ?? cell.displayValue : cell.displayValue
+        if (!haystack) continue
+        if (!matchPredicate(haystack)) continue
+        const lower = haystackTransform(haystack)
+        const start = options.regex ? 0 : lower.indexOf(target)
+        matches.push({
+          coord: { row: cell.row, col: cell.col },
+          sheetId: request.sheetId,
+          matchStart: Math.max(0, start),
+          matchEnd: Math.max(0, start) + needle.length,
+        })
+      }
+      matches.sort((a, b) => (a.coord.row - b.coord.row) || (a.coord.col - b.coord.col))
+      const pageStart = Math.max(0, request.pageStart)
+      const page = matches.slice(pageStart, pageStart + request.pageSize)
+      return {
+        kind: 'search-range',
+        sheetId: request.sheetId,
+        matches: page,
+        pageStart,
+        totalCount: matches.length,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
     async fillRange(request) {
       applyFillRange(state, request)
       state.revision = bumpRevision(state.revision)

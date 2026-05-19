@@ -325,12 +325,34 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     return snapshot.selection.sheetId || availability().sheetId
   }
 
+  function selectionContainsMergeAnchor(): boolean {
+    const snapshot = projectionSnapshot()
+    const result = snapshot.result
+    if (!isVisibleProjectionResult(result)) return false
+    const selection = selectionSnapshot()
+    if (result.sheetId !== selection.selection.sheetId) return false
+    const range = selection.range
+    for (const cell of result.cells) {
+      if (!cell.mergedSpan) continue
+      if (
+        cell.row >= range.rowStart &&
+        cell.row <= range.rowEnd &&
+        cell.col >= range.colStart &&
+        cell.col <= range.colEnd
+      ) {
+        return true
+      }
+    }
+    return false
+  }
+
   function canMergeSelection() {
     return (
       !!backend.mergeRange &&
       availability().editingMode !== 'drafting' &&
       getMutationSheetId() !== null &&
-      rangeCellCount(selectionSnapshot().range) > 1
+      rangeCellCount(selectionSnapshot().range) > 1 &&
+      !selectionContainsMergeAnchor()
     )
   }
 
@@ -339,7 +361,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       !!backend.unmergeRange &&
       availability().editingMode !== 'drafting' &&
       getMutationSheetId() !== null &&
-      rangeCellCount(selectionSnapshot().range) > 0
+      selectionContainsMergeAnchor()
     )
   }
 

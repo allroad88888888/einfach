@@ -36,6 +36,7 @@ import {
   MAX_VIEWPORT_ROW_HEIGHT,
   MIN_VIEWPORT_COL_WIDTH,
   MIN_VIEWPORT_ROW_HEIGHT,
+  selectionAtom,
   selectionSnapshotAtom,
   selectionRegionsAtom,
   selectAllAtom,
@@ -378,6 +379,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeWorkspace: (() => void) | null = null
   let unsubscribeShowGridlines: (() => void) | null = null
   let unsubscribeShowHeadings: (() => void) | null = null
+  let unsubscribeSelection: (() => void) | null = null
+  let unsubscribeEditing: (() => void) | null = null
   let lastActiveSheetId: string | null = null
 
   function bumpRender() {
@@ -635,6 +638,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
     unsubscribeShowGridlines = store.sub(viewportShowGridlinesAtom, bumpRender)
     unsubscribeShowHeadings = store.sub(viewportShowHeadingsAtom, bumpRender)
+    unsubscribeSelection = store.sub(selectionAtom, bumpRender)
+    unsubscribeEditing = store.sub(editingSessionAtom, bumpRender)
 
     lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
     unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
@@ -665,6 +670,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeWorkspace?.()
     unsubscribeShowGridlines?.()
     unsubscribeShowHeadings?.()
+    unsubscribeSelection?.()
+    unsubscribeEditing?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
     store.setter(cancelPointerAtom)

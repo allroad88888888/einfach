@@ -133,7 +133,7 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     await cell(page, 'A1').click()
 
     await page.keyboard.press('ControlOrMeta+f')
-    const dialog = page.getByTestId('find-replace-dialog')
+    const dialog = page.getByTestId('wave5-find-replace')
     await expect(dialog).toBeVisible()
 
     const needle = page.getByTestId('find-needle-input')
@@ -259,6 +259,70 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
       await expect(cellInput(page, 'H5')).toHaveValue('')
       await page.keyboard.press('Enter')
       await expect(cellDisplay(page, 'H5')).toHaveText('')
+    })
+  })
+
+  test.describe('merge / unmerge (toolbar)', () => {
+    const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge-cells')
+    const unmergeBtn = (page: Page) => page.getByTestId('toolbar-btn-unmerge-cells')
+
+    test('both buttons disabled on a single-cell selection with no merges', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'A1').click()
+      await expect(mergeBtn(page)).toBeDisabled()
+      await expect(unmergeBtn(page)).toBeDisabled()
+    })
+
+    test('merge enables on a multi-cell range, unmerge stays disabled', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'B2').click()
+      await cell(page, 'C3').click({ modifiers: ['Shift'] })
+      await expect(mergeBtn(page)).toBeEnabled()
+      await expect(unmergeBtn(page)).toBeDisabled()
+    })
+
+    test('clicking merge collapses B2:C3 into one anchor cell with the top-left value', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'B2').click()
+      await cell(page, 'C3').click({ modifiers: ['Shift'] })
+      await mergeBtn(page).click()
+
+      const anchor = cell(page, 'B2')
+      await expect(anchor).toHaveAttribute('rowspan', '2')
+      await expect(anchor).toHaveAttribute('colspan', '2')
+      await expect(anchor).toHaveAttribute('data-merge-anchor', 'true')
+      // Cells covered by the anchor's span are no longer rendered as separate TDs.
+      await expect(page.locator('[data-testid="wave5-grid"] td[data-row="1"][data-col="2"]')).toHaveCount(0)
+      await expect(page.locator('[data-testid="wave5-grid"] td[data-row="2"][data-col="2"]')).toHaveCount(0)
+    })
+
+    test('after merge: merge disables, unmerge enables, history records range.merge', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'B2').click()
+      await cell(page, 'C3').click({ modifiers: ['Shift'] })
+      await mergeBtn(page).click()
+
+      await expect(mergeBtn(page)).toBeDisabled()
+      await expect(unmergeBtn(page)).toBeEnabled()
+      await expect(page.getByTestId('history-timeline-list')).toContainText(/range\.merge/)
+    })
+
+    test('unmerge restores the original four cells and re-enables merge', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'B2').click()
+      await cell(page, 'C3').click({ modifiers: ['Shift'] })
+      await mergeBtn(page).click()
+      await expect(unmergeBtn(page)).toBeEnabled()
+
+      await unmergeBtn(page).click()
+      const b2 = cell(page, 'B2')
+      await expect(b2).toHaveAttribute('rowspan', '1')
+      await expect(b2).toHaveAttribute('colspan', '1')
+      await expect(cell(page, 'C2')).toBeVisible()
+      await expect(cell(page, 'B3')).toBeVisible()
+      await expect(cell(page, 'C3')).toBeVisible()
+      await expect(mergeBtn(page)).toBeEnabled()
+      await expect(unmergeBtn(page)).toBeDisabled()
     })
   })
 })
