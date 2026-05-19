@@ -1718,3 +1718,126 @@ thead .row-header {
   color: #c0392b;
   font-size: 12px;
 }
+
+/* === B. Grid headers + selection chrome ============================== */
+
+.spreadsheet-grid {
+  font-family: var(--excel-font);
+  font-size: 13px;
+}
+
+.spreadsheet-grid .spreadsheet-grid-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  background: #ffffff;
+}
+
+/* Top-left empty corner — pinned, slightly darker chrome */
+.spreadsheet-grid .spreadsheet-grid-corner {
+  background: var(--bg-chrome);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Column letters */
+.spreadsheet-grid .spreadsheet-grid-col-header {
+  position: relative;
+  height: 22px;
+  padding: 0 4px;
+  background: var(--bg-chrome);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-default);
+  font-weight: 500;
+  text-align: center;
+  user-select: none;
+}
+
+.spreadsheet-grid .spreadsheet-grid-col-header.is-selected {
+  background: var(--select-bg);
+  color: var(--excel-green);
+  font-weight: 700;
+  border-bottom: 2px solid var(--excel-green);
+}
+
+.spreadsheet-grid .spreadsheet-grid-col-header .spreadsheet-grid-header-label {
+  display: inline-block;
+}
+
+/* Row numbers */
+.spreadsheet-grid .spreadsheet-grid-row-header {
+  width: 36px;
+  padding: 0 6px;
+  background: var(--bg-chrome);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-default);
+  font-weight: 500;
+  text-align: right;
+  user-select: none;
+}
+
+.spreadsheet-grid .spreadsheet-grid-row-header.is-selected {
+  background: var(--select-bg);
+  color: var(--excel-green);
+  font-weight: 700;
+  border-right: 2px solid var(--excel-green);
+}
+
+/* Cell baseline */
+.spreadsheet-grid .spreadsheet-grid-cell {
+  height: 22px;
+  padding: 0 4px;
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: #ffffff;
+  font-variant-numeric: tabular-nums;
+  vertical-align: middle;
+}
+
+/* Numeric cells right-align by default (Excel convention) */
+.spreadsheet-grid .spreadsheet-grid-cell.kind-number {
+  text-align: right;
+}
+
+/* Resize handles — show on hover for usability */
+.spreadsheet-grid .spreadsheet-grid-col-resize-handle {
+  position: absolute;
+  right: -2px;
+  top: 0;
+  width: 4px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 2;
+}
+
+.spreadsheet-grid .spreadsheet-grid-col-resize-handle:hover {
+  background: var(--office-blue);
+}
+
+/* Filter chevron — small triangle on the right when a column has a filter */
+.spreadsheet-grid .spreadsheet-grid-filter-chevron {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--excel-green);
+  cursor: pointer;
+}
+
+/* Demo header — compress so the grid gets more vertical real estate */
+.vnext-demo .demo-header {
+  padding: 6px 12px;
+  margin-bottom: 4px;
+}
+
+.vnext-demo .demo-header h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.vnext-demo .demo-header .demo-desc {
+  margin: 2px 0 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+}
