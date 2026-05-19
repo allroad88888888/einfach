@@ -159,9 +159,9 @@ function formatAggregateValue(key: StatusBarAggregateKey, value: number): string
   if (Number.isInteger(value)) {
     return String(value)
   }
-  // Trim trailing zeros from up to 6 decimal places
-  const fixed = value.toFixed(6)
-  return fixed.replace(/\.?0+$/, '')
+  // Excel-standard: round to 2 decimal places then trim trailing zeros.
+  // 180.357143 -> "180.36", 1.5 -> "1.5", 1.234 -> "1.23".
+  return value.toFixed(2).replace(/\.?0+$/, '')
 }
 
 function rangesIntersect(a: CellRange, b: CellRange): boolean {

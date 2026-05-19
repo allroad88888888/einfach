@@ -3,18 +3,23 @@ import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   closeFindReplaceAtom,
+  closeHelpOverlayAtom,
   closeTopMenuAtom,
   copyClipboardAtom,
   cutClipboardAtom,
+  dispatchSortAtom,
   dispatchToolbarFormatCommandAtom,
   findMenuByAccessKey,
+  helpOverlayAtom,
   isMenuItemDescriptor,
+  issueFilterSortSyncTicketAtom,
   MENU_BAR_ITEMS,
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
   openFindReplaceAtom,
   openFormatCellsAtom,
+  openHelpOverlayAtom,
   openNameManagerAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
@@ -22,12 +27,20 @@ import {
   redoHistoryAtom,
   selectAllAtom,
   selectionSnapshotAtom,
+  setFilterSortErrorAtom,
   setViewportFreezeAtom,
   setViewportHiddenAtom,
+  toggleFormulaBarAtom,
+  toggleGridlinesAtom,
+  toggleHeadingsAtom,
   togglePrintPreviewAtom,
   topMenuOpenAtom,
   undoHistoryAtom,
+  viewportShowFormulaBarAtom,
+  viewportShowGridlinesAtom,
+  viewportShowHeadingsAtom,
   workspaceSessionAtom,
+  type FilterSortState,
   type MenuBarEntry,
   type MenuItemDescriptor,
   type MenuItemDispatch,
@@ -35,7 +48,7 @@ import {
   type TopMenuId,
 } from '@einfach/spreadsheet-ui-core'
 
-import { useSpreadsheetUiStore } from '../provider'
+import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 export interface SpreadsheetMenuBarProps {
   class?: string
@@ -44,8 +57,26 @@ export interface SpreadsheetMenuBarProps {
 
 export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const store = useSpreadsheetUiStore()
+  const backend = useSpreadsheetBackend()
   const openState = useAtomValue(topMenuOpenAtom)
+  const helpOverlay = useAtomValue(helpOverlayAtom)
+  const showGridlines = useAtomValue(viewportShowGridlinesAtom)
+  const showHeadings = useAtomValue(viewportShowHeadingsAtom)
+  const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
   let rootRef: HTMLDivElement | undefined
+
+  function checkedForDispatch(dispatch: MenuItemDispatch): boolean | undefined {
+    switch (dispatch.kind) {
+      case 'toggle-gridlines':
+        return showGridlines()
+      case 'toggle-headings':
+        return showHeadings()
+      case 'toggle-formula-bar':
+        return showFormulaBar()
+      default:
+        return undefined
+    }
+  }
 
   const openMenu = createMemo<TopMenuId | null>(() => {
     const s = openState()
@@ -263,17 +294,55 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return
       }
       case 'sort-asc':
-      case 'sort-desc':
+      case 'sort-desc': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId) return
+        const snap = store.getter(selectionSnapshotAtom)
+        const colIndex = snap.range.colStart
+        const direction = dispatch.kind === 'sort-asc' ? 'asc' : 'desc'
+        const next = store.setter(dispatchSortAtom, {
+          sheetId,
+          colIndex,
+          direction,
+        }) as FilterSortState
+        if (backend.setFilterSort) {
+          const ticket = store.setter(issueFilterSortSyncTicketAtom) as number
+          void (async () => {
+            try {
+              await backend.setFilterSort!({
+                kind: 'set-filter-sort',
+                sheetId,
+                rules: next.rules,
+                directives: next.directives,
+              })
+              store.setter(setFilterSortErrorAtom, null)
+              void ticket
+            } catch (err) {
+              store.setter(setFilterSortErrorAtom, err)
+            }
+          })()
+        }
         return
+      }
       case 'toggle-formula-bar':
+        store.setter(toggleFormulaBarAtom)
+        return
       case 'toggle-gridlines':
+        store.setter(toggleGridlinesAtom)
+        return
       case 'toggle-headings':
+        store.setter(toggleHeadingsAtom)
+        return
       case 'toggle-full-screen':
       case 'zoom-in':
       case 'zoom-out':
       case 'zoom-reset':
+        return
       case 'open-about':
+        store.setter(openHelpOverlayAtom, 'about')
+        return
       case 'open-keyboard-shortcuts':
+        store.setter(openHelpOverlayAtom, 'shortcuts')
         return
       case 'placeholder':
         return
@@ -283,24 +352,28 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   }
 
   return (
-    <div
-      ref={rootRef}
-      class={`spreadsheet-menu-bar ${props.class ?? ''}`.trim()}
-      role="menubar"
-      data-testid={props['data-testid'] ?? 'spreadsheet-menu-bar'}
-    >
-      <For each={MENU_BAR_ITEMS}>
-        {(menu) => (
-          <MenuBarTopButton
-            menu={menu}
-            isOpen={openMenu() === menu.id}
-            onClick={() => handleTopButtonClick(menu.id)}
-            onHover={() => handleTopButtonHover(menu.id)}
-            onItemActivate={dispatchItem}
-          />
-        )}
-      </For>
-    </div>
+    <>
+      <div
+        ref={rootRef}
+        class={`spreadsheet-menu-bar ${props.class ?? ''}`.trim()}
+        role="menubar"
+        data-testid={props['data-testid'] ?? 'spreadsheet-menu-bar'}
+      >
+        <For each={MENU_BAR_ITEMS}>
+          {(menu) => (
+            <MenuBarTopButton
+              menu={menu}
+              isOpen={openMenu() === menu.id}
+              onClick={() => handleTopButtonClick(menu.id)}
+              onHover={() => handleTopButtonHover(menu.id)}
+              onItemActivate={dispatchItem}
+              getChecked={checkedForDispatch}
+            />
+          )}
+        </For>
+      </div>
+      <HelpOverlayDialog kind={helpOverlay()} onClose={() => store.setter(closeHelpOverlayAtom)} />
+    </>
   )
 }
 
@@ -310,6 +383,7 @@ interface MenuBarTopButtonProps {
   onClick: () => void
   onHover: () => void
   onItemActivate: (item: MenuItemDescriptor) => void
+  getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
 }
 
 function MenuBarTopButton(props: MenuBarTopButtonProps) {
@@ -336,7 +410,11 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
         >
           <For each={props.menu.items}>
             {(entry) => (
-              <MenuBarDropdownEntry entry={entry} onActivate={props.onItemActivate} />
+              <MenuBarDropdownEntry
+                entry={entry}
+                onActivate={props.onItemActivate}
+                getChecked={props.getChecked}
+              />
             )}
           </For>
         </div>
@@ -348,6 +426,7 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
 interface MenuBarDropdownEntryProps {
   entry: MenuBarEntry
   onActivate: (item: MenuItemDescriptor) => void
+  getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
 }
 
 function MenuBarDropdownEntry(props: MenuBarDropdownEntryProps) {
@@ -365,6 +444,7 @@ function MenuBarDropdownEntry(props: MenuBarDropdownEntryProps) {
       <DropdownItemButton
         item={props.entry as MenuItemDescriptor}
         onActivate={props.onActivate}
+        getChecked={props.getChecked}
       />
     </Show>
   )
@@ -373,16 +453,22 @@ function MenuBarDropdownEntry(props: MenuBarDropdownEntryProps) {
 function DropdownItemButton(props: {
   item: MenuItemDescriptor
   onActivate: (item: MenuItemDescriptor) => void
+  getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
 }) {
   const t = useT()
   const isDisabled = () => props.item.isAvailable === 'placeholder'
+  const checked = () => props.getChecked(props.item.dispatch)
+  const hasCheck = () => checked() !== undefined
   return (
     <button
       type="button"
-      class={`menu-bar-item ${isDisabled() ? 'menu-bar-item-disabled' : ''}`.trim()}
-      role="menuitem"
+      class={`menu-bar-item ${isDisabled() ? 'menu-bar-item-disabled' : ''} ${
+        hasCheck() ? 'menu-bar-item-checkable' : ''
+      }`.trim()}
+      role={hasCheck() ? 'menuitemcheckbox' : 'menuitem'}
       data-testid={`menu-bar-item-${props.item.id}`}
       disabled={isDisabled()}
+      aria-checked={hasCheck() ? (checked() ? 'true' : 'false') : undefined}
       title={
         isDisabled()
           ? props.item.placeholderMessage
@@ -397,5 +483,86 @@ function DropdownItemButton(props: {
         <span class="menu-bar-item-shortcut">{props.item.shortcut}</span>
       </Show>
     </button>
+  )
+}
+
+interface HelpOverlayDialogProps {
+  kind: 'closed' | 'shortcuts' | 'about'
+  onClose: () => void
+}
+
+const KEYBOARD_SHORTCUTS: ReadonlyArray<{ keys: string; labelKey: string }> = [
+  { keys: 'Ctrl+Z', labelKey: 'help.shortcuts.undo' },
+  { keys: 'Ctrl+Y', labelKey: 'help.shortcuts.redo' },
+  { keys: 'Ctrl+C', labelKey: 'help.shortcuts.copy' },
+  { keys: 'Ctrl+X', labelKey: 'help.shortcuts.cut' },
+  { keys: 'Ctrl+V', labelKey: 'help.shortcuts.paste' },
+  { keys: 'Ctrl+F', labelKey: 'help.shortcuts.find' },
+  { keys: 'Ctrl+H', labelKey: 'help.shortcuts.replace' },
+  { keys: 'Ctrl+A', labelKey: 'help.shortcuts.selectAll' },
+  { keys: 'F2', labelKey: 'help.shortcuts.edit' },
+  { keys: 'Esc', labelKey: 'help.shortcuts.cancel' },
+]
+
+function HelpOverlayDialog(props: HelpOverlayDialogProps) {
+  const t = useT()
+  const isOpen = () => props.kind !== 'closed'
+  return (
+    <Show when={isOpen()}>
+      <div
+        class="spreadsheet-help-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="spreadsheet-help-overlay-title"
+        data-testid={`spreadsheet-help-overlay-${props.kind}`}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault()
+            props.onClose()
+          }
+        }}
+      >
+        <h2 class="spreadsheet-help-overlay-title" id="spreadsheet-help-overlay-title">
+          {props.kind === 'shortcuts'
+            ? t('help.shortcuts.title')
+            : t('help.about.title')}
+        </h2>
+        <Show
+          when={props.kind === 'shortcuts'}
+          fallback={
+            <p
+              class="spreadsheet-help-overlay-body"
+              data-testid="spreadsheet-help-overlay-about-body"
+            >
+              {t('help.about.body')}
+            </p>
+          }
+        >
+          <ul
+            class="spreadsheet-help-overlay-shortcut-list"
+            data-testid="spreadsheet-help-overlay-shortcut-list"
+          >
+            <For each={KEYBOARD_SHORTCUTS}>
+              {(item) => (
+                <li class="spreadsheet-help-overlay-shortcut-item">
+                  <kbd class="spreadsheet-help-overlay-keys">{item.keys}</kbd>
+                  <span class="spreadsheet-help-overlay-label">{t(item.labelKey)}</span>
+                </li>
+              )}
+            </For>
+          </ul>
+        </Show>
+        <div class="spreadsheet-help-overlay-actions">
+          <button
+            type="button"
+            class="spreadsheet-help-overlay-close"
+            data-testid="spreadsheet-help-overlay-close"
+            onClick={() => props.onClose()}
+          >
+            {t('help.close')}
+          </button>
+        </div>
+      </div>
+    </Show>
   )
 }

@@ -1,5 +1,6 @@
-import { Show, createEffect, createSignal } from 'solid-js'
+import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import type { CellRange, FindReplaceScope } from '@einfach/spreadsheet-ui-core'
 import {
   advanceFindCursorAtom,
@@ -9,9 +10,11 @@ import {
   EXCEL_MAX_ROWS,
   findReplaceCursorAtom,
   findReplaceOpenAtom,
+  scrollToCellAtom,
   selectionSnapshotAtom,
   setFindMatchesAtom,
   setFindReplaceErrorAtom,
+  setSelectionAtom,
   workspaceSessionAtom,
   MAX_FIND_PAGE,
 } from '@einfach/spreadsheet-ui-core'
@@ -23,6 +26,7 @@ export interface SpreadsheetFindReplaceDialogProps {
 }
 
 export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialogProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const isOpen = useAtomValue(findReplaceOpenAtom)
@@ -49,6 +53,18 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     }
     return open
   }, false)
+
+  createEffect(() => {
+    if (!isOpen()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeFindReplaceAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   function buildQuery() {
     return {
@@ -95,12 +111,38 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         pageSize: MAX_FIND_PAGE,
       })
       store.setter(setFindMatchesAtom, result)
+      focusCurrentMatch()
     } catch (err) {
       store.setter(setFindReplaceErrorAtom, {
         code: 'BACKEND_ERROR',
         message: err instanceof Error ? err.message : String(err),
       })
     }
+  }
+
+  function focusCurrentMatch() {
+    const c = store.getter(findReplaceCursorAtom)
+    const match = c.pageMatches[c.currentIndex]
+    if (!match) return
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: match.sheetId,
+      anchor: match.coord,
+      focus: match.coord,
+    })
+    store.setter(scrollToCellAtom, { coord: match.coord })
+  }
+
+  async function handleFindStep(direction: 1 | -1) {
+    const c = store.getter(findReplaceCursorAtom)
+    if (c.totalCount === 0 || c.pageMatches.length === 0) {
+      if (needle().length > 0) {
+        await runSearch()
+      }
+      return
+    }
+    store.setter(advanceFindCursorAtom, direction)
+    focusCurrentMatch()
   }
 
   async function handleReplaceCurrent() {
@@ -179,6 +221,15 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         role="dialog"
         aria-label="Find and Replace"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={() => store.setter(closeFindReplaceAtom)}
+        >
+          ×
+        </button>
         <div class="find-replace-row">
           <label class="find-replace-label" for="find-needle">
             Find
@@ -270,7 +321,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             type="button"
             class="find-replace-btn"
             data-testid="find-next-button"
-            onClick={() => store.setter(advanceFindCursorAtom, 1)}
+            onClick={() => void handleFindStep(1)}
           >
             Find next
           </button>
@@ -278,7 +329,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             type="button"
             class="find-replace-btn"
             data-testid="find-prev-button"
-            onClick={() => store.setter(advanceFindCursorAtom, -1)}
+            onClick={() => void handleFindStep(-1)}
           >
             Find prev
           </button>
