@@ -2067,4 +2067,371 @@ describe('vNext SpreadsheetGrid', () => {
     })
     expect(exportCalls).toHaveLength(1)
   })
+
+  it("applies transform: rotate(...) when format.rotation is numeric (Wave 6.2)", async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Rotated',
+              valueKind: 'string',
+              format: { rotation: 90 },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Rotated',
+      )
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.transform).toBe('rotate(90deg)')
+    expect(display.style.transformOrigin).toContain('center')
+  })
+
+  it("uses writing-mode: vertical-rl when format.rotation is 'vertical' (Wave 6.2)", async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Stacked',
+              valueKind: 'string',
+              format: { rotation: 'vertical' },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'Stacked',
+      )
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.writingMode).toBe('vertical-rl')
+    expect(display.style.transform).toBe('')
+  })
+
+  it("applies white-space: normal when format.overflow is 'wrap' (Wave 6.2)", async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'A long sentence that should wrap onto multiple lines.',
+              valueKind: 'string',
+              format: { overflow: 'wrap' },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent,
+      ).toContain('long sentence')
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.whiteSpace).toBe('normal')
+    expect(display.style.wordBreak).toBe('break-word')
+  })
+
+  it("applies text-overflow: ellipsis when format.overflow is 'clip' (Wave 6.2)", async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'A very long value that does not fit',
+              valueKind: 'string',
+              format: { overflow: 'clip' },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')).not.toBeNull()
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.textOverflow).toBe('ellipsis')
+    expect(display.style.overflow).toBe('hidden')
+    expect(display.style.whiteSpace).toBe('nowrap')
+  })
+
+  it("maps horizontalAlign 'fill' / 'justify' / 'distributed' to expected text-align (Wave 6.2)", async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 3,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'fill',
+              valueKind: 'string',
+              format: { align: 'fill' },
+            },
+            {
+              row: 0,
+              col: 1,
+              displayValue: 'justify',
+              valueKind: 'string',
+              format: { align: 'justify' },
+            },
+            {
+              row: 0,
+              col: 2,
+              displayValue: 'distributed',
+              valueKind: 'string',
+              format: { align: 'distributed' },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')?.textContent).toBe(
+        'fill',
+      )
+    })
+
+    const fillCell = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    const justifyCell = container.querySelector(
+      '[data-cell-addr="B1"] .cell-display',
+    ) as HTMLElement
+    const distributedCell = container.querySelector(
+      '[data-cell-addr="C1"] .cell-display',
+    ) as HTMLElement
+
+    expect(fillCell.style.textAlign).toBe('left')
+    expect(justifyCell.style.textAlign).toBe('justify')
+    expect(distributedCell.style.textAlign).toBe('justify')
+    expect(distributedCell.style.textAlignLast).toBe('justify')
+  })
+
+  it('legacy format.wrap still produces wrap CSS (Wave 6.2 back-compat)', async () => {
+    const store = createStore()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 1,
+      viewportWidth: 1,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 2,
+      colCount: 2,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection(request) {
+        return {
+          kind: 'visible-window',
+          sheetId: request.sheetId,
+          window: { ...request.window },
+          requestId: request.requestId,
+          revision: request.revision,
+          cells: [
+            {
+              row: 0,
+              col: 0,
+              displayValue: 'Long content that should still wrap from the legacy flag',
+              valueKind: 'string',
+              format: { wrap: true },
+            },
+          ],
+        }
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-cell-addr="A1"] .cell-display')).not.toBeNull()
+    })
+
+    const display = container.querySelector('[data-cell-addr="A1"] .cell-display') as HTMLElement
+    expect(display.style.whiteSpace).toBe('normal')
+  })
 })

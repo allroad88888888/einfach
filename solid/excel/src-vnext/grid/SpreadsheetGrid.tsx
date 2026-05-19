@@ -128,8 +128,72 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (format.fgColor) style['color'] = format.fgColor
   if (format.bold) style['font-weight'] = '700'
   if (format.italic) style['font-style'] = 'italic'
-  if (format.align && format.align !== 'default') style['text-align'] = format.align
+  if (format.align && format.align !== 'default') {
+    if (format.align === 'distributed') {
+      style['text-align'] = 'justify'
+      style['text-align-last'] = 'justify'
+    } else if (format.align === 'fill') {
+      // Fill repeats the rendered text; without a measure pass we still left-align
+      // the existing string. Adapters that implement the repetition layer in a
+      // canvas overlay can read `align === 'fill'` directly from the format.
+      style['text-align'] = 'left'
+    } else {
+      style['text-align'] = format.align
+    }
+  }
   if (format.fontSize) style['font-size'] = `${format.fontSize}px`
+
+  if (format.verticalAlign) {
+    // Used by the cell box (display: flex) — leave a hint on the inner span so
+    // adapters that wrap the cell-display in their own flex container can map it.
+    style['--cell-vertical-align'] = format.verticalAlign
+  }
+
+  // Rotation. Numeric values rotate around the centre; `'vertical'` uses
+  // CSS writing-mode for character-stacked text.
+  if (format.rotation !== undefined && format.rotation !== 0) {
+    if (format.rotation === 'vertical') {
+      style['writing-mode'] = 'vertical-rl'
+      style['text-orientation'] = 'mixed'
+    } else if (typeof format.rotation === 'number') {
+      style['transform'] = `rotate(${format.rotation}deg)`
+      style['transform-origin'] = 'center center'
+      style['display'] = 'inline-block'
+    }
+  }
+
+  // Overflow handling. Legacy `format.wrap` maps to wrap; the new `overflow`
+  // field is preferred when both are present.
+  const overflow = format.overflow ?? (format.wrap ? 'wrap' : undefined)
+  if (overflow === 'wrap') {
+    style['white-space'] = 'normal'
+    style['word-break'] = 'break-word'
+    style['overflow-wrap'] = 'anywhere'
+  } else if (overflow === 'clip' || overflow === 'ellipsis') {
+    style['white-space'] = 'nowrap'
+    style['overflow'] = 'hidden'
+    style['text-overflow'] = 'ellipsis'
+  } else if (overflow === 'shrink-to-fit' || format.shrinkToFit) {
+    style['white-space'] = 'nowrap'
+    style['overflow'] = 'hidden'
+    // Best-effort: a CSS-only shrink cannot measure font metrics, so we mark
+    // the cell. A future measurement pass (or the canvas overlay) reads
+    // `--cell-shrink-to-fit` and sets `transform: scale(...)` from there.
+    style['--cell-shrink-to-fit'] = '1'
+  } else if (overflow === 'overflow') {
+    // Excel default for text: spill into empty neighbours. Without a layout
+    // measurement pass the DOM renderer leaves text intact and lets the
+    // neighbouring `<td>` clip it — same visible result for blank neighbours.
+    style['white-space'] = 'nowrap'
+    style['overflow'] = 'visible'
+  }
+
+  if (format.indent && format.indent > 0) {
+    // Indent is in level units; renderers translate to pixels. 8px per level
+    // matches Excel's default. Direction-aware adapters can swap to padding-right.
+    style['padding-left'] = `${format.indent * 8}px`
+  }
+
   return style
 }
 

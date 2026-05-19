@@ -207,7 +207,7 @@ export interface CellFormatJSON {
   numberFormat?: NumberFormatJSON
   bold?: boolean
   italic?: boolean
-  align?: 'default' | 'left' | 'center' | 'right'
+  align?: 'default' | 'left' | 'center' | 'right' | 'fill' | 'justify' | 'distributed'
   fontSize?: number
   /** Foreground / text color. */
   fgColor?: string

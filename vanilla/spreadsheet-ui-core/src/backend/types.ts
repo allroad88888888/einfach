@@ -119,7 +119,52 @@ export interface DisplayCell {
   locked?: boolean
 }
 
-export type SpreadsheetAlignment = 'default' | 'left' | 'center' | 'right'
+export type SpreadsheetAlignment =
+  | 'default'
+  | 'left'
+  | 'center'
+  | 'right'
+  | 'fill'
+  | 'justify'
+  | 'distributed'
+
+export type SpreadsheetVerticalAlignment =
+  | 'top'
+  | 'center'
+  | 'bottom'
+  | 'justify'
+  | 'distributed'
+
+/**
+ * Overflow strategy for a cell whose text exceeds its box.
+ *
+ * - `'overflow'` — default Excel behaviour for non-numeric text: the rendered
+ *   string spills into adjacent empty cells. Adapters that cannot detect
+ *   neighbour blankness may fall back to `'clip'`.
+ * - `'clip'` — truncate at the cell edge. Adapters typically draw a trailing
+ *   ellipsis via `text-overflow: ellipsis`.
+ * - `'ellipsis'` — synonym for `'clip'` that some adapters use to signal an
+ *   explicit ellipsis glyph; kept distinct for round-trip fidelity.
+ * - `'wrap'` — wrap text onto multiple lines. The renderer may also bump the
+ *   row height through the existing viewport-size projection / override path.
+ * - `'shrink-to-fit'` — scale the rendered text down to fit. Mutually
+ *   exclusive with `'wrap'` at the UI level; the editor decides precedence.
+ */
+export type SpreadsheetOverflow =
+  | 'overflow'
+  | 'clip'
+  | 'ellipsis'
+  | 'wrap'
+  | 'shrink-to-fit'
+
+/**
+ * Cell text rotation.
+ *
+ * - A number in `[-90, 90]` is degrees of baseline rotation.
+ * - The string literal `'vertical'` is character-stacked vertical text
+ *   (Excel's "Text" alignment angle 255 / `writing-mode: vertical-rl`).
+ */
+export type SpreadsheetRotation = number | 'vertical'
 
 export type SpreadsheetNumberFormat =
   | { kind: 'general' }
@@ -152,6 +197,29 @@ export interface SpreadsheetCellFormat {
   strikethrough?: boolean
   wrap?: boolean
   indent?: number
+  /**
+   * Vertical alignment inside the cell box.
+   *
+   * Default (when omitted) is `'bottom'`, matching Excel for non-numeric text.
+   */
+  verticalAlign?: SpreadsheetVerticalAlignment
+  /**
+   * Text rotation in degrees (`-90` to `90`), or `'vertical'` for stacked
+   * vertical text.
+   */
+  rotation?: SpreadsheetRotation
+  /**
+   * Overflow strategy when the rendered text exceeds the cell box.
+   *
+   * Default (when omitted) is `'overflow'` for text and `'clip'` for numbers;
+   * the renderer applies that fallback because it knows the value kind.
+   */
+  overflow?: SpreadsheetOverflow
+  /**
+   * Scale the rendered text down to fit the cell. Mutually exclusive with
+   * `wrap` at the editor level (the editor picks a winner before save).
+   */
+  shrinkToFit?: boolean
 }
 
 export interface VisibleProjectionRequest extends SheetRef {
