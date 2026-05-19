@@ -109,7 +109,8 @@ describe('SpreadsheetMenuBar', () => {
 
     const state = store.getter(historyStackAtom)
     expect(state.cursor).toBe(0)
-    expect(state.inFlight).toBe(true)
+    // dispatchUndo resolves inFlight once the backend (or fallback) acks.
+    expect(state.inFlight).toBe(false)
     expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
   })
 

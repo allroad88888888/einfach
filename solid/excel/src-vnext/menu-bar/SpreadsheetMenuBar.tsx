@@ -24,7 +24,6 @@ import {
   openTopMenuAtom,
   openValidationRuleEditorAtom,
   pasteClipboardAtom,
-  redoHistoryAtom,
   selectAllAtom,
   selectionSnapshotAtom,
   setFilterSortErrorAtom,
@@ -35,7 +34,6 @@ import {
   toggleHeadingsAtom,
   togglePrintPreviewAtom,
   topMenuOpenAtom,
-  undoHistoryAtom,
   viewportShowFormulaBarAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
@@ -48,7 +46,7 @@ import {
   type TopMenuId,
 } from '@einfach/spreadsheet-ui-core'
 
-import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import { dispatchRedo, dispatchUndo, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
 export interface SpreadsheetMenuBarProps {
   class?: string
@@ -149,10 +147,10 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   function routeDispatch(dispatch: MenuItemDispatch) {
     switch (dispatch.kind) {
       case 'undo':
-        store.setter(undoHistoryAtom)
+        void dispatchUndo(store, backend)
         return
       case 'redo':
-        store.setter(redoHistoryAtom)
+        void dispatchRedo(store, backend)
         return
       case 'cut':
       case 'copy':

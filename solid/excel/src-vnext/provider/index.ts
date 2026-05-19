@@ -1,5 +1,6 @@
 export * from './atoms'
 export * from './context'
+export * from './history-dispatch'
 export * from './hooks'
 export * from './SpreadsheetUiProvider'
 export * from './types'

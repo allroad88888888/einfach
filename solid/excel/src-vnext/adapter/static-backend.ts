@@ -315,6 +315,72 @@ interface StaticBackendState {
   revision: ProjectionRevision
   /** BCP-47 workbook locale used by the projection-layer number-format pipeline. */
   workbookLocale?: string
+  /** LIFO snapshots of state-before-mutation for backend-side undo. */
+  undoStack: StateSnapshot[]
+  /** LIFO snapshots populated when undoing so redo can roll forward. */
+  redoStack: StateSnapshot[]
+}
+
+interface StateSnapshot {
+  cellsBySheet: Map<string, Map<string, DisplayCell>>
+  cellFormatsBySheetId: Map<string, Map<string, SpreadsheetCellFormat>>
+  rangeFormatsBySheetId: Map<string, RangeFormatLayer[]>
+  mergeRangesBySheetId: Map<string, CellRange[]>
+  rowHeightsBySheetId: Map<string, Map<number, number>>
+  colWidthsBySheetId: Map<string, Map<number, number>>
+  sheets: SpreadsheetSheetMetadata[]
+  revision: ProjectionRevision
+}
+
+const STATIC_BACKEND_UNDO_CAP = 200
+
+function takeStateSnapshot(state: StaticBackendState): StateSnapshot {
+  return {
+    cellsBySheet: new Map(
+      Array.from(state.cellsBySheet, ([k, v]) => [k, new Map(v)]),
+    ),
+    cellFormatsBySheetId: new Map(
+      Array.from(state.cellFormatsBySheetId, ([k, v]) => [k, new Map(v)]),
+    ),
+    rangeFormatsBySheetId: new Map(
+      Array.from(state.rangeFormatsBySheetId, ([k, v]) => [
+        k,
+        v.map((layer) => ({ range: { ...layer.range }, format: { ...layer.format } })),
+      ]),
+    ),
+    mergeRangesBySheetId: new Map(
+      Array.from(state.mergeRangesBySheetId, ([k, v]) => [k, v.map((r) => ({ ...r }))]),
+    ),
+    rowHeightsBySheetId: new Map(
+      Array.from(state.rowHeightsBySheetId, ([k, v]) => [k, new Map(v)]),
+    ),
+    colWidthsBySheetId: new Map(
+      Array.from(state.colWidthsBySheetId, ([k, v]) => [k, new Map(v)]),
+    ),
+    sheets: state.sheets.map((s) => ({ ...s })),
+    revision: state.revision,
+  }
+}
+
+function restoreStateSnapshot(state: StaticBackendState, snap: StateSnapshot): void {
+  state.cellsBySheet = snap.cellsBySheet
+  state.cellFormatsBySheetId = snap.cellFormatsBySheetId
+  state.rangeFormatsBySheetId = snap.rangeFormatsBySheetId
+  state.mergeRangesBySheetId = snap.mergeRangesBySheetId
+  state.rowHeightsBySheetId = snap.rowHeightsBySheetId
+  state.colWidthsBySheetId = snap.colWidthsBySheetId
+  state.sheets = snap.sheets
+  state.revision = snap.revision
+}
+
+function beginUndoableMutation(state: StaticBackendState): void {
+  const snap = takeStateSnapshot(state)
+  state.undoStack.push(snap)
+  if (state.undoStack.length > STATIC_BACKEND_UNDO_CAP) {
+    state.undoStack.shift()
+  }
+  // Any forward-history is invalidated by a new mutation.
+  state.redoStack = []
 }
 
 function getOrCreateSheetCells(
@@ -423,6 +489,8 @@ function buildState(
     colWidthsBySheetId: new Map(),
     sheets,
     revision,
+    undoStack: [],
+    redoStack: [],
   }
 }
 
@@ -1387,6 +1455,7 @@ export function createStaticSpreadsheetBackend(
       return buildViewportSizeProjectionResult(request, state)
     },
     async setCellInput(request) {
+      beginUndoableMutation(state)
       updateCell(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
@@ -1403,6 +1472,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async setCellRichValue(request) {
+      beginUndoableMutation(state)
       updateCellRichValue(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
@@ -1419,6 +1489,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async importCells(request: ImportCellsRequest) {
+      beginUndoableMutation(state)
       const cells = getOrCreateSheetCells(state, request.sheetId)
       for (const cell of request.cells) {
         updateCell(cells, {
@@ -1439,6 +1510,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async importCellChunks(request: ImportCellChunksRequest) {
+      beginUndoableMutation(state)
       const cells = getOrCreateSheetCells(state, request.sheetId)
       for await (const chunk of request.chunks) {
         for (const cell of chunk) {
@@ -1461,6 +1533,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async clearRange(request) {
+      beginUndoableMutation(state)
       applyClearRange(state, request)
       state.revision = bumpRevision(state.revision)
 
@@ -1477,6 +1550,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async insertRows(request) {
+      beginUndoableMutation(state)
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1495,6 +1569,7 @@ export function createStaticSpreadsheetBackend(
       return structuralMutationResult(request, state.revision)
     },
     async deleteRows(request) {
+      beginUndoableMutation(state)
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1513,6 +1588,7 @@ export function createStaticSpreadsheetBackend(
       return structuralMutationResult(request, state.revision)
     },
     async insertColumns(request) {
+      beginUndoableMutation(state)
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1531,6 +1607,7 @@ export function createStaticSpreadsheetBackend(
       return structuralMutationResult(request, state.revision)
     },
     async deleteColumns(request) {
+      beginUndoableMutation(state)
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1549,6 +1626,7 @@ export function createStaticSpreadsheetBackend(
       return structuralMutationResult(request, state.revision)
     },
     async setFormatRange(request: SetFormatRangeRequest) {
+      beginUndoableMutation(state)
       const cellFormats = getOrCreateCellFormats(state, request.sheetId)
       const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
       clearCellFormatsInRange(cellFormats, request.range)
@@ -1571,6 +1649,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async setRowHeight(request: SetRowHeightRequest) {
+      beginUndoableMutation(state)
       getDimensionMap(state.rowHeightsBySheetId, request.sheetId).set(
         request.rowIndex,
         normalizeDimensionSize(request.heightPx),
@@ -1584,6 +1663,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async setColumnWidth(request: SetColumnWidthRequest) {
+      beginUndoableMutation(state)
       getDimensionMap(state.colWidthsBySheetId, request.sheetId).set(
         request.colIndex,
         normalizeDimensionSize(request.widthPx),
@@ -1597,6 +1677,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async mergeRange(request) {
+      beginUndoableMutation(state)
       const range = normalizeRange(request.range)
       const ranges = getMergeRanges(state, request.sheetId)
       const nextRanges = ranges.filter((candidate) => !rangesIntersect(candidate, range))
@@ -1609,6 +1690,7 @@ export function createStaticSpreadsheetBackend(
       return mergeMutationResult(request, state.revision)
     },
     async unmergeRange(request) {
+      beginUndoableMutation(state)
       const range = normalizeRange(request.range)
       const ranges = getMergeRanges(state, request.sheetId)
       state.mergeRangesBySheetId.set(
@@ -1672,6 +1754,7 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async fillRange(request) {
+      beginUndoableMutation(state)
       applyFillRange(state, request)
       state.revision = bumpRevision(state.revision)
 
@@ -1691,6 +1774,7 @@ export function createStaticSpreadsheetBackend(
       return resolveStaticDataEdge(state, request)
     },
     async addSheet(request) {
+      beginUndoableMutation(state)
       const name = normalizeSheetMutationName(request.name, createNextSheetName(state.sheets))
       assertUniqueSheetName(state.sheets, name)
 
@@ -1712,6 +1796,7 @@ export function createStaticSpreadsheetBackend(
       })
     },
     async renameSheet(request) {
+      beginUndoableMutation(state)
       const name = normalizeSheetMutationName(request.name, '')
       if (name.length === 0) {
         throw new Error('sheet name cannot be empty')
@@ -1734,6 +1819,7 @@ export function createStaticSpreadsheetBackend(
       })
     },
     async deleteSheet(request) {
+      beginUndoableMutation(state)
       if (state.sheets.length <= 1) {
         throw new Error('cannot delete the last sheet')
       }
@@ -1760,6 +1846,7 @@ export function createStaticSpreadsheetBackend(
       })
     },
     async reorderSheet(request: ReorderSheetRequest) {
+      beginUndoableMutation(state)
       const sheet = state.sheets.find((item) => item.id === request.sheetId)
       if (!sheet) {
         throw new Error(`unknown sheet: ${request.sheetId}`)
@@ -1775,6 +1862,36 @@ export function createStaticSpreadsheetBackend(
         sheetId: request.sheetId,
         activeSheetId: request.sheetId,
       })
+    },
+    async undoTransaction(request) {
+      const snap = state.undoStack.pop()
+      if (!snap) {
+        throw new Error('nothing to undo')
+      }
+      const current = takeStateSnapshot(state)
+      state.redoStack.push(current)
+      restoreStateSnapshot(state, snap)
+      state.revision = bumpRevision(state.revision)
+      return {
+        transactionId: request.transactionId,
+        requestId: request.requestId,
+        revision: state.revision,
+      }
+    },
+    async redoTransaction(request) {
+      const snap = state.redoStack.pop()
+      if (!snap) {
+        throw new Error('nothing to redo')
+      }
+      const current = takeStateSnapshot(state)
+      state.undoStack.push(current)
+      restoreStateSnapshot(state, snap)
+      state.revision = bumpRevision(state.revision)
+      return {
+        transactionId: request.transactionId,
+        requestId: request.requestId,
+        revision: state.revision,
+      }
     },
   }
 }

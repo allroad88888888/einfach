@@ -6,11 +6,9 @@ import {
   canRedoAtom,
   canUndoAtom,
   historyStackAtom,
-  redoHistoryAtom,
-  resolveHistoryAtom,
-  undoHistoryAtom,
   type HistoryEntry,
 } from '@einfach/spreadsheet-ui-core'
+import { dispatchRedo, dispatchUndo } from '../provider/history-dispatch'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 
 export interface SpreadsheetHistoryTimelineProps {
@@ -37,53 +35,8 @@ export function SpreadsheetHistoryTimeline(props: SpreadsheetHistoryTimelineProp
     return (props.formatTimestamp ?? defaultFormatTimestamp)(entry)
   }
 
-  async function dispatchUndoOnce(): Promise<boolean> {
-    const entry = store.setter(undoHistoryAtom)
-    if (!entry) return false
-    if (!backend.undoTransaction) {
-      store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: true })
-      return true
-    }
-    try {
-      const result = await backend.undoTransaction({
-        kind: 'undo-transaction',
-        transactionId: entry.transactionId,
-      })
-      store.setter(resolveHistoryAtom, {
-        transactionId: entry.transactionId,
-        ok: true,
-        revision: result.revision,
-      })
-      return true
-    } catch {
-      store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: false })
-      return false
-    }
-  }
-
-  async function dispatchRedoOnce(): Promise<boolean> {
-    const entry = store.setter(redoHistoryAtom)
-    if (!entry) return false
-    if (!backend.redoTransaction) {
-      store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: true })
-      return true
-    }
-    try {
-      const result = await backend.redoTransaction({
-        kind: 'redo-transaction',
-        transactionId: entry.transactionId,
-      })
-      store.setter(resolveHistoryAtom, {
-        transactionId: entry.transactionId,
-        ok: true,
-        revision: result.revision,
-      })
-      return true
-    } catch {
-      store.setter(resolveHistoryAtom, { transactionId: entry.transactionId, ok: false })
-      return false
-    }
-  }
+  const dispatchUndoOnce = () => dispatchUndo(store, backend)
+  const dispatchRedoOnce = () => dispatchRedo(store, backend)
 
   async function jumpTo(targetIndex: number) {
     // targetIndex 0 means "before any entry"; cursor==N means "after entry N-1".

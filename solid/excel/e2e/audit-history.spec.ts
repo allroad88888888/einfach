@@ -245,9 +245,9 @@ test.describe('audit: undo/redo defects on the Wave 5 demo', () => {
 
     const list = page.getByTestId('history-timeline-list')
 
-    // 1) cell.input — typing a value into a cell.
+    // 1) cell.set-input — typing a value into a cell.
     await commitCellValue(page, 'G2', 'hi')
-    await expect(list).toContainText(/cell\.input/)
+    await expect(list).toContainText(/cell\.set-input/)
 
     // 2) format.set — toolbar Bold on the active cell.
     await cell(page, 'G2').click()

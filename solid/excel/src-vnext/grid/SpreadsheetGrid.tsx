@@ -61,8 +61,6 @@ import {
   notifyActiveSheetChangedAtom,
   remoteCursorsAtom,
   presenceStateAtom,
-  redoHistoryAtom,
-  undoHistoryAtom,
   type CellCoord,
   type CellRange,
   type ClipboardTransferInput,
@@ -85,6 +83,8 @@ import {
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
+  dispatchRedo,
+  dispatchUndo,
   spreadsheetProjectionSnapshotAtom,
 } from '../provider'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
@@ -691,12 +691,28 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    await backend.setCellInput({
+    const result = await backend.setCellInput({
       kind: 'set-cell-input',
       sheetId: intent.sheetId,
       row: intent.cell.row,
       col: intent.cell.col,
       input: intent.input,
+    })
+    const cellRevision =
+      typeof result?.revision === 'number'
+        ? result.revision
+        : Number(result?.revision ?? 0) || 0
+    store.setter(pushHistoryAtom, {
+      transactionId: nextHistoryTransactionId(),
+      kind: 'cell.set-input',
+      sheetId: intent.sheetId,
+      projectionRevision: cellRevision,
+      affectedRange: result?.affectedRange ?? {
+        rowStart: intent.cell.row,
+        rowEnd: intent.cell.row,
+        colStart: intent.cell.col,
+        colEnd: intent.cell.col,
+      },
     })
     await loadProjection(requestProjection())
 
@@ -730,12 +746,23 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       const range = ranges[0]
       const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
       if (isSingleCell) {
-        await backend.setCellInput({
+        const result = await backend.setCellInput({
           kind: 'set-cell-input',
           sheetId: props.sheetId,
           row: range.rowStart,
           col: range.colStart,
           input: '',
+        })
+        const rev =
+          typeof result?.revision === 'number'
+            ? result.revision
+            : Number(result?.revision ?? 0) || 0
+        store.setter(pushHistoryAtom, {
+          transactionId: nextHistoryTransactionId(),
+          kind: 'cell.set-input',
+          sheetId: props.sheetId,
+          projectionRevision: rev,
+          affectedRange: result?.affectedRange ?? range,
         })
         await loadProjection(requestProjection())
         return
@@ -746,7 +773,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    await Promise.all(
+    const clearResults = await Promise.all(
       ranges.map((range) =>
         backend.clearRange!({
           kind: 'clear-range',
@@ -756,6 +783,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         }),
       ),
     )
+    const lastRev = clearResults
+      .map((r) => (typeof r?.revision === 'number' ? r.revision : Number(r?.revision ?? 0) || 0))
+      .reduce((a, b) => Math.max(a, b), 0)
+    store.setter(pushHistoryAtom, {
+      transactionId: nextHistoryTransactionId(),
+      kind: 'range.clear',
+      sheetId: props.sheetId,
+      projectionRevision: lastRev,
+      affectedRange: ranges[0],
+    })
     await loadProjection(requestProjection())
   }
 
@@ -1627,12 +1664,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
       case 'history.undo':
         event.preventDefault()
-        store.setter(undoHistoryAtom)
+        await dispatchUndo(store, backend)
         bumpRender()
         return
       case 'history.redo':
         event.preventDefault()
-        store.setter(redoHistoryAtom)
+        await dispatchRedo(store, backend)
         bumpRender()
         return
       case 'format.toggle':
