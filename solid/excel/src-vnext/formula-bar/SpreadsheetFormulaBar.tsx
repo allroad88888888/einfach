@@ -20,6 +20,7 @@ import {
   spreadsheetProjectionSnapshotAtom,
 } from '../provider/atoms'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
+import { SpreadsheetNameBox } from '../name-box'
 
 export interface SpreadsheetFormulaBarProps {
   class?: string
@@ -252,7 +253,13 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
       class={`formula-bar spreadsheet-formula-bar ${props.class ?? ''}`.trim()}
       data-testid={props['data-testid'] ?? 'formula-bar'}
     >
-      <span class="formula-bar-addr spreadsheet-formula-bar-addr" data-testid="formula-bar-addr">
+      <SpreadsheetNameBox />
+      <span
+        class="formula-bar-addr spreadsheet-formula-bar-addr"
+        data-testid="formula-bar-addr"
+        aria-hidden="true"
+        style={{ display: 'none' }}
+      >
         {cellAddress()}
       </span>
       <input

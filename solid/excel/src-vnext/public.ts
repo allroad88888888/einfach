@@ -1,6 +1,7 @@
 export * from './adapter'
 export * from './provider'
 export * from './formula-bar'
+export * from './name-box'
 export * from './context-menu'
 export * from './sheet-tabs'
 export * from './toolbar'
