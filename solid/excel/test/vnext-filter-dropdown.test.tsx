@@ -284,6 +284,36 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(el?.getAttribute('data-col-index')).toBe('0')
   })
 
+  it('equals input resets when switching to a different column', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    const input = container.querySelector(
+      '[data-testid="filter-equals-input"]',
+    ) as HTMLInputElement
+    fireEvent.input(input, { target: { value: 'leftover' } })
+
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 2 })
+
+    const input2 = container.querySelector(
+      '[data-testid="filter-equals-input"]',
+    ) as HTMLInputElement
+    expect(input2.value).toBe('')
+
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+    const state = store.getter(filterSortStateAtom)
+    expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: '' }])
+  })
+
   it('close button sets dropdown to closed', () => {
     const store = createStore()
     const backend = createFakeBackend()
