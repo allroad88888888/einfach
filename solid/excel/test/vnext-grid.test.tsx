@@ -722,6 +722,68 @@ describe('vNext SpreadsheetGrid', () => {
     )
   })
 
+  it('row header label click selects the row even when the label span receives the event', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 5,
+      viewportWidth: 5,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('.spreadsheet-grid-row-header').length).toBeGreaterThan(0)
+    })
+
+    const rowHeader = container.querySelector(
+      '.spreadsheet-grid-row-header[data-row="3"]',
+    ) as HTMLElement
+    expect(rowHeader).not.toBeNull()
+    expect(rowHeader.getAttribute('data-selected')).toBe('false')
+    fireEvent.click(rowHeader)
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'row',
+      sheetId: 'sheet-1',
+      rowAnchor: 3,
+      rowFocus: 3,
+    })
+    expect(
+      container
+        .querySelector('.spreadsheet-grid-row-header[data-row="3"]')
+        ?.getAttribute('data-selected'),
+    ).toBe('true')
+
+    const colHeader = container.querySelector(
+      '.spreadsheet-grid-col-header[data-col="2"]',
+    ) as HTMLElement
+    expect(colHeader).not.toBeNull()
+    fireEvent.click(colHeader)
+    expect(store.getter(selectionAtom)).toEqual({
+      kind: 'column',
+      sheetId: 'sheet-1',
+      colAnchor: 2,
+      colFocus: 2,
+    })
+    expect(
+      container
+        .querySelector('.spreadsheet-grid-col-header[data-col="2"]')
+        ?.getAttribute('data-selected'),
+    ).toBe('true')
+  })
+
   it('supports shift range selection and keyboard movement through core atoms', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()

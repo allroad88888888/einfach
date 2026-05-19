@@ -4,6 +4,8 @@ import type {
   FilterDropdownState,
   FilterSortState,
   FilterSortStateBySheet,
+  SortDirection,
+  SortDirective,
 } from './types'
 
 export * from './types'
@@ -110,6 +112,36 @@ export const closeFilterDropdownAtom = atom(
   },
 )
 closeFilterDropdownAtom.debugLabel = 'spreadsheet.filterSort.closeDropdown'
+
+// Replaces (or appends) the sort directive on `colIndex` with `direction`.
+// Other columns' directives are preserved untouched. Filters are unchanged.
+// Returns the next FilterSortState so the host can sync it to the backend.
+export const dispatchSortAtom = atom(
+  (get) => get(filterSortStateAtom),
+  (
+    get,
+    set,
+    input: { sheetId: string; colIndex: number; direction: SortDirection },
+  ): FilterSortState => {
+    if (!input.sheetId || input.sheetId.length === 0) {
+      return { rules: [], directives: [] }
+    }
+    const current = get(filterSortStateAtom)
+    const sheetState: FilterSortState = current[input.sheetId] ?? { rules: [], directives: [] }
+    const nextDirective: SortDirective = {
+      colIndex: input.colIndex,
+      direction: input.direction,
+    }
+    const otherDirectives = sheetState.directives.filter((d) => d.colIndex !== input.colIndex)
+    const next: FilterSortState = {
+      rules: sheetState.rules,
+      directives: [...otherDirectives, nextDirective],
+    }
+    set(filterSortStateAtom, { ...current, [input.sheetId]: next })
+    return next
+  },
+)
+dispatchSortAtom.debugLabel = 'spreadsheet.filterSort.dispatchSort'
 
 // Host adapter calls this when the workspace active sheet changes so
 // an open dropdown for a now-background sheet closes cleanly.

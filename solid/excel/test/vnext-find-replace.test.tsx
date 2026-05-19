@@ -14,7 +14,10 @@ import {
   advanceFindCursorAtom,
   findReplaceCursorAtom,
   findReplaceOpenAtom,
+  selectionAtom,
   setFindMatchesAtom,
+  setViewportMetricsAtom,
+  viewportMetricsAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetFindReplaceDialog } from '../src-vnext/find-replace'
@@ -210,6 +213,117 @@ describe('SpreadsheetFindReplaceDialog', () => {
     expect(store.getter(findReplaceCursorAtom).currentIndex).toBe(0)
     fireEvent.click(getEls(container).findNext!)
     expect(store.getter(findReplaceCursorAtom).currentIndex).toBe(1)
+  })
+
+  it('Find next moves selection to the matched cell and scrolls into view', () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+    store.setter(setFindMatchesAtom, {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [
+        { coord: { row: 1, col: 0 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 5 },
+        { coord: { row: 5, col: 2 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 5 },
+      ],
+      pageStart: 0,
+      totalCount: 2,
+    })
+
+    const backend = createBaseBackend()
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getEls(container).findNext!)
+    const selectionAfterNext = store.getter(selectionAtom)
+    expect(selectionAfterNext.sheetId).toBe('sheet-1')
+    expect(selectionAfterNext.kind).toBe('cell')
+    expect((selectionAfterNext as { anchor: { row: number; col: number } }).anchor).toEqual({
+      row: 5,
+      col: 2,
+    })
+    expect(store.getter(findReplaceCursorAtom).currentIndex).toBe(1)
+
+    fireEvent.click(getEls(container).findPrev!)
+    const selectionAfterPrev = store.getter(selectionAtom)
+    expect((selectionAfterPrev as { anchor: { row: number; col: number } }).anchor).toEqual({
+      row: 1,
+      col: 0,
+    })
+    expect(store.getter(findReplaceCursorAtom).currentIndex).toBe(0)
+  })
+
+  it('Find next dispatches scrollToCellAtom for the matched coord', () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+    store.setter(setViewportMetricsAtom, {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 240,
+      viewportWidth: 480,
+      rowHeight: 24,
+      colWidth: 96,
+      rowCount: 1000,
+      colCount: 100,
+      overscanRows: 0,
+      overscanCols: 0,
+    })
+    const initialMetrics = store.getter(viewportMetricsAtom)
+    store.setter(setFindMatchesAtom, {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [
+        { coord: { row: 0, col: 0 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 1 },
+        { coord: { row: 200, col: 5 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 1 },
+      ],
+      pageStart: 0,
+      totalCount: 2,
+    })
+
+    const backend = createBaseBackend()
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getEls(container).findNext!)
+    const after = store.getter(viewportMetricsAtom)
+    expect(after.scrollTop).not.toBe(initialMetrics.scrollTop)
+  })
+
+  it('Find next triggers a search when no matches have been committed yet', async () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+
+    const fakeResult: SearchRangeResult = {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [
+        { coord: { row: 2, col: 1 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 5 },
+      ],
+      pageStart: 0,
+      totalCount: 1,
+    }
+    const searchSpy = jest.fn(async (_req: SearchRangeRequest) => fakeResult)
+    const backend = createSearchBackend(searchSpy)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    const { needle, findNext } = getEls(container)
+    fireEvent.input(needle!, { target: { value: 'North' } })
+    fireEvent.click(findNext!)
+
+    await waitFor(() => {
+      expect(searchSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(store.getter(findReplaceCursorAtom).totalCount).toBe(1)
   })
 
   it('Replace button calls backend.replaceMatches for the current match', async () => {

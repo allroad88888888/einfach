@@ -29,6 +29,31 @@ export const closeTopMenuAtom = atom(
 )
 closeTopMenuAtom.debugLabel = 'spreadsheet.menuBar.close'
 
+// Help overlays (Keyboard Shortcuts / About). Lightweight placeholder dialogs
+// driven by a single discriminated atom rather than separate booleans so the
+// menu bar can only have one help overlay open at a time.
+
+export type HelpOverlayKind = 'closed' | 'shortcuts' | 'about'
+
+export const helpOverlayAtom = atom<HelpOverlayKind>('closed')
+helpOverlayAtom.debugLabel = 'spreadsheet.menuBar.helpOverlay'
+
+export const openHelpOverlayAtom = atom(
+  (get) => get(helpOverlayAtom),
+  (_get, set, kind: Exclude<HelpOverlayKind, 'closed'>) => {
+    set(helpOverlayAtom, kind)
+  },
+)
+openHelpOverlayAtom.debugLabel = 'spreadsheet.menuBar.openHelpOverlay'
+
+export const closeHelpOverlayAtom = atom(
+  (get) => get(helpOverlayAtom),
+  (_get, set) => {
+    set(helpOverlayAtom, 'closed')
+  },
+)
+closeHelpOverlayAtom.debugLabel = 'spreadsheet.menuBar.closeHelpOverlay'
+
 const FILE_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'file.new',
