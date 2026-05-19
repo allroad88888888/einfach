@@ -28,6 +28,11 @@
     "solid/*",
     "vanilla/*"
   ],
+  "pnpm": {
+    "overrides": {
+      "solid-js": "1.9.12"
+    }
+  },
   "dependencies": {
     "@changesets/cli": "^2.27.1",
     "@stylistic/eslint-plugin": "^2.1.0",
@@ -68,6 +73,6 @@
     "prettier": "^3.3.3",
     "rimraf": "^6.0.1",
     "rollup": "^4.27.4",
-    "solid-js": "^1.9.5"
+    "solid-js": "^1.9.12"
   }
 }
