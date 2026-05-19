@@ -5,6 +5,8 @@ export type HistoryEntryKind =
   | 'cells.import'
   | 'range.clear'
   | 'range.fill'
+  | 'range.merge'
+  | 'range.unmerge'
   | 'row.insert'
   | 'row.delete'
   | 'column.insert'

@@ -104,6 +104,76 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     await expect(painterButton).toHaveAttribute('data-format-painter-state', 'idle')
   })
 
+  test('row header click selects the row', async ({ page }) => {
+    await gotoWave5(page)
+    const grid = page.getByTestId('wave5-grid')
+    const rowHeader = grid.locator('.spreadsheet-grid-row-header[data-row="4"]')
+    await expect(rowHeader).toBeVisible()
+    await expect(rowHeader).toHaveAttribute('data-selected', 'false')
+    await rowHeader.click()
+    await expect(rowHeader).toHaveAttribute('data-selected', 'true')
+    await expect(cell(page, 'A5')).toHaveAttribute('data-selected', 'true')
+    await expect(cell(page, 'F5')).toHaveAttribute('data-selected', 'true')
+  })
+
+  test('column header click selects the column', async ({ page }) => {
+    await gotoWave5(page)
+    const grid = page.getByTestId('wave5-grid')
+    const colHeader = grid.locator('.spreadsheet-grid-col-header[data-col="2"]')
+    await expect(colHeader).toBeVisible()
+    await expect(colHeader).toHaveAttribute('data-selected', 'false')
+    await colHeader.click()
+    await expect(colHeader).toHaveAttribute('data-selected', 'true')
+    await expect(cell(page, 'C1')).toHaveAttribute('data-selected', 'true')
+    await expect(cell(page, 'C3')).toHaveAttribute('data-selected', 'true')
+  })
+
+  test('Find next dialog navigates selection to the matched cell', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+
+    await page.keyboard.press('ControlOrMeta+f')
+    const dialog = page.getByTestId('find-replace-dialog')
+    await expect(dialog).toBeVisible()
+
+    const needle = page.getByTestId('find-needle-input')
+    await needle.fill('North')
+
+    await page.getByTestId('find-next-button').click()
+
+    // Seed row 1 of the matrix is ['North', 120, 180, 240, 300, 840] so the
+    // unique match lands at A2. After Find next, A2 should be the active cell.
+    await expect(cell(page, 'A2')).toHaveAttribute('data-active', 'true')
+    await expect(dialog).toBeVisible()
+  })
+
+  test('Bold toolbar button toggles aria-pressed on the active cell', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B3').click()
+    const boldButton = page.getByTestId('toolbar-btn-bold')
+    await expect(boldButton).toBeVisible()
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'false')
+
+    await boldButton.click()
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'true')
+
+    await boldButton.click()
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  test('Ctrl+B keyboard shortcut toggles bold on the active cell', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'C3').click()
+    const boldButton = page.getByTestId('toolbar-btn-bold')
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'false')
+
+    await page.keyboard.press('Control+b')
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'true')
+
+    await page.keyboard.press('Control+b')
+    await expect(boldButton).toHaveAttribute('aria-pressed', 'false')
+  })
+
   test.describe('editing flow (Excel parity)', () => {
     function cellInput(page: Page, addr: string) {
       return cell(page, addr).locator('.cell-input')

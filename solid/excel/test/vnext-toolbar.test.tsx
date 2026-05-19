@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it } from '@jest/globals'
+import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
@@ -11,6 +11,8 @@ import type {
   VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  formatPainterStateAtom,
+  historyStackAtom,
   selectCellAtom,
   setWorkspaceActiveSheetAtom,
   startEditingAtom,
@@ -107,6 +109,9 @@ function getButtons(container: HTMLElement) {
   return {
     bold: container.querySelector('[data-testid="toolbar-btn-bold"]') as HTMLButtonElement,
     italic: container.querySelector('[data-testid="toolbar-btn-italic"]') as HTMLButtonElement,
+    underline: container.querySelector(
+      '[data-testid="toolbar-btn-underline"]',
+    ) as HTMLButtonElement,
     fillColor: container.querySelector('[data-testid="toolbar-btn-fill-color"]') as HTMLButtonElement,
     textColor: container.querySelector('[data-testid="toolbar-btn-text-color"]') as HTMLButtonElement,
     numberFormat: container.querySelector(
@@ -118,6 +123,9 @@ function getButtons(container: HTMLElement) {
     ) as HTMLButtonElement,
     find: container.querySelector('[data-testid="toolbar-btn-find"]') as HTMLButtonElement,
     printPreview: container.querySelector('[data-testid="toolbar-btn-print-preview"]') as HTMLButtonElement,
+    painter: container.querySelector(
+      '[data-testid="toolbar-btn-format-painter"]',
+    ) as HTMLButtonElement,
   }
 }
 
@@ -407,5 +415,191 @@ describe('vNext SpreadsheetToolbar', () => {
     const buttons2 = getButtons(container)
     fireEvent.click(buttons2.printPreview)
     expect(store.getter(printPreviewOpenAtom)).toBe(false)
+  })
+
+  it('toggles bold off when the active cell is already bold', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [
+          {
+            row: 0,
+            col: 0,
+            displayValue: 'A1',
+            valueKind: 'string',
+            format: { bold: true },
+          },
+        ],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const buttons = getButtons(container)
+    expect(buttons.bold.getAttribute('aria-pressed')).toBe('true')
+
+    fireEvent.click(buttons.bold)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    expect(setFormatRangeCalls[0].format).toEqual({ bold: false })
+  })
+
+  it('clicking Italic toggles italic on the active cell and pushes a history entry', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).italic)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    expect(setFormatRangeCalls[0].format).toEqual({ italic: true })
+    await waitFor(() => expect(store.getter(historyStackAtom).entries.length).toBe(1))
+    expect(store.getter(historyStackAtom).entries[0].kind).toBe('format.set')
+  })
+
+  it('clicking Underline toggles underline on the active cell', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: {} }],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const buttons = getButtons(container)
+    expect(buttons.underline).not.toBeNull()
+    expect(buttons.underline.disabled).toBe(false)
+    fireEvent.click(buttons.underline)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    expect(setFormatRangeCalls[0].format).toEqual({ underline: true })
+  })
+
+  it('clicking Merge with a multi-cell selection records a range.merge history entry', async () => {
+    const store = createStore()
+    const { backend, mergeRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 1, col: 1 }, extend: true })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).merge)
+    await waitFor(() => expect(mergeRangeCalls).toHaveLength(1))
+    await waitFor(() => expect(store.getter(historyStackAtom).entries.length).toBe(1))
+    expect(store.getter(historyStackAtom).entries[0].kind).toBe('range.merge')
+  })
+
+  it('single click on Format Painter arms the painter after the dblclick window', async () => {
+    jest.useFakeTimers()
+    const store = createStore()
+    const { backend } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 4 },
+        cells: [{ row: 0, col: 0, displayValue: '', valueKind: 'string', format: { bold: true } }],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(formatPainterStateAtom)).toBe('idle')
+    fireEvent.click(getButtons(container).painter)
+    jest.advanceTimersByTime(250)
+    expect(store.getter(formatPainterStateAtom)).toBe('armed')
+    jest.useRealTimers()
   })
 })

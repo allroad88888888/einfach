@@ -150,6 +150,8 @@ export const messages: Record<string, string> = {
   'toolbar.bold.title': '加粗',
   'toolbar.italic': 'I',
   'toolbar.italic.title': '斜体',
+  'toolbar.underline': 'U',
+  'toolbar.underline.title': '下划线',
   'toolbar.fillColor': '填充',
   'toolbar.fillColor.title': '填充颜色',
   'toolbar.textColor': '字体',
@@ -181,6 +183,9 @@ export const messages: Record<string, string> = {
   'status.inputMode.edit': '编辑',
   'status.inputMode.enter': '输入',
   'status.inputMode.point': '指向',
+
+  // 共享对话框元素
+  'dialog.close.label': '关闭',
 
   // 设置单元格格式 — 选项卡
   'formatCells.tab.number': '数字',

@@ -269,6 +269,21 @@ function getCommandShortcutIntent(
       return {
         type: 'history.redo',
       }
+    case 'b':
+      return {
+        type: 'format.toggle',
+        field: 'bold',
+      }
+    case 'i':
+      return {
+        type: 'format.toggle',
+        field: 'italic',
+      }
+    case 'u':
+      return {
+        type: 'format.toggle',
+        field: 'underline',
+      }
     case 'pageup':
       return {
         type: 'sheet.activate-adjacent',

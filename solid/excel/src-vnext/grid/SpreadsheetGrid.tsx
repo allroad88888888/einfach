@@ -24,9 +24,11 @@ import {
   addSelectionRegionAtom,
   isMergeCovered,
   markClipboardReadyAtom,
+  nextHistoryTransactionId,
   openMenuAtom,
   pasteClipboardAtom,
   pointerSessionAtom,
+  pushHistoryAtom,
   scrollToCellAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
@@ -65,6 +67,7 @@ import {
   type ClipboardTransferInput,
   type DisplayCell,
   type DisplayCellRichValue,
+  type FormatToggleField,
   type PointerFillHandleCommitIntent,
   type RichTextRunFormat,
   type SelectionRegion,
@@ -1400,6 +1403,56 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     await loadProjection(requestProjection())
   }
 
+  function activeCellFormat(): SpreadsheetCellFormat {
+    const selection = selectionSnapshot()
+    const result = projectionSnapshot().result
+    if (!result || result.sheetId !== selection.selection.sheetId) {
+      return {}
+    }
+    const active = selection.activeCell
+    const cell = result.cells.find(
+      (candidate) => candidate.row === active.row && candidate.col === active.col,
+    )
+    return { ...(cell?.format ?? {}) }
+  }
+
+  async function toggleActiveFormatField(field: FormatToggleField) {
+    if (!backend.setFormatRange) {
+      return
+    }
+
+    const snapshot = selectionSnapshot()
+    const sheetId = snapshot.selection.sheetId
+    if (!sheetId) {
+      return
+    }
+
+    const range = snapshot.range
+    const current = activeCellFormat()
+    const nextFormat: SpreadsheetCellFormat = { ...current, [field]: !current[field] }
+
+    const result = await backend.setFormatRange({
+      kind: 'set-format-range',
+      sheetId,
+      range,
+      format: nextFormat,
+    })
+
+    const revision =
+      typeof result?.revision === 'number'
+        ? result.revision
+        : Number(result?.revision ?? 0) || 0
+    store.setter(pushHistoryAtom, {
+      transactionId: nextHistoryTransactionId(),
+      kind: 'format.set',
+      sheetId,
+      projectionRevision: revision,
+      affectedRange: { ...(result?.affectedRange ?? range) },
+    })
+
+    await loadProjection(requestProjection())
+  }
+
   async function handleGridKeyDown(event: KeyboardEvent) {
     if (event.defaultPrevented) {
       return
@@ -1496,6 +1549,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         store.setter(redoHistoryAtom)
         bumpRender()
+        return
+      case 'format.toggle':
+        event.preventDefault()
+        await toggleActiveFormatField(intent.field)
         return
       default:
         return

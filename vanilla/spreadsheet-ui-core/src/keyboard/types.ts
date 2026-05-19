@@ -71,6 +71,13 @@ export interface HistoryIntent {
   type: 'history.undo' | 'history.redo'
 }
 
+export type FormatToggleField = 'bold' | 'italic' | 'underline'
+
+export interface FormatToggleIntent {
+  type: 'format.toggle'
+  field: FormatToggleField
+}
+
 export type ClearCellsTarget = 'values' | 'formats' | 'all'
 
 export interface ClearCellsIntent {
@@ -105,6 +112,7 @@ export type KeyboardCommandIntent =
   | KeyboardClipboardIntent
   | SheetNavigationIntent
   | HistoryIntent
+  | FormatToggleIntent
   | ClearCellsIntent
   | FormulaReferenceArrowPickIntent
   | FormulaReferenceExitIntent

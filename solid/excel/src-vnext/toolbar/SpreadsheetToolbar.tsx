@@ -7,6 +7,8 @@ import {
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
   formatPainterStateAtom,
+  nextHistoryTransactionId,
+  pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
   activeCellLockedAtom,
@@ -16,6 +18,7 @@ import {
   togglePrintPreviewAtom,
   type CapturedFormat,
   type CellRange,
+  type HistoryEntryKind,
   type SpreadsheetCellFormat,
   type SpreadsheetNumberFormat,
   type ToolbarFormatCommandInput,
@@ -45,6 +48,13 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.italic.title',
     testId: 'toolbar-btn-italic',
     isEnabled: (availability) => availability.italic,
+  },
+  {
+    command: 'underline',
+    label: 'toolbar.underline',
+    title: 'toolbar.underline.title',
+    testId: 'toolbar-btn-underline',
+    isEnabled: (availability) => availability.underline,
   },
   {
     command: 'fill-color',
@@ -198,6 +208,8 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         return { ...current, bold: !current.bold }
       case 'italic':
         return { ...current, italic: !current.italic }
+      case 'underline':
+        return { ...current, underline: !current.underline }
       case 'fill-color':
         return { ...current, bgColor: intent.value ?? '#ffd966' }
       case 'text-color':
@@ -260,17 +272,40 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     })
   }
 
+  function recordHistoryEntry(input: {
+    sheetId: string | null
+    kind: HistoryEntryKind
+    revision: number | string | undefined
+    affectedRange?: CellRange
+  }) {
+    const projectionRevision =
+      typeof input.revision === 'number' ? input.revision : Number(input.revision ?? 0) || 0
+    store.setter(pushHistoryAtom, {
+      transactionId: nextHistoryTransactionId(),
+      kind: input.kind,
+      sheetId: input.sheetId,
+      projectionRevision,
+      affectedRange: input.affectedRange ? { ...input.affectedRange } : undefined,
+    })
+  }
+
   async function executeCommand(intent: ToolbarFormatCommandIntent, range: CellRange) {
     if (!backend.setFormatRange) {
       throw new Error('Range formatting is not supported by this spreadsheet backend.')
     }
 
     const current = activeCellFormat()
-    await backend.setFormatRange({
+    const result = await backend.setFormatRange({
       kind: 'set-format-range',
       sheetId: intent.sheetId,
       range,
       format: commandFormat(intent, current),
+    })
+    recordHistoryEntry({
+      sheetId: intent.sheetId,
+      kind: 'format.set',
+      revision: result?.revision,
+      affectedRange: result?.affectedRange ?? range,
     })
     await refreshProjection(intent.sheetId)
   }
@@ -314,10 +349,17 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       return
     }
 
-    await backend.mergeRange({
+    const range = selectionSnapshot().range
+    const result = await backend.mergeRange({
       kind: 'merge-range',
       sheetId,
-      range: selectionSnapshot().range,
+      range,
+    })
+    recordHistoryEntry({
+      sheetId,
+      kind: 'range.merge',
+      revision: result?.revision,
+      affectedRange: result?.affectedRange ?? range,
     })
     await refreshProjection(sheetId)
   }
@@ -328,10 +370,17 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       return
     }
 
-    await backend.unmergeRange({
+    const range = selectionSnapshot().range
+    const result = await backend.unmergeRange({
       kind: 'unmerge-range',
       sheetId,
-      range: selectionSnapshot().range,
+      range,
+    })
+    recordHistoryEntry({
+      sheetId,
+      kind: 'range.unmerge',
+      revision: result?.revision,
+      affectedRange: result?.affectedRange ?? range,
     })
     await refreshProjection(sheetId)
   }
@@ -349,7 +398,9 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             ? !!activeCellFormat().bold
             : command.command === 'italic'
               ? !!activeCellFormat().italic
-              : undefined
+              : command.command === 'underline'
+                ? !!activeCellFormat().underline
+                : undefined
 
         return (
           <button

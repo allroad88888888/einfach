@@ -166,6 +166,8 @@ export const messages: Record<string, string> = {
   'toolbar.bold.title': 'Bold',
   'toolbar.italic': 'I',
   'toolbar.italic.title': 'Italic',
+  'toolbar.underline': 'U',
+  'toolbar.underline.title': 'Underline',
   'toolbar.fillColor': 'Fill',
   'toolbar.fillColor.title': 'Fill color',
   'toolbar.textColor': 'Text',
@@ -200,6 +202,9 @@ export const messages: Record<string, string> = {
   'status.inputMode.edit': 'Edit',
   'status.inputMode.enter': 'Enter',
   'status.inputMode.point': 'Point',
+
+  // Shared dialog chrome
+  'dialog.close.label': 'Close',
 
   // Format Cells dialog — tabs
   'formatCells.tab.number': 'Number',

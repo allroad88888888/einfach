@@ -5,6 +5,19 @@ export * from './types'
 
 export const DEFAULT_HISTORY_CAP = 100
 
+let historyTransactionCounter = 0
+
+/**
+ * Generate a unique, monotonic transaction id for a history entry. Hosts that
+ * record a mutation should call this once and reuse the id for both the
+ * history entry and any subsequent resolve/backend correlation. The format is
+ * intentionally compact (`tx-<n>`) so debug logs stay readable.
+ */
+export function nextHistoryTransactionId(prefix = 'tx'): string {
+  historyTransactionCounter += 1
+  return `${prefix}-${historyTransactionCounter}`
+}
+
 const DEFAULT_HISTORY_STACK_STATE: HistoryStackState = {
   entries: [],
   cursor: 0,

@@ -523,6 +523,64 @@ describe('formula-reference mode', () => {
   })
 })
 
+describe('format toggle shortcuts (Ctrl+B / Ctrl+I / Ctrl+U)', () => {
+  function makeNavStore() {
+    const store = createStore()
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 1, col: 1 },
+    })
+    return store
+  }
+
+  test('Ctrl+B in navigation mode yields format.toggle bold intent', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'b', ctrlKey: true })
+    expect(intent).toEqual({ type: 'format.toggle', field: 'bold' })
+    expect(store.getter(lastKeyboardIntentAtom)).toEqual(intent)
+  })
+
+  test('Ctrl+I yields format.toggle italic intent', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'i', ctrlKey: true })
+    expect(intent).toEqual({ type: 'format.toggle', field: 'italic' })
+  })
+
+  test('Ctrl+U yields format.toggle underline intent', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'u', ctrlKey: true })
+    expect(intent).toEqual({ type: 'format.toggle', field: 'underline' })
+  })
+
+  test('Meta+B (mac) yields format.toggle bold intent', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'b', metaKey: true })
+    expect(intent).toEqual({ type: 'format.toggle', field: 'bold' })
+  })
+
+  test('plain "b" without modifier starts editing rather than toggling format', () => {
+    const store = makeNavStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'b' })
+    expect(intent).toEqual({
+      type: 'editing.start',
+      source: 'keyboard',
+      initialDraft: 'b',
+      clearOnStart: true,
+    })
+  })
+
+  test('Ctrl+B in editing mode does NOT emit a format toggle', () => {
+    const store = makeNavStore()
+    store.setter(keyboardModeAtom, 'editing')
+    const intent = store.setter(dispatchKeyboardInputAtom, { key: 'b', ctrlKey: true })
+    // Editing mode owns the key path; format toggle is suppressed.
+    expect(intent.type).not.toBe('format.toggle')
+  })
+})
+
 function expectMoveIntent(intent: KeyboardCommandIntent, to: { row: number; col: number }) {
   if (intent.type !== 'selection.move') {
     throw new Error(`Expected selection.move intent, received ${intent.type}`)
