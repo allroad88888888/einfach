@@ -1397,7 +1397,8 @@ thead .row-header {
   background: var(--hover);
 }
 
-.spreadsheet-sheet-tabs .spreadsheet-sheet-tab[aria-selected='true'] {
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab[data-active='true'],
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab.is-active {
   background: #ffffff;
   border-color: var(--border);
   color: var(--excel-green);
@@ -1430,4 +1431,49 @@ thead .row-header {
   color: var(--text-muted);
   cursor: grab;
   user-select: none;
+}
+
+/* === E. Button universal states ====================================== */
+
+/* Excel-style focus ring — only via keyboard (focus-visible), Office blue,
+ * inset so it never expands box geometry. Applies broadly to vnext chrome. */
+.spreadsheet-menu-bar button:focus-visible,
+.spreadsheet-toolbar button:focus-visible,
+.spreadsheet-name-box-input:focus-visible,
+.spreadsheet-formula-bar-input:focus-visible,
+.spreadsheet-status-bar button:focus-visible,
+.spreadsheet-sheet-tabs button:focus-visible,
+.spreadsheet-grid-cell:focus-visible {
+  outline: 2px solid var(--office-blue);
+  outline-offset: -1px;
+}
+
+/* Hide native focus outline when JS sets focus programmatically (no keyboard).
+ * focus-visible above re-adds it for keyboard navigation. */
+.spreadsheet-menu-bar button:focus:not(:focus-visible),
+.spreadsheet-toolbar button:focus:not(:focus-visible),
+.spreadsheet-status-bar button:focus:not(:focus-visible),
+.spreadsheet-sheet-tabs button:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Universal disabled baseline — anything with disabled attribute inside vnext
+ * chrome dims and stops pointer events except for tooltips. */
+.spreadsheet-menu-bar button:disabled,
+.spreadsheet-toolbar button:disabled,
+.spreadsheet-status-bar button:disabled,
+.spreadsheet-sheet-tabs button:disabled {
+  color: #b0b0b0;
+  cursor: not-allowed;
+  background: transparent;
+  border-color: transparent;
+}
+
+/* Universal pressed/armed accent — any element advertising aria-pressed=true
+ * or data-active=true gets the Excel green inset highlight if nothing
+ * more specific overrides. Specific selectors above still win on cascade. */
+.spreadsheet-menu-bar button[aria-pressed='true'],
+.spreadsheet-toolbar button[aria-pressed='true'],
+.spreadsheet-status-bar button[aria-pressed='true'] {
+  box-shadow: inset 0 -2px 0 0 var(--excel-green);
 }
