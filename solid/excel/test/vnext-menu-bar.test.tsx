@@ -1,0 +1,257 @@
+/** @jsxImportSource solid-js */
+
+import { afterEach, describe, expect, it } from '@jest/globals'
+import { createStore } from '@einfach/core'
+import { cleanup, fireEvent, render } from '@solidjs/testing-library'
+import {
+  findReplaceOpenAtom,
+  historyStackAtom,
+  MENU_BAR_ITEMS,
+  openTopMenuAtom,
+  printPreviewOpenAtom,
+  selectionAtom,
+  topMenuOpenAtom,
+  type SpreadsheetBackend,
+} from '@einfach/spreadsheet-ui-core'
+import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
+
+afterEach(cleanup)
+
+function createBaseBackend(): SpreadsheetBackend {
+  return {
+    async readVisibleProjection() {
+      throw new Error('not used')
+    },
+    async readRangeProjection() {
+      throw new Error('not used')
+    },
+    async setCellInput() {
+      throw new Error('not used')
+    },
+  }
+}
+
+function setupSelection(store: ReturnType<typeof createStore>) {
+  store.setter(selectionAtom, {
+    kind: 'cell',
+    sheetId: 'sheet-1',
+    anchor: { row: 0, col: 0 },
+    focus: { row: 0, col: 0 },
+  })
+}
+
+describe('SpreadsheetMenuBar', () => {
+  it('renders the seven top-level menu buttons in the expected order', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    const buttons = container.querySelectorAll('[data-testid^="menu-bar-button-"]')
+    expect(buttons).toHaveLength(7)
+    const ids = MENU_BAR_ITEMS.map((m) => m.id)
+    expect(ids).toEqual(['file', 'edit', 'insert', 'format', 'data', 'view', 'help'])
+  })
+
+  it('clicking File renders the File dropdown', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(container.querySelector('[data-testid="menu-bar-dropdown-file"]')).toBeNull()
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    expect(container.querySelector('[data-testid="menu-bar-dropdown-file"]')).not.toBeNull()
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'file' })
+  })
+
+  it('Edit > Undo fires undoHistoryAtom when history has an entry', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    store.setter(historyStackAtom, {
+      entries: [
+        {
+          transactionId: 'tx1',
+          kind: 'cell.set-input',
+          sheetId: 'sheet-1',
+          projectionRevision: 1,
+        },
+      ],
+      cursor: 1,
+      inFlight: false,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.undo"]')!)
+
+    const state = store.getter(historyStackAtom)
+    expect(state.cursor).toBe(0)
+    expect(state.inFlight).toBe(true)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Edit > Find opens the find/replace dialog', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(findReplaceOpenAtom)).toBe(false)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.find"]')!)
+    expect(store.getter(findReplaceOpenAtom)).toBe(true)
+  })
+
+  it('File > Print Preview toggles printPreviewOpenAtom', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(printPreviewOpenAtom)).toBe(false)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-file.printPreview"]')!)
+    expect(store.getter(printPreviewOpenAtom)).toBe(true)
+  })
+
+  it('Esc closes an open menu', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    expect(store.getter(topMenuOpenAtom).kind).toBe('open')
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('click outside the menubar closes the open menu', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const outside = document.createElement('div')
+    outside.setAttribute('data-testid', 'outside-target')
+    document.body.appendChild(outside)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    expect(store.getter(topMenuOpenAtom).kind).toBe('open')
+
+    fireEvent.mouseDown(outside)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+    outside.remove()
+  })
+
+  it('placeholder items are disabled and do not dispatch', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    const goTo = container.querySelector('[data-testid="menu-bar-item-edit.goTo"]') as
+      | HTMLButtonElement
+      | null
+    expect(goTo).not.toBeNull()
+    expect(goTo!.disabled).toBe(true)
+    expect(goTo!.getAttribute('title')).toContain('Wave 7')
+
+    fireEvent.click(goTo!)
+    expect(store.getter(topMenuOpenAtom).kind).toBe('open')
+  })
+
+  it('Alt+F (mnemonic) opens the File menu', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    expect(store.getter(topMenuOpenAtom).kind).toBe('idle')
+    fireEvent.keyDown(document, { key: 'f', altKey: true })
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'file' })
+  })
+
+  it('hovering Edit while File is open switches focus to Edit (Excel-style)', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'file' })
+
+    fireEvent.mouseEnter(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'edit' })
+  })
+
+  it('openTopMenuAtom / topMenuOpenAtom integration: setter opens, closeTopMenuAtom returns to idle', () => {
+    const store = createStore()
+
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+    store.setter(openTopMenuAtom, 'view')
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'view' })
+  })
+
+  it('Insert > Name Manager fires openNameManagerAtom and closes menu', () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    setupSelection(store)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-insert"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-insert.nameManager"]')!)
+
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+})
