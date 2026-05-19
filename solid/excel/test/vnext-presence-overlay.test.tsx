@@ -235,4 +235,50 @@ describe('SpreadsheetPresenceOverlay', () => {
     ) as HTMLElement | null
     expect(marker?.getAttribute('data-selection-kind')).toBe('row')
   })
+
+  it('reflects participant color and cursor position updates on the existing marker', async () => {
+    const store = createStore()
+    const backend = createBaseBackend()
+    joinParticipant(store, 'alice', 'Alice', '#ff0000', 1_000)
+    setCursor(store, 'alice', 'sheet-1', 0, 0)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetPresenceOverlay
+          resolveCellPosition={(_sheet, row, col) => ({
+            left: col * 100,
+            top: row * 30,
+            width: 100,
+            height: 30,
+          })}
+        />
+      </SpreadsheetUiProvider>
+    ))
+
+    const initial = container.querySelector(
+      '[data-testid="presence-cursor-alice"]',
+    ) as HTMLElement | null
+    expect(initial).not.toBeNull()
+    expect(initial!.getAttribute('style') ?? '').toContain('#ff0000')
+
+    // Update participant color via re-join with the same id.
+    joinParticipant(store, 'alice', 'Alice', '#0000ff', 2_000)
+    await waitFor(() => {
+      const marker = container.querySelector(
+        '[data-testid="presence-cursor-alice"]',
+      ) as HTMLElement | null
+      expect(marker?.getAttribute('style') ?? '').toContain('#0000ff')
+    })
+
+    // Move the cursor; the rendered position should follow.
+    setCursor(store, 'alice', 'sheet-1', 4, 7)
+    await waitFor(() => {
+      const marker = container.querySelector(
+        '[data-testid="presence-cursor-alice"]',
+      ) as HTMLElement | null
+      const style = marker?.getAttribute('style') ?? ''
+      expect(style).toContain('left: 700px')
+      expect(style).toContain('top: 120px')
+    })
+  })
 })

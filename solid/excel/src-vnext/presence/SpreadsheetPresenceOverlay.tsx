@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { For, Show } from 'solid-js'
+import { createMemo, For, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   presenceStateAtom,
@@ -110,9 +110,9 @@ export function SpreadsheetPresenceOverlay(props: SpreadsheetPresenceOverlayProp
     >
       <For each={visibleCursors()}>
         {(cursor) => {
-          const participant = participantFor(cursor.participantId)
-          const pos = positionFor(cursor)
-          const color = participant?.colorHint ?? '#888888'
+          const participant = createMemo(() => participantFor(cursor.participantId))
+          const pos = createMemo(() => positionFor(cursor))
+          const color = createMemo(() => participant()?.colorHint ?? '#888888')
           return (
             <div
               class={`presence-cursor ${props.cursorClass ?? ''}`.trim()}
@@ -122,26 +122,26 @@ export function SpreadsheetPresenceOverlay(props: SpreadsheetPresenceOverlayProp
               data-selection-kind={cursor.selection.kind}
               style={{
                 position: 'absolute',
-                left: `${pos.left}px`,
-                top: `${pos.top}px`,
-                width: `${pos.width}px`,
-                height: `${pos.height}px`,
-                '--presence-color': color,
-                'border-color': color,
+                left: `${pos().left}px`,
+                top: `${pos().top}px`,
+                width: `${pos().width}px`,
+                height: `${pos().height}px`,
+                '--presence-color': color(),
+                'border-color': color(),
               }}
             >
               <div
                 class={`presence-selection ${props.selectionClass ?? ''}`.trim()}
                 data-testid={`presence-selection-${cursor.participantId}`}
-                style={{ 'background-color': color, opacity: '0.15' }}
+                style={{ 'background-color': color(), opacity: '0.15' }}
               />
-              <Show when={participant}>
+              <Show when={participant()}>
                 {(p) => (
                   <span
                     class={`presence-label ${props.labelClass ?? ''}`.trim()}
                     data-testid={`presence-label-${cursor.participantId}`}
                     data-last-seen-at={p().lastSeenAt}
-                    style={{ 'background-color': color, color: '#ffffff' }}
+                    style={{ 'background-color': color(), color: '#ffffff' }}
                   >
                     {p().displayName}
                   </span>
