@@ -1,4 +1,5 @@
 import {
+  CLIPBOARD_ORIGIN_MARKER_PREFIX,
   cancelEditingAtom,
   cancelPointerAtom,
   commitPointerAtom,
@@ -216,6 +217,7 @@ function getCellInputForFill(cell: DisplayCell | undefined): string {
 const MAX_UI_FILL_FALLBACK_CELLS = 200
 const AUTO_FIT_CELL_PADDING_PX = 16
 const AUTO_FIT_ROW_PADDING_PX = 4
+const CLIPBOARD_CELL_LIMIT = 10_000
 
 function clampDimension(value: number, min: number, max: number) {
   if (!Number.isFinite(value)) {
@@ -1148,41 +1150,91 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     const range = selection.range
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const result = await backend.readRangeProjection({
-      kind: 'range',
-      sheetId: props.sheetId,
-      requestId,
-      reason: 'clipboard',
-      range,
-    })
+    const cellCount =
+      (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
+    const originAddr = `${getColumnLabel(range.colStart)}${range.rowStart + 1}`
 
-    const cells: string[][] = []
-    const cellsByKey = new Map<string, (typeof result.cells)[number]>()
-    for (const cell of result.cells) {
-      cellsByKey.set(`${cell.row}:${cell.col}`, cell)
-    }
-    for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
-      const fields: string[] = []
-      for (let col = range.colStart; col <= range.colEnd; col += 1) {
-        const cell = cellsByKey.get(`${row}:${col}`)
-        fields.push(cell?.formula ?? cell?.displayValue ?? '')
+    let text: string
+    let transferInput: ClipboardTransferInput
+
+    if (cellCount > CLIPBOARD_CELL_LIMIT) {
+      const streamRequest = {
+        kind: 'export-range-tsv' as const,
+        sheetId: props.sheetId,
+        range,
+        requestId: store.setter(advanceSpreadsheetProjectionRequestIdAtom),
       }
-      cells.push(fields)
-    }
+      const chunks: string[] = []
+      let streamResult:
+        | Awaited<ReturnType<NonNullable<typeof backend.consumeExportRangeTsvChunks>>>
+        | Awaited<ReturnType<NonNullable<typeof backend.exportRangeTsv>>>
+        | null = null
+      if (backend.consumeExportRangeTsvChunks) {
+        streamResult = await backend.consumeExportRangeTsvChunks(streamRequest, (chunk) => {
+          chunks.push(chunk.text)
+        })
+      } else if (backend.exportRangeTsv) {
+        streamResult = await backend.exportRangeTsv(streamRequest)
+        chunks.push(streamResult.text)
+      } else {
+        store.setter(setClipboardErrorAtom, {
+          code: 'BACKEND_ERROR',
+          message: `Clipboard range is too large: ${cellCount} cells. Backend streaming export unavailable.`,
+        })
+        return
+      }
+      const resolvedOrigin = streamResult?.originAddr ?? originAddr
+      text = `${CLIPBOARD_ORIGIN_MARKER_PREFIX}${resolvedOrigin}\n${chunks.join('\n')}`
+      const plan = createClipboardTsvPastePlan({
+        text,
+        fallbackOriginAddr: resolvedOrigin,
+        targetOrigin: { row: range.rowStart, col: range.colStart },
+      })
+      transferInput = {
+        source: { sheetId: props.sheetId, range },
+        serialization: 'tab-separated',
+        includesFormulas: plan.includesFormulas,
+        includesErrors: false,
+        estimatedBytes: streamResult?.estimatedBytes ?? text.length,
+        revision: streamResult?.revision ?? undefined,
+      }
+    } else {
+      const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+      const result = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId: props.sheetId,
+        requestId,
+        reason: 'clipboard',
+        range,
+      })
 
-    const text = serializeClipboardTsv({
-      originAddr: `${String.fromCharCode(65 + range.colStart)}${range.rowStart + 1}`,
-      cells,
-    })
+      const cells: string[][] = []
+      const cellsByKey = new Map<string, (typeof result.cells)[number]>()
+      for (const cell of result.cells) {
+        cellsByKey.set(`${cell.row}:${cell.col}`, cell)
+      }
+      for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+        const fields: string[] = []
+        for (let col = range.colStart; col <= range.colEnd; col += 1) {
+          const cell = cellsByKey.get(`${row}:${col}`)
+          fields.push(cell?.formula ?? cell?.displayValue ?? '')
+        }
+        cells.push(fields)
+      }
 
-    const transferInput: ClipboardTransferInput = {
-      source: { sheetId: props.sheetId, range },
-      serialization: 'tab-separated',
-      includesFormulas: cells.some((row) => row.some((f) => f.startsWith('='))),
-      includesErrors: result.cells.some((c) => c.valueKind === 'error' || !!c.error),
-      estimatedBytes: text.length,
-      revision: result.revision ?? undefined,
+      text = serializeClipboardTsv({
+        originAddr,
+        cells,
+      })
+
+      transferInput = {
+        source: { sheetId: props.sheetId, range },
+        serialization: 'tab-separated',
+        includesFormulas: cells.some((row) => row.some((f) => f.startsWith('='))),
+        includesErrors: result.cells.some((c) => c.valueKind === 'error' || !!c.error),
+        estimatedBytes: text.length,
+        revision: result.revision ?? undefined,
+      }
     }
 
     store.setter(operation === 'cut' ? cutClipboardAtom : copyClipboardAtom, transferInput)
@@ -1213,7 +1265,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const targetOrigin = { row: selection.activeCell.row, col: selection.activeCell.col }
     const plan = createClipboardTsvPastePlan({
       text,
-      fallbackOriginAddr: `${String.fromCharCode(65 + targetOrigin.col)}${targetOrigin.row + 1}`,
+      fallbackOriginAddr: `${getColumnLabel(targetOrigin.col)}${targetOrigin.row + 1}`,
       targetOrigin,
     })
     const pasteRange = plan.estimatedRange

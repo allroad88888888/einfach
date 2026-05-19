@@ -9,6 +9,9 @@ import type {
   FillRangeRequest,
   RangeProjectionRequest,
   RangeProjectionResult,
+  RangeTsvChunkExportResult,
+  RangeTsvExportRequest,
+  RangeTsvExportResult,
   ResolveDataEdgeRequest,
   SpreadsheetBackend,
   VisibleProjectionRequest,
@@ -22,6 +25,7 @@ import {
   selectionAtom,
   selectionRegionsAtom,
   addSelectionRegionAtom,
+  selectRowsAtom,
   setSheetTabsSheetsAtom,
   setWorkspaceActiveSheetAtom,
   viewportHiddenAtom,
@@ -1779,5 +1783,288 @@ describe('vNext SpreadsheetGrid', () => {
     const cursorEl = container.querySelector('[data-testid="remote-cursor-user-42"]') as HTMLElement
     expect(cursorEl.style.border).toContain('#ff0000')
     expect(cursorEl.style.position).toBe('absolute')
+  })
+
+  it('Ctrl+C origin marker uses correct A1 label for columns at AA boundary', async () => {
+    const store = createStore()
+    const rangeRequests: RangeProjectionRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.readRangeProjection = async (request) => {
+      rangeRequests.push(request)
+      return {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        cells: [],
+      }
+    }
+
+    const writeText = jest.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 2,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 30,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    // Select cell at col index 26 (AA) row 0
+    store.setter(addSelectionRegionAtom, {
+      region: {
+        kind: 'cell',
+        sheetId: 'sheet-1',
+        anchor: { row: 0, col: 26 },
+        focus: { row: 0, col: 26 },
+      },
+    })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'c',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1)
+    })
+    const written = writeText.mock.calls[0][0]
+    expect(written).toContain('AA1')
+    expect(written).not.toContain('[1')
+  })
+
+  it('Ctrl+C on a full-row selection uses the streaming export path, not in-memory materialization', async () => {
+    const store = createStore()
+    const streamCalls: RangeTsvExportRequest[] = []
+    const rangeRequests: RangeProjectionRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.readRangeProjection = async (request) => {
+      rangeRequests.push(request)
+      return {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        cells: [],
+      }
+    }
+    backend.consumeExportRangeTsvChunks = async (request, onChunk) => {
+      streamCalls.push(request)
+      // emit two small chunks; do NOT materialize a full row in memory
+      onChunk({ startRow: 0, endRow: 0, text: 'one\ttwo\tthree' })
+      const result: RangeTsvChunkExportResult = {
+        kind: 'range-tsv-chunks',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        originAddr: 'A1',
+        estimatedBytes: 13,
+      }
+      return result
+    }
+
+    const writeText = jest.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 16_384,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    // Full-row selection spans the entire column range (16_384 cells).
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 0, rowFocus: 0 })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'c',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1)
+    })
+
+    // Streaming path was used.
+    expect(streamCalls).toHaveLength(1)
+    expect(streamCalls[0].range).toEqual({
+      rowStart: 0,
+      rowEnd: 0,
+      colStart: 0,
+      colEnd: 16_383,
+    })
+    // Non-streaming path was NOT used.
+    expect(rangeRequests).toHaveLength(0)
+    expect(store.getter(clipboardStateAtom).status).toBe('ready')
+  })
+
+  it('Ctrl+C on full-row selection without streaming backend surfaces a clipboard error', async () => {
+    const store = createStore()
+    const rangeRequests: RangeProjectionRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.readRangeProjection = async (request) => {
+      rangeRequests.push(request)
+      return {
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        cells: [],
+      }
+    }
+    // no consumeExportRangeTsvChunks / exportRangeTsv on backend
+
+    const writeText = jest.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 16_384,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 0, rowFocus: 0 })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'c',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(store.getter(clipboardStateAtom).error).not.toBeNull()
+    })
+    expect(rangeRequests).toHaveLength(0)
+    expect(writeText).not.toHaveBeenCalled()
+  })
+
+  it('Ctrl+C on a full-row selection via exportRangeTsv fallback when only that is available', async () => {
+    const store = createStore()
+    const exportCalls: RangeTsvExportRequest[] = []
+    const { backend } = createFakeBackend()
+    backend.readRangeProjection = async (request) => ({
+      kind: 'range',
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      revision: request.revision,
+      range: request.range,
+      cells: [],
+    })
+    backend.exportRangeTsv = async (request) => {
+      exportCalls.push(request)
+      const result: RangeTsvExportResult = {
+        kind: 'range-tsv',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        range: request.range,
+        originAddr: 'A1',
+        text: 'short',
+        estimatedBytes: 5,
+      }
+      return result
+    }
+
+    const writeText = jest.fn<(text: string) => Promise<void>>().mockResolvedValue(undefined)
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    })
+
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 4,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 4,
+      colCount: 16_384,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell').length).toBeGreaterThan(0)
+    })
+
+    store.setter(selectRowsAtom, { sheetId: 'sheet-1', rowAnchor: 0, rowFocus: 0 })
+
+    fireEvent.keyDown(container.querySelector('[data-testid="grid"]')!, {
+      key: 'c',
+      ctrlKey: true,
+    })
+
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledTimes(1)
+    })
+    expect(exportCalls).toHaveLength(1)
   })
 })
