@@ -672,6 +672,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeShowHeadings?.()
     unsubscribeSelection?.()
     unsubscribeEditing?.()
+    activeDragSelectCleanup?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
     store.setter(cancelPointerAtom)
@@ -913,6 +914,65 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     })
     bumpRender()
     focusGrid()
+  }
+
+  let activeDragSelectCleanup: (() => void) | null = null
+
+  function startDragSelection(event: PointerEvent, row: number, col: number) {
+    if (event.button !== 0) return
+    if (event.shiftKey || event.ctrlKey || event.metaKey) return
+    event.preventDefault()
+    activeDragSelectCleanup?.()
+    activeFillCleanup?.()
+    activeResizeCleanup?.()
+
+    const anchor: CellCoord = { row, col }
+    store.setter(selectCellAtom, {
+      sheetId: props.sheetId,
+      coord: anchor,
+      extend: false,
+    })
+    store.setter(startPointerAtom, {
+      kind: 'drag-selection',
+      sheetId: props.sheetId,
+      anchor,
+      focus: anchor,
+      source: 'pointer',
+    })
+    bumpRender()
+    focusGrid()
+
+    let lastFocus = anchor
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const focus = getCellCoordFromPoint(moveEvent)
+      if (!focus) return
+      if (focus.row === lastFocus.row && focus.col === lastFocus.col) return
+      lastFocus = focus
+      store.setter(selectCellAtom, {
+        sheetId: props.sheetId,
+        coord: focus,
+        extend: true,
+      })
+      store.setter(updatePointerAtom, { kind: 'drag-selection', focus })
+      bumpRender()
+    }
+
+    const onPointerUp = () => {
+      store.setter(commitPointerAtom)
+      cleanup()
+      bumpRender()
+    }
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+      activeDragSelectCleanup = null
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp, { once: true })
+    activeDragSelectCleanup = cleanup
   }
 
   function isActive(row: number, col: number) {
@@ -1898,6 +1958,26 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(presenceStateAtom).participants.find((p) => p.id === participantId)?.colorHint
   }
 
+  function findMergeAnchorCovering(
+    row: number,
+    col: number,
+  ): { el: HTMLElement; row: number; col: number; rowspan: number; colspan: number } | null {
+    if (!gridRoot) return null
+    const anchors = gridRoot.querySelectorAll<HTMLElement>(
+      'td.spreadsheet-grid-cell[data-merge-anchor="true"]',
+    )
+    for (const el of anchors) {
+      const ar = Number(el.dataset.row)
+      const ac = Number(el.dataset.col)
+      const rs = Number(el.getAttribute('rowspan') ?? 1) || 1
+      const cs = Number(el.getAttribute('colspan') ?? 1) || 1
+      if (row >= ar && row < ar + rs && col >= ac && col < ac + cs) {
+        return { el, row: ar, col: ac, rowspan: rs, colspan: cs }
+      }
+    }
+    return null
+  }
+
   function getOverlayCellRect(row: number, col: number): { x: number; y: number; w: number; h: number } | null {
     if (!gridRoot) return null
     const td = gridRoot.querySelector(
@@ -1911,6 +1991,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         y: cellRect.top - rootRect.top,
         w: cellRect.width,
         h: cellRect.height,
+      }
+    }
+
+    // Covered by a merge: return the anchor's full rendered rect so overlays
+    // (selection outline, active-cell highlight) snap to the visible merge
+    // boundary instead of a phantom sub-cell position.
+    const anchor = findMergeAnchorCovering(row, col)
+    if (anchor) {
+      const rootRect = gridRoot.getBoundingClientRect()
+      const anchorRect = anchor.el.getBoundingClientRect()
+      return {
+        x: anchorRect.left - rootRect.left,
+        y: anchorRect.top - rootRect.top,
+        w: anchorRect.width,
+        h: anchorRect.height,
       }
     }
 
@@ -2176,7 +2271,6 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               if (!event.shiftKey || event.ctrlKey || event.metaKey) {
                                 return
                               }
-
                               event.preventDefault()
                               store.setter(selectCellAtom, {
                                 sheetId: props.sheetId,
@@ -2185,6 +2279,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                               })
                               bumpRender()
                               focusGrid()
+                            }}
+                            onPointerDown={(event) => {
+                              if (event.pointerType === 'mouse' && event.button !== 0) return
+                              if (event.shiftKey || event.ctrlKey || event.metaKey) return
+                              startDragSelection(event, row, col)
                             }}
                             onDblClick={() => {
                               startEditingCell(row, col, 'cell')

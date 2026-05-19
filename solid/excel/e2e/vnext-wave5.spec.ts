@@ -262,6 +262,26 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     })
   })
 
+  test.describe('drag-select (Excel parity)', () => {
+    test('pointer drag from B2 to C3 selects B2:C3 without holding Shift', async ({ page }) => {
+      await gotoWave5(page)
+      const start = cell(page, 'B2')
+      const end = cell(page, 'C3')
+      const sb = await start.boundingBox()
+      const eb = await end.boundingBox()
+      if (!sb || !eb) throw new Error('cells not visible')
+      await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2)
+      await page.mouse.down()
+      await page.mouse.move(eb.x + eb.width / 2, eb.y + eb.height / 2, { steps: 5 })
+      await page.mouse.up()
+
+      for (const addr of ['B2', 'C2', 'B3', 'C3']) {
+        await expect(cell(page, addr)).toHaveAttribute('data-selected', 'true')
+      }
+      await expect(page.getByTestId('toolbar-btn-merge-cells')).toBeEnabled()
+    })
+  })
+
   test.describe('merge / unmerge (toolbar)', () => {
     const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge-cells')
     const unmergeBtn = (page: Page) => page.getByTestId('toolbar-btn-unmerge-cells')
