@@ -228,9 +228,9 @@ const FORMAT_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'format.cells',
     label: 'menuBar.format.cells',
-    dispatch: { kind: 'placeholder', reason: 'menuBar.placeholder.wave6' },
-    isAvailable: 'placeholder',
-    placeholderMessage: 'menuBar.placeholder.wave6',
+    accessKey: 'E',
+    dispatch: { kind: 'open-format-cells' },
+    isAvailable: 'always',
   },
   { kind: 'separator', id: 'format.sep-1' },
   {

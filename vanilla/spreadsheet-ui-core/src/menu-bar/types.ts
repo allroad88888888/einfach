@@ -47,6 +47,7 @@ export type MenuItemDispatch =
   | { kind: 'open-comment-session' }
   | { kind: 'open-conditional-format' }
   | { kind: 'open-data-validation' }
+  | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
   | { kind: 'insert-row-above' }
   | { kind: 'insert-row-below' }

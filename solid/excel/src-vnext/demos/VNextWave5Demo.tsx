@@ -11,6 +11,7 @@ import { SpreadsheetContextMenu } from '../context-menu'
 import { SpreadsheetDataValidationDialog } from '../data-validation'
 import { SpreadsheetFilterDropdown } from '../filter-sort'
 import { SpreadsheetFindReplaceDialog } from '../find-replace'
+import { SpreadsheetFormatCellsDialog } from '../format-cells'
 import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
@@ -128,6 +129,7 @@ function VNextWave5Workbook() {
       <SpreadsheetStatusBar data-testid="wave5-status-bar" />
       <SpreadsheetContextMenu data-testid="wave5-context-menu" />
       <SpreadsheetFormatPainter data-testid="wave5-format-painter" />
+      <SpreadsheetFormatCellsDialog data-testid="wave5-format-cells" />
       <SpreadsheetFindReplaceDialog data-testid="wave5-find-replace" />
       <SpreadsheetFilterDropdown data-testid="wave5-filter-dropdown" />
       <SpreadsheetConditionalFormatDialog data-testid="wave5-conditional-format" />

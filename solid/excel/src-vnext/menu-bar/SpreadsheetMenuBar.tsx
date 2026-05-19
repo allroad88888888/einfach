@@ -14,6 +14,7 @@ import {
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
   openFindReplaceAtom,
+  openFormatCellsAtom,
   openNameManagerAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
@@ -170,6 +171,16 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'open-data-validation':
         store.setter(openValidationRuleEditorAtom, {})
         return
+      case 'open-format-cells': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        store.setter(openFormatCellsAtom, {
+          sheetId,
+          range: snap.range,
+        })
+        return
+      }
       case 'open-filter-dropdown': {
         const snap = store.getter(selectionSnapshotAtom)
         const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
