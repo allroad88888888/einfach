@@ -118,10 +118,16 @@ function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
   return (
     !format.bold &&
     !format.italic &&
+    !format.underline &&
+    !format.strikethrough &&
+    !format.wrap &&
     (format.align === undefined || format.align === 'default') &&
+    (format.verticalAlign === undefined) &&
     format.fontSize === undefined &&
     (format.fgColor === undefined || format.fgColor.length === 0) &&
     (format.bgColor === undefined || format.bgColor.length === 0) &&
+    (format.indent === undefined || format.indent === 0) &&
+    (format.rotation === undefined || format.rotation === 0) &&
     numberFormatIsDefault
   )
 }

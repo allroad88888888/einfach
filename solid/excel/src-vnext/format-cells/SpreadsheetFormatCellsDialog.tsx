@@ -20,6 +20,11 @@ import {
   type SpreadsheetVerticalAlignment,
 } from '@einfach/spreadsheet-ui-core'
 import { useT } from '../../src/i18n'
+import {
+  advanceSpreadsheetProjectionRequestIdAtom,
+  isVisibleProjectionResult,
+  spreadsheetProjectionSnapshotAtom,
+} from '../provider/atoms'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 
 export interface SpreadsheetFormatCellsDialogProps {
@@ -214,6 +219,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
           range: payload.range,
           format: payload.format,
         })
+        await refreshProjectionAfterFormat(payload.sheetId)
       } catch {
         // Surface failure by leaving the editor open. A production build
         // would dispatch a diagnostic atom; we omit the console log to comply
@@ -222,6 +228,37 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
       }
     }
     store.setter(saveFormatCellsAtom)
+  }
+
+  async function refreshProjectionAfterFormat(sheetId: string) {
+    if (!backend.readVisibleProjection) return
+    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
+    if (!isVisibleProjectionResult(snapshot.result)) return
+    const window = snapshot.result.window
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    try {
+      const result = await backend.readVisibleProjection({
+        kind: 'visible-window',
+        sheetId,
+        requestId,
+        reason: 'toolbar',
+        window,
+      })
+      store.setter(spreadsheetProjectionSnapshotAtom, {
+        status: 'ready',
+        request: {
+          kind: 'visible-window',
+          sheetId,
+          requestId,
+          reason: 'toolbar',
+          window,
+        },
+        result,
+        error: undefined,
+      })
+    } catch {
+      // Read failure — leave existing snapshot. Caller already handled save.
+    }
   }
 
   function onCategoryChange(category: FormatCellsNumberCategory) {

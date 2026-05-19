@@ -77,7 +77,9 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     label: 'toolbar.numberFormat',
     title: 'toolbar.numberFormat.title',
     testId: 'toolbar-btn-number-format',
-    value: 'General',
+    // Default toolbar press applies a decimal-2 number format. Use the Format
+    // Cells dialog (or future dropdown) for non-Number variants.
+    value: 'Number',
     isEnabled: (availability) => availability.numberFormat,
   },
 ]

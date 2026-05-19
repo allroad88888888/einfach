@@ -134,6 +134,10 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (format.fgColor) style['color'] = format.fgColor
   if (format.bold) style['font-weight'] = '700'
   if (format.italic) style['font-style'] = 'italic'
+  const decorations: string[] = []
+  if (format.underline) decorations.push('underline')
+  if (format.strikethrough) decorations.push('line-through')
+  if (decorations.length > 0) style['text-decoration'] = decorations.join(' ')
   if (format.align && format.align !== 'default') {
     if (format.align === 'distributed') {
       style['text-align'] = 'justify'
