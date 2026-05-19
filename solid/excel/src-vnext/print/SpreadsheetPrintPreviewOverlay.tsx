@@ -1,5 +1,6 @@
-import { Show } from 'solid-js'
+import { Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   DEFAULT_PRINT_CONFIG,
   printConfigStateAtom,
@@ -27,10 +28,23 @@ function scaleText(config: PrintConfig): string {
 }
 
 export function SpreadsheetPrintPreviewOverlay(props: SpreadsheetPrintPreviewOverlayProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const previewOpen = useAtomValue(printPreviewOpenAtom)
   const printConfigState = useAtomValue(printConfigStateAtom)
   const workspaceSession = useAtomValue(workspaceSessionAtom)
+
+  createEffect(() => {
+    if (!previewOpen()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(togglePrintPreviewAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   const activeSheetId = () => workspaceSession().activeSheetId ?? ''
 
@@ -51,7 +65,18 @@ export function SpreadsheetPrintPreviewOverlay(props: SpreadsheetPrintPreviewOve
         class={`print-preview-overlay spreadsheet-print-preview ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'print-preview-overlay'}
         data-sheet-id={activeSheetId()}
+        role="dialog"
+        aria-label="Print preview"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={() => closePreview()}
+        >
+          ×
+        </button>
         <div
           class="print-preview-orientation"
           data-testid="print-orientation-text"

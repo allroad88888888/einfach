@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { For, Show, createMemo } from 'solid-js'
+import { For, Show, createEffect, createMemo, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   closeFormatCellsAtom,
@@ -179,6 +179,18 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
 
   const currentCategory = createMemo(() => detectCategory(draft()))
 
+  createEffect(() => {
+    if (!isOpen()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeFormatCellsAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
+
   function patch(next: Partial<FormatCellsDraft>) {
     store.setter(patchFormatCellsDraftAtom, next)
   }
@@ -309,6 +321,15 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
         aria-modal="true"
         aria-label="Format Cells"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={handleCancel}
+        >
+          ×
+        </button>
         <div class="format-cells-tabs" role="tablist" data-testid="format-cells-tabs">
           <For each={TABS}>
             {(tab) => (

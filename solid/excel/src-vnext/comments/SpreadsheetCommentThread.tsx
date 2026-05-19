@@ -1,5 +1,6 @@
-import { Show } from 'solid-js'
+import { Show, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   closeCommentSessionAtom,
   commentEditorDraftAtom,
@@ -14,10 +15,23 @@ export interface SpreadsheetCommentThreadProps {
 }
 
 export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const session = useAtomValue(commentSessionAtom)
   const draft = useAtomValue(commentEditorDraftAtom)
+
+  createEffect(() => {
+    if (session() === null) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeCommentSessionAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   function cellLabel() {
     const s = session()
@@ -65,7 +79,18 @@ export function SpreadsheetCommentThread(props: SpreadsheetCommentThreadProps) {
       <div
         class={`comment-thread spreadsheet-comment-thread ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'comment-thread'}
+        role="dialog"
+        aria-label="Comment thread"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={handleClose}
+        >
+          ×
+        </button>
         <span class="comment-thread-cell" data-testid="comment-thread-cell">
           {session()?.sheetId} · {cellLabel()}
         </span>

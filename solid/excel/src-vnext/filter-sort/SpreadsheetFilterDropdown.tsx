@@ -1,5 +1,6 @@
-import { Show, createEffect, createMemo, createSignal, on } from 'solid-js'
+import { Show, createEffect, createMemo, createSignal, on, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   clearColumnFilterSortAtom,
   closeFilterDropdownAtom,
@@ -25,6 +26,7 @@ export interface SpreadsheetFilterDropdownProps {
 const EMPTY_STATE: FilterSortState = { rules: [], directives: [] }
 
 export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const dropdown = useAtomValue(filterDropdownAtom)
@@ -108,6 +110,18 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
     store.setter(closeFilterDropdownAtom)
   }
 
+  createEffect(() => {
+    if (!isOpen()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeFilterDropdownAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
+
   return (
     <Show when={isOpen()}>
       <div
@@ -115,7 +129,18 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
         data-testid={props['data-testid'] ?? 'filter-dropdown'}
         data-sheet-id={sheetId()}
         data-col-index={colIndex()}
+        role="dialog"
+        aria-label="Filter and sort"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={() => close()}
+        >
+          ×
+        </button>
         <div class="filter-dropdown-rules">
           {currentRulesForCol().map((rule, i) => (
             <div class="filter-rule" data-rule-index={i} data-rule-kind={rule.kind}>

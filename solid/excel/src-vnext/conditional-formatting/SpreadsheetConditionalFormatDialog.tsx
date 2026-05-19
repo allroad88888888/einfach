@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createSignal, createEffect } from 'solid-js'
+import { Show, For, createSignal, createEffect, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   conditionalFormatEditorAtom,
   conditionalFormatRulesCacheAtom,
@@ -53,6 +54,7 @@ function defaultDraftForKind(kind: ConditionalFormatRuleKind): ConditionalFormat
 export function SpreadsheetConditionalFormatDialog(
   props: SpreadsheetConditionalFormatDialogProps,
 ) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(conditionalFormatEditorAtom)
@@ -75,6 +77,18 @@ export function SpreadsheetConditionalFormatDialog(
     }
     return open
   }, false)
+
+  createEffect(() => {
+    if (!isEditing()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeConditionalFormatEditorAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   function currentKind(): ConditionalFormatRuleKind {
     const draft = editor().draft
@@ -163,6 +177,15 @@ export function SpreadsheetConditionalFormatDialog(
         aria-modal="true"
         aria-label="Conditional formatting"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={close}
+        >
+          ×
+        </button>
         <ul data-testid="cf-rule-list">
           <For each={rulesCache().rules}>
             {(entry) => (

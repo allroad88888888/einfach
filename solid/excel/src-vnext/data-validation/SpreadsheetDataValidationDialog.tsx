@@ -1,5 +1,6 @@
-import { Show, createSignal } from 'solid-js'
+import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   closeValidationRuleEditorAtom,
   validationRuleEditorAtom,
@@ -35,11 +36,24 @@ function rangeLabel(range: CellRange | undefined): string {
 }
 
 export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidationDialogProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(validationRuleEditorAtom)
 
   const isEditing = () => editor().status === 'editing'
+
+  createEffect(() => {
+    if (!isEditing()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeValidationRuleEditorAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   const [kind, setKind] = createSignal<ValidationRuleKind>('list')
   const [mode, setMode] = createSignal<ValidationMode>('warn')
@@ -105,7 +119,18 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
       <div
         class={`validation-dialog spreadsheet-validation-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'validation-dialog'}
+        role="dialog"
+        aria-label="Data validation"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={handleCancel}
+        >
+          ×
+        </button>
         <span class="validation-range" data-testid="validation-range">
           {rangeLabel(editor().range)}
         </span>

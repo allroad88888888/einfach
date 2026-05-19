@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { Show, createEffect, createSignal } from 'solid-js'
+import { Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   closeProtectionUnlockAtom,
   issueProtectionUnlockSyncTicketAtom,
@@ -27,6 +28,7 @@ export interface SpreadsheetProtectionUnlockDialogProps {
 }
 
 export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUnlockDialogProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const state = useAtomValue(protectionUnlockStateAtom)
@@ -40,6 +42,18 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
     }
     return open
   }, false)
+
+  createEffect(() => {
+    if (!state().isOpen) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        handleClose()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   function handleClose() {
     // Advance the ticket so any in-flight unlock resolves into a no-op
@@ -122,6 +136,15 @@ export function SpreadsheetProtectionUnlockDialog(props: SpreadsheetProtectionUn
         aria-modal="true"
         aria-label="Unlock protected range"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={handleClose}
+        >
+          ×
+        </button>
         <div class="protection-unlock-row">
           <span class="protection-unlock-target" data-testid="protection-unlock-target">
             {targetLabel()}

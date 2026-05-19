@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createEffect, createSignal } from 'solid-js'
+import { Show, For, createEffect, createSignal, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   nameManagerEditorAtom,
   nameRegistryCacheAtom,
@@ -29,6 +30,7 @@ function stringToScope(value: string): NamedRangeScope {
 }
 
 export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
+  const t = useT()
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const editor = useAtomValue(nameManagerEditorAtom)
@@ -36,6 +38,18 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const sheets = useAtomValue(sheetTabsSheetsAtom)
 
   const isOpen = () => editor().status !== 'closed'
+
+  createEffect(() => {
+    if (!isOpen()) return
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.stopPropagation()
+        store.setter(closeNameManagerAtom)
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    onCleanup(() => document.removeEventListener('keydown', onKeyDown))
+  })
 
   const [name, setName] = createSignal('')
   const [scope, setScope] = createSignal<string>('workbook')
@@ -154,6 +168,15 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
         aria-modal="true"
         aria-label="Name Manager"
       >
+        <button
+          type="button"
+          class="dialog-close-x"
+          data-testid="dialog-close-x"
+          aria-label={t('dialog.close.label')}
+          onClick={handleClose}
+        >
+          ×
+        </button>
         <ul data-testid="name-list">
           <For each={registry()}>
             {(entry) => (
