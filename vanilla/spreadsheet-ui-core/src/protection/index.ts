@@ -168,3 +168,68 @@ export const selectionLockedAtom = atom((get): 'open' | 'locked' | 'partial' => 
   return 'locked'
 })
 selectionLockedAtom.debugLabel = 'spreadsheet.protection.selectionLocked'
+
+// --- unlock dialog UI state ---
+
+export interface ProtectionUnlockTarget {
+  sheetId: string
+  range?: CellRange
+}
+
+export interface ProtectionUnlockState {
+  isOpen: boolean
+  target: ProtectionUnlockTarget | null
+  pending: boolean
+  error: string | null
+}
+
+export const DEFAULT_PROTECTION_UNLOCK_STATE: ProtectionUnlockState = {
+  isOpen: false,
+  target: null,
+  pending: false,
+  error: null,
+}
+
+export const protectionUnlockStateAtom = atom<ProtectionUnlockState>(
+  DEFAULT_PROTECTION_UNLOCK_STATE,
+)
+protectionUnlockStateAtom.debugLabel = 'spreadsheet.protection.unlockState'
+
+export const protectionUnlockOpenAtom = atom((get) => get(protectionUnlockStateAtom).isOpen)
+protectionUnlockOpenAtom.debugLabel = 'spreadsheet.protection.unlockOpen'
+
+export const openProtectionUnlockAtom = atom(
+  null,
+  (_get, set, target: ProtectionUnlockTarget) => {
+    set(protectionUnlockStateAtom, {
+      isOpen: true,
+      target,
+      pending: false,
+      error: null,
+    })
+  },
+)
+openProtectionUnlockAtom.debugLabel = 'spreadsheet.protection.openUnlock'
+
+export const closeProtectionUnlockAtom = atom(null, (_get, set) => {
+  set(protectionUnlockStateAtom, DEFAULT_PROTECTION_UNLOCK_STATE)
+})
+closeProtectionUnlockAtom.debugLabel = 'spreadsheet.protection.closeUnlock'
+
+export const setProtectionUnlockPendingAtom = atom(
+  null,
+  (get, set, pending: boolean) => {
+    const prev = get(protectionUnlockStateAtom)
+    set(protectionUnlockStateAtom, { ...prev, pending, error: pending ? null : prev.error })
+  },
+)
+setProtectionUnlockPendingAtom.debugLabel = 'spreadsheet.protection.setUnlockPending'
+
+export const setProtectionUnlockErrorAtom = atom(
+  null,
+  (get, set, error: string | null) => {
+    const prev = get(protectionUnlockStateAtom)
+    set(protectionUnlockStateAtom, { ...prev, error, pending: false })
+  },
+)
+setProtectionUnlockErrorAtom.debugLabel = 'spreadsheet.protection.setUnlockError'
