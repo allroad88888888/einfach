@@ -935,3 +935,244 @@ thead .row-header {
   border-top: 1px solid #e0e4e8;
   margin: 4px 0;
 }
+
+/* ============================================================================
+ * Wave 5 — Excel-like chrome (palette + typography lock)
+ *
+ * --excel-green: Excel signature green for primary action / selection accent
+ * --office-blue: focus ring, link-like states
+ * --bg-chrome:   light gray surface for menubars / status bar
+ * --border:      hairline 1px dividers between sections
+ * --hover:       neutral hover background
+ * --active-bg:   pressed / open / armed state
+ * --select-bg:   range fill behind selection (canvas overlay matches)
+ * ========================================================================= */
+:root {
+  --excel-green: #217346;
+  --office-blue: #0078d4;
+  --bg-chrome: #f3f2f1;
+  --bg-chrome-light: #fafafa;
+  --border: #d4d4d4;
+  --border-strong: #b0b0b0;
+  --hover: #e8e8e8;
+  --active-bg: #d8d8d8;
+  --select-bg: rgba(33, 115, 70, 0.12);
+  --text-default: #1a1a1a;
+  --text-muted: #6a6a6a;
+  --excel-font:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+}
+
+/* === A. Top chrome ====================================================== */
+
+/* A.1 Menu bar — horizontal row, hover/open states, dropdown panel */
+.spreadsheet-menu-bar {
+  display: flex;
+  align-items: stretch;
+  height: 26px;
+  background: var(--bg-chrome);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--excel-font);
+  font-size: 12px;
+  user-select: none;
+  position: relative;
+  z-index: 100;
+}
+
+.spreadsheet-menu-bar .menu-bar-top {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.spreadsheet-menu-bar .menu-bar-button {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 10px;
+  border: none;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out;
+}
+
+.spreadsheet-menu-bar .menu-bar-button:hover {
+  background: var(--hover);
+}
+
+.spreadsheet-menu-bar .menu-bar-button-open {
+  background: var(--active-bg);
+}
+
+.spreadsheet-menu-bar .menu-bar-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 200px;
+  padding: 4px 0;
+  background: #ffffff;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  z-index: 200;
+}
+
+.spreadsheet-menu-bar .menu-bar-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 4px 14px;
+  border: none;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.spreadsheet-menu-bar .menu-bar-item:hover {
+  background: var(--select-bg);
+}
+
+.spreadsheet-menu-bar .menu-bar-item-disabled,
+.spreadsheet-menu-bar .menu-bar-item-disabled:hover {
+  color: #b0b0b0;
+  background: transparent;
+  cursor: default;
+}
+
+.spreadsheet-menu-bar .menu-bar-item-label {
+  flex: 1;
+}
+
+.spreadsheet-menu-bar .menu-bar-item-shortcut {
+  margin-left: 16px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.spreadsheet-menu-bar .menu-bar-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+
+/* A.2 Toolbar — button groups separated by thin dividers, icon-like look */
+.spreadsheet-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 32px;
+  padding: 0 6px;
+  background: var(--bg-chrome-light);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--excel-font);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.spreadsheet-toolbar .spreadsheet-toolbar-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 8px;
+  margin: 0 1px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.spreadsheet-toolbar .spreadsheet-toolbar-button:hover:not(:disabled) {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.spreadsheet-toolbar .spreadsheet-toolbar-button[aria-pressed='true'] {
+  background: var(--active-bg);
+  border-color: var(--border-strong);
+}
+
+.spreadsheet-toolbar .spreadsheet-toolbar-button:disabled {
+  color: #b0b0b0;
+  cursor: default;
+}
+
+/* Format Painter state colors — armed / sticky */
+.spreadsheet-toolbar
+  .spreadsheet-toolbar-button[data-format-painter-state='armed'],
+.spreadsheet-toolbar
+  .spreadsheet-toolbar-button[data-format-painter-state='sticky'] {
+  background: var(--select-bg);
+  border-color: var(--excel-green);
+  color: var(--excel-green);
+}
+
+/* A.3 Name Box + Formula Bar row */
+.spreadsheet-formula-bar {
+  display: flex;
+  align-items: stretch;
+  height: 24px;
+  background: #ffffff;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--excel-font);
+  font-size: 13px;
+}
+
+.spreadsheet-name-box {
+  display: inline-flex;
+  align-items: center;
+  min-width: 120px;
+  max-width: 160px;
+  padding: 0;
+  border-right: 1px solid var(--border);
+  background: #ffffff;
+}
+
+.spreadsheet-name-box .spreadsheet-name-box-input {
+  width: 100%;
+  height: 100%;
+  padding: 0 8px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+}
+
+.spreadsheet-name-box .spreadsheet-name-box-input:focus {
+  background: var(--select-bg);
+}
+
+.spreadsheet-name-box[data-error='true'] .spreadsheet-name-box-input {
+  background: rgba(220, 53, 69, 0.12);
+}
+
+.spreadsheet-formula-bar-input {
+  flex: 1;
+  height: 100%;
+  padding: 0 8px 0 28px;
+  border: none;
+  outline: none;
+  background: #ffffff
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext x='12' y='17' text-anchor='middle' font-family='serif' font-style='italic' font-size='14' fill='%236a6a6a'%3Efx%3C/text%3E%3C/svg%3E")
+    no-repeat 4px center;
+  background-size: 20px 20px;
+  color: var(--text-default);
+  font: inherit;
+}
+
+.spreadsheet-formula-bar-input:focus {
+  background-color: #ffffff;
+  outline: 1px solid var(--office-blue);
+  outline-offset: -1px;
+}
