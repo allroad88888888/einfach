@@ -36,9 +36,36 @@ import {
 import { spreadsheetProjectionSnapshotAtom } from '../provider'
 import { useT } from '../../src/i18n'
 
+export type SpreadsheetStatusBarSection =
+  | 'cell-address'
+  | 'selection'
+  | 'projection'
+  | 'visible-cells'
+  | 'loaded-values'
+  | 'last-command'
+  | 'aggregates'
+  | 'view-modes'
+  | 'zoom'
+  | 'mode-badge'
+
+const DEFAULT_SECTIONS: readonly SpreadsheetStatusBarSection[] = [
+  'cell-address',
+  'selection',
+  'projection',
+  'visible-cells',
+  'loaded-values',
+  'last-command',
+  'aggregates',
+  'view-modes',
+  'zoom',
+  'mode-badge',
+]
+
 export interface SpreadsheetStatusBarProps {
   class?: string
   'data-testid'?: string
+  sections?: readonly SpreadsheetStatusBarSection[]
+  orientation?: 'horizontal' | 'vertical'
 }
 
 function getColumnLabel(index: number): string {
@@ -294,35 +321,55 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
     }
   }
 
+  const sections = createMemo<readonly SpreadsheetStatusBarSection[]>(
+    () => props.sections ?? DEFAULT_SECTIONS,
+  )
+  const showSection = (section: SpreadsheetStatusBarSection) => sections().includes(section)
+  const orientation = createMemo(() => props.orientation ?? 'horizontal')
+
   return (
     <div
-      class={`spreadsheet-status-bar ${props.class ?? ''}`.trim()}
+      class={`spreadsheet-status-bar spreadsheet-status-bar--${orientation()} ${props.class ?? ''}`.trim()}
       data-testid={props['data-testid'] ?? 'spreadsheet-status-bar'}
+      data-orientation={orientation()}
     >
-      <span class="spreadsheet-status-bar-item" data-testid="status-active-cell">
-        {activeAddress()}
-      </span>
-      <span class="spreadsheet-status-bar-item" data-testid="status-selection">
-        {selectionText()}
-      </span>
-      <span class="spreadsheet-status-bar-item" data-testid="status-projection">
-        {projectionText()}
-      </span>
-      <span class="spreadsheet-status-bar-item" data-testid="status-visible-cells">
-        {visibleCellsText()}
-      </span>
-      <span class="spreadsheet-status-bar-item" data-testid="status-loaded-values">
-        {loadedValuesText()}
-      </span>
-      <span class="spreadsheet-status-bar-item" data-testid="status-last-command">
-        {commandText()}
-      </span>
+      {showSection('cell-address') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-active-cell">
+          {activeAddress()}
+        </span>
+      ) : null}
+      {showSection('selection') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-selection">
+          {selectionText()}
+        </span>
+      ) : null}
+      {showSection('projection') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-projection">
+          {projectionText()}
+        </span>
+      ) : null}
+      {showSection('visible-cells') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-visible-cells">
+          {visibleCellsText()}
+        </span>
+      ) : null}
+      {showSection('loaded-values') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-loaded-values">
+          {loadedValuesText()}
+        </span>
+      ) : null}
+      {showSection('last-command') ? (
+        <span class="spreadsheet-status-bar-item" data-testid="status-last-command">
+          {commandText()}
+        </span>
+      ) : null}
 
-      <span
-        class="spreadsheet-status-bar-aggregates"
-        data-testid="status-aggregates"
-        data-truncated={aggregates().truncated ? 'true' : 'false'}
-      >
+      {showSection('aggregates') ? (
+        <span
+          class="spreadsheet-status-bar-aggregates"
+          data-testid="status-aggregates"
+          data-truncated={aggregates().truncated ? 'true' : 'false'}
+        >
         <For each={AGGREGATE_ORDER}>
           {(key) => {
             const enabled = () => Boolean(aggregateConfig()[key])
@@ -350,73 +397,80 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
             )
           }}
         </For>
-        {visibleAggregates().length === 0 ? (
-          <span class="spreadsheet-status-bar-aggregate-empty" data-testid="status-aggregates-empty">
-            No aggregates
-          </span>
-        ) : null}
-      </span>
+          {visibleAggregates().length === 0 ? (
+            <span class="spreadsheet-status-bar-aggregate-empty" data-testid="status-aggregates-empty">
+              No aggregates
+            </span>
+          ) : null}
+        </span>
+      ) : null}
 
-      <span class="spreadsheet-status-bar-view-modes" data-testid="status-view-modes">
-        <For each={VIEW_MODE_BUTTONS}>
-          {(item) => (
-            <button
-              type="button"
-              class="spreadsheet-status-bar-view-mode"
-              data-testid={`status-view-mode-${item.value}`}
-              data-active={viewMode() === item.value ? 'true' : 'false'}
-              aria-pressed={viewMode() === item.value}
-              onClick={() => setViewMode(item.value)}
-            >
-              {t(item.label)}
-            </button>
-          )}
-        </For>
-      </span>
+      {showSection('view-modes') ? (
+        <span class="spreadsheet-status-bar-view-modes" data-testid="status-view-modes">
+          <For each={VIEW_MODE_BUTTONS}>
+            {(item) => (
+              <button
+                type="button"
+                class="spreadsheet-status-bar-view-mode"
+                data-testid={`status-view-mode-${item.value}`}
+                data-active={viewMode() === item.value ? 'true' : 'false'}
+                aria-pressed={viewMode() === item.value}
+                onClick={() => setViewMode(item.value)}
+              >
+                {t(item.label)}
+              </button>
+            )}
+          </For>
+        </span>
+      ) : null}
 
-      <span class="spreadsheet-status-bar-zoom" data-testid="status-zoom">
-        <For each={ZOOM_LEVEL_PRESETS}>
-          {(preset) => (
-            <button
-              type="button"
-              class="spreadsheet-status-bar-zoom-preset"
-              data-testid={`status-zoom-preset-${Math.round(preset * 100)}`}
-              data-active={zoomLevel() === preset ? 'true' : 'false'}
-              aria-pressed={zoomLevel() === preset}
-              onClick={() => setZoom(preset)}
-            >
-              {Math.round(preset * 100)}%
-            </button>
-          )}
-        </For>
-        <input
-          type="range"
-          class="spreadsheet-status-bar-zoom-slider"
-          data-testid="status-zoom-slider"
-          min={Math.round(ZOOM_LEVEL_MIN * 100)}
-          max={Math.round(ZOOM_LEVEL_MAX * 100)}
-          step="1"
-          value={zoomSliderValue()}
-          onInput={handleSliderInput}
-        />
-        <button
-          type="button"
-          class="spreadsheet-status-bar-zoom-value"
-          data-testid="status-zoom-value"
-          aria-label="Reset zoom to 100%"
-          onClick={() => resetZoom()}
+      {showSection('zoom') ? (
+        <span class="spreadsheet-status-bar-zoom" data-testid="status-zoom">
+          <For each={ZOOM_LEVEL_PRESETS}>
+            {(preset) => (
+              <button
+                type="button"
+                class="spreadsheet-status-bar-zoom-preset"
+                data-testid={`status-zoom-preset-${Math.round(preset * 100)}`}
+                data-active={zoomLevel() === preset ? 'true' : 'false'}
+                aria-pressed={zoomLevel() === preset}
+                onClick={() => setZoom(preset)}
+              >
+                {Math.round(preset * 100)}%
+              </button>
+            )}
+          </For>
+          <input
+            type="range"
+            class="spreadsheet-status-bar-zoom-slider"
+            data-testid="status-zoom-slider"
+            min={Math.round(ZOOM_LEVEL_MIN * 100)}
+            max={Math.round(ZOOM_LEVEL_MAX * 100)}
+            step="1"
+            value={zoomSliderValue()}
+            onInput={handleSliderInput}
+          />
+          <button
+            type="button"
+            class="spreadsheet-status-bar-zoom-value"
+            data-testid="status-zoom-value"
+            aria-label="Reset zoom to 100%"
+            onClick={() => resetZoom()}
+          >
+            {zoomPercent()}%
+          </button>
+        </span>
+      ) : null}
+
+      {showSection('mode-badge') ? (
+        <span
+          class="spreadsheet-status-bar-mode-badge"
+          data-testid="status-mode-badge"
+          data-mode={inputMode()}
         >
-          {zoomPercent()}%
-        </button>
-      </span>
-
-      <span
-        class="spreadsheet-status-bar-mode-badge"
-        data-testid="status-mode-badge"
-        data-mode={inputMode()}
-      >
-        {t(INPUT_MODE_LABEL_KEY[inputMode()])}
-      </span>
+          {t(INPUT_MODE_LABEL_KEY[inputMode()])}
+        </span>
+      ) : null}
     </div>
   )
 }

@@ -124,13 +124,41 @@ function VNextWave5Workbook() {
       <Show when={showFormulaBar()}>
         <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />
       </Show>
-      <Show keyed when={activeSheetId()}>
-        {(sheetId) => (
-          <SpreadsheetGrid sheetId={sheetId} viewport={viewport} data-testid="wave5-grid" />
-        )}
-      </Show>
-      <SpreadsheetSheetTabs sheets={sheets} data-testid="wave5-sheet-tabs" />
-      <SpreadsheetStatusBar data-testid="wave5-status-bar" />
+      <div class="vnext-demo-body">
+        <div class="vnext-demo-main">
+          <Show keyed when={activeSheetId()}>
+            {(sheetId) => (
+              <SpreadsheetGrid sheetId={sheetId} viewport={viewport} data-testid="wave5-grid" />
+            )}
+          </Show>
+          <div class="vnext-demo-bottom-row">
+            <SpreadsheetSheetTabs sheets={sheets} data-testid="wave5-sheet-tabs" />
+            <SpreadsheetStatusBar
+              sections={['zoom']}
+              data-testid="wave5-status-bar-zoom"
+              class="vnext-demo-zoom-bar"
+            />
+          </div>
+        </div>
+        <aside class="vnext-demo-sidebar" data-testid="wave5-sidebar">
+          <SpreadsheetStatusBar
+            sections={[
+              'cell-address',
+              'selection',
+              'projection',
+              'visible-cells',
+              'loaded-values',
+              'last-command',
+              'aggregates',
+              'view-modes',
+              'mode-badge',
+            ]}
+            orientation="vertical"
+            data-testid="wave5-status-bar"
+          />
+          <SpreadsheetHistoryTimeline data-testid="wave5-history-timeline" />
+        </aside>
+      </div>
       <SpreadsheetContextMenu data-testid="wave5-context-menu" />
       <SpreadsheetFormatPainter data-testid="wave5-format-painter" />
       <SpreadsheetFormatCellsDialog data-testid="wave5-format-cells" />
@@ -142,7 +170,6 @@ function VNextWave5Workbook() {
       <SpreadsheetCommentThread data-testid="wave5-comment-thread" />
       <SpreadsheetPrintPreviewOverlay data-testid="wave5-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="wave5-protection-unlock" />
-      <SpreadsheetHistoryTimeline data-testid="wave5-history-timeline" />
       <SpreadsheetPresenceOverlay data-testid="wave5-presence" />
     </>
   )

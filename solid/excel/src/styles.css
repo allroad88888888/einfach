@@ -1459,6 +1459,120 @@ thead .row-header {
   pointer-events: none;
 }
 
+/* === Wave 5 demo two-column layout ============================================== */
+
+.vnext-demo-body {
+  display: flex;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.vnext-demo-main {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vnext-demo-bottom-row {
+  display: flex;
+  align-items: stretch;
+  min-height: 28px;
+  border-top: 1px solid var(--border);
+}
+
+.vnext-demo-bottom-row .spreadsheet-sheet-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-top: none;
+}
+
+.vnext-demo-bottom-row .vnext-demo-zoom-bar {
+  flex: 0 0 auto;
+  border-top: none;
+  border-left: 1px solid var(--border);
+}
+
+.vnext-demo-sidebar {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 220px;
+  min-height: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg-chrome);
+}
+
+.vnext-demo-sidebar .spreadsheet-status-bar--vertical {
+  flex: 0 0 auto;
+}
+
+.vnext-demo-sidebar .spreadsheet-history-timeline {
+  flex: 1 1 auto;
+  border-top: 1px solid var(--border);
+  min-height: 0;
+}
+
+/* Status-bar vertical orientation — used in the right sidebar */
+.spreadsheet-status-bar--vertical {
+  flex-direction: column;
+  align-items: stretch;
+  overflow-x: visible;
+  overflow-y: auto;
+  white-space: normal;
+  padding: 6px;
+  gap: 4px;
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-item {
+  height: auto;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-right: none;
+  border-bottom: 1px dashed var(--border);
+  justify-content: space-between;
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-item:last-of-type {
+  border-bottom: none;
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-aggregates {
+  flex-direction: column;
+  align-items: stretch;
+  height: auto;
+  gap: 2px;
+  padding: 4px 0;
+  border-right: none;
+  border-top: 1px solid var(--border);
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-aggregate {
+  justify-content: space-between;
+  width: 100%;
+  height: 22px;
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-view-modes {
+  flex-direction: column;
+  align-items: stretch;
+  height: auto;
+  gap: 2px;
+  padding: 4px 0;
+  border-right: none;
+  border-top: 1px solid var(--border);
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-view-mode {
+  justify-content: flex-start;
+  height: 22px;
+  padding: 0 8px;
+}
+
+.spreadsheet-status-bar--vertical .spreadsheet-status-bar-mode-badge {
+  align-self: flex-start;
+  margin: 4px 0 0 0;
+}
+
 /* === History timeline panel (demo right-rail) ====================================== */
 
 .spreadsheet-history-timeline {
