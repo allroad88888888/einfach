@@ -5,9 +5,19 @@ import {
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createStaticSpreadsheetBackend } from '../adapter'
+import { SpreadsheetCommentThread } from '../comments'
+import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
 import { SpreadsheetContextMenu } from '../context-menu'
+import { SpreadsheetDataValidationDialog } from '../data-validation'
+import { SpreadsheetFilterDropdown } from '../filter-sort'
+import { SpreadsheetFindReplaceDialog } from '../find-replace'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
+import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPresenceOverlay } from '../presence'
+import { SpreadsheetPrintPreviewOverlay } from '../print'
+import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
@@ -116,6 +126,16 @@ function VNextSmokeWorkbook() {
       <SpreadsheetSheetTabs sheets={sheets} data-testid="vnext-sheet-tabs" />
       <SpreadsheetStatusBar data-testid="vnext-status-bar" />
       <SpreadsheetContextMenu data-testid="vnext-context-menu" />
+      <SpreadsheetFindReplaceDialog data-testid="vnext-find-replace" />
+      <SpreadsheetFilterDropdown data-testid="vnext-filter-dropdown" />
+      <SpreadsheetConditionalFormatDialog data-testid="vnext-conditional-format" />
+      <SpreadsheetDataValidationDialog data-testid="vnext-data-validation" />
+      <SpreadsheetNameManagerDialog data-testid="vnext-name-manager" />
+      <SpreadsheetCommentThread data-testid="vnext-comment-thread" />
+      <SpreadsheetPrintPreviewOverlay data-testid="vnext-print-preview" />
+      <SpreadsheetProtectionUnlockDialog data-testid="vnext-protection-unlock" />
+      <SpreadsheetHistoryTimeline data-testid="vnext-history-timeline" />
+      <SpreadsheetPresenceOverlay data-testid="vnext-presence" />
     </>
   )
 }

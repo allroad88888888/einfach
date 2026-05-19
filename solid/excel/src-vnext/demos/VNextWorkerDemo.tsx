@@ -11,9 +11,19 @@ import {
   type WorkerWorkbookBackendSheet,
   type WorkerWorkbookSpreadsheetBackendOptions,
 } from '../adapter'
+import { SpreadsheetCommentThread } from '../comments'
+import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
 import { SpreadsheetContextMenu } from '../context-menu'
+import { SpreadsheetDataValidationDialog } from '../data-validation'
+import { SpreadsheetFilterDropdown } from '../filter-sort'
+import { SpreadsheetFindReplaceDialog } from '../find-replace'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
+import { SpreadsheetHistoryTimeline } from '../history'
+import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPresenceOverlay } from '../presence'
+import { SpreadsheetPrintPreviewOverlay } from '../print'
+import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
@@ -170,6 +180,16 @@ function VNextWorkerWorkbook() {
       <SpreadsheetSheetTabs sheets={sheets} data-testid="vnext-worker-sheet-tabs" />
       <SpreadsheetStatusBar data-testid="vnext-worker-status-bar" />
       <SpreadsheetContextMenu data-testid="vnext-worker-context-menu" />
+      <SpreadsheetFindReplaceDialog data-testid="vnext-worker-find-replace" />
+      <SpreadsheetFilterDropdown data-testid="vnext-worker-filter-dropdown" />
+      <SpreadsheetConditionalFormatDialog data-testid="vnext-worker-conditional-format" />
+      <SpreadsheetDataValidationDialog data-testid="vnext-worker-data-validation" />
+      <SpreadsheetNameManagerDialog data-testid="vnext-worker-name-manager" />
+      <SpreadsheetCommentThread data-testid="vnext-worker-comment-thread" />
+      <SpreadsheetPrintPreviewOverlay data-testid="vnext-worker-print-preview" />
+      <SpreadsheetProtectionUnlockDialog data-testid="vnext-worker-protection-unlock" />
+      <SpreadsheetHistoryTimeline data-testid="vnext-worker-history-timeline" />
+      <SpreadsheetPresenceOverlay data-testid="vnext-worker-presence" />
     </>
   )
 }

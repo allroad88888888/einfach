@@ -74,7 +74,7 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
       ? projectionSnapshot().result
       : undefined
 
-    return selection.activeCell.sheetId || visible?.sheetId || ''
+    return visible?.sheetId || selection.activeCell.sheetId || ''
   }
 
   createEffect(() => {
@@ -83,7 +83,7 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
     const visibleResult = isVisibleProjectionResult(snapshot.result)
       ? snapshot.result
       : undefined
-    const activeSheetId = selection.activeCell.sheetId || visibleResult?.sheetId || ''
+    const activeSheetId = visibleResult?.sheetId || selection.activeCell.sheetId || ''
     const input: FormulaBarSyncInput = {
       sheetId: activeSheetId,
       cell: selection.activeCell,

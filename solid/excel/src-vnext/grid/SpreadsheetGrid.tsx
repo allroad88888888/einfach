@@ -58,6 +58,8 @@ import {
   notifyActiveSheetChangedAtom,
   remoteCursorsAtom,
   presenceStateAtom,
+  redoHistoryAtom,
+  undoHistoryAtom,
   type CellCoord,
   type CellRange,
   type ClipboardTransferInput,
@@ -303,6 +305,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribePointer: (() => void) | null = null
   let unsubscribePresence: (() => void) | null = null
   let unsubscribeFilterSort: (() => void) | null = null
+  let unsubscribeWorkspace: (() => void) | null = null
   let lastActiveSheetId: string | null = null
 
   function bumpRender() {
@@ -550,7 +553,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
 
     lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
-    store.sub(workspaceSessionAtom, () => {
+    unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
       const nextSheetId = store.getter(workspaceSessionAtom).activeSheetId
       if (nextSheetId !== lastActiveSheetId) {
         lastActiveSheetId = nextSheetId
@@ -575,6 +578,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribePointer?.()
     unsubscribePresence?.()
     unsubscribeFilterSort?.()
+    unsubscribeWorkspace?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
     store.setter(cancelPointerAtom)
@@ -610,7 +614,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const bounds = getSelectionBounds()
     const ranges = regions.map((r) => getSelectionRange(r, bounds))
 
-    if (regions.length === 1) {
+    if (regions.length === 1 && target === 'values') {
       const range = ranges[0]
       const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
       if (isSingleCell) {
@@ -851,9 +855,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         colAnchor: target.col,
         colFocus: target.col,
       })
-    } else {
+    } else if (target.kind === 'all') {
       store.setter(selectAllAtom, props.sheetId)
     }
+    // target.kind === 'range': keep current range selection as-is
 
     store.setter(openMenuAtom, {
       surface: target.kind === 'cell' || target.kind === 'range' ? 'cell' : 'header',
@@ -1384,6 +1389,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         }
         return
       }
+      case 'history.undo':
+        event.preventDefault()
+        store.setter(undoHistoryAtom)
+        bumpRender()
+        return
+      case 'history.redo':
+        event.preventDefault()
+        store.setter(redoHistoryAtom)
+        bumpRender()
+        return
       default:
         return
     }
