@@ -30,6 +30,16 @@ filterDropdownAtom.debugLabel = 'spreadsheet.filterSort.dropdown'
 export const filterSortErrorAtom = atom<string>('')
 filterSortErrorAtom.debugLabel = 'spreadsheet.filterSort.error'
 
+export const filterSortSyncTicketAtom = atom<number>(0)
+filterSortSyncTicketAtom.debugLabel = 'spreadsheet.filterSort.syncTicket'
+
+export const issueFilterSortSyncTicketAtom = atom(null, (get, set) => {
+  const next = get(filterSortSyncTicketAtom) + 1
+  set(filterSortSyncTicketAtom, next)
+  return next
+})
+issueFilterSortSyncTicketAtom.debugLabel = 'spreadsheet.filterSort.issueSyncTicket'
+
 export const setFilterSortAtom = atom(
   (get) => get(filterSortStateAtom),
   (get, set, { sheetId, state }: { sheetId: string; state: FilterSortState }) => {

@@ -6,6 +6,8 @@ import {
   filterDropdownAtom,
   filterSortErrorAtom,
   filterSortStateAtom,
+  filterSortSyncTicketAtom,
+  issueFilterSortSyncTicketAtom,
   setFilterSortAtom,
   setFilterSortErrorAtom,
   type ColumnFilterRule,
@@ -21,8 +23,6 @@ export interface SpreadsheetFilterDropdownProps {
 }
 
 const EMPTY_STATE: FilterSortState = { rules: [], directives: [] }
-
-let GLOBAL_SYNC_TICKET = 0
 
 export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps) {
   const store = useSpreadsheetUiStore()
@@ -55,8 +55,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
       store.setter(setFilterSortErrorAtom, null)
       return
     }
-    GLOBAL_SYNC_TICKET += 1
-    const ticket = GLOBAL_SYNC_TICKET
+    const ticket = store.setter(issueFilterSortSyncTicketAtom) as number
     try {
       await backend.setFilterSort({
         kind: 'set-filter-sort',
@@ -64,10 +63,10 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
         rules: next.rules,
         directives: next.directives,
       })
-      if (ticket !== GLOBAL_SYNC_TICKET) return
+      if (ticket !== store.getter(filterSortSyncTicketAtom)) return
       store.setter(setFilterSortErrorAtom, null)
     } catch (err) {
-      if (ticket !== GLOBAL_SYNC_TICKET) return
+      if (ticket !== store.getter(filterSortSyncTicketAtom)) return
       store.setter(setFilterSortErrorAtom, err)
     }
   }
