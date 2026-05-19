@@ -367,3 +367,5 @@ function normalizeOptionalIndex(index: number | null): number | null {
 
   return normalizeIndex(index)
 }
+
+export * from './format'

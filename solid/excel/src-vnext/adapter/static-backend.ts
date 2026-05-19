@@ -33,6 +33,8 @@ import type {
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  DEFAULT_WORKBOOK_LOCALE,
+  formatNumberValue,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
   getRichValueText,
@@ -311,6 +313,8 @@ interface StaticBackendState {
   colWidthsBySheetId: Map<string, Map<number, number>>
   sheets: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
+  /** BCP-47 workbook locale used by the projection-layer number-format pipeline. */
+  workbookLocale?: string
 }
 
 function getOrCreateSheetCells(
@@ -754,6 +758,27 @@ function addFormatOnlyCells(
   }
 }
 
+function applyNumberFormatToCell(cell: DisplayCell, workbookLocale: string): void {
+  const numberFormat = cell.format?.numberFormat
+  if (!numberFormat) return
+  if (cell.valueKind === 'error') return
+  if (cell.valueKind !== 'number' && numberFormat.kind !== 'text' && numberFormat.kind !== 'custom') {
+    return
+  }
+  const raw = cell.displayValue
+  const numeric = Number(raw)
+  const value =
+    cell.valueKind === 'number' && Number.isFinite(numeric)
+      ? numeric
+      : raw
+  const locale = cell.format?.locale ?? workbookLocale
+  const result = formatNumberValue(numberFormat, value, { locale })
+  cell.displayValue = result.text
+  if (result.color && !cell.format!.fgColor) {
+    cell.format = { ...cell.format!, fgColor: result.color }
+  }
+}
+
 function buildProjectionResult(
   request: StaticProjectionRequest,
   state: StaticBackendState,
@@ -763,12 +788,14 @@ function buildProjectionResult(
   const sheetCells = getOrCreateSheetCells(state, request.sheetId)
   const cellFormats = getOrCreateCellFormats(state, request.sheetId)
   const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
+  const workbookLocale = state.workbookLocale ?? DEFAULT_WORKBOOK_LOCALE
 
   for (const cell of sheetCells.values()) {
     if (!isCellInsideRange(cell, range)) continue
     const clone = cloneCell(cell)
     const format = getEffectiveFormat(cell.row, cell.col, cellFormats, rangeFormats)
     if (format) clone.format = format
+    applyNumberFormatToCell(clone, workbookLocale)
     resultCellMap.set(keyFor(clone.row, clone.col), clone)
   }
 

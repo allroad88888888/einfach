@@ -215,13 +215,13 @@ export interface CellFormatJSON {
   bgColor?: string
 }
 
-export interface NumberFormatJSON {
-  kind: 'general' | 'decimal' | 'percent' | 'currency' | 'date'
-  digits?: number
-  symbol?: string
-  pattern?: string
-  thousands?: boolean
-}
+/**
+ * Wave 6.3 widening: `NumberFormatJSON` now mirrors the canonical
+ * `SpreadsheetNumberFormat` discriminated union from `@einfach/spreadsheet-ui-core`.
+ * The alias is kept so existing call sites continue to compile.
+ */
+export type NumberFormatJSON =
+  import('@einfach/spreadsheet-ui-core').SpreadsheetNumberFormat
 
 /** Empty format → equivalent to the default (no styling, General number). */
 export const EMPTY_FORMAT: CellFormatJSON = {}
@@ -242,15 +242,54 @@ function numberFormatsEqual(a?: NumberFormatJSON, b?: NumberFormatJSON): boolean
   const ak = a?.kind ?? 'general'
   const bk = b?.kind ?? 'general'
   if (ak !== bk) return false
-  if (ak === 'decimal') {
-    return (a?.digits ?? 2) === (b?.digits ?? 2) && !!a?.thousands === !!b?.thousands
+  // Use a loose any-cast for property comparison; the discriminant gate above
+  // already guarantees both variants carry the same optional fields.
+  const av = a as unknown as Record<string, unknown> | undefined
+  const bv = b as unknown as Record<string, unknown> | undefined
+  if (ak === 'decimal' || ak === 'number') {
+    return (
+      ((av?.digits as number | undefined) ?? 2) === ((bv?.digits as number | undefined) ?? 2) &&
+      !!av?.thousands === !!bv?.thousands
+    )
   }
-  if (ak === 'percent') return (a?.digits ?? 0) === (b?.digits ?? 0)
+  if (ak === 'percent' || ak === 'percentage') {
+    return ((av?.digits as number | undefined) ?? 0) === ((bv?.digits as number | undefined) ?? 0)
+  }
   if (ak === 'currency') {
-    return (a?.digits ?? 2) === (b?.digits ?? 2) && (a?.symbol ?? '$') === (b?.symbol ?? '$')
+    return (
+      ((av?.digits as number | undefined) ?? 2) === ((bv?.digits as number | undefined) ?? 2) &&
+      ((av?.symbol as string | undefined) ?? '$') === ((bv?.symbol as string | undefined) ?? '$')
+    )
+  }
+  if (ak === 'accounting') {
+    return (
+      ((av?.digits as number | undefined) ?? 2) === ((bv?.digits as number | undefined) ?? 2) &&
+      ((av?.symbol as string | undefined) ?? '$') === ((bv?.symbol as string | undefined) ?? '$')
+    )
   }
   if (ak === 'date') {
-    return (a?.pattern ?? 'yyyy-mm-dd') === (b?.pattern ?? 'yyyy-mm-dd')
+    return (
+      ((av?.pattern as string | undefined) ?? 'yyyy-mm-dd') ===
+      ((bv?.pattern as string | undefined) ?? 'yyyy-mm-dd')
+    )
+  }
+  if (ak === 'time') {
+    return (
+      ((av?.pattern as string | undefined) ?? 'hh:mm:ss') ===
+      ((bv?.pattern as string | undefined) ?? 'hh:mm:ss')
+    )
+  }
+  if (ak === 'fraction') {
+    return (av?.denominator ?? 'one-digit') === (bv?.denominator ?? 'one-digit')
+  }
+  if (ak === 'scientific') {
+    return ((av?.digits as number | undefined) ?? 2) === ((bv?.digits as number | undefined) ?? 2)
+  }
+  if (ak === 'special') {
+    return (av?.preset as string | undefined) === (bv?.preset as string | undefined)
+  }
+  if (ak === 'custom') {
+    return (av?.pattern as string | undefined) === (bv?.pattern as string | undefined)
   }
   return true
 }

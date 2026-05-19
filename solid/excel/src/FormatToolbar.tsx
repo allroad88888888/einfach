@@ -48,12 +48,11 @@ const NUMBER_FORMAT_PRESETS: NumberFormatPreset[] = [
 
 /** Stringify a NumberFormat to a stable id so the <select> value compares. */
 function numberFormatId(nf: NumberFormatJSON | undefined): string {
-  const kind = nf?.kind ?? 'general'
-  if (kind === 'general') return 'general'
-  if (kind === 'decimal') return `decimal-${nf?.digits ?? 2}`
-  if (kind === 'percent') return `percent-${nf?.digits ?? 0}`
-  if (kind === 'currency') return `currency-${nf?.digits ?? 2}`
-  if (kind === 'date') return `date-iso`
+  if (!nf || nf.kind === 'general') return 'general'
+  if (nf.kind === 'decimal' || nf.kind === 'number') return `decimal-${nf.digits ?? 2}`
+  if (nf.kind === 'percent' || nf.kind === 'percentage') return `percent-${nf.digits ?? 0}`
+  if (nf.kind === 'currency') return `currency-${nf.digits ?? 2}`
+  if (nf.kind === 'date') return `date-iso`
   return 'general'
 }
 

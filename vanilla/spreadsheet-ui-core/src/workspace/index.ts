@@ -185,3 +185,24 @@ export const resetWorkspaceSessionAtom = atom(
   },
 )
 resetWorkspaceSessionAtom.debugLabel = 'spreadsheet.workspace.resetSession'
+
+/**
+ * Workbook-wide BCP-47 locale tag used by the projection-layer number-format
+ * pipeline (Wave 6.3). Adapters that don't override it fall back to `'en-US'`.
+ *
+ * Cell-level `SpreadsheetCellFormat.locale` overrides this value when set.
+ */
+export const DEFAULT_WORKBOOK_LOCALE = 'en-US'
+
+export const workbookLocaleAtom = atom<string>(DEFAULT_WORKBOOK_LOCALE)
+workbookLocaleAtom.debugLabel = 'spreadsheet.workspace.locale'
+
+export const setWorkbookLocaleAtom = atom(
+  (get) => get(workbookLocaleAtom),
+  (_get, set, locale: string): string => {
+    const next = typeof locale === 'string' && locale.length > 0 ? locale : DEFAULT_WORKBOOK_LOCALE
+    set(workbookLocaleAtom, next)
+    return next
+  },
+)
+setWorkbookLocaleAtom.debugLabel = 'spreadsheet.workspace.setLocale'

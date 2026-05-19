@@ -166,12 +166,74 @@ export type SpreadsheetOverflow =
  */
 export type SpreadsheetRotation = number | 'vertical'
 
+/**
+ * How negative numeric values display for `number`, `currency` and `percent`
+ * variants. `'minus'` is the default (`-1234`); `'red'` paints the rendered
+ * string red and emits a color hint on `DisplayCell.format.fgColor`;
+ * `'parens'` wraps the absolute value in parentheses (`(1234)`); `'red-parens'`
+ * combines both.
+ */
+export type SpreadsheetNumberFormatNegative = 'minus' | 'red' | 'parens' | 'red-parens'
+
+/**
+ * Denominator hint for the `fraction` variant. `'one-digit'` allows up to
+ * `9` (`# ?/?`), `'two-digit'` up to `99`, `'three-digit'` up to `999`. A
+ * numeric value forces a fixed denominator (e.g. `2` for halves, `4` for
+ * quarters).
+ */
+export type SpreadsheetNumberFormatFractionDenominator =
+  | 'one-digit'
+  | 'two-digit'
+  | 'three-digit'
+  | number
+
+/**
+ * Twelve Excel-style number-format categories.
+ *
+ * Wave 6.3 widens this type. The historical `'decimal'` variant is retained
+ * as a deprecated alias for `'number'`; the projection layer treats them as
+ * identical for one wave.
+ */
 export type SpreadsheetNumberFormat =
   | { kind: 'general' }
-  | { kind: 'decimal'; digits?: number; thousands?: boolean }
-  | { kind: 'percent'; digits?: number }
-  | { kind: 'currency'; symbol?: string; digits?: number }
+  | {
+      kind: 'number'
+      digits?: number
+      thousands?: boolean
+      negative?: SpreadsheetNumberFormatNegative
+    }
+  | {
+      /** Deprecated alias for `'number'`. Slated for removal one wave after 6.3. */
+      kind: 'decimal'
+      digits?: number
+      thousands?: boolean
+      negative?: SpreadsheetNumberFormatNegative
+    }
+  | {
+      kind: 'currency'
+      symbol?: string
+      digits?: number
+      negative?: SpreadsheetNumberFormatNegative
+    }
+  | { kind: 'accounting'; symbol?: string; digits?: number }
   | { kind: 'date'; pattern?: string }
+  | { kind: 'time'; pattern?: string }
+  | {
+      kind: 'percent'
+      digits?: number
+      negative?: SpreadsheetNumberFormatNegative
+    }
+  | {
+      /** Synonym for `'percent'` used by the Format Cells dialog. */
+      kind: 'percentage'
+      digits?: number
+      negative?: SpreadsheetNumberFormatNegative
+    }
+  | { kind: 'fraction'; denominator?: SpreadsheetNumberFormatFractionDenominator }
+  | { kind: 'scientific'; digits?: number }
+  | { kind: 'text' }
+  | { kind: 'special'; preset: string; locale?: string }
+  | { kind: 'custom'; pattern: string }
 
 export type SpreadsheetBorderSide = 'top' | 'right' | 'bottom' | 'left'
 
@@ -220,6 +282,13 @@ export interface SpreadsheetCellFormat {
    * `wrap` at the editor level (the editor picks a winner before save).
    */
   shrinkToFit?: boolean
+  /**
+   * Per-cell BCP-47 locale override. The projection formatter falls back to
+   * the workbook locale (`workbookLocaleAtom`, default `'en-US'`) when this
+   * field is omitted. Affects thousands / decimal separators and the default
+   * currency symbol.
+   */
+  locale?: string
 }
 
 export interface VisibleProjectionRequest extends SheetRef {
