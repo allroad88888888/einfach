@@ -1,4 +1,4 @@
-import type { CellCoord, CellRange, SheetRef } from '../shared'
+import type { CellCoord, CellRange, SheetRef, SpreadsheetError } from '../shared'
 import type { ProjectionRevision } from '../backend/types'
 
 export type FindReplaceStatus = 'idle' | 'searching' | 'ready' | 'error'
@@ -33,6 +33,7 @@ export interface FindCursorState {
   currentIndex: number
   totalCount: number
   pageMatches: FindMatch[]
+  error?: SpreadsheetError
 }
 
 export interface FindRangeRequest extends SheetRef {

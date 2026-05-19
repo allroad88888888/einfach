@@ -1,4 +1,5 @@
 import { atom } from '@einfach/core'
+import type { SpreadsheetError } from '../shared'
 import type { FindCursorState, FindReplaceQuery, SearchRangeResult } from './types'
 
 export * from './types'
@@ -79,10 +80,24 @@ export const advanceFindCursorAtom = atom(
 )
 advanceFindCursorAtom.debugLabel = 'spreadsheet.findReplace.advance'
 
+function normalizeFindReplaceError(error: unknown): SpreadsheetError {
+  if (error && typeof error === 'object' && 'code' in error && 'message' in error) {
+    const e = error as { code: unknown; message: unknown }
+    if (typeof e.code === 'string' && typeof e.message === 'string') {
+      return error as SpreadsheetError
+    }
+  }
+  if (error instanceof Error) {
+    return { code: 'BACKEND_ERROR', message: error.message }
+  }
+  return { code: 'BACKEND_ERROR', message: String(error) }
+}
+
 export const setFindReplaceErrorAtom = atom(
   null,
-  (_get, set, _error: unknown) => {
-    set(findReplaceCursorAtom, (prev) => ({ ...prev, status: 'error' }))
+  (_get, set, error: unknown) => {
+    const normalized = normalizeFindReplaceError(error)
+    set(findReplaceCursorAtom, (prev) => ({ ...prev, status: 'error', error: normalized }))
   },
 )
 setFindReplaceErrorAtom.debugLabel = 'spreadsheet.findReplace.error'

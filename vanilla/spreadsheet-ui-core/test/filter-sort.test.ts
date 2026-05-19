@@ -3,13 +3,16 @@ import { createStore } from '@einfach/core'
 import type { DisplayCell } from '../src'
 import {
   MAX_FILTER_LIST_VALUES,
+  clearColumnFilterSortAtom,
   clearFilterSortAtom,
   closeFilterDropdownAtom,
   filterDropdownAtom,
+  filterSortErrorAtom,
   filterSortStateAtom,
   notifyActiveSheetChangedAtom,
   openFilterDropdownAtom,
   setFilterSortAtom,
+  setFilterSortErrorAtom,
 } from '../src'
 import type { FilterSortState } from '../src'
 
@@ -109,6 +112,75 @@ describe('clearFilterSortAtom', () => {
     store.setter(openFilterDropdownAtom, { sheetId: 'A', colIndex: 2 })
     store.setter(clearFilterSortAtom, 'A')
     expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
+  })
+})
+
+describe('clearColumnFilterSortAtom', () => {
+  test('removes both rules and directives for the column', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'A',
+      state: {
+        rules: [
+          { kind: 'equals', colIndex: 1, value: 'x' },
+          { kind: 'equals', colIndex: 2, value: 'y' },
+        ],
+        directives: [
+          { colIndex: 1, direction: 'asc' },
+          { colIndex: 2, direction: 'desc' },
+        ],
+      },
+    })
+    store.setter(clearColumnFilterSortAtom, { sheetId: 'A', colIndex: 1 })
+    const state = store.getter(filterSortStateAtom)['A']
+    expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
+    expect(state?.directives).toEqual([{ colIndex: 2, direction: 'desc' }])
+  })
+
+  test('no-op when sheet has no state', () => {
+    const store = makeStore()
+    store.setter(clearColumnFilterSortAtom, { sheetId: 'missing', colIndex: 0 })
+    expect(store.getter(filterSortStateAtom)).toEqual({})
+  })
+
+  test('no-op when column has neither rule nor directive', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'A',
+      state: {
+        rules: [{ kind: 'equals', colIndex: 1, value: 'x' }],
+        directives: [{ colIndex: 1, direction: 'asc' }],
+      },
+    })
+    const before = store.getter(filterSortStateAtom)
+    store.setter(clearColumnFilterSortAtom, { sheetId: 'A', colIndex: 9 })
+    expect(store.getter(filterSortStateAtom)).toBe(before)
+  })
+})
+
+describe('setFilterSortErrorAtom', () => {
+  test('initial error is empty string', () => {
+    const store = makeStore()
+    expect(store.getter(filterSortErrorAtom)).toBe('')
+  })
+
+  test('stores Error.message', () => {
+    const store = makeStore()
+    store.setter(setFilterSortErrorAtom, new Error('boom'))
+    expect(store.getter(filterSortErrorAtom)).toBe('boom')
+  })
+
+  test('stores non-Error stringified', () => {
+    const store = makeStore()
+    store.setter(setFilterSortErrorAtom, 'plain')
+    expect(store.getter(filterSortErrorAtom)).toBe('plain')
+  })
+
+  test('null clears the error', () => {
+    const store = makeStore()
+    store.setter(setFilterSortErrorAtom, new Error('boom'))
+    store.setter(setFilterSortErrorAtom, null)
+    expect(store.getter(filterSortErrorAtom)).toBe('')
   })
 })
 

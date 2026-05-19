@@ -7,7 +7,10 @@ import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
 import {
   conditionalFormatEditorAtom,
   conditionalFormatRulesCacheAtom,
+  closeConditionalFormatEditorAtom,
   openConditionalFormatEditorAtom,
+  selectionAtom,
+  workspaceSessionAtom,
   type ConditionalFormatRuleEntry,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -185,5 +188,180 @@ describe('SpreadsheetConditionalFormatDialog', () => {
     expect(options).toContain('data-bar')
     expect(options).toContain('color-scale')
     expect(options).toContain('top-bottom')
+  })
+
+  it('surfaces backend errors on Save and clears them on the next attempt', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    let shouldFail = true
+    backend.setConditionalFormatRule = jest.fn(async (req) => {
+      if (shouldFail) throw new Error('boom')
+      return { sheetId: (req as { sheetId: string }).sheetId }
+    })
+
+    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
+    store.setter(openConditionalFormatEditorAtom, sampleEntry)
+
+    const { getByTestId, queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-save-button')).toBeTruthy())
+    fireEvent.click(getByTestId('cf-save-button'))
+
+    await waitFor(() => expect(getByTestId('cf-error-text').textContent).toBe('boom'))
+    expect(store.getter(conditionalFormatEditorAtom).open).toBe(true)
+
+    shouldFail = false
+    fireEvent.click(getByTestId('cf-save-button'))
+    await waitFor(() => expect(store.getter(conditionalFormatEditorAtom).open).toBe(false))
+    expect(queryByTestId('cf-error-text')).toBeNull()
+  })
+
+  it('surfaces backend errors on Remove', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+    backend.removeConditionalFormatRule = jest.fn(async () => {
+      throw new Error('remove failed')
+    })
+
+    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'sheet-1', rules: [sampleEntry] })
+    store.setter(openConditionalFormatEditorAtom, sampleEntry)
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-remove-button')).toBeTruthy())
+    fireEvent.click(getByTestId('cf-remove-button'))
+
+    await waitFor(() => expect(getByTestId('cf-error-text').textContent).toBe('remove failed'))
+    expect(store.getter(conditionalFormatEditorAtom).open).toBe(true)
+  })
+
+  it('prefers workspace active sheet id over rules cache when present', async () => {
+    const store = createStore()
+    const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
+
+    store.setter(workspaceSessionAtom, {
+      activeSheetId: 'active-sheet',
+      viewportRevision: 0,
+      projectionRequestRevision: 0,
+      committedProjectionRequestRevision: 0,
+    })
+    store.setter(conditionalFormatRulesCacheAtom, {
+      sheetId: 'stale-sheet',
+      rules: [sampleEntry],
+    })
+    store.setter(openConditionalFormatEditorAtom, sampleEntry)
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-save-button')).toBeTruthy())
+    fireEvent.click(getByTestId('cf-save-button'))
+
+    await waitFor(() => expect(setConditionalFormatRuleRequests).toHaveLength(1))
+    expect(setConditionalFormatRuleRequests[0]).toMatchObject({
+      sheetId: 'active-sheet',
+    })
+  })
+
+  it('falls back to rules cache sheet id when workspace active sheet is unset', async () => {
+    const store = createStore()
+    const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
+
+    store.setter(conditionalFormatRulesCacheAtom, { sheetId: 'cache-sheet', rules: [sampleEntry] })
+    store.setter(openConditionalFormatEditorAtom, sampleEntry)
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-save-button')).toBeTruthy())
+    fireEvent.click(getByTestId('cf-save-button'))
+
+    await waitFor(() => expect(setConditionalFormatRuleRequests).toHaveLength(1))
+    expect(setConditionalFormatRuleRequests[0]).toMatchObject({ sheetId: 'cache-sheet' })
+  })
+
+  it('uses current selection range as scope when no draft scope exists', async () => {
+    const store = createStore()
+    const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
+
+    store.setter(workspaceSessionAtom, {
+      activeSheetId: 'sheet-a',
+      viewportRevision: 0,
+      projectionRequestRevision: 0,
+      committedProjectionRequestRevision: 0,
+    })
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: 'sheet-a',
+      anchor: { row: 2, col: 1 },
+      focus: { row: 4, col: 3 },
+    })
+    store.setter(openConditionalFormatEditorAtom, null)
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-save-button')).toBeTruthy())
+    fireEvent.click(getByTestId('cf-save-button'))
+
+    await waitFor(() => expect(setConditionalFormatRuleRequests).toHaveLength(1))
+    expect(setConditionalFormatRuleRequests[0]).toMatchObject({
+      scope: { range: { rowStart: 2, rowEnd: 4, colStart: 1, colEnd: 3 } },
+    })
+  })
+
+  it('resets signals when dialog is reopened without a draft', async () => {
+    const store = createStore()
+    const { backend, setConditionalFormatRuleRequests } = createFakeBackend()
+
+    store.setter(openConditionalFormatEditorAtom, sampleEntry)
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetConditionalFormatDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('cf-rule-kind-select')).toBeTruthy())
+    const select = getByTestId('cf-rule-kind-select') as HTMLSelectElement
+    // Initially mirrors the sample entry's kind.
+    await waitFor(() => expect(select.value).toBe('cell-value'))
+
+    // Switch to a different kind, then close.
+    fireEvent.change(select, { target: { value: 'formula' } })
+    await waitFor(() => expect(select.value).toBe('formula'))
+
+    store.setter(closeConditionalFormatEditorAtom)
+    await waitFor(() => expect(store.getter(conditionalFormatEditorAtom).open).toBe(false))
+
+    // Reopen without a draft — selectedKind should reset to 'cell-value'.
+    store.setter(openConditionalFormatEditorAtom, null)
+    await waitFor(() => expect(store.getter(conditionalFormatEditorAtom).open).toBe(true))
+    const reopenedSelect = getByTestId('cf-rule-kind-select') as HTMLSelectElement
+    await waitFor(() => expect(reopenedSelect.value).toBe('cell-value'))
+
+    // Sanity-check: save uses default rule for cell-value.
+    fireEvent.click(getByTestId('cf-save-button'))
+    await waitFor(() => expect(setConditionalFormatRuleRequests).toHaveLength(1))
+    expect(setConditionalFormatRuleRequests[0]).toMatchObject({
+      rule: { kind: 'cell-value' },
+    })
   })
 })

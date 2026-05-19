@@ -1,13 +1,16 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createSignal } from 'solid-js'
+import { Show, For, createSignal, createEffect } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
   conditionalFormatEditorAtom,
   conditionalFormatRulesCacheAtom,
   closeConditionalFormatEditorAtom,
+  selectionSnapshotAtom,
+  workspaceSessionAtom,
   type ConditionalFormatRuleEntry,
   type ConditionalFormatRuleKind,
+  type ConditionalFormatScope,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
@@ -58,7 +61,20 @@ export function SpreadsheetConditionalFormatDialog(
   const isEditing = () => editor().open
 
   const [selectedKind, setSelectedKind] = createSignal<ConditionalFormatRuleKind>('cell-value')
+  const [errorText, setErrorText] = createSignal<string | null>(null)
   let lastSyncedDraftId: string | undefined
+
+  createEffect((prevOpen: boolean) => {
+    const open = isEditing()
+    if (open && !prevOpen && !editor().draft) {
+      setSelectedKind('cell-value')
+      lastSyncedDraftId = undefined
+    }
+    if (!open && prevOpen) {
+      setErrorText(null)
+    }
+    return open
+  }, false)
 
   function currentKind(): ConditionalFormatRuleKind {
     const draft = editor().draft
@@ -70,40 +86,63 @@ export function SpreadsheetConditionalFormatDialog(
     return selectedKind()
   }
 
+  function resolveSheetId(): string {
+    const workspaceSheetId = store.getter(workspaceSessionAtom).activeSheetId
+    if (workspaceSheetId && workspaceSheetId.length > 0) return workspaceSheetId
+    return rulesCache().sheetId ?? ''
+  }
+
+  function resolveScope(): ConditionalFormatScope {
+    const draft = editor().draft
+    if (draft?.scope) return draft.scope
+    const snapshot = store.getter(selectionSnapshotAtom)
+    return { range: snapshot.range }
+  }
+
   function close() {
     store.setter(closeConditionalFormatEditorAtom)
   }
 
   async function handleSave() {
     if (!backend.setConditionalFormatRule) return
+    setErrorText(null)
     const draft = editor().draft
     const kind = currentKind()
     const useDraftRule = draft && draft.rule.kind === kind
     const rule = useDraftRule ? draft.rule : defaultDraftForKind(kind)
-    const scope = draft?.scope ?? { range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 } }
-    const sheetId = rulesCache().sheetId ?? ''
-    await backend.setConditionalFormatRule({
-      kind: 'set-conditional-format-rule',
-      sheetId,
-      ruleId: draft?.id,
-      scope,
-      priority: draft?.priority,
-      rule,
-    })
-    close()
+    const scope = resolveScope()
+    const sheetId = resolveSheetId()
+    try {
+      await backend.setConditionalFormatRule({
+        kind: 'set-conditional-format-rule',
+        sheetId,
+        ruleId: draft?.id,
+        scope,
+        priority: draft?.priority,
+        rule,
+      })
+      close()
+    } catch (err) {
+      setErrorText(err instanceof Error ? err.message : String(err))
+    }
   }
 
   async function handleRemove() {
     if (!backend.removeConditionalFormatRule) return
+    setErrorText(null)
     const draft = editor().draft
     if (!draft) return
-    const sheetId = rulesCache().sheetId ?? ''
-    await backend.removeConditionalFormatRule({
-      kind: 'remove-conditional-format-rule',
-      sheetId,
-      ruleId: draft.id,
-    })
-    close()
+    const sheetId = resolveSheetId()
+    try {
+      await backend.removeConditionalFormatRule({
+        kind: 'remove-conditional-format-rule',
+        sheetId,
+        ruleId: draft.id,
+      })
+      close()
+    } catch (err) {
+      setErrorText(err instanceof Error ? err.message : String(err))
+    }
   }
 
   function handleCancel() {
@@ -176,6 +215,12 @@ export function SpreadsheetConditionalFormatDialog(
             Cancel
           </button>
         </div>
+
+        <Show when={errorText()}>
+          <div class="cf-error" data-testid="cf-error-text" role="alert">
+            {errorText()}
+          </div>
+        </Show>
       </div>
     </Show>
   )

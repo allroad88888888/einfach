@@ -27,6 +27,9 @@ filterSortStateAtom.debugLabel = 'spreadsheet.filterSort.state'
 export const filterDropdownAtom = atom<FilterDropdownState>({ status: 'closed' })
 filterDropdownAtom.debugLabel = 'spreadsheet.filterSort.dropdown'
 
+export const filterSortErrorAtom = atom<string>('')
+filterSortErrorAtom.debugLabel = 'spreadsheet.filterSort.error'
+
 export const setFilterSortAtom = atom(
   (get) => get(filterSortStateAtom),
   (get, set, { sheetId, state }: { sheetId: string; state: FilterSortState }) => {
@@ -37,6 +40,18 @@ export const setFilterSortAtom = atom(
   },
 )
 setFilterSortAtom.debugLabel = 'spreadsheet.filterSort.set'
+
+export const setFilterSortErrorAtom = atom(
+  null,
+  (_get, set, error: unknown) => {
+    if (error == null) {
+      set(filterSortErrorAtom, '')
+      return
+    }
+    set(filterSortErrorAtom, error instanceof Error ? error.message : String(error))
+  },
+)
+setFilterSortErrorAtom.debugLabel = 'spreadsheet.filterSort.setError'
 
 export const clearFilterSortAtom = atom(
   (get) => get(filterSortStateAtom),
@@ -49,6 +64,26 @@ export const clearFilterSortAtom = atom(
   },
 )
 clearFilterSortAtom.debugLabel = 'spreadsheet.filterSort.clear'
+
+export const clearColumnFilterSortAtom = atom(
+  (get) => get(filterSortStateAtom),
+  (get, set, { sheetId, colIndex }: { sheetId: string; colIndex: number }) => {
+    const current = get(filterSortStateAtom)
+    const sheetState = current[sheetId]
+    if (!sheetState) return
+    const nextRules = sheetState.rules.filter((r) => r.colIndex !== colIndex)
+    const nextDirectives = sheetState.directives.filter((d) => d.colIndex !== colIndex)
+    const unchanged =
+      nextRules.length === sheetState.rules.length &&
+      nextDirectives.length === sheetState.directives.length
+    if (unchanged) return
+    set(filterSortStateAtom, {
+      ...current,
+      [sheetId]: { rules: nextRules, directives: nextDirectives },
+    })
+  },
+)
+clearColumnFilterSortAtom.debugLabel = 'spreadsheet.filterSort.clearColumn'
 
 export const openFilterDropdownAtom = atom(
   (get) => get(filterDropdownAtom),

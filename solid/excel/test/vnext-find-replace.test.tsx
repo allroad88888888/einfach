@@ -53,6 +53,19 @@ function getEls(container: HTMLElement) {
     replacement: container.querySelector(
       '[data-testid="find-replacement-input"]',
     ) as HTMLInputElement | null,
+    caseSensitive: container.querySelector(
+      '[data-testid="find-opt-case-sensitive"]',
+    ) as HTMLInputElement | null,
+    wholeMatch: container.querySelector(
+      '[data-testid="find-opt-whole-match"]',
+    ) as HTMLInputElement | null,
+    regex: container.querySelector('[data-testid="find-opt-regex"]') as HTMLInputElement | null,
+    formulas: container.querySelector(
+      '[data-testid="find-opt-formulas"]',
+    ) as HTMLInputElement | null,
+    scopeSelect: container.querySelector(
+      '[data-testid="find-scope-select"]',
+    ) as HTMLSelectElement | null,
     findNext: container.querySelector('[data-testid="find-next-button"]') as HTMLButtonElement | null,
     findPrev: container.querySelector('[data-testid="find-prev-button"]') as HTMLButtonElement | null,
     replace: container.querySelector('[data-testid="replace-button"]') as HTMLButtonElement | null,
@@ -61,6 +74,7 @@ function getEls(container: HTMLElement) {
     ) as HTMLButtonElement | null,
     close: container.querySelector('[data-testid="find-close-button"]') as HTMLButtonElement | null,
     status: container.querySelector('[data-testid="find-status-text"]'),
+    error: container.querySelector('[data-testid="find-error-text"]'),
   }
 }
 
@@ -254,6 +268,159 @@ describe('SpreadsheetFindReplaceDialog', () => {
     expect(store.getter(findReplaceOpenAtom)).toBe(true)
     fireEvent.click(getEls(container).close!)
     expect(store.getter(findReplaceOpenAtom)).toBe(false)
+  })
+
+  it('resets form fields when the dialog reopens after being closed', async () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    const initial = getEls(container)
+    fireEvent.input(initial.needle!, { target: { value: 'foo' } })
+    fireEvent.input(initial.replacement!, { target: { value: 'bar' } })
+    fireEvent.click(initial.caseSensitive!)
+    fireEvent.click(initial.wholeMatch!)
+    fireEvent.click(initial.regex!)
+    fireEvent.click(initial.formulas!)
+    fireEvent.change(initial.scopeSelect!, { target: { value: 'workbook' } })
+
+    expect(initial.needle!.value).toBe('foo')
+    expect(initial.caseSensitive!.checked).toBe(true)
+    expect(initial.scopeSelect!.value).toBe('workbook')
+
+    store.setter(findReplaceOpenAtom, false)
+    await waitFor(() => {
+      expect(getEls(container).dialog).toBeNull()
+    })
+    store.setter(findReplaceOpenAtom, true)
+
+    await waitFor(() => {
+      expect(getEls(container).dialog).not.toBeNull()
+    })
+    const after = getEls(container)
+    expect(after.needle!.value).toBe('')
+    expect(after.replacement!.value).toBe('')
+    expect(after.caseSensitive!.checked).toBe(false)
+    expect(after.wholeMatch!.checked).toBe(false)
+    expect(after.regex!.checked).toBe(false)
+    expect(after.formulas!.checked).toBe(false)
+    expect(after.scopeSelect!.value).toBe('sheet')
+  })
+
+  it('surfaces a replaceMatches failure via find-error-text', async () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+
+    const fakeSearchResult: SearchRangeResult = {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [{ coord: { row: 0, col: 0 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 3 }],
+      pageStart: 0,
+      totalCount: 1,
+    }
+    const searchSpy = jest.fn(async (_req: SearchRangeRequest) => fakeSearchResult)
+    const replaceSpy = jest.fn(async (_req: ReplaceMatchesRequest): Promise<ReplaceMatchesResult> => {
+      throw new Error('replace exploded')
+    })
+    const backend = createSearchBackend(searchSpy, replaceSpy)
+
+    store.setter(setFindMatchesAtom, fakeSearchResult)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getEls(container).replace!)
+
+    await waitFor(() => {
+      const err = getEls(container).error
+      expect(err).not.toBeNull()
+      expect(err!.textContent).toBe('replace exploded')
+    })
+    expect(store.getter(findReplaceCursorAtom).status).toBe('error')
+    expect(searchSpy).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a replace-all failure via find-error-text', async () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+
+    const fakeSearchResult: SearchRangeResult = {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [{ coord: { row: 0, col: 0 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 3 }],
+      pageStart: 0,
+      totalCount: 1,
+    }
+    const searchSpy = jest.fn(async (_req: SearchRangeRequest) => fakeSearchResult)
+    const replaceSpy = jest.fn(async (_req: ReplaceMatchesRequest): Promise<ReplaceMatchesResult> => {
+      throw new Error('bulk replace exploded')
+    })
+    const backend = createSearchBackend(searchSpy, replaceSpy)
+
+    store.setter(setFindMatchesAtom, fakeSearchResult)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getEls(container).replaceAll!)
+
+    await waitFor(() => {
+      const err = getEls(container).error
+      expect(err).not.toBeNull()
+      expect(err!.textContent).toBe('bulk replace exploded')
+    })
+  })
+
+  it('clears find-error-text after a subsequent successful search dispatch', async () => {
+    const store = createStore()
+    store.setter(findReplaceOpenAtom, true)
+
+    const fakeSearchResult: SearchRangeResult = {
+      kind: 'search-range',
+      sheetId: 'sheet-1',
+      matches: [{ coord: { row: 0, col: 0 }, sheetId: 'sheet-1', matchStart: 0, matchEnd: 3 }],
+      pageStart: 0,
+      totalCount: 1,
+    }
+    const searchSpy = jest.fn(async (_req: SearchRangeRequest) => {
+      throw new Error('first search failed')
+    })
+    const backend = createSearchBackend(searchSpy)
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFindReplaceDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    const { needle } = getEls(container)
+    fireEvent.input(needle!, { target: { value: 'foo' } })
+    fireEvent.keyDown(needle!, { key: 'Enter' })
+
+    await waitFor(() => {
+      const err = getEls(container).error
+      expect(err).not.toBeNull()
+      expect(err!.textContent).toBe('first search failed')
+    })
+
+    store.setter(setFindMatchesAtom, fakeSearchResult)
+
+    await waitFor(() => {
+      expect(getEls(container).error).toBeNull()
+    })
+    expect(store.getter(findReplaceCursorAtom).status).toBe('ready')
   })
 
   it('does not crash when backend omits searchRange — find is a no-op', () => {

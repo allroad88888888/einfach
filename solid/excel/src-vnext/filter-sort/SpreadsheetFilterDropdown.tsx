@@ -1,10 +1,13 @@
-import { Show } from 'solid-js'
+import { Show, createEffect, createMemo, createSignal, on } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
+  clearColumnFilterSortAtom,
   closeFilterDropdownAtom,
   filterDropdownAtom,
+  filterSortErrorAtom,
   filterSortStateAtom,
   setFilterSortAtom,
+  setFilterSortErrorAtom,
   type ColumnFilterRule,
   type FilterSortState,
   type SortDirective,
@@ -17,35 +20,61 @@ export interface SpreadsheetFilterDropdownProps {
   'data-testid'?: string
 }
 
+const EMPTY_STATE: FilterSortState = { rules: [], directives: [] }
+
 export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const dropdown = useAtomValue(filterDropdownAtom)
   const filterSortState = useAtomValue(filterSortStateAtom)
+  const errorText = useAtomValue(filterSortErrorAtom)
+  const [equalsInput, setEqualsInput] = createSignal('')
+  let pendingSyncId = 0
 
-  const isOpen = () => dropdown().status === 'open'
-  const sheetId = () => (dropdown().status === 'open' ? dropdown().sheetId! : '')
-  const colIndex = () => (dropdown().status === 'open' ? dropdown().colIndex! : -1)
+  const isOpen = createMemo(() => dropdown().status === 'open')
+  const sheetId = createMemo(() => (dropdown().status === 'open' ? dropdown().sheetId! : ''))
+  const colIndex = createMemo(() => (dropdown().status === 'open' ? dropdown().colIndex! : -1))
+  const currentState = createMemo<FilterSortState>(
+    () => filterSortState()[sheetId()] ?? EMPTY_STATE,
+  )
+  const currentRulesForCol = createMemo<readonly ColumnFilterRule[]>(() =>
+    currentState().rules.filter((r) => r.colIndex === colIndex()),
+  )
 
-  function currentState(): FilterSortState {
-    return filterSortState()[sheetId()] ?? { rules: [], directives: [] }
-  }
+  createEffect(
+    on(
+      () => `${sheetId()}::${colIndex()}`,
+      () => setEqualsInput(''),
+      { defer: true },
+    ),
+  )
 
-  function currentRulesForCol(): readonly ColumnFilterRule[] {
-    return currentState().rules.filter((r) => r.colIndex === colIndex())
-  }
-
-  function applyFilterSort(next: FilterSortState) {
-    const sid = sheetId()
-    store.setter(setFilterSortAtom, { sheetId: sid, state: next })
-    if (backend.setFilterSort) {
-      void backend.setFilterSort({
+  async function syncBackend(sid: string, next: FilterSortState) {
+    if (!backend.setFilterSort) {
+      store.setter(setFilterSortErrorAtom, null)
+      return
+    }
+    pendingSyncId += 1
+    const ticket = pendingSyncId
+    try {
+      await backend.setFilterSort({
         kind: 'set-filter-sort',
         sheetId: sid,
         rules: next.rules,
         directives: next.directives,
       })
+      if (ticket !== pendingSyncId) return
+      store.setter(setFilterSortErrorAtom, null)
+    } catch (err) {
+      if (ticket !== pendingSyncId) return
+      store.setter(setFilterSortErrorAtom, err)
     }
+  }
+
+  function applyFilterSort(next: FilterSortState) {
+    const sid = sheetId()
+    store.setter(setFilterSortAtom, { sheetId: sid, state: next })
+    void syncBackend(sid, next)
   }
 
   function replaceDirective(direction: 'asc' | 'desc') {
@@ -57,19 +86,21 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
   }
 
   function clearColFilter() {
+    const sid = sheetId()
     const col = colIndex()
-    const state = currentState()
-    const rules = state.rules.filter((r) => r.colIndex !== col)
-    applyFilterSort({ ...state, rules })
+    store.setter(clearColumnFilterSortAtom, { sheetId: sid, colIndex: col })
+    const next = store.getter(filterSortStateAtom)[sid] ?? EMPTY_STATE
+    void syncBackend(sid, next)
   }
 
-  function addEqualsFilter() {
-    const value = window.prompt('Filter value:')
-    if (value === null) return
+  function applyEqualsFilter() {
+    const value = equalsInput()
     const col = colIndex()
     const state = currentState()
     const rule: ColumnFilterRule = { kind: 'equals', colIndex: col, value }
-    const rules = state.rules.filter((r) => !(r.kind === 'equals' && r.colIndex === col)).concat(rule)
+    const rules = state.rules
+      .filter((r) => !(r.kind === 'equals' && r.colIndex === col))
+      .concat(rule)
     applyFilterSort({ ...state, rules })
   }
 
@@ -116,14 +147,38 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
         >
           Clear filter
         </button>
-        <button
-          type="button"
-          class="filter-btn"
-          data-testid="filter-add-equals"
-          onClick={() => addEqualsFilter()}
-        >
-          Add equals filter
-        </button>
+        <div class="filter-equals-row">
+          <label class="filter-equals-label" for="filter-equals-input">
+            Equals
+          </label>
+          <input
+            id="filter-equals-input"
+            class="filter-equals-input"
+            data-testid="filter-equals-input"
+            type="text"
+            value={equalsInput()}
+            onInput={(e) => setEqualsInput(e.currentTarget.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                applyEqualsFilter()
+              }
+            }}
+          />
+          <button
+            type="button"
+            class="filter-btn"
+            data-testid="filter-add-equals"
+            onClick={() => applyEqualsFilter()}
+          >
+            Add equals filter
+          </button>
+        </div>
+        <Show when={errorText().length > 0}>
+          <div class="filter-error" data-testid="filter-error-text" role="alert">
+            {errorText()}
+          </div>
+        </Show>
         <button
           type="button"
           class="filter-btn"

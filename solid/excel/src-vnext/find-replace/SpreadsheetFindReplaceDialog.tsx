@@ -1,4 +1,4 @@
-import { Show, createSignal } from 'solid-js'
+import { Show, createEffect, createSignal } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import type { CellRange, FindReplaceScope } from '@einfach/spreadsheet-ui-core'
 import {
@@ -35,6 +35,20 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   const [regex, setRegex] = createSignal(false)
   const [searchFormulas, setSearchFormulas] = createSignal(false)
   const [scope, setScope] = createSignal<FindReplaceScope>('sheet')
+
+  createEffect<boolean>((wasOpen) => {
+    const open = isOpen()
+    if (open && !wasOpen) {
+      setNeedle('')
+      setReplacement('')
+      setCaseSensitive(false)
+      setWholeMatch(false)
+      setRegex(false)
+      setSearchFormulas(false)
+      setScope('sheet')
+    }
+    return open
+  }, false)
 
   function buildQuery() {
     return {
@@ -94,18 +108,26 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     const c = cursor()
     const match = c.pageMatches[c.currentIndex]
     if (!match) return
-    await backend.replaceMatches({
-      kind: 'replace-matches',
-      coords: [
-        {
-          sheetId: match.sheetId,
-          coord: match.coord,
-          matchStart: match.matchStart,
-          matchEnd: match.matchEnd,
-        },
-      ],
-      replacement: replacement(),
-    })
+    try {
+      await backend.replaceMatches({
+        kind: 'replace-matches',
+        coords: [
+          {
+            sheetId: match.sheetId,
+            coord: match.coord,
+            matchStart: match.matchStart,
+            matchEnd: match.matchEnd,
+          },
+        ],
+        replacement: replacement(),
+      })
+    } catch (err) {
+      store.setter(setFindReplaceErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
     await runSearch()
   }
 
@@ -113,16 +135,24 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     if (!backend.replaceMatches) return
     const c = cursor()
     if (c.pageMatches.length === 0) return
-    await backend.replaceMatches({
-      kind: 'replace-matches',
-      coords: c.pageMatches.map((m) => ({
-        sheetId: m.sheetId,
-        coord: m.coord,
-        matchStart: m.matchStart,
-        matchEnd: m.matchEnd,
-      })),
-      replacement: replacement(),
-    })
+    try {
+      await backend.replaceMatches({
+        kind: 'replace-matches',
+        coords: c.pageMatches.map((m) => ({
+          sheetId: m.sheetId,
+          coord: m.coord,
+          matchStart: m.matchStart,
+          matchEnd: m.matchEnd,
+        })),
+        replacement: replacement(),
+      })
+    } catch (err) {
+      store.setter(setFindReplaceErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      })
+      return
+    }
     await runSearch()
   }
 
@@ -133,6 +163,12 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     if (c.status === 'error') return 'Search failed'
     if (c.totalCount === 0) return 'No matches'
     return `${c.currentIndex + 1} of ${c.totalCount}`
+  }
+
+  function errorText() {
+    const c = cursor()
+    if (c.status !== 'error') return ''
+    return c.error?.message ?? ''
   }
 
   return (
@@ -275,6 +311,11 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         <div class="find-replace-status" data-testid="find-status-text" aria-live="polite">
           {statusText()}
         </div>
+        <Show when={errorText()}>
+          <div class="find-replace-error" data-testid="find-error-text" role="alert">
+            {errorText()}
+          </div>
+        </Show>
       </div>
     </Show>
   )

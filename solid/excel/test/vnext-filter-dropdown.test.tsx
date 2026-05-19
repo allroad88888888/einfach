@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
-import { cleanup, fireEvent, render } from '@solidjs/testing-library'
+import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
 import {
   filterDropdownAtom,
@@ -65,6 +65,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(container.querySelector('[data-testid="filter-sort-desc"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-clear"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-add-equals"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="filter-equals-input"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-close"]')).not.toBeNull()
   })
 
@@ -142,6 +143,145 @@ describe('vNext SpreadsheetFilterDropdown', () => {
 
     const state = store.getter(filterSortStateAtom)
     expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 5, value: 'world' }])
+  })
+
+  it('clear filter also removes the sort directive on the same column', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 3 })
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: {
+        rules: [{ kind: 'equals', colIndex: 3, value: 'hello' }],
+        directives: [
+          { colIndex: 3, direction: 'asc' },
+          { colIndex: 5, direction: 'desc' },
+        ],
+      },
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-clear"]') as HTMLElement)
+
+    const state = store.getter(filterSortStateAtom)
+    expect(state['sheet-1']?.rules).toEqual([])
+    expect(state['sheet-1']?.directives).toEqual([{ colIndex: 5, direction: 'desc' }])
+  })
+
+  it('controlled equals input applies on Enter and on button click', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 4 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    const input = container.querySelector(
+      '[data-testid="filter-equals-input"]',
+    ) as HTMLInputElement
+    expect(input).not.toBeNull()
+    expect(input.tagName).toBe('INPUT')
+
+    fireEvent.input(input, { target: { value: 'alpha' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    let state = store.getter(filterSortStateAtom)
+    expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 4, value: 'alpha' }])
+
+    const input2 = container.querySelector(
+      '[data-testid="filter-equals-input"]',
+    ) as HTMLInputElement
+    fireEvent.input(input2, { target: { value: 'beta' } })
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+
+    state = store.getter(filterSortStateAtom)
+    expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 4, value: 'beta' }])
+  })
+
+  it('surfaces backend error in filter-error-text', async () => {
+    const store = createStore()
+    const backend = createFakeBackend({
+      async setFilterSort() {
+        throw new Error('backend exploded')
+      },
+    })
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+
+    await waitFor(() => {
+      const errorEl = container.querySelector('[data-testid="filter-error-text"]')
+      expect(errorEl).not.toBeNull()
+      expect(errorEl!.textContent).toBe('backend exploded')
+    })
+  })
+
+  it('clears error text after a subsequent successful apply', async () => {
+    const store = createStore()
+    let shouldFail = true
+    const backend = createFakeBackend({
+      async setFilterSort(req) {
+        if (shouldFail) throw new Error('first failed')
+        return { sheetId: req.sheetId, requestId: undefined, revision: 1 }
+      },
+    })
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="filter-error-text"]')).not.toBeNull()
+    })
+
+    shouldFail = false
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-desc"]') as HTMLElement)
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
+    })
+  })
+
+  it('column index 0 still renders dropdown attributes correctly', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    const el = container.querySelector('[data-testid="filter-dropdown"]')
+    expect(el).not.toBeNull()
+    expect(el?.getAttribute('data-col-index')).toBe('0')
   })
 
   it('close button sets dropdown to closed', () => {
