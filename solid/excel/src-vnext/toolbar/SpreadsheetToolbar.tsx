@@ -1,7 +1,11 @@
 import { useAtomValue } from '@einfach/solid'
 import {
+  armFormatPainterAtom,
+  armFormatPainterStickyAtom,
   createVisibleProjectionRequest,
   dispatchToolbarFormatCommandAtom,
+  exitFormatPainterAtom,
+  formatPainterStateAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
   activeCellLockedAtom,
@@ -9,6 +13,7 @@ import {
   findReplaceOpenAtom,
   printPreviewOpenAtom,
   togglePrintPreviewAtom,
+  type CapturedFormat,
   type CellRange,
   type SpreadsheetCellFormat,
   type SpreadsheetNumberFormat,
@@ -103,6 +108,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const selectionLocked = useAtomValue(selectionLockedAtom)
   const findReplaceOpen = useAtomValue(findReplaceOpenAtom)
   const printPreviewOpen = useAtomValue(printPreviewOpenAtom)
+  const formatPainterState = useAtomValue(formatPainterStateAtom)
 
   function isProtectionGated(): boolean {
     return activeCellLocked() || selectionLocked() !== 'open'
@@ -133,6 +139,52 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         candidate.col === selection.activeCell.col,
     )
     return cloneFormat(cell?.format)
+  }
+
+  function captureFormatPainterPayload(): CapturedFormat {
+    const selection = selectionSnapshot()
+    const snapshot = projectionSnapshot()
+    const result = snapshot.result
+    if (!isVisibleProjectionResult(result) || result.sheetId !== selection.selection.sheetId) {
+      return { format: {} }
+    }
+
+    const cell = result.cells.find(
+      (candidate) =>
+        candidate.row === selection.activeCell.row &&
+        candidate.col === selection.activeCell.col,
+    )
+    return {
+      format: cloneFormat(cell?.format),
+      conditionalFormat: cell?.conditionalFormat ? { ...cell.conditionalFormat } : undefined,
+    }
+  }
+
+  let painterClickTimer: ReturnType<typeof setTimeout> | null = null
+
+  function handleFormatPainterClick() {
+    if (formatPainterState() !== 'idle') {
+      if (painterClickTimer) {
+        clearTimeout(painterClickTimer)
+        painterClickTimer = null
+      }
+      store.setter(exitFormatPainterAtom)
+      return
+    }
+    if (painterClickTimer) return
+    painterClickTimer = setTimeout(() => {
+      painterClickTimer = null
+      if (formatPainterState() !== 'idle') return
+      store.setter(armFormatPainterAtom, captureFormatPainterPayload())
+    }, 220)
+  }
+
+  function handleFormatPainterDoubleClick() {
+    if (painterClickTimer) {
+      clearTimeout(painterClickTimer)
+      painterClickTimer = null
+    }
+    store.setter(armFormatPainterStickyAtom, captureFormatPainterPayload())
   }
 
   function commandFormat(
@@ -367,6 +419,26 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         }}
       >
         Print preview
+      </button>
+      <button
+        type="button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          formatPainterState() !== 'idle' ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid="toolbar-btn-format-painter"
+        data-format-painter-state={formatPainterState()}
+        title={
+          formatPainterState() === 'sticky'
+            ? 'Format painter (sticky - click button or Esc to exit)'
+            : 'Format painter (single click to copy format; double click for sticky)'
+        }
+        aria-label="Format painter"
+        aria-pressed={formatPainterState() !== 'idle'}
+        disabled={isProtectionGated()}
+        onClick={handleFormatPainterClick}
+        onDblClick={handleFormatPainterDoubleClick}
+      >
+        Painter
       </button>
     </div>
   )
