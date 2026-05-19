@@ -161,6 +161,22 @@ export const messages: Record<string, string> = {
   'menuBar.placeholder.closeFile': 'Close is not wired yet',
   'menuBar.placeholder.hyperlink': 'Hyperlink editor not wired yet',
 
+  // Help overlay dialog
+  'help.close': 'Close',
+  'help.shortcuts.title': 'Keyboard Shortcuts',
+  'help.shortcuts.undo': 'Undo',
+  'help.shortcuts.redo': 'Redo',
+  'help.shortcuts.copy': 'Copy',
+  'help.shortcuts.cut': 'Cut',
+  'help.shortcuts.paste': 'Paste',
+  'help.shortcuts.find': 'Find',
+  'help.shortcuts.replace': 'Find & Replace',
+  'help.shortcuts.selectAll': 'Select All',
+  'help.shortcuts.edit': 'Edit active cell',
+  'help.shortcuts.cancel': 'Cancel edit / close dialog',
+  'help.about.title': 'About',
+  'help.about.body': 'Einfach Excel — Wave 5 demo, Rust + WASM + SolidJS.',
+
   // Toolbar buttons
   'toolbar.bold': 'B',
   'toolbar.bold.title': 'Bold',

@@ -146,6 +146,22 @@ export const messages: Record<string, string> = {
   'menuBar.placeholder.closeFile': '关闭尚未接入',
   'menuBar.placeholder.hyperlink': '超链接编辑器尚未接入',
 
+  // 帮助弹层
+  'help.close': '关闭',
+  'help.shortcuts.title': '键盘快捷键',
+  'help.shortcuts.undo': '撤销',
+  'help.shortcuts.redo': '重做',
+  'help.shortcuts.copy': '复制',
+  'help.shortcuts.cut': '剪切',
+  'help.shortcuts.paste': '粘贴',
+  'help.shortcuts.find': '查找',
+  'help.shortcuts.replace': '查找和替换',
+  'help.shortcuts.selectAll': '全选',
+  'help.shortcuts.edit': '编辑当前单元格',
+  'help.shortcuts.cancel': '取消编辑 / 关闭对话框',
+  'help.about.title': '关于',
+  'help.about.body': 'Einfach Excel —— Wave 5 演示，Rust + WASM + SolidJS。',
+
   'toolbar.bold': 'B',
   'toolbar.bold.title': '加粗',
   'toolbar.italic': 'I',

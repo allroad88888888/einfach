@@ -1541,6 +1541,29 @@ thead .row-header {
   background: var(--bg-chrome-light);
 }
 
+/* Shared header X close button — sits in the top-right corner of every vnext
+ * dialog. Each dialog body retains its existing Cancel/Close footer button;
+ * this is an additive affordance plus a paired Esc keybinding for keyboard
+ * users. */
+.vnext-demo [role='dialog'] .dialog-close-x {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 2px;
+}
+.vnext-demo [role='dialog'] .dialog-close-x:hover {
+  background: var(--hover);
+  color: var(--text-default);
+}
+
 /* Find/replace specific dialog form */
 .find-replace-row {
   display: flex;
@@ -1840,4 +1863,77 @@ thead .row-header {
   margin: 2px 0 0 0;
   font-size: 11px;
   color: var(--text-muted);
+}
+
+/* View > Show Gridlines: remove borders between cells. */
+.spreadsheet-grid.spreadsheet-grid--no-gridlines .spreadsheet-grid-cell {
+  border-right: none;
+  border-bottom: none;
+}
+
+/* Help overlay (Keyboard Shortcuts / About) — centered card. */
+.spreadsheet-help-overlay {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  min-width: 320px;
+  max-width: 480px;
+  background: var(--bg, #fff);
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  padding: 16px 20px;
+  font-size: 13px;
+}
+
+.spreadsheet-help-overlay-title {
+  margin: 0 0 12px 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.spreadsheet-help-overlay-body {
+  margin: 0 0 12px 0;
+  line-height: 1.5;
+}
+
+.spreadsheet-help-overlay-shortcut-list {
+  list-style: none;
+  margin: 0 0 12px 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+}
+
+.spreadsheet-help-overlay-shortcut-item {
+  display: contents;
+}
+
+.spreadsheet-help-overlay-keys {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bg-muted, #f1f1f1);
+  border: 1px solid var(--border, #d0d0d0);
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 12px;
+}
+
+.spreadsheet-help-overlay-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.spreadsheet-help-overlay-close {
+  padding: 4px 12px;
+  border: 1px solid var(--border, #d0d0d0);
+  background: var(--bg-muted, #f7f7f7);
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.spreadsheet-help-overlay-close:hover {
+  background: var(--bg-hover, #ececec);
 }
