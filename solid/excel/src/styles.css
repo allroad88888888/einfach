@@ -1176,3 +1176,258 @@ thead .row-header {
   outline: 1px solid var(--office-blue);
   outline-offset: -1px;
 }
+
+/* === C. Bottom chrome — status bar sections + sheet tabs =============== */
+
+/* C.1 Status bar — Excel-like sectioned layout, zoom controls on the right */
+.spreadsheet-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-height: 22px;
+  padding: 0;
+  border: none;
+  border-top: 1px solid var(--border);
+  background: var(--bg-chrome);
+  color: var(--text-default);
+  font-family: var(--excel-font);
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-item {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  border-right: 1px solid var(--border);
+  color: var(--text-default);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-item:first-child {
+  color: var(--excel-green);
+  font-weight: 600;
+  background: #ffffff;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregates {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  gap: 2px;
+  padding: 0 8px;
+  border-right: 1px solid var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate[data-enabled='false'] {
+  color: var(--text-muted);
+  opacity: 0.55;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate[aria-pressed='true'] {
+  background: var(--select-bg);
+  border-color: var(--excel-green);
+  color: var(--excel-green);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate-label {
+  font-weight: 600;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-aggregate-empty {
+  padding: 0 8px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-view-modes {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  gap: 1px;
+  padding: 0 6px;
+  border-right: 1px solid var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-view-mode {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-view-mode:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-view-mode[aria-pressed='true'] {
+  background: var(--active-bg);
+  border-color: var(--border-strong);
+}
+
+/* Zoom block — right-aligned via margin-left: auto */
+.spreadsheet-status-bar .spreadsheet-status-bar-zoom {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  gap: 1px;
+  padding: 0 8px;
+  margin-left: auto;
+  border-left: 1px solid var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-zoom-preset {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-zoom-preset:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-zoom-slider {
+  margin: 0 6px;
+  height: 12px;
+  cursor: pointer;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-zoom-value {
+  display: inline-flex;
+  align-items: center;
+  min-width: 42px;
+  height: 18px;
+  padding: 0 6px;
+  justify-content: center;
+  color: var(--text-default);
+  font-variant-numeric: tabular-nums;
+}
+
+.spreadsheet-status-bar .spreadsheet-status-bar-mode-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 8px;
+  margin: 0 4px;
+  border-radius: 2px;
+  background: var(--office-blue);
+  color: #ffffff;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+/* C.2 Sheet tabs — Excel-like rounded card with active raised */
+.spreadsheet-sheet-tabs {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  padding: 0 4px;
+  background: var(--bg-chrome);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  font-family: var(--excel-font);
+  font-size: 12px;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-item {
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-top-left-radius: 2px;
+  border-top-right-radius: 2px;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab:hover {
+  background: var(--hover);
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab[aria-selected='true'] {
+  background: #ffffff;
+  border-color: var(--border);
+  color: var(--excel-green);
+  font-weight: 600;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 100%;
+  margin-left: 4px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-add:hover {
+  background: var(--hover);
+  border-color: var(--border);
+  color: var(--text-default);
+}
+
+.spreadsheet-sheet-tabs .spreadsheet-sheet-tab-reorder {
+  padding: 0 4px;
+  color: var(--text-muted);
+  cursor: grab;
+  user-select: none;
+}
