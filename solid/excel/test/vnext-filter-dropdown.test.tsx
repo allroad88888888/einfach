@@ -358,6 +358,55 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
   })
 
+  it('two providers do not interfere with each other apply errors', async () => {
+    const storeA = createStore()
+    const storeB = createStore()
+    let rejectA: ((e: unknown) => void) | null = null
+    const backendA = createFakeBackend({
+      setFilterSort() {
+        return new Promise((_resolve, reject) => {
+          rejectA = reject
+        })
+      },
+    })
+    const backendB = createFakeBackend({
+      async setFilterSort(req) {
+        return { sheetId: req.sheetId, requestId: undefined, revision: 1 }
+      },
+    })
+
+    storeA.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    storeA.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+    storeB.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    storeB.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const a = render(() => (
+      <SpreadsheetUiProvider backend={backendA} store={storeA}>
+        <SpreadsheetFilterDropdown data-testid="fdrop-a" />
+      </SpreadsheetUiProvider>
+    ))
+    const b = render(() => (
+      <SpreadsheetUiProvider backend={backendB} store={storeB}>
+        <SpreadsheetFilterDropdown data-testid="fdrop-b" />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(a.container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+    fireEvent.click(b.container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+
+    await waitFor(() => {
+      expect(b.container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
+    })
+
+    rejectA!(new Error('A failed'))
+    await waitFor(() => {
+      const errA = a.container.querySelector('[data-testid="filter-error-text"]')
+      expect(errA).not.toBeNull()
+      expect(errA!.textContent).toBe('A failed')
+    })
+    expect(b.container.querySelector('[data-testid="filter-error-text"]')).toBeNull()
+  })
+
   it('close button sets dropdown to closed', () => {
     const store = createStore()
     const backend = createFakeBackend()

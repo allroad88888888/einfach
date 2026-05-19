@@ -9,6 +9,8 @@ import {
   filterDropdownAtom,
   filterSortErrorAtom,
   filterSortStateAtom,
+  filterSortSyncTicketAtom,
+  issueFilterSortSyncTicketAtom,
   notifyActiveSheetChangedAtom,
   openFilterDropdownAtom,
   setFilterSortAtom,
@@ -181,6 +183,28 @@ describe('setFilterSortErrorAtom', () => {
     store.setter(setFilterSortErrorAtom, new Error('boom'))
     store.setter(setFilterSortErrorAtom, null)
     expect(store.getter(filterSortErrorAtom)).toBe('')
+  })
+})
+
+describe('issueFilterSortSyncTicketAtom', () => {
+  test('starts at 0 and each issue returns a monotonically increasing ticket', () => {
+    const store = makeStore()
+    expect(store.getter(filterSortSyncTicketAtom)).toBe(0)
+    expect(store.setter(issueFilterSortSyncTicketAtom)).toBe(1)
+    expect(store.setter(issueFilterSortSyncTicketAtom)).toBe(2)
+    expect(store.setter(issueFilterSortSyncTicketAtom)).toBe(3)
+    expect(store.getter(filterSortSyncTicketAtom)).toBe(3)
+  })
+
+  test('two separate stores have independent ticket counters', () => {
+    const a = makeStore()
+    const b = makeStore()
+    a.setter(issueFilterSortSyncTicketAtom)
+    a.setter(issueFilterSortSyncTicketAtom)
+    expect(a.getter(filterSortSyncTicketAtom)).toBe(2)
+    expect(b.getter(filterSortSyncTicketAtom)).toBe(0)
+    expect(b.setter(issueFilterSortSyncTicketAtom)).toBe(1)
+    expect(a.getter(filterSortSyncTicketAtom)).toBe(2)
   })
 })
 
