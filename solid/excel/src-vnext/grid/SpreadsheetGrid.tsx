@@ -82,6 +82,7 @@ import {
   spreadsheetProjectionSnapshotAtom,
 } from '../provider'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import { SpreadsheetGridOverlay } from './SpreadsheetGridOverlay'
 
 export interface SpreadsheetGridProps {
   sheetId: string
@@ -1718,6 +1719,76 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(presenceStateAtom).participants.find((p) => p.id === participantId)?.colorHint
   }
 
+  function getOverlayCellRect(row: number, col: number): { x: number; y: number; w: number; h: number } | null {
+    if (!gridRoot) return null
+    const td = gridRoot.querySelector(
+      `td.spreadsheet-grid-cell[data-row="${row}"][data-col="${col}"]`,
+    ) as HTMLElement | null
+    if (td) {
+      const rootRect = gridRoot.getBoundingClientRect()
+      const cellRect = td.getBoundingClientRect()
+      return {
+        x: cellRect.left - rootRect.left,
+        y: cellRect.top - rootRect.top,
+        w: cellRect.width,
+        h: cellRect.height,
+      }
+    }
+
+    // Fall back to layout math when the cell is covered by a merge or not
+    // present in the DOM. We sum sized rows/cols up to the target.
+    const rows = getRows()
+    const cols = getCols()
+    if (rows.length === 0 || cols.length === 0) return null
+    const rowsBefore = rows.filter((r) => r < row)
+    const colsBefore = cols.filter((c) => c < col)
+    let y = 0
+    for (const r of rowsBefore) y += getRenderedRowHeight(r)
+    let x = 0
+    for (const c of colsBefore) x += getRenderedColumnWidth(c)
+    const cornerEl = gridRoot.querySelector('.spreadsheet-grid-corner') as HTMLElement | null
+    const headerCol = gridRoot.querySelector(
+      `.spreadsheet-grid-col-header[data-col="${cols[0]}"]`,
+    ) as HTMLElement | null
+    const rowHeader = gridRoot.querySelector(
+      `.spreadsheet-grid-row-header[data-row="${rows[0]}"]`,
+    ) as HTMLElement | null
+    const offsetX =
+      (cornerEl?.getBoundingClientRect().width ?? 0) ||
+      (rowHeader?.getBoundingClientRect().width ?? 0)
+    const offsetY =
+      (cornerEl?.getBoundingClientRect().height ?? 0) ||
+      (headerCol?.getBoundingClientRect().height ?? 0)
+    return {
+      x: offsetX + x,
+      y: offsetY + y,
+      w: getRenderedColumnWidth(col),
+      h: getRenderedRowHeight(row),
+    }
+  }
+
+  function getOverlaySurfaceSize(): { width: number; height: number } {
+    if (!gridRoot) return { width: 0, height: 0 }
+    const rect = gridRoot.getBoundingClientRect()
+    return { width: rect.width, height: rect.height }
+  }
+
+  function getOverlayCells(): readonly DisplayCell[] {
+    return projectionSnapshot().result?.cells ?? []
+  }
+
+  function getOverlayFreezeOrigin(): { x: number; y: number } {
+    if (!gridRoot) return { x: 0, y: 0 }
+    const corner = gridRoot.querySelector('.spreadsheet-grid-corner') as HTMLElement | null
+    if (!corner) return { x: 0, y: 0 }
+    const cornerRect = corner.getBoundingClientRect()
+    const rootRect = gridRoot.getBoundingClientRect()
+    return {
+      x: cornerRect.right - rootRect.left,
+      y: cornerRect.bottom - rootRect.top,
+    }
+  }
+
   function getRemoteCursorStyle(cursor: ReturnType<typeof getRemoteCursorsForSheet>[number]): Record<string, string> {
     const bounds = getSelectionBounds()
     const range = getSelectionRange(cursor.selection, bounds)
@@ -1764,6 +1835,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       class={`spreadsheet-grid ${props.class ?? ''}`.trim()}
       data-testid={props['data-testid'] ?? 'spreadsheet-grid'}
       tabIndex={0}
+      style={{ position: 'relative' }}
       onKeyDown={(event) => {
         void handleGridKeyDown(event)
       }}
@@ -1992,6 +2064,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           </Show>
         </tbody>
       </table>
+      <SpreadsheetGridOverlay
+        sheetId={props.sheetId}
+        getCellRect={getOverlayCellRect}
+        getSurfaceSize={getOverlaySurfaceSize}
+        getCells={getOverlayCells}
+        getFreezeOrigin={getOverlayFreezeOrigin}
+      />
       <For each={getRemoteCursorsForSheet()}>
         {(cursor) => (
           <div
