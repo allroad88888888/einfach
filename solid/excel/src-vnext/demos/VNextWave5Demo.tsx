@@ -2,6 +2,7 @@ import { useAtomValue } from '@einfach/solid'
 import { onMount, Show } from 'solid-js'
 import {
   setWorkspaceActiveSheetAtom,
+  viewportShowFormulaBarAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createStaticSpreadsheetBackend } from '../adapter'
@@ -107,6 +108,7 @@ const viewport = {
 function VNextWave5Workbook() {
   const store = useSpreadsheetUiStore()
   const workspace = useAtomValue(workspaceSessionAtom)
+  const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
   const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
 
   onMount(() => {
@@ -119,7 +121,9 @@ function VNextWave5Workbook() {
     <>
       <SpreadsheetMenuBar data-testid="wave5-menu-bar" />
       <SpreadsheetToolbar data-testid="wave5-toolbar" />
-      <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />
+      <Show when={showFormulaBar()}>
+        <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />
+      </Show>
       <Show keyed when={activeSheetId()}>
         {(sheetId) => (
           <SpreadsheetGrid sheetId={sheetId} viewport={viewport} data-testid="wave5-grid" />

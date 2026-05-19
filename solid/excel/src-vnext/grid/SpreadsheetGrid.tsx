@@ -75,6 +75,8 @@ import {
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportHiddenAtom,
+  viewportShowGridlinesAtom,
+  viewportShowHeadingsAtom,
   viewportSizeOverridesAtom,
   visibleWindowAtom,
   workspaceSessionAtom,
@@ -374,6 +376,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribePresence: (() => void) | null = null
   let unsubscribeFilterSort: (() => void) | null = null
   let unsubscribeWorkspace: (() => void) | null = null
+  let unsubscribeShowGridlines: (() => void) | null = null
+  let unsubscribeShowHeadings: (() => void) | null = null
   let lastActiveSheetId: string | null = null
 
   function bumpRender() {
@@ -418,6 +422,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function hiddenState() {
     renderTick()
     return store.getter(viewportHiddenAtom)
+  }
+
+  function showGridlines() {
+    renderTick()
+    return store.getter(viewportShowGridlinesAtom)
+  }
+
+  function showHeadings() {
+    renderTick()
+    return store.getter(viewportShowHeadingsAtom)
   }
 
   function requestProjection() {
@@ -619,6 +633,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
+    unsubscribeShowGridlines = store.sub(viewportShowGridlinesAtom, bumpRender)
+    unsubscribeShowHeadings = store.sub(viewportShowHeadingsAtom, bumpRender)
 
     lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
     unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
@@ -647,6 +663,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribePresence?.()
     unsubscribeFilterSort?.()
     unsubscribeWorkspace?.()
+    unsubscribeShowGridlines?.()
+    unsubscribeShowHeadings?.()
     activeResizeCleanup?.()
     activeFillCleanup?.()
     store.setter(cancelPointerAtom)
@@ -1986,7 +2004,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   return (
     <div
       ref={gridRoot}
-      class={`spreadsheet-grid ${props.class ?? ''}`.trim()}
+      class={`spreadsheet-grid ${props.class ?? ''} ${
+        showGridlines() ? '' : 'spreadsheet-grid--no-gridlines'
+      } ${showHeadings() ? '' : 'spreadsheet-grid--no-headings'}`
+        .replace(/\s+/g, ' ')
+        .trim()}
+      data-show-gridlines={showGridlines() ? 'true' : 'false'}
+      data-show-headings={showHeadings() ? 'true' : 'false'}
       data-testid={props['data-testid'] ?? 'spreadsheet-grid'}
       tabIndex={0}
       style={{ position: 'relative' }}
@@ -1997,6 +2021,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       <table class="spreadsheet-grid-table">
         <tbody>
           <Show when={getRows().length > 0 && getCols().length > 0}>
+            <Show when={showHeadings()}>
             <tr>
               <th
                 class="spreadsheet-grid-corner"
@@ -2060,9 +2085,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                 }}
               </For>
             </tr>
+            </Show>
             <For each={getRows()}>
               {(row) => (
                 <tr class="spreadsheet-grid-row">
+                  <Show when={showHeadings()}>
                   <th
                     class={`spreadsheet-grid-row-header ${
                       isRowSelected(row) ? 'is-selected' : ''
@@ -2091,6 +2118,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       }}
                     />
                   </th>
+                  </Show>
                   <For each={getCols()}>
                     {(col) => {
                       const addr = getCellAddress(row, col)
