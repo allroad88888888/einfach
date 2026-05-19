@@ -1477,3 +1477,244 @@ thead .row-header {
 .spreadsheet-status-bar button[aria-pressed='true'] {
   box-shadow: inset 0 -2px 0 0 var(--excel-green);
 }
+
+/* === D. Dialog universal skin ======================================== */
+
+/* All vnext modal dialogs share a centered card with backdrop, header bar,
+ * scrollable body, and footer action row. Each dialog still owns its own
+ * body class for layout (find-replace-form / cf-form / nm-form / ...).
+ *
+ * Selector strategy: target by role="dialog" so any dialog component picks
+ * up the skin automatically without per-component changes. Dialogs that
+ * choose not to participate can opt out by setting role="presentation". */
+
+.vnext-demo [role='dialog'],
+.demo-page [role='dialog'] {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  min-width: 360px;
+  max-width: 720px;
+  max-height: 85vh;
+  padding: 0;
+  background: #ffffff;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+  font-family: var(--excel-font);
+  font-size: 13px;
+  color: var(--text-default);
+  overflow: hidden;
+}
+
+/* Backdrop — rendered as a sibling ::before pseudo of <body>… we don't have
+ * portal control, so use a less elegant approach: a thin border ring + the
+ * dialog's own backdrop-filter on the content. Most browsers blur the bg. */
+.vnext-demo [role='dialog']::before,
+.demo-page [role='dialog']::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: rgba(0, 0, 0, 0.25);
+  pointer-events: none;
+}
+
+/* Body padding scoped via the dialog's inner content classes that
+ * each component already emits. */
+.vnext-demo [role='dialog'] > *,
+.demo-page [role='dialog'] > * {
+  padding: 12px 16px;
+}
+
+/* The status / footer / error rows visually separate via top border */
+.vnext-demo [role='dialog'] .find-replace-status,
+.vnext-demo [role='dialog'] .find-replace-actions,
+.vnext-demo [role='dialog'] .find-replace-error,
+.vnext-demo [role='dialog'] .nm-actions,
+.vnext-demo [role='dialog'] .cf-actions {
+  border-top: 1px solid var(--border);
+  background: var(--bg-chrome-light);
+}
+
+/* Find/replace specific dialog form */
+.find-replace-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.find-replace-label {
+  min-width: 96px;
+  color: var(--text-default);
+  font-weight: 600;
+}
+
+.find-replace-input {
+  flex: 1;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font: inherit;
+}
+
+.find-replace-input:focus {
+  outline: 1px solid var(--office-blue);
+  outline-offset: -1px;
+  border-color: var(--office-blue);
+}
+
+.find-replace-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+.find-replace-option {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.find-replace-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.find-replace-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+  transition: background 100ms ease-out;
+}
+
+.find-replace-btn:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.find-replace-btn-close,
+.find-replace-btn[data-variant='primary'] {
+  background: var(--excel-green);
+  border-color: var(--excel-green);
+  color: #ffffff;
+}
+
+.find-replace-btn-close:hover:not(:disabled),
+.find-replace-btn[data-variant='primary']:hover:not(:disabled) {
+  background: #1a5a37;
+}
+
+.find-replace-status,
+.find-replace-error {
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.find-replace-error {
+  color: #c0392b;
+}
+
+/* Name manager dialog form layout */
+.nm-form {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  gap: 6px 8px;
+  align-items: center;
+}
+
+.nm-form input,
+.nm-form select {
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font: inherit;
+}
+
+.nm-form input:focus,
+.nm-form select:focus {
+  outline: 1px solid var(--office-blue);
+  outline-offset: -1px;
+  border-color: var(--office-blue);
+}
+
+.nm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.nm-actions button {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+}
+
+.nm-actions button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+/* Conditional format dialog */
+.cf-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cf-form select,
+.cf-form input {
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font: inherit;
+}
+
+.cf-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.cf-actions button {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  background: #ffffff;
+  color: var(--text-default);
+  font: inherit;
+  cursor: pointer;
+}
+
+.cf-actions button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.cf-error,
+.find-replace-error {
+  color: #c0392b;
+  font-size: 12px;
+}
