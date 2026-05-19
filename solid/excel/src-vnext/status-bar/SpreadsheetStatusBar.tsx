@@ -34,6 +34,7 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 
 import { spreadsheetProjectionSnapshotAtom } from '../provider'
+import { useT } from '../../src/i18n'
 
 export interface SpreadsheetStatusBarProps {
   class?: string
@@ -130,13 +131,13 @@ function formatMenuIntent(intent: MenuCommandIntent | null): string | null {
   return `Menu ${intent.command}`
 }
 
-const AGGREGATE_LABELS: Record<StatusBarAggregateKey, string> = {
-  sum: 'Sum',
-  average: 'Avg',
-  count: 'Count',
-  numericCount: 'Numeric Count',
-  min: 'Min',
-  max: 'Max',
+const AGGREGATE_LABEL_KEYS: Record<StatusBarAggregateKey, string> = {
+  sum: 'status.aggregate.sum',
+  average: 'status.aggregate.average',
+  count: 'status.aggregate.count',
+  numericCount: 'status.aggregate.numericCount',
+  min: 'status.aggregate.min',
+  max: 'status.aggregate.max',
 }
 
 const AGGREGATE_ORDER: readonly StatusBarAggregateKey[] = [
@@ -187,21 +188,22 @@ const KEYBOARD_MODE_TO_BADGE: Record<KeyboardMode, StatusBarInputMode> = {
   'formula-reference': 'point',
 }
 
-const INPUT_MODE_LABEL: Record<StatusBarInputMode, string> = {
-  ready: 'Ready',
-  edit: 'Edit',
-  enter: 'Enter',
-  point: 'Point',
+const INPUT_MODE_LABEL_KEY: Record<StatusBarInputMode, string> = {
+  ready: 'status.inputMode.ready',
+  edit: 'status.inputMode.edit',
+  enter: 'status.inputMode.enter',
+  point: 'status.inputMode.point',
 }
 
 const VIEW_MODE_BUTTONS: ReadonlyArray<{ value: StatusBarViewMode; label: string }> = [
-  { value: 'normal', label: 'Normal' },
-  { value: 'page-break-preview', label: 'Page Break Preview' },
-  { value: 'page-layout', label: 'Page Layout' },
+  { value: 'normal', label: 'status.viewMode.normal' },
+  { value: 'page-break-preview', label: 'status.viewMode.pageBreak' },
+  { value: 'page-layout', label: 'status.viewMode.pageLayout' },
 ]
 
 export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
   const store = useStore()
+  const t = useT()
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const visibleWindow = useAtomValue(visibleWindowAtom)
@@ -334,7 +336,7 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
                 onClick={() => toggleAggregate(key)}
               >
                 <span class="spreadsheet-status-bar-aggregate-label">
-                  {AGGREGATE_LABELS[key]}
+                  {t(AGGREGATE_LABEL_KEYS[key])}
                 </span>
                 {enabled() ? (
                   <span
@@ -366,7 +368,7 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
               aria-pressed={viewMode() === item.value}
               onClick={() => setViewMode(item.value)}
             >
-              {item.label}
+              {t(item.label)}
             </button>
           )}
         </For>
@@ -413,7 +415,7 @@ export function SpreadsheetStatusBar(props: SpreadsheetStatusBarProps) {
         data-testid="status-mode-badge"
         data-mode={inputMode()}
       >
-        {INPUT_MODE_LABEL[inputMode()]}
+        {t(INPUT_MODE_LABEL_KEY[inputMode()])}
       </span>
     </div>
   )

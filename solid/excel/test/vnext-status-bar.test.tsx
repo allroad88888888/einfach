@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it } from '@jest/globals'
+import { afterAll, afterEach, beforeAll, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
@@ -16,6 +16,16 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetStatusBar } from '../src-vnext/status-bar'
+import { setLocale } from '../src/i18n'
+
+// Status bar tests assert on English labels; pin the locale so the default
+// (currently 'zh') doesn't break textContent comparisons.
+beforeAll(() => {
+  setLocale('en')
+})
+afterAll(() => {
+  setLocale('en')
+})
 
 afterEach(cleanup)
 

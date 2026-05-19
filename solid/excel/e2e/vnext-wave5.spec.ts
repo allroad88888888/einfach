@@ -28,7 +28,7 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
 
   test('menu bar opens File and dispatches Undo', async ({ page }) => {
     await gotoWave5(page)
-    const fileButton = page.getByTestId('wave5-menu-bar').getByRole('button', { name: /^File/ })
+    const fileButton = page.getByTestId('menu-bar-button-file')
     await fileButton.click()
     await expect(page.getByRole('menu')).toBeVisible()
     await page.keyboard.press('Escape')

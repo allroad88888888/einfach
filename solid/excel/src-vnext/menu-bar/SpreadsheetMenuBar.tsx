@@ -1,5 +1,6 @@
 import { For, Show, createMemo, onCleanup, onMount } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   closeFindReplaceAtom,
   closeTopMenuAtom,
@@ -301,6 +302,7 @@ interface MenuBarTopButtonProps {
 }
 
 function MenuBarTopButton(props: MenuBarTopButtonProps) {
+  const t = useT()
   return (
     <div class="menu-bar-top" data-testid={`menu-bar-top-${props.menu.id}`}>
       <button
@@ -313,7 +315,7 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
         onClick={() => props.onClick()}
         onMouseEnter={() => props.onHover()}
       >
-        {props.menu.label}
+        {t(props.menu.label)}
       </button>
       <Show when={props.isOpen}>
         <div
@@ -361,6 +363,7 @@ function DropdownItemButton(props: {
   item: MenuItemDescriptor
   onActivate: (item: MenuItemDescriptor) => void
 }) {
+  const t = useT()
   const isDisabled = () => props.item.isAvailable === 'placeholder'
   return (
     <button
@@ -369,10 +372,16 @@ function DropdownItemButton(props: {
       role="menuitem"
       data-testid={`menu-bar-item-${props.item.id}`}
       disabled={isDisabled()}
-      title={isDisabled() ? (props.item.placeholderMessage ?? '') : (props.item.shortcut ?? '')}
+      title={
+        isDisabled()
+          ? props.item.placeholderMessage
+            ? t(props.item.placeholderMessage)
+            : ''
+          : (props.item.shortcut ?? '')
+      }
       onClick={() => props.onActivate(props.item)}
     >
-      <span class="menu-bar-item-label">{props.item.label}</span>
+      <span class="menu-bar-item-label">{t(props.item.label)}</span>
       <Show when={props.item.shortcut}>
         <span class="menu-bar-item-shortcut">{props.item.shortcut}</span>
       </Show>

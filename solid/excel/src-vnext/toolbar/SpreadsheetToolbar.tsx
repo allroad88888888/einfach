@@ -1,4 +1,5 @@
 import { useAtomValue } from '@einfach/solid'
+import { useT } from '../../src/i18n'
 import {
   armFormatPainterAtom,
   armFormatPainterStickyAtom,
@@ -33,38 +34,38 @@ import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types
 const toolbarCommands: SpreadsheetToolbarCommand[] = [
   {
     command: 'bold',
-    label: 'B',
-    title: 'Bold',
+    label: 'toolbar.bold',
+    title: 'toolbar.bold.title',
     testId: 'toolbar-btn-bold',
     isEnabled: (availability) => availability.bold,
   },
   {
     command: 'italic',
-    label: 'I',
-    title: 'Italic',
+    label: 'toolbar.italic',
+    title: 'toolbar.italic.title',
     testId: 'toolbar-btn-italic',
     isEnabled: (availability) => availability.italic,
   },
   {
     command: 'fill-color',
-    label: 'Fill',
-    title: 'Fill color',
+    label: 'toolbar.fillColor',
+    title: 'toolbar.fillColor.title',
     testId: 'toolbar-btn-fill-color',
     value: '#ffd966',
     isEnabled: (availability) => availability.fillColor,
   },
   {
     command: 'text-color',
-    label: 'Text',
-    title: 'Text color',
+    label: 'toolbar.textColor',
+    title: 'toolbar.textColor.title',
     testId: 'toolbar-btn-text-color',
     value: '#000000',
     isEnabled: (availability) => availability.textColor,
   },
   {
     command: 'number-format',
-    label: 'Num',
-    title: 'Number format',
+    label: 'toolbar.numberFormat',
+    title: 'toolbar.numberFormat.title',
     testId: 'toolbar-btn-number-format',
     value: 'General',
     isEnabled: (availability) => availability.numberFormat,
@@ -101,6 +102,7 @@ function rangeCellCount(range: CellRange): number {
 export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
+  const t = useT()
   const availability = useAtomValue(toolbarCommandAvailabilityAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
@@ -356,15 +358,15 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
               isPressed() ? 'fmt-btn-active' : ''
             }`.trim()}
             data-testid={command.testId}
-            title={command.title}
-            aria-label={command.title}
+            title={t(command.title)}
+            aria-label={t(command.title)}
             aria-pressed={isPressed()}
             disabled={!command.isEnabled(availability()) || isProtectionGated()}
             onClick={() => {
               dispatchCommand(commandValue)
             }}
           >
-            {command.label}
+            {t(command.label)}
           </button>
         )
       })}
@@ -372,53 +374,53 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-merge-cells"
-        title="Merge cells"
-        aria-label="Merge cells"
+        title={t('toolbar.merge.title')}
+        aria-label={t('toolbar.merge.title')}
         disabled={!canMergeSelection() || isProtectionGated()}
         onClick={() => {
           void mergeSelection().catch(reportCommandError)
         }}
       >
-        Merge
+        {t('toolbar.merge')}
       </button>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-unmerge-cells"
-        title="Unmerge cells"
-        aria-label="Unmerge cells"
+        title={t('toolbar.unmerge.title')}
+        aria-label={t('toolbar.unmerge.title')}
         disabled={!canUnmergeSelection() || isProtectionGated()}
         onClick={() => {
           void unmergeSelection().catch(reportCommandError)
         }}
       >
-        Unmerge
+        {t('toolbar.unmerge')}
       </button>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-find"
-        title="Find"
-        aria-label="Find"
+        title={t('toolbar.find.title')}
+        aria-label={t('toolbar.find.title')}
         aria-pressed={findReplaceOpen()}
         onClick={() => {
           store.setter(findReplaceOpenAtom, true)
         }}
       >
-        Find
+        {t('toolbar.find')}
       </button>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-print-preview"
-        title="Print preview"
-        aria-label="Print preview"
+        title={t('toolbar.printPreview.title')}
+        aria-label={t('toolbar.printPreview.title')}
         aria-pressed={printPreviewOpen()}
         onClick={() => {
           store.setter(togglePrintPreviewAtom)
         }}
       >
-        Print preview
+        {t('toolbar.printPreview')}
       </button>
       <button
         type="button"
@@ -429,16 +431,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-format-painter-state={formatPainterState()}
         title={
           formatPainterState() === 'sticky'
-            ? 'Format painter (sticky - click button or Esc to exit)'
-            : 'Format painter (single click to copy format; double click for sticky)'
+            ? t('toolbar.painter.title.sticky')
+            : t('toolbar.painter.title')
         }
-        aria-label="Format painter"
+        aria-label={t('toolbar.painter')}
         aria-pressed={formatPainterState() !== 'idle'}
         disabled={isProtectionGated()}
         onClick={handleFormatPainterClick}
         onDblClick={handleFormatPainterDoubleClick}
       >
-        Painter
+        {t('toolbar.painter')}
       </button>
     </div>
   )
