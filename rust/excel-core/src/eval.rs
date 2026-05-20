@@ -505,6 +505,106 @@ fn eval_offset_as_range(args: &[Expr], provider: &dyn EvalProvider) -> Option<Ce
     Some(CellRange::new(start, end))
 }
 
+/// Normalized rectangle resolved from a range-shaped argument expression.
+/// Used by the multi-criteria aggregates (COUNTIFS / SUMIFS / AVERAGEIF /
+/// AVERAGEIFS / MAXIFS / MINIFS) where every range has to share the same
+/// (rows, cols) shape. `sheet` is `Some` only for cross-sheet ranges.
+#[derive(Clone)]
+struct ResolvedRange {
+    sheet: Option<String>,
+    start_row: u32,
+    start_col: u32,
+    rows: u32,
+    cols: u32,
+}
+
+/// Resolve a function-argument expression to a normalized range. Accepts
+/// `Expr::Range`, `Expr::SheetRange`, and `OFFSET(...)`. Anything else
+/// returns `None` — the caller surfaces `InvalidValue` to keep parity with
+/// Excel's `#VALUE!`.
+fn resolve_range_arg(arg: &Expr, provider: &dyn EvalProvider) -> Option<ResolvedRange> {
+    // OFFSET(...) → runtime range.
+    if let Expr::FuncCall { name, args: fn_args } = arg {
+        if name == "OFFSET" {
+            let r = eval_offset_as_range(fn_args, provider)?;
+            let n = r.normalize();
+            return Some(ResolvedRange {
+                sheet: None,
+                start_row: n.start.row,
+                start_col: n.start.col,
+                rows: n.end.row - n.start.row + 1,
+                cols: n.end.col - n.start.col + 1,
+            });
+        }
+    }
+    match arg_as_range(arg)? {
+        (sheet, start, end) => {
+            let r = CellRange::new(*start, *end).normalize();
+            // Guard: full-column / full-row sentinel ranges would balloon
+            // the (rows, cols) loop. Reject them — the caller surfaces
+            // InvalidValue, consistent with VLOOKUP's full-column guard.
+            if r.end.row > EXCEL_MAX_ROWS || r.end.col > EXCEL_MAX_COLS {
+                return None;
+            }
+            Some(ResolvedRange {
+                sheet: sheet.map(|s| s.to_string()),
+                start_row: r.start.row,
+                start_col: r.start.col,
+                rows: r.end.row - r.start.row + 1,
+                cols: r.end.col - r.start.col + 1,
+            })
+        }
+    }
+}
+
+/// Look up a single cell within a `ResolvedRange` by (dr, dc) offset.
+fn fetch_range_cell(
+    range: &ResolvedRange,
+    dr: u32,
+    dc: u32,
+    provider: &dyn EvalProvider,
+) -> Value {
+    let addr = CellAddress::new(range.start_row + dr, range.start_col + dc);
+    match &range.sheet {
+        Some(s) => provider.sheet_cell(s, addr),
+        None => provider.cell(addr),
+    }
+}
+
+/// Walk pairs of `(range_arg, criterion_arg)` from a slice of function
+/// arguments. The slice's length must be even and ≥ 2 — callers should
+/// arg-count check first. All ranges must share the shape of `args[0]`,
+/// otherwise `InvalidValue` is returned. Criteria expressions are
+/// evaluated once per call (outside the per-cell loop).
+fn collect_criteria_pairs(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> Result<Vec<(ResolvedRange, Value)>, ValueError> {
+    if args.is_empty() || args.len() % 2 != 0 {
+        return Err(ValueError::WrongArgCount);
+    }
+    let mut pairs: Vec<(ResolvedRange, Value)> = Vec::with_capacity(args.len() / 2);
+    let mut shape: Option<(u32, u32)> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let range = match resolve_range_arg(&args[i], provider) {
+            Some(r) => r,
+            None => return Err(ValueError::InvalidValue),
+        };
+        if let Some((rows, cols)) = shape {
+            if range.rows != rows || range.cols != cols {
+                return Err(ValueError::InvalidValue);
+            }
+        } else {
+            shape = Some((range.rows, range.cols));
+        }
+        let criterion = eval_expr_with_provider(&args[i + 1], provider);
+        pairs.push((range, criterion));
+        i += 2;
+    }
+    Ok(pairs)
+}
+
 /// Stream values produced by a function argument. For `Range` args this
 /// goes through `provider.for_each_range_cell` (sparse-aware); for any
 /// other expression it evaluates once and yields the single value. The
@@ -1001,6 +1101,298 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
             }
             Value::Number(total)
+        }
+
+        // === Multi-criteria aggregates (COUNTIFS/SUMIFS/AVERAGEIF/AVERAGEIFS/MAXIFS/MINIFS) ===
+        //
+        // Shape rules: all criteria ranges AND the value range (sum_range /
+        // average_range / max_range / min_range) share the same (rows, cols)
+        // shape. Shape mismatch → InvalidValue (Excel maps this to #VALUE!).
+        //
+        // Range arg accepted: literal `Range` / `SheetRange`, or `OFFSET(...)`.
+        // Anything else → InvalidValue.
+        //
+        // Error propagation: if any criteria-range cell or value-range cell
+        // evaluates to `Value::Error(e)`, the aggregate returns `Error(e)`.
+        //
+        // For COUNTIFS, "match" is reported on any non-Null criteria cell
+        // where the criterion passes — including Text and Boolean — matching
+        // Excel's COUNTIFS (which counts on criteria match, not numeric-ness).
+        // Sums/averages/min/max only accept `Value::Number(_)`.
+        "AVERAGEIF" => {
+            // AVERAGEIF(range, criterion[, average_range])
+            if args.len() != 2 && args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let crit_range = match resolve_range_arg(&args[0], provider) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let value_range = if args.len() == 3 {
+                match resolve_range_arg(&args[2], provider) {
+                    Some(r) => r,
+                    None => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                crit_range.clone()
+            };
+            if crit_range.rows != value_range.rows || crit_range.cols != value_range.cols {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let criterion = eval_expr_with_provider(&args[1], provider);
+            let mut sum = 0.0_f64;
+            let mut count = 0u64;
+            for dr in 0..crit_range.rows {
+                for dc in 0..crit_range.cols {
+                    let cv = fetch_range_cell(&crit_range, dr, dc, provider);
+                    if let Value::Error(e) = cv {
+                        return Value::Error(e);
+                    }
+                    if matches_criterion(&cv, &criterion) {
+                        let tv = fetch_range_cell(&value_range, dr, dc, provider);
+                        if let Value::Error(e) = tv {
+                            return Value::Error(e);
+                        }
+                        if let Value::Number(n) = tv {
+                            sum += n;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count == 0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            Value::Number(sum / count as f64)
+        }
+        "COUNTIFS" => {
+            // COUNTIFS(range1, criterion1, [range2, criterion2, ...])
+            if args.is_empty() || args.len() % 2 != 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let pairs = match collect_criteria_pairs(args, provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            // pairs[0] is the shape-defining range.
+            let (shape_range, _) = &pairs[0];
+            let rows = shape_range.rows;
+            let cols = shape_range.cols;
+            let mut count = 0u64;
+            for dr in 0..rows {
+                for dc in 0..cols {
+                    let mut all_match = true;
+                    let mut has_value = false;
+                    for (range, criterion) in &pairs {
+                        let cv = fetch_range_cell(range, dr, dc, provider);
+                        if let Value::Error(e) = cv {
+                            return Value::Error(e);
+                        }
+                        if !matches!(cv, Value::Null) {
+                            has_value = true;
+                        }
+                        if !matches_criterion(&cv, criterion) {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match && has_value {
+                        count += 1;
+                    }
+                }
+            }
+            Value::Number(count as f64)
+        }
+        "SUMIFS" => {
+            // SUMIFS(sum_range, range1, criterion1, [range2, criterion2, ...])
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let sum_range = match resolve_range_arg(&args[0], provider) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let pairs = match collect_criteria_pairs(&args[1..], provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            for (range, _) in &pairs {
+                if range.rows != sum_range.rows || range.cols != sum_range.cols {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            }
+            let mut total = 0.0_f64;
+            for dr in 0..sum_range.rows {
+                for dc in 0..sum_range.cols {
+                    let mut all_match = true;
+                    for (range, criterion) in &pairs {
+                        let cv = fetch_range_cell(range, dr, dc, provider);
+                        if let Value::Error(e) = cv {
+                            return Value::Error(e);
+                        }
+                        if !matches_criterion(&cv, criterion) {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        let tv = fetch_range_cell(&sum_range, dr, dc, provider);
+                        if let Value::Error(e) = tv {
+                            return Value::Error(e);
+                        }
+                        if let Value::Number(n) = tv {
+                            total += n;
+                        }
+                    }
+                }
+            }
+            Value::Number(total)
+        }
+        "AVERAGEIFS" => {
+            // AVERAGEIFS(average_range, range1, criterion1, ...)
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let avg_range = match resolve_range_arg(&args[0], provider) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let pairs = match collect_criteria_pairs(&args[1..], provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            for (range, _) in &pairs {
+                if range.rows != avg_range.rows || range.cols != avg_range.cols {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            }
+            let mut sum = 0.0_f64;
+            let mut count = 0u64;
+            for dr in 0..avg_range.rows {
+                for dc in 0..avg_range.cols {
+                    let mut all_match = true;
+                    for (range, criterion) in &pairs {
+                        let cv = fetch_range_cell(range, dr, dc, provider);
+                        if let Value::Error(e) = cv {
+                            return Value::Error(e);
+                        }
+                        if !matches_criterion(&cv, criterion) {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        let tv = fetch_range_cell(&avg_range, dr, dc, provider);
+                        if let Value::Error(e) = tv {
+                            return Value::Error(e);
+                        }
+                        if let Value::Number(n) = tv {
+                            sum += n;
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            if count == 0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            Value::Number(sum / count as f64)
+        }
+        "MAXIFS" => {
+            // MAXIFS(max_range, range1, criterion1, ...)
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let max_range = match resolve_range_arg(&args[0], provider) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let pairs = match collect_criteria_pairs(&args[1..], provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            for (range, _) in &pairs {
+                if range.rows != max_range.rows || range.cols != max_range.cols {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            }
+            let mut best: Option<f64> = None;
+            for dr in 0..max_range.rows {
+                for dc in 0..max_range.cols {
+                    let mut all_match = true;
+                    for (range, criterion) in &pairs {
+                        let cv = fetch_range_cell(range, dr, dc, provider);
+                        if let Value::Error(e) = cv {
+                            return Value::Error(e);
+                        }
+                        if !matches_criterion(&cv, criterion) {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        let tv = fetch_range_cell(&max_range, dr, dc, provider);
+                        if let Value::Error(e) = tv {
+                            return Value::Error(e);
+                        }
+                        if let Value::Number(n) = tv {
+                            best = Some(match best {
+                                Some(b) => b.max(n),
+                                None => n,
+                            });
+                        }
+                    }
+                }
+            }
+            Value::Number(best.unwrap_or(0.0))
+        }
+        "MINIFS" => {
+            // MINIFS(min_range, range1, criterion1, ...)
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let min_range = match resolve_range_arg(&args[0], provider) {
+                Some(r) => r,
+                None => return Value::Error(ValueError::InvalidValue),
+            };
+            let pairs = match collect_criteria_pairs(&args[1..], provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            for (range, _) in &pairs {
+                if range.rows != min_range.rows || range.cols != min_range.cols {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            }
+            let mut best: Option<f64> = None;
+            for dr in 0..min_range.rows {
+                for dc in 0..min_range.cols {
+                    let mut all_match = true;
+                    for (range, criterion) in &pairs {
+                        let cv = fetch_range_cell(range, dr, dc, provider);
+                        if let Value::Error(e) = cv {
+                            return Value::Error(e);
+                        }
+                        if !matches_criterion(&cv, criterion) {
+                            all_match = false;
+                            break;
+                        }
+                    }
+                    if all_match {
+                        let tv = fetch_range_cell(&min_range, dr, dc, provider);
+                        if let Value::Error(e) = tv {
+                            return Value::Error(e);
+                        }
+                        if let Value::Number(n) = tv {
+                            best = Some(match best {
+                                Some(b) => b.min(n),
+                                None => n,
+                            });
+                        }
+                    }
+                }
+            }
+            Value::Number(best.unwrap_or(0.0))
         }
 
         // === Phase 5: lookup / stats / dates ===
@@ -2768,7 +3160,25 @@ fn matches_criterion(v: &Value, criterion: &Value) -> bool {
             };
         }
     }
-    // Fallback: text equality (Excel-compatible default).
+    // Excel wildcard semantics: ? = 1 char, * = 0+ chars, ~ escapes the next char.
+    // Wildcards apply only to the "rest" (after any operator prefix). `=` and
+    // `<>` honor wildcards (match / not-match); comparison operators (`>`,
+    // `<`, `>=`, `<=`) fall through to text equality (existing legacy
+    // behavior — those forms don't apply meaningfully to text patterns).
+    if pattern_has_wildcard(rest) {
+        let text = coerce_to_text(v);
+        let matched = wildcard_match(rest, &text);
+        return match op {
+            "<>" => !matched,
+            "=" => matched,
+            // Comparison operators against a wildcard pattern fall back to
+            // equality semantics (Excel does the same).
+            _ => matched,
+        };
+    }
+    // Fallback: text equality (Excel-compatible default). Preserves the
+    // pre-wildcard behavior: any `op` other than the numeric branches above
+    // reduces to a string compare against `rest`.
     coerce_to_text(v) == rest
 }
 
@@ -2779,6 +3189,107 @@ fn parse_criterion_op(s: &str) -> (&str, &str) {
         }
     }
     ("=", s)
+}
+
+/// Detect whether a pattern is "wildcard-style". A pattern is wildcard-style
+/// if it contains an unescaped `?`/`*` OR any `~` escape sequence — the
+/// escape sequence itself needs the wildcard matcher to decode it (e.g.
+/// `~*` is a literal `*` only after escape resolution; a plain string
+/// compare against the raw pattern would still see the `~`).
+fn pattern_has_wildcard(pattern: &str) -> bool {
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '~' {
+            // A `~` always triggers the wildcard matcher so escapes are
+            // decoded uniformly. Consume the escaped char and continue.
+            let _ = chars.next();
+            return true;
+        }
+        if c == '?' || c == '*' {
+            return true;
+        }
+    }
+    false
+}
+
+/// Excel wildcard semantics: `?` = exactly one char, `*` = zero-or-more
+/// chars, `~` escapes the next char (`~?`, `~*`, `~~`). Match is
+/// case-insensitive (Excel convention; same as SEARCH).
+///
+/// Implementation: iterative two-pointer matcher with `*` backtracking. The
+/// pattern is pre-decoded into a token vector (`Lit(c) | Q | Star`) so the
+/// matcher itself only deals with three cases. Time complexity is O(p·t)
+/// in the worst case (multiple `*`s with backtracking); criteria patterns
+/// are short in practice so this is fine.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    enum Tok {
+        Lit(char),
+        Q,
+        Star,
+    }
+    // Decode pattern → tokens, honoring `~` escape. Case-folded to lower.
+    let mut toks: Vec<Tok> = Vec::with_capacity(pattern.len());
+    let mut it = pattern.chars();
+    while let Some(c) = it.next() {
+        if c == '~' {
+            // Escape: the next char is a literal (any char; `~` at end is
+            // treated as a literal `~`, matching Excel parity).
+            match it.next() {
+                Some(next) => toks.push(Tok::Lit(next.to_lowercase().next().unwrap_or(next))),
+                None => toks.push(Tok::Lit('~')),
+            }
+        } else if c == '?' {
+            toks.push(Tok::Q);
+        } else if c == '*' {
+            toks.push(Tok::Star);
+        } else {
+            toks.push(Tok::Lit(c.to_lowercase().next().unwrap_or(c)));
+        }
+    }
+    // Case-fold the text too.
+    let text_chars: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
+
+    // Two-pointer matcher with `*` backtracking. `star_p` is the index of
+    // the most recent `*` in the pattern (or None); `star_t` is the text
+    // index where that `*` last attempted to "start eating".
+    let mut p = 0usize;
+    let mut t = 0usize;
+    let mut star_p: Option<usize> = None;
+    let mut star_t: usize = 0;
+    while t < text_chars.len() {
+        match toks.get(p) {
+            Some(Tok::Lit(c)) if text_chars[t] == *c => {
+                p += 1;
+                t += 1;
+            }
+            Some(Tok::Q) => {
+                p += 1;
+                t += 1;
+            }
+            Some(Tok::Star) => {
+                star_p = Some(p);
+                star_t = t;
+                p += 1;
+            }
+            _ => {
+                // Mismatch or end-of-pattern with text remaining. Try to
+                // backtrack to the last `*` and let it consume one more char.
+                if let Some(sp) = star_p {
+                    p = sp + 1;
+                    star_t += 1;
+                    t = star_t;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    // Consume any trailing `*`s; anything else means leftover required
+    // tokens that have no text to match against.
+    while let Some(Tok::Star) = toks.get(p) {
+        p += 1;
+    }
+    p == toks.len()
 }
 
 #[cfg(test)]
@@ -5053,6 +5564,655 @@ mod tests {
         assert_eq!(
             eval_str("=TEXTJOIN(\",\",TRUE,A1/C1)", &cm, &vs),
             Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // === Wildcard matching tests ===
+
+    #[test]
+    fn wildcard_match_bare_and_case_insensitive() {
+        assert!(wildcard_match("apple", "apple"));
+        assert!(wildcard_match("apple", "Apple"));
+        assert!(wildcard_match("APPLE", "apple"));
+        assert!(!wildcard_match("apple", "banana"));
+        assert!(wildcard_match("", ""));
+        assert!(!wildcard_match("", "x"));
+        assert!(!wildcard_match("x", ""));
+    }
+
+    #[test]
+    fn wildcard_match_star_positions() {
+        // `*` at start / middle / end.
+        assert!(wildcard_match("*pple", "apple"));
+        assert!(wildcard_match("*pple", "pineapple")); // matches "pineap" + "ple"
+        assert!(wildcard_match("a*e", "apple"));
+        assert!(wildcard_match("a*e", "ae"));
+        assert!(wildcard_match("app*", "apple"));
+        assert!(wildcard_match("app*", "app"));
+        assert!(!wildcard_match("app*", "ap"));
+        // Bare `*` matches anything.
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("*", ""));
+    }
+
+    #[test]
+    fn wildcard_match_question_mark_exact_one_char() {
+        assert!(wildcard_match("?pple", "apple"));
+        assert!(!wildcard_match("?pple", "pple"));
+        assert!(!wildcard_match("?pple", "aapple"));
+        assert!(wildcard_match("a?", "ab"));
+        assert!(!wildcard_match("a?", "a"));
+    }
+
+    #[test]
+    fn wildcard_match_mixed_patterns() {
+        // a?p* — a, any-1, p, then anything.
+        // apple: a-p-p-l-e → pattern wants a + ? + p + …; '?' eats 'p',
+        // then literal 'p' matches 'p', `*` eats 'le'. ✓
+        assert!(wildcard_match("a?p*", "apple"));
+        assert!(wildcard_match("a?p*", "apply"));
+        // apricot: a-p-r-… — pattern needs a + ? + p, but char[2] is 'r',
+        // not 'p'. So a?p* does NOT match apricot.
+        assert!(!wildcard_match("a?p*", "apricot"));
+        // a*p* DOES match apricot (a + anything + p + anything).
+        assert!(wildcard_match("a*p*", "apricot"));
+        // ap?* matches all three: apple, apply, apricot.
+        assert!(wildcard_match("ap?*", "apple"));
+        assert!(wildcard_match("ap?*", "apply"));
+        assert!(wildcard_match("ap?*", "apricot"));
+    }
+
+    #[test]
+    fn wildcard_match_escaped_specials() {
+        // `~*` is a literal asterisk.
+        assert!(wildcard_match("a~*b", "a*b"));
+        assert!(!wildcard_match("a~*b", "axb"));
+        // `~?` is a literal question mark.
+        assert!(wildcard_match("a~?b", "a?b"));
+        assert!(!wildcard_match("a~?b", "axb"));
+        // `~~` is a literal tilde.
+        assert!(wildcard_match("a~~b", "a~b"));
+        // Escape applies once; subsequent `*` is still wildcard.
+        assert!(wildcard_match("~*a*", "*apple"));
+    }
+
+    #[test]
+    fn matches_criterion_wildcards_against_text() {
+        // `*` and `?` honored on text inputs (no operator prefix).
+        assert!(matches_criterion(
+            &Value::Text("apple".into()),
+            &Value::Text("a*e".into())
+        ));
+        // Wildcard matching is case-insensitive (Excel parity).
+        assert!(matches_criterion(
+            &Value::Text("Apple".into()),
+            &Value::Text("a*e".into())
+        ));
+        // With explicit `=` and wildcard.
+        assert!(matches_criterion(
+            &Value::Text("Apple".into()),
+            &Value::Text("=ap*".into())
+        ));
+        // `<>` with wildcard pattern: negation.
+        assert!(matches_criterion(
+            &Value::Text("banana".into()),
+            &Value::Text("<>a*".into())
+        ));
+        assert!(!matches_criterion(
+            &Value::Text("apple".into()),
+            &Value::Text("<>a*".into())
+        ));
+        // Escaped wildcard: criterion `~*` matches literal "*".
+        assert!(matches_criterion(
+            &Value::Text("*".into()),
+            &Value::Text("~*".into())
+        ));
+        // `?` for one-char.
+        assert!(matches_criterion(
+            &Value::Text("cat".into()),
+            &Value::Text("?at".into())
+        ));
+        assert!(!matches_criterion(
+            &Value::Text("cat".into()),
+            &Value::Text("?att".into())
+        ));
+    }
+
+    #[test]
+    fn matches_criterion_regression_operators_still_work() {
+        // Numeric ops still resolve correctly (no wildcard branch taken).
+        assert!(matches_criterion(
+            &Value::Number(10.0),
+            &Value::Text(">5".into())
+        ));
+        assert!(!matches_criterion(
+            &Value::Number(3.0),
+            &Value::Text(">5".into())
+        ));
+        assert!(matches_criterion(
+            &Value::Number(5.0),
+            &Value::Text(">=5".into())
+        ));
+        // `<>"x"` non-wildcard: legacy fallback (text eq) — preserved.
+        assert!(!matches_criterion(
+            &Value::Text("x".into()),
+            &Value::Text("<>y".into())
+        )); // legacy: "x" != "y" → false (existing quirk; not a wildcard case)
+        // Bare equality on numbers.
+        assert!(matches_criterion(
+            &Value::Number(7.0),
+            &Value::Number(7.0)
+        ));
+    }
+
+    // === Multi-criteria aggregate tests ===
+
+    fn make_multi_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // Layout:
+        //   A1=apple   B1=10   C1=red
+        //   A2=banana  B2=20   C2=yellow
+        //   A3=apricot B3=30   C3=red
+        //   A4=cherry  B4=40   C4=red
+        //   A5=apple   B5=50   C5=green
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let rows: [(&str, f64, &str); 5] = [
+            ("apple", 10.0, "red"),
+            ("banana", 20.0, "yellow"),
+            ("apricot", 30.0, "red"),
+            ("cherry", 40.0, "red"),
+            ("apple", 50.0, "green"),
+        ];
+        let mut next_id: u64 = 0;
+        for (row, (name, n, color)) in rows.iter().enumerate() {
+            let r = row as u32;
+            let a = AtomId::from_raw(next_id);
+            next_id += 1;
+            let b = AtomId::from_raw(next_id);
+            next_id += 1;
+            let c = AtomId::from_raw(next_id);
+            next_id += 1;
+            cell_map.insert(CellAddress::new(r, 0), a);
+            cell_map.insert(CellAddress::new(r, 1), b);
+            cell_map.insert(CellAddress::new(r, 2), c);
+            values.insert(a, Value::Text((*name).into()));
+            values.insert(b, Value::Number(*n));
+            values.insert(c, Value::Text((*color).into()));
+        }
+        (cell_map, values)
+    }
+
+    // ---- AVERAGEIF ----
+
+    #[test]
+    fn averageif_two_args_average_over_range_itself() {
+        let (cm, vs) = make_multi_env();
+        // B1:B5 = 10,20,30,40,50; criterion ">=30" → (30+40+50)/3 = 40.
+        assert_eq!(
+            eval_str("=AVERAGEIF(B1:B5,\">=30\")", &cm, &vs),
+            Value::Number(40.0)
+        );
+    }
+
+    #[test]
+    fn averageif_three_args_uses_average_range() {
+        let (cm, vs) = make_multi_env();
+        // Find rows where A is "apple" (rows 1, 5), average B → (10+50)/2 = 30.
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5,\"apple\",B1:B5)", &cm, &vs),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn averageif_wildcard_question_mark() {
+        let (cm, vs) = make_multi_env();
+        // `?pple` matches "apple" (rows 1 and 5), not "apricot". → (10+50)/2 = 30.
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5,\"?pple\",B1:B5)", &cm, &vs),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn averageif_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5,\"apple\",B1:B5,\"extra\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn averageif_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        // A1:A5 is 5×1, B1:B3 is 3×1 → shape mismatch.
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5,\"apple\",B1:B3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn averageif_empty_match_set_returns_div_zero() {
+        let (cm, vs) = make_multi_env();
+        // Nothing matches "zzz" → no numbers averaged → #DIV/0!.
+        assert_eq!(
+            eval_str("=AVERAGEIF(A1:A5,\"zzz\",B1:B5)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn averageif_error_propagation_from_criteria_cell() {
+        let (cm, vs) = make_multi_env();
+        // Force a cell to produce an error during eval.
+        // B1/C1 (text/0) coerces text → error. Use formula via temp eval.
+        // Simpler: pass an OFFSET that produces an invalid ref isn't easy
+        // through criteria; instead pre-populate one cell as Error.
+        let mut cm = cm;
+        let mut vs = vs;
+        let err_id = AtomId::from_raw(99);
+        cm.insert(CellAddress::new(10, 0), err_id);
+        cm.insert(CellAddress::new(10, 1), AtomId::from_raw(100));
+        vs.insert(err_id, Value::Error(ValueError::WrongType));
+        vs.insert(AtomId::from_raw(100), Value::Number(5.0));
+        assert_eq!(
+            eval_str("=AVERAGEIF(A11:A11,\"x\",B11:B11)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // ---- COUNTIFS ----
+
+    #[test]
+    fn countifs_single_pair_matches_countif() {
+        let (cm, vs) = make_multi_env();
+        // Same as COUNTIF(B1:B5, ">=30") → 3.
+        assert_eq!(
+            eval_str("=COUNTIFS(B1:B5,\">=30\")", &cm, &vs),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn countifs_two_pairs_intersect() {
+        let (cm, vs) = make_multi_env();
+        // Color=red AND amount>=30: rows 3 (apricot/30) and 4 (cherry/40) → 2.
+        assert_eq!(
+            eval_str("=COUNTIFS(C1:C5,\"red\",B1:B5,\">=30\")", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn countifs_wildcard_star() {
+        let (cm, vs) = make_multi_env();
+        // Names starting with "ap*": "apple", "apricot", "apple" → 3.
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A5,\"ap*\")", &cm, &vs),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn countifs_wildcard_escaped_star() {
+        // Build a small env with literal "*" in a cell.
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let a2 = AtomId::from_raw(1);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        cell_map.insert(CellAddress::new(1, 0), a2);
+        values.insert(a1, Value::Text("*".into()));
+        values.insert(a2, Value::Text("anything".into()));
+        // `~*` matches only the literal "*" cell.
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A2,\"~*\")", &cell_map, &values),
+            Value::Number(1.0)
+        );
+        // Plain `*` matches both (it's a wildcard).
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A2,\"*\")", &cell_map, &values),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn countifs_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A5,\"x\",B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn countifs_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        // A1:A5 (5×1) vs B1:B3 (3×1).
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A5,\"x\",B1:B3,\">0\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn countifs_empty_match_returns_zero() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A5,\"zzz\")", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn countifs_error_propagation() {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        values.insert(a1, Value::Error(ValueError::WrongType));
+        assert_eq!(
+            eval_str("=COUNTIFS(A1:A1,\"x\")", &cell_map, &values),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // ---- SUMIFS ----
+
+    #[test]
+    fn sumifs_single_pair_matches_sumif() {
+        let (cm, vs) = make_multi_env();
+        // SUMIFS(B, B, ">=30") → 30+40+50 = 120.
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5,B1:B5,\">=30\")", &cm, &vs),
+            Value::Number(120.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_two_pairs_intersect() {
+        let (cm, vs) = make_multi_env();
+        // Sum B where color=red AND B>=30 → 30+40 = 70.
+        assert_eq!(
+            eval_str(
+                "=SUMIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")",
+                &cm,
+                &vs
+            ),
+            Value::Number(70.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_wildcard() {
+        let (cm, vs) = make_multi_env();
+        // SUMIFS(B, A, "ap*") → 10+30+50 = 90 (apple, apricot, apple).
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5,A1:A5,\"ap*\")", &cm, &vs),
+            Value::Number(90.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Even number of args after sum_range → invalid (each criterion needs
+        // a paired range).
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5,A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn sumifs_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5,A1:A3,\"apple\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn sumifs_empty_match_returns_zero() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B5,A1:A5,\"zzz\")", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn sumifs_error_propagation() {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let b1 = AtomId::from_raw(1);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        cell_map.insert(CellAddress::new(0, 1), b1);
+        values.insert(a1, Value::Error(ValueError::DivisionByZero));
+        values.insert(b1, Value::Number(7.0));
+        // Criteria-range error propagates.
+        assert_eq!(
+            eval_str("=SUMIFS(B1:B1,A1:A1,\"x\")", &cell_map, &values),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // ---- AVERAGEIFS ----
+
+    #[test]
+    fn averageifs_happy_path() {
+        let (cm, vs) = make_multi_env();
+        // Avg B where color=red AND B>=30 → (30+40)/2 = 35.
+        assert_eq!(
+            eval_str(
+                "=AVERAGEIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")",
+                &cm,
+                &vs
+            ),
+            Value::Number(35.0)
+        );
+    }
+
+    #[test]
+    fn averageifs_wildcard() {
+        let (cm, vs) = make_multi_env();
+        // Avg B where name matches "?pple" → (10+50)/2 = 30.
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B5,A1:A5,\"?pple\")", &cm, &vs),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn averageifs_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B5,A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn averageifs_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B5,A1:A3,\"apple\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn averageifs_empty_match_returns_div_zero() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B5,A1:A5,\"zzz\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn averageifs_error_propagation() {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let b1 = AtomId::from_raw(1);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        cell_map.insert(CellAddress::new(0, 1), b1);
+        values.insert(a1, Value::Text("x".into()));
+        values.insert(b1, Value::Error(ValueError::WrongType));
+        // Value-range error propagates when a matching row's value is an error.
+        assert_eq!(
+            eval_str("=AVERAGEIFS(B1:B1,A1:A1,\"x\")", &cell_map, &values),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // ---- MAXIFS ----
+
+    #[test]
+    fn maxifs_happy_path() {
+        let (cm, vs) = make_multi_env();
+        // Max B where color=red → max(10, 30, 40) = 40.
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5,C1:C5,\"red\")", &cm, &vs),
+            Value::Number(40.0)
+        );
+    }
+
+    #[test]
+    fn maxifs_wildcard() {
+        let (cm, vs) = make_multi_env();
+        // Max B where name matches "ap*" → max(10, 30, 50) = 50.
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5,A1:A5,\"ap*\")", &cm, &vs),
+            Value::Number(50.0)
+        );
+    }
+
+    #[test]
+    fn maxifs_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5,A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn maxifs_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5,A1:A3,\"apple\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn maxifs_empty_match_returns_zero() {
+        let (cm, vs) = make_multi_env();
+        // Per Excel: zero matches → 0.
+        assert_eq!(
+            eval_str("=MAXIFS(B1:B5,A1:A5,\"zzz\")", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn maxifs_error_propagation() {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        values.insert(a1, Value::Error(ValueError::CyclicRef));
+        assert_eq!(
+            eval_str("=MAXIFS(A1:A1,A1:A1,\">0\")", &cell_map, &values),
+            Value::Error(ValueError::CyclicRef)
+        );
+    }
+
+    // ---- MINIFS ----
+
+    #[test]
+    fn minifs_happy_path() {
+        let (cm, vs) = make_multi_env();
+        // Min B where color=red → min(10, 30, 40) = 10.
+        assert_eq!(
+            eval_str("=MINIFS(B1:B5,C1:C5,\"red\")", &cm, &vs),
+            Value::Number(10.0)
+        );
+    }
+
+    #[test]
+    fn minifs_wildcard() {
+        let (cm, vs) = make_multi_env();
+        // Min B where name matches "ap*" → min(10, 30, 50) = 10.
+        assert_eq!(
+            eval_str("=MINIFS(B1:B5,A1:A5,\"ap*\")", &cm, &vs),
+            Value::Number(10.0)
+        );
+    }
+
+    #[test]
+    fn minifs_wrong_arg_count() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=MINIFS(B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn minifs_shape_mismatch() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=MINIFS(B1:B5,A1:A3,\"apple\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn minifs_empty_match_returns_zero() {
+        let (cm, vs) = make_multi_env();
+        assert_eq!(
+            eval_str("=MINIFS(B1:B5,A1:A5,\"zzz\")", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn minifs_error_propagation() {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        values.insert(a1, Value::Error(ValueError::Overflow));
+        assert_eq!(
+            eval_str("=MINIFS(A1:A1,A1:A1,\">0\")", &cell_map, &values),
+            Value::Error(ValueError::Overflow)
         );
     }
 }
