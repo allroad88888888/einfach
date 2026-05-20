@@ -26,6 +26,7 @@ import {
   spreadsheetProjectionSnapshotAtom,
 } from '../provider/atoms'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
+import './format-cells-dialog.css'
 
 export interface SpreadsheetFormatCellsDialogProps {
   class?: string
@@ -358,15 +359,21 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
         aria-modal="true"
         aria-label="Format Cells"
       >
-        <button
-          type="button"
-          class="dialog-close-x"
-          data-testid="dialog-close-x"
-          aria-label={t('dialog.close.label')}
-          onClick={handleCancel}
-        >
-          ×
-        </button>
+        <div class="format-cells-header">
+          {/* Title text — no i18n key exists yet; falls back to a literal so
+           * the header always carries something. The dialog already advertises
+           * its name via aria-label="Format Cells" above. */}
+          <span class="format-cells-title">Format Cells</span>
+          <button
+            type="button"
+            class="dialog-close-x"
+            data-testid="dialog-close-x"
+            aria-label={t('dialog.close.label')}
+            onClick={handleCancel}
+          >
+            ×
+          </button>
+        </div>
         <div class="format-cells-tabs" role="tablist" data-testid="format-cells-tabs">
           <For each={TABS}>
             {(tab) => (
