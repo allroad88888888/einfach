@@ -1853,6 +1853,682 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "RADIANS" => unary_number(args, provider, |d| d * std::f64::consts::PI / 180.0),
         "DEGREES" => unary_number(args, provider, |r| r * 180.0 / std::f64::consts::PI),
 
+        // === Error / type guards (Batch B1) ===
+        //
+        // IFERROR / IFNA: ValueError has no dedicated NA variant. Excel's
+        // #N/A surfaces here as `InvalidValue` (lookup misses) or
+        // `InvalidRef` (broken refs). IFNA catches those two; IFERROR
+        // catches every error.
+        "IFERROR" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            match v {
+                Value::Error(_) => eval_expr_with_provider(&args[1], provider),
+                other => other,
+            }
+        }
+        "IFNA" => {
+            // Our enum has no dedicated NA — treat InvalidValue / InvalidRef
+            // as the closest NA-equivalents (lookup misses, broken refs).
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            match v {
+                Value::Error(ValueError::InvalidValue) | Value::Error(ValueError::InvalidRef) => {
+                    eval_expr_with_provider(&args[1], provider)
+                }
+                other => other,
+            }
+        }
+        "IFS" => {
+            // IFS(cond1, val1, cond2, val2, ...) — variadic; pairs only.
+            if args.is_empty() || args.len() % 2 != 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut i = 0;
+            while i < args.len() {
+                let cond = eval_expr_with_provider(&args[i], provider);
+                if let Value::Error(e) = cond {
+                    return Value::Error(e);
+                }
+                let is_true = match cond {
+                    Value::Boolean(b) => b,
+                    Value::Number(n) => n != 0.0,
+                    _ => false,
+                };
+                if is_true {
+                    return eval_expr_with_provider(&args[i + 1], provider);
+                }
+                i += 2;
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+        "SWITCH" => {
+            // SWITCH(expr, case1, val1, [case2, val2, ...], [default]).
+            // Need at least expr + one (case, val) pair = 3 args.
+            if args.len() < 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let expr_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = expr_v {
+                return Value::Error(e);
+            }
+            // After the leading expr we walk (case, val) pairs. An odd
+            // remainder after the leading arg is the default.
+            let rest = &args[1..];
+            let mut i = 0;
+            while i + 1 < rest.len() {
+                let case_v = eval_expr_with_provider(&rest[i], provider);
+                if values_equal(&expr_v, &case_v) {
+                    return eval_expr_with_provider(&rest[i + 1], provider);
+                }
+                i += 2;
+            }
+            // Trailing default?
+            if i < rest.len() {
+                return eval_expr_with_provider(&rest[i], provider);
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+        "XOR" => {
+            // Variadic; result = (count of TRUE is odd). Errors propagate;
+            // non-coercible values surface as WrongType.
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut true_count = 0u64;
+            let mut saw_any = false;
+            let mut err: Option<ValueError> = None;
+            for arg in args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Null => {}
+                        other => match coerce_to_bool(&other) {
+                            Some(b) => {
+                                saw_any = true;
+                                if b {
+                                    true_count += 1;
+                                }
+                            }
+                            None => err = Some(ValueError::WrongType),
+                        },
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if !saw_any {
+                Value::Error(ValueError::WrongArgCount)
+            } else {
+                Value::Boolean(true_count % 2 == 1)
+            }
+        }
+
+        // === IS* family — never propagate errors, they classify them. ===
+        "ISNUMBER" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Number(_)))
+        }
+        "ISTEXT" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Text(_)))
+        }
+        "ISBLANK" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Null))
+        }
+        "ISERROR" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Error(_)))
+        }
+        "ISERR" => {
+            // Excel: ISERR = ISERROR and not #N/A. With our mapping treat
+            // InvalidValue as the NA-equivalent (same caveat as IFNA/ISNA).
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(
+                v,
+                Value::Error(e) if !matches!(e, ValueError::InvalidValue)
+            ))
+        }
+        "ISNA" => {
+            // No dedicated NA in our enum — closest equivalent is
+            // InvalidValue (same caveat as IFNA).
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Error(ValueError::InvalidValue)))
+        }
+        "ISLOGICAL" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(matches!(v, Value::Boolean(_)))
+        }
+        "ISNONTEXT" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            Value::Boolean(!matches!(v, Value::Text(_)))
+        }
+        "ISEVEN" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => Value::Boolean((n.trunc() as i64) % 2 == 0),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "ISODD" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => Value::Boolean((n.trunc() as i64) % 2 != 0),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "N" => {
+            // Excel quirk: N("anything") = 0; bool → 1/0; null → 0; error
+            // propagates.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            match v {
+                Value::Number(n) => Value::Number(n),
+                Value::Boolean(true) => Value::Number(1.0),
+                Value::Boolean(false) => Value::Number(0.0),
+                Value::Null => Value::Number(0.0),
+                Value::Text(_) => Value::Number(0.0),
+                Value::Error(e) => Value::Error(e),
+            }
+        }
+        "TYPE" => {
+            // 1=Number, 2=Text, 4=Boolean, 16=Error. Null coerces to 0
+            // (Excel returns 1 for empty cells).
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            let code = match v {
+                Value::Number(_) => 1.0,
+                Value::Text(_) => 2.0,
+                Value::Boolean(_) => 4.0,
+                Value::Error(_) => 16.0,
+                Value::Null => 1.0,
+            };
+            Value::Number(code)
+        }
+
+        // === Text expansion (Batch B4) ===
+        // FIND(find_text, within_text[, start_num]) — case-sensitive, 1-based.
+        // Char-based indexing (never byte offsets on &str).
+        "FIND" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let find_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = find_v {
+                return Value::Error(e);
+            }
+            let within_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = within_v {
+                return Value::Error(e);
+            }
+            let start_num = if args.len() == 3 {
+                let s = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = s {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&s) {
+                    Some(n) if n >= 1.0 => n as usize,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1
+            };
+            let find_text = coerce_to_text(&find_v);
+            let within_text = coerce_to_text(&within_v);
+            // Empty needle: Excel returns start_num itself.
+            if find_text.is_empty() {
+                if start_num > within_text.chars().count() + 1 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                return Value::Number(start_num as f64);
+            }
+            let needle_chars: Vec<char> = find_text.chars().collect();
+            let haystack_chars: Vec<char> = within_text.chars().collect();
+            if start_num > haystack_chars.len() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let start_idx = start_num - 1;
+            // Walk char-by-char starting at start_idx.
+            let mut i = start_idx;
+            while i + needle_chars.len() <= haystack_chars.len() {
+                if haystack_chars[i..i + needle_chars.len()] == needle_chars[..] {
+                    return Value::Number((i + 1) as f64);
+                }
+                i += 1;
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        // SEARCH(find_text, within_text[, start_num]) — case-insensitive, 1-based.
+        // no wildcard support yet
+        "SEARCH" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let find_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = find_v {
+                return Value::Error(e);
+            }
+            let within_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = within_v {
+                return Value::Error(e);
+            }
+            let start_num = if args.len() == 3 {
+                let s = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = s {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&s) {
+                    Some(n) if n >= 1.0 => n as usize,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1
+            };
+            let find_text = coerce_to_text(&find_v).to_lowercase();
+            let within_text = coerce_to_text(&within_v).to_lowercase();
+            if find_text.is_empty() {
+                if start_num > within_text.chars().count() + 1 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                return Value::Number(start_num as f64);
+            }
+            let needle_chars: Vec<char> = find_text.chars().collect();
+            let haystack_chars: Vec<char> = within_text.chars().collect();
+            if start_num > haystack_chars.len() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let start_idx = start_num - 1;
+            let mut i = start_idx;
+            while i + needle_chars.len() <= haystack_chars.len() {
+                if haystack_chars[i..i + needle_chars.len()] == needle_chars[..] {
+                    return Value::Number((i + 1) as f64);
+                }
+                i += 1;
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        // SUBSTITUTE(text, old, new[, instance_num]).
+        // Char-based to avoid byte-offset bugs on multi-byte strings.
+        "SUBSTITUTE" => {
+            if args.len() < 3 || args.len() > 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let text_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = text_v {
+                return Value::Error(e);
+            }
+            let old_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = old_v {
+                return Value::Error(e);
+            }
+            let new_v = eval_expr_with_provider(&args[2], provider);
+            if let Value::Error(e) = new_v {
+                return Value::Error(e);
+            }
+            let instance: Option<usize> = if args.len() == 4 {
+                let i = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = i {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&i) {
+                    Some(n) if n >= 1.0 => Some(n as usize),
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                None
+            };
+            let text = coerce_to_text(&text_v);
+            let old = coerce_to_text(&old_v);
+            let new_s = coerce_to_text(&new_v);
+            if old.is_empty() {
+                return Value::Text(text);
+            }
+            let text_chars: Vec<char> = text.chars().collect();
+            let old_chars: Vec<char> = old.chars().collect();
+            let mut out = String::new();
+            let mut i = 0;
+            let mut hit = 0usize;
+            while i < text_chars.len() {
+                if i + old_chars.len() <= text_chars.len()
+                    && text_chars[i..i + old_chars.len()] == old_chars[..]
+                {
+                    hit += 1;
+                    let replace_here = match instance {
+                        Some(n) => hit == n,
+                        None => true,
+                    };
+                    if replace_here {
+                        out.push_str(&new_s);
+                    } else {
+                        for c in &old_chars {
+                            out.push(*c);
+                        }
+                    }
+                    i += old_chars.len();
+                } else {
+                    out.push(text_chars[i]);
+                    i += 1;
+                }
+            }
+            Value::Text(out)
+        }
+
+        // REPLACE(text, start_num, num_chars, new_text). 1-based char position.
+        "REPLACE" => {
+            if args.len() != 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let text_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = text_v {
+                return Value::Error(e);
+            }
+            let start_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = start_v {
+                return Value::Error(e);
+            }
+            let num_v = eval_expr_with_provider(&args[2], provider);
+            if let Value::Error(e) = num_v {
+                return Value::Error(e);
+            }
+            let new_v = eval_expr_with_provider(&args[3], provider);
+            if let Value::Error(e) = new_v {
+                return Value::Error(e);
+            }
+            let start = match coerce_to_number(&start_v) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let num = match coerce_to_number(&num_v) {
+                Some(n) if n >= 0.0 => n as usize,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let text = coerce_to_text(&text_v);
+            let new_s = coerce_to_text(&new_v);
+            let text_chars: Vec<char> = text.chars().collect();
+            let len = text_chars.len();
+            let start_idx = start - 1; // 1-based -> 0-based
+            // start past end → append.
+            let prefix_end = start_idx.min(len);
+            let cut_end = (start_idx + num).min(len);
+            let mut out = String::new();
+            for c in &text_chars[..prefix_end] {
+                out.push(*c);
+            }
+            out.push_str(&new_s);
+            for c in &text_chars[cut_end..] {
+                out.push(*c);
+            }
+            Value::Text(out)
+        }
+
+        // REPT(text, n) — char-count limit 32767 per Excel.
+        "REPT" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let text_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = text_v {
+                return Value::Error(e);
+            }
+            let n_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = n_v {
+                return Value::Error(e);
+            }
+            let n_f = match coerce_to_number(&n_v) {
+                Some(n) => n,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            // trunc, reject negative
+            let n_trunc = n_f.trunc();
+            if n_trunc < 0.0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let n = n_trunc as usize;
+            if n == 0 {
+                return Value::Text(String::new());
+            }
+            let text = coerce_to_text(&text_v);
+            let char_count = text.chars().count();
+            // Char-count cap (Excel: 32767).
+            let total = char_count.checked_mul(n);
+            match total {
+                Some(t) if t <= 32767 => {
+                    let mut out = String::with_capacity(text.len() * n);
+                    for _ in 0..n {
+                        out.push_str(&text);
+                    }
+                    Value::Text(out)
+                }
+                _ => Value::Error(ValueError::InvalidValue),
+            }
+        }
+
+        // EXACT(a, b) — case-sensitive text equality.
+        "EXACT" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let a = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = a {
+                return Value::Error(e);
+            }
+            let b = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = b {
+                return Value::Error(e);
+            }
+            Value::Boolean(coerce_to_text(&a) == coerce_to_text(&b))
+        }
+
+        // VALUE(text) — coerce text to number.
+        "VALUE" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            match v {
+                Value::Error(e) => Value::Error(e),
+                Value::Number(n) => Value::Number(n),
+                Value::Boolean(true) => Value::Number(1.0),
+                Value::Boolean(false) => Value::Number(0.0),
+                Value::Null => Value::Number(0.0),
+                Value::Text(s) => match s.trim().parse::<f64>() {
+                    Ok(n) => Value::Number(n),
+                    Err(_) => Value::Error(ValueError::InvalidValue),
+                },
+            }
+        }
+
+        // T(v) — return Text if v is text, otherwise empty text.
+        "T" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            match v {
+                Value::Error(e) => Value::Error(e),
+                Value::Text(s) => Value::Text(s),
+                _ => Value::Text(String::new()),
+            }
+        }
+
+        // CHAR(n) — full Unicode 1..=1_114_111 (broader than Excel's 1..=255).
+        "CHAR" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            let n_f = match coerce_to_number(&v) {
+                Some(n) => n.trunc(),
+                None => return Value::Error(ValueError::WrongType),
+            };
+            if !(1.0..=1_114_111.0).contains(&n_f) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            match char::from_u32(n_f as u32) {
+                Some(c) => Value::Text(c.to_string()),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+
+        // CODE(text) — first char code point.
+        "CODE" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            let s = coerce_to_text(&v);
+            match s.chars().next() {
+                Some(c) => Value::Number(c as u32 as f64),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+
+        // CLEAN(text) — strip ASCII control chars (0..=31).
+        "CLEAN" => text_unary(args, provider, |s| {
+            s.chars().filter(|c| (*c as u32) > 31).collect()
+        }),
+
+        // PROPER(text) — capitalize first alpha of each word.
+        "PROPER" => text_unary(args, provider, |s| {
+            let mut out = String::with_capacity(s.len());
+            let mut start_of_word = true;
+            for c in s.chars() {
+                if c.is_alphabetic() {
+                    if start_of_word {
+                        for u in c.to_uppercase() {
+                            out.push(u);
+                        }
+                    } else {
+                        for u in c.to_lowercase() {
+                            out.push(u);
+                        }
+                    }
+                    start_of_word = false;
+                } else {
+                    out.push(c);
+                    start_of_word = true;
+                }
+            }
+            out
+        }),
+
+        // TEXTJOIN(delim, ignore_empty, ...). Range args streamed via for_each_arg_value.
+        "TEXTJOIN" => {
+            if args.len() < 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let delim_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = delim_v {
+                return Value::Error(e);
+            }
+            let ignore_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = ignore_v {
+                return Value::Error(e);
+            }
+            let delim = coerce_to_text(&delim_v);
+            let ignore_empty = match coerce_to_bool(&ignore_v) {
+                Some(b) => b,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let mut out = String::new();
+            let mut first = true;
+            let mut err: Option<ValueError> = None;
+            for arg in &args[2..] {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => {
+                            err = Some(e);
+                            return;
+                        }
+                        Value::Null if ignore_empty => return,
+                        _ => {}
+                    }
+                    let piece = coerce_to_text(&v);
+                    if ignore_empty && piece.is_empty() {
+                        return;
+                    }
+                    if !first {
+                        out.push_str(&delim);
+                    }
+                    out.push_str(&piece);
+                    first = false;
+                    if out.chars().count() > 32767 {
+                        err = Some(ValueError::InvalidValue);
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else {
+                Value::Text(out)
+            }
+        }
+
         _ => Value::Error(ValueError::InvalidName),
     }
 }
@@ -3516,6 +4192,866 @@ mod tests {
         );
         assert_eq!(
             eval_str("=DEGREES(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // === Batch B1: error/type-guard formulas ===
+
+    #[test]
+    fn eval_iferror() {
+        let (cm, vs) = make_test_env();
+        // Happy path: errored expression replaced.
+        assert_eq!(eval_str("=IFERROR(1/0,99)", &cm, &vs), Value::Number(99.0));
+        // Non-error passes through unchanged.
+        assert_eq!(eval_str("=IFERROR(A1,99)", &cm, &vs), Value::Number(10.0));
+        // Text fallback works too.
+        assert_eq!(
+            eval_str("=IFERROR(1/0,\"nope\")", &cm, &vs),
+            Value::Text("nope".into())
+        );
+        // Wrong-arg-count.
+        assert_eq!(
+            eval_str("=IFERROR(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_ifna() {
+        let (cm, vs) = make_test_env();
+        // VLOOKUP miss surfaces as InvalidValue → caught by IFNA.
+        assert_eq!(
+            eval_str("=IFNA(VLOOKUP(999,A1:B2,2,FALSE),0)", &cm, &vs),
+            Value::Number(0.0)
+        );
+        // DivisionByZero is NOT N/A-like → propagates.
+        assert_eq!(
+            eval_str("=IFNA(1/0,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Non-error passes through.
+        assert_eq!(eval_str("=IFNA(A1,0)", &cm, &vs), Value::Number(10.0));
+        // Wrong arity.
+        assert_eq!(
+            eval_str("=IFNA(A1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_ifs() {
+        let (cm, vs) = make_test_env();
+        // First truthy condition wins. A1=10 so A1>5 → "big".
+        assert_eq!(
+            eval_str("=IFS(A1>100,\"huge\",A1>5,\"big\",TRUE,\"x\")", &cm, &vs),
+            Value::Text("big".into())
+        );
+        // No condition matches → InvalidValue.
+        assert_eq!(
+            eval_str("=IFS(A1>100,1,A1<0,2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Odd arg count → WrongArgCount.
+        assert_eq!(
+            eval_str("=IFS(A1>0,1,A1>0)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error in a condition propagates.
+        assert_eq!(
+            eval_str("=IFS(1/0,1,TRUE,2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_switch() {
+        let (cm, vs) = make_test_env();
+        // Match case → returns matching val. A1=10 matches second pair.
+        assert_eq!(
+            eval_str("=SWITCH(A1,5,\"five\",10,\"ten\",\"def\")", &cm, &vs),
+            Value::Text("ten".into())
+        );
+        // No match, trailing default returned.
+        assert_eq!(
+            eval_str("=SWITCH(A1,1,\"a\",2,\"b\",\"default\")", &cm, &vs),
+            Value::Text("default".into())
+        );
+        // No match and no default → InvalidValue.
+        assert_eq!(
+            eval_str("=SWITCH(A1,1,\"a\",2,\"b\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Min 3 args.
+        assert_eq!(
+            eval_str("=SWITCH(A1,1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error in expr propagates.
+        assert_eq!(
+            eval_str("=SWITCH(1/0,1,\"a\",\"def\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_xor() {
+        let (cm, vs) = make_test_env();
+        // Odd count of TRUE → true.
+        assert_eq!(
+            eval_str("=XOR(TRUE,FALSE,FALSE)", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // Even count of TRUE → false.
+        assert_eq!(eval_str("=XOR(TRUE,TRUE)", &cm, &vs), Value::Boolean(false));
+        // Numeric coercion (non-zero is true).
+        assert_eq!(eval_str("=XOR(1,0,2)", &cm, &vs), Value::Boolean(false));
+        // No args → WrongArgCount.
+        assert_eq!(
+            eval_str("=XOR()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Text → WrongType.
+        assert_eq!(
+            eval_str("=XOR(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagates.
+        assert_eq!(
+            eval_str("=XOR(1/0,TRUE)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_isnumber() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISNUMBER(A1)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISNUMBER(B2)", &cm, &vs), Value::Boolean(false));
+        // Boolean is not a number.
+        assert_eq!(eval_str("=ISNUMBER(TRUE)", &cm, &vs), Value::Boolean(false));
+        // Errors are classified, not propagated.
+        assert_eq!(eval_str("=ISNUMBER(1/0)", &cm, &vs), Value::Boolean(false));
+        // Wrong arity.
+        assert_eq!(
+            eval_str("=ISNUMBER(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_istext() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISTEXT(B2)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISTEXT(A1)", &cm, &vs), Value::Boolean(false));
+        // Null is not text.
+        assert_eq!(eval_str("=ISTEXT(Z99)", &cm, &vs), Value::Boolean(false));
+        // Error is not text — classified, not propagated.
+        assert_eq!(eval_str("=ISTEXT(1/0)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISTEXT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_isblank() {
+        let (cm, vs) = make_test_env();
+        // Z99 is missing → Null.
+        assert_eq!(eval_str("=ISBLANK(Z99)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISBLANK(A1)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(eval_str("=ISBLANK(B2)", &cm, &vs), Value::Boolean(false));
+        // Error is not blank — classified, not propagated.
+        assert_eq!(eval_str("=ISBLANK(1/0)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISBLANK(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_iserror() {
+        let (cm, vs) = make_test_env();
+        // Any error variant is detected.
+        assert_eq!(eval_str("=ISERROR(1/0)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(
+            eval_str("=ISERROR(VLOOKUP(999,A1:B2,2,FALSE))", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // Non-errors are false.
+        assert_eq!(eval_str("=ISERROR(A1)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(eval_str("=ISERROR(B2)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISERROR()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_iserr() {
+        let (cm, vs) = make_test_env();
+        // DivisionByZero is an error but not NA-like → true.
+        assert_eq!(eval_str("=ISERR(1/0)", &cm, &vs), Value::Boolean(true));
+        // VLOOKUP miss → InvalidValue (our NA-equivalent) → false.
+        assert_eq!(
+            eval_str("=ISERR(VLOOKUP(999,A1:B2,2,FALSE))", &cm, &vs),
+            Value::Boolean(false)
+        );
+        // Non-errors are false.
+        assert_eq!(eval_str("=ISERR(A1)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISERR(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_isna() {
+        let (cm, vs) = make_test_env();
+        // VLOOKUP miss surfaces as InvalidValue → ISNA true.
+        assert_eq!(
+            eval_str("=ISNA(VLOOKUP(999,A1:B2,2,FALSE))", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // DivisionByZero is an error, but not NA-like.
+        assert_eq!(eval_str("=ISNA(1/0)", &cm, &vs), Value::Boolean(false));
+        // Non-error → false.
+        assert_eq!(eval_str("=ISNA(A1)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISNA()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_islogical() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISLOGICAL(TRUE)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISLOGICAL(A1>0)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISLOGICAL(A1)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(eval_str("=ISLOGICAL(B2)", &cm, &vs), Value::Boolean(false));
+        // Error classified, not propagated.
+        assert_eq!(eval_str("=ISLOGICAL(1/0)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISLOGICAL(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_isnontext() {
+        let (cm, vs) = make_test_env();
+        // Number, Boolean, Null, Error all count as non-text.
+        assert_eq!(eval_str("=ISNONTEXT(A1)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISNONTEXT(TRUE)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISNONTEXT(Z99)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISNONTEXT(1/0)", &cm, &vs), Value::Boolean(true));
+        // Text → false.
+        assert_eq!(eval_str("=ISNONTEXT(B2)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISNONTEXT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_iseven() {
+        let (cm, vs) = make_test_env();
+        // A1=10 → even.
+        assert_eq!(eval_str("=ISEVEN(A1)", &cm, &vs), Value::Boolean(true));
+        // A2=5 → odd.
+        assert_eq!(eval_str("=ISEVEN(A2)", &cm, &vs), Value::Boolean(false));
+        // Truncation toward zero: 4.7 → 4 → even.
+        assert_eq!(eval_str("=ISEVEN(4.7)", &cm, &vs), Value::Boolean(true));
+        // Boolean TRUE coerces to 1 → odd.
+        assert_eq!(eval_str("=ISEVEN(TRUE)", &cm, &vs), Value::Boolean(false));
+        // Text → WrongType.
+        assert_eq!(
+            eval_str("=ISEVEN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagates.
+        assert_eq!(
+            eval_str("=ISEVEN(1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=ISEVEN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_isodd() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISODD(A2)", &cm, &vs), Value::Boolean(true));
+        assert_eq!(eval_str("=ISODD(A1)", &cm, &vs), Value::Boolean(false));
+        // Truncation toward zero: 3.9 → 3 → odd.
+        assert_eq!(eval_str("=ISODD(3.9)", &cm, &vs), Value::Boolean(true));
+        // Text → WrongType.
+        assert_eq!(
+            eval_str("=ISODD(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagates.
+        assert_eq!(
+            eval_str("=ISODD(1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=ISODD(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_n() {
+        let (cm, vs) = make_test_env();
+        // Number passes through.
+        assert_eq!(eval_str("=N(A1)", &cm, &vs), Value::Number(10.0));
+        // Boolean true → 1, false → 0.
+        assert_eq!(eval_str("=N(TRUE)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=N(FALSE)", &cm, &vs), Value::Number(0.0));
+        // Text → 0 (Excel quirk).
+        assert_eq!(eval_str("=N(B2)", &cm, &vs), Value::Number(0.0));
+        // Null → 0.
+        assert_eq!(eval_str("=N(Z99)", &cm, &vs), Value::Number(0.0));
+        // Error propagates.
+        assert_eq!(
+            eval_str("=N(1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=N()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_type() {
+        let (cm, vs) = make_test_env();
+        // Number → 1.
+        assert_eq!(eval_str("=TYPE(A1)", &cm, &vs), Value::Number(1.0));
+        // Text → 2.
+        assert_eq!(eval_str("=TYPE(B2)", &cm, &vs), Value::Number(2.0));
+        // Boolean → 4.
+        assert_eq!(eval_str("=TYPE(TRUE)", &cm, &vs), Value::Number(4.0));
+        // Error → 16 (not propagated).
+        assert_eq!(eval_str("=TYPE(1/0)", &cm, &vs), Value::Number(16.0));
+        // Null → 1 (Excel quirk).
+        assert_eq!(eval_str("=TYPE(Z99)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(
+            eval_str("=TYPE(A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // === Batch B4: text expansion ===
+
+    #[test]
+    fn eval_find() {
+        let (cm, vs) = make_test_env();
+        // Case-sensitive: 'a' in "ABCabc" is at position 4 (1-based).
+        assert_eq!(
+            eval_str("=FIND(\"a\",\"ABCabc\")", &cm, &vs),
+            Value::Number(4.0)
+        );
+        // With start_num beyond first occurrence.
+        assert_eq!(
+            eval_str("=FIND(\"o\",\"hello world\",6)", &cm, &vs),
+            Value::Number(8.0)
+        );
+        // Not found.
+        assert_eq!(
+            eval_str("=FIND(\"z\",\"ABCabc\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Empty needle returns start_num.
+        assert_eq!(
+            eval_str("=FIND(\"\",\"hello\")", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=FIND(\"a\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation from arg.
+        assert_eq!(
+            eval_str("=FIND(\"a\",A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // start_num < 1.
+        assert_eq!(
+            eval_str("=FIND(\"a\",\"abc\",0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_search() {
+        let (cm, vs) = make_test_env();
+        // Case-insensitive: 'a' in "ABCabc" finds position 1.
+        assert_eq!(
+            eval_str("=SEARCH(\"a\",\"ABCabc\")", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // Explicitly contrast case sensitivity with FIND.
+        assert_eq!(
+            eval_str("=FIND(\"a\",\"ABCabc\")", &cm, &vs),
+            Value::Number(4.0)
+        );
+        // start_num argument.
+        assert_eq!(
+            eval_str("=SEARCH(\"A\",\"ABCabc\",2)", &cm, &vs),
+            Value::Number(4.0)
+        );
+        // Not found.
+        assert_eq!(
+            eval_str("=SEARCH(\"z\",\"ABCabc\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Empty needle.
+        assert_eq!(
+            eval_str("=SEARCH(\"\",\"abc\")", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=SEARCH(\"a\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=SEARCH(\"a\",A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_substitute() {
+        let (cm, vs) = make_test_env();
+        // Replace ALL occurrences.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"banana\",\"a\",\"o\")", &cm, &vs),
+            Value::Text("bonono".into())
+        );
+        // Replace single occurrence by instance_num.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"banana\",\"a\",\"o\",2)", &cm, &vs),
+            Value::Text("banona".into())
+        );
+        // instance_num beyond count → unchanged.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"banana\",\"a\",\"o\",10)", &cm, &vs),
+            Value::Text("banana".into())
+        );
+        // Empty old → unchanged.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"abc\",\"\",\"x\")", &cm, &vs),
+            Value::Text("abc".into())
+        );
+        // Empty text edge.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"\",\"a\",\"b\")", &cm, &vs),
+            Value::Text("".into())
+        );
+        // instance_num < 1.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"a\",\"a\",\"b\",0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(\"a\",\"b\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=SUBSTITUTE(A1/C1,\"a\",\"b\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_replace() {
+        let (cm, vs) = make_test_env();
+        // Replace 3 chars starting at position 2 with "XYZ".
+        assert_eq!(
+            eval_str("=REPLACE(\"abcdef\",2,3,\"XYZ\")", &cm, &vs),
+            Value::Text("aXYZef".into())
+        );
+        // num_chars 0 → insert.
+        assert_eq!(
+            eval_str("=REPLACE(\"abc\",2,0,\"--\")", &cm, &vs),
+            Value::Text("a--bc".into())
+        );
+        // start past end → append.
+        assert_eq!(
+            eval_str("=REPLACE(\"abc\",10,5,\"XX\")", &cm, &vs),
+            Value::Text("abcXX".into())
+        );
+        // Empty text edge.
+        assert_eq!(
+            eval_str("=REPLACE(\"\",1,0,\"hi\")", &cm, &vs),
+            Value::Text("hi".into())
+        );
+        // start_num < 1.
+        assert_eq!(
+            eval_str("=REPLACE(\"abc\",0,1,\"x\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // num_chars < 0.
+        assert_eq!(
+            eval_str("=REPLACE(\"abc\",1,-1,\"x\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=REPLACE(\"abc\",1,1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=REPLACE(A1/C1,1,1,\"x\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_rept() {
+        let (cm, vs) = make_test_env();
+        // Happy path.
+        assert_eq!(
+            eval_str("=REPT(\"ab\",3)", &cm, &vs),
+            Value::Text("ababab".into())
+        );
+        // n == 0 → empty.
+        assert_eq!(
+            eval_str("=REPT(\"abc\",0)", &cm, &vs),
+            Value::Text("".into())
+        );
+        // n is truncated.
+        assert_eq!(
+            eval_str("=REPT(\"a\",3.9)", &cm, &vs),
+            Value::Text("aaa".into())
+        );
+        // Empty text edge.
+        assert_eq!(
+            eval_str("=REPT(\"\",5)", &cm, &vs),
+            Value::Text("".into())
+        );
+        // n < 0 → InvalidValue.
+        assert_eq!(
+            eval_str("=REPT(\"a\",-1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // length limit: 1 char * 32768 > 32767.
+        assert_eq!(
+            eval_str("=REPT(\"a\",32768)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // length limit boundary: 1 char * 32767 is OK.
+        match eval_str("=REPT(\"a\",32767)", &cm, &vs) {
+            Value::Text(s) => assert_eq!(s.len(), 32767),
+            other => panic!("expected Text, got {:?}", other),
+        }
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=REPT(\"a\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=REPT(A1/C1,1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_exact() {
+        let (cm, vs) = make_test_env();
+        // Equal case.
+        assert_eq!(
+            eval_str("=EXACT(\"abc\",\"abc\")", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // Case-sensitive: different.
+        assert_eq!(
+            eval_str("=EXACT(\"abc\",\"ABC\")", &cm, &vs),
+            Value::Boolean(false)
+        );
+        // Number coercion: 10 -> "10" equals "10".
+        assert_eq!(
+            eval_str("=EXACT(A1,\"10\")", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // Empty-string edge.
+        assert_eq!(
+            eval_str("=EXACT(\"\",\"\")", &cm, &vs),
+            Value::Boolean(true)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=EXACT(\"a\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=EXACT(A1/C1,\"x\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_value() {
+        let (cm, vs) = make_test_env();
+        // Text with surrounding spaces parses.
+        assert_eq!(
+            eval_str("=VALUE(\"  42  \")", &cm, &vs),
+            Value::Number(42.0)
+        );
+        // Number passes through.
+        assert_eq!(eval_str("=VALUE(A1)", &cm, &vs), Value::Number(10.0));
+        // Boolean.
+        assert_eq!(eval_str("=VALUE(TRUE)", &cm, &vs), Value::Number(1.0));
+        // Empty text → InvalidValue.
+        assert_eq!(
+            eval_str("=VALUE(\"\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Unparseable → InvalidValue.
+        assert_eq!(
+            eval_str("=VALUE(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=VALUE(\"1\",\"2\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=VALUE(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_t() {
+        let (cm, vs) = make_test_env();
+        // B2 = "text"
+        assert_eq!(eval_str("=T(B2)", &cm, &vs), Value::Text("text".into()));
+        // Number → empty text.
+        assert_eq!(eval_str("=T(A1)", &cm, &vs), Value::Text("".into()));
+        // Boolean → empty text.
+        assert_eq!(eval_str("=T(TRUE)", &cm, &vs), Value::Text("".into()));
+        // Empty text → empty text.
+        assert_eq!(eval_str("=T(\"\")", &cm, &vs), Value::Text("".into()));
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=T(\"a\",\"b\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=T(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_char() {
+        let (cm, vs) = make_test_env();
+        // ASCII.
+        assert_eq!(eval_str("=CHAR(65)", &cm, &vs), Value::Text("A".into()));
+        // Unicode round-trip: 20013 → "中".
+        assert_eq!(
+            eval_str("=CHAR(20013)", &cm, &vs),
+            Value::Text("中".into())
+        );
+        // Truncation: 65.9 → 'A'.
+        assert_eq!(eval_str("=CHAR(65.9)", &cm, &vs), Value::Text("A".into()));
+        // Out of range low.
+        assert_eq!(
+            eval_str("=CHAR(0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Out of range high.
+        assert_eq!(
+            eval_str("=CHAR(2000000)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Surrogate (invalid Unicode scalar): 0xD800 = 55296.
+        assert_eq!(
+            eval_str("=CHAR(55296)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=CHAR(1,2)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=CHAR(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_code() {
+        let (cm, vs) = make_test_env();
+        // ASCII.
+        assert_eq!(eval_str("=CODE(\"A\")", &cm, &vs), Value::Number(65.0));
+        // First char only.
+        assert_eq!(eval_str("=CODE(\"ABC\")", &cm, &vs), Value::Number(65.0));
+        // Unicode round-trip: "中" → 20013.
+        assert_eq!(
+            eval_str("=CODE(\"中\")", &cm, &vs),
+            Value::Number(20013.0)
+        );
+        // Empty text → InvalidValue.
+        assert_eq!(
+            eval_str("=CODE(\"\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=CODE()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=CODE(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_clean() {
+        let (cm, vs) = make_test_env();
+        // Strip embedded TAB (9) and BEL (7).
+        assert_eq!(
+            eval_str(
+                "=CLEAN(CONCATENATE(\"a\",CHAR(9),\"b\",CHAR(7),\"c\"))",
+                &cm,
+                &vs
+            ),
+            Value::Text("abc".into())
+        );
+        // No-op on clean text.
+        assert_eq!(
+            eval_str("=CLEAN(\"hello\")", &cm, &vs),
+            Value::Text("hello".into())
+        );
+        // Strip newline (10) and CR (13).
+        assert_eq!(
+            eval_str(
+                "=CLEAN(CONCATENATE(\"x\",CHAR(10),CHAR(13),\"y\"))",
+                &cm,
+                &vs
+            ),
+            Value::Text("xy".into())
+        );
+        // Empty text edge.
+        assert_eq!(
+            eval_str("=CLEAN(\"\")", &cm, &vs),
+            Value::Text("".into())
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=CLEAN(\"a\",\"b\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=CLEAN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_proper() {
+        let (cm, vs) = make_test_env();
+        // Basic two-word.
+        assert_eq!(
+            eval_str("=PROPER(\"hello world\")", &cm, &vs),
+            Value::Text("Hello World".into())
+        );
+        // Apostrophe resets the word boundary.
+        assert_eq!(
+            eval_str("=PROPER(\"o'reilly\")", &cm, &vs),
+            Value::Text("O'Reilly".into())
+        );
+        // Mixed case is normalized.
+        assert_eq!(
+            eval_str("=PROPER(\"HELLO wOrLd\")", &cm, &vs),
+            Value::Text("Hello World".into())
+        );
+        // Numbers and punctuation pass through.
+        assert_eq!(
+            eval_str("=PROPER(\"abc 123 def\")", &cm, &vs),
+            Value::Text("Abc 123 Def".into())
+        );
+        // Empty text edge.
+        assert_eq!(
+            eval_str("=PROPER(\"\")", &cm, &vs),
+            Value::Text("".into())
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=PROPER(\"a\",\"b\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=PROPER(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_textjoin() {
+        let (cm, vs) = make_test_env();
+        // Basic join, ignore_empty=TRUE skips empty.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\",\",TRUE,\"a\",\"\",\"b\",\"c\")", &cm, &vs),
+            Value::Text("a,b,c".into())
+        );
+        // ignore_empty=FALSE keeps empty.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\",\",FALSE,\"a\",\"\",\"b\")", &cm, &vs),
+            Value::Text("a,,b".into())
+        );
+        // Numbers coerce; A1=10 B1=20.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\"-\",TRUE,A1,B1)", &cm, &vs),
+            Value::Text("10-20".into())
+        );
+        // Range arg streams: A1:B1 = 10,20.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\":\",TRUE,A1:B1)", &cm, &vs),
+            Value::Text("10:20".into())
+        );
+        // Empty text edge: delim="" and all empty inputs.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\"\",TRUE,\"\",\"\")", &cm, &vs),
+            Value::Text("".into())
+        );
+        // Wrong arg count: less than 3.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\",\",TRUE)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // ignore_empty not coercible → WrongType.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\",\",\"yes\",\"a\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=TEXTJOIN(\",\",TRUE,A1/C1)", &cm, &vs),
             Value::Error(ValueError::DivisionByZero)
         );
     }
