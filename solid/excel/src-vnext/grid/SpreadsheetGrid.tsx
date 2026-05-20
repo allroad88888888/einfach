@@ -87,6 +87,7 @@ import {
   dispatchEditingCancel,
   dispatchRedo,
   dispatchUndo,
+  notifyDraftTypedChar,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
 } from '../provider'
@@ -2460,7 +2461,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   store.setter(editingDraftAtom, {
                                     draft: event.currentTarget.value,
                                   })
-                                  syncFormulaReferenceCaret(
+                                  notifyDraftTypedChar(
                                     store,
                                     event.currentTarget.selectionStart ?? event.currentTarget.value.length,
                                   )

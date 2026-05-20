@@ -19,6 +19,7 @@ import { isVisibleProjectionResult } from '../provider'
 import {
   dispatchEditingCancel,
   dispatchEditingCommit,
+  notifyDraftTypedChar,
   syncFormulaReferenceCaret,
 } from '../provider/edit-dispatch'
 import { spreadsheetProjectionSnapshotAtom } from '../provider/atoms'
@@ -131,7 +132,7 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
     } else {
       store.setter(editingDraftAtom, { draft: next, source: 'formula-bar' })
     }
-    syncFormulaReferenceCaret(store, target.selectionStart ?? next.length)
+    notifyDraftTypedChar(store, target.selectionStart ?? next.length)
   }
 
   function onSelectionChange(event: Event) {

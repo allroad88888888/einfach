@@ -131,8 +131,11 @@ export function dispatchEditingCancel(store: Store): boolean {
  * when the character before the caret is a trigger (=, +, -, *, /, ^, &, (, ,,
  * <, >, %) and the character at the caret is end-of-string or ')'.
  *
- * The host calls this on every selectionchange / input event from the formula
- * bar or in-cell editor while editing is active.
+ * The host calls this on every selectionchange event from the formula bar
+ * or in-cell editor while editing is active. For *input* (the user typed),
+ * call `notifyDraftTypedChar` instead — typing past a freshly-picked
+ * reference must commit that pick and re-evaluate the new caret for
+ * another ref-pick trigger.
  */
 export function syncFormulaReferenceCaret(store: Store, caret: number): void {
   store.setter(formulaReferenceCaretAtom, caret)
@@ -148,4 +151,26 @@ export function syncFormulaReferenceCaret(store: Store, caret: number): void {
     insertionCaret: caret,
     draft,
   })
+}
+
+/**
+ * Driver for the editing input's `onInput` event — i.e. the user typed a
+ * real character (vs. a programmatic value change from picking a ref).
+ *
+ * If a formula-reference pick session was active, the user typing past the
+ * just-picked range commits that pick: we exit the session so the next
+ * click on a cell starts a fresh ref-pick at the new caret instead of
+ * replacing the previously-picked token. Then we re-run the trigger check
+ * — if the new char-before-caret is an operator/paren/comma, a new ref
+ * session opens automatically so the next pointer click splices in.
+ *
+ * Without this step, typing `=B2+` then clicking D2 wrongly produces
+ * `=D2+` (the still-active session replaces the B2 token) instead of
+ * the expected `=B2+D2`.
+ */
+export function notifyDraftTypedChar(store: Store, caret: number): void {
+  if (store.getter(formulaReferenceSessionAtom) !== null) {
+    store.setter(exitFormulaReferenceAtom, 'type-after-pick' as FormulaReferenceExitReason)
+  }
+  syncFormulaReferenceCaret(store, caret)
 }

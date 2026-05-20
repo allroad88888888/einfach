@@ -91,6 +91,27 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(cell(page, 'H2')).toHaveAttribute('data-active', 'true')
   })
 
+  test('typing an operator between two clicks appends the second ref instead of replacing the first', async ({
+    page,
+  }) => {
+    // Regression: before the `notifyDraftTypedChar` exit-and-resync, the
+    // ref-pick session stayed active after typing `+`, so the second click
+    // *replaced* the first ref via session.tokenRange — producing `=D2+`
+    // instead of `=B2+D2`. The fix exits the session on user input so the
+    // next pointer click starts a fresh splice at the new caret.
+    await gotoWave5(page)
+    await cell(page, 'H2').click()
+    await page.keyboard.press('=')
+    await cell(page, 'B2').click()
+    await expect(cellInput(page, 'H2')).toHaveValue('=B2')
+    await page.keyboard.press('+')
+    await expect(cellInput(page, 'H2')).toHaveValue('=B2+')
+    await cell(page, 'D2').click()
+    await expect(cellInput(page, 'H2')).toHaveValue('=B2+D2')
+    await page.keyboard.press('Enter')
+    await expect(display(page, 'H2')).toHaveText('360')
+  })
+
   test('reference highlight overlay paints while drafting', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H2').click()
