@@ -688,6 +688,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   async function commitCellEdit(
     move: 'none' | 'down' | 'up' | 'left' | 'right' = 'none',
   ) {
+    // Tear down any active formula-reference pick session so the post-commit
+    // pointer events route normally (selectCell, not pick).
+    if (store.getter(formulaReferenceSessionAtom)) {
+      store.setter(formulaReferenceSessionAtom, null)
+    }
     const intent = store.setter(commitEditingAtom, {
       input: store.getter(editingDraftAtom),
       source: 'cell',
@@ -1601,6 +1606,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   async function handleGridKeyDown(event: KeyboardEvent) {
     if (event.defaultPrevented) {
+      return
+    }
+    // Skip when the keystroke is targetted at an input element (cell editor,
+    // formula bar, name box). Those own their key handling; the grid only
+    // intervenes for keystrokes that bubble from the grid root itself.
+    const target = event.target as HTMLElement | null
+    const tag = target?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable) {
       return
     }
 

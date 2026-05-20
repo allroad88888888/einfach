@@ -49,6 +49,7 @@ import type {
   StaticSpreadsheetSeedInput,
   StaticSpreadsheetSheetInput,
 } from './types'
+import { evaluateFormula, formatEvalResult, type EvalCellLookup } from './static-formula-eval'
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
@@ -864,9 +865,24 @@ function buildProjectionResult(
   const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
   const workbookLocale = state.workbookLocale ?? DEFAULT_WORKBOOK_LOCALE
 
+  const lookup: EvalCellLookup = {
+    get(row: number, col: number) {
+      return sheetCells.get(keyFor(row, col))
+    },
+  }
+
   for (const cell of sheetCells.values()) {
     if (!isCellInsideRange(cell, range)) continue
     const clone = cloneCell(cell)
+    if (clone.formula) {
+      const result = evaluateFormula(clone.formula, lookup)
+      const formatted = formatEvalResult(result)
+      clone.displayValue = formatted.display
+      clone.valueKind = formatted.isError ? 'error' : 'number'
+      if (formatted.isError) {
+        clone.error = { code: formatted.display.replace(/^#|!$/g, '').toUpperCase(), message: formatted.display }
+      }
+    }
     const format = getEffectiveFormat(cell.row, cell.col, cellFormats, rangeFormats)
     if (format) clone.format = format
     applyNumberFormatToCell(clone, workbookLocale)
@@ -954,11 +970,34 @@ function updateCell(
     return null
   }
 
+  const trimmed = request.input.trimStart()
+  const isFormula = trimmed.startsWith('=')
+
+  let displayValue = request.input
+  let valueKind: DisplayCell['valueKind'] = 'string'
+  let formula: string | undefined
+
+  if (isFormula) {
+    formula = trimmed
+    // Initial pass — display will be replaced at projection-read time once we
+    // have the full sheet to resolve references against. Store a placeholder
+    // so downstream consumers (formula bar) see *something* before the next
+    // projection refresh.
+    displayValue = trimmed
+    valueKind = 'string'
+  } else {
+    const numeric = Number(request.input)
+    if (Number.isFinite(numeric) && request.input.trim().length > 0) {
+      valueKind = 'number'
+    }
+  }
+
   const cell: DisplayCell = {
     row: request.row,
     col: request.col,
-    displayValue: request.input,
-    valueKind: 'string',
+    displayValue,
+    valueKind,
+    ...(formula ? { formula } : {}),
   }
 
   cells.set(keyFor(request.row, request.col), cell)

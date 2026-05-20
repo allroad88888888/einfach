@@ -71,6 +71,12 @@ export async function dispatchEditingCommit(
   backend: SpreadsheetBackend,
   options: { move?: EditingCommitMove; source?: 'cell' | 'formula-bar' | 'keyboard' | 'paste' } = {},
 ): Promise<boolean> {
+  // Clear any active formula-reference pick session before committing —
+  // otherwise the next pointer click after commit would still route to
+  // pickFormulaReferenceAtom and silently mutate an empty draft.
+  if (store.getter(formulaReferenceSessionAtom) !== null) {
+    store.setter(exitFormulaReferenceAtom, 'commit' as FormulaReferenceExitReason)
+  }
   const draft = store.getter(editingDraftAtom)
   const intent = store.setter(commitEditingAtom, {
     input: draft,

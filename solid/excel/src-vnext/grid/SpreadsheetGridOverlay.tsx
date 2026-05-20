@@ -1,6 +1,8 @@
 import {
   activeCellAtom,
   clipboardStateAtom,
+  editingSessionAtom,
+  formulaReferenceTokensAtom,
   getSelectionRange,
   pointerSessionAtom,
   selectionRangeAtom,
@@ -12,6 +14,7 @@ import {
   type CellRange,
   type ClipboardState,
   type DisplayCell,
+  type FormulaReferenceToken,
   type PointerSessionState,
   type SelectionState,
 } from '@einfach/spreadsheet-ui-core'
@@ -19,6 +22,18 @@ import { onCleanup, onMount } from 'solid-js'
 import type { Store } from '@einfach/core'
 import { spreadsheetProjectionSnapshotAtom } from '../provider'
 import { useSpreadsheetUiStore } from '../provider'
+
+// Stable color palette for formula-reference highlights. Indexed by colorIndex
+// from the parsed token list — same token text → same slot so the box and
+// (future) inline text color stay in sync across re-renders.
+export const FORMULA_REFERENCE_PALETTE = [
+  '#1d6f42', // green
+  '#c75450', // red
+  '#3478f6', // blue
+  '#b54793', // magenta
+  '#d97706', // amber
+  '#0891b2', // teal
+] as const
 
 // Excel-ish accent colors. Single source of truth so tests can assert exactly.
 export const OVERLAY_COLORS = {
@@ -102,6 +117,8 @@ interface OverlaySnapshot {
   freezeRows: number
   freezeCols: number
   marchingAntsOffset: number
+  formulaReferenceTokens: readonly FormulaReferenceToken[]
+  formulaReferenceSheetId: string | null
 }
 
 export class OverlayRenderer {
@@ -207,6 +224,8 @@ export class OverlayRenderer {
     this.unsubscribes.push(store.sub(viewportSizeOverridesAtom, wake('metrics')))
     this.unsubscribes.push(store.sub(viewportHiddenAtom, wake('viewport')))
     this.unsubscribes.push(store.sub(spreadsheetProjectionSnapshotAtom, wake('projection')))
+    this.unsubscribes.push(store.sub(editingSessionAtom, wake('selection')))
+    this.unsubscribes.push(store.sub(formulaReferenceTokensAtom, wake('selection')))
     this.refreshMarchingAnts()
   }
 
@@ -247,6 +266,8 @@ export class OverlayRenderer {
     const active = store.getter(activeCellAtom)
     const ps = store.getter(pointerSessionAtom)
     const clip = store.getter(clipboardStateAtom)
+    const editing = store.getter(editingSessionAtom)
+    const tokens = store.getter(formulaReferenceTokensAtom)
     return {
       selectionRegions: regions,
       activeCell: { row: active.row, col: active.col, sheetId: active.sheetId ?? sheetId },
@@ -256,6 +277,8 @@ export class OverlayRenderer {
       freezeRows: freeze.rowsBySheet[sheetId] ?? 0,
       freezeCols: freeze.colsBySheet[sheetId] ?? 0,
       marchingAntsOffset: this.marchingAntsOffset,
+      formulaReferenceTokens: tokens,
+      formulaReferenceSheetId: editing.source?.sheetId ?? null,
     }
   }
 
@@ -282,6 +305,36 @@ export class OverlayRenderer {
     this.drawFillHandle(ctx, viewport, snap, sheetId)
     this.drawFillPreview(ctx, viewport, snap, sheetId)
     this.drawClipboardSource(ctx, viewport, snap)
+    this.drawFormulaReferenceTokens(ctx, viewport, snap, sheetId)
+  }
+
+  private drawFormulaReferenceTokens(
+    ctx: OverlayContext,
+    viewport: OverlayViewportProvider,
+    snap: OverlaySnapshot,
+    sheetId: string,
+  ): void {
+    if (snap.formulaReferenceTokens.length === 0) return
+    // Only paint tokens whose sheet matches the visible viewport. The editing
+    // session may live on another sheet (mid-edit when the user switches),
+    // in which case we just skip painting here.
+    for (const token of snap.formulaReferenceTokens) {
+      const tokenSheet = token.sheetId ?? snap.formulaReferenceSheetId
+      if (tokenSheet && tokenSheet !== sheetId) continue
+      const rect = this.rectForRange(viewport, token.range)
+      if (!rect) continue
+      const color = FORMULA_REFERENCE_PALETTE[token.colorIndex % FORMULA_REFERENCE_PALETTE.length]
+      ctx.strokeStyle = color
+      ctx.lineWidth = 1.5
+      ctx.setLineDash([4, 2])
+      ctx.strokeRect(
+        rect.x + 0.5,
+        rect.y + 0.5,
+        Math.max(0, rect.w - 1),
+        Math.max(0, rect.h - 1),
+      )
+      ctx.setLineDash([])
+    }
   }
 
   private rectForRange(

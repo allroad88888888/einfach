@@ -2,6 +2,7 @@ import { atom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import { editingDraftAtom, editingSessionAtom } from '../editing'
 import { keyboardModeAtom } from '../keyboard'
+import { parseFormulaReferences } from './parser'
 import type {
   EnterFormulaReferenceInput,
   FormulaReferenceExitReason,
@@ -10,6 +11,7 @@ import type {
   FormulaReferenceTokenRange,
 } from './types'
 
+export * from './parser'
 export * from './types'
 
 // ---------------------------------------------------------------------------
@@ -104,6 +106,20 @@ export const formulaReferenceTokenRangeAtom = atom(
   (get) => get(formulaReferenceSessionAtom)?.tokenRange ?? null,
 )
 formulaReferenceTokenRangeAtom.debugLabel = 'spreadsheet.formulaReference.tokenRange'
+
+/**
+ * Parsed reference tokens for the current editing draft. Returns an empty
+ * array when not drafting or when the draft does not start with '='. Hosts
+ * subscribe to this to paint colored frames in the grid overlay.
+ */
+export const formulaReferenceTokensAtom = atom((get) => {
+  const session = get(editingSessionAtom)
+  if (session.status !== 'drafting') return []
+  const draft = get(editingDraftAtom)
+  if (!draft.startsWith('=')) return []
+  return parseFormulaReferences(draft, session.source?.sheetId ?? null)
+})
+formulaReferenceTokensAtom.debugLabel = 'spreadsheet.formulaReference.tokens'
 
 // ---------------------------------------------------------------------------
 // Command atoms
