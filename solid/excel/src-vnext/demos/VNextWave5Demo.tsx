@@ -54,21 +54,24 @@ const backend = createStaticSpreadsheetBackend({
       col: 0,
       displayValue: 'Region',
       valueKind: 'string',
-      conditionalFormat: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
+      // Header styling is static, not from a conditional-format rule — use
+      // `format` so toolbar features (Clear Format, Bold-pressed indicator)
+      // see it as user formatting.
+      format: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
     },
     {
       row: 0,
       col: 5,
       displayValue: 'Total',
       valueKind: 'string',
-      conditionalFormat: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
+      format: { bgColor: '#1e3a8a', fgColor: '#ffffff', bold: true },
     },
     {
       row: 8,
       col: 0,
       displayValue: 'Total',
       valueKind: 'string',
-      conditionalFormat: { bgColor: '#94a3b8', fgColor: '#0f172a', bold: true },
+      format: { bgColor: '#94a3b8', fgColor: '#0f172a', bold: true },
     },
     {
       row: 3,

@@ -1370,13 +1370,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           ref={(el) => (mergeAnchorRef = el)}
           type="button"
           class={`fmt-btn spreadsheet-toolbar-button ${
-            mergeDropdownOpen() ? 'fmt-btn-active' : ''
+            mergeDropdownOpen() || activeCellMergeRange() !== null
+              ? 'fmt-btn-active'
+              : ''
           }`.trim()}
           data-testid="toolbar-btn-merge"
           data-tooltip={t('toolbar.merge.title')}
           aria-label={t('toolbar.merge.title')}
           aria-haspopup="menu"
           aria-expanded={mergeDropdownOpen()}
+          aria-pressed={activeCellMergeRange() !== null}
           disabled={
             !backend.mergeRange ||
             availability().editingMode === 'drafting' ||
@@ -1434,10 +1437,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       </button>
       <button
         type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          activeCellFormat().numberFormat?.kind === 'percent' ? 'fmt-btn-active' : ''
+        }`.trim()}
         data-testid="toolbar-btn-percent-format"
         data-tooltip={t('toolbar.percentFormat.title')}
         aria-label={t('toolbar.percentFormat.title')}
+        aria-pressed={activeCellFormat().numberFormat?.kind === 'percent'}
         disabled={!availability().numberFormat || isProtectionGated()}
         onClick={() => dispatchCommand({ command: 'number-format', value: 'Percent' })}
       >
@@ -1445,10 +1451,19 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       </button>
       <button
         type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          activeCellFormat().numberFormat?.kind === 'currency' ||
+          activeCellFormat().numberFormat?.kind === 'accounting'
+            ? 'fmt-btn-active'
+            : ''
+        }`.trim()}
         data-testid="toolbar-btn-currency-format"
         data-tooltip={t('toolbar.currencyFormat.title')}
         aria-label={t('toolbar.currencyFormat.title')}
+        aria-pressed={
+          activeCellFormat().numberFormat?.kind === 'currency' ||
+          activeCellFormat().numberFormat?.kind === 'accounting'
+        }
         disabled={!availability().numberFormat || isProtectionGated()}
         onClick={() => dispatchCommand({ command: 'number-format', value: 'Currency' })}
       >
