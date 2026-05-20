@@ -714,3 +714,103 @@ test.describe('Format audit — Univer-parity shortcuts', () => {
     await expect(cellDisplay(page, 'B2')).toHaveText('$120.00')
   })
 })
+
+test.describe('Format audit — merge dropdown', () => {
+test.describe('Format audit — merge dropdown', () => {
+  const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge')
+  const mergeDropdown = (page: Page) => page.getByTestId('toolbar-merge-dropdown')
+  const mergeCenterItem = (page: Page) => page.getByTestId('toolbar-merge-center')
+  const acrossRowsItem = (page: Page) => page.getByTestId('toolbar-merge-across-rows')
+  const acrossColsItem = (page: Page) => page.getByTestId('toolbar-merge-across-cols')
+  const unmergeItem = (page: Page) => page.getByTestId('toolbar-merge-unmerge')
+
+  async function selectRange(page: Page, fromAddr: string, toAddr: string) {
+    const start = cell(page, fromAddr)
+    const end = cell(page, toAddr)
+    const sb = await start.boundingBox()
+    const eb = await end.boundingBox()
+    if (!sb || !eb) throw new Error('cells not visible')
+    await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(eb.x + eb.width / 2, eb.y + eb.height / 2, { steps: 4 })
+    await page.mouse.up()
+  }
+
+  test('1x1 selection disables 合并居中 / 跨列合并 / 跨行合并 in the dropdown', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+
+    await expect(mergeDropdown(page)).toBeHidden()
+    await mergeBtn(page).click()
+    await expect(mergeDropdown(page)).toBeVisible()
+
+    await expect(mergeCenterItem(page)).toBeDisabled()
+    await expect(acrossRowsItem(page)).toBeDisabled()
+    await expect(acrossColsItem(page)).toBeDisabled()
+    // Unmerge is also disabled because A1 sits in no merged range.
+    await expect(unmergeItem(page)).toBeDisabled()
+
+    await page.keyboard.press('Escape')
+    await expect(mergeDropdown(page)).toBeHidden()
+  })
+
+  test('合并居中 on A1:B2 anchors at A1 and hides B1/A2/B2', async ({ page }) => {
+    await gotoWave5(page)
+
+    await selectRange(page, 'A1', 'B2')
+    for (const addr of ['A1', 'B1', 'A2', 'B2']) {
+      await expect(cell(page, addr)).toHaveAttribute('data-selected', 'true')
+    }
+
+    await mergeBtn(page).click()
+    await expect(mergeDropdown(page)).toBeVisible()
+    await expect(mergeCenterItem(page)).toBeEnabled()
+    await mergeCenterItem(page).click()
+    await expect(mergeDropdown(page)).toBeHidden()
+
+    // A1 is now the merge anchor and spans 2x2.
+    const anchor = cell(page, 'A1')
+    await expect(anchor).toHaveAttribute('data-merge-anchor', 'true')
+    await expect(anchor).toHaveAttribute('rowspan', '2')
+    await expect(anchor).toHaveAttribute('colspan', '2')
+
+    // B1 / A2 / B2 are covered by the anchor's span — their TDs are no
+    // longer in the DOM.
+    await expect(
+      page.locator('[data-testid="wave5-grid"] td[data-row="0"][data-col="1"]'),
+    ).toHaveCount(0)
+    await expect(
+      page.locator('[data-testid="wave5-grid"] td[data-row="1"][data-col="0"]'),
+    ).toHaveCount(0)
+    await expect(
+      page.locator('[data-testid="wave5-grid"] td[data-row="1"][data-col="1"]'),
+    ).toHaveCount(0)
+  })
+
+  test('after merge: 取消合并 enables, clicking it restores all four cells', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+
+    await selectRange(page, 'A1', 'B2')
+    await mergeBtn(page).click()
+    await mergeCenterItem(page).click()
+    await expect(cell(page, 'A1')).toHaveAttribute('data-merge-anchor', 'true')
+
+    // Re-open the dropdown — unmerge must now be enabled.
+    await mergeBtn(page).click()
+    await expect(mergeDropdown(page)).toBeVisible()
+    await expect(unmergeItem(page)).toBeEnabled()
+    await unmergeItem(page).click()
+    await expect(mergeDropdown(page)).toBeHidden()
+
+    // All four cells render again as their own TDs.
+    for (const addr of ['A1', 'B1', 'A2', 'B2']) {
+      await expect(cell(page, addr)).toBeVisible()
+    }
+    await expect(cell(page, 'A1')).toHaveAttribute('rowspan', '1')
+    await expect(cell(page, 'A1')).toHaveAttribute('colspan', '1')
+  })
+})

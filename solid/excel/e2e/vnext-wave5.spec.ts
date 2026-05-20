@@ -278,34 +278,42 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
       for (const addr of ['B2', 'C2', 'B3', 'C3']) {
         await expect(cell(page, addr)).toHaveAttribute('data-selected', 'true')
       }
-      await expect(page.getByTestId('toolbar-btn-merge-cells')).toBeEnabled()
+      await expect(page.getByTestId('toolbar-btn-merge')).toBeEnabled()
     })
   })
 
   test.describe('merge / unmerge (toolbar)', () => {
-    const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge-cells')
-    const unmergeBtn = (page: Page) => page.getByTestId('toolbar-btn-unmerge-cells')
+    const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge')
+    const mergeCenterItem = (page: Page) => page.getByTestId('toolbar-merge-center')
+    const unmergeItem = (page: Page) => page.getByTestId('toolbar-merge-unmerge')
 
-    test('both buttons disabled on a single-cell selection with no merges', async ({ page }) => {
+    test('1x1 selection disables merge variants in the dropdown', async ({ page }) => {
       await gotoWave5(page)
       await cell(page, 'A1').click()
-      await expect(mergeBtn(page)).toBeDisabled()
-      await expect(unmergeBtn(page)).toBeDisabled()
+      // The anchor button itself remains clickable so the user can see what
+      // the dropdown offers — only the per-row variants are disabled.
+      await mergeBtn(page).click()
+      await expect(mergeCenterItem(page)).toBeDisabled()
+      await expect(unmergeItem(page)).toBeDisabled()
+      await page.keyboard.press('Escape')
     })
 
-    test('merge enables on a multi-cell range, unmerge stays disabled', async ({ page }) => {
-      await gotoWave5(page)
-      await cell(page, 'B2').click()
-      await cell(page, 'C3').click({ modifiers: ['Shift'] })
-      await expect(mergeBtn(page)).toBeEnabled()
-      await expect(unmergeBtn(page)).toBeDisabled()
-    })
-
-    test('clicking merge collapses B2:C3 into one anchor cell with the top-left value', async ({ page }) => {
+    test('multi-cell range enables merge-center, leaves unmerge disabled', async ({ page }) => {
       await gotoWave5(page)
       await cell(page, 'B2').click()
       await cell(page, 'C3').click({ modifiers: ['Shift'] })
       await mergeBtn(page).click()
+      await expect(mergeCenterItem(page)).toBeEnabled()
+      await expect(unmergeItem(page)).toBeDisabled()
+      await page.keyboard.press('Escape')
+    })
+
+    test('合并居中 collapses B2:C3 into one anchor cell with the top-left value', async ({ page }) => {
+      await gotoWave5(page)
+      await cell(page, 'B2').click()
+      await cell(page, 'C3').click({ modifiers: ['Shift'] })
+      await mergeBtn(page).click()
+      await mergeCenterItem(page).click()
 
       const anchor = cell(page, 'B2')
       await expect(anchor).toHaveAttribute('rowspan', '2')
@@ -316,33 +324,38 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
       await expect(page.locator('[data-testid="wave5-grid"] td[data-row="2"][data-col="2"]')).toHaveCount(0)
     })
 
-    test('after merge: merge disables, unmerge enables, history records range.merge', async ({ page }) => {
+    test('after merge: merge-center disables, unmerge enables, history records range.merge', async ({ page }) => {
       await gotoWave5(page)
       await cell(page, 'B2').click()
       await cell(page, 'C3').click({ modifiers: ['Shift'] })
       await mergeBtn(page).click()
+      await mergeCenterItem(page).click()
 
-      await expect(mergeBtn(page)).toBeDisabled()
-      await expect(unmergeBtn(page)).toBeEnabled()
+      // Re-open: merge-center is now disabled (active cell already in merge),
+      // unmerge is enabled, and the timeline shows the entry.
+      await mergeBtn(page).click()
+      await expect(unmergeItem(page)).toBeEnabled()
       await expect(page.getByTestId('history-timeline-list')).toContainText(/range\.merge/)
+      await page.keyboard.press('Escape')
     })
 
-    test('unmerge restores the original four cells and re-enables merge', async ({ page }) => {
+    test('unmerge restores the original four cells and re-enables merge-center', async ({ page }) => {
       await gotoWave5(page)
       await cell(page, 'B2').click()
       await cell(page, 'C3').click({ modifiers: ['Shift'] })
       await mergeBtn(page).click()
-      await expect(unmergeBtn(page)).toBeEnabled()
+      await mergeCenterItem(page).click()
 
-      await unmergeBtn(page).click()
+      await mergeBtn(page).click()
+      await expect(unmergeItem(page)).toBeEnabled()
+      await unmergeItem(page).click()
+
       const b2 = cell(page, 'B2')
       await expect(b2).toHaveAttribute('rowspan', '1')
       await expect(b2).toHaveAttribute('colspan', '1')
       await expect(cell(page, 'C2')).toBeVisible()
       await expect(cell(page, 'B3')).toBeVisible()
       await expect(cell(page, 'C3')).toBeVisible()
-      await expect(mergeBtn(page)).toBeEnabled()
-      await expect(unmergeBtn(page)).toBeDisabled()
     })
   })
 })

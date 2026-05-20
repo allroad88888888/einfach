@@ -117,10 +117,14 @@ function getButtons(container: HTMLElement) {
     numberFormat: container.querySelector(
       '[data-testid="toolbar-btn-number-format"]',
     ) as HTMLButtonElement,
-    merge: container.querySelector('[data-testid="toolbar-btn-merge-cells"]') as HTMLButtonElement,
-    unmerge: container.querySelector(
-      '[data-testid="toolbar-btn-unmerge-cells"]',
-    ) as HTMLButtonElement,
+    // Wave 5 merge surface is a single dropdown — the top-level button always
+    // opens the menu; the dropdown's four items (merge-center, across-rows,
+    // across-cols, unmerge) carry the per-preset disabled state.
+    merge: container.querySelector('[data-testid="toolbar-btn-merge"]') as HTMLButtonElement,
+    mergeCenterItem: () =>
+      container.querySelector('[data-testid="toolbar-merge-center"]') as HTMLButtonElement | null,
+    unmergeItem: () =>
+      container.querySelector('[data-testid="toolbar-merge-unmerge"]') as HTMLButtonElement | null,
     find: container.querySelector('[data-testid="toolbar-btn-find"]') as HTMLButtonElement,
     printPreview: container.querySelector('[data-testid="toolbar-btn-print-preview"]') as HTMLButtonElement,
     painter: container.querySelector(
@@ -149,8 +153,9 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(false)
     expect(buttons.textColor.disabled).toBe(false)
     expect(buttons.numberFormat.disabled).toBe(false)
+    // createFakeBackend omits mergeRange so the dropdown anchor button is
+    // disabled — there is no merge surface to expose.
     expect(buttons.merge.disabled).toBe(true)
-    expect(buttons.unmerge.disabled).toBe(true)
 
     store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 2, col: 2 }, extend: true })
 
@@ -159,8 +164,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(false)
     expect(buttons.textColor.disabled).toBe(false)
     expect(buttons.numberFormat.disabled).toBe(false)
+    // Still no mergeRange port on the fake backend.
     expect(buttons.merge.disabled).toBe(true)
-    expect(buttons.unmerge.disabled).toBe(true)
   })
 
   it('disables formatting commands while editing is drafting', () => {
@@ -188,8 +193,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(true)
     expect(buttons.textColor.disabled).toBe(true)
     expect(buttons.numberFormat.disabled).toBe(true)
+    // Drafting also gates the merge dropdown's anchor button.
     expect(buttons.merge.disabled).toBe(true)
-    expect(buttons.unmerge.disabled).toBe(true)
   })
 
   it('dispatches toolbar.format.command intent when bold is clicked', () => {
@@ -314,9 +319,16 @@ describe('vNext SpreadsheetToolbar', () => {
 
     let buttons = getButtons(container)
     expect(buttons.merge.disabled).toBe(false)
-    expect(buttons.unmerge.disabled).toBe(true)
 
+    // Open the dropdown and click 合并居中. The dropdown body lives inside the
+    // same toolbar root, so a single fireEvent click on the anchor toggles it
+    // open, then the menu item triggers the merge.
     fireEvent.click(buttons.merge)
+    const mergeCenterItem = buttons.mergeCenterItem()
+    expect(mergeCenterItem).not.toBeNull()
+    expect(mergeCenterItem!.disabled).toBe(false)
+    expect(buttons.unmergeItem()?.disabled).toBe(true)
+    fireEvent.click(mergeCenterItem!)
     await waitFor(() => {
       expect(mergeRangeCalls).toHaveLength(1)
     })
@@ -358,8 +370,11 @@ describe('vNext SpreadsheetToolbar', () => {
     })
 
     buttons = getButtons(container)
-    expect(buttons.unmerge.disabled).toBe(false)
-    fireEvent.click(buttons.unmerge)
+    fireEvent.click(buttons.merge)
+    const unmergeItem = buttons.unmergeItem()
+    expect(unmergeItem).not.toBeNull()
+    expect(unmergeItem!.disabled).toBe(false)
+    fireEvent.click(unmergeItem!)
     await waitFor(() => {
       expect(unmergeRangeCalls).toHaveLength(1)
     })
@@ -394,8 +409,8 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.fillColor.disabled).toBe(true)
     expect(buttons.textColor.disabled).toBe(true)
     expect(buttons.numberFormat.disabled).toBe(true)
+    // Protected sheet → the merge dropdown anchor button is disabled.
     expect(buttons.merge.disabled).toBe(true)
-    expect(buttons.unmerge.disabled).toBe(true)
   })
 
   it('Find button opens findReplaceOpenAtom', () => {
@@ -588,7 +603,11 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    fireEvent.click(getButtons(container).merge)
+    const buttons = getButtons(container)
+    fireEvent.click(buttons.merge)
+    const mergeCenterItem = buttons.mergeCenterItem()
+    expect(mergeCenterItem).not.toBeNull()
+    fireEvent.click(mergeCenterItem!)
     await waitFor(() => expect(mergeRangeCalls).toHaveLength(1))
     await waitFor(() => expect(store.getter(historyStackAtom).entries.length).toBe(1))
     expect(store.getter(historyStackAtom).entries[0].kind).toBe('range.merge')

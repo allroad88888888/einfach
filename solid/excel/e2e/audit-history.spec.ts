@@ -151,9 +151,10 @@ test.describe('audit: undo/redo defects on the Wave 5 demo', () => {
     await cell(page, 'B2').click()
     await cell(page, 'C3').click({ modifiers: ['Shift'] })
 
-    const mergeBtn = page.getByTestId('toolbar-btn-merge-cells')
+    const mergeBtn = page.getByTestId('toolbar-btn-merge')
     await expect(mergeBtn).toBeEnabled()
     await mergeBtn.click()
+    await page.getByTestId('toolbar-merge-center').click()
 
     const anchor = cell(page, 'B2')
     await expect(anchor).toHaveAttribute('rowspan', '2')
@@ -257,7 +258,8 @@ test.describe('audit: undo/redo defects on the Wave 5 demo', () => {
     // 3) range.merge — merge a 2x2 selection.
     await cell(page, 'B5').click()
     await cell(page, 'C6').click({ modifiers: ['Shift'] })
-    await page.getByTestId('toolbar-btn-merge-cells').click()
+    await page.getByTestId('toolbar-btn-merge').click()
+    await page.getByTestId('toolbar-merge-center').click()
     await expect(list).toContainText(/range\.merge/)
   })
 })

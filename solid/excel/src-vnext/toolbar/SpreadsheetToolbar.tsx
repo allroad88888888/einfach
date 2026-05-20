@@ -39,6 +39,7 @@ import {
   useSpreadsheetUiStore,
 } from '../provider'
 import { BordersDropdown, type BordersPreset } from './BordersDropdown'
+import { MergeDropdown, type MergePreset } from './MergeDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
 import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
 import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
@@ -307,6 +308,11 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   // atom mutations but `createSignal` survives the re-run.
   const [bordersDropdownOpen, setBordersDropdownOpen] = createSignal(false)
   let bordersAnchorRef: HTMLButtonElement | undefined
+
+  // Merge dropdown mirrors the borders dropdown pattern — local signal, click-
+  // outside / Esc handled by the dropdown itself.
+  const [mergeDropdownOpen, setMergeDropdownOpen] = createSignal(false)
+  let mergeAnchorRef: HTMLButtonElement | undefined
 
   const colorPopover = useAtomValue(colorPopoverAtom)
   const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
@@ -681,65 +687,164 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     return snapshot.selection.sheetId || availability().sheetId
   }
 
-  function selectionContainsMergeAnchor(): boolean {
+  /**
+   * Merged range that contains the active cell, if any. Returns null when the
+   * active cell sits in a plain (non-merged) cell. This is what drives the
+   * "取消合并" item — the user may have a 1x1 selection inside a merged
+   * region and still expect unmerge to work.
+   *
+   * The projection emits one anchor row per merged region (with `mergedSpan`).
+   * Covered cells may or may not appear — when they do they carry
+   * `mergeAnchor` pointing back at the anchor's coords. The lookup below
+   * handles both shapes by scanning all anchors and testing range containment.
+   */
+  function activeCellMergeRange(): CellRange | null {
     const snapshot = projectionSnapshot()
     const result = snapshot.result
-    if (!isVisibleProjectionResult(result)) return false
+    if (!isVisibleProjectionResult(result)) return null
     const selection = selectionSnapshot()
-    if (result.sheetId !== selection.selection.sheetId) return false
-    const range = selection.range
-    for (const cell of result.cells) {
-      if (!cell.mergedSpan) continue
+    if (result.sheetId !== selection.selection.sheetId) return null
+    const active = selection.activeCell
+
+    for (const anchor of result.cells) {
+      if (!anchor.mergedSpan) continue
+      const rows = Math.max(1, Math.trunc(anchor.mergedSpan.rows))
+      const cols = Math.max(1, Math.trunc(anchor.mergedSpan.cols))
+      const range: CellRange = {
+        rowStart: anchor.row,
+        rowEnd: anchor.row + rows - 1,
+        colStart: anchor.col,
+        colEnd: anchor.col + cols - 1,
+      }
       if (
-        cell.row >= range.rowStart &&
-        cell.row <= range.rowEnd &&
-        cell.col >= range.colStart &&
-        cell.col <= range.colEnd
+        active.row >= range.rowStart &&
+        active.row <= range.rowEnd &&
+        active.col >= range.colStart &&
+        active.col <= range.colEnd
       ) {
-        return true
+        return range
       }
     }
-    return false
+
+    return null
   }
 
-  function canMergeSelection() {
-    return (
-      !!backend.mergeRange &&
-      availability().editingMode !== 'drafting' &&
-      getMutationSheetId() !== null &&
-      rangeCellCount(selectionSnapshot().range) > 1 &&
-      !selectionContainsMergeAnchor()
-    )
-  }
-
-  function canUnmergeSelection() {
-    return (
-      !!backend.unmergeRange &&
-      availability().editingMode !== 'drafting' &&
-      getMutationSheetId() !== null &&
-      selectionContainsMergeAnchor()
-    )
-  }
-
-  async function mergeSelection() {
+  /**
+   * Dispatch handler for the merge dropdown. Each preset issues one or more
+   * `mergeRange` / `unmergeRange` calls and then a single history entry.
+   */
+  async function executeMergePreset(preset: MergePreset) {
     const sheetId = getMutationSheetId()
-    if (!sheetId || !backend.mergeRange) {
+    if (!sheetId) return
+
+    const selectionRange = selectionSnapshot().range
+
+    if (preset === 'unmerge') {
+      if (!backend.unmergeRange) return
+      // Prefer the active-cell merge range so a 1x1 selection inside a merge
+      // still unmerges the full region; fall back to the raw selection.
+      const targetRange = activeCellMergeRange() ?? selectionRange
+      const result = await backend.unmergeRange({
+        kind: 'unmerge-range',
+        sheetId,
+        range: targetRange,
+      })
+      recordHistoryEntry({
+        sheetId,
+        kind: 'range.unmerge',
+        revision: result?.revision,
+        affectedRange: result?.affectedRange ?? targetRange,
+      })
+      await refreshProjection(sheetId)
       return
     }
 
-    const range = selectionSnapshot().range
-    const result = await backend.mergeRange({
-      kind: 'merge-range',
-      sheetId,
-      range,
-    })
-    recordHistoryEntry({
-      sheetId,
-      kind: 'range.merge',
-      revision: result?.revision,
-      affectedRange: result?.affectedRange ?? range,
-    })
-    await refreshProjection(sheetId)
+    if (!backend.mergeRange) return
+
+    if (preset === 'merge-center') {
+      // The dropdown promises "合并居中" (merge + center) but the backend
+      // exposes no compound transaction port — issuing a separate
+      // `setFormatRange` after the merge would put the centering on its own
+      // undo step, breaking the timeline contract that one user action equals
+      // one undo. Until a compound-transaction port lands we ship just the
+      // merge here so undo reverses the user's click in one move.
+      const result = await backend.mergeRange({
+        kind: 'merge-range',
+        sheetId,
+        range: selectionRange,
+      })
+      recordHistoryEntry({
+        sheetId,
+        kind: 'range.merge',
+        revision: result?.revision,
+        affectedRange: result?.affectedRange ?? selectionRange,
+      })
+      await refreshProjection(sheetId)
+      return
+    }
+
+    if (preset === 'across-rows') {
+      // Merge each row of the selection independently. Univer labels this
+      // 跨列合并 — within each row the cells across columns collapse.
+      let lastAffected: CellRange | undefined
+      for (let row = selectionRange.rowStart; row <= selectionRange.rowEnd; row += 1) {
+        if (selectionRange.colEnd <= selectionRange.colStart) break
+        const rowRange: CellRange = {
+          rowStart: row,
+          rowEnd: row,
+          colStart: selectionRange.colStart,
+          colEnd: selectionRange.colEnd,
+        }
+        const result = await backend.mergeRange({
+          kind: 'merge-range',
+          sheetId,
+          range: rowRange,
+        })
+        lastAffected = result?.affectedRange ?? rowRange
+      }
+      recordHistoryEntry({
+        sheetId,
+        kind: 'range.merge',
+        revision: undefined,
+        affectedRange: lastAffected ?? selectionRange,
+      })
+      await refreshProjection(sheetId)
+      return
+    }
+
+    if (preset === 'across-cols') {
+      // Merge each column of the selection independently. Univer labels this
+      // 跨行合并 — within each column the cells across rows collapse.
+      let lastAffected: CellRange | undefined
+      for (let col = selectionRange.colStart; col <= selectionRange.colEnd; col += 1) {
+        if (selectionRange.rowEnd <= selectionRange.rowStart) break
+        const colRange: CellRange = {
+          rowStart: selectionRange.rowStart,
+          rowEnd: selectionRange.rowEnd,
+          colStart: col,
+          colEnd: col,
+        }
+        const result = await backend.mergeRange({
+          kind: 'merge-range',
+          sheetId,
+          range: colRange,
+        })
+        lastAffected = result?.affectedRange ?? colRange
+      }
+      recordHistoryEntry({
+        sheetId,
+        kind: 'range.merge',
+        revision: undefined,
+        affectedRange: lastAffected ?? selectionRange,
+      })
+      await refreshProjection(sheetId)
+      return
+    }
+  }
+
+  function handleMergeSelect(preset: MergePreset) {
+    setMergeDropdownOpen(false)
+    void executeMergePreset(preset).catch(reportCommandError)
   }
 
   /**
@@ -759,27 +864,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     store.setter(pasteClipboardAtom, {
       source: { sheetId, range: snapshot.range },
     })
-  }
-
-  async function unmergeSelection() {
-    const sheetId = getMutationSheetId()
-    if (!sheetId || !backend.unmergeRange) {
-      return
-    }
-
-    const range = selectionSnapshot().range
-    const result = await backend.unmergeRange({
-      kind: 'unmerge-range',
-      sheetId,
-      range,
-    })
-    recordHistoryEntry({
-      sheetId,
-      kind: 'range.unmerge',
-      revision: result?.revision,
-      affectedRange: result?.affectedRange ?? range,
-    })
-    await refreshProjection(sheetId)
   }
 
   return (
@@ -897,32 +981,37 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           onRequestClose={() => setBordersDropdownOpen(false)}
         />
       </div>
-      <button
-        type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-merge-cells"
-        title={t('toolbar.merge.title')}
-        aria-label={t('toolbar.merge.title')}
-        disabled={!canMergeSelection() || isProtectionGated()}
-        onClick={() => {
-          void mergeSelection().catch(reportCommandError)
-        }}
+      <div
+        class="spreadsheet-toolbar-merge-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
       >
-        {t('toolbar.merge')}
-      </button>
-      <button
-        type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-unmerge-cells"
-        title={t('toolbar.unmerge.title')}
-        aria-label={t('toolbar.unmerge.title')}
-        disabled={!canUnmergeSelection() || isProtectionGated()}
-        onClick={() => {
-          void unmergeSelection().catch(reportCommandError)
-        }}
-      >
-        {t('toolbar.unmerge')}
-      </button>
+        <button
+          ref={(el) => (mergeAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            mergeDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-merge"
+          title={t('toolbar.merge.title')}
+          aria-label={t('toolbar.merge.title')}
+          aria-haspopup="menu"
+          aria-expanded={mergeDropdownOpen()}
+          disabled={!backend.mergeRange || availability().editingMode === 'drafting' || isProtectionGated()}
+          onClick={() => {
+            setMergeDropdownOpen((open) => !open)
+          }}
+        >
+          {t('toolbar.merge')}
+        </button>
+        <MergeDropdown
+          isOpen={mergeDropdownOpen()}
+          isMultiCell={rangeCellCount(selectionSnapshot().range) > 1}
+          canUnmerge={activeCellMergeRange() !== null}
+          anchorRef={mergeAnchorRef ?? null}
+          onSelect={handleMergeSelect}
+          onRequestClose={() => setMergeDropdownOpen(false)}
+        />
+      </div>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
