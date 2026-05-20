@@ -10,6 +10,7 @@ import {
   formatPainterStateAtom,
   nextHistoryTransactionId,
   openFormatCellsAtom,
+  pasteClipboardAtom,
   pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
@@ -115,6 +116,26 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     // value when dispatchCommand is invoked. The hard-coded value here is a
     // safety net for callers that bypass the dropdown (none today).
     value: 'Number',
+    isEnabled: (availability) => availability.numberFormat,
+  },
+  {
+    // Univer-parity shortcut — one-click percent format. The token routes
+    // through `numberFormatForValue('Percent')` → `{ kind: 'percent', digits: 0 }`.
+    command: 'number-format',
+    label: 'toolbar.percentFormat',
+    title: 'toolbar.percentFormat.title',
+    testId: 'toolbar-btn-percent-format',
+    value: 'Percent',
+    isEnabled: (availability) => availability.numberFormat,
+  },
+  {
+    // Univer-parity shortcut — one-click currency format. The token routes
+    // through `numberFormatForValue('Currency')` → `{ kind: 'currency', symbol: '$', digits: 2 }`.
+    command: 'number-format',
+    label: 'toolbar.currencyFormat',
+    title: 'toolbar.currencyFormat.title',
+    testId: 'toolbar-btn-currency-format',
+    value: 'Currency',
     isEnabled: (availability) => availability.numberFormat,
   },
   {
@@ -236,7 +257,11 @@ function numberFormatForValue(value: string | null): SpreadsheetNumberFormat {
     case 'Accounting':
       return { kind: 'accounting', symbol: '¥', digits: 2 }
     case 'Currency':
-      return { kind: 'currency', symbol: '¥', digits: 2 }
+      // Toolbar `¥`-shortcut and the dropdown `Currency` row both flow through
+      // here. The Format Cells dialog (and the seed currency test fixtures)
+      // standardise on `$` so we mirror that to keep the engine output
+      // consistent across surfaces.
+      return { kind: 'currency', symbol: '$', digits: 2 }
     case 'DateShort':
     case 'Date':
       return { kind: 'date', pattern: 'yyyy-mm-dd' }
@@ -717,6 +742,25 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     await refreshProjection(sheetId)
   }
 
+  /**
+   * Univer-parity "Paste" toolbar shortcut.
+   *
+   * Mirrors the menu-bar Edit > Paste route: stamps the clipboard intent for
+   * the active selection. The real paste work (text-from-OS-clipboard,
+   * intra-app TSV chunks, etc.) is owned by `SpreadsheetGrid` and
+   * `SpreadsheetContextMenu`; this button only fires the intent so those
+   * handlers can react. When no sheet is active (initial blank state) it is
+   * a no-op.
+   */
+  function dispatchPasteIntent() {
+    const snapshot = selectionSnapshot()
+    const sheetId = snapshot.selection.sheetId || getMutationSheetId() || ''
+    if (!sheetId) return
+    store.setter(pasteClipboardAtom, {
+      source: { sheetId, range: snapshot.range },
+    })
+  }
+
   async function unmergeSelection() {
     const sheetId = getMutationSheetId()
     if (!sheetId || !backend.unmergeRange) {
@@ -752,11 +796,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             : command.command === 'text-color'
               ? 'text'
               : null
+        // The Univer-parity %/¥ shortcuts re-use `command: 'number-format'`
+        // but dispatch a fixed value directly — only the canonical
+        // `toolbar-btn-number-format` entry opens the catalog dropdown.
+        const isNumberFormatDropdownOpener =
+          command.command === 'number-format' && command.testId === 'toolbar-btn-number-format'
         const isPressed = () => {
           if (command.command === 'bold') return !!activeCellFormat().bold
           if (command.command === 'italic') return !!activeCellFormat().italic
           if (command.command === 'underline') return !!activeCellFormat().underline
-          if (command.command === 'number-format') return numberFormatOpen()
+          if (isNumberFormatDropdownOpener) return numberFormatOpen()
           if (command.command === 'alignment') {
             return activeCellFormat().align === command.value
           }
@@ -784,14 +833,14 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             aria-label={t(command.title)}
             aria-pressed={isPressed()}
             aria-haspopup={
-              command.command === 'number-format'
+              isNumberFormatDropdownOpener
                 ? 'menu'
                 : colorMode
                   ? 'dialog'
                   : undefined
             }
             aria-expanded={
-              command.command === 'number-format'
+              isNumberFormatDropdownOpener
                 ? numberFormatOpen()
                 : colorMode
                   ? colorPopover().mode === colorMode
@@ -799,7 +848,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             }
             disabled={!command.isEnabled(availability()) || isProtectionGated()}
             onClick={(event) => {
-              if (command.command === 'number-format') {
+              if (isNumberFormatDropdownOpener) {
                 if (numberFormatOpen()) {
                   closeNumberFormatDropdown()
                 } else {
@@ -919,6 +968,17 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onDblClick={handleFormatPainterDoubleClick}
       >
         {t('toolbar.painter')}
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-paste"
+        title={t('toolbar.paste.title')}
+        aria-label={t('toolbar.paste.title')}
+        disabled={isProtectionGated()}
+        onClick={dispatchPasteIntent}
+      >
+        {t('toolbar.paste')}
       </button>
       <NumberFormatDropdown
         open={numberFormatOpen()}

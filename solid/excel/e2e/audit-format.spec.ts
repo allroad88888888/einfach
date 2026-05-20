@@ -686,3 +686,31 @@ test.describe('Format audit — multi-cell range', () => {
     }
   })
 })
+
+test.describe('Format audit — Univer-parity shortcuts', () => {
+  const percentBtn = (page: Page) => page.getByTestId('toolbar-btn-percent-format')
+  const currencyBtn = (page: Page) => page.getByTestId('toolbar-btn-currency-format')
+
+  test('% shortcut formats B2 (120) as 12000%', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await expect(cellDisplay(page, 'B2')).toHaveText('120')
+
+    await percentBtn(page).click()
+
+    // Toolbar shortcut applies the format inline — no dropdown should open.
+    await expect(page.getByTestId('number-format-dropdown')).toBeHidden()
+    await expect(cellDisplay(page, 'B2')).toHaveText('12000%')
+  })
+
+  test('$ shortcut formats B2 (120) as $120.00', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await expect(cellDisplay(page, 'B2')).toHaveText('120')
+
+    await currencyBtn(page).click()
+
+    await expect(page.getByTestId('number-format-dropdown')).toBeHidden()
+    await expect(cellDisplay(page, 'B2')).toHaveText('$120.00')
+  })
+})
