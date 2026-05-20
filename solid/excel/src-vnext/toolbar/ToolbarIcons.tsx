@@ -217,33 +217,42 @@ export const BordersIcon = (): JSX.Element => (
 
 export const FontSizeUpIcon = (): JSX.Element => (
   <svg {...SVG_PROPS}>
+    {/* Larger "A" glyph + clearer up arrow. Previous version drew "A" at
+        font-size 10 starting at x=2 — visually undersized next to the
+        16x16 button. Bumped to font-size 12 and the arrow stroke to 1.6. */}
     <text
-      x="2"
-      y="12"
-      font-size="10"
-      font-family="serif"
+      x="1.5"
+      y="13"
+      font-size="12"
+      font-family="Georgia, 'Times New Roman', serif"
+      font-weight="700"
       fill="currentColor"
       stroke="none"
     >
       A
     </text>
-    <path d="m10 6 1.5-1.5L13 6M11.5 4.5V10" />
+    <path d="M12 4v7" stroke-width="1.6" />
+    <path d="m9.6 6.2 2.4-2.4 2.4 2.4" stroke-width="1.6" />
   </svg>
 )
 
 export const FontSizeDownIcon = (): JSX.Element => (
   <svg {...SVG_PROPS}>
+    {/* Smaller "A" (visually one rank below FontSizeUpIcon) with a clear
+        down arrow. */}
     <text
-      x="3"
-      y="11"
-      font-size="8"
-      font-family="serif"
+      x="2.5"
+      y="12"
+      font-size="10"
+      font-family="Georgia, 'Times New Roman', serif"
+      font-weight="700"
       fill="currentColor"
       stroke="none"
     >
       A
     </text>
-    <path d="m10 8 1.5 1.5L13 8M11.5 9.5V4" />
+    <path d="M12 4v7" stroke-width="1.6" />
+    <path d="m9.6 8.8 2.4 2.4 2.4-2.4" stroke-width="1.6" />
   </svg>
 )
 
@@ -285,10 +294,26 @@ export const RedoIcon = (): JSX.Element => (
 
 export const ClearFormatIcon = (): JSX.Element => (
   <svg {...SVG_PROPS}>
-    <path d="M3 3h10l-3.5 5L11 13H6L3 3z" />
-    <line x1="2" y1="14" x2="14" y2="14" stroke-dasharray="1.5 1.2" />
-    <line x1="11.5" y1="2.5" x2="14" y2="5" stroke-width="1.2" />
-    <line x1="14" y1="2.5" x2="11.5" y2="5" stroke-width="1.2" />
+    {/*
+      "Eraser swept over text" composition — the universal Excel/Univer
+      glyph for clear formatting:
+        - background "T" letter (formatted text being erased)
+        - eraser shape on top, angled, with a clean separating line
+        - small flecks suggesting the format dust being removed
+      Heavier strokes (1.6) so the icon reads at 14-16px sizes.
+     */}
+    {/* The "T" letter being cleaned */}
+    <line x1="3" y1="3.5" x2="9" y2="3.5" stroke-width="1.6" />
+    <line x1="6" y1="3.5" x2="6" y2="9.5" stroke-width="1.6" />
+    {/* Eraser body — rounded rectangle on a tilt */}
+    <path
+      d="M8 14.5 5 11.5l6-6 3 3-6 6z"
+      fill="#fff"
+      stroke="currentColor"
+      stroke-width="1.5"
+    />
+    {/* Divider between the eraser's pink top and white pad */}
+    <line x1="7" y1="9.5" x2="10" y2="12.5" stroke-width="1.5" />
   </svg>
 )
 

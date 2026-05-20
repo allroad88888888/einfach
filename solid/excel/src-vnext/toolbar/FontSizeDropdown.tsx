@@ -95,6 +95,11 @@ export function FontSizeDropdown(props: FontSizeDropdownProps): JSX.Element {
                 data-font-size={String(size)}
                 role="menuitem"
                 style={{
+                  // `<button>` defaults to `inline-block`, which made the 11
+                  // size rows collapse onto a single horizontal line — only
+                  // the first row ("8") was visible. Force block so they
+                  // stack vertically as a real menu list.
+                  display: 'block',
                   width: '100%',
                   padding: '4px 12px',
                   'text-align': 'left',

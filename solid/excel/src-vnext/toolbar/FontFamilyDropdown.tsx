@@ -108,6 +108,9 @@ export function FontFamilyDropdown(props: FontFamilyDropdownProps): JSX.Element 
                 data-font-family={family}
                 role="menuitem"
                 style={{
+                  // Force block so the family rows stack vertically; default
+                  // <button> display:inline-block collapsed them onto one line.
+                  display: 'block',
                   width: '100%',
                   padding: '4px 12px',
                   'text-align': 'left',
