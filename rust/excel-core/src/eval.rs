@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use einfach_core::{AtomId, Value, ValueError};
 
@@ -4764,6 +4764,604 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             Value::Number(result)
         }
 
+        // === Engineering / base conversion / bit ops ===
+        //
+        // Excel's base-conversion family uses a fixed-width signed
+        // two's-complement encoding when the input is at the maximum
+        // width: BIN at 10 bits, OCT at 30 bits (10 octal digits), HEX
+        // at 40 bits (10 hex digits). Inputs shorter than the max are
+        // treated as positive. See `parse_base_n_text` and
+        // `format_base_n_signed` for the shared core; the per-function
+        // arms are thin wrappers that pick base / max-chars and any
+        // composition.
+        "BIN2DEC" => eval_xxx2dec(args, provider, 2, 10, 1),
+        "OCT2DEC" => eval_xxx2dec(args, provider, 8, 10, 3),
+        "HEX2DEC" => eval_xxx2dec(args, provider, 16, 10, 4),
+        "DEC2BIN" => eval_dec2xxx(args, provider, 2, 10, 1, false),
+        "DEC2OCT" => eval_dec2xxx(args, provider, 8, 10, 3, false),
+        "DEC2HEX" => eval_dec2xxx(args, provider, 16, 10, 4, true),
+        // Cross-base wrappers: parse via XXX2DEC's base, format via the
+        // target's DEC2XXX. We inline both halves rather than recursing
+        // through `eval_func` so error propagation stays local.
+        "BIN2HEX" => eval_cross_base(args, provider, (2, 10, 1), (16, 10, 4), true),
+        "BIN2OCT" => eval_cross_base(args, provider, (2, 10, 1), (8, 10, 3), false),
+        "HEX2BIN" => eval_cross_base(args, provider, (16, 10, 4), (2, 10, 1), false),
+        "HEX2OCT" => eval_cross_base(args, provider, (16, 10, 4), (8, 10, 3), false),
+        "OCT2BIN" => eval_cross_base(args, provider, (8, 10, 3), (2, 10, 1), false),
+        "OCT2HEX" => eval_cross_base(args, provider, (8, 10, 3), (16, 10, 4), true),
+
+        // Bitwise ops. Excel's documented domain is 0..=2^48-1; we
+        // accept the slightly looser 0..=2^53-1 (the f64 safe-integer
+        // range) so values that survive a round-trip through Value
+        // stay representable. Fractional / negative / out-of-range
+        // inputs surface #NUM!.
+        "BITAND" => eval_bit_binop(args, provider, |a, b| a & b),
+        "BITOR" => eval_bit_binop(args, provider, |a, b| a | b),
+        "BITXOR" => eval_bit_binop(args, provider, |a, b| a ^ b),
+        "BITLSHIFT" => eval_bit_shift(args, provider, false),
+        "BITRSHIFT" => eval_bit_shift(args, provider, true),
+
+        // DELTA(a[, b=0]) — 1 if a == b else 0. Excel uses #VALUE! for
+        // non-numeric args; we use WrongType to match the rest of this
+        // module.
+        "DELTA" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let a = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = a {
+                return Value::Error(e);
+            }
+            let b = if args.len() == 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                v
+            } else {
+                Value::Number(0.0)
+            };
+            let (an, bn) = match (as_engineering_number(&a), as_engineering_number(&b)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => return Value::Error(ValueError::WrongType),
+            };
+            Value::Number(if an == bn { 1.0 } else { 0.0 })
+        }
+
+        // GESTEP(num[, step=0]) — 1 if num >= step else 0.
+        "GESTEP" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let n = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = n {
+                return Value::Error(e);
+            }
+            let s = if args.len() == 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                v
+            } else {
+                Value::Number(0.0)
+            };
+            let (nn, sn) = match (as_engineering_number(&n), as_engineering_number(&s)) {
+                (Some(x), Some(y)) => (x, y),
+                _ => return Value::Error(ValueError::WrongType),
+            };
+            Value::Number(if nn >= sn { 1.0 } else { 0.0 })
+        }
+
+        // === Hyperbolic ===
+        // SINH / COSH / TANH / ASINH are total functions over the reals;
+        // `unary_number` already collapses non-finite results to
+        // `Overflow`, which matches Excel's `#NUM!` for the SINH/COSH
+        // explosions at large |n|.
+        "SINH" => unary_number(args, provider, f64::sinh),
+        "COSH" => unary_number(args, provider, f64::cosh),
+        "TANH" => unary_number(args, provider, f64::tanh),
+        "ASINH" => unary_number(args, provider, f64::asinh),
+        "ACOSH" => {
+            // Domain: n >= 1. Out of domain → #NUM!.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n >= 1.0 => {
+                    let r = n.acosh();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "ATANH" => {
+            // Domain: |n| < 1. n == ±1 produces ±∞, also Overflow.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n > -1.0 && n < 1.0 => {
+                    let r = n.atanh();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+
+        // === Reciprocal trig (radians input) ===
+        // CSC/SEC/COT each have isolated poles where the underlying
+        // sin/cos/tan hits 0. Excel reports `#DIV/0!` at those poles.
+        "CSC" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let s = n.sin();
+                    if s == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let r = 1.0 / s;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "SEC" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let c = n.cos();
+                    if c == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let r = 1.0 / c;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "COT" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let t = n.tan();
+                    if t == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let r = 1.0 / t;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+
+        // === Reciprocal hyperbolic ===
+        // CSCH undefined only at 0; SECH is finite & non-zero
+        // everywhere; COTH undefined only at 0 (tanh(0) == 0).
+        "CSCH" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let s = n.sinh();
+                    if s == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let r = 1.0 / s;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "SECH" => unary_number(args, provider, |n| 1.0 / n.cosh()),
+        "COTH" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let t = n.tanh();
+                    if t == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let r = 1.0 / t;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+
+        // === Inverse reciprocal trig ===
+        // ACSC(n) = asin(1/n); n == 0 is #DIV/0!, |n| < 1 is #NUM!.
+        // ACSC returns a value in [-PI/2, PI/2] \ {0} — sign follows n
+        // (same convention as Excel).
+        "ACSC" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    if n == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    if n.abs() < 1.0 {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    let r = (1.0 / n).asin();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        // ASEC(n) = acos(1/n); same domain (|n| >= 1, n != 0).
+        // Returns a value in [0, PI].
+        "ASEC" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    if n == 0.0 {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    if n.abs() < 1.0 {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    let r = (1.0 / n).acos();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        // ACOT(n) = PI/2 - atan(n); returns a value in (0, PI), matching
+        // Excel (which differs from the C/Rust `atan2(1, n)` convention
+        // only for n == 0, where Excel chooses +PI/2 rather than the
+        // signed-zero branch). Defined for all real n.
+        "ACOT" => unary_number(args, provider, |n| std::f64::consts::FRAC_PI_2 - n.atan()),
+
+        // === Math extras ===
+        //
+        // Pair-of-arrays sums. Same shape contract as CORREL / COVAR
+        // (see `collect_paired_numbers`). Pairs are kept only when BOTH
+        // cells are `Value::Number`; everything else (Null, Text,
+        // Boolean) is skipped, matching Excel's "non-numeric → 0
+        // contribution" behaviour for these aggregates.
+        "SUMX2MY2" => sum_pair_impl(args, provider, |x, y| x * x - y * y),
+        "SUMX2PY2" => sum_pair_impl(args, provider, |x, y| x * x + y * y),
+        "SUMXMY2" => sum_pair_impl(args, provider, |x, y| (x - y) * (x - y)),
+
+        // SUMSQ — variadic `Σ x²`. Walks each arg via `for_each_arg_value`
+        // so a `SUMSQ(A:A)` stays sparse. Only numeric values contribute;
+        // booleans and text are skipped, errors propagate.
+        "SUMSQ" => {
+            let mut total = 0.0_f64;
+            let mut err: Option<ValueError> = None;
+            for arg in args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => total += n * n,
+                        _ => {}
+                    }
+                });
+            }
+            match err {
+                Some(e) => Value::Error(e),
+                None => Value::Number(total),
+            }
+        }
+
+        // SQRTPI(n) — `sqrt(n * PI)`. Excel returns #NUM! for negatives.
+        "SQRTPI" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n < 0.0 => Value::Error(ValueError::Overflow),
+                Some(n) => Value::Number((n * std::f64::consts::PI).sqrt()),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+
+        // SUMPRODUCT(array1[, array2, ...]) — multiply element-wise across N
+        // arrays of identical shape, then sum. N == 1 collapses to "SUM over
+        // numerics" of the single array. Shape mismatch → #VALUE!.
+        // Non-numeric cells contribute 0 (Excel parity).
+        "SUMPRODUCT" => sumproduct_impl(args, provider),
+
+        // FLOOR.MATH / CEILING.MATH — precise rounding family. 1-3 args.
+        // `significance` defaults to 1; `mode` defaults to 0 ("toward
+        // -inf" for FLOOR.MATH, "toward +inf" for CEILING.MATH). When
+        // mode != 0, negatives round toward zero (FLOOR.MATH) / away
+        // from zero (CEILING.MATH) instead. These diverge from
+        // FLOOR.PRECISE / CEILING.PRECISE specifically on negatives.
+        "FLOOR.MATH" => floor_ceiling_math(args, provider, true),
+        "CEILING.MATH" => floor_ceiling_math(args, provider, false),
+
+        // FLOOR.PRECISE / CEILING.PRECISE — always round toward -inf /
+        // +inf regardless of sign. 1 or 2 args; `significance` defaults
+        // to 1. Negative significance is accepted but treated as `|sig|`
+        // per Excel parity.
+        "FLOOR.PRECISE" => floor_ceiling_precise(args, provider, true),
+        "CEILING.PRECISE" => floor_ceiling_precise(args, provider, false),
+
+        // ROMAN / ARABIC — round-trip between integers and Roman
+        // numerals. Only the classic form (form=0) is implemented; other
+        // form values are rejected with #VALUE!.
+        // note: only classic form supported.
+        "ROMAN" => fn_roman(args, provider),
+        "ARABIC" => fn_arabic(args, provider),
+
+        // DECIMAL / BASE — round-trip between text in base N (2..=36)
+        // and integers. Letters A..Z are 10..35, case-insensitive.
+        "DECIMAL" => fn_decimal(args, provider),
+        "BASE" => fn_base(args, provider),
+
+        // MDETERM(range) — determinant of a SQUARE matrix range.
+        // Implemented via Doolittle LU decomposition with partial
+        // pivoting; numerically stable up to ~50×50, tested through
+        // 10×10. Non-square → #VALUE!. Non-numeric cell → #TYPE!.
+        //
+        // note: MMULT/MINVERSE deferred until Value::Array lands — they
+        // require a matrix output type, which the current single-Value
+        // eval pipeline cannot express.
+        "MDETERM" => fn_mdeterm(args, provider),
+
+        // NETWORKDAYS(start, end[, holidays]) — count working days
+        // (Mon..Fri, excluding `holidays`) between `start` and `end`
+        // inclusive on both ends. If `start > end`, the result is
+        // negated (matches Excel).
+        //
+        // Epoch note: serials here are 1970-01-01 = 0 (see
+        // TODO(excel-1900-epoch) on `date_serial`). 1970-01-01 was a
+        // Thursday, so the Sunday-indexed day-of-week formula is
+        // `((serial.floor() as i64) + 4).rem_euclid(7)`.
+        //
+        // Holidays are filtered to whole-day integers (non-numeric
+        // cells are silently skipped — Excel raises #VALUE! on text
+        // holidays, but we stay lenient because mixed-type holiday
+        // columns are common when data is sparse). Errors inside the
+        // holiday range *do* propagate via WrongType to mirror the
+        // strict path of NETWORKDAYS.INTL.
+        "NETWORKDAYS" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (start, end) = match networkdays_endpoints(&args[0], &args[1], provider) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            let holidays = match collect_holidays(args.get(2), provider) {
+                Ok(h) => h,
+                Err(e) => return Value::Error(e),
+            };
+            // Default weekend mask: Sat+Sun (mask indexed Mon=0..Sun=6).
+            let weekend = [false, false, false, false, false, true, true];
+            Value::Number(count_workdays(start, end, &weekend, &holidays) as f64)
+        }
+
+        // NETWORKDAYS.INTL(start, end[, weekend[, holidays]]) — like
+        // NETWORKDAYS but with a configurable weekend. `weekend` is
+        // either an integer code (1..7 for two-day weekends, 11..17
+        // for single-day weekends) or a 7-character mask of '0'/'1'
+        // with char[0] = Monday. An all-'1' mask (no working days)
+        // returns InvalidValue, mirroring Excel's #VALUE!.
+        "NETWORKDAYS.INTL" => {
+            if args.len() < 2 || args.len() > 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (start, end) = match networkdays_endpoints(&args[0], &args[1], provider) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            let weekend = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match parse_weekend_arg(&v) {
+                    Ok(w) => w,
+                    Err(e) => return Value::Error(e),
+                }
+            } else {
+                [false, false, false, false, false, true, true]
+            };
+            let holidays = match collect_holidays(args.get(3), provider) {
+                Ok(h) => h,
+                Err(e) => return Value::Error(e),
+            };
+            Value::Number(count_workdays(start, end, &weekend, &holidays) as f64)
+        }
+
+        // WORKDAY(start, days[, holidays]) — advance `days` working
+        // days (Mon..Fri, skipping holidays) from `start`, returning
+        // the resulting serial as a Number. `days` may be negative.
+        // If `days == 0`, returns `start.floor()` regardless of
+        // whether `start` itself is a weekend/holiday.
+        "WORKDAY" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let start = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = start {
+                return Value::Error(e);
+            }
+            let days = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = days {
+                return Value::Error(e);
+            }
+            let start_n = match coerce_to_number(&start) {
+                Some(n) => n.floor() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let days_n = match coerce_to_number(&days) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let holidays = match collect_holidays(args.get(2), provider) {
+                Ok(h) => h,
+                Err(e) => return Value::Error(e),
+            };
+            let weekend = [false, false, false, false, false, true, true];
+            Value::Number(advance_workdays(start_n, days_n, &weekend, &holidays) as f64)
+        }
+
+        // WORKDAY.INTL(start, days[, weekend[, holidays]]) — like
+        // WORKDAY but with a configurable weekend (same parsing as
+        // NETWORKDAYS.INTL: numeric code or 7-char '0'/'1' mask).
+        "WORKDAY.INTL" => {
+            if args.len() < 2 || args.len() > 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let start = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = start {
+                return Value::Error(e);
+            }
+            let days = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = days {
+                return Value::Error(e);
+            }
+            let start_n = match coerce_to_number(&start) {
+                Some(n) => n.floor() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let days_n = match coerce_to_number(&days) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let weekend = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match parse_weekend_arg(&v) {
+                    Ok(w) => w,
+                    Err(e) => return Value::Error(e),
+                }
+            } else {
+                [false, false, false, false, false, true, true]
+            };
+            let holidays = match collect_holidays(args.get(3), provider) {
+                Ok(h) => h,
+                Err(e) => return Value::Error(e),
+            };
+            Value::Number(advance_workdays(start_n, days_n, &weekend, &holidays) as f64)
+        }
+
+        // ISOWEEKNUM(serial) — ISO 8601 week number (1..53). Weeks
+        // start Monday; week 1 of an ISO year is the week containing
+        // Jan 4 (equivalently, the week containing the year's first
+        // Thursday). Dates near year boundaries can therefore belong
+        // to the previous or next ISO year; we resolve that by
+        // recomputing against year-1 (when the date falls before
+        // week 1 starts) or year+1 (when the date falls past the
+        // computed year's last week).
+        "ISOWEEKNUM" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            let serial = match coerce_to_number(&v) {
+                Some(n) => n.floor() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            Value::Number(iso_week_number(serial) as f64)
+        }
+
         _ => Value::Error(ValueError::InvalidName),
     }
 }
@@ -5758,6 +6356,1104 @@ fn fn_ppmt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     } else {
         Value::Error(ValueError::Overflow)
     }
+}
+
+/// Parse a fixed-width base-n textual numeral with Excel's
+/// two's-complement convention.
+///
+/// `base`: 2, 8, or 16.
+/// `max_chars`: maximum number of digits the spec allows (10 for all
+///   three of Excel's BIN/OCT/HEX inputs).
+/// `bits_per_digit`: 1 / 3 / 4 for BIN / OCT / HEX. The signed
+///   bit-width is `max_chars * bits_per_digit`.
+///
+/// If `text.len() == max_chars` and the high bit (`bits-1`) is set,
+/// the result is sign-extended (i.e. `value - 2^bits`). Otherwise the
+/// numeric value is taken as-is.
+///
+/// Empty input, over-long input, or any non-digit / out-of-base char
+/// surfaces `InvalidValue`.
+pub(crate) fn parse_base_n_text(
+    text: &str,
+    base: u32,
+    max_chars: usize,
+    bits_per_digit: u32,
+) -> Result<f64, ValueError> {
+    if text.is_empty() || text.len() > max_chars {
+        return Err(ValueError::InvalidValue);
+    }
+    let mut value: u64 = 0;
+    for ch in text.chars() {
+        let d = match ch.to_digit(base) {
+            Some(d) => d as u64,
+            None => return Err(ValueError::InvalidValue),
+        };
+        value = value * base as u64 + d;
+    }
+    let bits = (max_chars as u32) * bits_per_digit;
+    // Sign-extend only when the input occupies the full width; shorter
+    // strings are positive by definition (matching Excel: BIN2DEC("1")
+    // is 1, not -1).
+    if text.len() == max_chars {
+        let sign_bit = 1u64 << (bits - 1);
+        if value & sign_bit != 0 {
+            let two_pow_n = 1u64 << bits;
+            // value - 2^bits as a signed quantity.
+            let signed = value as i64 - two_pow_n as i64;
+            return Ok(signed as f64);
+        }
+    }
+    Ok(value as f64)
+}
+
+/// Format a number into Excel's fixed-width signed two's-complement
+/// textual base-n representation.
+///
+/// Positive (or zero) values: emit the minimum-width base-n digits,
+/// optionally left-padded with `'0'` to `places`. `places` must satisfy
+/// `1 <= places <= max_chars` and `places >= min_chars`; otherwise
+/// `InvalidValue`.
+///
+/// Negative values: emit exactly `max_chars` digits (the two's-comp
+/// representation); `places` is ignored, matching Excel.
+///
+/// Out-of-range numbers surface `Overflow` (Excel's `#NUM!`). The
+/// argument is truncated toward zero before range-checking.
+pub(crate) fn format_base_n_signed(
+    value: f64,
+    base: u32,
+    max_chars: usize,
+    bits_per_digit: u32,
+    places: Option<usize>,
+    upper_hex: bool,
+) -> Result<String, ValueError> {
+    if !value.is_finite() {
+        return Err(ValueError::Overflow);
+    }
+    // Excel truncates toward zero before applying the range check.
+    let trunc = value.trunc();
+    let bits = (max_chars as u32) * bits_per_digit;
+    let max_pos: i64 = (1i64 << (bits - 1)) - 1;
+    let min_neg: i64 = -(1i64 << (bits - 1));
+    // Guard against trunc that doesn't fit in i64 before casting.
+    if trunc > max_pos as f64 || trunc < min_neg as f64 {
+        return Err(ValueError::Overflow);
+    }
+    let v = trunc as i64;
+
+    let digit_char = |d: u32| -> char {
+        let c = char::from_digit(d, base).unwrap_or('0');
+        if upper_hex { c.to_ascii_uppercase() } else { c }
+    };
+
+    if v < 0 {
+        // Two's-complement: encode (v + 2^bits) as an unsigned value
+        // and emit exactly `max_chars` digits, padded with leading
+        // zeros if the high digits are zero (rare since the sign bit
+        // is set by definition for in-range negatives).
+        let two_pow_n: u64 = 1u64 << bits;
+        let unsigned = (v as i64 + two_pow_n as i64) as u64;
+        let mut out = String::with_capacity(max_chars);
+        let mut buf = unsigned;
+        for _ in 0..max_chars {
+            let d = (buf % base as u64) as u32;
+            out.push(digit_char(d));
+            buf /= base as u64;
+        }
+        Ok(out.chars().rev().collect())
+    } else {
+        // Build the minimum-width unsigned representation.
+        let mut buf = v as u64;
+        let min_chars: String = if buf == 0 {
+            "0".to_string()
+        } else {
+            let mut s = String::new();
+            while buf > 0 {
+                let d = (buf % base as u64) as u32;
+                s.push(digit_char(d));
+                buf /= base as u64;
+            }
+            s.chars().rev().collect()
+        };
+        match places {
+            None => Ok(min_chars),
+            Some(p) => {
+                if p < 1 || p > max_chars {
+                    return Err(ValueError::InvalidValue);
+                }
+                if p < min_chars.len() {
+                    return Err(ValueError::InvalidValue);
+                }
+                let pad = p - min_chars.len();
+                let mut out = String::with_capacity(p);
+                for _ in 0..pad {
+                    out.push('0');
+                }
+                out.push_str(&min_chars);
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Shared body for BIN2DEC / OCT2DEC / HEX2DEC: coerce the single arg
+/// to text, hand off to `parse_base_n_text`, surface errors verbatim.
+fn eval_xxx2dec(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    base: u32,
+    max_chars: usize,
+    bits_per_digit: u32,
+) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    // Per Excel: a Boolean / Null isn't a valid binary numeral, even
+    // though coerce_to_text would happily emit "TRUE"/"FALSE"/"".
+    // Reject those up-front so they don't slip through as InvalidValue
+    // from the parser's "non-digit" path (less informative).
+    match v {
+        Value::Boolean(_) | Value::Null => return Value::Error(ValueError::WrongType),
+        _ => {}
+    }
+    let text = coerce_to_text(&v);
+    match parse_base_n_text(&text, base, max_chars, bits_per_digit) {
+        Ok(n) => Value::Number(n),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Optional-places extractor shared by DEC2XXX and the cross-base
+/// wrappers. Returns `Ok(None)` when the arg is absent; `Ok(Some(n))`
+/// for a valid 1..=max_chars place count; errors mirror Excel:
+///   - non-numeric → WrongType
+///   - non-integer / out of 1..=max_chars → InvalidValue
+///   - propagated cell error → that error
+fn engineering_places(
+    arg: Option<&Expr>,
+    provider: &dyn EvalProvider,
+    max_chars: usize,
+) -> Result<Option<usize>, ValueError> {
+    let Some(expr) = arg else {
+        return Ok(None);
+    };
+    let v = eval_expr_with_provider(expr, provider);
+    if let Value::Error(e) = v {
+        return Err(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) => n,
+        None => return Err(ValueError::WrongType),
+    };
+    if !n.is_finite() || n.trunc() != n {
+        return Err(ValueError::InvalidValue);
+    }
+    let p = n as i64;
+    if p < 1 || p as usize > max_chars {
+        return Err(ValueError::InvalidValue);
+    }
+    Ok(Some(p as usize))
+}
+
+/// Shared body for DEC2BIN / DEC2OCT / DEC2HEX.
+fn eval_dec2xxx(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    base: u32,
+    max_chars: usize,
+    bits_per_digit: u32,
+    upper_hex: bool,
+) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    let places = match engineering_places(args.get(1), provider, max_chars) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    match format_base_n_signed(n, base, max_chars, bits_per_digit, places, upper_hex) {
+        Ok(s) => Value::Text(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Shared body for cross-base wrappers (BIN2HEX, OCT2BIN, ...).
+/// `from` = (base, max_chars, bits_per_digit) for the source.
+/// `to` = same triple for the destination. `upper_hex` selects the
+/// uppercase digit set on the output.
+fn eval_cross_base(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    from: (u32, usize, u32),
+    to: (u32, usize, u32),
+    upper_hex: bool,
+) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    match v {
+        Value::Boolean(_) | Value::Null => return Value::Error(ValueError::WrongType),
+        _ => {}
+    }
+    let text = coerce_to_text(&v);
+    let dec = match parse_base_n_text(&text, from.0, from.1, from.2) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let places = match engineering_places(args.get(1), provider, to.1) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    match format_base_n_signed(dec, to.0, to.1, to.2, places, upper_hex) {
+        Ok(s) => Value::Text(s),
+        Err(e) => Value::Error(e),
+    }
+}
+
+/// Coerce a Value into a number for engineering-function consumption.
+/// Tighter than `coerce_to_number`: text and errors are rejected (the
+/// caller has already short-circuited on errors). Booleans coerce to
+/// 0/1 to match Excel's DELTA(TRUE, 1) = 1 behaviour.
+fn as_engineering_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => Some(*n),
+        Value::Boolean(true) => Some(1.0),
+        Value::Boolean(false) => Some(0.0),
+        Value::Null => Some(0.0),
+        _ => None,
+    }
+}
+
+/// Bit-op f64 → u64 domain check. Excel documents BITAND/OR/XOR as
+/// accepting 0..=2^48-1; we accept the f64-safe 0..=2^53-1 range so
+/// large values produced by other formulas stay representable.
+const BIT_OP_MAX: f64 = 9_007_199_254_740_991.0; // 2^53 - 1
+
+fn coerce_bit_operand(v: &Value) -> Result<u64, ValueError> {
+    let n = match coerce_to_number(v) {
+        Some(n) => n,
+        None => return Err(ValueError::WrongType),
+    };
+    if !n.is_finite() || n.trunc() != n {
+        return Err(ValueError::Overflow);
+    }
+    if n < 0.0 || n > BIT_OP_MAX {
+        return Err(ValueError::Overflow);
+    }
+    Ok(n as u64)
+}
+
+/// Shared body for BITAND / BITOR / BITXOR.
+fn eval_bit_binop(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(u64, u64) -> u64,
+) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let a = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = a {
+        return Value::Error(e);
+    }
+    let b = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = b {
+        return Value::Error(e);
+    }
+    let av = match coerce_bit_operand(&a) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let bv = match coerce_bit_operand(&b) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(f(av, bv) as f64)
+}
+
+/// Shared body for BITLSHIFT / BITRSHIFT. `reverse` flips the sign
+/// convention: BITLSHIFT(a, -3) == BITRSHIFT(a, 3) and vice versa.
+fn eval_bit_shift(args: &[Expr], provider: &dyn EvalProvider, reverse: bool) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let a = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = a {
+        return Value::Error(e);
+    }
+    let n = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = n {
+        return Value::Error(e);
+    }
+    let av = match coerce_bit_operand(&a) {
+        Ok(n) => n,
+        Err(e) => return Value::Error(e),
+    };
+    let nv = match coerce_to_number(&n) {
+        Some(x) => x,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !nv.is_finite() || nv.trunc() != nv {
+        return Value::Error(ValueError::Overflow);
+    }
+    let shift = nv as i64;
+    // Excel's documented shift domain is |n| <= 53.
+    if shift.abs() > 53 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Normalize to "shift left by `effective`": positive → left,
+    // negative → right.
+    let effective = if reverse { -shift } else { shift };
+    let result = if effective == 0 {
+        av
+    } else if effective > 0 {
+        // Left shift: result must still fit in the safe-integer range.
+        let r = (av as u128).checked_shl(effective as u32).unwrap_or(u128::MAX);
+        if r > BIT_OP_MAX as u128 {
+            return Value::Error(ValueError::Overflow);
+        }
+        r as u64
+    } else {
+        let amount = (-effective) as u32;
+        if amount >= 64 {
+            0
+        } else {
+            av >> amount
+        }
+    };
+    Value::Number(result as f64)
+}
+
+// === Math extras helpers ===
+
+/// Shared body for SUMX2MY2 / SUMX2PY2 / SUMXMY2. Collects (x,y) pairs
+/// via `collect_paired_numbers` (which enforces same-shape and skips
+/// non-numeric cells per offset), then folds with `f`.
+fn sum_pair_impl(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(f64, f64) -> f64,
+) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_paired_numbers(&args[0], &args[1], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    let total: f64 = pairs.iter().map(|(x, y)| f(*x, *y)).sum();
+    Value::Number(total)
+}
+
+/// SUMPRODUCT body. Accepts 1+ range-shaped args; all must share shape.
+/// Single-array case reduces to "SUM over numerics". Non-numeric cells
+/// contribute 0 to that position's product.
+fn sumproduct_impl(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    // Materialise each arg as a 2D grid. Scalar/non-range args are
+    // wrapped as a 1×1 grid so a SUMPRODUCT(A1:A3, 2) still has a
+    // shape — but we reject mismatched shapes between range args.
+    let mut grids: Vec<Vec<Vec<Value>>> = Vec::with_capacity(args.len());
+    for a in args {
+        match collect_range_2d_for_arg(a, provider) {
+            Some(g) => grids.push(g),
+            None => return Value::Error(ValueError::InvalidValue),
+        }
+    }
+    // Shape check.
+    let rows = grids[0].len();
+    let cols = grids[0].first().map(|r| r.len()).unwrap_or(0);
+    for g in &grids[1..] {
+        if g.len() != rows || g.first().map(|r| r.len()).unwrap_or(0) != cols {
+            return Value::Error(ValueError::InvalidValue);
+        }
+    }
+    let mut total = 0.0_f64;
+    for r in 0..rows {
+        for c in 0..cols {
+            let mut prod = 1.0_f64;
+            for g in &grids {
+                match &g[r][c] {
+                    Value::Error(e) => return Value::Error(e.clone()),
+                    Value::Number(n) => prod *= *n,
+                    // Non-numeric (Null, Text, Boolean) contributes 0
+                    // to the cell — for the single-array case this
+                    // matches "SUM over numerics" exactly.
+                    _ => {
+                        prod = 0.0;
+                        break;
+                    }
+                }
+            }
+            total += prod;
+        }
+    }
+    Value::Number(total)
+}
+
+/// FLOOR.MATH / CEILING.MATH shared body.
+///
+/// `is_floor` selects FLOOR.MATH (`true`) vs CEILING.MATH (`false`).
+///
+/// Default mode (=0) rounds toward -inf (FLOOR.MATH) or +inf
+/// (CEILING.MATH) regardless of sign. With mode != 0, negative
+/// numbers reverse direction: FLOOR.MATH rounds toward zero (i.e.
+/// ceil after sign flip) and CEILING.MATH rounds away from zero.
+/// Significance == 0 collapses to 0 (Excel parity).
+fn floor_ceiling_math(args: &[Expr], provider: &dyn EvalProvider, is_floor: bool) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&nv) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    let sig = if args.len() >= 2 {
+        let sv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = sv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&sv) {
+            Some(s) => s,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        1.0
+    };
+    let mode = if args.len() == 3 {
+        let mv = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = mv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&mv) {
+            Some(m) => m,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        0.0
+    };
+    if sig == 0.0 {
+        return Value::Number(0.0);
+    }
+    // FLOOR.MATH / CEILING.MATH treat significance sign as irrelevant —
+    // we always divide by |sig|. The direction is controlled by
+    // is_floor + mode + sign(n).
+    let s = sig.abs();
+    let r = if is_floor {
+        if n < 0.0 && mode != 0.0 {
+            // Round toward zero for negatives.
+            (n / s).ceil() * s
+        } else {
+            (n / s).floor() * s
+        }
+    } else {
+        // CEILING.MATH
+        if n < 0.0 && mode != 0.0 {
+            // Round away from zero for negatives.
+            (n / s).floor() * s
+        } else {
+            (n / s).ceil() * s
+        }
+    };
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+/// FLOOR.PRECISE / CEILING.PRECISE shared body. Always toward -inf
+/// (FLOOR.PRECISE) or +inf (CEILING.PRECISE). 1 or 2 args.
+fn floor_ceiling_precise(args: &[Expr], provider: &dyn EvalProvider, is_floor: bool) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&nv) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    let sig = if args.len() == 2 {
+        let sv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = sv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&sv) {
+            Some(s) => s,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        1.0
+    };
+    if sig == 0.0 {
+        return Value::Number(0.0);
+    }
+    let s = sig.abs();
+    let r = if is_floor {
+        (n / s).floor() * s
+    } else {
+        (n / s).ceil() * s
+    };
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+/// ROMAN(num[, form]) — convert integer 1..=3999 into a Roman numeral.
+/// `form` defaults to 0 (classic). Only classic form is supported;
+/// other values yield #VALUE!.
+fn fn_roman(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n_raw = match coerce_to_number(&nv) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    // Truncate toward zero, then range-check.
+    let n = n_raw.trunc() as i64;
+    if !(1..=3999).contains(&n) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    if args.len() == 2 {
+        let fv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = fv {
+            return Value::Error(e);
+        }
+        let form = match coerce_to_number(&fv) {
+            Some(f) => f.trunc() as i64,
+            // Boolean TRUE/FALSE coerce to 1/0 — both fall under "non-classic".
+            None => return Value::Error(ValueError::WrongType),
+        };
+        if form != 0 {
+            // note: only classic form supported.
+            return Value::Error(ValueError::InvalidValue);
+        }
+    }
+    // Classic table.
+    const TABLE: [(i64, &str); 13] = [
+        (1000, "M"),
+        (900, "CM"),
+        (500, "D"),
+        (400, "CD"),
+        (100, "C"),
+        (90, "XC"),
+        (50, "L"),
+        (40, "XL"),
+        (10, "X"),
+        (9, "IX"),
+        (5, "V"),
+        (4, "IV"),
+        (1, "I"),
+    ];
+    let mut rem = n;
+    let mut out = String::new();
+    for (v, sym) in TABLE.iter() {
+        while rem >= *v {
+            out.push_str(sym);
+            rem -= *v;
+        }
+    }
+    Value::Text(out)
+}
+
+/// ARABIC(roman_text) — parse a Roman numeral (case-insensitive).
+/// Empty string → 0. Whitespace is trimmed. Negative prefix `-` is
+/// rejected (Excel actually accepts a leading minus, but we keep the
+/// surface narrow until we need it). Invalid syntax → #VALUE!.
+fn fn_arabic(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let raw = match &v {
+        Value::Text(s) => s.clone(),
+        Value::Null => String::new(),
+        // Numbers/booleans → reject.
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let s = raw.trim().to_ascii_uppercase();
+    if s.is_empty() {
+        return Value::Number(0.0);
+    }
+    let mut total: i64 = 0;
+    let mut prev: i64 = 0;
+    for ch in s.chars().rev() {
+        let v = match ch {
+            'I' => 1,
+            'V' => 5,
+            'X' => 10,
+            'L' => 50,
+            'C' => 100,
+            'D' => 500,
+            'M' => 1000,
+            _ => return Value::Error(ValueError::InvalidValue),
+        };
+        if v < prev {
+            total -= v;
+        } else {
+            total += v;
+        }
+        prev = v;
+    }
+    Value::Number(total as f64)
+}
+
+/// DECIMAL(text, base) — parse `text` as an integer in `base` (2..=36).
+fn fn_decimal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let tv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = tv {
+        return Value::Error(e);
+    }
+    let bv = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = bv {
+        return Value::Error(e);
+    }
+    let base_f = match coerce_to_number(&bv) {
+        Some(b) => b,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !base_f.is_finite() || base_f.trunc() != base_f {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let base = base_f as i64;
+    if !(2..=36).contains(&base) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    // Accept Text only — numeric inputs would be lossy without us
+    // formatting them first; Excel itself coerces Number → string, but
+    // we keep the surface strict.
+    let text = match &tv {
+        Value::Text(s) => s.trim().to_ascii_uppercase(),
+        Value::Number(n) => {
+            if !n.is_finite() || n.trunc() != *n {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Render as plain decimal string; parse below in `base`
+            // still applies, matching Excel's coercion path.
+            format!("{}", *n as i64)
+        }
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if text.is_empty() {
+        return Value::Number(0.0);
+    }
+    let mut acc: i64 = 0;
+    for ch in text.chars() {
+        let digit = match ch {
+            '0'..='9' => ch as i64 - '0' as i64,
+            'A'..='Z' => ch as i64 - 'A' as i64 + 10,
+            _ => return Value::Error(ValueError::InvalidValue),
+        };
+        if digit >= base {
+            return Value::Error(ValueError::InvalidValue);
+        }
+        acc = match acc.checked_mul(base).and_then(|a| a.checked_add(digit)) {
+            Some(v) => v,
+            None => return Value::Error(ValueError::Overflow),
+        };
+    }
+    Value::Number(acc as f64)
+}
+
+/// BASE(num, base[, min_length]) — render a non-negative integer in
+/// `base` (2..=36), zero-padded to `min_length` if requested.
+fn fn_base(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if !(2..=3).contains(&args.len()) {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n_raw = match coerce_to_number(&nv) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !n_raw.is_finite() || n_raw < 0.0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let n = n_raw.trunc() as i64;
+    let bv = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = bv {
+        return Value::Error(e);
+    }
+    let base_f = match coerce_to_number(&bv) {
+        Some(b) => b,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !base_f.is_finite() || base_f.trunc() != base_f {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let base = base_f as i64;
+    if !(2..=36).contains(&base) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let min_len: usize = if args.len() == 3 {
+        let mv = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = mv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&mv) {
+            Some(m) if m.is_finite() && m >= 0.0 => m.trunc() as usize,
+            Some(_) => return Value::Error(ValueError::InvalidValue),
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        0
+    };
+    let s = if n == 0 {
+        "0".to_string()
+    } else {
+        let mut digits: Vec<char> = Vec::new();
+        let mut rem = n;
+        while rem > 0 {
+            let d = (rem % base) as u32;
+            let ch = if d < 10 {
+                (b'0' + d as u8) as char
+            } else {
+                (b'A' + (d - 10) as u8) as char
+            };
+            digits.push(ch);
+            rem /= base;
+        }
+        digits.iter().rev().collect::<String>()
+    };
+    if s.len() >= min_len {
+        Value::Text(s)
+    } else {
+        let pad = min_len - s.len();
+        Value::Text(format!("{}{}", "0".repeat(pad), s))
+    }
+}
+
+/// MDETERM(range) — determinant via Doolittle LU decomposition with
+/// partial pivoting. Numerically stable up to ~50×50; we cap inputs at
+/// 100×100 to keep eval time bounded.
+fn fn_mdeterm(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let grid = match collect_range_2d_for_arg(&args[0], provider) {
+        Some(g) => g,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    let n = grid.len();
+    if n == 0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let cols = grid[0].len();
+    if cols != n {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    if n > 100 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Materialise as f64 matrix; propagate errors and reject non-numeric.
+    let mut m: Vec<Vec<f64>> = vec![vec![0.0; n]; n];
+    for r in 0..n {
+        if grid[r].len() != n {
+            return Value::Error(ValueError::InvalidValue);
+        }
+        for c in 0..n {
+            match &grid[r][c] {
+                Value::Error(e) => return Value::Error(e.clone()),
+                Value::Number(x) => m[r][c] = *x,
+                Value::Null => m[r][c] = 0.0,
+                Value::Boolean(b) => m[r][c] = if *b { 1.0 } else { 0.0 },
+                Value::Text(_) => return Value::Error(ValueError::WrongType),
+            }
+        }
+    }
+    // LU with partial pivoting; det = product(diag(U)) * (-1)^swaps.
+    let mut det = 1.0_f64;
+    for i in 0..n {
+        // Find pivot in column i.
+        let mut piv_row = i;
+        let mut piv_val = m[i][i].abs();
+        for r in (i + 1)..n {
+            let v = m[r][i].abs();
+            if v > piv_val {
+                piv_val = v;
+                piv_row = r;
+            }
+        }
+        if piv_val == 0.0 {
+            return Value::Number(0.0);
+        }
+        if piv_row != i {
+            m.swap(i, piv_row);
+            det = -det;
+        }
+        det *= m[i][i];
+        // Eliminate column i below row i.
+        for r in (i + 1)..n {
+            let factor = m[r][i] / m[i][i];
+            for c in i..n {
+                m[r][c] -= factor * m[i][c];
+            }
+        }
+    }
+    if det.is_finite() {
+        Value::Number(det)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+/// 1970-epoch-aware Monday-indexed day-of-week (Mon=0..Sun=6). Used
+/// by the working-day helpers below — kept Mon-indexed because the
+/// NETWORKDAYS.INTL mask string is documented in Excel as Mon..Sun.
+fn dow_monday_indexed(serial: i64) -> usize {
+    // Sunday=0..Saturday=6 (since 1970-01-01 was Thursday → +4).
+    let dow_sun = (serial + 4).rem_euclid(7);
+    // Shift to Mon=0..Sun=6.
+    ((dow_sun + 6) % 7) as usize
+}
+
+/// Resolve two `(start, end)` serial endpoints for NETWORKDAYS /
+/// NETWORKDAYS.INTL, propagating cell-evaluation errors and surfacing
+/// type errors when coercion fails.
+fn networkdays_endpoints(
+    start_arg: &Expr,
+    end_arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<(i64, i64), ValueError> {
+    let s = eval_expr_with_provider(start_arg, provider);
+    if let Value::Error(e) = s {
+        return Err(e);
+    }
+    let e = eval_expr_with_provider(end_arg, provider);
+    if let Value::Error(er) = e {
+        return Err(er);
+    }
+    let start = coerce_to_number(&s).ok_or(ValueError::WrongType)?.floor() as i64;
+    let end = coerce_to_number(&e).ok_or(ValueError::WrongType)?.floor() as i64;
+    Ok((start, end))
+}
+
+/// Parse a NETWORKDAYS.INTL / WORKDAY.INTL `weekend` argument. Returns
+/// a Mon..Sun mask where `true` marks weekend days.
+///
+/// Accepted forms (matching Excel):
+///   - Number 1..7   → two-day weekend block starting on a given day
+///   - Number 11..17 → single-day weekend
+///   - Text mask     → 7 chars of '0'/'1', char[0] = Monday
+///
+/// An all-`1` mask (no working days at all) is rejected as
+/// InvalidValue, matching Excel's #VALUE! on the same input.
+fn parse_weekend_arg(v: &Value) -> Result<[bool; 7], ValueError> {
+    if let Value::Text(s) = v {
+        // Text mask path. 7 characters of '0'/'1', Mon..Sun.
+        let bytes = s.as_bytes();
+        if bytes.len() != 7 {
+            return Err(ValueError::InvalidValue);
+        }
+        let mut mask = [false; 7];
+        let mut all_weekend = true;
+        for (i, c) in bytes.iter().enumerate() {
+            match c {
+                b'0' => {
+                    all_weekend = false;
+                }
+                b'1' => {
+                    mask[i] = true;
+                }
+                _ => return Err(ValueError::InvalidValue),
+            }
+        }
+        if all_weekend {
+            // All days marked weekend → no working days at all.
+            return Err(ValueError::InvalidValue);
+        }
+        return Ok(mask);
+    }
+    let code = coerce_to_number(v).ok_or(ValueError::WrongType)?;
+    if code.fract() != 0.0 {
+        return Err(ValueError::InvalidValue);
+    }
+    let code = code as i64;
+    // Excel two-day codes: 1 = Sat+Sun, 2 = Sun+Mon, ..., 7 = Fri+Sat.
+    // Mask indices are Mon=0..Sun=6.
+    let two_day_pairs: [[usize; 2]; 7] = [
+        [5, 6], // 1: Sat+Sun
+        [6, 0], // 2: Sun+Mon
+        [0, 1], // 3: Mon+Tue
+        [1, 2], // 4: Tue+Wed
+        [2, 3], // 5: Wed+Thu
+        [3, 4], // 6: Thu+Fri
+        [4, 5], // 7: Fri+Sat
+    ];
+    if (1..=7).contains(&code) {
+        let pair = two_day_pairs[(code - 1) as usize];
+        let mut mask = [false; 7];
+        mask[pair[0]] = true;
+        mask[pair[1]] = true;
+        return Ok(mask);
+    }
+    // Single-day codes 11..17: 11 = Sun, 12 = Mon, ..., 17 = Sat.
+    if (11..=17).contains(&code) {
+        // 11 → Sun (mask idx 6), 12 → Mon (mask idx 0), ..., 17 → Sat (mask idx 5).
+        let day = ((code - 12).rem_euclid(7)) as usize; // 12→0..17→5, 11→6
+        let mut mask = [false; 7];
+        mask[day] = true;
+        return Ok(mask);
+    }
+    Err(ValueError::InvalidValue)
+}
+
+/// Walk an optional holidays argument via `for_each_arg_value`,
+/// collecting whole-day integer serials. Numeric cells are floored;
+/// Null / Text / Boolean cells are silently skipped (mixed-type
+/// holiday columns happen in practice). Errors *do* propagate — a
+/// `#DIV/0!` lurking in the holidays range short-circuits the whole
+/// function, matching Excel.
+fn collect_holidays(
+    arg: Option<&Expr>,
+    provider: &dyn EvalProvider,
+) -> Result<HashSet<i64>, ValueError> {
+    let mut set = HashSet::new();
+    let arg = match arg {
+        Some(a) => a,
+        None => return Ok(set),
+    };
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(arg, provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        match v {
+            Value::Error(e) => err = Some(e),
+            Value::Number(n) => {
+                set.insert(n.floor() as i64);
+            }
+            // Text / Boolean / Null inside a holidays range → lenient
+            // skip. Excel raises #VALUE! on text holidays; we match
+            // the more forgiving Google Sheets behaviour here so
+            // sparse data doesn't blow up the formula.
+            _ => {}
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    Ok(set)
+}
+
+/// Count whole-day workdays from `start` to `end` inclusive on both
+/// ends. A workday is a serial whose Mon-indexed day-of-week is not
+/// flagged in `weekend` AND whose serial is not in `holidays`. If
+/// `start > end` the count is negated (Excel parity).
+fn count_workdays(start: i64, end: i64, weekend: &[bool; 7], holidays: &HashSet<i64>) -> i64 {
+    if start == end {
+        return if weekend[dow_monday_indexed(start)] || holidays.contains(&start) {
+            0
+        } else {
+            1
+        };
+    }
+    let (a, b, sign) = if start <= end {
+        (start, end, 1)
+    } else {
+        (end, start, -1)
+    };
+    let mut count: i64 = 0;
+    let mut d = a;
+    while d <= b {
+        if !weekend[dow_monday_indexed(d)] && !holidays.contains(&d) {
+            count += 1;
+        }
+        d += 1;
+    }
+    sign * count
+}
+
+/// Advance `days` working days from `start`. `days == 0` returns
+/// `start` verbatim (Excel does *not* snap to the nearest workday).
+/// Positive `days` steps forward, negative steps backward; in both
+/// directions the step skips weekend days and any serial in
+/// `holidays`.
+fn advance_workdays(start: i64, days: i64, weekend: &[bool; 7], holidays: &HashSet<i64>) -> i64 {
+    if days == 0 {
+        return start;
+    }
+    let step: i64 = if days > 0 { 1 } else { -1 };
+    let mut remaining = days.abs();
+    let mut cur = start;
+    while remaining > 0 {
+        cur += step;
+        if !weekend[dow_monday_indexed(cur)] && !holidays.contains(&cur) {
+            remaining -= 1;
+        }
+    }
+    cur
+}
+
+/// ISO 8601 week number (1..53). Weeks start Monday; week 1 of the
+/// ISO year is the week containing Jan 4 (equivalently, the first
+/// week with ≥4 days of the new year). Dates within the first few
+/// days of January may belong to the *previous* ISO year (when the
+/// date sits before that year's week 1 starts); dates within the
+/// last few days of December may belong to the *next* ISO year (when
+/// the date sits past the computed year's last week boundary).
+fn iso_week_number(serial: i64) -> i64 {
+    // Helper: week-1 Monday for a given Gregorian year.
+    fn week1_start(year: i32) -> i64 {
+        let jan4 = date_serial(year, 1, 4) as i64;
+        // Convert jan4's day-of-week to Mon=0..Sun=6.
+        let dow_iso = dow_monday_indexed(jan4) as i64;
+        jan4 - dow_iso
+    }
+    let (year, _, _) = date_from_serial(serial as f64);
+    let start = week1_start(year);
+    if serial < start {
+        // Date is in the last ISO week of the previous Gregorian year.
+        let prev_start = week1_start(year - 1);
+        return (serial - prev_start) / 7 + 1;
+    }
+    // Could still be in week 1 of the next ISO year — check.
+    let next_start = week1_start(year + 1);
+    if serial >= next_start {
+        return (serial - next_start) / 7 + 1;
+    }
+    (serial - start) / 7 + 1
 }
 
 fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
@@ -12340,4 +14036,1846 @@ mod tests {
             Value::Number(175000.0)
         );
     }
+
+    // === Engineering / base-conversion / bit-op tests ===
+
+    #[test]
+    fn parse_base_n_text_bin_boundaries() {
+        // BIN: 10 chars, 1 bit/digit. Width-10 with high bit set → negative.
+        assert_eq!(parse_base_n_text("0", 2, 10, 1), Ok(0.0));
+        assert_eq!(parse_base_n_text("1010", 2, 10, 1), Ok(10.0));
+        assert_eq!(parse_base_n_text("0111111111", 2, 10, 1), Ok(511.0));
+        // Max-width string with high bit set → -1 (...11111111 = -1).
+        assert_eq!(parse_base_n_text("1111111111", 2, 10, 1), Ok(-1.0));
+        // Max-width with only the sign bit set → -512.
+        assert_eq!(parse_base_n_text("1000000000", 2, 10, 1), Ok(-512.0));
+        // Shorter strings stay positive even if the leading bit is 1.
+        assert_eq!(parse_base_n_text("111111111", 2, 10, 1), Ok(511.0));
+        // Errors.
+        assert_eq!(
+            parse_base_n_text("", 2, 10, 1),
+            Err(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            parse_base_n_text("11111111111", 2, 10, 1),
+            Err(ValueError::InvalidValue),
+        );
+        assert_eq!(
+            parse_base_n_text("12", 2, 10, 1),
+            Err(ValueError::InvalidValue),
+        );
+        // OCT: 10 chars, 3 bits/digit (30-bit total).
+        assert_eq!(parse_base_n_text("777", 8, 10, 3), Ok(511.0));
+        // Width-10 top digit 4 → bit 29 set → negative (subtract 2^30).
+        assert_eq!(
+            parse_base_n_text("7777777777", 8, 10, 3),
+            Ok(-1.0)
+        );
+        assert_eq!(
+            parse_base_n_text("4000000000", 8, 10, 3),
+            Ok(-(1i64 << 29) as f64),
+        );
+        // HEX: 10 chars, 4 bits/digit (40-bit total). Case-insensitive.
+        assert_eq!(parse_base_n_text("F", 16, 10, 4), Ok(15.0));
+        assert_eq!(parse_base_n_text("ff", 16, 10, 4), Ok(255.0));
+        assert_eq!(
+            parse_base_n_text("FFFFFFFFFF", 16, 10, 4),
+            Ok(-1.0)
+        );
+        // Width-10 with top hex digit 8 → bit 39 set → most-negative.
+        assert_eq!(
+            parse_base_n_text("8000000000", 16, 10, 4),
+            Ok(-(1i64 << 39) as f64),
+        );
+        assert_eq!(
+            parse_base_n_text("G", 16, 10, 4),
+            Err(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn format_base_n_signed_boundaries() {
+        // BIN: positive, min-width.
+        assert_eq!(
+            format_base_n_signed(0.0, 2, 10, 1, None, false).unwrap(),
+            "0"
+        );
+        assert_eq!(
+            format_base_n_signed(10.0, 2, 10, 1, None, false).unwrap(),
+            "1010"
+        );
+        assert_eq!(
+            format_base_n_signed(511.0, 2, 10, 1, None, false).unwrap(),
+            "111111111"
+        );
+        // BIN: negative, full-width two's complement (places ignored).
+        assert_eq!(
+            format_base_n_signed(-1.0, 2, 10, 1, None, false).unwrap(),
+            "1111111111"
+        );
+        assert_eq!(
+            format_base_n_signed(-512.0, 2, 10, 1, None, false).unwrap(),
+            "1000000000"
+        );
+        // places ignored for negatives — same output even with places=4.
+        assert_eq!(
+            format_base_n_signed(-1.0, 2, 10, 1, Some(4), false).unwrap(),
+            "1111111111"
+        );
+        // places padding for positives.
+        assert_eq!(
+            format_base_n_signed(5.0, 2, 10, 1, Some(8), false).unwrap(),
+            "00000101"
+        );
+        // places too small for the positive value → InvalidValue.
+        assert_eq!(
+            format_base_n_signed(10.0, 2, 10, 1, Some(3), false),
+            Err(ValueError::InvalidValue),
+        );
+        // Out-of-range positive / negative → Overflow.
+        assert_eq!(
+            format_base_n_signed(512.0, 2, 10, 1, None, false),
+            Err(ValueError::Overflow),
+        );
+        assert_eq!(
+            format_base_n_signed(-513.0, 2, 10, 1, None, false),
+            Err(ValueError::Overflow),
+        );
+        // OCT: positive, negative, padded.
+        assert_eq!(
+            format_base_n_signed(511.0, 8, 10, 3, None, false).unwrap(),
+            "777"
+        );
+        assert_eq!(
+            format_base_n_signed(-1.0, 8, 10, 3, None, false).unwrap(),
+            "7777777777"
+        );
+        assert_eq!(
+            format_base_n_signed(8.0, 8, 10, 3, Some(4), false).unwrap(),
+            "0010"
+        );
+        // HEX uppercase / lowercase.
+        assert_eq!(
+            format_base_n_signed(255.0, 16, 10, 4, None, true).unwrap(),
+            "FF"
+        );
+        assert_eq!(
+            format_base_n_signed(-1.0, 16, 10, 4, None, true).unwrap(),
+            "FFFFFFFFFF"
+        );
+        assert_eq!(
+            format_base_n_signed(255.0, 16, 10, 4, Some(4), true).unwrap(),
+            "00FF"
+        );
+        // places out of 1..=10 → InvalidValue.
+        assert_eq!(
+            format_base_n_signed(1.0, 2, 10, 1, Some(11), false),
+            Err(ValueError::InvalidValue),
+        );
+        // Truncates fractional inputs toward zero.
+        assert_eq!(
+            format_base_n_signed(10.9, 2, 10, 1, None, false).unwrap(),
+            "1010"
+        );
+        assert_eq!(
+            format_base_n_signed(-1.5, 2, 10, 1, None, false).unwrap(),
+            "1111111111"
+        );
+    }
+
+    #[test]
+    fn eval_bin2dec() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BIN2DEC(\"1010\")", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=BIN2DEC(\"1111111111\")", &cm, &vs),
+            Value::Number(-1.0)
+        );
+        assert_eq!(eval_str("=BIN2DEC(1010)", &cm, &vs), Value::Number(10.0));
+        // Invalid digit.
+        assert_eq!(
+            eval_str("=BIN2DEC(\"2\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // > 10 chars.
+        assert_eq!(
+            eval_str("=BIN2DEC(\"11111111110\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=BIN2DEC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=BIN2DEC(\"1\",2)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=BIN2DEC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_oct2dec() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=OCT2DEC(\"17\")", &cm, &vs), Value::Number(15.0));
+        assert_eq!(
+            eval_str("=OCT2DEC(\"7777777777\")", &cm, &vs),
+            Value::Number(-1.0)
+        );
+        assert_eq!(
+            eval_str("=OCT2DEC(\"4000000000\")", &cm, &vs),
+            Value::Number(-(1i64 << 29) as f64),
+        );
+        assert_eq!(
+            eval_str("=OCT2DEC(\"8\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_hex2dec() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=HEX2DEC(\"F\")", &cm, &vs), Value::Number(15.0));
+        assert_eq!(eval_str("=HEX2DEC(\"ff\")", &cm, &vs), Value::Number(255.0));
+        assert_eq!(
+            eval_str("=HEX2DEC(\"FFFFFFFFFF\")", &cm, &vs),
+            Value::Number(-1.0)
+        );
+        assert_eq!(
+            eval_str("=HEX2DEC(\"G\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_dec2bin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DEC2BIN(10)", &cm, &vs),
+            Value::Text("1010".into())
+        );
+        assert_eq!(
+            eval_str("=DEC2BIN(-1)", &cm, &vs),
+            Value::Text("1111111111".into())
+        );
+        assert_eq!(
+            eval_str("=DEC2BIN(-7)", &cm, &vs),
+            Value::Text("1111111001".into())
+        );
+        // places padding.
+        assert_eq!(
+            eval_str("=DEC2BIN(5,8)", &cm, &vs),
+            Value::Text("00000101".into())
+        );
+        // places ignored for negatives.
+        assert_eq!(
+            eval_str("=DEC2BIN(-1,4)", &cm, &vs),
+            Value::Text("1111111111".into())
+        );
+        // places too small.
+        assert_eq!(
+            eval_str("=DEC2BIN(10,3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Out of range.
+        assert_eq!(
+            eval_str("=DEC2BIN(512)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=DEC2BIN(-513)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Type / arg-count.
+        assert_eq!(
+            eval_str("=DEC2BIN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=DEC2BIN(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Negative round-trip.
+        match eval_str("=BIN2DEC(DEC2BIN(-7))", &cm, &vs) {
+            Value::Number(n) => assert_eq!(n, -7.0),
+            other => panic!("round-trip: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_dec2oct() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=DEC2OCT(15)", &cm, &vs), Value::Text("17".into()));
+        assert_eq!(
+            eval_str("=DEC2OCT(-1)", &cm, &vs),
+            Value::Text("7777777777".into())
+        );
+        assert_eq!(
+            eval_str("=DEC2OCT(8,4)", &cm, &vs),
+            Value::Text("0010".into())
+        );
+        // Out of range: 2^29 = 536870912.
+        assert_eq!(
+            eval_str("=DEC2OCT(536870912)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_dec2hex() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DEC2HEX(255)", &cm, &vs),
+            Value::Text("FF".into())
+        );
+        assert_eq!(
+            eval_str("=DEC2HEX(-1)", &cm, &vs),
+            Value::Text("FFFFFFFFFF".into())
+        );
+        assert_eq!(
+            eval_str("=DEC2HEX(255,4)", &cm, &vs),
+            Value::Text("00FF".into())
+        );
+        // Out of range: 2^39 = 549755813888.
+        assert_eq!(
+            eval_str("=DEC2HEX(549755813888)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_bin2hex() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=BIN2HEX(\"1111\")", &cm, &vs),
+            Value::Text("F".into())
+        );
+        // Negative: BIN2HEX("1111111111") = BIN2DEC(-1) → DEC2HEX(-1).
+        assert_eq!(
+            eval_str("=BIN2HEX(\"1111111111\")", &cm, &vs),
+            Value::Text("FFFFFFFFFF".into())
+        );
+        // places padding on positive.
+        assert_eq!(
+            eval_str("=BIN2HEX(\"1010\",4)", &cm, &vs),
+            Value::Text("000A".into())
+        );
+        // Invalid binary input propagates.
+        assert_eq!(
+            eval_str("=BIN2HEX(\"2\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_bin2oct() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=BIN2OCT(\"1010\")", &cm, &vs),
+            Value::Text("12".into())
+        );
+        assert_eq!(
+            eval_str("=BIN2OCT(\"1111111111\")", &cm, &vs),
+            Value::Text("7777777777".into())
+        );
+        assert_eq!(
+            eval_str("=BIN2OCT(\"1010\",4)", &cm, &vs),
+            Value::Text("0012".into())
+        );
+    }
+
+    #[test]
+    fn eval_hex2bin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=HEX2BIN(\"A\")", &cm, &vs),
+            Value::Text("1010".into())
+        );
+        assert_eq!(
+            eval_str("=HEX2BIN(\"FFFFFFFFFF\")", &cm, &vs),
+            Value::Text("1111111111".into())
+        );
+        // Out of range (positive HEX larger than 511 → BIN can't fit).
+        assert_eq!(
+            eval_str("=HEX2BIN(\"FFF\")", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=HEX2BIN(\"A\",6)", &cm, &vs),
+            Value::Text("001010".into())
+        );
+    }
+
+    #[test]
+    fn eval_hex2oct() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=HEX2OCT(\"F\")", &cm, &vs),
+            Value::Text("17".into())
+        );
+        assert_eq!(
+            eval_str("=HEX2OCT(\"FFFFFFFFFF\")", &cm, &vs),
+            Value::Text("7777777777".into())
+        );
+    }
+
+    #[test]
+    fn eval_oct2bin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=OCT2BIN(\"12\")", &cm, &vs),
+            Value::Text("1010".into())
+        );
+        assert_eq!(
+            eval_str("=OCT2BIN(\"7777777777\")", &cm, &vs),
+            Value::Text("1111111111".into())
+        );
+        assert_eq!(
+            eval_str("=OCT2BIN(\"1000\")", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_oct2hex() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=OCT2HEX(\"17\")", &cm, &vs),
+            Value::Text("F".into())
+        );
+        assert_eq!(
+            eval_str("=OCT2HEX(\"7777777777\")", &cm, &vs),
+            Value::Text("FFFFFFFFFF".into())
+        );
+    }
+
+    #[test]
+    fn eval_bitand() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BITAND(15,9)", &cm, &vs), Value::Number(9.0));
+        assert_eq!(eval_str("=BITAND(0,0)", &cm, &vs), Value::Number(0.0));
+        // Arg count.
+        assert_eq!(
+            eval_str("=BITAND(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Negative → Overflow (#NUM!).
+        assert_eq!(
+            eval_str("=BITAND(-1,3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Fractional → Overflow.
+        assert_eq!(
+            eval_str("=BITAND(1.5,3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Text → WrongType.
+        assert_eq!(
+            eval_str("=BITAND(\"x\",3)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    #[test]
+    fn eval_bitor() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BITOR(5,3)", &cm, &vs), Value::Number(7.0));
+        assert_eq!(
+            eval_str("=BITOR(-1,3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_bitxor() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BITXOR(5,3)", &cm, &vs), Value::Number(6.0));
+        assert_eq!(
+            eval_str("=BITXOR(255,170)", &cm, &vs),
+            Value::Number(85.0)
+        );
+    }
+
+    #[test]
+    fn eval_bitlshift() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BITLSHIFT(1,4)", &cm, &vs), Value::Number(16.0));
+        assert_eq!(eval_str("=BITLSHIFT(8,-2)", &cm, &vs), Value::Number(2.0));
+        // Beyond domain.
+        assert_eq!(
+            eval_str("=BITLSHIFT(1,54)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Shift result outside 2^53-1 → Overflow.
+        assert_eq!(
+            eval_str("=BITLSHIFT(1,53)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_bitrshift() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=BITRSHIFT(16,4)", &cm, &vs), Value::Number(1.0));
+        // Inverse of BITLSHIFT.
+        assert_eq!(eval_str("=BITRSHIFT(2,-3)", &cm, &vs), Value::Number(16.0));
+        assert_eq!(
+            eval_str("=BITRSHIFT(1,-54)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_delta() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=DELTA(1,1)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=DELTA(1,2)", &cm, &vs), Value::Number(0.0));
+        // Default second arg = 0.
+        assert_eq!(eval_str("=DELTA(0)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=DELTA(5)", &cm, &vs), Value::Number(0.0));
+        // Non-numeric → WrongType.
+        assert_eq!(
+            eval_str("=DELTA(\"x\",1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DELTA()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=DELTA(1,2,3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_gestep() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=GESTEP(5,3)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=GESTEP(3,5)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(eval_str("=GESTEP(3,3)", &cm, &vs), Value::Number(1.0));
+        // Default step = 0.
+        assert_eq!(eval_str("=GESTEP(0)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=GESTEP(-1)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(
+            eval_str("=GESTEP(\"x\",1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // ---- Hyperbolic + reciprocal trig ----
+
+    #[test]
+    fn eval_sinh() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=SINH(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=SINH(1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0f64.sinh()).abs() < 1e-9, "SINH(1) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=SINH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=SINH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SINH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Massive arg → finite double-precision overflow.
+        assert_eq!(
+            eval_str("=SINH(1000)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_cosh() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=COSH(0)", &cm, &vs), Value::Number(1.0));
+        match eval_str("=COSH(1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0f64.cosh()).abs() < 1e-9, "COSH(1) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=COSH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COSH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=COSH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=COSH(1000)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_tanh() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=TANH(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=TANH(1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0f64.tanh()).abs() < 1e-9, "TANH(1) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // Saturates to +/-1 at large |n| — still finite.
+        match eval_str("=TANH(1000)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9, "TANH(1000) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=TANH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=TANH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=TANH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_asinh() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ASINH(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ASINH(1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0f64.asinh()).abs() < 1e-9, "ASINH(1) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ASINH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ASINH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ASINH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_acosh() {
+        let (cm, vs) = make_test_env();
+        // acosh(1) = 0.
+        assert_eq!(eval_str("=ACOSH(1)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ACOSH(2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 2.0f64.acosh()).abs() < 1e-9, "ACOSH(2) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // Below domain — Excel #NUM!.
+        assert_eq!(
+            eval_str("=ACOSH(0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ACOSH(-2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ACOSH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ACOSH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ACOSH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_atanh() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ATANH(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ATANH(0.5)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 0.5f64.atanh()).abs() < 1e-9, "ATANH(0.5) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // |n| >= 1 → out of domain.
+        assert_eq!(
+            eval_str("=ATANH(1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ATANH(-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ATANH(2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ATANH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ATANH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ATANH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_csc() {
+        let (cm, vs) = make_test_env();
+        // CSC(PI/2) = 1.
+        match eval_str("=CSC(PI()/2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9, "CSC(PI/2) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // CSC(0) → sin(0)=0 → #DIV/0!.
+        assert_eq!(
+            eval_str("=CSC(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // CSC(PI) → sin(PI)≈0 but not exactly 0; just check we got a
+        // (huge) finite number or Overflow — accept either.
+        assert_eq!(
+            eval_str("=CSC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=CSC(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=CSC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_sec() {
+        let (cm, vs) = make_test_env();
+        // SEC(0) = 1.
+        match eval_str("=SEC(0)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9, "SEC(0) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // SEC(PI) = -1.
+        match eval_str("=SEC(PI())", &cm, &vs) {
+            Value::Number(n) => assert!((n + 1.0).abs() < 1e-9, "SEC(PI) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=SEC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=SEC(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SEC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_cot() {
+        let (cm, vs) = make_test_env();
+        // COT(PI/4) = 1.
+        match eval_str("=COT(PI()/4)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9, "COT(PI/4) = {n}"),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // COT(0) → tan(0)=0 → #DIV/0!.
+        assert_eq!(
+            eval_str("=COT(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=COT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COT(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=COT(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_csch() {
+        let (cm, vs) = make_test_env();
+        // CSCH(1) = 1/sinh(1).
+        match eval_str("=CSCH(1)", &cm, &vs) {
+            Value::Number(n) => {
+                assert!((n - 1.0 / 1.0f64.sinh()).abs() < 1e-9, "CSCH(1) = {n}")
+            }
+            other => panic!("expected number, got {:?}", other),
+        }
+        // CSCH(0) → sinh(0)=0 → #DIV/0!.
+        assert_eq!(
+            eval_str("=CSCH(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=CSCH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=CSCH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=CSCH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_sech() {
+        let (cm, vs) = make_test_env();
+        // SECH(0) = 1.
+        assert_eq!(eval_str("=SECH(0)", &cm, &vs), Value::Number(1.0));
+        match eval_str("=SECH(1)", &cm, &vs) {
+            Value::Number(n) => {
+                assert!((n - 1.0 / 1.0f64.cosh()).abs() < 1e-9, "SECH(1) = {n}")
+            }
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=SECH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=SECH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SECH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_coth() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=COTH(1)", &cm, &vs) {
+            Value::Number(n) => {
+                assert!((n - 1.0 / 1.0f64.tanh()).abs() < 1e-9, "COTH(1) = {n}")
+            }
+            other => panic!("expected number, got {:?}", other),
+        }
+        // COTH(0) → tanh(0)=0 → #DIV/0!.
+        assert_eq!(
+            eval_str("=COTH(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=COTH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COTH(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=COTH(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_acsc() {
+        let (cm, vs) = make_test_env();
+        // ACSC(1) = asin(1) = PI/2.
+        match eval_str("=ACSC(1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+                "ACSC(1) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // ACSC(2) = asin(0.5) = PI/6.
+        match eval_str("=ACSC(2)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_6).abs() < 1e-9,
+                "ACSC(2) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // n == 0 → #DIV/0!.
+        assert_eq!(
+            eval_str("=ACSC(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // |n| < 1 → out of domain.
+        assert_eq!(
+            eval_str("=ACSC(0.5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ACSC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ACSC(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ACSC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_asec() {
+        let (cm, vs) = make_test_env();
+        // ASEC(1) = acos(1) = 0.
+        assert_eq!(eval_str("=ASEC(1)", &cm, &vs), Value::Number(0.0));
+        // ASEC(2) = acos(0.5) = PI/3.
+        match eval_str("=ASEC(2)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_3).abs() < 1e-9,
+                "ASEC(2) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ASEC(0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=ASEC(0.5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ASEC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ASEC(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ASEC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_acot() {
+        let (cm, vs) = make_test_env();
+        // ACOT(1) = PI/4.
+        match eval_str("=ACOT(1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_4).abs() < 1e-9,
+                "ACOT(1) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // ACOT(0) = PI/2 (Excel convention, defined for all real n).
+        match eval_str("=ACOT(0)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+                "ACOT(0) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // ACOT(-1) = 3*PI/4 (Excel returns the (0, PI) branch).
+        match eval_str("=ACOT(-1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - 3.0 * std::f64::consts::FRAC_PI_4).abs() < 1e-9,
+                "ACOT(-1) = {n}"
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ACOT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ACOT(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ACOT(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // --- Math extras: pair-of-arrays sums, SUMSQ, SQRTPI, SUMPRODUCT,
+    // FLOOR.MATH / CEILING.MATH / FLOOR.PRECISE / CEILING.PRECISE,
+    // ROMAN / ARABIC / DECIMAL / BASE, MDETERM ---
+
+    /// Environment for math-extras tests.
+    /// Layout:
+    ///   A1=1 A2=2 A3=3 A4=4 A5=5       (x-array / single-column block)
+    ///   B1=2 B2=4 B3=6 B4=8 B5=10      (y-array = 2*x)
+    ///   C1=-2.5 C2=-1.5 C3=10.5 C4=11.5 (rounding fodder)
+    ///   D1="text"                       (non-numeric)
+    ///   2×2 MDETERM input at E1..F2:    [[1,2],[3,4]]
+    ///   3×3 identity at G1..I3
+    fn make_math_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let mut next: u64 = 0;
+        let mut put = |row: u32, col: u32, v: Value,
+                       cm: &mut HashMap<CellAddress, AtomId>,
+                       vs: &mut HashMap<AtomId, Value>| {
+            let id = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(row, col), id);
+            vs.insert(id, v);
+        };
+        for (i, n) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            put(i as u32, 0, Value::Number(*n), &mut cm, &mut vs);
+        }
+        for (i, n) in [2.0, 4.0, 6.0, 8.0, 10.0].iter().enumerate() {
+            put(i as u32, 1, Value::Number(*n), &mut cm, &mut vs);
+        }
+        put(0, 2, Value::Number(-2.5), &mut cm, &mut vs);
+        put(1, 2, Value::Number(-1.5), &mut cm, &mut vs);
+        put(2, 2, Value::Number(10.5), &mut cm, &mut vs);
+        put(3, 2, Value::Number(11.5), &mut cm, &mut vs);
+        put(0, 3, Value::Text("text".into()), &mut cm, &mut vs);
+        // 2×2 at E1:F2 = [[1,2],[3,4]]  (cols 4 and 5, rows 0 and 1)
+        put(0, 4, Value::Number(1.0), &mut cm, &mut vs);
+        put(0, 5, Value::Number(2.0), &mut cm, &mut vs);
+        put(1, 4, Value::Number(3.0), &mut cm, &mut vs);
+        put(1, 5, Value::Number(4.0), &mut cm, &mut vs);
+        // 3×3 identity at G1:I3 (cols 6..8, rows 0..2). Empty cells
+        // are Null = 0.0 in the determinant, so we only set diagonals.
+        put(0, 6, Value::Number(1.0), &mut cm, &mut vs);
+        put(1, 7, Value::Number(1.0), &mut cm, &mut vs);
+        put(2, 8, Value::Number(1.0), &mut cm, &mut vs);
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_sumx2my2() {
+        let (cm, vs) = make_math_env();
+        // A=1..5, B=2*A → Σ(x²-y²) = Σ(x²-4x²) = -3Σx² = -3*55 = -165.
+        assert_eq!(
+            eval_str("=SUMX2MY2(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(-165.0),
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=SUMX2MY2(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        // Shape mismatch → InvalidValue.
+        assert_eq!(
+            eval_str("=SUMX2MY2(A1:A5,B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_sumx2py2() {
+        let (cm, vs) = make_math_env();
+        // Σ(x²+y²) = Σx² + Σy² = 55 + 220 = 275.
+        assert_eq!(
+            eval_str("=SUMX2PY2(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(275.0),
+        );
+        assert_eq!(
+            eval_str("=SUMX2PY2(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        assert_eq!(
+            eval_str("=SUMX2PY2(A1:A5,B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_sumxmy2() {
+        let (cm, vs) = make_math_env();
+        // Σ(x-y)² where y=2x → Σ(-x)² = Σx² = 55.
+        assert_eq!(
+            eval_str("=SUMXMY2(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(55.0),
+        );
+        assert_eq!(
+            eval_str("=SUMXMY2(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        assert_eq!(
+            eval_str("=SUMXMY2(A1:A5,B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_sumsq() {
+        let (cm, vs) = make_math_env();
+        // SUMSQ(A1:A5) = 1+4+9+16+25 = 55.
+        assert_eq!(eval_str("=SUMSQ(A1:A5)", &cm, &vs), Value::Number(55.0));
+        // Variadic literals: 3,4 → 25.
+        assert_eq!(eval_str("=SUMSQ(3,4)", &cm, &vs), Value::Number(25.0));
+        // Non-numeric (text cell D1) skipped, no error.
+        assert_eq!(eval_str("=SUMSQ(A1:A5,D1)", &cm, &vs), Value::Number(55.0));
+        // No args → 0 (variadic empty → 0 like SUM).
+        assert_eq!(eval_str("=SUMSQ()", &cm, &vs), Value::Number(0.0));
+    }
+
+    #[test]
+    fn eval_sqrtpi() {
+        let (cm, vs) = make_math_env();
+        // SQRTPI(1) = sqrt(PI).
+        match eval_str("=SQRTPI(1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - std::f64::consts::PI.sqrt()).abs() < 1e-12),
+            other => panic!("expected number, got {other:?}"),
+        }
+        // SQRTPI(0) = 0.
+        assert_eq!(eval_str("=SQRTPI(0)", &cm, &vs), Value::Number(0.0));
+        // Negative → #NUM!.
+        assert_eq!(
+            eval_str("=SQRTPI(-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=SQRTPI(1,2)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_sumproduct() {
+        let (cm, vs) = make_math_env();
+        // 2 arrays: Σ x*2x = 2Σx² = 110.
+        assert_eq!(
+            eval_str("=SUMPRODUCT(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(110.0),
+        );
+        // 1 array = SUM over numerics (= 15).
+        assert_eq!(
+            eval_str("=SUMPRODUCT(A1:A5)", &cm, &vs),
+            Value::Number(15.0),
+        );
+        // Single-array equivalence: SUMPRODUCT(A1:A5) == SUM(A1:A5).
+        assert_eq!(
+            eval_str("=SUMPRODUCT(A1:A5)", &cm, &vs),
+            eval_str("=SUM(A1:A5)", &cm, &vs),
+        );
+        // Shape mismatch → InvalidValue.
+        assert_eq!(
+            eval_str("=SUMPRODUCT(A1:A5,B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // 0 args → arg-count.
+        assert_eq!(
+            eval_str("=SUMPRODUCT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_floor_math() {
+        let (cm, vs) = make_math_env();
+        // Default mode: FLOOR.MATH(-2.5) → -3 (toward -inf).
+        assert_eq!(eval_str("=FLOOR.MATH(-2.5)", &cm, &vs), Value::Number(-3.0));
+        // Mode != 0: -2.5 → -2 (toward zero).
+        assert_eq!(
+            eval_str("=FLOOR.MATH(-2.5,1,1)", &cm, &vs),
+            Value::Number(-2.0),
+        );
+        // FLOOR.MATH diverges from FLOOR.PRECISE for negatives + mode!=0:
+        // FLOOR.PRECISE always rounds toward -inf regardless of mode.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(-2.5)", &cm, &vs),
+            Value::Number(-3.0),
+        );
+        // Positive: same as floor.
+        assert_eq!(eval_str("=FLOOR.MATH(10.5)", &cm, &vs), Value::Number(10.0));
+        // Custom significance.
+        assert_eq!(
+            eval_str("=FLOOR.MATH(10.5,2)", &cm, &vs),
+            Value::Number(10.0),
+        );
+        // sig=0 → 0.
+        assert_eq!(eval_str("=FLOOR.MATH(10.5,0)", &cm, &vs), Value::Number(0.0));
+        // Type error.
+        assert_eq!(
+            eval_str("=FLOOR.MATH(D1)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=FLOOR.MATH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        assert_eq!(
+            eval_str("=FLOOR.MATH(1,2,3,4)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_ceiling_math() {
+        let (cm, vs) = make_math_env();
+        // Default mode: CEILING.MATH(-2.5) → -2 (toward +inf).
+        assert_eq!(
+            eval_str("=CEILING.MATH(-2.5)", &cm, &vs),
+            Value::Number(-2.0),
+        );
+        // Mode != 0: -2.5 → -3 (away from zero).
+        assert_eq!(
+            eval_str("=CEILING.MATH(-2.5,1,1)", &cm, &vs),
+            Value::Number(-3.0),
+        );
+        // CEILING.PRECISE always toward +inf regardless of mode (= -2 here).
+        assert_eq!(
+            eval_str("=CEILING.PRECISE(-2.5)", &cm, &vs),
+            Value::Number(-2.0),
+        );
+        // Positive.
+        assert_eq!(
+            eval_str("=CEILING.MATH(10.5)", &cm, &vs),
+            Value::Number(11.0),
+        );
+        // sig=0 → 0.
+        assert_eq!(
+            eval_str("=CEILING.MATH(10.5,0)", &cm, &vs),
+            Value::Number(0.0),
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=CEILING.MATH(D1)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=CEILING.MATH()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_floor_precise() {
+        let (cm, vs) = make_math_env();
+        // Always toward -inf.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(-2.5)", &cm, &vs),
+            Value::Number(-3.0),
+        );
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(10.5)", &cm, &vs),
+            Value::Number(10.0),
+        );
+        // Negative significance treated as |sig|.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(10.5,-2)", &cm, &vs),
+            Value::Number(10.0),
+        );
+        // sig=0 → 0.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(10.5,0)", &cm, &vs),
+            Value::Number(0.0),
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(D1)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        assert_eq!(
+            eval_str("=FLOOR.PRECISE(1,2,3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_ceiling_precise() {
+        let (cm, vs) = make_math_env();
+        // Always toward +inf.
+        assert_eq!(
+            eval_str("=CEILING.PRECISE(-2.5)", &cm, &vs),
+            Value::Number(-2.0),
+        );
+        assert_eq!(
+            eval_str("=CEILING.PRECISE(10.5)", &cm, &vs),
+            Value::Number(11.0),
+        );
+        // Negative significance treated as |sig|.
+        assert_eq!(
+            eval_str("=CEILING.PRECISE(10.5,-2)", &cm, &vs),
+            Value::Number(12.0),
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=CEILING.PRECISE(D1)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+    }
+
+    #[test]
+    fn eval_roman() {
+        let (cm, vs) = make_math_env();
+        // Canonical round-trip value.
+        assert_eq!(
+            eval_str("=ROMAN(1994)", &cm, &vs),
+            Value::Text("MCMXCIV".into()),
+        );
+        // Edge values.
+        assert_eq!(eval_str("=ROMAN(1)", &cm, &vs), Value::Text("I".into()));
+        assert_eq!(eval_str("=ROMAN(4)", &cm, &vs), Value::Text("IV".into()));
+        assert_eq!(eval_str("=ROMAN(3999)", &cm, &vs), Value::Text("MMMCMXCIX".into()));
+        // Out of range.
+        assert_eq!(
+            eval_str("=ROMAN(0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(4000)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Non-classic form rejected.
+        assert_eq!(
+            eval_str("=ROMAN(1994,1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=ROMAN(D1)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=ROMAN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_arabic() {
+        let (cm, vs) = make_math_env();
+        // Round-trip with ROMAN.
+        assert_eq!(
+            eval_str("=ARABIC(\"MCMXCIV\")", &cm, &vs),
+            Value::Number(1994.0),
+        );
+        // Lowercase / mixed.
+        assert_eq!(
+            eval_str("=ARABIC(\"mcmxciv\")", &cm, &vs),
+            Value::Number(1994.0),
+        );
+        // Empty string → 0.
+        assert_eq!(eval_str("=ARABIC(\"\")", &cm, &vs), Value::Number(0.0));
+        // Invalid syntax → #VALUE!.
+        assert_eq!(
+            eval_str("=ARABIC(\"hello\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Type: numbers are rejected.
+        assert_eq!(
+            eval_str("=ARABIC(123)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=ARABIC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_decimal() {
+        let (cm, vs) = make_math_env();
+        // DECIMAL("FF", 16) = 255.
+        assert_eq!(
+            eval_str("=DECIMAL(\"FF\",16)", &cm, &vs),
+            Value::Number(255.0),
+        );
+        // Lowercase letters accepted.
+        assert_eq!(
+            eval_str("=DECIMAL(\"ff\",16)", &cm, &vs),
+            Value::Number(255.0),
+        );
+        // Binary.
+        assert_eq!(
+            eval_str("=DECIMAL(\"1010\",2)", &cm, &vs),
+            Value::Number(10.0),
+        );
+        // Invalid digit for base.
+        assert_eq!(
+            eval_str("=DECIMAL(\"12\",2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Bad base.
+        assert_eq!(
+            eval_str("=DECIMAL(\"10\",1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        assert_eq!(
+            eval_str("=DECIMAL(\"10\",37)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=DECIMAL(\"FF\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_base() {
+        let (cm, vs) = make_math_env();
+        // BASE(255, 16) = "FF".
+        assert_eq!(eval_str("=BASE(255,16)", &cm, &vs), Value::Text("FF".into()));
+        // Padded.
+        assert_eq!(
+            eval_str("=BASE(7,2,8)", &cm, &vs),
+            Value::Text("00000111".into()),
+        );
+        // 0.
+        assert_eq!(eval_str("=BASE(0,16)", &cm, &vs), Value::Text("0".into()));
+        // Round-trip with DECIMAL: DECIMAL(BASE(255, 16), 16) == 255.
+        assert_eq!(
+            eval_str("=DECIMAL(BASE(255,16),16)", &cm, &vs),
+            Value::Number(255.0),
+        );
+        // Negative input rejected.
+        assert_eq!(
+            eval_str("=BASE(-1,16)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Bad base.
+        assert_eq!(
+            eval_str("=BASE(10,1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=BASE(10)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_mdeterm() {
+        let (cm, vs) = make_math_env();
+        // 2×2: det([[1,2],[3,4]]) = 1*4 - 2*3 = -2.
+        assert_eq!(
+            eval_str("=MDETERM(E1:F2)", &cm, &vs),
+            Value::Number(-2.0),
+        );
+        // 3×3 identity → 1.
+        match eval_str("=MDETERM(G1:I3)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "det(I) = {n}"),
+            other => panic!("expected number, got {other:?}"),
+        }
+        // Non-square → #VALUE!.
+        assert_eq!(
+            eval_str("=MDETERM(E1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Non-numeric cell → #TYPE! (D1 holds "text").
+        assert_eq!(
+            eval_str("=MDETERM(C1:D2)", &cm, &vs),
+            Value::Error(ValueError::WrongType),
+        );
+        // Arg-count.
+        assert_eq!(
+            eval_str("=MDETERM()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+    #[test]
+    fn eval_networkdays() {
+        let (cm, vs) = make_test_env();
+        // Mon 2024-01-01 (start) to Sun 2024-01-07 (end): 5 workdays
+        // Mon..Fri.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,7))",
+                &cm,
+                &vs
+            ),
+            Value::Number(5.0)
+        );
+        // Mon 2024-01-01 to Fri 2024-01-05 inclusive: 5 workdays.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,5))",
+                &cm,
+                &vs
+            ),
+            Value::Number(5.0)
+        );
+        // Whole calendar week with one holiday inside (Wed 2024-01-03):
+        // 4 workdays.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,7),DATE(2024,1,3))",
+                &cm,
+                &vs
+            ),
+            Value::Number(4.0)
+        );
+        // start > end → negative result.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,7),DATE(2024,1,1))",
+                &cm,
+                &vs
+            ),
+            Value::Number(-5.0)
+        );
+        // Same day, working day → 1.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,1))",
+                &cm,
+                &vs
+            ),
+            Value::Number(1.0)
+        );
+        // Same day, weekend → 0.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,6),DATE(2024,1,6))",
+                &cm,
+                &vs
+            ),
+            Value::Number(0.0)
+        );
+        // Arg-count error: zero args.
+        assert_eq!(
+            eval_str("=NETWORKDAYS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Arg-count error: too many args.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,7),DATE(2024,1,3),1)",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=NETWORKDAYS(\"a\",DATE(2024,1,7))", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagation through start arg.
+        assert_eq!(
+            eval_str("=NETWORKDAYS(A1/C1,DATE(2024,1,7))", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_networkdays_intl() {
+        let (cm, vs) = make_test_env();
+        // Default (code 1 = Sat+Sun): Mon 2024-01-01 to Sun 2024-01-07 → 5.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),1)",
+                &cm,
+                &vs
+            ),
+            Value::Number(5.0)
+        );
+        // Code 7 = Fri+Sat weekend. Mon..Sun has 5 working days
+        // (Sun, Mon, Tue, Wed, Thu).
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),7)",
+                &cm,
+                &vs
+            ),
+            Value::Number(5.0)
+        );
+        // Code 7 over a Mon..Thu range: 4 workdays.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,4),7)",
+                &cm,
+                &vs
+            ),
+            Value::Number(4.0)
+        );
+        // Code 7 over Fri..Sat: 0 workdays (both are weekend under code 7).
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,5),DATE(2024,1,6),7)",
+                &cm,
+                &vs
+            ),
+            Value::Number(0.0)
+        );
+        // Default code 1: same Fri..Sat range yields 1 workday (Fri).
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,5),DATE(2024,1,6))",
+                &cm,
+                &vs
+            ),
+            Value::Number(1.0)
+        );
+        // Mask "0000011" = Sat+Sun weekend, equivalent to default.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),\"0000011\")",
+                &cm,
+                &vs
+            ),
+            Value::Number(5.0)
+        );
+        // Single-day weekend code 11 = Sun only: Mon..Sun = 6 workdays.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),11)",
+                &cm,
+                &vs
+            ),
+            Value::Number(6.0)
+        );
+        // All-1s mask → InvalidValue.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),\"1111111\")",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Bad mask length → InvalidValue.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),\"011\")",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Bad mask character → InvalidValue.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),\"000002X\")",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Invalid numeric weekend code → InvalidValue.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),99)",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Code 7 with a holiday on Sun 2024-01-07 (a workday under code 7):
+        // 5 workdays minus 1 = 4.
+        assert_eq!(
+            eval_str(
+                "=NETWORKDAYS.INTL(DATE(2024,1,1),DATE(2024,1,7),7,DATE(2024,1,7))",
+                &cm,
+                &vs
+            ),
+            Value::Number(4.0)
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=NETWORKDAYS.INTL(DATE(2024,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_workday() {
+        let (cm, vs) = make_test_env();
+        // Mon 2024-01-01 + 4 workdays → Fri 2024-01-05.
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,1),4)", &cm, &vs),
+            Value::Number(date_serial(2024, 1, 5))
+        );
+        // Mon 2024-01-01 + 5 workdays → Mon 2024-01-08 (skipping weekend).
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,1),5)", &cm, &vs),
+            Value::Number(date_serial(2024, 1, 8))
+        );
+        // Zero days → returns the start serial (Excel does NOT snap to
+        // next workday for the 0 case).
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,1),0)", &cm, &vs),
+            Value::Number(date_serial(2024, 1, 1))
+        );
+        // Even from a weekend day, 0 days returns the start as-is.
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,6),0)", &cm, &vs),
+            Value::Number(date_serial(2024, 1, 6))
+        );
+        // Negative days: Mon 2024-01-08 - 5 workdays → Mon 2024-01-01.
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,8),-5)", &cm, &vs),
+            Value::Number(date_serial(2024, 1, 1))
+        );
+        // Holiday lands on the natural step target: must advance further.
+        // Mon 2024-01-01 + 2 workdays would normally → Wed 2024-01-03.
+        // Mark Wed 2024-01-03 as holiday → result must be Thu 2024-01-04.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY(DATE(2024,1,1),2,DATE(2024,1,3))",
+                &cm,
+                &vs
+            ),
+            Value::Number(date_serial(2024, 1, 4))
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Type error on `days`.
+        assert_eq!(
+            eval_str("=WORKDAY(DATE(2024,1,1),\"x\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    #[test]
+    fn eval_workday_intl() {
+        let (cm, vs) = make_test_env();
+        // Default weekend (Sat+Sun): Mon 2024-01-01 + 5 → Mon 2024-01-08.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY.INTL(DATE(2024,1,1),5,1)",
+                &cm,
+                &vs
+            ),
+            Value::Number(date_serial(2024, 1, 8))
+        );
+        // Weekend code 7 (Fri+Sat). Mon 2024-01-01 + 4 → step through
+        // Tue Wed Thu Sun (Sun is a workday under code 7), landing on
+        // Sun 2024-01-07.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY.INTL(DATE(2024,1,1),4,7)",
+                &cm,
+                &vs
+            ),
+            Value::Number(date_serial(2024, 1, 7))
+        );
+        // Mask "0000011" matches default.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY.INTL(DATE(2024,1,1),5,\"0000011\")",
+                &cm,
+                &vs
+            ),
+            Value::Number(date_serial(2024, 1, 8))
+        );
+        // Holiday under code 7: Mon + 4 normally → Sun 2024-01-07.
+        // Mark that day as holiday; next workday under code 7 is
+        // Mon 2024-01-08.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY.INTL(DATE(2024,1,1),4,7,DATE(2024,1,7))",
+                &cm,
+                &vs
+            ),
+            Value::Number(date_serial(2024, 1, 8))
+        );
+        // Invalid weekend mask → InvalidValue.
+        assert_eq!(
+            eval_str(
+                "=WORKDAY.INTL(DATE(2024,1,1),5,\"1111111\")",
+                &cm,
+                &vs
+            ),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_isoweeknum() {
+        let (cm, vs) = make_test_env();
+        // 2024-01-01 was a Monday → ISO 2024-W01.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2024,1,1))", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // 2021-01-01 was a Friday → ISO 2020-W53 (December rollover).
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2021,1,1))", &cm, &vs),
+            Value::Number(53.0)
+        );
+        // 2024-12-31 was a Tuesday → ISO 2025-W01 (next-year rollover).
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2024,12,31))", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // 2020-12-28 (Mon) is the start of ISO 2020-W53.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2020,12,28))", &cm, &vs),
+            Value::Number(53.0)
+        );
+        // 2024-12-30 (Mon) is the start of ISO 2025-W01.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2024,12,30))", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // Sun 2024-01-07 is the last day of ISO 2024-W01.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2024,1,7))", &cm, &vs),
+            Value::Number(1.0)
+        );
+        // Mon 2024-01-08 starts ISO 2024-W02.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(DATE(2024,1,8))", &cm, &vs),
+            Value::Number(2.0)
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Type error.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagation.
+        assert_eq!(
+            eval_str("=ISOWEEKNUM(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
 }
