@@ -265,6 +265,19 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
         onInput={onInput}
         onSelect={onSelectionChange}
         onClick={onSelectionChange}
+        onKeyUp={(event) => {
+          // Caret-only key events (ArrowLeft/Right/Home/End) don't fire
+          // onSelect — sync explicitly so signature + autocomplete
+          // recompute against the new caret position.
+          if (
+            event.key === 'ArrowLeft' ||
+            event.key === 'ArrowRight' ||
+            event.key === 'Home' ||
+            event.key === 'End'
+          ) {
+            onSelectionChange(event)
+          }
+        }}
         onFocus={() => {
           store.setter(focusFormulaBarAtom, true)
         }}

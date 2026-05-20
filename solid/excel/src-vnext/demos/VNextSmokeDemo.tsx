@@ -12,6 +12,7 @@ import { SpreadsheetDataValidationDialog } from '../data-validation'
 import { SpreadsheetFilterDropdown } from '../filter-sort'
 import { SpreadsheetFindReplaceDialog } from '../find-replace'
 import { SpreadsheetFormatPainter } from '../format-painter'
+import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
@@ -23,7 +24,7 @@ import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
-import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
+import { acceptFormulaSuggestion, SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
 const sheets = [
   { id: 'sheet-1', name: 'Sheet1' },
@@ -140,6 +141,22 @@ function VNextSmokeWorkbook() {
       <SpreadsheetProtectionUnlockDialog data-testid="vnext-protection-unlock" />
       <SpreadsheetHistoryTimeline data-testid="vnext-history-timeline" />
       <SpreadsheetPresenceOverlay data-testid="vnext-presence" />
+      <SpreadsheetFormulaAutocomplete
+        data-testid="vnext-formula-autocomplete"
+        onAccept={(suggestion) => {
+          const { caret } = acceptFormulaSuggestion(store, suggestion)
+          queueMicrotask(() => {
+            const el = document.activeElement
+            if (
+              el instanceof HTMLInputElement &&
+              (el.classList.contains('cell-input') || el.classList.contains('formula-bar-input'))
+            ) {
+              el.focus()
+              el.setSelectionRange(caret, caret)
+            }
+          })
+        }}
+      />
     </>
   )
 }

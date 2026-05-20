@@ -323,6 +323,73 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(bar).toBeFocused()
   })
 
+  test('caret-only ArrowLeft inside an existing formula surfaces the signature', async ({
+    page,
+  }) => {
+    // Regression for the missing onKeyUp wiring: onSelect doesn't fire
+    // when ArrowLeft/Right/Home/End only move the caret (no text
+    // selected), so the signature atom never recomputed.
+    await gotoWave5(page)
+    await commitFormulaInCell(page, 'H6', '=SUM(B2:E2)')
+    await cell(page, 'H6').click()
+    await page.keyboard.press('F2')
+
+    // F2 opens caret at end (index 11), outside the close paren — no signature.
+    await expect(page.getByTestId('formula-autocomplete-signature')).toHaveCount(0)
+
+    // ArrowLeft moves caret to 10, between `2` and `)` — inside the SUM call.
+    await page.keyboard.press('ArrowLeft')
+    await expect(page.getByTestId('formula-autocomplete-signature')).toContainText(
+      'SUM(number1, [number2, ...])',
+    )
+  })
+
+  test('Backspace from =SU back to =S re-opens the suggestion list', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'H7').click()
+    await page.keyboard.type('=SU')
+    await expect(page.getByTestId('formula-autocomplete-row-SUMIF')).toBeVisible()
+
+    await page.keyboard.press('Backspace')
+    await expect(cellInput(page, 'H7')).toHaveValue('=S')
+    // After Backspace, fragment shrinks → ABS now matches the broader "S".
+    await expect(page.getByTestId('formula-autocomplete-row-ABS')).toBeVisible()
+  })
+
+  test('extended evaluator: IF / SUMIF / COUNTIF / ABS / ROUND / CONCAT', async ({ page }) => {
+    await gotoWave5(page)
+
+    // IF: B2 (120) > 100 → "high", else "low". Truthy path.
+    await commitFormulaInCell(page, 'H2', '=IF(B2>100, 999, 0)')
+    await expect(display(page, 'H2')).toHaveText('999')
+
+    // IF with literal text branches.
+    await commitFormulaInCell(page, 'H3', '=IF(B2<100, "low", "high")')
+    await expect(display(page, 'H3')).toHaveText('high')
+
+    // ABS over a cell value.
+    await commitFormulaInCell(page, 'H4', '=ABS(0-B2)')
+    await expect(display(page, 'H4')).toHaveText('120')
+
+    // ROUND to 0 digits.
+    await commitFormulaInCell(page, 'H5', '=ROUND(B2/7, 2)')
+    await expect(display(page, 'H5')).toHaveText('17.14')
+
+    // COUNTIF over a numeric range with a >100 criterion.
+    await commitFormulaInCell(page, 'H6', '=COUNTIF(B2:E2, ">100")')
+    // Row 2: 120, 180, 240, 300 — all > 100 → count = 4.
+    await expect(display(page, 'H6')).toHaveText('4')
+
+    // SUMIF: sum row-2 cells >= 200.
+    await commitFormulaInCell(page, 'H7', '=SUMIF(B2:E2, ">=200")')
+    // 240 + 300 = 540.
+    await expect(display(page, 'H7')).toHaveText('540')
+
+    // CONCAT — text + ref + literal.
+    await commitFormulaInCell(page, 'H8', '=CONCAT("Q1=", B2)')
+    await expect(display(page, 'H8')).toHaveText('Q1=120')
+  })
+
   test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H9').click()

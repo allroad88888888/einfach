@@ -2534,6 +2534,23 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                     event.currentTarget.selectionStart ?? 0,
                                   )
                                 }}
+                                onKeyUp={(event) => {
+                                  // ArrowLeft/Right/Home/End move the caret
+                                  // without firing onSelect. Re-sync so the
+                                  // signature tooltip + autocomplete fragment
+                                  // recompute against the new caret position.
+                                  if (
+                                    event.key === 'ArrowLeft' ||
+                                    event.key === 'ArrowRight' ||
+                                    event.key === 'Home' ||
+                                    event.key === 'End'
+                                  ) {
+                                    syncFormulaReferenceCaret(
+                                      store,
+                                      event.currentTarget.selectionStart ?? 0,
+                                    )
+                                  }
+                                }}
                                 onKeyDown={(event) => {
                                   // Autocomplete first: ArrowUp/Down move
                                   // the dropdown cursor, Tab/Enter accept,

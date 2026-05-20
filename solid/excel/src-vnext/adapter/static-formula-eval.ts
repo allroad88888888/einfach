@@ -3,16 +3,23 @@
  *
  * Supports the subset the audit specs and showcase scenarios actually exercise:
  *   - number literals (decimals, signed)
+ *   - string literals: "hello"
  *   - cell references: A1, $A$1
  *   - range references inside function args: B2:E8
- *   - operators: + - * / ^ with normal precedence
+ *   - operators: + - * / ^ with normal precedence, plus comparison
+ *     operators = <> < <= > >= (lowest precedence) returning 1/0
  *   - unary minus / plus
  *   - parentheses
- *   - functions: SUM, AVERAGE, COUNT, MIN, MAX
+ *   - functions: SUM, AVERAGE, COUNT, MIN, MAX, IF, SUMIF, COUNTIF,
+ *     ABS, ROUND, CONCAT
  *
- * Anything beyond this returns the string '#ERROR!'. Division by zero returns
- * '#DIV/0!'. Cyclic references return '#CYCLE!'. Cross-sheet refs (Sheet!A1)
- * are not supported by this evaluator — the worker backend covers those.
+ * Anything beyond this returns the string '#ERROR!'. Division by zero
+ * returns '#DIV/0!'. Cyclic references return '#CYCLE!'. Cross-sheet
+ * refs (Sheet!A1) are not supported — the worker backend covers those.
+ *
+ * Plain (non-error) string results are valid first-class values: CONCAT
+ * builds them, comparisons can take them, IF can branch to them. Only
+ * strings that start with '#' are treated as error codes.
  */
 
 import type { DisplayCell } from '@einfach/spreadsheet-ui-core'
@@ -67,15 +74,29 @@ function parseRangeRef(token: string): RangeRef | null {
 
 type Token =
   | { kind: 'number'; value: number }
+  | { kind: 'string'; value: string }
   | { kind: 'cell'; ref: { row: number; col: number } }
   | { kind: 'range'; ref: RangeRef }
   | { kind: 'func'; name: string }
   | { kind: 'op'; op: string }
+  | { kind: 'cmp'; op: '=' | '<>' | '<' | '<=' | '>' | '>=' }
   | { kind: 'lparen' }
   | { kind: 'rparen' }
   | { kind: 'comma' }
 
-const FUNCTION_NAMES = new Set(['SUM', 'AVERAGE', 'COUNT', 'MIN', 'MAX'])
+const FUNCTION_NAMES = new Set([
+  'SUM',
+  'AVERAGE',
+  'COUNT',
+  'MIN',
+  'MAX',
+  'IF',
+  'SUMIF',
+  'COUNTIF',
+  'ABS',
+  'ROUND',
+  'CONCAT',
+])
 
 function tokenize(input: string): Token[] | null {
   const tokens: Token[] = []
@@ -98,6 +119,51 @@ function tokenize(input: string): Token[] | null {
     }
     if (ch === ',') {
       tokens.push({ kind: 'comma' })
+      i += 1
+      continue
+    }
+    if (ch === '"') {
+      // String literal — scan until the next unescaped `"`. Excel uses a
+      // doubled `""` inside a string to represent a literal quote, which
+      // is rarely needed at this scope — we don't support it. A second
+      // `"` always closes.
+      const start = i + 1
+      i += 1
+      while (i < input.length && input[i] !== '"') i += 1
+      if (input[i] !== '"') return null
+      tokens.push({ kind: 'string', value: input.slice(start, i) })
+      i += 1
+      continue
+    }
+    // Comparison operators must be matched BEFORE single-char + - * / ^
+    // because `>=`, `<=`, `<>` are two-char.
+    if (ch === '<') {
+      if (input[i + 1] === '=') {
+        tokens.push({ kind: 'cmp', op: '<=' })
+        i += 2
+        continue
+      }
+      if (input[i + 1] === '>') {
+        tokens.push({ kind: 'cmp', op: '<>' })
+        i += 2
+        continue
+      }
+      tokens.push({ kind: 'cmp', op: '<' })
+      i += 1
+      continue
+    }
+    if (ch === '>') {
+      if (input[i + 1] === '=') {
+        tokens.push({ kind: 'cmp', op: '>=' })
+        i += 2
+        continue
+      }
+      tokens.push({ kind: 'cmp', op: '>' })
+      i += 1
+      continue
+    }
+    if (ch === '=') {
+      tokens.push({ kind: 'cmp', op: '=' })
       i += 1
       continue
     }
@@ -144,15 +210,30 @@ function tokenize(input: string): Token[] | null {
   return tokens
 }
 
+type Value = number | string
+
+function isErr(v: Value): boolean {
+  return typeof v === 'string' && v.startsWith('#')
+}
+
+function isTruthy(v: Value): boolean {
+  if (isErr(v)) return false
+  if (typeof v === 'number') return v !== 0
+  // After number narrowing, v is string. Non-error strings are truthy if
+  // non-empty and not literally "false" (case-insensitive).
+  const str = v as string
+  return str.length > 0 && str.toLowerCase() !== 'false'
+}
+
 class Parser {
   private pos = 0
   constructor(
     private readonly tokens: Token[],
-    private readonly resolve: (row: number, col: number) => number | string,
+    private readonly resolve: (row: number, col: number) => Value,
   ) {}
 
-  parse(): number | string {
-    const value = this.parseAdditive()
+  parse(): Value {
+    const value = this.parseComparison()
     if (this.pos < this.tokens.length) return '#ERROR!'
     return value
   }
@@ -161,7 +242,18 @@ class Parser {
     return this.tokens[this.pos]
   }
 
-  private parseAdditive(): number | string {
+  private parseComparison(): Value {
+    let left = this.parseAdditive()
+    while (this.peek()?.kind === 'cmp') {
+      const op = (this.tokens[this.pos] as { op: string }).op
+      this.pos += 1
+      const right = this.parseAdditive()
+      left = this.combineCompare(op, left, right)
+    }
+    return left
+  }
+
+  private parseAdditive(): Value {
     let left = this.parseMultiplicative()
     while (this.peek()?.kind === 'op' && '+-'.includes((this.peek() as { op: string }).op)) {
       const op = (this.tokens[this.pos] as { op: string }).op
@@ -172,7 +264,7 @@ class Parser {
     return left
   }
 
-  private parseMultiplicative(): number | string {
+  private parseMultiplicative(): Value {
     let left = this.parseExponent()
     while (this.peek()?.kind === 'op' && '*/'.includes((this.peek() as { op: string }).op)) {
       const op = (this.tokens[this.pos] as { op: string }).op
@@ -183,7 +275,7 @@ class Parser {
     return left
   }
 
-  private parseExponent(): number | string {
+  private parseExponent(): Value {
     let left = this.parseUnary()
     while (this.peek()?.kind === 'op' && (this.peek() as { op: string }).op === '^') {
       this.pos += 1
@@ -193,7 +285,7 @@ class Parser {
     return left
   }
 
-  private parseUnary(): number | string {
+  private parseUnary(): Value {
     const tok = this.peek()
     if (tok?.kind === 'op' && (tok.op === '-' || tok.op === '+')) {
       this.pos += 1
@@ -204,16 +296,20 @@ class Parser {
     return this.parsePrimary()
   }
 
-  private parsePrimary(): number | string {
+  private parsePrimary(): Value {
     const tok = this.tokens[this.pos]
     if (!tok) return '#ERROR!'
     if (tok.kind === 'number') {
       this.pos += 1
       return tok.value
     }
+    if (tok.kind === 'string') {
+      this.pos += 1
+      return tok.value
+    }
     if (tok.kind === 'lparen') {
       this.pos += 1
-      const value = this.parseAdditive()
+      const value = this.parseComparison()
       if (this.tokens[this.pos]?.kind !== 'rparen') return '#ERROR!'
       this.pos += 1
       return value
@@ -234,8 +330,8 @@ class Parser {
     return '#ERROR!'
   }
 
-  private parseArgList(): Array<number | string | RangeRef> {
-    const args: Array<number | string | RangeRef> = []
+  private parseArgList(): Array<Value | RangeRef> {
+    const args: Array<Value | RangeRef> = []
     if (this.peek()?.kind === 'rparen') return args
     while (true) {
       const tok = this.peek()
@@ -243,7 +339,7 @@ class Parser {
         this.pos += 1
         args.push(tok.ref)
       } else {
-        args.push(this.parseAdditive())
+        args.push(this.parseComparison())
       }
       if (this.peek()?.kind !== 'comma') break
       this.pos += 1
@@ -251,9 +347,13 @@ class Parser {
     return args
   }
 
-  private combine(op: string, left: number | string, right: number | string): number | string {
-    if (typeof left === 'string') return left
-    if (typeof right === 'string') return right
+  private combine(op: string, left: Value, right: Value): Value {
+    if (isErr(left)) return left
+    if (isErr(right)) return right
+    if (typeof left === 'string' || typeof right === 'string') {
+      // Arithmetic on strings (other than via CONCAT) is invalid.
+      return '#VALUE!'
+    }
     switch (op) {
       case '+':
         return left + right
@@ -271,41 +371,241 @@ class Parser {
     }
   }
 
-  private applyFunction(name: string, args: Array<number | string | RangeRef>): number | string {
-    const numbers: number[] = []
-    for (const arg of args) {
-      if (typeof arg === 'string') return arg
-      if (typeof arg === 'number') {
-        numbers.push(arg)
-        continue
-      }
-      // Range — expand to all cell values.
-      for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
-        for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
-          const value = this.resolve(row, col)
-          if (typeof value === 'string') {
-            if (name === 'COUNT') continue
-            return value
-          }
-          numbers.push(value)
-        }
-      }
-    }
-    switch (name) {
-      case 'SUM':
-        return numbers.reduce((a, b) => a + b, 0)
-      case 'AVERAGE':
-        if (numbers.length === 0) return '#DIV/0!'
-        return numbers.reduce((a, b) => a + b, 0) / numbers.length
-      case 'COUNT':
-        return numbers.length
-      case 'MIN':
-        return numbers.length === 0 ? 0 : Math.min(...numbers)
-      case 'MAX':
-        return numbers.length === 0 ? 0 : Math.max(...numbers)
+  private combineCompare(op: string, left: Value, right: Value): Value {
+    if (isErr(left)) return left
+    if (isErr(right)) return right
+    // Excel compares mixed string + number with strings always greater than
+    // numbers; we keep it simple: same-kind comparison only.
+    if (typeof left !== typeof right) return 0
+    let result = false
+    switch (op) {
+      case '=':
+        result = left === right
+        break
+      case '<>':
+        result = left !== right
+        break
+      case '<':
+        result = left < right
+        break
+      case '<=':
+        result = left <= right
+        break
+      case '>':
+        result = left > right
+        break
+      case '>=':
+        result = left >= right
+        break
       default:
         return '#ERROR!'
     }
+    return result ? 1 : 0
+  }
+
+  private applyFunction(name: string, args: Array<Value | RangeRef>): Value {
+    switch (name) {
+      case 'IF':
+        return applyIf(args)
+      case 'SUMIF':
+        return applySumIf(args, this.resolve)
+      case 'COUNTIF':
+        return applyCountIf(args, this.resolve)
+      case 'ABS': {
+        const n = takeScalar(args, 0)
+        if (typeof n !== 'number') return isErr(n) ? n : '#VALUE!'
+        return Math.abs(n)
+      }
+      case 'ROUND': {
+        const n = takeScalar(args, 0)
+        const digits = takeScalar(args, 1)
+        if (typeof n !== 'number' || typeof digits !== 'number') return '#VALUE!'
+        const factor = Math.pow(10, Math.trunc(digits))
+        return Math.round(n * factor) / factor
+      }
+      case 'CONCAT': {
+        let out = ''
+        for (const arg of args) {
+          if (typeof arg === 'object') {
+            // Range — concat row-major.
+            for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
+              for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
+                const v = this.resolve(row, col)
+                if (isErr(v)) return v
+                out += String(v)
+              }
+            }
+            continue
+          }
+          if (isErr(arg)) return arg
+          out += String(arg)
+        }
+        return out
+      }
+      // SUM-like aggregations fall through.
+      default:
+        return aggregateNumeric(name, args, this.resolve)
+    }
+  }
+}
+
+function takeScalar(args: Array<Value | RangeRef>, index: number): Value {
+  const arg = args[index]
+  if (arg === undefined) return '#VALUE!'
+  if (typeof arg === 'object') return '#VALUE!'
+  return arg
+}
+
+function isErrLocal(v: Value): boolean {
+  return typeof v === 'string' && v.startsWith('#')
+}
+
+function applyIf(args: Array<Value | RangeRef>): Value {
+  const cond = args[0]
+  const ifTrue = args[1]
+  const ifFalse = args.length > 2 ? args[2] : 0
+  if (cond === undefined || ifTrue === undefined) return '#VALUE!'
+  if (typeof cond === 'object') return '#VALUE!'
+  if (isErrLocal(cond)) return cond
+  const branch = isTruthy(cond) ? ifTrue : ifFalse
+  if (typeof branch === 'object') return '#VALUE!'
+  return branch
+}
+
+interface Criteria {
+  match: (v: Value) => boolean
+}
+
+function parseCriteria(raw: Value | RangeRef): Criteria | string {
+  if (typeof raw === 'object') return '#VALUE!'
+  if (typeof raw === 'string' && raw.startsWith('#')) return raw
+  if (typeof raw === 'number') {
+    const target = raw
+    return { match: (v: Value) => typeof v === 'number' && v === target }
+  }
+  const text: string = raw
+  const match = /^(>=|<=|<>|>|<|=)(.+)$/.exec(text.trim())
+  if (!match) {
+    return { match: (v: Value) => String(v).toLowerCase() === text.toLowerCase() }
+  }
+  const op = match[1]
+  const rhsRaw = match[2].trim()
+  const rhsNum = Number(rhsRaw)
+  const rhsIsNumber = Number.isFinite(rhsNum) && rhsRaw !== ''
+  return {
+    match: (v: Value) => {
+      if (rhsIsNumber) {
+        if (typeof v !== 'number') return false
+        switch (op) {
+          case '>':
+            return v > rhsNum
+          case '<':
+            return v < rhsNum
+          case '>=':
+            return v >= rhsNum
+          case '<=':
+            return v <= rhsNum
+          case '=':
+            return v === rhsNum
+          case '<>':
+            return v !== rhsNum
+        }
+      }
+      const lhs = String(v).toLowerCase()
+      const rhs = rhsRaw.toLowerCase()
+      switch (op) {
+        case '=':
+          return lhs === rhs
+        case '<>':
+          return lhs !== rhs
+      }
+      return false
+    },
+  }
+}
+
+function applySumIf(
+  args: Array<Value | RangeRef>,
+  resolve: (row: number, col: number) => Value,
+): Value {
+  const range = args[0]
+  const criteriaArg = args[1]
+  if (typeof range !== 'object') return '#VALUE!'
+  const criteria = parseCriteria(criteriaArg)
+  if (typeof criteria === 'string') return criteria
+  const sumRange = args.length > 2 && typeof args[2] === 'object' ? (args[2] as RangeRef) : range
+  let total = 0
+  const rows = range.rowEnd - range.rowStart
+  const cols = range.colEnd - range.colStart
+  for (let dr = 0; dr <= rows; dr += 1) {
+    for (let dc = 0; dc <= cols; dc += 1) {
+      const v = resolve(range.rowStart + dr, range.colStart + dc)
+      if (!criteria.match(v)) continue
+      const target = resolve(sumRange.rowStart + dr, sumRange.colStart + dc)
+      if (isErrLocal(target)) return target
+      if (typeof target === 'number') total += target
+    }
+  }
+  return total
+}
+
+function applyCountIf(
+  args: Array<Value | RangeRef>,
+  resolve: (row: number, col: number) => Value,
+): Value {
+  const range = args[0]
+  const criteriaArg = args[1]
+  if (typeof range !== 'object') return '#VALUE!'
+  const criteria = parseCriteria(criteriaArg)
+  if (typeof criteria === 'string') return criteria
+  let count = 0
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const v = resolve(row, col)
+      if (criteria.match(v)) count += 1
+    }
+  }
+  return count
+}
+
+function aggregateNumeric(
+  name: string,
+  args: Array<Value | RangeRef>,
+  resolve: (row: number, col: number) => Value,
+): Value {
+  const numbers: number[] = []
+  for (const arg of args) {
+    if (typeof arg === 'object') {
+      for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
+        for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
+          const v = resolve(row, col)
+          if (typeof v === 'string') {
+            if (name === 'COUNT') continue
+            if (isErrLocal(v)) return v
+            continue
+          }
+          numbers.push(v)
+        }
+      }
+      continue
+    }
+    if (isErrLocal(arg)) return arg
+    if (typeof arg === 'number') numbers.push(arg)
+  }
+  switch (name) {
+    case 'SUM':
+      return numbers.reduce((a, b) => a + b, 0)
+    case 'AVERAGE':
+      if (numbers.length === 0) return '#DIV/0!'
+      return numbers.reduce((a, b) => a + b, 0) / numbers.length
+    case 'COUNT':
+      return numbers.length
+    case 'MIN':
+      return numbers.length === 0 ? 0 : Math.min(...numbers)
+    case 'MAX':
+      return numbers.length === 0 ? 0 : Math.max(...numbers)
+    default:
+      return '#ERROR!'
   }
 }
 
@@ -318,7 +618,7 @@ export function evaluateFormula(
   formula: string,
   lookup: EvalCellLookup,
   stack: Set<string> = new Set(),
-): number | string {
+): Value {
   const body = formula.startsWith('=') ? formula.slice(1) : formula
   const tokens = tokenize(body)
   if (!tokens) return '#ERROR!'
@@ -331,7 +631,7 @@ function resolveCellValue(
   row: number,
   col: number,
   stack: Set<string>,
-): number | string {
+): Value {
   const key = `${row}:${col}`
   if (stack.has(key)) return '#CYCLE!'
   const cell = lookup.get(row, col)
@@ -351,7 +651,7 @@ function resolveCellValue(
   return Number.isFinite(n) ? n : cell.displayValue
 }
 
-export function formatEvalResult(result: number | string): { display: string; isError: boolean } {
+export function formatEvalResult(result: Value): { display: string; isError: boolean } {
   if (typeof result === 'string' && result.startsWith('#')) {
     return { display: result, isError: true }
   }

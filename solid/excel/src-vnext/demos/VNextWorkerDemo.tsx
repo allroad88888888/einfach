@@ -18,6 +18,7 @@ import { SpreadsheetDataValidationDialog } from '../data-validation'
 import { SpreadsheetFilterDropdown } from '../filter-sort'
 import { SpreadsheetFindReplaceDialog } from '../find-replace'
 import { SpreadsheetFormatPainter } from '../format-painter'
+import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
@@ -29,7 +30,7 @@ import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
-import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
+import { acceptFormulaSuggestion, SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
 const viewport: ViewportMetrics = {
   scrollTop: 0,
@@ -194,6 +195,22 @@ function VNextWorkerWorkbook() {
       <SpreadsheetProtectionUnlockDialog data-testid="vnext-worker-protection-unlock" />
       <SpreadsheetHistoryTimeline data-testid="vnext-worker-history-timeline" />
       <SpreadsheetPresenceOverlay data-testid="vnext-worker-presence" />
+      <SpreadsheetFormulaAutocomplete
+        data-testid="vnext-worker-formula-autocomplete"
+        onAccept={(suggestion) => {
+          const { caret } = acceptFormulaSuggestion(store, suggestion)
+          queueMicrotask(() => {
+            const el = document.activeElement
+            if (
+              el instanceof HTMLInputElement &&
+              (el.classList.contains('cell-input') || el.classList.contains('formula-bar-input'))
+            ) {
+              el.focus()
+              el.setSelectionRange(caret, caret)
+            }
+          })
+        }}
+      />
     </>
   )
 }
