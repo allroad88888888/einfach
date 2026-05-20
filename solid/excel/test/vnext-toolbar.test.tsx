@@ -18,8 +18,6 @@ import {
   startEditingAtom,
   toolbarIntentAtom,
   setSheetProtectionAtom,
-  findReplaceOpenAtom,
-  printPreviewOpenAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetToolbar } from '../src-vnext/toolbar'
@@ -125,8 +123,6 @@ function getButtons(container: HTMLElement) {
       container.querySelector('[data-testid="toolbar-merge-center"]') as HTMLButtonElement | null,
     unmergeItem: () =>
       container.querySelector('[data-testid="toolbar-merge-unmerge"]') as HTMLButtonElement | null,
-    find: container.querySelector('[data-testid="toolbar-btn-find"]') as HTMLButtonElement,
-    printPreview: container.querySelector('[data-testid="toolbar-btn-print-preview"]') as HTMLButtonElement,
     painter: container.querySelector(
       '[data-testid="toolbar-btn-format-painter"]',
     ) as HTMLButtonElement,
@@ -413,7 +409,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.merge.disabled).toBe(true)
   })
 
-  it('Find button opens findReplaceOpenAtom', () => {
+  it('does not render Find or Print Preview toolbar buttons', () => {
     const store = createStore()
     const backend = createFakeBackend()
 
@@ -426,40 +422,11 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    expect(store.getter(findReplaceOpenAtom)).toBe(false)
-
-    const buttons = getButtons(container)
-    expect(buttons.find).not.toBeNull()
-    fireEvent.click(buttons.find)
-
-    expect(store.getter(findReplaceOpenAtom)).toBe(true)
-  })
-
-  it('Print preview button toggles printPreviewOpenAtom', () => {
-    const store = createStore()
-    const backend = createFakeBackend()
-
-    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
-    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
-
-    const { container } = render(() => (
-      <SpreadsheetUiProvider backend={backend} store={store}>
-        <SpreadsheetToolbar />
-      </SpreadsheetUiProvider>
-    ))
-
-    expect(store.getter(printPreviewOpenAtom)).toBe(false)
-
-    const buttons = getButtons(container)
-    expect(buttons.printPreview).not.toBeNull()
-    fireEvent.click(buttons.printPreview)
-
-    expect(store.getter(printPreviewOpenAtom)).toBe(true)
-
-    // re-query button in case Solid replaced the DOM node after re-render
-    const buttons2 = getButtons(container)
-    fireEvent.click(buttons2.printPreview)
-    expect(store.getter(printPreviewOpenAtom)).toBe(false)
+    // Find + Replace and Print Preview now ship only via menu entries — the
+    // toolbar surface dropped them in favour of icon-only formatting buttons
+    // for Univer parity.
+    expect(container.querySelector('[data-testid="toolbar-btn-find"]')).toBeNull()
+    expect(container.querySelector('[data-testid="toolbar-btn-print-preview"]')).toBeNull()
   })
 
   it('toggles bold off when the active cell is already bold', async () => {

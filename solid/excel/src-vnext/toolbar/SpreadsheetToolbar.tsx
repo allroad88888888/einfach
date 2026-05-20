@@ -16,9 +16,6 @@ import {
   toolbarCommandAvailabilityAtom,
   activeCellLockedAtom,
   selectionLockedAtom,
-  findReplaceOpenAtom,
-  printPreviewOpenAtom,
-  togglePrintPreviewAtom,
   type CapturedFormat,
   type CellRange,
   type DisplayCell,
@@ -53,6 +50,15 @@ import {
   FontSizeDropdown,
 } from './FontSizeDropdown'
 import { RotationDropdown, type RotationPreset } from './RotationDropdown'
+import {
+  BoldIcon,
+  FillColorIcon,
+  FormatPainterIcon,
+  ItalicIcon,
+  NumberFormatIcon,
+  TextColorIcon,
+  UnderlineIcon,
+} from './ToolbarIcons'
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
@@ -63,6 +69,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.bold.title',
     testId: 'toolbar-btn-bold',
     isEnabled: (availability) => availability.bold,
+    icon: BoldIcon,
   },
   {
     command: 'italic',
@@ -70,6 +77,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.italic.title',
     testId: 'toolbar-btn-italic',
     isEnabled: (availability) => availability.italic,
+    icon: ItalicIcon,
   },
   {
     command: 'underline',
@@ -77,6 +85,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.underline.title',
     testId: 'toolbar-btn-underline',
     isEnabled: (availability) => availability.underline,
+    icon: UnderlineIcon,
   },
   {
     command: 'strikethrough',
@@ -92,6 +101,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-fill-color',
     value: '#ffd966',
     isEnabled: (availability) => availability.fillColor,
+    icon: FillColorIcon,
   },
   {
     command: 'text-color',
@@ -100,6 +110,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-text-color',
     value: '#000000',
     isEnabled: (availability) => availability.textColor,
+    icon: TextColorIcon,
   },
   {
     command: 'number-format',
@@ -111,6 +122,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     // safety net for callers that bypass the dropdown (none today).
     value: 'Number',
     isEnabled: (availability) => availability.numberFormat,
+    icon: NumberFormatIcon,
   },
   {
     // Univer-parity shortcut — one-click percent format. The token routes
@@ -271,8 +283,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
   const activeCellLocked = useAtomValue(activeCellLockedAtom)
   const selectionLocked = useAtomValue(selectionLockedAtom)
-  const findReplaceOpen = useAtomValue(findReplaceOpenAtom)
-  const printPreviewOpen = useAtomValue(printPreviewOpenAtom)
   const formatPainterState = useAtomValue(formatPainterStateAtom)
   const [numberFormatOpen, setNumberFormatOpen] = createSignal(false)
   const [numberFormatAnchor, setNumberFormatAnchor] = createSignal<DOMRect | null>(null)
@@ -1137,7 +1147,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
               dispatchCommand(commandValue)
             }}
           >
-            {t(command.label)}
+            {command.icon ? command.icon() : t(command.label)}
           </button>
         )
       })}
@@ -1295,32 +1305,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       </div>
       <button
         type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-find"
-        title={t('toolbar.find.title')}
-        aria-label={t('toolbar.find.title')}
-        aria-pressed={findReplaceOpen()}
-        onClick={() => {
-          store.setter(findReplaceOpenAtom, true)
-        }}
-      >
-        {t('toolbar.find')}
-      </button>
-      <button
-        type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-print-preview"
-        title={t('toolbar.printPreview.title')}
-        aria-label={t('toolbar.printPreview.title')}
-        aria-pressed={printPreviewOpen()}
-        onClick={() => {
-          store.setter(togglePrintPreviewAtom)
-        }}
-      >
-        {t('toolbar.printPreview')}
-      </button>
-      <button
-        type="button"
         class={`fmt-btn spreadsheet-toolbar-button ${
           formatPainterState() !== 'idle' ? 'fmt-btn-active' : ''
         }`.trim()}
@@ -1337,7 +1321,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onClick={handleFormatPainterClick}
         onDblClick={handleFormatPainterDoubleClick}
       >
-        {t('toolbar.painter')}
+        <FormatPainterIcon />
       </button>
       <button
         type="button"

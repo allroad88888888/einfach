@@ -50,6 +50,26 @@ const strikethroughBtn = (page: Page) => page.getByTestId('toolbar-btn-strikethr
 const wrapBtn = (page: Page) => page.getByTestId('toolbar-btn-wrap')
 const rotationBtn = (page: Page) => page.getByTestId('toolbar-btn-rotation')
 
+test.describe('Format audit — toolbar icon glyphs', () => {
+  test('bold button renders an inline SVG glyph (icon-only, no text label)', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    // The Univer-style toolbar swaps the previous "B" text label for an SVG
+    // icon. The aria-label / title still carry the localized verb so screen
+    // readers and tooltips are unaffected.
+    await expect(boldBtn(page).locator('svg')).toHaveCount(1)
+  })
+
+  test('toolbar does not render Find / Print Preview buttons', async ({ page }) => {
+    await gotoWave5(page)
+    // Find + Replace and Print Preview were removed from the toolbar to match
+    // the Wave 5 target layout. Both surfaces still exist via menus.
+    await expect(page.getByTestId('toolbar-btn-find')).toHaveCount(0)
+    await expect(page.getByTestId('toolbar-btn-print-preview')).toHaveCount(0)
+  })
+})
+
 test.describe('Format audit — toolbar B/I/U', () => {
   test('bold persists across selection change and re-selection', async ({ page }) => {
     await gotoWave5(page)
