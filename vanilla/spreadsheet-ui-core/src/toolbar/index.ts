@@ -74,6 +74,7 @@ export function getToolbarCommandAvailability(
     underline: canStyleSelection,
     strikethrough: canStyleSelection,
     wrap: canStyleSelection,
+    rotation: canStyleSelection,
     indent: canStyleSelection,
     border: canStyleSelection,
     fontFamily: canStyleSelection,
@@ -106,6 +107,8 @@ export function isToolbarFormatCommandAvailable(
       return availability.strikethrough
     case 'wrap':
       return availability.wrap
+    case 'rotation':
+      return availability.rotation
     case 'indent-increase':
     case 'indent-decrease':
       return availability.indent

@@ -25,6 +25,7 @@ export type ToolbarFormatCommandKind =
   | 'underline'
   | 'strikethrough'
   | 'wrap'
+  | 'rotation'
   | 'indent-increase'
   | 'indent-decrease'
   | 'border'
@@ -54,6 +55,7 @@ export interface ToolbarCommandAvailability extends ToolbarAvailabilitySnapshot 
   underline: boolean
   strikethrough: boolean
   wrap: boolean
+  rotation: boolean
   indent: boolean
   border: boolean
   fontFamily: boolean

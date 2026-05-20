@@ -46,6 +46,9 @@ const vAlignDropdown = (page: Page) => page.getByTestId('toolbar-v-align-dropdow
 const vAlignTopOpt = (page: Page) => page.getByTestId('toolbar-v-align-top')
 const vAlignMiddleOpt = (page: Page) => page.getByTestId('toolbar-v-align-middle')
 const vAlignBottomOpt = (page: Page) => page.getByTestId('toolbar-v-align-bottom')
+const strikethroughBtn = (page: Page) => page.getByTestId('toolbar-btn-strikethrough')
+const wrapBtn = (page: Page) => page.getByTestId('toolbar-btn-wrap')
+const rotationBtn = (page: Page) => page.getByTestId('toolbar-btn-rotation')
 
 test.describe('Format audit — toolbar B/I/U', () => {
   test('bold persists across selection change and re-selection', async ({ page }) => {
@@ -787,7 +790,6 @@ test.describe('Format audit — Univer-parity shortcuts', () => {
 })
 
 test.describe('Format audit — merge dropdown', () => {
-test.describe('Format audit — merge dropdown', () => {
   const mergeBtn = (page: Page) => page.getByTestId('toolbar-btn-merge')
   const mergeDropdown = (page: Page) => page.getByTestId('toolbar-merge-dropdown')
   const mergeCenterItem = (page: Page) => page.getByTestId('toolbar-merge-center')
@@ -883,5 +885,107 @@ test.describe('Format audit — merge dropdown', () => {
     }
     await expect(cell(page, 'A1')).toHaveAttribute('rowspan', '1')
     await expect(cell(page, 'A1')).toHaveAttribute('colspan', '1')
+  })
+})
+
+test.describe('Format audit — strikethrough toolbar', () => {
+  test('strikethrough toggles text-decoration-line: line-through on B2', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await expect(strikethroughBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await strikethroughBtn(page).click()
+    await expect(strikethroughBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('text-decoration-line', 'line-through')
+
+    // Toggle off — line-through must clear.
+    await strikethroughBtn(page).click()
+    await expect(strikethroughBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(cellDisplay(page, 'B2')).not.toHaveCSS('text-decoration-line', 'line-through')
+  })
+})
+
+test.describe('Format audit — wrap toolbar', () => {
+  test('wrap toggles overflow-wrap on B2 and is pressed', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await expect(wrapBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await wrapBtn(page).click()
+    await expect(wrapBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    // Renderer sets `white-space: normal`, `word-break: break-word`,
+    // `overflow-wrap: anywhere` when wrap (or overflow === 'wrap') is
+    // engaged. `overflow-wrap: anywhere` is the most distinctive marker
+    // because the browser default is `normal`.
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('overflow-wrap', 'anywhere')
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('white-space', 'normal')
+
+    await wrapBtn(page).click()
+    await expect(wrapBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(cellDisplay(page, 'B2')).not.toHaveCSS('overflow-wrap', 'anywhere')
+  })
+})
+
+test.describe('Format audit — rotation dropdown', () => {
+  test('opening the dropdown shows the 6 preset options', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await rotationBtn(page).click()
+    const dropdown = page.getByTestId('toolbar-rotation-dropdown')
+    await expect(dropdown).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-0')).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-45')).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-90')).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-neg45')).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-neg90')).toBeVisible()
+    await expect(page.getByTestId('toolbar-rotation-vertical')).toBeVisible()
+  })
+
+  test('picking 90° applies rotate(90deg) transform to B2', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await rotationBtn(page).click()
+    await page.getByTestId('toolbar-rotation-90').click()
+    await expect(page.getByTestId('toolbar-rotation-dropdown')).toBeHidden()
+
+    // Computed `transform` for `rotate(90deg)` is the 2D matrix
+    // `matrix(0, 1, -1, 0, 0, 0)` (browsers sometimes round cos(90°) to a
+    // tiny epsilon like 6.1e-17 instead of 0).
+    const transform = await cellDisplay(page, 'B2').evaluate(
+      (el) => getComputedStyle(el).transform,
+    )
+    expect(transform).toMatch(/^matrix\(/)
+    // Second matrix slot is sin(90°) = 1, third is -sin = -1 — invariant
+    // regardless of how the engine renders cos(90°).
+    expect(transform).toMatch(/matrix\([^,]+,\s*1\s*,\s*-1\s*,/)
+  })
+
+  test('picking 竖排 (vertical) sets writing-mode to vertical-rl', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await rotationBtn(page).click()
+    await page.getByTestId('toolbar-rotation-vertical').click()
+    await expect(page.getByTestId('toolbar-rotation-dropdown')).toBeHidden()
+
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('writing-mode', 'vertical-rl')
+  })
+
+  test('Escape closes the rotation dropdown without applying a preset', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await rotationBtn(page).click()
+    await expect(page.getByTestId('toolbar-rotation-dropdown')).toBeVisible()
+
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('toolbar-rotation-dropdown')).toBeHidden()
+    // Transform untouched.
+    const transform = await cellDisplay(page, 'B2').evaluate(
+      (el) => getComputedStyle(el).transform,
+    )
+    expect(transform === 'none' || transform === '').toBeTruthy()
   })
 })

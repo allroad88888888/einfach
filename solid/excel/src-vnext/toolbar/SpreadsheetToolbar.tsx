@@ -52,6 +52,7 @@ import {
   FONT_SIZE_MIN,
   FontSizeDropdown,
 } from './FontSizeDropdown'
+import { RotationDropdown, type RotationPreset } from './RotationDropdown'
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
@@ -76,6 +77,13 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.underline.title',
     testId: 'toolbar-btn-underline',
     isEnabled: (availability) => availability.underline,
+  },
+  {
+    command: 'strikethrough',
+    label: 'toolbar.strikethrough',
+    title: 'toolbar.strikethrough.title',
+    testId: 'toolbar-btn-strikethrough',
+    isEnabled: (availability) => availability.strikethrough,
   },
   {
     command: 'fill-color',
@@ -123,6 +131,13 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-currency-format',
     value: 'Currency',
     isEnabled: (availability) => availability.numberFormat,
+  },
+  {
+    command: 'wrap',
+    label: 'toolbar.wrap',
+    title: 'toolbar.wrap.title',
+    testId: 'toolbar-btn-wrap',
+    isEnabled: (availability) => availability.wrap,
   },
 ]
 
@@ -338,6 +353,11 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     dispatchCommand({ command: 'vertical-alignment', value })
   }
 
+  // Rotation dropdown mirrors the borders pattern — local signal, anchored to
+  // its own toolbar button.
+  const [rotationDropdownOpen, setRotationDropdownOpen] = createSignal(false)
+  let rotationAnchorRef: HTMLButtonElement | undefined
+
   const colorPopover = useAtomValue(colorPopoverAtom)
   const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
   const colorAnchors: Partial<Record<ColorPopoverMode, HTMLButtonElement>> = {}
@@ -514,6 +534,25 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         return { ...current, italic: !current.italic }
       case 'underline':
         return { ...current, underline: !current.underline }
+      case 'strikethrough':
+        return { ...current, strikethrough: !current.strikethrough }
+      case 'wrap':
+        return { ...current, wrap: !current.wrap }
+      case 'rotation': {
+        // Empty-string / null sentinel clears the rotation. A numeric token
+        // ('0' included) commits the degrees; 'vertical' switches to stacked
+        // text via CSS writing-mode.
+        if (intent.value === '' || intent.value === null) {
+          const { rotation: _rotation, ...rest } = current
+          return rest
+        }
+        if (intent.value === 'vertical') {
+          return { ...current, rotation: 'vertical' }
+        }
+        const parsed = Number(intent.value)
+        if (!Number.isFinite(parsed)) return current
+        return { ...current, rotation: Math.max(-90, Math.min(90, Math.round(parsed))) }
+      }
       case 'fill-color': {
         // Empty-string sentinel from the color popover means "No Fill" — strip
         // bgColor entirely so the cell falls back to the sheet default.
@@ -759,6 +798,15 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     void executeBordersPreset(preset, sheetId, range).catch(reportCommandError)
+  }
+
+  function handleRotationSelect(preset: RotationPreset) {
+    setRotationDropdownOpen(false)
+    // Serialize the SpreadsheetRotation through the existing string-valued
+    // command channel. The receiving `commandFormat` arm parses 'vertical'
+    // and numeric tokens back into the union value.
+    const value: string = preset === 'vertical' ? 'vertical' : String(preset as number)
+    dispatchCommand({ command: 'rotation', value })
   }
 
   function getMutationSheetId() {
@@ -1038,6 +1086,8 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           if (command.command === 'bold') return !!activeCellFormat().bold
           if (command.command === 'italic') return !!activeCellFormat().italic
           if (command.command === 'underline') return !!activeCellFormat().underline
+          if (command.command === 'strikethrough') return !!activeCellFormat().strikethrough
+          if (command.command === 'wrap') return !!activeCellFormat().wrap
           if (isNumberFormatDropdownOpener) return numberFormatOpen()
           if (colorMode !== null) return colorPopover().mode === colorMode
           return undefined
@@ -1091,6 +1141,35 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           </button>
         )
       })}
+      <div
+        class="spreadsheet-toolbar-rotation-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (rotationAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            rotationDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-rotation"
+          title={t('toolbar.rotation.title')}
+          aria-label={t('toolbar.rotation.title')}
+          aria-haspopup="menu"
+          aria-expanded={rotationDropdownOpen()}
+          disabled={!availability().rotation || isProtectionGated()}
+          onClick={() => {
+            setRotationDropdownOpen((open) => !open)
+          }}
+        >
+          {t('toolbar.rotation')}
+        </button>
+        <RotationDropdown
+          isOpen={rotationDropdownOpen()}
+          anchorRef={rotationAnchorRef ?? null}
+          onSelect={handleRotationSelect}
+          onRequestClose={() => setRotationDropdownOpen(false)}
+        />
+      </div>
       <div
         class="spreadsheet-toolbar-borders-wrapper"
         style={{ position: 'relative', display: 'inline-flex' }}
