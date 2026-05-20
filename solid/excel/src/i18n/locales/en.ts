@@ -194,6 +194,8 @@ export const messages: Record<string, string> = {
   'toolbar.fillColor.title': 'Fill color',
   'toolbar.textColor': 'Text',
   'toolbar.textColor.title': 'Text color',
+  'toolbar.colorPopover.noFill': 'No fill',
+  'toolbar.colorPopover.automatic': 'Automatic',
   'toolbar.numberFormat': 'Num',
   'toolbar.numberFormat.title': 'Number format',
   'numberFormatDropdown.auto': 'Automatic',

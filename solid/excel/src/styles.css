@@ -1185,6 +1185,70 @@ thead .row-header {
   font-variant-numeric: tabular-nums;
 }
 
+/* Toolbar fill/text color popover */
+.spreadsheet-color-popover {
+  background: #ffffff;
+  border: 1px solid var(--border, #c0c0c0);
+  border-radius: 3px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 168px;
+  user-select: none;
+}
+
+.spreadsheet-color-popover-no-fill {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+.spreadsheet-color-popover-no-fill:hover {
+  background: var(--hover, #f0f0f0);
+  border-color: var(--border, #c0c0c0);
+}
+
+.spreadsheet-color-popover-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.spreadsheet-color-popover-row {
+  display: flex;
+  gap: 2px;
+}
+
+.spreadsheet-color-popover-swatch {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  border-radius: 1px;
+}
+
+.spreadsheet-color-popover-swatch:hover {
+  outline: 2px solid var(--excel-green, #217346);
+  outline-offset: -1px;
+}
+
+.spreadsheet-color-popover-hint {
+  min-height: 16px;
+  font-size: 11px;
+  color: #555;
+  padding: 2px 4px;
+  font-family: var(--excel-font);
+}
+
 /* A.3 Name Box + Formula Bar row */
 .spreadsheet-formula-bar {
   display: flex;

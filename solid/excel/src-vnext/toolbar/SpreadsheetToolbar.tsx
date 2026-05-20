@@ -40,6 +40,7 @@ import {
 import { BordersDropdown, type BordersPreset } from './BordersDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
 import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
+import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
@@ -282,6 +283,31 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const [bordersDropdownOpen, setBordersDropdownOpen] = createSignal(false)
   let bordersAnchorRef: HTMLButtonElement | undefined
 
+  const colorPopover = useAtomValue(colorPopoverAtom)
+  const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
+  const colorAnchors: Partial<Record<ColorPopoverMode, HTMLButtonElement>> = {}
+
+  function toggleColorPopover(mode: ColorPopoverMode) {
+    const current = colorPopover().mode
+    if (current === mode) {
+      store.setter(colorPopoverAtom, { mode: null })
+      setAnchorRect(null)
+      return
+    }
+    const anchor = colorAnchors[mode]
+    setAnchorRect(anchor ? anchor.getBoundingClientRect() : null)
+    store.setter(colorPopoverAtom, { mode })
+  }
+
+  function handleColorPick(hex: string) {
+    const mode = colorPopover().mode
+    if (mode === null) return
+    dispatchCommand({
+      command: mode === 'fill' ? 'fill-color' : 'text-color',
+      value: hex,
+    })
+  }
+
   function isProtectionGated(): boolean {
     return activeCellLocked() || selectionLocked() !== 'open'
   }
@@ -401,10 +427,24 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         return { ...current, italic: !current.italic }
       case 'underline':
         return { ...current, underline: !current.underline }
-      case 'fill-color':
+      case 'fill-color': {
+        // Empty-string sentinel from the color popover means "No Fill" — strip
+        // bgColor entirely so the cell falls back to the sheet default.
+        if (intent.value === '') {
+          const { bgColor: _bgColor, ...rest } = current
+          return rest
+        }
         return { ...current, bgColor: intent.value ?? '#ffd966' }
-      case 'text-color':
+      }
+      case 'text-color': {
+        // Empty-string sentinel from the color popover means "Automatic" —
+        // strip fgColor so the cell inherits the default text color.
+        if (intent.value === '') {
+          const { fgColor: _fgColor, ...rest } = current
+          return rest
+        }
         return { ...current, fgColor: intent.value ?? '#000000' }
+      }
       case 'number-format':
         return { ...current, numberFormat: numberFormatForValue(intent.value) }
       case 'alignment':
@@ -706,6 +746,12 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     >
       {toolbarCommands.map((command) => {
         const commandValue = { command: command.command, value: command.value }
+        const colorMode: ColorPopoverMode | null =
+          command.command === 'fill-color'
+            ? 'fill'
+            : command.command === 'text-color'
+              ? 'text'
+              : null
         const isPressed = () => {
           if (command.command === 'bold') return !!activeCellFormat().bold
           if (command.command === 'italic') return !!activeCellFormat().italic
@@ -720,12 +766,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             const current = activeCellFormat().verticalAlign ?? 'bottom'
             return current === command.value
           }
+          if (colorMode !== null) return colorPopover().mode === colorMode
           return undefined
         }
 
         return (
           <button
             type="button"
+            ref={(el) => {
+              if (colorMode) colorAnchors[colorMode] = el
+            }}
             class={`fmt-btn spreadsheet-toolbar-button ${
               isPressed() ? 'fmt-btn-active' : ''
             }`.trim()}
@@ -733,9 +783,19 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             title={t(command.title)}
             aria-label={t(command.title)}
             aria-pressed={isPressed()}
-            aria-haspopup={command.command === 'number-format' ? 'menu' : undefined}
+            aria-haspopup={
+              command.command === 'number-format'
+                ? 'menu'
+                : colorMode
+                  ? 'dialog'
+                  : undefined
+            }
             aria-expanded={
-              command.command === 'number-format' ? numberFormatOpen() : undefined
+              command.command === 'number-format'
+                ? numberFormatOpen()
+                : colorMode
+                  ? colorPopover().mode === colorMode
+                  : undefined
             }
             disabled={!command.isEnabled(availability()) || isProtectionGated()}
             onClick={(event) => {
@@ -745,6 +805,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
                 } else {
                   openNumberFormatDropdown(event.currentTarget)
                 }
+                return
+              }
+              if (colorMode) {
+                toggleColorPopover(colorMode)
                 return
               }
               dispatchCommand(commandValue)
@@ -863,6 +927,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onSelect={onNumberFormatPick}
         onClose={closeNumberFormatDropdown}
       />
+      <FillColorPopover anchorRect={anchorRect} onPick={handleColorPick} />
     </div>
   )
 }

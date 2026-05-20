@@ -140,26 +140,68 @@ test.describe('Format audit — horizontal alignment', () => {
 })
 
 test.describe('Format audit — color buttons', () => {
-  test('fill color paints the active cell background', async ({ page }) => {
+  test('fill color popover applies the picked swatch to the active cell', async ({
+    page,
+  }) => {
     await gotoWave5(page)
     await cell(page, 'B2').click()
-    await fillColorBtn(page).click()
 
-    // Toolbar wires fill-color to the literal "#ffd966".
-    // CSS computed background-color reports as rgb(255, 217, 102).
+    // Click the toolbar fill-color button — it should open the popover, not
+    // apply a color directly.
+    await fillColorBtn(page).click()
+    const popover = page.getByTestId('toolbar-color-popover')
+    await expect(popover).toBeVisible()
+    await expect(popover).toHaveAttribute('data-mode', 'fill')
+
+    // Pick the canonical yellow swatch (#ffd966).
+    await page.getByTestId('color-popover-swatch-#ffd966').click()
+
+    // Popover closes on selection.
+    await expect(popover).toBeHidden()
+
+    // The cell display should now be tinted yellow. The format style is
+    // applied as inline `background: #ffd966` on `.cell-display`, which the
+    // browser computes to rgb(255, 217, 102).
     await expect(cellDisplay(page, 'B2')).toHaveCSS(
       'background-color',
       'rgb(255, 217, 102)',
     )
   })
 
-  test('text color paints the active cell foreground', async ({ page }) => {
+  test('text color popover applies the picked swatch to the active cell', async ({
+    page,
+  }) => {
     await gotoWave5(page)
     await cell(page, 'B3').click()
-    await textColorBtn(page).click()
 
-    // Toolbar wires text-color to the literal "#000000" → rgb(0, 0, 0).
-    await expect(cellDisplay(page, 'B3')).toHaveCSS('color', 'rgb(0, 0, 0)')
+    await textColorBtn(page).click()
+    const popover = page.getByTestId('toolbar-color-popover')
+    await expect(popover).toBeVisible()
+    await expect(popover).toHaveAttribute('data-mode', 'text')
+
+    // Pick a recognisable red swatch (#ff0000 → rgb(255, 0, 0)).
+    await page.getByTestId('color-popover-swatch-#ff0000').click()
+
+    await expect(popover).toBeHidden()
+    await expect(cellDisplay(page, 'B3')).toHaveCSS('color', 'rgb(255, 0, 0)')
+  })
+
+  test('color popover closes on Escape and on outside click', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    // Escape closes.
+    await fillColorBtn(page).click()
+    await expect(page.getByTestId('toolbar-color-popover')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('toolbar-color-popover')).toBeHidden()
+
+    // Outside click also closes — open the popover, then click on a clearly
+    // out-of-popover target (the wave5 menu bar) and assert it closes.
+    await fillColorBtn(page).click()
+    await expect(page.getByTestId('toolbar-color-popover')).toBeVisible()
+    await page.getByTestId('wave5-menu-bar').click({ position: { x: 5, y: 5 } })
+    await expect(page.getByTestId('toolbar-color-popover')).toBeHidden()
   })
 })
 
