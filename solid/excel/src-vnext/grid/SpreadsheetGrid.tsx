@@ -165,27 +165,22 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (format.fontFamily) style['font-family'] = format.fontFamily
 
   if (format.verticalAlign) {
-    // The parent .spreadsheet-grid-cell-button is a column-flex container,
-    // so a child can pick its vertical anchor via auto margins. We still
-    // emit the legacy CSS variable as a hint for adapters that wrap the
-    // cell-display in their own flex container.
-    //
-    // Note: the cell-format `verticalAlign` enum uses `'center'` for middle
-    // (matching Excel and other spreadsheet engines), but the CSS
-    // `vertical-align` property uses `'middle'`. Translate so the rendered
-    // style is valid and not silently dropped to `baseline`.
+    // The parent .spreadsheet-grid-cell-button is flex-direction:column, so
+    // align-self positions the cell-display along the cross axis (vertical).
+    // The previous margin-auto approach was a no-op because .cell-display
+    // defaults to height:100%, leaving the auto margins no space to grow
+    // into. Override the height and use align-self so each anchor (top /
+    // center / bottom) actually moves the text. The legacy
+    // --cell-vertical-align var stays for canvas-overlay adapters that read
+    // the anchor directly.
     style['--cell-vertical-align'] = format.verticalAlign
-    style['vertical-align'] = format.verticalAlign === 'center' ? 'middle' : format.verticalAlign
-    if (format.verticalAlign === 'top') {
-      style['margin-top'] = '0'
-      style['margin-bottom'] = 'auto'
-    } else if (format.verticalAlign === 'center') {
-      style['margin-top'] = 'auto'
-      style['margin-bottom'] = 'auto'
-    } else if (format.verticalAlign === 'bottom') {
-      style['margin-top'] = 'auto'
-      style['margin-bottom'] = '0'
-    }
+    style['height'] = 'auto'
+    style['align-self'] =
+      format.verticalAlign === 'center'
+        ? 'center'
+        : format.verticalAlign === 'top'
+          ? 'flex-start'
+          : 'flex-end'
   }
 
   // Rotation. Numeric values rotate around the centre; `'vertical'` uses
