@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { withEnglishLocale } from './helpers'
 
 /**
  * P1: i18n locale switcher.
@@ -36,7 +37,10 @@ function demoH3(page: Page) {
 }
 
 async function gotoApp(page: Page) {
-  await page.goto('/')
+  // App bundles default to locale=zh; the i18n spec exercises the EN→ZH
+  // switch, so we anchor on EN at boot via the `?locale=en` URL param
+  // (see `i18n/index.ts::readLocaleFromUrl`).
+  await page.goto(withEnglishLocale())
   // i18n coverage stays on the legacy Blank demo even though the app now
   // boots into vNext by default.
   await page.getByRole('button', { name: 'Blank', exact: true }).click()

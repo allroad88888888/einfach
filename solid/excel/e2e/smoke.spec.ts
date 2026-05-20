@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { withEnglishLocale } from './helpers'
 
 /**
  * Smoke suite for the Solid Excel demo.
@@ -25,7 +26,7 @@ function cellInput(page: Page, addr: string) {
 }
 
 async function gotoBlank(page: Page) {
-  await page.goto('/')
+  await page.goto(withEnglishLocale())
   await page.getByRole('button', { name: 'Blank' }).click()
   // The blank table renders A1..J20; wait for it before each test acts.
   await expect(cell(page, 'A1')).toBeVisible()

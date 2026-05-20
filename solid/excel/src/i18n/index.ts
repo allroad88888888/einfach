@@ -18,13 +18,28 @@ export type Locale = 'en' | 'zh'
 
 const DEFAULT_LOCALE: Locale = 'zh'
 
+/**
+ * URL `?locale=en|zh` overrides the bundled default. Used by the e2e suite
+ * to force EN so legacy specs that match against English nav button labels
+ * keep working without each helper toggling the LocaleSwitcher. Returns
+ * `null` when the param is missing or invalid so production callers fall
+ * back to DEFAULT_LOCALE.
+ */
+function readLocaleFromUrl(): Locale | null {
+  if (typeof window === 'undefined') return null
+  const value = new URLSearchParams(window.location.search).get('locale')
+  return value === 'en' || value === 'zh' ? value : null
+}
+
+const INITIAL_LOCALE: Locale = readLocaleFromUrl() ?? DEFAULT_LOCALE
+
 // Lingui catalog setup happens once at module load. Side effect, but the
 // alternative (caller calls a `setupI18n()` initializer) just moves the same
 // import-order requirement onto the demo entry point.
 i18n.load({ en: enMessages, zh: zhMessages })
-i18n.activate(DEFAULT_LOCALE)
+i18n.activate(INITIAL_LOCALE)
 
-const [localeSignal, setLocaleSignal] = createSignal<Locale>(DEFAULT_LOCALE)
+const [localeSignal, setLocaleSignal] = createSignal<Locale>(INITIAL_LOCALE)
 
 /** Current active locale as a Solid accessor. */
 export const locale: Accessor<Locale> = localeSignal

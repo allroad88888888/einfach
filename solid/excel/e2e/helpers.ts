@@ -39,16 +39,38 @@ export function cellInput(page: Page, addr: string) {
 
 /**
  * Open a demo by name and wait for its table to render. `name` is the
- * exact button text in App.tsx's demo nav (e.g. "Blank", "Formulas",
- * "Multi-Sheet", "3-Sheet Chain").
+ * exact English button text in App.tsx's demo nav (e.g. "Blank",
+ * "Formulas", "Multi-Sheet", "3-Sheet Chain").
+ *
+ * The app boots with locale=zh (commit dede42a), so the demo buttons
+ * render with Chinese labels by default. We append `?locale=en` to the URL
+ * so the i18n module activates EN at boot (see `i18n/index.ts::readLocaleFromUrl`).
+ * That keeps every legacy spec — which still matches against the English
+ * literals "Blank" / "Formulas" / "1M Cells" — green without touching them.
  *
  * Pass `query` when you need debug params (e.g. `?debug=1` for the
- * render-counter probe). The query string is appended verbatim.
+ * render-counter probe). The query string is appended verbatim and we
+ * tack `locale=en` onto it.
  */
 export async function gotoDemo(page: Page, name: string, query = '') {
-  await page.goto(query ? `/?${query.replace(/^\?/, '')}` : '/')
+  await page.goto(withEnglishLocale(query))
   await page.getByRole('button', { name, exact: true }).click()
   await expect(cell(page, 'A1')).toBeVisible({ timeout: 30_000 })
+}
+
+/**
+ * Build a URL with `locale=en` appended to the query string. Idempotent —
+ * if the caller already supplied a `locale=` param we don't duplicate it.
+ * Used by `gotoDemo` and by any spec-local nav helper that bypasses
+ * `gotoDemo` but still needs the EN catalog.
+ */
+export function withEnglishLocale(query = ''): string {
+  const cleaned = query.replace(/^\?/, '')
+  if (/(^|&)locale=/.test(cleaned)) {
+    return cleaned ? `/?${cleaned}` : '/'
+  }
+  const merged = cleaned ? `${cleaned}&locale=en` : 'locale=en'
+  return `/?${merged}`
 }
 
 /**

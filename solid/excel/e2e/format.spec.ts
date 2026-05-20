@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test'
+import { withEnglishLocale } from './helpers'
 
 /**
  * Phase 6 — format toolbar e2e.
@@ -22,7 +23,7 @@ function cellInput(page: Page, addr: string) {
 }
 
 async function gotoBlank(page: Page) {
-  await page.goto('/')
+  await page.goto(withEnglishLocale())
   await page.getByRole('button', { name: 'Blank' }).click()
   await expect(cell(page, 'A1')).toBeVisible()
   // Format toolbar opt-in is wired on DemoBlank via `toolbar` prop.
@@ -30,7 +31,7 @@ async function gotoBlank(page: Page) {
 }
 
 async function gotoBlankDebug(page: Page) {
-  await page.goto('/?debug=1')
+  await page.goto(withEnglishLocale('debug=1'))
   await page.getByRole('button', { name: 'Blank' }).click()
   await expect(cell(page, 'A1')).toBeVisible()
   await expect(page.locator('.format-toolbar')).toBeVisible()
