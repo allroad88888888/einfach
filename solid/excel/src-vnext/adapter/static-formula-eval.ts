@@ -96,7 +96,22 @@ const FUNCTION_NAMES = new Set([
   'ABS',
   'ROUND',
   'CONCAT',
+  'AND',
+  'OR',
+  'NOT',
+  'LEN',
+  'LOWER',
+  'UPPER',
+  'TRIM',
+  'SQRT',
+  'MOD',
 ])
+
+/** Bare-name literals (no parens) — Excel parity for TRUE/FALSE. */
+const BARE_LITERALS: Record<string, number> = {
+  TRUE: 1,
+  FALSE: 0,
+}
 
 function tokenize(input: string): Token[] | null {
   const tokens: Token[] = []
@@ -196,6 +211,11 @@ function tokenize(input: string): Token[] | null {
       // Function name (followed by '(').
       if (FUNCTION_NAMES.has(text) && input[i] === '(') {
         tokens.push({ kind: 'func', name: text })
+        continue
+      }
+      // Bare TRUE/FALSE → numeric literal (Excel parity).
+      if (BARE_LITERALS[text] !== undefined) {
+        tokens.push({ kind: 'number', value: BARE_LITERALS[text] })
         continue
       }
       const cell = parseCellRef(text)
@@ -442,11 +462,92 @@ class Parser {
         }
         return out
       }
+      case 'AND':
+        return applyBooleanReduce(args, this.resolve, true)
+      case 'OR':
+        return applyBooleanReduce(args, this.resolve, false)
+      case 'NOT': {
+        const v = takeScalar(args, 0)
+        if (isErr(v)) return v
+        return isTruthy(v) ? 0 : 1
+      }
+      case 'LEN': {
+        const v = takeScalar(args, 0)
+        if (isErr(v)) return v
+        return String(v).length
+      }
+      case 'LOWER': {
+        const v = takeScalar(args, 0)
+        if (isErr(v)) return v
+        return String(v).toLowerCase()
+      }
+      case 'UPPER': {
+        const v = takeScalar(args, 0)
+        if (isErr(v)) return v
+        return String(v).toUpperCase()
+      }
+      case 'TRIM': {
+        const v = takeScalar(args, 0)
+        if (isErr(v)) return v
+        // Excel TRIM strips leading/trailing and collapses internal runs of
+        // spaces to single spaces.
+        return String(v).replace(/\s+/g, ' ').trim()
+      }
+      case 'SQRT': {
+        const n = takeScalar(args, 0)
+        if (typeof n !== 'number') return isErr(n) ? n : '#VALUE!'
+        if (n < 0) return '#NUM!'
+        return Math.sqrt(n)
+      }
+      case 'MOD': {
+        const n = takeScalar(args, 0)
+        const divisor = takeScalar(args, 1)
+        if (typeof n !== 'number' || typeof divisor !== 'number') return '#VALUE!'
+        if (divisor === 0) return '#DIV/0!'
+        return n - Math.floor(n / divisor) * divisor
+      }
       // SUM-like aggregations fall through.
       default:
         return aggregateNumeric(name, args, this.resolve)
     }
   }
+}
+
+function applyBooleanReduce(
+  args: Array<Value | RangeRef>,
+  resolve: (row: number, col: number) => Value,
+  isAnd: boolean,
+): Value {
+  let result = isAnd
+  let sawAny = false
+  for (const arg of args) {
+    if (typeof arg === 'object') {
+      for (let row = arg.rowStart; row <= arg.rowEnd; row += 1) {
+        for (let col = arg.colStart; col <= arg.colEnd; col += 1) {
+          const v = resolve(row, col)
+          if (isErrLocal(v)) return v
+          sawAny = true
+          const truthy = isTruthy(v)
+          if (isAnd) {
+            if (!truthy) return 0
+          } else {
+            if (truthy) return 1
+          }
+        }
+      }
+      continue
+    }
+    if (isErrLocal(arg)) return arg
+    sawAny = true
+    const truthy = isTruthy(arg)
+    if (isAnd) {
+      if (!truthy) return 0
+    } else {
+      if (truthy) return 1
+    }
+  }
+  if (!sawAny) return '#VALUE!'
+  return isAnd ? (result ? 1 : 0) : 0
 }
 
 function takeScalar(args: Array<Value | RangeRef>, index: number): Value {

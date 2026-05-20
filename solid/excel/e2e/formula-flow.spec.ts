@@ -390,6 +390,39 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(display(page, 'H8')).toHaveText('Q1=120')
   })
 
+  test('extended evaluator (2nd wave): TRUE/FALSE/AND/OR/NOT/LEN/LOWER/UPPER/TRIM/SQRT/MOD', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+
+    await commitFormulaInCell(page, 'H2', '=TRUE+TRUE')
+    await expect(display(page, 'H2')).toHaveText('2')
+
+    await commitFormulaInCell(page, 'H3', '=AND(B2>0, B2<1000)')
+    await expect(display(page, 'H3')).toHaveText('1')
+
+    await commitFormulaInCell(page, 'H4', '=OR(B2<0, B2>100)')
+    await expect(display(page, 'H4')).toHaveText('1')
+
+    await commitFormulaInCell(page, 'H5', '=NOT(B2>1000)')
+    await expect(display(page, 'H5')).toHaveText('1')
+
+    await commitFormulaInCell(page, 'H6', '=LEN("hello")')
+    await expect(display(page, 'H6')).toHaveText('5')
+
+    await commitFormulaInCell(page, 'H7', '=UPPER("hello")')
+    await expect(display(page, 'H7')).toHaveText('HELLO')
+
+    await commitFormulaInCell(page, 'H8', '=TRIM("  a   b  ")')
+    await expect(display(page, 'H8')).toHaveText('a b')
+
+    await commitFormulaInCell(page, 'H9', '=SQRT(16)')
+    await expect(display(page, 'H9')).toHaveText('4')
+
+    await commitFormulaInCell(page, 'I2', '=MOD(10, 3)')
+    await expect(display(page, 'I2')).toHaveText('1')
+  })
+
   test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H9').click()

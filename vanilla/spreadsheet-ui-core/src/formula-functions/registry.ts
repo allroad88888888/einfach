@@ -74,6 +74,51 @@ export const FORMULA_FUNCTION_SPECS: readonly FormulaFunctionSpec[] = [
     args: [{ name: 'text1' }, { name: 'text2', optional: true, repeats: true }],
     summary: 'Joins several text strings into one.',
   },
+  {
+    name: 'AND',
+    args: [{ name: 'logical1' }, { name: 'logical2', optional: true, repeats: true }],
+    summary: 'Returns TRUE if all arguments are TRUE.',
+  },
+  {
+    name: 'OR',
+    args: [{ name: 'logical1' }, { name: 'logical2', optional: true, repeats: true }],
+    summary: 'Returns TRUE if any argument is TRUE.',
+  },
+  {
+    name: 'NOT',
+    args: [{ name: 'logical' }],
+    summary: 'Reverses the logical value of its argument.',
+  },
+  {
+    name: 'LEN',
+    args: [{ name: 'text' }],
+    summary: 'Returns the number of characters in a text string.',
+  },
+  {
+    name: 'LOWER',
+    args: [{ name: 'text' }],
+    summary: 'Converts text to lowercase.',
+  },
+  {
+    name: 'UPPER',
+    args: [{ name: 'text' }],
+    summary: 'Converts text to uppercase.',
+  },
+  {
+    name: 'TRIM',
+    args: [{ name: 'text' }],
+    summary: 'Removes extra spaces from a text string.',
+  },
+  {
+    name: 'SQRT',
+    args: [{ name: 'number' }],
+    summary: 'Returns a positive square root.',
+  },
+  {
+    name: 'MOD',
+    args: [{ name: 'number' }, { name: 'divisor' }],
+    summary: 'Returns the remainder after a number is divided by a divisor.',
+  },
 ]
 
 const SPEC_BY_NAME: Map<string, FormulaFunctionSpec> = new Map(
