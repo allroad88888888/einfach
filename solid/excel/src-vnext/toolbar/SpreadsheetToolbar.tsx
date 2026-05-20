@@ -431,6 +431,27 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     return cloneFormat(cell?.format)
   }
 
+  /**
+   * Drives the Clear-Format button's disabled state: when the active cell
+   * carries no format overrides, clicking would be a no-op so the button
+   * stays greyed out. Matches Univer behavior (the slim toolbar greys out
+   * the eraser when the focused cell has nothing to clear).
+   *
+   * Tracks the active cell only — not every cell in the selection range —
+   * because that's both the Univer convention and the natural "what does
+   * the toolbar reflect about the focused cell?" model.
+   */
+  function activeCellHasFormat(): boolean {
+    const f = activeCellFormat()
+    for (const key in f) {
+      const value = (f as Record<string, unknown>)[key]
+      if (value === undefined || value === null || value === false) continue
+      if (typeof value === 'object' && value !== null && Object.keys(value).length === 0) continue
+      return true
+    }
+    return false
+  }
+
   function captureFormatPainterPayload(): CapturedFormat {
     const selection = selectionSnapshot()
     const snapshot = projectionSnapshot()
@@ -1094,7 +1115,9 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-clear-format"
         data-tooltip={t('toolbar.clearFormat.title')}
         aria-label={t('toolbar.clearFormat.title')}
-        disabled={!backend.setFormatRange || isProtectionGated()}
+        disabled={
+          !backend.setFormatRange || isProtectionGated() || !activeCellHasFormat()
+        }
         onClick={() => void handleClearFormat()}
       >
         <ClearFormatIcon />
@@ -1354,7 +1377,17 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           aria-label={t('toolbar.merge.title')}
           aria-haspopup="menu"
           aria-expanded={mergeDropdownOpen()}
-          disabled={!backend.mergeRange || availability().editingMode === 'drafting' || isProtectionGated()}
+          disabled={
+            !backend.mergeRange ||
+            availability().editingMode === 'drafting' ||
+            isProtectionGated() ||
+            // 1x1 selection that isn't inside an existing merge → every
+            // option in the merge dropdown (merge-center, across-rows,
+            // across-cols, unmerge) would be a no-op, so disable. Matches
+            // Univer slim toolbar behavior.
+            (rangeCellCount(selectionSnapshot().range) <= 1 &&
+              activeCellMergeRange() === null)
+          }
           onClick={() => {
             setMergeDropdownOpen((open) => !open)
           }}

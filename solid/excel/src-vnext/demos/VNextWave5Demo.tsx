@@ -1,6 +1,8 @@
 import { useAtomValue } from '@einfach/solid'
 import { onMount, Show } from 'solid-js'
 import {
+  selectCellAtom,
+  selectionAtom,
   setWorkspaceActiveSheetAtom,
   viewportShowFormulaBarAtom,
   workspaceSessionAtom,
@@ -112,8 +114,20 @@ function VNextWave5Workbook() {
   const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
 
   onMount(() => {
+    const activeSheetId =
+      store.getter(workspaceSessionAtom).activeSheetId ?? sheets[0].id
     if (!store.getter(workspaceSessionAtom).activeSheetId) {
       store.setter(setWorkspaceActiveSheetAtom, { sheetId: sheets[0].id })
+    }
+    // Default-cursor A1 so the toolbar/header reflect a focused cell from
+    // first paint (Excel + Univer convention). The initial selection state
+    // is `{ kind: 'cell', sheetId: '', ... }` — empty sheetId is the
+    // "untouched" signal we wire the cell selection against.
+    if (!store.getter(selectionAtom).sheetId) {
+      store.setter(selectCellAtom, {
+        sheetId: activeSheetId,
+        coord: { row: 0, col: 0 },
+      })
     }
   })
 

@@ -1,6 +1,8 @@
 import { createEffect, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
+  selectCellAtom,
+  selectionAtom,
   setWorkspaceActiveSheetAtom,
   workspaceSessionAtom,
   type ViewportMetrics,
@@ -164,8 +166,14 @@ function VNextWorkerWorkbook() {
   const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
 
   onMount(() => {
+    const sid =
+      store.getter(workspaceSessionAtom).activeSheetId ?? sheets[0].id
     if (!store.getter(workspaceSessionAtom).activeSheetId) {
       store.setter(setWorkspaceActiveSheetAtom, { sheetId: sheets[0].id })
+    }
+    // Default A1 cursor on first mount (Excel/Univer convention).
+    if (!store.getter(selectionAtom).sheetId) {
+      store.setter(selectCellAtom, { sheetId: sid, coord: { row: 0, col: 0 } })
     }
   })
 
