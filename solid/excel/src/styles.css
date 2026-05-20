@@ -1178,6 +1178,81 @@ thead .row-header {
   color: var(--excel-green);
 }
 
+/*
+ * Custom hover tooltips for toolbar buttons. Replaces the native
+ * title="..." pop-up (which has a multi-second OS delay and OS styling)
+ * with a dark-bubble tip that animates in after 500 ms — matches Univer /
+ * MS Office conventions.
+ *
+ * Accessibility note: each button still carries aria-label, so screen
+ * readers pick up the label even though we dropped title=.
+ *
+ * Suppressed when an associated menu/dialog is open (aria-expanded=true)
+ * so the tooltip does not stack on top of the dropdown panel.
+ */
+.spreadsheet-toolbar [data-tooltip] {
+  position: relative;
+}
+
+.spreadsheet-toolbar [data-tooltip]:hover::after,
+.spreadsheet-toolbar [data-tooltip]:focus-visible::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(34, 34, 34, 0.92);
+  color: #fff;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1.3;
+  font-weight: 400;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 10000;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  animation: spreadsheet-toolbar-tooltip-fade-in 140ms 500ms both;
+}
+
+/* Little arrow above the bubble pointing at the button. */
+.spreadsheet-toolbar [data-tooltip]:hover::before,
+.spreadsheet-toolbar [data-tooltip]:focus-visible::before {
+  content: '';
+  position: absolute;
+  top: calc(100% + 1px);
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-bottom: 5px solid rgba(34, 34, 34, 0.92);
+  transform: translateX(-50%);
+  pointer-events: none;
+  z-index: 10000;
+  animation: spreadsheet-toolbar-tooltip-fade-in 140ms 500ms both;
+}
+
+/* Suppress while the button has an open menu/dialog so the tooltip
+   doesn't sit on top of the popover. */
+.spreadsheet-toolbar [data-tooltip][aria-expanded='true']:hover::after,
+.spreadsheet-toolbar [data-tooltip][aria-expanded='true']:hover::before,
+.spreadsheet-toolbar [data-tooltip]:disabled:hover::after,
+.spreadsheet-toolbar [data-tooltip]:disabled:hover::before {
+  display: none;
+}
+
+@keyframes spreadsheet-toolbar-tooltip-fade-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
 /* Number-format dropdown — anchored beneath the toolbar's number-format
    button. Two-column rows (label left, preview right) mirroring Excel. */
 .number-format-dropdown {

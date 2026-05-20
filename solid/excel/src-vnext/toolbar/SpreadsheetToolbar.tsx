@@ -998,7 +998,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           isPressed() ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid={command.testId}
-        title={t(command.title)}
+        data-tooltip={t(command.title)}
         aria-label={t(command.title)}
         aria-pressed={isPressed()}
         disabled={!command.isEnabled(availability()) || isProtectionGated()}
@@ -1027,7 +1027,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           isPressed() ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid={testId}
-        title={t(titleKey)}
+        data-tooltip={t(titleKey)}
         aria-label={t(titleKey)}
         aria-haspopup="dialog"
         aria-expanded={isPressed()}
@@ -1050,7 +1050,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-undo"
-        title={t('toolbar.undo.title')}
+        data-tooltip={t('toolbar.undo.title')}
         aria-label={t('toolbar.undo.title')}
         disabled={!canUndo()}
         onClick={() => void handleUndo()}
@@ -1061,7 +1061,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-redo"
-        title={t('toolbar.redo.title')}
+        data-tooltip={t('toolbar.redo.title')}
         aria-label={t('toolbar.redo.title')}
         disabled={!canRedo()}
         onClick={() => void handleRedo()}
@@ -1075,7 +1075,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         }`.trim()}
         data-testid="toolbar-btn-format-painter"
         data-format-painter-state={formatPainterState()}
-        title={
+        data-tooltip={
           formatPainterState() === 'sticky'
             ? t('toolbar.painter.title.sticky')
             : t('toolbar.painter.title')
@@ -1092,7 +1092,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-clear-format"
-        title={t('toolbar.clearFormat.title')}
+        data-tooltip={t('toolbar.clearFormat.title')}
         aria-label={t('toolbar.clearFormat.title')}
         disabled={!backend.setFormatRange || isProtectionGated()}
         onClick={() => void handleClearFormat()}
@@ -1110,7 +1110,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           fontFamilyOpen() ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid="toolbar-btn-font-family"
-        title={t('toolbar.fontFamily.title')}
+        data-tooltip={t('toolbar.fontFamily.title')}
         aria-label={t('toolbar.fontFamily.title')}
         aria-haspopup="menu"
         aria-expanded={fontFamilyOpen()}
@@ -1132,7 +1132,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           fontSizeOpen() ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid="toolbar-btn-font-size"
-        title={t('toolbar.fontSize.title')}
+        data-tooltip={t('toolbar.fontSize.title')}
         aria-label={t('toolbar.fontSize.title')}
         aria-haspopup="menu"
         aria-expanded={fontSizeOpen()}
@@ -1151,7 +1151,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-font-size-up"
-        title={t('toolbar.fontSizeUp.title')}
+        data-tooltip={t('toolbar.fontSizeUp.title')}
         aria-label={t('toolbar.fontSizeUp.title')}
         disabled={!availability().fontSize || isProtectionGated()}
         onClick={() => {
@@ -1164,7 +1164,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-font-size-down"
-        title={t('toolbar.fontSizeDown.title')}
+        data-tooltip={t('toolbar.fontSizeDown.title')}
         aria-label={t('toolbar.fontSizeDown.title')}
         disabled={!availability().fontSize || isProtectionGated()}
         onClick={() => {
@@ -1195,7 +1195,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             bordersDropdownOpen() ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-borders"
-          title={t('toolbar.borders.title')}
+          data-tooltip={t('toolbar.borders.title')}
           aria-label={t('toolbar.borders.title')}
           aria-haspopup="menu"
           aria-expanded={bordersDropdownOpen()}
@@ -1230,7 +1230,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           }`.trim()}
           data-testid="toolbar-btn-h-align"
           data-active-align={currentHAlign()}
-          title={t('toolbar.hAlign.title')}
+          data-tooltip={t('toolbar.hAlign.title')}
           aria-label={t('toolbar.hAlign.title')}
           aria-haspopup="menu"
           aria-expanded={hAlignDropdownOpen()}
@@ -1267,7 +1267,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           }`.trim()}
           data-testid="toolbar-btn-v-align"
           data-active-vertical-align={currentVAlign()}
-          title={t('toolbar.vAlign.title')}
+          data-tooltip={t('toolbar.vAlign.title')}
           aria-label={t('toolbar.vAlign.title')}
           aria-haspopup="menu"
           aria-expanded={vAlignDropdownOpen()}
@@ -1298,7 +1298,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           activeCellFormat().wrap ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid="toolbar-btn-wrap"
-        title={t('toolbar.wrap.title')}
+        data-tooltip={t('toolbar.wrap.title')}
         aria-label={t('toolbar.wrap.title')}
         aria-pressed={!!activeCellFormat().wrap}
         disabled={!availability().wrap || isProtectionGated()}
@@ -1317,7 +1317,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             rotationDropdownOpen() ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-rotation"
-          title={t('toolbar.rotation.title')}
+          data-tooltip={t('toolbar.rotation.title')}
           aria-label={t('toolbar.rotation.title')}
           aria-haspopup="menu"
           aria-expanded={rotationDropdownOpen()}
@@ -1350,7 +1350,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             mergeDropdownOpen() ? 'fmt-btn-active' : ''
           }`.trim()}
           data-testid="toolbar-btn-merge"
-          title={t('toolbar.merge.title')}
+          data-tooltip={t('toolbar.merge.title')}
           aria-label={t('toolbar.merge.title')}
           aria-haspopup="menu"
           aria-expanded={mergeDropdownOpen()}
@@ -1381,7 +1381,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           numberFormatOpen() ? 'fmt-btn-active' : ''
         }`.trim()}
         data-testid="toolbar-btn-number-format"
-        title={t('toolbar.currencyDropdown.title')}
+        data-tooltip={t('toolbar.currencyDropdown.title')}
         aria-label={t('toolbar.currencyDropdown.title')}
         aria-haspopup="menu"
         aria-expanded={numberFormatOpen()}
@@ -1403,7 +1403,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-percent-format"
-        title={t('toolbar.percentFormat.title')}
+        data-tooltip={t('toolbar.percentFormat.title')}
         aria-label={t('toolbar.percentFormat.title')}
         disabled={!availability().numberFormat || isProtectionGated()}
         onClick={() => dispatchCommand({ command: 'number-format', value: 'Percent' })}
@@ -1414,7 +1414,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
         data-testid="toolbar-btn-currency-format"
-        title={t('toolbar.currencyFormat.title')}
+        data-tooltip={t('toolbar.currencyFormat.title')}
         aria-label={t('toolbar.currencyFormat.title')}
         disabled={!availability().numberFormat || isProtectionGated()}
         onClick={() => dispatchCommand({ command: 'number-format', value: 'Currency' })}
