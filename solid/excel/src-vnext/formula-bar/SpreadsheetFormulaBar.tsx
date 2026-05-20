@@ -5,6 +5,7 @@ import type {
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  dismissFormulaSuggestionsAtom,
   editingDraftAtom,
   editingSessionAtom,
   focusFormulaBarAtom,
@@ -208,6 +209,15 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
     }
 
     if (isEscapeKey(event)) {
+      // Autocomplete-first: if the popup is open, Esc dismisses it but
+      // keeps the editing session active so the user can keep typing.
+      // Only the second Esc (or Esc with no popup) cancels editing.
+      if (suggestionsOpen) {
+        event.preventDefault()
+        store.setter(dismissFormulaSuggestionsAtom)
+        store.setter(formulaFunctionSuggestionCursorAtom, 0)
+        return
+      }
       event.preventDefault()
       cancelDraft()
       inputRef?.blur()

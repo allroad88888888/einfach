@@ -45,12 +45,28 @@ function rankSuggestions(
 }
 
 /**
+ * Internal source atom: tracks the caret position the user dismissed the
+ * suggestions popup from (via Esc). The derived suggestions atom returns
+ * empty as long as the live caret matches this remembered position — so
+ * `=S` + Esc hides the dropdown, but moving the caret (typing another
+ * char, ArrowLeft/Right, mouse re-position) re-opens it.
+ *
+ * Null means no active dismissal. Hosts call `dismissFormulaSuggestionsAtom`
+ * to set it; helpers below clear it on any user-driven caret change.
+ */
+export const formulaFunctionSuggestionsDismissedAtCaretAtom = atom<number | null>(null)
+formulaFunctionSuggestionsDismissedAtCaretAtom.debugLabel =
+  'spreadsheet.formulaFunctions.dismissedAtCaret'
+
+/**
  * Autocomplete suggestions derived from the editing draft + the live caret
  * tracked in `formulaReferenceCaretAtom`. Returns empty when:
  *   - editing is not drafting
  *   - draft doesn't start with '='
  *   - caret has no function-name fragment to its immediate left
  *   - the fragment has no matching specs
+ *   - the user has dismissed the popup at the current caret position
+ *     (see `dismissFormulaSuggestionsAtom`)
  *
  * The host renders this as a dropdown anchored to the active input.
  */
@@ -61,6 +77,8 @@ export const formulaFunctionSuggestionsAtom = atom<FormulaFunctionSuggestion[]>(
   if (!draft.startsWith('=')) return []
   const caret = get(formulaReferenceCaretAtom)
   if (caret < 0) return []
+  const dismissedAt = get(formulaFunctionSuggestionsDismissedAtCaretAtom)
+  if (dismissedAt !== null && dismissedAt === caret) return []
   const fragment = findFunctionNameFragmentAtCaret(draft, caret)
   if (!fragment) return []
   const matches = rankSuggestions(fragment.text, FORMULA_FUNCTION_SPECS)
@@ -72,6 +90,17 @@ export const formulaFunctionSuggestionsAtom = atom<FormulaFunctionSuggestion[]>(
   }))
 })
 formulaFunctionSuggestionsAtom.debugLabel = 'spreadsheet.formulaFunctions.suggestions'
+
+/**
+ * Mark the autocomplete popup as dismissed at the current caret. Hosts
+ * call this from the input's Esc handler. The popup re-opens automatically
+ * once the caret moves to a different position.
+ */
+export const dismissFormulaSuggestionsAtom = atom(null, (get, set) => {
+  const caret = get(formulaReferenceCaretAtom)
+  set(formulaFunctionSuggestionsDismissedAtCaretAtom, caret < 0 ? null : caret)
+})
+dismissFormulaSuggestionsAtom.debugLabel = 'spreadsheet.formulaFunctions.dismiss'
 
 /**
  * Signature state for the caret: when the caret sits inside a known

@@ -268,6 +268,43 @@ test.describe('formula interaction on Wave 5', () => {
     )
   })
 
+  test('mouse-click on an autocomplete row accepts that suggestion', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'H6').click()
+    await page.keyboard.type('=SU')
+    await expect(page.getByTestId('formula-autocomplete-row-SUMIF')).toBeVisible()
+
+    // Click SUMIF directly (not via ArrowDown + Tab) — pointerdown path.
+    await page.getByTestId('formula-autocomplete-row-SUMIF').click()
+    await expect(cellInput(page, 'H6')).toHaveValue('=SUMIF(')
+  })
+
+  test('Esc closes the autocomplete popup but keeps editing active', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'H6').click()
+    await page.keyboard.type('=S')
+    await expect(page.getByTestId('formula-autocomplete-list')).toBeVisible()
+
+    // First Esc: dismiss popup. Editing input must stay so the user can
+    // continue typing.
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('formula-autocomplete-list')).toHaveCount(0)
+    await expect(cellInput(page, 'H6')).toHaveValue('=S')
+
+    // Typing another char moves the caret → popup re-opens automatically
+    // (dismissal is keyed to the dismissed-at caret position).
+    await page.keyboard.type('U')
+    await expect(page.getByTestId('formula-autocomplete-list')).toBeVisible()
+
+    // Second Esc with the popup re-opened: dismisses again. A subsequent
+    // Esc (popup already closed) cancels editing entirely.
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('formula-autocomplete-list')).toHaveCount(0)
+    await expect(cellInput(page, 'H6')).toHaveValue('=SU')
+    await page.keyboard.press('Escape')
+    await expect(cellInput(page, 'H6')).toHaveCount(0)
+  })
+
   test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H9').click()

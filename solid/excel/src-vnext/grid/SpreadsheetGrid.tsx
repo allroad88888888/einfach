@@ -9,6 +9,7 @@ import {
   createFillHandlePreview,
   createVisibleProjectionRequest,
   dispatchKeyboardInputAtom,
+  dismissFormulaSuggestionsAtom,
   editingDraftAtom,
   editingSessionAtom,
   formulaFunctionSuggestionCursorAtom,
@@ -2567,17 +2568,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                     }
                                     if (event.key === 'Escape') {
                                       event.preventDefault()
+                                      store.setter(dismissFormulaSuggestionsAtom)
                                       store.setter(formulaFunctionSuggestionCursorAtom, 0)
-                                      // Hide the list by inserting nothing —
-                                      // simplest is to bump editingDraft with
-                                      // the same value, which forces the
-                                      // derived suggestions atom to recompute
-                                      // with the latest caret. We instead set
-                                      // a sentinel via cursor reset; the user
-                                      // can re-trigger by typing another char.
-                                      // For now the list stays visible until
-                                      // the caret moves. (Future: a dismissed
-                                      // flag in core.)
                                       bumpRender()
                                       return
                                     }
