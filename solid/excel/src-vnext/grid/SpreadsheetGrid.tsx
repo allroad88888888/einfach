@@ -255,6 +255,25 @@ function getCellRichUrl(cell: DisplayCell | undefined): string | undefined {
   return cell?.richValue?.kind === 'hyperlink' ? cell.richValue.url : undefined
 }
 
+/**
+ * Stringified borders sides so e2e specs can verify the borders toolbar
+ * applied the right per-cell patch without touching the projection atom.
+ * Format: `"top right bottom left"` (sorted, sides that are present only).
+ * Returns `undefined` when no borders are set so the DOM attribute is absent
+ * — keeps the typical render footprint identical to before.
+ */
+function getCellBordersAttr(cell: DisplayCell | undefined): string | undefined {
+  const borders = cell?.format?.borders
+  if (!borders) return undefined
+  const sides: string[] = []
+  if (borders.top) sides.push('top')
+  if (borders.right) sides.push('right')
+  if (borders.bottom) sides.push('bottom')
+  if (borders.left) sides.push('left')
+  if (sides.length === 0) return undefined
+  return sides.join(' ')
+}
+
 function getRichRunStyle(format: RichTextRunFormat | undefined): Record<string, string> {
   if (!format) return {}
 
@@ -2450,6 +2469,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             }
                             data-rich-kind={cell()?.richValue?.kind}
                             data-rich-url={getCellRichUrl(cell())}
+                            data-borders={getCellBordersAttr(cell())}
                             aria-selected={selected() ? 'true' : 'false'}
                             title={getCellValidationMessage(cell())}
                             rowSpan={getCellRowSpan(row, col)}

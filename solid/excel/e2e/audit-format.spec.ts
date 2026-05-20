@@ -482,6 +482,142 @@ test.describe('Format audit — vertical alignment toolbar', () => {
   })
 })
 
+test.describe('Format audit — borders dropdown', () => {
+  const bordersBtn = (page: Page) => page.getByTestId('toolbar-btn-borders')
+  const bordersDropdown = (page: Page) => page.getByTestId('toolbar-borders-dropdown')
+
+  async function selectRange(page: Page, fromAddr: string, toAddr: string) {
+    const start = cell(page, fromAddr)
+    const end = cell(page, toAddr)
+    const sb = await start.boundingBox()
+    const eb = await end.boundingBox()
+    if (!sb || !eb) throw new Error('cells not visible')
+    await page.mouse.move(sb.x + sb.width / 2, sb.y + sb.height / 2)
+    await page.mouse.down()
+    await page.mouse.move(eb.x + eb.width / 2, eb.y + eb.height / 2, { steps: 4 })
+    await page.mouse.up()
+  }
+
+  // Renderer order — keep in sync with `getCellBordersAttr` in
+  // `solid/excel/src-vnext/grid/SpreadsheetGrid.tsx`.
+  const BORDER_SIDE_ORDER: ReadonlyArray<'top' | 'right' | 'bottom' | 'left'> = [
+    'top',
+    'right',
+    'bottom',
+    'left',
+  ]
+
+  async function expectCellHasBordersAttr(
+    page: Page,
+    addr: string,
+    expectedSides: ReadonlyArray<'top' | 'right' | 'bottom' | 'left'>,
+  ) {
+    // The cell <td> exposes its borders via `data-borders="<sides>"` so
+    // tests can verify the toolbar's per-cell patch without round-tripping
+    // through the Format Cells dialog (which shows a draft seeded blank).
+    const target = cell(page, addr)
+    const expected = BORDER_SIDE_ORDER.filter((side) => expectedSides.includes(side)).join(' ')
+    await expect(target).toHaveAttribute('data-borders', expected)
+  }
+
+  test('all-borders preset paints every cell in the A1:B2 selection', async ({ page }) => {
+    await gotoWave5(page)
+
+    // Drag-select A1:B2 (2x2).
+    await selectRange(page, 'A1', 'B2')
+    for (const addr of ['A1', 'B1', 'A2', 'B2']) {
+      await expect(cell(page, addr)).toHaveAttribute('data-selected', 'true')
+    }
+
+    // Open the borders dropdown (it must not be visible before clicking).
+    await expect(bordersDropdown(page)).toBeHidden()
+    await bordersBtn(page).click()
+    await expect(bordersDropdown(page)).toBeVisible()
+
+    // "Inner border" must be enabled because A1:B2 is multi-cell.
+    await expect(page.getByTestId('toolbar-borders-inner')).toBeEnabled()
+
+    // Pick "all borders".
+    await page.getByTestId('toolbar-borders-all').click()
+    await expect(bordersDropdown(page)).toBeHidden()
+
+    // Each of the four cells should now carry top/right/bottom/left borders.
+    for (const addr of ['A1', 'B1', 'A2', 'B2']) {
+      await expectCellHasBordersAttr(page, addr, ['top', 'right', 'bottom', 'left'])
+    }
+  })
+
+  test('outer-border preset only paints the boundary sides of A1:B2', async ({ page }) => {
+    await gotoWave5(page)
+
+    await selectRange(page, 'A1', 'B2')
+    await bordersBtn(page).click()
+    await page.getByTestId('toolbar-borders-outer').click()
+    await expect(bordersDropdown(page)).toBeHidden()
+
+    // Each corner of A1:B2 gets exactly two outer sides — the sides that
+    // touch the selection boundary.
+    await expectCellHasBordersAttr(page, 'A1', ['top', 'left'])
+    await expectCellHasBordersAttr(page, 'B1', ['top', 'right'])
+    await expectCellHasBordersAttr(page, 'A2', ['bottom', 'left'])
+    await expectCellHasBordersAttr(page, 'B2', ['right', 'bottom'])
+  })
+
+  test('no-border preset clears borders applied previously', async ({ page }) => {
+    await gotoWave5(page)
+
+    await selectRange(page, 'A1', 'B2')
+    await bordersBtn(page).click()
+    await page.getByTestId('toolbar-borders-all').click()
+    await expect(bordersDropdown(page)).toBeHidden()
+    await expectCellHasBordersAttr(page, 'A1', ['top', 'right', 'bottom', 'left'])
+
+    // Re-open and pick "no border" — the data attribute should be removed.
+    await bordersBtn(page).click()
+    await page.getByTestId('toolbar-borders-none').click()
+    await expect(bordersDropdown(page)).toBeHidden()
+    await expect(cell(page, 'A1')).not.toHaveAttribute('data-borders', /./)
+  })
+
+  test('Escape closes the borders dropdown without applying a preset', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+
+    await bordersBtn(page).click()
+    await expect(bordersDropdown(page)).toBeVisible()
+
+    await page.keyboard.press('Escape')
+    await expect(bordersDropdown(page)).toBeHidden()
+  })
+
+  test('click outside closes the borders dropdown without applying a preset', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+
+    await bordersBtn(page).click()
+    await expect(bordersDropdown(page)).toBeVisible()
+
+    // Click on the formula bar — neither the dropdown nor the borders button.
+    await page.getByTestId('wave5-formula-bar').click()
+    await expect(bordersDropdown(page)).toBeHidden()
+  })
+
+  test('inner-border option is disabled on a 1x1 selection', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+
+    await bordersBtn(page).click()
+    await expect(bordersDropdown(page)).toBeVisible()
+    await expect(page.getByTestId('toolbar-borders-inner')).toBeDisabled()
+
+    // Close to clean up.
+    await page.keyboard.press('Escape')
+    await expect(bordersDropdown(page)).toBeHidden()
+  })
+})
+
 test.describe('Format audit — multi-cell range', () => {
   test('bold applied to B2:E2 selection paints all four cells', async ({ page }) => {
     await gotoWave5(page)

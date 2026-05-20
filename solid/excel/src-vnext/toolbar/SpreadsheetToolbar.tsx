@@ -20,7 +20,10 @@ import {
   togglePrintPreviewAtom,
   type CapturedFormat,
   type CellRange,
+  type DisplayCell,
   type HistoryEntryKind,
+  type SpreadsheetBorders,
+  type SpreadsheetBorderStyle,
   type SpreadsheetCellFormat,
   type SpreadsheetNumberFormat,
   type ToolbarFormatCommandInput,
@@ -34,8 +37,11 @@ import {
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
 } from '../provider'
+import { BordersDropdown, type BordersPreset } from './BordersDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
 import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
+
+const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
 const toolbarCommands: SpreadsheetToolbarCommand[] = [
   {
@@ -139,7 +145,65 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
 function cloneFormat(format: SpreadsheetCellFormat | undefined): SpreadsheetCellFormat {
   const clone: SpreadsheetCellFormat = { ...(format ?? {}) }
   if (format?.numberFormat) clone.numberFormat = { ...format.numberFormat }
+  if (format?.borders) clone.borders = { ...format.borders }
   return clone
+}
+
+/**
+ * Per-cell border patch for a borders dropdown preset.
+ *
+ * - `all` / `outer` for 1x1 collapse to the same four-sided patch.
+ * - `outer` for a multi-cell range tags each cell with only the sides that
+ *   touch the selection boundary (corner cells get two sides).
+ * - `inner` is the dual of `outer`: each cell gets the sides that touch a
+ *   neighbouring selected cell. On a 1x1 the result is empty.
+ * - `none` removes all four sides; the toolbar treats that as "clear".
+ */
+function bordersPatchForCell(
+  preset: BordersPreset,
+  row: number,
+  col: number,
+  range: CellRange,
+  current: SpreadsheetBorders | undefined,
+): SpreadsheetBorders | undefined {
+  const isLeftEdge = col === range.colStart
+  const isRightEdge = col === range.colEnd
+  const isTopEdge = row === range.rowStart
+  const isBottomEdge = row === range.rowEnd
+  const spec = { style: BORDER_DEFAULT_STYLE }
+
+  switch (preset) {
+    case 'none':
+      return undefined
+    case 'all':
+      return { top: spec, right: spec, bottom: spec, left: spec }
+    case 'outer': {
+      const next: SpreadsheetBorders = { ...(current ?? {}) }
+      if (isTopEdge) next.top = spec
+      if (isRightEdge) next.right = spec
+      if (isBottomEdge) next.bottom = spec
+      if (isLeftEdge) next.left = spec
+      return next
+    }
+    case 'inner': {
+      const next: SpreadsheetBorders = { ...(current ?? {}) }
+      if (!isTopEdge) next.top = spec
+      if (!isRightEdge) next.right = spec
+      if (!isBottomEdge) next.bottom = spec
+      if (!isLeftEdge) next.left = spec
+      return next
+    }
+    case 'top':
+      return isTopEdge ? { ...(current ?? {}), top: spec } : current
+    case 'right':
+      return isRightEdge ? { ...(current ?? {}), right: spec } : current
+    case 'bottom':
+      return isBottomEdge ? { ...(current ?? {}), bottom: spec } : current
+    case 'left':
+      return isLeftEdge ? { ...(current ?? {}), left: spec } : current
+    default:
+      return current
+  }
 }
 
 /**
@@ -210,6 +274,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const [numberFormatOpen, setNumberFormatOpen] = createSignal(false)
   const [numberFormatAnchor, setNumberFormatAnchor] = createSignal<DOMRect | null>(null)
   let numberFormatAnchorEl: HTMLButtonElement | null = null
+
+  // Borders dropdown lives entirely inside the toolbar component since the
+  // backend exposes no toolbar-surface atom for it. We hold the open flag in
+  // a local signal — under solid-js 1.9.12 the toolbar body re-executes on
+  // atom mutations but `createSignal` survives the re-run.
+  const [bordersDropdownOpen, setBordersDropdownOpen] = createSignal(false)
+  let bordersAnchorRef: HTMLButtonElement | undefined
 
   function isProtectionGated(): boolean {
     return activeCellLocked() || selectionLocked() !== 'open'
@@ -347,6 +418,24 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           verticalAlign:
             intent.value === 'top' || intent.value === 'center' ? intent.value : 'bottom',
         }
+      case 'border': {
+        // Toolbar borders dropdown drives this command. The actual per-cell
+        // patch is applied via `executeBordersPreset` (which fans out
+        // setFormatRange calls so corner/edge cells get distinct sides). The
+        // single-format path here only fires when callers dispatch the
+        // 'border' command directly with a value of 'all' or 'none', which
+        // happens in unit tests and from older intents.
+        const spec = { style: BORDER_DEFAULT_STYLE }
+        if (intent.value === 'none') {
+          const next = { ...current }
+          delete next.borders
+          return next
+        }
+        return {
+          ...current,
+          borders: { top: spec, right: spec, bottom: spec, left: spec },
+        }
+      }
       default:
         return current
     }
@@ -444,6 +533,82 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
 
     const range = selectionSnapshot().range
     void executeCommand(intent, range).catch(reportCommandError)
+  }
+
+  function projectionCellMap(): Map<string, DisplayCell> {
+    const snapshot = projectionSnapshot()
+    const result = snapshot.result
+    const map = new Map<string, DisplayCell>()
+    if (!isVisibleProjectionResult(result)) return map
+    const selection = selectionSnapshot()
+    if (result.sheetId !== selection.selection.sheetId) return map
+    for (const cell of result.cells) {
+      map.set(`${cell.row}:${cell.col}`, cell)
+    }
+    return map
+  }
+
+  /**
+   * Fan out per-cell `setFormatRange` calls for a borders dropdown preset.
+   *
+   * Each cell in the selection gets a 1x1 range write that merges the new
+   * border sides over that cell's current format (read from the projection
+   * snapshot). Issuing one call per cell preserves per-cell distinct formats
+   * (`setFormatRange` clobbers cell formats within the range, so a single
+   * range-wide call would lose any pre-existing variation).
+   */
+  async function executeBordersPreset(
+    preset: BordersPreset,
+    sheetId: string,
+    range: CellRange,
+  ) {
+    if (!backend.setFormatRange) {
+      throw new Error('Range formatting is not supported by this spreadsheet backend.')
+    }
+
+    const cells = projectionCellMap()
+
+    for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+      for (let col = range.colStart; col <= range.colEnd; col += 1) {
+        const existing = cells.get(`${row}:${col}`)
+        const currentFormat = cloneFormat(existing?.format)
+        const nextBorders = bordersPatchForCell(preset, row, col, range, currentFormat.borders)
+        const nextFormat: SpreadsheetCellFormat = { ...currentFormat }
+        if (nextBorders === undefined || Object.keys(nextBorders).length === 0) {
+          delete nextFormat.borders
+        } else {
+          nextFormat.borders = nextBorders
+        }
+        await backend.setFormatRange({
+          kind: 'set-format-range',
+          sheetId,
+          range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+          format: nextFormat,
+        })
+      }
+    }
+
+    recordHistoryEntry({
+      sheetId,
+      kind: 'format.set',
+      revision: undefined,
+      affectedRange: range,
+    })
+
+    await refreshProjection(sheetId)
+  }
+
+  function handleBordersSelect(preset: BordersPreset) {
+    setBordersDropdownOpen(false)
+    const range = selectionSnapshot().range
+    const isMulti = rangeCellCount(range) > 1
+    if (preset === 'inner' && !isMulti) {
+      // 1x1 inner is a no-op by definition.
+      return
+    }
+    const sheetId = getMutationSheetId()
+    if (!sheetId) return
+    void executeBordersPreset(preset, sheetId, range).catch(reportCommandError)
   }
 
   function getMutationSheetId() {
@@ -589,6 +754,36 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           </button>
         )
       })}
+      <div
+        class="spreadsheet-toolbar-borders-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (bordersAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            bordersDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-borders"
+          title={t('toolbar.borders.title')}
+          aria-label={t('toolbar.borders.title')}
+          aria-haspopup="menu"
+          aria-expanded={bordersDropdownOpen()}
+          disabled={!availability().border || isProtectionGated()}
+          onClick={() => {
+            setBordersDropdownOpen((open) => !open)
+          }}
+        >
+          {t('toolbar.borders')}
+        </button>
+        <BordersDropdown
+          isOpen={bordersDropdownOpen()}
+          isMultiCell={rangeCellCount(selectionSnapshot().range) > 1}
+          anchorRef={bordersAnchorRef ?? null}
+          onSelect={handleBordersSelect}
+          onRequestClose={() => setBordersDropdownOpen(false)}
+        />
+      </div>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"

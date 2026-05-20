@@ -115,6 +115,9 @@ function normalizeFormat(
 function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
   const numberFormat = format.numberFormat
   const numberFormatIsDefault = !numberFormat || numberFormat.kind === 'general'
+  const borders = format.borders
+  const bordersAreDefault =
+    !borders || (!borders.top && !borders.right && !borders.bottom && !borders.left)
 
   return (
     !format.bold &&
@@ -129,7 +132,8 @@ function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
     (format.bgColor === undefined || format.bgColor.length === 0) &&
     (format.indent === undefined || format.indent === 0) &&
     (format.rotation === undefined || format.rotation === 0) &&
-    numberFormatIsDefault
+    numberFormatIsDefault &&
+    bordersAreDefault
   )
 }
 
