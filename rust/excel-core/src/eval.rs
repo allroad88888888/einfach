@@ -4165,6 +4165,96 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "IPMT" => fn_ipmt(args, provider),
         "PPMT" => fn_ppmt(args, provider),
 
+        // CELL(info_type[, reference]) — return metadata about `reference`.
+        //
+        // Supported info_type values (Excel matches case-insensitively):
+        //   "address"  → $A$1-style absolute text
+        //   "row"      → 1-based row number (Number)
+        //   "col"/"column" → 1-based column number (Number)
+        //   "contents" → the cell's value via provider.cell(addr)
+        //   "type"     → "b" blank, "l" text, "v" otherwise
+        //   "prefix"   → "'" for text, "" otherwise
+        //   "width"    → 8.0 (approximation; we don't plumb per-column widths)
+        //   "protect"  → 1.0 (approximation; per-cell unlock state isn't
+        //                tracked at the eval layer)
+        // Any other info_type returns #VALUE! (InvalidValue), matching Excel.
+        //
+        // When `reference` is omitted we fall back to `provider.current_cell()`.
+        // The legacy single-sheet `AtomEvalProvider` returns None there, so
+        // no-arg `CELL` on that path surfaces #REF! (InvalidRef). The
+        // production `WorkbookEvalProvider` tracks the current cell and
+        // resolves correctly — covered in tests/cell_function.rs.
+        "CELL" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // info_type must be Text — non-text args (numbers, bools) hit
+            // WrongType rather than coercing, so spreadsheets surface the
+            // type mismatch loudly.
+            let info_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = info_v {
+                return Value::Error(e);
+            }
+            let info_type = match &info_v {
+                Value::Text(s) => s.to_ascii_lowercase(),
+                _ => return Value::Error(ValueError::WrongType),
+            };
+
+            // Resolve the target address. With an explicit second arg, only
+            // direct cell/range references qualify; computed values (e.g.
+            // CELL("address","not-a-ref")) yield #TYPE!. Multi-cell ranges
+            // collapse to their top-left cell per Excel parity.
+            let addr: CellAddress = if args.len() == 2 {
+                match &args[1] {
+                    Expr::CellRef(a) | Expr::SheetRef { addr: a, .. } => *a,
+                    Expr::Range { start, .. } | Expr::SheetRange { start, .. } => *start,
+                    _ => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                match provider.current_cell() {
+                    Some(a) => a,
+                    // note: AtomEvalProvider doesn't carry current-cell, so
+                    // the no-arg unit tests below land here. The production
+                    // workbook path is covered by tests/cell_function.rs.
+                    None => return Value::Error(ValueError::InvalidRef),
+                }
+            };
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
+
+            match info_type.as_str() {
+                "address" => {
+                    let col_letters = col_index_to_letters_eval(addr.col);
+                    Value::Text(format!("${}${}", col_letters, addr.row + 1))
+                }
+                "row" => Value::Number((addr.row + 1) as f64),
+                // Excel accepts both "col" and "column" for the column index.
+                "col" | "column" => Value::Number((addr.col + 1) as f64),
+                "contents" => provider.cell(addr),
+                "type" => match provider.cell(addr) {
+                    Value::Null => Value::Text("b".into()),
+                    Value::Text(_) => Value::Text("l".into()),
+                    // Excel collapses numbers, booleans, and errors to "v".
+                    _ => Value::Text("v".into()),
+                },
+                "prefix" => match provider.cell(addr) {
+                    // Excel returns the actual alignment-prefix character;
+                    // we only know whether the cell is text, so we
+                    // approximate: text → "'", everything else → "".
+                    Value::Text(_) => Value::Text("'".into()),
+                    _ => Value::Text(String::new()),
+                },
+                // note: we don't plumb per-column widths through the eval
+                // layer yet, so this is a constant approximation of Excel's
+                // default column width (8.43 in the UI, rounded to 8).
+                "width" => Value::Number(8.0),
+                // note: per-cell locked/unlocked state lives outside the
+                // formula engine — we report "locked" (1) for every cell.
+                "protect" => Value::Number(1.0),
+                _ => Value::Error(ValueError::InvalidValue),
+            }
+        }
 
         _ => Value::Error(ValueError::InvalidName),
     }
@@ -8651,6 +8741,160 @@ mod tests {
         assert_eq!(
             eval_str("=ADDRESS(1)", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_cell_address() {
+        let (cm, vs) = make_test_env();
+        // Happy path: explicit cell ref → $A1$-style absolute.
+        assert_eq!(
+            eval_str("=CELL(\"address\",B2)", &cm, &vs),
+            Value::Text("$B$2".into())
+        );
+        // Case insensitivity: info_type is lowercased.
+        assert_eq!(
+            eval_str("=CELL(\"ADDRESS\",A1)", &cm, &vs),
+            Value::Text("$A$1".into())
+        );
+        // Multi-cell range → top-left.
+        assert_eq!(
+            eval_str("=CELL(\"address\",B2:D4)", &cm, &vs),
+            Value::Text("$B$2".into())
+        );
+        // Non-ref expression → WrongType.
+        assert_eq!(
+            eval_str("=CELL(\"address\",\"not-a-ref\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    #[test]
+    fn eval_cell_row() {
+        let (cm, vs) = make_test_env();
+        // 1-based row, not 0-based.
+        assert_eq!(eval_str("=CELL(\"row\",A1)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=CELL(\"row\",B2)", &cm, &vs), Value::Number(2.0));
+    }
+
+    #[test]
+    fn eval_cell_col() {
+        let (cm, vs) = make_test_env();
+        // Both "col" and "column" are accepted (Excel parity).
+        assert_eq!(eval_str("=CELL(\"col\",A1)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(
+            eval_str("=CELL(\"column\",A1)", &cm, &vs),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            eval_str("=CELL(\"col\",B2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn eval_cell_contents() {
+        let (cm, vs) = make_test_env();
+        // A1=10 in make_test_env.
+        assert_eq!(
+            eval_str("=CELL(\"contents\",A1)", &cm, &vs),
+            Value::Number(10.0)
+        );
+        // B2="text".
+        assert_eq!(
+            eval_str("=CELL(\"contents\",B2)", &cm, &vs),
+            Value::Text("text".into())
+        );
+    }
+
+    #[test]
+    fn eval_cell_type() {
+        let (cm, vs) = make_test_env();
+        // Number → "v".
+        assert_eq!(
+            eval_str("=CELL(\"type\",A1)", &cm, &vs),
+            Value::Text("v".into())
+        );
+        // Text → "l".
+        assert_eq!(
+            eval_str("=CELL(\"type\",B2)", &cm, &vs),
+            Value::Text("l".into())
+        );
+        // Empty cell (no entry in cell_map → Value::Null) → "b".
+        assert_eq!(
+            eval_str("=CELL(\"type\",Z99)", &cm, &vs),
+            Value::Text("b".into())
+        );
+    }
+
+    #[test]
+    fn eval_cell_prefix() {
+        let (cm, vs) = make_test_env();
+        // Text → "'".
+        assert_eq!(
+            eval_str("=CELL(\"prefix\",B2)", &cm, &vs),
+            Value::Text("'".into())
+        );
+        // Non-text → "".
+        assert_eq!(
+            eval_str("=CELL(\"prefix\",A1)", &cm, &vs),
+            Value::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn eval_cell_width() {
+        let (cm, vs) = make_test_env();
+        // Approximation: Excel default column width.
+        assert_eq!(
+            eval_str("=CELL(\"width\",A1)", &cm, &vs),
+            Value::Number(8.0)
+        );
+    }
+
+    #[test]
+    fn eval_cell_protect() {
+        let (cm, vs) = make_test_env();
+        // Approximation: every cell reports as locked.
+        assert_eq!(
+            eval_str("=CELL(\"protect\",A1)", &cm, &vs),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn eval_cell_errors() {
+        let (cm, vs) = make_test_env();
+        // Non-text info_type → WrongType.
+        assert_eq!(
+            eval_str("=CELL(42,A1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Unknown info_type → InvalidValue.
+        assert_eq!(
+            eval_str("=CELL(\"nope\",A1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Wrong arg count.
+        assert_eq!(
+            eval_str("=CELL()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=CELL(\"row\",A1,B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_cell_no_ref_legacy_provider() {
+        // note: AtomEvalProvider doesn't carry current-cell, so the no-arg
+        // path resolves to None → InvalidRef. The production
+        // WorkbookEvalProvider path is covered in tests/cell_function.rs.
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CELL(\"row\")", &cm, &vs),
+            Value::Error(ValueError::InvalidRef)
         );
     }
 
