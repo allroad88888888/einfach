@@ -1,6 +1,7 @@
 /** @jsxImportSource solid-js */
 
 import { createEffect, onCleanup } from 'solid-js'
+import { useAtomValue } from '@einfach/solid'
 import {
   applyFormatPainterAtom,
   exitFormatPainterAtom,
@@ -198,6 +199,47 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
     lastSelectionKey = key
   })
 
+  // When the active sheet changes while the painter is armed/sticky, the
+  // captured source format no longer corresponds to anything the user can see
+  // (they switched tabs). Clear the painter so the next cell click on the new
+  // sheet doesn't silently overwrite formatting with stale data.
+  //
+  // Seed `lastWorkspaceSheetId` with the current id so the *first* mutation
+  // after subscribe (e.g. user clicks a different tab) is recognised as a
+  // real change — a null seed would silently swallow the first switch.
+  let lastWorkspaceSheetId: string | null =
+    store.getter(workspaceSessionAtom).activeSheetId ?? null
+  const unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
+    const workspace = store.getter(workspaceSessionAtom)
+    const nextSheetId = workspace.activeSheetId ?? null
+    if (nextSheetId === lastWorkspaceSheetId) return
+    lastWorkspaceSheetId = nextSheetId
+    if (store.getter(formatPainterStateAtom) !== 'idle') {
+      store.setter(exitFormatPainterAtom)
+    }
+  })
+
+  // Mirror the painter state onto the grid root (if mounted) so the cell
+  // cursor can change while the painter is armed/sticky. This is the only
+  // visible signal the user gets that their next click will paint — without
+  // it the toolbar button is the only feedback, easily missed mid-drag.
+  function findGridRoots(): HTMLElement[] {
+    if (typeof document === 'undefined') return []
+    return Array.from(
+      document.querySelectorAll<HTMLElement>('.spreadsheet-grid'),
+    )
+  }
+  const unsubscribeStateForCursor = store.sub(formatPainterStateAtom, () => {
+    const state = store.getter(formatPainterStateAtom)
+    for (const root of findGridRoots()) {
+      if (state === 'idle') {
+        root.removeAttribute('data-format-painter-active')
+      } else {
+        root.setAttribute('data-format-painter-active', state)
+      }
+    }
+  })
+
   function handleKeyDown(event: KeyboardEvent) {
     if (event.key !== 'Escape') return
     const state = store.getter(formatPainterStateAtom)
@@ -215,14 +257,25 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
   onCleanup(() => {
     unsubscribeSelection()
     unsubscribeState()
+    unsubscribeWorkspace()
+    unsubscribeStateForCursor()
+    // Defensive: leave the grid in a clean state if the painter unmounts
+    // while armed (HMR, demo unmount, etc.).
+    for (const root of findGridRoots()) {
+      root.removeAttribute('data-format-painter-active')
+    }
   })
+
+  // Reactive read so the hidden marker reflects the current state even if the
+  // surrounding component body does not re-execute on atom mutations.
+  const painterStateSignal = useAtomValue(formatPainterStateAtom)
 
   return (
     <span
       aria-hidden="true"
       style={{ display: 'none' }}
       data-testid={props['data-testid'] ?? 'spreadsheet-format-painter'}
-      data-format-painter-state={store.getter(formatPainterStateAtom)}
+      data-format-painter-state={painterStateSignal()}
     />
   )
 }

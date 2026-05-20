@@ -244,6 +244,99 @@ test.describe('Format audit — format painter', () => {
     await cell(page, 'E2').click()
     await expect(cellDisplay(page, 'E2')).toHaveCSS('font-weight', '700')
   })
+
+  test('Esc cancels an armed painter and does not paint the next cell click', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await boldBtn(page).click()
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('font-weight', '700')
+
+    await painterBtn(page).click()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'armed')
+
+    await page.keyboard.press('Escape')
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'idle')
+
+    // Clicking a fresh cell after Esc must NOT paint it bold (C4 is plain text).
+    await cell(page, 'C4').click()
+    await expect(cellDisplay(page, 'C4')).not.toHaveCSS('font-weight', '700')
+  })
+
+  test('Esc cancels a sticky painter just like an armed one', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await boldBtn(page).click()
+
+    await painterBtn(page).dblclick()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'sticky')
+
+    await page.keyboard.press('Escape')
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'idle')
+
+    await cell(page, 'D4').click()
+    await expect(cellDisplay(page, 'D4')).not.toHaveCSS('font-weight', '700')
+  })
+
+  test('clicking the painter button while sticky toggles it off (no waiting)', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await boldBtn(page).click()
+
+    await painterBtn(page).dblclick()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'sticky')
+
+    // Re-clicking the same button must immediately cancel. We don't wait the
+    // dblclick window because the toolbar's "click while non-idle" branch
+    // short-circuits to exitFormatPainterAtom.
+    await painterBtn(page).click()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'idle')
+  })
+
+  test('switching active sheet while armed clears the painter', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await boldBtn(page).click()
+
+    await painterBtn(page).click()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'armed')
+
+    // Switch to the Forecast tab. The painter state must reset because the
+    // captured source cell is no longer visible.
+    await page.locator('button.spreadsheet-sheet-tab[data-sheet-id="sheet-2"]').click()
+    await expect(
+      page.locator('button.spreadsheet-sheet-tab[data-sheet-id="sheet-2"]'),
+    ).toHaveAttribute('data-active', 'true')
+
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'idle')
+  })
+
+  test('grid root exposes data-format-painter-active while armed (cell cursor feedback)', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    const grid = page.getByTestId('wave5-grid')
+
+    // Idle: no attribute at all.
+    expect(await grid.getAttribute('data-format-painter-active')).toBeNull()
+
+    await painterBtn(page).click()
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'armed')
+
+    // The grid root now advertises armed state. CSS keys off this attribute
+    // to switch the cell cursor (copy/cell), giving the user mid-drag visual
+    // feedback that the next click will paint.
+    await expect(grid).toHaveAttribute('data-format-painter-active', 'armed')
+
+    await page.keyboard.press('Escape')
+    await expect(painterBtn(page)).toHaveAttribute('data-format-painter-state', 'idle')
+    // Back to no attribute.
+    expect(await grid.getAttribute('data-format-painter-active')).toBeNull()
+  })
 })
 
 test.describe('Format audit — Format Cells dialog', () => {

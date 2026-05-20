@@ -340,4 +340,79 @@ describe('SpreadsheetToolbar format painter button', () => {
     expect(store.getter(formatPainterStateAtom)).toBe('idle')
     expect(store.getter(formatPainterClipboardAtom)).toBeNull()
   })
+
+  it('switching the active sheet while armed clears the painter to idle', () => {
+    const store = createStore()
+    const { backend } = createRecordingBackend()
+    primeStoreWithProjection(store)
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterAtom, { format: richFormat() })
+    expect(store.getter(formatPainterStateAtom)).toBe('armed')
+
+    // The user switches tabs. Painter must not carry over: the captured
+    // source format is no longer visible, and the next cell click on the
+    // new sheet would silently overwrite formatting with stale data.
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+
+    expect(store.getter(formatPainterStateAtom)).toBe('idle')
+    expect(store.getter(formatPainterClipboardAtom)).toBeNull()
+  })
+
+  it('switching the active sheet while sticky also clears the painter', () => {
+    const store = createStore()
+    const { backend } = createRecordingBackend()
+    primeStoreWithProjection(store)
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatPainter />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(armFormatPainterStickyAtom, { format: richFormat() })
+    expect(store.getter(formatPainterStateAtom)).toBe('sticky')
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+
+    expect(store.getter(formatPainterStateAtom)).toBe('idle')
+    expect(store.getter(formatPainterClipboardAtom)).toBeNull()
+  })
+
+  it('mirrors painter state onto .spreadsheet-grid via data-format-painter-active', () => {
+    const store = createStore()
+    const { backend } = createRecordingBackend()
+    primeStoreWithProjection(store)
+
+    // Inject a fake grid root so the painter has something to mark.
+    const grid = document.createElement('div')
+    grid.className = 'spreadsheet-grid'
+    document.body.appendChild(grid)
+
+    try {
+      render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetFormatPainter />
+        </SpreadsheetUiProvider>
+      ))
+
+      expect(grid.hasAttribute('data-format-painter-active')).toBe(false)
+
+      store.setter(armFormatPainterAtom, { format: richFormat() })
+      expect(grid.getAttribute('data-format-painter-active')).toBe('armed')
+
+      store.setter(exitFormatPainterAtom)
+      expect(grid.hasAttribute('data-format-painter-active')).toBe(false)
+
+      store.setter(armFormatPainterStickyAtom, { format: richFormat() })
+      expect(grid.getAttribute('data-format-painter-active')).toBe('sticky')
+    } finally {
+      grid.remove()
+    }
+  })
 })

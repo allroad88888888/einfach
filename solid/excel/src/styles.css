@@ -390,6 +390,21 @@ thead .row-header {
   box-shadow: 0 0 0 1px #1a73e8;
 }
 
+/*
+ * Format-painter cursor feedback. SpreadsheetFormatPainter mirrors the
+ * painter state onto the grid root via data-format-painter-active="armed"
+ * or "sticky". Without this rule, the only signal the painter is armed is
+ * the toolbar button — easy to miss when the user's eyes are on the grid.
+ */
+.spreadsheet-grid[data-format-painter-active] .cell,
+.spreadsheet-grid[data-format-painter-active] .spreadsheet-grid-cell {
+  cursor: copy;
+}
+.spreadsheet-grid[data-format-painter-active='sticky'] {
+  outline: 2px dashed #1a73e8;
+  outline-offset: -2px;
+}
+
 .spreadsheet-grid-table {
   border-collapse: collapse;
   table-layout: fixed;
