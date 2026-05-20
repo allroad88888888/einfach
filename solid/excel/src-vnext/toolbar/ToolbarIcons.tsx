@@ -251,3 +251,42 @@ export const CurrencyIcon = (): JSX.Element => (
     <path d="M11 4.5H6.5a2 2 0 0 0 0 4h3a2 2 0 0 1 0 4H5" />
   </svg>
 )
+
+export const UndoIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M3 7h7.5a3.5 3.5 0 0 1 0 7H7" />
+    <path d="m5.5 4.5-2.5 2.5 2.5 2.5" />
+  </svg>
+)
+
+export const RedoIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M13 7H5.5a3.5 3.5 0 0 0 0 7H9" />
+    <path d="m10.5 4.5 2.5 2.5-2.5 2.5" />
+  </svg>
+)
+
+export const ClearFormatIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M3 3h10l-3.5 5L11 13H6L3 3z" />
+    <line x1="2" y1="14" x2="14" y2="14" stroke-dasharray="1.5 1.2" />
+    <line x1="11.5" y1="2.5" x2="14" y2="5" stroke-width="1.2" />
+    <line x1="14" y1="2.5" x2="11.5" y2="5" stroke-width="1.2" />
+  </svg>
+)
+
+export const ChevronDownIcon = (): JSX.Element => (
+  <svg
+    width="8"
+    height="8"
+    viewBox="0 0 8 8"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.2"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M1.5 3 4 5.5 6.5 3" />
+  </svg>
+)

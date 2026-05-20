@@ -277,6 +277,14 @@ export const messages: Record<string, string> = {
     'Format painter (single click to copy format; double click for sticky)',
   'toolbar.painter.title.sticky':
     'Format painter (sticky — click button or Esc to exit)',
+  'toolbar.undo': 'Undo',
+  'toolbar.undo.title': 'Undo (Ctrl+Z)',
+  'toolbar.redo': 'Redo',
+  'toolbar.redo.title': 'Redo (Ctrl+Y)',
+  'toolbar.clearFormat': 'Clear',
+  'toolbar.clearFormat.title': 'Clear formatting',
+  'toolbar.currencyDropdown': 'Currency',
+  'toolbar.currencyDropdown.title': 'Number / currency format',
 
   // Status bar
   'status.aggregate.sum': 'Sum',

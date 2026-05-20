@@ -1081,18 +1081,22 @@ thead .row-header {
   background: var(--border);
 }
 
-/* A.2 Toolbar — button groups separated by thin dividers, icon-like look */
+/* A.2 Toolbar — button groups separated by thin dividers, icon-like look.
+   The Univer slim layout wraps to a second row when the viewport narrows
+   instead of showing an overflow chevron, so flex-wrap drives the reflow
+   and overflow-x stays visible. */
 .spreadsheet-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 1px;
-  height: 36px;
-  padding: 0 8px;
+  min-height: 36px;
+  padding: 4px 8px;
   background: var(--bg-chrome-light);
   border-bottom: 1px solid var(--border);
   font-family: var(--excel-font);
   font-size: 12px;
-  overflow-x: auto;
+  overflow-x: visible;
   white-space: nowrap;
   color: #444;
 }
@@ -1122,21 +1126,31 @@ thead .row-header {
   flex-shrink: 0;
 }
 
-/* Faint vertical separator between toolbar groups (undo group ↔ font ↔
-   B/I/U ↔ color ↔ borders ↔ alignment ↔ merge ↔ painter, etc.).
-   Each .spreadsheet-toolbar-*-wrapper acts as a group anchor; the rule
-   applies a subtle 1px line before the wrapper. */
-.spreadsheet-toolbar > .spreadsheet-toolbar-borders-wrapper::before,
-.spreadsheet-toolbar > .spreadsheet-toolbar-h-align-wrapper::before,
-.spreadsheet-toolbar > .spreadsheet-toolbar-merge-wrapper::before,
-.spreadsheet-toolbar > .spreadsheet-toolbar-rotation-wrapper::before {
-  content: '';
+/* Faint vertical separator between toolbar button groups. The JSX places an
+   explicit <span class="spreadsheet-toolbar-separator"> between groups,
+   matching Univer's slim layout:
+     [history] | [font] | [textStyle] | [color] | [align] | [merge] | [number] */
+.spreadsheet-toolbar > .spreadsheet-toolbar-separator {
   display: inline-block;
   width: 1px;
   height: 18px;
   background: #d8d8d8;
   margin: 0 6px;
-  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* Currency-dropdown opener: text + chevron (no icon). The button reads
+   wider than a 24x24 hit target so it gets explicit padding. */
+.spreadsheet-toolbar .spreadsheet-toolbar-currency-opener {
+  min-width: 80px;
+  padding: 0 8px;
+  gap: 4px;
+  font-weight: 500;
+}
+
+.spreadsheet-toolbar .spreadsheet-toolbar-currency-opener > .toolbar-chevron {
+  margin-left: 2px;
+  opacity: 0.65;
 }
 
 .spreadsheet-toolbar .spreadsheet-toolbar-button:hover:not(:disabled) {

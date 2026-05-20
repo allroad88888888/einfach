@@ -4,13 +4,14 @@ import { useT } from '../../src/i18n'
 import {
   armFormatPainterAtom,
   armFormatPainterStickyAtom,
+  canRedoAtom,
+  canUndoAtom,
   createVisibleProjectionRequest,
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
   formatPainterStateAtom,
   nextHistoryTransactionId,
   openFormatCellsAtom,
-  pasteClipboardAtom,
   pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
@@ -35,6 +36,7 @@ import {
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
 } from '../provider'
+import { dispatchRedo, dispatchUndo } from '../provider/history-dispatch'
 import { BordersDropdown, type BordersPreset } from './BordersDropdown'
 import { HAlignDropdown, type HAlignValue } from './HAlignDropdown'
 import { MergeDropdown, type MergePreset } from './MergeDropdown'
@@ -56,6 +58,8 @@ import {
   AlignRightIcon,
   BoldIcon,
   BordersIcon,
+  ChevronDownIcon,
+  ClearFormatIcon,
   CurrencyIcon,
   FillColorIcon,
   FontSizeDownIcon,
@@ -63,13 +67,13 @@ import {
   FormatPainterIcon,
   ItalicIcon,
   MergeCellsIcon,
-  NumberFormatIcon,
-  PasteIcon,
   PercentIcon,
+  RedoIcon,
   RotationIcon,
   StrikethroughIcon,
   TextColorIcon,
   UnderlineIcon,
+  UndoIcon,
   VAlignBottomIcon,
   VAlignMiddleIcon,
   VAlignTopIcon,
@@ -78,7 +82,13 @@ import {
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
-const toolbarCommands: SpreadsheetToolbarCommand[] = [
+/**
+ * Bold / Italic / Underline / Strikethrough — the four "toggle on selection"
+ * buttons that share identical JSX. Kept as a map-rendered group so each one
+ * picks up consistent pressed-state styling. Color buttons + number-format
+ * shortcuts + wrap render as their own standalone JSX below.
+ */
+const textStyleCommands: SpreadsheetToolbarCommand[] = [
   {
     command: 'bold',
     label: 'toolbar.bold',
@@ -110,66 +120,6 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-strikethrough',
     isEnabled: (availability) => availability.strikethrough,
     icon: StrikethroughIcon,
-  },
-  {
-    command: 'fill-color',
-    label: 'toolbar.fillColor',
-    title: 'toolbar.fillColor.title',
-    testId: 'toolbar-btn-fill-color',
-    value: '#ffd966',
-    isEnabled: (availability) => availability.fillColor,
-    icon: FillColorIcon,
-  },
-  {
-    command: 'text-color',
-    label: 'toolbar.textColor',
-    title: 'toolbar.textColor.title',
-    testId: 'toolbar-btn-text-color',
-    value: '#000000',
-    isEnabled: (availability) => availability.textColor,
-    icon: TextColorIcon,
-  },
-  {
-    command: 'number-format',
-    label: 'toolbar.numberFormat',
-    title: 'toolbar.numberFormat.title',
-    testId: 'toolbar-btn-number-format',
-    // The button opens the NumberFormatDropdown; the chosen row supplies the
-    // value when dispatchCommand is invoked. The hard-coded value here is a
-    // safety net for callers that bypass the dropdown (none today).
-    value: 'Number',
-    isEnabled: (availability) => availability.numberFormat,
-    icon: NumberFormatIcon,
-  },
-  {
-    // Univer-parity shortcut — one-click percent format. The token routes
-    // through `numberFormatForValue('Percent')` → `{ kind: 'percent', digits: 0 }`.
-    command: 'number-format',
-    label: 'toolbar.percentFormat',
-    title: 'toolbar.percentFormat.title',
-    testId: 'toolbar-btn-percent-format',
-    value: 'Percent',
-    isEnabled: (availability) => availability.numberFormat,
-    icon: PercentIcon,
-  },
-  {
-    // Univer-parity shortcut — one-click currency format. The token routes
-    // through `numberFormatForValue('Currency')` → `{ kind: 'currency', symbol: '$', digits: 2 }`.
-    command: 'number-format',
-    label: 'toolbar.currencyFormat',
-    title: 'toolbar.currencyFormat.title',
-    testId: 'toolbar-btn-currency-format',
-    value: 'Currency',
-    isEnabled: (availability) => availability.numberFormat,
-    icon: CurrencyIcon,
-  },
-  {
-    command: 'wrap',
-    label: 'toolbar.wrap',
-    title: 'toolbar.wrap.title',
-    testId: 'toolbar-btn-wrap',
-    isEnabled: (availability) => availability.wrap,
-    icon: WrapIcon,
   },
 ]
 
@@ -979,22 +929,114 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   }
 
   /**
-   * Univer-parity "Paste" toolbar shortcut.
-   *
-   * Mirrors the menu-bar Edit > Paste route: stamps the clipboard intent for
-   * the active selection. The real paste work (text-from-OS-clipboard,
-   * intra-app TSV chunks, etc.) is owned by `SpreadsheetGrid` and
-   * `SpreadsheetContextMenu`; this button only fires the intent so those
-   * handlers can react. When no sheet is active (initial blank state) it is
-   * a no-op.
+   * Univer-parity undo / redo handlers. The same atoms drive the history
+   * timeline panel; the toolbar buttons piggyback on that flow so undo state
+   * stays consistent across surfaces.
    */
-  function dispatchPasteIntent() {
-    const snapshot = selectionSnapshot()
-    const sheetId = snapshot.selection.sheetId || getMutationSheetId() || ''
+  async function handleUndo() {
+    await dispatchUndo(store, backend)
+  }
+
+  async function handleRedo() {
+    await dispatchRedo(store, backend)
+  }
+
+  /**
+   * Clear-formatting handler. Issues a direct `setFormatRange` with an empty
+   * format object, bypassing `dispatchToolbarFormatCommandAtom` because the
+   * spreadsheet-ui-core contract has no `clear-format` kind today and the
+   * toolbar already owns the projection refresh path. History entry kind
+   * stays `'format.set'` so undo treats it like any other range format
+   * mutation.
+   */
+  async function handleClearFormat() {
+    if (!backend.setFormatRange) return
+    const sheetId = getMutationSheetId()
     if (!sheetId) return
-    store.setter(pasteClipboardAtom, {
-      source: { sheetId, range: snapshot.range },
-    })
+    const range = selectionSnapshot().range
+    try {
+      const result = await backend.setFormatRange({
+        kind: 'set-format-range',
+        sheetId,
+        range,
+        format: {},
+      })
+      recordHistoryEntry({
+        sheetId,
+        kind: 'format.set',
+        revision: result?.revision,
+        affectedRange: result?.affectedRange ?? range,
+      })
+      await refreshProjection(sheetId)
+    } catch (error) {
+      reportCommandError(error)
+    }
+  }
+
+  const canUndo = useAtomValue(canUndoAtom)
+  const canRedo = useAtomValue(canRedoAtom)
+
+  /**
+   * Render helper for the text-style row (bold/italic/underline/strikethrough)
+   * and the two color buttons. Pulled out so both groups reuse the same
+   * pressed-state + disabled-state JSX without re-deriving per call site.
+   */
+  function renderTextStyleButton(command: SpreadsheetToolbarCommand) {
+    const commandValue = { command: command.command, value: command.value }
+    const isPressed = () => {
+      if (command.command === 'bold') return !!activeCellFormat().bold
+      if (command.command === 'italic') return !!activeCellFormat().italic
+      if (command.command === 'underline') return !!activeCellFormat().underline
+      if (command.command === 'strikethrough') return !!activeCellFormat().strikethrough
+      return undefined
+    }
+
+    return (
+      <button
+        type="button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          isPressed() ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid={command.testId}
+        title={t(command.title)}
+        aria-label={t(command.title)}
+        aria-pressed={isPressed()}
+        disabled={!command.isEnabled(availability()) || isProtectionGated()}
+        onClick={() => dispatchCommand(commandValue)}
+      >
+        {command.icon ? command.icon() : t(command.label)}
+      </button>
+    )
+  }
+
+  function renderColorButton(mode: ColorPopoverMode) {
+    const isText = mode === 'text'
+    const testId = isText ? 'toolbar-btn-text-color' : 'toolbar-btn-fill-color'
+    const titleKey = isText ? 'toolbar.textColor.title' : 'toolbar.fillColor.title'
+    const isEnabled = () => (isText ? availability().textColor : availability().fillColor)
+    const isPressed = () => colorPopover().mode === mode
+    const Icon = isText ? TextColorIcon : FillColorIcon
+
+    return (
+      <button
+        type="button"
+        ref={(el) => {
+          colorAnchors[mode] = el
+        }}
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          isPressed() ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid={testId}
+        title={t(titleKey)}
+        aria-label={t(titleKey)}
+        aria-haspopup="dialog"
+        aria-expanded={isPressed()}
+        disabled={!isEnabled() || isProtectionGated()}
+        onClick={() => toggleColorPopover(mode)}
+      >
+        <Icon />
+      </button>
+    )
   }
 
   return (
@@ -1003,6 +1045,64 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       role="toolbar"
       data-testid={props['data-testid'] ?? 'spreadsheet-toolbar'}
     >
+      {/* Group 1 — History + format painter + clear */}
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-undo"
+        title={t('toolbar.undo.title')}
+        aria-label={t('toolbar.undo.title')}
+        disabled={!canUndo()}
+        onClick={() => void handleUndo()}
+      >
+        <UndoIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-redo"
+        title={t('toolbar.redo.title')}
+        aria-label={t('toolbar.redo.title')}
+        disabled={!canRedo()}
+        onClick={() => void handleRedo()}
+      >
+        <RedoIcon />
+      </button>
+      <button
+        type="button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          formatPainterState() !== 'idle' ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid="toolbar-btn-format-painter"
+        data-format-painter-state={formatPainterState()}
+        title={
+          formatPainterState() === 'sticky'
+            ? t('toolbar.painter.title.sticky')
+            : t('toolbar.painter.title')
+        }
+        aria-label={t('toolbar.painter')}
+        aria-pressed={formatPainterState() !== 'idle'}
+        disabled={isProtectionGated()}
+        onClick={handleFormatPainterClick}
+        onDblClick={handleFormatPainterDoubleClick}
+      >
+        <FormatPainterIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-clear-format"
+        title={t('toolbar.clearFormat.title')}
+        aria-label={t('toolbar.clearFormat.title')}
+        disabled={!backend.setFormatRange || isProtectionGated()}
+        onClick={() => void handleClearFormat()}
+      >
+        <ClearFormatIcon />
+      </button>
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 2 — Font family + size */}
       <button
         type="button"
         ref={(el) => (fontFamilyAnchorEl = el)}
@@ -1073,107 +1173,17 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       >
         <FontSizeDownIcon />
       </button>
-      {toolbarCommands.map((command) => {
-        const commandValue = { command: command.command, value: command.value }
-        const colorMode: ColorPopoverMode | null =
-          command.command === 'fill-color'
-            ? 'fill'
-            : command.command === 'text-color'
-              ? 'text'
-              : null
-        // The Univer-parity %/¥ shortcuts re-use `command: 'number-format'`
-        // but dispatch a fixed value directly — only the canonical
-        // `toolbar-btn-number-format` entry opens the catalog dropdown.
-        const isNumberFormatDropdownOpener =
-          command.command === 'number-format' && command.testId === 'toolbar-btn-number-format'
-        const isPressed = () => {
-          if (command.command === 'bold') return !!activeCellFormat().bold
-          if (command.command === 'italic') return !!activeCellFormat().italic
-          if (command.command === 'underline') return !!activeCellFormat().underline
-          if (command.command === 'strikethrough') return !!activeCellFormat().strikethrough
-          if (command.command === 'wrap') return !!activeCellFormat().wrap
-          if (isNumberFormatDropdownOpener) return numberFormatOpen()
-          if (colorMode !== null) return colorPopover().mode === colorMode
-          return undefined
-        }
 
-        return (
-          <button
-            type="button"
-            ref={(el) => {
-              if (colorMode) colorAnchors[colorMode] = el
-            }}
-            class={`fmt-btn spreadsheet-toolbar-button ${
-              isPressed() ? 'fmt-btn-active' : ''
-            }`.trim()}
-            data-testid={command.testId}
-            title={t(command.title)}
-            aria-label={t(command.title)}
-            aria-pressed={isPressed()}
-            aria-haspopup={
-              isNumberFormatDropdownOpener
-                ? 'menu'
-                : colorMode
-                  ? 'dialog'
-                  : undefined
-            }
-            aria-expanded={
-              isNumberFormatDropdownOpener
-                ? numberFormatOpen()
-                : colorMode
-                  ? colorPopover().mode === colorMode
-                  : undefined
-            }
-            disabled={!command.isEnabled(availability()) || isProtectionGated()}
-            onClick={(event) => {
-              if (isNumberFormatDropdownOpener) {
-                if (numberFormatOpen()) {
-                  closeNumberFormatDropdown()
-                } else {
-                  openNumberFormatDropdown(event.currentTarget)
-                }
-                return
-              }
-              if (colorMode) {
-                toggleColorPopover(colorMode)
-                return
-              }
-              dispatchCommand(commandValue)
-            }}
-          >
-            {command.icon ? command.icon() : t(command.label)}
-          </button>
-        )
-      })}
-      <div
-        class="spreadsheet-toolbar-rotation-wrapper"
-        style={{ position: 'relative', display: 'inline-flex' }}
-      >
-        <button
-          ref={(el) => (rotationAnchorRef = el)}
-          type="button"
-          class={`fmt-btn spreadsheet-toolbar-button ${
-            rotationDropdownOpen() ? 'fmt-btn-active' : ''
-          }`.trim()}
-          data-testid="toolbar-btn-rotation"
-          title={t('toolbar.rotation.title')}
-          aria-label={t('toolbar.rotation.title')}
-          aria-haspopup="menu"
-          aria-expanded={rotationDropdownOpen()}
-          disabled={!availability().rotation || isProtectionGated()}
-          onClick={() => {
-            setRotationDropdownOpen((open) => !open)
-          }}
-        >
-          <RotationIcon />
-        </button>
-        <RotationDropdown
-          isOpen={rotationDropdownOpen()}
-          anchorRef={rotationAnchorRef ?? null}
-          onSelect={handleRotationSelect}
-          onRequestClose={() => setRotationDropdownOpen(false)}
-        />
-      </div>
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 3 — Text styles (B / I / U / S) */}
+      {textStyleCommands.map(renderTextStyleButton)}
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 4 — Colors + borders */}
+      {renderColorButton('text')}
+      {renderColorButton('fill')}
       <div
         class="spreadsheet-toolbar-borders-wrapper"
         style={{ position: 'relative', display: 'inline-flex' }}
@@ -1204,6 +1214,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           onRequestClose={() => setBordersDropdownOpen(false)}
         />
       </div>
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 5 — Alignment + wrap + rotation */}
       <div
         class="spreadsheet-toolbar-h-align-wrapper"
         style={{ position: 'relative', display: 'inline-flex' }}
@@ -1278,6 +1292,53 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           onRequestClose={() => setVAlignDropdownOpen(false)}
         />
       </div>
+      <button
+        type="button"
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          activeCellFormat().wrap ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid="toolbar-btn-wrap"
+        title={t('toolbar.wrap.title')}
+        aria-label={t('toolbar.wrap.title')}
+        aria-pressed={!!activeCellFormat().wrap}
+        disabled={!availability().wrap || isProtectionGated()}
+        onClick={() => dispatchCommand({ command: 'wrap' })}
+      >
+        <WrapIcon />
+      </button>
+      <div
+        class="spreadsheet-toolbar-rotation-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (rotationAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            rotationDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-rotation"
+          title={t('toolbar.rotation.title')}
+          aria-label={t('toolbar.rotation.title')}
+          aria-haspopup="menu"
+          aria-expanded={rotationDropdownOpen()}
+          disabled={!availability().rotation || isProtectionGated()}
+          onClick={() => {
+            setRotationDropdownOpen((open) => !open)
+          }}
+        >
+          <RotationIcon />
+        </button>
+        <RotationDropdown
+          isOpen={rotationDropdownOpen()}
+          anchorRef={rotationAnchorRef ?? null}
+          onSelect={handleRotationSelect}
+          onRequestClose={() => setRotationDropdownOpen(false)}
+        />
+      </div>
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 6 — Merge */}
       <div
         class="spreadsheet-toolbar-merge-wrapper"
         style={{ position: 'relative', display: 'inline-flex' }}
@@ -1309,37 +1370,58 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           onRequestClose={() => setMergeDropdownOpen(false)}
         />
       </div>
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
+      {/* Group 7 — Number format dropdown + percent / currency shortcuts */}
       <button
         type="button"
-        class={`fmt-btn spreadsheet-toolbar-button ${
-          formatPainterState() !== 'idle' ? 'fmt-btn-active' : ''
+        ref={(el) => (numberFormatAnchorEl = el)}
+        class={`fmt-btn spreadsheet-toolbar-button spreadsheet-toolbar-currency-opener ${
+          numberFormatOpen() ? 'fmt-btn-active' : ''
         }`.trim()}
-        data-testid="toolbar-btn-format-painter"
-        data-format-painter-state={formatPainterState()}
-        title={
-          formatPainterState() === 'sticky'
-            ? t('toolbar.painter.title.sticky')
-            : t('toolbar.painter.title')
-        }
-        aria-label={t('toolbar.painter')}
-        aria-pressed={formatPainterState() !== 'idle'}
-        disabled={isProtectionGated()}
-        onClick={handleFormatPainterClick}
-        onDblClick={handleFormatPainterDoubleClick}
+        data-testid="toolbar-btn-number-format"
+        title={t('toolbar.currencyDropdown.title')}
+        aria-label={t('toolbar.currencyDropdown.title')}
+        aria-haspopup="menu"
+        aria-expanded={numberFormatOpen()}
+        disabled={!availability().numberFormat || isProtectionGated()}
+        onClick={(event) => {
+          if (numberFormatOpen()) {
+            closeNumberFormatDropdown()
+          } else {
+            openNumberFormatDropdown(event.currentTarget)
+          }
+        }}
       >
-        <FormatPainterIcon />
+        <span>{t('toolbar.currencyDropdown')}</span>
+        <span class="toolbar-chevron">
+          <ChevronDownIcon />
+        </span>
       </button>
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-paste"
-        title={t('toolbar.paste.title')}
-        aria-label={t('toolbar.paste.title')}
-        disabled={isProtectionGated()}
-        onClick={dispatchPasteIntent}
+        data-testid="toolbar-btn-percent-format"
+        title={t('toolbar.percentFormat.title')}
+        aria-label={t('toolbar.percentFormat.title')}
+        disabled={!availability().numberFormat || isProtectionGated()}
+        onClick={() => dispatchCommand({ command: 'number-format', value: 'Percent' })}
       >
-        <PasteIcon />
+        <PercentIcon />
       </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-currency-format"
+        title={t('toolbar.currencyFormat.title')}
+        aria-label={t('toolbar.currencyFormat.title')}
+        disabled={!availability().numberFormat || isProtectionGated()}
+        onClick={() => dispatchCommand({ command: 'number-format', value: 'Currency' })}
+      >
+        <CurrencyIcon />
+      </button>
+
       <NumberFormatDropdown
         open={numberFormatOpen()}
         anchorRect={numberFormatAnchor()}
