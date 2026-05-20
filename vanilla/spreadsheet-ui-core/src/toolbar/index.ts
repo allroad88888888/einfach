@@ -70,6 +70,7 @@ export function getToolbarCommandAvailability(
     fillColor: canStyleSelection,
     numberFormat: canFormatSelection,
     alignment: canStyleSelection,
+    verticalAlignment: canStyleSelection,
     underline: canStyleSelection,
     strikethrough: canStyleSelection,
     wrap: canStyleSelection,
@@ -95,6 +96,8 @@ export function isToolbarFormatCommandAvailable(
       return availability.numberFormat
     case 'alignment':
       return availability.alignment
+    case 'vertical-alignment':
+      return availability.verticalAlignment
     case 'underline':
       return availability.underline
     case 'strikethrough':

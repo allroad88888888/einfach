@@ -143,6 +143,61 @@ test.describe('Format audit — number format', () => {
     // No menu — assert a visible format change.
     await expect(cellDisplay(page, 'B2')).not.toHaveText(before)
   })
+
+  test('dropdown shows 16 rows; choosing 百分比 turns 120 into 12000%', async ({ page }) => {
+    await gotoWave5(page)
+    // B2 = 120 under General formatting per the Wave 5 seed.
+    await cell(page, 'B2').click()
+    await expect(cellDisplay(page, 'B2')).toHaveText('120')
+
+    // Opening the toolbar number-format button must pop the catalog dropdown.
+    await numberFormatBtn(page).click()
+    const dropdown = page.getByTestId('number-format-dropdown')
+    await expect(dropdown).toBeVisible()
+
+    // 16 rows in the order shown in the spec image.
+    const items = dropdown.locator('[data-format-id]')
+    await expect(items).toHaveCount(16)
+
+    // 万元 ships disabled — the engine has no first-class 10000-unit variant.
+    await expect(page.getByTestId('number-format-item-WanYuan')).toBeDisabled()
+
+    // Click 百分比 → format applies, dropdown closes, 120 renders as 12000%.
+    await page.getByTestId('number-format-item-Percent').click()
+    await expect(dropdown).toBeHidden()
+    await expect(cellDisplay(page, 'B2')).toHaveText('12000%')
+  })
+
+  test('dropdown closes on Esc and click-outside without applying', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    const before = (await cellDisplay(page, 'B2').textContent())?.trim() ?? ''
+
+    // Esc closes.
+    await numberFormatBtn(page).click()
+    await expect(page.getByTestId('number-format-dropdown')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(page.getByTestId('number-format-dropdown')).toBeHidden()
+    expect((await cellDisplay(page, 'B2').textContent())?.trim()).toBe(before)
+
+    // Click-outside closes. Use the sidebar which is far to the right of the
+    // dropdown's horizontal band and outside the anchor button's rect.
+    await numberFormatBtn(page).click()
+    await expect(page.getByTestId('number-format-dropdown')).toBeVisible()
+    await page.getByTestId('wave5-sidebar').click({ position: { x: 5, y: 5 } })
+    await expect(page.getByTestId('number-format-dropdown')).toBeHidden()
+  })
+
+  test('自定义格式 row opens the Format Cells dialog on the number tab', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await numberFormatBtn(page).click()
+    await expect(page.getByTestId('number-format-dropdown')).toBeVisible()
+
+    await page.getByTestId('number-format-item-Custom').click()
+    await expect(page.getByTestId('number-format-dropdown')).toBeHidden()
+    await expect(page.getByTestId('wave5-format-cells')).toBeVisible()
+  })
 })
 
 test.describe('Format audit — format painter', () => {

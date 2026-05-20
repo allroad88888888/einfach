@@ -21,6 +21,7 @@ export type ToolbarFormatCommandKind =
   | 'fill-color'
   | 'number-format'
   | 'alignment'
+  | 'vertical-alignment'
   | 'underline'
   | 'strikethrough'
   | 'wrap'
@@ -45,6 +46,7 @@ export interface ToolbarCommandAvailability extends ToolbarAvailabilitySnapshot 
   fillColor: boolean
   numberFormat: boolean
   alignment: boolean
+  verticalAlignment: boolean
   underline: boolean
   strikethrough: boolean
   wrap: boolean

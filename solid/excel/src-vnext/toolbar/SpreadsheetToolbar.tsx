@@ -1,3 +1,4 @@
+import { createSignal } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
@@ -8,6 +9,7 @@ import {
   exitFormatPainterAtom,
   formatPainterStateAtom,
   nextHistoryTransactionId,
+  openFormatCellsAtom,
   pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
@@ -33,6 +35,7 @@ import {
   useSpreadsheetUiStore,
 } from '../provider'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
+import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
 
 const toolbarCommands: SpreadsheetToolbarCommand[] = [
   {
@@ -77,10 +80,35 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     label: 'toolbar.numberFormat',
     title: 'toolbar.numberFormat.title',
     testId: 'toolbar-btn-number-format',
-    // Default toolbar press applies a decimal-2 number format. Use the Format
-    // Cells dialog (or future dropdown) for non-Number variants.
+    // The button opens the NumberFormatDropdown; the chosen row supplies the
+    // value when dispatchCommand is invoked. The hard-coded value here is a
+    // safety net for callers that bypass the dropdown (none today).
     value: 'Number',
     isEnabled: (availability) => availability.numberFormat,
+  },
+  {
+    command: 'vertical-alignment',
+    label: 'toolbar.verticalAlignTop',
+    title: 'toolbar.verticalAlignTop.title',
+    testId: 'toolbar-btn-vertical-align-top',
+    value: 'top',
+    isEnabled: (availability) => availability.verticalAlignment,
+  },
+  {
+    command: 'vertical-alignment',
+    label: 'toolbar.verticalAlignMiddle',
+    title: 'toolbar.verticalAlignMiddle.title',
+    testId: 'toolbar-btn-vertical-align-middle',
+    value: 'center',
+    isEnabled: (availability) => availability.verticalAlignment,
+  },
+  {
+    command: 'vertical-alignment',
+    label: 'toolbar.verticalAlignBottom',
+    title: 'toolbar.verticalAlignBottom.title',
+    testId: 'toolbar-btn-vertical-align-bottom',
+    value: 'bottom',
+    isEnabled: (availability) => availability.verticalAlignment,
   },
 ]
 
@@ -90,17 +118,49 @@ function cloneFormat(format: SpreadsheetCellFormat | undefined): SpreadsheetCell
   return clone
 }
 
+/**
+ * Map a toolbar `value` token to a `SpreadsheetNumberFormat`. Token names are
+ * the `NumberFormatId` values from the dropdown plus the legacy aliases
+ * `'Number' | 'Percent' | 'Currency' | 'Date' | 'General'` used by callers
+ * before the dropdown existed.
+ *
+ * `'Custom'` and `'WanYuan'` are handled out-of-band by the toolbar (the
+ * former opens the Format Cells dialog; the latter is disabled in the
+ * dropdown) and never reach this function.
+ */
 function numberFormatForValue(value: string | null): SpreadsheetNumberFormat {
   switch (value) {
+    // 16-row dropdown identifiers
+    case 'Auto':
+    case 'General':
+      return { kind: 'general' }
+    case 'Text':
+      return { kind: 'text' }
     case 'Number':
       return { kind: 'decimal', digits: 2, thousands: false }
     case 'Percent':
       return { kind: 'percent', digits: 0 }
+    case 'Scientific':
+      return { kind: 'scientific', digits: 2 }
+    case 'NumberThousands':
+      return { kind: 'decimal', digits: 2, thousands: true }
+    case 'Accounting':
+      return { kind: 'accounting', symbol: '¥', digits: 2 }
     case 'Currency':
-      return { kind: 'currency', symbol: '$', digits: 2 }
+      return { kind: 'currency', symbol: '¥', digits: 2 }
+    case 'DateShort':
     case 'Date':
       return { kind: 'date', pattern: 'yyyy-mm-dd' }
-    case 'General':
+    case 'DateLong':
+      return { kind: 'date', pattern: 'yyyy"年"m"月"d"日"' }
+    case 'Time12':
+      return { kind: 'time', pattern: 'h:mm AM/PM' }
+    case 'Time24':
+      return { kind: 'time', pattern: 'HH:mm' }
+    case 'DateTime12':
+      return { kind: 'custom', pattern: 'yyyy-mm-dd h:mm AM/PM' }
+    case 'DateTime24':
+      return { kind: 'custom', pattern: 'yyyy-mm-dd HH:mm' }
     default:
       return { kind: 'general' }
   }
@@ -123,9 +183,43 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const findReplaceOpen = useAtomValue(findReplaceOpenAtom)
   const printPreviewOpen = useAtomValue(printPreviewOpenAtom)
   const formatPainterState = useAtomValue(formatPainterStateAtom)
+  const [numberFormatOpen, setNumberFormatOpen] = createSignal(false)
+  const [numberFormatAnchor, setNumberFormatAnchor] = createSignal<DOMRect | null>(null)
+  let numberFormatAnchorEl: HTMLButtonElement | null = null
 
   function isProtectionGated(): boolean {
     return activeCellLocked() || selectionLocked() !== 'open'
+  }
+
+  function openNumberFormatDropdown(buttonEl: HTMLButtonElement) {
+    numberFormatAnchorEl = buttonEl
+    setNumberFormatAnchor(buttonEl.getBoundingClientRect())
+    setNumberFormatOpen(true)
+  }
+
+  function closeNumberFormatDropdown() {
+    setNumberFormatOpen(false)
+    setNumberFormatAnchor(null)
+  }
+
+  function onNumberFormatPick(id: NumberFormatId) {
+    closeNumberFormatDropdown()
+    if (id === 'Custom') {
+      const selection = selectionSnapshot()
+      const sheetId = selection.selection.sheetId || availability().sheetId
+      if (!sheetId) return
+      store.setter(openFormatCellsAtom, {
+        sheetId,
+        range: selection.range,
+        initialTab: 'number',
+        initialFormat: activeCellFormat(),
+      })
+      return
+    }
+    // 'WanYuan' is disabled in the dropdown UI and never reaches here, but
+    // guard so a future re-enable does not silently fall through to General.
+    if (id === 'WanYuan') return
+    dispatchCommand({ command: 'number-format', value: id })
   }
 
   function getCurrentWindow() {
@@ -222,6 +316,12 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         return {
           ...current,
           align: intent.value === 'center' || intent.value === 'right' ? intent.value : 'left',
+        }
+      case 'vertical-alignment':
+        return {
+          ...current,
+          verticalAlign:
+            intent.value === 'top' || intent.value === 'center' ? intent.value : 'bottom',
         }
       default:
         return current
@@ -417,14 +517,19 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     >
       {toolbarCommands.map((command) => {
         const commandValue = { command: command.command, value: command.value }
-        const isPressed = () =>
-          command.command === 'bold'
-            ? !!activeCellFormat().bold
-            : command.command === 'italic'
-              ? !!activeCellFormat().italic
-              : command.command === 'underline'
-                ? !!activeCellFormat().underline
-                : undefined
+        const isPressed = () => {
+          if (command.command === 'bold') return !!activeCellFormat().bold
+          if (command.command === 'italic') return !!activeCellFormat().italic
+          if (command.command === 'underline') return !!activeCellFormat().underline
+          if (command.command === 'number-format') return numberFormatOpen()
+          if (command.command === 'vertical-alignment') {
+            // Default vertical alignment (when unset) is 'bottom', per the
+            // backend cell-format contract.
+            const current = activeCellFormat().verticalAlign ?? 'bottom'
+            return current === command.value
+          }
+          return undefined
+        }
 
         return (
           <button
@@ -436,8 +541,20 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             title={t(command.title)}
             aria-label={t(command.title)}
             aria-pressed={isPressed()}
+            aria-haspopup={command.command === 'number-format' ? 'menu' : undefined}
+            aria-expanded={
+              command.command === 'number-format' ? numberFormatOpen() : undefined
+            }
             disabled={!command.isEnabled(availability()) || isProtectionGated()}
-            onClick={() => {
+            onClick={(event) => {
+              if (command.command === 'number-format') {
+                if (numberFormatOpen()) {
+                  closeNumberFormatDropdown()
+                } else {
+                  openNumberFormatDropdown(event.currentTarget)
+                }
+                return
+              }
               dispatchCommand(commandValue)
             }}
           >
@@ -517,6 +634,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       >
         {t('toolbar.painter')}
       </button>
+      <NumberFormatDropdown
+        open={numberFormatOpen()}
+        anchorRect={numberFormatAnchor()}
+        anchorEl={numberFormatAnchorEl}
+        onSelect={onNumberFormatPick}
+        onClose={closeNumberFormatDropdown}
+      />
     </div>
   )
 }

@@ -503,7 +503,13 @@ thead .row-header {
 }
 
 .spreadsheet-grid-cell-button {
-  display: block;
+  /*
+   * Flex column so the inner `.cell-display` can pick its vertical position
+   * via `margin-top: auto` / `margin-bottom: auto`, driven from
+   * SpreadsheetCellFormat.verticalAlign in the cell renderer.
+   */
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100%;
   border: 0;
@@ -1115,6 +1121,53 @@ thead .row-header {
   background: var(--select-bg);
   border-color: var(--excel-green);
   color: var(--excel-green);
+}
+
+/* Number-format dropdown — anchored beneath the toolbar's number-format
+   button. Two-column rows (label left, preview right) mirroring Excel. */
+.number-format-dropdown {
+  min-width: 240px;
+  padding: 4px 0;
+  background: #ffffff;
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  font-family: var(--excel-font);
+  font-size: 12px;
+}
+
+.number-format-dropdown-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 4px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-default);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.number-format-dropdown-item:hover:not(:disabled) {
+  background: var(--select-bg);
+}
+
+.number-format-dropdown-item-disabled,
+.number-format-dropdown-item:disabled {
+  color: #b0b0b0;
+  cursor: default;
+}
+
+.number-format-dropdown-label {
+  flex: 1;
+  margin-right: 16px;
+}
+
+.number-format-dropdown-preview {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* A.3 Name Box + Formula Bar row */
