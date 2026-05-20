@@ -5354,6 +5354,18 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 }
 
 /// Naive Gregorian-only days-from-epoch. Epoch: 1970-01-01 = 0.
+///
+/// TODO(excel-1900-epoch): if Excel file import/export becomes a requirement,
+/// switch to Excel's 1900-01-01 = serial 1 convention. Constraints:
+///   - serials need a +25569 offset (days between 1900-01-01 and 1970-01-01,
+///     including the phantom Feb 29 1900 that Excel preserves for Lotus 1-2-3
+///     compatibility);
+///   - the phantom 1900-02-29 must be reproduced for serials 60..; dates before
+///     1900-03-01 stay off by one day from the real Gregorian calendar;
+///   - dates before 1900-01-01 → #NUM! (Excel rejects them);
+///   - every test in `eval_*date*` / `eval_weekday` / `eval_eomonth` / etc.
+///     needs its expected values regenerated against the new baseline.
+/// Until then 1970 epoch is internally consistent and has no leap-year bug.
 fn date_serial(year: i32, month: u32, day: u32) -> f64 {
     if month == 0 || month > 12 || day == 0 || day > 31 {
         return f64::NAN;
