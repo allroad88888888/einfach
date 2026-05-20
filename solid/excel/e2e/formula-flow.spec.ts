@@ -423,6 +423,23 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(display(page, 'I2')).toHaveText('1')
   })
 
+  test('VLOOKUP returns the matching value from a later column of the table_array', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    // Wave 5 seed:
+    //   A2=North B2=120 ... F2=840
+    //   A3=South B3=80  ... F3=800
+    //   A4=East  B4=200 ... F4=500
+    // Lookup "East" in column A, return Q1 from column B.
+    await commitFormulaInCell(page, 'H10', '=VLOOKUP("East", A2:F8, 2)')
+    await expect(display(page, 'H10')).toHaveText('200')
+
+    // No match → #N/A.
+    await commitFormulaInCell(page, 'H11', '=VLOOKUP("Antarctica", A2:F8, 2)')
+    await expect(display(page, 'H11')).toHaveText('#N/A')
+  })
+
   test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H9').click()

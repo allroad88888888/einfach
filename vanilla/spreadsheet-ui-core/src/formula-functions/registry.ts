@@ -119,6 +119,16 @@ export const FORMULA_FUNCTION_SPECS: readonly FormulaFunctionSpec[] = [
     args: [{ name: 'number' }, { name: 'divisor' }],
     summary: 'Returns the remainder after a number is divided by a divisor.',
   },
+  {
+    name: 'VLOOKUP',
+    args: [
+      { name: 'lookup_value' },
+      { name: 'table_array' },
+      { name: 'col_index_num' },
+      { name: 'range_lookup', optional: true },
+    ],
+    summary: 'Looks up a value in the first column of a range and returns a value from a column in the same row.',
+  },
 ]
 
 const SPEC_BY_NAME: Map<string, FormulaFunctionSpec> = new Map(

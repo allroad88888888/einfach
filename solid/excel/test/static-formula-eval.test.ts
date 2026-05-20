@@ -228,6 +228,38 @@ describe('static-formula-eval — SQRT / MOD', () => {
   })
 })
 
+describe('static-formula-eval — VLOOKUP', () => {
+  // Lookup table:
+  //   A1=apple  B1=10
+  //   A2=banana B2=20
+  //   A3=cherry B3=30
+  const table = { A1: 'apple', B1: 10, A2: 'banana', B2: 20, A3: 'cherry', B3: 30 }
+
+  it('returns the matching cell from a later column', () => {
+    expect(ev('=VLOOKUP("banana", A1:B3, 2, FALSE)', table)).toBe(20)
+  })
+
+  it('first-column match is case-insensitive', () => {
+    expect(ev('=VLOOKUP("APPLE", A1:B3, 2)', table)).toBe(10)
+  })
+
+  it('numeric lookup_value finds an exact-typed numeric match', () => {
+    expect(ev('=VLOOKUP(20, A1:B3, 1)', { A1: 10, B1: 'ten', A2: 20, B2: 'twenty' })).toBe(20)
+  })
+
+  it('returns #N/A when nothing matches', () => {
+    expect(ev('=VLOOKUP("nope", A1:B3, 2)', table)).toBe('#N/A')
+  })
+
+  it('col_index past the table width returns #REF!', () => {
+    expect(ev('=VLOOKUP("apple", A1:B3, 9)', table)).toBe('#REF!')
+  })
+
+  it('col_index 0 or negative returns #VALUE!', () => {
+    expect(ev('=VLOOKUP("apple", A1:B3, 0)', table)).toBe('#VALUE!')
+  })
+})
+
 describe('static-formula-eval — nesting + chaining', () => {
   it('IF over SUM with a ref-based threshold', () => {
     expect(ev('=IF(SUM(A1:A3)>=50, "big", "small")', { A1: 20, A2: 20, A3: 20 })).toBe('big')
