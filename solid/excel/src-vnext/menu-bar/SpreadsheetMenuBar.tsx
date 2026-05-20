@@ -14,6 +14,7 @@ import {
   isMenuItemDescriptor,
   issueFilterSortSyncTicketAtom,
   MENU_BAR_ITEMS,
+  nextHistoryTransactionId,
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
@@ -24,6 +25,7 @@ import {
   openTopMenuAtom,
   openValidationRuleEditorAtom,
   pasteClipboardAtom,
+  pushHistoryAtom,
   selectAllAtom,
   selectionSnapshotAtom,
   setFilterSortErrorAtom,
@@ -46,7 +48,15 @@ import {
   type TopMenuId,
 } from '@einfach/spreadsheet-ui-core'
 
-import { dispatchRedo, dispatchUndo, useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import {
+  advanceSpreadsheetProjectionRequestIdAtom,
+  dispatchRedo,
+  dispatchUndo,
+  isVisibleProjectionResult,
+  spreadsheetProjectionSnapshotAtom,
+  useSpreadsheetBackend,
+  useSpreadsheetUiStore,
+} from '../provider'
 
 export interface SpreadsheetMenuBarProps {
   class?: string
@@ -144,6 +154,37 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     return ws.activeSheetId ?? null
   }
 
+  async function refreshVisibleProjection(sheetId: string): Promise<void> {
+    if (!backend.readVisibleProjection) return
+    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
+    if (!isVisibleProjectionResult(snapshot.result)) return
+    const window = snapshot.result.window
+    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
+    try {
+      const result = await backend.readVisibleProjection({
+        kind: 'visible-window',
+        sheetId,
+        requestId,
+        reason: 'toolbar',
+        window,
+      })
+      store.setter(spreadsheetProjectionSnapshotAtom, {
+        status: 'ready',
+        request: {
+          kind: 'visible-window',
+          sheetId,
+          requestId,
+          reason: 'toolbar',
+          window,
+        },
+        result,
+        error: undefined,
+      })
+    } catch {
+      // Leave existing snapshot on read failure.
+    }
+  }
+
   function routeDispatch(dispatch: MenuItemDispatch) {
     switch (dispatch.kind) {
       case 'undo':
@@ -221,11 +262,70 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return
       }
       case 'insert-row-above':
-      case 'insert-row-below':
-      case 'insert-column-left':
-      case 'insert-column-right':
-      case 'insert-sheet':
+      case 'insert-row-below': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId || !backend.insertRows) return
+        const snap = store.getter(selectionSnapshotAtom)
+        const rowIndex =
+          dispatch.kind === 'insert-row-above' ? snap.range.rowStart : snap.range.rowEnd + 1
+        void (async () => {
+          const result = await backend.insertRows!({
+            kind: 'insert-rows',
+            sheetId,
+            rowIndex,
+            count: 1,
+          })
+          const rev =
+            typeof result?.revision === 'number'
+              ? result.revision
+              : Number(result?.revision ?? 0) || 0
+          store.setter(pushHistoryAtom, {
+            transactionId: nextHistoryTransactionId(),
+            kind: 'row.insert',
+            sheetId,
+            projectionRevision: rev,
+            affectedRange: result?.affectedRange,
+          })
+          await refreshVisibleProjection(sheetId)
+        })()
         return
+      }
+      case 'insert-column-left':
+      case 'insert-column-right': {
+        const sheetId = getActiveSheetId()
+        if (!sheetId || !backend.insertColumns) return
+        const snap = store.getter(selectionSnapshotAtom)
+        const colIndex =
+          dispatch.kind === 'insert-column-left' ? snap.range.colStart : snap.range.colEnd + 1
+        void (async () => {
+          const result = await backend.insertColumns!({
+            kind: 'insert-columns',
+            sheetId,
+            colIndex,
+            count: 1,
+          })
+          const rev =
+            typeof result?.revision === 'number'
+              ? result.revision
+              : Number(result?.revision ?? 0) || 0
+          store.setter(pushHistoryAtom, {
+            transactionId: nextHistoryTransactionId(),
+            kind: 'column.insert',
+            sheetId,
+            projectionRevision: rev,
+            affectedRange: result?.affectedRange,
+          })
+          await refreshVisibleProjection(sheetId)
+        })()
+        return
+      }
+      case 'insert-sheet': {
+        if (!backend.addSheet) return
+        void (async () => {
+          await backend.addSheet!({ kind: 'add-sheet' })
+        })()
+        return
+      }
       case 'toggle-bold': {
         const sheetId = getActiveSheetId() ?? undefined
         store.setter(dispatchToolbarFormatCommandAtom, { command: 'bold', sheetId })
@@ -315,6 +415,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
               })
               store.setter(setFilterSortErrorAtom, null)
               void ticket
+              await refreshVisibleProjection(sheetId)
             } catch (err) {
               store.setter(setFilterSortErrorAtom, err)
             }
