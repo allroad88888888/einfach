@@ -24,12 +24,16 @@ const SVG_PROPS = {
 } as const
 
 export const BoldIcon = (): JSX.Element => (
-  <svg {...SVG_PROPS}>
+  <svg width={16} height={16} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    {/*
+      Fill-only "B" — no stroke. The previous version layered a 0.8px stroke
+      on top of the fill which renders as a sub-pixel halo at 14-16px display
+      sizes (the path edges land on fractional pixel boundaries). Pure fill
+      with thicker bar geometry stays crisp at any zoom.
+     */}
     <path
-      d="M5 3h3.6a2.4 2.4 0 0 1 0 4.8H5zM5 7.8h4.2a2.6 2.6 0 0 1 0 5.2H5z"
+      d="M4.5 3h4a2.5 2.5 0 0 1 1.8 4.25A2.7 2.7 0 0 1 9 13H4.5V3zm2 1.6v2.7h2a1.35 1.35 0 0 0 0-2.7h-2zm0 4.3v2.5h2.5a1.25 1.25 0 0 0 0-2.5H6.5z"
       fill="currentColor"
-      stroke="currentColor"
-      stroke-width="0.8"
     />
   </svg>
 )
@@ -144,8 +148,21 @@ export const FormatPainterIcon = (): JSX.Element => (
 
 export const MergeCellsIcon = (): JSX.Element => (
   <svg {...SVG_PROPS}>
-    <rect x="2.5" y="3.5" width="11" height="9" />
-    <path d="M5.5 5.5 8 8l-2.5 2.5M10.5 5.5 8 8l2.5 2.5" />
+    {/*
+      4-cell grid that collapses inward:
+        - heavy outer rect = merged boundary
+        - dashed inner crosshatch = cell walls "fading away"
+        - center arrows pointing inward = collapse
+      Closer to the classic Excel / Univer merge glyph than the previous
+      rectangle-with-crossing-arrows (which read more like "swap").
+     */}
+    <rect x="2" y="3" width="12" height="10" stroke-width="1.6" />
+    <line x1="8" y1="3.2" x2="8" y2="6" stroke-dasharray="1.4 1.2" />
+    <line x1="8" y1="10" x2="8" y2="12.8" stroke-dasharray="1.4 1.2" />
+    <line x1="2.2" y1="8" x2="5" y2="8" stroke-dasharray="1.4 1.2" />
+    <line x1="11" y1="8" x2="13.8" y2="8" stroke-dasharray="1.4 1.2" />
+    <path d="M6 8h4" stroke-width="1.4" />
+    <path d="M6.5 7l-1 1 1 1M9.5 7l1 1-1 1" stroke-width="1.4" />
   </svg>
 )
 

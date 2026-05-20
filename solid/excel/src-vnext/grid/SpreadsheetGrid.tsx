@@ -166,21 +166,27 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
 
   if (format.verticalAlign) {
     // The parent .spreadsheet-grid-cell-button is flex-direction:column, so
-    // align-self positions the cell-display along the cross axis (vertical).
-    // The previous margin-auto approach was a no-op because .cell-display
-    // defaults to height:100%, leaving the auto margins no space to grow
-    // into. Override the height and use align-self so each anchor (top /
-    // center / bottom) actually moves the text. The legacy
-    // --cell-vertical-align var stays for canvas-overlay adapters that read
-    // the anchor directly.
+    // the MAIN axis is vertical. `margin-block: auto` on a flex item pushes
+    // it along the main axis — that's what actually moves text up/down.
+    // (`align-self` is the cross axis here, which is horizontal — wrong tool.)
+    //
+    // The earlier margin-auto attempt was a no-op only because .cell-display
+    // defaults to height:100% and ate all the slack. Override the height to
+    // auto AND set the auto margins to wire the anchor up correctly. The
+    // legacy --cell-vertical-align var stays for canvas-overlay adapters
+    // that read the anchor directly.
     style['--cell-vertical-align'] = format.verticalAlign
     style['height'] = 'auto'
-    style['align-self'] =
-      format.verticalAlign === 'center'
-        ? 'center'
-        : format.verticalAlign === 'top'
-          ? 'flex-start'
-          : 'flex-end'
+    if (format.verticalAlign === 'top') {
+      style['margin-top'] = '0'
+      style['margin-bottom'] = 'auto'
+    } else if (format.verticalAlign === 'center') {
+      style['margin-top'] = 'auto'
+      style['margin-bottom'] = 'auto'
+    } else if (format.verticalAlign === 'bottom') {
+      style['margin-top'] = 'auto'
+      style['margin-bottom'] = '0'
+    }
   }
 
   // Rotation. Numeric values rotate around the centre; `'vertical'` uses
