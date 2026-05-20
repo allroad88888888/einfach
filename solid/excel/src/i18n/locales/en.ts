@@ -210,6 +210,8 @@ export const messages: Record<string, string> = {
   'toolbar.textColor.title': 'Text color',
   'toolbar.colorPopover.noFill': 'No fill',
   'toolbar.colorPopover.automatic': 'Automatic',
+  'toolbar.colorPopover.themeColors': 'Theme colors',
+  'toolbar.colorPopover.moreColors': 'More colors…',
   'toolbar.numberFormat': 'Num',
   'toolbar.numberFormat.title': 'Number format',
   'toolbar.percentFormat': '%',

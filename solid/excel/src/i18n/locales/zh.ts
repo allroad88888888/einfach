@@ -194,6 +194,8 @@ export const messages: Record<string, string> = {
   'toolbar.textColor.title': '字体颜色',
   'toolbar.colorPopover.noFill': '无填充',
   'toolbar.colorPopover.automatic': '自动',
+  'toolbar.colorPopover.themeColors': '主题颜色',
+  'toolbar.colorPopover.moreColors': '更多颜色…',
   'toolbar.numberFormat': '数字',
   'toolbar.numberFormat.title': '数字格式',
   'toolbar.percentFormat': '%',

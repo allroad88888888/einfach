@@ -143,10 +143,62 @@ export function FillColorPopover(props: FillColorPopoverProps) {
           onMouseEnter={() => setHoverHex('')}
           onMouseLeave={() => setHoverHex(null)}
         >
-          {popover().mode === 'fill'
-            ? t('toolbar.colorPopover.noFill')
-            : t('toolbar.colorPopover.automatic')}
+          <span
+            class="spreadsheet-color-popover-no-fill-icon"
+            data-mode={popover().mode ?? ''}
+            aria-hidden="true"
+          >
+            <Show
+              when={popover().mode === 'fill'}
+              fallback={
+                /* Automatic: solid-fill square hints "use default text color" */
+                <svg width="14" height="14" viewBox="0 0 14 14">
+                  <rect
+                    x="1.5"
+                    y="1.5"
+                    width="11"
+                    height="11"
+                    fill="#000000"
+                    stroke="#8a8a8a"
+                    stroke-width="1"
+                  />
+                </svg>
+              }
+            >
+              {/* No fill: empty square with diagonal red slash */}
+              <svg width="14" height="14" viewBox="0 0 14 14">
+                <rect
+                  x="1.5"
+                  y="1.5"
+                  width="11"
+                  height="11"
+                  fill="#ffffff"
+                  stroke="#8a8a8a"
+                  stroke-width="1"
+                />
+                <line
+                  x1="2"
+                  y1="12"
+                  x2="12"
+                  y2="2"
+                  stroke="#d13438"
+                  stroke-width="1.5"
+                />
+              </svg>
+            </Show>
+          </span>
+          <span class="spreadsheet-color-popover-no-fill-label">
+            {popover().mode === 'fill'
+              ? t('toolbar.colorPopover.noFill')
+              : t('toolbar.colorPopover.automatic')}
+          </span>
         </button>
+        <div
+          class="spreadsheet-color-popover-section-title"
+          aria-hidden="true"
+        >
+          {t('toolbar.colorPopover.themeColors')}
+        </div>
         <div class="spreadsheet-color-popover-grid" role="grid">
           <For each={PALETTE}>
             {(row) => (
@@ -172,6 +224,29 @@ export function FillColorPopover(props: FillColorPopoverProps) {
             )}
           </For>
         </div>
+        <button
+          type="button"
+          class="spreadsheet-color-popover-more"
+          data-testid="color-popover-more-colors"
+          disabled
+          title={t('toolbar.colorPopover.moreColors')}
+        >
+          <span
+            class="spreadsheet-color-popover-more-icon"
+            aria-hidden="true"
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14">
+              <circle cx="7" cy="7" r="5.5" fill="none" stroke="#8a8a8a" stroke-width="1" />
+              <path d="M7 1.5 A5.5 5.5 0 0 1 12.5 7 L7 7 Z" fill="#ffc000" />
+              <path d="M12.5 7 A5.5 5.5 0 0 1 7 12.5 L7 7 Z" fill="#92d050" />
+              <path d="M7 12.5 A5.5 5.5 0 0 1 1.5 7 L7 7 Z" fill="#0070c0" />
+              <path d="M1.5 7 A5.5 5.5 0 0 1 7 1.5 L7 7 Z" fill="#c00000" />
+            </svg>
+          </span>
+          <span class="spreadsheet-color-popover-more-label">
+            {t('toolbar.colorPopover.moreColors')}
+          </span>
+        </button>
         <div
           class="spreadsheet-color-popover-hint"
           data-testid="color-popover-hint"
