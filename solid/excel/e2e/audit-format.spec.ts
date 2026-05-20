@@ -36,6 +36,9 @@ const fillColorBtn = (page: Page) => page.getByTestId('toolbar-btn-fill-color')
 const textColorBtn = (page: Page) => page.getByTestId('toolbar-btn-text-color')
 const numberFormatBtn = (page: Page) => page.getByTestId('toolbar-btn-number-format')
 const painterBtn = (page: Page) => page.getByTestId('toolbar-btn-format-painter')
+const vAlignTopBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-top')
+const vAlignMiddleBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-middle')
+const vAlignBottomBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-bottom')
 
 test.describe('Format audit — toolbar B/I/U', () => {
   test('bold persists across selection change and re-selection', async ({ page }) => {
@@ -287,6 +290,61 @@ test.describe('Format audit — Format Cells dialog', () => {
 
     await expect(cellDisplay(page, 'C2')).toHaveCSS('font-weight', /^(400|normal)$/)
     expect(await cellDisplay(page, 'C2').textContent()).toBe(before)
+  })
+})
+
+test.describe('Format audit — vertical alignment toolbar', () => {
+  test('vertical-align top sets the cell-display CSS to top and presses the button', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await vAlignTopBtn(page).click()
+
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('vertical-align', 'top')
+
+    // Move away then back: vertical-align persists.
+    await cell(page, 'D2').click()
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await cell(page, 'B2').click()
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('vertical-align middle (center) sets the cell-display CSS to middle', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'C2').click()
+
+    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await vAlignMiddleBtn(page).click()
+
+    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    // SpreadsheetVerticalAlignment maps the middle button to 'center'. The
+    // span renders `vertical-align: center` (a recognised CSS keyword for
+    // the rule even if the browser normalises it for table-cell contexts).
+    await expect(cellDisplay(page, 'C2')).toHaveCSS('vertical-align', 'middle')
+  })
+
+  test('vertical-align bottom round-trips top → bottom on the same cell', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'D2').click()
+
+    // Default state — no button pressed.
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'false')
+
+    // Top first.
+    await vAlignTopBtn(page).click()
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(cellDisplay(page, 'D2')).toHaveCSS('vertical-align', 'top')
+
+    // Then bottom — top button releases, bottom presses.
+    await vAlignBottomBtn(page).click()
+    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(vAlignBottomBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(cellDisplay(page, 'D2')).toHaveCSS('vertical-align', 'bottom')
   })
 })
 

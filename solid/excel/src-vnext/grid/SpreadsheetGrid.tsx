@@ -163,9 +163,27 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (format.fontSize) style['font-size'] = `${format.fontSize}px`
 
   if (format.verticalAlign) {
-    // Used by the cell box (display: flex) — leave a hint on the inner span so
-    // adapters that wrap the cell-display in their own flex container can map it.
+    // The parent .spreadsheet-grid-cell-button is a column-flex container,
+    // so a child can pick its vertical anchor via auto margins. We still
+    // emit the legacy CSS variable as a hint for adapters that wrap the
+    // cell-display in their own flex container.
+    //
+    // Note: the cell-format `verticalAlign` enum uses `'center'` for middle
+    // (matching Excel and other spreadsheet engines), but the CSS
+    // `vertical-align` property uses `'middle'`. Translate so the rendered
+    // style is valid and not silently dropped to `baseline`.
     style['--cell-vertical-align'] = format.verticalAlign
+    style['vertical-align'] = format.verticalAlign === 'center' ? 'middle' : format.verticalAlign
+    if (format.verticalAlign === 'top') {
+      style['margin-top'] = '0'
+      style['margin-bottom'] = 'auto'
+    } else if (format.verticalAlign === 'center') {
+      style['margin-top'] = 'auto'
+      style['margin-bottom'] = 'auto'
+    } else if (format.verticalAlign === 'bottom') {
+      style['margin-top'] = 'auto'
+      style['margin-bottom'] = '0'
+    }
   }
 
   // Rotation. Numeric values rotate around the centre; `'vertical'` uses
