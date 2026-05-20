@@ -28,6 +28,10 @@ export type ToolbarFormatCommandKind =
   | 'indent-increase'
   | 'indent-decrease'
   | 'border'
+  | 'font-family'
+  | 'font-size'
+  | 'font-size-up'
+  | 'font-size-down'
 
 export interface ToolbarUiState {
   activeSurface: ToolbarActiveSurface | null
@@ -52,6 +56,8 @@ export interface ToolbarCommandAvailability extends ToolbarAvailabilitySnapshot 
   wrap: boolean
   indent: boolean
   border: boolean
+  fontFamily: boolean
+  fontSize: boolean
 }
 
 export interface ToolbarSurfaceOpenIntent {

@@ -76,6 +76,8 @@ export function getToolbarCommandAvailability(
     wrap: canStyleSelection,
     indent: canStyleSelection,
     border: canStyleSelection,
+    fontFamily: canStyleSelection,
+    fontSize: canStyleSelection,
   }
 }
 
@@ -109,6 +111,12 @@ export function isToolbarFormatCommandAvailable(
       return availability.indent
     case 'border':
       return availability.border
+    case 'font-family':
+      return availability.fontFamily
+    case 'font-size':
+    case 'font-size-up':
+    case 'font-size-down':
+      return availability.fontSize
     default:
       return false
   }

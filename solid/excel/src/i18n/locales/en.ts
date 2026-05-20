@@ -178,6 +178,14 @@ export const messages: Record<string, string> = {
   'help.about.body': 'Einfach Excel — Wave 5 demo, Rust + WASM + SolidJS.',
 
   // Toolbar buttons
+  'toolbar.fontFamily': 'Font',
+  'toolbar.fontFamily.title': 'Font family',
+  'toolbar.fontSize': 'Size',
+  'toolbar.fontSize.title': 'Font size',
+  'toolbar.fontSizeUp': 'A+',
+  'toolbar.fontSizeUp.title': 'Increase font size',
+  'toolbar.fontSizeDown': 'A-',
+  'toolbar.fontSizeDown.title': 'Decrease font size',
   'toolbar.bold': 'B',
   'toolbar.bold.title': 'Bold',
   'toolbar.italic': 'I',

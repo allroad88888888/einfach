@@ -45,6 +45,13 @@ import { VAlignDropdown, type VAlignValue } from './VAlignDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
 import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
 import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
+import { DEFAULT_FONT_FAMILY, FontFamilyDropdown } from './FontFamilyDropdown'
+import {
+  DEFAULT_FONT_SIZE,
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
+  FontSizeDropdown,
+} from './FontSizeDropdown'
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
 
@@ -275,6 +282,14 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const [vAlignDropdownOpen, setVAlignDropdownOpen] = createSignal(false)
   let vAlignAnchorRef: HTMLButtonElement | undefined
 
+  // Font-family / font-size dropdown open-state + anchors.
+  const [fontFamilyOpen, setFontFamilyOpen] = createSignal(false)
+  const [fontFamilyAnchor, setFontFamilyAnchor] = createSignal<DOMRect | null>(null)
+  let fontFamilyAnchorEl: HTMLButtonElement | null = null
+  const [fontSizeOpen, setFontSizeOpen] = createSignal(false)
+  const [fontSizeAnchor, setFontSizeAnchor] = createSignal<DOMRect | null>(null)
+  let fontSizeAnchorEl: HTMLButtonElement | null = null
+
   function currentHAlign(): HAlignValue {
     const align = activeCellFormat().align
     return align === 'center' || align === 'right' ? align : 'left'
@@ -361,6 +376,38 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   function closeNumberFormatDropdown() {
     setNumberFormatOpen(false)
     setNumberFormatAnchor(null)
+  }
+
+  function openFontFamilyDropdown(buttonEl: HTMLButtonElement) {
+    fontFamilyAnchorEl = buttonEl
+    setFontFamilyAnchor(buttonEl.getBoundingClientRect())
+    setFontFamilyOpen(true)
+  }
+
+  function closeFontFamilyDropdown() {
+    setFontFamilyOpen(false)
+    setFontFamilyAnchor(null)
+  }
+
+  function onFontFamilyPick(family: string) {
+    closeFontFamilyDropdown()
+    dispatchCommand({ command: 'font-family', value: family })
+  }
+
+  function openFontSizeDropdown(buttonEl: HTMLButtonElement) {
+    fontSizeAnchorEl = buttonEl
+    setFontSizeAnchor(buttonEl.getBoundingClientRect())
+    setFontSizeOpen(true)
+  }
+
+  function closeFontSizeDropdown() {
+    setFontSizeOpen(false)
+    setFontSizeAnchor(null)
+  }
+
+  function onFontSizePick(size: number) {
+    closeFontSizeDropdown()
+    dispatchCommand({ command: 'font-size', value: String(size) })
   }
 
   function onNumberFormatPick(id: NumberFormatId) {
@@ -498,6 +545,29 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           verticalAlign:
             intent.value === 'top' || intent.value === 'center' ? intent.value : 'bottom',
         }
+      case 'font-family': {
+        if (!intent.value) {
+          const { fontFamily: _ff, ...rest } = current
+          return rest
+        }
+        return { ...current, fontFamily: intent.value }
+      }
+      case 'font-size': {
+        const parsed = intent.value ? Number(intent.value) : NaN
+        if (!Number.isFinite(parsed)) return current
+        const clamped = Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, Math.round(parsed)))
+        return { ...current, fontSize: clamped }
+      }
+      case 'font-size-up': {
+        const base = current.fontSize ?? DEFAULT_FONT_SIZE
+        const next = Math.min(FONT_SIZE_MAX, base + 1)
+        return { ...current, fontSize: next }
+      }
+      case 'font-size-down': {
+        const base = current.fontSize ?? DEFAULT_FONT_SIZE
+        const next = Math.max(FONT_SIZE_MIN, base - 1)
+        return { ...current, fontSize: next }
+      }
       case 'border': {
         // Toolbar borders dropdown drives this command. The actual per-cell
         // patch is applied via `executeBordersPreset` (which fans out
@@ -881,6 +951,76 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       role="toolbar"
       data-testid={props['data-testid'] ?? 'spreadsheet-toolbar'}
     >
+      <button
+        type="button"
+        ref={(el) => (fontFamilyAnchorEl = el)}
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          fontFamilyOpen() ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid="toolbar-btn-font-family"
+        title={t('toolbar.fontFamily.title')}
+        aria-label={t('toolbar.fontFamily.title')}
+        aria-haspopup="menu"
+        aria-expanded={fontFamilyOpen()}
+        disabled={!availability().fontFamily || isProtectionGated()}
+        onClick={(event) => {
+          if (fontFamilyOpen()) {
+            closeFontFamilyDropdown()
+          } else {
+            openFontFamilyDropdown(event.currentTarget)
+          }
+        }}
+      >
+        {activeCellFormat().fontFamily ?? DEFAULT_FONT_FAMILY}
+      </button>
+      <button
+        type="button"
+        ref={(el) => (fontSizeAnchorEl = el)}
+        class={`fmt-btn spreadsheet-toolbar-button ${
+          fontSizeOpen() ? 'fmt-btn-active' : ''
+        }`.trim()}
+        data-testid="toolbar-btn-font-size"
+        title={t('toolbar.fontSize.title')}
+        aria-label={t('toolbar.fontSize.title')}
+        aria-haspopup="menu"
+        aria-expanded={fontSizeOpen()}
+        disabled={!availability().fontSize || isProtectionGated()}
+        onClick={(event) => {
+          if (fontSizeOpen()) {
+            closeFontSizeDropdown()
+          } else {
+            openFontSizeDropdown(event.currentTarget)
+          }
+        }}
+      >
+        {activeCellFormat().fontSize ?? DEFAULT_FONT_SIZE}
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-font-size-up"
+        title={t('toolbar.fontSizeUp.title')}
+        aria-label={t('toolbar.fontSizeUp.title')}
+        disabled={!availability().fontSize || isProtectionGated()}
+        onClick={() => {
+          dispatchCommand({ command: 'font-size-up' })
+        }}
+      >
+        {t('toolbar.fontSizeUp')}
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-font-size-down"
+        title={t('toolbar.fontSizeDown.title')}
+        aria-label={t('toolbar.fontSizeDown.title')}
+        disabled={!availability().fontSize || isProtectionGated()}
+        onClick={() => {
+          dispatchCommand({ command: 'font-size-down' })
+        }}
+      >
+        {t('toolbar.fontSizeDown')}
+      </button>
       {toolbarCommands.map((command) => {
         const commandValue = { command: command.command, value: command.value }
         const colorMode: ColorPopoverMode | null =
@@ -1137,6 +1277,22 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         anchorEl={numberFormatAnchorEl}
         onSelect={onNumberFormatPick}
         onClose={closeNumberFormatDropdown}
+      />
+      <FontFamilyDropdown
+        open={fontFamilyOpen()}
+        anchorRect={fontFamilyAnchor()}
+        anchorEl={fontFamilyAnchorEl}
+        current={activeCellFormat().fontFamily ?? DEFAULT_FONT_FAMILY}
+        onSelect={onFontFamilyPick}
+        onClose={closeFontFamilyDropdown}
+      />
+      <FontSizeDropdown
+        open={fontSizeOpen()}
+        anchorRect={fontSizeAnchor()}
+        anchorEl={fontSizeAnchorEl}
+        current={activeCellFormat().fontSize ?? DEFAULT_FONT_SIZE}
+        onSelect={onFontSizePick}
+        onClose={closeFontSizeDropdown}
       />
       <FillColorPopover anchorRect={anchorRect} onPick={handleColorPick} />
     </div>

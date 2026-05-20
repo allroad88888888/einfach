@@ -161,6 +161,7 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
     }
   }
   if (format.fontSize) style['font-size'] = `${format.fontSize}px`
+  if (format.fontFamily) style['font-family'] = format.fontFamily
 
   if (format.verticalAlign) {
     // The parent .spreadsheet-grid-cell-button is a column-flex container,

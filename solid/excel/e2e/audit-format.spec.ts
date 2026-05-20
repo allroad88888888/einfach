@@ -682,6 +682,55 @@ test.describe('Format audit — borders dropdown', () => {
   })
 })
 
+test.describe('Format audit — font family + size', () => {
+  const fontFamilyBtn = (page: Page) => page.getByTestId('toolbar-btn-font-family')
+  const fontSizeBtn = (page: Page) => page.getByTestId('toolbar-btn-font-size')
+  const fontSizeUpBtn = (page: Page) => page.getByTestId('toolbar-btn-font-size-up')
+
+  test('font-family dropdown on B2 → click Helvetica → cell renders with that family', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await fontFamilyBtn(page).click()
+    const dropdown = page.getByTestId('toolbar-font-family-dropdown')
+    await expect(dropdown).toBeVisible()
+
+    await page.getByTestId('toolbar-font-family-item-Helvetica').click()
+    await expect(dropdown).toBeHidden()
+
+    // The cell-display inline `font-family` must include Helvetica. Browsers
+    // canonicalise the value but the substring stays present.
+    const fontFamily = await cellDisplay(page, 'B2').evaluate((el) =>
+      window.getComputedStyle(el).fontFamily,
+    )
+    expect(fontFamily.toLowerCase()).toContain('helvetica')
+  })
+
+  test('font-size dropdown on B2 → click 24 → cell renders 24px text', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await fontSizeBtn(page).click()
+    const dropdown = page.getByTestId('toolbar-font-size-dropdown')
+    await expect(dropdown).toBeVisible()
+
+    await page.getByTestId('toolbar-font-size-item-24').click()
+    await expect(dropdown).toBeHidden()
+
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('font-size', '24px')
+  })
+
+  test('font-size-up on B2 (default 12) renders 13px', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await fontSizeUpBtn(page).click()
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('font-size', '13px')
+  })
+})
+
 test.describe('Format audit — multi-cell range', () => {
   test('bold applied to B2:E2 selection paints all four cells', async ({ page }) => {
     await gotoWave5(page)

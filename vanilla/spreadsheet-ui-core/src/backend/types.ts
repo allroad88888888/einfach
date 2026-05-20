@@ -252,6 +252,7 @@ export interface SpreadsheetCellFormat {
   italic?: boolean
   align?: SpreadsheetAlignment
   fontSize?: number
+  fontFamily?: string
   fgColor?: string
   bgColor?: string
   borders?: SpreadsheetBorders
