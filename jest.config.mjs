@@ -55,6 +55,11 @@ const jestConfig = {
     '^@einfach/react-form$': '<rootDir>/react/form/src',
     '^@einfach/solid$': '<rootDir>/solid/solid/src',
     '^@einfach/solid-form$': '<rootDir>/solid/form/src',
+    // CSS / asset imports become an inert object during jest runs so test
+    // files that touch a component which `import './foo.css'` still load
+    // without a parse error. Solid dialogs co-locate their styles next to
+    // the .tsx; without this stub jest would try to parse the .css as JS.
+    '\\.(css|less|sass|scss)$': '<rootDir>/rules/css-stub.cjs',
   },
 
   /**
