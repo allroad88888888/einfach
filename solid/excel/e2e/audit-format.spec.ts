@@ -32,16 +32,20 @@ function cellDisplay(page: Page, addr: string): Locator {
 const boldBtn = (page: Page) => page.getByTestId('toolbar-btn-bold')
 const italicBtn = (page: Page) => page.getByTestId('toolbar-btn-italic')
 const underlineBtn = (page: Page) => page.getByTestId('toolbar-btn-underline')
-const alignLeftBtn = (page: Page) => page.getByTestId('toolbar-btn-align-left')
-const alignCenterBtn = (page: Page) => page.getByTestId('toolbar-btn-align-center')
-const alignRightBtn = (page: Page) => page.getByTestId('toolbar-btn-align-right')
+const hAlignBtn = (page: Page) => page.getByTestId('toolbar-btn-h-align')
+const hAlignDropdown = (page: Page) => page.getByTestId('toolbar-h-align-dropdown')
+const hAlignLeftOpt = (page: Page) => page.getByTestId('toolbar-h-align-left')
+const hAlignCenterOpt = (page: Page) => page.getByTestId('toolbar-h-align-center')
+const hAlignRightOpt = (page: Page) => page.getByTestId('toolbar-h-align-right')
 const fillColorBtn = (page: Page) => page.getByTestId('toolbar-btn-fill-color')
 const textColorBtn = (page: Page) => page.getByTestId('toolbar-btn-text-color')
 const numberFormatBtn = (page: Page) => page.getByTestId('toolbar-btn-number-format')
 const painterBtn = (page: Page) => page.getByTestId('toolbar-btn-format-painter')
-const vAlignTopBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-top')
-const vAlignMiddleBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-middle')
-const vAlignBottomBtn = (page: Page) => page.getByTestId('toolbar-btn-vertical-align-bottom')
+const vAlignBtn = (page: Page) => page.getByTestId('toolbar-btn-v-align')
+const vAlignDropdown = (page: Page) => page.getByTestId('toolbar-v-align-dropdown')
+const vAlignTopOpt = (page: Page) => page.getByTestId('toolbar-v-align-top')
+const vAlignMiddleOpt = (page: Page) => page.getByTestId('toolbar-v-align-middle')
+const vAlignBottomOpt = (page: Page) => page.getByTestId('toolbar-v-align-bottom')
 
 test.describe('Format audit — toolbar B/I/U', () => {
   test('bold persists across selection change and re-selection', async ({ page }) => {
@@ -101,41 +105,56 @@ test.describe('Format audit — toolbar B/I/U', () => {
   })
 })
 
-test.describe('Format audit — horizontal alignment', () => {
-  test('center button applies text-align: center to the active cell', async ({ page }) => {
+test.describe('Format audit — horizontal alignment dropdown', () => {
+  test('h-align dropdown 中 applies text-align: center to the active cell', async ({
+    page,
+  }) => {
     await gotoWave5(page)
 
-    // Select B2 — the seed value should render with the default (left)
-    // alignment before the toolbar is engaged.
+    // Select B2 — default alignment before the toolbar is engaged.
     await cell(page, 'B2').click()
-    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(hAlignBtn(page)).toHaveAttribute('data-active-align', 'left')
+    await expect(hAlignDropdown(page)).toBeHidden()
 
-    // Click 居中 / Center.
-    await alignCenterBtn(page).click()
+    // Open the dropdown and pick 中 / Center.
+    await hAlignBtn(page).click()
+    await expect(hAlignDropdown(page)).toBeVisible()
+    await hAlignCenterOpt(page).click()
+    await expect(hAlignDropdown(page)).toBeHidden()
 
-    // The cell display now carries an inline text-align: center.
+    // The cell display now carries an inline text-align: center; the button
+    // mirrors the active alignment via its data attribute.
     await expect(cellDisplay(page, 'B2')).toHaveCSS('text-align', 'center')
-    // And the toolbar button reflects the depressed (active) state.
-    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(hAlignBtn(page)).toHaveAttribute('data-active-align', 'center')
   })
 
-  test('left / center / right buttons each set the active alignment exclusively', async ({
+  test('h-align dropdown left / center / right set alignment exclusively', async ({
     page,
   }) => {
     await gotoWave5(page)
     await cell(page, 'C2').click()
 
-    await alignRightBtn(page).click()
+    await hAlignBtn(page).click()
+    await hAlignRightOpt(page).click()
     await expect(cellDisplay(page, 'C2')).toHaveCSS('text-align', 'right')
-    await expect(alignRightBtn(page)).toHaveAttribute('aria-pressed', 'true')
-    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await expect(alignLeftBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(hAlignBtn(page)).toHaveAttribute('data-active-align', 'right')
 
-    await alignLeftBtn(page).click()
+    await hAlignBtn(page).click()
+    await hAlignLeftOpt(page).click()
     await expect(cellDisplay(page, 'C2')).toHaveCSS('text-align', 'left')
-    await expect(alignLeftBtn(page)).toHaveAttribute('aria-pressed', 'true')
-    await expect(alignRightBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(hAlignBtn(page)).toHaveAttribute('data-active-align', 'left')
+  })
+
+  test('h-align dropdown closes on Escape without applying', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+
+    await hAlignBtn(page).click()
+    await expect(hAlignDropdown(page)).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(hAlignDropdown(page)).toBeHidden()
+    // No alignment change.
+    await expect(hAlignBtn(page)).toHaveAttribute('data-active-align', 'left')
   })
 })
 
@@ -469,57 +488,60 @@ test.describe('Format audit — Format Cells dialog', () => {
   })
 })
 
-test.describe('Format audit — vertical alignment toolbar', () => {
-  test('vertical-align top sets the cell-display CSS to top and presses the button', async ({
+test.describe('Format audit — vertical alignment dropdown', () => {
+  test('v-align dropdown 顶 sets the cell-display CSS to top and updates the button', async ({
     page,
   }) => {
     await gotoWave5(page)
     await cell(page, 'B2').click()
 
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await vAlignTopBtn(page).click()
+    // Default (unset) maps to 'bottom' per the backend contract.
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'bottom')
+    await expect(vAlignDropdown(page)).toBeHidden()
 
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await vAlignBtn(page).click()
+    await expect(vAlignDropdown(page)).toBeVisible()
+    await vAlignTopOpt(page).click()
+    await expect(vAlignDropdown(page)).toBeHidden()
+
     await expect(cellDisplay(page, 'B2')).toHaveCSS('vertical-align', 'top')
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'top')
 
     // Move away then back: vertical-align persists.
     await cell(page, 'D2').click()
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'bottom')
     await cell(page, 'B2').click()
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'top')
   })
 
-  test('vertical-align middle (center) sets the cell-display CSS to middle', async ({ page }) => {
+  test('v-align dropdown 中 (middle) sets the cell-display CSS to middle', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'C2').click()
 
-    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await vAlignMiddleBtn(page).click()
+    await vAlignBtn(page).click()
+    await vAlignMiddleOpt(page).click()
 
-    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'center')
     // SpreadsheetVerticalAlignment maps the middle button to 'center'. The
-    // span renders `vertical-align: center` (a recognised CSS keyword for
-    // the rule even if the browser normalises it for table-cell contexts).
+    // span renders `vertical-align: center` which the browser normalises to
+    // `middle` in table-cell contexts.
     await expect(cellDisplay(page, 'C2')).toHaveCSS('vertical-align', 'middle')
   })
 
-  test('vertical-align bottom round-trips top → bottom on the same cell', async ({ page }) => {
+  test('v-align dropdown round-trips top -> bottom on the same cell', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'D2').click()
 
-    // Default state — no button pressed.
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await expect(vAlignMiddleBtn(page)).toHaveAttribute('aria-pressed', 'false')
-
     // Top first.
-    await vAlignTopBtn(page).click()
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await vAlignBtn(page).click()
+    await vAlignTopOpt(page).click()
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'top')
     await expect(cellDisplay(page, 'D2')).toHaveCSS('vertical-align', 'top')
 
-    // Then bottom — top button releases, bottom presses.
-    await vAlignBottomBtn(page).click()
-    await expect(vAlignTopBtn(page)).toHaveAttribute('aria-pressed', 'false')
-    await expect(vAlignBottomBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    // Then bottom — button mirrors the new active value.
+    await vAlignBtn(page).click()
+    await vAlignBottomOpt(page).click()
+    await expect(vAlignBtn(page)).toHaveAttribute('data-active-vertical-align', 'bottom')
     await expect(cellDisplay(page, 'D2')).toHaveCSS('vertical-align', 'bottom')
   })
 })

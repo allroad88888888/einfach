@@ -1,5 +1,7 @@
 export * from './SpreadsheetToolbar'
 export * from './BordersDropdown'
+export * from './HAlignDropdown'
 export * from './MergeDropdown'
 export * from './NumberFormatDropdown'
+export * from './VAlignDropdown'
 export * from './types'

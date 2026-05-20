@@ -39,7 +39,9 @@ import {
   useSpreadsheetUiStore,
 } from '../provider'
 import { BordersDropdown, type BordersPreset } from './BordersDropdown'
+import { HAlignDropdown, type HAlignValue } from './HAlignDropdown'
 import { MergeDropdown, type MergePreset } from './MergeDropdown'
+import { VAlignDropdown, type VAlignValue } from './VAlignDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
 import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
 import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
@@ -67,30 +69,6 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.underline.title',
     testId: 'toolbar-btn-underline',
     isEnabled: (availability) => availability.underline,
-  },
-  {
-    command: 'alignment',
-    label: 'toolbar.alignLeft',
-    title: 'toolbar.alignLeft.title',
-    testId: 'toolbar-btn-align-left',
-    value: 'left',
-    isEnabled: (availability) => availability.alignment,
-  },
-  {
-    command: 'alignment',
-    label: 'toolbar.alignCenter',
-    title: 'toolbar.alignCenter.title',
-    testId: 'toolbar-btn-align-center',
-    value: 'center',
-    isEnabled: (availability) => availability.alignment,
-  },
-  {
-    command: 'alignment',
-    label: 'toolbar.alignRight',
-    title: 'toolbar.alignRight.title',
-    testId: 'toolbar-btn-align-right',
-    value: 'right',
-    isEnabled: (availability) => availability.alignment,
   },
   {
     command: 'fill-color',
@@ -138,30 +116,6 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-currency-format',
     value: 'Currency',
     isEnabled: (availability) => availability.numberFormat,
-  },
-  {
-    command: 'vertical-alignment',
-    label: 'toolbar.verticalAlignTop',
-    title: 'toolbar.verticalAlignTop.title',
-    testId: 'toolbar-btn-vertical-align-top',
-    value: 'top',
-    isEnabled: (availability) => availability.verticalAlignment,
-  },
-  {
-    command: 'vertical-alignment',
-    label: 'toolbar.verticalAlignMiddle',
-    title: 'toolbar.verticalAlignMiddle.title',
-    testId: 'toolbar-btn-vertical-align-middle',
-    value: 'center',
-    isEnabled: (availability) => availability.verticalAlignment,
-  },
-  {
-    command: 'vertical-alignment',
-    label: 'toolbar.verticalAlignBottom',
-    title: 'toolbar.verticalAlignBottom.title',
-    testId: 'toolbar-btn-vertical-align-bottom',
-    value: 'bottom',
-    isEnabled: (availability) => availability.verticalAlignment,
   },
 ]
 
@@ -313,6 +267,61 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   // outside / Esc handled by the dropdown itself.
   const [mergeDropdownOpen, setMergeDropdownOpen] = createSignal(false)
   let mergeAnchorRef: HTMLButtonElement | undefined
+
+  // Horizontal / vertical alignment dropdowns mirror the borders surface —
+  // a single toolbar anchor button reveals 3 options.
+  const [hAlignDropdownOpen, setHAlignDropdownOpen] = createSignal(false)
+  let hAlignAnchorRef: HTMLButtonElement | undefined
+  const [vAlignDropdownOpen, setVAlignDropdownOpen] = createSignal(false)
+  let vAlignAnchorRef: HTMLButtonElement | undefined
+
+  function currentHAlign(): HAlignValue {
+    const align = activeCellFormat().align
+    return align === 'center' || align === 'right' ? align : 'left'
+  }
+
+  function currentVAlign(): VAlignValue {
+    // Default vertical alignment (when unset) is 'bottom', per the backend
+    // cell-format contract.
+    const value = activeCellFormat().verticalAlign ?? 'bottom'
+    return value === 'top' || value === 'center' ? value : 'bottom'
+  }
+
+  /** i18n label for the h-align button — reflects the focused cell. */
+  function hAlignButtonLabelKey(): string {
+    switch (currentHAlign()) {
+      case 'center':
+        return 'toolbar.alignCenter'
+      case 'right':
+        return 'toolbar.alignRight'
+      case 'left':
+      default:
+        return 'toolbar.alignLeft'
+    }
+  }
+
+  /** i18n label for the v-align button — reflects the focused cell. */
+  function vAlignButtonLabelKey(): string {
+    switch (currentVAlign()) {
+      case 'top':
+        return 'toolbar.verticalAlignTop'
+      case 'center':
+        return 'toolbar.verticalAlignMiddle'
+      case 'bottom':
+      default:
+        return 'toolbar.verticalAlignBottom'
+    }
+  }
+
+  function handleHAlignSelect(value: HAlignValue) {
+    setHAlignDropdownOpen(false)
+    dispatchCommand({ command: 'alignment', value })
+  }
+
+  function handleVAlignSelect(value: VAlignValue) {
+    setVAlignDropdownOpen(false)
+    dispatchCommand({ command: 'vertical-alignment', value })
+  }
 
   const colorPopover = useAtomValue(colorPopoverAtom)
   const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
@@ -890,15 +899,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           if (command.command === 'italic') return !!activeCellFormat().italic
           if (command.command === 'underline') return !!activeCellFormat().underline
           if (isNumberFormatDropdownOpener) return numberFormatOpen()
-          if (command.command === 'alignment') {
-            return activeCellFormat().align === command.value
-          }
-          if (command.command === 'vertical-alignment') {
-            // Default vertical alignment (when unset) is 'bottom', per the
-            // backend cell-format contract.
-            const current = activeCellFormat().verticalAlign ?? 'bottom'
-            return current === command.value
-          }
           if (colorMode !== null) return colorPopover().mode === colorMode
           return undefined
         }
@@ -979,6 +979,68 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           anchorRef={bordersAnchorRef ?? null}
           onSelect={handleBordersSelect}
           onRequestClose={() => setBordersDropdownOpen(false)}
+        />
+      </div>
+      <div
+        class="spreadsheet-toolbar-h-align-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (hAlignAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            hAlignDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-h-align"
+          data-active-align={currentHAlign()}
+          title={t('toolbar.hAlign.title')}
+          aria-label={t('toolbar.hAlign.title')}
+          aria-haspopup="menu"
+          aria-expanded={hAlignDropdownOpen()}
+          disabled={!availability().alignment || isProtectionGated()}
+          onClick={() => {
+            setHAlignDropdownOpen((open) => !open)
+          }}
+        >
+          {t(hAlignButtonLabelKey())}
+        </button>
+        <HAlignDropdown
+          isOpen={hAlignDropdownOpen()}
+          current={currentHAlign()}
+          anchorRef={hAlignAnchorRef ?? null}
+          onSelect={handleHAlignSelect}
+          onRequestClose={() => setHAlignDropdownOpen(false)}
+        />
+      </div>
+      <div
+        class="spreadsheet-toolbar-v-align-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (vAlignAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            vAlignDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-v-align"
+          data-active-vertical-align={currentVAlign()}
+          title={t('toolbar.vAlign.title')}
+          aria-label={t('toolbar.vAlign.title')}
+          aria-haspopup="menu"
+          aria-expanded={vAlignDropdownOpen()}
+          disabled={!availability().verticalAlignment || isProtectionGated()}
+          onClick={() => {
+            setVAlignDropdownOpen((open) => !open)
+          }}
+        >
+          {t(vAlignButtonLabelKey())}
+        </button>
+        <VAlignDropdown
+          isOpen={vAlignDropdownOpen()}
+          current={currentVAlign()}
+          anchorRef={vAlignAnchorRef ?? null}
+          onSelect={handleVAlignSelect}
+          onRequestClose={() => setVAlignDropdownOpen(false)}
         />
       </div>
       <div
