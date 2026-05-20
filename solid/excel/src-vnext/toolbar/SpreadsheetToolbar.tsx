@@ -51,13 +51,29 @@ import {
 } from './FontSizeDropdown'
 import { RotationDropdown, type RotationPreset } from './RotationDropdown'
 import {
+  AlignCenterIcon,
+  AlignLeftIcon,
+  AlignRightIcon,
   BoldIcon,
+  BordersIcon,
+  CurrencyIcon,
   FillColorIcon,
+  FontSizeDownIcon,
+  FontSizeUpIcon,
   FormatPainterIcon,
   ItalicIcon,
+  MergeCellsIcon,
   NumberFormatIcon,
+  PasteIcon,
+  PercentIcon,
+  RotationIcon,
+  StrikethroughIcon,
   TextColorIcon,
   UnderlineIcon,
+  VAlignBottomIcon,
+  VAlignMiddleIcon,
+  VAlignTopIcon,
+  WrapIcon,
 } from './ToolbarIcons'
 
 const BORDER_DEFAULT_STYLE: SpreadsheetBorderStyle = 'thin'
@@ -93,6 +109,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.strikethrough.title',
     testId: 'toolbar-btn-strikethrough',
     isEnabled: (availability) => availability.strikethrough,
+    icon: StrikethroughIcon,
   },
   {
     command: 'fill-color',
@@ -133,6 +150,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-percent-format',
     value: 'Percent',
     isEnabled: (availability) => availability.numberFormat,
+    icon: PercentIcon,
   },
   {
     // Univer-parity shortcut — one-click currency format. The token routes
@@ -143,6 +161,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     testId: 'toolbar-btn-currency-format',
     value: 'Currency',
     isEnabled: (availability) => availability.numberFormat,
+    icon: CurrencyIcon,
   },
   {
     command: 'wrap',
@@ -150,6 +169,7 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     title: 'toolbar.wrap.title',
     testId: 'toolbar-btn-wrap',
     isEnabled: (availability) => availability.wrap,
+    icon: WrapIcon,
   },
 ]
 
@@ -325,32 +345,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     // cell-format contract.
     const value = activeCellFormat().verticalAlign ?? 'bottom'
     return value === 'top' || value === 'center' ? value : 'bottom'
-  }
-
-  /** i18n label for the h-align button — reflects the focused cell. */
-  function hAlignButtonLabelKey(): string {
-    switch (currentHAlign()) {
-      case 'center':
-        return 'toolbar.alignCenter'
-      case 'right':
-        return 'toolbar.alignRight'
-      case 'left':
-      default:
-        return 'toolbar.alignLeft'
-    }
-  }
-
-  /** i18n label for the v-align button — reflects the focused cell. */
-  function vAlignButtonLabelKey(): string {
-    switch (currentVAlign()) {
-      case 'top':
-        return 'toolbar.verticalAlignTop'
-      case 'center':
-        return 'toolbar.verticalAlignMiddle'
-      case 'bottom':
-      default:
-        return 'toolbar.verticalAlignBottom'
-    }
   }
 
   function handleHAlignSelect(value: HAlignValue) {
@@ -1064,7 +1058,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           dispatchCommand({ command: 'font-size-up' })
         }}
       >
-        {t('toolbar.fontSizeUp')}
+        <FontSizeUpIcon />
       </button>
       <button
         type="button"
@@ -1077,7 +1071,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           dispatchCommand({ command: 'font-size-down' })
         }}
       >
-        {t('toolbar.fontSizeDown')}
+        <FontSizeDownIcon />
       </button>
       {toolbarCommands.map((command) => {
         const commandValue = { command: command.command, value: command.value }
@@ -1171,7 +1165,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             setRotationDropdownOpen((open) => !open)
           }}
         >
-          {t('toolbar.rotation')}
+          <RotationIcon />
         </button>
         <RotationDropdown
           isOpen={rotationDropdownOpen()}
@@ -1200,7 +1194,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             setBordersDropdownOpen((open) => !open)
           }}
         >
-          {t('toolbar.borders')}
+          <BordersIcon />
         </button>
         <BordersDropdown
           isOpen={bordersDropdownOpen()}
@@ -1231,7 +1225,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             setHAlignDropdownOpen((open) => !open)
           }}
         >
-          {t(hAlignButtonLabelKey())}
+          {currentHAlign() === 'center' ? (
+            <AlignCenterIcon />
+          ) : currentHAlign() === 'right' ? (
+            <AlignRightIcon />
+          ) : (
+            <AlignLeftIcon />
+          )}
         </button>
         <HAlignDropdown
           isOpen={hAlignDropdownOpen()}
@@ -1262,7 +1262,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             setVAlignDropdownOpen((open) => !open)
           }}
         >
-          {t(vAlignButtonLabelKey())}
+          {currentVAlign() === 'top' ? (
+            <VAlignTopIcon />
+          ) : currentVAlign() === 'center' ? (
+            <VAlignMiddleIcon />
+          ) : (
+            <VAlignBottomIcon />
+          )}
         </button>
         <VAlignDropdown
           isOpen={vAlignDropdownOpen()}
@@ -1292,7 +1298,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
             setMergeDropdownOpen((open) => !open)
           }}
         >
-          {t('toolbar.merge')}
+          <MergeCellsIcon />
         </button>
         <MergeDropdown
           isOpen={mergeDropdownOpen()}
@@ -1332,7 +1338,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         disabled={isProtectionGated()}
         onClick={dispatchPasteIntent}
       >
-        {t('toolbar.paste')}
+        <PasteIcon />
       </button>
       <NumberFormatDropdown
         open={numberFormatOpen()}

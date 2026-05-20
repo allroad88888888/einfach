@@ -239,10 +239,10 @@ test.describe('Format audit — color buttons', () => {
     await expect(page.getByTestId('toolbar-color-popover')).toBeHidden()
 
     // Outside click also closes — open the popover, then click on a clearly
-    // out-of-popover target (the wave5 menu bar) and assert it closes.
+    // out-of-popover target (the formula bar) and assert it closes.
     await fillColorBtn(page).click()
     await expect(page.getByTestId('toolbar-color-popover')).toBeVisible()
-    await page.getByTestId('wave5-menu-bar').click({ position: { x: 5, y: 5 } })
+    await page.getByTestId('wave5-formula-bar').click()
     await expect(page.getByTestId('toolbar-color-popover')).toBeHidden()
   })
 })
@@ -466,9 +466,11 @@ test.describe('Format audit — format painter', () => {
 
 test.describe('Format audit — Format Cells dialog', () => {
   async function openFormatCellsDialog(page: Page) {
-    await page.getByTestId('menu-bar-button-format').click()
-    await expect(page.getByRole('menu')).toBeVisible()
-    await page.getByTestId('menu-bar-item-format.cells').click()
+    // Menubar was removed for Univer parity. The Format Cells dialog is
+    // reachable from the toolbar's number-format dropdown → 自定义格式
+    // (custom format) row.
+    await numberFormatBtn(page).click()
+    await page.getByTestId('number-format-item-Custom').click()
     await expect(page.getByTestId('wave5-format-cells')).toBeVisible()
   }
 

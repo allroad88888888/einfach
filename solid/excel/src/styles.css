@@ -1085,32 +1085,58 @@ thead .row-header {
 .spreadsheet-toolbar {
   display: flex;
   align-items: center;
-  gap: 2px;
-  height: 32px;
-  padding: 0 6px;
+  gap: 1px;
+  height: 36px;
+  padding: 0 8px;
   background: var(--bg-chrome-light);
   border-bottom: 1px solid var(--border);
   font-family: var(--excel-font);
   font-size: 12px;
   overflow-x: auto;
   white-space: nowrap;
+  color: #444;
 }
 
 .spreadsheet-toolbar .spreadsheet-toolbar-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 28px;
+  min-width: 24px;
   height: 24px;
-  padding: 0 8px;
-  margin: 0 1px;
+  padding: 0 4px;
+  margin: 0;
   border: 1px solid transparent;
-  border-radius: 2px;
+  border-radius: 4px;
   background: transparent;
-  color: var(--text-default);
+  color: inherit;
   font: inherit;
   cursor: pointer;
   transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+/* Toolbar SVG glyphs — Univer matches at ~14px; the parent button still
+   draws a 24x24 hit target so cursor accuracy doesn't suffer. */
+.spreadsheet-toolbar .spreadsheet-toolbar-button > svg {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+/* Faint vertical separator between toolbar groups (undo group ↔ font ↔
+   B/I/U ↔ color ↔ borders ↔ alignment ↔ merge ↔ painter, etc.).
+   Each .spreadsheet-toolbar-*-wrapper acts as a group anchor; the rule
+   applies a subtle 1px line before the wrapper. */
+.spreadsheet-toolbar > .spreadsheet-toolbar-borders-wrapper::before,
+.spreadsheet-toolbar > .spreadsheet-toolbar-h-align-wrapper::before,
+.spreadsheet-toolbar > .spreadsheet-toolbar-merge-wrapper::before,
+.spreadsheet-toolbar > .spreadsheet-toolbar-rotation-wrapper::before {
+  content: '';
+  display: inline-block;
+  width: 1px;
+  height: 18px;
+  background: #d8d8d8;
+  margin: 0 6px;
+  vertical-align: middle;
 }
 
 .spreadsheet-toolbar .spreadsheet-toolbar-button:hover:not(:disabled) {

@@ -22,7 +22,6 @@ import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
-import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
@@ -172,7 +171,6 @@ function VNextWorkerWorkbook() {
 
   return (
     <>
-      <SpreadsheetMenuBar data-testid="vnext-worker-menu-bar" />
       <SpreadsheetToolbar data-testid="vnext-worker-toolbar" />
       <SpreadsheetFormulaBar data-testid="vnext-worker-formula-bar" />
       <Show keyed when={activeSheetId()}>

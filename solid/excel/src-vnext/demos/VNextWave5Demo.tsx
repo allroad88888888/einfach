@@ -17,7 +17,6 @@ import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
-import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
 import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetPresenceOverlay } from '../presence'
@@ -120,7 +119,6 @@ function VNextWave5Workbook() {
 
   return (
     <>
-      <SpreadsheetMenuBar data-testid="wave5-menu-bar" />
       <SpreadsheetToolbar data-testid="wave5-toolbar" />
       <Show when={showFormulaBar()}>
         <SpreadsheetFormulaBar data-testid="wave5-formula-bar" />

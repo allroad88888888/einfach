@@ -18,21 +18,16 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
 
   test('demo loads with all Wave 5 surfaces mounted', async ({ page }) => {
     await gotoWave5(page)
-    await expect(page.getByTestId('wave5-menu-bar')).toBeVisible()
+    // Menubar (文件/编辑/插入/格式/数据/视图/帮助) was removed for Univer
+    // parity — every menu action is now reachable from the toolbar / right
+    // click / keyboard, so the redundant menubar would only steal vertical
+    // space.
+    await expect(page.getByTestId('wave5-menu-bar')).toHaveCount(0)
     await expect(page.getByTestId('wave5-toolbar')).toBeVisible()
     await expect(page.getByTestId('wave5-formula-bar')).toBeVisible()
     await expect(page.getByTestId('wave5-status-bar')).toBeVisible()
     await expect(page.getByTestId('grid-overlay-canvas')).toBeVisible()
     await expect(cell(page, 'A1')).toBeVisible()
-  })
-
-  test('menu bar opens File and dispatches Undo', async ({ page }) => {
-    await gotoWave5(page)
-    const fileButton = page.getByTestId('menu-bar-button-file')
-    await fileButton.click()
-    await expect(page.getByRole('menu')).toBeVisible()
-    await page.keyboard.press('Escape')
-    await expect(page.getByRole('menu')).toHaveCount(0)
   })
 
   test('name box reflects active cell and jumps on commit', async ({ page }) => {

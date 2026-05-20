@@ -156,3 +156,98 @@ export const UnmergeCellsIcon = (): JSX.Element => (
     <path d="m6 6 2 2-2 2M10 6l-2 2 2 2" />
   </svg>
 )
+
+export const StrikethroughIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <line x1="3" y1="8" x2="13" y2="8" />
+    <path d="M5 5a3 3 0 0 1 3-2 3 3 0 0 1 3 3M5 11a3 3 0 0 0 3 2 3 3 0 0 0 3-3" />
+  </svg>
+)
+
+export const WrapIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <line x1="3" y1="4" x2="13" y2="4" />
+    <path d="M3 8h7a2.5 2.5 0 1 1 0 5H8.5l1 1m0-2-1 1" />
+    <line x1="3" y1="12" x2="6" y2="12" />
+  </svg>
+)
+
+export const RotationIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <text
+      x="4"
+      y="13"
+      font-size="9"
+      font-family="serif"
+      font-style="italic"
+      fill="currentColor"
+      stroke="none"
+      transform="rotate(-25 8 8)"
+    >
+      ab
+    </text>
+    <line x1="2.5" y1="13.5" x2="13.5" y2="13.5" />
+  </svg>
+)
+
+export const BordersIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <rect x="2.5" y="2.5" width="11" height="11" />
+    <line x1="8" y1="2.5" x2="8" y2="13.5" />
+    <line x1="2.5" y1="8" x2="13.5" y2="8" />
+  </svg>
+)
+
+export const FontSizeUpIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <text
+      x="2"
+      y="12"
+      font-size="10"
+      font-family="serif"
+      fill="currentColor"
+      stroke="none"
+    >
+      A
+    </text>
+    <path d="m10 6 1.5-1.5L13 6M11.5 4.5V10" />
+  </svg>
+)
+
+export const FontSizeDownIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <text
+      x="3"
+      y="11"
+      font-size="8"
+      font-family="serif"
+      fill="currentColor"
+      stroke="none"
+    >
+      A
+    </text>
+    <path d="m10 8 1.5 1.5L13 8M11.5 9.5V4" />
+  </svg>
+)
+
+export const PasteIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <rect x="3" y="3" width="10" height="11" rx="0.5" />
+    <rect x="5.5" y="2" width="5" height="2.5" rx="0.4" fill="currentColor" />
+  </svg>
+)
+
+export const PercentIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <circle cx="5" cy="5" r="1.6" />
+    <circle cx="11" cy="11" r="1.6" />
+    <line x1="13" y1="3" x2="3" y2="13" />
+  </svg>
+)
+
+export const CurrencyIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <line x1="8" y1="2.5" x2="8" y2="13.5" />
+    <path d="M11 4.5H6.5a2 2 0 0 0 0 4h3a2 2 0 0 1 0 4H5" />
+  </svg>
+)

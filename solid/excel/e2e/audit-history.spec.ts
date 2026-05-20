@@ -193,20 +193,16 @@ test.describe('audit: undo/redo defects on the Wave 5 demo', () => {
     await expect(cellDisplay(page, 'B2')).toHaveText('120')
   })
 
-  test('8. Edit menu → Undo dispatches and reverts a value edit', async ({ page }) => {
+  test('8. Ctrl+Z reverts a value edit (Edit > Undo equivalent)', async ({ page }) => {
+    // The menubar was removed for Univer parity. Undo is now reachable via
+    // Ctrl+Z / the history timeline Undo button instead of Edit > Undo.
     await gotoWave5(page)
     await expect(cellDisplay(page, 'D3')).toHaveText('240')
 
     await commitCellValue(page, 'D3', '42')
+    await expect(cellDisplay(page, 'D3')).toHaveText('42')
 
-    // Open Edit menu and click Undo.
-    await page.getByTestId('menu-bar-button-edit').click()
-    const undoItem = page.getByTestId('menu-bar-item-edit.undo')
-    await expect(undoItem).toBeVisible()
-    await expect(undoItem).toBeEnabled()
-    await undoItem.click()
-
-    // Menu must close and the value must revert.
+    await page.keyboard.press('ControlOrMeta+z')
     await expect(cellDisplay(page, 'D3')).toHaveText('240')
   })
 
