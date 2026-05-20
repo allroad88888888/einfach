@@ -1294,6 +1294,565 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
         }
 
+        // === B2: extended math ===
+        // INT(n) truncates toward -∞ (i.e. floor), so INT(-2.5) = -3.
+        "INT" => unary_number(args, provider, f64::floor),
+        // TRUNC(n[, digits]) truncates toward zero. Default digits = 0.
+        // Negative digits truncate to the left of the decimal point
+        // (e.g. TRUNC(123.45, -1) = 120).
+        "TRUNC" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let digits = if args.len() == 2 {
+                let dv = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = dv {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&dv) {
+                    Some(d) => d.trunc() as i32,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0
+            };
+            match coerce_to_number(&nv) {
+                Some(n) => {
+                    let factor = 10f64.powi(digits);
+                    let r = (n * factor).trunc() / factor;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "SIGN" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let s = if n > 0.0 {
+                        1.0
+                    } else if n < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    Value::Number(s)
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "EXP" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let r = n.exp();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "LN" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n > 0.0 => {
+                    let r = n.ln();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "LOG" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let base = if args.len() == 2 {
+                let bv = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = bv {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&bv) {
+                    Some(b) => b,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                10.0
+            };
+            match coerce_to_number(&nv) {
+                Some(n) if n > 0.0 && base > 0.0 && base != 1.0 => {
+                    let r = n.log(base);
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "LOG10" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n > 0.0 => {
+                    let r = n.log10();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "PI" => {
+            if !args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            Value::Number(std::f64::consts::PI)
+        }
+        "ROUNDUP" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let dv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = dv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&nv), coerce_to_number(&dv)) {
+                (Some(n), Some(d)) => {
+                    let factor = 10f64.powi(d.trunc() as i32);
+                    let sign = if n < 0.0 { -1.0 } else { 1.0 };
+                    let r = (n.abs() * factor).ceil() / factor * sign;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "ROUNDDOWN" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let dv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = dv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&nv), coerce_to_number(&dv)) {
+                (Some(n), Some(d)) => {
+                    let factor = 10f64.powi(d.trunc() as i32);
+                    let sign = if n < 0.0 { -1.0 } else { 1.0 };
+                    let r = (n.abs() * factor).floor() / factor * sign;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "MROUND" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let mv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = mv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&nv), coerce_to_number(&mv)) {
+                (Some(_), Some(0.0)) => Value::Number(0.0),
+                (Some(n), Some(m)) => {
+                    // Excel: sign(n) must match sign(multiple) for both
+                    // non-zero, otherwise #NUM!.
+                    if n != 0.0 && ((n > 0.0) != (m > 0.0)) {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    let r = (n / m).round() * m;
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "PRODUCT" => {
+            // Variadic: walk every arg via for_each_arg_value so range
+            // args stream sparsely. Skip Null/Text/Boolean(false); treat
+            // Boolean(true) as 1. Errors propagate. With zero numeric
+            // contributors, return 0 to match Excel's "empty product → 0"
+            // convention for PRODUCT specifically.
+            let mut product = 1.0_f64;
+            let mut saw_number = false;
+            let mut err: Option<ValueError> = None;
+            for arg in args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => {
+                            product *= n;
+                            saw_number = true;
+                        }
+                        Value::Boolean(true) => {
+                            product *= 1.0;
+                            saw_number = true;
+                        }
+                        Value::Null | Value::Text(_) | Value::Boolean(false) => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if !saw_number {
+                Value::Number(0.0)
+            } else {
+                Value::Number(product)
+            }
+        }
+        "QUOTIENT" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let dv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = dv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&nv), coerce_to_number(&dv)) {
+                (Some(_), Some(0.0)) => Value::Error(ValueError::DivisionByZero),
+                (Some(num), Some(den)) => Value::Number((num / den).trunc()),
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "FACT" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) => {
+                    let trimmed = n.trunc();
+                    if trimmed < 0.0 {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    // 170! ≈ 7.26e306, 171! overflows f64.
+                    if trimmed > 170.0 {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    let k = trimmed as u64;
+                    let mut acc = 1.0_f64;
+                    for i in 2..=k {
+                        acc *= i as f64;
+                    }
+                    if acc.is_finite() {
+                        Value::Number(acc)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "COMBIN" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let nv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = nv {
+                return Value::Error(e);
+            }
+            let kv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = kv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&nv), coerce_to_number(&kv)) {
+                (Some(n_raw), Some(k_raw)) => {
+                    let n = n_raw.trunc();
+                    let k = k_raw.trunc();
+                    if n < 0.0 || k < 0.0 || k > n {
+                        return Value::Error(ValueError::Overflow);
+                    }
+                    // Symmetry: C(n,k) = C(n, n-k) — pick the smaller k
+                    // to keep the loop short and the product bounded.
+                    let n_i = n as u64;
+                    let mut k_i = k as u64;
+                    if k_i > n_i - k_i {
+                        k_i = n_i - k_i;
+                    }
+                    let mut acc = 1.0_f64;
+                    for i in 1..=k_i {
+                        acc = acc * (n_i - i + 1) as f64 / i as f64;
+                        if !acc.is_finite() {
+                            return Value::Error(ValueError::Overflow);
+                        }
+                    }
+                    Value::Number(acc.round())
+                }
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "GCD" => {
+            // Variadic; require ≥ 1 numeric arg. Coerce to non-negative
+            // integer; any negative or non-numeric → WrongType.
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut acc: Option<u64> = None;
+            let mut err: Option<ValueError> = None;
+            for arg in args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Null => {} // skip empties from ranges
+                        other => match coerce_to_number(&other) {
+                            Some(n) if n >= 0.0 && n.is_finite() => {
+                                let x = n.trunc() as u64;
+                                acc = Some(match acc {
+                                    None => x,
+                                    Some(a) => gcd_u64(a, x),
+                                });
+                            }
+                            _ => err = Some(ValueError::WrongType),
+                        },
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else {
+                match acc {
+                    Some(g) => Value::Number(g as f64),
+                    None => Value::Error(ValueError::WrongArgCount),
+                }
+            }
+        }
+        "LCM" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut acc: Option<u64> = None;
+            let mut err: Option<ValueError> = None;
+            for arg in args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Null => {}
+                        other => match coerce_to_number(&other) {
+                            Some(n) if n >= 0.0 && n.is_finite() => {
+                                let x = n.trunc() as u64;
+                                acc = Some(match acc {
+                                    None => x,
+                                    Some(a) => {
+                                        if a == 0 || x == 0 {
+                                            0
+                                        } else {
+                                            // (a / gcd(a,x)) * x with checked mul.
+                                            let g = gcd_u64(a, x);
+                                            match (a / g).checked_mul(x) {
+                                                Some(l) => l,
+                                                None => {
+                                                    err = Some(ValueError::Overflow);
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            _ => err = Some(ValueError::WrongType),
+                        },
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else {
+                match acc {
+                    Some(l) => Value::Number(l as f64),
+                    None => Value::Error(ValueError::WrongArgCount),
+                }
+            }
+        }
+        "COUNTA" => {
+            // Count of args that come back as anything other than Null.
+            // Errors and booleans both count (Excel semantics).
+            let mut count = 0u64;
+            for arg in args {
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if !matches!(v, Value::Null) {
+                        count += 1;
+                    }
+                });
+            }
+            Value::Number(count as f64)
+        }
+        "COUNTBLANK" => {
+            // Exactly 1 arg, ideally a range. Counts cells that come back
+            // as Value::Null. Note: this walks the values yielded by
+            // for_each_arg_value, which for sparse providers may visit
+            // only populated cells — fine for the small test ranges, but
+            // worth flagging if extended to full-column refs.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut count = 0u64;
+            for_each_arg_value(&args[0], provider, &mut |_addr, v| {
+                if matches!(v, Value::Null) {
+                    count += 1;
+                }
+            });
+            Value::Number(count as f64)
+        }
+
+        // === B3: trig (radians) ===
+        "SIN" => unary_number(args, provider, f64::sin),
+        "COS" => unary_number(args, provider, f64::cos),
+        "TAN" => unary_number(args, provider, f64::tan),
+        "ASIN" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if (-1.0..=1.0).contains(&n) => Value::Number(n.asin()),
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "ACOS" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if (-1.0..=1.0).contains(&n) => Value::Number(n.acos()),
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+        "ATAN" => unary_number(args, provider, f64::atan),
+        "ATAN2" => {
+            // Note: Excel order is ATAN2(x_num, y_num) — but our spec
+            // calls for (y, x) matching libm/JS Math.atan2. Per the task
+            // description we follow the (y, x) order.
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let yv = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = yv {
+                return Value::Error(e);
+            }
+            let xv = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = xv {
+                return Value::Error(e);
+            }
+            match (coerce_to_number(&yv), coerce_to_number(&xv)) {
+                (Some(y), Some(x)) => {
+                    let r = y.atan2(x);
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
+        "RADIANS" => unary_number(args, provider, |d| d * std::f64::consts::PI / 180.0),
+        "DEGREES" => unary_number(args, provider, |r| r * 180.0 / std::f64::consts::PI),
+
         _ => Value::Error(ValueError::InvalidName),
     }
 }
@@ -1314,6 +1873,16 @@ fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
         });
     }
     out
+}
+
+/// Iterative Euclidean GCD on u64. `gcd(a, 0) = a`. Used by GCD / LCM.
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
 }
 
 fn values_equal(a: &Value, b: &Value) -> bool {
@@ -2175,5 +2744,779 @@ mod tests {
             Value::Number(2.0)
         );
         assert_eq!(run_with(&p, "=SUMIF(A1:A1000,\">5\")"), Value::Number(30.0));
+    }
+
+    // === B2 + B3: math + trig formulas ===
+    //
+    // Each test follows the same shape: happy path; WrongArgCount;
+    // WrongType; numeric/domain edge; error propagation. Variadic
+    // function tests additionally exercise a range argument.
+
+    // ---- B2: math ----
+
+    #[test]
+    fn eval_int() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=INT(4.7)", &cm, &vs), Value::Number(4.0));
+        // floor toward -∞: INT(-2.5) = -3, NOT -2.
+        assert_eq!(eval_str("=INT(-2.5)", &cm, &vs), Value::Number(-3.0));
+        assert_eq!(eval_str("=INT(A1)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=INT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=INT(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Error propagation through a sub-expression.
+        assert_eq!(
+            eval_str("=INT(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_trunc() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=TRUNC(8.9)", &cm, &vs), Value::Number(8.0));
+        // Negative: trunc toward zero, not floor: -2.5 → -2.
+        assert_eq!(eval_str("=TRUNC(-2.5)", &cm, &vs), Value::Number(-2.0));
+        assert_eq!(eval_str("=TRUNC(3.14159,2)", &cm, &vs), Value::Number(3.14));
+        // Negative digits truncate to the left of the decimal point.
+        assert_eq!(eval_str("=TRUNC(123.45,-1)", &cm, &vs), Value::Number(120.0));
+        assert_eq!(
+            eval_str("=TRUNC()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=TRUNC(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=TRUNC(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_sign() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=SIGN(7)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=SIGN(-3)", &cm, &vs), Value::Number(-1.0));
+        assert_eq!(eval_str("=SIGN(0)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(eval_str("=SIGN(A1)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(
+            eval_str("=SIGN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=SIGN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SIGN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_exp() {
+        let (cm, vs) = make_test_env();
+        // EXP(0) = 1, EXP(1) ≈ e.
+        assert_eq!(eval_str("=EXP(0)", &cm, &vs), Value::Number(1.0));
+        match eval_str("=EXP(1)", &cm, &vs) {
+            Value::Number(n) => {
+                assert!((n - std::f64::consts::E).abs() < 1e-12, "EXP(1)={}", n)
+            }
+            other => panic!("expected number, got {:?}", other),
+        }
+        // Huge → +inf → Overflow.
+        assert_eq!(
+            eval_str("=EXP(1000)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=EXP()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=EXP(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=EXP(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_ln() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=LN(1)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=LN(2.718281828459045)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "LN(e)={}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // LN(0) and LN(-1) are domain errors → Overflow.
+        assert_eq!(
+            eval_str("=LN(0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LN(-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=LN(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=LN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_log() {
+        let (cm, vs) = make_test_env();
+        // Default base = 10.
+        assert_eq!(eval_str("=LOG(100)", &cm, &vs), Value::Number(2.0));
+        assert_eq!(eval_str("=LOG(8,2)", &cm, &vs), Value::Number(3.0));
+        // Domain violations → Overflow.
+        assert_eq!(
+            eval_str("=LOG(0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG(-5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG(10,1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG(10,-2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=LOG(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=LOG(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_log10() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=LOG10(1000)", &cm, &vs), Value::Number(3.0));
+        assert_eq!(eval_str("=LOG10(1)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(
+            eval_str("=LOG10(0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG10(-2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=LOG10()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=LOG10(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=LOG10(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_pi() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=PI()", &cm, &vs), Value::Number(std::f64::consts::PI));
+        // PI takes no args.
+        assert_eq!(
+            eval_str("=PI(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Round-trip in arithmetic.
+        match eval_str("=PI()*2", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - 2.0 * std::f64::consts::PI).abs() < 1e-12,
+                "PI()*2 = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_roundup() {
+        let (cm, vs) = make_test_env();
+        // Away from zero on both signs.
+        assert_eq!(eval_str("=ROUNDUP(3.2,0)", &cm, &vs), Value::Number(4.0));
+        assert_eq!(eval_str("=ROUNDUP(-3.2,0)", &cm, &vs), Value::Number(-4.0));
+        assert_eq!(eval_str("=ROUNDUP(3.14159,2)", &cm, &vs), Value::Number(3.15));
+        // Negative digits round to multiples of 10/100/...
+        assert_eq!(eval_str("=ROUNDUP(123,-1)", &cm, &vs), Value::Number(130.0));
+        assert_eq!(
+            eval_str("=ROUNDUP(3.2)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ROUNDUP(B2,0)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ROUNDUP(A1/C1,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_rounddown() {
+        let (cm, vs) = make_test_env();
+        // Toward zero on both signs.
+        assert_eq!(eval_str("=ROUNDDOWN(3.7,0)", &cm, &vs), Value::Number(3.0));
+        assert_eq!(eval_str("=ROUNDDOWN(-3.7,0)", &cm, &vs), Value::Number(-3.0));
+        assert_eq!(
+            eval_str("=ROUNDDOWN(3.14159,2)", &cm, &vs),
+            Value::Number(3.14)
+        );
+        assert_eq!(
+            eval_str("=ROUNDDOWN(189,-1)", &cm, &vs),
+            Value::Number(180.0)
+        );
+        assert_eq!(
+            eval_str("=ROUNDDOWN(3.7)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ROUNDDOWN(B2,0)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ROUNDDOWN(A1/C1,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_mround() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=MROUND(10,3)", &cm, &vs), Value::Number(9.0));
+        // 1.3 / 0.2 hits binary-float imprecision; assert "close enough".
+        match eval_str("=MROUND(1.3,0.2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.4).abs() < 1e-9, "MROUND(1.3,0.2) = {}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // multiple == 0 → 0.
+        assert_eq!(eval_str("=MROUND(5,0)", &cm, &vs), Value::Number(0.0));
+        // Sign mismatch → Overflow.
+        assert_eq!(
+            eval_str("=MROUND(5,-3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=MROUND(-5,3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Both negative is fine, same sign.
+        assert_eq!(eval_str("=MROUND(-10,-3)", &cm, &vs), Value::Number(-9.0));
+        assert_eq!(
+            eval_str("=MROUND(5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=MROUND(B2,2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=MROUND(A1/C1,2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_product() {
+        let (cm, vs) = make_test_env();
+        // A1=10, B1=20, A2=5 → 1000.
+        assert_eq!(
+            eval_str("=PRODUCT(A1,B1,A2)", &cm, &vs),
+            Value::Number(1000.0)
+        );
+        // Range arg over A1:B1 → 200.
+        assert_eq!(eval_str("=PRODUCT(A1:B1)", &cm, &vs), Value::Number(200.0));
+        // Mixed range + scalar.
+        assert_eq!(
+            eval_str("=PRODUCT(A1:B1,A2)", &cm, &vs),
+            Value::Number(1000.0)
+        );
+        // Text values are skipped (B2 is text); 10*20 = 200.
+        assert_eq!(eval_str("=PRODUCT(A1,B1,B2)", &cm, &vs), Value::Number(200.0));
+        // No numeric args → 0 (Excel convention for PRODUCT).
+        assert_eq!(eval_str("=PRODUCT(B2)", &cm, &vs), Value::Number(0.0));
+        // Variadic accepts >= 0 args, but supplying nothing returns 0.
+        assert_eq!(eval_str("=PRODUCT()", &cm, &vs), Value::Number(0.0));
+        // Error propagation.
+        assert_eq!(
+            eval_str("=PRODUCT(A1,A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_quotient() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=QUOTIENT(7,2)", &cm, &vs), Value::Number(3.0));
+        assert_eq!(eval_str("=QUOTIENT(-7,2)", &cm, &vs), Value::Number(-3.0));
+        assert_eq!(eval_str("=QUOTIENT(A1,A2)", &cm, &vs), Value::Number(2.0));
+        assert_eq!(
+            eval_str("=QUOTIENT(5,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=QUOTIENT(5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=QUOTIENT(B2,2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=QUOTIENT(A1,A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_fact() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=FACT(0)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=FACT(1)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=FACT(5)", &cm, &vs), Value::Number(120.0));
+        // Trunc the fractional part first.
+        assert_eq!(eval_str("=FACT(5.9)", &cm, &vs), Value::Number(120.0));
+        // Negative → Overflow.
+        assert_eq!(
+            eval_str("=FACT(-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // 171! overflows f64.
+        assert_eq!(
+            eval_str("=FACT(171)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=FACT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=FACT(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=FACT(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_combin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=COMBIN(5,2)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(eval_str("=COMBIN(8,3)", &cm, &vs), Value::Number(56.0));
+        assert_eq!(eval_str("=COMBIN(10,0)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=COMBIN(10,10)", &cm, &vs), Value::Number(1.0));
+        // k > n is a domain error.
+        assert_eq!(
+            eval_str("=COMBIN(3,5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Negative inputs.
+        assert_eq!(
+            eval_str("=COMBIN(-1,1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=COMBIN(5,-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=COMBIN(5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COMBIN(B2,2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=COMBIN(A1,A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_gcd() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=GCD(12,18)", &cm, &vs), Value::Number(6.0));
+        assert_eq!(eval_str("=GCD(12,18,24)", &cm, &vs), Value::Number(6.0));
+        assert_eq!(eval_str("=GCD(7,13)", &cm, &vs), Value::Number(1.0));
+        assert_eq!(eval_str("=GCD(0,5)", &cm, &vs), Value::Number(5.0));
+        // Range arg (A1=10, B1=20) and a scalar mix.
+        assert_eq!(eval_str("=GCD(A1:B1)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(eval_str("=GCD(A1:B1,A2)", &cm, &vs), Value::Number(5.0));
+        assert_eq!(
+            eval_str("=GCD()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Negative argument → WrongType per spec.
+        assert_eq!(
+            eval_str("=GCD(-4,8)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        // Non-numeric.
+        assert_eq!(
+            eval_str("=GCD(B2,8)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=GCD(A1,A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_lcm() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=LCM(4,6)", &cm, &vs), Value::Number(12.0));
+        assert_eq!(eval_str("=LCM(2,3,5)", &cm, &vs), Value::Number(30.0));
+        assert_eq!(eval_str("=LCM(0,5)", &cm, &vs), Value::Number(0.0));
+        // Range arg + scalar (A1=10, B1=20) → lcm(10,20) = 20; with A2=5 → 20.
+        assert_eq!(eval_str("=LCM(A1:B1)", &cm, &vs), Value::Number(20.0));
+        assert_eq!(eval_str("=LCM(A1:B1,A2)", &cm, &vs), Value::Number(20.0));
+        assert_eq!(
+            eval_str("=LCM()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=LCM(-4,6)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=LCM(B2,6)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=LCM(A1,A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_counta() {
+        let (cm, vs) = make_test_env();
+        // A1, B1, A2, B2 are all present in A1:B2 (C1 outside the range).
+        assert_eq!(eval_str("=COUNTA(A1:B2)", &cm, &vs), Value::Number(4.0));
+        // Scalar args: 3 args yield 3.
+        assert_eq!(eval_str("=COUNTA(1,2,3)", &cm, &vs), Value::Number(3.0));
+        // Mix range + scalar (A1:B1 = 2 cells, +A2 = 3).
+        assert_eq!(eval_str("=COUNTA(A1:B1,A2)", &cm, &vs), Value::Number(3.0));
+        // Text and booleans count.
+        assert_eq!(
+            eval_str("=COUNTA(B2,TRUE,\"x\")", &cm, &vs),
+            Value::Number(3.0)
+        );
+        // No args → 0.
+        assert_eq!(eval_str("=COUNTA()", &cm, &vs), Value::Number(0.0));
+        // Per spec: COUNTA counts errors too — they're "not blank".
+        assert_eq!(
+            eval_str("=COUNTA(A1/C1,A1)", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn eval_countblank() {
+        let (cm, vs) = make_test_env();
+        // A1:B2 has 4 populated cells; no Null hits.
+        assert_eq!(eval_str("=COUNTBLANK(A1:B2)", &cm, &vs), Value::Number(0.0));
+        // A range with two missing cells (C2 and C3 are not in cell_map).
+        assert_eq!(eval_str("=COUNTBLANK(C2:C3)", &cm, &vs), Value::Number(2.0));
+        // WrongArgCount.
+        assert_eq!(
+            eval_str("=COUNTBLANK(A1:B1,C1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COUNTBLANK()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation through a sub-expression — error is not Null.
+        assert_eq!(eval_str("=COUNTBLANK(A1/C1)", &cm, &vs), Value::Number(0.0));
+    }
+
+    // ---- B3: trig (radians) ----
+
+    #[test]
+    fn eval_sin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=SIN(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=SIN(PI()/2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "SIN(PI/2)={}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=SIN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=SIN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SIN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_cos() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=COS(0)", &cm, &vs), Value::Number(1.0));
+        match eval_str("=COS(PI())", &cm, &vs) {
+            Value::Number(n) => assert!((n + 1.0).abs() < 1e-12, "COS(PI)={}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=COS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COS(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=COS(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_tan() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=TAN(0)", &cm, &vs), Value::Number(0.0));
+        // Near PI/4 → ~1.
+        match eval_str("=TAN(PI()/4)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "TAN(PI/4)={}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=TAN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=TAN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=TAN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_asin() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ASIN(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ASIN(1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
+                "ASIN(1) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // Out of domain.
+        assert_eq!(
+            eval_str("=ASIN(2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ASIN(-1.5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ASIN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ASIN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ASIN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_acos() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ACOS(1)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ACOS(0)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
+                "ACOS(0) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ACOS(2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ACOS(-1.5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=ACOS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ACOS(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ACOS(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_atan() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ATAN(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=ATAN(1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+                "ATAN(1) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ATAN()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ATAN(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ATAN(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_atan2() {
+        let (cm, vs) = make_test_env();
+        // ATAN2(y, x) — y=1, x=1 → PI/4.
+        match eval_str("=ATAN2(1,1)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+                "ATAN2(1,1) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // y=0, x=1 → 0.
+        assert_eq!(eval_str("=ATAN2(0,1)", &cm, &vs), Value::Number(0.0));
+        // y=1, x=0 → PI/2.
+        match eval_str("=ATAN2(1,0)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
+                "ATAN2(1,0) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=ATAN2(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=ATAN2(B2,1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=ATAN2(A1/C1,1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_radians() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=RADIANS(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=RADIANS(180)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                (n - std::f64::consts::PI).abs() < 1e-12,
+                "RADIANS(180) = {}",
+                n
+            ),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=RADIANS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=RADIANS(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=RADIANS(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_degrees() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=DEGREES(0)", &cm, &vs), Value::Number(0.0));
+        match eval_str("=DEGREES(PI())", &cm, &vs) {
+            Value::Number(n) => assert!((n - 180.0).abs() < 1e-12, "DEGREES(PI) = {}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+        assert_eq!(
+            eval_str("=DEGREES()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=DEGREES(B2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=DEGREES(A1/C1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
     }
 }
