@@ -463,12 +463,32 @@ impl Parser {
     }
 
     /// Identifier: could be a function name (followed by '(') or a cell reference.
+    ///
+    /// We allow `.` between identifier chars so Excel 2010+ dotted function
+    /// names like `RANK.EQ` / `STDEV.P` / `PERCENTILE.INC` parse as a single
+    /// name. The rule: after the first alpha char, accept
+    /// `[A-Za-z0-9_]`. A `.` is only consumed when the very next char is
+    /// itself a valid identifier char (alpha / digit / underscore) — this
+    /// keeps a trailing `RANK.` from being absorbed (the `.` is left for
+    /// the caller, which will then fail to parse the formula), and
+    /// `RANK..EQ` won't be eaten as one identifier either. Numbers like
+    /// `1.5` route through `parse_number` instead, because identifiers
+    /// must start with an alpha char — so the decimal-separator role of
+    /// `.` is unaffected.
     fn parse_identifier(&mut self) -> Option<Expr> {
         let start = self.pos;
-        // Read alphanumeric chars
+        // Read alphanumerics + underscore. Allow '.' only when followed by
+        // another identifier char (see doc above).
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() {
+            if c.is_ascii_alphanumeric() || c == '_' {
                 self.advance();
+            } else if c == '.' {
+                match self.peek_at(1) {
+                    Some(next) if next.is_ascii_alphanumeric() || next == '_' => {
+                        self.advance();
+                    }
+                    _ => break,
+                }
             } else {
                 break;
             }
@@ -959,6 +979,76 @@ mod tests {
         // `A1` alone is a cell ref, not a sheet name. The bang disambiguates.
         let result = parse_formula("=A1").unwrap();
         assert!(matches!(result, Expr::CellRef(_)));
+    }
+
+    #[test]
+    fn parse_dotted_func_name() {
+        // Excel 2010+ dotted aliases like RANK.EQ must parse as a single
+        // function name (the dot is part of the identifier, not a stray
+        // token between two refs).
+        let result = parse_formula("=RANK.EQ(1,A1:A3)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "RANK.EQ".into(),
+                args: vec![
+                    Expr::Number(1.0),
+                    Expr::Range {
+                        start: CellAddress::new(0, 0),
+                        end: CellAddress::new(2, 0),
+                        unbounded: RangeBounds::None,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dotted_func_name_multi_dot() {
+        // PERCENTILE.INC is the canonical 2010+ rename of PERCENTILE.
+        let result = parse_formula("=PERCENTILE.INC(A1:A3,0.5)").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "PERCENTILE.INC".into(),
+                args: vec![
+                    Expr::Range {
+                        start: CellAddress::new(0, 0),
+                        end: CellAddress::new(2, 0),
+                        unbounded: RangeBounds::None,
+                    },
+                    Expr::Number(0.5),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_decimal_regression() {
+        // The dotted-identifier rule must NOT break decimal numbers, which
+        // are routed through `parse_number` because identifiers must start
+        // with an alpha char.
+        assert_eq!(parse_formula("=1.5"), Some(Expr::Number(1.5)));
+        assert_eq!(parse_formula("=0.25"), Some(Expr::Number(0.25)));
+    }
+
+    #[test]
+    fn parse_trailing_dot_in_identifier_rejected() {
+        // `RANK.` (trailing dot with no continuation) must NOT parse as an
+        // identifier called `RANK.`. The parser stops before the `.`,
+        // leaving it for the caller — there's nothing else `.` can be at
+        // the start of a token, so the formula as a whole fails to parse.
+        assert!(parse_formula("=RANK.").is_none());
+        // Even inside a function-call expression, the lone dot is fatal:
+        assert!(parse_formula("=RANK.(1,A1:A3)").is_none());
+    }
+
+    #[test]
+    fn parse_consecutive_dots_in_identifier_rejected() {
+        // `RANK..EQ` — the second dot has no preceding identifier char so
+        // the rule stops the identifier at `RANK` and the second `.` is
+        // not consumed → formula fails to parse.
+        assert!(parse_formula("=RANK..EQ(1,A1:A3)").is_none());
     }
 
     #[test]

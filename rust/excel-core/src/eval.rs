@@ -3784,17 +3784,18 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // If `value` is not present in `range`, returns #VALUE! (Excel uses #N/A
         // which has no direct equivalent in ValueError).
         //
-        // Excel dotted names not supported by parser; use RANKEQ/RANKAVG.
-        "RANK" | "RANKEQ" => rank_eq(args, provider),
+        // Dotted names (Excel 2010+): `RANK.EQ` aliases `RANK`/`RANKEQ`.
+        "RANK" | "RANKEQ" | "RANK.EQ" => rank_eq(args, provider),
 
         // RANKAVG(value, range[, order]) — Excel's RANK.AVG. Tied values get the
         // average of the ranks they span (e.g. three values tied for rank 5 → all
         // get 6.0, because they would occupy ranks 5, 6, 7).
-        "RANKAVG" => rank_avg(args, provider),
+        "RANKAVG" | "RANK.AVG" => rank_avg(args, provider),
 
         // PERCENTILE(range, k) — linear-interpolated percentile.
         // k in [0, 1]; otherwise #VALUE!. Empty range → #VALUE!.
-        "PERCENTILE" => {
+        // `PERCENTILE.INC` (Excel 2010+) is the same function.
+        "PERCENTILE" | "PERCENTILE.INC" => {
             if args.len() != 2 {
                 return Value::Error(ValueError::WrongArgCount);
             }
@@ -3809,8 +3810,28 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             percentile_impl(&args[..1], provider, k)
         }
 
+        // PERCENTILE.EXC(range, k) — exclusive percentile. k strictly in (0, 1);
+        // k=0 / k=1 → #VALUE!. The 1-based position is `k * (n + 1)`; if the
+        // resulting position is < 1 or > n the result is #VALUE!. Otherwise
+        // interpolates between the two surrounding sorted values.
+        "PERCENTILE.EXC" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let k_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = k_v {
+                return Value::Error(e);
+            }
+            let k = match coerce_to_number(&k_v) {
+                Some(n) => n,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            percentile_exc_impl(&args[..1], provider, k)
+        }
+
         // QUARTILE(range, quart) — quart ∈ {0,1,2,3,4} → PERCENTILE(range, quart/4).
-        "QUARTILE" => {
+        // `QUARTILE.INC` is the same function under Excel 2010+ naming.
+        "QUARTILE" | "QUARTILE.INC" => {
             if args.len() != 2 {
                 return Value::Error(ValueError::WrongArgCount);
             }
@@ -3829,6 +3850,58 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             percentile_impl(&args[..1], provider, q / 4.0)
         }
 
+        // QUARTILE.EXC(range, quart) — exclusive quartile. quart must be 1, 2,
+        // or 3 (0 and 4 are NOT valid in exclusive mode). Equivalent to
+        // PERCENTILE.EXC(range, quart/4).
+        "QUARTILE.EXC" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let q_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = q_v {
+                return Value::Error(e);
+            }
+            let q = match coerce_to_number(&q_v) {
+                Some(n) => n,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            // quart must be 1, 2, or 3 (integer).
+            if !q.is_finite() || q.trunc() != q {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let qi = q as i64;
+            if !(1..=3).contains(&qi) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            percentile_exc_impl(&args[..1], provider, qi as f64 / 4.0)
+        }
+
+        // STDEV.S / VAR.S — Excel 2010+ aliases for the sample-variance
+        // STDEV / VAR (divide by n-1).
+        "STDEV.S" => eval_func("STDEV", args, provider),
+        "VAR.S" => eval_func("VAR", args, provider),
+
+        // STDEV.P / VAR.P — population standard deviation / variance.
+        // Divide by n (not n-1).
+        "STDEV.P" => {
+            let nums = collect_numbers(args, provider);
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() as f64);
+            Value::Number(var.sqrt())
+        }
+        "VAR.P" => {
+            let nums = collect_numbers(args, provider);
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (nums.len() as f64);
+            Value::Number(var)
+        }
+
         // CORREL(arr1, arr2) — Pearson correlation. Both args must be ranges of
         // the same shape (same width × height). Pairs are collected only when
         // BOTH cells at the same offset are numeric. Need ≥ 2 pairs.
@@ -3837,6 +3910,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // Note: requires literal Range / SheetRange / OFFSET expressions (the
         // shape requirement is structural). Non-range args → #VALUE!.
         "CORREL" => correl_impl(args, provider),
+
+        // COVAR / COVAR.P — population covariance. `sum((x-mx)*(y-my)) / n`.
+        // Same pair-collection semantics as CORREL.
+        "COVAR" | "COVAR.P" => covar_impl(args, provider, false),
+
+        // COVAR.S — sample covariance. Divides by `n - 1` instead of `n`.
+        "COVAR.S" => covar_impl(args, provider, true),
 
         // SLOPE(y_array, x_array) — linear regression slope. Order matters: y
         // first, then x (Excel convention).
@@ -4080,6 +4160,38 @@ fn percentile_impl(range_args: &[Expr], provider: &dyn EvalProvider, k: f64) -> 
     }
 }
 
+/// Exclusive percentile (Excel 2010+ `PERCENTILE.EXC` / `QUARTILE.EXC`).
+///
+/// `k` must be strictly in `(0, 1)`. The 1-based rank is `k * (n + 1)`; if
+/// that falls below 1 or above `n` the result is #VALUE!. Otherwise the
+/// surrounding pair is linearly interpolated, same as `percentile_impl`.
+fn percentile_exc_impl(range_args: &[Expr], provider: &dyn EvalProvider, k: f64) -> Value {
+    if !k.is_finite() || k <= 0.0 || k >= 1.0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut nums = collect_numbers(range_args, provider);
+    if nums.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = nums.len();
+    // 1-based position. Excel: pos = k * (n + 1).
+    let pos = k * (n as f64 + 1.0);
+    if pos < 1.0 || pos > n as f64 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    // Convert to 0-based interpolation bounds.
+    let zero_based = pos - 1.0;
+    let lo = zero_based.floor() as usize;
+    let hi = zero_based.ceil() as usize;
+    if lo == hi {
+        Value::Number(nums[lo])
+    } else {
+        let frac = zero_based - lo as f64;
+        Value::Number(nums[lo] + (nums[hi] - nums[lo]) * frac)
+    }
+}
+
 /// Walk two range arguments in parallel and collect (x, y) pairs where BOTH
 /// cells are numeric. Returns:
 ///   - Ok(Vec<(x, y)>) on success
@@ -4159,6 +4271,32 @@ fn correl_impl(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::DivisionByZero);
     }
     Value::Number(sxy / denom)
+}
+
+/// Covariance (population or sample). `sum((x-mx) * (y-my)) / divisor`,
+/// where divisor is `n` for population (`COVAR` / `COVAR.P`) and `n - 1`
+/// for sample (`COVAR.S`). Shares range-pair and shape rules with CORREL.
+fn covar_impl(args: &[Expr], provider: &dyn EvalProvider, sample: bool) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_paired_numbers(&args[0], &args[1], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if pairs.is_empty() {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    if sample && pairs.len() < 2 {
+        // Sample covariance is undefined for a single pair (n - 1 == 0).
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let n = pairs.len() as f64;
+    let mx = pairs.iter().map(|(x, _)| *x).sum::<f64>() / n;
+    let my = pairs.iter().map(|(_, y)| *y).sum::<f64>() / n;
+    let sxy: f64 = pairs.iter().map(|(x, y)| (*x - mx) * (*y - my)).sum();
+    let divisor = if sample { n - 1.0 } else { n };
+    Value::Number(sxy / divisor)
 }
 
 /// Shared SLOPE / INTERCEPT body. Args are (y_array, x_array).
@@ -9101,13 +9239,14 @@ mod tests {
     }
 
     #[test]
-    fn eval_rankavg_dotted_name_parse_fails() {
-        // The parser does NOT accept '.' in function identifiers, so the
-        // Excel-canonical RANK.AVG name fails to parse. We expose it as
-        // RANKAVG instead — this test pins that contract.
-        let (_cm, _vs) = make_stat_env();
-        assert!(parse_formula("=RANK.AVG(1,A1:A3)").is_none());
-        assert!(parse_formula("=RANK.EQ(1,A1:A3)").is_none());
+    fn eval_rankavg_dotted_name_parses() {
+        // The parser accepts `.` inside function identifiers (Excel 2010+
+        // dotted aliases). RANK.AVG / RANK.EQ now parse as their own
+        // FuncCall names and route through the corresponding dispatcher
+        // arms; semantics are validated by `eval_rank_eq_dotted` /
+        // `eval_rank_avg_dotted`.
+        assert!(parse_formula("=RANK.AVG(1,A1:A3)").is_some());
+        assert!(parse_formula("=RANK.EQ(1,A1:A3)").is_some());
     }
 
     // --- PERCENTILE ---
@@ -9758,6 +9897,317 @@ mod tests {
         assert_eq!(
             eval_str("=PPMT(0.005,0,360,200000)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // ============================================================
+    // Excel 2010+ dotted-name aliases & variants.
+    //
+    // Parser support (`.` allowed inside identifiers) is verified in
+    // `formula::tests`; here we pin the dispatcher arms.
+    // ============================================================
+
+    // --- Pure aliases — RANK.EQ / RANK.AVG / PERCENTILE.INC / QUARTILE.INC ---
+
+    #[test]
+    fn eval_rank_eq_dotted() {
+        let (cm, vs) = make_stat_env();
+        // RANK.EQ(6, A1:A5) desc → 2 values > 6 → rank 3. Must match the
+        // bare RANK / RANKEQ arms exactly.
+        assert_eq!(eval_str("=RANK.EQ(6,A1:A5)", &cm, &vs), Value::Number(3.0));
+        assert_eq!(
+            eval_str("=RANK.EQ(6,A1:A5)", &cm, &vs),
+            eval_str("=RANK(6,A1:A5)", &cm, &vs),
+        );
+        // Arg-count error path is shared with RANK.
+        assert_eq!(
+            eval_str("=RANK.EQ(6)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_rank_avg_dotted() {
+        let (cm, vs) = make_stat_env();
+        // E1..E3 = 10, 10, 5 — ties at 10 → average(1, 2) = 1.5.
+        assert_eq!(
+            eval_str("=RANK.AVG(10,E1:E3)", &cm, &vs),
+            Value::Number(1.5),
+        );
+        assert_eq!(
+            eval_str("=RANK.AVG(10,E1:E3)", &cm, &vs),
+            eval_str("=RANKAVG(10,E1:E3)", &cm, &vs),
+        );
+        assert_eq!(
+            eval_str("=RANK.AVG(10)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_percentile_inc_dotted() {
+        let (cm, vs) = make_stat_env();
+        // PERCENTILE.INC is the same function as PERCENTILE.
+        assert_eq!(
+            eval_str("=PERCENTILE.INC(A1:A5,0.5)", &cm, &vs),
+            Value::Number(6.0),
+        );
+        assert_eq!(
+            eval_str("=PERCENTILE.INC(A1:A5,0.5)", &cm, &vs),
+            eval_str("=PERCENTILE(A1:A5,0.5)", &cm, &vs),
+        );
+        assert_eq!(
+            eval_str("=PERCENTILE.INC(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_quartile_inc_dotted() {
+        let (cm, vs) = make_stat_env();
+        // QUARTILE.INC mirrors QUARTILE (inclusive variant).
+        assert_eq!(
+            eval_str("=QUARTILE.INC(A1:A5,2)", &cm, &vs),
+            Value::Number(6.0),
+        );
+        assert_eq!(
+            eval_str("=QUARTILE.INC(A1:A5,2)", &cm, &vs),
+            eval_str("=QUARTILE(A1:A5,2)", &cm, &vs),
+        );
+        assert_eq!(
+            eval_str("=QUARTILE.INC(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    // --- Sample-variance aliases — STDEV.S / VAR.S ---
+
+    #[test]
+    fn eval_stdev_s() {
+        let (cm, vs) = make_stat_env();
+        // STDEV.S is an alias for STDEV (sample, divides by n-1).
+        // A1..A5 = 2,4,6,8,10 → mean=6, sumsq=40, var=40/4=10 → sd=√10.
+        match eval_str("=STDEV.S(A1:A5)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 10f64.sqrt()).abs() < 1e-12, "got {n}"),
+            other => panic!("STDEV.S: {other:?}"),
+        }
+        // Must agree numerically with STDEV.
+        assert_eq!(
+            eval_str("=STDEV.S(A1:A5)", &cm, &vs),
+            eval_str("=STDEV(A1:A5)", &cm, &vs),
+        );
+        // Arg-count handling is inherited from STDEV — at least one numeric
+        // value is required (collect_numbers returns empty → InvalidValue).
+        assert_eq!(
+            eval_str("=STDEV.S(D3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_var_s() {
+        let (cm, vs) = make_stat_env();
+        // VAR.S aliases VAR (sample). A1..A5 = 2,4,6,8,10 → var = 10.
+        assert_eq!(eval_str("=VAR.S(A1:A5)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=VAR.S(A1:A5)", &cm, &vs),
+            eval_str("=VAR(A1:A5)", &cm, &vs),
+        );
+        assert_eq!(
+            eval_str("=VAR.S(D3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    // --- Population variance — STDEV.P / VAR.P ---
+    //
+    // Wikipedia's canonical example: {2, 4, 4, 4, 5, 5, 7, 9}.
+    // mean = 5; sum of squared deviations = 32.
+    // Population: var = 32/8 = 4, sd = 2.
+    // Sample:    var = 32/7,    sd = √(32/7) ≈ 2.1381.
+
+    #[test]
+    fn eval_stdev_p() {
+        let (cm, vs) = make_stat_env();
+        // STDEV.P over inline args: {2,4,4,4,5,5,7,9} → pop SD = 2.
+        assert_eq!(
+            eval_str("=STDEV.P(2,4,4,4,5,5,7,9)", &cm, &vs),
+            Value::Number(2.0),
+        );
+        // Must DIFFER from sample STDEV / STDEV.S over the same input.
+        match eval_str("=STDEV.S(2,4,4,4,5,5,7,9)", &cm, &vs) {
+            Value::Number(sample) => {
+                assert!((sample - (32f64 / 7.0).sqrt()).abs() < 1e-12);
+                assert!((sample - 2.0).abs() > 0.1, "STDEV.P/S collapsed: {sample}");
+            }
+            other => panic!("STDEV.S: {other:?}"),
+        }
+        // Single value: pop SD is well-defined (= 0); sample SD is not.
+        assert_eq!(eval_str("=STDEV.P(7)", &cm, &vs), Value::Number(0.0));
+        // Empty input → InvalidValue.
+        assert_eq!(
+            eval_str("=STDEV.P(D3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_var_p() {
+        let (cm, vs) = make_stat_env();
+        // VAR.P over {2,4,4,4,5,5,7,9} → 4.
+        assert_eq!(
+            eval_str("=VAR.P(2,4,4,4,5,5,7,9)", &cm, &vs),
+            Value::Number(4.0),
+        );
+        // Sample VAR.S differs from pop VAR.P over the same input.
+        match eval_str("=VAR.S(2,4,4,4,5,5,7,9)", &cm, &vs) {
+            Value::Number(sample) => {
+                assert!((sample - 32f64 / 7.0).abs() < 1e-12);
+                assert!((sample - 4.0).abs() > 0.1, "VAR.P/S collapsed: {sample}");
+            }
+            other => panic!("VAR.S: {other:?}"),
+        }
+        assert_eq!(eval_str("=VAR.P(7)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(
+            eval_str("=VAR.P(D3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    // --- Exclusive percentile / quartile ---
+
+    #[test]
+    fn eval_percentile_exc() {
+        let (cm, vs) = make_stat_env();
+        // PERCENTILE.EXC(A1:A5, 0.5) on {2,4,6,8,10}: pos = 0.5*(5+1) = 3,
+        // i.e. the 3rd sorted value = 6.
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5,0.5)", &cm, &vs),
+            Value::Number(6.0),
+        );
+        // k=0.25 → pos = 1.5 → interp(nums[0]=2, nums[1]=4) at frac 0.5 = 3.
+        match eval_str("=PERCENTILE.EXC(A1:A5,0.25)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 3.0).abs() < 1e-12, "got {n}"),
+            other => panic!("PERCENTILE.EXC(0.25): {other:?}"),
+        }
+        // k=0 and k=1 are NOT allowed in exclusive mode.
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5,0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5,1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Position out of range (k too small / too large for n=5): pos<1 or pos>n.
+        // k=0.1 → pos = 0.6 → <1 → invalid.
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5,0.1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // k=0.9 → pos = 5.4 → >n=5 → invalid.
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5,0.9)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=PERCENTILE.EXC(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    #[test]
+    fn eval_quartile_exc() {
+        let (cm, vs) = make_stat_env();
+        // QUARTILE.EXC(A1:A5, 2) == PERCENTILE.EXC(0.5) = 6.
+        assert_eq!(
+            eval_str("=QUARTILE.EXC(A1:A5,2)", &cm, &vs),
+            Value::Number(6.0),
+        );
+        // quart=1 → PERCENTILE.EXC(0.25) = 3.
+        match eval_str("=QUARTILE.EXC(A1:A5,1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 3.0).abs() < 1e-12, "got {n}"),
+            other => panic!("QUARTILE.EXC(1): {other:?}"),
+        }
+        // quart=3 → PERCENTILE.EXC(0.75) = 9 (pos = 4.5 → interp 8/10).
+        match eval_str("=QUARTILE.EXC(A1:A5,3)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 9.0).abs() < 1e-12, "got {n}"),
+            other => panic!("QUARTILE.EXC(3): {other:?}"),
+        }
+        // 0 and 4 are NOT valid in exclusive mode.
+        assert_eq!(
+            eval_str("=QUARTILE.EXC(A1:A5,0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        assert_eq!(
+            eval_str("=QUARTILE.EXC(A1:A5,4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Fractional quart rejected.
+        assert_eq!(
+            eval_str("=QUARTILE.EXC(A1:A5,1.5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=QUARTILE.EXC(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    // --- Covariance — COVAR / COVAR.P / COVAR.S ---
+
+    #[test]
+    fn eval_covar() {
+        let (cm, vs) = make_stat_env();
+        // A = (2,4,6,8,10), B = 2A = (4,8,12,16,20).
+        // mx=6, my=12, sum((x-mx)(y-my)) = 2*(16+4+0+4+16) = 80.
+        // COVAR (pop): 80/5 = 16.
+        assert_eq!(
+            eval_str("=COVAR(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(16.0),
+        );
+        // COVAR.P is the same arm.
+        assert_eq!(
+            eval_str("=COVAR.P(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(16.0),
+        );
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=COVAR(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
+        );
+        // Shape mismatch propagates from collect_paired_numbers.
+        assert_eq!(
+            eval_str("=COVAR(A1:A5,B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue),
+        );
+    }
+
+    #[test]
+    fn eval_covar_s() {
+        let (cm, vs) = make_stat_env();
+        // Sample variant: same sum 80 divided by n-1 = 4 → 20.
+        assert_eq!(
+            eval_str("=COVAR.S(A1:A5,B1:B5)", &cm, &vs),
+            Value::Number(20.0),
+        );
+        // Must DIFFER from population COVAR over the same input.
+        match (
+            eval_str("=COVAR.P(A1:A5,B1:B5)", &cm, &vs),
+            eval_str("=COVAR.S(A1:A5,B1:B5)", &cm, &vs),
+        ) {
+            (Value::Number(p), Value::Number(s)) => {
+                assert!((p - 16.0).abs() < 1e-12 && (s - 20.0).abs() < 1e-12);
+                assert!((p - s).abs() > 0.1, "COVAR.P/S collapsed: {p}, {s}");
+            }
+            other => panic!("expected number pair, got {other:?}"),
+        }
+        // Arg-count error.
+        assert_eq!(
+            eval_str("=COVAR.S(A1:A5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount),
         );
     }
 }
