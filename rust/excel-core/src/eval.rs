@@ -671,6 +671,252 @@ fn for_each_arg_value(
     }
 }
 
+/// A database range resolved from a D* function's first argument. The
+/// header row is data row 0 in the original rectangle; `data_rows` is the
+/// number of rows BELOW the header. Built from `arg_as_range`/`OFFSET`
+/// shapes (the same set `resolve_range_arg` accepts) but kept separately
+/// so callers can address "data row i, column j" without subtracting the
+/// header offset each time.
+struct DatabaseRange {
+    sheet: Option<String>,
+    start_row: u32,
+    start_col: u32,
+    cols: u32,
+    data_rows: u32,
+}
+
+impl DatabaseRange {
+    /// Fetch the header cell at the given 0-based column index. Returns
+    /// `Value::Null` if `col` is out of range.
+    fn header(&self, col: u32, provider: &dyn EvalProvider) -> Value {
+        if col >= self.cols {
+            return Value::Null;
+        }
+        let addr = CellAddress::new(self.start_row, self.start_col + col);
+        match &self.sheet {
+            Some(s) => provider.sheet_cell(s, addr),
+            None => provider.cell(addr),
+        }
+    }
+
+    /// Fetch a data cell. `row` is 0-based against the data area (so row
+    /// 0 is the first row after the header), and `col` is the 0-based
+    /// column index.
+    fn data_cell(&self, row: u32, col: u32, provider: &dyn EvalProvider) -> Value {
+        let addr = CellAddress::new(self.start_row + 1 + row, self.start_col + col);
+        match &self.sheet {
+            Some(s) => provider.sheet_cell(s, addr),
+            None => provider.cell(addr),
+        }
+    }
+}
+
+/// Resolve a D* function's database argument into a `DatabaseRange`. The
+/// argument must be a literal range or `OFFSET(...)` with at least 2 rows
+/// (header + ≥ 1 data row). Otherwise `InvalidValue`.
+fn resolve_database_range(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<DatabaseRange, ValueError> {
+    let resolved = resolve_range_arg(arg, provider).ok_or(ValueError::InvalidValue)?;
+    if resolved.rows < 2 {
+        // A database needs a header row and at least one data row.
+        return Err(ValueError::InvalidValue);
+    }
+    Ok(DatabaseRange {
+        sheet: resolved.sheet,
+        start_row: resolved.start_row,
+        start_col: resolved.start_col,
+        cols: resolved.cols,
+        data_rows: resolved.rows - 1,
+    })
+}
+
+/// Resolve a D* function's `field` argument to a 0-based column index
+/// inside `database`. Accepts:
+/// - A 1-based number (1 → column 0, etc).
+/// - Text matching a header cell case-insensitively.
+/// Anything else, or out-of-range, is `InvalidValue`. Header cells that
+/// evaluate to `Value::Error(_)` propagate.
+fn resolve_db_field(
+    database: &DatabaseRange,
+    field_arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<usize, ValueError> {
+    let v = eval_expr_with_provider(field_arg, provider);
+    if let Value::Error(e) = v {
+        return Err(e);
+    }
+    // Numeric form first: 1-based column index. Booleans coerce per
+    // `coerce_to_number` (TRUE=1, FALSE=0); FALSE → out of range.
+    if let Value::Number(n) = v {
+        if !n.is_finite() || n.trunc() != n || n < 1.0 || (n as u32) > database.cols {
+            return Err(ValueError::InvalidValue);
+        }
+        return Ok((n as usize) - 1);
+    }
+    // Text form: case-insensitive header lookup.
+    let needle = match v {
+        Value::Text(s) => s,
+        _ => return Err(ValueError::InvalidValue),
+    };
+    let needle_lc = needle.to_lowercase();
+    for col in 0..database.cols {
+        let header = database.header(col, provider);
+        if let Value::Error(e) = header {
+            return Err(e);
+        }
+        if coerce_to_text(&header).to_lowercase() == needle_lc {
+            return Ok(col as usize);
+        }
+    }
+    Err(ValueError::InvalidValue)
+}
+
+/// Walk every data row of `database`, evaluate `criteria`, and invoke
+/// `callback(row_index)` for each matching row.
+///
+/// Criteria layout: row 0 is a header row whose cells name database
+/// columns (case-insensitive). Rows 1..N are criterion rows. A data row
+/// matches if it satisfies AT LEAST ONE criterion row; a criterion row
+/// is satisfied if EVERY non-empty cell in it passes `matches_criterion`
+/// against the corresponding database column. Empty (Null) criterion
+/// cells contribute nothing (vacuously true), so a fully empty criterion
+/// row matches every data row.
+///
+/// Returns `Err(e)` on the first `Value::Error(_)` encountered in either
+/// database or criteria cells, or on a malformed criteria range (no
+/// header row, or a header that doesn't match any database column).
+fn iter_db_matches(
+    database: &DatabaseRange,
+    criteria_arg: &Expr,
+    provider: &dyn EvalProvider,
+    mut callback: impl FnMut(u32) -> Result<(), ValueError>,
+) -> Result<(), ValueError> {
+    let criteria = resolve_range_arg(criteria_arg, provider).ok_or(ValueError::InvalidValue)?;
+    if criteria.rows < 2 {
+        // No criterion rows — Excel treats this as "no rows match".
+        return Ok(());
+    }
+
+    // Resolve criteria headers → database column index (lazily, once).
+    // `header_cols[i]` is the 0-based database column for criteria column
+    // `i`, or `None` if the criteria header is empty (skip column).
+    let mut header_cols: Vec<Option<u32>> = Vec::with_capacity(criteria.cols as usize);
+    for c in 0..criteria.cols {
+        let header = fetch_range_cell(&criteria, 0, c, provider);
+        if let Value::Error(e) = header {
+            return Err(e);
+        }
+        if matches!(header, Value::Null) {
+            header_cols.push(None);
+            continue;
+        }
+        let header_text = coerce_to_text(&header).to_lowercase();
+        let mut matched: Option<u32> = None;
+        for db_c in 0..database.cols {
+            let dh = database.header(db_c, provider);
+            if let Value::Error(e) = dh {
+                return Err(e);
+            }
+            if coerce_to_text(&dh).to_lowercase() == header_text {
+                matched = Some(db_c);
+                break;
+            }
+        }
+        // Bad criteria header (non-empty header not present in database)
+        // → InvalidValue. We choose strict-error semantics over silent
+        // mismatch so authoring mistakes surface loudly.
+        match matched {
+            Some(idx) => header_cols.push(Some(idx)),
+            None => return Err(ValueError::InvalidValue),
+        }
+    }
+
+    // For each data row, OR across criterion rows.
+    for dr in 0..database.data_rows {
+        let mut any_row_matches = false;
+        for cr in 1..criteria.rows {
+            let mut all_match = true;
+            for cc in 0..criteria.cols {
+                let cv = fetch_range_cell(&criteria, cr, cc, provider);
+                if let Value::Error(e) = cv {
+                    return Err(e);
+                }
+                if matches!(cv, Value::Null) {
+                    continue;
+                }
+                let db_col = match header_cols[cc as usize] {
+                    Some(c) => c,
+                    // Skipped column (criteria header was empty). The
+                    // criterion value here is non-empty but has no
+                    // anchor column → vacuously fail this criterion row.
+                    None => {
+                        all_match = false;
+                        break;
+                    }
+                };
+                let dv = database.data_cell(dr, db_col, provider);
+                if let Value::Error(e) = dv {
+                    return Err(e);
+                }
+                if !matches_criterion(&dv, &cv) {
+                    all_match = false;
+                    break;
+                }
+            }
+            if all_match {
+                any_row_matches = true;
+                break;
+            }
+        }
+        if any_row_matches {
+            callback(dr)?;
+        }
+    }
+    Ok(())
+}
+
+/// Common skeleton for D* numeric aggregates. Resolves the database and
+/// field column, then folds over matching rows' `field` values through
+/// `step`. `init` seeds the accumulator; `finalize` produces the result
+/// (e.g. wrap in `Value::Number`, or surface `DivisionByZero` if no
+/// values were collected).
+///
+/// `step` receives `(state, value)` and may inspect non-numeric values
+/// (DCOUNTA cares about Null vs non-Null) — callers gate by type.
+fn db_aggregate<S>(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    mut init: S,
+    step: impl Fn(&mut S, &Value),
+    finalize: impl FnOnce(S) -> Value,
+) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let database = match resolve_database_range(&args[0], provider) {
+        Ok(d) => d,
+        Err(e) => return Value::Error(e),
+    };
+    let field_col = match resolve_db_field(&database, &args[1], provider) {
+        Ok(c) => c,
+        Err(e) => return Value::Error(e),
+    };
+    let walk = iter_db_matches(&database, &args[2], provider, |row| {
+        let v = database.data_cell(row, field_col as u32, provider);
+        if let Value::Error(e) = v {
+            return Err(e);
+        }
+        step(&mut init, &v);
+        Ok(())
+    });
+    if let Err(e) = walk {
+        return Value::Error(e);
+    }
+    finalize(init)
+}
+
 fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
     match name {
         "SUM" => {
@@ -4325,6 +4571,197 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 "protect" => Value::Number(1.0),
                 _ => Value::Error(ValueError::InvalidValue),
             }
+        }
+
+        // === Database functions (D*) ===
+        //
+        // Shared signature: D*(database, field, criteria).
+        //   - database: range with a header row (row 0) and N data rows.
+        //   - field: column header (Text, case-insensitive) OR 1-based
+        //     column index (Number).
+        //   - criteria: range with a header row + 1+ criterion rows; rows
+        //     OR-combine, non-empty cells within a row AND-combine.
+        //
+        // Boolean handling: matches Excel — D* aggregates only operate on
+        // `Value::Number` data cells. Booleans / text / nulls are skipped
+        // for DCOUNT/DSUM/DAVERAGE/DSTDEV*/DVAR*/DPRODUCT/DMAX/DMIN. DCOUNTA
+        // counts ANY non-Null cell (numeric, text, boolean).
+        //
+        // Error propagation: any cell in `database` or `criteria` that
+        // holds `Value::Error(_)` short-circuits to that error.
+        //
+        // Empty-match handling (per Excel parity):
+        //   - DAVERAGE, DSTDEV/DSTDEVP, DVAR/DVARP → #DIV/0!
+        //   - DSUM, DPRODUCT, DMAX, DMIN, DCOUNT, DCOUNTA → 0
+        //   - DGET 0 matches → #VALUE!, > 1 matches → #NUM!
+        "DSUM" => db_aggregate(
+            args,
+            provider,
+            0.0_f64,
+            |acc, v| {
+                if let Value::Number(n) = v {
+                    *acc += *n;
+                }
+            },
+            Value::Number,
+        ),
+        "DAVERAGE" => db_aggregate(
+            args,
+            provider,
+            (0.0_f64, 0u64),
+            |acc, v| {
+                if let Value::Number(n) = v {
+                    acc.0 += *n;
+                    acc.1 += 1;
+                }
+            },
+            |(sum, count)| {
+                if count == 0 {
+                    Value::Error(ValueError::DivisionByZero)
+                } else {
+                    Value::Number(sum / count as f64)
+                }
+            },
+        ),
+        "DCOUNT" => db_aggregate(
+            args,
+            provider,
+            0u64,
+            |acc, v| {
+                if matches!(v, Value::Number(_)) {
+                    *acc += 1;
+                }
+            },
+            |c| Value::Number(c as f64),
+        ),
+        "DCOUNTA" => db_aggregate(
+            args,
+            provider,
+            0u64,
+            |acc, v| {
+                if !matches!(v, Value::Null) {
+                    *acc += 1;
+                }
+            },
+            |c| Value::Number(c as f64),
+        ),
+        "DMAX" => db_aggregate(
+            args,
+            provider,
+            None::<f64>,
+            |acc, v| {
+                if let Value::Number(n) = v {
+                    *acc = Some(acc.map_or(*n, |m| if *n > m { *n } else { m }));
+                }
+            },
+            |opt| Value::Number(opt.unwrap_or(0.0)),
+        ),
+        "DMIN" => db_aggregate(
+            args,
+            provider,
+            None::<f64>,
+            |acc, v| {
+                if let Value::Number(n) = v {
+                    *acc = Some(acc.map_or(*n, |m| if *n < m { *n } else { m }));
+                }
+            },
+            |opt| Value::Number(opt.unwrap_or(0.0)),
+        ),
+        "DPRODUCT" => db_aggregate(
+            args,
+            provider,
+            None::<f64>,
+            |acc, v| {
+                if let Value::Number(n) = v {
+                    *acc = Some(acc.map_or(*n, |p| p * *n));
+                }
+            },
+            |opt| Value::Number(opt.unwrap_or(0.0)),
+        ),
+        "DGET" => {
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let database = match resolve_database_range(&args[0], provider) {
+                Ok(d) => d,
+                Err(e) => return Value::Error(e),
+            };
+            let field_col = match resolve_db_field(&database, &args[1], provider) {
+                Ok(c) => c,
+                Err(e) => return Value::Error(e),
+            };
+            let mut found: Option<Value> = None;
+            let mut too_many = false;
+            let walk = iter_db_matches(&database, &args[2], provider, |row| {
+                if too_many {
+                    return Ok(());
+                }
+                let v = database.data_cell(row, field_col as u32, provider);
+                if let Value::Error(e) = v {
+                    return Err(e);
+                }
+                if found.is_some() {
+                    too_many = true;
+                } else {
+                    found = Some(v);
+                }
+                Ok(())
+            });
+            if let Err(e) = walk {
+                return Value::Error(e);
+            }
+            if too_many {
+                return Value::Error(ValueError::Overflow);
+            }
+            found.unwrap_or(Value::Error(ValueError::InvalidValue))
+        }
+        "DSTDEV" | "DSTDEVP" | "DVAR" | "DVARP" => {
+            // Two-pass; needs the full numeric Vec.
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let database = match resolve_database_range(&args[0], provider) {
+                Ok(d) => d,
+                Err(e) => return Value::Error(e),
+            };
+            let field_col = match resolve_db_field(&database, &args[1], provider) {
+                Ok(c) => c,
+                Err(e) => return Value::Error(e),
+            };
+            let mut nums: Vec<f64> = Vec::new();
+            let walk = iter_db_matches(&database, &args[2], provider, |row| {
+                let v = database.data_cell(row, field_col as u32, provider);
+                if let Value::Error(e) = v {
+                    return Err(e);
+                }
+                if let Value::Number(n) = v {
+                    nums.push(n);
+                }
+                Ok(())
+            });
+            if let Err(e) = walk {
+                return Value::Error(e);
+            }
+            // Sample (DSTDEV/DVAR) divides by n-1 and needs n >= 2.
+            // Population (DSTDEVP/DVARP) divides by n and needs n >= 1.
+            let is_sample = matches!(name, "DSTDEV" | "DVAR");
+            let min_n = if is_sample { 2 } else { 1 };
+            if nums.len() < min_n {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let denom = if is_sample {
+                (nums.len() - 1) as f64
+            } else {
+                nums.len() as f64
+            };
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denom;
+            let result = if name == "DSTDEV" || name == "DSTDEVP" {
+                var.sqrt()
+            } else {
+                var
+            };
+            Value::Number(result)
         }
 
         _ => Value::Error(ValueError::InvalidName),
@@ -11304,6 +11741,603 @@ mod tests {
         assert_eq!(
             eval_str("=COVAR.S(A1:A5)", &cm, &vs),
             Value::Error(ValueError::WrongArgCount),
+        );
+    }
+
+    // === Database functions (D*) ===
+    //
+    // Layout used by `make_db_env`:
+    //
+    //   A1:D1  =  "Name",  "Age", "Dept",  "Salary"   (header row)
+    //   A2:D2  =  "Alice",  30,   "Eng",   80000
+    //   A3:D3  =  "Bob",    25,   "Sales", 60000
+    //   A4:D4  =  "Carol",  35,   "Eng",   95000
+    //   A5:D5  =  "Dave",   28,   "Sales", 70000
+    //
+    //   F1:G1  =  "Dept",   "Age"                       (criteria header)
+    //   F2:G2  =  "Eng",    ">28"                       (criterion row 1)
+    //
+    // So the default criteria (F1:G2) matches Alice (Eng, 30) and Carol
+    // (Eng, 35). Bob/Dave fail Dept; Alice/Carol pass both Dept and Age.
+    fn make_db_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+
+        // Helper: insert a labelled (row, col) cell with a fresh AtomId.
+        let mut next_id: u64 = 0;
+        let mut put = |cm: &mut HashMap<CellAddress, AtomId>,
+                       vs: &mut HashMap<AtomId, Value>,
+                       row: u32,
+                       col: u32,
+                       v: Value| {
+            let id = AtomId::from_raw(next_id);
+            next_id += 1;
+            cm.insert(CellAddress::new(row, col), id);
+            vs.insert(id, v);
+        };
+
+        // Database header.
+        put(&mut cell_map, &mut values, 0, 0, Value::Text("Name".into()));
+        put(&mut cell_map, &mut values, 0, 1, Value::Text("Age".into()));
+        put(&mut cell_map, &mut values, 0, 2, Value::Text("Dept".into()));
+        put(&mut cell_map, &mut values, 0, 3, Value::Text("Salary".into()));
+
+        // Database rows.
+        let rows: [(&str, f64, &str, f64); 4] = [
+            ("Alice", 30.0, "Eng", 80000.0),
+            ("Bob", 25.0, "Sales", 60000.0),
+            ("Carol", 35.0, "Eng", 95000.0),
+            ("Dave", 28.0, "Sales", 70000.0),
+        ];
+        for (i, (name, age, dept, salary)) in rows.iter().enumerate() {
+            let r = (i + 1) as u32;
+            put(&mut cell_map, &mut values, r, 0, Value::Text((*name).into()));
+            put(&mut cell_map, &mut values, r, 1, Value::Number(*age));
+            put(&mut cell_map, &mut values, r, 2, Value::Text((*dept).into()));
+            put(&mut cell_map, &mut values, r, 3, Value::Number(*salary));
+        }
+
+        // Criteria region (F1:G2) — Dept="Eng" AND Age>28.
+        put(&mut cell_map, &mut values, 0, 5, Value::Text("Dept".into()));
+        put(&mut cell_map, &mut values, 0, 6, Value::Text("Age".into()));
+        put(&mut cell_map, &mut values, 1, 5, Value::Text("Eng".into()));
+        put(&mut cell_map, &mut values, 1, 6, Value::Text(">28".into()));
+
+        (cell_map, values)
+    }
+
+    #[test]
+    fn eval_dsum() {
+        let (cm, vs) = make_db_env();
+        // Salary sum over (Eng AND Age>28) → 80000 + 95000 = 175000.
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(175000.0)
+        );
+        // Field as 1-based number: Salary is column 4 → same result.
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(175000.0)
+        );
+        // Empty match set: a criteria of Dept="Marketing" → 0 numerics → 0.
+        let (mut cm2, mut vs2) = make_db_env();
+        // Overwrite criteria F1:G2 with Dept="Marketing" (single column).
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        // Empty the Age column criterion (G2) so only the Dept filter applies.
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field name → InvalidValue.
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count error.
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Salary\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Wildcard: Name="A*" → Alice only → 80000.
+        let (mut cm3, mut vs3) = make_db_env();
+        let h = AtomId::from_raw(900);
+        cm3.insert(CellAddress::new(0, 5), h);
+        vs3.insert(h, Value::Text("Name".into()));
+        let c = AtomId::from_raw(901);
+        cm3.insert(CellAddress::new(1, 5), c);
+        vs3.insert(c, Value::Text("A*".into()));
+        // Empty G column so only the Name criterion applies.
+        let empty_g1 = AtomId::from_raw(902);
+        cm3.insert(CellAddress::new(0, 6), empty_g1);
+        vs3.insert(empty_g1, Value::Null);
+        let empty_g2 = AtomId::from_raw(903);
+        cm3.insert(CellAddress::new(1, 6), empty_g2);
+        vs3.insert(empty_g2, Value::Null);
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Salary\",F1:G2)", &cm3, &vs3),
+            Value::Number(80000.0)
+        );
+    }
+
+    #[test]
+    fn eval_daverage() {
+        let (cm, vs) = make_db_env();
+        // (80000 + 95000) / 2 = 87500.
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(87500.0)
+        );
+        // Field as 1-based number.
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(87500.0)
+        );
+        // Empty match → DivisionByZero.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Bad field name.
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,\"Salary\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Error propagation: database cell holds an Error.
+        let (mut cm3, mut vs3) = make_db_env();
+        // Overwrite Alice's salary (cell D2 → row=1, col=3) with an Error.
+        let err_id = AtomId::from_raw(950);
+        cm3.insert(CellAddress::new(1, 3), err_id);
+        vs3.insert(err_id, Value::Error(ValueError::DivisionByZero));
+        assert_eq!(
+            eval_str("=DAVERAGE(A1:D5,\"Salary\",F1:G2)", &cm3, &vs3),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_dcount() {
+        let (cm, vs) = make_db_env();
+        // Count numeric Salary values in matches → 2.
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+        // Field as number.
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+        // Counting the Name column (Text) → 0 numerics among matches.
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5,\"Name\",F1:G2)", &cm, &vs),
+            Value::Number(0.0)
+        );
+        // Empty match → 0.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DCOUNT(A1:D5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dcounta() {
+        let (cm, vs) = make_db_env();
+        // 2 matches; Name column has 2 non-empty text cells.
+        assert_eq!(
+            eval_str("=DCOUNTA(A1:D5,\"Name\",F1:G2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+        // Numeric column also returns 2 (both non-Null).
+        assert_eq!(
+            eval_str("=DCOUNTA(A1:D5,2,F1:G2)", &cm, &vs),
+            Value::Number(2.0)
+        );
+        // Empty match → 0.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DCOUNTA(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DCOUNTA(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DCOUNTA(A1:D5,\"Name\",F1:G2,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dget() {
+        let (cm, vs) = make_db_env();
+        // Two matches → Overflow (#NUM!).
+        assert_eq!(
+            eval_str("=DGET(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Single match: filter narrower (Dept="Sales", Age>26 → only Dave).
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Sales".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Text(">26".into()));
+        assert_eq!(
+            eval_str("=DGET(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(70000.0)
+        );
+        // Same single match by 1-based field.
+        assert_eq!(
+            eval_str("=DGET(A1:D5,4,F1:G2)", &cm2, &vs2),
+            Value::Number(70000.0)
+        );
+        // No matches → InvalidValue.
+        let (mut cm3, mut vs3) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm3.insert(CellAddress::new(1, 5), id);
+        vs3.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm3.insert(CellAddress::new(1, 6), id2);
+        vs3.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DGET(A1:D5,\"Salary\",F1:G2)", &cm3, &vs3),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Bad field → InvalidValue.
+        assert_eq!(
+            eval_str("=DGET(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DGET(A1:D5,\"Salary\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dmax() {
+        let (cm, vs) = make_db_env();
+        // max(80000, 95000) = 95000.
+        assert_eq!(
+            eval_str("=DMAX(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(95000.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DMAX(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(95000.0)
+        );
+        // Empty match → 0 (Excel parity).
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DMAX(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DMAX(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DMAX(A1:D5,\"Salary\",F1:G2,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dmin() {
+        let (cm, vs) = make_db_env();
+        // min(80000, 95000) = 80000.
+        assert_eq!(
+            eval_str("=DMIN(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(80000.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DMIN(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(80000.0)
+        );
+        // Empty match → 0.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DMIN(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DMIN(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DMIN(A1:D5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dproduct() {
+        let (cm, vs) = make_db_env();
+        // 80000 * 95000 = 7_600_000_000.
+        assert_eq!(
+            eval_str("=DPRODUCT(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(7_600_000_000.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DPRODUCT(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(7_600_000_000.0)
+        );
+        // Empty match → 0.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DPRODUCT(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Number(0.0)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DPRODUCT(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DPRODUCT(A1:D5,\"Salary\",F1:G2,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dstdev() {
+        let (cm, vs) = make_db_env();
+        // Sample stddev of {80000, 95000} → sqrt(((80000-87500)^2 +
+        // (95000-87500)^2) / (2-1)) = sqrt(112_500_000) ≈ 10606.6017.
+        let v = eval_str("=DSTDEV(A1:D5,\"Salary\",F1:G2)", &cm, &vs);
+        match v {
+            Value::Number(n) => assert!(
+                (n - 112_500_000.0_f64.sqrt()).abs() < 1e-6,
+                "got {n}"
+            ),
+            other => panic!("expected number, got {other:?}"),
+        }
+        // 1-based field.
+        let v2 = eval_str("=DSTDEV(A1:D5,4,F1:G2)", &cm, &vs);
+        match v2 {
+            Value::Number(n) => assert!((n - 112_500_000.0_f64.sqrt()).abs() < 1e-6),
+            other => panic!("expected number, got {other:?}"),
+        }
+        // < 2 matches → DivisionByZero. Narrow to Dave only.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Sales".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Text(">26".into()));
+        assert_eq!(
+            eval_str("=DSTDEV(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DSTDEV(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DSTDEV(A1:D5,\"Salary\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dstdevp() {
+        let (cm, vs) = make_db_env();
+        // Population stddev of {80000, 95000} → sqrt(((80000-87500)^2 +
+        // (95000-87500)^2) / 2) = sqrt(56_250_000) = 7500.
+        assert_eq!(
+            eval_str("=DSTDEVP(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(7500.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DSTDEVP(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(7500.0)
+        );
+        // 0 matches → DivisionByZero.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DSTDEVP(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DSTDEVP(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DSTDEVP(A1:D5,\"Salary\",F1:G2,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dvar() {
+        let (cm, vs) = make_db_env();
+        // Sample variance of {80000, 95000} = 112_500_000.
+        assert_eq!(
+            eval_str("=DVAR(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(112_500_000.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DVAR(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(112_500_000.0)
+        );
+        // < 2 matches → DivisionByZero.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Sales".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Text(">26".into()));
+        assert_eq!(
+            eval_str("=DVAR(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DVAR(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DVAR(A1:D5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_dvarp() {
+        let (cm, vs) = make_db_env();
+        // Population variance of {80000, 95000} = 56_250_000.
+        assert_eq!(
+            eval_str("=DVARP(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Number(56_250_000.0)
+        );
+        // 1-based field.
+        assert_eq!(
+            eval_str("=DVARP(A1:D5,4,F1:G2)", &cm, &vs),
+            Value::Number(56_250_000.0)
+        );
+        // 0 matches → DivisionByZero.
+        let (mut cm2, mut vs2) = make_db_env();
+        let id = AtomId::from_raw(999);
+        cm2.insert(CellAddress::new(1, 5), id);
+        vs2.insert(id, Value::Text("Marketing".into()));
+        let id2 = AtomId::from_raw(998);
+        cm2.insert(CellAddress::new(1, 6), id2);
+        vs2.insert(id2, Value::Null);
+        assert_eq!(
+            eval_str("=DVARP(A1:D5,\"Salary\",F1:G2)", &cm2, &vs2),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        // Bad field.
+        assert_eq!(
+            eval_str("=DVARP(A1:D5,\"Bogus\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=DVARP(A1:D5,\"Salary\",F1:G2,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_db_bad_criteria_header() {
+        // Per-decision: a non-empty criteria header that does NOT match
+        // any database header → InvalidValue (#VALUE!). Authoring
+        // mistakes surface loudly rather than silently matching nothing.
+        let (mut cm, mut vs) = make_db_env();
+        // Overwrite F1 (criteria header) with a name that doesn't exist
+        // in the database.
+        let id = AtomId::from_raw(950);
+        cm.insert(CellAddress::new(0, 5), id);
+        vs.insert(id, Value::Text("Unknown".into()));
+        // F2 already holds "Eng" from the fixture; that's an OK criterion
+        // *value*, but F1's header doesn't resolve. So the criteria range
+        // is malformed.
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"Salary\",F1:G2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_db_case_insensitive_headers() {
+        // Header lookup is case-insensitive both for `field` arg and for
+        // criteria headers. We rewrite the criteria header F1 to "DEPT"
+        // (uppercase). It should still resolve to the database's "Dept".
+        let (mut cm, mut vs) = make_db_env();
+        let id = AtomId::from_raw(960);
+        cm.insert(CellAddress::new(0, 5), id);
+        vs.insert(id, Value::Text("DEPT".into()));
+        // `field` arg is also case-insensitive — "salary" matches "Salary".
+        assert_eq!(
+            eval_str("=DSUM(A1:D5,\"salary\",F1:G2)", &cm, &vs),
+            Value::Number(175000.0)
         );
     }
 }
