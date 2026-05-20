@@ -3196,8 +3196,29 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         // XLOOKUP(lookup, lookup_array, return_array[, if_not_found[,
         //         match_mode=0[, search_mode=1]]])
-        // Minimal subset: match_mode=0 (exact), search_mode=1 (forward).
-        // Anything else surfaces #VALUE!.
+        //
+        // match_mode:
+        //   0  exact (default) — return first/last exact match
+        //  -1  exact or next smaller — exact, else largest key <= needle
+        //   1  exact or next larger — exact, else smallest key >= needle
+        //   2  wildcard (text only) — needle is a wildcard pattern; walk
+        //      lookup_array and return the first cell whose text rep matches.
+        //
+        // search_mode:
+        //   1  forward, first-to-last (default)
+        //  -1  reverse, last-to-first
+        //   2  binary search, ascending-sorted lookup_array
+        //  -2  binary search, descending-sorted lookup_array
+        //
+        // Combination notes:
+        // - Wildcard (match_mode=2) requires a linear scan (wildcards have no
+        //   ordering), so search_mode must be 1 or -1; ±2 with wildcard
+        //   returns #VALUE!.
+        // - Approximate (match_mode=±1) with binary (search_mode=±2) is
+        //   supported and uses partition_point on the sorted array — O(log n).
+        // - Binary search modes ASSUME the array is sorted as advertised; we
+        //   do not verify, matching Excel's documented contract. (Caller's
+        //   responsibility, per stdlib `binary_search` semantics.)
         "XLOOKUP" => {
             if args.len() < 3 || args.len() > 6 {
                 return Value::Error(ValueError::WrongArgCount);
@@ -3206,31 +3227,45 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if let Value::Error(e) = needle {
                 return Value::Error(e);
             }
-            // match_mode: only 0 (exact) supported in this batch.
-            if args.len() >= 5 {
+            // Parse match_mode (default 0).
+            let match_mode: i64 = if args.len() >= 5 {
                 let mv = eval_expr_with_provider(&args[4], provider);
                 if let Value::Error(e) = mv {
                     return Value::Error(e);
                 }
                 match coerce_to_number(&mv) {
-                    Some(n) if n.trunc() as i64 == 0 => {}
-                    // approximate (-1/1) and wildcard (2) modes not yet
-                    // implemented; surface #VALUE!.
-                    _ => return Value::Error(ValueError::InvalidValue),
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::InvalidValue),
                 }
+            } else {
+                0
+            };
+            if !matches!(match_mode, -1 | 0 | 1 | 2) {
+                return Value::Error(ValueError::InvalidValue);
             }
-            // search_mode: only 1 (forward) supported in this batch.
-            if args.len() == 6 {
+            // Parse search_mode (default 1).
+            let search_mode: i64 = if args.len() == 6 {
                 let sv = eval_expr_with_provider(&args[5], provider);
                 if let Value::Error(e) = sv {
                     return Value::Error(e);
                 }
                 match coerce_to_number(&sv) {
-                    Some(n) if n.trunc() as i64 == 1 => {}
-                    // -1 reverse / 2 binary asc / -2 binary desc not yet
-                    // implemented.
-                    _ => return Value::Error(ValueError::InvalidValue),
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::InvalidValue),
                 }
+            } else {
+                1
+            };
+            if !matches!(search_mode, -2 | -1 | 1 | 2) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Wildcard match cannot use binary search (no ordering of patterns).
+            if match_mode == 2 && (search_mode == 2 || search_mode == -2) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // For wildcard mode, the needle MUST be text.
+            if match_mode == 2 && !matches!(needle, Value::Text(_)) {
+                return Value::Error(ValueError::WrongType);
             }
             // Both arrays must be ranges (lookup and return). Same linear
             // cell count required.
@@ -3249,18 +3284,203 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if lookup_flat.len() != return_flat.len() || lookup_flat.is_empty() {
                 return Value::Error(ValueError::InvalidValue);
             }
-            for (i, k) in lookup_flat.iter().enumerate() {
+            // Propagate any error cell inside lookup_array (per existing
+            // behavior).
+            for k in lookup_flat.iter() {
                 if let Value::Error(e) = k {
                     return Value::Error(e.clone());
                 }
-                if values_equal(k, &needle) {
-                    return return_flat[i].clone();
-                }
             }
-            if args.len() >= 4 {
-                eval_expr_with_provider(&args[3], provider)
-            } else {
-                Value::Error(ValueError::InvalidValue)
+            let n = lookup_flat.len();
+            // Helper: produce the not-found fallback.
+            let not_found = |this_args: &[Expr]| -> Value {
+                if this_args.len() >= 4 {
+                    eval_expr_with_provider(&this_args[3], provider)
+                } else {
+                    Value::Error(ValueError::InvalidValue)
+                }
+            };
+
+            // Compute the index of the matching cell (if any) given the mode
+            // combination.
+            let found: Option<usize> = match (match_mode, search_mode) {
+                // --- Exact match -----------------------------------------
+                (0, 1) => lookup_flat
+                    .iter()
+                    .position(|k| values_equal(k, &needle)),
+                (0, -1) => lookup_flat
+                    .iter()
+                    .rposition(|k| values_equal(k, &needle)),
+                (0, 2) => {
+                    // Binary search ascending for the first exact match.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(probe, &needle))
+                    {
+                        Ok(i) => Some(i),
+                        Err(_) => None,
+                    }
+                }
+                (0, -2) => {
+                    // Binary search descending: reverse the comparator.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(&needle, probe))
+                    {
+                        Ok(i) => Some(i),
+                        Err(_) => None,
+                    }
+                }
+                // --- Approximate next-smaller (-1) -----------------------
+                (-1, 1) | (-1, -1) => {
+                    // Linear scan: prefer exact; otherwise pick the largest
+                    // key still <= needle. Direction (forward / reverse)
+                    // only affects which equal candidate wins, but values
+                    // equal under `compare_lookup` are returned eagerly the
+                    // first time exact is detected, so behavior is the
+                    // same. We still respect direction for the "best ≤"
+                    // tie-break: forward keeps the first qualifying index,
+                    // reverse keeps the last.
+                    let mut best: Option<(usize, &Value)> = None;
+                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> =
+                        if search_mode == 1 {
+                            Box::new(lookup_flat.iter().enumerate())
+                        } else {
+                            Box::new(lookup_flat.iter().enumerate().rev())
+                        };
+                    let mut exact: Option<usize> = None;
+                    for (i, k) in iter {
+                        if values_equal(k, &needle) {
+                            exact = Some(i);
+                            break;
+                        }
+                        if compare_lookup(k, &needle).is_lt() {
+                            match best {
+                                None => best = Some((i, k)),
+                                Some((_, prev)) => {
+                                    if compare_lookup(k, prev).is_gt() {
+                                        best = Some((i, k));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    exact.or(best.map(|(i, _)| i))
+                }
+                (-1, 2) => {
+                    // Ascending binary search for exact-or-next-smaller.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(probe, &needle))
+                    {
+                        Ok(i) => Some(i),
+                        Err(i) => {
+                            // Insertion point: everything below i is < needle.
+                            if i == 0 {
+                                None
+                            } else {
+                                Some(i - 1)
+                            }
+                        }
+                    }
+                }
+                (-1, -2) => {
+                    // Descending binary search for exact-or-next-smaller.
+                    // In a descending array, the first element <= needle is
+                    // the insertion point.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(&needle, probe))
+                    {
+                        Ok(i) => Some(i),
+                        Err(i) => {
+                            if i >= n {
+                                None
+                            } else {
+                                Some(i)
+                            }
+                        }
+                    }
+                }
+                // --- Approximate next-larger (1) -------------------------
+                (1, 1) | (1, -1) => {
+                    let mut best: Option<(usize, &Value)> = None;
+                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> =
+                        if search_mode == 1 {
+                            Box::new(lookup_flat.iter().enumerate())
+                        } else {
+                            Box::new(lookup_flat.iter().enumerate().rev())
+                        };
+                    let mut exact: Option<usize> = None;
+                    for (i, k) in iter {
+                        if values_equal(k, &needle) {
+                            exact = Some(i);
+                            break;
+                        }
+                        if compare_lookup(k, &needle).is_gt() {
+                            match best {
+                                None => best = Some((i, k)),
+                                Some((_, prev)) => {
+                                    if compare_lookup(k, prev).is_lt() {
+                                        best = Some((i, k));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    exact.or(best.map(|(i, _)| i))
+                }
+                (1, 2) => {
+                    // Ascending binary search for exact-or-next-larger.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(probe, &needle))
+                    {
+                        Ok(i) => Some(i),
+                        Err(i) => {
+                            // Insertion point: everything at i and above is
+                            // >= needle. So index i is the next-larger.
+                            if i >= n {
+                                None
+                            } else {
+                                Some(i)
+                            }
+                        }
+                    }
+                }
+                (1, -2) => {
+                    // Descending binary search for exact-or-next-larger.
+                    match lookup_flat
+                        .binary_search_by(|probe| compare_lookup(&needle, probe))
+                    {
+                        Ok(i) => Some(i),
+                        Err(i) => {
+                            // In a descending array, the element just before
+                            // the insertion point is the smallest one still
+                            // >= needle.
+                            if i == 0 {
+                                None
+                            } else {
+                                Some(i - 1)
+                            }
+                        }
+                    }
+                }
+                // --- Wildcard (text-only) --------------------------------
+                (2, 1) => {
+                    let pattern = coerce_to_text(&needle);
+                    lookup_flat
+                        .iter()
+                        .position(|k| wildcard_match(&pattern, &coerce_to_text(k)))
+                }
+                (2, -1) => {
+                    let pattern = coerce_to_text(&needle);
+                    lookup_flat
+                        .iter()
+                        .rposition(|k| wildcard_match(&pattern, &coerce_to_text(k)))
+                }
+                // Wildcard + binary excluded above; any other mode pair was
+                // already rejected. Catch-all defensively.
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            match found {
+                Some(i) => return_flat[i].clone(),
+                None => not_found(args),
             }
         }
 
@@ -8512,14 +8732,252 @@ mod tests {
             eval_str("=XLOOKUP(10,A1:C1)", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
         );
-        // match_mode != 0 → InvalidValue (subset implementation).
+        // match_mode=1 (exact-or-larger) with an exact match present
+        // returns the exact hit (10 → A2=5).
         assert_eq!(
             eval_str("=XLOOKUP(10,A1:C1,A2:C2,\"x\",1)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Number(5.0)
         );
-        // search_mode != 1 → InvalidValue.
+        // search_mode=-1 (reverse) with an exact match also finds 10 → A2=5.
         assert_eq!(
             eval_str("=XLOOKUP(10,A1:C1,A2:C2,\"x\",0,-1)", &cm, &vs),
+            Value::Number(5.0)
+        );
+        // match_mode=99 → InvalidValue.
+        assert_eq!(
+            eval_str("=XLOOKUP(10,A1:C1,A2:C2,\"x\",99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // search_mode=99 → InvalidValue.
+        assert_eq!(
+            eval_str("=XLOOKUP(10,A1:C1,A2:C2,\"x\",0,99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    /// Build a numeric env where row 1 is the lookup array and row 2 is the
+    /// return array. Caller supplies the (lookup, return) pairs as a flat list
+    /// indexed left-to-right starting at column A.
+    fn make_xlookup_env(
+        pairs: &[(Value, Value)],
+    ) -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        for (i, (lookup, ret)) in pairs.iter().enumerate() {
+            let col = i as u32;
+            let l_atom = AtomId::from_raw((col * 2) as u64);
+            let r_atom = AtomId::from_raw((col * 2 + 1) as u64);
+            cm.insert(CellAddress::new(0, col), l_atom);
+            cm.insert(CellAddress::new(1, col), r_atom);
+            vs.insert(l_atom, lookup.clone());
+            vs.insert(r_atom, ret.clone());
+        }
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_xlookup_approximate_smaller() {
+        // lookup_array [10, 20, 30] with return "a"/"b"/"c". needle=25,
+        // match_mode=-1 → exact-or-next-smaller → 20 → "b".
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(10.0), Value::Text("a".into())),
+            (Value::Number(20.0), Value::Text("b".into())),
+            (Value::Number(30.0), Value::Text("c".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(25,A1:C1,A2:C2,\"none\",-1)", &cm, &vs),
+            Value::Text("b".into())
+        );
+        // Below the smallest key → no candidate → fallback.
+        assert_eq!(
+            eval_str("=XLOOKUP(5,A1:C1,A2:C2,\"none\",-1)", &cm, &vs),
+            Value::Text("none".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_approximate_larger() {
+        // Same array, needle=25, match_mode=1 → exact-or-next-larger → 30 → "c".
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(10.0), Value::Text("a".into())),
+            (Value::Number(20.0), Value::Text("b".into())),
+            (Value::Number(30.0), Value::Text("c".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(25,A1:C1,A2:C2,\"none\",1)", &cm, &vs),
+            Value::Text("c".into())
+        );
+        // Above the largest key → no candidate → fallback.
+        assert_eq!(
+            eval_str("=XLOOKUP(99,A1:C1,A2:C2,\"none\",1)", &cm, &vs),
+            Value::Text("none".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_wildcard() {
+        // lookup_array ["apple","banana","cherry"], needle="b*",
+        // match_mode=2 → matches "banana" → return at index 1 = 20.
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Text("apple".into()), Value::Number(10.0)),
+            (Value::Text("banana".into()), Value::Number(20.0)),
+            (Value::Text("cherry".into()), Value::Number(30.0)),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(\"b*\",A1:C1,A2:C2,\"none\",2)", &cm, &vs),
+            Value::Number(20.0)
+        );
+        // Plain text (no wildcards) also works through wildcard mode.
+        assert_eq!(
+            eval_str("=XLOOKUP(\"cherry\",A1:C1,A2:C2,\"none\",2)", &cm, &vs),
+            Value::Number(30.0)
+        );
+        // No match → fallback.
+        assert_eq!(
+            eval_str("=XLOOKUP(\"z*\",A1:C1,A2:C2,\"none\",2)", &cm, &vs),
+            Value::Text("none".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_wildcard_lookup_not_text() {
+        // Wildcard mode requires a Text needle; passing a number → #TYPE!.
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Text("apple".into()), Value::Number(10.0)),
+            (Value::Text("banana".into()), Value::Number(20.0)),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(42,A1:B1,A2:B2,\"none\",2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_reverse_search() {
+        // lookup_array [1,2,3,2,1] with return ["a","b","c","d","e"]. Needle
+        // 2 in reverse → matches the LATER 2 at index 3 → "d", not "b".
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(1.0), Value::Text("a".into())),
+            (Value::Number(2.0), Value::Text("b".into())),
+            (Value::Number(3.0), Value::Text("c".into())),
+            (Value::Number(2.0), Value::Text("d".into())),
+            (Value::Number(1.0), Value::Text("e".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(2,A1:E1,A2:E2,\"none\",0,-1)", &cm, &vs),
+            Value::Text("d".into())
+        );
+        // Sanity: forward search returns the first match → "b".
+        assert_eq!(
+            eval_str("=XLOOKUP(2,A1:E1,A2:E2,\"none\",0,1)", &cm, &vs),
+            Value::Text("b".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_binary_ascending() {
+        // Sorted ascending: [1,5,10,20,40] → return "a".."e". Needle 10 with
+        // search_mode=2 (binary asc) and exact match → "c".
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(1.0), Value::Text("a".into())),
+            (Value::Number(5.0), Value::Text("b".into())),
+            (Value::Number(10.0), Value::Text("c".into())),
+            (Value::Number(20.0), Value::Text("d".into())),
+            (Value::Number(40.0), Value::Text("e".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(10,A1:E1,A2:E2,\"none\",0,2)", &cm, &vs),
+            Value::Text("c".into())
+        );
+        // No exact match + exact mode → fallback.
+        assert_eq!(
+            eval_str("=XLOOKUP(7,A1:E1,A2:E2,\"none\",0,2)", &cm, &vs),
+            Value::Text("none".into())
+        );
+        // Binary search combined with approximate (next smaller): needle=7
+        // → 5 → "b".
+        assert_eq!(
+            eval_str("=XLOOKUP(7,A1:E1,A2:E2,\"none\",-1,2)", &cm, &vs),
+            Value::Text("b".into())
+        );
+        // Binary search combined with approximate (next larger): needle=7
+        // → 10 → "c".
+        assert_eq!(
+            eval_str("=XLOOKUP(7,A1:E1,A2:E2,\"none\",1,2)", &cm, &vs),
+            Value::Text("c".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_binary_descending() {
+        // Sorted descending: [40,20,10,5,1] → return "a".."e". Needle 10 with
+        // search_mode=-2 (binary desc) and exact match → "c".
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(40.0), Value::Text("a".into())),
+            (Value::Number(20.0), Value::Text("b".into())),
+            (Value::Number(10.0), Value::Text("c".into())),
+            (Value::Number(5.0), Value::Text("d".into())),
+            (Value::Number(1.0), Value::Text("e".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(10,A1:E1,A2:E2,\"none\",0,-2)", &cm, &vs),
+            Value::Text("c".into())
+        );
+        // Binary desc + approximate next smaller: needle=7 → 5 → "d".
+        assert_eq!(
+            eval_str("=XLOOKUP(7,A1:E1,A2:E2,\"none\",-1,-2)", &cm, &vs),
+            Value::Text("d".into())
+        );
+        // Binary desc + approximate next larger: needle=7 → 10 → "c".
+        assert_eq!(
+            eval_str("=XLOOKUP(7,A1:E1,A2:E2,\"none\",1,-2)", &cm, &vs),
+            Value::Text("c".into())
+        );
+        // Above the largest key (40) with next-larger → fallback.
+        assert_eq!(
+            eval_str("=XLOOKUP(99,A1:E1,A2:E2,\"none\",1,-2)", &cm, &vs),
+            Value::Text("none".into())
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_invalid_match_mode() {
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(1.0), Value::Text("a".into())),
+            (Value::Number(2.0), Value::Text("b".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(1,A1:B1,A2:B2,\"none\",99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_invalid_search_mode() {
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Number(1.0), Value::Text("a".into())),
+            (Value::Number(2.0), Value::Text("b".into())),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(1,A1:B1,A2:B2,\"none\",0,99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_xlookup_wildcard_with_binary_rejected() {
+        // Wildcard (match_mode=2) cannot be combined with binary search
+        // (search_mode=±2) because wildcards have no ordering. → InvalidValue.
+        let (cm, vs) = make_xlookup_env(&[
+            (Value::Text("apple".into()), Value::Number(10.0)),
+            (Value::Text("banana".into()), Value::Number(20.0)),
+        ]);
+        assert_eq!(
+            eval_str("=XLOOKUP(\"b*\",A1:B1,A2:B2,\"none\",2,2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=XLOOKUP(\"b*\",A1:B1,A2:B2,\"none\",2,-2)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
     }
