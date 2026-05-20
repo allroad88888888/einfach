@@ -267,6 +267,12 @@ export const messages: Record<string, string> = {
   'toolbar.redo.title': '重做 (Ctrl+Y)',
   'toolbar.clearFormat': '清除格式',
   'toolbar.clearFormat.title': '清除格式',
+  'toolbar.comment': '批注',
+  'toolbar.comment.title': '插入批注',
+  'toolbar.incDecimal': '增加小数位',
+  'toolbar.incDecimal.title': '增加小数位',
+  'toolbar.decDecimal': '减少小数位',
+  'toolbar.decDecimal.title': '减少小数位',
   'toolbar.currencyDropdown': 'Currency',
   'toolbar.currencyDropdown.title': '货币 / 数字格式',
 

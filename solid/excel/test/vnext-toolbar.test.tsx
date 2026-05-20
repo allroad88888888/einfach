@@ -409,7 +409,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.merge.disabled).toBe(true)
   })
 
-  it('does not render Find or Print Preview toolbar buttons', () => {
+  it('renders Print Preview, Comment, and Decimal-adjust toolbar buttons', () => {
     const store = createStore()
     const backend = createFakeBackend()
 
@@ -422,11 +422,13 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    // Find + Replace and Print Preview now ship only via menu entries — the
-    // toolbar surface dropped them in favour of icon-only formatting buttons
-    // for Univer parity.
-    expect(container.querySelector('[data-testid="toolbar-btn-find"]')).toBeNull()
-    expect(container.querySelector('[data-testid="toolbar-btn-print-preview"]')).toBeNull()
+    // The toolbar surfaces Print Preview + Comment alongside the existing
+    // history group, and a pair of Increase / Decrease Decimal buttons at
+    // the end of the number-format group.
+    expect(container.querySelector('[data-testid="toolbar-btn-print-preview"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="toolbar-btn-comment"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="toolbar-btn-inc-decimal"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="toolbar-btn-dec-decimal"]')).not.toBeNull()
   })
 
   it('toggles bold off when the active cell is already bold', async () => {

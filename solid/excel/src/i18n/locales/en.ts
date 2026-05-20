@@ -285,6 +285,12 @@ export const messages: Record<string, string> = {
   'toolbar.redo.title': 'Redo (Ctrl+Y)',
   'toolbar.clearFormat': 'Clear',
   'toolbar.clearFormat.title': 'Clear formatting',
+  'toolbar.comment': 'Comment',
+  'toolbar.comment.title': 'Insert comment',
+  'toolbar.incDecimal': 'Increase decimal',
+  'toolbar.incDecimal.title': 'Increase decimal places',
+  'toolbar.decDecimal': 'Decrease decimal',
+  'toolbar.decDecimal.title': 'Decrease decimal places',
   'toolbar.currencyDropdown': 'Currency',
   'toolbar.currencyDropdown.title': 'Number / currency format',
 

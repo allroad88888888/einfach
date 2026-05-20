@@ -1,4 +1,4 @@
-import { createSignal } from 'solid-js'
+import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
@@ -7,11 +7,19 @@ import {
   canRedoAtom,
   canUndoAtom,
   createVisibleProjectionRequest,
+  dispatchSortAtom,
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
+  findReplaceOpenAtom,
   formatPainterStateAtom,
   nextHistoryTransactionId,
+  openCommentSessionAtom,
+  openConditionalFormatEditorAtom,
+  openFilterDropdownAtom,
   openFormatCellsAtom,
+  openNameManagerAtom,
+  openValidationRuleEditorAtom,
+  printPreviewOpenAtom,
   pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
@@ -21,6 +29,7 @@ import {
   type CellRange,
   type DisplayCell,
   type HistoryEntryKind,
+  type SortDirection,
   type SpreadsheetBorders,
   type SpreadsheetBorderStyle,
   type SpreadsheetCellFormat,
@@ -60,16 +69,26 @@ import {
   BordersIcon,
   ChevronDownIcon,
   ClearFormatIcon,
+  CommentIcon,
+  ConditionalFormatIcon,
   CurrencyIcon,
+  DataValidationIcon,
+  DecreaseDecimalIcon,
   FillColorIcon,
+  FilterIcon,
+  FindReplaceIcon,
   FontSizeDownIcon,
   FontSizeUpIcon,
   FormatPainterIcon,
+  IncreaseDecimalIcon,
   ItalicIcon,
   MergeCellsIcon,
+  NameManagerIcon,
   PercentIcon,
+  PrintIcon,
   RedoIcon,
   RotationIcon,
+  SortIcon,
   StrikethroughIcon,
   TextColorIcon,
   UnderlineIcon,
@@ -244,6 +263,102 @@ function rangeCellCount(range: CellRange): number {
   return (range.rowEnd - range.rowStart + 1) * (range.colEnd - range.colStart + 1)
 }
 
+/**
+ * Minimal asc/desc dropdown that pairs with the Sort toolbar button. Inlined
+ * here (rather than living in `filter-sort/`) because it only carries two
+ * static options and mirrors the MergeDropdown layout — pulling it into its
+ * own module would just add an import for ~30 lines of JSX.
+ */
+interface SortDropdownProps {
+  isOpen: boolean
+  anchorRef?: HTMLElement | null
+  onSelect: (direction: SortDirection) => void
+  onRequestClose: () => void
+  /** Translator from the parent toolbar; avoids a second `useT()` call. */
+  t: (key: string) => string
+}
+
+function SortDropdown(props: SortDropdownProps) {
+  let rootRef: HTMLDivElement | undefined
+
+  function onDocPointerDown(event: MouseEvent) {
+    if (!rootRef) return
+    const target = event.target as Node | null
+    if (!target) return
+    if (rootRef.contains(target)) return
+    if (props.anchorRef && props.anchorRef.contains(target)) return
+    props.onRequestClose()
+  }
+
+  function onDocKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      props.onRequestClose()
+    }
+  }
+
+  onMount(() => {
+    document.addEventListener('mousedown', onDocPointerDown, true)
+    document.addEventListener('keydown', onDocKeyDown)
+  })
+
+  onCleanup(() => {
+    document.removeEventListener('mousedown', onDocPointerDown, true)
+    document.removeEventListener('keydown', onDocKeyDown)
+  })
+
+  const options: Array<{ direction: SortDirection; labelKey: string; testId: string }> = [
+    { direction: 'asc', labelKey: 'toolbar.sort.asc', testId: 'toolbar-sort-asc' },
+    { direction: 'desc', labelKey: 'toolbar.sort.desc', testId: 'toolbar-sort-desc' },
+  ]
+
+  return (
+    <Show when={props.isOpen}>
+      <div
+        ref={rootRef}
+        class="spreadsheet-toolbar-sort-dropdown"
+        role="menu"
+        data-testid="toolbar-sort-dropdown"
+        style={{
+          position: 'absolute',
+          top: '100%',
+          left: '0',
+          'z-index': 30,
+          'min-width': '140px',
+          background: '#fff',
+          border: '1px solid #d0d0d0',
+          'box-shadow': '0 4px 12px rgba(0,0,0,0.12)',
+          display: 'flex',
+          'flex-direction': 'column',
+          padding: '4px 0',
+        }}
+      >
+        <For each={options}>
+          {(option) => (
+            <button
+              type="button"
+              class="spreadsheet-toolbar-sort-option"
+              role="menuitem"
+              data-testid={option.testId}
+              style={{
+                padding: '4px 12px',
+                'text-align': 'left',
+                background: 'transparent',
+                border: 'none',
+                cursor: 'pointer',
+                font: 'inherit',
+              }}
+              onClick={() => props.onSelect(option.direction)}
+            >
+              {props.t(option.labelKey)}
+            </button>
+          )}
+        </For>
+      </div>
+    </Show>
+  )
+}
+
 export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
@@ -311,6 +426,11 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   // its own toolbar button.
   const [rotationDropdownOpen, setRotationDropdownOpen] = createSignal(false)
   let rotationAnchorRef: HTMLButtonElement | undefined
+
+  // Sort dropdown — minimal asc/desc menu, inlined rather than living in its
+  // own file since it only carries two static options.
+  const [sortDropdownOpen, setSortDropdownOpen] = createSignal(false)
+  let sortAnchorRef: HTMLButtonElement | undefined
 
   const colorPopover = useAtomValue(colorPopoverAtom)
   const [anchorRect, setAnchorRect] = createSignal<DOMRect | null>(null)
@@ -949,6 +1069,49 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     void executeMergePreset(preset).catch(reportCommandError)
   }
 
+  // === New group: Find/Replace, Conditional format, Data validation,
+  // Filter, Sort, Name manager. All six dispatch into existing spreadsheet-
+  // ui-core atoms — the dialog/dropdown components subscribe to those atoms
+  // and render themselves; the toolbar just opens them.
+
+  function handleOpenFindReplace() {
+    store.setter(findReplaceOpenAtom, true)
+  }
+
+  function handleOpenConditionalFormat() {
+    // openConditionalFormatEditorAtom takes an optional existing rule entry.
+    // Passing null opens the editor in "new rule" mode; the dialog itself
+    // reads selectionSnapshot when committing the rule, so we don't need to
+    // pre-bind a range here.
+    store.setter(openConditionalFormatEditorAtom, null)
+  }
+
+  function handleOpenDataValidation() {
+    const sheetId = getMutationSheetId()
+    if (!sheetId) return
+    const range = selectionSnapshot().range
+    store.setter(openValidationRuleEditorAtom, { range })
+  }
+
+  function handleOpenFilterDropdown() {
+    const sheetId = getMutationSheetId()
+    if (!sheetId) return
+    const colIndex = selectionSnapshot().activeCell.col
+    store.setter(openFilterDropdownAtom, { sheetId, colIndex })
+  }
+
+  function handleSortSelect(direction: SortDirection) {
+    setSortDropdownOpen(false)
+    const sheetId = getMutationSheetId()
+    if (!sheetId) return
+    const colIndex = selectionSnapshot().activeCell.col
+    store.setter(dispatchSortAtom, { sheetId, colIndex, direction })
+  }
+
+  function handleOpenNameManager() {
+    store.setter(openNameManagerAtom, { status: 'editing-new' })
+  }
+
   /**
    * Univer-parity undo / redo handlers. The same atoms drive the history
    * timeline panel; the toolbar buttons piggyback on that flow so undo state
@@ -992,6 +1155,115 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     } catch (error) {
       reportCommandError(error)
     }
+  }
+
+  /**
+   * Open the print preview overlay. Mirrors the menu-bar handler in
+   * `SpreadsheetMenuBar.tsx` but writes the open flag directly (rather than
+   * toggling) so the toolbar button always lands on "open" — re-clicking the
+   * button while the overlay is up is rare enough that the toggle path was
+   * not worth the surprise of "click does nothing while overlay is visible".
+   */
+  function handlePrintPreview() {
+    store.setter(printPreviewOpenAtom, true)
+  }
+
+  /**
+   * Open a comment session for the active cell. Same wiring as the menu bar
+   * 'open-comment-session' branch — pulls a fresh `selectionSnapshot` so the
+   * session anchors on the live active cell.
+   */
+  function handleOpenComment() {
+    const snap = store.getter(selectionSnapshotAtom)
+    const sheetId = snap.selection.sheetId || availability().sheetId
+    if (!sheetId) return
+    store.setter(openCommentSessionAtom, {
+      sheetId,
+      cell: snap.activeCell,
+    })
+  }
+
+  /**
+   * Kinds whose `digits` field the increase/decrease decimal buttons can bump.
+   * `'decimal'` is the deprecated alias for `'number'` (per
+   * `vanilla/spreadsheet-ui-core/src/backend/types.ts`); both share the same
+   * digits semantics so they're treated as one.
+   */
+  type DecimalCapableKind =
+    | 'number'
+    | 'decimal'
+    | 'percent'
+    | 'currency'
+    | 'accounting'
+    | 'scientific'
+
+  function isDecimalCapableFormat(
+    nf: SpreadsheetNumberFormat | undefined,
+  ): nf is SpreadsheetNumberFormat & { kind: DecimalCapableKind; digits?: number } {
+    if (!nf) return false
+    return (
+      nf.kind === 'number' ||
+      nf.kind === 'decimal' ||
+      nf.kind === 'percent' ||
+      nf.kind === 'currency' ||
+      nf.kind === 'accounting' ||
+      nf.kind === 'scientific'
+    )
+  }
+
+  /**
+   * Returns the current `digits` on the active cell's number format. Defaults
+   * to `0` when the cell is on a non-decimal-capable kind (e.g. `'general'`,
+   * `'text'`, or no format at all) — the increase button's first click will
+   * then promote that cell into `{ kind: 'decimal', digits: 1 }`.
+   */
+  function currentDecimalDigits(): number {
+    const nf = activeCellFormat().numberFormat
+    if (!isDecimalCapableFormat(nf)) return 0
+    return Math.max(0, nf.digits ?? 0)
+  }
+
+  /**
+   * Increase / decrease the digit count by 1. For non-decimal-capable kinds
+   * the increase path swaps in `{ kind: 'decimal', digits: 1, thousands: false }`
+   * so the cell starts displaying a single fractional digit; the decrease
+   * path is a no-op there because there is no `digits` to remove.
+   */
+  function adjustDigits(direction: 'increase' | 'decrease') {
+    if (!backend.setFormatRange) return
+    const sheetId = getMutationSheetId()
+    if (!sheetId) return
+    const range = selectionSnapshot().range
+    const currentFormat = activeCellFormat()
+    const nf = currentFormat.numberFormat
+    const nextFormat: SpreadsheetCellFormat = { ...currentFormat }
+    if (isDecimalCapableFormat(nf)) {
+      const current = nf.digits ?? 0
+      const nextDigits =
+        direction === 'increase' ? current + 1 : Math.max(0, current - 1)
+      if (nextDigits === current) return
+      nextFormat.numberFormat = { ...nf, digits: nextDigits } as SpreadsheetNumberFormat
+    } else {
+      if (direction === 'decrease') return
+      nextFormat.numberFormat = { kind: 'decimal', digits: 1, thousands: false }
+    }
+    void backend
+      .setFormatRange({
+        kind: 'set-format-range',
+        sheetId,
+        range,
+        format: nextFormat,
+      })
+      .then((result) => {
+        recordHistoryEntry({
+          sheetId,
+          kind: 'format.set',
+          revision: result?.revision,
+          affectedRange: result?.affectedRange ?? range,
+        })
+        return refreshProjection(sheetId)
+      })
+      .catch(reportCommandError)
   }
 
   const canUndo = useAtomValue(canUndoAtom)
@@ -1121,6 +1393,30 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onClick={() => void handleClearFormat()}
       >
         <ClearFormatIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-print-preview"
+        data-tooltip={t('toolbar.printPreview.title')}
+        aria-label={t('toolbar.printPreview.title')}
+        disabled={!availability().sheetId}
+        onClick={handlePrintPreview}
+      >
+        <PrintIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-comment"
+        data-tooltip={t('toolbar.comment.title')}
+        aria-label={t('toolbar.comment.title')}
+        disabled={
+          !availability().sheetId || availability().editingMode === 'drafting'
+        }
+        onClick={handleOpenComment}
+      >
+        <CommentIcon />
       </button>
 
       <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
@@ -1409,6 +1705,98 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
 
       <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
 
+      {/* Group 6b — Find/Replace, conditional formatting, data validation,
+          filter, sort, name manager. Each button is a thin opener that
+          flips an existing spreadsheet-ui-core atom; the dialogs/dropdowns
+          subscribe to those atoms and render themselves. */}
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-find-replace"
+        data-tooltip={t('toolbar.findReplace.title')}
+        aria-label={t('toolbar.findReplace.title')}
+        disabled={!availability().sheetId}
+        onClick={handleOpenFindReplace}
+      >
+        <FindReplaceIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-conditional-format"
+        data-tooltip={t('toolbar.condFmt.title')}
+        aria-label={t('toolbar.condFmt.title')}
+        disabled={!availability().sheetId}
+        onClick={handleOpenConditionalFormat}
+      >
+        <ConditionalFormatIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-data-validation"
+        data-tooltip={t('toolbar.dataValidation.title')}
+        aria-label={t('toolbar.dataValidation.title')}
+        disabled={!availability().sheetId}
+        onClick={handleOpenDataValidation}
+      >
+        <DataValidationIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-filter"
+        data-tooltip={t('toolbar.filter.title')}
+        aria-label={t('toolbar.filter.title')}
+        disabled={!availability().sheetId || !backend.setFilterSort}
+        onClick={handleOpenFilterDropdown}
+      >
+        <FilterIcon />
+      </button>
+      <div
+        class="spreadsheet-toolbar-sort-wrapper"
+        style={{ position: 'relative', display: 'inline-flex' }}
+      >
+        <button
+          ref={(el) => (sortAnchorRef = el)}
+          type="button"
+          class={`fmt-btn spreadsheet-toolbar-button ${
+            sortDropdownOpen() ? 'fmt-btn-active' : ''
+          }`.trim()}
+          data-testid="toolbar-btn-sort"
+          data-tooltip={t('toolbar.sort.title')}
+          aria-label={t('toolbar.sort.title')}
+          aria-haspopup="menu"
+          aria-expanded={sortDropdownOpen()}
+          disabled={!availability().sheetId}
+          onClick={() => {
+            setSortDropdownOpen((open) => !open)
+          }}
+        >
+          <SortIcon />
+        </button>
+        <SortDropdown
+          isOpen={sortDropdownOpen()}
+          anchorRef={sortAnchorRef ?? null}
+          onSelect={handleSortSelect}
+          onRequestClose={() => setSortDropdownOpen(false)}
+          t={t}
+        />
+      </div>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-name-manager"
+        data-tooltip={t('toolbar.nameManager.title')}
+        aria-label={t('toolbar.nameManager.title')}
+        disabled={!availability().sheetId}
+        onClick={handleOpenNameManager}
+      >
+        <NameManagerIcon />
+      </button>
+
+      <span class="spreadsheet-toolbar-separator" aria-hidden="true" />
+
       {/* Group 7 — Number format dropdown + percent / currency shortcuts */}
       <button
         type="button"
@@ -1468,6 +1856,32 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         onClick={() => dispatchCommand({ command: 'number-format', value: 'Currency' })}
       >
         <CurrencyIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-inc-decimal"
+        data-tooltip={t('toolbar.incDecimal.title')}
+        aria-label={t('toolbar.incDecimal.title')}
+        disabled={!availability().numberFormat || isProtectionGated()}
+        onClick={() => adjustDigits('increase')}
+      >
+        <IncreaseDecimalIcon />
+      </button>
+      <button
+        type="button"
+        class="fmt-btn spreadsheet-toolbar-button"
+        data-testid="toolbar-btn-dec-decimal"
+        data-tooltip={t('toolbar.decDecimal.title')}
+        aria-label={t('toolbar.decDecimal.title')}
+        disabled={
+          !availability().numberFormat ||
+          isProtectionGated() ||
+          currentDecimalDigits() <= 0
+        }
+        onClick={() => adjustDigits('decrease')}
+      >
+        <DecreaseDecimalIcon />
       </button>
 
       <NumberFormatDropdown

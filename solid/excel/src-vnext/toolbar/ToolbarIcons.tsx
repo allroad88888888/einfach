@@ -317,6 +317,110 @@ export const ClearFormatIcon = (): JSX.Element => (
   </svg>
 )
 
+export const PrintIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    {/*
+      Printer with a paper sheet poking out the top (input) and an output
+      sheet emerging from the bottom. Body is filled so it reads at 16px;
+      the output sheet is a white rect with two ink lines so the "printout"
+      detail stays legible.
+     */}
+    {/* Input sheet — top tab */}
+    <rect x="4.5" y="2" width="7" height="3.2" rx="0.3" />
+    {/* Printer body */}
+    <path
+      d="M3 5.5h10a1 1 0 0 1 1 1V11a1 1 0 0 1-1 1h-1.5v-2h-7v2H3a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1z"
+      fill="currentColor"
+      stroke="none"
+    />
+    {/* Output sheet on the front */}
+    <rect x="4.5" y="9" width="7" height="5" rx="0.3" fill="#fff" />
+    {/* Output sheet ink lines */}
+    <line x1="6" y1="11" x2="10" y2="11" stroke-width="1" />
+    <line x1="6" y1="12.5" x2="10" y2="12.5" stroke-width="1" />
+  </svg>
+)
+
+export const CommentIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    {/*
+      Rounded speech bubble with a tail at the lower-left. Two horizontal
+      lines hint at message content. Pure stroke so it reads at 16px.
+     */}
+    <path d="M2.5 4a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 13.5 4v5A1.5 1.5 0 0 1 12 10.5H6.5L4 13v-2.5A1.5 1.5 0 0 1 2.5 9V4z" />
+    <line x1="5" y1="5.5" x2="11" y2="5.5" stroke-width="1.3" />
+    <line x1="5" y1="7.8" x2="9" y2="7.8" stroke-width="1.3" />
+  </svg>
+)
+
+export const IncreaseDecimalIcon = (): JSX.Element => (
+  <svg
+    width={16}
+    height={16}
+    viewBox="0 0 16 16"
+    fill="none"
+    aria-hidden="true"
+  >
+    {/*
+      ".00" glyph + a right-pointing arrow above — "add a digit to the
+      right of the decimal point". Mirrors the classic Excel/Univer icon.
+     */}
+    <text
+      x="1"
+      y="13"
+      font-size="8"
+      font-family="system-ui, -apple-system, sans-serif"
+      font-weight="600"
+      fill="currentColor"
+      stroke="none"
+    >
+      .00
+    </text>
+    <path
+      d="M9.5 3.5h4M11.7 1.7l1.8 1.8-1.8 1.8"
+      stroke="currentColor"
+      stroke-width="1.4"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      fill="none"
+    />
+  </svg>
+)
+
+export const DecreaseDecimalIcon = (): JSX.Element => (
+  <svg
+    width={16}
+    height={16}
+    viewBox="0 0 16 16"
+    fill="none"
+    aria-hidden="true"
+  >
+    {/*
+      Mirror of IncreaseDecimalIcon — arrow points left so it reads as
+      "remove a digit from the right of the decimal point".
+     */}
+    <text
+      x="1"
+      y="13"
+      font-size="8"
+      font-family="system-ui, -apple-system, sans-serif"
+      font-weight="600"
+      fill="currentColor"
+      stroke="none"
+    >
+      .00
+    </text>
+    <path
+      d="M9.5 3.5h4M11.3 1.7 9.5 3.5l1.8 1.8"
+      stroke="currentColor"
+      stroke-width="1.4"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      fill="none"
+    />
+  </svg>
+)
+
 export const ChevronDownIcon = (): JSX.Element => (
   <svg
     width="8"
@@ -330,5 +434,94 @@ export const ChevronDownIcon = (): JSX.Element => (
     aria-hidden="true"
   >
     <path d="M1.5 3 4 5.5 6.5 3" />
+  </svg>
+)
+
+/**
+ * Magnifying glass laid over a small document. Stroke-only — the lens, handle,
+ * and document edges all read at 16px without any sub-pixel fill overlap.
+ */
+export const FindReplaceIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M3 2.5h6l1.5 1.5v3" />
+    <path d="M3 2.5v8h3" />
+    <circle cx="9.5" cy="10" r="2.5" />
+    <line x1="11.3" y1="11.8" x2="13.5" y2="14" />
+  </svg>
+)
+
+/**
+ * Three stacked bands with descending darkness — the Univer-style indicator
+ * for "data bars / colour scales". Solid fills only; opacity gives the
+ * gradient feel without sub-pixel stroke artefacts.
+ */
+export const ConditionalFormatIcon = (): JSX.Element => (
+  <svg width={16} height={16} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <rect x="2.5" y="3" width="11" height="2.5" fill="currentColor" opacity="0.95" />
+    <rect x="2.5" y="6.75" width="8" height="2.5" fill="currentColor" opacity="0.65" />
+    <rect x="2.5" y="10.5" width="5" height="2.5" fill="currentColor" opacity="0.35" />
+  </svg>
+)
+
+/**
+ * Shield silhouette with an inset checkmark — Univer/Office convention for
+ * "Data Validation". Fill-only outline so corners stay crisp at 16px.
+ */
+export const DataValidationIcon = (): JSX.Element => (
+  <svg width={16} height={16} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+    <path
+      d="M8 1.5 3 3v4.5c0 3 2.2 5.5 5 7 2.8-1.5 5-4 5-7V3L8 1.5z"
+      fill="currentColor"
+      opacity="0.18"
+    />
+    <path
+      d="M8 1.5 3 3v4.5c0 3 2.2 5.5 5 7 2.8-1.5 5-4 5-7V3L8 1.5z"
+      stroke="currentColor"
+      stroke-width="1.3"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M5.5 8 7.2 9.7 10.7 6.2"
+      stroke="currentColor"
+      stroke-width="1.6"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      fill="none"
+    />
+  </svg>
+)
+
+/**
+ * Funnel — wide at top, narrow at bottom, with a short stem. Single closed
+ * path; matches the Univer slim toolbar's filter glyph.
+ */
+export const FilterIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M2.5 3h11l-4 5v4l-3 1.5V8z" />
+  </svg>
+)
+
+/**
+ * Two vertical bars next to up/down arrows — the canonical "Sort A→Z / Z→A"
+ * icon. Bars hint at the direction; arrows make the action unambiguous.
+ */
+export const SortIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <line x1="3" y1="3.5" x2="3" y2="12.5" />
+    <path d="M1.5 11 3 12.5 4.5 11" />
+    <line x1="7.5" y1="4" x2="13" y2="4" />
+    <line x1="7.5" y1="8" x2="11.5" y2="8" />
+    <line x1="7.5" y1="12" x2="10" y2="12" />
+  </svg>
+)
+
+/**
+ * Tag / bookmark — a label-shaped polygon with a small punch hole. Matches
+ * the Office "Name Manager" glyph. Stroke-only.
+ */
+export const NameManagerIcon = (): JSX.Element => (
+  <svg {...SVG_PROPS}>
+    <path d="M2.5 2.5h6L13.5 7l-5 5.5-6-6.5z" />
+    <circle cx="5.5" cy="5.5" r="0.9" fill="currentColor" stroke="none" />
   </svg>
 )
