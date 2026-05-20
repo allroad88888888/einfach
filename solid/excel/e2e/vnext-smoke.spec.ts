@@ -24,14 +24,12 @@ test.describe('Solid Excel vNext smoke', () => {
     return page.getByTestId('formula-bar-input')
   }
 
-  test('app boots directly into the vNext demo', async ({ page }) => {
+  test('app boots directly into the Wave 5 demo by default', async ({ page }) => {
+    // Commit dede42a flipped the default boot tab to vnext-wave5; the
+    // vNext smoke demo is still reachable via the nav button.
     await page.goto('/')
-    await expect(page.getByRole('button', { name: 'vNext', exact: true })).toHaveClass(
-      /tab-active/,
-    )
-    await expect(page.getByTestId('vnext-grid')).toBeVisible({ timeout: 30_000 })
-    await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
-    await expect(cell(page, 'J20')).toHaveCount(0)
+    await expect(page.getByTestId('nav-tab-vnext-wave5')).toHaveClass(/tab-active/)
+    await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
   })
 
   test('renders only the visible window', async ({ page }) => {
@@ -319,14 +317,17 @@ test.describe('Solid Excel vNext smoke', () => {
       rowHandleBox!.y + rowHandleBox!.height / 2,
     )
     await page.mouse.down()
+    // Drag well past any minimum row clamp; the previous 12px drag
+    // bottomed out at +8px due to handle-center vs. row-bottom offset
+    // (handle straddles the row boundary).
     await page.mouse.move(
       rowHandleBox!.x + rowHandleBox!.width / 2,
-      rowHandleBox!.y + rowHandleBox!.height / 2 + 12,
+      rowHandleBox!.y + rowHandleBox!.height / 2 + 24,
     )
     await page.mouse.up()
     const afterRow = await rowHeader.boundingBox()
     expect(afterRow).not.toBeNull()
-    expect(afterRow!.height).toBeGreaterThan(beforeRow!.height + 8)
+    expect(afterRow!.height).toBeGreaterThan(beforeRow!.height + 12)
 
     await expect(page.getByTestId('status-visible-cells')).toHaveText('30 cells')
     await expect(cell(page, 'J20')).toHaveCount(0)
