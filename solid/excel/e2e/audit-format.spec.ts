@@ -32,6 +32,9 @@ function cellDisplay(page: Page, addr: string): Locator {
 const boldBtn = (page: Page) => page.getByTestId('toolbar-btn-bold')
 const italicBtn = (page: Page) => page.getByTestId('toolbar-btn-italic')
 const underlineBtn = (page: Page) => page.getByTestId('toolbar-btn-underline')
+const alignLeftBtn = (page: Page) => page.getByTestId('toolbar-btn-align-left')
+const alignCenterBtn = (page: Page) => page.getByTestId('toolbar-btn-align-center')
+const alignRightBtn = (page: Page) => page.getByTestId('toolbar-btn-align-right')
 const fillColorBtn = (page: Page) => page.getByTestId('toolbar-btn-fill-color')
 const textColorBtn = (page: Page) => page.getByTestId('toolbar-btn-text-color')
 const numberFormatBtn = (page: Page) => page.getByTestId('toolbar-btn-number-format')
@@ -95,6 +98,44 @@ test.describe('Format audit — toolbar B/I/U', () => {
     await underlineBtn(page).click()
     await expect(underlineBtn(page)).toHaveAttribute('aria-pressed', 'true')
     await expect(cellDisplay(page, 'C3')).toHaveCSS('text-decoration-line', 'underline')
+  })
+})
+
+test.describe('Format audit — horizontal alignment', () => {
+  test('center button applies text-align: center to the active cell', async ({ page }) => {
+    await gotoWave5(page)
+
+    // Select B2 — the seed value should render with the default (left)
+    // alignment before the toolbar is engaged.
+    await cell(page, 'B2').click()
+    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
+
+    // Click 居中 / Center.
+    await alignCenterBtn(page).click()
+
+    // The cell display now carries an inline text-align: center.
+    await expect(cellDisplay(page, 'B2')).toHaveCSS('text-align', 'center')
+    // And the toolbar button reflects the depressed (active) state.
+    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  test('left / center / right buttons each set the active alignment exclusively', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'C2').click()
+
+    await alignRightBtn(page).click()
+    await expect(cellDisplay(page, 'C2')).toHaveCSS('text-align', 'right')
+    await expect(alignRightBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(alignLeftBtn(page)).toHaveAttribute('aria-pressed', 'false')
+
+    await alignLeftBtn(page).click()
+    await expect(cellDisplay(page, 'C2')).toHaveCSS('text-align', 'left')
+    await expect(alignLeftBtn(page)).toHaveAttribute('aria-pressed', 'true')
+    await expect(alignRightBtn(page)).toHaveAttribute('aria-pressed', 'false')
+    await expect(alignCenterBtn(page)).toHaveAttribute('aria-pressed', 'false')
   })
 })
 

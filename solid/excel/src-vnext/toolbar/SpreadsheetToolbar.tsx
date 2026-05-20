@@ -60,6 +60,30 @@ const toolbarCommands: SpreadsheetToolbarCommand[] = [
     isEnabled: (availability) => availability.underline,
   },
   {
+    command: 'alignment',
+    label: 'toolbar.alignLeft',
+    title: 'toolbar.alignLeft.title',
+    testId: 'toolbar-btn-align-left',
+    value: 'left',
+    isEnabled: (availability) => availability.alignment,
+  },
+  {
+    command: 'alignment',
+    label: 'toolbar.alignCenter',
+    title: 'toolbar.alignCenter.title',
+    testId: 'toolbar-btn-align-center',
+    value: 'center',
+    isEnabled: (availability) => availability.alignment,
+  },
+  {
+    command: 'alignment',
+    label: 'toolbar.alignRight',
+    title: 'toolbar.alignRight.title',
+    testId: 'toolbar-btn-align-right',
+    value: 'right',
+    isEnabled: (availability) => availability.alignment,
+  },
+  {
     command: 'fill-color',
     label: 'toolbar.fillColor',
     title: 'toolbar.fillColor.title',
@@ -522,6 +546,9 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           if (command.command === 'italic') return !!activeCellFormat().italic
           if (command.command === 'underline') return !!activeCellFormat().underline
           if (command.command === 'number-format') return numberFormatOpen()
+          if (command.command === 'alignment') {
+            return activeCellFormat().align === command.value
+          }
           if (command.command === 'vertical-alignment') {
             // Default vertical alignment (when unset) is 'bottom', per the
             // backend cell-format contract.
