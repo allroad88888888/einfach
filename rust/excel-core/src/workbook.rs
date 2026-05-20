@@ -327,6 +327,7 @@ impl Workbook {
         let provider = WorkbookEvalProvider {
             wb: self,
             current: Cell::new(idx),
+            current_cell: Cell::new(None),
         };
         self.sheets[idx].peek_value_with_provider(addr, &provider)
     }
@@ -349,6 +350,7 @@ impl Workbook {
         let provider = WorkbookEvalProvider {
             wb: self,
             current: Cell::new(sheet_idx),
+            current_cell: Cell::new(None),
         };
         sheet.for_each_sparse_cell_with(
             range,
@@ -1186,6 +1188,11 @@ fn collect_workbook_refs(
 struct WorkbookEvalProvider<'a> {
     wb: &'a Workbook,
     current: Cell<usize>,
+    /// Cell currently being evaluated. Mirrors `SheetEvalProvider`: pushed
+    /// by `Sheet::eval_formula_at_with_provider` via `set_current_cell` so
+    /// `ROW()` / `COLUMN()` no-arg calls can return the formula's own
+    /// row/column even when eval crosses sheets.
+    current_cell: Cell<Option<CellAddress>>,
 }
 
 impl<'a> WorkbookEvalProvider<'a> {
@@ -1265,6 +1272,14 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             );
         });
     }
+
+    fn current_cell(&self) -> Option<CellAddress> {
+        self.current_cell.get()
+    }
+
+    fn set_current_cell(&self, addr: Option<CellAddress>) {
+        self.current_cell.set(addr);
+    }
 }
 
 #[cfg(test)]
@@ -1280,6 +1295,26 @@ mod tests {
         let wb = Workbook::new();
         assert_eq!(wb.sheet_count(), 1);
         assert_eq!(wb.name(0), Some("Sheet1"));
+    }
+
+    /// `WorkbookEvalProvider::current_cell()` round-trips whatever
+    /// `set_current_cell` was last called with. The `Sheet` eval loop drives
+    /// this via a save/restore guard around each formula's eval call so
+    /// `ROW()` / `COLUMN()` can read the formula's own address.
+    #[test]
+    fn workbook_provider_current_cell_round_trip() {
+        let wb = Workbook::new();
+        let provider = WorkbookEvalProvider {
+            wb: &wb,
+            current: Cell::new(0),
+            current_cell: Cell::new(None),
+        };
+        assert_eq!(provider.current_cell(), None);
+        let addr = CellAddress::new(2, 1); // B3 in 0-indexed (row=2, col=1)
+        provider.set_current_cell(Some(addr));
+        assert_eq!(provider.current_cell(), Some(addr));
+        provider.set_current_cell(None);
+        assert_eq!(provider.current_cell(), None);
     }
 
     #[test]

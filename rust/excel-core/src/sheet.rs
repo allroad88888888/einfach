@@ -1122,7 +1122,10 @@ impl Sheet {
     /// `Value::Null` for cells that haven't been touched. Used by the
     /// Workbook layer (cross-sheet read) so it can stay `&self`.
     pub fn peek_value(&self, addr: CellAddress) -> Value {
-        let provider = SheetEvalProvider { sheet: self };
+        let provider = SheetEvalProvider {
+            sheet: self,
+            current_cell: Cell::new(None),
+        };
         self.peek_value_with_provider(addr, &provider)
     }
 
@@ -1217,7 +1220,16 @@ impl Sheet {
         // typed-dep split lands; keep it boring until then.
         self.formula_eval_count
             .set(self.formula_eval_count.get() + 1);
+        // Push the formula's own address as the provider's current cell so
+        // `ROW()` / `COLUMN()` no-arg calls inside the formula resolve to
+        // this cell. Restore the previous value on the way out so nested
+        // formula evaluation (cell A's formula references cell B's formula)
+        // sees the right addr in each frame. Providers that don't track a
+        // current cell ignore both calls (default no-op impls).
+        let prev_current = provider.current_cell();
+        provider.set_current_cell(Some(addr));
         let value = eval_expr_with_provider(&record.expr, &tracking);
+        provider.set_current_cell(prev_current);
         *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
         self.replace_formula_deps(addr, &record, deps.borrow().clone());
         value
@@ -2459,11 +2471,16 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
 
 struct SheetEvalProvider<'a> {
     sheet: &'a Sheet,
+    /// Cell currently being evaluated. Updated by
+    /// `eval_formula_at_with_provider` via `set_current_cell` (save/restore
+    /// guard pattern) so `ROW()` / `COLUMN()` no-arg calls can read the
+    /// formula's own row/column.
+    current_cell: Cell<Option<CellAddress>>,
 }
 
 impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn cell(&self, addr: CellAddress) -> Value {
-        self.sheet.peek_value(addr)
+        self.sheet.peek_value_with_provider(addr, self)
     }
 
     fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
@@ -2475,11 +2492,22 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     /// `SUM(A:A)` walk the dozen real cells in column A instead of
     /// expanding the nominal column extent.
     ///
-    /// Formula cells are read via `Sheet::peek_value` (single-sheet
-    /// context, no cross-sheet resolution).
+    /// Formula cells are read via `peek_value_with_provider(self)` so the
+    /// current-cell guard is preserved across the sparse walk.
     fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
-        self.sheet
-            .for_each_sparse_cell_with(range, &|sheet, addr| sheet.peek_value(addr), f);
+        self.sheet.for_each_sparse_cell_with(
+            range,
+            &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+            f,
+        );
+    }
+
+    fn current_cell(&self) -> Option<CellAddress> {
+        self.current_cell.get()
+    }
+
+    fn set_current_cell(&self, addr: Option<CellAddress>) {
+        self.current_cell.set(addr);
     }
 }
 
@@ -2521,6 +2549,14 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
         f: &mut dyn FnMut(CellAddress, Value),
     ) {
         self.inner.for_each_sheet_range_cell(sheet, range, f);
+    }
+
+    fn current_cell(&self) -> Option<CellAddress> {
+        self.inner.current_cell()
+    }
+
+    fn set_current_cell(&self, addr: Option<CellAddress>) {
+        self.inner.set_current_cell(addr);
     }
 }
 

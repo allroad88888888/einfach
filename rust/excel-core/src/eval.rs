@@ -62,6 +62,19 @@ pub trait EvalProvider {
             Value::Error(ValueError::InvalidRef),
         );
     }
+
+    /// The cell currently being evaluated, if known. Used by `ROW()` /
+    /// `COLUMN()` (no-arg) to return the formula's own row/column. Providers
+    /// that don't track this (e.g. the legacy single-sheet shim) return None.
+    fn current_cell(&self) -> Option<CellAddress> {
+        None
+    }
+
+    /// Set the current cell being evaluated. Providers that surface
+    /// `current_cell()` use this to push/pop the address as the evaluator
+    /// recurses into nested formula cells. Default impl is a no-op so
+    /// providers without a current-cell concept ignore the call.
+    fn set_current_cell(&self, _addr: Option<CellAddress>) {}
 }
 
 struct AtomEvalProvider<'a> {
@@ -2930,10 +2943,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::WrongArgCount);
             }
             if args.is_empty() {
-                // no_args: 'current cell' context not yet plumbed through
-                // EvalProvider. Returning #REF! is consistent with the
-                // single-sheet shim semantics elsewhere in this file.
-                return Value::Error(ValueError::InvalidRef);
+                return provider
+                    .current_cell()
+                    .map(|a| Value::Number((a.row + 1) as f64))
+                    .unwrap_or(Value::Error(ValueError::InvalidRef));
             }
             match &args[0] {
                 Expr::CellRef(addr) | Expr::SheetRef { addr, .. } => {
@@ -2952,9 +2965,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::WrongArgCount);
             }
             if args.is_empty() {
-                // no_args: 'current cell' context not yet plumbed through
-                // EvalProvider.
-                return Value::Error(ValueError::InvalidRef);
+                return provider
+                    .current_cell()
+                    .map(|a| Value::Number((a.col + 1) as f64))
+                    .unwrap_or(Value::Error(ValueError::InvalidRef));
             }
             match &args[0] {
                 Expr::CellRef(addr) | Expr::SheetRef { addr, .. } => {
@@ -8085,7 +8099,11 @@ mod tests {
         assert_eq!(eval_str("=ROW(B5)", &cm, &vs), Value::Number(5.0));
         // Range arg: ROW returns the start row.
         assert_eq!(eval_str("=ROW(A3:B7)", &cm, &vs), Value::Number(3.0));
-        // No args → InvalidRef (current-cell context not plumbed yet).
+        // No args → InvalidRef under the legacy `AtomEvalProvider`, which
+        // has no concept of "current cell" and returns `None` from
+        // `current_cell()`. `Workbook` / `Sheet` providers fill it in so
+        // `=ROW()` in a real workbook returns the formula's own row — see
+        // `tests/reference_lookup.rs::row_column_no_args_uses_current_cell`.
         assert_eq!(
             eval_str("=ROW()", &cm, &vs),
             Value::Error(ValueError::InvalidRef)
@@ -8110,7 +8128,9 @@ mod tests {
         assert_eq!(eval_str("=COLUMN(C7)", &cm, &vs), Value::Number(3.0));
         // Range arg: COLUMN returns the start column.
         assert_eq!(eval_str("=COLUMN(D2:F8)", &cm, &vs), Value::Number(4.0));
-        // No args → InvalidRef.
+        // No args → InvalidRef under the legacy `AtomEvalProvider` (no
+        // current-cell concept). See sibling `eval_row` comment for the
+        // workbook-context behaviour.
         assert_eq!(
             eval_str("=COLUMN()", &cm, &vs),
             Value::Error(ValueError::InvalidRef)

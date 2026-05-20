@@ -22,6 +22,20 @@ fn row_column_dimensions_round_trip() {
     assert_eq!(wb.get_cell("Sheet1", "H4"), Value::Number(5.0));
 }
 
+/// `=ROW()` / `=COLUMN()` with no args resolve to the formula's own row /
+/// column once the provider exposes `current_cell()`. The legacy single-sheet
+/// `AtomEvalProvider` returns `#REF!` for the no-arg form (covered by the
+/// inline `eval_row` / `eval_column` unit tests); this exercise covers the
+/// production `WorkbookEvalProvider` path.
+#[test]
+fn row_column_no_args_uses_current_cell() {
+    let mut wb = Workbook::new();
+    wb.set_formula(0, "B3", "=ROW()");
+    wb.set_formula(0, "C5", "=COLUMN()");
+    assert_eq!(wb.get_cell("Sheet1", "B3"), Value::Number(3.0));
+    assert_eq!(wb.get_cell("Sheet1", "C5"), Value::Number(3.0));
+}
+
 /// CHOOSE + ADDRESS + INDIRECT chain: build an address string with ADDRESS,
 /// then deref it with INDIRECT, using CHOOSE to pick the source. This was a
 /// motivator for landing all four together — they compose nicely.
