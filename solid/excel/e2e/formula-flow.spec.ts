@@ -112,6 +112,27 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(display(page, 'H2')).toHaveText('360')
   })
 
+  test('dragging across cells inside a ref-pick session inserts an A1:B2 range', async ({
+    page,
+  }) => {
+    // Excel parity: after typing `=SUM(`, dragging from B2 to E2 should
+    // splice `B2:E2` into the draft. Implemented by the grid's
+    // `startFormulaReferenceDragPick` window-pointermove handler, which
+    // keeps re-calling pickFormulaReferenceAtom with the latest focus
+    // until pointerup.
+    await gotoWave5(page)
+    await cell(page, 'I3').click()
+    await page.keyboard.type('=SUM(')
+    await expect(cellInput(page, 'I3')).toHaveValue('=SUM(')
+
+    await cell(page, 'B2').dragTo(cell(page, 'E2'))
+    await expect(cellInput(page, 'I3')).toHaveValue('=SUM(B2:E2')
+
+    await page.keyboard.type(')')
+    await page.keyboard.press('Enter')
+    await expect(display(page, 'I3')).toHaveText('840')
+  })
+
   test('reference highlight overlay paints while drafting', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H2').click()

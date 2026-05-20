@@ -968,6 +968,67 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   let activeDragSelectCleanup: (() => void) | null = null
 
+  function startFormulaReferenceDragPick(event: PointerEvent, row: number, col: number) {
+    // Capture the editing input up-front so pointerup can restore focus to
+    // it (a stray blur during the drag would otherwise commit the draft).
+    const activeInput = document.activeElement as HTMLInputElement | null
+    const anchor: CellCoord = { row, col }
+
+    store.setter(pickFormulaReferenceAtom, {
+      pickAnchor: anchor,
+      pickFocus: anchor,
+      sheetId: props.sheetId,
+      dragging: true,
+    })
+    bumpRender()
+
+    let lastFocus = anchor
+
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const focus = getCellCoordFromPoint(moveEvent)
+      if (!focus) return
+      if (focus.row === lastFocus.row && focus.col === lastFocus.col) return
+      lastFocus = focus
+      store.setter(pickFormulaReferenceAtom, {
+        pickAnchor: anchor,
+        pickFocus: focus,
+        sheetId: props.sheetId,
+        dragging: true,
+      })
+      bumpRender()
+    }
+
+    const onPointerUp = () => {
+      store.setter(pickFormulaReferenceAtom, {
+        pickAnchor: anchor,
+        pickFocus: lastFocus,
+        sheetId: props.sheetId,
+        dragging: false,
+      })
+      cleanup()
+      bumpRender()
+      if (
+        activeInput &&
+        (activeInput.classList.contains('cell-input') ||
+          activeInput.classList.contains('formula-bar-input'))
+      ) {
+        queueMicrotask(() => {
+          activeInput.focus()
+          const len = activeInput.value.length
+          activeInput.setSelectionRange(len, len)
+        })
+      }
+    }
+
+    const cleanup = () => {
+      window.removeEventListener('pointermove', onPointerMove)
+      window.removeEventListener('pointerup', onPointerUp)
+    }
+
+    window.addEventListener('pointermove', onPointerMove)
+    window.addEventListener('pointerup', onPointerUp, { once: true })
+  }
+
   function startDragSelection(event: PointerEvent, row: number, col: number) {
     if (event.button !== 0) return
     if (event.shiftKey || event.ctrlKey || event.metaKey) return
@@ -2393,29 +2454,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             onPointerDown={(event) => {
                               if (event.pointerType === 'mouse' && event.button !== 0) return
                               // Formula-reference pick mode: clicking a cell
-                              // inserts an A1 ref into the current draft and
-                              // does NOT change the editing-anchor selection.
+                              // inserts an A1 ref into the current draft; a
+                              // drag expands the pick to a range like B2:E2.
+                              // Selection is NOT mutated — pick re-focuses
+                              // the editing input on release.
                               if (store.getter(formulaReferenceSessionAtom)) {
                                 event.preventDefault()
                                 event.stopPropagation()
-                                const activeInput = document.activeElement as HTMLInputElement | null
-                                store.setter(pickFormulaReferenceAtom, {
-                                  pickAnchor: { row, col },
-                                  pickFocus: { row, col },
-                                  sheetId: props.sheetId,
-                                  dragging: false,
-                                })
-                                bumpRender()
-                                // Re-focus the editing input so blur does not
-                                // fire and commit the draft prematurely.
-                                if (activeInput && (activeInput.classList.contains('cell-input') ||
-                                  activeInput.classList.contains('formula-bar-input'))) {
-                                  queueMicrotask(() => {
-                                    activeInput.focus()
-                                    const len = activeInput.value.length
-                                    activeInput.setSelectionRange(len, len)
-                                  })
-                                }
+                                startFormulaReferenceDragPick(event, row, col)
                                 return
                               }
                               if (event.shiftKey || event.ctrlKey || event.metaKey) return
