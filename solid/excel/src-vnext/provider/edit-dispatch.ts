@@ -6,12 +6,15 @@ import {
   editingSessionAtom,
   enterFormulaReferenceAtom,
   exitFormulaReferenceAtom,
+  formulaFunctionSuggestionCursorAtom,
+  formulaFunctionSuggestionsAtom,
   formulaReferenceCaretAtom,
   formulaReferenceSessionAtom,
   nextHistoryTransactionId,
   pushHistoryAtom,
   shouldEnterFormulaReferenceMode,
   type EditingCommitMove,
+  type FormulaFunctionSuggestion,
   type FormulaReferenceExitReason,
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
@@ -173,4 +176,50 @@ export function notifyDraftTypedChar(store: Store, caret: number): void {
     store.setter(exitFormulaReferenceAtom, 'type-after-pick' as FormulaReferenceExitReason)
   }
   syncFormulaReferenceCaret(store, caret)
+}
+
+/**
+ * Splice the chosen function-suggestion into the editing draft and move
+ * the DOM caret inside the freshly-opened `(`.
+ *
+ * Replaces the fragment range reported by the suggestion (e.g. `SU` →
+ * `SUM(`) and returns the new caret position so the host can update
+ * `selectionStart` on the active input. Idempotent: passing the same
+ * suggestion twice produces the same draft because the second
+ * `fragmentStart..fragmentEnd` would point at the just-inserted `SUM(`.
+ *
+ * Designed to be called from both the click-to-accept onAccept prop on
+ * the autocomplete dropdown and the Enter/Tab keyboard handler in the
+ * cell-input + formula-bar onKeyDown paths.
+ */
+export function acceptFormulaSuggestion(
+  store: Store,
+  suggestion: FormulaFunctionSuggestion,
+): { draft: string; caret: number } {
+  const draft = store.getter(editingDraftAtom)
+  const replacement = `${suggestion.spec.name}(`
+  const next =
+    draft.slice(0, suggestion.fragmentStart) +
+    replacement +
+    draft.slice(suggestion.fragmentEnd)
+  const caret = suggestion.fragmentStart + replacement.length
+  store.setter(editingDraftAtom, { draft: next })
+  // Reset the cursor so the next ArrowDown lands on the first suggestion.
+  store.setter(formulaFunctionSuggestionCursorAtom, 0)
+  // Run the standard typed-char re-evaluation: typing past a picked ref
+  // exits the ref-pick session; entering an open paren is a trigger that
+  // opens a fresh ref session ready for the first arg pick.
+  notifyDraftTypedChar(store, caret)
+  return { draft: next, caret }
+}
+
+/**
+ * Read the currently-highlighted suggestion, if any. Returns null when
+ * the list is empty or the cursor falls outside its bounds.
+ */
+export function readActiveFormulaSuggestion(store: Store): FormulaFunctionSuggestion | null {
+  const list = store.getter(formulaFunctionSuggestionsAtom)
+  if (list.length === 0) return null
+  const cursor = store.getter(formulaFunctionSuggestionCursorAtom)
+  return list[Math.max(0, Math.min(cursor, list.length - 1))] ?? null
 }

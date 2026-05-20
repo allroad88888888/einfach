@@ -9,6 +9,8 @@ import {
   editingSessionAtom,
   focusFormulaBarAtom,
   formulaBarStateAtom,
+  formulaFunctionSuggestionCursorAtom,
+  formulaFunctionSuggestionsAtom,
   startEditingAtom,
   syncFormulaBarAtom,
   selectionSnapshotAtom,
@@ -19,7 +21,9 @@ import { isVisibleProjectionResult } from '../provider'
 import {
   dispatchEditingCancel,
   dispatchEditingCommit,
+  acceptFormulaSuggestion,
   notifyDraftTypedChar,
+  readActiveFormulaSuggestion,
   syncFormulaReferenceCaret,
 } from '../provider/edit-dispatch'
 import { spreadsheetProjectionSnapshotAtom } from '../provider/atoms'
@@ -166,6 +170,36 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
   }
 
   async function handleKeyDown(event: KeyboardEvent) {
+    // Autocomplete first: when the dropdown has rows, ArrowUp/Down move
+    // the cursor and Tab/Enter accept the highlighted suggestion (open
+    // the function paren without committing the cell). Esc dismisses.
+    const suggestionsOpen = store.getter(formulaFunctionSuggestionsAtom).length > 0
+    if (suggestionsOpen) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault()
+        const list = store.getter(formulaFunctionSuggestionsAtom)
+        const current = store.getter(formulaFunctionSuggestionCursorAtom)
+        const next =
+          event.key === 'ArrowDown'
+            ? (current + 1) % list.length
+            : (current - 1 + list.length) % list.length
+        store.setter(formulaFunctionSuggestionCursorAtom, next)
+        return
+      }
+      if (event.key === 'Tab' || isCommitKey(event)) {
+        const suggestion = readActiveFormulaSuggestion(store)
+        if (suggestion) {
+          event.preventDefault()
+          const { caret } = acceptFormulaSuggestion(store, suggestion)
+          queueMicrotask(() => {
+            inputRef?.focus()
+            inputRef?.setSelectionRange(caret, caret)
+          })
+          return
+        }
+      }
+    }
+
     if (isCommitKey(event)) {
       event.preventDefault()
       await commitDraft()

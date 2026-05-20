@@ -1,5 +1,6 @@
 export * from './adapter'
 export * from './provider'
+export * from './formula-autocomplete'
 export * from './formula-bar'
 export * from './name-box'
 export * from './menu-bar'

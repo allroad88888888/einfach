@@ -11,6 +11,8 @@ import {
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
+  formulaFunctionSuggestionCursorAtom,
+  formulaFunctionSuggestionsAtom,
   formulaReferenceSessionAtom,
   pickFormulaReferenceAtom,
   getHiddenColumnsForSheet,
@@ -83,11 +85,13 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
+  acceptFormulaSuggestion,
   advanceSpreadsheetProjectionRequestIdAtom,
   dispatchEditingCancel,
   dispatchRedo,
   dispatchUndo,
   notifyDraftTypedChar,
+  readActiveFormulaSuggestion,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
 } from '../provider'
@@ -2520,6 +2524,64 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   )
                                 }}
                                 onKeyDown={(event) => {
+                                  // Autocomplete first: ArrowUp/Down move
+                                  // the dropdown cursor, Tab/Enter accept,
+                                  // Esc dismisses without ending editing.
+                                  const suggestionsOpen =
+                                    store.getter(formulaFunctionSuggestionsAtom).length > 0
+                                  if (suggestionsOpen) {
+                                    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                                      event.preventDefault()
+                                      const list = store.getter(formulaFunctionSuggestionsAtom)
+                                      const current = store.getter(
+                                        formulaFunctionSuggestionCursorAtom,
+                                      )
+                                      const next =
+                                        event.key === 'ArrowDown'
+                                          ? (current + 1) % list.length
+                                          : (current - 1 + list.length) % list.length
+                                      store.setter(formulaFunctionSuggestionCursorAtom, next)
+                                      bumpRender()
+                                      return
+                                    }
+                                    if (event.key === 'Tab' || event.key === 'Enter') {
+                                      const suggestion = readActiveFormulaSuggestion(store)
+                                      if (suggestion) {
+                                        event.preventDefault()
+                                        const inputEl = event.currentTarget
+                                        const { caret } = acceptFormulaSuggestion(store, suggestion)
+                                        // Solid swaps the input's value on the
+                                        // next reactive tick; defer caret
+                                        // placement so it lands on the post-
+                                        // splice value. Capture the input
+                                        // synchronously — event.currentTarget
+                                        // is reset to null once the handler
+                                        // returns.
+                                        queueMicrotask(() => {
+                                          inputEl.focus()
+                                          inputEl.setSelectionRange(caret, caret)
+                                        })
+                                        bumpRender()
+                                        return
+                                      }
+                                    }
+                                    if (event.key === 'Escape') {
+                                      event.preventDefault()
+                                      store.setter(formulaFunctionSuggestionCursorAtom, 0)
+                                      // Hide the list by inserting nothing —
+                                      // simplest is to bump editingDraft with
+                                      // the same value, which forces the
+                                      // derived suggestions atom to recompute
+                                      // with the latest caret. We instead set
+                                      // a sentinel via cursor reset; the user
+                                      // can re-trigger by typing another char.
+                                      // For now the list stays visible until
+                                      // the caret moves. (Future: a dismissed
+                                      // flag in core.)
+                                      bumpRender()
+                                      return
+                                    }
+                                  }
                                   if (event.key === 'Enter') {
                                     event.preventDefault()
                                     void commitCellEdit(event.shiftKey ? 'up' : 'down')

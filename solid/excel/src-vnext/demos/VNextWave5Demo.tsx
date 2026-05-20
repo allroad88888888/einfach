@@ -19,13 +19,14 @@ import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
 import { SpreadsheetMenuBar } from '../menu-bar'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
 import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
 import { SpreadsheetToolbar } from '../toolbar'
-import { SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
+import { acceptFormulaSuggestion, SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
 const sheets = [
   { id: 'sheet-1', name: 'Sales' },
@@ -171,6 +172,23 @@ function VNextWave5Workbook() {
       <SpreadsheetPrintPreviewOverlay data-testid="wave5-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="wave5-protection-unlock" />
       <SpreadsheetPresenceOverlay data-testid="wave5-presence" />
+      <SpreadsheetFormulaAutocomplete
+        data-testid="wave5-formula-autocomplete"
+        onAccept={(suggestion) => {
+          const { caret } = acceptFormulaSuggestion(store, suggestion)
+          // Restore focus + caret on whichever input was active.
+          queueMicrotask(() => {
+            const el = document.activeElement
+            if (
+              el instanceof HTMLInputElement &&
+              (el.classList.contains('cell-input') || el.classList.contains('formula-bar-input'))
+            ) {
+              el.focus()
+              el.setSelectionRange(caret, caret)
+            }
+          })
+        }}
+      />
     </>
   )
 }

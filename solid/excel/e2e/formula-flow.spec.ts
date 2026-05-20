@@ -204,4 +204,81 @@ test.describe('formula interaction on Wave 5', () => {
     await commitFormulaInCell(page, 'H3', '=H2*2')
     await expect(display(page, 'H3')).toHaveText('600')
   })
+
+  test('autocomplete dropdown opens on partial function name and Tab accepts', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'H6').click()
+    await page.keyboard.type('=SU')
+
+    // Dropdown lists SUM (exact-prefix match wins) and SUMIF.
+    const dropdown = page.getByTestId('formula-autocomplete-list')
+    await expect(dropdown).toBeVisible()
+    const sumRow = page.getByTestId('formula-autocomplete-row-SUM')
+    await expect(sumRow).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByTestId('formula-autocomplete-row-SUMIF')).toBeVisible()
+
+    // Tab accepts the highlighted suggestion → `=SUM(` with caret inside.
+    await page.keyboard.press('Tab')
+    await expect(cellInput(page, 'H6')).toHaveValue('=SUM(')
+    await expect(page.getByTestId('formula-autocomplete-signature')).toBeVisible()
+  })
+
+  test('ArrowDown moves the autocomplete cursor to the next match', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'H7').click()
+    await page.keyboard.type('=SU')
+    await expect(page.getByTestId('formula-autocomplete-row-SUM')).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+
+    await page.keyboard.press('ArrowDown')
+    await expect(page.getByTestId('formula-autocomplete-row-SUMIF')).toHaveAttribute(
+      'aria-selected',
+      'true',
+    )
+    await expect(page.getByTestId('formula-autocomplete-row-SUM')).toHaveAttribute(
+      'aria-selected',
+      'false',
+    )
+  })
+
+  test('signature tooltip highlights the active arg as commas advance the caret', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'H8').click()
+    await page.keyboard.type('=IF(1')
+
+    const sig = page.getByTestId('formula-autocomplete-signature')
+    await expect(sig).toContainText('IF(logical_test, value_if_true, [value_if_false])')
+
+    // After the first comma the active arg shifts to value_if_true.
+    await page.keyboard.press(',')
+    await expect(sig.locator('.spreadsheet-formula-autocomplete-signature-arg-active')).toHaveText(
+      'value_if_true',
+    )
+
+    // Second comma → value_if_false becomes active.
+    await page.keyboard.type('2,')
+    await expect(sig.locator('.spreadsheet-formula-autocomplete-signature-arg-active')).toHaveText(
+      '[value_if_false]',
+    )
+  })
+
+  test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'H9').click()
+    await page.keyboard.type('=SU')
+    await page.keyboard.press('Tab')
+    await expect(cellInput(page, 'H9')).toHaveValue('=SUM(')
+
+    await cell(page, 'B2').dragTo(cell(page, 'E2'))
+    await expect(cellInput(page, 'H9')).toHaveValue('=SUM(B2:E2')
+    await page.keyboard.type(')')
+    await page.keyboard.press('Enter')
+    await expect(display(page, 'H9')).toHaveText('840')
+  })
 })
