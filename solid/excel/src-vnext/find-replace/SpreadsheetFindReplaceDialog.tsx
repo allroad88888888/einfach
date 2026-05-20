@@ -19,11 +19,14 @@ import {
   MAX_FIND_PAGE,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
+import './find-replace-dialog.css'
 
 export interface SpreadsheetFindReplaceDialogProps {
   class?: string
   'data-testid'?: string
 }
+
+type FindReplaceTab = 'find' | 'replace'
 
 export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialogProps) {
   const t = useT()
@@ -32,6 +35,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   const isOpen = useAtomValue(findReplaceOpenAtom)
   const cursor = useAtomValue(findReplaceCursorAtom)
 
+  const [activeTab, setActiveTab] = createSignal<FindReplaceTab>('find')
   const [needle, setNeedle] = createSignal('')
   const [replacement, setReplacement] = createSignal('')
   const [caseSensitive, setCaseSensitive] = createSignal(false)
@@ -43,6 +47,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   createEffect<boolean>((wasOpen) => {
     const open = isOpen()
     if (open && !wasOpen) {
+      setActiveTab('find')
       setNeedle('')
       setReplacement('')
       setCaseSensitive(false)
@@ -218,155 +223,202 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
       <div
         class={`find-replace-dialog ${props.class ?? ''}`.trim()}
         data-testid={props['data-testid'] ?? 'find-replace-dialog'}
+        data-active-tab={activeTab()}
         role="dialog"
         aria-label="Find and Replace"
       >
-        <button
-          type="button"
-          class="dialog-close-x"
-          data-testid="dialog-close-x"
-          aria-label={t('dialog.close.label')}
-          onClick={() => store.setter(closeFindReplaceAtom)}
-        >
-          ×
-        </button>
-        <div class="find-replace-row">
-          <label class="find-replace-label" for="find-needle">
-            Find
-          </label>
-          <input
-            id="find-needle"
-            class="find-replace-input"
-            data-testid="find-needle-input"
-            type="text"
-            value={needle()}
-            onInput={(e) => setNeedle(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                void runSearch()
-              }
-            }}
-          />
-        </div>
-
-        <div class="find-replace-row">
-          <label class="find-replace-label" for="find-replacement">
-            Replace with
-          </label>
-          <input
-            id="find-replacement"
-            class="find-replace-input"
-            data-testid="find-replacement-input"
-            type="text"
-            value={replacement()}
-            onInput={(e) => setReplacement(e.currentTarget.value)}
-          />
-        </div>
-
-        <div class="find-replace-options">
-          <label class="find-replace-option">
-            <input
-              type="checkbox"
-              data-testid="find-opt-case-sensitive"
-              checked={caseSensitive()}
-              onChange={(e) => setCaseSensitive(e.currentTarget.checked)}
-            />
-            Case sensitive
-          </label>
-          <label class="find-replace-option">
-            <input
-              type="checkbox"
-              data-testid="find-opt-whole-match"
-              checked={wholeMatch()}
-              onChange={(e) => setWholeMatch(e.currentTarget.checked)}
-            />
-            Whole match
-          </label>
-          <label class="find-replace-option">
-            <input
-              type="checkbox"
-              data-testid="find-opt-regex"
-              checked={regex()}
-              onChange={(e) => setRegex(e.currentTarget.checked)}
-            />
-            Regex
-          </label>
-          <label class="find-replace-option">
-            <input
-              type="checkbox"
-              data-testid="find-opt-formulas"
-              checked={searchFormulas()}
-              onChange={(e) => setSearchFormulas(e.currentTarget.checked)}
-            />
-            Search formulas
-          </label>
-        </div>
-
-        <div class="find-replace-scope">
-          <label class="find-replace-label">Scope</label>
-          <select
-            data-testid="find-scope-select"
-            value={scope()}
-            onChange={(e) => setScope(e.currentTarget.value as FindReplaceScope)}
-          >
-            <option value="sheet">Sheet</option>
-            <option value="workbook">Workbook</option>
-            <option value="current-selection">Current selection</option>
-          </select>
-        </div>
-
-        <div class="find-replace-actions">
+        {/* === Header === */}
+        <div class="fr-header">
+          <span class="fr-title">查找和替换</span>
           <button
             type="button"
-            class="find-replace-btn"
-            data-testid="find-next-button"
-            onClick={() => void handleFindStep(1)}
-          >
-            Find next
-          </button>
-          <button
-            type="button"
-            class="find-replace-btn"
-            data-testid="find-prev-button"
-            onClick={() => void handleFindStep(-1)}
-          >
-            Find prev
-          </button>
-          <button
-            type="button"
-            class="find-replace-btn"
-            data-testid="replace-button"
-            onClick={() => void handleReplaceCurrent()}
-          >
-            Replace
-          </button>
-          <button
-            type="button"
-            class="find-replace-btn"
-            data-testid="replace-all-button"
-            onClick={() => void handleReplaceAll()}
-          >
-            Replace all
-          </button>
-          <button
-            type="button"
-            class="find-replace-btn find-replace-btn-close"
-            data-testid="find-close-button"
+            class="dialog-close-x"
+            data-testid="dialog-close-x"
+            aria-label={t('dialog.close.label')}
             onClick={() => store.setter(closeFindReplaceAtom)}
           >
-            Close
+            ×
           </button>
         </div>
 
-        <div class="find-replace-status" data-testid="find-status-text" aria-live="polite">
+        {/* === Tab strip === */}
+        <div class="fr-tabs" role="tablist">
+          <button
+            type="button"
+            class="fr-tab"
+            role="tab"
+            aria-selected={activeTab() === 'find'}
+            data-testid="find-tab"
+            onClick={() => setActiveTab('find')}
+          >
+            查找
+          </button>
+          <button
+            type="button"
+            class="fr-tab"
+            role="tab"
+            aria-selected={activeTab() === 'replace'}
+            data-testid="replace-tab"
+            onClick={() => setActiveTab('replace')}
+          >
+            替换
+          </button>
+        </div>
+
+        {/* === Body === */}
+        <div class="fr-body">
+          <div class="fr-field">
+            <label class="fr-field-label" for="find-needle">
+              查找内容
+            </label>
+            <input
+              id="find-needle"
+              class="fr-input"
+              data-testid="find-needle-input"
+              type="text"
+              value={needle()}
+              onInput={(e) => setNeedle(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void runSearch()
+                }
+              }}
+            />
+            <span class="fr-step-group">
+              <button
+                type="button"
+                class="fr-step-btn"
+                data-testid="find-prev-button"
+                aria-label="上一个"
+                title="上一个"
+                onClick={() => void handleFindStep(-1)}
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                class="fr-step-btn"
+                data-testid="find-next-button"
+                aria-label="下一个"
+                title="下一个"
+                onClick={() => void handleFindStep(1)}
+              >
+                ↓
+              </button>
+            </span>
+          </div>
+
+          <div class="fr-field fr-field-replace" data-replace-only="true">
+            <label class="fr-field-label" for="find-replacement">
+              替换为
+            </label>
+            <input
+              id="find-replacement"
+              class="fr-input"
+              data-testid="find-replacement-input"
+              type="text"
+              value={replacement()}
+              onInput={(e) => setReplacement(e.currentTarget.value)}
+            />
+          </div>
+
+          <div class="fr-options">
+            <label class="fr-option">
+              <input
+                type="checkbox"
+                data-testid="find-opt-case-sensitive"
+                checked={caseSensitive()}
+                onChange={(e) => setCaseSensitive(e.currentTarget.checked)}
+              />
+              区分大小写
+            </label>
+            <label class="fr-option">
+              <input
+                type="checkbox"
+                data-testid="find-opt-whole-match"
+                checked={wholeMatch()}
+                onChange={(e) => setWholeMatch(e.currentTarget.checked)}
+              />
+              单元格匹配
+            </label>
+            <label class="fr-option">
+              <input
+                type="checkbox"
+                data-testid="find-opt-formulas"
+                checked={searchFormulas()}
+                onChange={(e) => setSearchFormulas(e.currentTarget.checked)}
+              />
+              公式搜索
+            </label>
+            <label class="fr-option">
+              <input
+                type="checkbox"
+                data-testid="find-opt-regex"
+                checked={regex()}
+                onChange={(e) => setRegex(e.currentTarget.checked)}
+              />
+              正则匹配
+            </label>
+          </div>
+
+          <div class="fr-scope">
+            <label class="fr-field-label" for="find-scope-select">
+              范围
+            </label>
+            <select
+              id="find-scope-select"
+              class="fr-select"
+              data-testid="find-scope-select"
+              value={scope()}
+              onChange={(e) => setScope(e.currentTarget.value as FindReplaceScope)}
+            >
+              <option value="sheet">工作表</option>
+              <option value="workbook">工作簿</option>
+              <option value="current-selection">当前选区</option>
+            </select>
+          </div>
+        </div>
+
+        {/* === Status / error === */}
+        <div class="fr-status" data-testid="find-status-text" aria-live="polite">
           {statusText()}
         </div>
         <Show when={errorText()}>
-          <div class="find-replace-error" data-testid="find-error-text" role="alert">
+          <div class="fr-error" data-testid="find-error-text" role="alert">
             {errorText()}
           </div>
         </Show>
+
+        {/* === Footer === */}
+        <div class="fr-footer">
+          <button
+            type="button"
+            class="fr-btn"
+            data-testid="replace-all-button"
+            data-replace-only="true"
+            onClick={() => void handleReplaceAll()}
+          >
+            全部替换
+          </button>
+          <button
+            type="button"
+            class="fr-btn"
+            data-testid="replace-button"
+            data-replace-only="true"
+            onClick={() => void handleReplaceCurrent()}
+          >
+            替换
+          </button>
+          <button
+            type="button"
+            class="fr-btn fr-btn-primary"
+            data-testid="find-close-button"
+            onClick={() => store.setter(closeFindReplaceAtom)}
+          >
+            关闭
+          </button>
+        </div>
       </div>
     </Show>
   )
