@@ -62,6 +62,7 @@ import {
   findReplaceOpenAtom,
   filterSortStateAtom,
   openFilterDropdownAtom,
+  openFormatCellsAtom,
   notifyActiveSheetChangedAtom,
   remoteCursorsAtom,
   presenceStateAtom,
@@ -1725,6 +1726,32 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     if ((event.ctrlKey || event.metaKey) && event.key === 'f' && !event.altKey && !event.shiftKey) {
       event.preventDefault()
       store.setter(findReplaceOpenAtom, true)
+      return
+    }
+
+    // Ctrl/Cmd+H opens the Find/Replace dialog (Excel parity). The dialog
+    // remembers its last-active tab so users who want Replace will click
+    // it once and subsequent Ctrl+H invocations land there.
+    if ((event.ctrlKey || event.metaKey) && event.key === 'h' && !event.altKey && !event.shiftKey) {
+      event.preventDefault()
+      store.setter(findReplaceOpenAtom, true)
+      return
+    }
+
+    // Ctrl/Cmd+1 opens the Format Cells dialog on the active selection —
+    // Excel's classic shortcut. Note: on macOS Chrome, Cmd+1 is intercepted
+    // by the browser as "switch tab 1" so users have to use Ctrl+1 (which
+    // works on Windows + Mac alike inside a non-fullscreen window).
+    if ((event.ctrlKey || event.metaKey) && event.key === '1' && !event.altKey && !event.shiftKey) {
+      event.preventDefault()
+      const snapshot = store.getter(selectionSnapshotAtom)
+      const sheetId = snapshot.selection.sheetId
+      if (sheetId) {
+        store.setter(openFormatCellsAtom, {
+          sheetId,
+          range: snapshot.range,
+        })
+      }
       return
     }
 

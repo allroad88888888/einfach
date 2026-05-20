@@ -464,6 +464,29 @@ test.describe('Format audit — format painter', () => {
   })
 })
 
+test.describe('Format audit — keyboard shortcuts', () => {
+  test('Ctrl+F opens the Find/Replace dialog', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+f')
+    await expect(page.getByTestId('wave5-find-replace')).toBeVisible()
+  })
+
+  test('Ctrl+H opens the Find/Replace dialog (replace flow)', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'A1').click()
+    await page.keyboard.press('Control+h')
+    await expect(page.getByTestId('wave5-find-replace')).toBeVisible()
+  })
+
+  test('Ctrl+1 opens the Format Cells dialog on the active selection', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B2').click()
+    await page.keyboard.press('Control+1')
+    await expect(page.getByTestId('wave5-format-cells')).toBeVisible()
+  })
+})
+
 test.describe('Format audit — Format Cells dialog', () => {
   async function openFormatCellsDialog(page: Page) {
     // Menubar was removed for Univer parity. The Format Cells dialog is
