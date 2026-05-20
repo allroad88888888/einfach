@@ -1,6 +1,5 @@
 import {
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
-  cancelEditingAtom,
   cancelPointerAtom,
   commitPointerAtom,
   commitEditingAtom,
@@ -12,6 +11,8 @@ import {
   dispatchKeyboardInputAtom,
   editingDraftAtom,
   editingSessionAtom,
+  formulaReferenceSessionAtom,
+  pickFormulaReferenceAtom,
   getHiddenColumnsForSheet,
   getHiddenRowsForSheet,
   getAdjacentSheetId,
@@ -83,9 +84,11 @@ import {
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
+  dispatchEditingCancel,
   dispatchRedo,
   dispatchUndo,
   spreadsheetProjectionSnapshotAtom,
+  syncFormulaReferenceCaret,
 } from '../provider'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 import { SpreadsheetGridOverlay } from './SpreadsheetGridOverlay'
@@ -1304,6 +1307,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       draft,
       source,
     })
+    // Trigger formula-reference auto-enter when the initial draft (e.g. from
+    // typing '=' in navigation mode) already qualifies.
+    syncFormulaReferenceCaret(store, draft.length)
     bumpRender()
   }
 
@@ -1694,6 +1700,38 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         await toggleActiveFormatField(intent.field)
         return
+      case 'formulaReference.arrowPick': {
+        event.preventDefault()
+        const session = store.getter(formulaReferenceSessionAtom)
+        if (!session) return
+        const prev = session.tokenRange
+          ? // After a previous pick, advance from the existing pick focus.
+            // We don't store it explicitly, so reuse the session anchor as
+            // the starting point; arrow keys move from anchor by delta.
+            { row: session.anchorCell.row, col: session.anchorCell.col }
+          : { row: session.anchorCell.row, col: session.anchorCell.col }
+        const next = {
+          row: Math.max(0, prev.row + intent.rowDelta),
+          col: Math.max(0, prev.col + intent.colDelta),
+        }
+        store.setter(pickFormulaReferenceAtom, {
+          pickAnchor: next,
+          pickFocus: next,
+          sheetId: session.sheetId,
+          dragging: false,
+        })
+        bumpRender()
+        return
+      }
+      case 'formulaReference.exit': {
+        event.preventDefault()
+        // The keyboard dispatcher emits this for operator/separator typed, or
+        // for commit/cancel keys. The host clears the session here; if the
+        // reason is commit/cancel the cell editor's keydown will follow.
+        store.setter(formulaReferenceSessionAtom, null)
+        bumpRender()
+        return
+      }
       default:
         return
     }
@@ -2320,6 +2358,9 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             colSpan={getCellColSpan(row, col)}
                             style={getCellBoxStyle(row, col)}
                             onClick={(event) => {
+                              // Suppress selection mutation during formula-
+                              // reference pick mode (handled by onPointerDown).
+                              if (store.getter(formulaReferenceSessionAtom)) return
                               selectCellFromEvent(row, col, event)
                             }}
                             onMouseDown={(event) => {
@@ -2337,6 +2378,32 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             }}
                             onPointerDown={(event) => {
                               if (event.pointerType === 'mouse' && event.button !== 0) return
+                              // Formula-reference pick mode: clicking a cell
+                              // inserts an A1 ref into the current draft and
+                              // does NOT change the editing-anchor selection.
+                              if (store.getter(formulaReferenceSessionAtom)) {
+                                event.preventDefault()
+                                event.stopPropagation()
+                                const activeInput = document.activeElement as HTMLInputElement | null
+                                store.setter(pickFormulaReferenceAtom, {
+                                  pickAnchor: { row, col },
+                                  pickFocus: { row, col },
+                                  sheetId: props.sheetId,
+                                  dragging: false,
+                                })
+                                bumpRender()
+                                // Re-focus the editing input so blur does not
+                                // fire and commit the draft prematurely.
+                                if (activeInput && (activeInput.classList.contains('cell-input') ||
+                                  activeInput.classList.contains('formula-bar-input'))) {
+                                  queueMicrotask(() => {
+                                    activeInput.focus()
+                                    const len = activeInput.value.length
+                                    activeInput.setSelectionRange(len, len)
+                                  })
+                                }
+                                return
+                              }
                               if (event.shiftKey || event.ctrlKey || event.metaKey) return
                               startDragSelection(event, row, col)
                             }}
@@ -2380,7 +2447,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   store.setter(editingDraftAtom, {
                                     draft: event.currentTarget.value,
                                   })
+                                  syncFormulaReferenceCaret(
+                                    store,
+                                    event.currentTarget.selectionStart ?? event.currentTarget.value.length,
+                                  )
                                   bumpRender()
+                                }}
+                                onSelect={(event) => {
+                                  syncFormulaReferenceCaret(
+                                    store,
+                                    event.currentTarget.selectionStart ?? 0,
+                                  )
                                 }}
                                 onKeyDown={(event) => {
                                   if (event.key === 'Enter') {
@@ -2391,11 +2468,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                     void commitCellEdit(event.shiftKey ? 'left' : 'right')
                                   } else if (event.key === 'Escape') {
                                     event.preventDefault()
-                                    store.setter(cancelEditingAtom)
+                                    dispatchEditingCancel(store)
                                     bumpRender()
                                   }
                                 }}
                                 onBlur={() => {
+                                  // Do not commit if the blur was caused by
+                                  // a formula-reference pick — focus will be
+                                  // restored in the next microtask.
+                                  if (store.getter(formulaReferenceSessionAtom)) return
                                   if (store.getter(editingSessionAtom).status === 'drafting') {
                                     void commitCellEdit()
                                   }

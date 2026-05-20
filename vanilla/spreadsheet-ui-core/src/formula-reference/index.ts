@@ -1,6 +1,7 @@
 import { atom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import { editingDraftAtom, editingSessionAtom } from '../editing'
+import { keyboardModeAtom } from '../keyboard'
 import type {
   EnterFormulaReferenceInput,
   FormulaReferenceExitReason,
@@ -118,6 +119,7 @@ export const enterFormulaReferenceAtom = atom(
       tokenRange: null,
       dragging: false,
     })
+    set(keyboardModeAtom, 'formula-reference')
   },
 )
 enterFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.enter'
@@ -145,8 +147,14 @@ pickFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.pick'
 
 export const exitFormulaReferenceAtom = atom(
   null,
-  (_get, set, _reason: FormulaReferenceExitReason) => {
+  (get, set, _reason: FormulaReferenceExitReason) => {
     set(formulaReferenceSessionAtom, null)
+    // Restore the keyboard mode to whichever phase logically follows: if an
+    // editing session is still active, fall back to 'editing'; otherwise
+    // 'navigation'. Callers committing/cancelling editing flip the mode
+    // themselves so the explicit reset here only handles operator/paren exits.
+    const editing = get(editingSessionAtom)
+    set(keyboardModeAtom, editing.status === 'drafting' ? 'editing' : 'navigation')
   },
 )
 exitFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.exit'

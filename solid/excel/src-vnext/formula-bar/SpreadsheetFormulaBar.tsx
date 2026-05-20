@@ -1,24 +1,27 @@
-import { createEffect, onCleanup } from 'solid-js'
+import { createEffect, createMemo, onCleanup } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import type {
   CellCoord,
-  SetCellInputRequest,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
 import {
-  createVisibleProjectionRequest,
+  editingDraftAtom,
+  editingSessionAtom,
   focusFormulaBarAtom,
-  formulaBarDraftAtom,
   formulaBarStateAtom,
+  startEditingAtom,
   syncFormulaBarAtom,
   selectionSnapshotAtom,
+  workspaceSessionAtom,
   type FormulaBarSyncInput,
 } from '@einfach/spreadsheet-ui-core'
 import { isVisibleProjectionResult } from '../provider'
 import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  spreadsheetProjectionSnapshotAtom,
-} from '../provider/atoms'
+  dispatchEditingCancel,
+  dispatchEditingCommit,
+  syncFormulaReferenceCaret,
+} from '../provider/edit-dispatch'
+import { spreadsheetProjectionSnapshotAtom } from '../provider/atoms'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import { SpreadsheetNameBox } from '../name-box'
 
@@ -44,19 +47,15 @@ function toA1(cell: CellCoord): string {
   return `${getColumnLabel(cell.col)}${cell.row + 1}`
 }
 
-function getDraftFromProjection(
+function getSourceTextFromProjection(
   result: VisibleProjectionResult | undefined,
   cell: CellCoord,
   activeSheetId: string,
 ): string {
-  if (!result || result.sheetId !== activeSheetId) {
-    return ''
-  }
-
+  if (!result || result.sheetId !== activeSheetId) return ''
   const draftCell = result.cells.find(
     (projectionCell) => projectionCell.row === cell.row && projectionCell.col === cell.col,
   )
-
   return draftCell ? (draftCell.formula ?? draftCell.displayValue ?? '') : ''
 }
 
@@ -64,139 +63,91 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
   const store = useSpreadsheetUiStore()
   const backend = useSpreadsheetBackend()
   const selectionSnapshot = useAtomValue(selectionSnapshotAtom)
-  const formulaBarDraft = useAtomValue(formulaBarDraftAtom)
   const formulaBarState = useAtomValue(formulaBarStateAtom)
+  const editingSession = useAtomValue(editingSessionAtom)
+  const editingDraft = useAtomValue(editingDraftAtom)
   const projectionSnapshot = useAtomValue(spreadsheetProjectionSnapshotAtom)
+  const workspace = useAtomValue(workspaceSessionAtom)
   let inputRef: HTMLInputElement | undefined
 
   function resolveActiveSheetId() {
     const selection = selectionSnapshot()
+    if (selection.selection.sheetId) return selection.selection.sheetId
     const visible = isVisibleProjectionResult(projectionSnapshot().result)
       ? projectionSnapshot().result
       : undefined
-
-    return visible?.sheetId || selection.activeCell.sheetId || ''
+    return visible?.sheetId || workspace().activeSheetId || ''
   }
 
+  // Sync the formula-bar's "synced draft" from projection when not actively
+  // editing. While editing, the value reflects the live editingDraftAtom so
+  // typing in the formula bar mirrors the in-cell editor.
   createEffect(() => {
+    if (editingSession().status === 'drafting') return
     const selection = selectionSnapshot()
     const snapshot = projectionSnapshot()
     const visibleResult = isVisibleProjectionResult(snapshot.result)
       ? snapshot.result
       : undefined
-    const activeSheetId = visibleResult?.sheetId || selection.activeCell.sheetId || ''
+    const activeSheetId = visibleResult?.sheetId || resolveActiveSheetId()
     const input: FormulaBarSyncInput = {
       sheetId: activeSheetId,
       cell: selection.activeCell,
-      draft: getDraftFromProjection(
-        visibleResult,
-        selection.activeCell,
-        activeSheetId,
-      ),
+      draft: getSourceTextFromProjection(visibleResult, selection.activeCell, activeSheetId),
       source: 'selection',
       revision: visibleResult?.revision,
     }
-
     store.setter(syncFormulaBarAtom, input)
   })
 
-  function getCurrentWindow() {
-    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (isVisibleProjectionResult(snapshot.result)) {
-      return snapshot.result.window
-    }
-    if (snapshot.request?.kind === 'visible-window') {
-      return snapshot.request.window
-    }
-    return null
-  }
+  // The input element's value: editingDraft while drafting, otherwise the
+  // formula-bar synced draft (which reflects the projection source text).
+  const displayValue = createMemo(() => {
+    if (editingSession().status === 'drafting') return editingDraft()
+    return formulaBarState().draft
+  })
 
-  async function refreshProjection(sheetId: string) {
-    const window = getCurrentWindow()
-    if (!window) {
-      return
-    }
-
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = createVisibleProjectionRequest({
-      sheetId,
-      window,
-      requestId,
-      reason: 'formula-bar',
-    })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'loading',
-      request,
-      result: undefined,
-      error: undefined,
-    })
-
-    try {
-      const result = await backend.readVisibleProjection(request)
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'ready',
-        request,
-        result,
-        error: undefined,
-      })
-    } catch (error: unknown) {
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'error',
-        request,
-        result: undefined,
-        error:
-          error instanceof Error
-            ? { code: 'BACKEND_ERROR', message: error.message }
-            : { code: 'BACKEND_ERROR', message: 'Spreadsheet projection failed.' },
-      })
-    }
-  }
-
-  async function commitDraft() {
+  function ensureEditingSession(initialDraft: string) {
+    if (editingSession().status === 'drafting') return
     const selection = selectionSnapshot()
-    const activeSheetId = resolveActiveSheetId()
-    const draft = formulaBarDraft()
-    const { sheetId, row, col } = selection.activeCell
-
-    const targetSheetId = activeSheetId || sheetId
-    if (!targetSheetId) {
-      return
-    }
-
-    const request: SetCellInputRequest = {
-      kind: 'set-cell-input',
-      sheetId: targetSheetId,
-      row,
-      col,
-      input: draft,
-    }
-    await backend.setCellInput(request)
-    await refreshProjection(targetSheetId)
-  }
-
-  function restoreDraft(target?: HTMLInputElement) {
-    const draft = formulaBarState().syncedDraft
-    store.setter(formulaBarDraftAtom, draft)
-    if (target) {
-      target.value = draft
-    }
+    const sheetId = resolveActiveSheetId()
+    if (!sheetId) return
+    store.setter(startEditingAtom, {
+      sheetId,
+      cell: selection.activeCell,
+      draft: initialDraft,
+      source: 'formula-bar',
+    })
   }
 
   function onInput(event: InputEvent) {
     const target = event.target as HTMLInputElement | null
-    if (!target) {
-      return
+    if (!target) return
+    const next = target.value
+    if (editingSession().status !== 'drafting') {
+      // First keystroke in the formula bar opens an editing session for the
+      // currently-selected cell. The draft becomes the typed value.
+      ensureEditingSession(next)
+    } else {
+      store.setter(editingDraftAtom, { draft: next, source: 'formula-bar' })
     }
+    syncFormulaReferenceCaret(store, target.selectionStart ?? next.length)
+  }
 
-    store.setter(formulaBarDraftAtom, target.value)
+  function onSelectionChange(event: Event) {
+    const target = event.target as HTMLInputElement | null
+    if (!target) return
+    if (editingSession().status !== 'drafting') return
+    syncFormulaReferenceCaret(store, target.selectionStart ?? 0)
+  }
+
+  async function commitDraft() {
+    if (editingSession().status !== 'drafting') return
+    await dispatchEditingCommit(store, backend, { source: 'formula-bar', move: 'none' })
+  }
+
+  function cancelDraft() {
+    dispatchEditingCancel(store)
   }
 
   function isCommitKey(event: KeyboardEvent) {
@@ -216,16 +167,15 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
   async function handleKeyDown(event: KeyboardEvent) {
     if (isCommitKey(event)) {
       event.preventDefault()
-      void commitDraft()
+      await commitDraft()
+      inputRef?.blur()
       return
     }
 
     if (isEscapeKey(event)) {
       event.preventDefault()
-      const target = event.currentTarget instanceof HTMLInputElement
-        ? event.currentTarget
-        : inputRef
-      restoreDraft(target)
+      cancelDraft()
+      inputRef?.blur()
     }
   }
 
@@ -266,8 +216,10 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
         class="formula-bar-input spreadsheet-formula-bar-input"
         data-testid="formula-bar-input"
         type="text"
-        value={formulaBarDraft()}
+        value={displayValue()}
         onInput={onInput}
+        onSelect={onSelectionChange}
+        onClick={onSelectionChange}
         onFocus={() => {
           store.setter(focusFormulaBarAtom, true)
         }}
