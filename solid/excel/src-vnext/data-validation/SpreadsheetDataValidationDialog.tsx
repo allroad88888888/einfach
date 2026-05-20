@@ -11,6 +11,15 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 
+// Pull in the dialog stylesheet as a side-effect import. Vite picks the
+// dynamic-import target up statically and bundles the CSS into the chunk;
+// the runtime guard skips evaluation under jest so unit tests aren't
+// blocked when no CSS transform is configured. The co-located
+// `.css.d.ts` keeps tsc satisfied under the Bundler moduleResolution.
+if (typeof process === 'undefined' || !process.env.JEST_WORKER_ID) {
+  void import('./data-validation-dialog.css')
+}
+
 export interface SpreadsheetDataValidationDialogProps {
   class?: string
   'data-testid'?: string
@@ -122,151 +131,177 @@ export function SpreadsheetDataValidationDialog(props: SpreadsheetDataValidation
         role="dialog"
         aria-label="Data validation"
       >
-        <button
-          type="button"
-          class="dialog-close-x"
-          data-testid="dialog-close-x"
-          aria-label={t('dialog.close.label')}
-          onClick={handleCancel}
-        >
-          ×
-        </button>
-        <span class="validation-range" data-testid="validation-range">
-          {rangeLabel(editor().range)}
-        </span>
+        <div class="dv-dialog-header">
+          <span class="dv-dialog-title">Data validation</span>
+          <button
+            type="button"
+            class="dialog-close-x"
+            data-testid="dialog-close-x"
+            aria-label={t('dialog.close.label')}
+            onClick={handleCancel}
+          >
+            ×
+          </button>
+        </div>
 
-        <label>
-          {'Rule type'}
-          <select
-            class="validation-kind-select"
-            data-testid="validation-kind-select"
-            value={kind()}
-            onChange={(e) => {
-              setKind((e.target as HTMLSelectElement).value as ValidationRuleKind)
+        <div class="dv-dialog-body">
+          <div class="dv-range-row">
+            <span class="dv-range-label">Range</span>
+            <span class="validation-range" data-testid="validation-range">
+              {rangeLabel(editor().range)}
+            </span>
+          </div>
+
+          <div class="dv-form-row">
+            <label>
+              Rule type
+              <select
+                class="validation-kind-select"
+                data-testid="validation-kind-select"
+                value={kind()}
+                onChange={(e) => {
+                  setKind((e.target as HTMLSelectElement).value as ValidationRuleKind)
+                }}
+              >
+                <option value="list">List</option>
+                <option value="range">Range</option>
+                <option value="regex">Regex</option>
+                <option value="formula">Formula</option>
+              </select>
+            </label>
+          </div>
+
+          <Show when={kind() === 'list'}>
+            <div class="dv-form-row">
+              <label>
+                Values (comma-separated)
+                <input
+                  type="text"
+                  class="validation-list-values"
+                  data-testid="validation-list-values"
+                  value={listValues()}
+                  onInput={(e) => {
+                    setListValues((e.target as HTMLInputElement).value)
+                  }}
+                />
+              </label>
+            </div>
+          </Show>
+
+          <Show when={kind() === 'range'}>
+            <div class="dv-form-row">
+              <label>Min/Max</label>
+              <div class="dv-range-pair">
+                <input
+                  type="number"
+                  class="validation-range-min"
+                  data-testid="validation-range-min"
+                  aria-label="Min"
+                  placeholder="Min"
+                  value={rangeMin()}
+                  onInput={(e) => {
+                    setRangeMin((e.target as HTMLInputElement).value)
+                  }}
+                />
+                <input
+                  type="number"
+                  class="validation-range-max"
+                  data-testid="validation-range-max"
+                  aria-label="Max"
+                  placeholder="Max"
+                  value={rangeMax()}
+                  onInput={(e) => {
+                    setRangeMax((e.target as HTMLInputElement).value)
+                  }}
+                />
+              </div>
+            </div>
+          </Show>
+
+          <Show when={kind() === 'regex'}>
+            <div class="dv-form-row">
+              <label>
+                Pattern
+                <input
+                  type="text"
+                  class="validation-regex-pattern"
+                  data-testid="validation-regex-pattern"
+                  value={regexPattern()}
+                  onInput={(e) => {
+                    setRegexPattern((e.target as HTMLInputElement).value)
+                  }}
+                />
+              </label>
+            </div>
+          </Show>
+
+          <Show when={kind() === 'formula'}>
+            <div class="dv-form-row">
+              <label>
+                Formula
+                <input
+                  type="text"
+                  class="validation-formula-text"
+                  data-testid="validation-formula-text"
+                  value={formulaText()}
+                  onInput={(e) => {
+                    setFormulaText((e.target as HTMLInputElement).value)
+                  }}
+                />
+              </label>
+            </div>
+          </Show>
+
+          <div class="dv-form-row">
+            <label>
+              Mode
+              <select
+                class="validation-mode-select"
+                data-testid="validation-mode-select"
+                value={mode()}
+                onChange={(e) => {
+                  setMode((e.target as HTMLSelectElement).value as ValidationMode)
+                }}
+              >
+                <option value="warn">Warn</option>
+                <option value="reject">Reject</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div class="dv-dialog-footer">
+          <button
+            type="button"
+            class="validation-clear-button"
+            data-testid="validation-clear-button"
+            data-variant="danger"
+            onClick={() => {
+              void handleClear()
             }}
           >
-            <option value="list">List</option>
-            <option value="range">Range</option>
-            <option value="regex">Regex</option>
-            <option value="formula">Formula</option>
-          </select>
-        </label>
-
-        <Show when={kind() === 'list'}>
-          <label>
-            {'Values (comma-separated)'}
-            <input
-              type="text"
-              class="validation-list-values"
-              data-testid="validation-list-values"
-              value={listValues()}
-              onInput={(e) => {
-                setListValues((e.target as HTMLInputElement).value)
-              }}
-            />
-          </label>
-        </Show>
-
-        <Show when={kind() === 'range'}>
-          <label>
-            {'Min'}
-            <input
-              type="number"
-              class="validation-range-min"
-              data-testid="validation-range-min"
-              value={rangeMin()}
-              onInput={(e) => {
-                setRangeMin((e.target as HTMLInputElement).value)
-              }}
-            />
-          </label>
-          <label>
-            {'Max'}
-            <input
-              type="number"
-              class="validation-range-max"
-              data-testid="validation-range-max"
-              value={rangeMax()}
-              onInput={(e) => {
-                setRangeMax((e.target as HTMLInputElement).value)
-              }}
-            />
-          </label>
-        </Show>
-
-        <Show when={kind() === 'regex'}>
-          <label>
-            {'Pattern'}
-            <input
-              type="text"
-              class="validation-regex-pattern"
-              data-testid="validation-regex-pattern"
-              value={regexPattern()}
-              onInput={(e) => {
-                setRegexPattern((e.target as HTMLInputElement).value)
-              }}
-            />
-          </label>
-        </Show>
-
-        <Show when={kind() === 'formula'}>
-          <label>
-            {'Formula'}
-            <input
-              type="text"
-              class="validation-formula-text"
-              data-testid="validation-formula-text"
-              value={formulaText()}
-              onInput={(e) => {
-                setFormulaText((e.target as HTMLInputElement).value)
-              }}
-            />
-          </label>
-        </Show>
-
-        <label>
-          {'Mode'}
-          <select
-            class="validation-mode-select"
-            data-testid="validation-mode-select"
-            value={mode()}
-            onChange={(e) => {
-              setMode((e.target as HTMLSelectElement).value as ValidationMode)
+            Clear
+          </button>
+          <button
+            type="button"
+            class="validation-cancel-button"
+            data-testid="validation-cancel-button"
+            onClick={handleCancel}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            class="validation-save-button"
+            data-testid="validation-save-button"
+            data-variant="primary"
+            onClick={() => {
+              void handleSave()
             }}
           >
-            <option value="warn">Warn</option>
-            <option value="reject">Reject</option>
-          </select>
-        </label>
-
-        <button
-          type="button"
-          class="validation-save-button"
-          data-testid="validation-save-button"
-          onClick={() => {
-            void handleSave()
-          }}
-        >
-          Save
-        </button>
-        <button
-          type="button"
-          class="validation-clear-button"
-          data-testid="validation-clear-button"
-          onClick={() => {
-            void handleClear()
-          }}
-        >
-          Clear
-        </button>
-        <button
-          type="button"
-          class="validation-cancel-button"
-          data-testid="validation-cancel-button"
-          onClick={handleCancel}
-        >
-          Cancel
-        </button>
+            确定
+          </button>
+        </div>
       </div>
     </Show>
   )

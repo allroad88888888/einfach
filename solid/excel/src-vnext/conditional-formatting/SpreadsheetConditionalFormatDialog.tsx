@@ -15,6 +15,15 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 
+// Pull in the dialog stylesheet as a side-effect import. Vite picks the
+// dynamic-import target up statically and bundles the CSS into the chunk;
+// the runtime guard skips evaluation under jest so unit tests aren't
+// blocked when no CSS transform is configured. The co-located
+// `.css.d.ts` keeps tsc satisfied under the Bundler moduleResolution.
+if (typeof process === 'undefined' || !process.env.JEST_WORKER_ID) {
+  void import('./conditional-format-dialog.css')
+}
+
 export interface SpreadsheetConditionalFormatDialogProps {
   class?: string
   'data-testid'?: string
@@ -177,66 +186,57 @@ export function SpreadsheetConditionalFormatDialog(
         aria-modal="true"
         aria-label="Conditional formatting"
       >
-        <button
-          type="button"
-          class="dialog-close-x"
-          data-testid="dialog-close-x"
-          aria-label={t('dialog.close.label')}
-          onClick={close}
-        >
-          ×
-        </button>
-        <ul data-testid="cf-rule-list">
-          <For each={rulesCache().rules}>
-            {(entry) => (
-              <li data-rule-id={entry.id} data-rule-kind={entry.rule.kind}>
-                {entry.rule.kind} — priority {entry.priority}
-              </li>
-            )}
-          </For>
-        </ul>
-
-        <div class="cf-form">
-          <label for="cf-rule-kind-select">Rule type</label>
-          <select
-            id="cf-rule-kind-select"
-            data-testid="cf-rule-kind-select"
-            value={currentKind()}
-            onChange={onKindChange}
+        <div class="cf-dialog-header">
+          <span class="cf-dialog-title">Conditional formatting</span>
+          <button
+            type="button"
+            class="dialog-close-x"
+            data-testid="dialog-close-x"
+            aria-label={t('dialog.close.label')}
+            onClick={close}
           >
-            <For each={ruleKinds}>
-              {(kind) => <option value={kind}>{kindLabels[kind]}</option>}
-            </For>
-          </select>
+            ×
+          </button>
         </div>
 
-        <div class="cf-actions">
-          <button
-            type="button"
-            data-testid="cf-save-button"
-            onClick={() => {
-              void handleSave()
-            }}
-          >
-            Save
-          </button>
-          <button
-            type="button"
-            data-testid="cf-remove-button"
-            disabled={!editor().draft}
-            onClick={() => {
-              void handleRemove()
-            }}
-          >
-            Remove
-          </button>
-          <button
-            type="button"
-            data-testid="cf-cancel-button"
-            onClick={handleCancel}
-          >
-            Cancel
-          </button>
+        <div class="cf-dialog-body">
+          <div class="cf-rules-section">
+            <span class="cf-section-label">Existing rules</span>
+            <ul class="cf-rule-list" data-testid="cf-rule-list">
+              <For each={rulesCache().rules}>
+                {(entry) => (
+                  <li data-rule-id={entry.id} data-rule-kind={entry.rule.kind}>
+                    {entry.rule.kind} — priority {entry.priority}
+                  </li>
+                )}
+              </For>
+            </ul>
+          </div>
+
+          <div class="cf-form">
+            <div class="cf-form-row">
+              <label class="cf-form-label" for="cf-rule-kind-select">
+                Rule type
+              </label>
+              <select
+                id="cf-rule-kind-select"
+                data-testid="cf-rule-kind-select"
+                value={currentKind()}
+                onChange={onKindChange}
+              >
+                <For each={ruleKinds}>
+                  {(kind) => <option value={kind}>{kindLabels[kind]}</option>}
+                </For>
+              </select>
+            </div>
+
+            <div class="cf-rule-preview" aria-hidden="true">
+              <span class="cf-rule-preview-swatch" />
+              <span class="cf-rule-preview-text">
+                Preview · {kindLabels[currentKind()]}
+              </span>
+            </div>
+          </div>
         </div>
 
         <Show when={errorText()}>
@@ -244,6 +244,38 @@ export function SpreadsheetConditionalFormatDialog(
             {errorText()}
           </div>
         </Show>
+
+        <div class="cf-dialog-footer">
+          <button
+            type="button"
+            data-testid="cf-remove-button"
+            data-variant="danger"
+            disabled={!editor().draft}
+            onClick={() => {
+              void handleRemove()
+            }}
+          >
+            Remove
+          </button>
+          <span class="cf-error-spacer" />
+          <button
+            type="button"
+            data-testid="cf-cancel-button"
+            onClick={handleCancel}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            data-testid="cf-save-button"
+            data-variant="primary"
+            onClick={() => {
+              void handleSave()
+            }}
+          >
+            确定
+          </button>
+        </div>
       </div>
     </Show>
   )
