@@ -305,6 +305,24 @@ test.describe('formula interaction on Wave 5', () => {
     await expect(cellInput(page, 'H6')).toHaveCount(0)
   })
 
+  test('autocomplete in the formula bar accepts without losing focus to the cell input', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await cell(page, 'H6').click()
+    const bar = page.getByTestId('formula-bar-input')
+    await bar.click()
+    await page.keyboard.type('=SU')
+    await expect(page.getByTestId('formula-autocomplete-list')).toBeVisible()
+
+    await page.keyboard.press('Tab')
+    await expect(bar).toHaveValue('=SUM(')
+    // Focus must stay on the formula bar — the in-cell editor mounts as a
+    // side effect of editing being active, but its autofocus is suppressed
+    // when the session was opened from 'formula-bar'.
+    await expect(bar).toBeFocused()
+  })
+
   test('full SUM via autocomplete + drag pick evaluates the range', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'H9').click()

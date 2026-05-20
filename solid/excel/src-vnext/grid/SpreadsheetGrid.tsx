@@ -2500,8 +2500,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                                   // has focus; queue an explicit focus + caret
                                   // placement so subsequent keystrokes land on
                                   // the input, not on the grid keydown handler.
+                                  //
+                                  // Skip when the editing session is owned by
+                                  // the formula bar — otherwise the cell-input
+                                  // mount on every draft change would steal
+                                  // focus away from the formula bar input.
                                   if (el) {
                                     queueMicrotask(() => {
+                                      const session = store.getter(editingSessionAtom)
+                                      const ownedByFormulaBar =
+                                        session.status === 'drafting' &&
+                                        session.source?.source === 'formula-bar'
+                                      if (ownedByFormulaBar) return
                                       el.focus()
                                       const len = el.value.length
                                       el.setSelectionRange(len, len)
