@@ -240,6 +240,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FLOOR"
             | "FLOOR.MATH"
             | "FLOOR.PRECISE"
+            | "FORECAST"
+            | "FORECAST.LINEAR"
             | "FORMULATEXT"
             | "FTEST"
             | "FV"
@@ -253,6 +255,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "GCD"
             | "GEOMEAN"
             | "GESTEP"
+            | "GROWTH"
             | "HARMEAN"
             | "HEX2BIN"
             | "HEX2DEC"
@@ -296,6 +299,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "LEN"
             | "LENB"
             | "LET"
+            | "LINEST"
             | "LN"
             | "LOG"
             | "LOG10"
@@ -303,6 +307,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "LOGNORM.DIST"
             | "LOGNORM.INV"
             | "LOGNORMDIST"
+            | "LOGEST"
             | "LOOKUP"
             | "LOWER"
             | "MAKEARRAY"
@@ -317,10 +322,13 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MIN"
             | "MINIFS"
             | "MINUTE"
+            | "MINVERSE"
+            | "MMULT"
             | "MOD"
             | "MODE"
             | "MONTH"
             | "MROUND"
+            | "MUNIT"
             | "N"
             | "NEGBINOM.DIST"
             | "NEGBINOMDIST"
@@ -348,6 +356,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "OFFSET"
             | "OR"
             | "PDURATION"
+            | "PEARSON"
             | "PERCENTILE.EXC"
             | "PHONETIC"
             | "PI"
@@ -377,6 +386,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ROW"
             | "ROWS"
             | "RRI"
+            | "RSQ"
             | "SCAN"
             | "SEARCH"
             | "SEARCHB"
@@ -398,6 +408,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "STDEV"
             | "STDEV.P"
             | "STDEV.S"
+            | "STEYX"
             | "SUBSTITUTE"
             | "SUM"
             | "SUMIF"
@@ -430,6 +441,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "TOCOL"
             | "TODAY"
             | "TOROW"
+            | "TRANSPOSE"
+            | "TREND"
             | "TRIM"
             | "TRIMMEAN"
             | "TRUNC"
@@ -8584,6 +8597,32 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "T.TEST" | "TTEST" => stat_t_test(args, provider),
         "WEIBULL" => stat_weibull_dist(args, provider),
         "Z.TEST" | "ZTEST" => stat_z_test(args, provider),
+        // Regression + matrix algebra (P batch).
+        //
+        // LINEST / LOGEST / TREND / GROWTH all share the same least-squares
+        // core (`linreg_core`): solve `(X^T X) β = X^T y` via Gauss-Jordan
+        // on the augmented normal-equation matrix. LOGEST/GROWTH log-
+        // transform `y` first (and `exp` at the end). Multi-x is supported
+        // by feeding multiple columns of `known_x`. FORECAST is a scalar
+        // shortcut that uses single-variable LINEST internally.
+        //
+        // MMULT / MINVERSE / MUNIT / TRANSPOSE are array-producing matrix
+        // helpers. MINVERSE uses Gauss-Jordan with partial pivoting
+        // (pivot magnitude < 1e-12 → #NUM!). MMULT rejects mismatched
+        // inner dimensions with #VALUE! and propagates errors.
+        "LINEST" => fn_linest(args, provider, /*log_y=*/ false),
+        "LOGEST" => fn_linest(args, provider, /*log_y=*/ true),
+        "TREND" => fn_trend_growth(args, provider, /*log_y=*/ false),
+        "GROWTH" => fn_trend_growth(args, provider, /*log_y=*/ true),
+        "FORECAST" | "FORECAST.LINEAR" => fn_forecast(args, provider),
+        "STEYX" => fn_steyx(args, provider),
+        "RSQ" => fn_rsq(args, provider),
+        // PEARSON is identical to CORREL — route through the same impl.
+        "PEARSON" => correl_impl(args, provider),
+        "MMULT" => fn_mmult(args, provider),
+        "MINVERSE" => fn_minverse(args, provider),
+        "MUNIT" => fn_munit(args, provider),
+        "TRANSPOSE" => fn_transpose(args, provider),
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
@@ -16629,6 +16668,77 @@ fn dbcs_find_byte_index(
     Err(ValueError::InvalidValue)
 }
 
+// ---- Regression + matrix algebra helpers (P batch) ---------------------
+//
+// Numerical strategy:
+//   * Least-squares (LINEST/LOGEST/TREND/GROWTH/FORECAST) solve the
+//     normal equations `(X^T X) β = X^T y` via in-place Gauss-Jordan on
+//     the (k+1)×(k+2) augmented matrix. This is adequate for the
+//     workbook-scale problems we expect (≤ ~50 variables). For larger /
+//     near-collinear inputs we surface `#NUM!` (Overflow) when the
+//     pivot drops below 1e-12, matching MINVERSE's singular guard.
+//   * MINVERSE row-reduces `[A | I]` to `[I | A^-1]` with partial
+//     pivoting. Same 1e-12 singular tolerance.
+//   * MMULT is the textbook triple-loop (a×b)·(b×c) → (a×c). No BLAS
+//     dependency; sizes are bounded by the workbook (1M-element cap).
+//   * MUNIT / TRANSPOSE are O(n²) shape transforms.
+//
+// All array-producing functions return `Value::Array(Arc::new(...))`
+// and are listed in `sheet::expr_may_produce_array` so the spill
+// machinery picks them up.
+
+/// Materialise a 2D argument as a `Vec<Vec<f64>>` matrix, propagating
+/// errors and rejecting non-numeric cells. `Null` → 0.0, `Boolean` →
+/// 0/1, `Text` / `Lambda` → `WrongType`.
+fn arg_to_f64_matrix(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<Vec<Vec<f64>>, ValueError> {
+    let (rows, cols, data) = arg_to_2d(arg, provider)?;
+    if rows == 0 || cols == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<Vec<f64>> = vec![vec![0.0; cols as usize]; rows as usize];
+    for r in 0..rows as usize {
+        for c in 0..cols as usize {
+            let idx = r * cols as usize + c;
+            let v = &data[idx];
+            match v {
+                Value::Error(e) => return Err(e.clone()),
+                Value::Number(n) => out[r][c] = *n,
+                Value::Null => out[r][c] = 0.0,
+                Value::Boolean(b) => out[r][c] = if *b { 1.0 } else { 0.0 },
+                Value::Text(_) | Value::Lambda(_) => return Err(ValueError::WrongType),
+                Value::Array(arr) => match arr.get(0, 0) {
+                    Some(Value::Number(n)) => out[r][c] = *n,
+                    Some(Value::Null) | None => out[r][c] = 0.0,
+                    Some(Value::Boolean(b)) => out[r][c] = if *b { 1.0 } else { 0.0 },
+                    Some(Value::Error(e)) => return Err(e.clone()),
+                    Some(_) => return Err(ValueError::WrongType),
+                },
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Flatten a 1-D-ish matrix (either 1×n, n×1, or already a flat list)
+/// into a `Vec<f64>`. Errors on rank-2 inputs.
+fn matrix_to_vector_strict(m: &[Vec<f64>]) -> Result<Vec<f64>, ValueError> {
+    if m.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = m.len();
+    let cols = m[0].len();
+    if rows == 1 {
+        return Ok(m[0].clone());
+    }
+    if cols == 1 {
+        return Ok(m.iter().map(|r| r[0]).collect());
+    }
+    Err(ValueError::InvalidValue)
+}
+
 fn fn_findb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ValueError::WrongArgCount);
@@ -17313,6 +17423,787 @@ fn stat_z_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let z = (mean - x0) / (sigma / (n as f64).sqrt());
     let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
     stat_finite(1.0 - dist.cdf(z))
+}
+
+/// Invert a square matrix via Gauss-Jordan on `[A | I]`. Returns
+/// `Err(ValueError::Overflow)` if singular within 1e-12. Consumes `a`.
+fn matrix_inverse_inplace(a_in: Vec<Vec<f64>>) -> Result<Vec<Vec<f64>>, ValueError> {
+    let n = a_in.len();
+    if n == 0 || a_in.iter().any(|r| r.len() != n) {
+        return Err(ValueError::InvalidValue);
+    }
+    let mut a: Vec<Vec<f64>> = a_in;
+    let mut inv: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let mut row = vec![0.0; n];
+            row[i] = 1.0;
+            row
+        })
+        .collect();
+    for i in 0..n {
+        // Partial pivot.
+        let mut piv = i;
+        let mut piv_val = a[i][i].abs();
+        for r in (i + 1)..n {
+            let v = a[r][i].abs();
+            if v > piv_val {
+                piv_val = v;
+                piv = r;
+            }
+        }
+        if piv_val < 1e-12 {
+            return Err(ValueError::Overflow);
+        }
+        if piv != i {
+            a.swap(i, piv);
+            inv.swap(i, piv);
+        }
+        // Normalise row i.
+        let div = a[i][i];
+        for c in 0..n {
+            a[i][c] /= div;
+            inv[i][c] /= div;
+        }
+        // Eliminate other rows.
+        for r in 0..n {
+            if r == i {
+                continue;
+            }
+            let factor = a[r][i];
+            if factor == 0.0 {
+                continue;
+            }
+            for c in 0..n {
+                a[r][c] -= factor * a[i][c];
+                inv[r][c] -= factor * inv[i][c];
+            }
+        }
+    }
+    Ok(inv)
+}
+
+/// Linear least-squares core used by LINEST/LOGEST/TREND/GROWTH/FORECAST.
+///
+/// Inputs:
+///   * `xs`: `n × k` matrix of regressors (already log-transformed for
+///     LOGEST/GROWTH). One row per observation.
+///   * `ys`: length-`n` vector (already log-transformed for LOGEST/GROWTH).
+///   * `with_intercept`: when `false`, the model is `y = m1*x1 + …`;
+///     when `true`, an implicit column of 1s is appended.
+struct LinRegFit {
+    /// Slopes in input order (`m1..mk`). Length = `k`.
+    slopes: Vec<f64>,
+    /// Intercept (`0.0` when `with_intercept = false`).
+    intercept: f64,
+    with_intercept: bool,
+    ss_res: f64,
+    ss_tot: f64,
+    /// Per-slope standard errors, same order as `slopes`.
+    se: Vec<f64>,
+    se_intercept: f64,
+    df: f64,
+    k_vars: usize,
+}
+
+fn linreg_core(
+    xs: &[Vec<f64>],
+    ys: &[f64],
+    with_intercept: bool,
+) -> Result<LinRegFit, ValueError> {
+    let n = ys.len();
+    if n == 0 {
+        return Err(ValueError::InvalidValue);
+    }
+    if !xs.is_empty() && xs.len() != n {
+        return Err(ValueError::InvalidValue);
+    }
+    let k = if xs.is_empty() { 0 } else { xs[0].len() };
+    for row in xs {
+        if row.len() != k {
+            return Err(ValueError::InvalidValue);
+        }
+    }
+    let p_eff = k + if with_intercept { 1 } else { 0 };
+    if p_eff == 0 {
+        return Err(ValueError::InvalidValue);
+    }
+    if n < p_eff {
+        return Err(ValueError::InvalidValue);
+    }
+    // Build the design matrix X (n × p_eff). Layout: x columns first,
+    // then optional intercept column of 1s.
+    let mut x_mat: Vec<Vec<f64>> = (0..n).map(|_| vec![0.0; p_eff]).collect();
+    for r in 0..n {
+        for c in 0..k {
+            x_mat[r][c] = xs[r][c];
+        }
+        if with_intercept {
+            x_mat[r][p_eff - 1] = 1.0;
+        }
+    }
+    // Normal equations: A = X^T X (p×p), bvec = X^T y (p).
+    let mut a: Vec<Vec<f64>> = vec![vec![0.0; p_eff]; p_eff];
+    let mut bvec: Vec<f64> = vec![0.0; p_eff];
+    for i in 0..p_eff {
+        for j in 0..p_eff {
+            let mut s = 0.0;
+            for r in 0..n {
+                s += x_mat[r][i] * x_mat[r][j];
+            }
+            a[i][j] = s;
+        }
+        let mut s = 0.0;
+        for r in 0..n {
+            s += x_mat[r][i] * ys[r];
+        }
+        bvec[i] = s;
+    }
+    // Keep a copy of A for SE computation (we need (X^T X)^-1).
+    let a_copy: Vec<Vec<f64>> = a.iter().cloned().collect();
+    // Solve via Gauss-Jordan augmented with bvec.
+    let mut piv_a = a;
+    {
+        let n_local = p_eff;
+        for i in 0..n_local {
+            let mut piv = i;
+            let mut piv_val = piv_a[i][i].abs();
+            for r in (i + 1)..n_local {
+                let v = piv_a[r][i].abs();
+                if v > piv_val {
+                    piv_val = v;
+                    piv = r;
+                }
+            }
+            if piv_val < 1e-12 {
+                return Err(ValueError::Overflow);
+            }
+            if piv != i {
+                piv_a.swap(i, piv);
+                bvec.swap(i, piv);
+            }
+            let div = piv_a[i][i];
+            for c in i..n_local {
+                piv_a[i][c] /= div;
+            }
+            bvec[i] /= div;
+            for r in 0..n_local {
+                if r == i {
+                    continue;
+                }
+                let factor = piv_a[r][i];
+                if factor == 0.0 {
+                    continue;
+                }
+                for c in i..n_local {
+                    piv_a[r][c] -= factor * piv_a[i][c];
+                }
+                bvec[r] -= factor * bvec[i];
+            }
+        }
+    }
+    let betas = bvec; // length p_eff
+    let slopes: Vec<f64> = (0..k).map(|i| betas[i]).collect();
+    let intercept = if with_intercept { betas[p_eff - 1] } else { 0.0 };
+    // Predicted ŷ.
+    let mut predicted = vec![0.0_f64; n];
+    for r in 0..n {
+        let mut yhat = 0.0;
+        for c in 0..k {
+            yhat += xs[r][c] * slopes[c];
+        }
+        if with_intercept {
+            yhat += intercept;
+        }
+        predicted[r] = yhat;
+    }
+    // SS_res, SS_tot.
+    let y_mean: f64 = ys.iter().sum::<f64>() / (n as f64);
+    let mut ss_res = 0.0;
+    let mut ss_tot = 0.0;
+    for r in 0..n {
+        let resid = ys[r] - predicted[r];
+        ss_res += resid * resid;
+        // Excel treats SS_tot as Σ(y - ȳ)² when intercept = TRUE, and
+        // as Σy² (uncorrected) when intercept = FALSE.
+        if with_intercept {
+            let diff = ys[r] - y_mean;
+            ss_tot += diff * diff;
+        } else {
+            ss_tot += ys[r] * ys[r];
+        }
+    }
+    let df = (n as f64) - (p_eff as f64);
+    let mse = if df > 0.0 { ss_res / df } else { 0.0 };
+    let (se_slopes, se_intercept) = if df > 0.0 {
+        match matrix_inverse_inplace(a_copy) {
+            Ok(inv) => {
+                let mut se_v = vec![0.0_f64; k];
+                for j in 0..k {
+                    let var_j = inv[j][j] * mse;
+                    se_v[j] = if var_j > 0.0 { var_j.sqrt() } else { 0.0 };
+                }
+                let se_int = if with_intercept {
+                    let last = p_eff - 1;
+                    let var_int = inv[last][last] * mse;
+                    if var_int > 0.0 { var_int.sqrt() } else { 0.0 }
+                } else {
+                    0.0
+                };
+                (se_v, se_int)
+            }
+            Err(_) => (vec![0.0_f64; k], 0.0),
+        }
+    } else {
+        (vec![0.0_f64; k], 0.0)
+    };
+    Ok(LinRegFit {
+        slopes,
+        intercept,
+        with_intercept,
+        ss_res,
+        ss_tot,
+        se: se_slopes,
+        se_intercept,
+        df,
+        k_vars: k,
+    })
+}
+
+/// Parse the optional 3rd/4th args of LINEST/LOGEST (`const`, `stats`).
+/// Default `const` is TRUE, `stats` is FALSE.
+fn linest_flags(
+    args: &[Expr],
+    flag_offset: usize,
+    provider: &dyn EvalProvider,
+) -> Result<(bool, bool), ValueError> {
+    let with_intercept = if args.len() > flag_offset {
+        let v = eval_expr_with_provider(&args[flag_offset], provider);
+        if let Value::Error(e) = v {
+            return Err(e);
+        }
+        coerce_to_bool(&v).unwrap_or(true)
+    } else {
+        true
+    };
+    let stats = if args.len() > flag_offset + 1 {
+        let v = eval_expr_with_provider(&args[flag_offset + 1], provider);
+        if let Value::Error(e) = v {
+            return Err(e);
+        }
+        coerce_to_bool(&v).unwrap_or(false)
+    } else {
+        false
+    };
+    Ok((with_intercept, stats))
+}
+
+/// Build the LINEST/LOGEST diagnostic output array.
+///
+/// Excel surfaces slopes **right-to-left**: the last regressor's slope
+/// is in column 0, the first regressor's slope sits just left of the
+/// intercept (column k-1), and the intercept lands in column k. When
+/// `stats = FALSE`, this is a single 1×(k+1) row. When `stats = TRUE`,
+/// the shape is `5 × (k+1)`:
+///
+///   row 0: [mk, ..., m1, b]              ← slopes (reversed) + intercept
+///   row 1: [se(mk), ..., se(m1), se(b)]
+///   row 2: [r², SE_y, #N/A, ..., #N/A]
+///   row 3: [F, df, #N/A, ..., #N/A]
+///   row 4: [SS_reg, SS_resid, #N/A, ..., #N/A]
+fn linest_array(fit: &LinRegFit, stats: bool, exp_coefs: bool) -> Value {
+    let k = fit.k_vars;
+    let cols = k + 1;
+    if !stats {
+        let mut row: Vec<Value> = Vec::with_capacity(cols);
+        for j in 0..k {
+            let s = fit.slopes[k - 1 - j];
+            row.push(Value::Number(if exp_coefs { s.exp() } else { s }));
+        }
+        let b = fit.intercept;
+        row.push(Value::Number(if exp_coefs { b.exp() } else { b }));
+        return Value::Array(Arc::new(ArrayData::new(1, cols as u32, row)));
+    }
+    let mut data: Vec<Value> = Vec::with_capacity(5 * cols);
+    // Row 0: slopes reversed + intercept (exp-transformed for LOGEST).
+    for j in 0..k {
+        let s = fit.slopes[k - 1 - j];
+        data.push(Value::Number(if exp_coefs { s.exp() } else { s }));
+    }
+    data.push(Value::Number(if exp_coefs {
+        fit.intercept.exp()
+    } else {
+        fit.intercept
+    }));
+    // Row 1: SEs (always log-space for LOGEST per Excel reference).
+    for j in 0..k {
+        data.push(Value::Number(fit.se[k - 1 - j]));
+    }
+    data.push(Value::Number(fit.se_intercept));
+    // Row 2: R², SE_y.
+    let r2 = if fit.ss_tot > 0.0 {
+        1.0 - fit.ss_res / fit.ss_tot
+    } else {
+        0.0
+    };
+    let se_y = if fit.df > 0.0 {
+        (fit.ss_res / fit.df).sqrt()
+    } else {
+        0.0
+    };
+    data.push(Value::Number(r2));
+    data.push(Value::Number(se_y));
+    for _ in 2..cols {
+        data.push(Value::Error(ValueError::InvalidValue));
+    }
+    // Row 3: F-stat, df.
+    let p = k as f64;
+    let f_stat = if p > 0.0 && fit.df > 0.0 && fit.ss_res > 0.0 {
+        let ss_reg = if fit.ss_tot > fit.ss_res {
+            fit.ss_tot - fit.ss_res
+        } else {
+            0.0
+        };
+        (ss_reg / p) / (fit.ss_res / fit.df)
+    } else {
+        0.0
+    };
+    data.push(Value::Number(f_stat));
+    data.push(Value::Number(fit.df));
+    for _ in 2..cols {
+        data.push(Value::Error(ValueError::InvalidValue));
+    }
+    // Row 4: SS_reg, SS_resid.
+    let ss_reg = if fit.ss_tot > fit.ss_res {
+        fit.ss_tot - fit.ss_res
+    } else {
+        0.0
+    };
+    data.push(Value::Number(ss_reg));
+    data.push(Value::Number(fit.ss_res));
+    for _ in 2..cols {
+        data.push(Value::Error(ValueError::InvalidValue));
+    }
+    Value::Array(Arc::new(ArrayData::new(5, cols as u32, data)))
+}
+
+/// Extract `known_y` as a `Vec<f64>` and report whether the original
+/// shape is vertical (`true` for n×1) or horizontal (`false` for 1×n).
+fn extract_known_y(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<(Vec<f64>, bool), ValueError> {
+    let m = arg_to_f64_matrix(arg, provider)?;
+    if m.is_empty() {
+        return Err(ValueError::InvalidValue);
+    }
+    let rows = m.len();
+    let cols = m[0].len();
+    if rows == 1 {
+        Ok((m[0].clone(), false))
+    } else if cols == 1 {
+        Ok((m.iter().map(|r| r[0]).collect(), true))
+    } else {
+        Err(ValueError::InvalidValue)
+    }
+}
+
+/// Extract `known_x` as an n×k regressor matrix. Each row is an
+/// observation, each column is a variable. Auto-transposes when the
+/// orientation doesn't match `y`.
+fn extract_known_x(
+    arg: Option<&Expr>,
+    n_required: usize,
+    y_vertical: bool,
+    provider: &dyn EvalProvider,
+) -> Result<Vec<Vec<f64>>, ValueError> {
+    let Some(a) = arg else {
+        // Default x = 1..n, single column.
+        return Ok((0..n_required).map(|i| vec![(i + 1) as f64]).collect());
+    };
+    let m = arg_to_f64_matrix(a, provider)?;
+    if m.is_empty() {
+        return Err(ValueError::InvalidValue);
+    }
+    let rows = m.len();
+    let cols = m[0].len();
+    let (n_obs, k_vars, transpose) = if y_vertical {
+        if rows == n_required {
+            (rows, cols, false)
+        } else if cols == n_required {
+            (cols, rows, true)
+        } else {
+            return Err(ValueError::InvalidValue);
+        }
+    } else if cols == n_required {
+        (cols, rows, true)
+    } else if rows == n_required {
+        (rows, cols, false)
+    } else {
+        return Err(ValueError::InvalidValue);
+    };
+    let mut out: Vec<Vec<f64>> = vec![vec![0.0; k_vars]; n_obs];
+    for r in 0..n_obs {
+        for c in 0..k_vars {
+            out[r][c] = if transpose { m[c][r] } else { m[r][c] };
+        }
+    }
+    Ok(out)
+}
+
+/// LINEST(known_y, [known_x], [const=TRUE], [stats=FALSE]).
+/// LOGEST is the same dispatch with `log_y = true`.
+fn fn_linest(args: &[Expr], provider: &dyn EvalProvider, log_y: bool) -> Value {
+    if args.is_empty() || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (mut ys, y_vertical) = match extract_known_y(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    if log_y {
+        for y in ys.iter_mut() {
+            if !(*y > 0.0) {
+                return Value::Error(ValueError::Overflow);
+            }
+            *y = y.ln();
+        }
+    }
+    let n = ys.len();
+    let x_arg = if args.len() >= 2 { Some(&args[1]) } else { None };
+    let xs = match extract_known_x(x_arg, n, y_vertical, provider) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let (with_intercept, stats) = match linest_flags(args, 2, provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    let fit = match linreg_core(&xs, &ys, with_intercept) {
+        Ok(f) => f,
+        Err(e) => return Value::Error(e),
+    };
+    linest_array(&fit, stats, /* exp_coefs = */ log_y)
+}
+
+/// TREND(known_y, [known_x], [new_x], [const]).
+/// GROWTH is the same shape with `log_y = true`.
+fn fn_trend_growth(args: &[Expr], provider: &dyn EvalProvider, log_y: bool) -> Value {
+    if args.is_empty() || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (mut ys, y_vertical) = match extract_known_y(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    if log_y {
+        for y in ys.iter_mut() {
+            if !(*y > 0.0) {
+                return Value::Error(ValueError::Overflow);
+            }
+            *y = y.ln();
+        }
+    }
+    let n = ys.len();
+    let x_arg = if args.len() >= 2 { Some(&args[1]) } else { None };
+    let xs = match extract_known_x(x_arg, n, y_vertical, provider) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let with_intercept = if args.len() >= 4 {
+        let v = eval_expr_with_provider(&args[3], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        coerce_to_bool(&v).unwrap_or(true)
+    } else {
+        true
+    };
+    let fit = match linreg_core(&xs, &ys, with_intercept) {
+        Ok(f) => f,
+        Err(e) => return Value::Error(e),
+    };
+    let new_xs: Vec<Vec<f64>> = if args.len() >= 3 {
+        match arg_to_f64_matrix(&args[2], provider) {
+            Ok(m) if !m.is_empty() => {
+                let rows = m.len();
+                let cols = m[0].len();
+                let k = fit.k_vars;
+                let (n_new, k_new, transpose) = if cols == k {
+                    (rows, cols, false)
+                } else if rows == k {
+                    (cols, rows, true)
+                } else if k == 1 && (rows == 1 || cols == 1) {
+                    if rows == 1 {
+                        (cols, 1, true)
+                    } else {
+                        (rows, 1, false)
+                    }
+                } else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                let mut out: Vec<Vec<f64>> = vec![vec![0.0; k_new]; n_new];
+                for r in 0..n_new {
+                    for c in 0..k_new {
+                        out[r][c] = if transpose { m[c][r] } else { m[r][c] };
+                    }
+                }
+                out
+            }
+            Ok(_) => xs.clone(),
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        xs.clone()
+    };
+    let n_new = new_xs.len();
+    let mut preds: Vec<Value> = Vec::with_capacity(n_new);
+    for r in 0..n_new {
+        let mut yhat = 0.0;
+        for c in 0..fit.k_vars {
+            yhat += new_xs[r][c] * fit.slopes[c];
+        }
+        if fit.with_intercept {
+            yhat += fit.intercept;
+        }
+        if log_y {
+            yhat = yhat.exp();
+        }
+        preds.push(Value::Number(yhat));
+    }
+    if y_vertical {
+        Value::Array(Arc::new(ArrayData::new(n_new as u32, 1, preds)))
+    } else {
+        Value::Array(Arc::new(ArrayData::new(1, n_new as u32, preds)))
+    }
+}
+
+/// FORECAST(x, known_y, known_x). Scalar single-variable forecast at `x`.
+fn fn_forecast(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let xv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = xv {
+        return Value::Error(e);
+    }
+    let x_at = match coerce_to_number(&xv) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    let (ys, _y_vertical) = match extract_known_y(&args[1], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    let m_x = match arg_to_f64_matrix(&args[2], provider) {
+        Ok(m) if !m.is_empty() => m,
+        Ok(_) => return Value::Error(ValueError::InvalidValue),
+        Err(e) => return Value::Error(e),
+    };
+    let xs_vec = match matrix_to_vector_strict(&m_x) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if xs_vec.len() != ys.len() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let xs: Vec<Vec<f64>> = xs_vec.iter().map(|x| vec![*x]).collect();
+    let fit = match linreg_core(&xs, &ys, true) {
+        Ok(f) => f,
+        Err(e) => return Value::Error(e),
+    };
+    let m1 = fit.slopes.first().copied().unwrap_or(0.0);
+    Value::Number(fit.intercept + m1 * x_at)
+}
+
+/// STEYX(known_y, known_x). Standard error of the predicted y in a
+/// simple linear regression.
+fn fn_steyx(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_paired_numbers(&args[1], &args[0], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if pairs.len() < 3 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let n = pairs.len() as f64;
+    let mx = pairs.iter().map(|(x, _)| *x).sum::<f64>() / n;
+    let my = pairs.iter().map(|(_, y)| *y).sum::<f64>() / n;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    let mut sxy = 0.0;
+    for (x, y) in &pairs {
+        let dx = *x - mx;
+        let dy = *y - my;
+        sxx += dx * dx;
+        syy += dy * dy;
+        sxy += dx * dy;
+    }
+    if sxx == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let val = ((syy - sxy * sxy / sxx) / (n - 2.0)).max(0.0);
+    Value::Number(val.sqrt())
+}
+
+/// RSQ(known_y, known_x). Pearson R² — square of the correlation.
+fn fn_rsq(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_paired_numbers(&args[0], &args[1], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if pairs.len() < 2 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let n = pairs.len() as f64;
+    let mx = pairs.iter().map(|(x, _)| *x).sum::<f64>() / n;
+    let my = pairs.iter().map(|(_, y)| *y).sum::<f64>() / n;
+    let mut sxy = 0.0;
+    let mut sxx = 0.0;
+    let mut syy = 0.0;
+    for (x, y) in &pairs {
+        let dx = *x - mx;
+        let dy = *y - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    let denom = sxx * syy;
+    if denom == 0.0 || !denom.is_finite() {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    Value::Number((sxy * sxy) / denom)
+}
+
+/// MMULT(array1, array2). Matrix product (a×b)·(b×c) → (a×c).
+fn fn_mmult(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let a = match arg_to_f64_matrix(&args[0], provider) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let b = match arg_to_f64_matrix(&args[1], provider) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    if a.is_empty() || b.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let ra = a.len();
+    let ca = a[0].len();
+    let rb = b.len();
+    let cb = b[0].len();
+    if ca != rb {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let total = (ra as u64).checked_mul(cb as u64).unwrap_or(u64::MAX);
+    if total > 1_048_576 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut data: Vec<Value> = Vec::with_capacity(ra * cb);
+    for r in 0..ra {
+        for c in 0..cb {
+            let mut s = 0.0;
+            for k in 0..ca {
+                s += a[r][k] * b[k][c];
+            }
+            if !s.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            data.push(Value::Number(s));
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(ra as u32, cb as u32, data)))
+}
+
+/// MINVERSE(square_array). Inverse via Gauss-Jordan with partial pivoting.
+fn fn_minverse(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let m = match arg_to_f64_matrix(&args[0], provider) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(e),
+    };
+    let n = m.len();
+    if n == 0 || m.iter().any(|r| r.len() != n) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    if n > 100 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let inv = match matrix_inverse_inplace(m) {
+        Ok(i) => i,
+        Err(e) => return Value::Error(e),
+    };
+    let mut data: Vec<Value> = Vec::with_capacity(n * n);
+    for r in 0..n {
+        for c in 0..n {
+            data.push(Value::Number(inv[r][c]));
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(n as u32, n as u32, data)))
+}
+
+/// MUNIT(n). Identity matrix of size n×n.
+fn fn_munit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) if n >= 1.0 => n.trunc() as u32,
+        _ => return Value::Error(ValueError::InvalidValue),
+    };
+    if (n as u64) * (n as u64) > 1_048_576 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut data: Vec<Value> = Vec::with_capacity((n as usize) * (n as usize));
+    for r in 0..n {
+        for c in 0..n {
+            data.push(Value::Number(if r == c { 1.0 } else { 0.0 }));
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(n, n, data)))
+}
+
+/// TRANSPOSE(array). Swap rows and columns. Preserves cell-error /
+/// type cells verbatim (no numeric coercion required).
+fn fn_transpose(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    if rows == 0 || cols == 0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let total = (rows as u64) * (cols as u64);
+    if total > 1_048_576 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut out: Vec<Value> = vec![Value::Null; (rows as usize) * (cols as usize)];
+    // Source idx = r * cols + c; dest idx (in cols × rows) = c * rows + r.
+    for r in 0..rows as usize {
+        for c in 0..cols as usize {
+            let src = r * (cols as usize) + c;
+            let dst = c * (rows as usize) + r;
+            out[dst] = data[src].clone();
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(cols, rows, out)))
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -33012,6 +33903,119 @@ mod tests {
         }
     }
 
+    // ---- P batch: regression + matrix algebra ------------------------
+    //
+    // The cell-level layout used by `make_math_env` (A=1..5, B=2*A) lets
+    // us exercise the linear-regression family directly: slope = 2,
+    // intercept = 0 on a perfect fit. Matrix-shaped scenarios live in
+    // the dedicated `regression_matrix.rs` integration test file.
+
+    #[test]
+    fn eval_linest_perfect_line_returns_slope_and_intercept() {
+        let (cm, vs) = make_math_env();
+        // y = 2x, x = 1..5. Slope 2, intercept 0.
+        match eval_str("=LINEST(B1:B5, A1:A5)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                if let Some(Value::Number(slope)) = arr.get(0, 0) {
+                    assert!((slope - 2.0).abs() < 1e-9, "slope {}", slope);
+                } else {
+                    panic!("expected number slope, got {:?}", arr.get(0, 0));
+                }
+                if let Some(Value::Number(b)) = arr.get(0, 1) {
+                    assert!(b.abs() < 1e-9, "intercept {}", b);
+                } else {
+                    panic!("expected number intercept, got {:?}", arr.get(0, 1));
+                }
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_linest_stats_block_shape_is_5_x_kplus1() {
+        let (cm, vs) = make_math_env();
+        match eval_str("=LINEST(B1:B5, A1:A5, TRUE, TRUE)", &cm, &vs) {
+            Value::Array(arr) => assert_eq!(arr.shape(), (5, 2)),
+            other => panic!("expected 5x2 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_linest_wrong_arg_count_surfaces_error() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=LINEST()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_forecast_predicts_on_perfect_line() {
+        let (cm, vs) = make_math_env();
+        // y = 2x → at x=10, y=20.
+        assert_eq!(
+            eval_str("=FORECAST(10, B1:B5, A1:A5)", &cm, &vs),
+            Value::Number(20.0)
+        );
+    }
+
+    #[test]
+    fn eval_forecast_linear_alias() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=FORECAST.LINEAR(10, B1:B5, A1:A5)", &cm, &vs),
+            Value::Number(20.0)
+        );
+    }
+
+    #[test]
+    fn eval_trend_predicts_at_training_points() {
+        let (cm, vs) = make_math_env();
+        match eval_str("=TREND(B1:B5, A1:A5)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (5, 1));
+                if let Some(Value::Number(n)) = arr.get(0, 0) {
+                    assert!((n - 2.0).abs() < 1e-9);
+                }
+                if let Some(Value::Number(n)) = arr.get(4, 0) {
+                    assert!((n - 10.0).abs() < 1e-9);
+                }
+            }
+            other => panic!("expected 5x1 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_growth_recovers_exponential_at_training_points() {
+        // y = 2^x at x = 1..4.
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let mut next = 0u64;
+        for (i, (x, y)) in [(1.0, 2.0), (2.0, 4.0), (3.0, 8.0), (4.0, 16.0)]
+            .iter()
+            .enumerate()
+        {
+            let xa = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(i as u32, 0), xa);
+            vs.insert(xa, Value::Number(*x));
+            let ya = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(i as u32, 1), ya);
+            vs.insert(ya, Value::Number(*y));
+        }
+        match eval_str("=GROWTH(B1:B4, A1:A4)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (4, 1));
+                if let Some(Value::Number(n)) = arr.get(3, 0) {
+                    assert!((n - 16.0).abs() < 1e-7);
+                }
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
     #[test]
     fn eval_chisq_test_shape_mismatch_is_error() {
         let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
@@ -33034,6 +34038,80 @@ mod tests {
     }
 
     #[test]
+    fn eval_steyx_perfect_fit_is_zero() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=STEYX(B1:B5, A1:A5)", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    #[test]
+    fn eval_steyx_arg_count() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=STEYX(B1:B5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_rsq_perfect_correlation_is_one() {
+        let (cm, vs) = make_math_env();
+        match eval_str("=RSQ(B1:B5, A1:A5)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            other => panic!("expected 1.0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_pearson_matches_correl() {
+        let (cm, vs) = make_math_env();
+        let p = eval_str("=PEARSON(B1:B5, A1:A5)", &cm, &vs);
+        let c = eval_str("=CORREL(B1:B5, A1:A5)", &cm, &vs);
+        match (p, c) {
+            (Value::Number(pp), Value::Number(cc)) => assert!((pp - cc).abs() < 1e-12),
+            other => panic!("expected matching scalars, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_pearson_arg_count() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=PEARSON()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_mmult_2x2_correctness() {
+        let (cm, vs) = make_math_env();
+        // E1:F2 = [[1,2],[3,4]] (already populated by make_math_env).
+        // Multiply by itself: [[7,10],[15,22]].
+        match eval_str("=MMULT(E1:F2, E1:F2)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(7.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(10.0)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(15.0)));
+                assert_eq!(arr.get(1, 1), Some(&Value::Number(22.0)));
+            }
+            other => panic!("expected 2x2 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_mmult_dimension_mismatch() {
+        let (cm, vs) = make_math_env();
+        // 2×2 * 1×5 → inner mismatch (2 ≠ 1).
+        assert_eq!(
+            eval_str("=MMULT(E1:F2, B1:B5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn eval_searchb_case_insensitive() {
         // SEARCHB ignores case; "B" matches "b" at byte 2.
         assert_eq!(ev(r#"=SEARCHB("B", "abc")"#), Value::Number(2.0));
@@ -33046,6 +34124,50 @@ mod tests {
     fn eval_searchb_not_found() {
         assert_eq!(
             ev(r#"=SEARCHB("x", "abc")"#),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_minverse_2x2_correctness() {
+        let (cm, vs) = make_math_env();
+        // [[1,2],[3,4]] → [[-2, 1], [1.5, -0.5]]
+        match eval_str("=MINVERSE(E1:F2)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 2));
+                if let Some(Value::Number(n)) = arr.get(0, 0) {
+                    assert!((n - (-2.0)).abs() < 1e-9, "got {}", n);
+                }
+                if let Some(Value::Number(n)) = arr.get(1, 1) {
+                    assert!((n - (-0.5)).abs() < 1e-9, "got {}", n);
+                }
+            }
+            other => panic!("expected 2x2 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_munit_3_is_identity() {
+        let (cm, vs) = make_math_env();
+        match eval_str("=MUNIT(3)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (3, 3));
+                for r in 0..3 {
+                    for c in 0..3 {
+                        let expected = if r == c { 1.0 } else { 0.0 };
+                        assert_eq!(arr.get(r, c), Some(&Value::Number(expected)));
+                    }
+                }
+            }
+            other => panic!("expected 3x3 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_munit_zero_is_value_error() {
+        let (cm, vs) = make_math_env();
+        assert_eq!(
+            eval_str("=MUNIT(0)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
     }
@@ -33164,6 +34286,22 @@ mod tests {
         match eval_str("=COVARIANCE.S(A1:B1, A2:B2)", &cm, &vs) {
             Value::Number(n) => assert!((n - 2.0).abs() < 1e-9),
             other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_transpose_2x2_swaps_off_diagonals() {
+        let (cm, vs) = make_math_env();
+        // E1:F2 = [[1,2],[3,4]] → transpose [[1,3],[2,4]].
+        match eval_str("=TRANSPOSE(E1:F2)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(3.0)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(2.0)));
+                assert_eq!(arr.get(1, 1), Some(&Value::Number(4.0)));
+            }
+            other => panic!("expected 2x2 Array, got {:?}", other),
         }
     }
 
@@ -33825,6 +34963,19 @@ mod tests {
                 "{} should be a builtin",
                 name
             );
+        }
+    }
+
+    #[test]
+    fn eval_transpose_row_to_column() {
+        let (cm, vs) = make_math_env();
+        // A1:A5 (5 rows × 1 col) → transpose 1 × 5.
+        match eval_str("=TRANSPOSE(A1:A5)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 5));
+                assert_eq!(arr.get(0, 4), Some(&Value::Number(5.0)));
+            }
+            other => panic!("expected 1x5 Array, got {:?}", other),
         }
     }
 

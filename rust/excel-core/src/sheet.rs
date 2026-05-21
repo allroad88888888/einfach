@@ -3325,6 +3325,14 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
                     | "TOROW"
                     | "TOCOL"
                     | "TEXTSPLIT"
+                    | "LINEST"
+                    | "LOGEST"
+                    | "TREND"
+                    | "GROWTH"
+                    | "MMULT"
+                    | "MINVERSE"
+                    | "MUNIT"
+                    | "TRANSPOSE"
             ) {
                 return true;
             }
