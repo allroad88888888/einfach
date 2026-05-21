@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use einfach_core::{AtomId, Value, ValueError};
+use einfach_core::{ArrayData, AtomId, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
@@ -426,6 +427,51 @@ fn lookup_2d(
     };
     cell.cloned()
         .unwrap_or(Value::Error(ValueError::InvalidRef))
+}
+
+/// Materialize a function argument as a row-major 2D buffer plus shape.
+/// Accepts:
+///   - `Expr::Range` / `Expr::SheetRange` — collected via the provider.
+///   - `OFFSET(...)` — evaluated to a runtime range, then collected.
+///   - Anything else — evaluated to a scalar `Value`; a `Value::Array`
+///     result returns its shape and data directly, everything else
+///     becomes a 1×1 buffer.
+///
+/// Returns `Err(InvalidValue)` only for ranges whose nominal rectangle
+/// exceeds Excel max bounds (full-column / full-row sentinels). Range
+/// extraction failures from the provider yield empty grids rather than
+/// errors, matching the rest of eval.rs's range-handling.
+fn arg_to_2d(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<(u32, u32, Vec<Value>), ValueError> {
+    // Range-shaped argument (literal range or OFFSET).
+    if let Some(grid) = collect_range_2d_for_arg(arg, provider) {
+        if grid.is_empty() {
+            // Either an over-bound sentinel range or a 0-row collection.
+            // Treat as a 0×0 buffer; callers reject empty arrays as
+            // InvalidValue at their own discretion.
+            return Ok((0, 0, Vec::new()));
+        }
+        let rows = grid.len() as u32;
+        let cols = grid[0].len() as u32;
+        let mut data: Vec<Value> = Vec::with_capacity(grid.len() * (cols as usize));
+        for row in grid {
+            data.extend(row);
+        }
+        return Ok((rows, cols, data));
+    }
+    // Non-range argument: evaluate to a value. Array → expand. Scalar → 1×1.
+    let v = eval_expr_with_provider(arg, provider);
+    match v {
+        Value::Array(arr) => {
+            let (rows, cols) = arr.shape();
+            let data = arr.data.clone();
+            Ok((rows, cols, data))
+        }
+        Value::Error(e) => Err(e),
+        other => Ok((1, 1, vec![other])),
+    }
 }
 
 fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
@@ -5416,6 +5462,365 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 None => return Value::Error(ValueError::WrongType),
             };
             Value::Number(iso_week_number(serial) as f64)
+        }
+
+        // === Dynamic-array (spill) functions ===
+        // Each returns `Value::Array(Arc::new(ArrayData::new(...)))`; the
+        // Sheet layer detects Array results and registers a spill range.
+
+        // SEQUENCE(rows[, cols[, start[, step]]]) — Build a numeric grid of
+        // the given shape with values `start + (i*cols + j) * step`.
+        // note: hard-capped at 1_048_576 total elements (matches Excel's
+        // worksheet row count); larger requests surface #VALUE! rather
+        // than attempt the allocation.
+        "SEQUENCE" => {
+            if args.is_empty() || args.len() > 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // rows
+            let rows_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = rows_v {
+                return Value::Error(e);
+            }
+            let rows = match coerce_to_number(&rows_v) {
+                Some(n) if n >= 1.0 => n.trunc() as u64,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            // cols
+            let cols = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u64,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u64
+            };
+            // start
+            let start = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                1.0
+            };
+            // step
+            let step = if args.len() == 4 {
+                let v = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                1.0
+            };
+            // Cap total elements to keep allocations bounded.
+            let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let rows = rows as u32;
+            let cols = cols as u32;
+            let mut data: Vec<Value> = Vec::with_capacity(total as usize);
+            for i in 0..rows {
+                for j in 0..cols {
+                    let idx = (i as u64) * (cols as u64) + (j as u64);
+                    data.push(Value::Number(start + (idx as f64) * step));
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, cols, data)))
+        }
+
+        // UNIQUE(array[, by_col[, exactly_once]]) — Deduplicate rows (or
+        // columns, when `by_col`). When `exactly_once`, drop anything that
+        // appears more than once. Empty result (all dropped) → #VALUE!.
+        "UNIQUE" => {
+            if args.is_empty() || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let by_col = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            let exactly_once = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Pull each unit (row or column) into a Vec<Value> for compare.
+            let unit = |i: u32| -> Vec<Value> {
+                if by_col {
+                    (0..rows)
+                        .map(|r| {
+                            data[(r as usize) * (cols as usize) + (i as usize)].clone()
+                        })
+                        .collect()
+                } else {
+                    (0..cols)
+                        .map(|c| {
+                            data[(i as usize) * (cols as usize) + (c as usize)].clone()
+                        })
+                        .collect()
+                }
+            };
+            let units = if by_col { cols } else { rows };
+            // First pass: count duplicates (for `exactly_once`).
+            // Element-wise equality on Vec<Value> uses `values_equal`.
+            let vec_eq = |a: &Vec<Value>, b: &Vec<Value>| -> bool {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| values_equal(x, y))
+            };
+            // Build (unique_unit, count) list, preserving first-seen order.
+            let mut buckets: Vec<(Vec<Value>, u32)> = Vec::new();
+            for i in 0..units {
+                let u = unit(i);
+                if let Some(slot) = buckets.iter_mut().find(|(b, _)| vec_eq(b, &u)) {
+                    slot.1 += 1;
+                } else {
+                    buckets.push((u, 1));
+                }
+            }
+            // Filter per `exactly_once`.
+            let keep: Vec<&Vec<Value>> = buckets
+                .iter()
+                .filter(|(_, c)| if exactly_once { *c == 1 } else { true })
+                .map(|(u, _)| u)
+                .collect();
+            if keep.is_empty() {
+                // Excel surfaces #CALC! here. We don't have CALC; use
+                // InvalidValue (#VALUE!) so the test signal is unambiguous.
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Re-assemble.
+            if by_col {
+                // Output shape: rows × keep.len()
+                let out_cols = keep.len() as u32;
+                let mut out: Vec<Value> = Vec::with_capacity((rows as usize) * keep.len());
+                for r in 0..rows {
+                    for u in &keep {
+                        out.push(u[r as usize].clone());
+                    }
+                }
+                Value::Array(Arc::new(ArrayData::new(rows, out_cols, out)))
+            } else {
+                let out_rows = keep.len() as u32;
+                let mut out: Vec<Value> = Vec::with_capacity(keep.len() * (cols as usize));
+                for u in &keep {
+                    out.extend(u.iter().cloned());
+                }
+                Value::Array(Arc::new(ArrayData::new(out_rows, cols, out)))
+            }
+        }
+
+        // SORT(array[, sort_index[, sort_order[, by_col]]]) — Sort rows by
+        // column `sort_index` (default 1) ascending (1) or descending (-1).
+        // When `by_col=TRUE`, sort columns by row `sort_index` instead.
+        "SORT" => {
+            if args.is_empty() || args.len() > 4 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let sort_index = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u32,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u32
+            };
+            let sort_order = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n == 1.0 => 1i32,
+                    Some(n) if n == -1.0 => -1i32,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1i32
+            };
+            let by_col = if args.len() == 4 {
+                let v = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Range check on sort_index.
+            if by_col {
+                if sort_index > rows {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            } else if sort_index > cols {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Build indices and sort by the key. Stable sort via Vec::sort_by.
+            if by_col {
+                // Sort columns by row (sort_index - 1).
+                let key_row = (sort_index - 1) as usize;
+                let mut order: Vec<u32> = (0..cols).collect();
+                // Propagate any errors found in the key row.
+                for &c in order.iter() {
+                    let v = &data[key_row * (cols as usize) + (c as usize)];
+                    if let Value::Error(e) = v {
+                        return Value::Error(e.clone());
+                    }
+                }
+                order.sort_by(|&a, &b| {
+                    let va = &data[key_row * (cols as usize) + (a as usize)];
+                    let vb = &data[key_row * (cols as usize) + (b as usize)];
+                    let c = compare_lookup(va, vb);
+                    if sort_order == -1 { c.reverse() } else { c }
+                });
+                let mut out: Vec<Value> = Vec::with_capacity(data.len());
+                for r in 0..rows {
+                    for &c in &order {
+                        out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                    }
+                }
+                Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+            } else {
+                // Sort rows by column (sort_index - 1).
+                let key_col = (sort_index - 1) as usize;
+                let mut order: Vec<u32> = (0..rows).collect();
+                for &r in order.iter() {
+                    let v = &data[(r as usize) * (cols as usize) + key_col];
+                    if let Value::Error(e) = v {
+                        return Value::Error(e.clone());
+                    }
+                }
+                order.sort_by(|&a, &b| {
+                    let va = &data[(a as usize) * (cols as usize) + key_col];
+                    let vb = &data[(b as usize) * (cols as usize) + key_col];
+                    let c = compare_lookup(va, vb);
+                    if sort_order == -1 { c.reverse() } else { c }
+                });
+                let mut out: Vec<Value> = Vec::with_capacity(data.len());
+                for &r in &order {
+                    for c in 0..cols {
+                        out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                    }
+                }
+                Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+            }
+        }
+
+        // FILTER(array, include[, if_empty]) — Keep rows where include's
+        // matching element is truthy (column-vector include with rows ==
+        // array.rows) OR keep columns (row-vector include with cols ==
+        // array.cols). Empty result → if_empty (1x1 array) or #VALUE!.
+        "FILTER" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (irows, icols, idata) = match arg_to_2d(&args[1], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            // include must be either column-vector (irows == rows && icols == 1)
+            // OR row-vector (icols == cols && irows == 1).
+            let filter_rows: bool;
+            if irows == rows && icols == 1 {
+                filter_rows = true;
+            } else if icols == cols && irows == 1 {
+                filter_rows = false;
+            } else {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Decode include into bool, propagating errors / type mismatches.
+            let mut mask: Vec<bool> = Vec::with_capacity(idata.len());
+            for v in &idata {
+                if let Value::Error(e) = v {
+                    return Value::Error(e.clone());
+                }
+                // Treat Null as FALSE so a sparse include vector silently
+                // drops the matching rows/cols (matches Excel behavior).
+                if matches!(v, Value::Null) {
+                    mask.push(false);
+                    continue;
+                }
+                match coerce_to_bool(v) {
+                    Some(b) => mask.push(b),
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            }
+            let kept: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &b)| if b { Some(i) } else { None })
+                .collect();
+            if kept.is_empty() {
+                if args.len() == 3 {
+                    let v = eval_expr_with_provider(&args[2], provider);
+                    // Wrap whatever it is in a 1×1 array. Errors flow through
+                    // as the array element (Excel parity: =FILTER(...,error)
+                    // surfaces the error inside the spill).
+                    return Value::Array(Arc::new(ArrayData::new(1, 1, vec![v])));
+                }
+                return Value::Error(ValueError::InvalidValue);
+            }
+            if filter_rows {
+                let out_rows = kept.len() as u32;
+                let mut out: Vec<Value> = Vec::with_capacity(kept.len() * (cols as usize));
+                for &r in &kept {
+                    let base = r * (cols as usize);
+                    out.extend(data[base..base + (cols as usize)].iter().cloned());
+                }
+                Value::Array(Arc::new(ArrayData::new(out_rows, cols, out)))
+            } else {
+                let out_cols = kept.len() as u32;
+                let mut out: Vec<Value> = Vec::with_capacity((rows as usize) * kept.len());
+                for r in 0..rows {
+                    for &c in &kept {
+                        out.push(data[(r as usize) * (cols as usize) + c].clone());
+                    }
+                }
+                Value::Array(Arc::new(ArrayData::new(rows, out_cols, out)))
+            }
         }
 
         _ => Value::Error(ValueError::InvalidName),
@@ -15943,4 +16348,421 @@ mod tests {
         );
     }
 
+    // === Dynamic-array (spill) functions ===
+
+    /// Helper: extract `(rows, cols, data)` from a `Value::Array` result
+    /// or panic with a useful message. Mirrors the helpers in
+    /// `tests/spill_infra.rs`.
+    fn unwrap_array(v: Value) -> (u32, u32, Vec<Value>) {
+        match v {
+            Value::Array(arr) => {
+                let (r, c) = arr.shape();
+                (r, c, arr.data.clone())
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    // --- SEQUENCE ---
+
+    #[test]
+    fn eval_sequence_5() {
+        let (cm, vs) = make_test_env();
+        let (r, c, data) = unwrap_array(eval_str("=SEQUENCE(5)", &cm, &vs));
+        assert_eq!((r, c), (5, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sequence_2_by_3() {
+        let (cm, vs) = make_test_env();
+        let (r, c, data) = unwrap_array(eval_str("=SEQUENCE(2,3)", &cm, &vs));
+        assert_eq!((r, c), (2, 3));
+        // Row-major: [1,2,3, 4,5,6].
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sequence_start_step() {
+        let (cm, vs) = make_test_env();
+        let (r, c, data) = unwrap_array(eval_str("=SEQUENCE(3, 1, 10, 2)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(10.0), Value::Number(12.0), Value::Number(14.0)]
+        );
+    }
+
+    #[test]
+    fn eval_sequence_zero_rows_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SEQUENCE(0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_sequence_over_cap_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SEQUENCE(2000000)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_sequence_no_args_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SEQUENCE()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // --- UNIQUE ---
+    //
+    // No `={...}` literal-array syntax in Phase 3 — drive UNIQUE inputs
+    // through cell ranges so the surrounding test fixture stays the
+    // same shape as the rest of the eval suite.
+
+    fn make_unique_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // A1..A5 = [1, 2, 2, 3, 1] → single-column dedupe case.
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        for (row, n) in [1.0, 2.0, 2.0, 3.0, 1.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cell_map.insert(CellAddress::new(row as u32, 0), id);
+            values.insert(id, Value::Number(*n));
+        }
+        (cell_map, values)
+    }
+
+    #[test]
+    fn eval_unique_single_column_dedupes() {
+        let (cm, vs) = make_unique_env();
+        let (r, c, data) = unwrap_array(eval_str("=UNIQUE(A1:A5)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]
+        );
+    }
+
+    #[test]
+    fn eval_unique_2d_row_dedupe() {
+        // Build a 3x2 grid where rows 0 and 2 are identical.
+        //   A1=1 B1=2
+        //   A2=3 B2=4
+        //   A3=1 B3=2
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let rows = [[1.0, 2.0], [3.0, 4.0], [1.0, 2.0]];
+        let mut next = 0u64;
+        for (r, row) in rows.iter().enumerate() {
+            for (c, &n) in row.iter().enumerate() {
+                let id = AtomId::from_raw(next);
+                next += 1;
+                cell_map.insert(CellAddress::new(r as u32, c as u32), id);
+                values.insert(id, Value::Number(n));
+            }
+        }
+        let (out_r, out_c, data) = unwrap_array(eval_str("=UNIQUE(A1:B3)", &cell_map, &values));
+        assert_eq!((out_r, out_c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_unique_by_col() {
+        // 2x3 grid where cols 0 and 2 are identical.
+        //   A1=1 B1=2 C1=1
+        //   A2=3 B2=4 C2=3
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let grid = [[1.0, 2.0, 1.0], [3.0, 4.0, 3.0]];
+        let mut next = 0u64;
+        for (r, row) in grid.iter().enumerate() {
+            for (c, &n) in row.iter().enumerate() {
+                let id = AtomId::from_raw(next);
+                next += 1;
+                cell_map.insert(CellAddress::new(r as u32, c as u32), id);
+                values.insert(id, Value::Number(n));
+            }
+        }
+        let (out_r, out_c, data) =
+            unwrap_array(eval_str("=UNIQUE(A1:C2, TRUE)", &cell_map, &values));
+        assert_eq!((out_r, out_c), (2, 2));
+        // Row-major output: col 0 then col 1 (the originals minus the dup).
+        // First seen: [1, 2], so kept cols are [1, 2].
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_unique_exactly_once_drops_duplicates() {
+        let (cm, vs) = make_unique_env();
+        let (r, c, data) = unwrap_array(eval_str("=UNIQUE(A1:A5, FALSE, TRUE)", &cm, &vs));
+        // Input: [1, 2, 2, 3, 1]. Counts: 1→2, 2→2, 3→1. Only 3 appears
+        // exactly once → keep only [3].
+        assert_eq!((r, c), (1, 1));
+        assert_eq!(data, vec![Value::Number(3.0)]);
+    }
+
+    #[test]
+    fn eval_unique_exactly_once_all_dropped_invalid() {
+        // Build a column where everything is duplicated → exactly_once
+        // drops everything → InvalidValue.
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        for (row, n) in [1.0, 2.0, 1.0, 2.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cell_map.insert(CellAddress::new(row as u32, 0), id);
+            values.insert(id, Value::Number(*n));
+        }
+        assert_eq!(
+            eval_str("=UNIQUE(A1:A4, FALSE, TRUE)", &cell_map, &values),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // --- SORT ---
+
+    fn make_sort_env_1d() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // A1..A3 = [3, 1, 2].
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        for (row, n) in [3.0, 1.0, 2.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cell_map.insert(CellAddress::new(row as u32, 0), id);
+            values.insert(id, Value::Number(*n));
+        }
+        (cell_map, values)
+    }
+
+    #[test]
+    fn eval_sort_ascending_default() {
+        let (cm, vs) = make_sort_env_1d();
+        let (r, c, data) = unwrap_array(eval_str("=SORT(A1:A3)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]
+        );
+    }
+
+    #[test]
+    fn eval_sort_descending() {
+        let (cm, vs) = make_sort_env_1d();
+        let (r, c, data) = unwrap_array(eval_str("=SORT(A1:A3, 1, -1)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(3.0), Value::Number(2.0), Value::Number(1.0)]
+        );
+    }
+
+    #[test]
+    fn eval_sort_multi_column_by_column_2() {
+        // 2x2 grid: row 0 = ["b", 1], row 1 = ["a", 2]
+        // Sort by column 2 ascending → row order [0, 1] (1 < 2) → unchanged.
+        // Sort by column 2 descending → row order [1, 0].
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let b1 = AtomId::from_raw(1);
+        let a2 = AtomId::from_raw(2);
+        let b2 = AtomId::from_raw(3);
+        cell_map.insert(CellAddress::new(0, 0), a1);
+        cell_map.insert(CellAddress::new(0, 1), b1);
+        cell_map.insert(CellAddress::new(1, 0), a2);
+        cell_map.insert(CellAddress::new(1, 1), b2);
+        values.insert(a1, Value::Text("b".into()));
+        values.insert(b1, Value::Number(1.0));
+        values.insert(a2, Value::Text("a".into()));
+        values.insert(b2, Value::Number(2.0));
+
+        let (r, c, data) = unwrap_array(eval_str("=SORT(A1:B2, 2, -1)", &cell_map, &values));
+        assert_eq!((r, c), (2, 2));
+        // Descending by col 2 → row 1 first (2), then row 0 (1).
+        assert_eq!(
+            data,
+            vec![
+                Value::Text("a".into()),
+                Value::Number(2.0),
+                Value::Text("b".into()),
+                Value::Number(1.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sort_invalid_order() {
+        let (cm, vs) = make_sort_env_1d();
+        assert_eq!(
+            eval_str("=SORT(A1:A3, 1, 99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_sort_invalid_sort_index() {
+        let (cm, vs) = make_sort_env_1d();
+        // sort_index = 99 > cols (1) → InvalidValue.
+        assert_eq!(
+            eval_str("=SORT(A1:A3, 99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // --- FILTER ---
+
+    fn make_filter_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // A1..A4 = [10, 20, 30, 40] (the array).
+        // B1..B4 = [TRUE, FALSE, TRUE, FALSE] (the include mask).
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        for (row, n) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cell_map.insert(CellAddress::new(row as u32, 0), id);
+            values.insert(id, Value::Number(*n));
+        }
+        for (row, b) in [true, false, true, false].iter().enumerate() {
+            let id = AtomId::from_raw(100 + row as u64);
+            cell_map.insert(CellAddress::new(row as u32, 1), id);
+            values.insert(id, Value::Boolean(*b));
+        }
+        (cell_map, values)
+    }
+
+    #[test]
+    fn eval_filter_basic() {
+        let (cm, vs) = make_filter_env();
+        let (r, c, data) = unwrap_array(eval_str("=FILTER(A1:A4, B1:B4)", &cm, &vs));
+        assert_eq!((r, c), (2, 1));
+        assert_eq!(data, vec![Value::Number(10.0), Value::Number(30.0)]);
+    }
+
+    #[test]
+    fn eval_filter_all_false_no_if_empty_invalid() {
+        // Mask: A1..A4 = [10, 20, 30, 40], include: B1..B4 = [FALSE,FALSE,FALSE,FALSE].
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        for (row, n) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cm.insert(CellAddress::new(row as u32, 0), id);
+            vs.insert(id, Value::Number(*n));
+        }
+        for row in 0..4 {
+            let id = AtomId::from_raw(100 + row as u64);
+            cm.insert(CellAddress::new(row, 1), id);
+            vs.insert(id, Value::Boolean(false));
+        }
+        assert_eq!(
+            eval_str("=FILTER(A1:A4, B1:B4)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_filter_all_false_with_if_empty() {
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        for (row, n) in [10.0, 20.0, 30.0, 40.0].iter().enumerate() {
+            let id = AtomId::from_raw(row as u64);
+            cm.insert(CellAddress::new(row as u32, 0), id);
+            vs.insert(id, Value::Number(*n));
+        }
+        for row in 0..4 {
+            let id = AtomId::from_raw(100 + row as u64);
+            cm.insert(CellAddress::new(row, 1), id);
+            vs.insert(id, Value::Boolean(false));
+        }
+        let (r, c, data) =
+            unwrap_array(eval_str("=FILTER(A1:A4, B1:B4, \"none\")", &cm, &vs));
+        assert_eq!((r, c), (1, 1));
+        assert_eq!(data, vec![Value::Text("none".into())]);
+    }
+
+    #[test]
+    fn eval_filter_shape_mismatch() {
+        let (cm, vs) = make_filter_env();
+        // Use a 3-row mask against a 4-row array — neither a row-vector
+        // (B1:B1, cols=2) nor a column-vector (B1:B3, rows=3 ≠ 4) shape
+        // matches; expect InvalidValue.
+        assert_eq!(
+            eval_str("=FILTER(A1:A4, B1:B3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_filter_row_vector_filters_columns() {
+        // 2x3 array, 1x3 include vector → keep matching columns.
+        //   A1=1 B1=2 C1=3
+        //   A2=4 B2=5 C2=6
+        //   A3=TRUE B3=FALSE C3=TRUE (include row)
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let mut next = 0u64;
+        for (r, row) in [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]].iter().enumerate() {
+            for (c, &n) in row.iter().enumerate() {
+                let id = AtomId::from_raw(next);
+                next += 1;
+                cm.insert(CellAddress::new(r as u32, c as u32), id);
+                vs.insert(id, Value::Number(n));
+            }
+        }
+        // Row 2 (zero-indexed) is the include row.
+        for (c, b) in [true, false, true].iter().enumerate() {
+            let id = AtomId::from_raw(200 + c as u64);
+            cm.insert(CellAddress::new(2, c as u32), id);
+            vs.insert(id, Value::Boolean(*b));
+        }
+        let (r, c, data) = unwrap_array(eval_str("=FILTER(A1:C2, A3:C3)", &cm, &vs));
+        assert_eq!((r, c), (2, 2));
+        // Keep cols 0 and 2 of each row.
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
 }

@@ -1255,6 +1255,172 @@ impl Sheet {
         }
     }
 
+    /// Install (or refresh) a primitive anchor atom holding `arr` at
+    /// `addr` for a formula whose latest result was `Value::Array(arr)`.
+    /// The formula record at `addr` is preserved — only the primitive
+    /// atom in `self.cells[addr]` is created / updated to mirror the
+    /// formula's array result, so spilled derived atoms have a
+    /// dependency-tracked source to read.
+    ///
+    /// On spill collision the anchor primitive atom is set to
+    /// `Value::Error(Spill)` (sheet-level read of `addr` still goes
+    /// through the formula cache and surfaces the Array — but the
+    /// returned `Err(Spill)` signals the caller that they should NOT
+    /// trust the Array result; the eager re-eval path overwrites the
+    /// formula cache with `#SPILL!` to keep Sheet-level reads honest).
+    ///
+    /// Returns `Ok(())` on clean install or `Err(ValueError::Spill)` on
+    /// collision. Other variants propagate from `register_spill`.
+    fn install_formula_spill(
+        &mut self,
+        addr: CellAddress,
+        arr: Arc<ArrayData>,
+    ) -> Result<(), ValueError> {
+        // Reuse the anchor primitive atom if it already exists (re-spill
+        // case — same address, shape may or may not differ). Otherwise
+        // create one. The atom holds `Value::Array` so the per-target
+        // derived atoms (installed below) can read it.
+        let anchor_atom = self.ensure_cell(addr);
+        self.attach_address_sub(addr);
+        self.store.set(anchor_atom, Value::Array(arr.clone()));
+        self.register_spill(addr, anchor_atom, &arr)
+    }
+
+    /// Eager re-eval + spill maintenance for a single formula cell.
+    /// Forces a recompute (bypassing the cache), then:
+    ///   - if the new result is `Value::Array` → install / refresh the
+    ///     spill anchor and derived targets via `install_formula_spill`.
+    ///     On collision, the formula cache is overwritten with
+    ///     `Value::Error(Spill)` so subsequent reads at `addr` surface
+    ///     `#SPILL!`.
+    ///   - if the new result is not an array → tear down any existing
+    ///     spill at `addr` (the formula previously produced an array).
+    ///
+    /// No-op for non-formula cells. Called from the mutation paths
+    /// (`try_set_formula`, `try_set_cell`, `clear_cell`) so dynamic-array
+    /// formulas re-spill synchronously on dependency changes — the
+    /// `Sheet::get_cell` lazy eval path can't mutate, so the spill
+    /// install has to happen here.
+    fn recompute_array_formula(&mut self, addr: CellAddress) {
+        // Snapshot whether this address previously held a spill anchor
+        // (in cells[addr] → spill_targets). Used to decide whether we
+        // need to tear down on a scalar result.
+        let prev_anchor_atom: Option<AtomId> = self
+            .cells
+            .get(&addr)
+            .copied()
+            .filter(|id| self.spill_targets.contains_key(id));
+
+        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+            // Not a formula cell — nothing to recompute.
+            return;
+        };
+
+        // Gate the eager re-eval: only formulas that *might* produce a
+        // `Value::Array` get this treatment. Scalar-only formulas stay
+        // fully lazy (preserves the lazy-eval debug counters and the
+        // existing dirty-count invariants).
+        if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
+            return;
+        }
+
+        // Mark dirty so eval_formula_at_with_provider re-runs (it bails
+        // early on `FormulaCache::Clean`).
+        *record.cache.borrow_mut() = FormulaCache::Dirty;
+
+        // Build a borrowing provider mirroring `peek_value`. We can't
+        // call `peek_value_with_provider` directly because it takes
+        // `&self`; we need `&mut self` after the eval to mutate the
+        // spill state. The pattern: scope the immutable borrow inside
+        // a block, extract the resulting value, then take &mut self.
+        let value = {
+            let provider = SheetEvalProvider {
+                sheet: &*self,
+                current_cell: Cell::new(None),
+            };
+            self.eval_formula_at_with_provider(addr, &provider)
+        };
+
+        match value {
+            Value::Array(arr) => {
+                // Tear down any previous spill at this address before
+                // re-installing (handles shape changes).
+                self.clear_spill_at_address(addr);
+                match self.install_formula_spill(addr, arr) {
+                    Ok(()) => {}
+                    Err(ValueError::Spill) => {
+                        // Overwrite the formula cache with #SPILL! so
+                        // Sheet-level reads surface the error. The
+                        // anchor primitive atom is already set to
+                        // Value::Error(Spill) by install_formula_spill's
+                        // error path? No — install_formula_spill leaves
+                        // the atom holding Value::Array on collision.
+                        // Fix that here:
+                        if let Some(&atom_id) = self.cells.get(&addr) {
+                            self.store.set(atom_id, Value::Error(ValueError::Spill));
+                        }
+                        if let Some(record) = self.formula_cells.get(&addr) {
+                            *record.cache.borrow_mut() =
+                                FormulaCache::Clean(Value::Error(ValueError::Spill));
+                        }
+                    }
+                    Err(other) => {
+                        if let Some(&atom_id) = self.cells.get(&addr) {
+                            self.store.set(atom_id, Value::Error(other.clone()));
+                        }
+                        if let Some(record) = self.formula_cells.get(&addr) {
+                            *record.cache.borrow_mut() =
+                                FormulaCache::Clean(Value::Error(other));
+                        }
+                    }
+                }
+                self.mark_dependents_dirty(addr);
+            }
+            _ => {
+                // Formula no longer produces an array — tear down any
+                // prior spill. If the cells[addr] primitive atom was the
+                // spill anchor, drop it so future reads go cleanly
+                // through the formula cache.
+                if prev_anchor_atom.is_some() {
+                    self.clear_spill_at_address(addr);
+                    if let Some(prim) = self.cells.remove(&addr) {
+                        if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
+                            self.store.destroy_atom(prim);
+                        }
+                    }
+                    // Re-attach the address subscription bucket to
+                    // whatever the cell is now (formula-only).
+                    self.attach_address_sub(addr);
+                    self.mark_dependents_dirty(addr);
+                }
+            }
+        }
+    }
+
+    /// Walk every dirty formula reachable from `root` and re-evaluate
+    /// it; for ones that produce / used to produce a `Value::Array`,
+    /// (re)install or tear down the spill via
+    /// `recompute_array_formula`. Called from the mutation paths after
+    /// `mark_dependents_dirty` so dependency changes propagate into the
+    /// spill state synchronously (the `&self` lazy-read path can't
+    /// install spills).
+    ///
+    /// Scope: addresses in `dependents`, plus `root` itself if it has a
+    /// formula record (the initial-install path also calls this to
+    /// catch the just-installed formula at `root`).
+    fn recompute_array_formulas_in(&mut self, addrs: &HashSet<CellAddress>) {
+        // Collect addresses to process — clone the addresses to avoid
+        // borrowing self while we mutate.
+        let candidates: Vec<CellAddress> = addrs
+            .iter()
+            .copied()
+            .filter(|a| self.formula_cells.contains_key(a))
+            .collect();
+        for a in candidates {
+            self.recompute_array_formula(a);
+        }
+    }
+
     /// Write a `Value::Array` to an anchor cell and install / re-install
     /// the spill range. On spill collision, the anchor is set to
     /// `Value::Error(Spill)` and no targets are installed.
@@ -1378,7 +1544,9 @@ impl Sheet {
                 self.try_release_primitive(addr);
             }
         }
-        self.mark_dependents_dirty(addr);
+        let dirtied = self.mark_dependents_dirty(addr);
+        // Eager spill maintenance for downstream array formulas.
+        self.recompute_array_formulas_in(&dirtied);
         Ok(())
     }
 
@@ -1515,7 +1683,13 @@ impl Sheet {
             sheet.formula_exprs.insert(addr, expr);
             sheet.formula_texts.insert(addr, formula_str.to_string());
         });
-        self.mark_dependents_dirty(addr);
+        let dirtied = self.mark_dependents_dirty(addr);
+        // Eager spill maintenance: re-evaluate the just-installed
+        // formula (and any downstream array formulas) and install /
+        // tear down spill state. The lazy `peek_value` read path can't
+        // mutate the sheet, so the spill install has to happen here.
+        self.recompute_array_formula(addr);
+        self.recompute_array_formulas_in(&dirtied);
         Ok(true)
     }
 
@@ -2930,6 +3104,33 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
             false
         }
+    }
+}
+
+/// Conservative static check: does this AST contain a call to a
+/// function that can produce a `Value::Array`? Used to gate the eager
+/// spill re-eval — formulas that can't produce arrays stay fully lazy
+/// and preserve the dirty-count / eval-count debug counters.
+///
+/// Currently any of SEQUENCE / UNIQUE / SORT / FILTER, or any function
+/// that itself receives an array-producing call as an argument
+/// (a `=SUM(SEQUENCE(5))`-shaped call needs to be detected so the array
+/// produced inside collapses naturally; the outer scalar function eats
+/// the array via `for_each_arg_value`, but the static check stays
+/// conservative and flags any nested occurrence).
+fn expr_may_produce_array(expr: &Expr) -> bool {
+    match expr {
+        Expr::FuncCall { name, args } => {
+            if matches!(name.as_str(), "SEQUENCE" | "UNIQUE" | "SORT" | "FILTER") {
+                return true;
+            }
+            args.iter().any(expr_may_produce_array)
+        }
+        Expr::BinOp { left, right, .. } => {
+            expr_may_produce_array(left) || expr_may_produce_array(right)
+        }
+        Expr::Negate(inner) => expr_may_produce_array(inner),
+        _ => false,
     }
 }
 
