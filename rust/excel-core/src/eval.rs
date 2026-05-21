@@ -651,6 +651,11 @@ pub trait EvalProvider {
     fn sheet_count(&self) -> usize {
         1
     }
+
+    // ===== EVAL_PROVIDER TRAIT METHODS: ADD NEW METHODS BEFORE THIS LINE =====
+    // Sentinel for parallel-agent merges — when a new feature needs a new
+    // EvalProvider hook, add it BEFORE this marker (with a sensible default)
+    // and update the provider impls in sheet.rs / workbook.rs separately.
 }
 
 struct AtomEvalProvider<'a> {
@@ -25453,4 +25458,12 @@ mod tests {
             Value::Error(ValueError::InvalidValue)
         );
     }
+
+    // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====
+    // Sentinel for parallel-agent merges — every new test fn, test-only
+    // helper, or `const TOL: f64 = ...`-style constant goes BEFORE this
+    // marker. The closing `}` below closes `mod tests`; without this
+    // sentinel git's 3-way merge would treat that `}` as the
+    // disambiguating context line and lose closers from concurrent
+    // branches whose last test fn shared it.
 }
