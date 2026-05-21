@@ -244,6 +244,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FORECAST.LINEAR"
             | "FORMULATEXT"
             | "FTEST"
+            | "FREQUENCY"
             | "FV"
             | "FVSCHEDULE"
             | "GAMMA"
@@ -252,6 +253,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "GAMMADIST"
             | "GAMMAINV"
             | "GAMMALN"
+            | "GAUSS"
             | "GCD"
             | "GEOMEAN"
             | "GESTEP"
@@ -314,18 +316,22 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MAP"
             | "MATCH"
             | "MAX"
+            | "MAXA"
             | "MAXIFS"
             | "MDETERM"
             | "MEDIAN"
             | "MID"
             | "MIDB"
             | "MIN"
+            | "MINA"
             | "MINIFS"
             | "MINUTE"
             | "MINVERSE"
             | "MMULT"
             | "MOD"
             | "MODE"
+            | "MODE.MULT"
+            | "MODE.SNGL"
             | "MONTH"
             | "MROUND"
             | "MUNIT"
@@ -357,7 +363,13 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "OR"
             | "PDURATION"
             | "PEARSON"
+            | "PERCENTILE"
             | "PERCENTILE.EXC"
+            | "PERCENTILE.INC"
+            | "PERCENTRANK"
+            | "PERCENTRANK.EXC"
+            | "PERCENTRANK.INC"
+            | "PHI"
             | "PHONETIC"
             | "PI"
             | "PMT"
@@ -365,13 +377,21 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "POISSON.DIST"
             | "POWER"
             | "PPMT"
+            | "PROB"
             | "PRODUCT"
             | "PROPER"
             | "PV"
+            | "QUARTILE"
             | "QUARTILE.EXC"
+            | "QUARTILE.INC"
             | "QUOTIENT"
             | "RADIANS"
+            | "RAND"
             | "RANDARRAY"
+            | "RANDBETWEEN"
+            | "RANK"
+            | "RANK.AVG"
+            | "RANK.EQ"
             | "RATE"
             | "REDUCE"
             | "REPLACE"
@@ -398,6 +418,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "SIN"
             | "SINH"
             | "SKEW"
+            | "SKEW.P"
             | "SLOPE"
             | "SMALL"
             | "SORT"
@@ -409,6 +430,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "STDEV.P"
             | "STDEV.S"
             | "STEYX"
+            | "STDEVA"
+            | "STDEVPA"
             | "SUBSTITUTE"
             | "SUM"
             | "SUMIF"
@@ -454,6 +477,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "VAR"
             | "VAR.P"
             | "VAR.S"
+            | "VARA"
+            | "VARPA"
             | "VLOOKUP"
             | "VSTACK"
             | "WEEKDAY"
@@ -8623,6 +8648,64 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "MINVERSE" => fn_minverse(args, provider),
         "MUNIT" => fn_munit(args, provider),
         "TRANSPOSE" => fn_transpose(args, provider),
+        // === Q batch: random / ranking / percentile / mode / A-variants / stats ===
+
+        // RAND() — uniform [0, 1). Volatile: every evaluation draws fresh
+        // from the OS-seeded thread RNG, so two `RAND()` calls in the same
+        // formula return different values (Excel parity).
+        "RAND" => stat_rand(args),
+        // RANDBETWEEN(low, high) — uniform integer in [low, high] inclusive.
+        // low > high → #NUM!. Both args truncate toward zero before validation.
+        "RANDBETWEEN" => stat_randbetween(args, provider),
+
+        // PERCENTRANK / PERCENTRANK.INC(array, x[, significance=3]) —
+        // inclusive rank-in-array as decimal fraction. Truncated to
+        // `significance` digits.
+        "PERCENTRANK" | "PERCENTRANK.INC" => stat_percentrank_inc(args, provider),
+        // PERCENTRANK.EXC(array, x[, significance=3]) — exclusive variant
+        // using rank/(N+1).
+        "PERCENTRANK.EXC" => stat_percentrank_exc(args, provider),
+
+        // MODE.SNGL — Excel 2010+ rename of MODE. Routes through the same
+        // arm (returns the most-frequent number; ties broken by smallest).
+        "MODE.SNGL" => eval_func("MODE", args, provider),
+        // MODE.MULT — array form returning every value tied for the mode.
+        // Returns a column array (n×1). SPILL.
+        "MODE.MULT" => stat_mode_mult(args, provider),
+
+        // MAXA / MINA — like MAX / MIN but TEXT contributes 0, TRUE 1,
+        // FALSE 0 (logicals are NOT skipped). Empty cells are still skipped.
+        "MAXA" => stat_max_min_a(args, provider, /*want_max=*/ true),
+        "MINA" => stat_max_min_a(args, provider, /*want_max=*/ false),
+
+        // STDEVA / STDEVPA / VARA / VARPA — A-variants of the sample/pop
+        // standard-deviation and variance. Text counts as 0, TRUE/FALSE as
+        // 1/0; empty cells are skipped.
+        "STDEVA" => stat_var_a(args, provider, /*sample=*/ true, /*sqrt=*/ true),
+        "STDEVPA" => stat_var_a(args, provider, /*sample=*/ false, /*sqrt=*/ true),
+        "VARA" => stat_var_a(args, provider, /*sample=*/ true, /*sqrt=*/ false),
+        "VARPA" => stat_var_a(args, provider, /*sample=*/ false, /*sqrt=*/ false),
+
+        // SKEW.P — population skewness. The existing `SKEW` is the sample
+        // form; `SKEW.P` divides moment-3 by n (not the bias-correction
+        // factor) and uses the population standard deviation.
+        "SKEW.P" => stat_skew_p(args, provider),
+
+        // FREQUENCY(data_array, bins_array) — distribution count.
+        // Returns an array of length `bins.len() + 1`, one bucket per bin
+        // plus a final "greater than the largest bin" bucket. SPILL.
+        "FREQUENCY" => stat_frequency(args, provider),
+
+        // PROB(x_range, prob_range, lower[, upper]) — sum of probabilities
+        // for x values in [lower, upper]. Validates prob_range sums to ≈ 1
+        // and every prob ∈ (0, 1].
+        "PROB" => stat_prob(args, provider),
+
+        // GAUSS(x) — NORM.S.DIST(x, TRUE) - 0.5 (probability between 0 and x
+        // in the standard normal distribution).
+        "GAUSS" => stat_gauss(args, provider),
+        // PHI(x) — standard normal probability density.
+        "PHI" => stat_phi(args, provider),
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
@@ -18080,6 +18163,296 @@ fn fn_rsq(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     Value::Number((sxy * sxy) / denom)
 }
 
+// === Q batch helpers: RAND / RANDBETWEEN / PERCENTRANK / MODE.MULT /
+//     MAXA / MINA / *VAR.A / SKEW.P / FREQUENCY / PROB / GAUSS / PHI ===
+
+/// RAND() — uniform [0, 1). No args. Volatile: every call returns a
+/// fresh draw from the OS-seeded thread RNG, so two `RAND()` uses in the
+/// same formula give different numbers (Excel parity).
+fn stat_rand(args: &[Expr]) -> Value {
+    if !args.is_empty() {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    use rand::Rng;
+    let n: f64 = rand::thread_rng().gen_range(0.0..1.0);
+    Value::Number(n)
+}
+
+/// RANDBETWEEN(low, high) — uniform integer in `[low, high]` inclusive.
+/// Both args truncate toward zero before validation. `low > high` surfaces
+/// #NUM! (Overflow), matching Excel.
+fn stat_randbetween(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let lo = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let hi = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let lo_i = lo.trunc() as i64;
+    let hi_i = hi.trunc() as i64;
+    if lo_i > hi_i {
+        return Value::Error(ValueError::Overflow);
+    }
+    use rand::Rng;
+    // gen_range is exclusive on the high bound; widen to i128 to avoid
+    // overflow when `hi_i == i64::MAX`.
+    let pick = rand::thread_rng().gen_range((lo_i as i128)..(hi_i as i128 + 1));
+    Value::Number(pick as f64)
+}
+
+/// PERCENTRANK / PERCENTRANK.INC(array, x[, significance=3]).
+fn stat_percentrank_inc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    percentrank_common(args, provider, /*exclusive=*/ false)
+}
+
+/// PERCENTRANK.EXC(array, x[, significance=3]).
+fn stat_percentrank_exc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    percentrank_common(args, provider, /*exclusive=*/ true)
+}
+
+fn percentrank_common(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    exclusive: bool,
+) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let significance = if args.len() == 3 {
+        match stat_num(&args[2], provider) {
+            Ok(n) => {
+                let s = n.trunc() as i64;
+                if s < 1 {
+                    return Value::Error(ValueError::Overflow);
+                }
+                s as u32
+            }
+            Err(e) => return e,
+        }
+    } else {
+        3
+    };
+    let mut nums = collect_numbers(&args[..1], provider);
+    if nums.is_empty() {
+        return Value::Error(ValueError::Overflow);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = nums.len();
+    if x < nums[0] || x > nums[n - 1] {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let (k_lower, exact) = locate_lower(&nums, x);
+    let frac = if exact {
+        0.0
+    } else {
+        let lo = nums[k_lower];
+        let hi = nums[k_lower + 1];
+        (x - lo) / (hi - lo)
+    };
+    let pos = k_lower as f64 + frac; // 0-based fractional index
+    let rank = if exclusive {
+        (pos + 1.0) / (n as f64 + 1.0)
+    } else if n == 1 {
+        1.0
+    } else {
+        pos / (n as f64 - 1.0)
+    };
+    Value::Number(truncate_digits(rank, significance))
+}
+
+/// Return `(idx, exact)` where `idx` is the largest i with `sorted[i] <= x`,
+/// and `exact == true` when `sorted[idx] == x`. Caller has already
+/// verified `x` lies in `[sorted[0], sorted[last]]`.
+fn locate_lower(sorted: &[f64], x: f64) -> (usize, bool) {
+    let mut best = 0usize;
+    for (i, &v) in sorted.iter().enumerate() {
+        if v <= x {
+            best = i;
+        } else {
+            break;
+        }
+    }
+    (best, (sorted[best] - x).abs() == 0.0)
+}
+
+/// Truncate `value` to `digits` decimal digits (Excel PERCENTRANK
+/// significance semantics — truncation toward zero, not rounding).
+fn truncate_digits(value: f64, digits: u32) -> f64 {
+    if !value.is_finite() {
+        return value;
+    }
+    let scale = 10f64.powi(digits as i32);
+    (value * scale).trunc() / scale
+}
+
+/// MODE.MULT — array form returning every value tied for the most-frequent
+/// count. Returns an n×1 `Value::Array`. If all values are unique, returns
+/// `#N/A` (InvalidValue) just like single-value `MODE`.
+fn stat_mode_mult(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    // Bucket integer-quantised numbers exactly like `MODE` does, so 1.0 and
+    // 1.0 collide on hash; the 1e9 scale gives 9 decimal digits of fidelity.
+    let mut nums: Vec<i64> = Vec::new();
+    for arg in args {
+        for_each_arg_value(arg, provider, &mut |_addr, v| {
+            if let Value::Number(n) = v {
+                nums.push((n * 1e9).round() as i64);
+            }
+        });
+    }
+    if nums.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for n in &nums {
+        *counts.entry(*n).or_insert(0) += 1;
+    }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    if max_count <= 1 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut seen: HashSet<i64> = HashSet::new();
+    let mut modes: Vec<Value> = Vec::new();
+    for n in &nums {
+        if counts[n] == max_count && seen.insert(*n) {
+            modes.push(Value::Number(*n as f64 / 1e9));
+        }
+    }
+    let len = modes.len() as u32;
+    Value::Array(Arc::new(ArrayData::new(len, 1, modes)))
+}
+
+/// Collect numbers + logical + text for the A-variants. Empty cells are
+/// skipped; text contributes 0; logical TRUE/FALSE contributes 1/0.
+fn collect_numbers_a(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> (Vec<f64>, Option<ValueError>) {
+    let mut nums: Vec<f64> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for arg in args {
+        if err.is_some() {
+            break;
+        }
+        for_each_arg_value(arg, provider, &mut |_addr, v| {
+            if err.is_some() {
+                return;
+            }
+            match v {
+                Value::Error(e) => err = Some(e),
+                Value::Number(n) => nums.push(n),
+                Value::Boolean(true) => nums.push(1.0),
+                Value::Boolean(false) => nums.push(0.0),
+                Value::Text(_) => nums.push(0.0),
+                Value::Null => {}
+                Value::Array(_) => {}
+                Value::Lambda(_) => err = Some(ValueError::WrongType),
+            }
+        });
+    }
+    (nums, err)
+}
+
+/// MAXA / MINA — A-variant of MAX / MIN.
+fn stat_max_min_a(args: &[Expr], provider: &dyn EvalProvider, want_max: bool) -> Value {
+    let (nums, err) = collect_numbers_a(args, provider);
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    if nums.is_empty() {
+        return Value::Number(0.0);
+    }
+    let result = if want_max {
+        nums.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+    } else {
+        nums.iter().copied().fold(f64::INFINITY, f64::min)
+    };
+    stat_finite(result)
+}
+
+/// STDEVA / STDEVPA / VARA / VARPA. `sample` selects n-1 vs n; `sqrt`
+/// selects STDEV* (return s.d.) vs VAR* (return variance).
+fn stat_var_a(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    sample: bool,
+    sqrt: bool,
+) -> Value {
+    let (nums, err) = collect_numbers_a(args, provider);
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    let n = nums.len();
+    if (sample && n < 2) || (!sample && n < 1) {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let mean = nums.iter().sum::<f64>() / n as f64;
+    let denom = if sample { (n - 1) as f64 } else { n as f64 };
+    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denom;
+    stat_finite(if sqrt { var.sqrt() } else { var })
+}
+
+/// SKEW.P — population skewness. Divides moment-3 by `n` and uses
+/// population s.d. (vs SKEW which uses the sample n-1 + bias correction).
+fn stat_skew_p(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    let n = nums.len() as f64;
+    if nums.len() < 3 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mean = nums.iter().sum::<f64>() / n;
+    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    let s = var.sqrt();
+    if s == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let m3 = nums.iter().map(|x| (x - mean).powi(3)).sum::<f64>() / n;
+    stat_finite(m3 / s.powi(3))
+}
+
+/// FREQUENCY(data, bins). Returns a `(bins.len() + 1) × 1` column array.
+///
+/// Tie-handling: ties land in the LOWER bucket (Excel parity — comparison
+/// is `x <= bin`, so a value equal to `bins[i]` belongs to bucket `i`,
+/// never `i+1`). Bins are sorted ascending before bucketing.
+fn stat_frequency(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let data = collect_numbers(&args[..1], provider);
+    let mut bins = collect_numbers(&args[1..2], provider);
+    bins.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let nbins = bins.len();
+    let mut counts: Vec<u64> = vec![0; nbins + 1];
+    for &x in &data {
+        let mut placed = false;
+        for (i, &b) in bins.iter().enumerate() {
+            if x <= b {
+                counts[i] += 1;
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            counts[nbins] += 1;
+        }
+    }
+    let out: Vec<Value> = counts
+        .into_iter()
+        .map(|c| Value::Number(c as f64))
+        .collect();
+    let rows = (nbins + 1) as u32;
+    Value::Array(Arc::new(ArrayData::new(rows, 1, out)))
+}
+
 /// MMULT(array1, array2). Matrix product (a×b)·(b×c) → (a×c).
 fn fn_mmult(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 2 {
@@ -18204,6 +18577,85 @@ fn fn_transpose(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         }
     }
     Value::Array(Arc::new(ArrayData::new(cols, rows, out)))
+}
+
+/// `PROB(x_range, prob_range, lower_limit, [upper_limit])` — sum probs for
+/// x in [lower, upper]. Verify ∑prob_range ≈ 1 (tolerance 1e-9); any prob
+/// ≤ 0 or > 1 → #NUM!. PROB_SUM_TOL is loose enough to absorb FP error from
+/// summing 10⁴+ probabilities.
+fn stat_prob(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_paired_numbers(&args[0], &args[1], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    if pairs.is_empty() {
+        return Value::Error(ValueError::Overflow);
+    }
+    const PROB_SUM_TOL: f64 = 1e-9;
+    let mut sum = 0.0_f64;
+    for &(_, p) in &pairs {
+        if p <= 0.0 || p > 1.0 {
+            return Value::Error(ValueError::Overflow);
+        }
+        sum += p;
+    }
+    if (sum - 1.0).abs() > PROB_SUM_TOL {
+        return Value::Error(ValueError::Overflow);
+    }
+    let lower = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let upper = if args.len() == 4 {
+        match stat_num(&args[3], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        lower
+    };
+    let (lo, hi) = if lower <= upper {
+        (lower, upper)
+    } else {
+        (upper, lower)
+    };
+    let mut total = 0.0_f64;
+    for &(x, p) in &pairs {
+        if x >= lo && x <= hi {
+            total += p;
+        }
+    }
+    Value::Number(total)
+}
+
+/// GAUSS(x) — `NORM.S.DIST(x, TRUE) - 0.5`.
+fn stat_gauss(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    stat_finite(dist.cdf(x) - 0.5)
+}
+
+/// PHI(x) — standard normal pdf: `exp(-x²/2) / sqrt(2π)`.
+fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let two_pi = std::f64::consts::TAU; // 2π
+    stat_finite((-0.5 * x * x).exp() / two_pi.sqrt())
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -33672,6 +34124,90 @@ mod tests {
         );
     }
 
+    // === Q batch tests: random / ranking / percentile / mode / A-variants / stats ===
+
+    // --- RAND ---
+
+    #[test]
+    fn rand_in_unit_interval() {
+        let (cm, vs) = make_test_env();
+        for _ in 0..1000 {
+            match eval_str("=RAND()", &cm, &vs) {
+                Value::Number(n) => {
+                    assert!((0.0..1.0).contains(&n), "RAND draw out of [0,1): {}", n);
+                }
+                other => panic!("RAND should return Number, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn rand_two_calls_differ() {
+        // Statistically RAND() collisions across 100 paired draws should be
+        // vanishingly rare; we only assert "at least one pair differs",
+        // which has effective probability 1 for any non-trivial RNG.
+        let (cm, vs) = make_test_env();
+        let mut any_diff = false;
+        for _ in 0..100 {
+            let a = eval_str("=RAND()", &cm, &vs);
+            let b = eval_str("=RAND()", &cm, &vs);
+            if a != b {
+                any_diff = true;
+                break;
+            }
+        }
+        assert!(any_diff, "RAND produced identical values across 100 paired draws");
+    }
+
+    #[test]
+    fn rand_rejects_args() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RAND(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // --- RANDBETWEEN ---
+
+    #[test]
+    fn randbetween_inclusive_bounds() {
+        let (cm, vs) = make_test_env();
+        for _ in 0..500 {
+            match eval_str("=RANDBETWEEN(1, 6)", &cm, &vs) {
+                Value::Number(n) => {
+                    assert!(n.fract() == 0.0, "RANDBETWEEN should produce integer");
+                    let i = n as i64;
+                    assert!((1..=6).contains(&i), "RANDBETWEEN out of range: {}", i);
+                }
+                other => panic!("RANDBETWEEN -> {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn randbetween_single_point() {
+        // low == high → always returns that value.
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RANDBETWEEN(7, 7)", &cm, &vs),
+            Value::Number(7.0)
+        );
+        assert_eq!(
+            eval_str("=RANDBETWEEN(-3, -3)", &cm, &vs),
+            Value::Number(-3.0)
+        );
+    }
+
+    #[test]
+    fn randbetween_low_gt_high_is_num() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RANDBETWEEN(10, 5)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
     // PDURATION / RRI / FVSCHEDULE
     #[test]
     fn eval_pduration_basic() {
@@ -33815,6 +34351,55 @@ mod tests {
         );
     }
 
+    // --- PERCENTILE.INC (alias to PERCENTILE) ---
+    // The bare `PERCENTILE` / `PERCENTILE.INC` arm was already present
+    // in the dispatcher (`percentile_impl`); the Q batch just registers
+    // both names. These three tests verify the alias works end-to-end.
+
+    #[test]
+    fn percentile_inc_alias_works() {
+        let (cm, vs) = make_test_env();
+        // [1,2,3,4,5] k=0.5 → 3 (median).
+        assert_eq!(
+            eval_str("=PERCENTILE.INC({1,2,3,4,5}, 0.5)", &cm, &vs),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            eval_str("=PERCENTILE({1,2,3,4,5}, 0.5)", &cm, &vs),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn percentile_inc_interpolates_fractional_k() {
+        let (cm, vs) = make_test_env();
+        // [1,2,3,4,5] k=0.25 → 2.0 (Excel: linear interp at pos = 0.25*4 = 1).
+        // pos=1 → index 1 directly → value 2.
+        match eval_str("=PERCENTILE.INC({1,2,3,4,5}, 0.25)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 2.0, 1e-9), "PERCENTILE.INC k=0.25 = {}", n),
+            other => panic!("{:?}", other),
+        }
+        // [10,20,30,40] k=0.4 → pos = 0.4*3 = 1.2 → between idx 1 (20) and
+        // idx 2 (30); 20 + (30-20)*0.2 = 22.
+        match eval_str("=PERCENTILE.INC({10,20,30,40}, 0.4)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 22.0, 1e-9), "PERCENTILE.INC k=0.4 = {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn percentile_inc_rejects_bad_k() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PERCENTILE.INC({1,2,3}, 1.5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=PERCENTILE.INC({1,2,3}, -0.1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
     #[test]
     fn eval_legacy_chidist_complement_of_chisq_dist() {
         // CHIDIST(x, df) = 1 - CHISQ.DIST(x, df, TRUE).
@@ -33837,11 +34422,40 @@ mod tests {
         );
     }
 
+    // --- QUARTILE / QUARTILE.INC ---
+
+    #[test]
+    fn quartile_inc_min_median_max() {
+        let (cm, vs) = make_test_env();
+        // [1,2,3,4,5] quart=0 → min=1, quart=2 → median=3, quart=4 → max=5.
+        assert_eq!(
+            eval_str("=QUARTILE.INC({1,2,3,4,5}, 0)", &cm, &vs),
+            Value::Number(1.0)
+        );
+        assert_eq!(
+            eval_str("=QUARTILE.INC({1,2,3,4,5}, 2)", &cm, &vs),
+            Value::Number(3.0)
+        );
+        assert_eq!(
+            eval_str("=QUARTILE.INC({1,2,3,4,5}, 4)", &cm, &vs),
+            Value::Number(5.0)
+        );
+    }
+
     #[test]
     fn eval_legacy_chidist_negative_x_is_error() {
         assert_eq!(
             ev("=CHIDIST(-1, 5)"),
             Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn quartile_alias_to_inc() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=QUARTILE({2,4,6,8,10}, 1)", &cm, &vs),
+            eval_str("=QUARTILE.INC({2,4,6,8,10}, 1)", &cm, &vs)
         );
     }
 
@@ -34038,10 +34652,156 @@ mod tests {
     }
 
     #[test]
+    fn quartile_inc_rejects_out_of_range() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=QUARTILE.INC({1,2,3}, 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn eval_steyx_perfect_fit_is_zero() {
         let (cm, vs) = make_math_env();
         assert_eq!(
             eval_str("=STEYX(B1:B5, A1:A5)", &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    // --- PERCENTRANK.INC ---
+
+    #[test]
+    fn percentrank_inc_endpoints() {
+        let (cm, vs) = make_test_env();
+        // Smallest value → 0; largest → 1.
+        match eval_str("=PERCENTRANK.INC({10,20,30,40}, 10)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.0, 1e-9)),
+            other => panic!("{:?}", other),
+        }
+        match eval_str("=PERCENTRANK.INC({10,20,30,40}, 40)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 1.0, 1e-9)),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn percentrank_inc_interior() {
+        let (cm, vs) = make_test_env();
+        // [10,20,30,40], x=25 → k_lower=1, frac=0.5, pos=1.5, rank=1.5/3=0.5.
+        match eval_str("=PERCENTRANK.INC({10,20,30,40}, 25)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.5, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+        // Default significance=3 truncates: rank = 1.2/3 ≈ 0.399999...
+        // → truncated to 0.399 (Excel parity — significance is "decimal
+        // digits to keep", truncation toward zero, not rounding).
+        match eval_str("=PERCENTRANK.INC({10,20,30,40}, 22)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.399, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn percentrank_inc_out_of_range() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PERCENTRANK.INC({10,20,30}, 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=PERCENTRANK.INC({10,20,30}, 50)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // --- PERCENTRANK.EXC ---
+
+    #[test]
+    fn percentrank_exc_basic() {
+        let (cm, vs) = make_test_env();
+        // [10,20,30,40], x=20 → k_lower=1, pos=1, rank=(1+1)/(4+1)=0.4.
+        match eval_str("=PERCENTRANK.EXC({10,20,30,40}, 20)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.4, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn percentrank_exc_significance() {
+        let (cm, vs) = make_test_env();
+        // 1/3 ≈ 0.33333... → significance=2 truncates to 0.33.
+        // [10,20,30,40] x=15 → k_lower=0, frac=0.5, pos=0.5, rank=1.5/5=0.3.
+        // Try a case that exercises truncation: significance=2 of a 0.333...
+        // is reached by [10,20] x≈15 (rank=0.5) — too clean. Try [a,b,c]
+        // mid-x.
+        // Just exercise the parameter: result should match default-3 here.
+        match eval_str("=PERCENTRANK.EXC({10,20,30,40}, 25, 4)", &cm, &vs) {
+            Value::Number(n) => {
+                // x=25 → k_lower=1, frac=0.5, pos=1.5, rank=2.5/5=0.5.
+                assert!(approx(n, 0.5, 1e-9), "got {}", n);
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn percentrank_exc_out_of_range() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PERCENTRANK.EXC({10,20,30}, 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // --- MODE.SNGL / MODE.MULT ---
+
+    #[test]
+    fn mode_sngl_routes_to_mode() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=MODE.SNGL(1, 2, 2, 3)", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn mode_mult_returns_all_modes() {
+        let (cm, vs) = make_test_env();
+        // 2 and 3 both appear twice → both modes.
+        let (r, c, data) = unwrap_array(eval_str("=MODE.MULT({1,2,2,3,3,4})", &cm, &vs));
+        assert_eq!((r, c), (2, 1));
+        // First-occurrence order: 2 appears before 3 in input.
+        assert_eq!(data, vec![Value::Number(2.0), Value::Number(3.0)]);
+    }
+
+    #[test]
+    fn mode_mult_no_repeats_is_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=MODE.MULT({1,2,3,4})", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // --- MAXA / MINA ---
+
+    #[test]
+    fn maxa_treats_logical_as_one_zero() {
+        let (cm, vs) = make_test_env();
+        // TRUE = 1, FALSE = 0; -1 < 0 so the TRUE wins.
+        assert_eq!(
+            eval_str("=MAXA(-1, FALSE, TRUE)", &cm, &vs),
+            Value::Number(1.0)
+        );
+    }
+
+    #[test]
+    fn mina_treats_text_as_zero() {
+        let (cm, vs) = make_test_env();
+        // 5 is the smallest non-text candidate; "hello" counts as 0 → 0 wins.
+        assert_eq!(
+            eval_str(r#"=MINA(5, 10, "hello")"#, &cm, &vs),
             Value::Number(0.0)
         );
     }
@@ -34102,6 +34862,37 @@ mod tests {
     }
 
     #[test]
+    fn maxa_empty_returns_zero() {
+        let (cm, vs) = make_test_env();
+        // C1 is 0 in the test env, but a fully-empty range goes to 0.
+        // Use a literal of no args to trip the empty path (Excel returns 0).
+        // We can synthesize via an unused range; in our env C2 is empty.
+        // MAX(C2) → InvalidValue (existing), MAXA(C2) → 0 (Excel parity).
+        // The empty-input path is hard to hit purely with literals; use a
+        // single empty arg through Null coercion (literal "")=text counts
+        // as 0, so check that path too.
+        assert_eq!(
+            eval_str(r#"=MAXA("")"#, &cm, &vs),
+            Value::Number(0.0)
+        );
+    }
+
+    // --- STDEVA / STDEVPA / VARA / VARPA ---
+
+    #[test]
+    fn stdeva_matches_stdev_when_all_numeric() {
+        let (cm, vs) = make_test_env();
+        let a = eval_str("=STDEV.S({1,2,3,4,5})", &cm, &vs);
+        let b = eval_str("=STDEVA({1,2,3,4,5})", &cm, &vs);
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => {
+                assert!(approx(x, y, 1e-12), "STDEV.S={} STDEVA={}", x, y);
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
     fn eval_mmult_dimension_mismatch() {
         let (cm, vs) = make_math_env();
         // 2×2 * 1×5 → inner mismatch (2 ≠ 1).
@@ -34143,6 +34934,19 @@ mod tests {
                 }
             }
             other => panic!("expected 2x2 Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn vara_includes_logical_zero() {
+        let (cm, vs) = make_test_env();
+        // {1, FALSE, 3} → values [1, 0, 3], mean=4/3, var = sum((x-mean)^2)/2.
+        // Compute: differences = (-1/3)^2 + (-4/3)^2 + (5/3)^2
+        //                     = 1/9 + 16/9 + 25/9 = 42/9.
+        // var = (42/9) / 2 = 21/9 ≈ 2.3333.
+        match eval_str("=VARA({1, FALSE, 3})", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 21.0 / 9.0, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
         }
     }
 
@@ -34192,6 +34996,16 @@ mod tests {
         }
         assert_eq!(
             eval_str("=CHISQ.TEST(A1:B1, A2:B2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn stdevpa_empty_input_is_div_by_zero() {
+        let (cm, vs) = make_test_env();
+        // No values at all → DivisionByZero.
+        assert_eq!(
+            eval_str("=STDEVPA()", &cm, &vs),
             Value::Error(ValueError::DivisionByZero)
         );
     }
@@ -34254,6 +35068,47 @@ mod tests {
         );
         assert_eq!(
             ev("=CONFIDENCE(1, 2.5, 50)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn varpa_single_value_returns_zero() {
+        let (cm, vs) = make_test_env();
+        // Population variance over a single point is 0 (no spread).
+        match eval_str("=VARPA({5})", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.0, 1e-12)),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    // --- SKEW.P ---
+
+    #[test]
+    fn skew_p_symmetric_is_zero() {
+        let (cm, vs) = make_test_env();
+        // Symmetric distribution → skewness 0.
+        match eval_str("=SKEW.P({1,2,3,4,5})", &cm, &vs) {
+            Value::Number(n) => assert!(n.abs() < 1e-12, "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn skew_p_positive_skew() {
+        let (cm, vs) = make_test_env();
+        // Right-skewed: long tail on the high side.
+        match eval_str("=SKEW.P({1,1,1,2,10})", &cm, &vs) {
+            Value::Number(n) => assert!(n > 0.5, "expected positive skew, got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn skew_p_too_few_values() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SKEW.P({1,2})", &cm, &vs),
             Value::Error(ValueError::Overflow)
         );
     }
@@ -34465,9 +35320,74 @@ mod tests {
     }
 
     #[test]
+    fn skew_p_zero_variance_is_div_by_zero() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SKEW.P({3,3,3})", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
     fn eval_f_test_wrong_arg_count() {
         assert_eq!(
             ev("=F.TEST(1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // --- FREQUENCY ---
+
+    #[test]
+    fn frequency_basic_buckets() {
+        let (cm, vs) = make_test_env();
+        // data={1,2,3,4,5}, bins={2,4} → buckets are (-∞,2], (2,4], (4,∞).
+        // bucket[0]: 1,2 → 2; bucket[1]: 3,4 → 2; bucket[2]: 5 → 1.
+        let (r, c, data) = unwrap_array(eval_str("=FREQUENCY({1,2,3,4,5}, {2,4})", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(2.0),
+                Value::Number(2.0),
+                Value::Number(1.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn frequency_tie_lands_in_lower_bucket() {
+        let (cm, vs) = make_test_env();
+        // x = 5 with bins {5, 10} → 5 goes into bucket 0 (≤5), not bucket 1.
+        let (_, _, data) = unwrap_array(eval_str("=FREQUENCY({5,5}, {5,10})", &cm, &vs));
+        assert_eq!(
+            data,
+            vec![Value::Number(2.0), Value::Number(0.0), Value::Number(0.0)]
+        );
+    }
+
+    #[test]
+    fn frequency_overflow_bucket() {
+        let (cm, vs) = make_test_env();
+        // A value above every bin lands in the overflow bucket at the end.
+        let (rr, cc, dd) = unwrap_array(eval_str("=FREQUENCY({100}, {1,2,3})", &cm, &vs));
+        assert_eq!((rr, cc), (4, 1));
+        assert_eq!(
+            dd,
+            vec![
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(0.0),
+                Value::Number(1.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn frequency_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=FREQUENCY({1,2,3})", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
         );
     }
@@ -34879,10 +35799,125 @@ mod tests {
         );
     }
 
+    // --- PROB ---
+
+    #[test]
+    fn prob_single_point() {
+        // x={1,2,3}, p={0.2,0.5,0.3}; PROB(x, p, 2) → 0.5.
+        // Use cell-backed ranges so collect_paired_numbers can shape-match.
+        use crate::cell::CellAddress;
+        use einfach_core::AtomId;
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let mk = |row: u32, col: u32, val: Value, cm: &mut HashMap<CellAddress, AtomId>, vs: &mut HashMap<AtomId, Value>| {
+            let id = AtomId::from_raw(row as u64 * 100 + col as u64);
+            cm.insert(CellAddress::new(row, col), id);
+            vs.insert(id, val);
+        };
+        mk(0, 0, Value::Number(1.0), &mut cm, &mut vs);
+        mk(1, 0, Value::Number(2.0), &mut cm, &mut vs);
+        mk(2, 0, Value::Number(3.0), &mut cm, &mut vs);
+        mk(0, 1, Value::Number(0.2), &mut cm, &mut vs);
+        mk(1, 1, Value::Number(0.5), &mut cm, &mut vs);
+        mk(2, 1, Value::Number(0.3), &mut cm, &mut vs);
+        match eval_str("=PROB(A1:A3, B1:B3, 2)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.5, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+        // Range form: PROB(x, p, 2, 3) → 0.5 + 0.3 = 0.8.
+        match eval_str("=PROB(A1:A3, B1:B3, 2, 3)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.8, 1e-9), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn prob_rejects_unnormalized() {
+        use crate::cell::CellAddress;
+        use einfach_core::AtomId;
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let id1 = AtomId::from_raw(1);
+        let id2 = AtomId::from_raw(2);
+        let id3 = AtomId::from_raw(3);
+        let id4 = AtomId::from_raw(4);
+        cm.insert(CellAddress::new(0, 0), id1);
+        cm.insert(CellAddress::new(1, 0), id2);
+        cm.insert(CellAddress::new(0, 1), id3);
+        cm.insert(CellAddress::new(1, 1), id4);
+        vs.insert(id1, Value::Number(1.0));
+        vs.insert(id2, Value::Number(2.0));
+        vs.insert(id3, Value::Number(0.3));
+        vs.insert(id4, Value::Number(0.4));
+        // Sum 0.7 ≠ 1 → #NUM!.
+        assert_eq!(
+            eval_str("=PROB(A1:A2, B1:B2, 1, 2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
     #[test]
     fn eval_legacy_weibull_wrong_arg_count() {
         assert_eq!(
             ev("=WEIBULL(1, 1, 1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn prob_rejects_out_of_range_prob() {
+        use crate::cell::CellAddress;
+        use einfach_core::AtomId;
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let id1 = AtomId::from_raw(11);
+        let id2 = AtomId::from_raw(12);
+        let id3 = AtomId::from_raw(13);
+        let id4 = AtomId::from_raw(14);
+        cm.insert(CellAddress::new(0, 0), id1);
+        cm.insert(CellAddress::new(1, 0), id2);
+        cm.insert(CellAddress::new(0, 1), id3);
+        cm.insert(CellAddress::new(1, 1), id4);
+        vs.insert(id1, Value::Number(1.0));
+        vs.insert(id2, Value::Number(2.0));
+        vs.insert(id3, Value::Number(1.5)); // > 1 invalid
+        vs.insert(id4, Value::Number(-0.5));
+        assert_eq!(
+            eval_str("=PROB(A1:A2, B1:B2, 1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    // --- GAUSS ---
+
+    #[test]
+    fn gauss_zero() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=GAUSS(0)", &cm, &vs) {
+            Value::Number(n) => assert!(n.abs() < 1e-12, "GAUSS(0) = {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn gauss_one_sigma() {
+        let (cm, vs) = make_test_env();
+        // GAUSS(1) ≈ 0.341344746... (68% rule: 68/2 ≈ 34.13%).
+        match eval_str("=GAUSS(1)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.3413447461, 1e-6), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn gauss_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=GAUSS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=GAUSS(1, 2)", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
         );
     }
@@ -34913,12 +35948,36 @@ mod tests {
         }
     }
 
+    // --- PHI ---
+
+    #[test]
+    fn phi_zero_peak() {
+        let (cm, vs) = make_test_env();
+        // φ(0) = 1/sqrt(2π) ≈ 0.39894228.
+        match eval_str("=PHI(0)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.3989422804, 1e-6), "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
     #[test]
     fn eval_z_test_three_arg() {
         let (cm, vs) = ztest_env();
         // Provide sigma = 2; x0 below mean → p < 0.5.
         match eval_str("=Z.TEST(A1:A5, 5, 2)", &cm, &vs) {
             Value::Number(n) => assert!(n > 0.0 && n < 0.5),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn phi_symmetric() {
+        let (cm, vs) = make_test_env();
+        // φ(x) is even: PHI(1) == PHI(-1).
+        let a = eval_str("=PHI(1)", &cm, &vs);
+        let b = eval_str("=PHI(-1)", &cm, &vs);
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) => assert!(approx(x, y, 1e-12)),
             other => panic!("{:?}", other),
         }
     }
@@ -34977,6 +36036,14 @@ mod tests {
             }
             other => panic!("expected 1x5 Array, got {:?}", other),
         }
+    }
+
+    fn phi_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PHI()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====

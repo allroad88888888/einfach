@@ -230,6 +230,7 @@ dependencies = [
  "chrono",
  "criterion",
  "einfach-core",
+ "rand",
  "regex",
  "statrs",
 ]

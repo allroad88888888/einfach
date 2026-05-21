@@ -12,6 +12,10 @@ chrono = { version = "0.4", default-features = false, features = ["wasmbind", "c
 # Statistical distributions (NORM/T/F/CHISQ/...), gamma/erf special functions.
 statrs = "0.16"
 regex = "1.12.3"
+# `rand` powers RAND() / RANDBETWEEN() volatile draws. The thread RNG is
+# good enough for spreadsheet RNG and matches Excel's "fresh draw per
+# evaluation" volatility model.
+rand = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"

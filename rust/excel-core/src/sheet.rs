@@ -3333,6 +3333,8 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
                     | "MINVERSE"
                     | "MUNIT"
                     | "TRANSPOSE"
+                    | "FREQUENCY"
+                    | "MODE.MULT"
             ) {
                 return true;
             }
