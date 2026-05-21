@@ -117,6 +117,21 @@ pub enum Expr {
         cols: u32,
         data: Vec<Expr>,
     },
+    /// Excel multi-area (union) reference: `(A1:B2, D5:E6, F1)`. Each
+    /// inner expression is itself a reference (`CellRef`, `Range`,
+    /// `SheetRef`, or `SheetRange`) — arbitrary expressions are
+    /// rejected at parse time (a `(A1, 1+2)` shape is a parse error,
+    /// not a `MultiArea`). The parser only emits this when ≥ 2 refs are
+    /// separated by commas inside parentheses; `(A1:B2)` is just the
+    /// grouped single ref `A1:B2`.
+    ///
+    /// Eval contract: `Expr::MultiArea` doesn't reduce to a scalar
+    /// `Value`. The bare expression yields `#VALUE!` and built-ins that
+    /// take a single range argument (SUM, AVERAGE, INDEX, ...) also
+    /// surface `#VALUE!`. The only consumer that handles it as data is
+    /// `AREAS`, which counts the parts. Future work may extend SUMIF /
+    /// COUNTIF criteria-range handling.
+    MultiArea(Vec<Expr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +171,20 @@ fn is_valid_array_lit_element(expr: &Expr) -> bool {
         Expr::Negate(inner) => matches!(inner.as_ref(), Expr::Number(_)),
         _ => false,
     }
+}
+
+/// Does `expr` denote a reference (the only thing allowed inside a
+/// multi-area `(A1:B2, D5:E6)` reference)? Accepts same-sheet and
+/// cross-sheet cell refs and ranges. Everything else — literals,
+/// binops, function calls, nested multi-area — is rejected.
+fn is_ref_expr(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::CellRef(_)
+            | Expr::Range { .. }
+            | Expr::SheetRef { .. }
+            | Expr::SheetRange { .. }
+    )
 }
 
 /// Parse a formula string. Must start with '='.
@@ -428,10 +457,50 @@ impl Parser {
 
         match self.peek()? {
             '(' => {
+                // Two surface forms share the `(` opener:
+                //   1. Grouped expression: `(A1+B1)`, `(1+2)`, `(A1:B2)`.
+                //   2. Multi-area reference: `(A1:B2, D5:E6, F1)` — Excel's
+                //      union/list-of-areas syntax, consumed by AREAS (and
+                //      some criteria-style aggregates in advanced Excel).
+                //
+                // Speculative parse: consume `(`, parse one inner expr,
+                // then peek for `,`. If we see a comma AND the inner expr
+                // is a reference (CellRef / Range / SheetRef / SheetRange),
+                // commit to multi-area parsing — every remaining element
+                // must also be a reference. Otherwise the inner expr is
+                // just the body of a grouped expression and `)` follows.
+                //
+                // A `(A1, 1+2)` shape (ref then non-ref) is a parse error
+                // — it can't be a grouped expression (no operator between
+                // refs) and can't be a multi-area reference (non-ref
+                // element). Returning `None` here surfaces as a top-level
+                // parse failure.
                 self.advance();
-                let expr = self.parse_expr()?;
-                self.expect(')')?;
-                Some(expr)
+                let first = self.parse_expr()?;
+                self.skip_whitespace();
+                if self.peek() == Some(',') {
+                    // Multi-area path: first element MUST be a ref.
+                    if !is_ref_expr(&first) {
+                        return None;
+                    }
+                    let mut parts: Vec<Expr> = vec![first];
+                    while self.peek() == Some(',') {
+                        self.advance();
+                        self.skip_whitespace();
+                        let next = self.parse_expr()?;
+                        if !is_ref_expr(&next) {
+                            return None;
+                        }
+                        parts.push(next);
+                        self.skip_whitespace();
+                    }
+                    self.expect(')')?;
+                    Some(Expr::MultiArea(parts))
+                } else {
+                    // Grouped expression — strip the parens.
+                    self.expect(')')?;
+                    Some(first)
+                }
             }
             '{' => self.parse_array_literal(),
             '"' => self.parse_string(),
@@ -1510,5 +1579,122 @@ mod tests {
                 }],
             }
         );
+    }
+
+    // === Excel multi-area reference syntax: `(A1:B2, D5:E6)` ===
+
+    #[test]
+    fn parse_multi_area_two_ranges() {
+        // `=(A1:B2, D5)` — multi-area with two refs (Range + CellRef).
+        let result = parse_formula("=(A1:B2, D5)").unwrap();
+        assert_eq!(
+            result,
+            Expr::MultiArea(vec![
+                Expr::Range {
+                    start: CellAddress::new(0, 0),
+                    end: CellAddress::new(1, 1),
+                    unbounded: RangeBounds::None,
+                },
+                Expr::CellRef(CellAddress::new(4, 3)),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_multi_area_three_parts() {
+        // `=(A1:B2, D5:E6, F1)` — three-part multi-area.
+        let result = parse_formula("=(A1:B2, D5:E6, F1)").unwrap();
+        let Expr::MultiArea(parts) = result else {
+            panic!("expected MultiArea");
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(parts[0], Expr::Range { .. }));
+        assert!(matches!(parts[1], Expr::Range { .. }));
+        assert_eq!(parts[2], Expr::CellRef(CellAddress::new(0, 5)));
+    }
+
+    #[test]
+    fn parse_single_paren_ref_strips_parens() {
+        // `=(A1)` — single ref in parens is just the cell ref, NOT a
+        // single-element MultiArea.
+        assert_eq!(
+            parse_formula("=(A1)"),
+            Some(Expr::CellRef(CellAddress::new(0, 0)))
+        );
+    }
+
+    #[test]
+    fn parse_paren_binop_still_grouped() {
+        // `=(1+2)` — paren'd binop survives as a grouped expression
+        // (not a MultiArea). The multi-area detection only kicks in
+        // when a `,` follows the first inner expr.
+        let result = parse_formula("=(1+2)").unwrap();
+        assert!(matches!(result, Expr::BinOp { .. }));
+    }
+
+    #[test]
+    fn parse_paren_addition_is_binop() {
+        // `=(A1+B1)` must keep parsing as a BinOp — the addition takes
+        // precedence over any multi-area interpretation. (The first
+        // inner expr is `A1+B1` and no comma follows, so the path is
+        // the grouped-expression path.)
+        let result = parse_formula("=(A1+B1)").unwrap();
+        assert_eq!(
+            result,
+            Expr::BinOp {
+                op: BinOperator::Add,
+                left: Box::new(Expr::CellRef(CellAddress::new(0, 0))),
+                right: Box::new(Expr::CellRef(CellAddress::new(0, 1))),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_multi_area_rejects_non_ref_in_list() {
+        // `=(A1, 1+2)` — the second part isn't a reference, so the
+        // multi-area path rejects it. The grouped-expression path
+        // can't take over either (a comma never appears in a normal
+        // parenthesized binop). Overall parse fails.
+        assert!(parse_formula("=(A1, 1+2)").is_none());
+    }
+
+    #[test]
+    fn parse_multi_area_inside_func_call() {
+        // `=SUM((A1:B2, D5:E6))` — the function arg is a multi-area.
+        // SUM's eval will surface #VALUE! (multi-area isn't a normal
+        // arg shape) but the formula must parse.
+        let result = parse_formula("=SUM((A1:B2, D5:E6))").unwrap();
+        let Expr::FuncCall { name, args } = result else {
+            panic!("expected FuncCall");
+        };
+        assert_eq!(name, "SUM");
+        assert_eq!(args.len(), 1);
+        assert!(matches!(args[0], Expr::MultiArea(_)));
+    }
+
+    #[test]
+    fn parse_areas_func_call_with_multi_area() {
+        // `=AREAS((A1:B2, D5:E6))` — argument is a MultiArea.
+        let result = parse_formula("=AREAS((A1:B2, D5:E6))").unwrap();
+        let Expr::FuncCall { name, args } = result else {
+            panic!("expected FuncCall");
+        };
+        assert_eq!(name, "AREAS");
+        match &args[0] {
+            Expr::MultiArea(parts) => assert_eq!(parts.len(), 2),
+            other => panic!("expected MultiArea, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_multi_area_with_cross_sheet_ref() {
+        // `=(Sheet2!A1, B2)` — multi-area with a cross-sheet part.
+        let result = parse_formula("=(Sheet2!A1, B2)").unwrap();
+        let Expr::MultiArea(parts) = result else {
+            panic!("expected MultiArea");
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts[0], Expr::SheetRef { .. }));
+        assert_eq!(parts[1], Expr::CellRef(CellAddress::new(1, 1)));
     }
 }

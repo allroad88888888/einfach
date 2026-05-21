@@ -54,6 +54,9 @@ pub fn contains_invalid_ref(expr: &Expr) -> bool {
         // ref / range / func call inside, so the elements can't carry a
         // #REF! sentinel.
         Expr::ArrayLit { .. } => false,
+        // Multi-area: every part is a reference, so a #REF! in any of
+        // them propagates the same way it would for a bare ref.
+        Expr::MultiArea(parts) => parts.iter().any(contains_invalid_ref),
         _ => false,
     }
 }
@@ -155,6 +158,10 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
         // parse time, so there are no addresses to retarget. Clone the
         // node as-is.
         Expr::ArrayLit { .. } => expr.clone(),
+        // Multi-area: every part is a reference subject to retargeting.
+        Expr::MultiArea(parts) => {
+            Expr::MultiArea(parts.iter().map(|p| map_addrs(p, f)).collect())
+        }
     }
 }
 
@@ -268,6 +275,13 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
         ),
         // Constant-array literal: no addresses to shift; clone as-is.
         Expr::ArrayLit { .. } => expr.clone(),
+        // Multi-area: shift every inner reference.
+        Expr::MultiArea(parts) => Expr::MultiArea(
+            parts
+                .iter()
+                .map(|p| shift_refs(p, drow, dcol))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
     })
 }
 
@@ -528,6 +542,20 @@ fn render_into(expr: &Expr, out: &mut String) {
             }
             out.push(')');
         }
+        // Multi-area: render as `(part1, part2, ...)`. Parens are
+        // required for round-trip — the parser only recognises the
+        // multi-area form inside parens (a bare `A1, B1` outside parens
+        // would be ambiguous with a function-arg list).
+        Expr::MultiArea(parts) => {
+            out.push('(');
+            for (i, p) in parts.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_into(p, out);
+            }
+            out.push(')');
+        }
     }
 }
 
@@ -634,5 +662,26 @@ mod tests {
         assert_eq!(shifted("=SUM(1:1)", 0, 5), "=SUM(1:1)");
         // But shifting down moves the bounded row.
         assert_eq!(shifted("=SUM(1:1)", 2, 0), "=SUM(3:3)");
+    }
+
+    #[test]
+    fn render_multi_area_roundtrip() {
+        // Multi-area parse → render → parse yields the same AST.
+        for syntax in [
+            "=AREAS((A1:B2,D5:E6))",
+            "=AREAS((A1:B2,D5:E6,F1))",
+            "=(A1,B2)",
+        ] {
+            let parsed = parse_formula(syntax).unwrap();
+            let rendered = render_formula(&parsed);
+            let reparsed = parse_formula(&rendered).unwrap();
+            assert_eq!(parsed, reparsed, "round-trip {} -> {}", syntax, rendered);
+        }
+    }
+
+    #[test]
+    fn shift_multi_area_shifts_each_part() {
+        // Multi-area shifts every inner reference by the same delta.
+        assert_eq!(shifted("=AREAS((A1:B2,D5))", 1, 1), "=AREAS((B2:C3,E6))");
     }
 }

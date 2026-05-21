@@ -3091,6 +3091,13 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         // Constant-array literal: parser rejects any range / cell ref
         // inside, so there are no dependencies to register.
         Expr::ArrayLit { .. } => {}
+        // Multi-area: every part is a reference; descend into each so
+        // ranges inside the union register as deps.
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_range_refs_into(p, out);
+            }
+        }
     }
 }
 
@@ -3153,6 +3160,13 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         }
         // Constant-array literal carries no cell references.
         Expr::ArrayLit { .. } => {}
+        // Multi-area: descend into every inner ref so static cycle
+        // detection sees every cell mentioned in the union.
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_refs(p, out);
+            }
+        }
     }
 }
 
@@ -3233,6 +3247,13 @@ fn collect_formula_refs_into(
         }
         // Constant-array literal carries no formula-graph references.
         Expr::ArrayLit { .. } => {}
+        // Multi-area: descend so cells referenced via the union also
+        // count as formula-graph refs.
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_formula_refs_into(p, formula_exprs, out);
+            }
+        }
     }
 }
 
@@ -3257,6 +3278,9 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         // Constant-array literal can't carry a SheetRef (parser rejected
         // refs of any kind inside `{...}`).
         Expr::ArrayLit { .. } => false,
+        // Multi-area: a `SheetRef` / `SheetRange` could be one of the
+        // inner parts (`(Sheet2!A1, Sheet3!B2)` is valid).
+        Expr::MultiArea(parts) => parts.iter().any(expr_has_sheet_ref),
     }
 }
 
@@ -3336,6 +3360,10 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
         // so a top-level `={1,2,3}` must take the eager spill re-eval
         // path just like a SEQUENCE / UNIQUE call would.
         Expr::ArrayLit { .. } => true,
+        // Multi-area evaluates to `#VALUE!` (error scalar) anywhere
+        // other than as an `AREAS` argument — it never produces a
+        // spillable `Value::Array`.
+        Expr::MultiArea(_) => false,
         _ => false,
     }
 }

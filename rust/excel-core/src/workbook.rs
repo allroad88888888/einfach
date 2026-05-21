@@ -1497,6 +1497,9 @@ fn formula_needs_workbook_context(expr: &Expr) -> bool {
             false
         }
         Expr::ArrayLit { data, .. } => data.iter().any(formula_needs_workbook_context),
+        // Multi-area: a cross-sheet ref inside the union still demands
+        // workbook context. Same-sheet-only unions stay sheet-local.
+        Expr::MultiArea(parts) => parts.iter().any(formula_needs_workbook_context),
     }
 }
 
@@ -1534,6 +1537,10 @@ fn formula_references_name(expr: &Expr, key: &str) -> bool {
         | Expr::SheetRef { .. }
         | Expr::SheetRange { .. } => false,
         Expr::ArrayLit { data, .. } => data.iter().any(|e| formula_references_name(e, key)),
+        // Multi-area parts are themselves refs (CellRef / Range /
+        // SheetRef / SheetRange), so none of them can reference a
+        // defined name. Kept as an explicit `false` for clarity.
+        Expr::MultiArea(_) => false,
     }
 }
 
@@ -1593,6 +1600,13 @@ fn collect_cross_sheet_refs_into(
         // Constant-array literal can't carry a cross-sheet ref (parser
         // rejected SheetRef / SheetRange inside `{...}`).
         Expr::ArrayLit { .. } => {}
+        // Multi-area: descend into every inner ref so cross-sheet refs
+        // inside the union register against `by_name`.
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_cross_sheet_refs_into(p, by_name, out);
+            }
+        }
     }
 }
 
@@ -1695,6 +1709,13 @@ fn collect_workbook_refs(
         }
         // Constant-array literal carries no cell or sheet references.
         Expr::ArrayLit { .. } => {}
+        // Multi-area: descend into every inner ref so workbook-level
+        // BFS sees every cell mentioned in the union.
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_workbook_refs(p, current_idx, by_name, out);
+            }
+        }
     }
 }
 

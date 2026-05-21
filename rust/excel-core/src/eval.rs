@@ -839,6 +839,19 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             }
             Value::Array(Arc::new(ArrayData::new(*rows, *cols, values)))
         }
+
+        Expr::MultiArea(_) => {
+            // A multi-area reference (`(A1:B2, D5:E6)`) is NOT a scalar
+            // value — it's a union of disjoint ranges that only certain
+            // built-ins (AREAS at first; SUMIF / COUNTIF criteria-range
+            // in advanced cases) know how to consume. Anywhere else it
+            // surfaces #VALUE!, matching Excel.
+            //
+            // AREAS receives the unevaluated `Expr::MultiArea` directly
+            // via the func-call arm (see `eval_func`); it never recurses
+            // back into this branch for its argument.
+            Value::Error(ValueError::InvalidValue)
+        }
     }
 }
 
@@ -8209,6 +8222,31 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             Value::Text(format_complex(r, i, s))
         }
+        // AREAS(reference) — count the number of disjoint areas in a
+        // reference. Excel parity:
+        //   • A bare cell ref or range counts as 1 area.
+        //   • A multi-area `(A1:B2, D5:E6)` counts each part separately.
+        //   • Cross-sheet refs / ranges count as 1.
+        //   • Anything else (literals, arithmetic, function calls that
+        //     return scalars) → #VALUE!.
+        //
+        // The argument is inspected as an AST (not evaluated) because the
+        // multi-area syntax doesn't produce a scalar value — see
+        // `Expr::MultiArea`'s eval arm. `=AREAS(1+2)` is a parse-tree
+        // BinOp, not a ref, so it surfaces #VALUE! per Excel.
+        "AREAS" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            match &args[0] {
+                Expr::MultiArea(parts) => Value::Number(parts.len() as f64),
+                Expr::CellRef(_)
+                | Expr::Range { .. }
+                | Expr::SheetRef { .. }
+                | Expr::SheetRange { .. } => Value::Number(1.0),
+                _ => Value::Error(ValueError::WrongType),
+            }
+        }
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
         // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
@@ -8246,14 +8284,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // referenced cell. Non-formula cell → #N/A; non-ref argument →
         // #VALUE!. Reads through `EvalProvider::cell_formula_text`.
         "FORMULATEXT" => fn_formulatext(args, provider),
-
-        // AREAS(ref) — number of distinct areas in a reference.
-        //
-        // note: We do not parse the `(A1:B2, D5)` multi-area paren-group
-        // syntax, so any well-formed single reference returns 1. A
-        // multi-area implementation would require lifting this through
-        // the parser as a first-class AST node.
-        "AREAS" => fn_areas(args),
 
         // ENCODEURL(text) — percent-encode `text` per RFC 3986 unreserved
         // class `[A-Za-z0-9-_.~]`. Everything else encodes as `%XX`
@@ -15335,27 +15365,6 @@ fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 None => Value::Error(ValueError::InvalidValue),
             }
         }
-        _ => Value::Error(ValueError::WrongType),
-    }
-}
-
-/// AREAS(ref) — number of areas. We don't support multi-area paren-group
-/// references at the parser level, so every well-formed single ref
-/// returns 1.
-///
-/// note: multi-area reference syntax `(A1:B2, D5)` is not parsed by
-/// `formula::parse_formula`, so this function never sees a synthesized
-/// "union" Expr. Lifting that would require a new AST node + parser
-/// rule; tracked as a documented gap.
-fn fn_areas(args: &[Expr]) -> Value {
-    if args.len() != 1 {
-        return Value::Error(ValueError::WrongArgCount);
-    }
-    match &args[0] {
-        Expr::CellRef(_)
-        | Expr::Range { .. }
-        | Expr::SheetRef { .. }
-        | Expr::SheetRange { .. } => Value::Number(1.0),
         _ => Value::Error(ValueError::WrongType),
     }
 }
@@ -28803,22 +28812,40 @@ mod tests {
         );
     }
 
-    // === AREAS ===
+    // === AREAS — multi-area reference counting ===
 
     #[test]
-    fn eval_areas_single_cell_ref() {
+    fn areas_single_cell_ref_is_one() {
         let (cm, vs) = make_test_env();
         assert_eq!(eval_str("=AREAS(A1)", &cm, &vs), Value::Number(1.0));
     }
 
     #[test]
-    fn eval_areas_range_ref() {
+    fn areas_single_range_is_one() {
         let (cm, vs) = make_test_env();
         assert_eq!(eval_str("=AREAS(A1:B2)", &cm, &vs), Value::Number(1.0));
     }
 
     #[test]
-    fn eval_areas_arg_count_error() {
+    fn areas_multi_area_two_parts() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AREAS((A1:B2, D5:E6))", &cm, &vs),
+            Value::Number(2.0)
+        );
+    }
+
+    #[test]
+    fn areas_multi_area_three_parts() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AREAS((A1:B2, D5:E6, F1))", &cm, &vs),
+            Value::Number(3.0)
+        );
+    }
+
+    #[test]
+    fn areas_no_args_wrong_arg_count() {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=AREAS()", &cm, &vs),
@@ -28827,11 +28854,33 @@ mod tests {
     }
 
     #[test]
-    fn eval_areas_non_ref_arg() {
+    fn areas_non_ref_arg_wrong_type() {
+        let (cm, vs) = make_test_env();
+        // `1+2` is a BinOp expression, not a reference. Excel surfaces
+        // #VALUE!; we mirror that via WrongType.
+        assert_eq!(
+            eval_str("=AREAS(1+2)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    #[test]
+    fn areas_too_many_args_wrong_arg_count() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str("=AREAS(1)", &cm, &vs),
-            Value::Error(ValueError::WrongType)
+            eval_str("=AREAS(A1, B1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn sum_of_multi_area_is_value_error() {
+        // SUM doesn't know how to walk a multi-area; the inner
+        // `Expr::MultiArea` evaluates to #VALUE!, which propagates.
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SUM((A1:B1, A2:B2))", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
         );
     }
 
