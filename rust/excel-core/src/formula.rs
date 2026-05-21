@@ -85,6 +85,11 @@ pub enum Expr {
         end: CellAddress,
         unbounded: RangeBounds,
     },
+    /// A bare identifier that doesn't parse as a cell ref, function call,
+    /// or boolean literal — e.g. `x` in `LET(x, 5, x*x)`. The evaluator
+    /// resolves the name against the current LET scope (and, in future,
+    /// named ranges); otherwise it surfaces `#NAME?`.
+    Name(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -624,7 +629,12 @@ impl Parser {
             self.pos = save;
         }
 
-        None // unknown identifier
+        // A bare identifier that didn't match anything above (function
+        // call, TRUE/FALSE, cross-sheet ref, cell ref, or whole-column
+        // range) is a `Name`. The evaluator resolves it against the LET
+        // scope at eval time, or yields `#NAME?` if unbound. Numbers
+        // never reach here because they route through `parse_number`.
+        Some(Expr::Name(ident))
     }
 
     fn parse_func_args(&mut self) -> Option<Vec<Expr>> {
@@ -1049,6 +1059,48 @@ mod tests {
         // the rule stops the identifier at `RANK` and the second `.` is
         // not consumed → formula fails to parse.
         assert!(parse_formula("=RANK..EQ(1,A1:A3)").is_none());
+    }
+
+    #[test]
+    fn parse_bare_identifier_is_name() {
+        // Bare identifier that isn't a cell ref / func call / TRUE/FALSE
+        // surfaces as Expr::Name. The evaluator binds it via LET scope or
+        // returns #NAME? if unbound.
+        assert_eq!(parse_formula("=x"), Some(Expr::Name("x".into())));
+        assert_eq!(parse_formula("=foo"), Some(Expr::Name("foo".into())));
+        // Underscores allowed inside identifiers.
+        assert_eq!(parse_formula("=my_var"), Some(Expr::Name("my_var".into())));
+    }
+
+    #[test]
+    fn parse_let_func_with_name_args() {
+        // `LET` is a function call; its name args are Expr::Name nodes.
+        let result = parse_formula("=LET(x, 5, x*x)").unwrap();
+        let Expr::FuncCall { name, args } = result else {
+            panic!("expected FuncCall");
+        };
+        assert_eq!(name, "LET");
+        assert_eq!(args[0], Expr::Name("x".into()));
+        assert_eq!(args[1], Expr::Number(5.0));
+        // args[2] is x*x — BinOp with Name on both sides.
+        match &args[2] {
+            Expr::BinOp { op, left, right } => {
+                assert_eq!(*op, BinOperator::Mul);
+                assert_eq!(**left, Expr::Name("x".into()));
+                assert_eq!(**right, Expr::Name("x".into()));
+            }
+            _ => panic!("expected BinOp"),
+        }
+    }
+
+    #[test]
+    fn parse_decimal_still_works_with_name_fallback() {
+        // The Expr::Name fallback added for LET must not capture decimals
+        // — `1.5` routes through parse_number because identifiers must
+        // start with an alpha char.
+        assert_eq!(parse_formula("=1.5"), Some(Expr::Number(1.5)));
+        assert_eq!(parse_formula("=.5"), Some(Expr::Number(0.5)));
+        assert_eq!(parse_formula("=100.25"), Some(Expr::Number(100.25)));
     }
 
     #[test]

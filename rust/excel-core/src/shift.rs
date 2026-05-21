@@ -137,6 +137,8 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
             name: name.clone(),
             args: args.iter().map(|a| map_addrs(a, f)).collect(),
         },
+        // LET / future-LAMBDA bindings carry no cell address; copy as-is.
+        Expr::Name(_) => expr.clone(),
     }
 }
 
@@ -239,6 +241,8 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
                 .map(|a| shift_refs(a, drow, dcol))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        // LET binding names carry no cell address; copy as-is.
+        Expr::Name(_) => expr.clone(),
     })
 }
 
@@ -460,6 +464,9 @@ fn render_into(expr: &Expr, out: &mut String) {
             }
             out.push(')');
         }
+        // LET-style bound name (or future LAMBDA parameter). Round-trips
+        // verbatim — the parser will rebuild the same `Expr::Name`.
+        Expr::Name(n) => out.push_str(n),
     }
 }
 

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -7,6 +8,61 @@ use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
 use crate::range::CellRange;
 use crate::shift::{REF_INVALID_COL, REF_INVALID_ROW};
+
+/// Lexical-scope frame for a single `LET(...)` activation. Bindings are
+/// pushed sequentially in source order so a later `(name, value)` pair
+/// can reference earlier names in the same LET, and a nested `LET`'s
+/// frame links to the surrounding frame so outer bindings remain
+/// visible through the parent chain.
+///
+/// Why a frame rather than a flat `HashMap`? A LET inside another LET
+/// must shadow — `=LET(x, 5, LET(x, 10, x*2))` returns 20. Linking a
+/// fresh frame to the parent gives shadow semantics in O(depth) lookup
+/// without copying the outer table.
+#[derive(Debug)]
+struct LetFrame {
+    bindings: HashMap<String, Value>,
+}
+
+impl LetFrame {
+    fn new() -> Self {
+        LetFrame {
+            bindings: HashMap::new(),
+        }
+    }
+
+    fn bind(&mut self, name: String, value: Value) {
+        self.bindings.insert(name, value);
+    }
+}
+
+thread_local! {
+    /// Thread-local stack of active LET frames. The top of the stack is
+    /// the innermost LET; lookup walks down. The stack is empty outside
+    /// any LET body — `Expr::Name` then surfaces `#NAME?`.
+    ///
+    /// Why TLS rather than a parameter? Threading a `&Scope` through
+    /// every helper (`for_each_arg_value`, `eval_func` arms, range
+    /// resolvers, etc.) would touch the entire 16k-line `eval.rs`. The
+    /// LET arm pushes/pops a frame in a save/restore guard so the stack
+    /// stays balanced even when the body short-circuits on an error,
+    /// and `Expr::Name` only ever reads — no aliasing hazards.
+    static LET_FRAMES: RefCell<Vec<LetFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Walk the active LET frame stack from innermost to outermost. Returns
+/// the first binding for `name`, or `None` if unbound.
+fn lookup_let_binding(name: &str) -> Option<Value> {
+    LET_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        for frame in frames.iter().rev() {
+            if let Some(v) = frame.bindings.get(name) {
+                return Some(v.clone());
+            }
+        }
+        None
+    })
+}
 
 /// Address-based evaluation source. Both production (Workbook) and the
 /// legacy `eval_expr(get, cell_map)` shim route through this trait.
@@ -156,6 +212,16 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             // cell already on the eval stack returns CyclicRef. No TLS
             // guard needed; provider dispatch is the canonical path.
             provider.sheet_cell(sheet, *addr)
+        }
+
+        Expr::Name(name) => {
+            // Resolve against the current LET scope chain. Unbound names
+            // surface `#NAME?` per Excel.
+            //
+            // Named ranges, if/when implemented, would consult them here
+            // BEFORE falling through to InvalidName — LET bindings take
+            // precedence (Excel parity).
+            lookup_let_binding(name).unwrap_or(Value::Error(ValueError::InvalidName))
         }
     }
 }
@@ -993,6 +1059,67 @@ fn db_aggregate<S>(
 
 fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
     match name {
+        // LET is the first arm so the LET frame is pushed/popped before
+        // any other dispatch can resolve a bare `Expr::Name` against
+        // the stack. L1 of the LAMBDA arc; LAMBDA / MAP / REDUCE come
+        // later.
+        //
+        //   LET(name1, value1, name2, value2, ..., expression)
+        //
+        // Total arg count must be odd and ≥ 3 (at least one binding +
+        // a body). Bindings are LEXICAL and SEQUENTIAL: each value can
+        // see the bindings declared earlier in the same LET, and a
+        // nested LET sees outer bindings through the frame chain.
+        "LET" => {
+            if args.len() < 3 || args.len() % 2 == 0 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let body = args.last().unwrap();
+            let pairs = &args[..args.len() - 1];
+
+            // Push a fresh frame, then bind sequentially. Each value
+            // expression is evaluated WITH the current scope (so later
+            // bindings can reference earlier ones), and an error from
+            // any value propagates out — we still pop the frame via a
+            // guard so the stack stays balanced.
+            //
+            // We don't reject names that shadow built-in function names
+            // (e.g. `LET(SUM, 5, SUM)`). Excel rejects this with #NAME?
+            // but the spec for this commit allows skipping that check;
+            // a future tightening can compare against the dispatch
+            // table here. A non-`Expr::Name` in a name slot is the only
+            // structural rejection — caught below.
+            LET_FRAMES.with(|frames| frames.borrow_mut().push(LetFrame::new()));
+
+            let result = (|| {
+                let mut i = 0;
+                while i < pairs.len() {
+                    let binding_name = match &pairs[i] {
+                        Expr::Name(n) => n.clone(),
+                        _ => return Value::Error(ValueError::InvalidName),
+                    };
+                    let value = eval_expr_with_provider(&pairs[i + 1], provider);
+                    if let Value::Error(e) = &value {
+                        return Value::Error(e.clone());
+                    }
+                    LET_FRAMES.with(|frames| {
+                        frames
+                            .borrow_mut()
+                            .last_mut()
+                            .expect("LET frame just pushed")
+                            .bind(binding_name, value);
+                    });
+                    i += 2;
+                }
+                eval_expr_with_provider(body, provider)
+            })();
+
+            LET_FRAMES.with(|frames| {
+                frames.borrow_mut().pop();
+            });
+            result
+        }
+
         "SUM" => {
             // Real streaming: O(1) accumulator, no Vec allocation. Errors
             // short-circuit through `err`.
@@ -16764,5 +16891,127 @@ mod tests {
                 Value::Number(6.0),
             ]
         );
+    }
+
+    // === LET — L1 of the LAMBDA arc =====================================
+    //
+    // Excel 365's LET introduces lexical, sequential bindings into a
+    // single expression: `LET(name1, value1, ..., expr)`. The tests
+    // below cover the contract documented in the LET arm of
+    // `eval_func`.
+
+    #[test]
+    fn eval_let_simple() {
+        let (cm, vs) = make_test_env();
+        // Single binding, body uses the name twice.
+        assert_eq!(eval_str("=LET(x, 5, x*x)", &cm, &vs), Value::Number(25.0));
+    }
+
+    #[test]
+    fn eval_let_sequential() {
+        let (cm, vs) = make_test_env();
+        // Second binding references the first — lexical/sequential.
+        assert_eq!(
+            eval_str("=LET(x, 5, y, x*2, x+y)", &cm, &vs),
+            Value::Number(15.0)
+        );
+    }
+
+    #[test]
+    fn eval_let_uses_cells() {
+        let (cm, vs) = make_test_env();
+        // A1 = 10 in make_test_env; t = 10 + 1 = 11; body = t*2 = 22.
+        assert_eq!(eval_str("=LET(t, A1+1, t*2)", &cm, &vs), Value::Number(22.0));
+    }
+
+    #[test]
+    fn eval_let_nested() {
+        let (cm, vs) = make_test_env();
+        // Inner LET sees outer `x` through the frame chain.
+        assert_eq!(
+            eval_str("=LET(x, 5, LET(y, x*2, x+y))", &cm, &vs),
+            Value::Number(15.0)
+        );
+    }
+
+    #[test]
+    fn eval_let_shadow() {
+        let (cm, vs) = make_test_env();
+        // Inner `x` shadows outer `x`: inner LET body is `x*2` where
+        // x is 10 (the inner binding), so result is 20.
+        assert_eq!(
+            eval_str("=LET(x, 5, LET(x, 10, x*2))", &cm, &vs),
+            Value::Number(20.0)
+        );
+    }
+
+    #[test]
+    fn eval_let_wrong_arity_even() {
+        let (cm, vs) = make_test_env();
+        // 4 args = 1.5 pairs + 1 body — even total → WrongArgCount.
+        assert_eq!(
+            eval_str("=LET(x, 5, x*2, x*3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_let_wrong_arity_one() {
+        let (cm, vs) = make_test_env();
+        // 1 arg = body alone, no bindings → WrongArgCount.
+        assert_eq!(
+            eval_str("=LET(5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_let_bad_name() {
+        let (cm, vs) = make_test_env();
+        // 123 is parsed as Expr::Number, not Expr::Name → InvalidName.
+        // (The body `x` would itself error too, but the name check
+        // fires first since we walk bindings in order.)
+        assert_eq!(
+            eval_str("=LET(123, 5, x)", &cm, &vs),
+            Value::Error(ValueError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn eval_let_error_in_value() {
+        let (cm, vs) = make_test_env();
+        // 1/0 in the value expression — error propagates out of LET.
+        assert_eq!(
+            eval_str("=LET(x, 1/0, x*2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_name_unbound() {
+        let (cm, vs) = make_test_env();
+        // Bare `x` with no LET scope → #NAME?.
+        assert_eq!(eval_str("=x", &cm, &vs), Value::Error(ValueError::InvalidName));
+    }
+
+    #[test]
+    fn eval_let_inside_func_call() {
+        let (cm, vs) = make_test_env();
+        // LET binding visible to nested function call inside the body.
+        // The thread-local scope guarantees SUM's arg eval still sees x.
+        assert_eq!(
+            eval_str("=LET(x, 5, SUM(x, x, x))", &cm, &vs),
+            Value::Number(15.0)
+        );
+    }
+
+    #[test]
+    fn eval_let_frame_stack_balanced_on_error() {
+        let (cm, vs) = make_test_env();
+        // After an error-propagating LET, the frame stack must pop.
+        // A subsequent bare `x` outside any LET should still surface
+        // #NAME?, not pick up a leaked binding.
+        let _ = eval_str("=LET(x, 1/0, x)", &cm, &vs);
+        assert_eq!(eval_str("=x", &cm, &vs), Value::Error(ValueError::InvalidName));
     }
 }

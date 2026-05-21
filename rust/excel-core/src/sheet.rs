@@ -2962,13 +2962,15 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         }
         // CellRef goes through the point-cell `deps` path; SheetRef is
         // cross-sheet and tracked at the workbook layer; literals have
-        // no deps.
+        // no deps. LET-bound names resolve at eval time against the
+        // local scope, not against the cell graph.
         Expr::CellRef(_)
         | Expr::SheetRef { .. }
         | Expr::SheetRange { .. }
         | Expr::Number(_)
         | Expr::Text(_)
-        | Expr::Bool(_) => {}
+        | Expr::Bool(_)
+        | Expr::Name(_) => {}
     }
 }
 
@@ -3020,6 +3022,8 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         // this sheet (cross-sheet cycles need workbook-level analysis).
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        // LET-bound names don't reference cells.
+        Expr::Name(_) => {}
     }
 }
 
@@ -3089,6 +3093,8 @@ fn collect_formula_refs_into(
         // by local BFS.
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        // LET-bound names don't reference cells in the formula graph.
+        Expr::Name(_) => {}
     }
 }
 
@@ -3104,6 +3110,7 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
             false
         }
+        Expr::Name(_) => false,
     }
 }
 
@@ -3431,8 +3438,13 @@ mod tests {
         sheet.set_formula("B1", "=A1+1");
         assert_eq!(sheet.get_formula("B1").as_deref(), Some("=A1+1"));
 
-        // Invalid formula clears the text (cell becomes #VALUE!)
-        sheet.set_formula("B1", "=garbage");
+        // Unparseable formula clears the stored text (cell becomes #VALUE!).
+        // After Expr::Name was added for LET support, bare identifiers like
+        // `=garbage` now PARSE successfully (they evaluate to #NAME? at
+        // read time, matching Excel semantics). To test the "cannot parse"
+        // branch we use an unmatched paren — there's no surface syntax
+        // that can rescue it.
+        sheet.set_formula("B1", "=(");
         assert_eq!(sheet.get_formula("B1"), None);
     }
 

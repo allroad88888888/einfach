@@ -1091,6 +1091,8 @@ fn collect_cross_sheet_refs_into(
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        // LET-bound names don't reference cross-sheet cells.
+        Expr::Name(_) => {}
     }
 }
 
@@ -1182,6 +1184,8 @@ fn collect_workbook_refs(
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        // LET-bound names don't reference cells in the cross-sheet graph.
+        Expr::Name(_) => {}
     }
 }
 
