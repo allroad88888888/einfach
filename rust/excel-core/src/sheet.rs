@@ -3175,6 +3175,16 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
                     | "BYROW"
                     | "BYCOL"
                     | "MAKEARRAY"
+                    | "SORTBY"
+                    | "RANDARRAY"
+                    | "TAKE"
+                    | "DROP"
+                    | "VSTACK"
+                    | "HSTACK"
+                    | "CHOOSEROWS"
+                    | "CHOOSECOLS"
+                    | "TOROW"
+                    | "TOCOL"
             ) {
                 return true;
             }

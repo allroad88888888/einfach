@@ -6508,6 +6508,1340 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             Value::Array(Arc::new(ArrayData::new(rows_u, cols_u, out)))
         }
 
+        "SORTBY" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Validate the trailing arg pattern. After `array`, args come in
+            // (by_array, [sort_order]) pairs; the order arg is optional, so we
+            // accept any number of trailing args as long as they parse cleanly.
+            // We walk the args list and pull (by_array, order) groups.
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Each key: (Vec<Value> with `rows` entries, order: i32)
+            let mut keys: Vec<(Vec<Value>, i32)> = Vec::new();
+            let mut idx = 1;
+            while idx < args.len() {
+                let (krows, kcols, kdata) = match arg_to_2d(&args[idx], provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                // by_array must have rows == array.rows. Accept either a column
+                // vector (kcols == 1) or take the first column otherwise — but
+                // strict Excel parity requires a single column shape, so reject
+                // anything else.
+                if krows != rows || kcols != 1 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                // Propagate any errors found in this key array.
+                for v in &kdata {
+                    if let Value::Error(e) = v {
+                        return Value::Error(e.clone());
+                    }
+                }
+                // Optional sort_order following the by_array.
+                let order = if idx + 1 < args.len() {
+                    // Peek the next arg. If it evaluates to a number 1 or -1,
+                    // treat it as the order. We cannot disambiguate "by_array
+                    // shaped like a 1-element array passed as a key" from
+                    // "scalar 1 used as sort_order"; Excel resolves this by
+                    // strictly requiring a scalar where a sort_order is
+                    // expected. We follow the SORT precedent: any arg that
+                    // coerces to a scalar 1 / -1 is taken as the order.
+                    // Evaluate without consuming: if it's a range/array, treat
+                    // as the next key.
+                    let is_range = matches!(
+                        &args[idx + 1],
+                        Expr::Range { .. } | Expr::SheetRange { .. }
+                    );
+                    if is_range {
+                        // Definitely another key; no explicit order.
+                        1i32
+                    } else {
+                        let v = eval_expr_with_provider(&args[idx + 1], provider);
+                        if let Value::Error(e) = v {
+                            return Value::Error(e);
+                        }
+                        match coerce_to_number(&v) {
+                            Some(n) if n == 1.0 => {
+                                idx += 1;
+                                1i32
+                            }
+                            Some(n) if n == -1.0 => {
+                                idx += 1;
+                                -1i32
+                            }
+                            _ => return Value::Error(ValueError::InvalidValue),
+                        }
+                    }
+                } else {
+                    1i32
+                };
+                keys.push((kdata, order));
+                idx += 1;
+            }
+            if keys.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Build the permutation. Stable sort_by lets us cleanly express
+            // multi-key precedence: compare key[0]; if equal, compare key[1];
+            // etc. Stability covers any final ties.
+            let mut order: Vec<u32> = (0..rows).collect();
+            order.sort_by(|&a, &b| {
+                for (kdata, sort_order) in &keys {
+                    let va = &kdata[a as usize];
+                    let vb = &kdata[b as usize];
+                    let mut c = compare_lookup(va, vb);
+                    if *sort_order == -1 {
+                        c = c.reverse();
+                    }
+                    if c != std::cmp::Ordering::Equal {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            // Re-assemble `data` in the new row order.
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            for &r in &order {
+                for c in 0..cols {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+        }
+        "RANDARRAY" => {
+            if args.len() > 5 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let rows = if !args.is_empty() {
+                let v = eval_expr_with_provider(&args[0], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u64,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u64
+            };
+            let cols = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u64,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u64
+            };
+            let min_v = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0.0
+            };
+            let max_v = if args.len() >= 4 {
+                let v = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                1.0
+            };
+            let whole = if args.len() == 5 {
+                let v = eval_expr_with_provider(&args[4], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            if min_v > max_v {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            if whole && (min_v.fract() != 0.0 || max_v.fract() != 0.0) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Seed from system clock + a tiny mix so two rapid calls don't
+            // collide. We don't have access to a `rand` crate; xorshift64
+            // is plenty for spreadsheet RNG.
+            let seed = {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E37_79B9_7F4A_7C15);
+                // XOR in the requested shape so back-to-back calls of the
+                // same shape still vary.
+                nanos ^ ((rows as u64) << 32) ^ (cols as u64)
+            };
+            let mut state: u64 = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+            let next_u64 = |s: &mut u64| -> u64 {
+                // xorshift64
+                let mut x = *s;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *s = x;
+                x
+            };
+            let rows_u = rows as u32;
+            let cols_u = cols as u32;
+            let mut data: Vec<Value> = Vec::with_capacity(total as usize);
+            if whole {
+                let min_i = min_v as i64;
+                let max_i = max_v as i64;
+                // Inclusive range size.
+                let span = (max_i - min_i) as u64 + 1;
+                for _ in 0..total {
+                    let r = next_u64(&mut state) % span;
+                    data.push(Value::Number((min_i as f64) + (r as f64)));
+                }
+            } else {
+                let span = max_v - min_v;
+                for _ in 0..total {
+                    // Mantissa-style uniform [0,1).
+                    let r = (next_u64(&mut state) >> 11) as f64 * (1.0f64 / ((1u64 << 53) as f64));
+                    data.push(Value::Number(min_v + r * span));
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows_u, cols_u, data)))
+        }
+        "TAKE" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let rows_arg_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = rows_arg_v {
+                return Value::Error(e);
+            }
+            let rows_arg = match coerce_to_number(&rows_arg_v) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            if rows_arg == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let cols_arg = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                if n == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                Some(n)
+            } else {
+                None
+            };
+            // Compute row slice [r_start, r_end).
+            let (r_start, r_end) = if rows_arg > 0 {
+                let take = (rows_arg as u32).min(rows);
+                (0u32, take)
+            } else {
+                let want = ((-rows_arg) as u32).min(rows);
+                (rows - want, rows)
+            };
+            // Compute col slice [c_start, c_end).
+            let (c_start, c_end) = match cols_arg {
+                None => (0u32, cols),
+                Some(n) if n > 0 => (0u32, (n as u32).min(cols)),
+                Some(n) => {
+                    let want = ((-n) as u32).min(cols);
+                    (cols - want, cols)
+                }
+            };
+            let out_rows = r_end - r_start;
+            let out_cols = c_end - c_start;
+            let mut out: Vec<Value> =
+                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in r_start..r_end {
+                for c in c_start..c_end {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "DROP" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let rows_arg_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = rows_arg_v {
+                return Value::Error(e);
+            }
+            let rows_arg = match coerce_to_number(&rows_arg_v) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let cols_arg = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => Some(n.trunc() as i64),
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                None
+            };
+            // Row slice [r_start, r_end).
+            let (r_start, r_end) = if rows_arg >= 0 {
+                let drop = (rows_arg as u32).min(rows);
+                (drop, rows)
+            } else {
+                let drop = ((-rows_arg) as u32).min(rows);
+                (0u32, rows - drop)
+            };
+            // Col slice [c_start, c_end).
+            let (c_start, c_end) = match cols_arg {
+                None => (0u32, cols),
+                Some(n) if n >= 0 => ((n as u32).min(cols), cols),
+                Some(n) => {
+                    let drop = ((-n) as u32).min(cols);
+                    (0u32, cols - drop)
+                }
+            };
+            if r_end <= r_start || c_end <= c_start {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_rows = r_end - r_start;
+            let out_cols = c_end - c_start;
+            let mut out: Vec<Value> =
+                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in r_start..r_end {
+                for c in c_start..c_end {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "VSTACK" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut blocks: Vec<(u32, u32, Vec<Value>)> = Vec::with_capacity(args.len());
+            for a in args {
+                let (r, c, d) = match arg_to_2d(a, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                if r == 0 || c == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                blocks.push((r, c, d));
+            }
+            let out_cols = blocks.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
+            let out_rows: u32 = blocks.iter().map(|(r, _, _)| *r).sum();
+            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for (br, bc, bd) in &blocks {
+                for r in 0..*br {
+                    for c in 0..out_cols {
+                        if c < *bc {
+                            out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
+                        } else {
+                            out.push(Value::Error(ValueError::InvalidValue));
+                        }
+                    }
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "HSTACK" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut blocks: Vec<(u32, u32, Vec<Value>)> = Vec::with_capacity(args.len());
+            for a in args {
+                let (r, c, d) = match arg_to_2d(a, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                if r == 0 || c == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                blocks.push((r, c, d));
+            }
+            let out_rows = blocks.iter().map(|(r, _, _)| *r).max().unwrap_or(0);
+            let out_cols: u32 = blocks.iter().map(|(_, c, _)| *c).sum();
+            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in 0..out_rows {
+                for (br, bc, bd) in &blocks {
+                    for c in 0..*bc {
+                        if r < *br {
+                            out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
+                        } else {
+                            out.push(Value::Error(ValueError::InvalidValue));
+                        }
+                    }
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "CHOOSEROWS" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut picks: Vec<u32> = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                let resolved: i64 = if n > 0 {
+                    n - 1
+                } else if n < 0 {
+                    (rows as i64) + n
+                } else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                if resolved < 0 || resolved >= rows as i64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                picks.push(resolved as u32);
+            }
+            let out_rows = picks.len() as u32;
+            let mut out: Vec<Value> = Vec::with_capacity(picks.len() * (cols as usize));
+            for &r in &picks {
+                for c in 0..cols {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, cols, out)))
+        }
+        "CHOOSECOLS" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut picks: Vec<u32> = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                let resolved: i64 = if n > 0 {
+                    n - 1
+                } else if n < 0 {
+                    (cols as i64) + n
+                } else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                if resolved < 0 || resolved >= cols as i64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                picks.push(resolved as u32);
+            }
+            let out_cols = picks.len() as u32;
+            let mut out: Vec<Value> = Vec::with_capacity((rows as usize) * picks.len());
+            for r in 0..rows {
+                for &c in &picks {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, out_cols, out)))
+        }
+        "TOROW" => {
+            if args.is_empty() || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let ignore = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0i64
+            };
+            if !(0..=3).contains(&ignore) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let by_col = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            let skip_blanks = ignore == 1 || ignore == 3;
+            let skip_errors = ignore == 2 || ignore == 3;
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            let push = |v: &Value, out: &mut Vec<Value>| {
+                let drop = (skip_blanks && matches!(v, Value::Null))
+                    || (skip_errors && matches!(v, Value::Error(_)));
+                if !drop {
+                    out.push(v.clone());
+                }
+            };
+            if by_col {
+                for c in 0..cols {
+                    for r in 0..rows {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            } else {
+                for r in 0..rows {
+                    for c in 0..cols {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_cols = out.len() as u32;
+            Value::Array(Arc::new(ArrayData::new(1, out_cols, out)))
+        }
+        "TOCOL" => {
+            if args.is_empty() || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let ignore = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0i64
+            };
+            if !(0..=3).contains(&ignore) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let by_col = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            let skip_blanks = ignore == 1 || ignore == 3;
+            let skip_errors = ignore == 2 || ignore == 3;
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            let push = |v: &Value, out: &mut Vec<Value>| {
+                let drop = (skip_blanks && matches!(v, Value::Null))
+                    || (skip_errors && matches!(v, Value::Error(_)));
+                if !drop {
+                    out.push(v.clone());
+                }
+            };
+            if by_col {
+                for c in 0..cols {
+                    for r in 0..rows {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            } else {
+                for r in 0..rows {
+                    for c in 0..cols {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_rows = out.len() as u32;
+            Value::Array(Arc::new(ArrayData::new(out_rows, 1, out)))
+        }
+        "NORM.DIST" => stat_norm_dist(args, provider),
+        "NORM.INV" => stat_norm_inv(args, provider),
+        "NORM.S.DIST" => stat_norm_s_dist(args, provider),
+        "NORM.S.INV" => stat_norm_s_inv(args, provider),
+        "T.DIST" => stat_t_dist(args, provider),
+        "T.DIST.RT" => stat_t_dist_rt(args, provider),
+        "T.DIST.2T" => stat_t_dist_2t(args, provider),
+        "T.INV" => stat_t_inv(args, provider),
+        "T.INV.2T" => stat_t_inv_2t(args, provider),
+        "F.DIST" => stat_f_dist(args, provider),
+        "F.DIST.RT" => stat_f_dist_rt(args, provider),
+        "F.INV" => stat_f_inv(args, provider),
+        "F.INV.RT" => stat_f_inv_rt(args, provider),
+        "CHISQ.DIST" => stat_chisq_dist(args, provider),
+        "CHISQ.DIST.RT" => stat_chisq_dist_rt(args, provider),
+        "CHISQ.INV" => stat_chisq_inv(args, provider),
+        "CHISQ.INV.RT" => stat_chisq_inv_rt(args, provider),
+        "EXPON.DIST" => stat_expon_dist(args, provider),
+        "WEIBULL.DIST" => stat_weibull_dist(args, provider),
+        "BETA.DIST" => stat_beta_dist(args, provider),
+        "BETA.INV" => stat_beta_inv(args, provider),
+        "GAMMA.DIST" => stat_gamma_dist(args, provider),
+        "GAMMA.INV" => stat_gamma_inv(args, provider),
+        "BINOM.DIST" => stat_binom_dist(args, provider),
+        "BINOM.INV" => stat_binom_inv(args, provider),
+        "POISSON.DIST" => stat_poisson_dist(args, provider),
+        "HYPGEOM.DIST" => stat_hypgeom_dist(args, provider),
+        "NEGBINOM.DIST" => stat_negbinom_dist(args, provider),
+        "GAMMA" => stat_gamma_func(args, provider),
+        "GAMMALN" => stat_gammaln(args, provider),
+        "ERF" => stat_erf(args, provider),
+        "ERFC" => stat_erfc(args, provider),
+        "KURT" => stat_kurt(args, provider),
+        "SKEW" => stat_skew(args, provider),
+        "AVEDEV" => stat_avedev(args, provider),
+        "DEVSQ" => stat_devsq(args, provider),
+        "GEOMEAN" => stat_geomean(args, provider),
+        "HARMEAN" => stat_harmean(args, provider),
+        "TRIMMEAN" => stat_trimmean(args, provider),
+        "STANDARDIZE" => stat_standardize(args, provider),
+        "FISHER" => stat_fisher(args, provider),
+        "FISHERINV" => stat_fisherinv(args, provider),
+        "SORTBY" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Validate the trailing arg pattern. After `array`, args come in
+            // (by_array, [sort_order]) pairs; the order arg is optional, so we
+            // accept any number of trailing args as long as they parse cleanly.
+            // We walk the args list and pull (by_array, order) groups.
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Each key: (Vec<Value> with `rows` entries, order: i32)
+            let mut keys: Vec<(Vec<Value>, i32)> = Vec::new();
+            let mut idx = 1;
+            while idx < args.len() {
+                let (krows, kcols, kdata) = match arg_to_2d(&args[idx], provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                // by_array must have rows == array.rows. Accept either a column
+                // vector (kcols == 1) or take the first column otherwise — but
+                // strict Excel parity requires a single column shape, so reject
+                // anything else.
+                if krows != rows || kcols != 1 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                // Propagate any errors found in this key array.
+                for v in &kdata {
+                    if let Value::Error(e) = v {
+                        return Value::Error(e.clone());
+                    }
+                }
+                // Optional sort_order following the by_array.
+                let order = if idx + 1 < args.len() {
+                    // Peek the next arg. If it evaluates to a number 1 or -1,
+                    // treat it as the order. We cannot disambiguate "by_array
+                    // shaped like a 1-element array passed as a key" from
+                    // "scalar 1 used as sort_order"; Excel resolves this by
+                    // strictly requiring a scalar where a sort_order is
+                    // expected. We follow the SORT precedent: any arg that
+                    // coerces to a scalar 1 / -1 is taken as the order.
+                    // Evaluate without consuming: if it's a range/array, treat
+                    // as the next key.
+                    let is_range = matches!(
+                        &args[idx + 1],
+                        Expr::Range { .. } | Expr::SheetRange { .. }
+                    );
+                    if is_range {
+                        // Definitely another key; no explicit order.
+                        1i32
+                    } else {
+                        let v = eval_expr_with_provider(&args[idx + 1], provider);
+                        if let Value::Error(e) = v {
+                            return Value::Error(e);
+                        }
+                        match coerce_to_number(&v) {
+                            Some(n) if n == 1.0 => {
+                                idx += 1;
+                                1i32
+                            }
+                            Some(n) if n == -1.0 => {
+                                idx += 1;
+                                -1i32
+                            }
+                            _ => return Value::Error(ValueError::InvalidValue),
+                        }
+                    }
+                } else {
+                    1i32
+                };
+                keys.push((kdata, order));
+                idx += 1;
+            }
+            if keys.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Build the permutation. Stable sort_by lets us cleanly express
+            // multi-key precedence: compare key[0]; if equal, compare key[1];
+            // etc. Stability covers any final ties.
+            let mut order: Vec<u32> = (0..rows).collect();
+            order.sort_by(|&a, &b| {
+                for (kdata, sort_order) in &keys {
+                    let va = &kdata[a as usize];
+                    let vb = &kdata[b as usize];
+                    let mut c = compare_lookup(va, vb);
+                    if *sort_order == -1 {
+                        c = c.reverse();
+                    }
+                    if c != std::cmp::Ordering::Equal {
+                        return c;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            // Re-assemble `data` in the new row order.
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            for &r in &order {
+                for c in 0..cols {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+        }
+        "RANDARRAY" => {
+            if args.len() > 5 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let rows = if !args.is_empty() {
+                let v = eval_expr_with_provider(&args[0], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u64,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u64
+            };
+            let cols = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) if n >= 1.0 => n.trunc() as u64,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                1u64
+            };
+            let min_v = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0.0
+            };
+            let max_v = if args.len() >= 4 {
+                let v = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                1.0
+            };
+            let whole = if args.len() == 5 {
+                let v = eval_expr_with_provider(&args[4], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            if min_v > max_v {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            if whole && (min_v.fract() != 0.0 || max_v.fract() != 0.0) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            // Seed from system clock + a tiny mix so two rapid calls don't
+            // collide. We don't have access to a `rand` crate; xorshift64
+            // is plenty for spreadsheet RNG.
+            let seed = {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0x9E37_79B9_7F4A_7C15);
+                // XOR in the requested shape so back-to-back calls of the
+                // same shape still vary.
+                nanos ^ ((rows as u64) << 32) ^ (cols as u64)
+            };
+            let mut state: u64 = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+            let next_u64 = |s: &mut u64| -> u64 {
+                // xorshift64
+                let mut x = *s;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *s = x;
+                x
+            };
+            let rows_u = rows as u32;
+            let cols_u = cols as u32;
+            let mut data: Vec<Value> = Vec::with_capacity(total as usize);
+            if whole {
+                let min_i = min_v as i64;
+                let max_i = max_v as i64;
+                // Inclusive range size.
+                let span = (max_i - min_i) as u64 + 1;
+                for _ in 0..total {
+                    let r = next_u64(&mut state) % span;
+                    data.push(Value::Number((min_i as f64) + (r as f64)));
+                }
+            } else {
+                let span = max_v - min_v;
+                for _ in 0..total {
+                    // Mantissa-style uniform [0,1).
+                    let r = (next_u64(&mut state) >> 11) as f64 * (1.0f64 / ((1u64 << 53) as f64));
+                    data.push(Value::Number(min_v + r * span));
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows_u, cols_u, data)))
+        }
+        "TAKE" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let rows_arg_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = rows_arg_v {
+                return Value::Error(e);
+            }
+            let rows_arg = match coerce_to_number(&rows_arg_v) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            if rows_arg == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let cols_arg = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                if n == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                Some(n)
+            } else {
+                None
+            };
+            // Compute row slice [r_start, r_end).
+            let (r_start, r_end) = if rows_arg > 0 {
+                let take = (rows_arg as u32).min(rows);
+                (0u32, take)
+            } else {
+                let want = ((-rows_arg) as u32).min(rows);
+                (rows - want, rows)
+            };
+            // Compute col slice [c_start, c_end).
+            let (c_start, c_end) = match cols_arg {
+                None => (0u32, cols),
+                Some(n) if n > 0 => (0u32, (n as u32).min(cols)),
+                Some(n) => {
+                    let want = ((-n) as u32).min(cols);
+                    (cols - want, cols)
+                }
+            };
+            let out_rows = r_end - r_start;
+            let out_cols = c_end - c_start;
+            let mut out: Vec<Value> =
+                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in r_start..r_end {
+                for c in c_start..c_end {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "DROP" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let rows_arg_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = rows_arg_v {
+                return Value::Error(e);
+            }
+            let rows_arg = match coerce_to_number(&rows_arg_v) {
+                Some(n) => n.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let cols_arg = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => Some(n.trunc() as i64),
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                None
+            };
+            // Row slice [r_start, r_end).
+            let (r_start, r_end) = if rows_arg >= 0 {
+                let drop = (rows_arg as u32).min(rows);
+                (drop, rows)
+            } else {
+                let drop = ((-rows_arg) as u32).min(rows);
+                (0u32, rows - drop)
+            };
+            // Col slice [c_start, c_end).
+            let (c_start, c_end) = match cols_arg {
+                None => (0u32, cols),
+                Some(n) if n >= 0 => ((n as u32).min(cols), cols),
+                Some(n) => {
+                    let drop = ((-n) as u32).min(cols);
+                    (0u32, cols - drop)
+                }
+            };
+            if r_end <= r_start || c_end <= c_start {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_rows = r_end - r_start;
+            let out_cols = c_end - c_start;
+            let mut out: Vec<Value> =
+                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in r_start..r_end {
+                for c in c_start..c_end {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "VSTACK" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut blocks: Vec<(u32, u32, Vec<Value>)> = Vec::with_capacity(args.len());
+            for a in args {
+                let (r, c, d) = match arg_to_2d(a, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                if r == 0 || c == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                blocks.push((r, c, d));
+            }
+            let out_cols = blocks.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
+            let out_rows: u32 = blocks.iter().map(|(r, _, _)| *r).sum();
+            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for (br, bc, bd) in &blocks {
+                for r in 0..*br {
+                    for c in 0..out_cols {
+                        if c < *bc {
+                            out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
+                        } else {
+                            out.push(Value::Error(ValueError::InvalidValue));
+                        }
+                    }
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "HSTACK" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let mut blocks: Vec<(u32, u32, Vec<Value>)> = Vec::with_capacity(args.len());
+            for a in args {
+                let (r, c, d) = match arg_to_2d(a, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                if r == 0 || c == 0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                blocks.push((r, c, d));
+            }
+            let out_rows = blocks.iter().map(|(r, _, _)| *r).max().unwrap_or(0);
+            let out_cols: u32 = blocks.iter().map(|(_, c, _)| *c).sum();
+            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            for r in 0..out_rows {
+                for (br, bc, bd) in &blocks {
+                    for c in 0..*bc {
+                        if r < *br {
+                            out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
+                        } else {
+                            out.push(Value::Error(ValueError::InvalidValue));
+                        }
+                    }
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, out_cols, out)))
+        }
+        "CHOOSEROWS" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut picks: Vec<u32> = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                let resolved: i64 = if n > 0 {
+                    n - 1
+                } else if n < 0 {
+                    (rows as i64) + n
+                } else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                if resolved < 0 || resolved >= rows as i64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                picks.push(resolved as u32);
+            }
+            let out_rows = picks.len() as u32;
+            let mut out: Vec<Value> = Vec::with_capacity(picks.len() * (cols as usize));
+            for &r in &picks {
+                for c in 0..cols {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(out_rows, cols, out)))
+        }
+        "CHOOSECOLS" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut picks: Vec<u32> = Vec::with_capacity(args.len() - 1);
+            for a in &args[1..] {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                let n = match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                };
+                let resolved: i64 = if n > 0 {
+                    n - 1
+                } else if n < 0 {
+                    (cols as i64) + n
+                } else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                if resolved < 0 || resolved >= cols as i64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                picks.push(resolved as u32);
+            }
+            let out_cols = picks.len() as u32;
+            let mut out: Vec<Value> = Vec::with_capacity((rows as usize) * picks.len());
+            for r in 0..rows {
+                for &c in &picks {
+                    out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, out_cols, out)))
+        }
+        "TOROW" => {
+            if args.is_empty() || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let ignore = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0i64
+            };
+            if !(0..=3).contains(&ignore) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let by_col = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            let skip_blanks = ignore == 1 || ignore == 3;
+            let skip_errors = ignore == 2 || ignore == 3;
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            let push = |v: &Value, out: &mut Vec<Value>| {
+                let drop = (skip_blanks && matches!(v, Value::Null))
+                    || (skip_errors && matches!(v, Value::Error(_)));
+                if !drop {
+                    out.push(v.clone());
+                }
+            };
+            if by_col {
+                for c in 0..cols {
+                    for r in 0..rows {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            } else {
+                for r in 0..rows {
+                    for c in 0..cols {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_cols = out.len() as u32;
+            Value::Array(Arc::new(ArrayData::new(1, out_cols, out)))
+        }
+        "TOCOL" => {
+            if args.is_empty() || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let ignore = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match coerce_to_number(&v) {
+                    Some(n) => n.trunc() as i64,
+                    None => return Value::Error(ValueError::WrongType),
+                }
+            } else {
+                0i64
+            };
+            if !(0..=3).contains(&ignore) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let by_col = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                coerce_to_bool(&v).unwrap_or(false)
+            } else {
+                false
+            };
+            let skip_blanks = ignore == 1 || ignore == 3;
+            let skip_errors = ignore == 2 || ignore == 3;
+            let mut out: Vec<Value> = Vec::with_capacity(data.len());
+            let push = |v: &Value, out: &mut Vec<Value>| {
+                let drop = (skip_blanks && matches!(v, Value::Null))
+                    || (skip_errors && matches!(v, Value::Error(_)));
+                if !drop {
+                    out.push(v.clone());
+                }
+            };
+            if by_col {
+                for c in 0..cols {
+                    for r in 0..rows {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            } else {
+                for r in 0..rows {
+                    for c in 0..cols {
+                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                    }
+                }
+            }
+            if out.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let out_rows = out.len() as u32;
+            Value::Array(Arc::new(ArrayData::new(out_rows, 1, out)))
+        }
+        "NORM.DIST" => stat_norm_dist(args, provider),
+        "NORM.INV" => stat_norm_inv(args, provider),
+        "NORM.S.DIST" => stat_norm_s_dist(args, provider),
+        "NORM.S.INV" => stat_norm_s_inv(args, provider),
+        "T.DIST" => stat_t_dist(args, provider),
+        "T.DIST.RT" => stat_t_dist_rt(args, provider),
+        "T.DIST.2T" => stat_t_dist_2t(args, provider),
+        "T.INV" => stat_t_inv(args, provider),
+        "T.INV.2T" => stat_t_inv_2t(args, provider),
+        "F.DIST" => stat_f_dist(args, provider),
+        "F.DIST.RT" => stat_f_dist_rt(args, provider),
+        "F.INV" => stat_f_inv(args, provider),
+        "F.INV.RT" => stat_f_inv_rt(args, provider),
+        "CHISQ.DIST" => stat_chisq_dist(args, provider),
+        "CHISQ.DIST.RT" => stat_chisq_dist_rt(args, provider),
+        "CHISQ.INV" => stat_chisq_inv(args, provider),
+        "CHISQ.INV.RT" => stat_chisq_inv_rt(args, provider),
+        "EXPON.DIST" => stat_expon_dist(args, provider),
+        "WEIBULL.DIST" => stat_weibull_dist(args, provider),
+        "BETA.DIST" => stat_beta_dist(args, provider),
+        "BETA.INV" => stat_beta_inv(args, provider),
+        "GAMMA.DIST" => stat_gamma_dist(args, provider),
+        "GAMMA.INV" => stat_gamma_inv(args, provider),
+        "BINOM.DIST" => stat_binom_dist(args, provider),
+        "BINOM.INV" => stat_binom_inv(args, provider),
+        "POISSON.DIST" => stat_poisson_dist(args, provider),
+        "HYPGEOM.DIST" => stat_hypgeom_dist(args, provider),
+        "NEGBINOM.DIST" => stat_negbinom_dist(args, provider),
+        "GAMMA" => stat_gamma_func(args, provider),
+        "GAMMALN" => stat_gammaln(args, provider),
+        "ERF" => stat_erf(args, provider),
+        "ERFC" => stat_erfc(args, provider),
+        "KURT" => stat_kurt(args, provider),
+        "SKEW" => stat_skew(args, provider),
+        "AVEDEV" => stat_avedev(args, provider),
+        "DEVSQ" => stat_devsq(args, provider),
+        "GEOMEAN" => stat_geomean(args, provider),
+        "HARMEAN" => stat_harmean(args, provider),
+        "TRIMMEAN" => stat_trimmean(args, provider),
+        "STANDARDIZE" => stat_standardize(args, provider),
+        "FISHER" => stat_fisher(args, provider),
+        "FISHERINV" => stat_fisherinv(args, provider),
         _ => Value::Error(ValueError::InvalidName),
     }
 }
@@ -8612,6 +9946,1139 @@ fn iso_week_number(serial: i64) -> i64 {
     }
     (serial - start) / 7 + 1
 }
+
+fn stat_num(arg: &Expr, provider: &dyn EvalProvider) -> Result<f64, Value> {
+    let v = eval_expr_with_provider(arg, provider);
+    if let Value::Error(e) = v {
+        return Err(Value::Error(e));
+    }
+    match coerce_to_number(&v) {
+        Some(n) => Ok(n),
+        None => Err(Value::Error(ValueError::WrongType)),
+    }
+}
+
+fn stat_bool(arg: &Expr, provider: &dyn EvalProvider) -> Result<bool, Value> {
+    let v = eval_expr_with_provider(arg, provider);
+    if let Value::Error(e) = v {
+        return Err(Value::Error(e));
+    }
+    match coerce_to_bool(&v) {
+        Some(b) => Ok(b),
+        None => Err(Value::Error(ValueError::WrongType)),
+    }
+}
+
+fn stat_finite(n: f64) -> Value {
+    if n.is_finite() {
+        Value::Number(n)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn stat_norm_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(sd > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Normal::new(mean, sd) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_norm_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p < 1.0) || !(sd > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Normal::new(mean, sd) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_norm_s_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let z = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[1], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    stat_finite(if cumulative { dist.cdf(z) } else { dist.pdf(z) })
+}
+
+fn stat_norm_s_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p < 1.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_t_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, StudentsT};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[2], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(df > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_t_dist_rt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // Excel: T.DIST.RT requires x >= 0 (returns #NUM! for negative).
+    if !(df > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(1.0 - dist.cdf(x))
+}
+
+fn stat_t_dist_2t(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(df > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(2.0 * (1.0 - dist.cdf(x)))
+}
+
+fn stat_t_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p < 1.0) || !(df > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_t_inv_2t(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // p ∈ (0, 1]. p=0 invalid (would yield infinity).
+    if !(p > 0.0 && p <= 1.0) || !(df > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    // Two-tail: find x s.t. P(|T| > x) = p  →  P(T > x) = p/2  →  x = invCDF(1 - p/2).
+    stat_finite(dist.inverse_cdf(1.0 - p / 2.0))
+}
+
+fn stat_f_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, FisherSnedecor};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d1 = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d2 = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(d1 > 0.0) || !(d2 > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match FisherSnedecor::new(d1, d2) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_f_dist_rt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, FisherSnedecor};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d1 = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d2 = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(d1 > 0.0) || !(d2 > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match FisherSnedecor::new(d1, d2) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(1.0 - dist.cdf(x))
+}
+
+fn stat_f_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, FisherSnedecor};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d1 = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d2 = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p >= 0.0 && p < 1.0) || !(d1 > 0.0) || !(d2 > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match FisherSnedecor::new(d1, d2) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_f_inv_rt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, FisherSnedecor};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d1 = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let d2 = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p <= 1.0) || !(d1 > 0.0) || !(d2 > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match FisherSnedecor::new(d1, d2) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(1.0 - p))
+}
+
+fn stat_chisq_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ChiSquared, Continuous, ContinuousCDF};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[2], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(df > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match ChiSquared::new(df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_chisq_dist_rt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(df > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match ChiSquared::new(df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(1.0 - dist.cdf(x))
+}
+
+fn stat_chisq_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p >= 0.0 && p < 1.0) || !(df > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match ChiSquared::new(df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_chisq_inv_rt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p <= 1.0) || !(df > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match ChiSquared::new(df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(1.0 - p))
+}
+
+fn stat_expon_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, Exp};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let lambda = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[2], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(lambda > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Exp::new(lambda) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_weibull_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, Weibull};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(alpha > 0.0) || !(beta > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Excel: WEIBULL.DIST(x, shape=alpha, scale=beta). statrs::Weibull::new
+    // takes (shape, scale) in that order — same convention.
+    let dist = match Weibull::new(alpha, beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_beta_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Beta, Continuous, ContinuousCDF};
+    if !(4..=6).contains(&args.len()) {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let a = if args.len() >= 5 {
+        match stat_num(&args[4], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        0.0
+    };
+    let b = if args.len() == 6 {
+        match stat_num(&args[5], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        1.0
+    };
+    if !(alpha > 0.0) || !(beta > 0.0) || !(b > a) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if x < a || x > b {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Beta::new(alpha, beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    // Map x ∈ [a,b] → u ∈ [0,1].
+    let u = (x - a) / (b - a);
+    if cumulative {
+        stat_finite(dist.cdf(u))
+    } else {
+        // PDF transforms by chain rule: f_X(x) = f_U(u) / (b - a).
+        stat_finite(dist.pdf(u) / (b - a))
+    }
+}
+
+fn stat_beta_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Beta, ContinuousCDF};
+    if !(3..=5).contains(&args.len()) {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let a = if args.len() >= 4 {
+        match stat_num(&args[3], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        0.0
+    };
+    let b = if args.len() == 5 {
+        match stat_num(&args[4], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        1.0
+    };
+    if !(p >= 0.0 && p <= 1.0) || !(alpha > 0.0) || !(beta > 0.0) || !(b > a) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Beta::new(alpha, beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let u = dist.inverse_cdf(p);
+    stat_finite(a + u * (b - a))
+}
+
+fn stat_gamma_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, Gamma};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(alpha > 0.0) || !(beta > 0.0) || x < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Gamma::new(alpha, 1.0 / beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+fn stat_gamma_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Gamma};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p >= 0.0 && p < 1.0) || !(alpha > 0.0) || !(beta > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Gamma::new(alpha, 1.0 / beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+fn stat_binom_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Binomial, Discrete, DiscreteCDF};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let num_s = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let trials = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let p = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(p >= 0.0 && p <= 1.0) || trials < 0.0 || num_s < 0.0 || num_s > trials {
+        return Value::Error(ValueError::Overflow);
+    }
+    if num_s.trunc() != num_s || trials.trunc() != trials {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Binomial::new(p, trials as u64) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let k = num_s as u64;
+    stat_finite(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+fn stat_binom_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Binomial, DiscreteCDF};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let trials = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let p = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p < 1.0)
+        || !(alpha > 0.0 && alpha < 1.0)
+        || trials < 0.0
+        || trials.trunc() != trials
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    let n = trials as u64;
+    let dist = match Binomial::new(p, n) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    // Smallest k s.t. CDF(k) >= alpha. Linear scan is fine for typical n;
+    // for very large n statrs's inverse_cdf would do bisection but its
+    // default returns u64 and we want exact integer semantics here.
+    for k in 0..=n {
+        if dist.cdf(k) >= alpha {
+            return Value::Number(k as f64);
+        }
+    }
+    // Fallback (shouldn't happen since cdf(n)=1 ≥ alpha): return n.
+    Value::Number(n as f64)
+}
+
+fn stat_poisson_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Discrete, DiscreteCDF, Poisson};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[2], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(mean > 0.0) || x < 0.0 || x.trunc() != x {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Poisson::new(mean) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let k = x as u64;
+    stat_finite(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+fn stat_hypgeom_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Discrete, DiscreteCDF, Hypergeometric};
+    if args.len() != 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let sample_s = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_sample = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let pop_s = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_pop = match stat_num(&args[3], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[4], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    for v in [sample_s, num_sample, pop_s, num_pop] {
+        if v < 0.0 || v.trunc() != v {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    if pop_s > num_pop || num_sample > num_pop || sample_s > num_sample || sample_s > pop_s {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Hypergeometric::new(num_pop as u64, pop_s as u64, num_sample as u64) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let k = sample_s as u64;
+    stat_finite(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+fn stat_negbinom_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    // Excel NEGBINOM.DIST(num_f, num_s, prob_s, cumulative): number of
+    // failures before num_s successes. statrs::NegativeBinomial::new(r, p)
+    // takes r = number of successes, p = success prob, and parameterises X
+    // as the number of failures, matching Excel.
+    use statrs::distribution::{Discrete, DiscreteCDF, NegativeBinomial};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let num_f = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_s = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let p = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p <= 1.0)
+        || num_f < 0.0
+        || num_s < 1.0
+        || num_f.trunc() != num_f
+        || num_s.trunc() != num_s
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match NegativeBinomial::new(num_s, p) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let k = num_f as u64;
+    stat_finite(if cumulative { dist.cdf(k) } else { dist.pmf(k) })
+}
+
+fn stat_gamma_func(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::function::gamma::gamma;
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    // Gamma function: undefined for 0 and negative integers (poles).
+    if x == 0.0 || (x < 0.0 && x.trunc() == x) {
+        return Value::Error(ValueError::Overflow);
+    }
+    stat_finite(gamma(x))
+}
+
+fn stat_gammaln(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::function::gamma::ln_gamma;
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if x <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    stat_finite(ln_gamma(x))
+}
+
+fn stat_erf(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::function::erf::erf;
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let lower = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if args.len() == 1 {
+        stat_finite(erf(lower))
+    } else {
+        let upper = match stat_num(&args[1], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        };
+        // Two-arg form: erf(upper) - erf(lower).
+        stat_finite(erf(upper) - erf(lower))
+    }
+}
+
+fn stat_erfc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::function::erf::erfc;
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    stat_finite(erfc(x))
+}
+
+fn stat_kurt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    let n = nums.len() as f64;
+    if nums.len() < 4 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mean = nums.iter().sum::<f64>() / n;
+    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let s = var.sqrt();
+    if s == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let sum4 = nums.iter().map(|x| ((x - mean) / s).powi(4)).sum::<f64>();
+    let k = (n * (n + 1.0)) / ((n - 1.0) * (n - 2.0) * (n - 3.0)) * sum4
+        - 3.0 * (n - 1.0).powi(2) / ((n - 2.0) * (n - 3.0));
+    stat_finite(k)
+}
+
+fn stat_skew(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    let n = nums.len() as f64;
+    if nums.len() < 3 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mean = nums.iter().sum::<f64>() / n;
+    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let s = var.sqrt();
+    if s == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let sum3 = nums.iter().map(|x| ((x - mean) / s).powi(3)).sum::<f64>();
+    let sk = n / ((n - 1.0) * (n - 2.0)) * sum3;
+    stat_finite(sk)
+}
+
+fn stat_avedev(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    if nums.is_empty() {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let n = nums.len() as f64;
+    let mean = nums.iter().sum::<f64>() / n;
+    let sum_abs: f64 = nums.iter().map(|x| (x - mean).abs()).sum();
+    stat_finite(sum_abs / n)
+}
+
+fn stat_devsq(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    if nums.is_empty() {
+        return Value::Number(0.0);
+    }
+    let n = nums.len() as f64;
+    let mean = nums.iter().sum::<f64>() / n;
+    stat_finite(nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>())
+}
+
+fn stat_geomean(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    if nums.is_empty() {
+        return Value::Error(ValueError::Overflow);
+    }
+    // All values must be strictly positive; else #NUM!.
+    for &v in &nums {
+        if v <= 0.0 {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    // Use log-mean to avoid overflow on large products.
+    let n = nums.len() as f64;
+    let log_mean = nums.iter().map(|x| x.ln()).sum::<f64>() / n;
+    stat_finite(log_mean.exp())
+}
+
+fn stat_harmean(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let nums = collect_numbers(args, provider);
+    if nums.is_empty() {
+        return Value::Error(ValueError::Overflow);
+    }
+    for &v in &nums {
+        if v <= 0.0 {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    let n = nums.len() as f64;
+    let inv_sum: f64 = nums.iter().map(|x| 1.0 / x).sum();
+    stat_finite(n / inv_sum)
+}
+
+fn stat_trimmean(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let percent = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(percent >= 0.0 && percent < 1.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mut nums = collect_numbers(&args[..1], provider);
+    let n = nums.len();
+    if n == 0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    // Excel rule: total number to trim = floor(n * percent), then round
+    // *down* to the nearest even integer so the same count is trimmed from
+    // each end. e.g. n=20, percent=0.2 → floor(4)=4, even → trim 2 from
+    // each end. n=10, percent=0.2 → floor(2)=2, even → trim 1 from each
+    // end. n=10, percent=0.15 → floor(1.5)=1, made even → 0 → trim none.
+    let trim_total = (n as f64 * percent).floor() as usize;
+    let trim_each = trim_total / 2; // integer divide drops the odd bit -> "round down to even"
+    if 2 * trim_each >= n {
+        return Value::Error(ValueError::Overflow);
+    }
+    nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let kept = &nums[trim_each..n - trim_each];
+    let mean = kept.iter().sum::<f64>() / kept.len() as f64;
+    stat_finite(mean)
+}
+
+fn stat_standardize(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if sd <= 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    stat_finite((x - mean) / sd)
+}
+
+fn stat_fisher(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if x <= -1.0 || x >= 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    stat_finite(0.5 * ((1.0 + x) / (1.0 - x)).ln())
+}
+
+fn stat_fisherinv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let y = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let e2y = (2.0 * y).exp();
+    stat_finite((e2y - 1.0) / (e2y + 1.0))
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
     let mut out = Vec::new();
@@ -17901,4 +20368,1294 @@ mod tests {
             _ => panic!("expected Array, got {:?}", v),
         }
     }
+    #[test]
+    fn eval_sortby_single_key_asc() {
+        let (cm, vs) = make_sortby_env_multi_key();
+        // Sort col A by col B ascending. Col B is [1,1,2,2] so the order
+        // is stable: rows [0,1,2,3] → unchanged.
+        let (r, c, data) = unwrap_array(eval_str("=SORTBY(A1:A4, B1:B4)", &cm, &vs));
+        assert_eq!((r, c), (4, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Text("w".into()),
+                Value::Text("x".into()),
+                Value::Text("y".into()),
+                Value::Text("z".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sortby_single_key_desc() {
+        let (cm, vs) = make_sortby_env_multi_key();
+        // Sort col A by col B descending. Col B = [1,1,2,2] → rows with
+        // key 2 first (rows 2, 3, stable), then rows with key 1.
+        let (r, c, data) = unwrap_array(eval_str("=SORTBY(A1:A4, B1:B4, -1)", &cm, &vs));
+        assert_eq!((r, c), (4, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Text("y".into()),
+                Value::Text("z".into()),
+                Value::Text("w".into()),
+                Value::Text("x".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sortby_multi_key_stable_tiebreak() {
+        let (cm, vs) = make_sortby_env_multi_key();
+        // Sort by B asc, ties broken by C asc.
+        // Keys: (1,20), (1,10), (2,20), (2,10).
+        // Within B=1: prefer C=10 → row 1 first, then row 0.
+        // Within B=2: prefer C=10 → row 3 first, then row 2.
+        // Expected order: x, w, z, y.
+        let (r, c, data) =
+            unwrap_array(eval_str("=SORTBY(A1:A4, B1:B4, 1, C1:C4, 1)", &cm, &vs));
+        assert_eq!((r, c), (4, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Text("x".into()),
+                Value::Text("w".into()),
+                Value::Text("z".into()),
+                Value::Text("y".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_sortby_wrong_arg_count() {
+        let (cm, vs) = make_sortby_env_multi_key();
+        assert_eq!(
+            eval_str("=SORTBY(A1:A4)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_sortby_by_array_shape_mismatch() {
+        let (cm, vs) = make_sortby_env_multi_key();
+        // by_array has 3 rows but array has 4 → InvalidValue.
+        assert_eq!(
+            eval_str("=SORTBY(A1:A4, B1:B3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_randarray_default_shape() {
+        let (cm, vs) = make_test_env();
+        // RANDARRAY() → 1×1 array with one number in [0,1).
+        let (r, c, data) = unwrap_array(eval_str("=RANDARRAY()", &cm, &vs));
+        assert_eq!((r, c), (1, 1));
+        match &data[0] {
+            Value::Number(n) => {
+                assert!(*n >= 0.0 && *n < 1.0, "expected [0,1), got {}", n);
+            }
+            other => panic!("expected Number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_randarray_shape_and_bounds() {
+        let (cm, vs) = make_test_env();
+        // 2×3, range [10, 20] (continuous).
+        let (r, c, data) = unwrap_array(eval_str("=RANDARRAY(2, 3, 10, 20)", &cm, &vs));
+        assert_eq!((r, c), (2, 3));
+        assert_eq!(data.len(), 6);
+        for v in &data {
+            match v {
+                Value::Number(n) => {
+                    assert!(*n >= 10.0 && *n <= 20.0, "expected [10,20], got {}", n);
+                }
+                other => panic!("expected Number, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn eval_randarray_whole_number() {
+        let (cm, vs) = make_test_env();
+        // 1×5 whole numbers in [1, 6].
+        let (r, c, data) = unwrap_array(eval_str("=RANDARRAY(1, 5, 1, 6, TRUE)", &cm, &vs));
+        assert_eq!((r, c), (1, 5));
+        for v in &data {
+            match v {
+                Value::Number(n) => {
+                    assert!(*n >= 1.0 && *n <= 6.0, "expected [1,6], got {}", n);
+                    assert_eq!(n.fract(), 0.0, "expected integer, got {}", n);
+                }
+                other => panic!("expected Number, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn eval_randarray_min_gt_max_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RANDARRAY(1, 1, 10, 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_randarray_whole_with_fractional_bounds_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RANDARRAY(1, 1, 1.5, 5, TRUE)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_randarray_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        // 6 args: too many.
+        assert_eq!(
+            eval_str("=RANDARRAY(1, 1, 0, 1, FALSE, 99)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_take_first_rows() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(5, 2) is a 5×2 grid. TAKE 3 rows.
+        let (r, c, data) = unwrap_array(eval_str("=TAKE(SEQUENCE(5, 2), 3)", &cm, &vs));
+        assert_eq!((r, c), (3, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_take_last_rows_negative() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(5, 2): rows are 1..2, 3..4, 5..6, 7..8, 9..10. Last 2 rows.
+        let (r, c, data) = unwrap_array(eval_str("=TAKE(SEQUENCE(5, 2), -2)", &cm, &vs));
+        assert_eq!((r, c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(7.0),
+                Value::Number(8.0),
+                Value::Number(9.0),
+                Value::Number(10.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_take_rows_and_cols() {
+        let (cm, vs) = make_test_env();
+        // First 2 rows, last 1 col of SEQUENCE(3, 3).
+        // SEQUENCE(3,3) = [[1,2,3],[4,5,6],[7,8,9]] → take 2 rows, -1 col → [[3],[6]].
+        let (r, c, data) = unwrap_array(eval_str("=TAKE(SEQUENCE(3, 3), 2, -1)", &cm, &vs));
+        assert_eq!((r, c), (2, 1));
+        assert_eq!(data, vec![Value::Number(3.0), Value::Number(6.0)]);
+    }
+
+    #[test]
+    fn eval_take_over_caps() {
+        let (cm, vs) = make_test_env();
+        // Asking for more rows than exist caps at array's actual row count.
+        let (r, c, data) = unwrap_array(eval_str("=TAKE(SEQUENCE(3), 99)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]
+        );
+    }
+
+    #[test]
+    fn eval_take_zero_rows_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TAKE(SEQUENCE(3), 0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_take_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TAKE(SEQUENCE(3))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_drop_first_rows() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(5): [1,2,3,4,5]. DROP 2 → [3,4,5].
+        let (r, c, data) = unwrap_array(eval_str("=DROP(SEQUENCE(5), 2)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(3.0), Value::Number(4.0), Value::Number(5.0)]
+        );
+    }
+
+    #[test]
+    fn eval_drop_last_rows_negative() {
+        let (cm, vs) = make_test_env();
+        // DROP -2 = drop last 2 rows of SEQUENCE(5) → [1,2,3].
+        let (r, c, data) = unwrap_array(eval_str("=DROP(SEQUENCE(5), -2)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)]
+        );
+    }
+
+    #[test]
+    fn eval_drop_rows_and_cols() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(3,3): drop 1 row from start and 1 col from start.
+        // Original [[1,2,3],[4,5,6],[7,8,9]] → [[5,6],[8,9]].
+        let (r, c, data) = unwrap_array(eval_str("=DROP(SEQUENCE(3, 3), 1, 1)", &cm, &vs));
+        assert_eq!((r, c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(5.0),
+                Value::Number(6.0),
+                Value::Number(8.0),
+                Value::Number(9.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_drop_all_rows_invalid() {
+        let (cm, vs) = make_test_env();
+        // Dropping all rows → empty → InvalidValue.
+        assert_eq!(
+            eval_str("=DROP(SEQUENCE(3), 99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_vstack_equal_shapes() {
+        let (cm, vs) = make_test_env();
+        // VSTACK(SEQUENCE(2), SEQUENCE(2, 1, 10)) → 4×1.
+        let (r, c, data) =
+            unwrap_array(eval_str("=VSTACK(SEQUENCE(2), SEQUENCE(2, 1, 10))", &cm, &vs));
+        assert_eq!((r, c), (4, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(10.0),
+                Value::Number(11.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_vstack_unequal_cols_pads_with_error() {
+        let (cm, vs) = make_test_env();
+        // VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99)) → result cols = 3.
+        // First block fills row 0: [1, 2, 3].
+        // Second block's row 0 has only 1 col [99]; pad cols 1, 2 with #VALUE!.
+        let (r, c, data) = unwrap_array(eval_str(
+            "=VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99))",
+            &cm,
+            &vs,
+        ));
+        assert_eq!((r, c), (2, 3));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(99.0),
+                Value::Error(ValueError::InvalidValue),
+                Value::Error(ValueError::InvalidValue),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_vstack_no_args() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=VSTACK()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_hstack_equal_shapes() {
+        let (cm, vs) = make_test_env();
+        // HSTACK(SEQUENCE(2,1), SEQUENCE(2,1,10)) → 2×2.
+        let (r, c, data) = unwrap_array(eval_str(
+            "=HSTACK(SEQUENCE(2, 1), SEQUENCE(2, 1, 10))",
+            &cm,
+            &vs,
+        ));
+        assert_eq!((r, c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(10.0),
+                Value::Number(2.0),
+                Value::Number(11.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_hstack_unequal_rows_pads_with_error() {
+        let (cm, vs) = make_test_env();
+        // HSTACK(SEQUENCE(3,1), SEQUENCE(1,1,99)) → result rows = 3, cols = 2.
+        // Row 0: [1, 99]. Row 1: [2, #VALUE!]. Row 2: [3, #VALUE!].
+        let (r, c, data) = unwrap_array(eval_str(
+            "=HSTACK(SEQUENCE(3, 1), SEQUENCE(1, 1, 99))",
+            &cm,
+            &vs,
+        ));
+        assert_eq!((r, c), (3, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(99.0),
+                Value::Number(2.0),
+                Value::Error(ValueError::InvalidValue),
+                Value::Number(3.0),
+                Value::Error(ValueError::InvalidValue),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_hstack_no_args() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=HSTACK()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_chooserows_basic() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(4) = [1,2,3,4]. CHOOSEROWS(1, 3) → [1, 3].
+        let (r, c, data) = unwrap_array(eval_str("=CHOOSEROWS(SEQUENCE(4), 1, 3)", &cm, &vs));
+        assert_eq!((r, c), (2, 1));
+        assert_eq!(data, vec![Value::Number(1.0), Value::Number(3.0)]);
+    }
+
+    #[test]
+    fn eval_chooserows_negative_indices() {
+        let (cm, vs) = make_test_env();
+        // -1 = last row. SEQUENCE(4): last → 4.
+        let (r, c, data) = unwrap_array(eval_str("=CHOOSEROWS(SEQUENCE(4), -1, 1)", &cm, &vs));
+        assert_eq!((r, c), (2, 1));
+        assert_eq!(data, vec![Value::Number(4.0), Value::Number(1.0)]);
+    }
+
+    #[test]
+    fn eval_chooserows_duplicates() {
+        let (cm, vs) = make_test_env();
+        // Duplicates allowed → CHOOSEROWS(SEQUENCE(3), 1, 1, 2) → [1, 1, 2].
+        let (r, c, data) = unwrap_array(eval_str("=CHOOSEROWS(SEQUENCE(3), 1, 1, 2)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(1.0), Value::Number(2.0)]
+        );
+    }
+
+    #[test]
+    fn eval_chooserows_zero_index_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CHOOSEROWS(SEQUENCE(3), 0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_chooserows_out_of_range_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CHOOSEROWS(SEQUENCE(3), 99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_chooserows_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CHOOSEROWS(SEQUENCE(3))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_choosecols_basic() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(2, 3) = [[1,2,3],[4,5,6]]. CHOOSECOLS(1, 3) → [[1,3],[4,6]].
+        let (r, c, data) = unwrap_array(eval_str("=CHOOSECOLS(SEQUENCE(2, 3), 1, 3)", &cm, &vs));
+        assert_eq!((r, c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_choosecols_negative_indices() {
+        let (cm, vs) = make_test_env();
+        // -1 = last col. SEQUENCE(2,3) → CHOOSECOLS(-1, -2) → last & second-to-last.
+        let (r, c, data) =
+            unwrap_array(eval_str("=CHOOSECOLS(SEQUENCE(2, 3), -1, -2)", &cm, &vs));
+        assert_eq!((r, c), (2, 2));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(3.0),
+                Value::Number(2.0),
+                Value::Number(6.0),
+                Value::Number(5.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_choosecols_out_of_range_invalid() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CHOOSECOLS(SEQUENCE(2, 3), 99)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_torow_basic_row_major() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(2,3) = [[1,2,3],[4,5,6]]. TOROW flattens to 1×6 row-major.
+        let (r, c, data) = unwrap_array(eval_str("=TOROW(SEQUENCE(2, 3))", &cm, &vs));
+        assert_eq!((r, c), (1, 6));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_torow_by_column() {
+        let (cm, vs) = make_test_env();
+        // Same array, scan_by_column=TRUE → 1,4,2,5,3,6.
+        let (r, c, data) =
+            unwrap_array(eval_str("=TOROW(SEQUENCE(2, 3), 0, TRUE)", &cm, &vs));
+        assert_eq!((r, c), (1, 6));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(4.0),
+                Value::Number(2.0),
+                Value::Number(5.0),
+                Value::Number(3.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_torow_skip_blanks_and_errors() {
+        // Build a 1×4 array via cells: [1, null, error, 4]. Use a literal
+        // formula at C1 that produces #DIV/0!, then drive TOROW on A1:D1.
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        // B1 = null (no value entry).
+        let b1 = AtomId::from_raw(1);
+        let c1 = AtomId::from_raw(2);
+        let d1 = AtomId::from_raw(3);
+        cm.insert(CellAddress::new(0, 0), a1);
+        cm.insert(CellAddress::new(0, 1), b1);
+        cm.insert(CellAddress::new(0, 2), c1);
+        cm.insert(CellAddress::new(0, 3), d1);
+        vs.insert(a1, Value::Number(1.0));
+        vs.insert(b1, Value::Null);
+        vs.insert(c1, Value::Error(ValueError::DivisionByZero));
+        vs.insert(d1, Value::Number(4.0));
+        // ignore=3 → skip blanks AND errors.
+        let (r, c, data) = unwrap_array(eval_str("=TOROW(A1:D1, 3)", &cm, &vs));
+        assert_eq!((r, c), (1, 2));
+        assert_eq!(data, vec![Value::Number(1.0), Value::Number(4.0)]);
+        // ignore=1 → skip blanks only (errors remain).
+        let (r, c, data) = unwrap_array(eval_str("=TOROW(A1:D1, 1)", &cm, &vs));
+        assert_eq!((r, c), (1, 3));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Error(ValueError::DivisionByZero),
+                Value::Number(4.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_torow_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TOROW()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_tocol_basic_row_major() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(2,3) → 6 entries, default row-major → [1,2,3,4,5,6].
+        let (r, c, data) = unwrap_array(eval_str("=TOCOL(SEQUENCE(2, 3))", &cm, &vs));
+        assert_eq!((r, c), (6, 1));
+        assert_eq!(
+            data,
+            vec![
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Number(5.0),
+                Value::Number(6.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_tocol_by_column_skip_blanks() {
+        // Build a 2×2 grid where (0,1) is blank.
+        //   A1=1 B1=Null
+        //   A2=3 B2=4
+        // Column-major: 1, 3, Null, 4 → with skip-blanks → 1, 3, 4.
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let b1 = AtomId::from_raw(1);
+        let a2 = AtomId::from_raw(2);
+        let b2 = AtomId::from_raw(3);
+        cm.insert(CellAddress::new(0, 0), a1);
+        cm.insert(CellAddress::new(0, 1), b1);
+        cm.insert(CellAddress::new(1, 0), a2);
+        cm.insert(CellAddress::new(1, 1), b2);
+        vs.insert(a1, Value::Number(1.0));
+        vs.insert(b1, Value::Null);
+        vs.insert(a2, Value::Number(3.0));
+        vs.insert(b2, Value::Number(4.0));
+        let (r, c, data) = unwrap_array(eval_str("=TOCOL(A1:B2, 1, TRUE)", &cm, &vs));
+        assert_eq!((r, c), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(1.0), Value::Number(3.0), Value::Number(4.0)]
+        );
+    }
+
+    #[test]
+    fn eval_norm_dist_pdf_zero_is_one_over_sqrt_2pi() {
+        // Standard-normal PDF at 0 = 1/sqrt(2π) ≈ 0.39894228.
+        assert_approx_eq(ev("=NORM.DIST(0, 0, 1, FALSE)"), 0.398_942_280_4, TOL);
+    }
+
+    #[test]
+    fn eval_norm_dist_cdf_at_mean_is_half() {
+        assert_approx_eq(ev("=NORM.DIST(5, 5, 2, TRUE)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_norm_dist_sd_zero_is_num_error() {
+        assert_eq!(
+            ev("=NORM.DIST(0, 0, 0, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_norm_dist_wrong_arg_count() {
+        assert_eq!(
+            ev("=NORM.DIST(0, 0, 1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_norm_inv_round_trip() {
+        // NORM.INV(0.5, 5, 2) == 5.
+        assert_approx_eq(ev("=NORM.INV(0.5, 5, 2)"), 5.0, TOL);
+    }
+
+    #[test]
+    fn eval_norm_inv_p_out_of_range() {
+        assert_eq!(
+            ev("=NORM.INV(0, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=NORM.INV(1, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_norm_s_dist_cdf_zero() {
+        assert_approx_eq(ev("=NORM.S.DIST(0, TRUE)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_norm_s_dist_pdf_zero() {
+        assert_approx_eq(ev("=NORM.S.DIST(0, FALSE)"), 0.398_942_280_4, TOL);
+    }
+
+    #[test]
+    fn eval_norm_s_inv_half_is_zero() {
+        assert_approx_eq(ev("=NORM.S.INV(0.5)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_norm_s_inv_wrong_arg_count() {
+        assert_eq!(
+            ev("=NORM.S.INV()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_t_dist_cdf_zero_is_half() {
+        // Student's t is symmetric around 0.
+        assert_approx_eq(ev("=T.DIST(0, 10, TRUE)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_t_dist_pdf_zero_df10() {
+        // PDF(0) for t with df=10 ≈ 0.389108..
+        assert_approx_eq(ev("=T.DIST(0, 10, FALSE)"), 0.389_108_38, 1e-5);
+    }
+
+    #[test]
+    fn eval_t_dist_df_zero_is_num_error() {
+        assert_eq!(
+            ev("=T.DIST(0, 0, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_t_dist_rt_zero_is_half() {
+        assert_approx_eq(ev("=T.DIST.RT(0, 10)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_t_dist_rt_negative_x_is_error() {
+        assert_eq!(
+            ev("=T.DIST.RT(-1, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_t_dist_2t_zero_is_one() {
+        // Two-tail at 0 = 2 * (1 - 0.5) = 1.
+        assert_approx_eq(ev("=T.DIST.2T(0, 10)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_t_inv_half() {
+        assert_approx_eq(ev("=T.INV(0.5, 10)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_t_inv_2t_one() {
+        // p=1 → 1 - 1/2 = 0.5 → invCDF(0.5)=0.
+        assert_approx_eq(ev("=T.INV.2T(1, 10)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_f_dist_cdf() {
+        // F(1, 1) at x=1 has CDF=0.5 (df1=df2=1 gives a Cauchy-like).
+        // Skip exact value; just check finite and in (0,1).
+        match ev("=F.DIST(1, 5, 10, TRUE)") {
+            Value::Number(n) => assert!(n > 0.0 && n < 1.0, "expected CDF in (0,1), got {}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_f_dist_pdf_positive() {
+        match ev("=F.DIST(1, 5, 10, FALSE)") {
+            Value::Number(n) => assert!(n > 0.0, "expected positive PDF, got {}", n),
+            other => panic!("expected number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_f_dist_negative_x_is_error() {
+        assert_eq!(
+            ev("=F.DIST(-1, 5, 10, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_f_dist_rt_complement() {
+        // F.DIST(x, ...) + F.DIST.RT(x, ...) = 1.
+        let a = match ev("=F.DIST(2, 5, 10, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=F.DIST.RT(2, 5, 10)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a + b - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_f_inv_round_trip() {
+        // F.INV(F.DIST(2, 5, 10, TRUE), 5, 10) ≈ 2.
+        // Build via two evaluations.
+        let p = match ev("=F.DIST(2, 5, 10, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let inv = match ev(&format!("=F.INV({}, 5, 10)", p)) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((inv - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eval_f_inv_rt_p_zero_is_error() {
+        assert_eq!(
+            ev("=F.INV.RT(0, 5, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_chisq_dist_cdf_finite() {
+        match ev("=CHISQ.DIST(3, 5, TRUE)") {
+            Value::Number(n) => assert!(n > 0.0 && n < 1.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_chisq_dist_rt_complement() {
+        let a = match ev("=CHISQ.DIST(3, 5, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=CHISQ.DIST.RT(3, 5)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a + b - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_chisq_inv_df_zero_is_error() {
+        assert_eq!(
+            ev("=CHISQ.INV(0.5, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_chisq_inv_rt_p_one_is_zero() {
+        // P=1 means we want the value such that survival = 1, i.e. x = 0.
+        assert_approx_eq(ev("=CHISQ.INV.RT(1, 5)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_expon_dist_pdf_zero_is_lambda() {
+        // PDF(0) = lambda.
+        assert_approx_eq(ev("=EXPON.DIST(0, 2, FALSE)"), 2.0, TOL);
+    }
+
+    #[test]
+    fn eval_expon_dist_cdf_known_value() {
+        // CDF(x; λ) = 1 - exp(-λx). CDF(1; 1) = 1 - 1/e ≈ 0.6321205588.
+        assert_approx_eq(ev("=EXPON.DIST(1, 1, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_expon_dist_lambda_zero_is_error() {
+        assert_eq!(
+            ev("=EXPON.DIST(1, 0, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_weibull_dist_cdf_at_scale() {
+        // CDF(beta; alpha, beta) = 1 - exp(-1) ≈ 0.6321205588 for any alpha.
+        assert_approx_eq(ev("=WEIBULL.DIST(2, 3, 2, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_weibull_dist_alpha_zero_is_error() {
+        assert_eq!(
+            ev("=WEIBULL.DIST(1, 0, 1, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_beta_dist_uniform_cdf() {
+        // Beta(1, 1) on [0,1] is the uniform distribution → CDF(x) = x.
+        assert_approx_eq(ev("=BETA.DIST(0.25, 1, 1, TRUE)"), 0.25, TOL);
+    }
+
+    #[test]
+    fn eval_beta_dist_uniform_pdf() {
+        assert_approx_eq(ev("=BETA.DIST(0.5, 1, 1, FALSE)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_beta_dist_with_ab() {
+        // Beta(1,1) on [2,4] → uniform on [2,4] → CDF(3) = (3-2)/(4-2) = 0.5.
+        assert_approx_eq(ev("=BETA.DIST(3, 1, 1, TRUE, 2, 4)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_beta_dist_x_outside_range_is_error() {
+        assert_eq!(
+            ev("=BETA.DIST(2, 1, 1, TRUE, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_beta_inv_uniform() {
+        // Uniform → inverse = p. statrs's default inverse_cdf is a 16-step
+        // bisection — accurate to ~1e-4, not 1e-6.
+        assert_approx_eq(ev("=BETA.INV(0.3, 1, 1)"), 0.3, 1e-3);
+    }
+
+    #[test]
+    fn eval_beta_inv_with_ab() {
+        assert_approx_eq(ev("=BETA.INV(0.5, 1, 1, 2, 4)"), 3.0, 1e-3);
+    }
+
+    #[test]
+    fn eval_gamma_dist_exponential_equivalent() {
+        // Gamma(1, beta) is the exponential distribution with rate 1/beta.
+        // CDF(1; alpha=1, beta=1) = 1 - exp(-1) ≈ 0.6321...
+        assert_approx_eq(ev("=GAMMA.DIST(1, 1, 1, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_gamma_dist_alpha_zero_is_error() {
+        assert_eq!(
+            ev("=GAMMA.DIST(1, 0, 1, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_gamma_inv_round_trip() {
+        // GAMMA.INV(GAMMA.DIST(2; 3, 2, TRUE), 3, 2) ≈ 2.
+        let p = match ev("=GAMMA.DIST(2, 3, 2, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let inv = match ev(&format!("=GAMMA.INV({}, 3, 2)", p)) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((inv - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eval_binom_dist_pmf_known() {
+        // P(X=2) for Binom(10, 0.5) = C(10,2) * 0.5^10 = 45/1024 ≈ 0.0439453.
+        assert_approx_eq(ev("=BINOM.DIST(2, 10, 0.5, FALSE)"), 45.0 / 1024.0, TOL);
+    }
+
+    #[test]
+    fn eval_binom_dist_cdf_full() {
+        // P(X <= 10) for Binom(10, 0.5) = 1.
+        assert_approx_eq(ev("=BINOM.DIST(10, 10, 0.5, TRUE)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_binom_dist_p_out_of_range_is_error() {
+        assert_eq!(
+            ev("=BINOM.DIST(1, 10, 1.5, FALSE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_binom_inv_half() {
+        // Smallest k with P(X<=k) >= 0.5 for Binom(10, 0.5) → k=5.
+        assert_approx_eq(ev("=BINOM.INV(10, 0.5, 0.5)"), 5.0, TOL);
+    }
+
+    #[test]
+    fn eval_poisson_dist_pmf_zero() {
+        // P(X=0) for Poisson(2) = e^-2 ≈ 0.1353352832.
+        assert_approx_eq(ev("=POISSON.DIST(0, 2, FALSE)"), 0.135_335_283_2, TOL);
+    }
+
+    #[test]
+    fn eval_poisson_dist_mean_zero_is_error() {
+        assert_eq!(
+            ev("=POISSON.DIST(0, 0, FALSE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_poisson_dist_wrong_arg_count() {
+        assert_eq!(
+            ev("=POISSON.DIST(0)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_hypgeom_dist_pmf() {
+        // 20 balls, 6 red. Draw 5. P(exactly 2 red) = C(6,2)*C(14,3)/C(20,5)
+        //   = 15 * 364 / 15504 ≈ 0.3522
+        assert_approx_eq(
+            ev("=HYPGEOM.DIST(2, 5, 6, 20, FALSE)"),
+            15.0 * 364.0 / 15504.0,
+            TOL,
+        );
+    }
+
+    #[test]
+    fn eval_hypgeom_dist_sample_gt_pop_is_error() {
+        assert_eq!(
+            ev("=HYPGEOM.DIST(2, 5, 25, 20, FALSE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_negbinom_dist_zero_failures() {
+        // P(0 failures before 1st success) for prob=0.5 = 0.5.
+        assert_approx_eq(ev("=NEGBINOM.DIST(0, 1, 0.5, FALSE)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_negbinom_dist_p_zero_is_error() {
+        assert_eq!(
+            ev("=NEGBINOM.DIST(0, 1, 0, FALSE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_gamma_func_integers() {
+        // Gamma(n) = (n-1)!. Gamma(5) = 24.
+        assert_approx_eq(ev("=GAMMA(5)"), 24.0, TOL);
+        assert_approx_eq(ev("=GAMMA(1)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_gamma_func_half() {
+        // Gamma(0.5) = sqrt(π).
+        assert_approx_eq(ev("=GAMMA(0.5)"), std::f64::consts::PI.sqrt(), TOL);
+    }
+
+    #[test]
+    fn eval_gamma_func_zero_is_error() {
+        assert_eq!(ev("=GAMMA(0)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_gamma_func_negative_integer_is_error() {
+        assert_eq!(ev("=GAMMA(-3)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_gammaln_known() {
+        // ln(Gamma(5)) = ln(24) ≈ 3.178053830347946.
+        assert_approx_eq(ev("=GAMMALN(5)"), 24.0_f64.ln(), TOL);
+    }
+
+    #[test]
+    fn eval_gammaln_negative_is_error() {
+        assert_eq!(ev("=GAMMALN(-1)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_erf_one() {
+        // erf(1) ≈ 0.8427007929
+        assert_approx_eq(ev("=ERF(1)"), 0.842_700_792_9, TOL);
+    }
+
+    #[test]
+    fn eval_erf_zero() {
+        assert_approx_eq(ev("=ERF(0)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_erf_two_arg() {
+        // erf(2) - erf(1).
+        let one = 0.842_700_792_9_f64;
+        let two = 0.995_322_265_0_f64;
+        assert_approx_eq(ev("=ERF(1, 2)"), two - one, 1e-5);
+    }
+
+    #[test]
+    fn eval_erfc_one() {
+        // erfc(1) = 1 - erf(1) ≈ 0.1572992070.
+        assert_approx_eq(ev("=ERFC(1)"), 1.0 - 0.842_700_792_9, TOL);
+    }
+
+    #[test]
+    fn eval_erfc_wrong_arg_count() {
+        assert_eq!(ev("=ERFC()"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    #[test]
+    fn eval_kurt_uniform_dataset() {
+        // Known result for SKEW.K and KURT requires ≥ 4 points.
+        // Symmetric dataset has skew ≈ 0; kurtosis of symmetric flat-ish
+        // dataset is negative (platykurtic).
+        let v = ev("=KURT(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)");
+        match v {
+            Value::Number(_) => {}
+            other => panic!("expected number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_kurt_too_few_args_is_error() {
+        assert_eq!(
+            ev("=KURT(1, 2, 3)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_kurt_known_value() {
+        // KURT(1,2,3,4,5) — Excel returns -1.2.
+        assert_approx_eq(ev("=KURT(1, 2, 3, 4, 5)"), -1.2, TOL);
+    }
+
+    #[test]
+    fn eval_skew_symmetric_is_zero() {
+        assert_approx_eq(ev("=SKEW(1, 2, 3, 4, 5)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_skew_too_few_args_is_error() {
+        assert_eq!(
+            ev("=SKEW(1, 2)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_avedev_simple() {
+        // mean = 4. |1-4|+|2-4|+|3-4|+|6-4|+|8-4| = 3+2+1+2+4 = 12. 12/5 = 2.4.
+        assert_approx_eq(ev("=AVEDEV(1, 2, 3, 6, 8)"), 2.4, TOL);
+    }
+
+    #[test]
+    fn eval_avedev_empty_is_div_zero() {
+        assert_eq!(ev("=AVEDEV()"), Value::Error(ValueError::DivisionByZero));
+    }
+
+    #[test]
+    fn eval_devsq_simple() {
+        // mean = 3. Sum (xi - 3)^2 = 4+1+0+1+4 = 10.
+        assert_approx_eq(ev("=DEVSQ(1, 2, 3, 4, 5)"), 10.0, TOL);
+    }
+
+    #[test]
+    fn eval_geomean_simple() {
+        // geomean(2, 8) = sqrt(16) = 4.
+        assert_approx_eq(ev("=GEOMEAN(2, 8)"), 4.0, TOL);
+    }
+
+    #[test]
+    fn eval_geomean_negative_is_error() {
+        assert_eq!(
+            ev("=GEOMEAN(1, -1, 2)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_geomean_zero_is_error() {
+        assert_eq!(
+            ev("=GEOMEAN(1, 0, 2)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_harmean_simple() {
+        // harmean(1, 2, 4) = 3 / (1 + 0.5 + 0.25) = 3 / 1.75 ≈ 1.714286.
+        assert_approx_eq(ev("=HARMEAN(1, 2, 4)"), 3.0 / 1.75, TOL);
+    }
+
+    #[test]
+    fn eval_harmean_negative_is_error() {
+        assert_eq!(
+            ev("=HARMEAN(1, -1, 2)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_trimmean_no_trim() {
+        // n=10, percent=0.1 → trim_total=1 → trim_each=0. Mean of all = 5.5.
+        // SEQUENCE(10) produces 1..=10 as a 10x1 spill array which TRIMMEAN
+        // consumes as its first arg.
+        assert_approx_eq(ev("=TRIMMEAN(SEQUENCE(10), 0.1)"), 5.5, TOL);
+    }
+
+    #[test]
+    fn eval_trimmean_with_trim() {
+        // n=10, percent=0.2 → trim_total=2 → trim_each=1. Mean of 2..9 = 5.5.
+        assert_approx_eq(ev("=TRIMMEAN(SEQUENCE(10), 0.2)"), 5.5, TOL);
+    }
+
+    #[test]
+    fn eval_trimmean_percent_out_of_range() {
+        assert_eq!(
+            ev("=TRIMMEAN(SEQUENCE(3), 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_standardize_simple() {
+        assert_approx_eq(ev("=STANDARDIZE(7, 5, 2)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_standardize_sd_zero_is_div_zero() {
+        assert_eq!(
+            ev("=STANDARDIZE(1, 0, 0)"),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_fisher_zero() {
+        // FISHER(0) = 0.5 * ln(1/1) = 0.
+        assert_approx_eq(ev("=FISHER(0)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_fisher_known() {
+        // FISHER(0.75) = 0.5 * ln(1.75 / 0.25) ≈ 0.5 * ln(7) ≈ 0.9729550745.
+        assert_approx_eq(ev("=FISHER(0.75)"), 0.5 * 7.0_f64.ln(), TOL);
+    }
+
+    #[test]
+    fn eval_fisher_out_of_range() {
+        assert_eq!(ev("=FISHER(1)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=FISHER(-1)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_fisherinv_round_trip() {
+        // FISHERINV(FISHER(0.5)) ≈ 0.5.
+        let y = match ev("=FISHER(0.5)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert_approx_eq(ev(&format!("=FISHERINV({})", y)), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_fisherinv_zero() {
+        assert_approx_eq(ev("=FISHERINV(0)"), 0.0, TOL);
+    }
+
+    fn make_sortby_env_multi_key() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // A: data  ["w", "x", "y", "z"]
+        // B: key1  [1,   1,   2,   2]
+        // C: key2  [20,  10,  20,  10]
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let data = ["w", "x", "y", "z"];
+        let k1 = [1.0, 1.0, 2.0, 2.0];
+        let k2 = [20.0, 10.0, 20.0, 10.0];
+        let mut next = 0u64;
+        for (r, ((t, n1), n2)) in data.iter().zip(k1.iter()).zip(k2.iter()).enumerate() {
+            let a_id = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(r as u32, 0), a_id);
+            vs.insert(a_id, Value::Text((*t).into()));
+            let b_id = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(r as u32, 1), b_id);
+            vs.insert(b_id, Value::Number(*n1));
+            let c_id = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(r as u32, 2), c_id);
+            vs.insert(c_id, Value::Number(*n2));
+        }
+        (cm, vs)
+    }
+    fn assert_approx_eq(actual: Value, expected: f64, tol: f64) {
+        match actual {
+            Value::Number(n) => {
+                let diff = (n - expected).abs();
+                assert!(
+                    diff < tol,
+                    "expected ≈ {} (tol={}), got {} (|diff|={})",
+                    expected,
+                    tol,
+                    n,
+                    diff
+                );
+            }
+            other => panic!("expected Value::Number, got {:?}", other),
+        }
+    }
+    fn empty_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        (HashMap::new(), HashMap::new())
+    }
+    fn ev(formula: &str) -> Value {
+        let (cm, vs) = empty_env();
+        eval_str(formula, &cm, &vs)
+    }
+    const TOL: f64 = 1e-6;
 }
