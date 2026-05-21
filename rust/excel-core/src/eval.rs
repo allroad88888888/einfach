@@ -108,6 +108,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ACOS"
             | "ACOSH"
             | "ACOT"
+            | "ACOTH"
             | "ACSC"
             | "ADDRESS"
             | "AGGREGATE"
@@ -139,6 +140,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "BIN2HEX"
             | "BIN2OCT"
             | "BINOM.DIST"
+            | "BINOM.DIST.RANGE"
             | "BINOM.INV"
             | "BINOMDIST"
             | "BITAND"
@@ -170,9 +172,11 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COLUMNS"
             | "COMBIN"
             | "COMBINA"
+            | "CONCAT"
             | "CONCATENATE"
             | "CONFIDENCE"
             | "CONFIDENCE.NORM"
+            | "CONFIDENCE.T"
             | "CONVERT"
             | "CORREL"
             | "COS"
@@ -201,6 +205,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "DAVERAGE"
             | "DAY"
             | "DAYS"
+            | "DAYS360"
             | "DBCS"
             | "DCOUNT"
             | "DCOUNTA"
@@ -226,7 +231,9 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ENCODEURL"
             | "EOMONTH"
             | "ERF"
+            | "ERF.PRECISE"
             | "ERFC"
+            | "ERFC.PRECISE"
             | "ERROR.TYPE"
             | "EVEN"
             | "EXACT"
@@ -241,6 +248,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "F.TEST"
             | "FACT"
             | "FACTDOUBLE"
+            | "FALSE"
             | "FDIST"
             | "FILTER"
             | "FIND"
@@ -265,6 +273,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "GAMMADIST"
             | "GAMMAINV"
             | "GAMMALN"
+            | "GAMMALN.PRECISE"
             | "GAUSS"
             | "GCD"
             | "GEOMEAN"
@@ -305,6 +314,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ISODD"
             | "ISOMITTED"
             | "ISOWEEKNUM"
+            | "ISREF"
             | "ISTEXT"
             | "JIS"
             | "KURT"
@@ -352,6 +362,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MULTINOMIAL"
             | "MUNIT"
             | "N"
+            | "NA"
             | "NEGBINOM.DIST"
             | "NEGBINOMDIST"
             | "NETWORKDAYS"
@@ -386,6 +397,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "PERCENTRANK"
             | "PERCENTRANK.EXC"
             | "PERCENTRANK.INC"
+            | "PERMUT"
+            | "PERMUTATIONA"
             | "PHI"
             | "PHONETIC"
             | "PI"
@@ -449,6 +462,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "STDEV.S"
             | "STEYX"
             | "STDEVA"
+            | "STDEVP"
             | "STDEVPA"
             | "SUBSTITUTE"
             | "SUBTOTAL"
@@ -483,10 +497,12 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "TOCOL"
             | "TODAY"
             | "TOROW"
+            | "TRANSLATE"
             | "TRANSPOSE"
             | "TREND"
             | "TRIM"
             | "TRIMMEAN"
+            | "TRUE"
             | "TRUNC"
             | "TTEST"
             | "TYPE"
@@ -497,6 +513,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "VAR.P"
             | "VAR.S"
             | "VARA"
+            | "VARP"
             | "VARPA"
             | "VLOOKUP"
             | "VSTACK"
@@ -8778,6 +8795,137 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         }
         "EXPAND" => fn_expand(args, provider),
         "XMATCH" => fn_xmatch(args, provider),
+
+        // === T-batch cleanup arms (Q1 2026) ===
+        //
+        // ACOTH(n) — inverse hyperbolic cotangent. `0.5 * ln((n+1)/(n-1))`.
+        // Domain: |n| > 1 strictly. At |n| = 1 the argument of `ln` is 0
+        // or infinity, both → #NUM!.
+        "ACOTH" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            match coerce_to_number(&v) {
+                Some(n) if n.abs() > 1.0 => {
+                    let r = 0.5 * ((n + 1.0) / (n - 1.0)).ln();
+                    if r.is_finite() {
+                        Value::Number(r)
+                    } else {
+                        Value::Error(ValueError::Overflow)
+                    }
+                }
+                Some(_) => Value::Error(ValueError::Overflow),
+                None => Value::Error(ValueError::WrongType),
+            }
+        }
+
+        // TRUE() / FALSE() — zero-arg constructors. The parser already
+        // emits bare `TRUE` / `FALSE` as `Expr::Bool`, but the
+        // function-call form `=TRUE()` routes through here. Any
+        // arguments → #VALUE! (Excel surfaces #N/A — we follow our
+        // existing convention of WrongArgCount for arity mismatch).
+        "TRUE" => {
+            if !args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            Value::Boolean(true)
+        }
+        "FALSE" => {
+            if !args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            Value::Boolean(false)
+        }
+
+        // NA() — zero-arg. Returns our #N/A sentinel (`InvalidValue`).
+        // Useful as a placeholder while sketching a sheet.
+        "NA" => {
+            if !args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
+
+        // ISREF(value) — TRUE iff the argument expression is a
+        // reference. Inspects the AST directly (mirrors AREAS): a bare
+        // `CellRef`, `Range`, `SheetRef`, `SheetRange`, or `MultiArea`
+        // counts. Named references are NOT followed — Excel does
+        // follow them, but our named registry stores values rather
+        // than references, so a named "x = A1" stores `10`, not the
+        // ref to A1. Refining that requires storing the source Expr
+        // for each name; we deliberately defer.
+        "ISREF" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let is_ref = matches!(
+                &args[0],
+                Expr::CellRef(_)
+                    | Expr::Range { .. }
+                    | Expr::SheetRef { .. }
+                    | Expr::SheetRange { .. }
+                    | Expr::MultiArea(_)
+            );
+            Value::Boolean(is_ref)
+        }
+
+        // STDEVP / VARP — legacy aliases for STDEV.P / VAR.P (Excel
+        // 2003 names). Population variance / stdev (divide by n).
+        "STDEVP" => eval_func("STDEV.P", args, provider),
+        "VARP" => eval_func("VAR.P", args, provider),
+
+        // CONFIDENCE.T(alpha, stdev, size) — Student-t confidence
+        // interval half-width: `T.INV.2T(alpha, size - 1) * stdev / sqrt(size)`.
+        "CONFIDENCE.T" => stat_confidence_t(args, provider),
+
+        // BINOM.DIST.RANGE(trials, prob, lower[, upper]) — sum of
+        // binomial PMF over `k ∈ [lower, upper]`. Single-arg form
+        // (no upper) returns just PMF(lower).
+        "BINOM.DIST.RANGE" => stat_binom_dist_range(args, provider),
+
+        // PERMUT(n, k) — number of permutations: `n! / (n-k)!`.
+        // PERMUTATIONA(n, k) — permutations with repetition: `n^k`.
+        "PERMUT" => stat_permut(args, provider),
+        "PERMUTATIONA" => stat_permutationa(args, provider),
+
+        // DAYS360(start, end[, method=FALSE]) — 30/360 day count.
+        // method=FALSE → US (NASD) form (basis 0); method=TRUE →
+        // European form (basis 4). Always returns an integer.
+        "DAYS360" => date_days360(args, provider),
+
+        // *.PRECISE — Excel 2010 aliases of the existing functions.
+        // The "precise" suffix exists because the legacy ERF / ERFC
+        // had an awkward two-arg form; the modern *.PRECISE name
+        // disambiguates. We compute identically either way.
+        "ERF.PRECISE" => eval_func("ERF", args, provider),
+        "ERFC.PRECISE" => eval_func("ERFC", args, provider),
+        "GAMMALN.PRECISE" => eval_func("GAMMALN", args, provider),
+
+        // CONCAT(text1, text2, …) — Excel-365 alias of CONCATENATE
+        // that accepts ranges/arrays. Our CONCATENATE already
+        // flattens ranges via `for_each_arg_value`, so they share an
+        // implementation.
+        "CONCAT" => eval_func("CONCATENATE", args, provider),
+
+        // TRANSLATE(text, source_lang, target_lang) — Excel routes
+        // this to a Microsoft Translator service. With no network
+        // available, we surface #N/A. Three args required; errors
+        // propagate.
+        "TRANSLATE" => {
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            for arg in args {
+                if let Value::Error(e) = eval_expr_with_provider(arg, provider) {
+                    return Value::Error(e);
+                }
+            }
+            Value::Error(ValueError::InvalidValue)
+        }
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
@@ -19867,6 +20015,219 @@ fn fn_xmatch(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Some(i) => Value::Number((i + 1) as f64),
         None => Value::Error(ValueError::InvalidValue),
     }
+}
+
+// === T-batch cleanup helpers (Q1 2026) ===
+//
+// CONFIDENCE.T half-width: `T.INV.2T(alpha, size - 1) * stdev / sqrt(size)`.
+// Validation mirrors CONFIDENCE.NORM: 0 < alpha < 1, stdev > 0, size ≥ 2
+// (size = 1 would give zero degrees of freedom).
+fn stat_confidence_t(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let alpha = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let stdev = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let size = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(alpha > 0.0 && alpha < 1.0) || !(stdev > 0.0) || size < 2.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let n_int = size.trunc();
+    let df = n_int - 1.0;
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    // Two-tail inverse: P(|T| > t) = alpha  →  P(T > t) = alpha/2.
+    let t_crit = dist.inverse_cdf(1.0 - alpha / 2.0);
+    stat_finite(t_crit * stdev / n_int.sqrt())
+}
+
+// BINOM.DIST.RANGE(trials, prob, lower[, upper]).
+// Validation: integer trials ≥ 0, 0 ≤ prob ≤ 1, 0 ≤ lower ≤ trials and
+// (if present) lower ≤ upper ≤ trials. Bounds are truncated to integers.
+fn stat_binom_dist_range(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Binomial, Discrete};
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let trials = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let p = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let lower = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let upper = if args.len() == 4 {
+        match stat_num(&args[3], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        lower
+    };
+    if !(p >= 0.0 && p <= 1.0) || trials < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let trials_i = trials.trunc() as i64;
+    let lower_i = lower.trunc() as i64;
+    let upper_i = upper.trunc() as i64;
+    if lower_i < 0 || upper_i < lower_i || upper_i > trials_i {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Binomial::new(p, trials_i as u64) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let mut acc = 0.0_f64;
+    for k in lower_i..=upper_i {
+        acc += dist.pmf(k as u64);
+    }
+    stat_finite(acc)
+}
+
+// PERMUT(n, k) — `n! / (n - k)!`. Inputs truncated; negatives or k > n
+// give #NUM!. Cap at n = 170 to avoid f64 overflow (170! is the
+// largest representable factorial in f64).
+fn stat_permut(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let n_f = match stat_num(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let k_f = match stat_num(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let n = n_f.trunc();
+    let k = k_f.trunc();
+    if n < 0.0 || k < 0.0 || k > n {
+        return Value::Error(ValueError::Overflow);
+    }
+    let n_i = n as u64;
+    let k_i = k as u64;
+    let mut acc = 1.0_f64;
+    // Product of the top k descending integers: n * (n-1) * … * (n-k+1).
+    for i in 0..k_i {
+        acc *= (n_i - i) as f64;
+        if !acc.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    Value::Number(acc)
+}
+
+// PERMUTATIONA(n, k) — `n^k` (permutations with repetition).
+fn stat_permutationa(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let n_f = match stat_num(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let k_f = match stat_num(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let n = n_f.trunc();
+    let k = k_f.trunc();
+    if n < 0.0 || k < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Special case 0^0 = 1 (Excel parity).
+    if n == 0.0 && k == 0.0 {
+        return Value::Number(1.0);
+    }
+    let r = n.powf(k);
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+// DAYS360(start_date, end_date[, method]) — 30/360 day-count.
+// method=FALSE (default) → US (NASD) form (basis 0).
+// method=TRUE → European form (basis 4).
+// Internally we apply the same `(y2-y1)*360 + (m2-m1)*30 + (d2-d1)`
+// formula as `yearfrac_basis`, but multiply by 360 (skip the divide).
+// The US form clamps `d1 = min(d1, 30)` then if `d1 = 30` clamps
+// `d2 = min(d2, 30)` (Excel's NASD30/360 quirk). The European form
+// clamps both ends unconditionally.
+fn date_days360(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let start = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let european = if args.len() == 3 {
+        let v = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_bool(&v) {
+            Some(b) => b,
+            None => match coerce_to_number(&v) {
+                Some(n) => n != 0.0,
+                None => return Value::Error(ValueError::WrongType),
+            },
+        }
+    } else {
+        false
+    };
+    // Reject negative serials (Excel's date model starts at 1900-01-01,
+    // which is serial 1; serial 0 is the placeholder Jan 0, 1900). Allow
+    // anything ≥ 0.
+    if start < 0.0 || end < 0.0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let (y1, m1, d1) = date_from_serial(start);
+    let (y2, m2, d2) = date_from_serial(end);
+    let (mut d1, mut d2) = (d1 as i64, d2 as i64);
+    if european {
+        if d1 == 31 {
+            d1 = 30;
+        }
+        if d2 == 31 {
+            d2 = 30;
+        }
+    } else {
+        // US (NASD): if d1 == 31 → d1 = 30. Then if d1 == 30 (after the
+        // adjustment) AND d2 == 31 → d2 = 30.
+        if d1 == 31 {
+            d1 = 30;
+        }
+        if d1 == 30 && d2 == 31 {
+            d2 = 30;
+        }
+    }
+    let result =
+        (y2 - y1) as f64 * 360.0 + (m2 as f64 - m1 as f64) * 30.0 + (d2 - d1) as f64;
+    Value::Number(result)
 }
 
 // Sentinel for parallel-agent merges — every new free helper fn (`fn yearfrac_basis(...)`),
@@ -37254,6 +37615,450 @@ mod tests {
             eval_str("=PHI()", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
         );
+    }
+
+    // === T-batch cleanup tests (Q1 2026) ===
+    //
+    // Helper: tight numeric assertion against `Value::Number(n)` with a
+    // configurable tolerance so we don't pollute every test with the
+    // pattern.
+    fn assert_num_close(formula: &str, expected: f64, tol: f64) {
+        let v = ev(formula);
+        match v {
+            Value::Number(n) => assert!(
+                (n - expected).abs() < tol,
+                "{formula} = {n}, expected {expected} ± {tol}"
+            ),
+            other => panic!("{formula} = {other:?}, expected ~{expected}"),
+        }
+    }
+
+    // --- ACOTH ---
+
+    #[test]
+    fn acoth_happy_path() {
+        // ACOTH(2) = 0.5 * ln(3) ≈ 0.549306
+        assert_num_close("=ACOTH(2)", 0.5 * 3f64.ln(), 1e-9);
+        // ACOTH(-2) = -ACOTH(2)
+        assert_num_close("=ACOTH(-2)", -0.5 * 3f64.ln(), 1e-9);
+    }
+
+    #[test]
+    fn acoth_at_boundary_num_error() {
+        // |x| == 1 → log(0)/log(inf) → #NUM!.
+        assert_eq!(ev("=ACOTH(1)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=ACOTH(-1)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn acoth_inside_domain_num_error() {
+        // |x| < 1 → out of domain.
+        assert_eq!(ev("=ACOTH(0.5)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=ACOTH(0)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn acoth_wrong_arg_count() {
+        assert_eq!(ev("=ACOTH()"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(ev("=ACOTH(2, 3)"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    // --- TRUE / FALSE / NA ---
+
+    #[test]
+    fn true_function_returns_boolean() {
+        assert_eq!(ev("=TRUE()"), Value::Boolean(true));
+    }
+
+    #[test]
+    fn false_function_returns_boolean() {
+        assert_eq!(ev("=FALSE()"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn bare_true_false_still_literal() {
+        // Without parens these remain pure literals (Expr::Bool).
+        assert_eq!(ev("=TRUE"), Value::Boolean(true));
+        assert_eq!(ev("=FALSE"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn true_false_reject_args() {
+        assert_eq!(ev("=TRUE(1)"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(ev("=FALSE(1)"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    #[test]
+    fn na_returns_invalid_value_error() {
+        assert_eq!(ev("=NA()"), Value::Error(ValueError::InvalidValue));
+    }
+
+    #[test]
+    fn na_rejects_args() {
+        assert_eq!(ev("=NA(1)"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    // --- ISREF ---
+
+    #[test]
+    fn isref_true_for_bare_cell_ref() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISREF(A1)", &cm, &vs), Value::Boolean(true));
+    }
+
+    #[test]
+    fn isref_true_for_range() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISREF(A1:B2)", &cm, &vs), Value::Boolean(true));
+    }
+
+    #[test]
+    fn isref_false_for_literal() {
+        assert_eq!(ev("=ISREF(42)"), Value::Boolean(false));
+        assert_eq!(ev("=ISREF(\"hello\")"), Value::Boolean(false));
+    }
+
+    #[test]
+    fn isref_false_for_arithmetic() {
+        let (cm, vs) = make_test_env();
+        // A1 + 1 is an arithmetic expression, not a bare ref.
+        assert_eq!(eval_str("=ISREF(A1+1)", &cm, &vs), Value::Boolean(false));
+    }
+
+    #[test]
+    fn isref_wrong_arg_count() {
+        assert_eq!(ev("=ISREF()"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    // --- STDEVP / VARP aliases ---
+
+    #[test]
+    fn stdevp_matches_stdev_p() {
+        let canonical = ev("=STDEV.P(2, 4, 4, 4, 5, 5, 7, 9)");
+        let alias = ev("=STDEVP(2, 4, 4, 4, 5, 5, 7, 9)");
+        assert_eq!(canonical, alias);
+    }
+
+    #[test]
+    fn varp_matches_var_p() {
+        let canonical = ev("=VAR.P(2, 4, 4, 4, 5, 5, 7, 9)");
+        let alias = ev("=VARP(2, 4, 4, 4, 5, 5, 7, 9)");
+        assert_eq!(canonical, alias);
+    }
+
+    // --- CONFIDENCE.T ---
+
+    #[test]
+    fn confidence_t_happy_path() {
+        // For α=0.05, σ=1, n=10 → t_{0.025,9} = 2.262157…
+        // half-width = 2.262157 * 1 / sqrt(10) ≈ 0.7153912.
+        assert_num_close("=CONFIDENCE.T(0.05, 1, 10)", 0.7153912, 1e-4);
+    }
+
+    #[test]
+    fn confidence_t_invalid_alpha() {
+        assert_eq!(
+            ev("=CONFIDENCE.T(0, 1, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=CONFIDENCE.T(1, 1, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn confidence_t_invalid_stdev() {
+        assert_eq!(
+            ev("=CONFIDENCE.T(0.05, 0, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=CONFIDENCE.T(0.05, -1, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn confidence_t_size_too_small() {
+        // size = 1 → df = 0 → invalid.
+        assert_eq!(
+            ev("=CONFIDENCE.T(0.05, 1, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn confidence_t_wrong_arg_count() {
+        assert_eq!(
+            ev("=CONFIDENCE.T(0.05, 1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // --- BINOM.DIST.RANGE ---
+
+    #[test]
+    fn binom_dist_range_single_point() {
+        // PMF(2; 10, 0.5) = C(10,2) * 0.5^10 = 45/1024 ≈ 0.043945.
+        assert_num_close("=BINOM.DIST.RANGE(10, 0.5, 2)", 45.0 / 1024.0, 1e-9);
+    }
+
+    #[test]
+    fn binom_dist_range_full_sums_to_one() {
+        assert_num_close("=BINOM.DIST.RANGE(10, 0.3, 0, 10)", 1.0, 1e-9);
+    }
+
+    #[test]
+    fn binom_dist_range_partial_sum() {
+        // Σ_{k=0}^{3} C(10,k) 0.5^10 = (1+10+45+120)/1024 = 176/1024 ≈ 0.171875.
+        assert_num_close(
+            "=BINOM.DIST.RANGE(10, 0.5, 0, 3)",
+            176.0 / 1024.0,
+            1e-9,
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_invalid_bounds() {
+        // upper < lower
+        assert_eq!(
+            ev("=BINOM.DIST.RANGE(10, 0.5, 5, 3)"),
+            Value::Error(ValueError::Overflow)
+        );
+        // upper > trials
+        assert_eq!(
+            ev("=BINOM.DIST.RANGE(10, 0.5, 0, 11)"),
+            Value::Error(ValueError::Overflow)
+        );
+        // lower < 0
+        assert_eq!(
+            ev("=BINOM.DIST.RANGE(10, 0.5, -1, 5)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn binom_dist_range_invalid_prob() {
+        assert_eq!(
+            ev("=BINOM.DIST.RANGE(10, 1.5, 0, 5)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=BINOM.DIST.RANGE(10, -0.1, 0, 5)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    // --- PERMUT ---
+
+    #[test]
+    fn permut_happy_path() {
+        // P(5, 3) = 5*4*3 = 60.
+        assert_eq!(ev("=PERMUT(5, 3)"), Value::Number(60.0));
+        // P(n, 0) = 1.
+        assert_eq!(ev("=PERMUT(10, 0)"), Value::Number(1.0));
+        // P(n, n) = n!.
+        assert_eq!(ev("=PERMUT(5, 5)"), Value::Number(120.0));
+    }
+
+    #[test]
+    fn permut_k_too_large() {
+        assert_eq!(
+            ev("=PERMUT(3, 5)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn permut_negative() {
+        assert_eq!(ev("=PERMUT(-1, 3)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=PERMUT(5, -1)"), Value::Error(ValueError::Overflow));
+    }
+
+    // --- PERMUTATIONA ---
+
+    #[test]
+    fn permutationa_happy_path() {
+        // PA(n, k) = n^k.
+        assert_eq!(ev("=PERMUTATIONA(3, 2)"), Value::Number(9.0));
+        assert_eq!(ev("=PERMUTATIONA(5, 3)"), Value::Number(125.0));
+    }
+
+    #[test]
+    fn permutationa_zero_zero() {
+        // 0^0 = 1 in Excel.
+        assert_eq!(ev("=PERMUTATIONA(0, 0)"), Value::Number(1.0));
+    }
+
+    #[test]
+    fn permutationa_negative() {
+        assert_eq!(
+            ev("=PERMUTATIONA(-1, 2)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    // --- DAYS360 ---
+
+    #[test]
+    fn days360_one_month_us() {
+        // DATE(2021,1,1) → 2021-01-01 ; DATE(2021,2,1) → 2021-02-01.
+        // 30/360 ⇒ 30 days.
+        assert_eq!(
+            ev("=DAYS360(DATE(2021,1,1), DATE(2021,2,1))"),
+            Value::Number(30.0)
+        );
+    }
+
+    #[test]
+    fn days360_full_year_us() {
+        assert_eq!(
+            ev("=DAYS360(DATE(2020,1,1), DATE(2021,1,1))"),
+            Value::Number(360.0)
+        );
+    }
+
+    #[test]
+    fn days360_us_clamps_31_to_30() {
+        // 2021-01-31 → treat day-of-start as 30; end is 2021-02-28 (no
+        // clamp). Days = (0)*360 + (1)*30 + (28-30) = 30 - 2 = 28.
+        assert_eq!(
+            ev("=DAYS360(DATE(2021,1,31), DATE(2021,2,28))"),
+            Value::Number(28.0)
+        );
+    }
+
+    #[test]
+    fn days360_european_clamps_both() {
+        // European: both 31s clamp to 30. 2021-01-31 → 2021-12-31 = 11 months
+        // = 330. (US would yield 360 because d1=30 then d2=31 → d2=30.)
+        // d1=31→30, d2=31→30 → (0)*360 + 11*30 + (30-30) = 330.
+        assert_eq!(
+            ev("=DAYS360(DATE(2021,1,31), DATE(2021,12,31), TRUE)"),
+            Value::Number(330.0)
+        );
+    }
+
+    #[test]
+    fn days360_negative_serial_is_error() {
+        // DATE() returns InvalidValue for impossible dates; check raw input.
+        assert_eq!(
+            ev("=DAYS360(-1, 100)"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn days360_wrong_arg_count() {
+        assert_eq!(ev("=DAYS360()"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(
+            ev("=DAYS360(1, 2, 3, 4)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // --- ERF.PRECISE / ERFC.PRECISE / GAMMALN.PRECISE aliases ---
+
+    #[test]
+    fn erf_precise_matches_erf() {
+        assert_eq!(ev("=ERF.PRECISE(0.5)"), ev("=ERF(0.5)"));
+        assert_eq!(ev("=ERF.PRECISE(0)"), ev("=ERF(0)"));
+    }
+
+    #[test]
+    fn erfc_precise_matches_erfc() {
+        assert_eq!(ev("=ERFC.PRECISE(0.5)"), ev("=ERFC(0.5)"));
+        assert_eq!(ev("=ERFC.PRECISE(2)"), ev("=ERFC(2)"));
+    }
+
+    #[test]
+    fn gammaln_precise_matches_gammaln() {
+        assert_eq!(ev("=GAMMALN.PRECISE(5)"), ev("=GAMMALN(5)"));
+    }
+
+    // --- CONCAT ---
+
+    #[test]
+    fn concat_matches_concatenate() {
+        assert_eq!(
+            ev("=CONCAT(\"a\", \"b\", \"c\")"),
+            ev("=CONCATENATE(\"a\", \"b\", \"c\")")
+        );
+    }
+
+    #[test]
+    fn concat_accepts_ranges() {
+        // CONCAT's distinguishing feature: takes ranges. We already
+        // accept ranges in CONCATENATE through for_each_arg_value, so
+        // both behave the same way here.
+        let (cm, vs) = make_test_env();
+        // A1=10, B1=20 → "1020".
+        assert_eq!(
+            eval_str("=CONCAT(A1:B1)", &cm, &vs),
+            Value::Text("1020".into())
+        );
+    }
+
+    #[test]
+    fn concat_propagates_error() {
+        let (cm, vs) = make_test_env();
+        // 1/0 inside a CONCAT arg → error propagates.
+        assert_eq!(
+            eval_str("=CONCAT(\"x\", 1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // --- TRANSLATE ---
+
+    #[test]
+    fn translate_returns_na() {
+        // No translator available — return #N/A.
+        assert_eq!(
+            ev("=TRANSLATE(\"hello\", \"en\", \"es\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn translate_wrong_arg_count() {
+        assert_eq!(
+            ev("=TRANSLATE(\"hello\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=TRANSLATE(\"a\", \"b\", \"c\", \"d\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn translate_propagates_error() {
+        // 1/0 inside an arg → error short-circuits before the stub
+        // result.
+        assert_eq!(
+            ev("=TRANSLATE(\"x\", 1/0, \"en\")"),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // --- T-batch: confirm all new names register as builtins ---
+
+    #[test]
+    fn t_batch_names_registered_as_builtins() {
+        for name in [
+            "ACOTH", "TRUE", "FALSE", "NA", "ISREF", "STDEVP", "VARP",
+            "CONFIDENCE.T", "BINOM.DIST.RANGE", "PERMUT", "PERMUTATIONA",
+            "DAYS360", "ERF.PRECISE", "ERFC.PRECISE", "GAMMALN.PRECISE",
+            "CONCAT", "TRANSLATE",
+        ] {
+            assert!(
+                is_builtin_function_name(name),
+                "{} should be a builtin",
+                name
+            );
+        }
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====

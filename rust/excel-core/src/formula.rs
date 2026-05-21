@@ -749,13 +749,14 @@ impl Parser {
 
         // Check for TRUE / FALSE literals (case-insensitive). Excel treats
         // these as bare identifiers (no parens needed) — they shouldn't be
-        // tried as cell addresses or function names.
+        // tried as cell addresses. BUT `=TRUE()` / `=FALSE()` are also legal
+        // (Excel exposes them as zero-arg functions), so a trailing `(` must
+        // route through the function-call branch first, where the dispatcher
+        // returns the same boolean. Bare `TRUE` / `FALSE` (no parens) stays
+        // an `Expr::Bool` literal.
         let upper = ident.to_ascii_uppercase();
-        if upper == "TRUE" {
-            return Some(Expr::Bool(true));
-        }
-        if upper == "FALSE" {
-            return Some(Expr::Bool(false));
+        if (upper == "TRUE" || upper == "FALSE") && self.peek() != Some('(') {
+            return Some(Expr::Bool(upper == "TRUE"));
         }
 
         // Check if it's a function call
