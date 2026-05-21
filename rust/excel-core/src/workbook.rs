@@ -7,7 +7,7 @@ use crate::cell::CellAddress;
 use crate::eval::EvalProvider;
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
-use crate::sheet::{RangeDependentIndex, Sheet};
+use crate::sheet::{RangeDependentIndex, Sheet, SheetError};
 
 /// One outgoing edge from a formula cell to a cross-sheet source.
 ///
@@ -517,6 +517,101 @@ impl Workbook {
         self.cross_sheet.remove_outgoing(sheet_idx, addr);
         self.sheets[sheet_idx].clear_cell(addr_str);
         self.propagate_cross_sheet_dirty(sheet_idx, addr);
+    }
+
+    /// Fallible variant of `set_cell`. Mirrors `Sheet::try_set_cell` —
+    /// returns `Err(SpillCellWrite { anchor })` when the target address
+    /// is a non-anchor target of an active spill range. On success the
+    /// cross-sheet dirty fanout runs exactly like `set_cell`.
+    ///
+    /// Used by the WASM boundary so JS-side hosts can surface a
+    /// "cannot edit spill range" toast instead of silently swallowing
+    /// the rejection.
+    pub fn try_set_cell(
+        &mut self,
+        sheet_idx: usize,
+        addr_str: &str,
+        value: Value,
+    ) -> Result<(), SheetError> {
+        if sheet_idx >= self.sheets.len() {
+            return Err(SheetError::InvalidAddress);
+        }
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        self.sheets[sheet_idx].try_set_cell(addr_str, value)?;
+        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        Ok(())
+    }
+
+    /// Fallible variant of `clear_cell`. Mirrors `Sheet::try_clear_cell`.
+    /// Returns `Err(SpillCellWrite { anchor })` when the target is
+    /// inside an active spill range and `clear` was attempted on a
+    /// non-anchor target.
+    pub fn try_clear_cell(
+        &mut self,
+        sheet_idx: usize,
+        addr_str: &str,
+    ) -> Result<(), SheetError> {
+        if sheet_idx >= self.sheets.len() {
+            return Err(SheetError::InvalidAddress);
+        }
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        self.sheets[sheet_idx].try_clear_cell(addr_str)?;
+        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        Ok(())
+    }
+
+    /// Fallible variant of `set_formula`. Mirrors `Sheet::try_set_formula`
+    /// but routes through the workbook so cross-sheet dirty fanout still
+    /// happens on success. Returns:
+    ///   - `Ok(true)`  — formula parsed and installed.
+    ///   - `Ok(false)` — formula parse failed (`#VALUE!`) or cycle (`#CYCLE!`).
+    ///   - `Err(SpillCellWrite { anchor })` — target inside a spill range.
+    ///   - `Err(InvalidAddress)` — address parse or out-of-range sheet index.
+    pub fn try_set_formula(
+        &mut self,
+        sheet_idx: usize,
+        addr_str: &str,
+        formula_text: &str,
+    ) -> Result<bool, SheetError> {
+        if sheet_idx >= self.sheets.len() {
+            return Err(SheetError::InvalidAddress);
+        }
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        // Reject up-front so the cross-sheet graph isn't touched on rejection.
+        if self.sheets[sheet_idx].is_spilled(addr) {
+            // Re-derive anchor through the sheet-level fallible path so the
+            // error carries the same anchor the per-sheet write would have
+            // reported.
+            return match self.sheets[sheet_idx].try_set_formula(addr_str, formula_text) {
+                Err(err) => Err(err),
+                // is_spilled() said yes but try_set_formula returned Ok — race
+                // against a teardown elsewhere. Treat as a no-op success so
+                // the user's keystroke is not lost on the rare race.
+                Ok(ok) => Ok(ok),
+            };
+        }
+        // Standard path: delegate to the existing infallible-on-spill
+        // workbook variant; the sheet rejection turns into `Ok(false)` per
+        // the legacy contract, which is fine since we've already proven the
+        // address is not spilled.
+        Ok(self.set_formula(sheet_idx, addr_str, formula_text))
+    }
+
+    /// Look up the spill anchor for a non-anchor spilled cell on the
+    /// given sheet. Returns `None` for plain cells, anchor cells, or
+    /// out-of-range sheet indexes. Used by the JS UI to draw the
+    /// spill outline around the anchor's bounding rectangle even when
+    /// the anchor itself is outside the visible window.
+    pub fn spill_anchor(
+        &self,
+        sheet_idx: usize,
+        addr_str: &str,
+    ) -> Option<CellAddress> {
+        let sheet = self.sheets.get(sheet_idx)?;
+        let addr = CellAddress::parse(addr_str)?;
+        sheet.spill_anchor_for(addr)
     }
 
     /// Clear every non-empty cell inside a range without materializing

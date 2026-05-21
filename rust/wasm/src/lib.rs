@@ -1,7 +1,7 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, CellAddress, CellFormat, CellRange, CellSubscription, FormatRangeSnapshot, NumberFormat,
-    RangeFormatSnapshotLayer, Sheet, Workbook,
+    RangeFormatSnapshotLayer, Sheet, SheetError, Workbook,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1462,6 +1462,115 @@ impl WasmWorkbook {
         self.workbook.set_formula(sheet_idx, addr, src)
     }
 
+    // === Dynamic-array spill: fallible setters ===
+    //
+    // These mirror the infallible `set_cell_*` / `setFormulaAt` /
+    // `clearCellAt` entries above but surface `SheetError::SpillCellWrite`
+    // across the WASM boundary so the JS layer can show a "cannot edit
+    // spill" toast and restore the cell display. The result shape is:
+    //
+    //   { ok: true } | { ok: false, code: 'spill-write', anchor: 'A1' }
+    //
+    // `code: 'invalid-address'` is also returned for unparseable addrs;
+    // the legacy infallible path silently no-ops in that case.
+
+    #[wasm_bindgen(js_name = "trySetCellNumber")]
+    pub fn try_set_cell_number(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+        value: f64,
+    ) -> Result<JsValue, JsValue> {
+        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Number(value)))
+    }
+
+    #[wasm_bindgen(js_name = "trySetCellText")]
+    pub fn try_set_cell_text(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+        value: &str,
+    ) -> Result<JsValue, JsValue> {
+        try_set_cell_result(self.workbook.try_set_cell(
+            sheet_idx,
+            addr,
+            Value::Text(value.to_string()),
+        ))
+    }
+
+    #[wasm_bindgen(js_name = "trySetCellBoolean")]
+    pub fn try_set_cell_boolean(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+        value: bool,
+    ) -> Result<JsValue, JsValue> {
+        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Boolean(value)))
+    }
+
+    #[wasm_bindgen(js_name = "trySetCellError")]
+    pub fn try_set_cell_error(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+        value: &str,
+    ) -> Result<JsValue, JsValue> {
+        let err = value_error_from_display(value);
+        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Error(err)))
+    }
+
+    #[wasm_bindgen(js_name = "tryClearCellAt")]
+    pub fn try_clear_cell_at(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+    ) -> Result<JsValue, JsValue> {
+        try_set_cell_result(self.workbook.try_clear_cell(sheet_idx, addr))
+    }
+
+    /// Returns the formula install outcome plus an optional spill-write
+    /// rejection. JS shape:
+    ///   { ok: true, installed: true } | { ok: true, installed: false }
+    ///     | { ok: false, code: 'spill-write', anchor: 'A1' }
+    /// `installed: false` corresponds to parse failure (`#VALUE!`) or
+    /// cycle detection (`#CYCLE!`) — the cell value already reflects
+    /// that, and the caller can pick it up via a follow-up snapshot.
+    #[wasm_bindgen(js_name = "trySetFormulaAt")]
+    pub fn try_set_formula_at(
+        &mut self,
+        sheet_idx: usize,
+        addr: &str,
+        src: &str,
+    ) -> Result<JsValue, JsValue> {
+        match self.workbook.try_set_formula(sheet_idx, addr, src) {
+            Ok(installed) => {
+                let obj = js_sys::Object::new();
+                js_sys::Reflect::set(&obj, &JsValue::from_str("ok"), &JsValue::TRUE).ok();
+                js_sys::Reflect::set(
+                    &obj,
+                    &JsValue::from_str("installed"),
+                    &JsValue::from_bool(installed),
+                )
+                .ok();
+                Ok(obj.into())
+            }
+            Err(err) => Ok(sheet_error_to_js(err)),
+        }
+    }
+
+    /// Look up the spill anchor for a non-anchor spilled cell. Returns
+    /// the anchor address as a `"A1"`-style string, or `null` when
+    /// `addr` is the anchor itself, a plain cell, or an empty cell.
+    /// Used by the JS UI to draw the spill outline relative to the
+    /// anchor even when the anchor cell is outside the visible window.
+    #[wasm_bindgen(js_name = "spillAnchor")]
+    pub fn spill_anchor(&self, sheet_idx: u32, addr: &str) -> JsValue {
+        match self.workbook.spill_anchor(sheet_idx as usize, addr) {
+            Some(anchor) => JsValue::from_str(&anchor.to_string()),
+            None => JsValue::null(),
+        }
+    }
+
     /// Read a cell's display string through the workbook eval path.
     /// Convenience wrapper around `get_display(u32, ...)` with `usize`
     /// for the Phase 3 canonical API shape. The `&mut self` receiver
@@ -2231,6 +2340,53 @@ impl WasmWorkbook {
         });
         restored
     }
+}
+
+/// Convert a `Result<(), SheetError>` from a workbook try-set into the
+/// `{ ok, code?, anchor? }` JS object shape used by the WASM-facing
+/// `trySetCell*` exports.
+fn try_set_cell_result(result: Result<(), SheetError>) -> Result<JsValue, JsValue> {
+    match result {
+        Ok(()) => {
+            let obj = js_sys::Object::new();
+            js_sys::Reflect::set(&obj, &JsValue::from_str("ok"), &JsValue::TRUE).ok();
+            Ok(obj.into())
+        }
+        Err(err) => Ok(sheet_error_to_js(err)),
+    }
+}
+
+/// Serialize a `SheetError` to the JS-facing `{ ok: false, code, anchor? }`
+/// object so callers can match on `code` rather than parsing a message
+/// string. The `anchor` field is only present for `SpillCellWrite`.
+fn sheet_error_to_js(err: SheetError) -> JsValue {
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &JsValue::from_str("ok"), &JsValue::FALSE).ok();
+    match err {
+        SheetError::SpillCellWrite { anchor } => {
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("code"),
+                &JsValue::from_str("spill-write"),
+            )
+            .ok();
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("anchor"),
+                &JsValue::from_str(&anchor.to_string()),
+            )
+            .ok();
+        }
+        SheetError::InvalidAddress => {
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("code"),
+                &JsValue::from_str("invalid-address"),
+            )
+            .ok();
+        }
+    }
+    obj.into()
 }
 
 /// Collapse a spill-anchor `Value::Array` to its top-left scalar before

@@ -1030,6 +1030,15 @@ impl Sheet {
         self.spilled_into_anchor(addr).is_some()
     }
 
+    /// Public accessor for `spilled_into_anchor`. Returns the anchor
+    /// address of the spill range that covers `addr`, or `None` if
+    /// `addr` is not a spilled (non-anchor) cell. Used by JS UI hosts
+    /// to draw the spill outline relative to the anchor even when the
+    /// anchor cell falls outside the visible window.
+    pub fn spill_anchor_for(&self, addr: CellAddress) -> Option<CellAddress> {
+        self.spilled_into_anchor(addr)
+    }
+
     /// If `addr` is part of an active spill range whose anchor lives
     /// elsewhere, return the anchor's address. Returns None when `addr`
     /// is either the anchor itself, a plain cell, or empty.
