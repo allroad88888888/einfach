@@ -704,9 +704,19 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
         }
 
         Expr::BinOp { op, left, right } => {
-            let lv = eval_expr_with_provider(left, provider);
-            let rv = eval_expr_with_provider(right, provider);
-            eval_binop(*op, &lv, &rv)
+            // Implicit arithmetic broadcast: when either operand is a
+            // multi-cell range or evaluates to a `Value::Array`, we lift
+            // the binop over the array shapes (Excel parity). A single-
+            // cell range collapses to a scalar before the broadcast check
+            // so `=A1+1` still takes the scalar path even with a `A1:A1`
+            // synonym.
+            let lv = eval_operand_for_binop(left, provider);
+            let rv = eval_operand_for_binop(right, provider);
+            if is_array_like(&lv) || is_array_like(&rv) {
+                broadcast_binop(*op, lv, rv)
+            } else {
+                eval_binop(*op, &lv, &rv)
+            }
         }
 
         Expr::Negate(inner) => {
@@ -925,6 +935,186 @@ fn eval_compare(op: BinOperator, l: &Value, r: &Value) -> bool {
         (BinOperator::GtEq, Greater | Equal) => true,
         _ => false,
     }
+}
+
+/// Evaluate a binop operand with array-aware semantics.
+///
+/// Standard `eval_expr_with_provider` collapses a bare `Expr::Range` to
+/// `#VALUE!` (ranges are only meaningful as function args), and lets a
+/// `Value::Array` from a constructor function (`SEQUENCE`, `={1;2;3}`)
+/// flow through as-is. For implicit broadcast we want the OPPOSITE
+/// behaviour at the binop boundary: a multi-cell range becomes a
+/// `Value::Array`, but a single-cell range collapses to its scalar so
+/// `=A1+1` keeps the scalar-arithmetic fast path.
+fn eval_operand_for_binop(expr: &Expr, provider: &dyn EvalProvider) -> Value {
+    let range_parts: Option<(Option<&str>, &CellAddress, &CellAddress)> = match expr {
+        Expr::Range { start, end, .. } => Some((None, start, end)),
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => Some((Some(sheet.as_str()), start, end)),
+        _ => None,
+    };
+    if let Some((sheet_opt, start, end)) = range_parts {
+        let r = CellRange::new(*start, *end).normalize();
+        // Reject full-column / full-row sentinels: a binop over those
+        // would balloon the (rows * cols) loop. Excel surfaces #VALUE!
+        // for that pattern.
+        if r.end.row > EXCEL_MAX_ROWS || r.end.col > EXCEL_MAX_COLS {
+            return Value::Error(ValueError::InvalidValue);
+        }
+        let rows = r.end.row - r.start.row + 1;
+        let cols = r.end.col - r.start.col + 1;
+        // Single-cell range: collapse to scalar to preserve the scalar
+        // arithmetic path. `=A1:A1+1` then behaves exactly like `=A1+1`.
+        if rows == 1 && cols == 1 {
+            return match sheet_opt {
+                Some(s) => provider.sheet_cell(s, r.start),
+                None => provider.cell(r.start),
+            };
+        }
+        // Multi-cell range: materialize a dense 2D buffer pre-filled with
+        // `Null` and let the provider populate the cells it knows about
+        // (sparse-aware providers don't visit empty cells). Matches
+        // `collect_range_2d`'s semantics for VLOOKUP / INDEX.
+        let n = (rows as usize).saturating_mul(cols as usize);
+        let mut data: Vec<Value> = vec![Value::Null; n];
+        let range = CellRange::new(*start, *end);
+        let min_row = r.start.row;
+        let min_col = r.start.col;
+        let max_row = r.end.row;
+        let max_col = r.end.col;
+        let cols_usize = cols as usize;
+        let mut fill = |addr: CellAddress, v: Value| {
+            if addr.row < min_row || addr.row > max_row {
+                return;
+            }
+            if addr.col < min_col || addr.col > max_col {
+                return;
+            }
+            let dr = (addr.row - min_row) as usize;
+            let dc = (addr.col - min_col) as usize;
+            data[dr * cols_usize + dc] = v;
+        };
+        match sheet_opt {
+            Some(s) => provider.for_each_sheet_range_cell(s, range, &mut fill),
+            None => provider.for_each_range_cell(range, &mut fill),
+        }
+        return Value::Array(Arc::new(ArrayData::new(rows, cols, data)));
+    }
+    // Non-range operand: defer to the normal evaluator. `Value::Array`
+    // results (constant-array literals, SEQUENCE, etc.) flow through and
+    // trigger broadcast at the call site.
+    eval_expr_with_provider(expr, provider)
+}
+
+/// Predicate gating the broadcast path in `Expr::BinOp`. Only true for a
+/// concrete `Value::Array`; scalars (including a collapsed 1×1 range)
+/// keep the scalar arithmetic path.
+fn is_array_like(v: &Value) -> bool {
+    matches!(v, Value::Array(_))
+}
+
+/// Pick the element of an operand that corresponds to output cell
+/// `(i, j)` under Excel broadcast rules.
+///
+/// - Scalar → returned as-is (broadcasts to every output cell).
+/// - Array shape `(1, N)` → row 0, column `j`.
+/// - Array shape `(M, 1)` → row `i`, column 0.
+/// - Array shape matching the output → row `i`, column `j`.
+/// - Out-of-shape access (caller passed a mismatched index) → `#VALUE!`.
+fn pick_for_broadcast(v: &Value, i: u32, j: u32) -> Value {
+    match v {
+        Value::Array(arr) => {
+            let (rows, cols) = arr.shape();
+            let r = if rows == 1 { 0 } else { i };
+            let c = if cols == 1 { 0 } else { j };
+            arr.get(r, c)
+                .cloned()
+                .unwrap_or(Value::Error(ValueError::InvalidValue))
+        }
+        other => other.clone(),
+    }
+}
+
+/// Compute the broadcast output shape for a binary op on operands `l`
+/// and `r`. Returns `None` if the shapes are not compatible:
+///   - identical → that shape
+///   - one scalar, one array → array's shape
+///   - 1×N and N×1 (either order) → N×N outer-product shape
+///   - row × row of same width, col × col of same height → that shape
+///   - otherwise → incompatible.
+///
+/// Excel surfaces incompatible shapes as `#N/A`; we use the closest
+/// available variant, `#VALUE!` (InvalidValue).
+fn broadcast_shape(l: &Value, r: &Value) -> Option<(u32, u32)> {
+    let lshape = match l {
+        Value::Array(a) => Some(a.shape()),
+        _ => None,
+    };
+    let rshape = match r {
+        Value::Array(a) => Some(a.shape()),
+        _ => None,
+    };
+    match (lshape, rshape) {
+        (None, None) => Some((1, 1)),
+        (Some(s), None) => Some(s),
+        (None, Some(s)) => Some(s),
+        (Some((lr, lc)), Some((rr, rc))) => {
+            if lr == rr && lc == rc {
+                Some((lr, lc))
+            } else if lr == 1 && rc == 1 {
+                // 1×N · M×1  → M×N outer product.
+                Some((rr, lc))
+            } else if lc == 1 && rr == 1 {
+                // M×1 · 1×N → M×N outer product.
+                Some((lr, rc))
+            } else if lr == 1 && lc == rc {
+                // row vector broadcast down a multi-row array.
+                Some((rr, rc))
+            } else if rr == 1 && rc == lc {
+                Some((lr, lc))
+            } else if lc == 1 && lr == rr {
+                // column vector broadcast across a multi-col array.
+                Some((rr, rc))
+            } else if rc == 1 && rr == lr {
+                Some((lr, lc))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Apply a binary arithmetic op pointwise under broadcast. Errors at
+/// individual cells stay in the result array (Excel parity — a single
+/// `#DIV/0!` in `=A1:A3/B1:B3` only poisons one output cell, not the
+/// whole spill).
+fn broadcast_binop(op: BinOperator, l: Value, r: Value) -> Value {
+    // Whole-operand errors (e.g. `#REF!` from a malformed range) bypass
+    // broadcast and propagate scalar-style, matching how `eval_binop`
+    // treats an error operand.
+    if let Value::Error(e) = &l {
+        return Value::Error(e.clone());
+    }
+    if let Value::Error(e) = &r {
+        return Value::Error(e.clone());
+    }
+    let (rows, cols) = match broadcast_shape(&l, &r) {
+        Some(s) => s,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    let n = (rows as usize).saturating_mul(cols as usize);
+    let mut out: Vec<Value> = Vec::with_capacity(n);
+    for i in 0..rows {
+        for j in 0..cols {
+            let lv = pick_for_broadcast(&l, i, j);
+            let rv = pick_for_broadcast(&r, i, j);
+            // Per-cell evaluation reuses the scalar code path. Errors
+            // stay in-array — this is the documented behaviour.
+            out.push(eval_binop(op, &lv, &rv));
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
 }
 
 /// Coerce a value to a number for arithmetic.
@@ -26956,6 +27146,194 @@ mod tests {
             ),
             Value::Error(ValueError::Overflow)
         );
+    }
+
+    // === Implicit arithmetic broadcast ===
+    //
+    // These exercise the broadcast path added to `Expr::BinOp` so that a
+    // multi-cell `Expr::Range` / `Value::Array` operand produces a
+    // `Value::Array` result (rather than the legacy implicit-intersection
+    // collapse). The Workbook end-to-end spill behaviour lives in
+    // `tests/broadcast.rs`; here we cover the evaluator directly.
+
+    /// Build a column-major env: A1..A5 = 10, 20, 30, 40, 50;
+    /// B1..B5 = 1, 2, 3, 4, 5; C1..C3 = 7, 8, 9.
+    fn make_broadcast_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let mut next: u64 = 0;
+        let mut put = |cm: &mut HashMap<CellAddress, AtomId>,
+                       vs: &mut HashMap<AtomId, Value>,
+                       row: u32,
+                       col: u32,
+                       value: Value| {
+            let id = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(row, col), id);
+            vs.insert(id, value);
+        };
+        // A1..A5 (col 0)
+        for (i, n) in [10.0, 20.0, 30.0, 40.0, 50.0].iter().enumerate() {
+            put(&mut cm, &mut vs, i as u32, 0, Value::Number(*n));
+        }
+        // B1..B5 (col 1)
+        for (i, n) in [1.0, 2.0, 3.0, 4.0, 5.0].iter().enumerate() {
+            put(&mut cm, &mut vs, i as u32, 1, Value::Number(*n));
+        }
+        // C1..C3 (col 2) — used for outer-product 1x3 row source
+        for (i, n) in [7.0, 8.0, 9.0].iter().enumerate() {
+            put(&mut cm, &mut vs, i as u32, 2, Value::Number(*n));
+        }
+        (cm, vs)
+    }
+
+    /// Convenience: extract a (rows, cols, data) tuple from a Value::Array
+    /// result. Panics with a useful message if `v` isn't an Array.
+    fn broadcast_unwrap_array(v: Value) -> (u32, u32, Vec<Value>) {
+        match v {
+            Value::Array(arr) => {
+                let (r, c) = arr.shape();
+                (r, c, arr.data.clone())
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn broadcast_range_times_scalar_column() {
+        let (cm, vs) = make_broadcast_env();
+        let v = eval_str("=A1:A5*2", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (5, 1));
+        let expected = [20.0, 40.0, 60.0, 80.0, 100.0];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(data[i], Value::Number(*want));
+        }
+    }
+
+    #[test]
+    fn broadcast_range_plus_range_elementwise() {
+        let (cm, vs) = make_broadcast_env();
+        let v = eval_str("=A1:A3+B1:B3", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (3, 1));
+        // 10+1, 20+2, 30+3
+        assert_eq!(
+            data,
+            vec![Value::Number(11.0), Value::Number(22.0), Value::Number(33.0)]
+        );
+    }
+
+    #[test]
+    fn broadcast_range_plus_single_cell_collapses_scalar() {
+        let (cm, vs) = make_broadcast_env();
+        // B1 is single-cell range; collapses to scalar 1 → broadcasts.
+        let v = eval_str("=A1:A3+B1", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (3, 1));
+        assert_eq!(
+            data,
+            vec![Value::Number(11.0), Value::Number(21.0), Value::Number(31.0)]
+        );
+    }
+
+    #[test]
+    fn broadcast_row_times_col_outer_product() {
+        // A1:C1 is 1x3 → (7,? ...) wait that uses row 0. A1:C1 = 10, ?, 7
+        // — A1=10, B1=1, C1=7. Use A1:A3 (3x1) * a manual row range.
+        // Build env with a clear row + column. Use A1:C1 row times A1:A3 col.
+        let (cm, vs) = make_broadcast_env();
+        // A1:C1 row vector = [10, 1, 7], A1:A3 column = [10, 20, 30].
+        // Outer product should be 3x3, where (i, j) = col[i] * row[j].
+        let v = eval_str("=A1:A3*A1:C1", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (3, 3));
+        // row 0: 10*10, 10*1, 10*7 = 100, 10, 70
+        // row 1: 20*10, 20*1, 20*7 = 200, 20, 140
+        // row 2: 30*10, 30*1, 30*7 = 300, 30, 210
+        let expected = [
+            100.0, 10.0, 70.0, 200.0, 20.0, 140.0, 300.0, 30.0, 210.0,
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(data[i], Value::Number(*want));
+        }
+    }
+
+    #[test]
+    fn broadcast_range_times_array_literal() {
+        let (cm, vs) = make_broadcast_env();
+        // ={2;3;4} is a 3x1 column array literal; element-wise with A1:A3.
+        let v = eval_str("=A1:A3*{2;3;4}", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (3, 1));
+        // 10*2, 20*3, 30*4
+        assert_eq!(
+            data,
+            vec![Value::Number(20.0), Value::Number(60.0), Value::Number(120.0)]
+        );
+    }
+
+    #[test]
+    fn broadcast_shape_mismatch_returns_value_error() {
+        let (cm, vs) = make_broadcast_env();
+        // A1:A3 is 3x1, B1:B5 is 5x1 — incompatible. Excel: #N/A; we use
+        // InvalidValue per the documented mapping.
+        assert_eq!(
+            eval_str("=A1:A3+B1:B5", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn broadcast_comparison_returns_boolean_array() {
+        let (cm, vs) = make_broadcast_env();
+        let v = eval_str("=A1:A5>15", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (5, 1));
+        // 10>15=F, 20>15=T, 30>15=T, 40>15=T, 50>15=T
+        assert_eq!(
+            data,
+            vec![
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]
+        );
+    }
+
+    #[test]
+    fn broadcast_per_cell_error_stays_in_array() {
+        // Build an env where A2 is text; A1=10, A3=30. `=A1:A3*2` should
+        // produce [20, WrongType, 60] — the error sits in cell index 1
+        // without poisoning the rest of the spill.
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let a2 = AtomId::from_raw(1);
+        let a3 = AtomId::from_raw(2);
+        cm.insert(CellAddress::new(0, 0), a1);
+        cm.insert(CellAddress::new(1, 0), a2);
+        cm.insert(CellAddress::new(2, 0), a3);
+        vs.insert(a1, Value::Number(10.0));
+        vs.insert(a2, Value::Text("text".into()));
+        vs.insert(a3, Value::Number(30.0));
+        let v = eval_str("=A1:A3*2", &cm, &vs);
+        let (rows, cols, data) = broadcast_unwrap_array(v);
+        assert_eq!((rows, cols), (3, 1));
+        assert_eq!(data[0], Value::Number(20.0));
+        assert_eq!(data[1], Value::Error(ValueError::WrongType));
+        assert_eq!(data[2], Value::Number(60.0));
+    }
+
+    #[test]
+    fn broadcast_single_cell_range_stays_scalar() {
+        // `=A1:A1+1` should match the scalar path: result is a Number,
+        // NOT a 1x1 Array. This proves we don't accidentally widen
+        // implicit intersection.
+        let (cm, vs) = make_broadcast_env();
+        assert_eq!(eval_str("=A1:A1+1", &cm, &vs), Value::Number(11.0));
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====

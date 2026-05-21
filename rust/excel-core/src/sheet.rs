@@ -3296,7 +3296,23 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
             args.iter().any(expr_may_produce_array)
         }
         Expr::BinOp { left, right, .. } => {
-            expr_may_produce_array(left) || expr_may_produce_array(right)
+            // A binop now broadcasts when either operand is a multi-cell
+            // range or array literal (eval.rs § `broadcast_binop`). Range
+            // operands always produce multi-cell at the binop boundary,
+            // so flag the binop as array-producing whenever an operand
+            // is a `Range` / `SheetRange` — the broadcast path on the
+            // eval side handles the single-cell range collapse so we
+            // only over-flag, never under-flag.
+            let operand_is_range = |e: &Expr| {
+                matches!(
+                    e,
+                    Expr::Range { .. } | Expr::SheetRange { .. }
+                )
+            };
+            operand_is_range(left)
+                || operand_is_range(right)
+                || expr_may_produce_array(left)
+                || expr_may_produce_array(right)
         }
         Expr::Negate(inner) => expr_may_produce_array(inner),
         // An immediate-call could be `MAP(...)(...)` chained, but even a
