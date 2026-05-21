@@ -173,6 +173,9 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COUNTBLANK"
             | "COUNTIF"
             | "COUNTIFS"
+            | "COUPDAYSNC"
+            | "COUPNCD"
+            | "COUPPCD"
             | "COVAR.S"
             | "CSC"
             | "CSCH"
@@ -213,6 +216,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FACT"
             | "FILTER"
             | "FIND"
+            | "FINDB"
             | "FISHER"
             | "FISHERINV"
             | "FLOOR"
@@ -220,6 +224,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FLOOR.PRECISE"
             | "FORMULATEXT"
             | "FV"
+            | "FVSCHEDULE"
             | "GAMMA"
             | "GAMMA.DIST"
             | "GAMMA.INV"
@@ -265,7 +270,9 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "LARGE"
             | "LCM"
             | "LEFT"
+            | "LEFTB"
             | "LEN"
+            | "LENB"
             | "LET"
             | "LN"
             | "LOG"
@@ -280,6 +287,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MDETERM"
             | "MEDIAN"
             | "MID"
+            | "MIDB"
             | "MIN"
             | "MINIFS"
             | "MINUTE"
@@ -302,8 +310,13 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "OCT2BIN"
             | "OCT2DEC"
             | "OCT2HEX"
+            | "ODDFPRICE"
+            | "ODDFYIELD"
+            | "ODDLPRICE"
+            | "ODDLYIELD"
             | "OFFSET"
             | "OR"
+            | "PDURATION"
             | "PERCENTILE.EXC"
             | "PHONETIC"
             | "PI"
@@ -321,16 +334,20 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "RATE"
             | "REDUCE"
             | "REPLACE"
+            | "REPLACEB"
             | "REPT"
             | "RIGHT"
+            | "RIGHTB"
             | "ROMAN"
             | "ROUND"
             | "ROUNDDOWN"
             | "ROUNDUP"
             | "ROW"
             | "ROWS"
+            | "RRI"
             | "SCAN"
             | "SEARCH"
+            | "SEARCHB"
             | "SEC"
             | "SECH"
             | "SECOND"
@@ -8459,6 +8476,33 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // because its conversions are affine, not linear.
         "CONVERT" => eval_convert(args, provider),
 
+        // === R batch: odd-coupon bond pricing + coupon-date utilities + misc finance ===
+        // Yield solvers (ODDFYIELD) use Newton-Raphson seeded at the coupon
+        // rate (same approach as YIELD). ODDLYIELD has a closed-form
+        // solution and so does not iterate.
+        "ODDFPRICE" => fn_oddfprice(args, provider),
+        "ODDFYIELD" => fn_oddfyield(args, provider),
+        "ODDLPRICE" => fn_oddlprice(args, provider),
+        "ODDLYIELD" => fn_oddlyield(args, provider),
+        "COUPNCD" => fn_coupncd(args, provider),
+        "COUPPCD" => fn_couppcd(args, provider),
+        "COUPDAYSNC" => fn_coupdaysnc(args, provider),
+        "PDURATION" => fn_pduration(args, provider),
+        "RRI" => fn_rri(args, provider),
+        "FVSCHEDULE" => fn_fvschedule(args, provider),
+
+        // === R batch: CJK byte-aware text functions ===
+        // Each treats CJK / full-width characters as 2 "bytes" wide and
+        // ASCII / half-width as 1 (Excel Shift-JIS / DBCS parity).
+        // `dbcs_byte_width` is the shared decision.
+        "LENB" => fn_lenb(args, provider),
+        "LEFTB" => fn_leftb(args, provider),
+        "RIGHTB" => fn_rightb(args, provider),
+        "MIDB" => fn_midb(args, provider),
+        "FINDB" => fn_findb(args, provider),
+        "SEARCHB" => fn_searchb(args, provider),
+        "REPLACEB" => fn_replaceb(args, provider),
+
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
         // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
@@ -15570,6 +15614,1046 @@ fn eval_convert(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         value * from_factor / to_factor
     };
     stat_finite(result)
+}
+
+// ---------------------------------------------------------------------------
+// R-batch helpers: odd-coupon bond pricing + coupon-date utilities + misc
+// finance. Uses existing `date_from_serial`, `date_serial`, `days_in_month`,
+// `prev_coupon_date`, `next_coupon_date`, `coup_num`, `coup_period_split`,
+// `coup_period_days`, `yearfrac_basis`, `fin_basis`, `fin_coerce`, and
+// `day_diff` from the rest of the eval module.
+// ---------------------------------------------------------------------------
+
+/// Walk forward from a quasi-coupon date by `k` whole coupon periods.
+fn add_coupon_periods(quasi_date: f64, frequency: i64, k: i32) -> f64 {
+    let months_per_period = (12 / frequency) as i32;
+    let (qy, qm, qd) = date_from_serial(quasi_date);
+    let total_months = qy * 12 + (qm as i32 - 1) + k * months_per_period;
+    let ny = total_months.div_euclid(12);
+    let nm = (total_months.rem_euclid(12) + 1) as u32;
+    let dom = days_in_month(ny, nm);
+    let nd = qd.min(dom);
+    date_serial(ny, nm, nd)
+}
+
+/// Count quasi-coupon dates strictly after `start` and ≤ `end`.
+fn nc_quasi_dates_between(start: f64, end: f64, frequency: i64) -> i32 {
+    if end <= start {
+        return 0;
+    }
+    let months_per_period = (12 / frequency) as i32;
+    let (ey, em, ed) = date_from_serial(end);
+    let mut k: i32 = 0;
+    loop {
+        let total_months = ey * 12 + (em as i32 - 1) - k * months_per_period;
+        let ny = total_months.div_euclid(12);
+        let nm = (total_months.rem_euclid(12) + 1) as u32;
+        let dom = days_in_month(ny, nm);
+        let nd = ed.min(dom);
+        let serial = date_serial(ny, nm, nd);
+        if serial <= start {
+            return k;
+        }
+        k += 1;
+        if k > 4_000 {
+            return k;
+        }
+    }
+}
+
+/// ODDFPRICE — price per $100 face with an odd first coupon period.
+/// Short odd (issue inside the prev-quasi → first_coupon period): first
+/// coupon payment = coupon * DFC (period-fraction issue→first_coupon).
+/// Long odd: walk back from first_coupon in whole quasi-periods to the
+/// period containing issue; first coupon payment scales by the sum of
+/// full intermediate periods plus the partial issue-period fraction.
+/// Discounts the first coupon at exponent DSC (settlement→first_coupon
+/// in periods), standard coupons at DSC + (k-1) for k ∈ 2..=N, and
+/// redemption at DSC + (N-1).
+fn oddfprice_from_yield(
+    settlement: f64,
+    maturity: f64,
+    issue: f64,
+    first_coupon: f64,
+    rate: f64,
+    yld: f64,
+    redemption: f64,
+    frequency: i64,
+    basis: i64,
+) -> Result<f64, ValueError> {
+    let f = frequency as f64;
+    let one_plus = 1.0 + yld / f;
+    if one_plus <= 0.0 {
+        return Err(ValueError::Overflow);
+    }
+    let coupon = 100.0 * rate / f;
+    let n_regular = nc_quasi_dates_between(first_coupon, maturity, frequency);
+    let n_total = n_regular + 1;
+    let dsc = yearfrac_basis(settlement, first_coupon, basis)? * f;
+
+    let prev_quasi = add_coupon_periods(first_coupon, frequency, -1);
+    let (first_cpn, accrued) = if prev_quasi <= issue {
+        // Short odd first period.
+        let dfc = yearfrac_basis(issue, first_coupon, basis)? * f;
+        let a = yearfrac_basis(issue, settlement, basis)? * f;
+        (coupon * dfc, coupon * a)
+    } else {
+        // Long odd first period.
+        let nq = nc_quasi_dates_between(issue, first_coupon, frequency).max(1);
+        let mut quasi_dates: Vec<f64> = Vec::with_capacity((nq + 1) as usize);
+        for i in 0..=nq {
+            quasi_dates.push(add_coupon_periods(first_coupon, frequency, -i));
+        }
+        let q_issue_lo = quasi_dates[nq as usize];
+        let q_issue_hi = quasi_dates[(nq - 1) as usize];
+        let nl_issue = (q_issue_hi - q_issue_lo).max(1.0);
+        let dci_frac = ((q_issue_hi - issue).max(0.0)) / nl_issue;
+        let first_period_cpn_frac = dci_frac + (nq as f64 - 1.0);
+        let accrued_periods = if settlement <= q_issue_hi {
+            ((settlement - issue).max(0.0)) / nl_issue
+        } else {
+            let mut frac = dci_frac;
+            let mut found = false;
+            for i in 1..nq {
+                let q_lo = quasi_dates[(nq - i) as usize];
+                let q_hi = quasi_dates[(nq - i - 1) as usize];
+                if settlement >= q_lo && settlement <= q_hi {
+                    let nl = (q_hi - q_lo).max(1.0);
+                    frac += ((settlement - q_lo).max(0.0)) / nl;
+                    found = true;
+                    break;
+                } else {
+                    frac += 1.0;
+                }
+            }
+            if !found {
+                frac = first_period_cpn_frac;
+            }
+            frac
+        };
+        (coupon * first_period_cpn_frac, coupon * accrued_periods)
+    };
+
+    let mut pv = first_cpn / one_plus.powf(dsc);
+    for k in 2..=n_total {
+        let exp = dsc + (k as f64 - 1.0);
+        pv += coupon / one_plus.powf(exp);
+    }
+    let redemp = redemption / one_plus.powf(dsc + (n_total as f64 - 1.0));
+    let price = pv + redemp - accrued;
+    if !price.is_finite() {
+        return Err(ValueError::Overflow);
+    }
+    Ok(price)
+}
+
+fn fn_oddfprice(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 8 || args.len() > 9 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let issue = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let first_coupon = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[6], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[7], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 8, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0
+        || yld < 0.0
+        || redemption <= 0.0
+        || issue >= settlement
+        || settlement >= first_coupon
+        || first_coupon >= maturity
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    match oddfprice_from_yield(
+        settlement,
+        maturity,
+        issue,
+        first_coupon,
+        rate,
+        yld,
+        redemption,
+        frequency,
+        basis,
+    ) {
+        Ok(p) => Value::Number(p),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_oddfyield(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 8 || args.len() > 9 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let issue = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let first_coupon = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[6], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[7], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 8, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0
+        || pr <= 0.0
+        || redemption <= 0.0
+        || issue >= settlement
+        || settlement >= first_coupon
+        || first_coupon >= maturity
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mut y = rate.max(0.05);
+    for _ in 0..100 {
+        let p = match oddfprice_from_yield(
+            settlement,
+            maturity,
+            issue,
+            first_coupon,
+            rate,
+            y,
+            redemption,
+            frequency,
+            basis,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        };
+        let dy = 1e-6_f64;
+        let p2 = match oddfprice_from_yield(
+            settlement,
+            maturity,
+            issue,
+            first_coupon,
+            rate,
+            y + dy,
+            redemption,
+            frequency,
+            basis,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        };
+        let diff = p - pr;
+        if diff.abs() < 1e-7 {
+            return Value::Number(y);
+        }
+        let fp = (p2 - p) / dy;
+        if fp == 0.0 || !fp.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        let next = y - diff / fp;
+        if !next.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        if (next - y).abs() < 1e-9 {
+            return Value::Number(next);
+        }
+        y = next;
+    }
+    Value::Error(ValueError::Overflow)
+}
+
+/// ODDLPRICE — price per $100 face with an odd last coupon period.
+/// PCD = latest quasi-coupon date ≤ settlement (walking forward from
+/// last_interest). A_p = period-fraction PCD→settlement. DSM = period-
+/// fraction settlement→maturity. coupon = 100*rate/F.
+/// P = (DSM*coupon + R) / (1 + DSM*yld/F) - A_p*coupon.
+fn oddlprice_from_yield(
+    settlement: f64,
+    maturity: f64,
+    last_interest: f64,
+    rate: f64,
+    yld: f64,
+    redemption: f64,
+    frequency: i64,
+    basis: i64,
+) -> Result<f64, ValueError> {
+    let f = frequency as f64;
+    let mut prev_q = last_interest;
+    let mut k = 1i32;
+    loop {
+        let next_q = add_coupon_periods(last_interest, frequency, k);
+        if next_q > settlement {
+            break;
+        }
+        prev_q = next_q;
+        k += 1;
+        if k > 4_000 {
+            return Err(ValueError::Overflow);
+        }
+    }
+    let a_periods = yearfrac_basis(prev_q, settlement, basis)? * f;
+    let dsm_periods = yearfrac_basis(settlement, maturity, basis)? * f;
+    let coupon = 100.0 * rate / f;
+    let factor = 1.0 + dsm_periods * yld / f;
+    if factor == 0.0 || !factor.is_finite() {
+        return Err(ValueError::Overflow);
+    }
+    let numer = dsm_periods * coupon + redemption;
+    let accrued = a_periods * coupon;
+    let price = numer / factor - accrued;
+    if !price.is_finite() {
+        return Err(ValueError::Overflow);
+    }
+    Ok(price)
+}
+
+fn fn_oddlprice(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 7 || args.len() > 8 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let last_interest = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[6], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 7, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0
+        || yld < 0.0
+        || redemption <= 0.0
+        || last_interest >= settlement
+        || settlement >= maturity
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    match oddlprice_from_yield(
+        settlement,
+        maturity,
+        last_interest,
+        rate,
+        yld,
+        redemption,
+        frequency,
+        basis,
+    ) {
+        Ok(p) => Value::Number(p),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_oddlyield(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 7 || args.len() > 8 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let last_interest = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[6], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 7, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0
+        || pr <= 0.0
+        || redemption <= 0.0
+        || last_interest >= settlement
+        || settlement >= maturity
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    // ODDLPRICE has a closed-form in yld; solve directly.
+    //   P + A_p*coupon = (DSM_p*coupon + R) / (1 + DSM_p * yld/F)
+    //   => yld = F / DSM_p * ((numer / denom) - 1)
+    let mut prev_q = last_interest;
+    let mut k = 1i32;
+    loop {
+        let next_q = add_coupon_periods(last_interest, frequency, k);
+        if next_q > settlement {
+            break;
+        }
+        prev_q = next_q;
+        k += 1;
+        if k > 4_000 {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    let f = frequency as f64;
+    let a_periods = match yearfrac_basis(prev_q, settlement, basis) {
+        Ok(v) => v * f,
+        Err(e) => return Value::Error(e),
+    };
+    let dsm_periods = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v * f,
+        Err(e) => return Value::Error(e),
+    };
+    if dsm_periods == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let coupon = 100.0 * rate / f;
+    let numer = dsm_periods * coupon + redemption;
+    let denom = pr + a_periods * coupon;
+    if denom == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let y = f / dsm_periods * (numer / denom - 1.0);
+    if y.is_finite() {
+        Value::Number(y)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_coupncd(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let _basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(next_coupon_date(settlement, maturity, frequency))
+}
+
+fn fn_couppcd(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let _basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(prev_coupon_date(settlement, maturity, frequency))
+}
+
+fn fn_coupdaysnc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    let ncd = next_coupon_date(settlement, maturity, frequency);
+    let days = if basis == 1 {
+        day_diff(settlement, ncd).max(0.0)
+    } else {
+        let (_a, dsc, _e) = coup_period_split(settlement, maturity, frequency, basis);
+        dsc
+    };
+    Value::Number(days)
+}
+
+fn fn_pduration(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let rate = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pv = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let fv = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate <= 0.0 || pv <= 0.0 || fv <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let log_base = (1.0 + rate).ln();
+    if log_base == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let result = (fv / pv).ln() / log_base;
+    if result.is_finite() {
+        Value::Number(result)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_rri(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nper = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pv = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let fv = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if nper <= 0.0 || pv <= 0.0 || fv <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let result = (fv / pv).powf(1.0 / nper) - 1.0;
+    if result.is_finite() {
+        Value::Number(result)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_fvschedule(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let principal = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let mut product = principal;
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(&args[1], provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        match v {
+            Value::Error(e) => err = Some(e),
+            Value::Null => {}
+            other => match coerce_to_number(&other) {
+                Some(r) => {
+                    product *= 1.0 + r;
+                }
+                None => err = Some(ValueError::WrongType),
+            },
+        }
+    });
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    if product.is_finite() {
+        Value::Number(product)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R-batch helpers: CJK byte-aware text functions. Each treats CJK +
+// full-width characters as 2 bytes (Shift-JIS / DBCS), everything else
+// as 1. LEFTB / RIGHTB / MIDB substitute a space when a 2-byte char
+// would be split across the byte boundary.
+// ---------------------------------------------------------------------------
+
+/// True when `c` would be 2 bytes in Shift-JIS / DBCS.
+fn is_cjk_or_fullwidth(c: char) -> bool {
+    let cp = c as u32;
+    matches!(cp,
+        0x3000..=0x303F   // CJK Symbols and Punctuation
+        | 0x3040..=0x309F // Hiragana
+        | 0x30A0..=0x30FF // Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFF01..=0xFF60 // Full-width ASCII
+        | 0xFFA0..=0xFFEF // Full-width Hangul Jamo etc.
+    )
+}
+
+fn dbcs_byte_width(c: char) -> usize {
+    if is_cjk_or_fullwidth(c) {
+        2
+    } else {
+        1
+    }
+}
+
+fn dbcs_byte_len(s: &str) -> usize {
+    s.chars().map(dbcs_byte_width).sum()
+}
+
+fn dbcs_take_left(s: &str, num_bytes: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in s.chars() {
+        let w = dbcs_byte_width(c);
+        if used + w <= num_bytes {
+            out.push(c);
+            used += w;
+        } else if used < num_bytes {
+            out.push(' ');
+            break;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn dbcs_take_right(s: &str, num_bytes: usize) -> String {
+    let total = dbcs_byte_len(s);
+    if num_bytes >= total {
+        return s.to_string();
+    }
+    let target_start_byte = total - num_bytes;
+    let mut out = String::new();
+    let mut byte_off = 0usize;
+    let mut leading_pad = false;
+    for c in s.chars() {
+        let w = dbcs_byte_width(c);
+        let next = byte_off + w;
+        if byte_off >= target_start_byte {
+            out.push(c);
+        } else if next > target_start_byte {
+            leading_pad = true;
+        }
+        byte_off = next;
+    }
+    if leading_pad {
+        let mut padded = String::with_capacity(out.len() + 1);
+        padded.push(' ');
+        padded.push_str(&out);
+        padded
+    } else {
+        out
+    }
+}
+
+fn dbcs_mid(s: &str, start_byte: usize, num_bytes: usize) -> String {
+    if num_bytes == 0 {
+        return String::new();
+    }
+    let end_byte = start_byte + num_bytes - 1;
+    let mut out = String::new();
+    let mut byte_pos = 1usize;
+    for c in s.chars() {
+        let w = dbcs_byte_width(c);
+        let first = byte_pos;
+        let last = byte_pos + w - 1;
+        if last < start_byte || first > end_byte {
+            // outside the slice
+        } else if first >= start_byte && last <= end_byte {
+            out.push(c);
+        } else {
+            out.push(' ');
+        }
+        byte_pos += w;
+        if byte_pos > end_byte {
+            break;
+        }
+    }
+    out
+}
+
+fn fn_lenb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    Value::Number(dbcs_byte_len(&coerce_to_text(&v)) as f64)
+}
+
+fn fn_leftb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let s = coerce_to_text(&v);
+    let n = if args.len() == 2 {
+        let nv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = nv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&nv) {
+            Some(x) if x >= 0.0 => x.trunc() as usize,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        1
+    };
+    Value::Text(dbcs_take_left(&s, n))
+}
+
+fn fn_rightb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let s = coerce_to_text(&v);
+    let n = if args.len() == 2 {
+        let nv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = nv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&nv) {
+            Some(x) if x >= 0.0 => x.trunc() as usize,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        1
+    };
+    Value::Text(dbcs_take_right(&s, n))
+}
+
+fn fn_midb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let sv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = sv {
+        return Value::Error(e);
+    }
+    let start_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = start_v {
+        return Value::Error(e);
+    }
+    let num_v = eval_expr_with_provider(&args[2], provider);
+    if let Value::Error(e) = num_v {
+        return Value::Error(e);
+    }
+    let start = match coerce_to_number(&start_v) {
+        Some(n) if n >= 1.0 => n.trunc() as usize,
+        _ => return Value::Error(ValueError::InvalidValue),
+    };
+    let num = match coerce_to_number(&num_v) {
+        Some(n) if n >= 0.0 => n.trunc() as usize,
+        _ => return Value::Error(ValueError::InvalidValue),
+    };
+    let s = coerce_to_text(&sv);
+    Value::Text(dbcs_mid(&s, start, num))
+}
+
+/// FINDB / SEARCHB shared byte-positioning engine. Returns Excel-style
+/// 1-based byte index of the first match, or `Err(InvalidValue)` if no
+/// match. `case_insensitive` mirrors SEARCH semantics.
+fn dbcs_find_byte_index(
+    needle: &str,
+    haystack: &str,
+    start_byte: usize,
+    case_insensitive: bool,
+) -> Result<usize, ValueError> {
+    let total_bytes = dbcs_byte_len(haystack);
+    if needle.is_empty() {
+        if start_byte > total_bytes + 1 {
+            return Err(ValueError::InvalidValue);
+        }
+        return Ok(start_byte);
+    }
+    if start_byte == 0 || start_byte > total_bytes {
+        return Err(ValueError::InvalidValue);
+    }
+    let mut h_chars: Vec<char> = Vec::new();
+    let mut h_offsets: Vec<usize> = Vec::new();
+    {
+        let mut off = 0usize;
+        for c in haystack.chars() {
+            h_chars.push(c);
+            h_offsets.push(off);
+            off += dbcs_byte_width(c);
+        }
+    }
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let n_norm: Vec<char> = if case_insensitive {
+        needle_chars
+            .iter()
+            .flat_map(|c| c.to_lowercase())
+            .collect()
+    } else {
+        needle_chars
+    };
+    for i in 0..h_chars.len() {
+        let first_byte = h_offsets[i] + 1;
+        if first_byte < start_byte {
+            continue;
+        }
+        if i + n_norm.len() > h_chars.len() {
+            break;
+        }
+        let slice = &h_chars[i..i + n_norm.len()];
+        let cmp_eq = if case_insensitive {
+            let lower: Vec<char> = slice.iter().flat_map(|c| c.to_lowercase()).collect();
+            lower == n_norm
+        } else {
+            slice == n_norm.as_slice()
+        };
+        if cmp_eq {
+            return Ok(first_byte);
+        }
+    }
+    Err(ValueError::InvalidValue)
+}
+
+fn fn_findb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let find_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = find_v {
+        return Value::Error(e);
+    }
+    let within_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = within_v {
+        return Value::Error(e);
+    }
+    let start_byte = if args.len() == 3 {
+        let s = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = s {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&s) {
+            Some(n) if n >= 1.0 => n.trunc() as usize,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        1
+    };
+    let needle = coerce_to_text(&find_v);
+    let hay = coerce_to_text(&within_v);
+    match dbcs_find_byte_index(&needle, &hay, start_byte, false) {
+        Ok(p) => Value::Number(p as f64),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_searchb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let find_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = find_v {
+        return Value::Error(e);
+    }
+    let within_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = within_v {
+        return Value::Error(e);
+    }
+    let start_byte = if args.len() == 3 {
+        let s = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = s {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&s) {
+            Some(n) if n >= 1.0 => n.trunc() as usize,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        1
+    };
+    let needle = coerce_to_text(&find_v);
+    let hay = coerce_to_text(&within_v);
+    match dbcs_find_byte_index(&needle, &hay, start_byte, true) {
+        Ok(p) => Value::Number(p as f64),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_replaceb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = text_v {
+        return Value::Error(e);
+    }
+    let start_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = start_v {
+        return Value::Error(e);
+    }
+    let num_v = eval_expr_with_provider(&args[2], provider);
+    if let Value::Error(e) = num_v {
+        return Value::Error(e);
+    }
+    let new_v = eval_expr_with_provider(&args[3], provider);
+    if let Value::Error(e) = new_v {
+        return Value::Error(e);
+    }
+    let start = match coerce_to_number(&start_v) {
+        Some(n) if n >= 1.0 => n.trunc() as usize,
+        _ => return Value::Error(ValueError::InvalidValue),
+    };
+    let num = match coerce_to_number(&num_v) {
+        Some(n) if n >= 0.0 => n.trunc() as usize,
+        _ => return Value::Error(ValueError::InvalidValue),
+    };
+    let text = coerce_to_text(&text_v);
+    let new_s = coerce_to_text(&new_v);
+    let total = dbcs_byte_len(&text);
+    let left = dbcs_take_left(&text, start.saturating_sub(1));
+    let consumed_end = start.saturating_sub(1) + num;
+    let right = if consumed_end < total {
+        dbcs_take_right(&text, total - consumed_end)
+    } else {
+        String::new()
+    };
+    let mut out = String::new();
+    out.push_str(&left);
+    out.push_str(&new_s);
+    out.push_str(&right);
+    Value::Text(out)
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -30773,6 +31857,398 @@ mod tests {
         assert_eq!(
             ev(r#"=CONVERT(1, "m", "cm", "extra")"#),
             Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // ----- R batch: odd-coupon bond + CJK byte text functions ----------------
+
+    // ODDFPRICE — sanity: when issue ≈ first_coupon - 1 period and
+    // yield == rate, the short-odd path collapses to the standard PRICE
+    // case and should return ~100.
+    #[test]
+    fn eval_oddfprice_short_at_par() {
+        let (cm, vs) = make_test_env();
+        // 5-year semi bond, issue exactly one period before first coupon.
+        let v = eval_str(
+            "=ODDFPRICE(DATE(2020,7,1),DATE(2025,7,1),DATE(2020,1,1),DATE(2021,1,1),0.05,0.05,100,2,0)",
+            &cm, &vs,
+        );
+        match v {
+            Value::Number(n) => assert!((n - 100.0).abs() < 1.0, "ODDFPRICE got {}", n),
+            other => panic!("ODDFPRICE: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_oddfprice_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ODDFPRICE(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_oddfprice_settlement_after_first_coupon() {
+        let (cm, vs) = make_test_env();
+        // settlement must be < first_coupon.
+        assert_eq!(
+            eval_str(
+                "=ODDFPRICE(DATE(2022,7,1),DATE(2025,7,1),DATE(2020,1,1),DATE(2021,1,1),0.05,0.05,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_oddfyield_inverts_oddfprice() {
+        let (cm, vs) = make_test_env();
+        // PRICE-then-YIELD round-trip; tolerance loose because the
+        // odd-period scheme is sensitive to basis quantization.
+        let v = eval_str(
+            "=ODDFYIELD(DATE(2020,7,1),DATE(2025,7,1),DATE(2020,1,1),DATE(2021,1,1),0.05,ODDFPRICE(DATE(2020,7,1),DATE(2025,7,1),DATE(2020,1,1),DATE(2021,1,1),0.05,0.07,100,2,0),100,2,0)",
+            &cm, &vs,
+        );
+        match v {
+            Value::Number(n) => assert!((n - 0.07).abs() < 1e-3, "ODDFYIELD got {}", n),
+            other => panic!("ODDFYIELD: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_oddfyield_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ODDFYIELD(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_oddfyield_invalid_frequency() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=ODDFYIELD(DATE(2020,7,1),DATE(2025,7,1),DATE(2020,1,1),DATE(2021,1,1),0.05,100,100,3,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_oddlprice_at_par() {
+        let (cm, vs) = make_test_env();
+        // last_interest exactly one period before maturity, settlement
+        // mid-period, yield == rate → price ≈ 100 + ~half-period accrued.
+        let v = eval_str(
+            "=ODDLPRICE(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,0.05,100,2,0)",
+            &cm, &vs,
+        );
+        match v {
+            Value::Number(n) => assert!(n > 95.0 && n < 105.0, "ODDLPRICE got {}", n),
+            other => panic!("ODDLPRICE: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_oddlprice_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ODDLPRICE(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_oddlprice_last_interest_after_settlement() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=ODDLPRICE(DATE(2024,1,1),DATE(2025,1,1),DATE(2024,7,1),0.05,0.05,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_oddlyield_round_trip() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str(
+            "=ODDLYIELD(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,ODDLPRICE(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,0.06,100,2,0),100,2,0)",
+            &cm, &vs,
+        );
+        match v {
+            Value::Number(n) => assert!((n - 0.06).abs() < 1e-4, "ODDLYIELD got {}", n),
+            other => panic!("ODDLYIELD: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_oddlyield_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ODDLYIELD(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_oddlyield_zero_price_is_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=ODDLYIELD(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,0,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    // COUPNCD / COUPPCD / COUPDAYSNC
+    #[test]
+    fn eval_coupncd_basic() {
+        let (cm, vs) = make_test_env();
+        // Settlement mid-period; NCD should be > settlement.
+        match eval_str(
+            "=COUPNCD(DATE(2024,4,1),DATE(2025,1,1),2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => {
+                let settle = eval_str("=DATE(2024,4,1)", &cm, &vs);
+                if let Value::Number(s) = settle {
+                    assert!(n > s, "COUPNCD {} should be > settle {}", n, s);
+                }
+            }
+            other => panic!("COUPNCD: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_couppcd_basic() {
+        let (cm, vs) = make_test_env();
+        match eval_str(
+            "=COUPPCD(DATE(2024,4,1),DATE(2025,1,1),2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => {
+                let settle = eval_str("=DATE(2024,4,1)", &cm, &vs);
+                if let Value::Number(s) = settle {
+                    assert!(n <= s, "COUPPCD {} should be <= settle {}", n, s);
+                }
+            }
+            other => panic!("COUPPCD: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_coupdaysnc_basis_0() {
+        let (cm, vs) = make_test_env();
+        // Same setup as COUPDAYS / COUPDAYBS — DSC should be positive.
+        match eval_str(
+            "=COUPDAYSNC(DATE(2024,4,1),DATE(2025,1,1),2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(n > 0.0 && n <= 180.0, "COUPDAYSNC got {}", n),
+            other => panic!("COUPDAYSNC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_coupncd_settle_after_mat() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COUPNCD(DATE(2025,1,1),DATE(2024,1,1),2,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_coupdaysnc_invalid_frequency() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COUPDAYSNC(DATE(2024,1,1),DATE(2025,1,1),3,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    // PDURATION / RRI / FVSCHEDULE
+    #[test]
+    fn eval_pduration_basic() {
+        // log(2000/1000) / log(1.05) ≈ 14.2067.
+        assert_approx_eq(ev("=PDURATION(0.05,1000,2000)"), 14.20669908, 1e-6);
+    }
+    #[test]
+    fn eval_pduration_zero_rate() {
+        assert_eq!(ev("=PDURATION(0,1000,2000)"), Value::Error(ValueError::Overflow));
+    }
+    #[test]
+    fn eval_pduration_negative_pv() {
+        assert_eq!(ev("=PDURATION(0.05,-1000,2000)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_rri_basic() {
+        // (2000/1000)^(1/10) - 1 ≈ 0.07177346.
+        assert_approx_eq(ev("=RRI(10,1000,2000)"), 0.0717734625, 1e-6);
+    }
+    #[test]
+    fn eval_rri_inverts_pduration() {
+        // RRI(PDURATION(0.05, 1000, 2000), 1000, 2000) should land back near 0.05.
+        match ev("=RRI(PDURATION(0.05,1000,2000),1000,2000)") {
+            Value::Number(n) => assert!((n - 0.05).abs() < 1e-6, "RRI round trip {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+    #[test]
+    fn eval_rri_zero_nper_is_error() {
+        assert_eq!(ev("=RRI(0,1000,2000)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_fvschedule_constants() {
+        // 1000 * 1.05 * 1.06 * 1.07 = 1190.91.
+        assert_approx_eq(ev("=FVSCHEDULE(1000,{0.05;0.06;0.07})"), 1190.91, 1e-2);
+    }
+    #[test]
+    fn eval_fvschedule_range() {
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let a2 = AtomId::from_raw(1);
+        let a3 = AtomId::from_raw(2);
+        cm.insert(CellAddress::new(0, 0), a1);
+        cm.insert(CellAddress::new(1, 0), a2);
+        cm.insert(CellAddress::new(2, 0), a3);
+        vs.insert(a1, Value::Number(0.05));
+        vs.insert(a2, Value::Number(0.06));
+        vs.insert(a3, Value::Number(0.07));
+        match eval_str("=FVSCHEDULE(1000,A1:A3)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1190.91).abs() < 1e-2, "FVSCHEDULE got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+    #[test]
+    fn eval_fvschedule_wrong_arg_count() {
+        assert_eq!(ev("=FVSCHEDULE(1000)"), Value::Error(ValueError::WrongArgCount));
+    }
+
+    // LENB / LEFTB / RIGHTB / MIDB / FINDB / SEARCHB / REPLACEB
+    #[test]
+    fn eval_lenb_japanese() {
+        // "あいう" = 3 chars × 2 bytes = 6.
+        assert_eq!(ev(r#"=LENB("あいう")"#), Value::Number(6.0));
+    }
+    #[test]
+    fn eval_lenb_mixed() {
+        // "abcあ" = 3 + 2 = 5.
+        assert_eq!(ev(r#"=LENB("abcあ")"#), Value::Number(5.0));
+    }
+    #[test]
+    fn eval_lenb_ascii() {
+        assert_eq!(ev(r#"=LENB("hello")"#), Value::Number(5.0));
+    }
+
+    #[test]
+    fn eval_leftb_clean_boundary() {
+        // First 4 bytes of "abcあ" = "abc" + 1 byte of あ; the half-char
+        // surfaces as a space.
+        assert_eq!(ev(r#"=LEFTB("abcあ", 4)"#), Value::Text("abc ".into()));
+    }
+    #[test]
+    fn eval_leftb_full_char() {
+        // First 5 bytes of "abcあ" = full "abcあ".
+        assert_eq!(ev(r#"=LEFTB("abcあ", 5)"#), Value::Text("abcあ".into()));
+    }
+    #[test]
+    fn eval_leftb_default_is_1() {
+        assert_eq!(ev(r#"=LEFTB("hello")"#), Value::Text("h".into()));
+    }
+
+    #[test]
+    fn eval_rightb_split_pad() {
+        // Last 4 bytes of "abcあ" should pad the half-char with a space.
+        // "abcあ" total = 5 bytes; right 4 starts at byte 2, splits "a"
+        // away. Since the cut falls between 'a' and 'b' (clean), returns "bcあ" (4 bytes).
+        assert_eq!(ev(r#"=RIGHTB("abcあ", 4)"#), Value::Text("bcあ".into()));
+    }
+    #[test]
+    fn eval_rightb_half_char() {
+        // Right 1 byte of "あ" (2 bytes): split → " ".
+        assert_eq!(ev(r#"=RIGHTB("あ", 1)"#), Value::Text(" ".into()));
+    }
+    #[test]
+    fn eval_rightb_default_is_1() {
+        assert_eq!(ev(r#"=RIGHTB("hello")"#), Value::Text("o".into()));
+    }
+
+    #[test]
+    fn eval_midb_clean() {
+        // MIDB("abcあ", 2, 2) = bytes 2..=3 = "bc"
+        assert_eq!(ev(r#"=MIDB("abcあ", 2, 2)"#), Value::Text("bc".into()));
+    }
+    #[test]
+    fn eval_midb_half_char() {
+        // MIDB("abcあ", 4, 1) = the first byte of あ → " "
+        assert_eq!(ev(r#"=MIDB("abcあ", 4, 1)"#), Value::Text(" ".into()));
+    }
+    #[test]
+    fn eval_midb_past_end() {
+        assert_eq!(ev(r#"=MIDB("abc", 10, 5)"#), Value::Text("".into()));
+    }
+
+    #[test]
+    fn eval_findb_japanese() {
+        // FINDB("い", "あいう") — "い" starts at byte 3 (after "あ" = 2 bytes).
+        assert_eq!(ev(r#"=FINDB("い", "あいう")"#), Value::Number(3.0));
+    }
+    #[test]
+    fn eval_findb_ascii_offset() {
+        // FINDB("b", "abc", 1) = 2.
+        assert_eq!(ev(r#"=FINDB("b", "abc")"#), Value::Number(2.0));
+    }
+    #[test]
+    fn eval_findb_not_found() {
+        assert_eq!(
+            ev(r#"=FINDB("x", "abc")"#),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_searchb_case_insensitive() {
+        // SEARCHB ignores case; "B" matches "b" at byte 2.
+        assert_eq!(ev(r#"=SEARCHB("B", "abc")"#), Value::Number(2.0));
+    }
+    #[test]
+    fn eval_searchb_japanese() {
+        assert_eq!(ev(r#"=SEARCHB("う", "あいう")"#), Value::Number(5.0));
+    }
+    #[test]
+    fn eval_searchb_not_found() {
+        assert_eq!(
+            ev(r#"=SEARCHB("x", "abc")"#),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_replaceb_clean() {
+        // REPLACEB("abcあ", 2, 2, "XYZ") = "a" + "XYZ" + "あ" = "aXYZあ"
+        assert_eq!(
+            ev(r#"=REPLACEB("abcあ", 2, 2, "XYZ")"#),
+            Value::Text("aXYZあ".into())
+        );
+    }
+    #[test]
+    fn eval_replaceb_full_string() {
+        // Replace from byte 1, all 5 bytes.
+        assert_eq!(
+            ev(r#"=REPLACEB("abcあ", 1, 5, "NEW")"#),
+            Value::Text("NEW".into())
+        );
+    }
+    #[test]
+    fn eval_replaceb_split_boundary() {
+        // Replace 1 byte starting at byte 4 (inside "あ"): the half-char
+        // means left side keeps "abc" + space, replacement string, right
+        // side starts mid-char → no right tail because the original 2-byte
+        // char is fully consumed.
+        // dbcs_take_left(text, 3) = "abc"; consumed_end = 3 + 1 = 4; total = 5;
+        // dbcs_take_right(text, 1) = " " (half of あ).
+        assert_eq!(
+            ev(r#"=REPLACEB("abcあ", 4, 1, "X")"#),
+            Value::Text("abcX ".into())
         );
     }
 
