@@ -2264,6 +2264,10 @@ fn value_to_display(val: &Value) -> String {
         Value::Error(e) => format!("{}", e),
         // Unreachable: collapsed above. Defensive fallback.
         Value::Array(_) => String::new(),
+        // Lambdas are transient evaluator state — they never get
+        // persisted into a cell. A defensive empty string keeps the
+        // boundary safe if one ever leaks through.
+        Value::Lambda(_) => String::new(),
     }
 }
 
@@ -2277,6 +2281,8 @@ fn value_to_cell_type(val: &Value) -> String {
         Value::Error(_) => "error",
         // Unreachable: collapsed above.
         Value::Array(_) => "null",
+        // Lambda is not a persistable cell type — surface as "null".
+        Value::Lambda(_) => "null",
     }
     .into()
 }
@@ -2291,6 +2297,8 @@ fn sparse_cell_from_value(sheet: usize, addr: CellAddress, val: &Value) -> Optio
         Value::Null => return None,
         // Unreachable: collapsed above.
         Value::Array(_) => return None,
+        // Lambdas don't make it into the sparse-cell export.
+        Value::Lambda(_) => return None,
     };
     Some(SparseCellJSON {
         sheet,

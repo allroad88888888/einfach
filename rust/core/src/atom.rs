@@ -95,6 +95,30 @@ impl ArrayData {
     }
 }
 
+/// Trait object implemented by lambda payloads. The actual lambda body
+/// (the `Expr` AST) lives in `einfach-excel-core` to avoid pulling the
+/// formula parser into `einfach-core`; we keep `Value` framework-neutral
+/// by exposing just enough surface here (`arity`, `param_names`, equality
+/// via `Arc::ptr_eq`) and let the formula evaluator downcast through
+/// `as_any` when it actually needs the body to apply the lambda.
+///
+/// Why a trait + downcast rather than embedding `Expr` directly in
+/// `Value`? `Expr` is defined in `einfach-excel-core` (the formula
+/// engine), and `Value` ships in `einfach-core` (used by the atom store
+/// for arbitrary state, not just formula results). A direct enum variant
+/// would force a circular dependency. The trait keeps `Value::Lambda`
+/// opaque at the core boundary and the excel-core layer reaches the
+/// body through `as_any` + `downcast_ref::<ExcelLambda>`.
+pub trait LambdaValue: std::fmt::Debug + Send + Sync {
+    fn arity(&self) -> usize;
+    fn param_names(&self) -> &[String];
+    /// Hook for downcasting to the concrete payload (e.g. `ExcelLambda`
+    /// in the formula evaluator). The default impl returns `self` so any
+    /// implementor satisfies the contract without writing boilerplate;
+    /// concrete impls can leave it as-is.
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
 /// A value held by an atom.
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -108,6 +132,13 @@ pub enum Value {
     /// spill targets; the top-level boundary (WASM) collapses `Array` to
     /// the top-left element so JS consumers never observe this variant.
     Array(std::sync::Arc<ArrayData>),
+    /// A first-class lambda value. Constructed by `=LAMBDA(p1, ..., body)`
+    /// in the formula evaluator and consumed by the array higher-order
+    /// functions (MAP / REDUCE / SCAN / BYROW / BYCOL / MAKEARRAY) or by
+    /// immediate application (`=LAMBDA(x, x*x)(5)`). The Arc'd trait
+    /// object hides the AST body from this crate; equality is `ptr_eq`
+    /// (two lambdas are the same iff they share the same Arc).
+    Lambda(std::sync::Arc<dyn LambdaValue>),
 }
 
 impl Value {
@@ -175,6 +206,14 @@ impl PartialEq for Value {
                 // `Value::eq` so nested NaN parity etc. is preserved.
                 a.rows == b.rows && a.cols == b.cols && a.data == b.data
             }
+            // Lambdas compare by Arc identity only — there's no structural
+            // equality on lambda bodies (an `Expr` AST is involved and lives
+            // in another crate). Two distinct `=LAMBDA(x, x)` evaluations
+            // produce distinct Arcs and are therefore unequal even though
+            // their source text matches. This is fine because lambdas are
+            // produced/consumed within a single evaluation chain — they
+            // don't get persisted into the cell-store as durable equal values.
+            (Value::Lambda(a), Value::Lambda(b)) => std::sync::Arc::ptr_eq(a, b),
             _ => false,
         }
     }

@@ -2412,6 +2412,10 @@ impl Sheet {
             Value::Error(e) => format!("{}", e),
             // Unreachable: collapsed above, but keep arm for exhaustiveness.
             Value::Array(_) => String::new(),
+            // Lambda values are transient evaluator state — they don't get
+            // persisted into a cell. Render an empty string defensively if
+            // one ever leaks through.
+            Value::Lambda(_) => String::new(),
         }
     }
 
@@ -2971,6 +2975,14 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         | Expr::Text(_)
         | Expr::Bool(_)
         | Expr::Name(_) => {}
+        // Immediate-call form — descend into callee + args so ranges
+        // hidden inside the lambda body or arg list still register.
+        Expr::Call(callee, args) => {
+            collect_range_refs_into(callee, out);
+            for a in args {
+                collect_range_refs_into(a, out);
+            }
+        }
     }
 }
 
@@ -3024,6 +3036,13 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
         // LET-bound names don't reference cells.
         Expr::Name(_) => {}
+        // Immediate-call form — descend into callee + args.
+        Expr::Call(callee, args) => {
+            collect_refs(callee, out);
+            for a in args {
+                collect_refs(a, out);
+            }
+        }
     }
 }
 
@@ -3095,6 +3114,13 @@ fn collect_formula_refs_into(
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
         // LET-bound names don't reference cells in the formula graph.
         Expr::Name(_) => {}
+        // Immediate-call form — descend into callee + args.
+        Expr::Call(callee, args) => {
+            collect_formula_refs_into(callee, formula_exprs, out);
+            for a in args {
+                collect_formula_refs_into(a, formula_exprs, out);
+            }
+        }
     }
 }
 
@@ -3111,6 +3137,11 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
             false
         }
         Expr::Name(_) => false,
+        // Immediate-call could resolve to a LAMBDA whose body references
+        // another sheet; descend conservatively.
+        Expr::Call(callee, args) => {
+            expr_has_sheet_ref(callee) || args.iter().any(expr_has_sheet_ref)
+        }
     }
 }
 
@@ -3128,7 +3159,23 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
 fn expr_may_produce_array(expr: &Expr) -> bool {
     match expr {
         Expr::FuncCall { name, args } => {
-            if matches!(name.as_str(), "SEQUENCE" | "UNIQUE" | "SORT" | "FILTER") {
+            // SEQUENCE / UNIQUE / SORT / FILTER are the existing dynamic-
+            // array constructors; MAP / SCAN / BYROW / BYCOL / MAKEARRAY
+            // are the L3 array higher-order functions added alongside
+            // LAMBDA. REDUCE always returns a scalar so it's intentionally
+            // omitted. ISOMITTED is a scalar predicate.
+            if matches!(
+                name.as_str(),
+                "SEQUENCE"
+                    | "UNIQUE"
+                    | "SORT"
+                    | "FILTER"
+                    | "MAP"
+                    | "SCAN"
+                    | "BYROW"
+                    | "BYCOL"
+                    | "MAKEARRAY"
+            ) {
                 return true;
             }
             args.iter().any(expr_may_produce_array)
@@ -3137,6 +3184,12 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
             expr_may_produce_array(left) || expr_may_produce_array(right)
         }
         Expr::Negate(inner) => expr_may_produce_array(inner),
+        // An immediate-call could be `MAP(...)(...)` chained, but even a
+        // bare `LAMBDA(x, MAP(...))(arg)` returns an array. Descend the
+        // callee + args conservatively.
+        Expr::Call(callee, args) => {
+            expr_may_produce_array(callee) || args.iter().any(expr_may_produce_array)
+        }
         _ => false,
     }
 }

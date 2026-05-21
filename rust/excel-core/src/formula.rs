@@ -90,6 +90,19 @@ pub enum Expr {
     /// resolves the name against the current LET scope (and, in future,
     /// named ranges); otherwise it surfaces `#NAME?`.
     Name(String),
+    /// Immediate application of a computed callee — produced by trailing
+    /// `(args)` on a non-identifier primary. The canonical case is
+    /// `=LAMBDA(x, x*x)(5)`: `LAMBDA(...)` parses as a `FuncCall` and
+    /// the trailing `(5)` wraps it in a `Call`. The evaluator evaluates
+    /// the callee (must yield `Value::Lambda`), then applies it to the
+    /// argument values.
+    ///
+    /// Why a separate variant rather than reusing `FuncCall` with a
+    /// computed name? `FuncCall` carries a `String` (built-in name); the
+    /// callee here is an arbitrary expression that resolves to a lambda
+    /// value at runtime. Keeping them distinct means parser and eval
+    /// stay simple and existing `FuncCall` dispatch keeps O(1).
+    Call(Box<Expr>, Vec<Expr>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,7 +336,13 @@ impl Parser {
         self.chars.get(self.pos + offset).copied()
     }
 
-    /// unary = '-' unary | primary
+    /// unary = '-' unary | primary call_suffix
+    ///
+    /// `call_suffix` chains trailing `(args)` onto the primary so
+    /// `=LAMBDA(x, x*x)(5)` parses as `Call(FuncCall("LAMBDA", ...), [5])`
+    /// — immediate-application of an inline lambda. Multiple chained
+    /// applications (`=f()()()`) iterate the loop; if no `(` follows,
+    /// the primary is returned untouched.
     fn parse_unary(&mut self) -> Option<Expr> {
         self.skip_whitespace();
         if self.peek() == Some('-') {
@@ -331,7 +350,40 @@ impl Parser {
             let expr = self.parse_unary()?;
             Some(Expr::Negate(Box::new(expr)))
         } else {
-            self.parse_primary()
+            let primary = self.parse_primary()?;
+            self.parse_call_suffix(primary)
+        }
+    }
+
+    /// After parsing a primary, consume any trailing `(args)` chain and
+    /// wrap the callee in `Expr::Call`. A trailing `(` is only treated
+    /// as a call if the parsed callee CAN produce a callable value —
+    /// we lean conservative and accept it on any `FuncCall` / `Name` /
+    /// `Call` callee (the cases that can resolve to a lambda). This
+    /// avoids `=A1(5)` (where A1 is a cell ref) being mis-parsed as a
+    /// call when the user meant `A1 *... *(5)` etc.; the parser already
+    /// requires `*` for that case so the ambiguity is moot, but the
+    /// guard keeps the surface tight in case future primaries appear.
+    fn parse_call_suffix(&mut self, mut callee: Expr) -> Option<Expr> {
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some('(') {
+                return Some(callee);
+            }
+            // Only callees that could plausibly be a lambda value get the
+            // trailing-call treatment. Cell refs / literals / ranges
+            // can't, and accepting them would shadow legitimate parse
+            // failures with confusing "Call(CellRef(A1), …)" nodes.
+            if !matches!(
+                callee,
+                Expr::FuncCall { .. } | Expr::Name(_) | Expr::Call(_, _)
+            ) {
+                return Some(callee);
+            }
+            self.advance(); // consume '('
+            let args = self.parse_func_args()?;
+            self.expect(')')?;
+            callee = Expr::Call(Box::new(callee), args);
         }
     }
 
@@ -1122,5 +1174,72 @@ mod tests {
                 ],
             }
         );
+    }
+
+    // ── Expr::Call (trailing-call chaining for LAMBDA invocation) ────
+
+    #[test]
+    fn parse_lambda_immediate_call_wraps_in_expr_call() {
+        // `=LAMBDA(x, x*x)(5)` parses as Call(FuncCall("LAMBDA", ...), [5]).
+        let result = parse_formula("=LAMBDA(x, x*x)(5)").unwrap();
+        match result {
+            Expr::Call(callee, args) => {
+                match *callee {
+                    Expr::FuncCall { name, args: lam_args } => {
+                        assert_eq!(name, "LAMBDA");
+                        assert_eq!(lam_args[0], Expr::Name("x".into()));
+                    }
+                    other => panic!("expected FuncCall callee, got {:?}", other),
+                }
+                assert_eq!(args, vec![Expr::Number(5.0)]);
+            }
+            other => panic!("expected Expr::Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_chained_call_wraps_each_application() {
+        // `=LAMBDA(x, LAMBDA(y, x*y))(3)(4)` — two trailing calls
+        // chain into Call(Call(FuncCall("LAMBDA",..), [3]), [4]).
+        let result = parse_formula("=LAMBDA(x, LAMBDA(y, x*y))(3)(4)").unwrap();
+        match result {
+            Expr::Call(outer_callee, outer_args) => {
+                assert_eq!(outer_args, vec![Expr::Number(4.0)]);
+                match *outer_callee {
+                    Expr::Call(inner_callee, inner_args) => {
+                        assert_eq!(inner_args, vec![Expr::Number(3.0)]);
+                        assert!(matches!(*inner_callee, Expr::FuncCall { .. }));
+                    }
+                    other => panic!("expected nested Call, got {:?}", other),
+                }
+            }
+            other => panic!("expected Expr::Call, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_trailing_call_on_name_wraps_in_expr_call() {
+        // `=f(1, 2)` where `f` is a Name (no built-in by that name)
+        // parses as Call(Name("f"), [1, 2]). This is the path stored
+        // lambdas use when bound through LET and then immediately
+        // invoked. NOTE: bare identifier "f" followed by "(" actually
+        // parses as a FuncCall via the identifier branch — so this
+        // test exercises an explicit Name produced inside a LET body
+        // by other means rather than the surface `f(1,2)`. Skip this
+        // exact assertion if the parser ambiguity surfaces; the
+        // canonical immediate-invocation path is exercised in the
+        // other parser tests above and the integration tests.
+        //
+        // To keep behavior verified, we instead confirm that a
+        // *parenthesized* identifier wraps in Call:
+        //   `=(f)(1, 2)` — parens deliberately disambiguate.
+        let result = parse_formula("=(f)(1, 2)").unwrap();
+        match result {
+            Expr::Call(callee, args) => {
+                assert_eq!(*callee, Expr::Name("f".into()));
+                assert_eq!(args, vec![Expr::Number(1.0), Expr::Number(2.0)]);
+            }
+            other => panic!("expected Expr::Call, got {:?}", other),
+        }
     }
 }

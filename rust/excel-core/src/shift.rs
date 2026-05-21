@@ -139,6 +139,14 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
         },
         // LET / future-LAMBDA bindings carry no cell address; copy as-is.
         Expr::Name(_) => expr.clone(),
+        // Immediate-call form: walk both the callee subtree and the
+        // argument list. The callee can itself contain CellRefs (e.g.
+        // `LAMBDA(x, A1+x)(5)` keeps the `A1` reference under the
+        // callee's body), and arg expressions can too.
+        Expr::Call(callee, args) => Expr::Call(
+            Box::new(map_addrs(callee, f)),
+            args.iter().map(|a| map_addrs(a, f)).collect(),
+        ),
     }
 }
 
@@ -243,6 +251,13 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
         },
         // LET binding names carry no cell address; copy as-is.
         Expr::Name(_) => expr.clone(),
+        // Immediate-call form mirrors FuncCall — walk callee + args.
+        Expr::Call(callee, args) => Expr::Call(
+            Box::new(shift_refs(callee, drow, dcol)?),
+            args.iter()
+                .map(|a| shift_refs(a, drow, dcol))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
     })
 }
 
@@ -467,6 +482,24 @@ fn render_into(expr: &Expr, out: &mut String) {
         // LET-style bound name (or future LAMBDA parameter). Round-trips
         // verbatim — the parser will rebuild the same `Expr::Name`.
         Expr::Name(n) => out.push_str(n),
+        // Immediate-call: render `(callee)(args, ...)`. The wrapping
+        // parens around the callee keep the round-trip unambiguous —
+        // without them, `LAMBDA(x, x)(5)` and `LAMBDA(x, x(5))` would
+        // share the same surface string when the callee is itself a
+        // FuncCall with one body arg.
+        Expr::Call(callee, args) => {
+            out.push('(');
+            render_into(callee, out);
+            out.push(')');
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_into(a, out);
+            }
+            out.push(')');
+        }
     }
 }
 

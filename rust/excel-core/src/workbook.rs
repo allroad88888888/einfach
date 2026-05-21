@@ -1093,6 +1093,14 @@ fn collect_cross_sheet_refs_into(
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
         // LET-bound names don't reference cross-sheet cells.
         Expr::Name(_) => {}
+        // Immediate-call: descend into callee + args so cross-sheet refs
+        // hidden inside a LAMBDA body still register.
+        Expr::Call(callee, args) => {
+            collect_cross_sheet_refs_into(callee, by_name, out);
+            for a in args {
+                collect_cross_sheet_refs_into(a, by_name, out);
+            }
+        }
     }
 }
 
@@ -1186,6 +1194,13 @@ fn collect_workbook_refs(
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
         // LET-bound names don't reference cells in the cross-sheet graph.
         Expr::Name(_) => {}
+        // Immediate-call: descend into callee + args.
+        Expr::Call(callee, args) => {
+            collect_workbook_refs(callee, current_idx, by_name, out);
+            for a in args {
+                collect_workbook_refs(a, current_idx, by_name, out);
+            }
+        }
     }
 }
 

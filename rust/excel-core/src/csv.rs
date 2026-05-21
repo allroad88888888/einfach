@@ -157,6 +157,12 @@ fn value_to_csv_field(v: &Value) -> String {
             .get(0, 0)
             .map(value_to_csv_field)
             .unwrap_or_default(),
+        // Lambdas have no canonical CSV form. They should never escape the
+        // evaluator into a persisted cell value — they're transient
+        // higher-order-function plumbing. If one ever reaches here it's a
+        // bug; render `<lambda>` so the failure is visible rather than
+        // panicking on export.
+        Value::Lambda(_) => "<lambda>".into(),
     }
 }
 

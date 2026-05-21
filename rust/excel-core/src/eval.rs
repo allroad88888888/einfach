@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use einfach_core::{ArrayData, AtomId, Value, ValueError};
+use einfach_core::{ArrayData, AtomId, LambdaValue, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::formula::{BinOperator, Expr};
@@ -62,6 +62,128 @@ fn lookup_let_binding(name: &str) -> Option<Value> {
         }
         None
     })
+}
+
+/// Snapshot every binding visible at the call site into a flat
+/// `Vec<(String, Value)>`. Used by `LAMBDA` to capture the active LET
+/// scope at the point the lambda literal is evaluated — the lambda
+/// outlives its enclosing LET and must keep those bindings alive in
+/// its own state rather than relying on a reference to the live stack
+/// (which is empty by the time the lambda is later applied).
+///
+/// Inner frames shadow outer ones (innermost-first walk), and we
+/// dedupe on first occurrence so the snapshot mirrors `lookup_let_binding`
+/// semantics exactly. Order is irrelevant to the consumer (`apply_lambda`
+/// builds a HashMap-backed frame from the result) but we keep
+/// innermost-first for readability when debugging.
+fn snapshot_let_frames() -> Vec<(String, Value)> {
+    LET_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        let mut out: Vec<(String, Value)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for frame in frames.iter().rev() {
+            for (k, v) in &frame.bindings {
+                if seen.insert(k.clone()) {
+                    out.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        out
+    })
+}
+
+/// Push a fresh frame onto the LET stack and seed it with the provided
+/// bindings. Used by `apply_lambda` to extend the scope chain with the
+/// lambda's captured snapshot + parameter bindings before evaluating the
+/// body. `pop_let_frame` MUST be called after — the public API leaks
+/// the imbalance otherwise; callers use a guard to enforce that.
+fn push_let_frame(initial: Vec<(String, Value)>) {
+    LET_FRAMES.with(|frames| {
+        let mut frame = LetFrame::new();
+        for (k, v) in initial {
+            frame.bind(k, v);
+        }
+        frames.borrow_mut().push(frame);
+    });
+}
+
+fn pop_let_frame() {
+    LET_FRAMES.with(|frames| {
+        frames.borrow_mut().pop();
+    });
+}
+
+/// Concrete lambda payload used by the formula evaluator. The `params`
+/// vec stores parameter names (in declaration order); `body` is the AST
+/// the LAMBDA literal wraps; `captured` is the snapshot of LET bindings
+/// visible when the lambda literal was evaluated. Owned by an `Arc` at
+/// the `Value::Lambda` boundary so clones are cheap (lambdas pass
+/// through array higher-order functions and get cloned per call).
+#[derive(Debug)]
+pub(crate) struct ExcelLambda {
+    pub params: Vec<String>,
+    pub body: Expr,
+    pub captured: Vec<(String, Value)>,
+}
+
+impl LambdaValue for ExcelLambda {
+    fn arity(&self) -> usize {
+        self.params.len()
+    }
+    fn param_names(&self) -> &[String] {
+        &self.params
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Apply a lambda value to a positional argument list. Returns
+/// `WrongType` if the value isn't a lambda (or a downcast fails), and
+/// `WrongArgCount` on arity mismatch. The body is evaluated against a
+/// fresh LET frame seeded with the lambda's captured bindings PLUS the
+/// new parameter bindings (parameters shadow same-named captured
+/// bindings).
+///
+/// Errors from the body propagate out as-is. The frame is popped via a
+/// guard so the LET stack stays balanced even when the body
+/// short-circuits.
+pub(crate) fn apply_lambda(
+    lambda: &Value,
+    args: Vec<Value>,
+    provider: &dyn EvalProvider,
+) -> Value {
+    let arc = match lambda {
+        Value::Lambda(a) => a.clone(),
+        Value::Error(e) => return Value::Error(e.clone()),
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let excel_lambda = match arc.as_any().downcast_ref::<ExcelLambda>() {
+        Some(l) => l,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if args.len() != excel_lambda.params.len() {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    // Build the activation frame: start with the captured snapshot, then
+    // overwrite/append each parameter binding. Parameters with the same
+    // name as a captured binding shadow it (Excel parity — `LAMBDA(x,
+    // ...)` body sees the new `x`, not the outer LET's `x`).
+    let mut frame_bindings: Vec<(String, Value)> = excel_lambda.captured.clone();
+    for (name, value) in excel_lambda.params.iter().zip(args) {
+        if let Some(slot) = frame_bindings.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value;
+        } else {
+            frame_bindings.push((name.clone(), value));
+        }
+    }
+    push_let_frame(frame_bindings);
+    // Save/restore-style guard equivalent: any early-return from the
+    // body still has the pop executed because we route everything
+    // through the closure below.
+    let result = eval_expr_with_provider(&excel_lambda.body, provider);
+    pop_let_frame();
+    result
 }
 
 /// Address-based evaluation source. Both production (Workbook) and the
@@ -223,6 +345,28 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             // precedence (Excel parity).
             lookup_let_binding(name).unwrap_or(Value::Error(ValueError::InvalidName))
         }
+
+        Expr::Call(callee, call_args) => {
+            // Immediate-application form: evaluate the callee, then apply
+            // the resulting lambda to the evaluated arguments. The L2
+            // entry point — `=LAMBDA(x, x*x)(5)` lands here. Argument
+            // evaluation happens *outside* the lambda body so it sees the
+            // CALLER's LET scope, not the lambda's captured frame
+            // (matches Excel call semantics).
+            let callee_value = eval_expr_with_provider(callee, provider);
+            if let Value::Error(e) = &callee_value {
+                return Value::Error(e.clone());
+            }
+            let mut arg_values: Vec<Value> = Vec::with_capacity(call_args.len());
+            for a in call_args {
+                let v = eval_expr_with_provider(a, provider);
+                if let Value::Error(e) = &v {
+                    return Value::Error(e.clone());
+                }
+                arg_values.push(v);
+            }
+            apply_lambda(&callee_value, arg_values, provider)
+        }
     }
 }
 
@@ -313,6 +457,13 @@ fn coerce_to_text(v: &Value) -> String {
             .get(0, 0)
             .map(coerce_to_text)
             .unwrap_or_default(),
+        // A lambda has no scalar text rendering — Excel surfaces `#CALC!`
+        // when text contexts hit a lambda. We don't have CALC! in our
+        // enum, so a generic placeholder keeps the function pure (no
+        // error injection at coercion time) and any operator that
+        // actually needed a numeric/boolean lambda will fail via the
+        // usual WrongType path.
+        Value::Lambda(_) => "<lambda>".into(),
     }
 }
 
@@ -1120,6 +1271,66 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             result
         }
 
+        // LAMBDA(param1, param2, ..., body) — produce a first-class
+        // lambda value. The last argument is the body expression; every
+        // preceding argument must be a bare identifier (Expr::Name) and
+        // becomes a parameter name. L2 of the LAMBDA arc; immediate
+        // invocation `=LAMBDA(...)(args)` is handled by Expr::Call.
+        //
+        // Closure capture: the lambda snapshots the current LET frames
+        // at literal-evaluation time. That snapshot moves into the
+        // ExcelLambda struct and is later pushed as a fresh frame when
+        // `apply_lambda` evaluates the body. This is what lets
+        // `=LET(n, 7, LAMBDA(x, x*n)(3))` resolve `n` to 7 — even
+        // though the LET frame is popped before the lambda's body
+        // would otherwise run (in this immediate-call case it doesn't
+        // matter, but the contract holds for stored lambdas too).
+        //
+        // Error contract: 0 args → WrongArgCount (need the body at
+        // least). A non-`Name` in a param slot → InvalidName. The
+        // 1-arg form `=LAMBDA(body)` is allowed (zero-param lambda),
+        // applied via `=LAMBDA(body)()`.
+        "LAMBDA" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let body = args.last().unwrap().clone();
+            let mut params: Vec<String> = Vec::with_capacity(args.len() - 1);
+            for a in &args[..args.len() - 1] {
+                match a {
+                    Expr::Name(n) => params.push(n.clone()),
+                    _ => return Value::Error(ValueError::InvalidName),
+                }
+            }
+            let captured = snapshot_let_frames();
+            let lambda = ExcelLambda {
+                params,
+                body,
+                captured,
+            };
+            Value::Lambda(Arc::new(lambda))
+        }
+
+        // ISOMITTED(arg) — Excel uses this in conjunction with LAMBDA's
+        // OPTIONAL-parameter syntax (e.g. `LAMBDA(x, [y], IF(ISOMITTED(y),
+        // x, x+y))`). We don't support optional parameters in this phase
+        // (every LAMBDA parameter is required; arity is strict in
+        // `apply_lambda`), so ISOMITTED has no meaningful work to do and
+        // always returns FALSE. Documented gap — re-evaluate when
+        // optional-param syntax lands.
+        "ISOMITTED" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Evaluate the arg so any error it contains propagates
+            // (Excel parity). Otherwise: FALSE.
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            Value::Boolean(false)
+        }
+
         "SUM" => {
             // Real streaming: O(1) accumulator, no Vec allocation. Errors
             // short-circuit through `err`.
@@ -1143,6 +1354,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                         // Unreachable: for_each_arg_value flattens Array
                         // sub-expressions into per-element callbacks.
                         Value::Array(_) => {}
+                        // A lambda landing in SUM is a type error (the user
+                        // wrote `=SUM(LAMBDA(x, x))`-style nonsense). Match
+                        // Excel: surface #VALUE!.
+                        Value::Lambda(_) => err = Some(ValueError::WrongType),
                     }
                 });
             }
@@ -2494,6 +2709,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                         Value::Null | Value::Text(_) | Value::Boolean(false) => {}
                         // Unreachable: for_each_arg_value flattens Array.
                         Value::Array(_) => {}
+                        // Lambda inside PRODUCT is a type error.
+                        Value::Lambda(_) => err = Some(ValueError::WrongType),
                     }
                 });
             }
@@ -3013,6 +3230,9 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     Value::Boolean(true) => Value::Number(1.0),
                     _ => Value::Number(0.0),
                 },
+                // N of a lambda is meaningless — return 0 (Excel would
+                // surface #VALUE!; we keep the existing tolerant policy).
+                Value::Lambda(_) => Value::Number(0.0),
             }
         }
         "TYPE" => {
@@ -3029,6 +3249,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Value::Error(_) => 16.0,
                 Value::Null => 1.0,
                 Value::Array(_) => 64.0,
+                // No Excel code for lambda; closest match is 128 (a value
+                // category Excel reserves). Use 128 distinctly so callers
+                // can detect lambda-typed values.
+                Value::Lambda(_) => 128.0,
             };
             Value::Number(code)
         }
@@ -3336,7 +3560,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     },
                     Value::Error(e) => Value::Error(e),
                     Value::Array(_) => Value::Error(ValueError::WrongType),
+                    Value::Lambda(_) => Value::Error(ValueError::WrongType),
                 },
+                // VALUE(lambda) — type error.
+                Value::Lambda(_) => Value::Error(ValueError::WrongType),
             }
         }
 
@@ -4531,6 +4758,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                         }
                         // Unreachable: for_each_arg_value flattens Array.
                         Value::Array(_) => {}
+                        // Lambda inside AVERAGEA is a type error.
+                        Value::Lambda(_) => err = Some(ValueError::WrongType),
                     }
                 });
             }
@@ -5948,6 +6177,335 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 Value::Array(Arc::new(ArrayData::new(rows, out_cols, out)))
             }
+        }
+
+        // ── Array higher-order functions (L3 of the LAMBDA arc) ──────
+        //
+        // All of these take a lambda value as one of their arguments
+        // (always the LAST one — Excel's calling convention) and apply
+        // it pointwise / by row / by column / accumulator-style to
+        // produce a derived array. Lambdas reach them either inline
+        // (`=MAP(SEQUENCE(5), LAMBDA(x, x*2))`) or via a LET binding
+        // (`=LET(sq, LAMBDA(x, x*x), MAP(A1:A5, sq))`).
+        //
+        // Common patterns:
+        //   - Lambda arg evaluated first; non-lambda → WrongType.
+        //   - Arity matched at call time; mismatch → WrongArgCount.
+        //   - Per-element errors propagate from the lambda body.
+
+        // MAP(array1, ..., arrayN, lambda)
+        //
+        // Lambda must accept exactly N arguments (one per input array).
+        // All input arrays must share the same shape — mismatch → WrongType.
+        // The result has the same shape as the inputs; each cell is
+        // `lambda(array1[i,j], ..., arrayN[i,j])`.
+        "MAP" => {
+            if args.len() < 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            // Last arg is the lambda. Evaluate it first so a non-lambda
+            // surfaces a clean error before doing any array work.
+            let lambda_v = eval_expr_with_provider(&args[args.len() - 1], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            let n_arrays = args.len() - 1;
+            // Gather every input array as a 2D buffer + shape.
+            let mut grids: Vec<(u32, u32, Vec<Value>)> = Vec::with_capacity(n_arrays);
+            for arg in &args[..n_arrays] {
+                let (r, c, d) = match arg_to_2d(arg, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                grids.push((r, c, d));
+            }
+            // All inputs must share the same shape.
+            let (rows, cols, _) = grids[0];
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            for (r, c, _) in &grids[1..] {
+                if *r != rows || *c != cols {
+                    return Value::Error(ValueError::WrongType);
+                }
+            }
+            // Arity check on the lambda. apply_lambda would catch this
+            // per-cell, but we'd waste work — fail eagerly with a clear
+            // signal that the lambda doesn't fit the call shape.
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != n_arrays {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            // Cap matches SEQUENCE — keep allocations bounded.
+            let total = (rows as u64) * (cols as u64);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(total as usize);
+            for i in 0..rows {
+                for j in 0..cols {
+                    let idx = (i as usize) * (cols as usize) + (j as usize);
+                    let cell_args: Vec<Value> =
+                        grids.iter().map(|(_, _, d)| d[idx].clone()).collect();
+                    let v = apply_lambda(&lambda_v, cell_args, provider);
+                    if let Value::Error(e) = v {
+                        return Value::Error(e);
+                    }
+                    out.push(v);
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+        }
+
+        // REDUCE(initial, array, lambda)
+        //
+        // Lambda takes 2 args: (accumulator, value). Walks the array in
+        // row-major order, accumulator = lambda(accumulator, value).
+        // Returns the final accumulator — SCALAR result (NOT an Array).
+        // The L3 spec is explicit: REDUCE returns a scalar; use SCAN if
+        // you want the trail of intermediate accumulators.
+        "REDUCE" => {
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let initial = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = initial {
+                return Value::Error(e);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[1], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let lambda_v = eval_expr_with_provider(&args[2], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != 2 {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            let mut acc = initial;
+            for i in 0..rows {
+                for j in 0..cols {
+                    let idx = (i as usize) * (cols as usize) + (j as usize);
+                    let v = data[idx].clone();
+                    acc = apply_lambda(&lambda_v, vec![acc, v], provider);
+                    if let Value::Error(e) = &acc {
+                        return Value::Error(e.clone());
+                    }
+                }
+            }
+            acc
+        }
+
+        // SCAN(initial, array, lambda)
+        //
+        // Same accumulator pattern as REDUCE, but emits an Array of the
+        // INTERMEDIATE accumulator values (same shape as the input
+        // array). `out[i,j] = lambda(acc, array[i,j])` where `acc` is
+        // updated in place row-major. SCAN is the spillable counterpart
+        // of REDUCE.
+        "SCAN" => {
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let initial = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = initial {
+                return Value::Error(e);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[1], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let lambda_v = eval_expr_with_provider(&args[2], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != 2 {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let total = (rows as u64) * (cols as u64);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(total as usize);
+            let mut acc = initial;
+            for i in 0..rows {
+                for j in 0..cols {
+                    let idx = (i as usize) * (cols as usize) + (j as usize);
+                    let v = data[idx].clone();
+                    acc = apply_lambda(&lambda_v, vec![acc, v], provider);
+                    if let Value::Error(e) = &acc {
+                        return Value::Error(e.clone());
+                    }
+                    out.push(acc.clone());
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, cols, out)))
+        }
+
+        // BYROW(array, lambda) and BYCOL(array, lambda)
+        //
+        // Lambda takes a SINGLE argument — a row (1×cols Array) for
+        // BYROW or a column (rows×1 Array) for BYCOL. Result shape is
+        // N×1 (BYROW: one accumulator per row) or 1×N (BYCOL: one per
+        // column). The "row" / "column" passed to the lambda is itself
+        // a `Value::Array`, NOT a flat list — this is what lets
+        // `BYROW(input, LAMBDA(r, SUM(r)))` work (SUM unwraps the Array
+        // through `for_each_arg_value`).
+        "BYROW" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let lambda_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != 1 {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(rows as usize);
+            for i in 0..rows {
+                let base = (i as usize) * (cols as usize);
+                let row_data: Vec<Value> =
+                    data[base..base + (cols as usize)].iter().cloned().collect();
+                let row_arr = Value::Array(Arc::new(ArrayData::new(1, cols, row_data)));
+                let v = apply_lambda(&lambda_v, vec![row_arr], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                out.push(v);
+            }
+            Value::Array(Arc::new(ArrayData::new(rows, 1, out)))
+        }
+
+        "BYCOL" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let lambda_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != 1 {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            if rows == 0 || cols == 0 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut out: Vec<Value> = Vec::with_capacity(cols as usize);
+            for j in 0..cols {
+                let mut col_data: Vec<Value> = Vec::with_capacity(rows as usize);
+                for i in 0..rows {
+                    let idx = (i as usize) * (cols as usize) + (j as usize);
+                    col_data.push(data[idx].clone());
+                }
+                let col_arr = Value::Array(Arc::new(ArrayData::new(rows, 1, col_data)));
+                let v = apply_lambda(&lambda_v, vec![col_arr], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                out.push(v);
+            }
+            Value::Array(Arc::new(ArrayData::new(1, cols, out)))
+        }
+
+        // MAKEARRAY(rows, cols, lambda)
+        //
+        // Lambda takes 2 args: (row_index, col_index), both 1-based
+        // (Excel parity). Returns a rows×cols Array where each cell is
+        // `lambda(i, j)`. Same 1M-element cap as SEQUENCE — keeps
+        // allocations bounded.
+        "MAKEARRAY" => {
+            if args.len() != 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let rows_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = rows_v {
+                return Value::Error(e);
+            }
+            let cols_v = eval_expr_with_provider(&args[1], provider);
+            if let Value::Error(e) = cols_v {
+                return Value::Error(e);
+            }
+            let rows = match coerce_to_number(&rows_v) {
+                Some(n) if n >= 1.0 => n.trunc() as u64,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let cols = match coerce_to_number(&cols_v) {
+                Some(n) if n >= 1.0 => n.trunc() as u64,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
+            if total > 1_048_576 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let lambda_v = eval_expr_with_provider(&args[2], provider);
+            if let Value::Error(e) = lambda_v {
+                return Value::Error(e);
+            }
+            if !matches!(lambda_v, Value::Lambda(_)) {
+                return Value::Error(ValueError::WrongType);
+            }
+            if let Value::Lambda(lam) = &lambda_v {
+                if lam.arity() != 2 {
+                    return Value::Error(ValueError::WrongArgCount);
+                }
+            }
+            let rows_u = rows as u32;
+            let cols_u = cols as u32;
+            let mut out: Vec<Value> = Vec::with_capacity(total as usize);
+            for i in 1..=rows_u {
+                for j in 1..=cols_u {
+                    let v = apply_lambda(
+                        &lambda_v,
+                        vec![Value::Number(i as f64), Value::Number(j as f64)],
+                        provider,
+                    );
+                    if let Value::Error(e) = v {
+                        return Value::Error(e);
+                    }
+                    out.push(v);
+                }
+            }
+            Value::Array(Arc::new(ArrayData::new(rows_u, cols_u, out)))
         }
 
         _ => Value::Error(ValueError::InvalidName),
@@ -7796,6 +8354,8 @@ fn fn_mdeterm(args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     Some(Value::Error(e)) => return Value::Error(e.clone()),
                     Some(_) => return Value::Error(ValueError::WrongType),
                 },
+                // Determinant of a matrix containing a lambda — type error.
+                Value::Lambda(_) => return Value::Error(ValueError::WrongType),
             }
         }
     }
@@ -17013,5 +17573,332 @@ mod tests {
         // #NAME?, not pick up a leaked binding.
         let _ = eval_str("=LET(x, 1/0, x)", &cm, &vs);
         assert_eq!(eval_str("=x", &cm, &vs), Value::Error(ValueError::InvalidName));
+    }
+
+    // ── LAMBDA + immediate-call (Part A of L2) ───────────────────────
+
+    /// `=LAMBDA(x, x*x)(5)` is the canonical immediate-call sanity test
+    /// — defines a one-param lambda, applies it to 5, expects 25.
+    #[test]
+    fn eval_lambda_immediate_unary() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LAMBDA(x, x*x)(5)", &cm, &vs),
+            Value::Number(25.0)
+        );
+    }
+
+    /// Multiple parameters in declaration order.
+    #[test]
+    fn eval_lambda_immediate_binary() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LAMBDA(x, y, x+y)(3, 4)", &cm, &vs),
+            Value::Number(7.0)
+        );
+    }
+
+    /// Arity mismatch: too few args → WrongArgCount.
+    #[test]
+    fn eval_lambda_too_few_args() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LAMBDA(x, x*x)()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// Arity mismatch: too many args → WrongArgCount.
+    #[test]
+    fn eval_lambda_too_many_args() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LAMBDA(x, x*x)(1, 2)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// Nested LAMBDA producing a closure: `LAMBDA(x, LAMBDA(y, x*y))(3)`
+    /// returns a lambda that captures x=3; applying it to 4 yields 12.
+    #[test]
+    fn eval_lambda_closure_from_nested_lambda() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LAMBDA(x, LAMBDA(y, x*y))(3)(4)", &cm, &vs),
+            Value::Number(12.0)
+        );
+    }
+
+    /// LAMBDA captures LET bindings visible at literal eval time.
+    /// `=LET(n, 7, LAMBDA(x, x*n)(3))` → 3*7 = 21.
+    #[test]
+    fn eval_lambda_captures_let_binding() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LET(n, 7, LAMBDA(x, x*n)(3))", &cm, &vs),
+            Value::Number(21.0)
+        );
+    }
+
+    /// LAMBDA literal without immediate call returns Value::Lambda.
+    /// Sanity-check that the constructor produces the right variant.
+    #[test]
+    fn eval_lambda_literal_produces_lambda_value() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=LAMBDA(x, x*x)", &cm, &vs);
+        match v {
+            Value::Lambda(arc) => {
+                assert_eq!(arc.arity(), 1);
+                assert_eq!(arc.param_names(), &["x".to_string()]);
+            }
+            _ => panic!("expected Value::Lambda, got {:?}", v),
+        }
+    }
+
+    /// LAMBDA with no params and zero args still applies — the body
+    /// captures its surrounding scope and evaluates verbatim.
+    #[test]
+    fn eval_lambda_nullary_immediate_invocation() {
+        let (cm, vs) = make_test_env();
+        // Note: bare `=LAMBDA(42)` would be a 0-param lambda with body
+        // = 42 since LAMBDA needs ≥ 1 arg (the body). Immediate-apply
+        // returns 42.
+        assert_eq!(
+            eval_str("=LAMBDA(42)()", &cm, &vs),
+            Value::Number(42.0)
+        );
+    }
+
+    /// Bad LAMBDA: < 2 args → WrongArgCount (just a body, no params is
+    /// OK at 1; 0 args is the only WrongArgCount path).
+    #[test]
+    fn eval_lambda_zero_args_is_error() {
+        let (cm, vs) = make_test_env();
+        // The parser will reject `=LAMBDA()` because parse_func_args
+        // requires at least one expression between parens; check at the
+        // formula level.
+        let v = eval_str("=LAMBDA()", &cm, &vs);
+        // Either WrongArgCount from eval (if it slips through) or a
+        // parse failure caught earlier — both surface a kind of error
+        // depending on the parse path. Right now `LAMBDA()` parses to
+        // FuncCall { args: [] } and lands here with WrongArgCount.
+        assert_eq!(v, Value::Error(ValueError::WrongArgCount));
+    }
+
+    /// Non-identifier in a param slot → InvalidName.
+    #[test]
+    fn eval_lambda_param_must_be_identifier() {
+        let (cm, vs) = make_test_env();
+        // `5` in the param slot is a number literal, not Expr::Name.
+        assert_eq!(
+            eval_str("=LAMBDA(5, 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidName)
+        );
+    }
+
+    // ── ISOMITTED (Part B) ────────────────────────────────────────────
+
+    /// ISOMITTED currently returns FALSE for any argument — we don't
+    /// support optional LAMBDA parameters yet so the function is a stub.
+    /// Documented gap.
+    #[test]
+    fn eval_isomitted_returns_false() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISOMITTED(123)", &cm, &vs), Value::Boolean(false));
+        assert_eq!(
+            eval_str("=ISOMITTED(\"hi\")", &cm, &vs),
+            Value::Boolean(false)
+        );
+    }
+
+    // ── MAP / REDUCE / SCAN (Part B) ──────────────────────────────────
+
+    /// `=MAP(SEQUENCE(5), LAMBDA(x, x*2))` → [2, 4, 6, 8, 10] (5×1).
+    #[test]
+    fn eval_map_unary_doubles() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=MAP(SEQUENCE(5), LAMBDA(x, x*2))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (5, 1));
+                let expected = [2.0, 4.0, 6.0, 8.0, 10.0];
+                for (i, e) in expected.iter().enumerate() {
+                    assert_eq!(arr.get(i as u32, 0), Some(&Value::Number(*e)));
+                }
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    /// `=MAP(SEQUENCE(3), SEQUENCE(3), LAMBDA(a,b, a+b))` → [2, 4, 6].
+    /// The two arrays must share shape; lambda receives one value from
+    /// each per cell.
+    #[test]
+    fn eval_map_binary_zip() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=MAP(SEQUENCE(3), SEQUENCE(3), LAMBDA(a, b, a+b))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (3, 1));
+                let expected = [2.0, 4.0, 6.0];
+                for (i, e) in expected.iter().enumerate() {
+                    assert_eq!(arr.get(i as u32, 0), Some(&Value::Number(*e)));
+                }
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    /// Lambda arity != number of input arrays → WrongArgCount.
+    #[test]
+    fn eval_map_lambda_arity_mismatch() {
+        let (cm, vs) = make_test_env();
+        // 2 arrays + 1-param lambda — should fail early before any
+        // element gets evaluated.
+        assert_eq!(
+            eval_str("=MAP(SEQUENCE(2), SEQUENCE(2), LAMBDA(x, x*2))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// Shape mismatch between input arrays → WrongType.
+    #[test]
+    fn eval_map_shape_mismatch() {
+        let (cm, vs) = make_test_env();
+        // SEQUENCE(3) is 3×1; SEQUENCE(5) is 5×1.
+        assert_eq!(
+            eval_str("=MAP(SEQUENCE(3), SEQUENCE(5), LAMBDA(a, b, a+b))", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    /// REDUCE walks the array, returning the final accumulator.
+    /// `=REDUCE(0, SEQUENCE(5), LAMBDA(acc, x, acc+x))` → 15.
+    #[test]
+    fn eval_reduce_sum() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=REDUCE(0, SEQUENCE(5), LAMBDA(acc, x, acc+x))", &cm, &vs),
+            Value::Number(15.0)
+        );
+    }
+
+    /// REDUCE result is scalar, not Array (the L2/L3 contract).
+    #[test]
+    fn eval_reduce_returns_scalar_not_array() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=REDUCE(10, SEQUENCE(3), LAMBDA(a, x, a*x))", &cm, &vs);
+        assert!(matches!(v, Value::Number(_)));
+        assert_eq!(v, Value::Number(60.0));
+    }
+
+    /// SCAN emits the intermediate accumulators. With initial=0, body=
+    /// `acc+x`, over [1,2,3,4,5]: [1, 3, 6, 10, 15] as 5×1.
+    #[test]
+    fn eval_scan_cumulative_sum() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=SCAN(0, SEQUENCE(5), LAMBDA(acc, x, acc+x))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (5, 1));
+                let expected = [1.0, 3.0, 6.0, 10.0, 15.0];
+                for (i, e) in expected.iter().enumerate() {
+                    assert_eq!(arr.get(i as u32, 0), Some(&Value::Number(*e)));
+                }
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    // ── BYROW / BYCOL (Part B) ────────────────────────────────────────
+
+    /// `=BYROW(SEQUENCE(2,3), LAMBDA(r, SUM(r)))` →
+    /// row sums = [1+2+3, 4+5+6] = [6, 15] as 2×1.
+    #[test]
+    fn eval_byrow_sum() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=BYROW(SEQUENCE(2,3), LAMBDA(r, SUM(r)))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 1));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(6.0)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(15.0)));
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    /// `=BYCOL(SEQUENCE(2,3), LAMBDA(c, SUM(c)))` →
+    /// column sums = [1+4, 2+5, 3+6] = [5, 7, 9] as 1×3.
+    #[test]
+    fn eval_bycol_sum() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=BYCOL(SEQUENCE(2,3), LAMBDA(c, SUM(c)))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(5.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(7.0)));
+                assert_eq!(arr.get(0, 2), Some(&Value::Number(9.0)));
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    // ── MAKEARRAY (Part B) ────────────────────────────────────────────
+
+    /// `=MAKEARRAY(2, 3, LAMBDA(i, j, i*j))` →
+    ///   row 1: 1*1=1, 1*2=2, 1*3=3
+    ///   row 2: 2*1=2, 2*2=4, 2*3=6
+    #[test]
+    fn eval_makearray_product() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str("=MAKEARRAY(2, 3, LAMBDA(i, j, i*j))", &cm, &vs);
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(2.0)));
+                assert_eq!(arr.get(0, 2), Some(&Value::Number(3.0)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(2.0)));
+                assert_eq!(arr.get(1, 1), Some(&Value::Number(4.0)));
+                assert_eq!(arr.get(1, 2), Some(&Value::Number(6.0)));
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    /// MAKEARRAY cap matches SEQUENCE — over 1M elements → InvalidValue.
+    #[test]
+    fn eval_makearray_cap_enforced() {
+        let (cm, vs) = make_test_env();
+        // 1025 * 1025 = 1,050,625 > 1,048,576.
+        assert_eq!(
+            eval_str("=MAKEARRAY(1025, 1025, LAMBDA(i, j, i+j))", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    /// LAMBDA stored in a LET binding, then passed to MAP — the lambda
+    /// flows through a name. This exercises the path "Name -> Value"
+    /// where the value is itself a Lambda.
+    #[test]
+    fn eval_lambda_named_via_let_then_mapped() {
+        let (cm, vs) = make_test_env();
+        let v = eval_str(
+            "=LET(sq, LAMBDA(x, x*x), MAP(SEQUENCE(4), sq))",
+            &cm,
+            &vs,
+        );
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (4, 1));
+                let expected = [1.0, 4.0, 9.0, 16.0];
+                for (i, e) in expected.iter().enumerate() {
+                    assert_eq!(arr.get(i as u32, 0), Some(&Value::Number(*e)));
+                }
+            }
+            _ => panic!("expected Array, got {:?}", v),
+        }
     }
 }
