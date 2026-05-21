@@ -18,6 +18,14 @@ serde-wasm-bindgen = "0.6"
 # is an opaque trap and the whole wasm instance dies silently (C.10).
 console_error_panic_hook = "0.1"
 
+# excel-core pulls `rand`, which transitively pulls `getrandom`. On
+# `wasm32-unknown-unknown` getrandom refuses to compile unless a
+# downstream crate opts into the `js` feature (it then routes entropy
+# through `crypto.getRandomValues`). Surface that here so
+# `npm run build:wasm` does not blow up. No-op for non-wasm builds.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
 # Needed by `tests/web.rs` to await JS Promises (microtask drain) inside
