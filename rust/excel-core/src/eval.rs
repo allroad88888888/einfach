@@ -132,11 +132,14 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "BESSELY"
             | "BETA.DIST"
             | "BETA.INV"
+            | "BETADIST"
+            | "BETAINV"
             | "BIN2DEC"
             | "BIN2HEX"
             | "BIN2OCT"
             | "BINOM.DIST"
             | "BINOM.INV"
+            | "BINOMDIST"
             | "BITAND"
             | "BITLSHIFT"
             | "BITOR"
@@ -149,10 +152,14 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "CEILING.PRECISE"
             | "CELL"
             | "CHAR"
+            | "CHIDIST"
+            | "CHIINV"
             | "CHISQ.DIST"
             | "CHISQ.DIST.RT"
             | "CHISQ.INV"
             | "CHISQ.INV.RT"
+            | "CHISQ.TEST"
+            | "CHITEST"
             | "CHOOSE"
             | "CHOOSECOLS"
             | "CHOOSEROWS"
@@ -162,6 +169,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COLUMNS"
             | "COMBIN"
             | "CONCATENATE"
+            | "CONFIDENCE"
+            | "CONFIDENCE.NORM"
             | "CONVERT"
             | "CORREL"
             | "COS"
@@ -176,7 +185,12 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COUPDAYSNC"
             | "COUPNCD"
             | "COUPPCD"
+            | "COVAR"
+            | "COVAR.P"
             | "COVAR.S"
+            | "COVARIANCE.P"
+            | "COVARIANCE.S"
+            | "CRITBINOM"
             | "CSC"
             | "CSCH"
             | "DATE"
@@ -209,25 +223,32 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "EXACT"
             | "EXP"
             | "EXPON.DIST"
+            | "EXPONDIST"
             | "F.DIST"
             | "F.DIST.RT"
             | "F.INV"
             | "F.INV.RT"
+            | "F.TEST"
             | "FACT"
+            | "FDIST"
             | "FILTER"
             | "FIND"
             | "FINDB"
+            | "FINV"
             | "FISHER"
             | "FISHERINV"
             | "FLOOR"
             | "FLOOR.MATH"
             | "FLOOR.PRECISE"
             | "FORMULATEXT"
+            | "FTEST"
             | "FV"
             | "FVSCHEDULE"
             | "GAMMA"
             | "GAMMA.DIST"
             | "GAMMA.INV"
+            | "GAMMADIST"
+            | "GAMMAINV"
             | "GAMMALN"
             | "GCD"
             | "GEOMEAN"
@@ -241,6 +262,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "HSTACK"
             | "HYPERLINK"
             | "HYPGEOM.DIST"
+            | "HYPGEOMDIST"
             | "IF"
             | "IFERROR"
             | "IFNA"
@@ -277,6 +299,10 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "LN"
             | "LOG"
             | "LOG10"
+            | "LOGINV"
+            | "LOGNORM.DIST"
+            | "LOGNORM.INV"
+            | "LOGNORMDIST"
             | "LOOKUP"
             | "LOWER"
             | "MAKEARRAY"
@@ -297,12 +323,17 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MROUND"
             | "N"
             | "NEGBINOM.DIST"
+            | "NEGBINOMDIST"
             | "NETWORKDAYS"
             | "NETWORKDAYS.INTL"
             | "NORM.DIST"
             | "NORM.INV"
             | "NORM.S.DIST"
             | "NORM.S.INV"
+            | "NORMDIST"
+            | "NORMINV"
+            | "NORMSDIST"
+            | "NORMSINV"
             | "NOT"
             | "NOW"
             | "NPER"
@@ -321,6 +352,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "PHONETIC"
             | "PI"
             | "PMT"
+            | "POISSON"
             | "POISSON.DIST"
             | "POWER"
             | "PPMT"
@@ -382,9 +414,11 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "T.DIST.RT"
             | "T.INV"
             | "T.INV.2T"
+            | "T.TEST"
             | "TAKE"
             | "TAN"
             | "TANH"
+            | "TDIST"
             | "TEXT"
             | "TEXTAFTER"
             | "TEXTBEFORE"
@@ -392,12 +426,14 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "TEXTSPLIT"
             | "TIME"
             | "TIMEVALUE"
+            | "TINV"
             | "TOCOL"
             | "TODAY"
             | "TOROW"
             | "TRIM"
             | "TRIMMEAN"
             | "TRUNC"
+            | "TTEST"
             | "TYPE"
             | "UNIQUE"
             | "UPPER"
@@ -409,6 +445,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "VSTACK"
             | "WEEKDAY"
             | "WEEKNUM"
+            | "WEIBULL"
             | "WEIBULL.DIST"
             | "WORKDAY"
             | "WORKDAY.INTL"
@@ -416,6 +453,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "XOR"
             | "YEAR"
             | "YEARFRAC"
+            | "Z.TEST"
+            | "ZTEST"
     )
 }
 
@@ -8502,6 +8541,49 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "FINDB" => fn_findb(args, provider),
         "SEARCHB" => fn_searchb(args, provider),
         "REPLACEB" => fn_replaceb(args, provider),
+        // === Legacy statistical aliases (Excel pre-2010 names) ===
+        //
+        // Most route directly to the canonical Excel-365 implementations.
+        // A few need wrappers because the legacy form has a different
+        // signature (LOGNORMDIST is cumulative-only, NORMSDIST has no
+        // cumulative arg, TDIST takes a tails switch instead of cumulative,
+        // HYPGEOMDIST / NEGBINOMDIST have no cumulative arg, etc.). The
+        // four statistical hypothesis tests (CHISQ.TEST / F.TEST / T.TEST /
+        // Z.TEST) and their legacy aliases (CHITEST / FTEST / TTEST /
+        // ZTEST) are implemented from scratch — there was no canonical
+        // arm yet. LOGNORM.DIST / LOGNORM.INV are also brand-new
+        // bodies; the legacy LOGNORMDIST / LOGINV wrap them.
+        "BETADIST" => stat_legacy_betadist(args, provider),
+        "BETAINV" => stat_beta_inv(args, provider),
+        "BINOMDIST" => stat_binom_dist(args, provider),
+        "CHIDIST" => stat_chisq_dist_rt(args, provider),
+        "CHIINV" => stat_chisq_inv_rt(args, provider),
+        "CHISQ.TEST" | "CHITEST" => stat_chisq_test(args, provider),
+        "CONFIDENCE" | "CONFIDENCE.NORM" => stat_confidence_norm(args, provider),
+        "COVARIANCE.P" => covar_impl(args, provider, false),
+        "COVARIANCE.S" => covar_impl(args, provider, true),
+        "CRITBINOM" => stat_binom_inv(args, provider),
+        "EXPONDIST" => stat_expon_dist(args, provider),
+        "FDIST" => stat_f_dist_rt(args, provider),
+        "FINV" => stat_f_inv_rt(args, provider),
+        "F.TEST" | "FTEST" => stat_f_test(args, provider),
+        "GAMMADIST" => stat_gamma_dist(args, provider),
+        "GAMMAINV" => stat_gamma_inv(args, provider),
+        "HYPGEOMDIST" => stat_legacy_hypgeomdist(args, provider),
+        "LOGNORM.DIST" => stat_lognorm_dist(args, provider),
+        "LOGNORM.INV" | "LOGINV" => stat_lognorm_inv(args, provider),
+        "LOGNORMDIST" => stat_legacy_lognormdist(args, provider),
+        "NEGBINOMDIST" => stat_legacy_negbinomdist(args, provider),
+        "NORMDIST" => stat_norm_dist(args, provider),
+        "NORMINV" => stat_norm_inv(args, provider),
+        "NORMSDIST" => stat_legacy_normsdist(args, provider),
+        "NORMSINV" => stat_norm_s_inv(args, provider),
+        "POISSON" => stat_poisson_dist(args, provider),
+        "TDIST" => stat_legacy_tdist(args, provider),
+        "TINV" => stat_t_inv_2t(args, provider),
+        "T.TEST" | "TTEST" => stat_t_test(args, provider),
+        "WEIBULL" => stat_weibull_dist(args, provider),
+        "Z.TEST" | "ZTEST" => stat_z_test(args, provider),
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
@@ -16654,6 +16736,583 @@ fn fn_replaceb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     out.push_str(&new_s);
     out.push_str(&right);
     Value::Text(out)
+}
+
+// === Legacy statistical helper functions ===
+//
+// Wrappers that adapt the canonical Excel-365 `.DIST` / `.INV` signatures
+// to the legacy Excel-2007 forms (no cumulative flag, single-arg signed
+// form, tails switch, etc.), plus brand-new implementations for the
+// four statistical hypothesis tests (CHISQ.TEST / F.TEST / T.TEST /
+// Z.TEST), confidence intervals, and the lognormal distribution.
+
+/// Legacy `BETADIST(x, alpha, beta, [A], [B])`. Always returns the
+/// cumulative distribution (no boolean cumulative flag). Defaults:
+/// `A = 0`, `B = 1`.
+fn stat_legacy_betadist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Beta, ContinuousCDF};
+    if !(3..=5).contains(&args.len()) {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let alpha = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let beta = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let a = if args.len() >= 4 {
+        match stat_num(&args[3], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        0.0
+    };
+    let b = if args.len() == 5 {
+        match stat_num(&args[4], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        1.0
+    };
+    if !(alpha > 0.0) || !(beta > 0.0) || !(b > a) || x < a || x > b {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Beta::new(alpha, beta) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let u = (x - a) / (b - a);
+    stat_finite(dist.cdf(u))
+}
+
+/// Legacy `HYPGEOMDIST(sample_s, num_sample, pop_s, num_pop)`. Returns
+/// the PMF only (no cumulative flag).
+fn stat_legacy_hypgeomdist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Discrete, Hypergeometric};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let sample_s = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_sample = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let pop_s = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_pop = match stat_num(&args[3], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    for v in [sample_s, num_sample, pop_s, num_pop] {
+        if v < 0.0 || v.trunc() != v {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    if pop_s > num_pop || num_sample > num_pop || sample_s > num_sample || sample_s > pop_s {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match Hypergeometric::new(num_pop as u64, pop_s as u64, num_sample as u64) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.pmf(sample_s as u64))
+}
+
+/// Legacy `NEGBINOMDIST(num_f, num_s, prob_s)`. Returns PMF only.
+fn stat_legacy_negbinomdist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Discrete, NegativeBinomial};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let num_f = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let num_s = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let p = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p <= 1.0)
+        || num_f < 0.0
+        || num_s < 1.0
+        || num_f.trunc() != num_f
+        || num_s.trunc() != num_s
+    {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match NegativeBinomial::new(num_s, p) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.pmf(num_f as u64))
+}
+
+/// Legacy `NORMSDIST(z)` — single-argument form that always returns the
+/// standard-normal CDF (Excel's pre-2010 spelling for NORM.S.DIST in
+/// cumulative mode).
+fn stat_legacy_normsdist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let z = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    stat_finite(dist.cdf(z))
+}
+
+/// Legacy `LOGNORMDIST(x, mean, sd)`. Cumulative only.
+fn stat_legacy_lognormdist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, LogNormal};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(sd > 0.0) || x <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match LogNormal::new(mean, sd) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.cdf(x))
+}
+
+/// `LOGNORM.DIST(x, mean, sd, cumulative)`. statrs's `LogNormal` is
+/// parameterised by the underlying normal's mean (μ) and stdev (σ),
+/// matching Excel's signature directly.
+fn stat_lognorm_dist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{Continuous, ContinuousCDF, LogNormal};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let cumulative = match stat_bool(&args[3], provider) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    if !(sd > 0.0) || x <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match LogNormal::new(mean, sd) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(if cumulative { dist.cdf(x) } else { dist.pdf(x) })
+}
+
+/// `LOGNORM.INV(probability, mean, sd)`. Also exposed as legacy
+/// `LOGINV`.
+fn stat_lognorm_inv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, LogNormal};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let p = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let mean = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let sd = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !(p > 0.0 && p < 1.0) || !(sd > 0.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match LogNormal::new(mean, sd) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(dist.inverse_cdf(p))
+}
+
+/// Legacy `TDIST(x, deg_freedom, tails)`. `tails` must be 1 or 2:
+///   - 1 → right-tail probability `P(T > x)`,
+///   - 2 → two-tail probability  `P(|T| > x)`.
+/// Excel requires `x >= 0`; negative `x` surfaces `#NUM!`.
+fn stat_legacy_tdist(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let df = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let tails = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if x < 0.0 || !(df >= 1.0) {
+        return Value::Error(ValueError::Overflow);
+    }
+    let tails_i = tails.trunc() as i64;
+    if tails.trunc() != tails || (tails_i != 1 && tails_i != 2) {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Excel TDIST truncates df toward zero (it must be >= 1 after truncation).
+    let df_trunc = df.trunc();
+    if df_trunc < 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df_trunc) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let upper_tail = 1.0 - dist.cdf(x);
+    stat_finite(if tails_i == 1 {
+        upper_tail
+    } else {
+        2.0 * upper_tail
+    })
+}
+
+/// `CONFIDENCE(alpha, stdev, size)` / `CONFIDENCE.NORM(alpha, stdev, size)`.
+/// Returns the half-width of the normal-distribution confidence
+/// interval: `NORM.S.INV(1 - alpha/2) * stdev / sqrt(size)`. Excel
+/// truncates `size` toward zero before validating.
+fn stat_confidence_norm(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let alpha = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let stdev = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let size_raw = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let size = size_raw.trunc();
+    if !(alpha > 0.0 && alpha < 1.0) || !(stdev > 0.0) || size < 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    let z = dist.inverse_cdf(1.0 - alpha / 2.0);
+    stat_finite(z * stdev / size.sqrt())
+}
+
+/// Mean and sample variance (divisor `n - 1`) of a flat slice. Returns
+/// `None` if fewer than two values were given.
+fn mean_and_sample_var(xs: &[f64]) -> Option<(f64, f64)> {
+    let n = xs.len();
+    if n < 2 {
+        return None;
+    }
+    let mean = xs.iter().sum::<f64>() / n as f64;
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+    Some((mean, var))
+}
+
+/// `CHISQ.TEST(actual_range, expected_range)` / `CHITEST(...)`.
+///
+/// Computes the chi-square statistic
+///   `χ² = Σ (actual_i - expected_i)² / expected_i`
+/// over every paired-cell of the two equally-shaped grids, then returns
+/// the right-tail probability of that statistic under a chi-square
+/// distribution with `(rows - 1) * (cols - 1)` degrees of freedom (or
+/// `n - 1` if either dimension is 1). Empty / non-numeric cells in a
+/// pair are skipped (must skip in both); a zero expected value surfaces
+/// `#DIV/0!`. Mismatched shapes surface `#N/A` (`InvalidValue`).
+fn stat_chisq_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ChiSquared, ContinuousCDF};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let grid_a = match collect_range_2d_for_arg(&args[0], provider) {
+        Some(g) => g,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    let grid_b = match collect_range_2d_for_arg(&args[1], provider) {
+        Some(g) => g,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    let rows = grid_a.len();
+    let cols = grid_a.first().map(|r| r.len()).unwrap_or(0);
+    if rows != grid_b.len() || cols != grid_b.first().map(|r| r.len()).unwrap_or(0) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut chi2 = 0.0_f64;
+    let mut pairs: usize = 0;
+    for r in 0..rows {
+        for c in 0..cols {
+            let av = &grid_a[r][c];
+            let bv = &grid_b[r][c];
+            if let Value::Error(e) = av {
+                return Value::Error(e.clone());
+            }
+            if let Value::Error(e) = bv {
+                return Value::Error(e.clone());
+            }
+            if let (Value::Number(a_n), Value::Number(b_n)) = (av, bv) {
+                if *b_n == 0.0 {
+                    return Value::Error(ValueError::DivisionByZero);
+                }
+                let diff = a_n - b_n;
+                chi2 += diff * diff / b_n;
+                pairs += 1;
+            }
+        }
+    }
+    if pairs < 2 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    // Degrees of freedom: contingency-table convention. Single row or
+    // column -> n-1; otherwise (rows-1)*(cols-1).
+    let df = if rows == 1 || cols == 1 {
+        (pairs as f64) - 1.0
+    } else {
+        ((rows - 1) as f64) * ((cols - 1) as f64)
+    };
+    if df <= 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let dist = match ChiSquared::new(df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    stat_finite(1.0 - dist.cdf(chi2))
+}
+
+/// `F.TEST(arr1, arr2)` / `FTEST(...)`. Two-tail probability that two
+/// samples have equal variance: `2 * min(P, 1-P)` where `P` is the F
+/// distribution's right-tail probability at `var1 / var2` with
+/// `(n1 - 1, n2 - 1)` degrees of freedom.
+fn stat_f_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, FisherSnedecor};
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let xs = collect_numbers(&[args[0].clone()], provider);
+    let ys = collect_numbers(&[args[1].clone()], provider);
+    let (_, var_x) = match mean_and_sample_var(&xs) {
+        Some(t) => t,
+        None => return Value::Error(ValueError::DivisionByZero),
+    };
+    let (_, var_y) = match mean_and_sample_var(&ys) {
+        Some(t) => t,
+        None => return Value::Error(ValueError::DivisionByZero),
+    };
+    if var_x == 0.0 || var_y == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let df1 = (xs.len() as f64) - 1.0;
+    let df2 = (ys.len() as f64) - 1.0;
+    let f = var_x / var_y;
+    let dist = match FisherSnedecor::new(df1, df2) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    let p_right = 1.0 - dist.cdf(f);
+    stat_finite(2.0 * p_right.min(1.0 - p_right))
+}
+
+/// `T.TEST(arr1, arr2, tails, type)` / `TTEST(...)`.
+///
+/// `type`:
+///   1. Paired (arrays must be equal length, neither variance zero).
+///   2. Two-sample, equal variance (pooled).
+///   3. Two-sample, unequal variance (Welch's).
+///
+/// `tails`: 1 or 2.
+fn stat_t_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, StudentsT};
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let tails_raw = match stat_num(&args[2], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let type_raw = match stat_num(&args[3], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if tails_raw.trunc() != tails_raw || type_raw.trunc() != type_raw {
+        return Value::Error(ValueError::Overflow);
+    }
+    let tails = tails_raw as i64;
+    let ttype = type_raw as i64;
+    if (tails != 1 && tails != 2) || !(1..=3).contains(&ttype) {
+        return Value::Error(ValueError::Overflow);
+    }
+
+    let (t_stat, df) = match ttype {
+        1 => {
+            // Paired t-test. Pair grids cell-by-cell (numeric pairs
+            // only); skip pairs where either side is non-numeric.
+            let pairs = match collect_paired_numbers(&args[0], &args[1], provider) {
+                Ok(p) => p,
+                Err(e) => return Value::Error(e),
+            };
+            let n = pairs.len();
+            if n < 2 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let diffs: Vec<f64> = pairs.iter().map(|(x, y)| x - y).collect();
+            let (mean, var) = match mean_and_sample_var(&diffs) {
+                Some(t) => t,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            if var == 0.0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let se = (var / n as f64).sqrt();
+            (mean / se, (n as f64) - 1.0)
+        }
+        2 => {
+            // Two-sample equal-variance (pooled).
+            let xs = collect_numbers(&[args[0].clone()], provider);
+            let ys = collect_numbers(&[args[1].clone()], provider);
+            let (mx, vx) = match mean_and_sample_var(&xs) {
+                Some(t) => t,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            let (my, vy) = match mean_and_sample_var(&ys) {
+                Some(t) => t,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            let n1 = xs.len() as f64;
+            let n2 = ys.len() as f64;
+            let pooled = ((n1 - 1.0) * vx + (n2 - 1.0) * vy) / (n1 + n2 - 2.0);
+            if pooled <= 0.0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let se = (pooled * (1.0 / n1 + 1.0 / n2)).sqrt();
+            ((mx - my) / se, n1 + n2 - 2.0)
+        }
+        3 => {
+            // Welch's two-sample unequal-variance t-test.
+            let xs = collect_numbers(&[args[0].clone()], provider);
+            let ys = collect_numbers(&[args[1].clone()], provider);
+            let (mx, vx) = match mean_and_sample_var(&xs) {
+                Some(t) => t,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            let (my, vy) = match mean_and_sample_var(&ys) {
+                Some(t) => t,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            let n1 = xs.len() as f64;
+            let n2 = ys.len() as f64;
+            let se_sq = vx / n1 + vy / n2;
+            if se_sq <= 0.0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let t = (mx - my) / se_sq.sqrt();
+            // Welch-Satterthwaite df.
+            let df_num = se_sq.powi(2);
+            let df_den =
+                (vx / n1).powi(2) / (n1 - 1.0) + (vy / n2).powi(2) / (n2 - 1.0);
+            if df_den <= 0.0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            (t, df_num / df_den)
+        }
+        _ => unreachable!(),
+    };
+    if !df.is_finite() || df <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dist = match StudentsT::new(0.0, 1.0, df) {
+        Ok(d) => d,
+        Err(_) => return Value::Error(ValueError::Overflow),
+    };
+    // Two-tail probability is `2 * P(T > |t_stat|)`; one-tail is
+    // `P(T > |t_stat|)`. Using `1 - cdf(|t|)` covers both signs.
+    let p_one = 1.0 - dist.cdf(t_stat.abs());
+    stat_finite(if tails == 1 { p_one } else { 2.0 * p_one })
+}
+
+/// `Z.TEST(array, x, [sigma])` / `ZTEST(...)`. Returns the one-tailed
+/// P-value `1 - NORM.S.DIST((mean - x) / (sigma / sqrt(n)))`. When
+/// `sigma` is omitted the sample standard deviation is used.
+fn stat_z_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    use statrs::distribution::{ContinuousCDF, Normal};
+    if !(2..=3).contains(&args.len()) {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let xs = collect_numbers(&[args[0].clone()], provider);
+    let n = xs.len();
+    if n < 2 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let x0 = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let (mean, var) = match mean_and_sample_var(&xs) {
+        Some(t) => t,
+        None => return Value::Error(ValueError::DivisionByZero),
+    };
+    let sigma = if args.len() == 3 {
+        match stat_num(&args[2], provider) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    } else {
+        var.sqrt()
+    };
+    if !(sigma > 0.0) {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let z = (mean - x0) / (sigma / (n as f64).sqrt());
+    let dist = Normal::new(0.0, 1.0).expect("standard normal always constructs");
+    stat_finite(1.0 - dist.cdf(z))
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -31899,6 +32558,28 @@ mod tests {
         );
     }
 
+    // === Legacy statistical aliases (Excel pre-2010 names) ===
+
+    #[test]
+    fn eval_legacy_betadist_uniform_cdf() {
+        // BETA(1,1) on [0,1] = uniform → CDF(0.25) = 0.25.
+        assert_approx_eq(ev("=BETADIST(0.25, 1, 1)"), 0.25, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_betadist_with_ab() {
+        // BETA(1,1) on [2,4] → CDF(3) = 0.5.
+        assert_approx_eq(ev("=BETADIST(3, 1, 1, 2, 4)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_betadist_x_out_of_range_is_error() {
+        assert_eq!(
+            ev("=BETADIST(2, 1, 1, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
     #[test]
     fn eval_oddfyield_inverts_oddfprice() {
         let (cm, vs) = make_test_env();
@@ -31934,6 +32615,20 @@ mod tests {
     }
 
     #[test]
+    fn eval_legacy_betainv_round_trip() {
+        // BETAINV is just BETA.INV — uniform inverse is identity.
+        assert_approx_eq(ev("=BETAINV(0.3, 1, 1)"), 0.3, 1e-3);
+    }
+
+    #[test]
+    fn eval_legacy_betainv_invalid_alpha() {
+        assert_eq!(
+            ev("=BETAINV(0.5, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
     fn eval_oddlprice_at_par() {
         let (cm, vs) = make_test_env();
         // last_interest exactly one period before maturity, settlement
@@ -31963,6 +32658,30 @@ mod tests {
                 "=ODDLPRICE(DATE(2024,1,1),DATE(2025,1,1),DATE(2024,7,1),0.05,0.05,100,2,0)",
                 &cm, &vs
             ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_betainv_with_ab() {
+        assert_approx_eq(ev("=BETAINV(0.5, 1, 1, 2, 4)"), 3.0, 1e-3);
+    }
+
+    #[test]
+    fn eval_legacy_binomdist_pmf() {
+        // Same numbers as BINOM.DIST.
+        assert_approx_eq(ev("=BINOMDIST(2, 10, 0.5, FALSE)"), 45.0 / 1024.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_binomdist_cumulative() {
+        assert_approx_eq(ev("=BINOMDIST(10, 10, 0.5, TRUE)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_binomdist_invalid_p() {
+        assert_eq!(
+            ev("=BINOMDIST(1, 10, 1.5, FALSE)"),
             Value::Error(ValueError::Overflow)
         );
     }
@@ -32206,6 +32925,115 @@ mod tests {
     }
 
     #[test]
+    fn eval_legacy_chidist_complement_of_chisq_dist() {
+        // CHIDIST(x, df) = 1 - CHISQ.DIST(x, df, TRUE).
+        let a = match ev("=CHIDIST(3, 5)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=CHISQ.DIST(3, 5, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a + b - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eval_legacy_chidist_df_zero_is_error() {
+        assert_eq!(
+            ev("=CHIDIST(3, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_chidist_negative_x_is_error() {
+        assert_eq!(
+            ev("=CHIDIST(-1, 5)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_chiinv_p_one_is_zero() {
+        // CHIINV(p=1, df) == survival-CDF^-1(1) == 0.
+        assert_approx_eq(ev("=CHIINV(1, 5)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_chiinv_invalid_p() {
+        assert_eq!(ev("=CHIINV(0, 5)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_legacy_chiinv_invalid_df() {
+        assert_eq!(ev("=CHIINV(0.5, 0)"), Value::Error(ValueError::Overflow));
+    }
+
+    fn chisq_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // Two 1x4 ranges:
+        //   A1:D1 actuals  = 10, 20, 30, 40
+        //   A2:D2 expected = 15, 15, 35, 35
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        let actuals = [10.0_f64, 20.0, 30.0, 40.0];
+        let expecteds = [15.0_f64, 15.0, 35.0, 35.0];
+        let mut next: u64 = 1;
+        for (c, (a, e)) in actuals.iter().zip(expecteds.iter()).enumerate() {
+            let id_a = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(0, c as u32), id_a);
+            vs.insert(id_a, Value::Number(*a));
+            let id_e = AtomId::from_raw(next);
+            next += 1;
+            cm.insert(CellAddress::new(1, c as u32), id_e);
+            vs.insert(id_e, Value::Number(*e));
+        }
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_chisq_test_known_value() {
+        // χ² = (10-15)²/15 + (20-15)²/15 + (30-35)²/35 + (40-35)²/35
+        //    = 25/15 + 25/15 + 25/35 + 25/35 = 50/15 + 50/35 ≈ 4.7619.
+        // df = (rows-1)*(cols-1) = 0*3 = 0 → fall through to n-1 = 3.
+        use statrs::distribution::{ChiSquared, ContinuousCDF};
+        let chi2 = 50.0_f64 / 15.0 + 50.0_f64 / 35.0;
+        let expected = 1.0 - ChiSquared::new(3.0).unwrap().cdf(chi2);
+        let (cm, vs) = chisq_env();
+        match eval_str("=CHISQ.TEST(A1:D1, A2:D2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - expected).abs() < 1e-9),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // Legacy alias agrees.
+        match eval_str("=CHITEST(A1:D1, A2:D2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - expected).abs() < 1e-9),
+            other => panic!("expected number, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_chisq_test_shape_mismatch_is_error() {
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        // A1:B1 actuals; A2:C2 expected.
+        for c in 0..2 {
+            let id = AtomId::from_raw((c + 1) as u64);
+            cm.insert(CellAddress::new(0, c as u32), id);
+            vs.insert(id, Value::Number(10.0));
+        }
+        for c in 0..3 {
+            let id = AtomId::from_raw((c + 10) as u64);
+            cm.insert(CellAddress::new(1, c as u32), id);
+            vs.insert(id, Value::Number(10.0));
+        }
+        assert_eq!(
+            eval_str("=CHISQ.TEST(A1:B1, A2:C2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn eval_searchb_case_insensitive() {
         // SEARCHB ignores case; "B" matches "b" at byte 2.
         assert_eq!(ev(r#"=SEARCHB("B", "abc")"#), Value::Number(2.0));
@@ -32219,6 +33047,30 @@ mod tests {
         assert_eq!(
             ev(r#"=SEARCHB("x", "abc")"#),
             Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_chisq_test_zero_expected_is_div_zero() {
+        // A1=10, B1=20, A2=15, B2=0 → B2 is zero expected → #DIV/0!.
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        for (idx, (addr, v)) in [
+            (CellAddress::new(0, 0), 10.0),
+            (CellAddress::new(0, 1), 20.0),
+            (CellAddress::new(1, 0), 15.0),
+            (CellAddress::new(1, 1), 0.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id = AtomId::from_raw((idx + 1) as u64);
+            cm.insert(*addr, id);
+            vs.insert(id, Value::Number(*v));
+        }
+        assert_eq!(
+            eval_str("=CHISQ.TEST(A1:B1, A2:B2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
         );
     }
 
@@ -32250,6 +33102,730 @@ mod tests {
             ev(r#"=REPLACEB("abcあ", 4, 1, "X")"#),
             Value::Text("abcX ".into())
         );
+    }
+
+    fn eval_confidence_known_value() {
+        // CONFIDENCE(0.05, 2.5, 50) = NORM.S.INV(0.975) * 2.5 / sqrt(50)
+        //                          ≈ 1.959964 * 2.5 / 7.0711 ≈ 0.692952.
+        assert_approx_eq(ev("=CONFIDENCE(0.05, 2.5, 50)"), 0.692_952, 1e-4);
+    }
+
+    #[test]
+    fn eval_confidence_norm_alias() {
+        // Same arm; should match.
+        let a = match ev("=CONFIDENCE(0.05, 2.5, 50)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=CONFIDENCE.NORM(0.05, 2.5, 50)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn eval_confidence_alpha_out_of_range_is_error() {
+        assert_eq!(
+            ev("=CONFIDENCE(0, 2.5, 50)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=CONFIDENCE(1, 2.5, 50)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_covar_alias_present() {
+        // COVAR was already implemented but not in is_builtin_function_name.
+        // Spot-check the path via two 2-element ranges.
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        for (c, (a, b)) in [(1.0_f64, 2.0_f64), (3.0, 4.0)].iter().enumerate() {
+            let id_a = AtomId::from_raw((c * 2 + 1) as u64);
+            let id_b = AtomId::from_raw((c * 2 + 2) as u64);
+            cm.insert(CellAddress::new(0, c as u32), id_a);
+            cm.insert(CellAddress::new(1, c as u32), id_b);
+            vs.insert(id_a, Value::Number(*a));
+            vs.insert(id_b, Value::Number(*b));
+        }
+        // Mean of (1,3) = 2, mean of (2,4) = 3. Cov(p)= ((1-2)(2-3)+(3-2)(4-3))/2
+        //                                              = (1+1)/2 = 1.
+        match eval_str("=COVAR(A1:B1, A2:B2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+        match eval_str("=COVARIANCE.P(A1:B1, A2:B2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.0).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+        // COVARIANCE.S = sample: divide by (n-1) = 1 → 2.
+        match eval_str("=COVARIANCE.S(A1:B1, A2:B2)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 2.0).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_legacy_critbinom_half() {
+        assert_approx_eq(ev("=CRITBINOM(10, 0.5, 0.5)"), 5.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_critbinom_invalid_alpha() {
+        assert_eq!(
+            ev("=CRITBINOM(10, 0.5, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_critbinom_extremes() {
+        // alpha very close to 1: should pick the largest k.
+        assert_approx_eq(ev("=CRITBINOM(10, 0.5, 0.999)"), 9.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_expondist_pdf() {
+        assert_approx_eq(ev("=EXPONDIST(0, 2, FALSE)"), 2.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_expondist_cdf() {
+        assert_approx_eq(ev("=EXPONDIST(1, 1, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_expondist_lambda_zero_is_error() {
+        assert_eq!(
+            ev("=EXPONDIST(1, 0, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_fdist_right_tail() {
+        // FDIST(x, df1, df2) == F.DIST.RT(x, df1, df2).
+        let a = match ev("=FDIST(2, 5, 10)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=F.DIST.RT(2, 5, 10)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn eval_legacy_fdist_negative_x_is_error() {
+        assert_eq!(
+            ev("=FDIST(-1, 5, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_fdist_wrong_arg_count() {
+        assert_eq!(
+            ev("=FDIST(1, 5)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_finv_right_tail() {
+        let a = match ev("=FINV(0.5, 5, 10)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=F.INV.RT(0.5, 5, 10)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn eval_legacy_finv_p_zero_is_error() {
+        assert_eq!(
+            ev("=FINV(0, 5, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_finv_invalid_df() {
+        assert_eq!(
+            ev("=FINV(0.5, 0, 10)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    fn ftest_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        // A1:A5 = 1,2,3,4,5 (var = 2.5); B1:B5 = 10,20,30,40,50 (var = 250).
+        for (r, (a, b)) in [
+            (1.0_f64, 10.0_f64),
+            (2.0, 20.0),
+            (3.0, 30.0),
+            (4.0, 40.0),
+            (5.0, 50.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id_a = AtomId::from_raw((r * 2 + 1) as u64);
+            let id_b = AtomId::from_raw((r * 2 + 2) as u64);
+            cm.insert(CellAddress::new(r as u32, 0), id_a);
+            cm.insert(CellAddress::new(r as u32, 1), id_b);
+            vs.insert(id_a, Value::Number(*a));
+            vs.insert(id_b, Value::Number(*b));
+        }
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_f_test_known() {
+        // var1/var2 = 2.5/250 = 0.01. F.DIST(0.01, 4, 4) is small
+        // right-tail; symmetric two-tail = 2 * min(P, 1-P).
+        use statrs::distribution::{ContinuousCDF, FisherSnedecor};
+        let dist = FisherSnedecor::new(4.0, 4.0).unwrap();
+        let p_right = 1.0 - dist.cdf(0.01);
+        let expected = 2.0 * p_right.min(1.0 - p_right);
+        let (cm, vs) = ftest_env();
+        match eval_str("=F.TEST(A1:A5, B1:B5)", &cm, &vs) {
+            Value::Number(n) => assert!((n - expected).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+        // Alias FTEST.
+        match eval_str("=FTEST(A1:A5, B1:B5)", &cm, &vs) {
+            Value::Number(n) => assert!((n - expected).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_f_test_zero_variance_is_div_zero() {
+        // Column A has constant values (variance 0) → must return #DIV/0!.
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        cm.insert(CellAddress::new(0, 0), AtomId::from_raw(1));
+        vs.insert(AtomId::from_raw(1), Value::Number(5.0));
+        cm.insert(CellAddress::new(1, 0), AtomId::from_raw(2));
+        vs.insert(AtomId::from_raw(2), Value::Number(5.0));
+        cm.insert(CellAddress::new(0, 1), AtomId::from_raw(3));
+        vs.insert(AtomId::from_raw(3), Value::Number(1.0));
+        cm.insert(CellAddress::new(1, 1), AtomId::from_raw(4));
+        vs.insert(AtomId::from_raw(4), Value::Number(2.0));
+        assert_eq!(
+            eval_str("=F.TEST(A1:A2, B1:B2)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_f_test_wrong_arg_count() {
+        assert_eq!(
+            ev("=F.TEST(1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_gammadist_alias() {
+        // GAMMADIST is just GAMMA.DIST.
+        assert_approx_eq(ev("=GAMMADIST(1, 1, 1, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_gammadist_alpha_zero_is_error() {
+        assert_eq!(
+            ev("=GAMMADIST(1, 0, 1, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_gammainv_round_trip() {
+        let p = match ev("=GAMMADIST(2, 3, 2, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let inv = match ev(&format!("=GAMMAINV({}, 3, 2)", p)) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((inv - 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eval_legacy_hypgeomdist_pmf() {
+        // 4-arg form (no cumulative); matches the cumulative=FALSE arm
+        // of HYPGEOM.DIST.
+        assert_approx_eq(
+            ev("=HYPGEOMDIST(2, 5, 6, 20)"),
+            15.0 * 364.0 / 15504.0,
+            TOL,
+        );
+    }
+
+    #[test]
+    fn eval_legacy_hypgeomdist_wrong_arg_count() {
+        assert_eq!(
+            ev("=HYPGEOMDIST(2, 5, 6, 20, FALSE)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_hypgeomdist_invalid_sample_size() {
+        assert_eq!(
+            ev("=HYPGEOMDIST(2, 5, 25, 20)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_lognorm_dist_cdf_at_median() {
+        // LOGNORM.DIST(e, 1, 0.5, TRUE) — median of lognormal(μ=1, σ=0.5)
+        // is e^1 = e, so CDF at e is exactly 0.5.
+        assert_approx_eq(
+            ev(&format!("=LOGNORM.DIST({}, 1, 0.5, TRUE)", std::f64::consts::E)),
+            0.5,
+            TOL,
+        );
+    }
+
+    #[test]
+    fn eval_lognorm_dist_pdf_positive() {
+        match ev("=LOGNORM.DIST(1, 0, 1, FALSE)") {
+            Value::Number(n) => assert!(n > 0.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_lognorm_dist_x_zero_is_error() {
+        // x must be > 0.
+        assert_eq!(
+            ev("=LOGNORM.DIST(0, 0, 1, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_lognorm_inv_round_trip() {
+        // LOGNORM.INV(LOGNORM.DIST(x, ...), ...) == x.
+        let p = match ev("=LOGNORM.DIST(3, 1, 0.5, TRUE)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let inv = match ev(&format!("=LOGNORM.INV({}, 1, 0.5)", p)) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((inv - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn eval_lognorm_inv_p_zero_is_error() {
+        assert_eq!(
+            ev("=LOGNORM.INV(0, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_loginv_matches_lognorm_inv() {
+        let a = match ev("=LOGNORM.INV(0.5, 1, 0.5)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match ev("=LOGINV(0.5, 1, 0.5)") {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn eval_legacy_lognormdist_cdf() {
+        // LOGNORMDIST(e, 1, 0.5) is the CDF at the median → 0.5.
+        assert_approx_eq(
+            ev(&format!("=LOGNORMDIST({}, 1, 0.5)", std::f64::consts::E)),
+            0.5,
+            TOL,
+        );
+    }
+
+    #[test]
+    fn eval_legacy_lognormdist_x_zero_is_error() {
+        assert_eq!(
+            ev("=LOGNORMDIST(0, 0, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_lognormdist_wrong_arg_count() {
+        assert_eq!(
+            ev("=LOGNORMDIST(1, 0, 1, TRUE)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_negbinomdist_zero_failures() {
+        // P(0 failures before 1st success) for p=0.5 = 0.5.
+        assert_approx_eq(ev("=NEGBINOMDIST(0, 1, 0.5)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_negbinomdist_wrong_arg_count() {
+        // Legacy 3-arg only; reject 4 args.
+        assert_eq!(
+            ev("=NEGBINOMDIST(0, 1, 0.5, FALSE)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_negbinomdist_p_zero_is_error() {
+        assert_eq!(
+            ev("=NEGBINOMDIST(0, 1, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_normdist_cdf() {
+        assert_approx_eq(ev("=NORMDIST(5, 5, 2, TRUE)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_normdist_pdf() {
+        assert_approx_eq(ev("=NORMDIST(0, 0, 1, FALSE)"), 0.398_942_280_4, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_normdist_sd_zero_is_error() {
+        assert_eq!(
+            ev("=NORMDIST(0, 0, 0, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_norminv_half_is_mean() {
+        assert_approx_eq(ev("=NORMINV(0.5, 5, 2)"), 5.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_norminv_invalid_p() {
+        assert_eq!(ev("=NORMINV(0, 0, 1)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_legacy_norminv_invalid_sd() {
+        assert_eq!(
+            ev("=NORMINV(0.5, 0, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_normsdist_zero_is_half() {
+        // Single-arg form, always returns CDF.
+        assert_approx_eq(ev("=NORMSDIST(0)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_normsdist_wrong_arg_count() {
+        assert_eq!(
+            ev("=NORMSDIST(0, TRUE)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_normsdist_large_positive_close_to_one() {
+        match ev("=NORMSDIST(5)") {
+            Value::Number(n) => assert!(n > 0.999_999 && n <= 1.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_legacy_normsinv_half_is_zero() {
+        assert_approx_eq(ev("=NORMSINV(0.5)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_normsinv_invalid_p() {
+        assert_eq!(ev("=NORMSINV(0)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=NORMSINV(1)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_legacy_normsinv_known_value() {
+        // NORMSINV(0.975) ≈ 1.959963985.
+        assert_approx_eq(ev("=NORMSINV(0.975)"), 1.959_963_985, 1e-6);
+    }
+
+    #[test]
+    fn eval_legacy_poisson_pmf() {
+        // POISSON(0, 2, FALSE) = e^-2.
+        assert_approx_eq(ev("=POISSON(0, 2, FALSE)"), 0.135_335_283_2, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_poisson_cdf() {
+        // POISSON(10, 2, TRUE) should be very close to 1.
+        match ev("=POISSON(10, 2, TRUE)") {
+            Value::Number(n) => assert!(n > 0.999 && n <= 1.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_legacy_poisson_mean_zero_is_error() {
+        assert_eq!(
+            ev("=POISSON(0, 0, FALSE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_tdist_right_tail() {
+        // TDIST(0, 10, 1) = P(T>0) = 0.5 for symmetric T.
+        assert_approx_eq(ev("=TDIST(0, 10, 1)"), 0.5, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_tdist_two_tail() {
+        // TDIST(0, 10, 2) = 2 * P(T>0) = 1.0.
+        assert_approx_eq(ev("=TDIST(0, 10, 2)"), 1.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_tdist_negative_x_is_error() {
+        assert_eq!(
+            ev("=TDIST(-1, 10, 1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_tdist_bad_tails_is_error() {
+        assert_eq!(
+            ev("=TDIST(1, 10, 3)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_tinv_two_tail() {
+        // TINV(1, 10) = T.INV.2T(1, 10) = 0.
+        assert_approx_eq(ev("=TINV(1, 10)"), 0.0, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_tinv_invalid_p() {
+        assert_eq!(ev("=TINV(0, 10)"), Value::Error(ValueError::Overflow));
+    }
+
+    #[test]
+    fn eval_legacy_tinv_invalid_df() {
+        assert_eq!(ev("=TINV(0.5, 0)"), Value::Error(ValueError::Overflow));
+    }
+
+    fn ttest_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // Two paired samples, n=5.
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        for (r, (a, b)) in [
+            (1.0_f64, 2.0_f64),
+            (2.0, 4.0),
+            (3.0, 5.0),
+            (4.0, 7.0),
+            (5.0, 9.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let id_a = AtomId::from_raw((r * 2 + 1) as u64);
+            let id_b = AtomId::from_raw((r * 2 + 2) as u64);
+            cm.insert(CellAddress::new(r as u32, 0), id_a);
+            cm.insert(CellAddress::new(r as u32, 1), id_b);
+            vs.insert(id_a, Value::Number(*a));
+            vs.insert(id_b, Value::Number(*b));
+        }
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_t_test_paired_known() {
+        // Paired diffs: -1, -2, -2, -3, -4 → mean = -2.4, var = 1.3.
+        // SE = sqrt(1.3/5) ≈ 0.5099. t ≈ -4.7064. df=4.
+        // Two-tail p ≈ 0.009240 (well-known reference value).
+        let (cm, vs) = ttest_env();
+        match eval_str("=T.TEST(A1:A5, B1:B5, 2, 1)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 0.009_240).abs() < 1e-4, "got {}", n),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_t_test_two_sample_equal_var() {
+        let (cm, vs) = ttest_env();
+        match eval_str("=T.TEST(A1:A5, B1:B5, 2, 2)", &cm, &vs) {
+            Value::Number(n) => assert!(n > 0.0 && n < 1.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_t_test_welch() {
+        let (cm, vs) = ttest_env();
+        match eval_str("=T.TEST(A1:A5, B1:B5, 2, 3)", &cm, &vs) {
+            Value::Number(n) => assert!(n > 0.0 && n < 1.0),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_t_test_invalid_type() {
+        let (cm, vs) = ttest_env();
+        assert_eq!(
+            eval_str("=T.TEST(A1:A5, B1:B5, 2, 4)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_t_test_invalid_tails() {
+        let (cm, vs) = ttest_env();
+        assert_eq!(
+            eval_str("=T.TEST(A1:A5, B1:B5, 3, 1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_t_test_legacy_alias() {
+        let (cm, vs) = ttest_env();
+        let a = match eval_str("=T.TEST(A1:A5, B1:B5, 2, 2)", &cm, &vs) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        let b = match eval_str("=TTEST(A1:A5, B1:B5, 2, 2)", &cm, &vs) {
+            Value::Number(n) => n,
+            other => panic!("{:?}", other),
+        };
+        assert!((a - b).abs() < 1e-12);
+    }
+
+    #[test]
+    fn eval_legacy_weibull_alias() {
+        assert_approx_eq(ev("=WEIBULL(2, 3, 2, TRUE)"), 0.632_120_558_8, TOL);
+    }
+
+    #[test]
+    fn eval_legacy_weibull_alpha_zero_is_error() {
+        assert_eq!(
+            ev("=WEIBULL(1, 0, 1, TRUE)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn eval_legacy_weibull_wrong_arg_count() {
+        assert_eq!(
+            ev("=WEIBULL(1, 1, 1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    fn ztest_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // A1:A5 = 3,6,7,8,6 (mean=6, sample sd ≈ 1.871).
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        for (r, v) in [3.0_f64, 6.0, 7.0, 8.0, 6.0].iter().enumerate() {
+            let id = AtomId::from_raw((r + 1) as u64);
+            cm.insert(CellAddress::new(r as u32, 0), id);
+            vs.insert(id, Value::Number(*v));
+        }
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_z_test_two_arg() {
+        // x0 = mean → z=0 → p=0.5.
+        let (cm, vs) = ztest_env();
+        match eval_str("=Z.TEST(A1:A5, 6)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 0.5).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+        match eval_str("=ZTEST(A1:A5, 6)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 0.5).abs() < 1e-9),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_z_test_three_arg() {
+        let (cm, vs) = ztest_env();
+        // Provide sigma = 2; x0 below mean → p < 0.5.
+        match eval_str("=Z.TEST(A1:A5, 5, 2)", &cm, &vs) {
+            Value::Number(n) => assert!(n > 0.0 && n < 0.5),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_z_test_invalid_sigma() {
+        let (cm, vs) = ztest_env();
+        assert_eq!(
+            eval_str("=Z.TEST(A1:A5, 5, 0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_z_test_single_value_is_error() {
+        let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
+        let mut vs: HashMap<AtomId, Value> = HashMap::new();
+        cm.insert(CellAddress::new(0, 0), AtomId::from_raw(1));
+        vs.insert(AtomId::from_raw(1), Value::Number(5.0));
+        assert_eq!(
+            eval_str("=Z.TEST(A1:A1, 5)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn legacy_aliases_registered_as_builtins() {
+        // Smoke test the alphabetised reserved-name list.
+        for name in [
+            "BETADIST", "BETAINV", "BINOMDIST", "CHIDIST", "CHIINV",
+            "CHITEST", "CHISQ.TEST", "CONFIDENCE", "CONFIDENCE.NORM",
+            "COVAR", "COVAR.P", "COVARIANCE.P", "COVARIANCE.S",
+            "CRITBINOM", "EXPONDIST", "FDIST", "FINV", "F.TEST", "FTEST",
+            "GAMMADIST", "GAMMAINV", "HYPGEOMDIST", "LOGINV",
+            "LOGNORM.DIST", "LOGNORM.INV", "LOGNORMDIST", "NEGBINOMDIST",
+            "NORMDIST", "NORMINV", "NORMSDIST", "NORMSINV", "POISSON",
+            "TDIST", "TINV", "T.TEST", "TTEST", "WEIBULL", "Z.TEST",
+            "ZTEST",
+        ] {
+            assert!(
+                is_builtin_function_name(name),
+                "{} should be a builtin",
+                name
+            );
+        }
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====
