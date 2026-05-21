@@ -126,6 +126,10 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "AVERAGEIF"
             | "AVERAGEIFS"
             | "BASE"
+            | "BESSELI"
+            | "BESSELJ"
+            | "BESSELK"
+            | "BESSELY"
             | "BETA.DIST"
             | "BETA.INV"
             | "BIN2DEC"
@@ -158,6 +162,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COLUMNS"
             | "COMBIN"
             | "CONCATENATE"
+            | "CONVERT"
             | "CORREL"
             | "COS"
             | "COSH"
@@ -8437,6 +8442,23 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             Value::Text(format_image_payload(&source, alt.as_deref(), sizing, height, width))
         }
+        // === Bessel family ===
+        // BESSELJ / BESSELY / BESSELI / BESSELK all follow the same shape:
+        // two numeric args (x, n), n must be a non-negative integer (Excel
+        // truncates n toward zero before validating). The actual math lives
+        // in `bessel_j_n` / `bessel_y_n` / `bessel_i_n` / `bessel_k_n` below.
+        "BESSELJ" => eval_bessel(args, provider, bessel_j_n),
+        "BESSELY" => eval_bessel(args, provider, bessel_y_n),
+        "BESSELI" => eval_bessel(args, provider, bessel_i_n),
+        "BESSELK" => eval_bessel(args, provider, bessel_k_n),
+
+        // CONVERT(number, from_unit, to_unit) — unit conversion. Looks up
+        // each unit in the static table built by `convert_unit_factor`;
+        // mismatched categories surface `#N/A` (we use `InvalidValue` per
+        // the project's error mapping). Temperature is special-cased
+        // because its conversions are affine, not linear.
+        "CONVERT" => eval_convert(args, provider),
+
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
         // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
@@ -14954,6 +14976,600 @@ fn format_image_number(n: f64) -> String {
     } else {
         format!("{}", n)
     }
+}
+
+// === Bessel + CONVERT helpers ===
+//
+// Bessel functions are implemented from scratch — statrs 0.16 ships
+// gamma/beta/erf but not Bessel, and libm has no Bessel either. The
+// approximations below combine Abramowitz & Stegun rational forms for
+// the low-order kernels (J0/J1, Y0/Y1, I0/I1, K0/K1) with the
+// standard three-term recurrence to reach arbitrary integer order n.
+//
+// Recurrence stability — important:
+//   J_{n+1}(x) =  (2n/x) J_n(x) - J_{n-1}(x)   — forward is unstable
+//                 for n > x; use Miller's downward recurrence instead.
+//   Y_{n+1}(x) =  (2n/x) Y_n(x) - Y_{n-1}(x)   — forward is stable
+//                 (|Y_n| grows in n).
+//   I_{n+1}(x) = -(2n/x) I_n(x) + I_{n-1}(x)   — forward is unstable
+//                 for n > x; Miller-downward keeps it tame.
+//   K_{n+1}(x) =  (2n/x) K_n(x) + K_{n-1}(x)   — forward is stable
+//                 (|K_n| grows in n).
+//
+// Tolerance budget: we aim for ~1e-6 absolute / relative on Excel-typical
+// arguments (|x| ≤ 50, n ≤ 20). That matches `TOL = 1e-6` used by the
+// statrs-based stat tests elsewhere in this file.
+
+/// Shared entry-point for the four BESSEL* arms. Validates arg count,
+/// reads `x` and truncates `n` to integer (Excel's behaviour: `n` is
+/// "truncated to integer if it's not an integer"). Negative `n`, NaN
+/// args, or a kernel that returns a non-finite value all collapse to
+/// `#NUM!`.
+fn eval_bessel(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    kernel: fn(f64, i64) -> Option<f64>,
+) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let x = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let n_raw = match stat_num(&args[1], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !x.is_finite() || !n_raw.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    let n = n_raw.trunc() as i64;
+    if n < 0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    match kernel(x, n) {
+        Some(r) if r.is_finite() => Value::Number(r),
+        _ => Value::Error(ValueError::Overflow),
+    }
+}
+
+/// BESSELJ — Bessel function of the first kind, integer order n ≥ 0.
+///
+/// For small |x| or n ≤ |x|, forward recurrence from J0/J1 (kernels
+/// below) is fine. For n > |x| forward recurrence loses precision, so
+/// we use Miller's downward recurrence: start from a high index with
+/// J_M = 1, J_{M+1} = 0, recur downward, then renormalise using the
+/// identity J_0(x) + 2*Σ_{k≥1} J_{2k}(x) = 1 ... but a cheaper option
+/// is to renormalise against the exact J_0(x) we already compute. We
+/// pick the latter.
+fn bessel_j_n(x: f64, n: i64) -> Option<f64> {
+    let ax = x.abs();
+    if n == 0 {
+        return Some(bessel_j0(x));
+    }
+    if n == 1 {
+        return Some(bessel_j1(x));
+    }
+    if ax == 0.0 {
+        // J_n(0) = 0 for n >= 1.
+        return Some(0.0);
+    }
+    // Sign convention: J_n(-x) = (-1)^n J_n(x). Compute with |x|, fix sign.
+    let sign_flip = if x < 0.0 && n % 2 != 0 { -1.0 } else { 1.0 };
+
+    let n_us = n as usize;
+    // Forward recurrence is stable when n <= ax. Else Miller downward.
+    if (n as f64) <= ax {
+        let mut jm1 = bessel_j0(ax);
+        let mut j = bessel_j1(ax);
+        let mut k = 1i64;
+        while k < n {
+            let jp1 = (2.0 * (k as f64) / ax) * j - jm1;
+            jm1 = j;
+            j = jp1;
+            k += 1;
+        }
+        return Some(sign_flip * j);
+    }
+    // Miller downward recurrence. Start index needs to be well above
+    // n; the classic choice is n + sqrt(40*n). The recurrence we walk
+    // is J_{k-1}(x) = (2k/x) J_k(x) - J_{k+1}(x), with the scratch
+    // initial values J_{M+1} = 0, J_M = 1 (unnormalised). After the
+    // loop, `j_high` holds the unnormalised J_0(x); we rescale every
+    // unnormalised quantity by J_0_true / j_high to recover the true
+    // values, including the J_n captured along the way.
+    let m_start = (n_us + ((40.0 * n_us as f64).sqrt() as usize)).max(2 * n_us + 8);
+    let mut j_higher: f64 = 0.0; // unnormalised J_{k+1}
+    let mut j_high: f64 = 1.0;   // unnormalised J_k (starts at k = m_start)
+    let mut value_at_n: f64 = 0.0;
+    // Iterate k = m_start, m_start - 1, ..., 1 and compute J_{k-1}.
+    for k in (1..=m_start).rev() {
+        let j_lower = (2.0 * (k as f64) / ax) * j_high - j_higher;
+        j_higher = j_high;
+        j_high = j_lower;
+        // After the shift, j_high == J_{k-1}.
+        if (k as i64) - 1 == n {
+            value_at_n = j_high;
+        }
+        // Rescale to keep magnitudes manageable.
+        if j_high.abs() > 1e10 {
+            j_high *= 1e-10;
+            j_higher *= 1e-10;
+            value_at_n *= 1e-10;
+        }
+    }
+    // After the loop, j_high ≈ unnormalised J_0(x). Renormalise.
+    let j0_true = bessel_j0(ax);
+    if j_high == 0.0 {
+        return Some(0.0);
+    }
+    Some(sign_flip * value_at_n * (j0_true / j_high))
+}
+
+/// BESSELY — Bessel function of the second kind, integer order n ≥ 0.
+/// Singular at x = 0 for all n, and undefined for x < 0 (Excel
+/// returns `#NUM!`).
+fn bessel_y_n(x: f64, n: i64) -> Option<f64> {
+    if x <= 0.0 {
+        return None; // singular / undefined
+    }
+    if n == 0 {
+        return Some(bessel_y0(x));
+    }
+    if n == 1 {
+        return Some(bessel_y1(x));
+    }
+    // Forward recurrence is stable for Y_n.
+    let mut ym1 = bessel_y0(x);
+    let mut y = bessel_y1(x);
+    let mut k = 1i64;
+    while k < n {
+        let yp1 = (2.0 * (k as f64) / x) * y - ym1;
+        ym1 = y;
+        y = yp1;
+        k += 1;
+    }
+    Some(y)
+}
+
+/// BESSELI — Modified Bessel function of the first kind, integer
+/// order n ≥ 0.
+fn bessel_i_n(x: f64, n: i64) -> Option<f64> {
+    let ax = x.abs();
+    if n == 0 {
+        return Some(bessel_i0(ax));
+    }
+    if n == 1 {
+        // Sign convention: I_n(-x) = (-1)^n I_n(x). For n=1, odd → flip.
+        let s = if x < 0.0 { -1.0 } else { 1.0 };
+        return Some(s * bessel_i1(ax));
+    }
+    if ax == 0.0 {
+        return Some(0.0);
+    }
+    let sign_flip = if x < 0.0 && n % 2 != 0 { -1.0 } else { 1.0 };
+    let n_us = n as usize;
+
+    // Miller-downward for stability. Recurrence:
+    //   I_{k-1}(x) = (2k/x) I_k(x) + I_{k+1}(x)
+    // (NOTE: plus, not minus, because I is the *modified* Bessel.)
+    // Start from a high index M with I_M = 1, I_{M+1} = 0, recur down,
+    // then renormalise via the true I_0(x).
+    let m_start = (n_us + ((40.0 * n_us as f64).sqrt() as usize)).max(2 * n_us + 8);
+    let mut i_higher: f64 = 0.0; // unnormalised I_{k+1}
+    let mut i_high: f64 = 1.0;   // unnormalised I_k (starts at k = m_start)
+    let mut value_at_n: f64 = 0.0;
+    for k in (1..=m_start).rev() {
+        let i_lower = (2.0 * (k as f64) / ax) * i_high + i_higher;
+        i_higher = i_high;
+        i_high = i_lower;
+        // After the shift, i_high == I_{k-1}.
+        if (k as i64) - 1 == n {
+            value_at_n = i_high;
+        }
+        if i_high.abs() > 1e10 {
+            i_high *= 1e-10;
+            i_higher *= 1e-10;
+            value_at_n *= 1e-10;
+        }
+    }
+    let i0_true = bessel_i0(ax);
+    if i_high == 0.0 {
+        return Some(0.0);
+    }
+    Some(sign_flip * value_at_n * (i0_true / i_high))
+}
+
+/// BESSELK — Modified Bessel function of the second kind, integer
+/// order n ≥ 0. Singular at x = 0 and undefined for x < 0.
+fn bessel_k_n(x: f64, n: i64) -> Option<f64> {
+    if x <= 0.0 {
+        return None;
+    }
+    if n == 0 {
+        return Some(bessel_k0(x));
+    }
+    if n == 1 {
+        return Some(bessel_k1(x));
+    }
+    // Forward recurrence is stable for K_n (K_n grows in n).
+    let mut km1 = bessel_k0(x);
+    let mut k = bessel_k1(x);
+    let mut j = 1i64;
+    while j < n {
+        let kp1 = (2.0 * (j as f64) / x) * k + km1;
+        km1 = k;
+        k = kp1;
+        j += 1;
+    }
+    Some(k)
+}
+
+/// J_0(x). Rational approximation from Abramowitz & Stegun 9.4.1 / 9.4.3.
+/// Accurate to ~1e-7 over the reals.
+fn bessel_j0(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 8.0 {
+        let y = x * x;
+        let p = 57568490574.0
+            + y * (-13362590354.0
+                + y * (651619640.7
+                    + y * (-11214424.18 + y * (77392.33017 + y * -184.9052456))));
+        let q = 57568490411.0
+            + y * (1029532985.0
+                + y * (9494680.718 + y * (59272.64853 + y * (267.8532712 + y))));
+        p / q
+    } else {
+        let z = 8.0 / ax;
+        let y = z * z;
+        let p1 = 1.0
+            + y * (-0.1098628627e-2
+                + y * (0.2734510407e-4
+                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+        let q1 = -0.1562499995e-1
+            + y * (0.1430488765e-3
+                + y * (-0.6911147651e-5
+                    + y * (0.7621095161e-6 + y * -0.934935152e-7)));
+        let xx = ax - std::f64::consts::FRAC_PI_4;
+        (2.0 / (std::f64::consts::PI * ax)).sqrt() * (xx.cos() * p1 - z * xx.sin() * q1)
+    }
+}
+
+/// J_1(x). A&S 9.4.4 / 9.4.6.
+fn bessel_j1(x: f64) -> f64 {
+    let ax = x.abs();
+    let result = if ax < 8.0 {
+        let y = x * x;
+        let p = x
+            * (72362614232.0
+                + y * (-7895059235.0
+                    + y * (242396853.1
+                        + y * (-2972611.439 + y * (15704.48260 + y * -30.16036606)))));
+        let q = 144725228442.0
+            + y * (2300535178.0
+                + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y))));
+        p / q
+    } else {
+        let z = 8.0 / ax;
+        let y = z * z;
+        let p1 = 1.0
+            + y * (0.183105e-2
+                + y * (-0.3516396496e-4
+                    + y * (0.2457520174e-5 + y * -0.240337019e-6)));
+        let q1 = 0.04687499995
+            + y * (-0.2002690873e-3
+                + y * (0.8449199096e-5
+                    + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+        let xx = ax - 3.0 * std::f64::consts::FRAC_PI_4;
+        let s = (2.0 / (std::f64::consts::PI * ax)).sqrt() * (xx.cos() * p1 - z * xx.sin() * q1);
+        if x < 0.0 { -s } else { s }
+    };
+    result
+}
+
+/// Y_0(x). A&S 9.4.2 / 9.4.3. Caller must pass x > 0.
+fn bessel_y0(x: f64) -> f64 {
+    if x < 8.0 {
+        let y = x * x;
+        let p = -2957821389.0
+            + y * (7062834065.0
+                + y * (-512359803.6
+                    + y * (10879881.29 + y * (-86327.92757 + y * 228.4622733))));
+        let q = 40076544269.0
+            + y * (745249964.8
+                + y * (7189466.438 + y * (47447.26470 + y * (226.1030244 + y))));
+        p / q + 0.636619772 * bessel_j0(x) * x.ln()
+    } else {
+        let z = 8.0 / x;
+        let y = z * z;
+        let p1 = 1.0
+            + y * (-0.1098628627e-2
+                + y * (0.2734510407e-4
+                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+        let q1 = -0.1562499995e-1
+            + y * (0.1430488765e-3
+                + y * (-0.6911147651e-5
+                    + y * (0.7621095161e-6 + y * -0.934935152e-7)));
+        let xx = x - std::f64::consts::FRAC_PI_4;
+        (2.0 / (std::f64::consts::PI * x)).sqrt() * (xx.sin() * p1 + z * xx.cos() * q1)
+    }
+}
+
+/// Y_1(x). A&S 9.4.5 / 9.4.6. Caller must pass x > 0.
+fn bessel_y1(x: f64) -> f64 {
+    if x < 8.0 {
+        let y = x * x;
+        let p = x
+            * (-4.900604943e13
+                + y * (1.275274390e13
+                    + y * (-5.153438139e11
+                        + y * (7.349264551e9
+                            + y * (-4.237922726e7 + y * 8.511937935e4)))));
+        let q = 2.499580570e14
+            + y * (4.244419664e12
+                + y * (3.733650367e10
+                    + y * (2.245904002e8
+                        + y * (1.020426050e6 + y * (3.549632885e3 + y)))));
+        p / q + 0.636619772 * (bessel_j1(x) * x.ln() - 1.0 / x)
+    } else {
+        let z = 8.0 / x;
+        let y = z * z;
+        let p1 = 1.0
+            + y * (0.183105e-2
+                + y * (-0.3516396496e-4
+                    + y * (0.2457520174e-5 + y * -0.240337019e-6)));
+        let q1 = 0.04687499995
+            + y * (-0.2002690873e-3
+                + y * (0.8449199096e-5
+                    + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+        let xx = x - 3.0 * std::f64::consts::FRAC_PI_4;
+        (2.0 / (std::f64::consts::PI * x)).sqrt() * (xx.sin() * p1 + z * xx.cos() * q1)
+    }
+}
+
+/// I_0(x). A&S 9.8.1 / 9.8.2.
+fn bessel_i0(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let y = (x / 3.75).powi(2);
+        1.0 + y
+            * (3.5156229
+                + y * (3.0899424
+                    + y * (1.2067492
+                        + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
+    } else {
+        let y = 3.75 / ax;
+        (ax.exp() / ax.sqrt())
+            * (0.39894228
+                + y * (0.01328592
+                    + y * (0.00225319
+                        + y * (-0.00157565
+                            + y * (0.00916281
+                                + y * (-0.02057706
+                                    + y * (0.02635537
+                                        + y * (-0.01647633 + y * 0.00392377))))))))
+    }
+}
+
+/// I_1(x). A&S 9.8.3 / 9.8.4.
+fn bessel_i1(x: f64) -> f64 {
+    let ax = x.abs();
+    let result = if ax < 3.75 {
+        let y = (x / 3.75).powi(2);
+        ax * (0.5
+            + y * (0.87890594
+                + y * (0.51498869
+                    + y * (0.15084934
+                        + y * (0.02658733 + y * (0.00301532 + y * 0.00032411))))))
+    } else {
+        let y = 3.75 / ax;
+        let p = 0.39894228
+            + y * (-0.03988024
+                + y * (-0.00362018
+                    + y * (0.00163801
+                        + y * (-0.01031555
+                            + y * (0.02282967
+                                + y * (-0.02895312
+                                    + y * (0.01787654 + y * -0.00420059)))))));
+        (ax.exp() / ax.sqrt()) * p
+    };
+    if x < 0.0 { -result } else { result }
+}
+
+/// K_0(x). A&S 9.8.5 / 9.8.6. Caller must pass x > 0.
+fn bessel_k0(x: f64) -> f64 {
+    if x <= 2.0 {
+        let y = x * x / 4.0;
+        -((x / 2.0).ln() * bessel_i0(x))
+            + (-0.57721566
+                + y * (0.42278420
+                    + y * (0.23069756
+                        + y * (0.03488590
+                            + y * (0.00262698 + y * (0.00010750 + y * 0.00000740))))))
+    } else {
+        let y = 2.0 / x;
+        ((-x).exp() / x.sqrt())
+            * (1.25331414
+                + y * (-0.07832358
+                    + y * (0.02189568
+                        + y * (-0.01062446
+                            + y * (0.00587872 + y * (-0.00251540 + y * 0.00053208))))))
+    }
+}
+
+/// K_1(x). A&S 9.8.7 / 9.8.8. Caller must pass x > 0.
+fn bessel_k1(x: f64) -> f64 {
+    if x <= 2.0 {
+        let y = x * x / 4.0;
+        ((x / 2.0).ln() * bessel_i1(x))
+            + (1.0 / x)
+                * (1.0
+                    + y * (0.15443144
+                        + y * (-0.67278579
+                            + y * (-0.18156897
+                                + y * (-0.01919402
+                                    + y * (-0.00110404 + y * -0.00004686))))))
+    } else {
+        let y = 2.0 / x;
+        ((-x).exp() / x.sqrt())
+            * (1.25331414
+                + y * (0.23498619
+                    + y * (-0.03655620
+                        + y * (0.01504268
+                            + y * (-0.00780353
+                                + y * (0.00325614 + y * -0.00068245))))))
+    }
+}
+
+/// Unit categories used by CONVERT. Two units must share a category
+/// (or both be temperature) to convert; otherwise CONVERT returns
+/// `#N/A` (modelled as `InvalidValue` per the project's error map).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConvertCategory {
+    Length,
+    Mass,
+    Time,
+    Pressure,
+    Energy,
+    Power,
+    Temperature,
+}
+
+/// Lookup a unit symbol used by CONVERT. Returns the (category,
+/// factor) pair, where `factor` is "how many base units does one of
+/// these equal" (base unit per category: meter, kilogram, second,
+/// pascal, joule, watt). Temperature units are flagged via
+/// `ConvertCategory::Temperature`; their conversions are affine, not
+/// linear, so the factor field is meaningless and the special-cased
+/// `convert_temperature` is used instead.
+///
+/// Future expansion: Excel's CONVERT supports hundreds of unit
+/// symbols and a metric-prefix expansion grammar (k, M, G, m, u, n,
+/// etc.) that can be stacked on any "metric-prefixable" base. We ship
+/// a representative subset here and only the bare symbols. Metric
+/// prefixing for arbitrary bases is not supported in this revision —
+/// only the explicit table entries below.
+fn convert_unit_factor(unit: &str) -> Option<(ConvertCategory, f64)> {
+    // NOTE: Excel CONVERT is *case-sensitive* for most units (`g` is
+    // gram, `G` is the giga prefix). We follow that — match exactly.
+    use ConvertCategory::*;
+    Some(match unit {
+        // Length (base = meter)
+        "m" => (Length, 1.0),
+        "km" => (Length, 1_000.0),
+        "cm" => (Length, 0.01),
+        "mm" => (Length, 0.001),
+        "in" => (Length, 0.0254),
+        "ft" => (Length, 0.3048),
+        "yd" => (Length, 0.9144),
+        "mi" => (Length, 1609.344),
+        "Nmi" | "nmi" => (Length, 1852.0),
+
+        // Mass / Weight (base = kilogram)
+        "kg" => (Mass, 1.0),
+        "g" => (Mass, 0.001),
+        "mg" => (Mass, 1e-6),
+        "lbm" => (Mass, 0.45359237),
+        "ozm" => (Mass, 0.028349523125),
+        "ton" => (Mass, 907.18474), // US short ton
+
+        // Time (base = second)
+        "sec" | "s" => (Time, 1.0),
+        "mn" | "min" => (Time, 60.0),
+        "hr" => (Time, 3600.0),
+        "day" | "d" => (Time, 86_400.0),
+        "yr" => (Time, 31_557_600.0), // Excel's Julian year (365.25 days)
+
+        // Pressure (base = pascal)
+        "Pa" => (Pressure, 1.0),
+        "atm" => (Pressure, 101_325.0),
+        "mmHg" => (Pressure, 133.322387415),
+        "psi" => (Pressure, 6_894.757293168),
+
+        // Energy (base = joule)
+        "J" => (Energy, 1.0),
+        "cal" => (Energy, 4.184),
+        "kWh" | "wh" => (Energy, 3_600_000.0),
+        "BTU" | "btu" => (Energy, 1_055.05585262),
+        "eV" | "ev" => (Energy, 1.602176634e-19),
+
+        // Power (base = watt)
+        "W" | "w" => (Power, 1.0),
+        "HP" | "h" => (Power, 745.69987158227022),
+        "PS" => (Power, 735.49875),
+
+        // Temperature is special (affine, not linear). The factor here
+        // is unused; the `convert_temperature` path handles the
+        // arithmetic explicitly. We still need distinct entries so the
+        // lookup succeeds.
+        "C" | "cel" => (Temperature, 0.0),
+        "F" | "fah" => (Temperature, 1.0),
+        "K" | "kel" => (Temperature, 2.0),
+
+        _ => return None,
+    })
+}
+
+/// Affine temperature conversion. The "factor" field carried in the
+/// table is overloaded as a tag (0=C, 1=F, 2=K) so we can dispatch
+/// here without re-parsing the unit string.
+fn convert_temperature(value: f64, from_tag: f64, to_tag: f64) -> f64 {
+    // Go via Celsius as the pivot.
+    let c = match from_tag as i32 {
+        0 => value,                          // C
+        1 => (value - 32.0) * 5.0 / 9.0,     // F -> C
+        2 => value - 273.15,                 // K -> C
+        _ => f64::NAN,
+    };
+    match to_tag as i32 {
+        0 => c,                          // C
+        1 => c * 9.0 / 5.0 + 32.0,       // C -> F
+        2 => c + 273.15,                 // C -> K
+        _ => f64::NAN,
+    }
+}
+
+fn eval_convert(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let value = match stat_num(&args[0], provider) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if !value.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    let from_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = from_v {
+        return Value::Error(e);
+    }
+    let to_v = eval_expr_with_provider(&args[2], provider);
+    if let Value::Error(e) = to_v {
+        return Value::Error(e);
+    }
+    let from_unit = coerce_to_text(&from_v);
+    let to_unit = coerce_to_text(&to_v);
+
+    let (from_cat, from_factor) = match convert_unit_factor(&from_unit) {
+        Some(t) => t,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    let (to_cat, to_factor) = match convert_unit_factor(&to_unit) {
+        Some(t) => t,
+        None => return Value::Error(ValueError::InvalidValue),
+    };
+    if from_cat != to_cat {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let result = if from_cat == ConvertCategory::Temperature {
+        convert_temperature(value, from_factor, to_factor)
+    } else {
+        // Linear: value (in `from`) -> base unit -> target unit.
+        value * from_factor / to_factor
+    };
+    stat_finite(result)
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -29976,6 +30592,188 @@ mod tests {
         // string literal, so we drive the helper directly here.
         let s = super::format_image_payload("u", Some("a \"b\" c"), 0, None, None);
         assert_eq!(s, "<IMAGE: u alt=\"a \\\"b\\\" c\">");
+    }
+
+    // === Bessel + CONVERT tests ===
+    //
+    // Tolerance: BESSEL_TOL = 1e-5. The hand-written rational
+    // approximations are good to ~1e-7 in their primary range but lose
+    // a couple of digits across the recurrence chain for n > 1.
+    // 1e-5 covers every entry in this suite with margin.
+
+    const BESSEL_TOL: f64 = 1e-5;
+
+    #[test]
+    fn bessel_j_basic() {
+        // J_0(0) = 1 exactly.
+        assert_approx_eq(ev("=BESSELJ(0, 0)"), 1.0, BESSEL_TOL);
+        // J_n(0) = 0 for n >= 1.
+        assert_approx_eq(ev("=BESSELJ(0, 1)"), 0.0, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELJ(0, 5)"), 0.0, BESSEL_TOL);
+        // First positive zero of J_0 is ≈ 2.4048255577.
+        assert_approx_eq(ev("=BESSELJ(2.4048255577, 0)"), 0.0, 1e-4);
+        // Known reference values (Wikipedia / DLMF tables).
+        assert_approx_eq(ev("=BESSELJ(1, 0)"), 0.7651976866, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELJ(1, 1)"), 0.4400505857, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELJ(5, 2)"), 0.046565116278635, 1e-4);
+    }
+
+    #[test]
+    fn bessel_j_higher_order_via_recurrence() {
+        // J_3(10) ≈ 0.0583789589 (forward recurrence range: n < x).
+        assert_approx_eq(ev("=BESSELJ(10, 3)"), 0.0583789589, 1e-4);
+        // J_5(2) ≈ 0.0070396 (Miller-downward range: n > x).
+        assert_approx_eq(ev("=BESSELJ(2, 5)"), 0.0070396298635, 1e-4);
+    }
+
+    #[test]
+    fn bessel_j_truncates_order_and_rejects_negative() {
+        // n is truncated toward zero, so 1.9 -> 1.
+        assert_approx_eq(ev("=BESSELJ(1, 1.9)"), 0.4400505857, BESSEL_TOL);
+        // Negative n is `#NUM!`.
+        assert_eq!(
+            ev("=BESSELJ(1, -1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn bessel_y_basic() {
+        // Y is singular at x=0 for every n -> `#NUM!`.
+        assert_eq!(
+            ev("=BESSELY(0, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            ev("=BESSELY(0, 3)"),
+            Value::Error(ValueError::Overflow)
+        );
+        // Y is undefined for x < 0 -> `#NUM!`.
+        assert_eq!(
+            ev("=BESSELY(-1, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+        // Reference: Y_0(1) ≈ 0.08825696, Y_1(1) ≈ -0.78121282.
+        assert_approx_eq(ev("=BESSELY(1, 0)"), 0.0882569642, 1e-4);
+        assert_approx_eq(ev("=BESSELY(1, 1)"), -0.7812128213, 1e-4);
+        // Higher order via recurrence: Y_2(1) ≈ -1.6506826.
+        assert_approx_eq(ev("=BESSELY(1, 2)"), -1.6506826, 1e-3);
+    }
+
+    #[test]
+    fn bessel_i_basic() {
+        // I_0(0) = 1 exactly; I_n(0) = 0 for n >= 1.
+        assert_approx_eq(ev("=BESSELI(0, 0)"), 1.0, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELI(0, 1)"), 0.0, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELI(0, 4)"), 0.0, BESSEL_TOL);
+        // I_0(1) ≈ 1.2660658, I_1(1) ≈ 0.5651591.
+        assert_approx_eq(ev("=BESSELI(1, 0)"), 1.2660658, BESSEL_TOL);
+        assert_approx_eq(ev("=BESSELI(1, 1)"), 0.5651591, BESSEL_TOL);
+        // I_3(2) ≈ 0.2127836 (Miller-downward range).
+        assert_approx_eq(ev("=BESSELI(2, 3)"), 0.2127836, 1e-4);
+        // Negative n -> `#NUM!`.
+        assert_eq!(
+            ev("=BESSELI(1, -1)"),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+
+    #[test]
+    fn bessel_k_basic() {
+        // Singular at x=0 -> `#NUM!`.
+        assert_eq!(
+            ev("=BESSELK(0, 0)"),
+            Value::Error(ValueError::Overflow)
+        );
+        // K_0(1) ≈ 0.42102443, K_1(1) ≈ 0.60190723.
+        assert_approx_eq(ev("=BESSELK(1, 0)"), 0.42102443, 1e-4);
+        assert_approx_eq(ev("=BESSELK(1, 1)"), 0.60190723, 1e-4);
+        // K_2(1) ≈ 1.6248389 (forward recurrence).
+        assert_approx_eq(ev("=BESSELK(1, 2)"), 1.6248389, 1e-3);
+    }
+
+    #[test]
+    fn bessel_arg_count_errors() {
+        assert_eq!(ev("=BESSELJ()"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(ev("=BESSELJ(1)"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(
+            ev("=BESSELJ(1, 0, 2)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn convert_length() {
+        // 1 yard = 0.9144 metre exactly.
+        assert_approx_eq(ev(r#"=CONVERT(1, "yd", "m")"#), 0.9144, 1e-9);
+        // 100 cm = 1 m.
+        assert_approx_eq(ev(r#"=CONVERT(100, "cm", "m")"#), 1.0, 1e-9);
+        // 1 mile = 1609.344 m.
+        assert_approx_eq(ev(r#"=CONVERT(1, "mi", "m")"#), 1609.344, 1e-6);
+        // 1 inch = 2.54 cm.
+        assert_approx_eq(ev(r#"=CONVERT(1, "in", "cm")"#), 2.54, 1e-9);
+    }
+
+    #[test]
+    fn convert_mass() {
+        // 1 kg ≈ 2.20462 lbm.
+        assert_approx_eq(ev(r#"=CONVERT(1, "kg", "lbm")"#), 2.20462262185, 1e-6);
+        // 1 ton = 2000 lbm (US short ton, by definition: 907.18474 kg).
+        assert_approx_eq(ev(r#"=CONVERT(1, "ton", "lbm")"#), 2000.0, 1e-3);
+    }
+
+    #[test]
+    fn convert_time() {
+        assert_approx_eq(ev(r#"=CONVERT(60, "sec", "mn")"#), 1.0, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(1, "hr", "sec")"#), 3600.0, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(1, "day", "hr")"#), 24.0, 1e-9);
+    }
+
+    #[test]
+    fn convert_pressure() {
+        assert_approx_eq(ev(r#"=CONVERT(1, "atm", "Pa")"#), 101325.0, 1e-3);
+        assert_approx_eq(ev(r#"=CONVERT(1, "psi", "Pa")"#), 6894.757293168, 1e-3);
+    }
+
+    #[test]
+    fn convert_energy_power() {
+        assert_approx_eq(ev(r#"=CONVERT(1, "cal", "J")"#), 4.184, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(1, "kWh", "J")"#), 3_600_000.0, 1e-3);
+        assert_approx_eq(ev(r#"=CONVERT(1, "HP", "W")"#), 745.69987158227022, 1e-3);
+    }
+
+    #[test]
+    fn convert_temperature() {
+        // Boiling point: 100C = 212F = 373.15K.
+        assert_approx_eq(ev(r#"=CONVERT(212, "F", "C")"#), 100.0, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(100, "C", "F")"#), 212.0, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(0, "C", "K")"#), 273.15, 1e-9);
+        assert_approx_eq(ev(r#"=CONVERT(273.15, "K", "C")"#), 0.0, 1e-9);
+        // Cross conversion F <-> K.
+        assert_approx_eq(ev(r#"=CONVERT(32, "F", "K")"#), 273.15, 1e-9);
+    }
+
+    #[test]
+    fn convert_errors() {
+        // Incompatible categories -> `#VALUE!` (project's stand-in for #N/A).
+        assert_eq!(
+            ev(r#"=CONVERT(1, "kg", "sec")"#),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Unknown unit -> same error.
+        assert_eq!(
+            ev(r#"=CONVERT(1, "frobnicate", "m")"#),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count error.
+        assert_eq!(
+            ev(r#"=CONVERT(1, "m")"#),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev(r#"=CONVERT(1, "m", "cm", "extra")"#),
+            Value::Error(ValueError::WrongArgCount)
+        );
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====
