@@ -7635,6 +7635,21 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "XIRR" => fn_xirr(args, provider),
         "XNPV" => fn_xnpv(args, provider),
         "MIRR" => fn_mirr(args, provider),
+        "PRICE" => fn_price(args, provider),
+        "YIELD" => fn_yield(args, provider),
+        "DURATION" => fn_duration(args, provider),
+        "MDURATION" => fn_mduration(args, provider),
+        "PRICEDISC" => fn_pricedisc(args, provider),
+        "YIELDDISC" => fn_yielddisc(args, provider),
+        "PRICEMAT" => fn_pricemat(args, provider),
+        "YIELDMAT" => fn_yieldmat(args, provider),
+        "DOLLARDE" => fn_dollarde(args, provider),
+        "DOLLARFR" => fn_dollarfr(args, provider),
+        "COUPDAYBS" => fn_coupdaybs(args, provider),
+        "COUPDAYS" => fn_coupdays(args, provider),
+        "COUPNUM" => fn_coupnum(args, provider),
+        "AMORDEGRC" => fn_amordegrc(args, provider),
+        "AMORLINC" => fn_amorlinc(args, provider),
         "UNICHAR" => fn_unichar(args, provider),
         "UNICODE" => fn_unicode(args, provider),
         "NUMBERVALUE" => fn_numbervalue(args, provider),
@@ -7976,6 +7991,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             Value::Text(format_complex(r, i, s))
         }
+        // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
+        // Sentinel for parallel-agent merges — every new built-in dispatch arm
+        // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
+        // marker so concurrent worktrees don't fight over the `_ =>` line.
         _ => eval_named_call(name, args, provider),
     }
 }
@@ -12271,6 +12290,904 @@ fn fn_mirr(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
 }
 
+// ----- Bond-depth helpers ------------------------------------------------
+//
+// Coupon-period arithmetic is intentionally simplified: we treat the
+// previous-coupon date as `maturity - N*period_days` (largest N keeping
+// the result >= settlement). `period_days` is 360/freq for basis 0/2/4,
+// 365/freq for basis 3, and `actual` (computed via DATE math subtracting
+// months) for basis 1. This is faithful enough for happy-path bond
+// scenarios but does not match Excel's exact actual/actual handling for
+// odd first/last coupon periods.
+
+/// Coupon-period length in days for a given frequency + basis.
+/// Returns the canonical Excel "E" denominator used in PRICE/YIELD.
+fn coup_period_days(frequency: i64, basis: i64) -> f64 {
+    match basis {
+        0 | 2 | 4 => 360.0 / frequency as f64,
+        3 => 365.0 / frequency as f64,
+        // basis 1 (actual/actual): we approximate with the average year
+        // length; callers that need the actual period split use
+        // prev/next_coupon_date together with day_diff.
+        1 => 365.25 / frequency as f64,
+        _ => f64::NAN,
+    }
+}
+
+/// Previous coupon date strictly <= settlement, derived by walking back
+/// from maturity in whole coupon periods. We use a date-arithmetic walk
+/// (subtract `12 / frequency` months) rather than serial subtraction so
+/// month-end semantics line up with Excel's coupon-date conventions.
+fn prev_coupon_date(settlement: f64, maturity: f64, frequency: i64) -> f64 {
+    let months_per_period = 12 / frequency as i32;
+    let (my, mm, md) = date_from_serial(maturity);
+    let mut k = 0i32;
+    loop {
+        let total_months = (my * 12 + (mm as i32 - 1)) - k * months_per_period;
+        let ny = total_months.div_euclid(12);
+        let nm = (total_months.rem_euclid(12) + 1) as u32;
+        // Day-of-month clamp to last day of target month.
+        let dom = days_in_month(ny, nm);
+        let nd = md.min(dom);
+        let serial = date_serial(ny, nm, nd);
+        if serial <= settlement {
+            return serial;
+        }
+        k += 1;
+        if k > 4_000 {
+            // Safety net: ~1000 years on quarterly bonds; bail out so we
+            // never spin forever on a malformed input.
+            return serial;
+        }
+    }
+}
+
+/// Next coupon date strictly > settlement. Same walk as prev but stops
+/// one period earlier.
+fn next_coupon_date(settlement: f64, maturity: f64, frequency: i64) -> f64 {
+    let prev = prev_coupon_date(settlement, maturity, frequency);
+    let months_per_period = 12 / frequency as i32;
+    let (py, pm, pd) = date_from_serial(prev);
+    let total_months = py * 12 + (pm as i32 - 1) + months_per_period;
+    let ny = total_months.div_euclid(12);
+    let nm = (total_months.rem_euclid(12) + 1) as u32;
+    let dom = days_in_month(ny, nm);
+    let nd = pd.min(dom);
+    date_serial(ny, nm, nd)
+}
+
+/// Number of coupons from settlement to maturity (rounded up to whole
+/// coupons). Used by COUPNUM and PRICE's `N`.
+fn coup_num(settlement: f64, maturity: f64, frequency: i64) -> f64 {
+    let months_per_period = 12 / frequency as i32;
+    let (sy, sm, _sd) = date_from_serial(settlement);
+    let (my, mm, _md) = date_from_serial(maturity);
+    let months_between = (my * 12 + mm as i32 - 1) - (sy * 12 + sm as i32 - 1);
+    let raw = months_between as f64 / months_per_period as f64;
+    // Settlement strictly before any coupon contributes a fractional
+    // period — round up to a whole coupon count.
+    raw.ceil().max(1.0)
+}
+
+/// Coupon-period split (A, DSC, E) at `settlement` in days. Returned
+/// triple is `(A = days from prev coupon to settlement, DSC = days from
+/// settlement to next coupon, E = days in coupon period)`. We pin DSC + A = E
+/// so that at exact coupon boundaries DSC/E = 1.0 and A/E = 0.0 (the
+/// invariant that drives PRICE_at_par_yield = par).
+fn coup_period_split(
+    settlement: f64,
+    maturity: f64,
+    frequency: i64,
+    basis: i64,
+) -> (f64, f64, f64) {
+    let pcd = prev_coupon_date(settlement, maturity, frequency);
+    let ncd = next_coupon_date(settlement, maturity, frequency);
+    // For basis 1 and 3 we use the real day diff; for 0/2/4 we use the
+    // canonical 30/360 period length so A + DSC = E exactly.
+    let e_real = day_diff(pcd, ncd).max(1.0);
+    let e_canonical = coup_period_days(frequency, basis);
+    let (a_real, dsc_real) = (
+        day_diff(pcd, settlement).max(0.0),
+        day_diff(settlement, ncd).max(0.0),
+    );
+    match basis {
+        0 | 2 | 4 => {
+            // Map the real fractional position onto the canonical period
+            // length. A/E and DSC/E thus depend only on where settlement
+            // falls within the period, not the basis-specific year length.
+            let frac = if e_real > 0.0 { a_real / e_real } else { 0.0 };
+            let a = e_canonical * frac;
+            (a, e_canonical - a, e_canonical)
+        }
+        _ => (a_real, dsc_real, e_real),
+    }
+}
+
+/// Clean-price ("PRICE") computation pulled out so YIELD's Newton solver
+/// can re-use it without re-parsing arguments.
+fn price_from_yield(
+    settlement: f64,
+    maturity: f64,
+    rate: f64,
+    yld: f64,
+    redemption: f64,
+    frequency: i64,
+    basis: i64,
+) -> Result<f64, ValueError> {
+    let (a, dsc, e) = coup_period_split(settlement, maturity, frequency, basis);
+    if !e.is_finite() || e <= 0.0 {
+        return Err(ValueError::InvalidValue);
+    }
+    // N = coupons remaining from settlement to maturity (inclusive of the
+    // last one). The largest k such that pcd + k*period <= maturity.
+    let n = coup_num(settlement, maturity, frequency);
+    let f = frequency as f64;
+    let dsc_e = (dsc / e).max(0.0);
+    let coupon = 100.0 * rate / f;
+    let one_plus = 1.0 + yld / f;
+    if one_plus <= 0.0 {
+        return Err(ValueError::Overflow);
+    }
+    // Redemption discount: redemption / (1+y/f)^(N-1+DSC/E).
+    let redemp = redemption / one_plus.powf(n - 1.0 + dsc_e);
+    let mut coupons_pv = 0.0_f64;
+    let n_int = n as i64;
+    for k in 1..=n_int {
+        let exp = (k as f64) - 1.0 + dsc_e;
+        coupons_pv += coupon / one_plus.powf(exp);
+    }
+    let accrued = coupon * a / e;
+    let price = redemp + coupons_pv - accrued;
+    if !price.is_finite() {
+        return Err(ValueError::Overflow);
+    }
+    Ok(price)
+}
+
+fn fn_price(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 6 || args.len() > 7 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[5], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 6, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0 || yld < 0.0 || redemption <= 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    match price_from_yield(settlement, maturity, rate, yld, redemption, frequency, basis) {
+        Ok(p) => Value::Number(p),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_yield(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 6 || args.len() > 7 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[5], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 6, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if rate < 0.0 || pr <= 0.0 || redemption <= 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Newton-Raphson on PRICE(yield) - pr.
+    let mut y = rate.max(0.05);
+    for _ in 0..100 {
+        let p = match price_from_yield(settlement, maturity, rate, y, redemption, frequency, basis)
+        {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        };
+        let dy = 1e-6_f64;
+        let p2 = match price_from_yield(
+            settlement,
+            maturity,
+            rate,
+            y + dy,
+            redemption,
+            frequency,
+            basis,
+        ) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        };
+        let f = p - pr;
+        if f.abs() < 1e-7 {
+            return Value::Number(y);
+        }
+        let fp = (p2 - p) / dy;
+        if fp == 0.0 || !fp.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        let next = y - f / fp;
+        if !next.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        if (next - y).abs() < 1e-9 {
+            return Value::Number(next);
+        }
+        y = next;
+    }
+    Value::Error(ValueError::Overflow)
+}
+
+/// Macaulay duration shared between DURATION (returns it directly) and
+/// MDURATION (divides it by `1 + yld/freq`).
+fn macaulay_duration(
+    settlement: f64,
+    maturity: f64,
+    coupon: f64,
+    yld: f64,
+    frequency: i64,
+    basis: i64,
+) -> Result<f64, ValueError> {
+    let (_a, dsc, e) = coup_period_split(settlement, maturity, frequency, basis);
+    if !e.is_finite() || e <= 0.0 {
+        return Err(ValueError::InvalidValue);
+    }
+    let dsc_e = dsc / e;
+    let n = coup_num(settlement, maturity, frequency);
+    let f = frequency as f64;
+    let cpn = 100.0 * coupon / f;
+    let redemption = 100.0;
+    let one_plus = 1.0 + yld / f;
+    if one_plus <= 0.0 {
+        return Err(ValueError::Overflow);
+    }
+    let mut weighted = 0.0_f64;
+    let mut pv_total = 0.0_f64;
+    let n_int = n as i64;
+    for k in 1..=n_int {
+        let t_periods = (k as f64) - 1.0 + dsc_e;
+        let t_years = t_periods / f;
+        let pv = cpn / one_plus.powf(t_periods);
+        weighted += t_years * pv;
+        pv_total += pv;
+    }
+    let t_redemp_periods = (n_int as f64) - 1.0 + dsc_e;
+    let t_redemp_years = t_redemp_periods / f;
+    let pv_redemp = redemption / one_plus.powf(t_redemp_periods);
+    weighted += t_redemp_years * pv_redemp;
+    pv_total += pv_redemp;
+    if pv_total == 0.0 || !pv_total.is_finite() {
+        return Err(ValueError::DivisionByZero);
+    }
+    Ok(weighted / pv_total)
+}
+
+fn fn_duration(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 5 || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let coupon = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[4], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 5, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if coupon < 0.0 || yld < 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    match macaulay_duration(settlement, maturity, coupon, yld, frequency, basis) {
+        Ok(d) => Value::Number(d),
+        Err(e) => Value::Error(e),
+    }
+}
+
+fn fn_mduration(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 5 || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let coupon = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[4], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 5, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if coupon < 0.0 || yld < 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    let d = match macaulay_duration(settlement, maturity, coupon, yld, frequency, basis) {
+        Ok(d) => d,
+        Err(e) => return Value::Error(e),
+    };
+    let denom = 1.0 + yld / frequency as f64;
+    if denom == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    Value::Number(d / denom)
+}
+
+fn fn_pricedisc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let discount = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if discount <= 0.0 || redemption <= 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(redemption * (1.0 - discount * yf))
+}
+
+fn fn_yielddisc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if pr <= 0.0 || redemption <= 0.0 || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if yf == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    Value::Number((redemption - pr) / pr / yf)
+}
+
+fn fn_pricemat(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 5 || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let issue = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let yld = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 5, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate < 0.0 || yld < 0.0 || settlement >= maturity || issue >= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dim = match yearfrac_basis(issue, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let a = match yearfrac_basis(issue, settlement, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let dsm = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let denom = 1.0 + dsm * yld;
+    if denom == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let numer = 100.0 + dim * rate * 100.0;
+    let price = numer / denom - a * rate * 100.0;
+    if price.is_finite() {
+        Value::Number(price)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_yieldmat(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 5 || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let issue = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 5, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate < 0.0 || pr <= 0.0 || settlement >= maturity || issue >= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dim = match yearfrac_basis(issue, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let a = match yearfrac_basis(issue, settlement, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let dsm = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if dsm == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    // YIELDMAT closed form: y = ((1 + DIM*rate) / (pr/100 + A*rate) - 1) / DSM.
+    let denom_inner = pr / 100.0 + a * rate;
+    if denom_inner == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let y = ((1.0 + dim * rate) / denom_inner - 1.0) / dsm;
+    if y.is_finite() {
+        Value::Number(y)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_dollarde(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let frac_dollar = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let fraction = match fin_coerce(&args[1], provider) {
+        Ok(v) => v.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if fraction < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if fraction < 1.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let sign = if frac_dollar < 0.0 { -1.0 } else { 1.0 };
+    let abs_dollar = frac_dollar.abs();
+    let int_part = abs_dollar.trunc();
+    let frac_part = abs_dollar - int_part;
+    let scale = 10.0_f64.powf((fraction).log10().ceil());
+    let decimal = int_part + frac_part * scale / fraction;
+    let result = sign * decimal;
+    if result.is_finite() {
+        Value::Number(result)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_dollarfr(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let dec_dollar = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let fraction = match fin_coerce(&args[1], provider) {
+        Ok(v) => v.trunc(),
+        Err(e) => return Value::Error(e),
+    };
+    if fraction < 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if fraction < 1.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let sign = if dec_dollar < 0.0 { -1.0 } else { 1.0 };
+    let abs_dollar = dec_dollar.abs();
+    let int_part = abs_dollar.trunc();
+    let dec_part = abs_dollar - int_part;
+    let scale = 10.0_f64.powf((fraction).log10().ceil());
+    let frac_part = dec_part * fraction / scale;
+    let result = sign * (int_part + frac_part);
+    if result.is_finite() {
+        Value::Number(result)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_coupdaybs(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    // basis is validated for range parity with Excel but doesn't change
+    // the simple settlement - prev_coupon day count we surface.
+    let _basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    let pcd = prev_coupon_date(settlement, maturity, frequency);
+    Value::Number(day_diff(pcd, settlement).max(0.0))
+}
+
+fn fn_coupdays(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    // For basis 1 (actual/actual) we return the real day count between
+    // prev and next coupon dates. For other bases we return the canonical
+    // 360/freq or 365/freq number that yearfrac_basis uses.
+    let days = if basis == 1 {
+        let pcd = prev_coupon_date(settlement, maturity, frequency);
+        let ncd = next_coupon_date(settlement, maturity, frequency);
+        day_diff(pcd, ncd)
+    } else {
+        coup_period_days(frequency, basis)
+    };
+    Value::Number(days)
+}
+
+fn fn_coupnum(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[2], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let _basis = match fin_basis(args, 3, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if !matches!(frequency, 1 | 2 | 4) || settlement >= maturity {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(coup_num(settlement, maturity, frequency))
+}
+
+/// AMORDEGRC coefficient table per the French tax-accounting
+/// convention. Life is `1/rate`.
+fn amordegrc_coefficient(life: f64) -> Option<f64> {
+    if life >= 3.0 && life < 5.0 {
+        Some(1.5)
+    } else if life >= 5.0 && life <= 6.0 {
+        Some(2.0)
+    } else if life > 6.0 {
+        Some(2.5)
+    } else {
+        None
+    }
+}
+
+fn fn_amordegrc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 6 || args.len() > 7 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let purchased = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let first_period = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match fin_coerce(&args[4], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 6, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if cost <= 0.0 || rate <= 0.0 || period < 0 || salvage < 0.0 || salvage >= cost {
+        return Value::Error(ValueError::Overflow);
+    }
+    let life = 1.0 / rate;
+    let coef = match amordegrc_coefficient(life) {
+        Some(c) => c,
+        None => 1.0,
+    };
+    let ddb_rate = rate * coef;
+    let first_frac = match yearfrac_basis(purchased, first_period, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let first_dep = (cost * ddb_rate * first_frac).round();
+    let mut book = cost - first_dep;
+    if period == 0 {
+        return Value::Number(first_dep.max(0.0).min(cost - salvage));
+    }
+    // Subsequent periods: apply ddb_rate to book; switch to straight-line
+    // once SL >= DDB. Last period clamps to salvage.
+    let mut last_dep = first_dep;
+    for p in 1..=period {
+        let ddb_dep = book * ddb_rate;
+        // straight-line over *remaining* life (in whole periods).
+        let remaining_periods = (life - p as f64).max(1.0);
+        let sl_dep = (book - salvage) / remaining_periods;
+        let dep = if sl_dep > ddb_dep { sl_dep } else { ddb_dep };
+        let dep = dep.max(0.0).min(book - salvage).max(0.0);
+        last_dep = dep;
+        book -= dep;
+        if book <= salvage {
+            break;
+        }
+    }
+    if last_dep.is_finite() {
+        Value::Number(last_dep)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_amorlinc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 6 || args.len() > 7 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let purchased = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let first_period = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match fin_coerce(&args[4], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[5], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 6, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if cost <= 0.0 || rate <= 0.0 || period < 0 || salvage < 0.0 || salvage >= cost {
+        return Value::Error(ValueError::Overflow);
+    }
+    let first_frac = match yearfrac_basis(purchased, first_period, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let annual = cost * rate;
+    let first_dep = (cost * rate * first_frac).round();
+    if period == 0 {
+        return Value::Number(first_dep.max(0.0).min(cost - salvage));
+    }
+    // Each subsequent full period depreciates `cost * rate` until book
+    // reaches salvage; last period adjusts to land exactly at salvage.
+    let mut book = cost - first_dep;
+    let mut last_dep = first_dep;
+    for _ in 1..=period {
+        if book <= salvage {
+            last_dep = 0.0;
+            break;
+        }
+        let dep = annual.min(book - salvage).max(0.0);
+        last_dep = dep;
+        book -= dep;
+    }
+    if last_dep.is_finite() {
+        Value::Number(last_dep)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
 fn fn_unichar(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::WrongArgCount);
@@ -13069,6 +13986,11 @@ fn complex_div(a: f64, b: f64, c: f64, d: f64) -> Option<(f64, f64)> {
     }
     Some(((a * c + b * d) / denom, (b * c - a * d) / denom))
 }
+
+// ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
+// Sentinel for parallel-agent merges — every new free helper fn (`fn yearfrac_basis(...)`),
+// helper struct, or module-private const goes BEFORE this marker so concurrent worktrees
+// don't conflict on `fn collect_numbers`'s preceding blank line.
 
 fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
     let mut out = Vec::new();
@@ -25456,6 +26378,583 @@ mod tests {
         assert_eq!(
             eval_str("=IMABS(B2)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    // ----- Bond-depth tests -------------------------------------------------
+    #[test]
+    fn eval_price_par_yields_par() {
+        let (cm, vs) = make_test_env();
+        // When yield == coupon rate on a bond paying coupons, price ≈ par
+        // (100). This is a textbook property and is robust to our
+        // simplified day-count assumptions because at an exact coupon
+        // boundary A=0 and DSC=E.
+        match eval_str(
+            "=PRICE(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,100,2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 100.0).abs() < 1e-2, "PRICE par got {}", n),
+            other => panic!("PRICE par: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_price_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PRICE(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_price_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICE(DATE(2020,1,1),DATE(2025,1,1),B2,0.05,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_price_invalid_frequency() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICE(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,100,3,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_price_settlement_after_maturity() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICE(DATE(2025,1,1),DATE(2020,1,1),0.05,0.05,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_price_error_propagates() {
+        let (cm, vs) = make_test_env();
+        // 1/0 propagates as DIV/0! through to PRICE's rate arg.
+        assert_eq!(
+            eval_str(
+                "=PRICE(DATE(2020,1,1),DATE(2025,1,1),1/0,0.05,100,2,0)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_yield_inverts_price() {
+        let (cm, vs) = make_test_env();
+        // Round-trip: PRICE then YIELD should land back on the input yield.
+        match eval_str(
+            "=YIELD(DATE(2020,1,1),DATE(2025,1,1),0.05,PRICE(DATE(2020,1,1),DATE(2025,1,1),0.05,0.06,100,2,0),100,2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 0.06).abs() < 1e-5, "YIELD round-trip got {}", n),
+            other => panic!("YIELD round-trip: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_yield_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=YIELD(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_yield_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=YIELD(DATE(2020,1,1),DATE(2025,1,1),0.05,B2,100,2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_yield_settlement_after_maturity() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=YIELD(DATE(2025,1,1),DATE(2020,1,1),0.05,100,100,2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_duration_positive() {
+        let (cm, vs) = make_test_env();
+        // 5-year semi-annual bond: Macaulay duration < life and > 0.
+        match eval_str(
+            "=DURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => {
+                assert!(n > 0.0 && n < 5.0, "DURATION out of range: {}", n);
+            }
+            other => panic!("DURATION: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_duration_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DURATION(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_duration_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=DURATION(DATE(2020,1,1),DATE(2025,1,1),B2,0.05,2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_mduration_less_than_duration() {
+        let (cm, vs) = make_test_env();
+        // MDURATION = DURATION / (1 + yld/freq), so MDURATION < DURATION
+        // when yld > 0.
+        match (
+            eval_str(
+                "=DURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.06,2,0)",
+                &cm, &vs,
+            ),
+            eval_str(
+                "=MDURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.06,2,0)",
+                &cm, &vs,
+            ),
+        ) {
+            (Value::Number(d), Value::Number(m)) => {
+                assert!(m > 0.0 && m < d, "MDURATION {} >= DURATION {}", m, d);
+            }
+            other => panic!("DUR/MDUR: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_mduration_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=MDURATION()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_pricedisc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // PRICEDISC: red * (1 - discount * yearfrac).
+        // basis 0, settlement 2020-01-01, maturity 2020-07-01 → yf=0.5,
+        // discount 0.05, red 100 → 100*(1 - 0.025) = 97.5.
+        match eval_str(
+            "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),0.05,100,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 97.5).abs() < 1e-2, "PRICEDISC got {}", n),
+            other => panic!("PRICEDISC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_pricedisc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PRICEDISC(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_pricedisc_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),B2,100)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_pricedisc_settlement_after_maturity() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICEDISC(DATE(2020,7,1),DATE(2020,1,1),0.05,100)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_yielddisc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // YIELDDISC: (red - pr)/pr/yf. 97.5 -> 100 over 0.5y = 0.05128205...
+        match eval_str(
+            "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),97.5,100,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(
+                (n - (100.0 - 97.5) / 97.5 / 0.5).abs() < 1e-7,
+                "YIELDDISC got {}",
+                n
+            ),
+            other => panic!("YIELDDISC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_yielddisc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=YIELDDISC(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_yielddisc_negative_price() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),-1,100)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_pricemat_happy_path() {
+        let (cm, vs) = make_test_env();
+        // Issue 2019-01-01, settlement 2020-01-01, maturity 2021-01-01,
+        // rate=0.05, yld=0.05. With basis=0: DIM=2.0, A=1.0, DSM=1.0.
+        // price = (100 + 2*0.05*100)/(1 + 1*0.05) - 1*0.05*100
+        //       = 110/1.05 - 5 ≈ 99.7619.
+        match eval_str(
+            "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,0.05,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - (110.0 / 1.05 - 5.0)).abs() < 1e-2, "PRICEMAT got {}", n),
+            other => panic!("PRICEMAT: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_pricemat_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PRICEMAT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_pricemat_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),B2,0.05)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_pricemat_issue_after_settlement() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2020,6,1),0.05,0.05)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_yieldmat_inverts_pricemat() {
+        let (cm, vs) = make_test_env();
+        // Round-trip with PRICEMAT.
+        match eval_str(
+            "=YIELDMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,0.06,0),0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 0.06).abs() < 1e-5, "YIELDMAT round-trip got {}", n),
+            other => panic!("YIELDMAT round-trip: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_yieldmat_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=YIELDMAT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_yieldmat_negative_price() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=YIELDMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,-1)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_dollarde_happy_path() {
+        let (cm, vs) = make_test_env();
+        // 1.10 in 16ths: 1 + 10/16 = 1.625.
+        match eval_str("=DOLLARDE(1.1,16)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.625).abs() < 1e-7, "DOLLARDE got {}", n),
+            other => panic!("DOLLARDE: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_dollarde_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARDE(1.1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_dollarde_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARDE(B2,16)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_dollarde_zero_fraction() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARDE(1.1,0.5)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_dollarde_negative_fraction() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARDE(1.1,-2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_dollarfr_roundtrip() {
+        let (cm, vs) = make_test_env();
+        // DOLLARFR is the inverse of DOLLARDE.
+        match eval_str("=DOLLARFR(1.625,16)", &cm, &vs) {
+            Value::Number(n) => assert!((n - 1.1).abs() < 1e-7, "DOLLARFR got {}", n),
+            other => panic!("DOLLARFR: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_dollarfr_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARFR(1.625)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_dollarfr_zero_fraction() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DOLLARFR(1.625,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_coupdaybs_happy_path() {
+        let (cm, vs) = make_test_env();
+        // Maturity 2020-07-01, frequency 2 → coupons on 01-Jan and 01-Jul.
+        // Settlement 2020-04-01 → days since 01-Jan = 91 (actual days).
+        match eval_str(
+            "=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),2,1)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(n >= 89.0 && n <= 92.0, "COUPDAYBS got {}", n),
+            other => panic!("COUPDAYBS: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_coupdaybs_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COUPDAYBS(DATE(2020,4,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_coupdaybs_invalid_frequency() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),3)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_coupdays_basis_0() {
+        let (cm, vs) = make_test_env();
+        // basis 0 → 360/freq. freq=2 → 180.
+        match eval_str(
+            "=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 180.0).abs() < 1e-9, "COUPDAYS basis0 got {}", n),
+            other => panic!("COUPDAYS basis0: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_coupdays_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COUPDAYS(DATE(2020,4,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_coupdays_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),B2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_coupnum_5_years_semiannual() {
+        let (cm, vs) = make_test_env();
+        // 5 years × 2 = 10 coupons remaining.
+        match eval_str(
+            "=COUPNUM(DATE(2020,1,1),DATE(2025,1,1),2,0)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!((n - 10.0).abs() < 1e-9, "COUPNUM got {}", n),
+            other => panic!("COUPNUM: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_coupnum_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COUPNUM(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_coupnum_settlement_after_maturity() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=COUPNUM(DATE(2025,1,1),DATE(2020,1,1),2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_amordegrc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // cost=2400, salvage=300, rate=0.15 (life ≈ 6.67 → coef 2.5).
+        // First period frac (basis 0) from 2008-08-19 to 2008-12-31.
+        // We just confirm the result is a finite, positive number bounded
+        // by cost - salvage.
+        match eval_str(
+            "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15,1)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(n >= 0.0 && n <= 2100.0, "AMORDEGRC got {}", n),
+            other => panic!("AMORDEGRC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_amordegrc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AMORDEGRC(2400)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_amordegrc_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=AMORDEGRC(B2,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_amordegrc_salvage_exceeds_cost() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=AMORDEGRC(100,DATE(2008,8,19),DATE(2008,12,31),200,1,0.15)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_amorlinc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // Same shape as AMORDEGRC but no coefficient; first-period
+        // depreciation should be cost*rate*frac.
+        match eval_str(
+            "=AMORLINC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,0.15,1)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(n > 0.0 && n < 2400.0, "AMORLINC got {}", n),
+            other => panic!("AMORLINC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_amorlinc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AMORLINC(2400)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_amorlinc_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=AMORLINC(B2,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_amorlinc_negative_rate() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=AMORLINC(2400,DATE(2008,8,19),DATE(2008,12,31),300,1,-0.15)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
         );
     }
 
