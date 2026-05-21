@@ -50,6 +50,10 @@ pub fn contains_invalid_ref(expr: &Expr) -> bool {
             contains_invalid_ref(left) || contains_invalid_ref(right)
         }
         Expr::FuncCall { args, .. } => args.iter().any(contains_invalid_ref),
+        // Constant-array literal: the parser already rejected any cell
+        // ref / range / func call inside, so the elements can't carry a
+        // #REF! sentinel.
+        Expr::ArrayLit { .. } => false,
         _ => false,
     }
 }
@@ -147,6 +151,10 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
             Box::new(map_addrs(callee, f)),
             args.iter().map(|a| map_addrs(a, f)).collect(),
         ),
+        // Constant-array literal: cells are restricted to literals at
+        // parse time, so there are no addresses to retarget. Clone the
+        // node as-is.
+        Expr::ArrayLit { .. } => expr.clone(),
     }
 }
 
@@ -258,6 +266,8 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
                 .map(|a| shift_refs(a, drow, dcol))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        // Constant-array literal: no addresses to shift; clone as-is.
+        Expr::ArrayLit { .. } => expr.clone(),
     })
 }
 
@@ -487,6 +497,24 @@ fn render_into(expr: &Expr, out: &mut String) {
         // without them, `LAMBDA(x, x)(5)` and `LAMBDA(x, x(5))` would
         // share the same surface string when the callee is itself a
         // FuncCall with one body arg.
+        Expr::ArrayLit { rows, cols, data } => {
+            // Render `{a,b;c,d}` — comma separates columns, semicolon
+            // separates rows, row-major. Round-trip with parse_formula.
+            out.push('{');
+            for r in 0..*rows {
+                if r > 0 {
+                    out.push(';');
+                }
+                for c in 0..*cols {
+                    if c > 0 {
+                        out.push(',');
+                    }
+                    let idx = (r as usize) * (*cols as usize) + (c as usize);
+                    render_into(&data[idx], out);
+                }
+            }
+            out.push('}');
+        }
         Expr::Call(callee, args) => {
             out.push('(');
             render_into(callee, out);
@@ -565,6 +593,25 @@ mod tests {
     #[test]
     fn render_whole_row_roundtrip() {
         for syntax in ["=SUM(1:1)", "=SUM(1:3)", "=SUM(100:200)"] {
+            let parsed = parse_formula(syntax).unwrap();
+            let rendered = render_formula(&parsed);
+            let reparsed = parse_formula(&rendered).unwrap();
+            assert_eq!(parsed, reparsed, "round-trip {} -> {}", syntax, rendered);
+        }
+    }
+
+    #[test]
+    fn render_array_literal_roundtrip() {
+        // Parse → render → parse yields the same AST for the
+        // constant-array literal syntax. Covers single-row, single-col,
+        // 2D, and embedded-in-SUM shapes.
+        for syntax in [
+            "={1,2,3}",
+            "={1;2;3}",
+            "={1,2;3,4}",
+            "={-1,2}",
+            "=SUM({10,20,30})",
+        ] {
             let parsed = parse_formula(syntax).unwrap();
             let rendered = render_formula(&parsed);
             let reparsed = parse_formula(&rendered).unwrap();

@@ -3072,6 +3072,9 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
                 collect_range_refs_into(a, out);
             }
         }
+        // Constant-array literal: parser rejects any range / cell ref
+        // inside, so there are no dependencies to register.
+        Expr::ArrayLit { .. } => {}
     }
 }
 
@@ -3132,6 +3135,8 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
                 collect_refs(a, out);
             }
         }
+        // Constant-array literal carries no cell references.
+        Expr::ArrayLit { .. } => {}
     }
 }
 
@@ -3210,6 +3215,8 @@ fn collect_formula_refs_into(
                 collect_formula_refs_into(a, formula_exprs, out);
             }
         }
+        // Constant-array literal carries no formula-graph references.
+        Expr::ArrayLit { .. } => {}
     }
 }
 
@@ -3231,6 +3238,9 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::Call(callee, args) => {
             expr_has_sheet_ref(callee) || args.iter().any(expr_has_sheet_ref)
         }
+        // Constant-array literal can't carry a SheetRef (parser rejected
+        // refs of any kind inside `{...}`).
+        Expr::ArrayLit { .. } => false,
     }
 }
 
@@ -3289,6 +3299,10 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
         Expr::Call(callee, args) => {
             expr_may_produce_array(callee) || args.iter().any(expr_may_produce_array)
         }
+        // Constant-array literal evaluates directly to `Value::Array`,
+        // so a top-level `={1,2,3}` must take the eager spill re-eval
+        // path just like a SEQUENCE / UNIQUE call would.
+        Expr::ArrayLit { .. } => true,
         _ => false,
     }
 }

@@ -1496,6 +1496,7 @@ fn formula_needs_workbook_context(expr: &Expr) -> bool {
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::CellRef(_) | Expr::Range { .. } => {
             false
         }
+        Expr::ArrayLit { data, .. } => data.iter().any(formula_needs_workbook_context),
     }
 }
 
@@ -1532,6 +1533,7 @@ fn formula_references_name(expr: &Expr, key: &str) -> bool {
         | Expr::Range { .. }
         | Expr::SheetRef { .. }
         | Expr::SheetRange { .. } => false,
+        Expr::ArrayLit { data, .. } => data.iter().any(|e| formula_references_name(e, key)),
     }
 }
 
@@ -1588,6 +1590,9 @@ fn collect_cross_sheet_refs_into(
                 collect_cross_sheet_refs_into(a, by_name, out);
             }
         }
+        // Constant-array literal can't carry a cross-sheet ref (parser
+        // rejected SheetRef / SheetRange inside `{...}`).
+        Expr::ArrayLit { .. } => {}
     }
 }
 
@@ -1688,6 +1693,8 @@ fn collect_workbook_refs(
                 collect_workbook_refs(a, current_idx, by_name, out);
             }
         }
+        // Constant-array literal carries no cell or sheet references.
+        Expr::ArrayLit { .. } => {}
     }
 }
 

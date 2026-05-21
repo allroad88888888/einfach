@@ -746,6 +746,29 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             }
             apply_lambda(&callee_value, arg_values, provider)
         }
+
+        Expr::ArrayLit { rows, cols, data } => {
+            // Excel constant-array literal: evaluate every element
+            // (each is a Number / Text / Bool / Negate(Number) per the
+            // parser's invariant) and pack the row-major `Vec<Value>`
+            // into a `Value::Array`. The first error encountered
+            // short-circuits the whole literal so `={1/0, 2}` surfaces
+            // as #DIV/0!.
+            //
+            // No provider reads are needed (no cell refs inside), and
+            // the resulting Array flows into the existing spill /
+            // for_each_arg_value paths exactly like a SEQUENCE result
+            // would.
+            let mut values: Vec<Value> = Vec::with_capacity(data.len());
+            for e in data {
+                let v = eval_expr_with_provider(e, provider);
+                if let Value::Error(err) = v {
+                    return Value::Error(err);
+                }
+                values.push(v);
+            }
+            Value::Array(Arc::new(ArrayData::new(*rows, *cols, values)))
+        }
     }
 }
 
@@ -21609,5 +21632,90 @@ mod tests {
         assert!(!is_builtin_function_name("SQUARE"));
         assert!(!is_builtin_function_name("MY_FUNC"));
         assert!(!is_builtin_function_name("answer"));
+    }
+
+    // === Excel constant-array literal evaluation ===
+
+    /// `={1,2,3,4,5}` produces a 1×5 `Value::Array`.
+    #[test]
+    fn eval_array_literal_row() {
+        let (cm, vs) = make_test_env();
+        match eval_str("={1,2,3,4,5}", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 5));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 4), Some(&Value::Number(5.0)));
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    /// `={1,2;3,4}` produces a row-major 2×2 array.
+    #[test]
+    fn eval_array_literal_2x2() {
+        let (cm, vs) = make_test_env();
+        match eval_str("={1,2;3,4}", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(2.0)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(3.0)));
+                assert_eq!(arr.get(1, 1), Some(&Value::Number(4.0)));
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    /// `=SUM({1,2,3,4,5})` flows through `for_each_arg_value`'s
+    /// `Value::Array` branch and sums to 15.
+    #[test]
+    fn eval_sum_of_array_literal() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=SUM({1,2,3,4,5})", &cm, &vs), Value::Number(15.0));
+    }
+
+    /// `={-1, 2}` — unary minus inside the literal evaluates to -1.
+    #[test]
+    fn eval_array_literal_negate() {
+        let (cm, vs) = make_test_env();
+        match eval_str("={-1, 2}", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(-1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(2.0)));
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    /// An error inside the literal propagates as the literal's value —
+    /// `={1/0, 2}` surfaces #DIV/0!.
+    #[test]
+    fn eval_array_literal_error_propagates() {
+        let (cm, vs) = make_test_env();
+        // `1/0` is a binop — but our parser rejects binops inside the
+        // literal. To exercise error propagation we use a divisor cell
+        // (C1=0 in make_test_env) outside the literal, then a
+        // synthesized literal pulls just the result back via SUM:
+        // here we instead use ArrayLit directly with a synthetic Error
+        // element via constructing the AST manually.
+        let arr_expr = Expr::ArrayLit {
+            rows: 1,
+            cols: 2,
+            data: vec![
+                // Number that the parser would have produced — replaced
+                // here by a sub-expression that evaluates to #DIV/0!.
+                Expr::BinOp {
+                    op: BinOperator::Div,
+                    left: Box::new(Expr::Number(1.0)),
+                    right: Box::new(Expr::Number(0.0)),
+                },
+                Expr::Number(2.0),
+            ],
+        };
+        let get =
+            |id: AtomId| -> Value { vs.get(&id).cloned().unwrap_or(Value::Null) };
+        let result = eval_expr(&arr_expr, &get, &cm);
+        assert_eq!(result, Value::Error(ValueError::DivisionByZero));
     }
 }

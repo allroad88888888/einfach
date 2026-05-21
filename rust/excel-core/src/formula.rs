@@ -98,11 +98,25 @@ pub enum Expr {
     /// argument values.
     ///
     /// Why a separate variant rather than reusing `FuncCall` with a
-    /// computed name? `FuncCall` carries a `String` (built-in name); the
-    /// callee here is an arbitrary expression that resolves to a lambda
-    /// value at runtime. Keeping them distinct means parser and eval
-    /// stay simple and existing `FuncCall` dispatch keeps O(1).
+    /// computed name? `FuncCall` carries a `String` (always upper-cased
+    /// built-in name); the callee here is an arbitrary expression that
+    /// resolves to a lambda value at runtime. Keeping them distinct
+    /// means parser and eval stay simple and existing `FuncCall`
+    /// dispatch keeps O(1).
     Call(Box<Expr>, Vec<Expr>),
+    /// Excel constant-array literal: `={1,2,3;4,5,6}`. `,` separates
+    /// columns, `;` separates rows. `data` is row-major, so the cell at
+    /// `(row, col)` lives at `data[row * cols + col]`. The parser
+    /// restricts cell expressions to literals (numbers, text, booleans,
+    /// or `Negate(Number)` for signed numerics); cell refs, function
+    /// calls, ranges, etc. inside the literal are a parse error — those
+    /// are not the Excel constant-array form. Eval lowers this directly
+    /// to `Value::Array`.
+    ArrayLit {
+        rows: u32,
+        cols: u32,
+        data: Vec<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +135,27 @@ pub enum BinOperator {
     LtEq,
     Gt,
     GtEq,
+}
+
+/// Cell-expression check for `Expr::ArrayLit` elements. Excel restricts
+/// constant-array entries to literal values; we accept exactly the four
+/// shapes that can appear in the parsed source for such a literal:
+///
+/// - `Expr::Number(_)` — `1`, `3.14`, etc.
+/// - `Expr::Text(_)` — `"foo"`.
+/// - `Expr::Bool(_)` — `TRUE` / `FALSE`.
+/// - `Expr::Negate(inner)` where `inner` is one of the above (numeric
+///   only is what Excel itself accepts, but we mirror the parser:
+///   unary minus already wraps any unary expression, so we permit it
+///   over a `Number`).
+///
+/// Cell refs, function calls, ranges, names, and binops are rejected.
+fn is_valid_array_lit_element(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => true,
+        Expr::Negate(inner) => matches!(inner.as_ref(), Expr::Number(_)),
+        _ => false,
+    }
 }
 
 /// Parse a formula string. Must start with '='.
@@ -387,7 +422,7 @@ impl Parser {
         }
     }
 
-    /// primary = number | string | func_call | cell_ref_or_range | '(' expr ')'
+    /// primary = number | string | func_call | cell_ref_or_range | '(' expr ')' | '{' array_lit '}'
     fn parse_primary(&mut self) -> Option<Expr> {
         self.skip_whitespace();
 
@@ -398,6 +433,7 @@ impl Parser {
                 self.expect(')')?;
                 Some(expr)
             }
+            '{' => self.parse_array_literal(),
             '"' => self.parse_string(),
             c if c.is_ascii_digit() || c == '.' => {
                 // Disambiguate `<digits>:<digits>` (whole-row range) from a
@@ -517,6 +553,94 @@ impl Parser {
             self.advance();
         }
         None // unterminated string
+    }
+
+    /// Excel constant-array literal: `{a,b;c,d}`. `,` separates columns
+    /// within a row, `;` separates rows. We've already peeked the opening
+    /// `{`; this consumes the brace, the body, and the closing `}`.
+    ///
+    /// Cell expressions inside the literal are parsed via `parse_expr`
+    /// (so unary minus on a number works: `={-1, 2}`) and then validated
+    /// against the constant-array contract: only `Number`, `Text`,
+    /// `Bool`, and `Negate(Number)` are accepted. Anything else (cell
+    /// refs, function calls, ranges, nested literals, binops other than
+    /// the single Negate-of-Number form) is rejected by returning
+    /// `None`, which surfaces as a parse error at the top level. This
+    /// matches Excel's restriction that constant-array elements be
+    /// literals — formulas inside `{...}` would otherwise blur the
+    /// boundary between the parsed literal and a CSE-array context the
+    /// engine doesn't otherwise support.
+    ///
+    /// Rows MUST be rectangular: every row has the same column count as
+    /// the first. A ragged literal (`={1,2;3}`) is a parse error.
+    fn parse_array_literal(&mut self) -> Option<Expr> {
+        self.advance(); // consume '{'
+        self.skip_whitespace();
+        let mut rows_data: Vec<Vec<Expr>> = Vec::new();
+        // Parse at least one cell — empty `{}` is not a valid Excel
+        // constant array and parsing nothing here would yield a 0x0
+        // array that the spill machinery can't anchor anywhere useful.
+        loop {
+            let mut row: Vec<Expr> = Vec::new();
+            // Parse cells separated by `,` within this row.
+            loop {
+                self.skip_whitespace();
+                let cell = self.parse_expr()?;
+                if !is_valid_array_lit_element(&cell) {
+                    return None;
+                }
+                row.push(cell);
+                self.skip_whitespace();
+                if self.peek() == Some(',') {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            rows_data.push(row);
+            self.skip_whitespace();
+            if self.peek() == Some(';') {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.skip_whitespace();
+        if self.peek() != Some('}') {
+            return None;
+        }
+        self.advance(); // consume '}'
+
+        if rows_data.is_empty() {
+            return None;
+        }
+        let cols = rows_data[0].len();
+        if cols == 0 {
+            return None;
+        }
+        // Rectangular check — every row must share the column count.
+        for r in &rows_data {
+            if r.len() != cols {
+                return None;
+            }
+        }
+        let rows = rows_data.len();
+        let mut data: Vec<Expr> = Vec::with_capacity(rows * cols);
+        for r in rows_data {
+            for cell in r {
+                data.push(cell);
+            }
+        }
+        // u32 conversion: practical literals fit easily; if a literal
+        // somehow overflowed (millions of cells in source) we'd rather
+        // fail parse than silently truncate.
+        let rows_u32 = u32::try_from(rows).ok()?;
+        let cols_u32 = u32::try_from(cols).ok()?;
+        Some(Expr::ArrayLit {
+            rows: rows_u32,
+            cols: cols_u32,
+            data,
+        })
     }
 
     /// Identifier: could be a function name (followed by '(') or a cell reference.
@@ -1241,5 +1365,150 @@ mod tests {
             }
             other => panic!("expected Expr::Call, got {:?}", other),
         }
+    }
+
+    // === Excel constant-array literal: `={a,b;c,d}` ===
+
+    #[test]
+    fn parse_array_lit_single_row() {
+        // `={1,2,3}` — 1 row × 3 cols, row-major data.
+        let result = parse_formula("={1,2,3}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 1,
+                cols: 3,
+                data: vec![Expr::Number(1.0), Expr::Number(2.0), Expr::Number(3.0)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_single_column() {
+        // `={1;2;3}` — 3 rows × 1 col.
+        let result = parse_formula("={1;2;3}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 3,
+                cols: 1,
+                data: vec![Expr::Number(1.0), Expr::Number(2.0), Expr::Number(3.0)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_2x2() {
+        // `={1,2;3,4}` — 2×2, row-major: [1,2,3,4].
+        let result = parse_formula("={1,2;3,4}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 2,
+                cols: 2,
+                data: vec![
+                    Expr::Number(1.0),
+                    Expr::Number(2.0),
+                    Expr::Number(3.0),
+                    Expr::Number(4.0),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_mixed_text_numbers() {
+        // `={"a","b";1,2}` — mixed types in a 2×2 literal.
+        let result = parse_formula("={\"a\",\"b\";1,2}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 2,
+                cols: 2,
+                data: vec![
+                    Expr::Text("a".into()),
+                    Expr::Text("b".into()),
+                    Expr::Number(1.0),
+                    Expr::Number(2.0),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_negate_number_allowed() {
+        // `={-1, 2}` — unary minus over a number is allowed.
+        let result = parse_formula("={-1, 2}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 1,
+                cols: 2,
+                data: vec![
+                    Expr::Negate(Box::new(Expr::Number(1.0))),
+                    Expr::Number(2.0),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_bool() {
+        let result = parse_formula("={TRUE,FALSE}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 1,
+                cols: 2,
+                data: vec![Expr::Bool(true), Expr::Bool(false)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_ragged_rejected() {
+        // `={1,2;3}` — second row only has one column.
+        assert!(parse_formula("={1,2;3}").is_none());
+    }
+
+    #[test]
+    fn parse_array_lit_cell_ref_rejected() {
+        // `={A1, B1}` — cell refs are not allowed inside a literal.
+        assert!(parse_formula("={A1, B1}").is_none());
+    }
+
+    #[test]
+    fn parse_array_lit_func_call_rejected() {
+        // `={SUM(1)}` — function calls are not allowed inside a literal.
+        assert!(parse_formula("={SUM(1)}").is_none());
+    }
+
+    #[test]
+    fn parse_array_lit_binop_rejected() {
+        // `={1+1}` — even pure-literal arithmetic isn't a valid constant.
+        assert!(parse_formula("={1+1}").is_none());
+    }
+
+    #[test]
+    fn parse_array_lit_nested_rejected() {
+        // `={{1}}` — nested array literals are not valid Excel.
+        assert!(parse_formula("={{1}}").is_none());
+    }
+
+    #[test]
+    fn parse_array_lit_inside_func_call() {
+        // `=SUM({1,2,3})` parses with the literal as the SUM arg.
+        let result = parse_formula("=SUM({1,2,3})").unwrap();
+        assert_eq!(
+            result,
+            Expr::FuncCall {
+                name: "SUM".into(),
+                args: vec![Expr::ArrayLit {
+                    rows: 1,
+                    cols: 3,
+                    data: vec![Expr::Number(1.0), Expr::Number(2.0), Expr::Number(3.0)],
+                }],
+            }
+        );
     }
 }
