@@ -3335,6 +3335,7 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
                     | "TRANSPOSE"
                     | "FREQUENCY"
                     | "MODE.MULT"
+                    | "EXPAND"
             ) {
                 return true;
             }

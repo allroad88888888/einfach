@@ -110,6 +110,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ACOT"
             | "ACSC"
             | "ADDRESS"
+            | "AGGREGATE"
             | "AND"
             | "ARABIC"
             | "AREAS"
@@ -168,6 +169,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "COLUMN"
             | "COLUMNS"
             | "COMBIN"
+            | "COMBINA"
             | "CONCATENATE"
             | "CONFIDENCE"
             | "CONFIDENCE.NORM"
@@ -212,16 +214,24 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "DGET"
             | "DMAX"
             | "DMIN"
+            | "DOLLAR"
             | "DPRODUCT"
             | "DROP"
+            | "DSTDEV"
+            | "DSTDEVP"
             | "DSUM"
+            | "DVAR"
+            | "DVARP"
             | "EDATE"
             | "ENCODEURL"
             | "EOMONTH"
             | "ERF"
             | "ERFC"
+            | "ERROR.TYPE"
+            | "EVEN"
             | "EXACT"
             | "EXP"
+            | "EXPAND"
             | "EXPON.DIST"
             | "EXPONDIST"
             | "F.DIST"
@@ -230,6 +240,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "F.INV.RT"
             | "F.TEST"
             | "FACT"
+            | "FACTDOUBLE"
             | "FDIST"
             | "FILTER"
             | "FIND"
@@ -237,6 +248,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FINV"
             | "FISHER"
             | "FISHERINV"
+            | "FIXED"
             | "FLOOR"
             | "FLOOR.MATH"
             | "FLOOR.PRECISE"
@@ -273,6 +285,8 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "IFNA"
             | "IFS"
             | "IMAGE"
+            | "IMCSCH"
+            | "IMSECH"
             | "INDEX"
             | "INDIRECT"
             | "INT"
@@ -287,6 +301,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ISNA"
             | "ISNONTEXT"
             | "ISNUMBER"
+            | "ISO.CEILING"
             | "ISODD"
             | "ISOMITTED"
             | "ISOWEEKNUM"
@@ -334,6 +349,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "MODE.SNGL"
             | "MONTH"
             | "MROUND"
+            | "MULTINOMIAL"
             | "MUNIT"
             | "N"
             | "NEGBINOM.DIST"
@@ -355,6 +371,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "OCT2BIN"
             | "OCT2DEC"
             | "OCT2HEX"
+            | "ODD"
             | "ODDFPRICE"
             | "ODDFYIELD"
             | "ODDLPRICE"
@@ -414,6 +431,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "SECH"
             | "SECOND"
             | "SEQUENCE"
+            | "SERIESSUM"
             | "SIGN"
             | "SIN"
             | "SINH"
@@ -433,6 +451,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "STDEVA"
             | "STDEVPA"
             | "SUBSTITUTE"
+            | "SUBTOTAL"
             | "SUM"
             | "SUMIF"
             | "SUMIFS"
@@ -488,6 +507,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "WORKDAY"
             | "WORKDAY.INTL"
             | "XLOOKUP"
+            | "XMATCH"
             | "XOR"
             | "YEAR"
             | "YEARFRAC"
@@ -8706,6 +8726,58 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "GAUSS" => stat_gauss(args, provider),
         // PHI(x) — standard normal probability density.
         "PHI" => stat_phi(args, provider),
+
+        // S batch arms: math/aggregation/formatting/complex/dynamic-array.
+        "SUBTOTAL" => fn_subtotal(args, provider),
+        "AGGREGATE" => fn_aggregate(args, provider),
+        "ODD" => fn_odd(args, provider),
+        "EVEN" => fn_even(args, provider),
+        "FACTDOUBLE" => fn_factdouble(args, provider),
+        "COMBINA" => fn_combina(args, provider),
+        "MULTINOMIAL" => fn_multinomial(args, provider),
+        "SERIESSUM" => fn_seriessum(args, provider),
+        "ISO.CEILING" => floor_ceiling_precise(args, provider, false),
+        "ERROR.TYPE" => fn_error_type(args, provider),
+        "DOLLAR" => fn_dollar(args, provider),
+        "FIXED" => fn_fixed(args, provider),
+        "IMSECH" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (cosh_r, cosh_i) = (a.cosh() * b.cos(), a.sinh() * b.sin());
+            let (r, i) = match complex_div(1.0, 0.0, cosh_r, cosh_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMCSCH" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (sinh_r, sinh_i) = (a.sinh() * b.cos(), a.cosh() * b.sin());
+            let (r, i) = match complex_div(1.0, 0.0, sinh_r, sinh_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "EXPAND" => fn_expand(args, provider),
+        "XMATCH" => fn_xmatch(args, provider),
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
@@ -18658,7 +18730,1145 @@ fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     stat_finite((-0.5 * x * x).exp() / two_pi.sqrt())
 }
 
-// ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
+
+/// Shared body for SUBTOTAL function_num ∈ 1..=11. Walks every
+/// `data_args` element via `for_each_arg_value` so streaming numeric
+/// accumulators match the standalone SUM/AVERAGE/etc. arms.
+fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    match fn_num {
+        // 1: AVERAGE
+        1 => {
+            let mut total = 0.0_f64;
+            let mut count = 0u64;
+            let mut err: Option<ValueError> = None;
+            for arg in data_args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => {
+                            total += n;
+                            count += 1;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if count == 0 {
+                Value::Error(ValueError::DivisionByZero)
+            } else {
+                Value::Number(total / count as f64)
+            }
+        }
+        // 2: COUNT (numerics only)
+        2 => {
+            let mut count = 0u64;
+            for arg in data_args {
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if matches!(v, Value::Number(_)) {
+                        count += 1;
+                    }
+                });
+            }
+            Value::Number(count as f64)
+        }
+        // 3: COUNTA (non-null)
+        3 => {
+            let mut count = 0u64;
+            for arg in data_args {
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if !matches!(v, Value::Null) {
+                        count += 1;
+                    }
+                });
+            }
+            Value::Number(count as f64)
+        }
+        // 4: MAX
+        4 => {
+            let mut max: Option<f64> = None;
+            let mut err: Option<ValueError> = None;
+            for arg in data_args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => {
+                            max = Some(max.map_or(n, |m: f64| m.max(n)));
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                return Value::Error(e);
+            }
+            max.map_or(Value::Number(0.0), Value::Number)
+        }
+        // 5: MIN
+        5 => {
+            let mut min: Option<f64> = None;
+            let mut err: Option<ValueError> = None;
+            for arg in data_args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => {
+                            min = Some(min.map_or(n, |m: f64| m.min(n)));
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                return Value::Error(e);
+            }
+            min.map_or(Value::Number(0.0), Value::Number)
+        }
+        // 6: PRODUCT
+        6 => {
+            let mut product = 1.0_f64;
+            let mut saw_number = false;
+            let mut err: Option<ValueError> = None;
+            for arg in data_args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => {
+                            product *= n;
+                            saw_number = true;
+                        }
+                        _ => {}
+                    }
+                });
+            }
+            if let Some(e) = err {
+                Value::Error(e)
+            } else if !saw_number {
+                Value::Number(0.0)
+            } else {
+                Value::Number(product)
+            }
+        }
+        // 7: STDEV / 8: STDEVP / 10: VAR / 11: VARP
+        7 | 8 | 10 | 11 => {
+            let nums = collect_numbers(data_args, provider);
+            let is_sample = matches!(fn_num, 7 | 10);
+            let min_n = if is_sample { 2 } else { 1 };
+            if nums.len() < min_n {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+            let denom = if is_sample {
+                (nums.len() - 1) as f64
+            } else {
+                nums.len() as f64
+            };
+            let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denom;
+            let is_stdev = matches!(fn_num, 7 | 8);
+            Value::Number(if is_stdev { var.sqrt() } else { var })
+        }
+        // 9: SUM
+        9 => {
+            let mut total = 0.0_f64;
+            let mut err: Option<ValueError> = None;
+            for arg in data_args {
+                if err.is_some() {
+                    break;
+                }
+                for_each_arg_value(arg, provider, &mut |_addr, v| {
+                    if err.is_some() {
+                        return;
+                    }
+                    match v {
+                        Value::Error(e) => err = Some(e),
+                        Value::Number(n) => total += n,
+                        _ => {}
+                    }
+                });
+            }
+            match err {
+                Some(e) => Value::Error(e),
+                None => Value::Number(total),
+            }
+        }
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+
+/// SUBTOTAL(function_num, ref1, [ref2…]).
+fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let f_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = f_v {
+        return Value::Error(e);
+    }
+    let fn_raw = match coerce_to_number(&f_v) {
+        Some(n) => n,
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !fn_raw.is_finite() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let fn_int = fn_raw.trunc() as i64;
+    let fn_norm = if (1..=11).contains(&fn_int) {
+        fn_int as u32
+    } else if (101..=111).contains(&fn_int) {
+        (fn_int - 100) as u32
+    } else {
+        return Value::Error(ValueError::InvalidValue);
+    };
+    run_subtotal(fn_norm, &args[1..], provider)
+}
+
+
+/// AGGREGATE(function_num, options, ref1, [ref2…]).
+fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let f_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = f_v {
+        return Value::Error(e);
+    }
+    let fn_int = match coerce_to_number(&f_v) {
+        Some(n) if n.is_finite() => n.trunc() as i64,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if !(1..=19).contains(&fn_int) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let opt_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = opt_v {
+        return Value::Error(e);
+    }
+    let options = match coerce_to_number(&opt_v) {
+        Some(n) if n.is_finite() => n.trunc() as i64,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if !(0..=7).contains(&options) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let ignore_errors = (options & 4) != 0;
+
+    let (data_args, k_arg): (&[Expr], Option<&Expr>) = if (14..=19).contains(&fn_int) {
+        if args.len() < 4 {
+            return Value::Error(ValueError::WrongArgCount);
+        }
+        let split = args.len() - 1;
+        (&args[2..split], Some(&args[split]))
+    } else {
+        (&args[2..], None)
+    };
+
+    let collect_nums_skip_errors = |args_inner: &[Expr]| -> Result<Vec<f64>, ValueError> {
+        let mut out = Vec::new();
+        let mut err: Option<ValueError> = None;
+        for arg in args_inner {
+            if err.is_some() {
+                break;
+            }
+            for_each_arg_value(arg, provider, &mut |_addr, v| {
+                if err.is_some() {
+                    return;
+                }
+                match v {
+                    Value::Error(_) if ignore_errors => {}
+                    Value::Error(e) => err = Some(e),
+                    Value::Number(n) => out.push(n),
+                    _ => {}
+                }
+            });
+        }
+        if let Some(e) = err {
+            Err(e)
+        } else {
+            Ok(out)
+        }
+    };
+
+    match fn_int {
+        1..=11 => {
+            if !ignore_errors {
+                return run_subtotal(fn_int as u32, data_args, provider);
+            }
+            let nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            match fn_int {
+                1 => {
+                    if nums.is_empty() {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    Value::Number(nums.iter().sum::<f64>() / nums.len() as f64)
+                }
+                2 => Value::Number(nums.len() as f64),
+                3 => {
+                    let mut count = 0u64;
+                    for arg in data_args {
+                        for_each_arg_value(arg, provider, &mut |_addr, v| match v {
+                            Value::Error(_) => {}
+                            Value::Null => {}
+                            _ => count += 1,
+                        });
+                    }
+                    Value::Number(count as f64)
+                }
+                4 => nums
+                    .iter()
+                    .copied()
+                    .fold(None::<f64>, |acc, n| Some(acc.map_or(n, |m| m.max(n))))
+                    .map_or(Value::Number(0.0), Value::Number),
+                5 => nums
+                    .iter()
+                    .copied()
+                    .fold(None::<f64>, |acc, n| Some(acc.map_or(n, |m| m.min(n))))
+                    .map_or(Value::Number(0.0), Value::Number),
+                6 => {
+                    if nums.is_empty() {
+                        Value::Number(0.0)
+                    } else {
+                        Value::Number(nums.iter().product())
+                    }
+                }
+                7 | 8 | 10 | 11 => {
+                    let is_sample = matches!(fn_int, 7 | 10);
+                    let min_n = if is_sample { 2 } else { 1 };
+                    if nums.len() < min_n {
+                        return Value::Error(ValueError::DivisionByZero);
+                    }
+                    let mean = nums.iter().sum::<f64>() / nums.len() as f64;
+                    let denom = if is_sample {
+                        (nums.len() - 1) as f64
+                    } else {
+                        nums.len() as f64
+                    };
+                    let var = nums.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / denom;
+                    let is_stdev = matches!(fn_int, 7 | 8);
+                    Value::Number(if is_stdev { var.sqrt() } else { var })
+                }
+                9 => Value::Number(nums.iter().sum::<f64>()),
+                _ => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        12 => {
+            let mut nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = nums.len();
+            let mid = if n % 2 == 1 {
+                nums[n / 2]
+            } else {
+                (nums[n / 2 - 1] + nums[n / 2]) / 2.0
+            };
+            Value::Number(mid)
+        }
+        13 => {
+            let nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut best_val = nums[0];
+            let mut best_count = 0usize;
+            for (i, &v) in nums.iter().enumerate() {
+                let mut c = 1usize;
+                for &w in &nums[i + 1..] {
+                    if w == v {
+                        c += 1;
+                    }
+                }
+                if c > best_count {
+                    best_count = c;
+                    best_val = v;
+                }
+            }
+            if best_count <= 1 {
+                Value::Error(ValueError::InvalidValue)
+            } else {
+                Value::Number(best_val)
+            }
+        }
+        14 | 15 => {
+            let mut nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            let k_e = k_arg.expect("LARGE/SMALL require k arg");
+            let k_v = eval_expr_with_provider(k_e, provider);
+            if let Value::Error(e) = k_v {
+                return Value::Error(e);
+            }
+            let k = match coerce_to_number(&k_v) {
+                Some(n) if n >= 1.0 => n as usize,
+                _ => return Value::Error(ValueError::WrongType),
+            };
+            if k > nums.len() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            if fn_int == 14 {
+                nums.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            }
+            Value::Number(nums[k - 1])
+        }
+        16 | 18 => {
+            let k_e = k_arg.expect("PERCENTILE requires k arg");
+            let k_v = eval_expr_with_provider(k_e, provider);
+            if let Value::Error(e) = k_v {
+                return Value::Error(e);
+            }
+            let k = match coerce_to_number(&k_v) {
+                Some(n) => n,
+                _ => return Value::Error(ValueError::WrongType),
+            };
+            let nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut sorted = nums;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if fn_int == 16 {
+                if !k.is_finite() || !(0.0..=1.0).contains(&k) {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                let n = sorted.len();
+                let pos = k * (n as f64 - 1.0);
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                if lo == hi {
+                    Value::Number(sorted[lo])
+                } else {
+                    let frac = pos - lo as f64;
+                    Value::Number(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+                }
+            } else {
+                if !k.is_finite() || k <= 0.0 || k >= 1.0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                let n = sorted.len();
+                let pos = k * (n as f64 + 1.0);
+                if pos < 1.0 || pos > n as f64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                let zero_based = pos - 1.0;
+                let lo = zero_based.floor() as usize;
+                let hi = zero_based.ceil() as usize;
+                if lo == hi {
+                    Value::Number(sorted[lo])
+                } else {
+                    let frac = zero_based - lo as f64;
+                    Value::Number(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+                }
+            }
+        }
+        17 | 19 => {
+            let k_e = k_arg.expect("QUARTILE requires k arg");
+            let k_v = eval_expr_with_provider(k_e, provider);
+            if let Value::Error(e) = k_v {
+                return Value::Error(e);
+            }
+            let q = match coerce_to_number(&k_v) {
+                Some(n) if n.is_finite() && n.trunc() == n => n as i64,
+                _ => return Value::Error(ValueError::InvalidValue),
+            };
+            if fn_int == 17 {
+                if !(0..=4).contains(&q) {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+            } else if !(1..=3).contains(&q) {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let nums = match collect_nums_skip_errors(data_args) {
+                Ok(v) => v,
+                Err(e) => return Value::Error(e),
+            };
+            if nums.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let mut sorted = nums;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let k_frac = q as f64 / 4.0;
+            if fn_int == 17 {
+                let n = sorted.len();
+                let pos = k_frac * (n as f64 - 1.0);
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                if lo == hi {
+                    Value::Number(sorted[lo])
+                } else {
+                    let frac = pos - lo as f64;
+                    Value::Number(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+                }
+            } else {
+                let n = sorted.len();
+                let pos = k_frac * (n as f64 + 1.0);
+                if pos < 1.0 || pos > n as f64 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                let zero_based = pos - 1.0;
+                let lo = zero_based.floor() as usize;
+                let hi = zero_based.ceil() as usize;
+                if lo == hi {
+                    Value::Number(sorted[lo])
+                } else {
+                    let frac = zero_based - lo as f64;
+                    Value::Number(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+                }
+            }
+        }
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+
+/// EVEN(n) — round AWAY from zero to the nearest even integer.
+fn fn_even(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) if n.is_finite() => n,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if n == 0.0 {
+        return Value::Number(0.0);
+    }
+    let sign = if n < 0.0 { -1.0 } else { 1.0 };
+    let absn = n.abs();
+    let mut rounded = absn.ceil();
+    if (rounded as i64) % 2 != 0 {
+        rounded += 1.0;
+    }
+    Value::Number(sign * rounded)
+}
+
+
+/// FACTDOUBLE(n) — double factorial: n · (n-2) · (n-4) · … down to 2 or 1.
+fn fn_factdouble(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) if n.is_finite() => n.trunc() as i64,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if n < 0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if n == 0 || n == 1 {
+        return Value::Number(1.0);
+    }
+    if n > 300 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mut acc = 1.0_f64;
+    let mut k = n;
+    while k >= 2 {
+        acc *= k as f64;
+        if !acc.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        k -= 2;
+    }
+    Value::Number(acc)
+}
+
+
+/// COMBINA(n, k) — combinations with repetition = C(n + k - 1, k).
+fn fn_combina(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let kv = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = kv {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&nv) {
+        Some(x) if x.is_finite() => x.trunc() as i64,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let k = match coerce_to_number(&kv) {
+        Some(x) if x.is_finite() => x.trunc() as i64,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if n < 0 || k < 0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if n == 0 && k == 0 {
+        return Value::Number(1.0);
+    }
+    let top = (n + k - 1) as u64;
+    let mut pick = k as u64;
+    if top.saturating_sub(pick) < pick {
+        pick = top - pick;
+    }
+    let mut acc = 1.0_f64;
+    for i in 1..=pick {
+        acc = acc * (top - i + 1) as f64 / i as f64;
+        if !acc.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    Value::Number(acc.round())
+}
+
+
+/// MULTINOMIAL(n1, n2, …).
+fn fn_multinomial(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let mut nums: Vec<u64> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for arg in args {
+        if err.is_some() {
+            break;
+        }
+        for_each_arg_value(arg, provider, &mut |_addr, v| {
+            if err.is_some() {
+                return;
+            }
+            match v {
+                Value::Error(e) => err = Some(e),
+                Value::Null => {}
+                other => match coerce_to_number(&other) {
+                    Some(n) if n.is_finite() && n.trunc() >= 0.0 => {
+                        nums.push(n.trunc() as u64);
+                    }
+                    _ => err = Some(ValueError::WrongType),
+                },
+            }
+        });
+    }
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    if nums.is_empty() {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let total: u64 = nums.iter().sum();
+    let fact = |k: u64| -> Option<f64> {
+        if k > 170 {
+            return None;
+        }
+        let mut acc = 1.0_f64;
+        for i in 2..=k {
+            acc *= i as f64;
+            if !acc.is_finite() {
+                return None;
+            }
+        }
+        Some(acc)
+    };
+    let num = match fact(total) {
+        Some(x) => x,
+        None => return Value::Error(ValueError::Overflow),
+    };
+    let mut den = 1.0_f64;
+    for n in &nums {
+        let f = match fact(*n) {
+            Some(x) => x,
+            None => return Value::Error(ValueError::Overflow),
+        };
+        den *= f;
+        if !den.is_finite() || den == 0.0 {
+            return Value::Error(ValueError::Overflow);
+        }
+    }
+    let r = num / den;
+    if !r.is_finite() {
+        Value::Error(ValueError::Overflow)
+    } else {
+        Value::Number(r.round())
+    }
+}
+
+
+/// SERIESSUM(x, n, m, coefs).
+fn fn_seriessum(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let xv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = xv {
+        return Value::Error(e);
+    }
+    let nv = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let mv = eval_expr_with_provider(&args[2], provider);
+    if let Value::Error(e) = mv {
+        return Value::Error(e);
+    }
+    let x = match coerce_to_number(&xv) {
+        Some(n) if n.is_finite() => n,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let n_init = match coerce_to_number(&nv) {
+        Some(n) if n.is_finite() => n,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let m_step = match coerce_to_number(&mv) {
+        Some(n) if n.is_finite() => n,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let mut coefs: Vec<f64> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(&args[3], provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        match v {
+            Value::Error(e) => err = Some(e),
+            Value::Null => coefs.push(0.0),
+            other => match coerce_to_number(&other) {
+                Some(n) => coefs.push(n),
+                None => err = Some(ValueError::WrongType),
+            },
+        }
+    });
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    if coefs.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut total = 0.0_f64;
+    for (i, c) in coefs.iter().enumerate() {
+        let exponent = n_init + (i as f64) * m_step;
+        let term = c * x.powf(exponent);
+        if !term.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        total += term;
+    }
+    if total.is_finite() {
+        Value::Number(total)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+
+/// ERROR.TYPE(error_value) — see top-of-arm comment for the
+/// ValueError → 1..=8 mapping.
+fn fn_error_type(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    match v {
+        Value::Error(ValueError::DivisionByZero) => Value::Number(2.0),
+        Value::Error(ValueError::InvalidValue) => Value::Number(7.0),
+        Value::Error(ValueError::InvalidRef) => Value::Number(4.0),
+        Value::Error(ValueError::InvalidName) => Value::Number(5.0),
+        Value::Error(ValueError::Overflow) => Value::Number(6.0),
+        Value::Error(ValueError::CyclicRef) => Value::Number(4.0),
+        Value::Error(ValueError::WrongType) => Value::Number(3.0),
+        Value::Error(ValueError::WrongArgCount) => Value::Number(3.0),
+        Value::Error(ValueError::Spill) => Value::Number(3.0),
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+
+/// Format an absolute-value number with thousands separators and the
+/// requested fractional precision. Used by DOLLAR and FIXED. `decimals`
+/// may be negative (round to the left of the decimal point).
+fn format_thousands(value: f64, decimals: i64, use_commas: bool) -> String {
+    let abs = value.abs();
+    if decimals < 0 {
+        let factor = 10f64.powi((-decimals) as i32);
+        let rounded = (abs / factor).round() * factor;
+        let whole = rounded as u64;
+        let whole_s = whole.to_string();
+        if use_commas {
+            return insert_commas(&whole_s);
+        }
+        return whole_s;
+    }
+    let dec = decimals.min(15) as usize;
+    let formatted = format!("{:.*}", dec, abs);
+    let (whole, frac) = match formatted.find('.') {
+        Some(i) => (&formatted[..i], Some(&formatted[i + 1..])),
+        None => (formatted.as_str(), None),
+    };
+    let whole_out = if use_commas {
+        insert_commas(whole)
+    } else {
+        whole.to_string()
+    };
+    match frac {
+        Some(f) if !f.is_empty() => format!("{}.{}", whole_out, f),
+        _ => whole_out,
+    }
+}
+
+
+fn insert_commas(digits: &str) -> String {
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let len = bytes.len();
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+
+/// DOLLAR(number, [decimals=2]).
+fn fn_dollar(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&nv) {
+        Some(x) if x.is_finite() => x,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let decimals: i64 = if args.len() == 2 {
+        let dv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = dv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&dv) {
+            Some(x) if x.is_finite() => x.trunc() as i64,
+            _ => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        2
+    };
+    let body = format_thousands(n, decimals, true);
+    let result = if n < 0.0 {
+        format!("(${})", body)
+    } else {
+        format!("${}", body)
+    };
+    Value::Text(result)
+}
+
+
+/// FIXED(number, [decimals=2], [no_commas=FALSE]).
+fn fn_fixed(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nv = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = nv {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&nv) {
+        Some(x) if x.is_finite() => x,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    let decimals: i64 = if args.len() >= 2 {
+        let dv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = dv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&dv) {
+            Some(x) if x.is_finite() => x.trunc() as i64,
+            _ => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        2
+    };
+    let no_commas: bool = if args.len() == 3 {
+        let bv = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = bv {
+            return Value::Error(e);
+        }
+        coerce_to_bool(&bv).unwrap_or(false)
+    } else {
+        false
+    };
+    let body = format_thousands(n, decimals, !no_commas);
+    let result = if n < 0.0 {
+        format!("-{}", body)
+    } else {
+        body
+    };
+    Value::Text(result)
+}
+
+
+/// ODD(number) — round AWAY from zero to nearest odd integer.
+fn fn_odd(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n = match coerce_to_number(&v) {
+        Some(n) if n.is_finite() => n,
+        _ => return Value::Error(ValueError::WrongType),
+    };
+    if n == 0.0 {
+        return Value::Number(1.0);
+    }
+    let sign = if n < 0.0 { -1.0 } else { 1.0 };
+    let absn = n.abs();
+    let mut rounded = absn.ceil();
+    if (rounded as i64) % 2 == 0 {
+        rounded += 1.0;
+    }
+    Value::Number(sign * rounded)
+}
+
+/// EXPAND(array, rows, [cols], [pad_with=#N/A]).
+fn fn_expand(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (rows, cols, data) = match arg_to_2d(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    if rows == 0 || cols == 0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let new_rows = {
+        let v = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) if n.is_finite() && n.trunc() >= 1.0 => n.trunc() as u32,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    };
+    let new_cols = if args.len() >= 3 {
+        let v = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) if n.is_finite() && n.trunc() >= 1.0 => n.trunc() as u32,
+            _ => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        cols
+    };
+    let pad = if args.len() == 4 {
+        eval_expr_with_provider(&args[3], provider)
+    } else {
+        Value::Error(ValueError::InvalidValue)
+    };
+    if new_rows < rows || new_cols < cols {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut out: Vec<Value> = Vec::with_capacity((new_rows as usize) * (new_cols as usize));
+    for r in 0..new_rows {
+        for c in 0..new_cols {
+            if r < rows && c < cols {
+                out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
+            } else {
+                out.push(pad.clone());
+            }
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(new_rows, new_cols, out)))
+}
+
+
+/// XMATCH(needle, lookup_array, [match_mode=0], [search_mode=1]).
+fn fn_xmatch(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let needle = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = needle {
+        return Value::Error(e);
+    }
+    let match_mode: i32 = if args.len() >= 3 {
+        let v = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) if n.is_finite() => n as i32,
+            _ => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        0
+    };
+    if !matches!(match_mode, -1 | 0 | 1 | 2) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let search_mode: i32 = if args.len() == 4 {
+        let v = eval_expr_with_provider(&args[3], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) if n.is_finite() => n as i32,
+            _ => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        1
+    };
+    if !matches!(search_mode, -2 | -1 | 1 | 2) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut items: Vec<Value> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(&args[1], provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        if let Value::Error(e) = &v {
+            err = Some(e.clone());
+            return;
+        }
+        items.push(v);
+    });
+    if let Some(e) = err {
+        return Value::Error(e);
+    }
+    if items.is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let wildcard_pattern: Option<String> = match (&needle, match_mode) {
+        (Value::Text(p), 2) => Some(p.clone()),
+        (Value::Text(p), 0) if pattern_has_wildcard(p) => Some(p.clone()),
+        _ => None,
+    };
+    let test_exact = |v: &Value| -> bool {
+        match &wildcard_pattern {
+            Some(p) => wildcard_match(p, &coerce_to_text(v)),
+            None => values_equal(v, &needle),
+        }
+    };
+
+    if matches!(search_mode, 2 | -2) {
+        if wildcard_pattern.is_some() {
+            return Value::Error(ValueError::InvalidValue);
+        }
+        let n = items.len();
+        let mut lo = 0usize;
+        let mut hi = n;
+        let ascending = search_mode == 2;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let ord = compare_lookup(&items[mid], &needle);
+            if ord == std::cmp::Ordering::Equal {
+                return Value::Number((mid + 1) as f64);
+            }
+            let go_right = if ascending {
+                ord == std::cmp::Ordering::Less
+            } else {
+                ord == std::cmp::Ordering::Greater
+            };
+            if go_right {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if match_mode == 0 || match_mode == 2 {
+            return Value::Error(ValueError::InvalidValue);
+        }
+    }
+
+    let n = items.len();
+    let order: Box<dyn Iterator<Item = usize>> = if search_mode == -1 {
+        Box::new((0..n).rev())
+    } else {
+        Box::new(0..n)
+    };
+    let mut best: Option<usize> = None;
+    let mut best_diff: Option<f64> = None;
+    let needle_num = coerce_to_number(&needle);
+    for i in order {
+        let v = &items[i];
+        if test_exact(v) {
+            return Value::Number((i + 1) as f64);
+        }
+        if matches!(match_mode, -1 | 1) {
+            if let (Some(needle_n), Some(item_n)) = (needle_num, coerce_to_number(v)) {
+                if match_mode == -1 && item_n <= needle_n {
+                    let diff = needle_n - item_n;
+                    if best_diff.map_or(true, |bd| diff < bd) {
+                        best = Some(i);
+                        best_diff = Some(diff);
+                    }
+                } else if match_mode == 1 && item_n >= needle_n {
+                    let diff = item_n - needle_n;
+                    if best_diff.map_or(true, |bd| diff < bd) {
+                        best = Some(i);
+                        best_diff = Some(diff);
+                    }
+                }
+            }
+        }
+    }
+    match best {
+        Some(i) => Value::Number((i + 1) as f64),
+        None => Value::Error(ValueError::InvalidValue),
+    }
+}
+
 // Sentinel for parallel-agent merges — every new free helper fn (`fn yearfrac_basis(...)`),
 // helper struct, or module-private const goes BEFORE this marker so concurrent worktrees
 // don't conflict on `fn collect_numbers`'s preceding blank line.
