@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
-use einfach_core::{AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
+use std::sync::Arc;
+
+use einfach_core::{ArrayData, AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::{eval_expr_with_provider, EvalProvider};
@@ -242,6 +244,39 @@ pub struct CellSubscription {
     addr: CellAddress,
     listener_id: u64,
 }
+
+/// Errors returned by the `try_*` write APIs on `Sheet`. The plain
+/// `set_cell` / `set_formula` family stays infallible (silently no-ops
+/// on rejection) for backwards compatibility with existing callers; the
+/// `try_*` family surfaces the same outcome as a `Result` so dynamic-
+/// array hosts can report the failure to the user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SheetError {
+    /// The target address is part of an active spill range whose anchor
+    /// lives elsewhere. The user must either clear the anchor or shrink
+    /// the spill range before writing here. `anchor` is the address that
+    /// currently owns the spill, so the UI can highlight or jump to it.
+    SpillCellWrite { anchor: CellAddress },
+    /// The supplied address string failed to parse as `A1`-style. Mirrors
+    /// the panic that the infallible variants raise; surfaced as an error
+    /// in the `try_*` variants so worker hosts don't crash on bad input.
+    InvalidAddress,
+}
+
+impl std::fmt::Display for SheetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SheetError::SpillCellWrite { anchor } => write!(
+                f,
+                "cannot write to cell inside spill range anchored at {}",
+                anchor
+            ),
+            SheetError::InvalidAddress => write!(f, "invalid cell address"),
+        }
+    }
+}
+
+impl std::error::Error for SheetError {}
 
 /// Ranges spanning more than this many rows or columns skip the
 /// per-row / per-col bucket registration and live in `wide_ranges` instead,
@@ -522,6 +557,41 @@ pub struct Sheet {
     /// `Sheet::set_formula` path does NOT bump this. Used by the scale
     /// suite to verify "imported" vs "live-edited" formula provenance.
     imported_formula_count: Cell<usize>,
+
+    // === Spill (dynamic-array) infrastructure ===
+    //
+    // Phase 1 wires the *plumbing* for dynamic-array spill. The atom-based
+    // store already gives us correctly-derived dependent recompute and
+    // subscription propagation — we don't need a parallel spill index or
+    // look-aside table. Instead:
+    //
+    //   * The anchor cell's atom holds a `Value::Array`.
+    //   * Each non-(0,0) target gets a NEW derived atom that reads the
+    //     anchor and indexes into the array. We replace whatever was at
+    //     that position in `Sheet::cells` with this derived atom.
+    //   * On re-spill / clear, we remove those derived atoms from
+    //     `Sheet::cells` and destroy them in the store. The single
+    //     `spill_targets` map below records which atoms we installed so
+    //     teardown is exact.
+    //
+    // Phase 1 limitations (documented in `register_spill` docs):
+    //   - No auto-retry on conflict-resolve (clearing the obstructing
+    //     cell does not retry the spill until the user re-evaluates).
+    //   - No implicit array broadcast in arithmetic — Phase 3 work.
+    //   - The JS / WASM boundary collapses `Value::Array` to its top-left
+    //     element via `collapse_array_for_js`. JS never observes Array.
+    /// Anchor atom → derived atoms we installed at the non-(0,0)
+    /// spill targets. Stored by atom rather than address so the
+    /// teardown path (`clear_spill`) does not need to re-resolve which
+    /// addresses we wrote into — it already has the atom ids we
+    /// allocated. Each target derived atom is also recorded in
+    /// `Sheet::cells` under its target address so reads route through
+    /// the normal cell-fetch path.
+    ///
+    /// `HashMap` rather than `BTreeMap` because `AtomId` deliberately
+    /// does not derive `Ord` — atom-id ordering carries no semantic
+    /// meaning and we never iterate this map in order.
+    spill_targets: HashMap<AtomId, Vec<CellAddress>>,
 }
 
 impl Sheet {
@@ -543,6 +613,7 @@ impl Sheet {
             col_widths: BTreeMap::new(),
             formula_eval_count: Cell::new(0),
             imported_formula_count: Cell::new(0),
+            spill_targets: HashMap::new(),
         }
     }
 
@@ -926,10 +997,359 @@ impl Sheet {
         notified
     }
 
+    // === Spill (dynamic-array) infrastructure ===
+    //
+    // See the `spill_targets` field doc comment above for the high-level
+    // design rationale. The methods below are the bookkeeping primitives
+    // that every spill mutation goes through.
+
+    /// UI helper: if `addr` is a spill *anchor*, return its array shape
+    /// `(rows, cols)`. Otherwise None.
+    ///
+    /// Detection: walk `cells` for `addr`, fetch the underlying atom's
+    /// value, and inspect for `Value::Array`. We can't index `spill_targets`
+    /// by anchor address — it's keyed by anchor *atom id* — so this lookup
+    /// goes through the live value. Anchors that hold `#SPILL!` (collision)
+    /// have no `Array` and so return None here, matching Excel's "the
+    /// anchor has no spill" semantics in the collision case.
+    pub fn spill_info(&self, addr: CellAddress) -> Option<(u32, u32)> {
+        let &atom_id = self.cells.get(&addr)?;
+        if !self.store.has_atom(atom_id) {
+            return None;
+        }
+        match self.store.get(atom_id) {
+            Value::Array(arr) => Some(arr.shape()),
+            _ => None,
+        }
+    }
+
+    /// True if `addr` is a NON-anchor spilled cell. Convenience for
+    /// callers that need to refuse writes or annotate the UI without
+    /// resolving the anchor address.
+    pub fn is_spilled(&self, addr: CellAddress) -> bool {
+        self.spilled_into_anchor(addr).is_some()
+    }
+
+    /// If `addr` is part of an active spill range whose anchor lives
+    /// elsewhere, return the anchor's address. Returns None when `addr`
+    /// is either the anchor itself, a plain cell, or empty.
+    ///
+    /// Implementation: scan `spill_targets` values. For Phase 1 we keep
+    /// this O(spills) — the typical workbook has a handful of active
+    /// spill ranges, well below the cost of a reverse address index.
+    fn spilled_into_anchor(&self, addr: CellAddress) -> Option<CellAddress> {
+        for (&anchor_atom, targets) in &self.spill_targets {
+            if !targets.iter().any(|t| *t == addr) {
+                continue;
+            }
+            // Locate the anchor address by reverse-scanning `cells`.
+            // The map is small (one entry per cell) but for Phase 1 we
+            // accept the O(n) scan — anchor address lookups are rare
+            // (only for error messages and `is_spilled`).
+            for (cell_addr, &cell_atom) in self.cells.iter() {
+                if cell_atom == anchor_atom {
+                    return Some(cell_addr);
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up the anchor address for a given anchor atom by reverse-scanning
+    /// `cells`. Returns None if the anchor has been removed from `cells`
+    /// (which shouldn't happen in normal flow — spill teardown clears
+    /// `spill_targets` first). Currently unused — kept for symmetry with
+    /// `spilled_into_anchor`, which performs the same lookup inline.
+    #[allow(dead_code)]
+    fn anchor_address_for(&self, anchor_atom: AtomId) -> Option<CellAddress> {
+        for (cell_addr, &cell_atom) in self.cells.iter() {
+            if cell_atom == anchor_atom {
+                return Some(cell_addr);
+            }
+        }
+        None
+    }
+
+    /// Install spilled derived atoms for every non-(0,0) target inside
+    /// the array's bounding rectangle anchored at `anchor_addr`. The
+    /// anchor's own atom is expected to already hold `Value::Array(arr)`
+    /// — this method only wires up the targets.
+    ///
+    /// Returns `Err(ValueError::Spill)` if any target collides with an
+    /// existing non-empty cell. On error NO targets are installed and the
+    /// caller is responsible for routing `#SPILL!` to the anchor.
+    ///
+    /// Collision rule: a target cell is "occupied" if it has a primitive
+    /// atom holding a non-Null value, OR it is itself a formula cell, OR
+    /// it is currently a spilled cell from another anchor. A truly-empty
+    /// cell (no atom or atom = Null with no formula) is fine to spill into.
+    fn register_spill(
+        &mut self,
+        anchor_addr: CellAddress,
+        anchor_atom: AtomId,
+        arr: &Arc<ArrayData>,
+    ) -> Result<(), ValueError> {
+        let (rows, cols) = arr.shape();
+        if rows == 0 || cols == 0 {
+            // Empty array — nothing to spill into. Treat as success.
+            self.spill_targets.insert(anchor_atom, Vec::new());
+            return Ok(());
+        }
+
+        // First pass: collision detection. We compute every target
+        // (skipping (0, 0) which is the anchor) and ensure no obstruction.
+        let mut targets: Vec<CellAddress> = Vec::with_capacity(
+            (rows as usize) * (cols as usize) - 1,
+        );
+        for di in 0..rows {
+            for dj in 0..cols {
+                if di == 0 && dj == 0 {
+                    continue;
+                }
+                let target = CellAddress::new(anchor_addr.row + di, anchor_addr.col + dj);
+                if self.is_target_occupied(target, anchor_atom) {
+                    return Err(ValueError::Spill);
+                }
+                targets.push(target);
+            }
+        }
+
+        // Second pass: install. For each target, create a derived atom
+        // that reads the anchor and indexes into the array at the offset
+        // implied by (di, dj). The derived atom is registered in `cells`
+        // under the target address so reads go through the normal path.
+        let mut idx = 0usize;
+        for di in 0..rows {
+            for dj in 0..cols {
+                if di == 0 && dj == 0 {
+                    continue;
+                }
+                let target = targets[idx];
+                idx += 1;
+                let anchor_atom_for_read = anchor_atom;
+                let row_off = di;
+                let col_off = dj;
+                let derived = self.store.create_derived(move |get| match get(anchor_atom_for_read) {
+                    Value::Array(inner) => inner
+                        .get(row_off, col_off)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    // Anchor switched off Array (e.g. became #SPILL! after
+                    // a later remap that hasn't yet cleared us). Return
+                    // Null defensively — the parent re-spill will
+                    // re-install a fresh derived atom anyway.
+                    _ => Value::Null,
+                });
+
+                // If there was a stale primitive at this address (e.g.
+                // empty `Value::Null` placeholder created by a previous
+                // subscribe), remove it first so we don't leak an atom.
+                if let Some(prev) = self.cells.remove(&target) {
+                    if self.store.has_atom(prev) && !self.store.has_dependents(prev) {
+                        self.store.destroy_atom(prev);
+                    }
+                }
+                self.cells.insert(target, derived);
+                // Re-attach subscription bucket (if any) so address-level
+                // listeners see updates from the new derived atom.
+                self.attach_address_sub(target);
+                self.mark_dependents_dirty(target);
+            }
+        }
+
+        self.spill_targets.insert(anchor_atom, targets);
+        Ok(())
+    }
+
+    /// Detect whether `target` is currently occupied for spill purposes.
+    /// `our_anchor_atom` is the anchor we're spilling FROM — entries in
+    /// `spill_targets[our_anchor_atom]` should NOT be considered
+    /// collisions (we're re-spilling into our own previous range).
+    fn is_target_occupied(&self, target: CellAddress, our_anchor_atom: AtomId) -> bool {
+        // (a) Formula cell at target — always blocks.
+        if self.formula_cells.contains_key(&target) {
+            return true;
+        }
+        // (b) Primitive atom holding a non-Null value.
+        if let Some(&atom_id) = self.cells.get(&target) {
+            if self.store.has_atom(atom_id) {
+                let v = self.store.get(atom_id);
+                if !matches!(v, Value::Null) {
+                    // (c) Skip if this is already one of OUR own spill
+                    // targets — we're re-spilling and the previous round
+                    // installed this derived atom. Caller (`set_array`)
+                    // tears the old spill down BEFORE calling
+                    // register_spill, so in practice we never see our
+                    // own targets here; the guard is defensive.
+                    if let Some(targets) = self.spill_targets.get(&our_anchor_atom) {
+                        if targets.iter().any(|t| *t == target) {
+                            return false;
+                        }
+                    }
+                    // Check if it's a spilled cell from ANOTHER anchor.
+                    // Iterate `spill_targets` — if any OTHER anchor lists
+                    // `target`, that's a cross-anchor collision.
+                    for (anchor_atom, targets) in &self.spill_targets {
+                        if *anchor_atom == our_anchor_atom {
+                            continue;
+                        }
+                        if targets.iter().any(|t| *t == target) {
+                            return true;
+                        }
+                    }
+                    // Plain non-Null primitive — collision.
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Inverse of `register_spill`. For each derived atom recorded under
+    /// `anchor_atom`, remove it from `cells` and destroy the underlying
+    /// atom. The anchor itself is NOT touched — caller decides whether
+    /// to leave the anchor in place (re-spill incoming) or also clear it.
+    ///
+    /// Subscribers on the cleared addresses are re-fired via the
+    /// remap helper so listeners observe the now-empty cell.
+    fn clear_spill(&mut self, anchor_atom: AtomId) {
+        let Some(targets) = self.spill_targets.remove(&anchor_atom) else {
+            return;
+        };
+        for target in targets {
+            // Detach the address subscription bucket from the soon-dead
+            // atom; reattach after removal so listeners refresh.
+            self.detach_address_sub(target);
+            if let Some(derived_id) = self.cells.remove(&target) {
+                if self.store.has_atom(derived_id) {
+                    // Spilled cells are read-only derived atoms with
+                    // (typically) no further atom-level dependents.
+                    // Formula cells that referenced this address read
+                    // via the Sheet-level peek path; the dep graph
+                    // there is in `cell_dependents`, not in the store's
+                    // back_deps. So destroy is safe.
+                    if !self.store.has_dependents(derived_id) {
+                        self.store.destroy_atom(derived_id);
+                    }
+                    // If something did register a downstream derived atom
+                    // (no API for that today), we'd leak the spilled
+                    // derived atom rather than panic — acknowledged as
+                    // a Phase 1 limitation.
+                }
+            }
+            self.attach_address_sub(target);
+            self.mark_dependents_dirty(target);
+        }
+    }
+
+    /// Locate the anchor atom for `addr` (if any) and clear its spill.
+    /// Used when overwriting the anchor cell — the new write replaces
+    /// the array, so the old spill must go away. No-op when `addr` is
+    /// not a spill anchor.
+    fn clear_spill_at_address(&mut self, addr: CellAddress) {
+        let Some(&atom_id) = self.cells.get(&addr) else {
+            return;
+        };
+        if self.spill_targets.contains_key(&atom_id) {
+            self.clear_spill(atom_id);
+        }
+    }
+
+    /// Write a `Value::Array` to an anchor cell and install / re-install
+    /// the spill range. On spill collision, the anchor is set to
+    /// `Value::Error(Spill)` and no targets are installed.
+    ///
+    /// This is the Phase 1 entry point used by tests to exercise the
+    /// spill plumbing without a user-facing array-producing function.
+    /// Phase 3 will wire the formula eval path to call this when a
+    /// formula result evaluates to `Value::Array`.
+    ///
+    /// Returns the same `Result` shape as `register_spill` so callers
+    /// can distinguish "spilled cleanly" from "collision, anchor now
+    /// `#SPILL!`". Either outcome leaves the sheet in a consistent
+    /// state — the anchor cell always reflects the result.
+    pub fn set_array(
+        &mut self,
+        addr_str: &str,
+        arr: Arc<ArrayData>,
+    ) -> Result<(), SheetError> {
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        // Reject writes into another anchor's spill range — same
+        // contract as `try_set_cell`. The user must clear that anchor
+        // first.
+        if let Some(anchor) = self.spilled_into_anchor(addr) {
+            return Err(SheetError::SpillCellWrite { anchor });
+        }
+
+        // Tear down any spill the current cell already owns; we're
+        // replacing it.
+        self.clear_spill_at_address(addr);
+
+        // Drop any prior formula at the anchor — an array write is a
+        // primitive-style mutation that replaces formula state.
+        let had_formula = self.formula_cells.contains_key(&addr);
+        if had_formula {
+            self.with_remap(addr, |sheet| {
+                sheet.remove_formula_record(addr);
+                let _ = sheet.ensure_cell(addr);
+            });
+        }
+
+        let anchor_atom = self.ensure_cell(addr);
+        self.attach_address_sub(addr);
+
+        // Write the array to the anchor.
+        self.store.set(anchor_atom, Value::Array(arr.clone()));
+
+        // Try to install spill targets. On collision, overwrite the
+        // anchor with `#SPILL!` so the user sees the error at the
+        // anchor cell (Excel parity).
+        match self.register_spill(addr, anchor_atom, &arr) {
+            Ok(()) => {}
+            Err(ValueError::Spill) => {
+                self.store
+                    .set(anchor_atom, Value::Error(ValueError::Spill));
+            }
+            Err(other) => {
+                // register_spill currently only returns Spill, but
+                // future variants would surface here defensively.
+                self.store.set(anchor_atom, Value::Error(other));
+            }
+        }
+        self.mark_dependents_dirty(addr);
+        Ok(())
+    }
+
     /// Set a cell's value by address string (e.g. "A1").
-    /// Clears any existing formula on this cell.
+    /// Clears any existing formula on this cell. Silently no-ops when
+    /// `addr_str` is the non-anchor target of an active spill — use
+    /// `try_set_cell` for callers that need to surface that rejection.
+    ///
+    /// Panics on an unparseable `addr_str`. The fallible
+    /// `try_set_cell` returns `Err(SheetError::InvalidAddress)` instead;
+    /// the panic here preserves the historical contract.
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
-        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        // Preserve legacy panic-on-bad-address contract — only the
+        // spill-rejection branch is the new silent-no-op behavior.
+        CellAddress::parse(addr_str).expect("invalid cell address");
+        let _ = self.try_set_cell(addr_str, value);
+    }
+
+    /// Fallible variant of `set_cell`. Returns `Err(SpillCellWrite { .. })`
+    /// when the address is currently a non-anchor target of an active
+    /// spill range — the anchor must be cleared or shrunk before that
+    /// cell can be overwritten. Returns `Err(InvalidAddress)` when the
+    /// address string fails to parse (the infallible variant panics).
+    pub fn try_set_cell(&mut self, addr_str: &str, value: Value) -> Result<(), SheetError> {
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        if let Some(anchor) = self.spilled_into_anchor(addr) {
+            return Err(SheetError::SpillCellWrite { anchor });
+        }
+        // If this address was itself a spill anchor, the new write
+        // replaces the array — tear the spill down first so we don't
+        // strand the derived atoms at the old targets.
+        self.clear_spill_at_address(addr);
+
         let had_formula = self.formula_cells.contains_key(&addr);
         let is_null = matches!(value, Value::Null);
 
@@ -959,19 +1379,28 @@ impl Sheet {
             }
         }
         self.mark_dependents_dirty(addr);
+        Ok(())
     }
 
     /// Clear a cell back to empty (Null). Equivalent to `set_cell(addr, Value::Null)`
     /// but with a more discoverable name for callers implementing Delete-key /
-    /// undo-to-empty UX.
+    /// undo-to-empty UX. Silently no-ops on spill rejection — use
+    /// `try_clear_cell` if you need the error.
     pub fn clear_cell(&mut self, addr_str: &str) {
-        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        self.set_cell(addr_str, Value::Null);
+        let _ = self.try_clear_cell(addr_str);
+    }
+
+    /// Fallible variant of `clear_cell`. Returns the same error variants
+    /// as `try_set_cell` with `Value::Null`.
+    pub fn try_clear_cell(&mut self, addr_str: &str) -> Result<(), SheetError> {
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        self.try_set_cell(addr_str, Value::Null)?;
         // set_cell already calls try_release_primitive when the new value is
         // Null; the second call here is defensive in case a future change to
         // set_cell rearranges that path. It's a no-op when the cell was
         // already released.
         self.try_release_primitive(addr);
+        Ok(())
     }
 
     /// 3.10 — release the primitive cell atom for `addr` when it is Null and
@@ -1019,12 +1448,42 @@ impl Sheet {
     /// this cell is cleared.
     ///
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
-        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        match self.try_set_formula(addr_str, formula_str) {
+            Ok(success) => success,
+            // Spill rejection: matches the `false` legacy contract so existing
+            // callers that ignore the spill case behave as if the write was
+            // a parse / cycle failure (no value change, returns `false`).
+            Err(_) => false,
+        }
+    }
+
+    /// Fallible variant of `set_formula`. Returns:
+    ///   - `Ok(true)` — formula parsed and installed.
+    ///   - `Ok(false)` — formula failed to parse or would create a cycle.
+    ///     The cell is now `#VALUE!` or `#CYCLE!` respectively (existing
+    ///     behavior preserved).
+    ///   - `Err(SpillCellWrite { .. })` — the address is currently a
+    ///     non-anchor target of an active spill range; the formula was
+    ///     NOT installed.
+    ///   - `Err(InvalidAddress)` — address parse failure.
+    pub fn try_set_formula(
+        &mut self,
+        addr_str: &str,
+        formula_str: &str,
+    ) -> Result<bool, SheetError> {
+        let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
+        if let Some(anchor) = self.spilled_into_anchor(addr) {
+            return Err(SheetError::SpillCellWrite { anchor });
+        }
+        // Replacing the cell at this address: tear down any spill the
+        // previous content (if it was an anchor) installed.
+        self.clear_spill_at_address(addr);
+
         let expr = match parse_formula(formula_str) {
             Some(e) => e,
             None => {
                 self.write_error(addr, ValueError::InvalidValue);
-                return false;
+                return Ok(false);
             }
         };
 
@@ -1032,7 +1491,7 @@ impl Sheet {
         // then BFS through their formula_exprs to see if `addr` is reachable.
         if self.would_create_cycle(addr, &expr) {
             self.write_error(addr, ValueError::CyclicRef);
-            return false;
+            return Ok(false);
         }
 
         self.with_remap(addr, move |sheet| {
@@ -1057,7 +1516,7 @@ impl Sheet {
             sheet.formula_texts.insert(addr, formula_str.to_string());
         });
         self.mark_dependents_dirty(addr);
-        true
+        Ok(true)
     }
 
     /// Drop any existing formula and write an error value to the cell.
@@ -1764,7 +2223,10 @@ impl Sheet {
     /// the default display path (matches `value_to_display` behavior).
     pub fn formatted_display(&self, addr_str: &str) -> String {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let value = self.peek_value(addr);
+        // Collapse spill anchor to top-left for display — UI parity with
+        // the WASM boundary. The full Array is only visible to internal
+        // spill bookkeeping; users see the top-left scalar at the anchor.
+        let value = collapse_array_for_eval(self.peek_value(addr));
         match &value {
             Value::Number(n) => {
                 let fmt = self.effective_format(addr_str);
@@ -1774,6 +2236,8 @@ impl Sheet {
             Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
             Value::Null => String::new(),
             Value::Error(e) => format!("{}", e),
+            // Unreachable: collapsed above, but keep arm for exhaustiveness.
+            Value::Array(_) => String::new(),
         }
     }
 
@@ -2478,9 +2942,24 @@ struct SheetEvalProvider<'a> {
     current_cell: Cell<Option<CellAddress>>,
 }
 
+/// Collapse a `Value::Array` returned from a cell-read to its top-left
+/// element so that scalar formula contexts see a scalar. Spilled cells
+/// already return scalars via their derived atom; only the anchor cell
+/// holds the underlying `Array`. Within formula eval we want
+/// `=A1 + 1` (where A1 is a 3x1 spill anchor) to act on the top-left
+/// element — Excel "implicit intersection" semantics. The `Sheet::get_cell`
+/// / `peek_value` boundary intentionally still returns the raw `Array`
+/// so the spill UI helpers (`spill_info`) can detect anchors.
+pub(crate) fn collapse_array_for_eval(v: Value) -> Value {
+    match v {
+        Value::Array(arr) => arr.get(0, 0).cloned().unwrap_or(Value::Null),
+        other => other,
+    }
+}
+
 impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn cell(&self, addr: CellAddress) -> Value {
-        self.sheet.peek_value_with_provider(addr, self)
+        collapse_array_for_eval(self.sheet.peek_value_with_provider(addr, self))
     }
 
     fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
@@ -2497,7 +2976,7 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
         self.sheet.for_each_sparse_cell_with(
             range,
-            &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+            &|sheet, addr| collapse_array_for_eval(sheet.peek_value_with_provider(addr, self)),
             f,
         );
     }

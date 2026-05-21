@@ -52,6 +52,8 @@ rust/wasm/                     → einfach-wasm               # WASM bindings ex
 
 **Form system** (`react/form/src/core/`, `solid/form/src/core/`): Backs form state (values, errors, validation rules) with atoms via `useForm()`.
 
+**Spill-derived atoms** (`rust/excel-core/src/sheet.rs` § "Spill (dynamic-array) infrastructure"): when a formula evaluates to `Value::Array`, the anchor cell's atom holds the array and each non-(0,0) target gets a derived atom that reads the anchor and indexes into it. Reads, dependency tracking, and subscription propagation reuse the existing atom framework — no parallel spill index — and the WASM boundary collapses `Value::Array` to its top-left scalar so JS never sees an Array variant.
+
 ## Architecture: vnext (spreadsheet stack)
 
 The `vnext` arc layers a spreadsheet on top of the existing atom core. It is the active surface for new feature work; the legacy `solid/excel/src/` shell is kept only for parity tests.

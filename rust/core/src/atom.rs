@@ -31,6 +31,11 @@ pub enum ValueError {
     /// this as a parse/compile error; we surface it at eval time as a
     /// distinct code so tests can assert precise argument-count checking.
     WrongArgCount, // #ARGS!
+    /// A dynamic-array formula attempted to spill into a cell that already
+    /// holds a non-empty value (primitive, formula, or another spill range).
+    /// Excel shows this as `#SPILL!`. The anchor cell holds this error and
+    /// the would-be spill targets remain unchanged.
+    Spill, // #SPILL!
 }
 
 impl std::fmt::Display for ValueError {
@@ -44,7 +49,49 @@ impl std::fmt::Display for ValueError {
             ValueError::Overflow => write!(f, "#NUM!"),
             ValueError::WrongType => write!(f, "#TYPE!"),
             ValueError::WrongArgCount => write!(f, "#ARGS!"),
+            ValueError::Spill => write!(f, "#SPILL!"),
         }
+    }
+}
+
+/// A rectangular block of values produced by a dynamic-array (spill)
+/// formula. Stored row-major (`row * cols + col`). Wrapped in `Arc` at the
+/// `Value::Array` boundary so cloning is cheap — the spilled cell's
+/// derived atom calls `arr.get(di, dj)` on every read, and we never want
+/// to deep-copy the whole array per read.
+#[derive(Debug)]
+pub struct ArrayData {
+    pub rows: u32,
+    pub cols: u32,
+    pub data: Vec<Value>, // row-major: index = row * cols + col
+}
+
+impl ArrayData {
+    /// Construct a new ArrayData. Panics if `data.len() != rows * cols`.
+    pub fn new(rows: u32, cols: u32, data: Vec<Value>) -> Self {
+        assert_eq!(
+            data.len() as u64,
+            rows as u64 * cols as u64,
+            "ArrayData::new: data.len() ({}) must equal rows ({}) * cols ({})",
+            data.len(),
+            rows,
+            cols
+        );
+        ArrayData { rows, cols, data }
+    }
+
+    /// Fetch a single element by 0-based (row, col). None if out of range.
+    pub fn get(&self, row: u32, col: u32) -> Option<&Value> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let idx = (row as usize) * (self.cols as usize) + (col as usize);
+        self.data.get(idx)
+    }
+
+    /// Shape as `(rows, cols)`.
+    pub fn shape(&self) -> (u32, u32) {
+        (self.rows, self.cols)
     }
 }
 
@@ -56,10 +103,16 @@ pub enum Value {
     Boolean(bool),
     Null,
     Error(ValueError),
+    /// A rectangular block of scalar values produced by a dynamic-array
+    /// formula. The `Sheet` layer expands this into derived atoms at the
+    /// spill targets; the top-level boundary (WASM) collapses `Array` to
+    /// the top-left element so JS consumers never observe this variant.
+    Array(std::sync::Arc<ArrayData>),
 }
 
 impl Value {
     /// Try to extract a number, returning None for non-numeric types.
+    /// `Array` is intentionally rejected — callers operate on scalars.
     pub fn as_number(&self) -> Option<f64> {
         match self {
             Value::Number(n) => Some(*n),
@@ -68,6 +121,7 @@ impl Value {
     }
 
     /// Try to extract text, returning None for non-text types.
+    /// `Array` is intentionally rejected — callers operate on scalars.
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Value::Text(s) => Some(s),
@@ -76,6 +130,7 @@ impl Value {
     }
 
     /// Try to extract a boolean.
+    /// `Array` is intentionally rejected — callers operate on scalars.
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Boolean(b) => Some(*b),
@@ -84,11 +139,14 @@ impl Value {
     }
 
     /// Returns true if this value is an error.
+    /// `Array` is NOT an error even if some elements inside are errors —
+    /// per-element error handling happens on the spilled-cell derived atoms.
     pub fn is_error(&self) -> bool {
         matches!(self, Value::Error(_))
     }
 
     /// Returns true if this value is null/empty.
+    /// `Array` is never null (it's a populated block).
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -108,6 +166,15 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Null, Value::Null) => true,
             (Value::Error(a), Value::Error(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => {
+                // Fast path: same Arc means same data.
+                if std::sync::Arc::ptr_eq(a, b) {
+                    return true;
+                }
+                // Shape + element-wise compare. Recurses through
+                // `Value::eq` so nested NaN parity etc. is preserved.
+                a.rows == b.rows && a.cols == b.cols && a.data == b.data
+            }
             _ => false,
         }
     }

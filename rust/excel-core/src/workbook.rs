@@ -1219,7 +1219,9 @@ impl<'a> WorkbookEvalProvider<'a> {
 impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
     fn cell(&self, addr: CellAddress) -> Value {
         let idx = self.current.get();
-        self.wb.sheets[idx].peek_value_with_provider(addr, self)
+        crate::sheet::collapse_array_for_eval(
+            self.wb.sheets[idx].peek_value_with_provider(addr, self),
+        )
     }
 
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
@@ -1227,7 +1229,9 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             return Value::Error(ValueError::InvalidRef);
         };
         self.with_current(idx, || {
-            self.wb.sheets[idx].peek_value_with_provider(addr, self)
+            crate::sheet::collapse_array_for_eval(
+                self.wb.sheets[idx].peek_value_with_provider(addr, self),
+            )
         })
     }
 
@@ -1245,7 +1249,9 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         let sheet = &self.wb.sheets[idx];
         sheet.for_each_sparse_cell_with(
             range,
-            &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+            &|sheet, addr| {
+                crate::sheet::collapse_array_for_eval(sheet.peek_value_with_provider(addr, self))
+            },
             f,
         );
     }
@@ -1267,7 +1273,11 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             let target_sheet = &self.wb.sheets[idx];
             target_sheet.for_each_sparse_cell_with(
                 range,
-                &|sheet, addr| sheet.peek_value_with_provider(addr, self),
+                &|sheet, addr| {
+                    crate::sheet::collapse_array_for_eval(
+                        sheet.peek_value_with_provider(addr, self),
+                    )
+                },
                 f,
             );
         });

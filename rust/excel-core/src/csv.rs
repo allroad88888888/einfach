@@ -146,6 +146,17 @@ fn value_to_csv_field(v: &Value) -> String {
         Value::Boolean(false) => "FALSE".into(),
         Value::Null => String::new(),
         Value::Error(e) => format!("{}", e),
+        // Phase 1 spill plumbing: CSV export of an anchor cell collapses
+        // to the top-left element. Spilled cells already render their
+        // own scalar via the derived atom, so they hit one of the scalar
+        // arms above. Reachable only if a caller hands `value_to_csv_field`
+        // a raw anchor value without going through `Sheet::peek_value`
+        // post-collapse — defensive parity with `coerce_to_text` /
+        // wasm `value_to_display`.
+        Value::Array(arr) => arr
+            .get(0, 0)
+            .map(value_to_csv_field)
+            .unwrap_or_default(),
     }
 }
 

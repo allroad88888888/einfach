@@ -890,7 +890,10 @@ impl WasmSheet {
 
     /// Get a cell's raw numeric value. Returns NaN if not a number.
     pub fn get_number(&mut self, addr: &str) -> f64 {
-        match self.sheet.get_cell(addr) {
+        // Collapse a spill anchor's Array to its top-left element first,
+        // so a spilled numeric anchor returns the [0][0] number instead
+        // of NaN (the JS boundary contract).
+        match collapse_array_for_js(&self.sheet.get_cell(addr)).into_owned() {
             Value::Number(n) => n,
             _ => f64::NAN,
         }
@@ -898,18 +901,35 @@ impl WasmSheet {
 
     /// Get the type of a cell's value: "number", "text", "boolean", "null", "error"
     pub fn get_type(&mut self, addr: &str) -> String {
-        match self.sheet.get_cell(addr) {
-            Value::Number(_) => "number".into(),
-            Value::Text(_) => "text".into(),
-            Value::Boolean(_) => "boolean".into(),
-            Value::Null => "null".into(),
-            Value::Error(_) => "error".into(),
-        }
+        // Funnel through `value_to_cell_type` so spill anchors collapse
+        // to their top-left element's type instead of leaking an Array
+        // string the JS layer wouldn't know how to handle.
+        value_to_cell_type(&self.sheet.get_cell(addr))
     }
 
     /// Check if a cell contains an error.
     pub fn is_error(&mut self, addr: &str) -> bool {
         self.sheet.get_cell(addr).is_error()
+    }
+
+    /// If `addr` is a dynamic-array spill *anchor*, return the spill
+    /// shape as a `[rows, cols]` `Uint32Array`. Returns `undefined` /
+    /// `null` (`JsValue::null`) for plain cells, spilled-into cells,
+    /// and `#SPILL!` anchors. The JS UI uses this to render the spill
+    /// border around the anchor's bounding rectangle.
+    #[wasm_bindgen(js_name = "spillInfo")]
+    pub fn spill_info(&self, addr: &str) -> JsValue {
+        let Some(parsed) = CellAddress::parse(addr) else {
+            return JsValue::null();
+        };
+        match self.sheet.spill_info(parsed) {
+            Some((rows, cols)) => {
+                let arr = js_sys::Uint32Array::new_with_length(2);
+                arr.copy_from(&[rows, cols]);
+                arr.into()
+            }
+            None => JsValue::null(),
+        }
     }
 
     /// Set multiple cells at once (batch). Pass arrays of addresses and values.
@@ -1251,24 +1271,40 @@ impl WasmWorkbook {
     }
 
     pub fn get_number(&self, sheet_idx: u32, addr: &str) -> f64 {
-        match self.workbook_value(sheet_idx, addr) {
+        // Funnel through `collapse_array_for_js` so spill anchors return
+        // their [0][0] element instead of NaN at the JS boundary.
+        match collapse_array_for_js(&self.workbook_value(sheet_idx, addr)).into_owned() {
             Value::Number(n) => n,
             _ => f64::NAN,
         }
     }
 
     pub fn get_type(&self, sheet_idx: u32, addr: &str) -> String {
-        match self.workbook_value(sheet_idx, addr) {
-            Value::Number(_) => "number".into(),
-            Value::Text(_) => "text".into(),
-            Value::Boolean(_) => "boolean".into(),
-            Value::Null => "null".into(),
-            Value::Error(_) => "error".into(),
-        }
+        value_to_cell_type(&self.workbook_value(sheet_idx, addr))
     }
 
     pub fn is_error(&self, sheet_idx: u32, addr: &str) -> bool {
         self.workbook_value(sheet_idx, addr).is_error()
+    }
+
+    /// Workbook variant of `WasmSheet::spill_info`. See that method for
+    /// JS-side semantics. Returns `null` for an unknown sheet index.
+    #[wasm_bindgen(js_name = "spillInfo")]
+    pub fn spill_info(&self, sheet_idx: u32, addr: &str) -> JsValue {
+        let Some(parsed) = CellAddress::parse(addr) else {
+            return JsValue::null();
+        };
+        let Some(sheet) = self.workbook.sheet(sheet_idx as usize) else {
+            return JsValue::null();
+        };
+        match sheet.spill_info(parsed) {
+            Some((rows, cols)) => {
+                let arr = js_sys::Uint32Array::new_with_length(2);
+                arr.copy_from(&[rows, cols]);
+                arr.into()
+            }
+            None => JsValue::null(),
+        }
     }
 
     pub fn get_formula(&self, sheet_idx: u32, addr: &str) -> String {
@@ -2197,8 +2233,24 @@ impl WasmWorkbook {
     }
 }
 
-fn value_to_display(val: &Value) -> String {
+/// Collapse a spill-anchor `Value::Array` to its top-left scalar before
+/// crossing into JS. The JS layer never observes the `Array` variant —
+/// spilled cells already return scalars through their derived atoms, and
+/// the anchor cell renders the [0][0] element exactly like Excel does
+/// when copying an array-formula anchor. This is the Phase 1 boundary
+/// contract: see `rust/excel-core/src/sheet.rs` § "Spill infrastructure".
+fn collapse_array_for_js(val: &Value) -> std::borrow::Cow<'_, Value> {
     match val {
+        Value::Array(arr) => std::borrow::Cow::Owned(
+            arr.get(0, 0).cloned().unwrap_or(Value::Null),
+        ),
+        _ => std::borrow::Cow::Borrowed(val),
+    }
+}
+
+fn value_to_display(val: &Value) -> String {
+    let val = collapse_array_for_js(val);
+    match &*val {
         Value::Number(n) => {
             if *n == n.floor() && n.abs() < 1e15 {
                 format!("{}", *n as i64)
@@ -2210,27 +2262,35 @@ fn value_to_display(val: &Value) -> String {
         Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.into(),
         Value::Null => String::new(),
         Value::Error(e) => format!("{}", e),
+        // Unreachable: collapsed above. Defensive fallback.
+        Value::Array(_) => String::new(),
     }
 }
 
 fn value_to_cell_type(val: &Value) -> String {
-    match val {
+    let val = collapse_array_for_js(val);
+    match &*val {
         Value::Number(_) => "number",
         Value::Text(_) => "text",
         Value::Boolean(_) => "boolean",
         Value::Null => "null",
         Value::Error(_) => "error",
+        // Unreachable: collapsed above.
+        Value::Array(_) => "null",
     }
     .into()
 }
 
 fn sparse_cell_from_value(sheet: usize, addr: CellAddress, val: &Value) -> Option<SparseCellJSON> {
-    let (kind, value) = match val {
+    let val = collapse_array_for_js(val);
+    let (kind, value) = match &*val {
         Value::Number(n) => ("number", Some(ImportValueJSON::Number(*n))),
         Value::Text(s) => ("text", Some(ImportValueJSON::Text(s.clone()))),
         Value::Boolean(b) => ("boolean", Some(ImportValueJSON::Boolean(*b))),
         Value::Error(e) => ("error", Some(ImportValueJSON::Text(format!("{}", e)))),
         Value::Null => return None,
+        // Unreachable: collapsed above.
+        Value::Array(_) => return None,
     };
     Some(SparseCellJSON {
         sheet,

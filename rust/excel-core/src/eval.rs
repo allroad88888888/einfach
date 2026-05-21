@@ -236,6 +236,16 @@ fn coerce_to_text(v: &Value) -> String {
         Value::Boolean(false) => "FALSE".into(),
         Value::Null => String::new(),
         Value::Error(e) => format!("{}", e),
+        // Phase 1 spill plumbing: scalar coercion of an anchor Array
+        // collapses to the top-left element. This branch is reachable
+        // only for callers that bypass `for_each_arg_value` (which
+        // already iterates Array elements). Falling back to top-left
+        // keeps Excel parity (`=A1 & ""` when A1 is a 3x1 spill produces
+        // the first element's text).
+        Value::Array(arr) => arr
+            .get(0, 0)
+            .map(coerce_to_text)
+            .unwrap_or_default(),
     }
 }
 
@@ -667,7 +677,25 @@ fn for_each_arg_value(
                 None => f(None, Value::Error(ValueError::InvalidRef)),
             }
         }
-        _ => f(None, eval_expr_with_provider(arg, provider)),
+        _ => {
+            let v = eval_expr_with_provider(arg, provider);
+            // Dynamic-array path: when a sub-expression evaluates to a
+            // `Value::Array`, iterate every element so aggregate-like
+            // callers (SUM, AVERAGE, COUNT, ...) see the elements rather
+            // than a single opaque Array value. Synthetic positions yield
+            // `None` for the address — only literal range refs get a
+            // `Some(addr)` (see the `Range` and `SheetRange` arms above).
+            // This is the Phase 1 plumbing; no built-in function produces
+            // `Value::Array` yet (Phase 3 work), so this branch is dead
+            // until a constructor function exists.
+            if let Value::Array(arr) = v {
+                for elem in arr.data.iter() {
+                    f(None, elem.clone());
+                }
+            } else {
+                f(None, v);
+            }
+        }
     }
 }
 
@@ -939,6 +967,9 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                         Value::Boolean(true) => total += 1.0,
                         Value::Boolean(false) => {}
                         Value::Text(_) => {}
+                        // Unreachable: for_each_arg_value flattens Array
+                        // sub-expressions into per-element callbacks.
+                        Value::Array(_) => {}
                     }
                 });
             }
@@ -2288,6 +2319,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                             saw_number = true;
                         }
                         Value::Null | Value::Text(_) | Value::Boolean(false) => {}
+                        // Unreachable: for_each_arg_value flattens Array.
+                        Value::Array(_) => {}
                     }
                 });
             }
@@ -2800,11 +2833,18 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Value::Null => Value::Number(0.0),
                 Value::Text(_) => Value::Number(0.0),
                 Value::Error(e) => Value::Error(e),
+                // Dynamic-array: collapse to top-left then re-classify.
+                // Phase 1 unreachable until a constructor produces Array.
+                Value::Array(arr) => match arr.get(0, 0).cloned().unwrap_or(Value::Null) {
+                    Value::Number(n) => Value::Number(n),
+                    Value::Boolean(true) => Value::Number(1.0),
+                    _ => Value::Number(0.0),
+                },
             }
         }
         "TYPE" => {
             // 1=Number, 2=Text, 4=Boolean, 16=Error. Null coerces to 0
-            // (Excel returns 1 for empty cells).
+            // (Excel returns 1 for empty cells). Excel uses 64 for arrays.
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
@@ -2815,6 +2855,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Value::Boolean(_) => 4.0,
                 Value::Error(_) => 16.0,
                 Value::Null => 1.0,
+                Value::Array(_) => 64.0,
             };
             Value::Number(code)
         }
@@ -3109,6 +3150,19 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Value::Text(s) => match s.trim().parse::<f64>() {
                     Ok(n) => Value::Number(n),
                     Err(_) => Value::Error(ValueError::InvalidValue),
+                },
+                // Dynamic-array: collapse to top-left. Phase 1 unreachable
+                // — no constructor produces Array yet.
+                Value::Array(arr) => match arr.get(0, 0).cloned().unwrap_or(Value::Null) {
+                    Value::Number(n) => Value::Number(n),
+                    Value::Boolean(true) => Value::Number(1.0),
+                    Value::Boolean(false) | Value::Null => Value::Number(0.0),
+                    Value::Text(s) => match s.trim().parse::<f64>() {
+                        Ok(n) => Value::Number(n),
+                        Err(_) => Value::Error(ValueError::InvalidValue),
+                    },
+                    Value::Error(e) => Value::Error(e),
+                    Value::Array(_) => Value::Error(ValueError::WrongType),
                 },
             }
         }
@@ -4302,6 +4356,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                         Value::Null => {
                             // Null (empty cell) is not counted at all.
                         }
+                        // Unreachable: for_each_arg_value flattens Array.
+                        Value::Array(_) => {}
                     }
                 });
             }
@@ -7199,6 +7255,15 @@ fn fn_mdeterm(args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Value::Null => m[r][c] = 0.0,
                 Value::Boolean(b) => m[r][c] = if *b { 1.0 } else { 0.0 },
                 Value::Text(_) => return Value::Error(ValueError::WrongType),
+                // Dynamic-array: collapse to top-left scalar then retry.
+                // Phase 1 unreachable — no constructor produces Array yet.
+                Value::Array(arr) => match arr.get(0, 0) {
+                    Some(Value::Number(x)) => m[r][c] = *x,
+                    Some(Value::Null) | None => m[r][c] = 0.0,
+                    Some(Value::Boolean(b)) => m[r][c] = if *b { 1.0 } else { 0.0 },
+                    Some(Value::Error(e)) => return Value::Error(e.clone()),
+                    Some(_) => return Value::Error(ValueError::WrongType),
+                },
             }
         }
     }
