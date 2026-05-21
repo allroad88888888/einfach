@@ -229,11 +229,13 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "HLOOKUP"
             | "HOUR"
             | "HSTACK"
+            | "HYPERLINK"
             | "HYPGEOM.DIST"
             | "IF"
             | "IFERROR"
             | "IFNA"
             | "IFS"
+            | "IMAGE"
             | "INDEX"
             | "INDIRECT"
             | "INT"
@@ -8280,6 +8282,161 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             Value::Error(ValueError::InvalidValue)
         }
+        // HYPERLINK(link_location, [friendly_name]) — 1 or 2 args.
+        // The formula's RESULT is the `friendly_name` (or `link_location` if
+        // absent), coerced to text. Excel's UI separately renders the result
+        // as a clickable link to `link_location`; that rendering is HOST
+        // INTEGRATION (the JS / WASM consumer can detect a HYPERLINK by
+        // inspecting the formula text — e.g. `formula.starts_with("=HYPERLINK(")`
+        // — and decorate the displayed value accordingly). The Rust core only
+        // returns the text label.
+        //
+        // Error propagation: if either argument evaluates to an Error, the
+        // error short-circuits (left-to-right). Empty `link_location` text
+        // and no `friendly_name` returns "" (matches Excel parity — Excel
+        // shows an empty cell when both are blank).
+        //
+        // future: WEBSERVICE / FILTERXML are not implemented (require HTTP +
+        // XML parsing, out of scope for this batch).
+        "HYPERLINK" => {
+            if args.is_empty() || args.len() > 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let link_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = link_v {
+                return Value::Error(e);
+            }
+            let link_text = coerce_to_text(&link_v);
+            if args.len() == 2 {
+                let friendly_v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = friendly_v {
+                    return Value::Error(e);
+                }
+                Value::Text(coerce_to_text(&friendly_v))
+            } else {
+                Value::Text(link_text)
+            }
+        }
+        // IMAGE(source, [alt_text], [sizing=0], [height], [width]) — 1..=5 args.
+        //
+        //   source  : URL or local file path. Coerced to text. Empty → #VALUE!.
+        //   alt_text: optional accessibility text. Coerced to text if present.
+        //   sizing  : 0 = original size (default), 1 = stretch to fit cell,
+        //             2 = fit within cell preserving aspect, 3 = custom h+w
+        //             (uses args 4 and 5). Anything else → #VALUE!.
+        //   height  : only valid when sizing == 3, must be > 0.
+        //   width   : only valid when sizing == 3, must be > 0.
+        //
+        // Excel surfaces a special "image value" cell type that isn't text.
+        // We don't model that variant — instead the formula evaluates to a
+        // structured `Value::Text` payload the host UI can detect by prefix:
+        //
+        //   `<IMAGE: {source}>`                                 (basic case)
+        //   `<IMAGE: {source} alt="{alt}">`                     (with alt text)
+        //   `<IMAGE: {source} alt="{alt}" sizing={n}>`          (non-default sizing)
+        //   `<IMAGE: {source} alt="..." sizing=3 height={h} width={w}>` (custom)
+        //
+        // This is HOST INTEGRATION: the JS side spots the `<IMAGE: ` prefix
+        // and renders an actual `<img>` element instead of the literal text.
+        // We picked the structured-text route (vs returning the raw URL and
+        // making the host walk the formula AST) so the same detection logic
+        // works for cells that copy/paste the formula result as a value.
+        "IMAGE" => {
+            if args.is_empty() || args.len() > 5 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let source_v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = source_v {
+                return Value::Error(e);
+            }
+            let source = coerce_to_text(&source_v);
+            if source.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let alt = if args.len() >= 2 {
+                let v = eval_expr_with_provider(&args[1], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                // Null (omitted-ish) → no alt text; otherwise coerce.
+                if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(coerce_to_text(&v))
+                }
+            } else {
+                None
+            };
+            let sizing = if args.len() >= 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                if matches!(v, Value::Null) {
+                    0
+                } else {
+                    match coerce_to_number(&v) {
+                        Some(n) if (n - n.trunc()).abs() < 1e-9 => {
+                            let i = n.trunc() as i64;
+                            if !(0..=3).contains(&i) {
+                                return Value::Error(ValueError::InvalidValue);
+                            }
+                            i as u8
+                        }
+                        _ => return Value::Error(ValueError::InvalidValue),
+                    }
+                }
+            } else {
+                0
+            };
+            let (height, width) = if sizing == 3 {
+                if args.len() != 5 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                let hv = eval_expr_with_provider(&args[3], provider);
+                if let Value::Error(e) = hv {
+                    return Value::Error(e);
+                }
+                let wv = eval_expr_with_provider(&args[4], provider);
+                if let Value::Error(e) = wv {
+                    return Value::Error(e);
+                }
+                let h = match coerce_to_number(&hv) {
+                    Some(n) if n > 0.0 && n.is_finite() => n,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                };
+                let w = match coerce_to_number(&wv) {
+                    Some(n) if n > 0.0 && n.is_finite() => n,
+                    _ => return Value::Error(ValueError::InvalidValue),
+                };
+                (Some(h), Some(w))
+            } else {
+                // For sizing 0/1/2, height/width must NOT be supplied (Excel
+                // ignores them silently, but we surface #VALUE! to keep the
+                // contract explicit). If they happen to be present we still
+                // accept Null-y omissions: only flag when args 4/5 are real.
+                if args.len() >= 4 {
+                    let hv = eval_expr_with_provider(&args[3], provider);
+                    if let Value::Error(e) = hv {
+                        return Value::Error(e);
+                    }
+                    if !matches!(hv, Value::Null) {
+                        return Value::Error(ValueError::InvalidValue);
+                    }
+                }
+                if args.len() == 5 {
+                    let wv = eval_expr_with_provider(&args[4], provider);
+                    if let Value::Error(e) = wv {
+                        return Value::Error(e);
+                    }
+                    if !matches!(wv, Value::Null) {
+                        return Value::Error(ValueError::InvalidValue);
+                    }
+                }
+                (None, None)
+            };
+            Value::Text(format_image_payload(&source, alt.as_deref(), sizing, height, width))
+        }
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
         // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
@@ -14747,6 +14904,56 @@ fn halfwidth_kana_to_fullwidth(c: char, next: Option<char>) -> (char, usize) {
         _ => c,
     };
     (full, 1)
+}
+
+/// Build the structured-text payload returned by `IMAGE(...)`. The host UI
+/// detects images by the `<IMAGE: ` prefix and parses out the source / alt
+/// text / sizing / dimensions. Format mirrors what the match arm comments
+/// in the `IMAGE` dispatch describe. Embedded `"` characters in `alt` are
+/// escaped (`\"`) so a downstream parser can recover the original text.
+fn format_image_payload(
+    source: &str,
+    alt: Option<&str>,
+    sizing: u8,
+    height: Option<f64>,
+    width: Option<f64>,
+) -> String {
+    let mut out = String::with_capacity(16 + source.len());
+    out.push_str("<IMAGE: ");
+    out.push_str(source);
+    if let Some(a) = alt {
+        out.push_str(" alt=\"");
+        for ch in a.chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                _ => out.push(ch),
+            }
+        }
+        out.push('"');
+    }
+    if sizing != 0 {
+        out.push_str(" sizing=");
+        out.push_str(&sizing.to_string());
+    }
+    if let (Some(h), Some(w)) = (height, width) {
+        // Trim trailing-zero noise the same way `coerce_to_text` does for
+        // integer-valued doubles, so `120` round-trips as `120` not `120.0`.
+        out.push_str(" height=");
+        out.push_str(&format_image_number(h));
+        out.push_str(" width=");
+        out.push_str(&format_image_number(w));
+    }
+    out.push('>');
+    out
+}
+
+fn format_image_number(n: f64) -> String {
+    if n == n.floor() && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{}", n)
+    }
 }
 
 // ===== HELPERS REGISTRY: ADD NEW HELPER FNS / CONSTS / STRUCTS BEFORE THIS LINE =====
@@ -29171,6 +29378,36 @@ mod tests {
         );
     }
 
+    // === HYPERLINK + IMAGE ===
+    //
+    // Formula-level behaviour only. The host UI is responsible for turning
+    // the returned text into a clickable link or rendered `<img>`. The
+    // tests below assert (a) the scalar return value, (b) error
+    // propagation, (c) arg-count guards, and (d) the structured-text
+    // payload contract documented on the IMAGE match arm.
+
+    /// Build a env with a URL string in A1 so HYPERLINK can read a cell.
+    fn make_link_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        let mut cm = HashMap::new();
+        let mut vs = HashMap::new();
+        let a1 = AtomId::from_raw(0);
+        let a2 = AtomId::from_raw(1);
+        cm.insert(CellAddress::new(0, 0), a1); // A1
+        cm.insert(CellAddress::new(1, 0), a2); // A2
+        vs.insert(a1, Value::Text("https://example.com".into()));
+        vs.insert(a2, Value::Number(42.0));
+        (cm, vs)
+    }
+
+    #[test]
+    fn eval_hyperlink_with_friendly_name() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=HYPERLINK(\"https://example.com\", \"click me\")", &cm, &vs),
+            Value::Text("click me".into())
+        );
+    }
+
     #[test]
     fn eval_jis_ascii_round_trip() {
         let (cm, vs) = make_test_env();
@@ -29179,6 +29416,15 @@ mod tests {
         assert_eq!(
             eval_str("=JIS(ASC(\"\u{FF21}\u{FF22}\u{FF23}\"))", &cm, &vs),
             Value::Text("\u{FF21}\u{FF22}\u{FF23}".into())
+        );
+    }
+
+    #[test]
+    fn eval_hyperlink_url_only() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=HYPERLINK(\"https://example.com\")", &cm, &vs),
+            Value::Text("https://example.com".into())
         );
     }
 
@@ -29193,11 +29439,31 @@ mod tests {
     }
 
     #[test]
+    fn eval_hyperlink_cell_ref_url() {
+        let (cm, vs) = make_link_env();
+        // A1 holds "https://example.com" — used as both link and label.
+        assert_eq!(
+            eval_str("=HYPERLINK(A1)", &cm, &vs),
+            Value::Text("https://example.com".into())
+        );
+    }
+
+    #[test]
     fn eval_jis_widens_ascii_directly() {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=JIS(\"ABC\")", &cm, &vs),
             Value::Text("\u{FF21}\u{FF22}\u{FF23}".into())
+        );
+    }
+
+    #[test]
+    fn eval_hyperlink_friendly_number_coerces() {
+        let (cm, vs) = make_link_env();
+        // friendly_name is a Number → coerced to integer text.
+        assert_eq!(
+            eval_str("=HYPERLINK(A1, A2)", &cm, &vs),
+            Value::Text("42".into())
         );
     }
 
@@ -29209,6 +29475,16 @@ mod tests {
         assert_eq!(
             eval_str("=DBCS(\"ABC\")", &cm, &vs),
             eval_str("=JIS(\"ABC\")", &cm, &vs),
+        );
+    }
+
+    #[test]
+    fn eval_hyperlink_propagates_error_in_link() {
+        let (cm, vs) = make_link_env();
+        // 1/0 in link_location short-circuits.
+        assert_eq!(
+            eval_str("=HYPERLINK(1/0, \"x\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
         );
     }
 
@@ -29233,6 +29509,15 @@ mod tests {
     }
 
     #[test]
+    fn eval_hyperlink_propagates_error_in_friendly() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=HYPERLINK(\"u\", 1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
     fn eval_jis_voiced_katakana_composes() {
         let (cm, vs) = make_test_env();
         // ｶ + ﾞ → ガ (one full-width char).
@@ -29253,6 +29538,16 @@ mod tests {
     }
 
     #[test]
+    fn eval_hyperlink_empty_link_returns_empty() {
+        let (cm, vs) = make_link_env();
+        // No friendly name + empty link → empty text (Excel parity).
+        assert_eq!(
+            eval_str("=HYPERLINK(\"\")", &cm, &vs),
+            Value::Text(String::new())
+        );
+    }
+
+    #[test]
     fn eval_asc_mixed_text_passthrough() {
         let (cm, vs) = make_test_env();
         // Full-width "Ｈｅｌｌｏ" + full-width space + CJK ideographs.
@@ -29268,6 +29563,43 @@ mod tests {
     }
 
     #[test]
+    fn eval_hyperlink_wrong_arg_count() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=HYPERLINK()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=HYPERLINK(\"a\",\"b\",\"c\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_image_basic() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"https://example.com/cat.jpg\")", &cm, &vs),
+            Value::Text("<IMAGE: https://example.com/cat.jpg>".into())
+        );
+    }
+
+    #[test]
+    fn eval_image_with_alt() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str(
+                "=IMAGE(\"https://example.com/cat.jpg\", \"a cat\")",
+                &cm,
+                &vs
+            ),
+            Value::Text(
+                "<IMAGE: https://example.com/cat.jpg alt=\"a cat\">".into()
+            )
+        );
+    }
+
+    #[test]
     fn eval_asc_yen_sign_becomes_backslash() {
         let (cm, vs) = make_test_env();
         // U+FFE5 ￥ → U+005C \ per Excel's JIS code page convention.
@@ -29275,6 +29607,15 @@ mod tests {
         assert_eq!(
             eval_str("=ASC(\"\u{FFE5}100\")", &cm, &vs),
             Value::Text("\\100".into())
+        );
+    }
+
+    #[test]
+    fn eval_image_sizing_fit() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"alt\", 2)", &cm, &vs),
+            Value::Text("<IMAGE: u alt=\"alt\" sizing=2>".into())
         );
     }
 
@@ -29320,6 +29661,30 @@ mod tests {
     }
 
     #[test]
+    fn eval_image_custom_dimensions() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 3, 120, 240)", &cm, &vs),
+            Value::Text(
+                "<IMAGE: u alt=\"a\" sizing=3 height=120 width=240>".into()
+            )
+        );
+    }
+
+    #[test]
+    fn eval_image_invalid_sizing() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", -1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn eval_jis_wrong_arg_count() {
         let (cm, vs) = make_test_env();
         assert_eq!(
@@ -29359,6 +29724,20 @@ mod tests {
         // #VALUE! until that sidecar exists.
         assert_eq!(
             eval_str("=PHONETIC(A1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_image_sizing_3_missing_dimensions() {
+        let (cm, vs) = make_link_env();
+        // sizing=3 needs both height AND width.
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 3, 120)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
     }
@@ -29463,6 +29842,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn eval_image_sizing_3_non_positive_dimensions() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 3, 0, 100)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", \"a\", 3, 100, -5)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
     // === ENCODEURL ===
 
     /// Spaces encode as %20; reserved chars encode; unreserved
@@ -29510,6 +29902,15 @@ mod tests {
     }
 
     #[test]
+    fn eval_image_empty_source() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(\"\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn eval_encodeurl_arg_count_error() {
         let (cm, vs) = make_test_env();
         assert_eq!(
@@ -29530,6 +29931,7 @@ mod tests {
         assert!(is_builtin_function_name("ENCODEURL"));
     }
 
+    #[test]
     fn eval_phonetic_error_propagates() {
         let (cm, vs) = make_test_env();
         // Even though the result is normally #VALUE!, an upstream error
@@ -29538,6 +29940,42 @@ mod tests {
             eval_str("=PHONETIC(A1/C1)", &cm, &vs),
             Value::Error(ValueError::DivisionByZero)
         );
+    }
+
+    #[test]
+    fn eval_image_propagates_error() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE(1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=IMAGE(\"u\", 1/0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    #[test]
+    fn eval_image_wrong_arg_count() {
+        let (cm, vs) = make_link_env();
+        assert_eq!(
+            eval_str("=IMAGE()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=IMAGE(\"a\",\"b\",0,1,2,3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn format_image_payload_escapes_alt_quotes() {
+        // Unit-level: confirm the formatter escapes embedded `"` so a
+        // downstream parser can recover the original alt text. The formula
+        // parser doesn't currently support `""`-escaped quotes inside a
+        // string literal, so we drive the helper directly here.
+        let s = super::format_image_payload("u", Some("a \"b\" c"), 0, None, None);
+        assert_eq!(s, "<IMAGE: u alt=\"a \\\"b\\\" c\">");
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====
