@@ -2195,6 +2195,12 @@ impl Sheet {
         self.formula_texts.get(&addr).cloned()
     }
 
+    /// Is there a formula at `addr`? Used by `ISFORMULA(reference)` via
+    /// the `EvalProvider::cell_has_formula` hook.
+    pub fn has_formula_at(&self, addr: CellAddress) -> bool {
+        self.formula_cells.contains_key(&addr)
+    }
+
     /// Iterate every address that has a primitive value or a formula. Empty
     /// addresses are skipped. Used by structural-undo to snapshot only the
     /// cells that actually need restoring (see `solid/excel/docs/STRUCTURAL_UNDO.md`).
@@ -3362,6 +3368,10 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn set_current_cell(&self, addr: Option<CellAddress>) {
         self.current_cell.set(addr);
     }
+
+    fn cell_has_formula(&self, addr: CellAddress) -> bool {
+        self.sheet.has_formula_at(addr)
+    }
 }
 
 struct TrackingEvalProvider<'a> {
@@ -3421,6 +3431,26 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
         // anything in the per-cell `deps` set when a named lookup
         // succeeds.
         self.inner.lookup_named(name)
+    }
+
+    fn cell_has_formula(&self, addr: CellAddress) -> bool {
+        self.inner.cell_has_formula(addr)
+    }
+
+    fn sheet_cell_has_formula(&self, sheet: &str, addr: CellAddress) -> bool {
+        self.inner.sheet_cell_has_formula(sheet, addr)
+    }
+
+    fn current_sheet_index(&self) -> Option<usize> {
+        self.inner.current_sheet_index()
+    }
+
+    fn sheet_index_of(&self, name: &str) -> Option<usize> {
+        self.inner.sheet_index_of(name)
+    }
+
+    fn sheet_count(&self) -> usize {
+        self.inner.sheet_count()
     }
 }
 

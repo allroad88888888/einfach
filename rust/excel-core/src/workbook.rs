@@ -1810,6 +1810,38 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         // wraps an `Arc<dyn LambdaValue>`; constant-time for scalars).
         self.wb.get_named(name)
     }
+
+    fn cell_has_formula(&self, addr: CellAddress) -> bool {
+        let idx = self.current.get();
+        self.wb
+            .sheets
+            .get(idx)
+            .map(|s| s.has_formula_at(addr))
+            .unwrap_or(false)
+    }
+
+    fn sheet_cell_has_formula(&self, sheet: &str, addr: CellAddress) -> bool {
+        let Some(idx) = self.wb.by_name.get(sheet).copied() else {
+            return false;
+        };
+        self.wb
+            .sheets
+            .get(idx)
+            .map(|s| s.has_formula_at(addr))
+            .unwrap_or(false)
+    }
+
+    fn current_sheet_index(&self) -> Option<usize> {
+        Some(self.current.get())
+    }
+
+    fn sheet_index_of(&self, name: &str) -> Option<usize> {
+        self.wb.by_name.get(name).copied()
+    }
+
+    fn sheet_count(&self) -> usize {
+        self.wb.sheets.len()
+    }
 }
 
 #[cfg(test)]

@@ -624,6 +624,33 @@ pub trait EvalProvider {
     fn lookup_named(&self, _name: &str) -> Option<Value> {
         None
     }
+
+    /// Does the cell at `addr` contain a formula? Default `false`.
+    fn cell_has_formula(&self, _addr: CellAddress) -> bool {
+        false
+    }
+
+    /// Does the cell at `(sheet, addr)` contain a formula? Cross-sheet
+    /// variant. Default delegates to local `cell_has_formula`.
+    fn sheet_cell_has_formula(&self, _sheet: &str, addr: CellAddress) -> bool {
+        self.cell_has_formula(addr)
+    }
+
+    /// 0-based index of the sheet that owns the currently-active eval
+    /// frame (in workbook context). Default `None`.
+    fn current_sheet_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// Look up a sheet by name and return its 0-based index. Default `None`.
+    fn sheet_index_of(&self, _name: &str) -> Option<usize> {
+        None
+    }
+
+    /// Total sheets in the host workbook. Default `1`.
+    fn sheet_count(&self) -> usize {
+        1
+    }
 }
 
 struct AtomEvalProvider<'a> {
@@ -7582,6 +7609,368 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // `=SQUARE(5)` work after `define_name("SQUARE", "=LAMBDA(x, x*x)")`.
         // Non-lambda named values aren't callable as a function (Excel parity:
         // `=answer()` when `answer` is 42 is a #VALUE!, not 42).
+        "SLN" => fn_sln(args, provider),
+        "SYD" => fn_syd(args, provider),
+        "DB" => fn_db(args, provider),
+        "DDB" => fn_ddb(args, provider),
+        "VDB" => fn_vdb(args, provider),
+        "CUMIPMT" => fn_cumipmt(args, provider),
+        "CUMPRINC" => fn_cumprinc(args, provider),
+        "EFFECT" => fn_effect(args, provider),
+        "NOMINAL" => fn_nominal(args, provider),
+        "ISPMT" => fn_ispmt(args, provider),
+        "ACCRINT" => fn_accrint(args, provider),
+        "ACCRINTM" => fn_accrintm(args, provider),
+        "DISC" => fn_disc(args, provider),
+        "INTRATE" => fn_intrate(args, provider),
+        "RECEIVED" => fn_received(args, provider),
+        "TBILLEQ" => fn_tbilleq(args, provider),
+        "TBILLPRICE" => fn_tbillprice(args, provider),
+        "TBILLYIELD" => fn_tbillyield(args, provider),
+        "XIRR" => fn_xirr(args, provider),
+        "XNPV" => fn_xnpv(args, provider),
+        "MIRR" => fn_mirr(args, provider),
+        "UNICHAR" => fn_unichar(args, provider),
+        "UNICODE" => fn_unicode(args, provider),
+        "NUMBERVALUE" => fn_numbervalue(args, provider),
+        "ARRAYTOTEXT" => fn_arraytotext(args, provider),
+        "VALUETOTEXT" => fn_valuetotext(args, provider),
+        "REGEXTEST" => fn_regextest(args, provider),
+        "REGEXEXTRACT" => fn_regexextract(args, provider),
+        "REGEXREPLACE" => fn_regexreplace(args, provider),
+        "ISFORMULA" => fn_isformula(args, provider),
+        "SHEET" => fn_sheet(args, provider),
+        "SHEETS" => fn_sheets(args, provider),
+        "INFO" => fn_info(args, provider),
+        "COMPLEX" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let real = match coerce_to_number(&eval_expr_with_provider(&args[0], provider)) {
+                Some(n) => n,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let imag = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
+                Some(n) => n,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            let suffix = if args.len() == 3 {
+                let v = eval_expr_with_provider(&args[2], provider);
+                if let Value::Error(e) = v {
+                    return Value::Error(e);
+                }
+                match v {
+                    Value::Text(s) if s == "i" => 'i',
+                    Value::Text(s) if s == "j" => 'j',
+                    // Excel surfaces #VALUE! for any other suffix.
+                    _ => return Value::Error(ValueError::InvalidValue),
+                }
+            } else {
+                'i'
+            };
+            if !real.is_finite() || !imag.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(real, imag, suffix))
+        }
+        "IMABS" => complex_unary_number(args, provider, |a, b| (a * a + b * b).sqrt()),
+        "IMAGINARY" => complex_unary_number(args, provider, |_a, b| b),
+        "IMREAL" => complex_unary_number(args, provider, |a, _b| a),
+        "IMARGUMENT" => {
+            // Excel: IMARGUMENT(0) is #DIV/0! (no well-defined
+            // argument at the origin). atan2(0, 0) returns 0 in Rust,
+            // which would silently mask that case — guard explicitly.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, _s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if a == 0.0 && b == 0.0 {
+                return Value::Error(ValueError::DivisionByZero);
+            }
+            Value::Number(b.atan2(a))
+        }
+        "IMCONJUGATE" => complex_unary_text(args, provider, |a, b, s| (a, -b, s)),
+        "IMSUM" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (mut sum_r, mut sum_i, suffix) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            for arg in &args[1..] {
+                let (r, i, _s) = match eval_complex_arg(arg, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                sum_r += r;
+                sum_i += i;
+            }
+            if !sum_r.is_finite() || !sum_i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(sum_r, sum_i, suffix))
+        }
+        "IMSUB" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, suffix) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (c, d, _s) = match eval_complex_arg(&args[1], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let r = a - c;
+            let i = b - d;
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, suffix))
+        }
+        "IMPRODUCT" => {
+            if args.is_empty() {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (mut pr, mut pi, suffix) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            for arg in &args[1..] {
+                let (r, i, _s) = match eval_complex_arg(arg, provider) {
+                    Ok(t) => t,
+                    Err(e) => return Value::Error(e),
+                };
+                let (nr, ni) = complex_mul(pr, pi, r, i);
+                pr = nr;
+                pi = ni;
+            }
+            if !pr.is_finite() || !pi.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(pr, pi, suffix))
+        }
+        "IMDIV" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, suffix) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (c, d, _s) = match eval_complex_arg(&args[1], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (r, i) = match complex_div(a, b, c, d) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::DivisionByZero),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, suffix))
+        }
+        "IMEXP" => complex_unary_text(args, provider, |a, b, s| {
+            let mag = a.exp();
+            (mag * b.cos(), mag * b.sin(), s)
+        }),
+        "IMLN" => {
+            // ln(z) = ln|z| + i*arg(z). Domain: z != 0.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if a == 0.0 && b == 0.0 {
+                return Value::Error(ValueError::Overflow);
+            }
+            let r = (a * a + b * b).sqrt().ln();
+            let i = b.atan2(a);
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMLOG10" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if a == 0.0 && b == 0.0 {
+                return Value::Error(ValueError::Overflow);
+            }
+            let denom = 10.0_f64.ln();
+            let r = (a * a + b * b).sqrt().ln() / denom;
+            let i = b.atan2(a) / denom;
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMLOG2" => {
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            if a == 0.0 && b == 0.0 {
+                return Value::Error(ValueError::Overflow);
+            }
+            let denom = 2.0_f64.ln();
+            let r = (a * a + b * b).sqrt().ln() / denom;
+            let i = b.atan2(a) / denom;
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMSQRT" => complex_unary_text(args, provider, |a, b, s| {
+            // sqrt(z) = sqrt(r) * (cos(arg/2) + sin(arg/2)i), principal value.
+            let r = (a * a + b * b).sqrt();
+            let arg_half = b.atan2(a) / 2.0;
+            let mag = r.sqrt();
+            (mag * arg_half.cos(), mag * arg_half.sin(), s)
+        }),
+        "IMPOWER" => {
+            if args.len() != 2 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let n = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
+                Some(x) => x,
+                None => return Value::Error(ValueError::WrongType),
+            };
+            // De Moivre. Origin handling: 0^0 mirrors POWER (Excel
+            // returns 1), 0^positive == 0, 0^negative is #NUM!.
+            if a == 0.0 && b == 0.0 {
+                if n == 0.0 {
+                    return Value::Text(format_complex(1.0, 0.0, s));
+                }
+                if n < 0.0 {
+                    return Value::Error(ValueError::Overflow);
+                }
+                return Value::Text(format_complex(0.0, 0.0, s));
+            }
+            let r = (a * a + b * b).sqrt();
+            let arg = b.atan2(a);
+            let mag = r.powf(n);
+            let theta = arg * n;
+            let real = mag * theta.cos();
+            let imag = mag * theta.sin();
+            if !real.is_finite() || !imag.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(real, imag, s))
+        }
+        "IMCOS" => complex_unary_text(args, provider, |a, b, s| {
+            (a.cos() * b.cosh(), -a.sin() * b.sinh(), s)
+        }),
+        "IMCOSH" => complex_unary_text(args, provider, |a, b, s| {
+            (a.cosh() * b.cos(), a.sinh() * b.sin(), s)
+        }),
+        "IMSIN" => complex_unary_text(args, provider, |a, b, s| {
+            (a.sin() * b.cosh(), a.cos() * b.sinh(), s)
+        }),
+        "IMSINH" => complex_unary_text(args, provider, |a, b, s| {
+            (a.sinh() * b.cos(), a.cosh() * b.sin(), s)
+        }),
+        "IMTAN" => {
+            // tan = sin/cos. Singularities at z = (k + 1/2)π for real
+            // z; cos hits zero exactly there. Surface #NUM! per Excel
+            // when the denominator is zero (we use Overflow which maps
+            // to #NUM!).
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (sin_r, sin_i) = (a.sin() * b.cosh(), a.cos() * b.sinh());
+            let (cos_r, cos_i) = (a.cos() * b.cosh(), -a.sin() * b.sinh());
+            let (r, i) = match complex_div(sin_r, sin_i, cos_r, cos_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMSEC" => {
+            // sec = 1/cos.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (cos_r, cos_i) = (a.cos() * b.cosh(), -a.sin() * b.sinh());
+            let (r, i) = match complex_div(1.0, 0.0, cos_r, cos_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMCSC" => {
+            // csc = 1/sin.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (sin_r, sin_i) = (a.sin() * b.cosh(), a.cos() * b.sinh());
+            let (r, i) = match complex_div(1.0, 0.0, sin_r, sin_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
+        "IMCOT" => {
+            // cot = cos/sin.
+            if args.len() != 1 {
+                return Value::Error(ValueError::WrongArgCount);
+            }
+            let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+                Ok(t) => t,
+                Err(e) => return Value::Error(e),
+            };
+            let (cos_r, cos_i) = (a.cos() * b.cosh(), -a.sin() * b.sinh());
+            let (sin_r, sin_i) = (a.sin() * b.cosh(), a.cos() * b.sinh());
+            let (r, i) = match complex_div(cos_r, cos_i, sin_r, sin_i) {
+                Some(z) => z,
+                None => return Value::Error(ValueError::Overflow),
+            };
+            if !r.is_finite() || !i.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            Value::Text(format_complex(r, i, s))
+        }
         _ => eval_named_call(name, args, provider),
     }
 }
@@ -10855,6 +11244,1826 @@ fn stat_fisherinv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
 
 
+
+fn yearfrac_basis(start: f64, end: f64, basis: i64) -> Result<f64, ValueError> {
+    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    match basis {
+        0 | 4 => {
+            let (y1, m1, d1) = date_from_serial(lo);
+            let (y2, m2, d2) = date_from_serial(hi);
+            let num = (y2 - y1) as f64 * 360.0
+                + (m2 as f64 - m1 as f64) * 30.0
+                + (d2 as f64 - d1 as f64);
+            Ok(num / 360.0)
+        }
+        1 => Ok((hi - lo) / 365.0),
+        2 => Ok((hi - lo) / 360.0),
+        3 => Ok((hi - lo) / 365.0),
+        _ => Err(ValueError::InvalidValue),
+    }
+}
+
+fn fin_basis(
+    args: &[Expr],
+    idx: usize,
+    provider: &dyn EvalProvider,
+) -> Result<i64, ValueError> {
+    if args.len() <= idx {
+        return Ok(0);
+    }
+    let b = fin_coerce(&args[idx], provider)?;
+    let n = b.trunc() as i64;
+    if !(0..=4).contains(&n) {
+        return Err(ValueError::InvalidValue);
+    }
+    Ok(n)
+}
+
+fn day_diff(start: f64, end: f64) -> f64 {
+    end.floor() - start.floor()
+}
+
+fn fn_sln(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if life <= 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    Value::Number((cost - salvage) / life)
+}
+
+fn fn_syd(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let per = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if life <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if per < 1.0 || per > life {
+        return Value::Error(ValueError::Overflow);
+    }
+    let result = (cost - salvage) * (life - per + 1.0) * 2.0 / (life * (life + 1.0));
+    Value::Number(result)
+}
+
+fn fn_db(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let month = if args.len() == 5 {
+        match fin_coerce(&args[4], provider) {
+            Ok(v) => v.trunc(),
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        12.0
+    };
+    if life <= 0.0 || period < 1.0 || month < 1.0 || month > 12.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if cost == 0.0 {
+        return Value::Number(0.0);
+    }
+    if salvage < 0.0 || cost < 0.0 || (cost > 0.0 && salvage > cost) {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Excel rounds the rate to 3 decimals.
+    let raw_rate = if salvage == 0.0 {
+        1.0
+    } else {
+        1.0 - (salvage / cost).powf(1.0 / life)
+    };
+    let rate = (raw_rate * 1000.0).round() / 1000.0;
+    // The "extra" period beyond `life` is allowed when month < 12; reject
+    // anything past `life + 1`.
+    let life_i = life.trunc() as i64;
+    let per_i = period.trunc() as i64;
+    if per_i > life_i + 1 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Simulate period-by-period. We do a tight closed-form loop because
+    // each period's depreciation depends only on running total.
+    let mut total: f64 = 0.0;
+    let mut last_dep: f64 = 0.0;
+    let last_period = per_i.min(life_i + 1);
+    for k in 1..=last_period {
+        let dep = if k == 1 {
+            cost * rate * month / 12.0
+        } else if (k as f64) == life + 1.0 {
+            (cost - total) * rate * (12.0 - month) / 12.0
+        } else {
+            (cost - total) * rate
+        };
+        last_dep = dep;
+        total += dep;
+    }
+    if !last_dep.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(last_dep)
+}
+
+fn fn_ddb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let period = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let factor = if args.len() == 5 {
+        match fin_coerce(&args[4], provider) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        2.0
+    };
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || period < 1.0 || factor <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if period > life + 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let dep = ddb_period(cost, salvage, life, period, factor);
+    if dep.is_finite() {
+        Value::Number(dep)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn ddb_period(cost: f64, salvage: f64, life: f64, period: f64, factor: f64) -> f64 {
+    let rate = factor / life;
+    let mut prior: f64 = 0.0;
+    let p_int = period.floor() as i64;
+    for _ in 1..p_int {
+        let d = ((cost - prior) * rate).min(cost - salvage - prior).max(0.0);
+        prior += d;
+    }
+    ((cost - prior) * rate).min(cost - salvage - prior).max(0.0)
+}
+
+fn fn_vdb(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 5 || args.len() > 7 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let cost = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let salvage = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let life = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let start = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let factor = if args.len() >= 6 {
+        match fin_coerce(&args[5], provider) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        2.0
+    };
+    let no_switch = if args.len() == 7 {
+        match fin_coerce(&args[6], provider) {
+            Ok(v) => v != 0.0,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        false
+    };
+    if cost < 0.0 || salvage < 0.0 || life <= 0.0 || factor <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if start < 0.0 || end < start || end > life {
+        return Value::Error(ValueError::Overflow);
+    }
+    // Walk full periods 1..=life. For each period, accumulate the
+    // DDB amount (no-switch) or the larger of DDB-vs-SL-on-remaining-life
+    // (switch). Then take the slice of total dep between `start` and `end`.
+    //
+    // VDB allows fractional start/end; we approximate by integrating
+    // whole periods and pro-rating the fractional ends. This is the same
+    // approach used by every open-source spreadsheet engine we've seen.
+    let rate = factor / life;
+    let life_i = life.ceil() as i64;
+    let mut prior: f64 = 0.0;
+    let mut per_dep: Vec<f64> = Vec::with_capacity(life_i as usize);
+    let mut switched = false;
+    for k in 1..=life_i {
+        let ddb_d = ((cost - prior) * rate).min(cost - salvage - prior).max(0.0);
+        let dep = if no_switch {
+            ddb_d
+        } else {
+            // Straight-line over remaining life. `(life - (k-1))` is the
+            // number of full periods left at the START of period k.
+            let remaining_periods = life - (k as f64 - 1.0);
+            let sl_d = if remaining_periods > 0.0 {
+                ((cost - salvage - prior) / remaining_periods).max(0.0)
+            } else {
+                0.0
+            };
+            if switched || sl_d > ddb_d {
+                switched = true;
+                sl_d
+            } else {
+                ddb_d
+            }
+        };
+        per_dep.push(dep);
+        prior += dep;
+    }
+    // Sum dep[start..end] with fractional pro-rating at the boundaries.
+    let mut total = 0.0_f64;
+    let s_floor = start.floor() as i64;
+    let e_ceil = end.ceil() as i64;
+    for k in (s_floor + 1).max(1)..=e_ceil.min(life_i) {
+        let idx = (k - 1) as usize;
+        let p_start = (k - 1) as f64;
+        let p_end = k as f64;
+        let s = start.max(p_start);
+        let e = end.min(p_end);
+        if e > s {
+            total += per_dep[idx] * (e - s) / (p_end - p_start);
+        }
+    }
+    if total.is_finite() {
+        Value::Number(total)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+/// Trivial EvalProvider used inside CUMIPMT/CUMPRINC's IPMT/PPMT recursion
+/// where all args are already literals (no cell lookups needed).
+struct CumNoopProvider;
+impl EvalProvider for CumNoopProvider {
+    fn cell(&self, _addr: CellAddress) -> Value {
+        Value::Null
+    }
+    fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        Value::Null
+    }
+}
+
+const XIRR_TOL: f64 = 1e-7;
+const XIRR_MAX_ITER: usize = 100;
+
+fn cumulative_pmt<F>(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    per_call: F,
+) -> Value
+where
+    F: Fn(f64, f64, f64, f64, f64) -> Value,
+{
+    if args.len() != 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let rate = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let nper = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pv = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let start = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let end = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let type_ = match fin_coerce_type(args, 5, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate <= 0.0 || nper <= 0.0 || pv <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let s = start.trunc() as i64;
+    let e = end.trunc() as i64;
+    let n = nper.trunc() as i64;
+    if s < 1 || e < s || e > n {
+        return Value::Error(ValueError::Overflow);
+    }
+    let mut total = 0.0_f64;
+    for k in s..=e {
+        match per_call(rate, k as f64, nper, pv, type_) {
+            Value::Number(v) => total += v,
+            other => return other,
+        }
+    }
+    if total.is_finite() {
+        Value::Number(total)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_cumipmt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    cumulative_pmt(args, provider, |rate, per, nper, pv, type_| {
+        // Build the args IPMT expects: (rate, per, nper, pv, fv=0, type).
+        let synth = [
+            Expr::Number(rate),
+            Expr::Number(per),
+            Expr::Number(nper),
+            Expr::Number(pv),
+            Expr::Number(0.0),
+            Expr::Number(type_),
+        ];
+        fn_ipmt(&synth, &CumNoopProvider)
+    })
+}
+
+fn fn_cumprinc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    cumulative_pmt(args, provider, |rate, per, nper, pv, type_| {
+        let synth = [
+            Expr::Number(rate),
+            Expr::Number(per),
+            Expr::Number(nper),
+            Expr::Number(pv),
+            Expr::Number(0.0),
+            Expr::Number(type_),
+        ];
+        fn_ppmt(&synth, &CumNoopProvider)
+    })
+}
+
+fn fn_effect(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let nominal = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let npery = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let n = npery.trunc();
+    if nominal <= 0.0 || n < 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let r = (1.0 + nominal / n).powf(n) - 1.0;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_nominal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let effect = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let npery = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let n = npery.trunc();
+    if effect <= 0.0 || n < 1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let r = ((1.0 + effect).powf(1.0 / n) - 1.0) * n;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_ispmt(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let rate = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let per = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let nper = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pv = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if nper == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    // Excel sign convention: a positive `pv` (loan we receive) implies
+    // negative interest (outflow), and ISPMT pays straight-line interest.
+    Value::Number(-pv * rate * (1.0 - per / nper))
+}
+
+fn fn_accrint(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 6 || args.len() > 8 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let issue = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // first_interest is consumed for parity with Excel's signature but
+    // doesn't affect the simplified computation.
+    let _first_interest = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let settlement = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let par = match fin_coerce(&args[4], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let frequency = match fin_coerce(&args[5], provider) {
+        Ok(v) => v.trunc() as i64,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 6, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    // calc_method (arg 7) is accepted for parity but doesn't change our
+    // simplified result (Excel only varies behavior when settlement
+    // crosses multiple periods backward).
+    if args.len() == 8 {
+        if let Err(e) = fin_coerce(&args[7], provider) {
+            return Value::Error(e);
+        }
+    }
+    if rate <= 0.0 || par <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if !matches!(frequency, 1 | 2 | 4) {
+        return Value::Error(ValueError::Overflow);
+    }
+    if settlement <= issue {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(issue, settlement, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(par * rate * yf)
+}
+
+fn fn_accrintm(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let issue = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let settlement = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let rate = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let par = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate <= 0.0 || par <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if settlement <= issue {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(issue, settlement, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    Value::Number(par * rate * yf)
+}
+
+fn fn_disc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if pr <= 0.0 || redemption <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if yf == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let r = (redemption - pr) / redemption / yf;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_intrate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let investment = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let redemption = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if investment <= 0.0 || redemption <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if yf == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let r = (redemption - investment) / investment / yf;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_received(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 4 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let investment = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let discount = match fin_coerce(&args[3], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let basis = match fin_basis(args, 4, provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if investment <= 0.0 || discount <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    if maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let yf = match yearfrac_basis(settlement, maturity, basis) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let denom = 1.0 - discount * yf;
+    if denom <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let r = investment / denom;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_tbilleq(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let discount = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if discount <= 0.0 || maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let diff = day_diff(settlement, maturity);
+    if diff > 365.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let denom = 360.0 - discount * diff;
+    if denom <= 0.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(365.0 * discount / denom)
+}
+
+fn fn_tbillprice(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let discount = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if discount <= 0.0 || maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let diff = day_diff(settlement, maturity);
+    if diff > 365.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(100.0 * (1.0 - discount * diff / 360.0))
+}
+
+fn fn_tbillyield(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let settlement = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let maturity = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let pr = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if pr <= 0.0 || maturity <= settlement {
+        return Value::Error(ValueError::Overflow);
+    }
+    let diff = day_diff(settlement, maturity);
+    if diff <= 0.0 || diff > 365.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number((100.0 - pr) / pr * 360.0 / diff)
+}
+
+fn collect_xirr_pairs(
+    values: &Expr,
+    dates: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<Vec<(f64, f64)>, ValueError> {
+    let mut vs: Vec<f64> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(values, provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        match v {
+            Value::Number(n) => vs.push(n),
+            Value::Error(e) => err = Some(e),
+            Value::Null => {}
+            _ => err = Some(ValueError::InvalidValue),
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    let mut ds: Vec<f64> = Vec::new();
+    let mut err: Option<ValueError> = None;
+    for_each_arg_value(dates, provider, &mut |_addr, v| {
+        if err.is_some() {
+            return;
+        }
+        match v {
+            Value::Number(n) => ds.push(n.floor()),
+            Value::Error(e) => err = Some(e),
+            Value::Null => {}
+            _ => err = Some(ValueError::InvalidValue),
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if vs.len() != ds.len() || vs.len() < 2 {
+        return Err(ValueError::InvalidValue);
+    }
+    // Pair them. Sort by date to keep the first date as the anchor.
+    let mut paired: Vec<(f64, f64)> = ds.into_iter().zip(vs.into_iter()).collect();
+    paired.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(paired)
+}
+
+fn fn_xirr(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let pairs = match collect_xirr_pairs(&args[0], &args[1], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    // Require at least one positive AND one negative cash flow.
+    let has_pos = pairs.iter().any(|(_, v)| *v > 0.0);
+    let has_neg = pairs.iter().any(|(_, v)| *v < 0.0);
+    if !(has_pos && has_neg) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let guess = if args.len() == 3 {
+        match fin_coerce(&args[2], provider) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(e),
+        }
+    } else {
+        0.1
+    };
+    if guess <= -1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let d0 = pairs[0].0;
+    let mut r = guess;
+    for _ in 0..XIRR_MAX_ITER {
+        let base = 1.0 + r;
+        if base <= 0.0 || !base.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        let mut f = 0.0_f64;
+        let mut fp = 0.0_f64;
+        for (d, v) in &pairs {
+            let t = (*d - d0) / 365.0;
+            let denom = base.powf(t);
+            if denom == 0.0 || !denom.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            f += v / denom;
+            // df/dr [v * (1+r)^(-t)] = -t * v * (1+r)^(-t-1)
+            fp += -t * v / (denom * base);
+        }
+        if !f.is_finite() || !fp.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        if f.abs() < XIRR_TOL {
+            return Value::Number(r);
+        }
+        if fp == 0.0 {
+            return Value::Error(ValueError::Overflow);
+        }
+        let next = r - f / fp;
+        if !next.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        if (next - r).abs() < XIRR_TOL {
+            return Value::Number(next);
+        }
+        r = next;
+    }
+    Value::Error(ValueError::Overflow)
+}
+
+fn fn_xnpv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let rate = match fin_coerce(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    if rate <= -1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    let pairs = match collect_xirr_pairs(&args[1], &args[2], provider) {
+        Ok(p) => p,
+        Err(e) => return Value::Error(e),
+    };
+    let d0 = pairs[0].0;
+    let mut total = 0.0_f64;
+    let base = 1.0 + rate;
+    if base <= 0.0 || !base.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    for (d, v) in &pairs {
+        let t = (*d - d0) / 365.0;
+        let denom = base.powf(t);
+        if denom == 0.0 || !denom.is_finite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        total += v / denom;
+    }
+    if total.is_finite() {
+        Value::Number(total)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_mirr(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let values = match collect_irr_values(&args[0], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let finance_rate = match fin_coerce(&args[1], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let reinvest_rate = match fin_coerce(&args[2], provider) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+    let has_pos = values.iter().any(|v| *v > 0.0);
+    let has_neg = values.iter().any(|v| *v < 0.0);
+    if !(has_pos && has_neg) {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let n = values.len() as i32;
+    if n < 2 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    if finance_rate <= -1.0 || reinvest_rate <= -1.0 {
+        return Value::Error(ValueError::Overflow);
+    }
+    // PV of negatives at finance_rate (period i counts as i, starting at 0).
+    let mut pv_neg = 0.0_f64;
+    for (i, v) in values.iter().enumerate() {
+        if *v < 0.0 {
+            let denom = (1.0 + finance_rate).powi(i as i32);
+            if denom == 0.0 || !denom.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            pv_neg += v / denom;
+        }
+    }
+    // FV of positives at reinvest_rate at the end (period i grows for n-1-i periods).
+    let mut fv_pos = 0.0_f64;
+    for (i, v) in values.iter().enumerate() {
+        if *v > 0.0 {
+            let pow = (1.0 + reinvest_rate).powi((n - 1 - i as i32) as i32);
+            if !pow.is_finite() {
+                return Value::Error(ValueError::Overflow);
+            }
+            fv_pos += v * pow;
+        }
+    }
+    if pv_neg == 0.0 {
+        return Value::Error(ValueError::DivisionByZero);
+    }
+    let ratio = -fv_pos / pv_neg;
+    if ratio <= 0.0 || !ratio.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    let r = ratio.powf(1.0 / (n as f64 - 1.0)) - 1.0;
+    if r.is_finite() {
+        Value::Number(r)
+    } else {
+        Value::Error(ValueError::Overflow)
+    }
+}
+
+fn fn_unichar(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let n_f = match coerce_to_number(&v) {
+        Some(n) => n.trunc(),
+        None => return Value::Error(ValueError::WrongType),
+    };
+    if !(1.0..=1_114_111.0).contains(&n_f) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let cp = n_f as u32;
+    // Reject surrogate halves explicitly — char::from_u32 also returns None
+    // here, but spelling it out keeps the intent loud.
+    if (0xD800..=0xDFFF).contains(&cp) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    match char::from_u32(cp) {
+        Some(c) => Value::Text(c.to_string()),
+        None => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn fn_unicode(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let s = coerce_to_text(&v);
+    match s.chars().next() {
+        Some(c) => Value::Number(c as u32 as f64),
+        None => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn fn_numbervalue(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = text_v {
+        return Value::Error(e);
+    }
+    // Optional separator args. Take the first character; empty strings
+    // fall back to the defaults (Excel parity).
+    let decimal_sep = if args.len() >= 2 {
+        let dv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = dv {
+            return Value::Error(e);
+        }
+        coerce_to_text(&dv).chars().next().unwrap_or('.')
+    } else {
+        '.'
+    };
+    let group_sep = if args.len() == 3 {
+        let gv = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = gv {
+            return Value::Error(e);
+        }
+        coerce_to_text(&gv).chars().next().unwrap_or(',')
+    } else {
+        ','
+    };
+    if decimal_sep == group_sep {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let raw = coerce_to_text(&text_v);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        // Excel treats NUMBERVALUE("") as 0. Keep parity.
+        return Value::Number(0.0);
+    }
+    // Strip group separators, then swap decimal → '.'.
+    let mut buf = String::with_capacity(trimmed.len());
+    for ch in trimmed.chars() {
+        if ch == group_sep {
+            continue;
+        }
+        if ch.is_whitespace() {
+            continue;
+        }
+        if ch == decimal_sep {
+            buf.push('.');
+        } else {
+            buf.push(ch);
+        }
+    }
+    // Excel also allows a trailing `%` to scale by 0.01 (repeated `%` stacks).
+    let mut pct: i32 = 0;
+    while buf.ends_with('%') {
+        buf.pop();
+        pct += 1;
+    }
+    match buf.parse::<f64>() {
+        Ok(n) => {
+            let scale = 100f64.powi(pct);
+            if scale == 0.0 {
+                Value::Number(n)
+            } else {
+                Value::Number(n / scale)
+            }
+        }
+        Err(_) => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn quote_strict_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' {
+            out.push('"');
+            out.push('"');
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render_value_to_text(v: &Value, strict: bool) -> String {
+    match v {
+        Value::Text(s) => {
+            if strict {
+                quote_strict_text(s)
+            } else {
+                s.clone()
+            }
+        }
+        Value::Null => String::new(),
+        _ => coerce_to_text(v),
+    }
+}
+
+fn fn_valuetotext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let strict = if args.len() == 2 {
+        let fv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = fv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&fv) {
+            Some(n) => n.trunc() == 1.0,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        false
+    };
+    // Array unwrap: a Value::Array reaching here (e.g. from a nested
+    // formula that spilled) should serialise the entire array, not just
+    // the top-left scalar. ARRAYTOTEXT is the canonical entrypoint for
+    // that; reuse it.
+    if let Value::Array(arr) = &v {
+        return render_array_to_text(arr, strict);
+    }
+    Value::Text(render_value_to_text(&v, strict))
+}
+
+fn fn_arraytotext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 2 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let strict = if args.len() == 2 {
+        let fv = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = fv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&fv) {
+            Some(n) => n.trunc() == 1.0,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        false
+    };
+
+    // Range / SheetRange / OFFSET / array-producing scalar: walk through
+    // `for_each_arg_value` and capture (row, col) so we can serialise in
+    // row-major order with `;` row separators. For a Value::Array we get
+    // a flat stream; we reconstruct shape from the underlying array.
+    //
+    // Strategy: detect the input shape via two passes.
+    //   - Literal range / sheet range: peek at the AST to recover the
+    //     rectangle dimensions.
+    //   - Anything else (including OFFSET dynamic ranges and Value::Array
+    //     scalars): evaluate once and dispatch on the result.
+    //
+    // This keeps the implementation small while still emitting the
+    // correct row/col grid.
+    match &args[0] {
+        Expr::Range { start, end, .. } => {
+            let range = CellRange::new(*start, *end).normalize();
+            let rows = range.end.row - range.start.row + 1;
+            let cols = range.end.col - range.start.col + 1;
+            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols as usize]; rows as usize];
+            let mut err: Option<ValueError> = None;
+            for_each_arg_value(&args[0], provider, &mut |addr, v| {
+                if err.is_some() {
+                    return;
+                }
+                if let Value::Error(e) = &v {
+                    err = Some(e.clone());
+                    return;
+                }
+                if let Some(a) = addr {
+                    let r = (a.row - range.start.row) as usize;
+                    let c = (a.col - range.start.col) as usize;
+                    grid[r][c] = render_value_to_text(&v, strict);
+                }
+            });
+            if let Some(e) = err {
+                return Value::Error(e);
+            }
+            Value::Text(format_grid(&grid, strict))
+        }
+        Expr::SheetRange { start, end, .. } => {
+            let range = CellRange::new(*start, *end).normalize();
+            let rows = range.end.row - range.start.row + 1;
+            let cols = range.end.col - range.start.col + 1;
+            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols as usize]; rows as usize];
+            let mut err: Option<ValueError> = None;
+            for_each_arg_value(&args[0], provider, &mut |addr, v| {
+                if err.is_some() {
+                    return;
+                }
+                if let Value::Error(e) = &v {
+                    err = Some(e.clone());
+                    return;
+                }
+                if let Some(a) = addr {
+                    let r = (a.row - range.start.row) as usize;
+                    let c = (a.col - range.start.col) as usize;
+                    grid[r][c] = render_value_to_text(&v, strict);
+                }
+            });
+            if let Some(e) = err {
+                return Value::Error(e);
+            }
+            Value::Text(format_grid(&grid, strict))
+        }
+        _ => {
+            let v = eval_expr_with_provider(&args[0], provider);
+            if let Value::Error(e) = v {
+                return Value::Error(e);
+            }
+            if let Value::Array(arr) = &v {
+                return render_array_to_text(arr, strict);
+            }
+            // Scalar fallback: a single value emits its text directly
+            // (concise) or quoted-text-then-braced (strict). Excel's
+            // strict mode wraps even a single scalar in `{...}`; we match.
+            let body = render_value_to_text(&v, strict);
+            if strict {
+                Value::Text(format!("{{{}}}", body))
+            } else {
+                Value::Text(body)
+            }
+        }
+    }
+}
+
+fn format_grid(grid: &[Vec<String>], strict: bool) -> String {
+    let inner = grid
+        .iter()
+        .map(|row| row.join(","))
+        .collect::<Vec<_>>()
+        .join(";");
+    if strict {
+        format!("{{{}}}", inner)
+    } else {
+        inner
+    }
+}
+
+fn render_array_to_text(arr: &Arc<ArrayData>, strict: bool) -> Value {
+    let rows = arr.rows as usize;
+    let cols = arr.cols as usize;
+    let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols]; rows];
+    for r in 0..rows {
+        for c in 0..cols {
+            let idx = r * cols + c;
+            let v = arr.data.get(idx).cloned().unwrap_or(Value::Null);
+            grid[r][c] = render_value_to_text(&v, strict);
+        }
+    }
+    Value::Text(format_grid(&grid, strict))
+}
+
+fn compile_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex, regex::Error> {
+    if case_insensitive {
+        regex::Regex::new(&format!("(?i){}", pattern))
+    } else {
+        regex::Regex::new(pattern)
+    }
+}
+
+fn read_case_arg(arg: &Expr, provider: &dyn EvalProvider) -> Result<bool, Value> {
+    let v = eval_expr_with_provider(arg, provider);
+    if let Value::Error(e) = v {
+        return Err(Value::Error(e));
+    }
+    match coerce_to_number(&v) {
+        Some(n) => Ok(n.trunc() != 0.0),
+        None => Err(Value::Error(ValueError::WrongType)),
+    }
+}
+
+fn fn_regextest(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = text_v {
+        return Value::Error(e);
+    }
+    let pat_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = pat_v {
+        return Value::Error(e);
+    }
+    let case_insensitive = if args.len() == 3 {
+        match read_case_arg(&args[2], provider) {
+            Ok(b) => b,
+            Err(v) => return v,
+        }
+    } else {
+        false
+    };
+    let text = coerce_to_text(&text_v);
+    let pattern = coerce_to_text(&pat_v);
+    match compile_regex(&pattern, case_insensitive) {
+        Ok(re) => Value::Boolean(re.is_match(&text)),
+        Err(_) => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn fn_regexextract(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 4 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = text_v {
+        return Value::Error(e);
+    }
+    let pat_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = pat_v {
+        return Value::Error(e);
+    }
+    let mode = if args.len() >= 3 {
+        let mv = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = mv {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&mv) {
+            Some(n) => n.trunc() as i64,
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        0
+    };
+    let case_insensitive = if args.len() == 4 {
+        match read_case_arg(&args[3], provider) {
+            Ok(b) => b,
+            Err(v) => return v,
+        }
+    } else {
+        false
+    };
+    let text = coerce_to_text(&text_v);
+    let pattern = coerce_to_text(&pat_v);
+    let re = match compile_regex(&pattern, case_insensitive) {
+        Ok(r) => r,
+        Err(_) => return Value::Error(ValueError::InvalidValue),
+    };
+    match mode {
+        0 => {
+            match re.find(&text) {
+                Some(m) => Value::Text(m.as_str().to_string()),
+                // Excel surfaces `#N/A` for "no match"; we don't have a
+                // distinct N/A enum yet, so InvalidValue is the closest.
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        1 => {
+            let matches: Vec<Value> = re
+                .find_iter(&text)
+                .map(|m| Value::Text(m.as_str().to_string()))
+                .collect();
+            if matches.is_empty() {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let n = matches.len() as u32;
+            // 1-column array (one match per row) is how Excel returns this
+            // when the pattern has no capture groups in mode 1.
+            Value::Array(Arc::new(ArrayData::new(n, 1, matches)))
+        }
+        // Mode 2 (capture groups as a row array): TODO. Documented at
+        // the function entry above.
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn fn_regexreplace(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 3 || args.len() > 5 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = text_v {
+        return Value::Error(e);
+    }
+    let pat_v = eval_expr_with_provider(&args[1], provider);
+    if let Value::Error(e) = pat_v {
+        return Value::Error(e);
+    }
+    let rep_v = eval_expr_with_provider(&args[2], provider);
+    if let Value::Error(e) = rep_v {
+        return Value::Error(e);
+    }
+    let occurrence = if args.len() >= 4 {
+        let ov = eval_expr_with_provider(&args[3], provider);
+        if let Value::Error(e) = ov {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&ov) {
+            Some(n) => {
+                let n = n.trunc();
+                if n < 0.0 {
+                    return Value::Error(ValueError::InvalidValue);
+                }
+                n as u64
+            }
+            None => return Value::Error(ValueError::WrongType),
+        }
+    } else {
+        0
+    };
+    let case_insensitive = if args.len() == 5 {
+        match read_case_arg(&args[4], provider) {
+            Ok(b) => b,
+            Err(v) => return v,
+        }
+    } else {
+        false
+    };
+    let text = coerce_to_text(&text_v);
+    let pattern = coerce_to_text(&pat_v);
+    let replacement = coerce_to_text(&rep_v);
+    let re = match compile_regex(&pattern, case_insensitive) {
+        Ok(r) => r,
+        Err(_) => return Value::Error(ValueError::InvalidValue),
+    };
+    if occurrence == 0 {
+        Value::Text(re.replace_all(&text, replacement.as_str()).into_owned())
+    } else {
+        // Replace just the nth (1-based) match. Walk match indexes and
+        // splice in `replacement` at the matching span.
+        let mut out = String::with_capacity(text.len());
+        let mut last_end = 0usize;
+        let mut count: u64 = 0;
+        let mut done = false;
+        for m in re.find_iter(&text) {
+            count += 1;
+            if count == occurrence {
+                out.push_str(&text[last_end..m.start()]);
+                out.push_str(&replacement);
+                last_end = m.end();
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            // Occurrence not reached → return original text untouched
+            // (Excel returns the original string when the nth match
+            // doesn't exist; the formula isn't an error).
+            return Value::Text(text);
+        }
+        out.push_str(&text[last_end..]);
+        Value::Text(out)
+    }
+}
+
+fn fn_isformula(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    match &args[0] {
+        Expr::CellRef(addr) => {
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
+            Value::Boolean(provider.cell_has_formula(*addr))
+        }
+        Expr::Range { start, end, .. } => {
+            let r = CellRange::new(*start, *end).normalize();
+            Value::Boolean(provider.cell_has_formula(r.start))
+        }
+        Expr::SheetRef { sheet, addr } => {
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
+            Value::Boolean(provider.sheet_cell_has_formula(sheet, *addr))
+        }
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => {
+            let r = CellRange::new(*start, *end).normalize();
+            Value::Boolean(provider.sheet_cell_has_formula(sheet, r.start))
+        }
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn fn_sheet(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() > 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    if args.is_empty() {
+        match provider.current_sheet_index() {
+            Some(idx) => Value::Number((idx + 1) as f64),
+            None => Value::Error(ValueError::InvalidRef),
+        }
+    } else {
+        match &args[0] {
+            // Same-sheet ref → current sheet (Excel parity).
+            Expr::CellRef(_) | Expr::Range { .. } => match provider.current_sheet_index() {
+                Some(idx) => Value::Number((idx + 1) as f64),
+                None => Value::Error(ValueError::InvalidRef),
+            },
+            Expr::SheetRef { sheet, .. } | Expr::SheetRange { sheet, .. } => {
+                match provider.sheet_index_of(sheet) {
+                    Some(idx) => Value::Number((idx + 1) as f64),
+                    None => Value::Error(ValueError::InvalidRef),
+                }
+            }
+            _ => Value::Error(ValueError::InvalidValue),
+        }
+    }
+}
+
+fn fn_sheets(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() > 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    if args.is_empty() {
+        Value::Number(provider.sheet_count() as f64)
+    } else {
+        match &args[0] {
+            Expr::CellRef(_)
+            | Expr::Range { .. }
+            | Expr::SheetRef { .. }
+            | Expr::SheetRange { .. } => Value::Number(1.0),
+            _ => Value::Error(ValueError::InvalidValue),
+        }
+    }
+}
+
+fn fn_info(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = v {
+        return Value::Error(e);
+    }
+    let key = coerce_to_text(&v).to_ascii_lowercase();
+    match key.as_str() {
+        "directory" => Value::Text(String::new()),
+        "numfile" => Value::Number(1.0),
+        "osversion" => Value::Text(String::new()),
+        "recalc" => Value::Text("Automatic".into()),
+        "release" => Value::Text(format!("einfach-{}", env!("CARGO_PKG_VERSION"))),
+        "system" => {
+            let os = if cfg!(target_os = "macos") {
+                "mac"
+            } else if cfg!(target_os = "windows") {
+                "pc"
+            } else {
+                "other"
+            };
+            Value::Text(os.into())
+        }
+        _ => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+fn parse_complex(text: &str) -> Result<(f64, f64, char), ValueError> {
+    let s = text.trim();
+    if s.is_empty() {
+        return Err(ValueError::InvalidValue);
+    }
+    // Detect and strip suffix.
+    let (body, suffix, has_suffix) = match s.chars().last() {
+        Some(c) if c == 'i' || c == 'j' => (&s[..s.len() - 1], c, true),
+        _ => (s, 'i', false),
+    };
+    if !has_suffix {
+        // Pure real number — must parse cleanly.
+        let n: f64 = body.parse().map_err(|_| ValueError::InvalidValue)?;
+        return Ok((n, 0.0, 'i'));
+    }
+    // body now holds the part preceding the suffix. Find a split sign
+    // (`+` or `-`) that separates real and imaginary parts, skipping
+    // any sign that is part of a scientific-notation exponent (i.e.
+    // immediately preceded by `e` or `E`) and any leading sign at
+    // position 0 (which is the real part's sign, not a separator).
+    let bytes = body.as_bytes();
+    let mut split: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        if b != b'+' && b != b'-' {
+            continue;
+        }
+        let prev = bytes[i - 1];
+        if prev == b'e' || prev == b'E' {
+            continue;
+        }
+        split = Some(i);
+        // Don't break — we want the LAST eligible split so that any
+        // earlier sign that is part of the real part's own scientific
+        // exponent is correctly skipped past. Example: `"1e+3+4i"`
+        // — the loop visits the `+` at index 2 (skipped, follows `e`)
+        // then the `+` at index 4 (kept).
+    }
+    match split {
+        Some(idx) => {
+            let real_str = &body[..idx];
+            let imag_str = &body[idx..];
+            if real_str.is_empty() {
+                return Err(ValueError::InvalidValue);
+            }
+            let real: f64 = real_str.parse().map_err(|_| ValueError::InvalidValue)?;
+            // imag_str starts with `+` or `-` and may be just that sign
+            // (meaning ±1) or `±<coef>`.
+            let imag = if imag_str == "+" || imag_str == "" {
+                1.0
+            } else if imag_str == "-" {
+                -1.0
+            } else {
+                imag_str.parse().map_err(|_| ValueError::InvalidValue)?
+            };
+            Ok((real, imag, suffix))
+        }
+        None => {
+            // No split — body is the imaginary coefficient (may be
+            // empty for bare `"i"`, or just `"+"` / `"-"` for `"+i"`
+            // / `"-i"`).
+            let imag = if body.is_empty() || body == "+" {
+                1.0
+            } else if body == "-" {
+                -1.0
+            } else {
+                body.parse().map_err(|_| ValueError::InvalidValue)?
+            };
+            Ok((0.0, imag, suffix))
+        }
+    }
+}
+
+fn format_complex(real: f64, imag: f64, suffix: char) -> String {
+    if imag == 0.0 {
+        return format_finite_for_complex(real);
+    }
+    if real == 0.0 {
+        // Pure imaginary: drop coefficient when ±1.
+        if imag == 1.0 {
+            return format!("{}", suffix);
+        }
+        if imag == -1.0 {
+            return format!("-{}", suffix);
+        }
+        return format!("{}{}", format_finite_for_complex(imag), suffix);
+    }
+    // Both parts non-zero. Sign of `imag` lives in the connector.
+    if imag > 0.0 {
+        let imag_part = if imag == 1.0 {
+            String::new()
+        } else {
+            format_finite_for_complex(imag)
+        };
+        format!(
+            "{}+{}{}",
+            format_finite_for_complex(real),
+            imag_part,
+            suffix
+        )
+    } else {
+        // imag < 0 — emit `-` connector and the absolute value coef.
+        let abs_imag = -imag;
+        let imag_part = if abs_imag == 1.0 {
+            String::new()
+        } else {
+            format_finite_for_complex(abs_imag)
+        };
+        format!(
+            "{}-{}{}",
+            format_finite_for_complex(real),
+            imag_part,
+            suffix
+        )
+    }
+}
+
+fn format_finite_for_complex(n: f64) -> String {
+    if n == n.trunc() && n.abs() < 1e16 {
+        // Integral value — print as an integer to match Excel's
+        // `COMPLEX(3, 4) == "3+4i"` (not "3.0+4.0i").
+        format!("{}", n as i64)
+    } else {
+        // {:e?} would force scientific notation; we want the shortest
+        // representation that round-trips. Rust's default Display for
+        // f64 already trims trailing zeros and uses scientific notation
+        // only for very large/small magnitudes — close enough to {:g}
+        // for our parity needs.
+        format!("{}", n)
+    }
+}
+
+fn coerce_to_complex(v: &Value) -> Result<(f64, f64, char), ValueError> {
+    match v {
+        Value::Error(e) => Err(e.clone()),
+        Value::Text(s) => parse_complex(s),
+        Value::Number(n) => Ok((*n, 0.0, 'i')),
+        Value::Boolean(true) => Ok((1.0, 0.0, 'i')),
+        Value::Boolean(false) => Ok((0.0, 0.0, 'i')),
+        Value::Null => Ok((0.0, 0.0, 'i')),
+        // Arrays/Lambdas have no scalar complex interpretation.
+        _ => Err(ValueError::WrongType),
+    }
+}
+
+fn eval_complex_arg(arg: &Expr, provider: &dyn EvalProvider) -> Result<(f64, f64, char), ValueError> {
+    let v = eval_expr_with_provider(arg, provider);
+    coerce_to_complex(&v)
+}
+
+fn complex_unary_text(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(f64, f64, char) -> (f64, f64, char),
+) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (a, b, s) = match eval_complex_arg(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    let (r, i, sfx) = f(a, b, s);
+    if !r.is_finite() || !i.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Text(format_complex(r, i, sfx))
+}
+
+fn complex_unary_number(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+    f: impl Fn(f64, f64) -> f64,
+) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let (a, b, _s) = match eval_complex_arg(&args[0], provider) {
+        Ok(t) => t,
+        Err(e) => return Value::Error(e),
+    };
+    let r = f(a, b);
+    if !r.is_finite() {
+        return Value::Error(ValueError::Overflow);
+    }
+    Value::Number(r)
+}
+
+fn complex_mul(a: f64, b: f64, c: f64, d: f64) -> (f64, f64) {
+    (a * c - b * d, a * d + b * c)
+}
+
+fn complex_div(a: f64, b: f64, c: f64, d: f64) -> Option<(f64, f64)> {
+    let denom = c * c + d * d;
+    if denom == 0.0 {
+        return None;
+    }
+    Some(((a * c + b * d) / denom, (b * c - a * d) / denom))
+}
 
 fn collect_numbers(args: &[Expr], provider: &dyn EvalProvider) -> Vec<f64> {
     let mut out = Vec::new();
@@ -21717,5 +23926,1531 @@ mod tests {
             |id: AtomId| -> Value { vs.get(&id).cloned().unwrap_or(Value::Null) };
         let result = eval_expr(&arr_expr, &get, &cm);
         assert_eq!(result, Value::Error(ValueError::DivisionByZero));
+    }
+    fn make_xirr_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
+        // Cash flows: -100 on Jan 1 2020, +50 on Jun 1 2020, +70 on Dec 31 2020.
+        // Verified XIRR ≈ 0.2092.
+        let mut cell_map = HashMap::new();
+        let mut values = HashMap::new();
+        let flows = [-100.0_f64, 50.0, 70.0];
+        // Date serials under our 1970 epoch.
+        // 2020-01-01 = 18262, 2020-06-01 = 18414, 2020-12-31 = 18627.
+        let dates = [
+            date_serial(2020, 1, 1),
+            date_serial(2020, 6, 1),
+            date_serial(2020, 12, 31),
+        ];
+        for (i, v) in flows.iter().enumerate() {
+            let id = AtomId::from_raw(300 + i as u64);
+            cell_map.insert(CellAddress::new(i as u32, 0), id);
+            values.insert(id, Value::Number(*v));
+        }
+        for (i, d) in dates.iter().enumerate() {
+            let id = AtomId::from_raw(310 + i as u64);
+            cell_map.insert(CellAddress::new(i as u32, 1), id);
+            values.insert(id, Value::Number(*d));
+        }
+        (cell_map, values)
+    }
+    #[test]
+    fn eval_sln_happy_path() {
+        let (cm, vs) = make_test_env();
+        // SLN(10000, 1000, 5) = (10000-1000)/5 = 1800.
+        assert_eq!(
+            eval_str("=SLN(10000,1000,5)", &cm, &vs),
+            Value::Number(1800.0)
+        );
+    }
+    #[test]
+    fn eval_sln_zero_life_div_by_zero() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SLN(10000,1000,0)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            eval_str("=SLN(10000,1000,-1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_sln_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SLN(10000,1000)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_sln_type_error_propagation() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SLN(B2,1000,5)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+        assert_eq!(
+            eval_str("=SLN(A1/C1,1000,5)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_syd_happy_path() {
+        let (cm, vs) = make_test_env();
+        // SYD(10000, 1000, 5, 1) = 9000 * (5-1+1) * 2 / (5*6) = 9000*10/30 = 3000.
+        assert_eq!(
+            eval_str("=SYD(10000,1000,5,1)", &cm, &vs),
+            Value::Number(3000.0)
+        );
+        // SYD(10000, 1000, 5, 5) = 9000 * (5-5+1) * 2 / 30 = 600.
+        assert_eq!(
+            eval_str("=SYD(10000,1000,5,5)", &cm, &vs),
+            Value::Number(600.0)
+        );
+    }
+    #[test]
+    fn eval_syd_per_exceeds_life() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SYD(10000,1000,5,6)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_syd_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SYD(10000,1000,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_syd_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=SYD(B2,1000,5,1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_db_happy_path() {
+        let (cm, vs) = make_test_env();
+        // DB(1000000, 100000, 6, 1, 7) ≈ 186083.33 per Excel reference.
+        match eval_str("=DB(1000000,100000,6,1,7)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 186083.33, 1e-2), "DB(...,1,7) got {}", n),
+            other => panic!("DB(...,1,7): {:?}", other),
+        }
+        // DB(1000000, 100000, 6, 2, 7) ≈ 259639.42.
+        match eval_str("=DB(1000000,100000,6,2,7)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 259639.42, 1e-2), "DB(...,2,7) got {}", n),
+            other => panic!("DB(...,2,7): {:?}", other),
+        }
+        // DB with default month=12: DB(10000, 1000, 5, 1) — simpler check
+        // that just confirms it's finite and rate is positive.
+        match eval_str("=DB(10000,1000,5,1)", &cm, &vs) {
+            Value::Number(n) => assert!(n > 0.0 && n < 10000.0, "DB default-month got {}", n),
+            other => panic!("DB default-month: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_db_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DB(10000,1000,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_db_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DB(B2,1000,5,1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_db_invalid_life() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DB(10000,1000,0,1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=DB(10000,1000,5,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_ddb_happy_path() {
+        let (cm, vs) = make_test_env();
+        // DDB(10000, 1000, 5, 1) = min(10000 * 2/5, 9000) = min(4000, 9000) = 4000.
+        assert_eq!(
+            eval_str("=DDB(10000,1000,5,1)", &cm, &vs),
+            Value::Number(4000.0)
+        );
+        // DDB(10000, 1000, 5, 2) = (10000-4000) * 0.4 = 2400.
+        assert_eq!(
+            eval_str("=DDB(10000,1000,5,2)", &cm, &vs),
+            Value::Number(2400.0)
+        );
+        // Final period clamps at (cost - salvage - prior). DDB(10000, 1000, 5, 5):
+        // dep1=4000, dep2=2400, dep3=1440, dep4=864, prior=8704;
+        // ddb5 = (10000-8704)*0.4 = 518.4, clamp at 9000-8704 = 296 → 296.
+        match eval_str("=DDB(10000,1000,5,5)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 296.0, 1e-2), "DDB(5,5) got {}", n),
+            other => panic!("DDB(5,5): {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_ddb_factor_3() {
+        let (cm, vs) = make_test_env();
+        // DDB(10000, 1000, 5, 1, 3) = 10000*3/5 = 6000.
+        assert_eq!(
+            eval_str("=DDB(10000,1000,5,1,3)", &cm, &vs),
+            Value::Number(6000.0)
+        );
+    }
+    #[test]
+    fn eval_ddb_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DDB(10000,1000,5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_ddb_invalid_period() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DDB(10000,1000,5,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_vdb_no_switch_matches_ddb_sum() {
+        let (cm, vs) = make_test_env();
+        // VDB(10000, 1000, 5, 0, 1, 2, TRUE) should equal DDB period 1 = 4000.
+        assert_eq!(
+            eval_str("=VDB(10000,1000,5,0,1,2,TRUE)", &cm, &vs),
+            Value::Number(4000.0)
+        );
+        // VDB across 0..2 no-switch = DDB(1) + DDB(2) = 4000 + 2400 = 6400.
+        assert_eq!(
+            eval_str("=VDB(10000,1000,5,0,2,2,TRUE)", &cm, &vs),
+            Value::Number(6400.0)
+        );
+    }
+    #[test]
+    fn eval_vdb_with_switch_total_equals_cost_minus_salvage() {
+        let (cm, vs) = make_test_env();
+        // VDB across the full life (0..life) with switch enabled should
+        // depreciate exactly cost - salvage = 9000.
+        match eval_str("=VDB(10000,1000,5,0,5)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 9000.0, 1e-6), "VDB full got {}", n),
+            other => panic!("VDB full: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_vdb_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=VDB(10000,1000,5,0)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_vdb_invalid_range() {
+        let (cm, vs) = make_test_env();
+        // start > end → Overflow.
+        assert_eq!(
+            eval_str("=VDB(10000,1000,5,3,2)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // end > life → Overflow.
+        assert_eq!(
+            eval_str("=VDB(10000,1000,5,0,6)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_cumipmt_happy_path() {
+        let (cm, vs) = make_test_env();
+        // CUMIPMT(0.005, 360, 200000, 1, 12, 0) — sum of first-12-period
+        // interest charges on a $200k 0.5%/mo loan. Closed-form expected
+        // value ≈ -11933.19 (matches our IPMT(rate=0.005, per=k,...) summed
+        // over k=1..12). Most spreadsheet implementations agree to within
+        // a few cents depending on PMT rounding choices.
+        match eval_str("=CUMIPMT(0.005,360,200000,1,12,0)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, -11933.19, 1e-1), "CUMIPMT got {}", n),
+            other => panic!("CUMIPMT: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_cumipmt_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CUMIPMT(0.005,360,200000,1,12)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_cumipmt_invalid_range() {
+        let (cm, vs) = make_test_env();
+        // start < 1 → Overflow.
+        assert_eq!(
+            eval_str("=CUMIPMT(0.005,360,200000,0,12,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // end > nper.
+        assert_eq!(
+            eval_str("=CUMIPMT(0.005,360,200000,1,361,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // end < start.
+        assert_eq!(
+            eval_str("=CUMIPMT(0.005,360,200000,12,1,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // negative rate.
+        assert_eq!(
+            eval_str("=CUMIPMT(-0.005,360,200000,1,12,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_cumipmt_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CUMIPMT(B2,360,200000,1,12,0)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_cumprinc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // CUMPRINC(0.005, 360, 200000, 1, 12, 0) — sum of first-12-period
+        // principal payments. With PMT ≈ -1199.10/mo and our CUMIPMT ≈
+        // -11933.19, the principal portion ≈ 12 * -1199.10 - (-11933.19)
+        // ≈ -2456.02. (Excel/LibreOffice's PMT-rounding choices land
+        // within a few cents of this.)
+        match eval_str("=CUMPRINC(0.005,360,200000,1,12,0)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, -2456.02, 1e-1), "CUMPRINC got {}", n),
+            other => panic!("CUMPRINC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_cumprinc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CUMPRINC(0.005,360,200000)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_cumprinc_invalid_range() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=CUMPRINC(0.005,360,200000,0,12,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_effect_happy_path() {
+        let (cm, vs) = make_test_env();
+        // EFFECT(0.05, 4) = (1 + 0.05/4)^4 - 1 ≈ 0.0509453369140625.
+        match eval_str("=EFFECT(0.05,4)", &cm, &vs) {
+            Value::Number(n) => {
+                assert!(approx(n, 0.050945337, 1e-7), "EFFECT got {}", n)
+            }
+            other => panic!("EFFECT: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_effect_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=EFFECT(0.05)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_effect_invalid_npery() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=EFFECT(0.05,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        // Negative nominal rate → Overflow.
+        assert_eq!(
+            eval_str("=EFFECT(-0.05,4)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_effect_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=EFFECT(B2,4)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_nominal_happy_path_round_trip() {
+        let (cm, vs) = make_test_env();
+        // NOMINAL is the inverse of EFFECT.
+        // NOMINAL(EFFECT(0.05, 4), 4) ≈ 0.05.
+        let eff = match eval_str("=EFFECT(0.05,4)", &cm, &vs) {
+            Value::Number(n) => n,
+            _ => unreachable!(),
+        };
+        let formula = format!("=NOMINAL({},4)", eff);
+        match eval_str(&formula, &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.05, 1e-7), "NOMINAL got {}", n),
+            other => panic!("NOMINAL: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_nominal_invalid_npery() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=NOMINAL(0.05,0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_nominal_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=NOMINAL(0.05)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_ispmt_happy_path() {
+        let (cm, vs) = make_test_env();
+        // ISPMT(0.1, 1, 3, -1000) = -(-1000) * 0.1 * (1 - 1/3) = 100 * 2/3 ≈ 66.67.
+        match eval_str("=ISPMT(0.1,1,3,-1000)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 66.6667, 1e-3), "ISPMT got {}", n),
+            other => panic!("ISPMT: {:?}", other),
+        }
+        // ISPMT at per=nper → 0.
+        match eval_str("=ISPMT(0.1,3,3,-1000)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.0, 1e-9), "ISPMT(per=nper) got {}", n),
+            other => panic!("ISPMT(per=nper): {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_ispmt_zero_nper() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ISPMT(0.1,1,0,-1000)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_ispmt_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ISPMT(0.1,1,3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_ispmt_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ISPMT(B2,1,3,-1000)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_accrint_happy_path() {
+        let (cm, vs) = make_test_env();
+        // ACCRINT(DATE(2020,1,1), DATE(2020,7,1), DATE(2020,7,1), 0.1, 1000, 2)
+        // basis=0 (US 30/360): yearfrac = 0.5, so accrued = 1000 * 0.1 * 0.5 = 50.
+        match eval_str(
+            "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,2)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(approx(n, 50.0, 1e-2), "ACCRINT got {}", n),
+            other => panic!("ACCRINT: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_accrint_basis_3() {
+        let (cm, vs) = make_test_env();
+        // basis=3 (actual/365): 182 days / 365 * 1000 * 0.1 ≈ 49.863.
+        match eval_str(
+            "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,2,3)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(approx(n, 49.863, 1e-2), "ACCRINT basis3 got {}", n),
+            other => panic!("ACCRINT basis3: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_accrint_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ACCRINT(DATE(2020,1,1),DATE(2020,7,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_accrint_invalid_frequency() {
+        let (cm, vs) = make_test_env();
+        // frequency=3 not in {1, 2, 4}.
+        assert_eq!(
+            eval_str(
+                "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,3)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_accrint_settlement_before_issue() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=ACCRINT(DATE(2020,7,1),DATE(2020,1,1),DATE(2020,1,1),0.1,1000,2)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_accrintm_happy_path() {
+        let (cm, vs) = make_test_env();
+        // ACCRINTM(DATE(2020,1,1), DATE(2021,1,1), 0.1, 1000)
+        // basis=0: yearfrac = 1.0 → 100.
+        match eval_str("=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),0.1,1000)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 100.0, 1e-2), "ACCRINTM got {}", n),
+            other => panic!("ACCRINTM: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_accrintm_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ACCRINTM(DATE(2020,1,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_accrintm_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),B2,1000)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_disc_happy_path() {
+        let (cm, vs) = make_test_env();
+        // DISC(DATE(2020,1,1), DATE(2021,1,1), 90, 100) at basis 0:
+        // yearfrac = 1.0 → (100-90)/100/1 = 0.1.
+        match eval_str("=DISC(DATE(2020,1,1),DATE(2021,1,1),90,100)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.1, 1e-7), "DISC got {}", n),
+            other => panic!("DISC: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_disc_maturity_before_settlement() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DISC(DATE(2021,1,1),DATE(2020,1,1),90,100)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_disc_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=DISC(DATE(2020,1,1),DATE(2021,1,1),90)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_intrate_happy_path() {
+        let (cm, vs) = make_test_env();
+        // INTRATE(DATE(2020,1,1), DATE(2021,1,1), 1000, 1100) at basis 0:
+        // (1100-1000)/1000/1 = 0.1.
+        match eval_str("=INTRATE(DATE(2020,1,1),DATE(2021,1,1),1000,1100)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.1, 1e-7), "INTRATE got {}", n),
+            other => panic!("INTRATE: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_intrate_type_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str(
+                "=INTRATE(DATE(2020,1,1),DATE(2021,1,1),B2,1100)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_received_happy_path() {
+        let (cm, vs) = make_test_env();
+        // RECEIVED(DATE(2020,1,1), DATE(2021,1,1), 1000, 0.1) at basis 0:
+        // 1000 / (1 - 0.1 * 1) = 1000 / 0.9 ≈ 1111.11.
+        match eval_str(
+            "=RECEIVED(DATE(2020,1,1),DATE(2021,1,1),1000,0.1)",
+            &cm, &vs,
+        ) {
+            Value::Number(n) => assert!(approx(n, 1111.11, 1e-2), "RECEIVED got {}", n),
+            other => panic!("RECEIVED: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_received_discount_too_large() {
+        let (cm, vs) = make_test_env();
+        // discount * yearfrac >= 1 → denominator <= 0 → Overflow.
+        assert_eq!(
+            eval_str(
+                "=RECEIVED(DATE(2020,1,1),DATE(2021,1,1),1000,1.5)",
+                &cm, &vs
+            ),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_received_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=RECEIVED(DATE(2020,1,1),DATE(2021,1,1),1000)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_tbilleq_happy_path() {
+        let (cm, vs) = make_test_env();
+        // TBILLEQ(DATE(2020,1,1), DATE(2020,7,1), 0.05): days=182
+        // 365 * 0.05 / (360 - 0.05 * 182) = 18.25 / 350.9 ≈ 0.05201.
+        match eval_str("=TBILLEQ(DATE(2020,1,1),DATE(2020,7,1),0.05)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.05201, 1e-4), "TBILLEQ got {}", n),
+            other => panic!("TBILLEQ: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_tbilleq_invalid_discount() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TBILLEQ(DATE(2020,1,1),DATE(2020,7,1),0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_tbilleq_wrong_arg_count() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TBILLEQ(DATE(2020,1,1),DATE(2020,7,1))", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_tbillprice_happy_path() {
+        let (cm, vs) = make_test_env();
+        // TBILLPRICE(DATE(2020,1,1), DATE(2020,7,1), 0.05): days=182
+        // 100 * (1 - 0.05 * 182 / 360) = 100 - 2.5278 = 97.4722.
+        match eval_str("=TBILLPRICE(DATE(2020,1,1),DATE(2020,7,1),0.05)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 97.4722, 1e-3), "TBILLPRICE got {}", n),
+            other => panic!("TBILLPRICE: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_tbillprice_too_long() {
+        let (cm, vs) = make_test_env();
+        // diff > 365 → Overflow.
+        assert_eq!(
+            eval_str("=TBILLPRICE(DATE(2020,1,1),DATE(2022,1,1),0.05)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_tbillyield_happy_path() {
+        let (cm, vs) = make_test_env();
+        // TBILLYIELD(DATE(2020,1,1), DATE(2020,7,1), 97.4722): days=182
+        // (100 - 97.4722) / 97.4722 * 360 / 182 ≈ 0.05130.
+        match eval_str("=TBILLYIELD(DATE(2020,1,1),DATE(2020,7,1),97.4722)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.05130, 1e-4), "TBILLYIELD got {}", n),
+            other => panic!("TBILLYIELD: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_tbillyield_invalid_pr() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TBILLYIELD(DATE(2020,1,1),DATE(2020,7,1),0)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_xirr_known_result() {
+        let (cm, vs) = make_xirr_env();
+        // [-100, 50, 70] on (2020-01-01, 2020-06-01, 2020-12-31).
+        // XIRR solves Σ v_i / (1+r)^((d_i - d_0)/365) = 0:
+        //   -100 + 50/(1+r)^0.4164 + 70/(1+r)^1.0 = 0
+        // Numerically the root is r ≈ 0.27657. This matches Excel /
+        // LibreOffice (the spec hint of "0.21" was a low estimate; the
+        // actual mathematical root is closer to 0.277).
+        match eval_str("=XIRR(A1:A3,B1:B3)", &cm, &vs) {
+            Value::Number(n) => assert!(
+                approx(n, 0.27657, 1e-4),
+                "XIRR got {} (expected ~0.27657)",
+                n
+            ),
+            other => panic!("XIRR: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_xirr_with_guess() {
+        let (cm, vs) = make_xirr_env();
+        // Convergence from a different guess should land on the same root.
+        match eval_str("=XIRR(A1:A3,B1:B3,0.05)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.27657, 1e-4), "XIRR(guess) got {}", n),
+            other => panic!("XIRR(guess): {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_xirr_all_positive() {
+        let (cm, vs) = make_xirr_env();
+        // C1..C3 will be set up by all-positive scenario: just test that
+        // an all-positive sequence surfaces InvalidValue. We can synthesize
+        // via a literal range — use the env's all-positive C1..C3 region
+        // (10, 20, 30) from `make_finance_env`'s convention, but xirr env
+        // doesn't have that. Build inline via SUM-like check: skip and use
+        // an explicit all-positive 2-element via a constructed range —
+        // since we can't easily inline arrays, reuse A2:A3 (both >=50, both
+        // positive) and a 2-element date range.
+        // A2 = 50, A3 = 70, B2 = 2020-06-01, B3 = 2020-12-31 → all positive.
+        assert_eq!(
+            eval_str("=XIRR(A2:A3,B2:B3)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_xirr_wrong_arg_count() {
+        let (cm, vs) = make_xirr_env();
+        assert_eq!(
+            eval_str("=XIRR(A1:A3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_xirr_shape_mismatch() {
+        let (cm, vs) = make_xirr_env();
+        // 3 values, 2 dates → shape mismatch.
+        assert_eq!(
+            eval_str("=XIRR(A1:A3,B1:B2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_xnpv_happy_path() {
+        let (cm, vs) = make_xirr_env();
+        // XNPV(0.1, A1:A3, B1:B3): manually compute
+        // d0=2020-01-01=18262, d1=2020-06-01=18414 (+152 days = 0.4164y),
+        // d2=2020-12-31=18627 (+365 days = 1.0y).
+        // = -100 + 50/(1.1^0.4164) + 70/(1.1^1.0)
+        // ≈ -100 + 50/1.04063 + 70/1.1
+        // ≈ -100 + 48.05 + 63.636 ≈ 11.68.
+        match eval_str("=XNPV(0.1,A1:A3,B1:B3)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 11.68, 1e-1), "XNPV got {}", n),
+            other => panic!("XNPV: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_xnpv_rate_too_low() {
+        let (cm, vs) = make_xirr_env();
+        assert_eq!(
+            eval_str("=XNPV(-1,A1:A3,B1:B3)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_xnpv_wrong_arg_count() {
+        let (cm, vs) = make_xirr_env();
+        assert_eq!(
+            eval_str("=XNPV(0.1,A1:A3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_mirr_happy_path() {
+        let (cm, vs) = make_finance_env();
+        // MIRR([-100, 30, 40, 50], 0.05, 0.1) — manually computed:
+        // PV(neg) = -100 (at i=0).
+        // FV(pos) = 30*(1.1)^2 + 40*(1.1)^1 + 50*(1.1)^0 = 36.3 + 44 + 50 = 130.3.
+        // ratio = -130.3 / -100 = 1.303.
+        // MIRR = 1.303^(1/3) - 1 ≈ 0.0921.
+        match eval_str("=MIRR(A1:A4,0.05,0.1)", &cm, &vs) {
+            Value::Number(n) => assert!(approx(n, 0.0921, 1e-3), "MIRR got {}", n),
+            other => panic!("MIRR: {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_mirr_all_positive_div_by_zero() {
+        let (cm, vs) = make_finance_env();
+        // C1..C3 = [10, 20, 30] from make_finance_env.
+        assert_eq!(
+            eval_str("=MIRR(C1:C3,0.05,0.1)", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_mirr_wrong_arg_count() {
+        let (cm, vs) = make_finance_env();
+        assert_eq!(
+            eval_str("=MIRR(A1:A4,0.05)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_mirr_type_error() {
+        let (cm, vs) = make_finance_env();
+        assert_eq!(
+            eval_str("=MIRR(A1:A4,B1,0.1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_unichar_happy() {
+        assert_eq!(ev("=UNICHAR(65)"), Value::Text("A".into()));
+        assert_eq!(ev("=UNICHAR(20013)"), Value::Text("中".into()));
+        // Multi-byte emoji.
+        assert_eq!(ev("=UNICHAR(128512)"), Value::Text("😀".into()));
+    }
+    #[test]
+    fn eval_unichar_surrogate_is_error() {
+        assert_eq!(
+            ev("=UNICHAR(55296)"),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            ev("=UNICHAR(57343)"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_unichar_out_of_range() {
+        assert_eq!(ev("=UNICHAR(0)"), Value::Error(ValueError::InvalidValue));
+        assert_eq!(
+            ev("=UNICHAR(2000000)"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_unichar_arg_count() {
+        assert_eq!(
+            ev("=UNICHAR()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=UNICHAR(1,2)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_unichar_type_error() {
+        assert_eq!(
+            ev("=UNICHAR(\"abc\")"),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+    #[test]
+    fn eval_unicode_happy() {
+        assert_eq!(ev("=UNICODE(\"A\")"), Value::Number(65.0));
+        assert_eq!(ev("=UNICODE(\"ABC\")"), Value::Number(65.0));
+        assert_eq!(ev("=UNICODE(\"中\")"), Value::Number(20013.0));
+    }
+    #[test]
+    fn eval_unicode_empty_is_error() {
+        assert_eq!(
+            ev("=UNICODE(\"\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_unicode_arg_count() {
+        assert_eq!(
+            ev("=UNICODE()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_numbervalue_default_seps() {
+        assert_eq!(ev("=NUMBERVALUE(\"1,234.56\")"), Value::Number(1234.56));
+        assert_eq!(ev("=NUMBERVALUE(\"42\")"), Value::Number(42.0));
+        assert_eq!(ev("=NUMBERVALUE(\"  3.14  \")"), Value::Number(3.14));
+    }
+    #[test]
+    fn eval_numbervalue_swapped_seps() {
+        // European-style: `.` is the group sep, `,` is the decimal.
+        assert_eq!(
+            ev("=NUMBERVALUE(\"1.234,56\", \",\", \".\")"),
+            Value::Number(1234.56)
+        );
+    }
+    #[test]
+    fn eval_numbervalue_percent_scales() {
+        assert_eq!(ev("=NUMBERVALUE(\"50%\")"), Value::Number(0.5));
+        assert_eq!(ev("=NUMBERVALUE(\"100%%\")"), Value::Number(0.01));
+    }
+    #[test]
+    fn eval_numbervalue_parse_fail() {
+        assert_eq!(
+            ev("=NUMBERVALUE(\"hello\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_numbervalue_arg_count() {
+        assert_eq!(
+            ev("=NUMBERVALUE()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=NUMBERVALUE(\"1\",\".\",\",\",\"x\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_numbervalue_same_separators_is_error() {
+        assert_eq!(
+            ev("=NUMBERVALUE(\"1.2\", \".\", \".\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_valuetotext_concise() {
+        assert_eq!(ev("=VALUETOTEXT(\"abc\")"), Value::Text("abc".into()));
+        assert_eq!(ev("=VALUETOTEXT(42)"), Value::Text("42".into()));
+        assert_eq!(ev("=VALUETOTEXT(TRUE)"), Value::Text("TRUE".into()));
+    }
+    #[test]
+    fn eval_valuetotext_strict_quotes_text() {
+        assert_eq!(
+            ev("=VALUETOTEXT(\"abc\", 1)"),
+            Value::Text("\"abc\"".into())
+        );
+        // Embedded `"` doubling is exercised at the helper level rather than
+        // via the formula parser (the formula parser doesn't yet decode the
+        // Excel `""` escape, so we build the input directly).
+        let q = quote_strict_text("a\"b");
+        assert_eq!(q, "\"a\"\"b\"");
+        // Numbers stay un-quoted even in strict mode.
+        assert_eq!(ev("=VALUETOTEXT(7, 1)"), Value::Text("7".into()));
+    }
+    #[test]
+    fn eval_valuetotext_arg_count() {
+        assert_eq!(
+            ev("=VALUETOTEXT()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=VALUETOTEXT(1,2,3)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_arraytotext_2x2_concise() {
+        let (cm, vs) = make_test_env();
+        // A1=10, B1=20, A2=5, B2="text". Concise → "10,20;5,text".
+        assert_eq!(
+            eval_str("=ARRAYTOTEXT(A1:B2)", &cm, &vs),
+            Value::Text("10,20;5,text".into())
+        );
+    }
+    #[test]
+    fn eval_arraytotext_2x2_strict() {
+        let (cm, vs) = make_test_env();
+        // Strict → `{10,20;5,"text"}`.
+        assert_eq!(
+            eval_str("=ARRAYTOTEXT(A1:B2, 1)", &cm, &vs),
+            Value::Text("{10,20;5,\"text\"}".into())
+        );
+    }
+    #[test]
+    fn eval_arraytotext_scalar_strict_braced() {
+        assert_eq!(
+            ev("=ARRAYTOTEXT(\"x\", 1)"),
+            Value::Text("{\"x\"}".into())
+        );
+    }
+    #[test]
+    fn eval_arraytotext_arg_count() {
+        assert_eq!(
+            ev("=ARRAYTOTEXT()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_regextest_happy() {
+        assert_eq!(ev("=REGEXTEST(\"hello\", \"ell\")"), Value::Boolean(true));
+        assert_eq!(ev("=REGEXTEST(\"hello\", \"xyz\")"), Value::Boolean(false));
+    }
+    #[test]
+    fn eval_regextest_case_insensitive() {
+        assert_eq!(
+            ev("=REGEXTEST(\"Hello\", \"hello\")"),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            ev("=REGEXTEST(\"Hello\", \"hello\", 1)"),
+            Value::Boolean(true)
+        );
+    }
+    #[test]
+    fn eval_regextest_invalid_pattern() {
+        assert_eq!(
+            ev("=REGEXTEST(\"hello\", \"[\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_regextest_arg_count() {
+        assert_eq!(
+            ev("=REGEXTEST(\"a\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=REGEXTEST(\"a\", \"b\", 1, 2)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_regexextract_first_match() {
+        assert_eq!(
+            ev("=REGEXEXTRACT(\"abc123def\", \"[0-9]+\")"),
+            Value::Text("123".into())
+        );
+    }
+    #[test]
+    fn eval_regexextract_all_matches_as_array() {
+        let v = ev("=REGEXEXTRACT(\"a1 b2 c3\", \"[a-z][0-9]\", 1)");
+        match v {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (3, 1));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a1".into())));
+                assert_eq!(arr.get(1, 0), Some(&Value::Text("b2".into())));
+                assert_eq!(arr.get(2, 0), Some(&Value::Text("c3".into())));
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_regexextract_no_match_is_error() {
+        assert_eq!(
+            ev("=REGEXEXTRACT(\"abc\", \"[0-9]+\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_regexextract_arg_count() {
+        assert_eq!(
+            ev("=REGEXEXTRACT(\"a\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_regexreplace_replace_all() {
+        assert_eq!(
+            ev("=REGEXREPLACE(\"a1 b2 c3\", \"[0-9]\", \"X\")"),
+            Value::Text("aX bX cX".into())
+        );
+    }
+    #[test]
+    fn eval_regexreplace_nth_occurrence() {
+        assert_eq!(
+            ev("=REGEXREPLACE(\"a1 b2 c3\", \"[0-9]\", \"X\", 2)"),
+            Value::Text("a1 bX c3".into())
+        );
+    }
+    #[test]
+    fn eval_regexreplace_case_insensitive() {
+        assert_eq!(
+            ev("=REGEXREPLACE(\"HELLO hello\", \"hello\", \"X\", 0, 1)"),
+            Value::Text("X X".into())
+        );
+    }
+    #[test]
+    fn eval_regexreplace_arg_count() {
+        assert_eq!(
+            ev("=REGEXREPLACE(\"a\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_regexreplace_invalid_pattern() {
+        assert_eq!(
+            ev("=REGEXREPLACE(\"a\", \"[\", \"x\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_isformula_non_ref_is_error() {
+        // The legacy in-file AtomEvalProvider can't model formula cells —
+        // but ISFORMULA still distinguishes "ref vs not-a-ref".
+        assert_eq!(
+            ev("=ISFORMULA(\"abc\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            ev("=ISFORMULA(1+2)"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_isformula_cellref_with_no_provider_returns_false() {
+        // AtomEvalProvider has no formula data, so the default
+        // `cell_has_formula` returns false. The "TRUE on formula cell"
+        // path is exercised in `tests/text_info_extras.rs` via Workbook.
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=ISFORMULA(A1)", &cm, &vs), Value::Boolean(false));
+    }
+    #[test]
+    fn eval_isformula_arg_count() {
+        assert_eq!(
+            ev("=ISFORMULA()"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            ev("=ISFORMULA(A1,B1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_sheet_no_arg_default_provider_is_ref_error() {
+        // AtomEvalProvider has no current sheet → #REF!.
+        assert_eq!(ev("=SHEET()"), Value::Error(ValueError::InvalidRef));
+    }
+    #[test]
+    fn eval_sheet_non_ref_is_error() {
+        assert_eq!(
+            ev("=SHEET(\"hello\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_sheet_arg_count() {
+        assert_eq!(
+            ev("=SHEET(A1, B1)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_sheets_no_arg_default_provider_returns_one() {
+        // Default sheet_count() is 1 — single-sheet shims report exactly one.
+        assert_eq!(ev("=SHEETS()"), Value::Number(1.0));
+    }
+    #[test]
+    fn eval_sheets_with_ref_returns_one() {
+        // A 2-D ref spans exactly one sheet (we don't model 3-D refs).
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=SHEETS(A1:B2)", &cm, &vs), Value::Number(1.0));
+    }
+    #[test]
+    fn eval_info_known_subtypes() {
+        assert_eq!(ev("=INFO(\"directory\")"), Value::Text(String::new()));
+        assert_eq!(ev("=INFO(\"numfile\")"), Value::Number(1.0));
+        assert_eq!(ev("=INFO(\"osversion\")"), Value::Text(String::new()));
+        assert_eq!(ev("=INFO(\"recalc\")"), Value::Text("Automatic".into()));
+        match ev("=INFO(\"release\")") {
+            Value::Text(s) => assert!(s.starts_with("einfach-"), "got: {}", s),
+            other => panic!("expected Value::Text, got {:?}", other),
+        }
+    }
+    #[test]
+    fn eval_info_system_on_mac() {
+        assert_eq!(ev("=INFO(\"system\")"), Value::Text("mac".into()));
+    }
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn eval_info_system_on_windows() {
+        assert_eq!(ev("=INFO(\"system\")"), Value::Text("pc".into()));
+    }
+    #[test]
+    fn eval_info_unknown_subtype() {
+        assert_eq!(
+            ev("=INFO(\"bogus\")"),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_info_arg_count() {
+        assert_eq!(ev("=INFO()"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(
+            ev("=INFO(\"a\", \"b\")"),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    fn assert_complex_near(actual: Value, exp_r: f64, exp_i: f64, eps: f64) {
+        let s = match actual {
+            Value::Text(s) => s,
+            other => panic!("expected complex Text, got {:?}", other),
+        };
+        let (r, i, _) = parse_complex(&s)
+            .unwrap_or_else(|_| panic!("could not parse result {:?}", s));
+        assert!(
+            (r - exp_r).abs() < eps,
+            "real mismatch: got {} expected {} (full: {:?})",
+            r,
+            exp_r,
+            s,
+        );
+        assert!(
+            (i - exp_i).abs() < eps,
+            "imag mismatch: got {} expected {} (full: {:?})",
+            i,
+            exp_i,
+            s,
+        );
+    }
+    #[test]
+    fn parse_complex_simple_forms() {
+        assert_eq!(parse_complex("3+4i").unwrap(), (3.0, 4.0, 'i'));
+        assert_eq!(parse_complex("3-4j").unwrap(), (3.0, -4.0, 'j'));
+        assert_eq!(parse_complex("5").unwrap(), (5.0, 0.0, 'i'));
+        assert_eq!(parse_complex("-2i").unwrap(), (0.0, -2.0, 'i'));
+        assert_eq!(parse_complex("2i").unwrap(), (0.0, 2.0, 'i'));
+        assert_eq!(parse_complex("i").unwrap(), (0.0, 1.0, 'i'));
+        assert_eq!(parse_complex("j").unwrap(), (0.0, 1.0, 'j'));
+        assert_eq!(parse_complex("-i").unwrap(), (0.0, -1.0, 'i'));
+        assert_eq!(parse_complex("+i").unwrap(), (0.0, 1.0, 'i'));
+        // Decimals + scientific notation must not be split on the `+`
+        // / `-` inside the exponent.
+        assert_eq!(parse_complex("3.14+2.5i").unwrap(), (3.14, 2.5, 'i'));
+        let (r, i, s) = parse_complex("1.5e+3+2.5i").unwrap();
+        assert!((r - 1500.0).abs() < 1e-9);
+        assert_eq!(i, 2.5);
+        assert_eq!(s, 'i');
+        let (r, i, s) = parse_complex("1e-3-2i").unwrap();
+        assert!((r - 0.001).abs() < 1e-9);
+        assert_eq!(i, -2.0);
+        assert_eq!(s, 'i');
+    }
+    #[test]
+    fn parse_complex_rejects_garbage() {
+        assert_eq!(parse_complex("garbage"), Err(ValueError::InvalidValue));
+        assert_eq!(parse_complex(""), Err(ValueError::InvalidValue));
+        assert_eq!(parse_complex("3+i+4i"), Err(ValueError::InvalidValue));
+        assert_eq!(parse_complex("3+4k"), Err(ValueError::InvalidValue));
+    }
+    #[test]
+    fn format_complex_round_trip() {
+        // Real-only drops suffix.
+        assert_eq!(format_complex(3.0, 0.0, 'i'), "3");
+        // Pure-imaginary drops coefficient when ±1.
+        assert_eq!(format_complex(0.0, 1.0, 'i'), "i");
+        assert_eq!(format_complex(0.0, -1.0, 'i'), "-i");
+        assert_eq!(format_complex(0.0, 2.0, 'j'), "2j");
+        // Combined forms.
+        assert_eq!(format_complex(3.0, 4.0, 'i'), "3+4i");
+        assert_eq!(format_complex(3.0, -4.0, 'i'), "3-4i");
+        // ±1 coefficient drops in the imaginary part.
+        assert_eq!(format_complex(3.0, 1.0, 'i'), "3+i");
+        assert_eq!(format_complex(3.0, -1.0, 'i'), "3-i");
+    }
+    #[test]
+    fn eval_complex_constructor() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=COMPLEX(3,4)", &cm, &vs),
+            Value::Text("3+4i".into())
+        );
+        assert_eq!(
+            eval_str("=COMPLEX(3,4,\"j\")", &cm, &vs),
+            Value::Text("3+4j".into())
+        );
+        assert_eq!(
+            eval_str("=COMPLEX(3,0)", &cm, &vs),
+            Value::Text("3".into())
+        );
+        assert_eq!(
+            eval_str("=COMPLEX(0,1)", &cm, &vs),
+            Value::Text("i".into())
+        );
+        // Bad suffix → #VALUE!.
+        assert_eq!(
+            eval_str("=COMPLEX(3,4,\"k\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=COMPLEX(3)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=COMPLEX(3,4,\"i\",5)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_imabs_happy() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=IMABS(\"3+4i\")", &cm, &vs), Value::Number(5.0));
+        assert_eq!(eval_str("=IMABS(\"5\")", &cm, &vs), Value::Number(5.0));
+        // Argument count.
+        assert_eq!(
+            eval_str("=IMABS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        // Garbage text.
+        assert_eq!(
+            eval_str("=IMABS(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+    #[test]
+    fn eval_imreal_imag_accessors() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=IMREAL(\"3+4i\")", &cm, &vs), Value::Number(3.0));
+        assert_eq!(eval_str("=IMAGINARY(\"3+4i\")", &cm, &vs), Value::Number(4.0));
+        // Pure imaginary, no coefficient.
+        assert_eq!(eval_str("=IMREAL(\"-i\")", &cm, &vs), Value::Number(0.0));
+        assert_eq!(eval_str("=IMAGINARY(\"-i\")", &cm, &vs), Value::Number(-1.0));
+    }
+    #[test]
+    fn eval_imconjugate() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=IMCONJUGATE(\"3+4i\")", &cm, &vs),
+            Value::Text("3-4i".into())
+        );
+        assert_eq!(
+            eval_str("=IMCONJUGATE(\"5-2j\")", &cm, &vs),
+            Value::Text("5+2j".into())
+        );
+        // Real input: imag is 0 → no flip visible.
+        assert_eq!(
+            eval_str("=IMCONJUGATE(\"7\")", &cm, &vs),
+            Value::Text("7".into())
+        );
+    }
+    #[test]
+    fn eval_imargument() {
+        let (cm, vs) = make_test_env();
+        // arg(1+i) = π/4
+        match eval_str("=IMARGUMENT(\"1+i\")", &cm, &vs) {
+            Value::Number(n) => assert!((n - std::f64::consts::FRAC_PI_4).abs() < 1e-12),
+            other => panic!("expected number, got {:?}", other),
+        }
+        // arg(0) is undefined → #DIV/0!
+        assert_eq!(
+            eval_str("=IMARGUMENT(\"0\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_imsum_basic() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=IMSUM(\"3+4i\",\"1+2i\")", &cm, &vs),
+            Value::Text("4+6i".into())
+        );
+        // Variadic.
+        assert_eq!(
+            eval_str("=IMSUM(\"3+4i\",\"1+2i\",\"1-i\")", &cm, &vs),
+            Value::Text("5+5i".into())
+        );
+        // Arg count.
+        assert_eq!(
+            eval_str("=IMSUM()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_imsum_mixed_suffix_coerces_to_first() {
+        let (cm, vs) = make_test_env();
+        // Mixed suffix: the first arg's suffix wins; the `j` in the
+        // second arg is read as the same imaginary unit.
+        assert_eq!(
+            eval_str("=IMSUM(\"3+4i\",\"1+2j\")", &cm, &vs),
+            Value::Text("4+6i".into())
+        );
+    }
+    #[test]
+    fn eval_imsub_basic() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=IMSUB(\"3+4i\",\"1+2i\")", &cm, &vs),
+            Value::Text("2+2i".into())
+        );
+        assert_eq!(
+            eval_str("=IMSUB(\"3+4i\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+    #[test]
+    fn eval_improduct_basic() {
+        let (cm, vs) = make_test_env();
+        // (2+3i)(4+5i) = (8-15) + (10+12)i = -7 + 22i
+        assert_eq!(
+            eval_str("=IMPRODUCT(\"2+3i\",\"4+5i\")", &cm, &vs),
+            Value::Text("-7+22i".into())
+        );
+        // 3 args.
+        assert_eq!(
+            eval_str("=IMPRODUCT(\"1+i\",\"1+i\",\"1+i\")", &cm, &vs),
+            Value::Text("-2+2i".into())
+        );
+    }
+    #[test]
+    fn eval_imdiv_basic_and_div_by_zero() {
+        let (cm, vs) = make_test_env();
+        // (4+2i)/(1+i) = ((4+2) + (2-4)i)/2 = 3 - i
+        assert_eq!(
+            eval_str("=IMDIV(\"4+2i\",\"1+i\")", &cm, &vs),
+            Value::Text("3-i".into())
+        );
+        // Denominator zero.
+        assert_eq!(
+            eval_str("=IMDIV(\"3+4i\",\"0\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+    #[test]
+    fn eval_imexp_basic() {
+        let (cm, vs) = make_test_env();
+        // exp(0+pi*i) = -1 + 0i. We seed pi through a real cell as text isn't
+        // available; use a literal.
+        let pi = std::f64::consts::PI;
+        let formula = format!("=IMEXP(\"0+{}i\")", pi);
+        let v = eval_str(&formula, &cm, &vs);
+        assert_complex_near(v, -1.0, 0.0, 1e-12);
+        // exp(1+0i) = e
+        assert_complex_near(
+            eval_str("=IMEXP(\"1\")", &cm, &vs),
+            std::f64::consts::E,
+            0.0,
+            1e-12,
+        );
+    }
+    #[test]
+    fn eval_imln_imlog10_imlog2() {
+        let (cm, vs) = make_test_env();
+        // ln(e+0i) = 1
+        let e = std::f64::consts::E;
+        let formula = format!("=IMLN(\"{}\")", e);
+        assert_complex_near(eval_str(&formula, &cm, &vs), 1.0, 0.0, 1e-12);
+        // log10(100) = 2
+        assert_complex_near(
+            eval_str("=IMLOG10(\"100\")", &cm, &vs),
+            2.0,
+            0.0,
+            1e-12,
+        );
+        // log2(8) = 3
+        assert_complex_near(
+            eval_str("=IMLOG2(\"8\")", &cm, &vs),
+            3.0,
+            0.0,
+            1e-12,
+        );
+        // ln(0) is #NUM!
+        assert_eq!(
+            eval_str("=IMLN(\"0\")", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_imsqrt_principal() {
+        let (cm, vs) = make_test_env();
+        // sqrt(4) = 2 (real positive, no imag)
+        assert_eq!(
+            eval_str("=IMSQRT(\"4\")", &cm, &vs),
+            Value::Text("2".into())
+        );
+        // sqrt(-1) = i (pure imaginary)
+        assert_complex_near(
+            eval_str("=IMSQRT(\"-1\")", &cm, &vs),
+            0.0,
+            1.0,
+            1e-12,
+        );
+        // sqrt(0) = 0
+        assert_eq!(
+            eval_str("=IMSQRT(\"0\")", &cm, &vs),
+            Value::Text("0".into())
+        );
+    }
+    #[test]
+    fn eval_impower_de_moivre() {
+        let (cm, vs) = make_test_env();
+        // (1+i)^2 = 2i
+        assert_complex_near(
+            eval_str("=IMPOWER(\"1+i\",2)", &cm, &vs),
+            0.0,
+            2.0,
+            1e-12,
+        );
+        // i^4 = 1
+        assert_complex_near(
+            eval_str("=IMPOWER(\"i\",4)", &cm, &vs),
+            1.0,
+            0.0,
+            1e-12,
+        );
+        // 0^0 = 1 (matches POWER).
+        assert_eq!(
+            eval_str("=IMPOWER(\"0\",0)", &cm, &vs),
+            Value::Text("1".into())
+        );
+        // 0^-1 = #NUM!
+        assert_eq!(
+            eval_str("=IMPOWER(\"0\",-1)", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_imcos_imsin_real_axis() {
+        let (cm, vs) = make_test_env();
+        // cos(0) = 1, sin(0) = 0 along the real axis.
+        assert_complex_near(eval_str("=IMCOS(\"0\")", &cm, &vs), 1.0, 0.0, 1e-12);
+        assert_complex_near(eval_str("=IMSIN(\"0\")", &cm, &vs), 0.0, 0.0, 1e-12);
+        // cos(pi) = -1.
+        let pi = std::f64::consts::PI;
+        let formula = format!("=IMCOS(\"{}\")", pi);
+        assert_complex_near(eval_str(&formula, &cm, &vs), -1.0, 0.0, 1e-12);
+    }
+    #[test]
+    fn eval_imcosh_imsinh_real_axis() {
+        let (cm, vs) = make_test_env();
+        // cosh(0) = 1, sinh(0) = 0.
+        assert_complex_near(eval_str("=IMCOSH(\"0\")", &cm, &vs), 1.0, 0.0, 1e-12);
+        assert_complex_near(eval_str("=IMSINH(\"0\")", &cm, &vs), 0.0, 0.0, 1e-12);
+    }
+    #[test]
+    fn eval_imtan_imsec_imcsc_imcot() {
+        let (cm, vs) = make_test_env();
+        // tan(0) = 0, sec(0) = 1, cot is undefined at 0 (sin=0).
+        assert_complex_near(eval_str("=IMTAN(\"0\")", &cm, &vs), 0.0, 0.0, 1e-12);
+        assert_complex_near(eval_str("=IMSEC(\"0\")", &cm, &vs), 1.0, 0.0, 1e-12);
+        assert_eq!(
+            eval_str("=IMCOT(\"0\")", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+        assert_eq!(
+            eval_str("=IMCSC(\"0\")", &cm, &vs),
+            Value::Error(ValueError::Overflow)
+        );
+    }
+    #[test]
+    fn eval_complex_type_error_on_array() {
+        // Passing a range to a complex function — the eval path turns
+        // a Range expression into either a single cell or an Array;
+        // we surface WrongType when the value isn't text/number/etc.
+        let (cm, vs) = make_test_env();
+        // B2 holds text "text" — not a valid complex string → InvalidValue.
+        assert_eq!(
+            eval_str("=IMABS(B2)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
     }
 }
