@@ -112,6 +112,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "ADDRESS"
             | "AND"
             | "ARABIC"
+            | "AREAS"
             | "ASEC"
             | "ASIN"
             | "ASINH"
@@ -191,6 +192,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "DROP"
             | "DSUM"
             | "EDATE"
+            | "ENCODEURL"
             | "EOMONTH"
             | "ERF"
             | "ERFC"
@@ -209,6 +211,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "FLOOR"
             | "FLOOR.MATH"
             | "FLOOR.PRECISE"
+            | "FORMULATEXT"
             | "FV"
             | "GAMMA"
             | "GAMMA.DIST"
@@ -257,6 +260,7 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "LN"
             | "LOG"
             | "LOG10"
+            | "LOOKUP"
             | "LOWER"
             | "MAKEARRAY"
             | "MAP"
@@ -354,7 +358,10 @@ pub fn is_builtin_function_name(name: &str) -> bool {
             | "TAN"
             | "TANH"
             | "TEXT"
+            | "TEXTAFTER"
+            | "TEXTBEFORE"
             | "TEXTJOIN"
+            | "TEXTSPLIT"
             | "TIME"
             | "TIMEVALUE"
             | "TOCOL"
@@ -650,6 +657,27 @@ pub trait EvalProvider {
     /// Total sheets in the host workbook. Default `1`.
     fn sheet_count(&self) -> usize {
         1
+    }
+
+    /// Source formula text at `addr`, if any (for `FORMULATEXT(ref)`).
+    /// Returns the literal formula source as the user typed it (leading
+    /// `=` included), or `None` when the cell holds a primitive value
+    /// (in which case the FORMULATEXT arm surfaces `#N/A`).
+    ///
+    /// Default returns `None` so legacy / sheet-less providers
+    /// (`AtomEvalProvider`) consistently report "no formula" — they have
+    /// no formula registry to consult. `SheetEvalProvider` (sheet.rs)
+    /// and `WorkbookEvalProvider` (workbook.rs) override to look up the
+    /// stored source in their `formula_texts` map.
+    fn cell_formula_text(&self, _addr: CellAddress) -> Option<String> {
+        None
+    }
+
+    /// Cross-sheet variant of `cell_formula_text`. Default delegates to
+    /// the local lookup, dropping the sheet name — same shape as
+    /// `sheet_cell_has_formula`.
+    fn sheet_cell_formula_text(&self, _sheet: &str, addr: CellAddress) -> Option<String> {
+        self.cell_formula_text(addr)
     }
 
     // ===== EVAL_PROVIDER TRAIT METHODS: ADD NEW METHODS BEFORE THIS LINE =====
@@ -8185,6 +8213,53 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // Sentinel for parallel-agent merges — every new built-in dispatch arm
         // (e.g. `"PRICE" => eval_price(args, provider)`) goes BEFORE this
         // marker so concurrent worktrees don't fight over the `_ =>` line.
+        // TEXTSPLIT(text, col_delim[, row_delim[, ignore_empty[, match_mode[, pad_with]]]])
+        //
+        // Splits `text` on `col_delim` (and `row_delim` if given) into a
+        // 2D array. `col_delim` may be a single string OR an array of
+        // strings — every occurrence of any element splits.
+        //
+        // - `ignore_empty` (default FALSE) skips empty fragments.
+        // - `match_mode`: 0 case-sensitive (default), 1 case-insensitive.
+        // - `pad_with` fills jagged-row slots; default is the #N/A-style
+        //   `ValueError::InvalidValue`.
+        //
+        // Empty `text` → 1×1 array containing "" (Excel parity).
+        "TEXTSPLIT" => fn_textsplit(args, provider),
+
+        // TEXTBEFORE / TEXTAFTER — slice `text` around the Nth occurrence
+        // of `delimiter`. See `fn_text_before_after` for the shared
+        // search engine. `instance_num` < 0 counts from the right.
+        "TEXTBEFORE" => fn_text_before_after(args, provider, /* before = */ true),
+        "TEXTAFTER" => fn_text_before_after(args, provider, /* before = */ false),
+
+        // LOOKUP(needle, lookup_vector[, result_vector])
+        //
+        // Vector form: linear "exact-or-next-smaller" walk like VLOOKUP
+        // approximate (the input is supposed to be ascending; we don't
+        // verify). Two-arg form with a 2D second argument flips into the
+        // "array form" — pick the longer dimension as the lookup vector
+        // and the opposite end of the other dimension as the result.
+        "LOOKUP" => fn_lookup(args, provider),
+
+        // FORMULATEXT(ref) — literal source text of the formula at the
+        // referenced cell. Non-formula cell → #N/A; non-ref argument →
+        // #VALUE!. Reads through `EvalProvider::cell_formula_text`.
+        "FORMULATEXT" => fn_formulatext(args, provider),
+
+        // AREAS(ref) — number of distinct areas in a reference.
+        //
+        // note: We do not parse the `(A1:B2, D5)` multi-area paren-group
+        // syntax, so any well-formed single reference returns 1. A
+        // multi-area implementation would require lifting this through
+        // the parser as a first-class AST node.
+        "AREAS" => fn_areas(args),
+
+        // ENCODEURL(text) — percent-encode `text` per RFC 3986 unreserved
+        // class `[A-Za-z0-9-_.~]`. Everything else encodes as `%XX`
+        // (uppercase hex) of each UTF-8 byte.
+        "ENCODEURL" => fn_encodeurl(args, provider),
+
         _ => eval_named_call(name, args, provider),
     }
 }
@@ -14553,6 +14628,669 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
         p += 1;
     }
     p == toks.len()
+}
+
+// --- TEXTSPLIT / TEXTBEFORE / TEXTAFTER / LOOKUP / FORMULATEXT / AREAS / ENCODEURL
+//     helpers. The arms in `eval_func` are intentionally thin (`fn_*`-call
+//     style) so the bulk of the new logic sits below, near the other text /
+//     lookup helpers, instead of bloating the giant `match`.
+
+/// Collect a Vec<String> of delimiters from a TEXTSPLIT argument: a scalar
+/// becomes a single element, a `Value::Array` is flattened in row-major
+/// order. Empty / Null array slots are silently dropped — TEXTSPLIT can't
+/// split on an empty string anyway, and Excel ignores blanks in the
+/// delimiter array.
+fn collect_textsplit_delims(v: &Value) -> Result<Vec<String>, ValueError> {
+    match v {
+        Value::Error(e) => Err(e.clone()),
+        Value::Array(arr) => {
+            let mut out = Vec::new();
+            for elem in arr.data.iter() {
+                match elem {
+                    Value::Error(e) => return Err(e.clone()),
+                    Value::Null => {}
+                    other => {
+                        let s = coerce_to_text(other);
+                        if !s.is_empty() {
+                            out.push(s);
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
+        Value::Null => Ok(Vec::new()),
+        other => {
+            let s = coerce_to_text(other);
+            if s.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![s])
+            }
+        }
+    }
+}
+
+/// Walk `text` from byte position `start`, looking for the earliest start
+/// position of any delimiter in `delims`. Returns `(byte_start, byte_end,
+/// matched_index)` or `None`. `match_mode == 1` means case-insensitive
+/// (we lower-case both sides before comparing — fine for ASCII; Unicode
+/// case folding is best-effort via `to_lowercase()`).
+fn find_first_textsplit_delim(
+    text: &str,
+    delims: &[String],
+    start: usize,
+    match_mode: i64,
+) -> Option<(usize, usize, usize)> {
+    if delims.is_empty() || start > text.len() {
+        return None;
+    }
+    let case_insensitive = match_mode == 1;
+    let hay_lower: Option<String> = if case_insensitive {
+        Some(text.to_lowercase())
+    } else {
+        None
+    };
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (idx, d) in delims.iter().enumerate() {
+        if d.is_empty() {
+            continue;
+        }
+        let needle: String;
+        let needle_ref: &str = if case_insensitive {
+            needle = d.to_lowercase();
+            &needle
+        } else {
+            d.as_str()
+        };
+        let hay: &str = if case_insensitive {
+            hay_lower.as_deref().unwrap()
+        } else {
+            text
+        };
+        // For case-insensitive search, `to_lowercase()` can change byte
+        // length per char — we still want byte indices in the ORIGINAL
+        // text, but with non-ASCII case-folding the lengths may differ.
+        // We accept this best-effort limitation and search in the lowered
+        // strings; the returned byte indices then point into the LOWERED
+        // text. Since we use them to slice the lowered string for the
+        // output, we must reconstruct via the original. To keep this
+        // simple we restrict case-insensitive mode to byte-identical
+        // length transformations (ASCII): if a delim is non-ASCII, fall
+        // back to case-sensitive search for that delim so we don't
+        // mis-slice. This matches Excel's behavior for typical usage.
+        if case_insensitive && (!d.is_ascii() || !text.is_ascii()) {
+            // ASCII-fallback: search the original text directly. This
+            // means non-ASCII text matches case-sensitively under
+            // match_mode=1 — documented gap.
+            if let Some(pos) = text[start..].find(d.as_str()) {
+                let abs = start + pos;
+                let end = abs + d.len();
+                match best {
+                    Some((b, _, _)) if b <= abs => {}
+                    _ => best = Some((abs, end, idx)),
+                }
+            }
+            continue;
+        }
+        if let Some(pos) = hay[start..].find(needle_ref) {
+            let abs = start + pos;
+            let end = abs + needle_ref.len();
+            match best {
+                Some((b, _, _)) if b <= abs => {}
+                _ => best = Some((abs, end, idx)),
+            }
+        }
+    }
+    best
+}
+
+/// Split `text` into fragments by `delims`, honoring `ignore_empty` and
+/// `match_mode`. Returns the flat list of fragments in source order.
+fn textsplit_one_axis(
+    text: &str,
+    delims: &[String],
+    ignore_empty: bool,
+    match_mode: i64,
+) -> Vec<String> {
+    if delims.is_empty() {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut pos = 0usize;
+    while pos <= text.len() {
+        match find_first_textsplit_delim(text, delims, pos, match_mode) {
+            Some((s, e, _)) => {
+                let frag = &text[pos..s];
+                if !(ignore_empty && frag.is_empty()) {
+                    out.push(frag.to_string());
+                }
+                pos = e;
+                if pos > text.len() {
+                    break;
+                }
+            }
+            None => {
+                let frag = &text[pos..];
+                if !(ignore_empty && frag.is_empty()) {
+                    out.push(frag.to_string());
+                }
+                break;
+            }
+        }
+    }
+    if out.is_empty() && !ignore_empty {
+        // Excel TEXTSPLIT on "" returns a 1×1 with "". Keep that.
+        out.push(String::new());
+    }
+    out
+}
+
+fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.is_empty() || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    // text
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = &text_v {
+        return Value::Error(e.clone());
+    }
+    let text = coerce_to_text(&text_v);
+
+    // col_delim
+    let col_v = eval_expr_with_provider(&args[1], provider);
+    let col_delims = match collect_textsplit_delims(&col_v) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(e),
+    };
+
+    // row_delim (optional)
+    let row_delims = if args.len() >= 3 {
+        let v = eval_expr_with_provider(&args[2], provider);
+        match v {
+            Value::Null => Vec::new(),
+            v => match collect_textsplit_delims(&v) {
+                Ok(d) => d,
+                Err(e) => return Value::Error(e),
+            },
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ignore_empty (default FALSE)
+    let ignore_empty = if args.len() >= 4 {
+        let v = eval_expr_with_provider(&args[3], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        coerce_to_bool(&v).unwrap_or(false)
+    } else {
+        false
+    };
+
+    // match_mode (default 0)
+    let match_mode: i64 = if args.len() >= 5 {
+        let v = eval_expr_with_provider(&args[4], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) => n.trunc() as i64,
+            None => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        0
+    };
+    if !matches!(match_mode, 0 | 1) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+
+    // pad_with (default #N/A-equivalent)
+    let pad: Value = if args.len() == 6 {
+        let v = eval_expr_with_provider(&args[5], provider);
+        if let Value::Error(e) = &v {
+            return Value::Error(e.clone());
+        }
+        v
+    } else {
+        Value::Error(ValueError::InvalidValue)
+    };
+
+    // Empty text — Excel returns a 1×1 with "" regardless of delims.
+    if text.is_empty() {
+        return Value::Array(Arc::new(ArrayData::new(1, 1, vec![Value::Text(String::new())])));
+    }
+
+    if row_delims.is_empty() {
+        // 1×N column-split. Drop empty fragments per `ignore_empty`.
+        let fragments = textsplit_one_axis(&text, &col_delims, ignore_empty, match_mode);
+        let cols = fragments.len().max(1) as u32;
+        let data: Vec<Value> = fragments.into_iter().map(Value::Text).collect();
+        return Value::Array(Arc::new(ArrayData::new(1, cols, data)));
+    }
+
+    // 2D split. Outer = rows, inner = cols. We first split on row
+    // delimiters, then each row on column delimiters. Pad jagged rows
+    // with `pad`.
+    let rows_raw = textsplit_one_axis(&text, &row_delims, ignore_empty, match_mode);
+    let mut grid: Vec<Vec<String>> = Vec::with_capacity(rows_raw.len());
+    let mut max_cols = 0usize;
+    for row in &rows_raw {
+        let cols = textsplit_one_axis(row, &col_delims, ignore_empty, match_mode);
+        if cols.len() > max_cols {
+            max_cols = cols.len();
+        }
+        grid.push(cols);
+    }
+    if grid.is_empty() {
+        return Value::Array(Arc::new(ArrayData::new(1, 1, vec![Value::Text(String::new())])));
+    }
+    if max_cols == 0 {
+        max_cols = 1;
+    }
+    let r = grid.len() as u32;
+    let c = max_cols as u32;
+    let mut data: Vec<Value> = Vec::with_capacity((r as usize) * (c as usize));
+    for row in grid {
+        for j in 0..max_cols {
+            if j < row.len() {
+                data.push(Value::Text(row[j].clone()));
+            } else {
+                data.push(pad.clone());
+            }
+        }
+    }
+    Value::Array(Arc::new(ArrayData::new(r, c, data)))
+}
+
+/// Shared engine for TEXTBEFORE / TEXTAFTER. The shape is identical save
+/// the final slice direction.
+///
+/// Spec recap (Excel 365):
+///   TEXTBEFORE(text, delim[, instance_num=1[, match_mode=0[, match_end=0[, if_not_found]]]])
+///   TEXTAFTER (text, delim[, instance_num=1[, match_mode=0[, match_end=0[, if_not_found]]]])
+///
+/// - `instance_num`: 1-based; negative counts from the right (-1 = last).
+/// - `match_mode`: 0 case-sensitive (default), 1 case-insensitive.
+/// - `match_end`: 1 treats start- or end-of-string as an implicit match.
+///   Then asking for the last occurrence with end-of-string-match returns
+///   the tail / "" (TEXTAFTER) or whole text / before-tail (TEXTBEFORE).
+/// - `if_not_found`: returned on miss (default `#N/A` → `InvalidValue`).
+fn fn_text_before_after(args: &[Expr], provider: &dyn EvalProvider, before: bool) -> Value {
+    if args.len() < 2 || args.len() > 6 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let text_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = &text_v {
+        return Value::Error(e.clone());
+    }
+    let text = coerce_to_text(&text_v);
+
+    let delim_v = eval_expr_with_provider(&args[1], provider);
+    let delims = match collect_textsplit_delims(&delim_v) {
+        Ok(d) => d,
+        Err(e) => return Value::Error(e),
+    };
+
+    let instance: i64 = if args.len() >= 3 {
+        let v = eval_expr_with_provider(&args[2], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) => n.trunc() as i64,
+            None => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        1
+    };
+    if instance == 0 {
+        return Value::Error(ValueError::InvalidValue);
+    }
+
+    let match_mode: i64 = if args.len() >= 4 {
+        let v = eval_expr_with_provider(&args[3], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) => n.trunc() as i64,
+            None => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        0
+    };
+    if !matches!(match_mode, 0 | 1) {
+        return Value::Error(ValueError::InvalidValue);
+    }
+
+    let match_end: i64 = if args.len() >= 5 {
+        let v = eval_expr_with_provider(&args[4], provider);
+        if let Value::Error(e) = v {
+            return Value::Error(e);
+        }
+        match coerce_to_number(&v) {
+            Some(n) => n.trunc() as i64,
+            None => return Value::Error(ValueError::InvalidValue),
+        }
+    } else {
+        0
+    };
+
+    let not_found: Value = if args.len() == 6 {
+        let v = eval_expr_with_provider(&args[5], provider);
+        if let Value::Error(e) = &v {
+            return Value::Error(e.clone());
+        }
+        v
+    } else {
+        Value::Error(ValueError::InvalidValue)
+    };
+
+    if delims.iter().all(|d| d.is_empty()) {
+        // No usable delimiter — treat as miss.
+        return not_found;
+    }
+
+    // Enumerate every match position as (start, end). With `match_end`,
+    // we virtually prepend a "match" at byte 0 and append one at
+    // byte text.len(); these synthetic entries map to "the start/end of
+    // the string" and have zero width.
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    if match_end == 1 {
+        matches.push((0, 0));
+    }
+    let mut pos = 0usize;
+    while let Some((s, e, _)) = find_first_textsplit_delim(&text, &delims, pos, match_mode) {
+        matches.push((s, e));
+        if e == s {
+            // Empty delim guarded above, but defensive: avoid infinite loop.
+            pos = s + 1;
+        } else {
+            pos = e;
+        }
+        if pos > text.len() {
+            break;
+        }
+    }
+    if match_end == 1 {
+        matches.push((text.len(), text.len()));
+    }
+
+    // Resolve the requested instance.
+    let pick: Option<(usize, usize)> = if instance > 0 {
+        let i = instance as usize;
+        if i == 0 || i > matches.len() {
+            None
+        } else {
+            Some(matches[i - 1])
+        }
+    } else {
+        let i = (-instance) as usize;
+        if i == 0 || i > matches.len() {
+            None
+        } else {
+            Some(matches[matches.len() - i])
+        }
+    };
+
+    match pick {
+        Some((s, e)) => {
+            if before {
+                Value::Text(text[..s].to_string())
+            } else {
+                Value::Text(text[e..].to_string())
+            }
+        }
+        None => not_found,
+    }
+}
+
+/// LOOKUP. Two forms:
+///   - Vector form (3 args, or 2 args with a 1D vector second arg).
+///   - Array form  (2 args, second arg is a 2D shape — pick longer axis).
+fn fn_lookup(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() < 2 || args.len() > 3 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let needle = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = &needle {
+        return Value::Error(e.clone());
+    }
+    let lookup_grid = match collect_range_2d_for_arg(&args[1], provider) {
+        Some(g) => g,
+        None => {
+            // Non-range — accept a scalar / array value as a 1×1 grid.
+            let v = eval_expr_with_provider(&args[1], provider);
+            match v {
+                Value::Error(e) => return Value::Error(e),
+                Value::Array(arr) => {
+                    let (rows, cols) = arr.shape();
+                    let data = arr.data.clone();
+                    let mut g = Vec::with_capacity(rows as usize);
+                    for r in 0..rows as usize {
+                        let mut row = Vec::with_capacity(cols as usize);
+                        for c in 0..cols as usize {
+                            row.push(data[r * (cols as usize) + c].clone());
+                        }
+                        g.push(row);
+                    }
+                    g
+                }
+                other => vec![vec![other]],
+            }
+        }
+    };
+
+    if lookup_grid.is_empty() || lookup_grid[0].is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+
+    // Decide vector vs array form.
+    let lookup_rows = lookup_grid.len();
+    let lookup_cols = lookup_grid[0].len();
+
+    if args.len() == 2 {
+        // Either a 1D vector (treat as vector form, result = lookup) or
+        // 2D (array form).
+        if lookup_rows == 1 || lookup_cols == 1 {
+            // Vector form, result_vector = lookup_vector.
+            let keys: Vec<Value> = if lookup_rows == 1 {
+                lookup_grid[0].clone()
+            } else {
+                lookup_grid.iter().map(|r| r[0].clone()).collect()
+            };
+            return lookup_vector_walk(&keys, &keys, &needle);
+        }
+        // Array form: pick the longer dimension for lookup, the OPPOSITE
+        // end of the other dimension for the result.
+        if lookup_cols >= lookup_rows {
+            // Horizontal: first row = keys, last row = result.
+            let keys: Vec<Value> = lookup_grid[0].clone();
+            let result: Vec<Value> = lookup_grid[lookup_rows - 1].clone();
+            return lookup_vector_walk(&keys, &result, &needle);
+        } else {
+            // Vertical: first col = keys, last col = result.
+            let keys: Vec<Value> = lookup_grid.iter().map(|r| r[0].clone()).collect();
+            let result: Vec<Value> = lookup_grid
+                .iter()
+                .map(|r| r[lookup_cols - 1].clone())
+                .collect();
+            return lookup_vector_walk(&keys, &result, &needle);
+        }
+    }
+
+    // 3-arg vector form. Both must be 1D; lengths must agree.
+    let lookup_vec: Vec<Value> = if lookup_rows == 1 {
+        lookup_grid[0].clone()
+    } else if lookup_cols == 1 {
+        lookup_grid.iter().map(|r| r[0].clone()).collect()
+    } else {
+        // Not a vector — Excel still searches the first column/row but
+        // we surface #VALUE! to match the spec we documented for this
+        // commit (shape mismatch).
+        return Value::Error(ValueError::WrongType);
+    };
+    let result_grid = match collect_range_2d_for_arg(&args[2], provider) {
+        Some(g) => g,
+        None => {
+            let v = eval_expr_with_provider(&args[2], provider);
+            match v {
+                Value::Error(e) => return Value::Error(e),
+                Value::Array(arr) => {
+                    let (rows, cols) = arr.shape();
+                    let data = arr.data.clone();
+                    let mut g = Vec::with_capacity(rows as usize);
+                    for r in 0..rows as usize {
+                        let mut row = Vec::with_capacity(cols as usize);
+                        for c in 0..cols as usize {
+                            row.push(data[r * (cols as usize) + c].clone());
+                        }
+                        g.push(row);
+                    }
+                    g
+                }
+                other => vec![vec![other]],
+            }
+        }
+    };
+    if result_grid.is_empty() || result_grid[0].is_empty() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let r_rows = result_grid.len();
+    let r_cols = result_grid[0].len();
+    let result_vec: Vec<Value> = if r_rows == 1 {
+        result_grid[0].clone()
+    } else if r_cols == 1 {
+        result_grid.iter().map(|r| r[0].clone()).collect()
+    } else {
+        return Value::Error(ValueError::WrongType);
+    };
+    if lookup_vec.len() != result_vec.len() {
+        return Value::Error(ValueError::WrongType);
+    }
+    lookup_vector_walk(&lookup_vec, &result_vec, &needle)
+}
+
+/// Linear "exact-or-next-smaller" walk shared by LOOKUP's vector and
+/// array forms. We pick the index of the largest key still ≤ needle.
+/// If no key is ≤ needle, surface #N/A.
+fn lookup_vector_walk(keys: &[Value], result: &[Value], needle: &Value) -> Value {
+    if keys.is_empty() || keys.len() != result.len() {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let mut best: Option<usize> = None;
+    for (i, k) in keys.iter().enumerate() {
+        if let Value::Error(e) = k {
+            return Value::Error(e.clone());
+        }
+        if compare_lookup(k, needle).is_le() {
+            best = Some(i);
+        }
+        // Note: we do NOT break when overshoot, because the spec says
+        // we should treat the input as ascending but a relaxed walk
+        // tolerates non-sorted vectors. Last qualifying key wins —
+        // matches Excel's behavior on sorted input.
+    }
+    match best {
+        Some(i) => result[i].clone(),
+        None => Value::Error(ValueError::InvalidValue),
+    }
+}
+
+/// FORMULATEXT(ref). Walk the supported reference-shaped expressions and
+/// consult the provider for the cell's source formula text. A
+/// `Value::Error(ValueError::InvalidValue)` (≈ `#N/A`) is returned when
+/// the referenced cell holds a primitive — Excel returns `#N/A` for
+/// "this cell has no formula".
+fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    match &args[0] {
+        Expr::CellRef(addr) => {
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
+            match provider.cell_formula_text(*addr) {
+                Some(s) => Value::Text(s),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        Expr::Range { start, end, .. } => {
+            let r = CellRange::new(*start, *end).normalize();
+            match provider.cell_formula_text(r.start) {
+                Some(s) => Value::Text(s),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        Expr::SheetRef { sheet, addr } => {
+            if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
+                return Value::Error(ValueError::InvalidRef);
+            }
+            match provider.sheet_cell_formula_text(sheet, *addr) {
+                Some(s) => Value::Text(s),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        Expr::SheetRange {
+            sheet, start, end, ..
+        } => {
+            let r = CellRange::new(*start, *end).normalize();
+            match provider.sheet_cell_formula_text(sheet, r.start) {
+                Some(s) => Value::Text(s),
+                None => Value::Error(ValueError::InvalidValue),
+            }
+        }
+        _ => Value::Error(ValueError::WrongType),
+    }
+}
+
+/// AREAS(ref) — number of areas. We don't support multi-area paren-group
+/// references at the parser level, so every well-formed single ref
+/// returns 1.
+///
+/// note: multi-area reference syntax `(A1:B2, D5)` is not parsed by
+/// `formula::parse_formula`, so this function never sees a synthesized
+/// "union" Expr. Lifting that would require a new AST node + parser
+/// rule; tracked as a documented gap.
+fn fn_areas(args: &[Expr]) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    match &args[0] {
+        Expr::CellRef(_)
+        | Expr::Range { .. }
+        | Expr::SheetRef { .. }
+        | Expr::SheetRange { .. } => Value::Number(1.0),
+        _ => Value::Error(ValueError::WrongType),
+    }
+}
+
+/// ENCODEURL(text). Percent-encode `text` per RFC 3986 unreserved set
+/// `[A-Za-z0-9-_.~]`; every other byte (including multi-byte UTF-8 tail
+/// bytes) emits as `%XX` uppercase. Empty input → empty string.
+fn fn_encodeurl(args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    if args.len() != 1 {
+        return Value::Error(ValueError::WrongArgCount);
+    }
+    let v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = &v {
+        return Value::Error(e.clone());
+    }
+    let text = coerce_to_text(&v);
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+            out.push(c);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    Value::Text(out)
 }
 
 #[cfg(test)]
@@ -27224,6 +27962,155 @@ mod tests {
         );
     }
 
+    // === TEXTSPLIT ===
+
+    /// TEXTSPLIT happy path with only a column delimiter — produces a 1×N
+    /// row of fragments.
+    #[test]
+    fn eval_textsplit_col_only() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"a,b,c\", \",\")", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+                assert_eq!(arr.get(0, 2), Some(&Value::Text("c".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// TEXTSPLIT with both col and row delimiters builds a rectangular
+    /// 2D grid; jagged rows are padded by the default pad (`#N/A`).
+    #[test]
+    fn eval_textsplit_both_delims() {
+        let (cm, vs) = make_test_env();
+        // "a,b;c,d,e" → 2 rows of widths 2 and 3.
+        match eval_str("=TEXTSPLIT(\"a,b;c,d,e\", \",\", \";\")", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+                // Padded slot.
+                assert_eq!(arr.get(0, 2), Some(&Value::Error(ValueError::InvalidValue)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Text("c".into())));
+                assert_eq!(arr.get(1, 1), Some(&Value::Text("d".into())));
+                assert_eq!(arr.get(1, 2), Some(&Value::Text("e".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// TEXTSPLIT empty text → 1×1 array with "" — Excel parity.
+    #[test]
+    fn eval_textsplit_empty_text() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"\", \",\")", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 1));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text(String::new())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// `ignore_empty = TRUE` drops empty fragments produced by adjacent
+    /// delimiters. The 3rd row_delim arg is set to "" since our parser
+    /// doesn't yet support fully-omitted positional args via `,,`.
+    #[test]
+    fn eval_textsplit_ignore_empty() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"a,,b,\", \",\", \"\", TRUE)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// Multi-character column delimiter "->" works.
+    #[test]
+    fn eval_textsplit_multi_char_delim() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"a->b->c\", \"->\")", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 2), Some(&Value::Text("c".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// TEXTSPLIT supports an ARRAY of column delimiters — any of them
+    /// splits.
+    #[test]
+    fn eval_textsplit_array_of_delims() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"a,b;c\", {\",\",\";\"})", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 3));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+                assert_eq!(arr.get(0, 2), Some(&Value::Text("c".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// `match_mode = 1` matches case-insensitively (ASCII).
+    #[test]
+    fn eval_textsplit_case_insensitive_match() {
+        let (cm, vs) = make_test_env();
+        // Delim "X"; text has "x". match_mode=1 should split.
+        match eval_str("=TEXTSPLIT(\"axb\", \"X\", \"\", FALSE, 1)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    /// Zero-arg TEXTSPLIT → WrongArgCount.
+    #[test]
+    fn eval_textsplit_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTSPLIT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// Error inside the text arg propagates.
+    #[test]
+    fn eval_textsplit_error_propagates() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTSPLIT(A1/C1, \",\")", &cm, &vs),
+            Value::Error(ValueError::DivisionByZero)
+        );
+    }
+
+    // === TEXTBEFORE / TEXTAFTER ===
+
+    #[test]
+    fn eval_textbefore_happy_path() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"alpha-beta-gamma\", \"-\")", &cm, &vs),
+            Value::Text("alpha".into())
+        );
+        // 2nd occurrence.
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"alpha-beta-gamma\", \"-\", 2)", &cm, &vs),
+            Value::Text("alpha-beta".into())
+        );
+    }
+
     #[test]
     fn broadcast_range_plus_single_cell_collapses_scalar() {
         let (cm, vs) = make_broadcast_env();
@@ -27285,6 +28172,63 @@ mod tests {
     }
 
     #[test]
+    fn eval_textafter_happy_path() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTAFTER(\"alpha-beta-gamma\", \"-\")", &cm, &vs),
+            Value::Text("beta-gamma".into())
+        );
+        assert_eq!(
+            eval_str("=TEXTAFTER(\"alpha-beta-gamma\", \"-\", 2)", &cm, &vs),
+            Value::Text("gamma".into())
+        );
+    }
+
+    /// Negative `instance_num` counts from the right. -1 = last occurrence.
+    #[test]
+    fn eval_textbefore_negative_instance() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"a-b-c-d\", \"-\", -1)", &cm, &vs),
+            Value::Text("a-b-c".into())
+        );
+        assert_eq!(
+            eval_str("=TEXTAFTER(\"a-b-c-d\", \"-\", -1)", &cm, &vs),
+            Value::Text("d".into())
+        );
+    }
+
+    /// Not-found surfaces `#N/A` (≈ InvalidValue) when no `if_not_found`
+    /// arg is supplied, and the custom value when one is.
+    #[test]
+    fn eval_textbefore_not_found_default_and_custom() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"abc\", \"-\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"abc\", \"-\", 1, 0, 0, \"miss\")", &cm, &vs),
+            Value::Text("miss".into())
+        );
+    }
+
+    /// Case-insensitive mode (1) lets `"X"` match `"x"`.
+    #[test]
+    fn eval_textbefore_case_insensitive() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"axb\", \"X\", 1, 1)", &cm, &vs),
+            Value::Text("a".into())
+        );
+        // Without insensitive mode, no match.
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"axb\", \"X\")", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
     fn broadcast_comparison_returns_boolean_array() {
         let (cm, vs) = make_broadcast_env();
         let v = eval_str("=A1:A5>15", &cm, &vs);
@@ -27300,6 +28244,98 @@ mod tests {
                 Value::Boolean(true),
                 Value::Boolean(true),
             ]
+        );
+    }
+
+    #[test]
+    fn eval_textbefore_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"abc\")", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// match_end=1 treats end-of-string as a virtual match, so the last
+    /// occurrence is the implicit endpoint.
+    #[test]
+    fn eval_textafter_match_end() {
+        let (cm, vs) = make_test_env();
+        // "a-b" has matches at byte 0 (virtual start), byte 1 (real "-"),
+        // byte 3 (virtual end). instance=-1 picks byte 3 → "".
+        assert_eq!(
+            eval_str("=TEXTAFTER(\"a-b\", \"-\", -1, 0, 1)", &cm, &vs),
+            Value::Text("".into())
+        );
+    }
+
+    // === LOOKUP ===
+
+    /// LOOKUP vector form, 3-arg. Exact match returns the parallel
+    /// element.
+    #[test]
+    fn eval_lookup_vector_form_exact() {
+        let (cm, vs) = make_test_env();
+        // Keys: 1,2,3,4; Results: "a","b","c","d". LOOKUP(3,...) → "c".
+        assert_eq!(
+            eval_str("=LOOKUP(3, {1,2,3,4}, {\"a\",\"b\",\"c\",\"d\"})", &cm, &vs),
+            Value::Text("c".into())
+        );
+    }
+
+    /// LOOKUP picks the largest key ≤ needle (approximate walk).
+    #[test]
+    fn eval_lookup_vector_approximate() {
+        let (cm, vs) = make_test_env();
+        // Keys 1,3,5,7. needle=4 → largest ≤ is 3 → "b".
+        assert_eq!(
+            eval_str("=LOOKUP(4, {1,3,5,7}, {\"a\",\"b\",\"c\",\"d\"})", &cm, &vs),
+            Value::Text("b".into())
+        );
+    }
+
+    /// LOOKUP without `result_vector` returns the matching key itself.
+    #[test]
+    fn eval_lookup_two_arg_vector_form() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LOOKUP(3, {1,2,3,4})", &cm, &vs),
+            Value::Number(3.0)
+        );
+    }
+
+    /// LOOKUP array form: 2nd arg is 2D, longer dimension carries the
+    /// lookup keys; the opposite end of the other dimension is the
+    /// result. Here {1,2;3,4} is 2×2 with cols == rows, so we treat as
+    /// horizontal (first row = keys, last row = result).
+    #[test]
+    fn eval_lookup_array_form() {
+        let (cm, vs) = make_test_env();
+        // 2×3 horizontal: keys 1,2,3 in row 0; results "a","b","c" in row 1.
+        // LOOKUP(2, {1,2,3;"a","b","c"}) → "b".
+        assert_eq!(
+            eval_str("=LOOKUP(2, {1,2,3;\"a\",\"b\",\"c\"})", &cm, &vs),
+            Value::Text("b".into())
+        );
+    }
+
+    /// LOOKUP not found (needle smaller than every key) → #N/A.
+    #[test]
+    fn eval_lookup_not_found() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LOOKUP(0, {1,2,3}, {\"a\",\"b\",\"c\"})", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    /// Vector lengths must agree.
+    #[test]
+    fn eval_lookup_shape_mismatch() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LOOKUP(2, {1,2,3}, {\"a\",\"b\"})", &cm, &vs),
+            Value::Error(ValueError::WrongType)
         );
     }
 
@@ -27334,6 +28370,151 @@ mod tests {
         // implicit intersection.
         let (cm, vs) = make_broadcast_env();
         assert_eq!(eval_str("=A1:A1+1", &cm, &vs), Value::Number(11.0));
+    }
+
+    #[test]
+    fn eval_lookup_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=LOOKUP(1)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+        assert_eq!(
+            eval_str("=LOOKUP(1,2,3,4)", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    // === FORMULATEXT ===
+
+    /// FORMULATEXT on a primitive cell surfaces `#N/A` (InvalidValue) via
+    /// the AtomEvalProvider's default `cell_formula_text` returning None.
+    /// (Sheet/Workbook round-trip is exercised in the integration tests.)
+    #[test]
+    fn eval_formulatext_on_primitive_returns_na() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=FORMULATEXT(A1)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn eval_formulatext_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=FORMULATEXT()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// A non-ref argument is a type error per the spec.
+    #[test]
+    fn eval_formulatext_non_ref_arg() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=FORMULATEXT(42)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // === AREAS ===
+
+    #[test]
+    fn eval_areas_single_cell_ref() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=AREAS(A1)", &cm, &vs), Value::Number(1.0));
+    }
+
+    #[test]
+    fn eval_areas_range_ref() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(eval_str("=AREAS(A1:B2)", &cm, &vs), Value::Number(1.0));
+    }
+
+    #[test]
+    fn eval_areas_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AREAS()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    #[test]
+    fn eval_areas_non_ref_arg() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=AREAS(1)", &cm, &vs),
+            Value::Error(ValueError::WrongType)
+        );
+    }
+
+    // === ENCODEURL ===
+
+    /// Spaces encode as %20; reserved chars encode; unreserved
+    /// `[A-Za-z0-9-_.~]` pass through.
+    #[test]
+    fn eval_encodeurl_basic() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ENCODEURL(\"hello world\")", &cm, &vs),
+            Value::Text("hello%20world".into())
+        );
+        assert_eq!(
+            eval_str("=ENCODEURL(\"a-_.~b\")", &cm, &vs),
+            Value::Text("a-_.~b".into())
+        );
+        assert_eq!(
+            eval_str("=ENCODEURL(\"a/b?c=d&e\")", &cm, &vs),
+            Value::Text("a%2Fb%3Fc%3Dd%26e".into())
+        );
+    }
+
+    /// Multi-byte UTF-8 (the euro sign `€` = 0xE2 0x82 0xAC) encodes
+    /// per-byte.
+    #[test]
+    fn eval_encodeurl_unicode() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ENCODEURL(\"€\")", &cm, &vs),
+            Value::Text("%E2%82%AC".into())
+        );
+    }
+
+    /// Empty input → empty string. Numbers coerce to text first.
+    #[test]
+    fn eval_encodeurl_empty_and_numeric() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ENCODEURL(\"\")", &cm, &vs),
+            Value::Text(String::new())
+        );
+        assert_eq!(
+            eval_str("=ENCODEURL(123)", &cm, &vs),
+            Value::Text("123".into())
+        );
+    }
+
+    #[test]
+    fn eval_encodeurl_arg_count_error() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=ENCODEURL()", &cm, &vs),
+            Value::Error(ValueError::WrongArgCount)
+        );
+    }
+
+    /// is_builtin_function_name covers the seven new arms.
+    #[test]
+    fn builtin_function_name_covers_new_arms() {
+        assert!(is_builtin_function_name("TEXTSPLIT"));
+        assert!(is_builtin_function_name("TEXTBEFORE"));
+        assert!(is_builtin_function_name("TEXTAFTER"));
+        assert!(is_builtin_function_name("LOOKUP"));
+        assert!(is_builtin_function_name("FORMULATEXT"));
+        assert!(is_builtin_function_name("AREAS"));
+        assert!(is_builtin_function_name("ENCODEURL"));
     }
 
     // ===== TESTS REGISTRY: ADD NEW #[test] FNS / HELPERS BEFORE THIS LINE =====

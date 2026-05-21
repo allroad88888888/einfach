@@ -2201,6 +2201,16 @@ impl Sheet {
         self.formula_cells.contains_key(&addr)
     }
 
+    /// Source formula text at `addr`, if any. Used by
+    /// `FORMULATEXT(reference)` via the `EvalProvider::cell_formula_text`
+    /// hook. Returns a clone of the stored source (leading `=`
+    /// included) — the cost is bounded by the formula length, so cloning
+    /// per call is acceptable for the formula-bar / `FORMULATEXT` use
+    /// case.
+    pub fn formula_text_at(&self, addr: CellAddress) -> Option<String> {
+        self.formula_texts.get(&addr).cloned()
+    }
+
     /// Iterate every address that has a primitive value or a formula. Empty
     /// addresses are skipped. Used by structural-undo to snapshot only the
     /// cells that actually need restoring (see `solid/excel/docs/STRUCTURAL_UNDO.md`).
@@ -3290,6 +3300,7 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
                     | "CHOOSECOLS"
                     | "TOROW"
                     | "TOCOL"
+                    | "TEXTSPLIT"
             ) {
                 return true;
             }
@@ -3388,6 +3399,13 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn cell_has_formula(&self, addr: CellAddress) -> bool {
         self.sheet.has_formula_at(addr)
     }
+
+    /// FORMULATEXT hook — consult the sheet's `formula_texts` map and
+    /// return a clone of the stored source. A primitive cell has no
+    /// entry → `None` → the FORMULATEXT arm surfaces `#N/A`.
+    fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
+        self.sheet.formula_texts.get(&addr).cloned()
+    }
 }
 
 struct TrackingEvalProvider<'a> {
@@ -3455,6 +3473,14 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
 
     fn sheet_cell_has_formula(&self, sheet: &str, addr: CellAddress) -> bool {
         self.inner.sheet_cell_has_formula(sheet, addr)
+    }
+
+    fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
+        self.inner.cell_formula_text(addr)
+    }
+
+    fn sheet_cell_formula_text(&self, sheet: &str, addr: CellAddress) -> Option<String> {
+        self.inner.sheet_cell_formula_text(sheet, addr)
     }
 
     fn current_sheet_index(&self) -> Option<usize> {

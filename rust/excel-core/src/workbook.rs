@@ -1831,6 +1831,23 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             .unwrap_or(false)
     }
 
+    /// FORMULATEXT hook for the workbook context. Looks up the source
+    /// formula in the *current* sheet's text store. Returns `None` when
+    /// the cell holds a primitive — the FORMULATEXT arm then surfaces
+    /// `#N/A`.
+    fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
+        let idx = self.current.get();
+        let sheet = self.wb.sheets.get(idx)?;
+        sheet.formula_text_at(addr)
+    }
+
+    /// Cross-sheet variant: resolve the sheet by name first.
+    fn sheet_cell_formula_text(&self, sheet: &str, addr: CellAddress) -> Option<String> {
+        let idx = self.wb.by_name.get(sheet).copied()?;
+        let target = self.wb.sheets.get(idx)?;
+        target.formula_text_at(addr)
+    }
+
     fn current_sheet_index(&self) -> Option<usize> {
         Some(self.current.get())
     }
