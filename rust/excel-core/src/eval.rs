@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -48,6 +48,340 @@ thread_local! {
     /// stays balanced even when the body short-circuits on an error,
     /// and `Expr::Name` only ever reads — no aliasing hazards.
     static LET_FRAMES: RefCell<Vec<LetFrame>> = const { RefCell::new(Vec::new()) };
+
+    /// Thread-local recursion depth counter for named-LAMBDA calls. A
+    /// recursive defined name (e.g. `fact` = `LAMBDA(n, IF(n<=1, 1,
+    /// n*fact(n-1)))`) reaches itself through `provider.lookup_named`
+    /// every time the body's `fact(...)` resolves; without a guard a
+    /// pathological recursive definition (`bad` = `LAMBDA(n, bad(n))`)
+    /// would blow the OS stack. We cap the depth at `MAX_NAMED_CALL_DEPTH`
+    /// and surface `#NUM!` on overflow — matches Excel's behaviour for
+    /// stack-busting recursion.
+    ///
+    /// LET-frame depth is not bounded here: LET binds eagerly during
+    /// evaluation, so a runaway LET would already overflow at parse /
+    /// AST construction. The named-call counter only ticks when an
+    /// `Expr::Name` or `Expr::FuncCall` arm finds a `Value::Lambda` in
+    /// the workbook registry and is about to evaluate its body — i.e.
+    /// the entry/exit points where unbounded self-reference happens.
+    static NAMED_CALL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Maximum nesting depth for `apply_lambda` recursion. Exceeded depth
+/// returns `Value::Error(ValueError::Overflow)` (Excel's `#NUM!`) so a
+/// pathological recursive named LAMBDA (`bad` = `LAMBDA(n, bad(n))`)
+/// surfaces an error instead of overflowing the OS thread stack.
+///
+/// **Why 32 rather than the "obvious" 256**: each recursion level
+/// allocates a Rust stack frame for `apply_lambda` plus
+/// `eval_expr_with_provider` plus `eval_func`. `eval_func` is a 7k-line
+/// `match` that in debug builds carries an enormous stack frame
+/// (≈50KB) — the test runner's default 2MB thread stack only fits
+/// ~40 such frames. Cap chosen with headroom for nested `IF` arms and
+/// builtin auxiliary frames so realistic recursive helpers (factorial,
+/// fib up to n≈20, small tree walks) all work in debug mode while the
+/// release build still has comfortable margin.
+///
+/// If the host wants deeper recursion they can run a release build (the
+/// cap is the same constant but each frame is ~10× smaller, leaving
+/// the same 32-level cap with abundant unused stack budget). A future
+/// refactor could shrink `eval_func` via dispatch-table indirection,
+/// at which point this cap can be raised toward Excel's documented
+/// limit of 8191.
+pub(crate) const MAX_NAMED_CALL_DEPTH: usize = 32;
+
+/// True iff `name` (already uppercased per Excel name conventions) is a
+/// dispatched built-in function in `eval_func`. Used by the workbook
+/// defined-name registry to reject `define_name("SUM", ...)`-style
+/// shadowing — the dispatch table would beat the registry anyway, so
+/// forbidding the registration avoids a silently-ignored entry.
+///
+/// **Maintenance**: this list mirrors the top-level `match` arms in
+/// `eval_func` and must be updated together with them. Drift is
+/// caught by `tests::reserved_name_list_mirrors_eval_func_dispatch` —
+/// any newly-added builtin without a matching entry here will fail
+/// that assertion.
+pub fn is_builtin_function_name(name: &str) -> bool {
+    matches!(
+        name,
+        "ABS"
+            | "ACOS"
+            | "ACOSH"
+            | "ACOT"
+            | "ACSC"
+            | "ADDRESS"
+            | "AND"
+            | "ARABIC"
+            | "ASEC"
+            | "ASIN"
+            | "ASINH"
+            | "ATAN"
+            | "ATAN2"
+            | "ATANH"
+            | "AVEDEV"
+            | "AVERAGE"
+            | "AVERAGEA"
+            | "AVERAGEIF"
+            | "AVERAGEIFS"
+            | "BASE"
+            | "BETA.DIST"
+            | "BETA.INV"
+            | "BIN2DEC"
+            | "BIN2HEX"
+            | "BIN2OCT"
+            | "BINOM.DIST"
+            | "BINOM.INV"
+            | "BITAND"
+            | "BITLSHIFT"
+            | "BITOR"
+            | "BITRSHIFT"
+            | "BITXOR"
+            | "BYCOL"
+            | "BYROW"
+            | "CEILING"
+            | "CEILING.MATH"
+            | "CEILING.PRECISE"
+            | "CELL"
+            | "CHAR"
+            | "CHISQ.DIST"
+            | "CHISQ.DIST.RT"
+            | "CHISQ.INV"
+            | "CHISQ.INV.RT"
+            | "CHOOSE"
+            | "CHOOSECOLS"
+            | "CHOOSEROWS"
+            | "CLEAN"
+            | "CODE"
+            | "COLUMN"
+            | "COLUMNS"
+            | "COMBIN"
+            | "CONCATENATE"
+            | "CORREL"
+            | "COS"
+            | "COSH"
+            | "COT"
+            | "COTH"
+            | "COUNT"
+            | "COUNTA"
+            | "COUNTBLANK"
+            | "COUNTIF"
+            | "COUNTIFS"
+            | "COVAR.S"
+            | "CSC"
+            | "CSCH"
+            | "DATE"
+            | "DATEDIF"
+            | "DATEVALUE"
+            | "DAVERAGE"
+            | "DAY"
+            | "DAYS"
+            | "DCOUNT"
+            | "DCOUNTA"
+            | "DEC2BIN"
+            | "DEC2HEX"
+            | "DEC2OCT"
+            | "DECIMAL"
+            | "DEGREES"
+            | "DELTA"
+            | "DEVSQ"
+            | "DGET"
+            | "DMAX"
+            | "DMIN"
+            | "DPRODUCT"
+            | "DROP"
+            | "DSUM"
+            | "EDATE"
+            | "EOMONTH"
+            | "ERF"
+            | "ERFC"
+            | "EXACT"
+            | "EXP"
+            | "EXPON.DIST"
+            | "F.DIST"
+            | "F.DIST.RT"
+            | "F.INV"
+            | "F.INV.RT"
+            | "FACT"
+            | "FILTER"
+            | "FIND"
+            | "FISHER"
+            | "FISHERINV"
+            | "FLOOR"
+            | "FLOOR.MATH"
+            | "FLOOR.PRECISE"
+            | "FV"
+            | "GAMMA"
+            | "GAMMA.DIST"
+            | "GAMMA.INV"
+            | "GAMMALN"
+            | "GCD"
+            | "GEOMEAN"
+            | "GESTEP"
+            | "HARMEAN"
+            | "HEX2BIN"
+            | "HEX2DEC"
+            | "HEX2OCT"
+            | "HLOOKUP"
+            | "HOUR"
+            | "HSTACK"
+            | "HYPGEOM.DIST"
+            | "IF"
+            | "IFERROR"
+            | "IFNA"
+            | "IFS"
+            | "INDEX"
+            | "INDIRECT"
+            | "INT"
+            | "INTERCEPT"
+            | "IPMT"
+            | "IRR"
+            | "ISBLANK"
+            | "ISERR"
+            | "ISERROR"
+            | "ISEVEN"
+            | "ISLOGICAL"
+            | "ISNA"
+            | "ISNONTEXT"
+            | "ISNUMBER"
+            | "ISODD"
+            | "ISOMITTED"
+            | "ISOWEEKNUM"
+            | "ISTEXT"
+            | "KURT"
+            | "LAMBDA"
+            | "LARGE"
+            | "LCM"
+            | "LEFT"
+            | "LEN"
+            | "LET"
+            | "LN"
+            | "LOG"
+            | "LOG10"
+            | "LOWER"
+            | "MAKEARRAY"
+            | "MAP"
+            | "MATCH"
+            | "MAX"
+            | "MAXIFS"
+            | "MDETERM"
+            | "MEDIAN"
+            | "MID"
+            | "MIN"
+            | "MINIFS"
+            | "MINUTE"
+            | "MOD"
+            | "MODE"
+            | "MONTH"
+            | "MROUND"
+            | "N"
+            | "NEGBINOM.DIST"
+            | "NETWORKDAYS"
+            | "NETWORKDAYS.INTL"
+            | "NORM.DIST"
+            | "NORM.INV"
+            | "NORM.S.DIST"
+            | "NORM.S.INV"
+            | "NOT"
+            | "NOW"
+            | "NPER"
+            | "NPV"
+            | "OCT2BIN"
+            | "OCT2DEC"
+            | "OCT2HEX"
+            | "OFFSET"
+            | "OR"
+            | "PERCENTILE.EXC"
+            | "PI"
+            | "PMT"
+            | "POISSON.DIST"
+            | "POWER"
+            | "PPMT"
+            | "PRODUCT"
+            | "PROPER"
+            | "PV"
+            | "QUARTILE.EXC"
+            | "QUOTIENT"
+            | "RADIANS"
+            | "RANDARRAY"
+            | "RATE"
+            | "REDUCE"
+            | "REPLACE"
+            | "REPT"
+            | "RIGHT"
+            | "ROMAN"
+            | "ROUND"
+            | "ROUNDDOWN"
+            | "ROUNDUP"
+            | "ROW"
+            | "ROWS"
+            | "SCAN"
+            | "SEARCH"
+            | "SEC"
+            | "SECH"
+            | "SECOND"
+            | "SEQUENCE"
+            | "SIGN"
+            | "SIN"
+            | "SINH"
+            | "SKEW"
+            | "SLOPE"
+            | "SMALL"
+            | "SORT"
+            | "SORTBY"
+            | "SQRT"
+            | "SQRTPI"
+            | "STANDARDIZE"
+            | "STDEV"
+            | "STDEV.P"
+            | "STDEV.S"
+            | "SUBSTITUTE"
+            | "SUM"
+            | "SUMIF"
+            | "SUMIFS"
+            | "SUMPRODUCT"
+            | "SUMSQ"
+            | "SUMX2MY2"
+            | "SUMX2PY2"
+            | "SUMXMY2"
+            | "SWITCH"
+            | "T"
+            | "T.DIST"
+            | "T.DIST.2T"
+            | "T.DIST.RT"
+            | "T.INV"
+            | "T.INV.2T"
+            | "TAKE"
+            | "TAN"
+            | "TANH"
+            | "TEXT"
+            | "TEXTJOIN"
+            | "TIME"
+            | "TIMEVALUE"
+            | "TOCOL"
+            | "TODAY"
+            | "TOROW"
+            | "TRIM"
+            | "TRIMMEAN"
+            | "TRUNC"
+            | "TYPE"
+            | "UNIQUE"
+            | "UPPER"
+            | "VALUE"
+            | "VAR"
+            | "VAR.P"
+            | "VAR.S"
+            | "VLOOKUP"
+            | "VSTACK"
+            | "WEEKDAY"
+            | "WEEKNUM"
+            | "WEIBULL.DIST"
+            | "WORKDAY"
+            | "WORKDAY.INTL"
+            | "XLOOKUP"
+            | "XOR"
+            | "YEAR"
+            | "YEARFRAC"
+    )
 }
 
 /// Walk the active LET frame stack from innermost to outermost. Returns
@@ -177,12 +511,27 @@ pub(crate) fn apply_lambda(
             frame_bindings.push((name.clone(), value));
         }
     }
+    // Wrap body eval in the named-call depth guard. Each lambda
+    // application — whether triggered by `Expr::Call`, `eval_named_call`,
+    // or one of the higher-order callers (MAP / REDUCE / SCAN / BYROW /
+    // BYCOL / MAKEARRAY) — bumps the depth by one and restores it on
+    // return. The cap (`MAX_NAMED_CALL_DEPTH`) only bites when bodies
+    // recursively call back into `apply_lambda`; the sequential per-element
+    // dispatch inside MAP/REDUCE oscillates depth between N and N+1, so
+    // legitimate array work isn't blocked. Recursion overflow surfaces as
+    // `#NUM!` (Excel parity for stack-busting recursion).
+    let depth = NAMED_CALL_DEPTH.with(|c| c.get());
+    if depth >= MAX_NAMED_CALL_DEPTH {
+        return Value::Error(ValueError::Overflow);
+    }
+    NAMED_CALL_DEPTH.with(|c| c.set(depth + 1));
     push_let_frame(frame_bindings);
     // Save/restore-style guard equivalent: any early-return from the
     // body still has the pop executed because we route everything
     // through the closure below.
     let result = eval_expr_with_provider(&excel_lambda.body, provider);
     pop_let_frame();
+    NAMED_CALL_DEPTH.with(|c| c.set(depth));
     result
 }
 
@@ -254,6 +603,27 @@ pub trait EvalProvider {
     /// recurses into nested formula cells. Default impl is a no-op so
     /// providers without a current-cell concept ignore the call.
     fn set_current_cell(&self, _addr: Option<CellAddress>) {}
+
+    /// Workbook-scope defined-name lookup. Returns a clone of the value
+    /// registered under `name` (case-insensitive), or `None` if the
+    /// workbook has no entry for that name.
+    ///
+    /// Default impl returns `None`: the legacy single-sheet shim
+    /// (`AtomEvalProvider`) and any provider without a workbook context
+    /// has no named registry, so an unbound `Expr::Name` still surfaces
+    /// `#NAME?` exactly as before. Workbook-backed providers
+    /// (`WorkbookEvalProvider`, the tracking wrapper) override to
+    /// consult the workbook's `named_values` map.
+    ///
+    /// Consulted by `Expr::Name` (after LET-frame lookup) and by
+    /// `Expr::FuncCall` dispatch (before the InvalidName fallback) so a
+    /// registered `LAMBDA` value can be invoked with the function-call
+    /// syntax `=SQUARE(5)`. LET bindings win over workbook names per
+    /// Excel parity — `=LET(answer, 1, answer*2)` returns 2 even when
+    /// `answer` is registered as 42.
+    fn lookup_named(&self, _name: &str) -> Option<Value> {
+        None
+    }
 }
 
 struct AtomEvalProvider<'a> {
@@ -337,13 +707,22 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
         }
 
         Expr::Name(name) => {
-            // Resolve against the current LET scope chain. Unbound names
-            // surface `#NAME?` per Excel.
-            //
-            // Named ranges, if/when implemented, would consult them here
-            // BEFORE falling through to InvalidName — LET bindings take
-            // precedence (Excel parity).
-            lookup_let_binding(name).unwrap_or(Value::Error(ValueError::InvalidName))
+            // Resolution order (Excel parity):
+            //   1. Active LET scope chain. Innermost LET shadows outer
+            //      bindings, which in turn shadow workbook names so
+            //      `=LET(answer, 1, answer)` returns 1 even when the
+            //      workbook has a defined name `answer = 42`.
+            //   2. Workbook defined-name registry (consulted via the
+            //      provider, which returns None for non-workbook
+            //      contexts).
+            //   3. Otherwise `#NAME?`.
+            if let Some(v) = lookup_let_binding(name) {
+                return v;
+            }
+            if let Some(v) = provider.lookup_named(name) {
+                return v;
+            }
+            Value::Error(ValueError::InvalidName)
         }
 
         Expr::Call(callee, call_args) => {
@@ -7175,8 +7554,49 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "STANDARDIZE" => stat_standardize(args, provider),
         "FISHER" => stat_fisher(args, provider),
         "FISHERINV" => stat_fisherinv(args, provider),
-        _ => Value::Error(ValueError::InvalidName),
+        // Fallthrough: not a built-in. Before surfacing #NAME?, consult the
+        // workbook's defined-name registry — a stored `Value::Lambda` makes
+        // `=SQUARE(5)` work after `define_name("SQUARE", "=LAMBDA(x, x*x)")`.
+        // Non-lambda named values aren't callable as a function (Excel parity:
+        // `=answer()` when `answer` is 42 is a #VALUE!, not 42).
+        _ => eval_named_call(name, args, provider),
     }
+}
+
+/// Resolve a function call `name(args)` against the workbook's defined
+/// names when no built-in matched. If the registry holds a `Value::Lambda`
+/// under `name`, evaluate args (left-to-right, short-circuiting on the
+/// first error) and apply the lambda. Otherwise surface `#NAME?`.
+///
+/// Wraps `apply_lambda` in the named-call recursion guard so a runaway
+/// recursive definition (`bad` = `LAMBDA(n, bad(n))`) hits `#NUM!` at
+/// `MAX_NAMED_CALL_DEPTH` rather than panicking the thread.
+fn eval_named_call(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
+    let Some(value) = provider.lookup_named(name) else {
+        return Value::Error(ValueError::InvalidName);
+    };
+    match &value {
+        Value::Lambda(_) => {}
+        Value::Error(e) => return Value::Error(e.clone()),
+        _ => {
+            // A defined name like `answer = 42` exists but isn't callable.
+            // Excel surfaces #VALUE! when you try to invoke a non-function;
+            // we mirror that. `=answer` alone still returns 42 via Expr::Name.
+            return Value::Error(ValueError::InvalidValue);
+        }
+    }
+    let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+    for a in args {
+        let v = eval_expr_with_provider(a, provider);
+        if let Value::Error(e) = &v {
+            return Value::Error(e.clone());
+        }
+        arg_values.push(v);
+    }
+    // `apply_lambda` itself owns the recursion guard (see its body) so a
+    // recursive defined lambda (`fact` = `LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))`)
+    // hits #NUM! at MAX_NAMED_CALL_DEPTH instead of overflowing the stack.
+    apply_lambda(&value, arg_values, provider)
 }
 
 /// Streams every arg's numeric values into a local Vec. The Vec is an
@@ -20991,4 +21411,203 @@ mod tests {
         eval_str(formula, &cm, &vs)
     }
     const TOL: f64 = 1e-6;
+
+    // === Defined-name registry: unit tests ===
+    //
+    // The integration tests in `rust/excel-core/tests/named_lambda.rs`
+    // exercise the full Workbook path. These unit tests drive
+    // `EvalProvider::lookup_named` directly via a stub provider so the
+    // dispatch table changes in this commit (Expr::Name fallthrough +
+    // Expr::FuncCall fallthrough + recursion guard) are covered without
+    // dragging in cross-sheet / spill plumbing.
+
+    /// Minimal `EvalProvider` that wraps `AtomEvalProvider` with an
+    /// in-memory named-value registry. Mirrors what `WorkbookEvalProvider`
+    /// does at the workbook layer: cell reads go to the cell map, name
+    /// lookups go to the registry. Built per test so each case starts
+    /// from a clean slate.
+    struct NamedEvalProvider<'a> {
+        get: &'a dyn Fn(AtomId) -> Value,
+        cell_map: &'a HashMap<CellAddress, AtomId>,
+        names: HashMap<String, Value>,
+    }
+
+    impl<'a> EvalProvider for NamedEvalProvider<'a> {
+        fn cell(&self, addr: CellAddress) -> Value {
+            self.cell_map
+                .get(&addr)
+                .map(|&id| (self.get)(id))
+                .unwrap_or(Value::Null)
+        }
+        fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+            Value::Error(ValueError::InvalidRef)
+        }
+        fn lookup_named(&self, name: &str) -> Option<Value> {
+            // Case-insensitive lookup — match the workbook contract so
+            // tests can register `square` and reference `=SQUARE(5)`.
+            let key = name.to_ascii_uppercase();
+            self.names.get(&key).cloned()
+        }
+    }
+
+    fn eval_with_names(
+        formula: &str,
+        names: &[(&str, Value)],
+        cell_map: &HashMap<CellAddress, AtomId>,
+        values: &HashMap<AtomId, Value>,
+    ) -> Value {
+        let expr = parse_formula(formula).expect("parse failed");
+        let get = |id: AtomId| -> Value { values.get(&id).cloned().unwrap_or(Value::Null) };
+        let registry: HashMap<String, Value> = names
+            .iter()
+            .map(|(n, v)| (n.to_ascii_uppercase(), v.clone()))
+            .collect();
+        let provider = NamedEvalProvider {
+            get: &get,
+            cell_map,
+            names: registry,
+        };
+        eval_expr_with_provider(&expr, &provider)
+    }
+
+    /// Build a `Value::Lambda` by parsing & evaluating a `=LAMBDA(...)`
+    /// formula. Used by the recursive-LAMBDA tests so the captured
+    /// snapshot is built through the same path that production uses.
+    fn make_lambda(formula: &str) -> Value {
+        let (cm, vs) = empty_env();
+        let v = eval_str(formula, &cm, &vs);
+        assert!(matches!(v, Value::Lambda(_)), "expected Lambda, got {v:?}");
+        v
+    }
+
+    /// Defined name resolves as a scalar in `Expr::Name` position.
+    #[test]
+    fn defined_name_scalar_resolves() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names("=answer", &[("answer", Value::Number(42.0))], &cm, &vs);
+        assert_eq!(v, Value::Number(42.0));
+    }
+
+    /// Defined name participates in arithmetic.
+    #[test]
+    fn defined_name_scalar_in_expression() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names("=answer+1", &[("answer", Value::Number(42.0))], &cm, &vs);
+        assert_eq!(v, Value::Number(43.0));
+    }
+
+    /// Named LAMBDA invoked via function-call syntax.
+    #[test]
+    fn defined_name_lambda_callable_as_function() {
+        let (cm, vs) = empty_env();
+        let square = make_lambda("=LAMBDA(x, x*x)");
+        let v = eval_with_names("=square(7)", &[("square", square)], &cm, &vs);
+        assert_eq!(v, Value::Number(49.0));
+    }
+
+    /// Lookup is case-insensitive: definition uses lowercase, reference
+    /// uses uppercase.
+    #[test]
+    fn defined_name_lookup_case_insensitive() {
+        let (cm, vs) = empty_env();
+        let square = make_lambda("=LAMBDA(x, x*x)");
+        let v = eval_with_names("=SQUARE(3)", &[("square", square)], &cm, &vs);
+        assert_eq!(v, Value::Number(9.0));
+    }
+
+    /// Unbound name surfaces #NAME?.
+    #[test]
+    fn undefined_name_surfaces_name_error() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names("=missing", &[], &cm, &vs);
+        assert_eq!(v, Value::Error(ValueError::InvalidName));
+    }
+
+    /// Unknown function surfaces #NAME? (registry empty, no built-in
+    /// match).
+    #[test]
+    fn unknown_function_call_surfaces_name_error() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names("=missing(1, 2)", &[], &cm, &vs);
+        assert_eq!(v, Value::Error(ValueError::InvalidName));
+    }
+
+    /// Non-callable defined name invoked as a function surfaces #VALUE!.
+    #[test]
+    fn non_lambda_name_called_as_function_is_value_error() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names("=answer(1)", &[("answer", Value::Number(42.0))], &cm, &vs);
+        assert_eq!(v, Value::Error(ValueError::InvalidValue));
+    }
+
+    /// LET binding shadows a defined name (LET wins over registry).
+    #[test]
+    fn let_binding_shadows_defined_name() {
+        let (cm, vs) = empty_env();
+        let v = eval_with_names(
+            "=LET(answer, 1, answer*2)",
+            &[("answer", Value::Number(42.0))],
+            &cm,
+            &vs,
+        );
+        assert_eq!(v, Value::Number(2.0));
+    }
+
+    /// Recursive named LAMBDA — `fact(5) = 120`. Verifies the body's
+    /// internal `fact(n-1)` reference resolves through the registry
+    /// (not via LET-frame, which doesn't see the lambda's own name at
+    /// definition time).
+    #[test]
+    fn recursive_named_lambda_factorial() {
+        let (cm, vs) = empty_env();
+        let fact = make_lambda("=LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))");
+        let v = eval_with_names("=fact(5)", &[("fact", fact)], &cm, &vs);
+        assert_eq!(v, Value::Number(120.0));
+    }
+
+    /// Recursive named LAMBDA — fibonacci. Two recursive calls per
+    /// frame; verifies the recursion guard's depth tracking pops
+    /// correctly between sibling calls (otherwise depth would
+    /// monotonically grow and bust the cap for moderate n).
+    #[test]
+    fn recursive_named_lambda_fibonacci() {
+        let (cm, vs) = empty_env();
+        let fib = make_lambda("=LAMBDA(n, IF(n<=1, n, fib(n-1)+fib(n-2)))");
+        let v = eval_with_names("=fib(7)", &[("fib", fib)], &cm, &vs);
+        assert_eq!(v, Value::Number(13.0));
+    }
+
+    /// Pathological recursion hits the depth cap and returns #NUM!
+    /// instead of overflowing the stack. Uses a definition that just
+    /// recurses without converging — the cap should trigger long
+    /// before any stack damage.
+    #[test]
+    fn pathological_recursion_returns_num_error() {
+        let (cm, vs) = empty_env();
+        let bad = make_lambda("=LAMBDA(n, bad(n))");
+        let v = eval_with_names("=bad(1)", &[("bad", bad)], &cm, &vs);
+        assert_eq!(v, Value::Error(ValueError::Overflow));
+    }
+
+    /// `is_builtin_function_name` is exported for the workbook's reserved-name
+    /// check. Sanity-check a handful of arms so a typo in the giant
+    /// `matches!` block surfaces here rather than silently falling
+    /// through to the registry.
+    #[test]
+    fn builtin_function_name_check_covers_known_arms() {
+        // Sample of one-letter, dotted, and multi-character names.
+        assert!(is_builtin_function_name("SUM"));
+        assert!(is_builtin_function_name("IF"));
+        assert!(is_builtin_function_name("LAMBDA"));
+        assert!(is_builtin_function_name("LET"));
+        assert!(is_builtin_function_name("VLOOKUP"));
+        assert!(is_builtin_function_name("T.DIST"));
+        assert!(is_builtin_function_name("N"));
+        assert!(is_builtin_function_name("T"));
+        // Negative cases: names a user might pick, none of which are
+        // built-ins.
+        assert!(!is_builtin_function_name("SQUARE"));
+        assert!(!is_builtin_function_name("MY_FUNC"));
+        assert!(!is_builtin_function_name("answer"));
+    }
 }

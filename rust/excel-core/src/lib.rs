@@ -11,7 +11,7 @@ pub mod workbook;
 
 pub use cell::CellAddress;
 pub use csv::{export_csv, import_csv, parse_csv, to_csv};
-pub use eval::{eval_expr, EvalProvider};
+pub use eval::{eval_expr, is_builtin_function_name, EvalProvider};
 pub use format::{
     apply_rules, Align, CellFormat, Condition, ConditionalRule, NumberFormat, StyleOverrides,
 };
@@ -20,4 +20,4 @@ pub use range::CellRange;
 pub use sheet::{CellSubscription, FormatRangeSnapshot, RangeFormatSnapshotLayer, Sheet, SheetError};
 pub use shift::{render_formula, shift_refs};
 pub use undo::{CellSnapshot, Edit, UndoStack};
-pub use workbook::Workbook;
+pub use workbook::{Workbook, WorkbookError};

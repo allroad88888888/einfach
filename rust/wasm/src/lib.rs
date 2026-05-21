@@ -1,7 +1,7 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, CellAddress, CellFormat, CellRange, CellSubscription, FormatRangeSnapshot, NumberFormat,
-    RangeFormatSnapshotLayer, Sheet, SheetError, Workbook,
+    RangeFormatSnapshotLayer, Sheet, SheetError, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
@@ -1237,6 +1237,53 @@ impl WasmWorkbook {
         self.workbook.set_formula(sheet_idx as usize, addr, formula)
     }
 
+    /// Register a workbook-level defined name. `formula` must start with
+    /// `=`; the most common use is `define_name("SQUARE", "=LAMBDA(x,
+    /// x*x)")` so cells across all sheets can call `=SQUARE(5)`. The
+    /// result of evaluating `formula` is stored under `name`; subsequent
+    /// `Expr::Name` and `Expr::FuncCall` lookups for `name` (case-
+    /// insensitive) resolve through the registry.
+    ///
+    /// Returns a JS error string on validation / parse / eval failure:
+    ///   - `"reserved-name"` when `name` collides with a built-in
+    ///     function name (`SUM`, `IF`, `LAMBDA`, etc.).
+    ///   - `"invalid-name"` when `name` violates
+    ///     `[A-Za-z_][A-Za-z0-9_]*` (length 1..=255).
+    ///   - `"parse-failed"` when `formula` doesn't tokenize.
+    ///   - `"eval-failed: #DIV/0!"` (or other error code) when the
+    ///     definition's eval surfaces a cell-style error.
+    ///
+    /// Side effect: walks every formula in every sheet and marks those
+    /// referencing `name` dirty so cached values re-compute against the
+    /// updated registry on next read.
+    #[wasm_bindgen(js_name = "defineName")]
+    pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), JsValue> {
+        self.workbook
+            .define_name(name, formula)
+            .map_err(workbook_error_to_js)
+    }
+
+    /// Remove a previously-registered name. Returns `true` if an entry
+    /// was removed; `false` if no entry existed. Formulas that
+    /// reference the name are marked dirty so the next read surfaces
+    /// `#NAME?` (or hits any newly-shadowing definition).
+    #[wasm_bindgen(js_name = "undefineName")]
+    pub fn undefine_name(&mut self, name: &str) -> bool {
+        self.workbook.undefine_name(name)
+    }
+
+    /// Enumerate the workbook's defined names in canonical (user-typed)
+    /// casing, sorted alphabetically by uppercased key. Useful for the
+    /// W2 name-manager dialog so it doesn't need to subscribe to every
+    /// `defineName` call individually.
+    #[wasm_bindgen(js_name = "definedNames")]
+    pub fn defined_names(&self) -> Vec<String> {
+        self.workbook
+            .named_names()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
         self.workbook.clear_cell(sheet_idx as usize, addr);
     }
@@ -2387,6 +2434,25 @@ fn sheet_error_to_js(err: SheetError) -> JsValue {
         }
     }
     obj.into()
+}
+
+/// Map a `WorkbookError` to a JS-side string code the caller can match
+/// on. Plain strings (not the structured object that `sheet_error_to_js`
+/// returns) because `defineName` / `undefineName` are infallible-by-
+/// design from the host's perspective: the error space is small,
+/// deterministic, and reported synchronously, so a tag is enough.
+///
+/// The eval-failed variant includes the wrapped `ValueError`'s display
+/// form (`"eval-failed: #DIV/0!"`) so the host can show the cell-style
+/// code without re-decoding a numeric enum.
+fn workbook_error_to_js(err: WorkbookError) -> JsValue {
+    let msg = match err {
+        WorkbookError::ReservedName => "reserved-name".to_string(),
+        WorkbookError::InvalidName => "invalid-name".to_string(),
+        WorkbookError::ParseFailed => "parse-failed".to_string(),
+        WorkbookError::EvalFailed(e) => format!("eval-failed: {}", e),
+    };
+    JsValue::from_str(&msg)
 }
 
 /// Collapse a spill-anchor `Value::Array` to its top-left scalar before

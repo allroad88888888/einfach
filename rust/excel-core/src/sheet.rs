@@ -1430,6 +1430,86 @@ impl Sheet {
         }
     }
 
+    /// Apply a workbook-aware re-eval result to the spill state at
+    /// `addr`. Mirrors the array-vs-scalar arms inside
+    /// `recompute_array_formula` but takes the already-computed
+    /// `Value` rather than running its own eval. Used by
+    /// `Workbook::set_formula` to install spills produced by formulas
+    /// that depend on workbook-scope features (defined names,
+    /// cross-sheet refs) — the legacy sheet-only eager recompute
+    /// inside `Sheet::set_formula` can't resolve those without a
+    /// `&Workbook` handle, so the workbook layer runs the eval through
+    /// its own provider and hands the result here.
+    ///
+    /// No-op when:
+    ///   - `addr` is not a formula cell (defensive),
+    ///   - the formula isn't an array-producing candidate AND wasn't
+    ///     previously a spill anchor (matches `recompute_array_formula`'s
+    ///     gating so we don't waste work on plain scalar formulas).
+    ///
+    /// `value` is also stamped into the formula cache so the next read
+    /// hits the workbook-aware result instead of recomputing through
+    /// the sheet-local provider (which would re-surface `#NAME?`).
+    pub(crate) fn apply_workbook_recomputed_value(&mut self, addr: CellAddress, value: Value) {
+        let prev_anchor_atom: Option<AtomId> = self
+            .cells
+            .get(&addr)
+            .copied()
+            .filter(|id| self.spill_targets.contains_key(id));
+
+        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+            return;
+        };
+        if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
+            return;
+        }
+
+        // Stamp the workbook-aware value into the formula cache so
+        // subsequent reads bypass the sheet-local SheetEvalProvider
+        // path that would re-surface #NAME? for named-value references.
+        *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
+
+        match value {
+            Value::Array(arr) => {
+                self.clear_spill_at_address(addr);
+                match self.install_formula_spill(addr, arr) {
+                    Ok(()) => {}
+                    Err(ValueError::Spill) => {
+                        if let Some(&atom_id) = self.cells.get(&addr) {
+                            self.store.set(atom_id, Value::Error(ValueError::Spill));
+                        }
+                        if let Some(record) = self.formula_cells.get(&addr) {
+                            *record.cache.borrow_mut() =
+                                FormulaCache::Clean(Value::Error(ValueError::Spill));
+                        }
+                    }
+                    Err(other) => {
+                        if let Some(&atom_id) = self.cells.get(&addr) {
+                            self.store.set(atom_id, Value::Error(other.clone()));
+                        }
+                        if let Some(record) = self.formula_cells.get(&addr) {
+                            *record.cache.borrow_mut() =
+                                FormulaCache::Clean(Value::Error(other));
+                        }
+                    }
+                }
+                self.mark_dependents_dirty(addr);
+            }
+            _ => {
+                if prev_anchor_atom.is_some() {
+                    self.clear_spill_at_address(addr);
+                    if let Some(prim) = self.cells.remove(&addr) {
+                        if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
+                            self.store.destroy_atom(prim);
+                        }
+                    }
+                    self.attach_address_sub(addr);
+                    self.mark_dependents_dirty(addr);
+                }
+            }
+        }
+    }
+
     /// Write a `Value::Array` to an anchor cell and install / re-install
     /// the spill range. On spill collision, the anchor is set to
     /// `Value::Error(Spill)` and no targets are installed.
@@ -3316,6 +3396,17 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
 
     fn set_current_cell(&self, addr: Option<CellAddress>) {
         self.inner.set_current_cell(addr);
+    }
+
+    fn lookup_named(&self, name: &str) -> Option<Value> {
+        // Pass through to the underlying workbook/sheet provider. We do
+        // NOT record a dep edge here: defined-name dependency tracking
+        // is handled by `Workbook::invalidate_formulas_using_name` —
+        // every formula that references the name gets dirtied on
+        // `define_name` / `undefine_name`, so there's no need to mark
+        // anything in the per-cell `deps` set when a named lookup
+        // succeeds.
+        self.inner.lookup_named(name)
     }
 }
 

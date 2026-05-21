@@ -1,10 +1,10 @@
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use einfach_core::{Value, ValueError};
 
 use crate::cell::CellAddress;
-use crate::eval::EvalProvider;
+use crate::eval::{eval_expr_with_provider, is_builtin_function_name, EvalProvider};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 use crate::sheet::{RangeDependentIndex, Sheet, SheetError};
@@ -165,6 +165,74 @@ impl CrossSheetDeps {
     }
 }
 
+/// One entry in `Workbook::named_values`. Stores the user-supplied
+/// canonical-case name alongside the cached `Value` so the registry can
+/// report names back to UIs with the casing the user typed, while
+/// `define_name` / `undefine_name` / lookup still operate
+/// case-insensitively (key is the uppercased form).
+///
+/// Reserves room for a future `source: Option<String>` field carrying the
+/// original formula text — useful when a host wants to round-trip the
+/// definition through `serialize → restore`. Not added in this commit
+/// because none of the W3 callers need it yet.
+#[derive(Clone, Debug)]
+struct NamedEntry {
+    /// The name as the user originally typed it (e.g. `"Tax_Rate"`),
+    /// preserved across read-back so the registry doesn't force-uppercase.
+    canonical_name: String,
+    /// The materialized value. For LAMBDA-defining formulas this is
+    /// `Value::Lambda`; for `=42`-style formulas this is `Value::Number`,
+    /// etc.
+    value: Value,
+}
+
+/// Errors raised by the defined-name registry. Distinct from
+/// `SheetError` because the failure modes (parse / eval / reserved name
+/// collision) are orthogonal to per-cell write protections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkbookError {
+    /// The proposed name collides with a built-in function name (`SUM`,
+    /// `IF`, `LAMBDA`, etc.). Excel rejects this with `#NAME?` at
+    /// definition time and we mirror the rejection so callers know the
+    /// registration would never be reachable (the dispatch table beats
+    /// the registry anyway). Comparison is case-insensitive via
+    /// `is_builtin_function_name`.
+    ReservedName,
+    /// The proposed name violates the identifier grammar:
+    /// `[A-Za-z_][A-Za-z0-9_]*`, length 1..=255. We deliberately do not
+    /// accept dotted names here — Excel's dotted syntax (`T.DIST`) is
+    /// reserved for built-ins, and the parser would route `=foo.bar` as
+    /// a tokenization error anyway.
+    InvalidName,
+    /// The formula text supplied to `define_name(name, formula)` failed
+    /// to parse (must start with `=` and be a valid expression).
+    ParseFailed,
+    /// The formula parsed but evaluation surfaced an error (e.g. the
+    /// definition references an unbound name, or hits a #DIV/0! during
+    /// reduction). The wrapped `ValueError` is the eval-time error so
+    /// callers can show the same cell-style code the user would see if
+    /// they typed the formula into a cell.
+    EvalFailed(ValueError),
+}
+
+impl std::fmt::Display for WorkbookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkbookError::ReservedName => {
+                write!(f, "name collides with a built-in function name")
+            }
+            WorkbookError::InvalidName => write!(
+                f,
+                "name must match [A-Za-z_][A-Za-z0-9_]* and be 1..=255 chars"
+            ),
+            WorkbookError::ParseFailed => write!(f, "formula text failed to parse"),
+            WorkbookError::EvalFailed(e) => write!(f, "formula evaluation surfaced {}", e),
+        }
+    }
+}
+
+impl std::error::Error for WorkbookError {}
+
 /// A workbook is an ordered collection of named sheets. Phase 4 backend.
 ///
 /// Cross-sheet references (`=Sheet2!A1`) resolve through a Workbook
@@ -193,6 +261,24 @@ pub struct Workbook {
     /// Per-workbook (not process-global) so the assertion isn't flaky
     /// under cargo's parallel test runner.
     cycle_ast_walk_count: Cell<usize>,
+    /// Workbook-level defined names. Keyed by the uppercased form of the
+    /// name so lookup is case-insensitive (Excel parity — `=Tax_Rate` and
+    /// `=TAX_RATE` resolve to the same entry); the entry's
+    /// `canonical_name` field preserves the original casing for UIs.
+    ///
+    /// Holds arbitrary `Value`s (not just lambdas) so a user can register
+    /// `define_name("answer", "=42")` and reference it from any cell.
+    /// The dominant use case is LAMBDAs registered as named functions —
+    /// `define_name("SQUARE", "=LAMBDA(x, x*x)")` makes `=SQUARE(5)` work
+    /// just like a built-in.
+    ///
+    /// `BTreeMap` rather than `HashMap` so the registry has a stable
+    /// iteration order (alphabetical by uppercased name) — useful for
+    /// snapshot diffs and serialization. The map is unbounded in this
+    /// initial cut; the W2 ROADMAP caps the parallel UI-side named-range
+    /// list at 500, and the workbook-core layer can enforce a similar
+    /// cap once a host needs it.
+    named_values: BTreeMap<String, NamedEntry>,
 }
 
 impl Workbook {
@@ -203,11 +289,179 @@ impl Workbook {
             by_name: HashMap::new(),
             cross_sheet: CrossSheetDeps::new(),
             cycle_ast_walk_count: Cell::new(0),
+            named_values: BTreeMap::new(),
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
         wb.add_sheet("Sheet1");
         wb
+    }
+
+    // === Workbook-level defined-name registry ===
+    //
+    // Two-tier API:
+    //   - `define_name(name, formula)` parses + evaluates a `=`-prefixed
+    //     formula, then stores the resulting Value under `name`. This is
+    //     the "register a LAMBDA as a named function" entry point and is
+    //     the path the WASM binding exposes.
+    //   - `define_name_value(name, value)` skips parse/eval and stores a
+    //     value directly. Used by tests and by hosts that have a Value in
+    //     hand (e.g. round-tripping from a serialization layer).
+    //
+    // Both go through `register_name` for validation + dep invalidation.
+
+    /// Parse and evaluate `formula` (must start with `=`), then register
+    /// the result under `name`. The dominant use case is registering a
+    /// LAMBDA as a callable named function: after
+    /// `wb.define_name("SQUARE", "=LAMBDA(x, x*x)")`, the cell formula
+    /// `=SQUARE(5)` resolves through the registry's lambda and returns
+    /// `25`.
+    ///
+    /// Evaluation runs in the workbook context (so the definition can
+    /// reference cells, other named values, and built-in functions) on
+    /// `Sheet1` (sheet index 0) as the "current" sheet for any bare
+    /// cell-ref inside the definition. Hosts that need a different
+    /// evaluation sheet can build the `Value` themselves and call
+    /// `define_name_value` directly.
+    ///
+    /// Returns `WorkbookError::ParseFailed` for bad formula text,
+    /// `WorkbookError::EvalFailed(e)` if evaluation surfaces an error
+    /// (the registry is left unchanged in that case), and the same
+    /// validation errors as `define_name_value` otherwise.
+    pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), WorkbookError> {
+        let expr = parse_formula(formula).ok_or(WorkbookError::ParseFailed)?;
+
+        // Evaluate against a workbook provider rooted on sheet 0. Sheet
+        // index 0 is guaranteed to exist (constructor seeds Sheet1) so
+        // we don't need to guard the index here.
+        let provider = WorkbookEvalProvider {
+            wb: self,
+            current: Cell::new(0),
+            current_cell: Cell::new(None),
+        };
+        let value = eval_expr_with_provider(&expr, &provider);
+        // Drop the provider's borrow before mutating self.
+        drop(provider);
+        if let Value::Error(e) = value {
+            return Err(WorkbookError::EvalFailed(e));
+        }
+        self.define_name_value(name, value)
+    }
+
+    /// Register a pre-built `Value` under `name`. Mostly used by tests
+    /// and by hosts that already hold a constructed `Value` (e.g. after
+    /// deserialization). Production callers usually want `define_name`,
+    /// which handles the parse+eval round-trip.
+    ///
+    /// Validation:
+    ///   - `name` must match `[A-Za-z_][A-Za-z0-9_]*`, length 1..=255.
+    ///   - The uppercased name must not collide with a built-in function
+    ///     name (`SUM`, `IF`, etc.).
+    ///
+    /// On success, walks all sheets and marks every formula whose AST
+    /// references `name` (as either a bare `Expr::Name` or a
+    /// `Expr::FuncCall` whose target is `name`) dirty, so cached
+    /// formula values re-evaluate against the updated registry on next
+    /// read.
+    pub fn define_name_value(&mut self, name: &str, value: Value) -> Result<(), WorkbookError> {
+        Self::validate_name(name)?;
+        let key = name.to_ascii_uppercase();
+        if is_builtin_function_name(&key) {
+            return Err(WorkbookError::ReservedName);
+        }
+        self.named_values.insert(
+            key,
+            NamedEntry {
+                canonical_name: name.to_string(),
+                value,
+            },
+        );
+        self.invalidate_formulas_using_name(name);
+        Ok(())
+    }
+
+    /// Remove a previously-registered name. Idempotent — a no-op when
+    /// no entry exists for `name`. Returns `true` if an entry was
+    /// removed, `false` otherwise. Invalidates downstream formulas the
+    /// same way `define_name` does so previously-cached results that
+    /// depended on the name re-evaluate (and now surface `#NAME?`).
+    pub fn undefine_name(&mut self, name: &str) -> bool {
+        let key = name.to_ascii_uppercase();
+        let removed = self.named_values.remove(&key).is_some();
+        if removed {
+            self.invalidate_formulas_using_name(name);
+        }
+        removed
+    }
+
+    /// Case-insensitive lookup. Returns a clone of the registered
+    /// value, or `None` if no entry exists. Used by the
+    /// `WorkbookEvalProvider::lookup_named` impl that the formula
+    /// evaluator consults for `Expr::Name` / `Expr::FuncCall`
+    /// fallthrough.
+    pub fn get_named(&self, name: &str) -> Option<Value> {
+        let key = name.to_ascii_uppercase();
+        self.named_values.get(&key).map(|e| e.value.clone())
+    }
+
+    /// Iterator over registered names in canonical (user-typed) casing,
+    /// sorted alphabetically by their uppercased key. Companion API for
+    /// hosts that want to display the registry — the underlying value
+    /// is intentionally not exposed here (callers go through
+    /// `get_named` if they need it) so a future host that needs only
+    /// the names doesn't end up cloning every Lambda.
+    pub fn named_names(&self) -> impl Iterator<Item = &str> {
+        self.named_values.values().map(|e| e.canonical_name.as_str())
+    }
+
+    fn validate_name(name: &str) -> Result<(), WorkbookError> {
+        if name.is_empty() || name.len() > 255 {
+            return Err(WorkbookError::InvalidName);
+        }
+        let mut bytes = name.bytes();
+        let first = bytes.next().unwrap();
+        let first_ok = first.is_ascii_alphabetic() || first == b'_';
+        if !first_ok {
+            return Err(WorkbookError::InvalidName);
+        }
+        for b in bytes {
+            let ok = b.is_ascii_alphanumeric() || b == b'_';
+            if !ok {
+                return Err(WorkbookError::InvalidName);
+            }
+        }
+        Ok(())
+    }
+
+    /// Walk every formula in every sheet and mark it dirty if its AST
+    /// references `name` (case-insensitive). The dirty mark flips the
+    /// formula's cache to `Dirty` so the next read recomputes against
+    /// the up-to-date registry. Also fires any per-cell subscribers so
+    /// reactive hosts (the worker backend, the Solid components) see a
+    /// value-change signal without polling.
+    ///
+    /// **Why a global walk instead of a reverse-dep index**: cells
+    /// referencing a named value aren't tracked in the cross-sheet
+    /// graph (which keys on `(sheet, addr)`) or the per-sheet
+    /// `cell_dependents` (which keys on `CellAddress`). Adding a third
+    /// reverse index keyed on `String` would carry per-formula
+    /// bookkeeping that 99% of workbooks never exercise (defined names
+    /// are rare). The whole-workbook walk runs O(F) where F is the
+    /// total formula count — fine for the workbooks this engine
+    /// targets (low thousands of formulas). If a host registers
+    /// hundreds of names and re-defines them frequently, switching to
+    /// a `HashMap<String, HashSet<(sheet_idx, addr)>>` keyed on
+    /// uppercased name is a straightforward future optimization.
+    fn invalidate_formulas_using_name(&self, name: &str) {
+        let key = name.to_ascii_uppercase();
+        for sheet in &self.sheets {
+            for (addr, expr) in sheet.formula_exprs_iter() {
+                if formula_references_name(expr, &key) {
+                    sheet.mark_dirty_for_addr(*addr);
+                    sheet.fire_subscribers(*addr);
+                }
+            }
+        }
     }
 
     /// Append a new empty sheet. If the name is already taken, returns the
@@ -470,7 +724,68 @@ impl Workbook {
         // is no longer the previous formula's cached result.
         self.propagate_cross_sheet_dirty(sheet_idx, addr);
 
+        // Workbook-context array recompute: `Sheet::set_formula` runs an
+        // eager array-recompute pass with a sheet-only provider, which
+        // doesn't see the workbook's named-value registry or cross-sheet
+        // refs. If the formula relies on either (e.g.
+        // `=MAP(SEQUENCE(3), inc)` where `inc` is a defined LAMBDA),
+        // the sheet-local eval returns `#NAME?` and the spill isn't
+        // installed. Re-run the recompute here through a workbook-aware
+        // provider so the spill anchors / derived targets land correctly.
+        //
+        // Gated on `formula_needs_workbook_context` so the common case —
+        // a plain `=A1+B1` or inline `=MAP(A1:A3, LAMBDA(...))` — skips
+        // the second eval pass and stays as cheap as before this commit.
+        if ok && formula_needs_workbook_context(&expr) {
+            self.recompute_array_spill_with_workbook_context(sheet_idx, addr);
+        }
+
         ok
+    }
+
+    /// Re-run the spill recompute for `(sheet_idx, addr)` through a
+    /// `WorkbookEvalProvider`. The build-then-mutate split is what the
+    /// borrow checker requires: the provider needs `&self`, but the
+    /// install needs `&mut self.sheets[sheet_idx]`. We scope the
+    /// provider inside a block, snapshot the Value the provider
+    /// produced, drop the borrow, then hand the Value to a mutating
+    /// install path on the sheet.
+    fn recompute_array_spill_with_workbook_context(
+        &mut self,
+        sheet_idx: usize,
+        addr: CellAddress,
+    ) {
+        // Evaluate the formula through the workbook provider so named-
+        // value / cross-sheet lookups resolve. The value is returned by
+        // copy so we can drop the immutable borrow before mutating.
+        let value = {
+            let provider = WorkbookEvalProvider {
+                wb: self,
+                current: Cell::new(sheet_idx),
+                current_cell: Cell::new(None),
+            };
+            // Force a re-eval (bypass the cache) so any earlier sheet-
+            // local result that surfaced #NAME? doesn't shadow the
+            // correct workbook-aware Array.
+            if let Some(sheet) = self.sheets.get(sheet_idx) {
+                if let Some(record) = sheet.formula_exprs_iter().get(&addr).cloned() {
+                    sheet.mark_dirty_for_addr(addr);
+                    crate::eval::eval_expr_with_provider(record.as_ref(), &provider)
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        };
+        // Mutate: install / refresh the spill from the workbook-aware
+        // value. The sheet's `apply_workbook_recomputed_value` handles
+        // the array-vs-scalar branch identically to
+        // `recompute_array_formula`, so the spill state mirrors the
+        // sheet-only path when no workbook-scope refs are involved.
+        if let Some(sheet) = self.sheets.get_mut(sheet_idx) {
+            sheet.apply_workbook_recomputed_value(addr, value);
+        }
     }
 
     /// Workbook-routed cell write. Mirrors `Sheet::set_cell` but also
@@ -1143,6 +1458,83 @@ impl Default for Workbook {
 /// deliberately skipped — those are owned by `Sheet::set_formula`'s
 /// own `cell_dependents` / `range_dependents` insert paths and would
 /// double-fire if duplicated here.
+/// Does `expr` contain anything that requires workbook scope to
+/// evaluate correctly? Two surface points qualify:
+///   1. `Expr::Name(_)` — could resolve via the workbook's defined-name
+///      registry (when no LET binding shadows it).
+///   2. `Expr::FuncCall { name, .. }` whose `name` is not a built-in —
+///      could resolve via the registry as a callable lambda.
+///   3. `Expr::SheetRef` / `Expr::SheetRange` — cross-sheet refs.
+///
+/// Used by `Workbook::set_formula` to skip the second-pass workbook-
+/// aware spill recompute when the formula is purely sheet-local +
+/// uses only built-in functions (the dominant case). Without the
+/// gate, every `set_formula` on an array-producing formula would eval
+/// the formula twice; with it, the extra pass only fires for the
+/// minority of formulas that actually depend on workbook scope.
+fn formula_needs_workbook_context(expr: &Expr) -> bool {
+    match expr {
+        Expr::Name(_) | Expr::SheetRef { .. } | Expr::SheetRange { .. } => true,
+        Expr::FuncCall { name, args } => {
+            // A registered (non-builtin) name in function position is
+            // the lambda-call case. Built-ins are recognized via the
+            // eval crate's dispatch list so the gate stays in sync
+            // with the eval loop's resolution order.
+            if !is_builtin_function_name(name) {
+                return true;
+            }
+            args.iter().any(formula_needs_workbook_context)
+        }
+        Expr::BinOp { left, right, .. } => {
+            formula_needs_workbook_context(left) || formula_needs_workbook_context(right)
+        }
+        Expr::Negate(inner) => formula_needs_workbook_context(inner),
+        Expr::Call(callee, args) => {
+            formula_needs_workbook_context(callee)
+                || args.iter().any(formula_needs_workbook_context)
+        }
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::CellRef(_) | Expr::Range { .. } => {
+            false
+        }
+    }
+}
+
+/// Recursive AST walk: does `expr` reference the defined name `key`
+/// anywhere? `key` is the uppercased form; comparisons are
+/// case-insensitive (Excel parity — `=Foo` and `=FOO` resolve the same
+/// way). Returns `true` if the name appears as either a bare
+/// `Expr::Name` or as the target of an `Expr::FuncCall` (the two
+/// surface points where the eval loop consults the registry).
+///
+/// Used by `Workbook::invalidate_formulas_using_name` to flip cached
+/// formulas dirty when the named entry is added / replaced / removed.
+fn formula_references_name(expr: &Expr, key: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n.eq_ignore_ascii_case(key),
+        Expr::FuncCall { name, args } => {
+            if name.eq_ignore_ascii_case(key) {
+                return true;
+            }
+            args.iter().any(|a| formula_references_name(a, key))
+        }
+        Expr::BinOp { left, right, .. } => {
+            formula_references_name(left, key) || formula_references_name(right, key)
+        }
+        Expr::Negate(inner) => formula_references_name(inner, key),
+        Expr::Call(callee, args) => {
+            formula_references_name(callee, key)
+                || args.iter().any(|a| formula_references_name(a, key))
+        }
+        Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_)
+        | Expr::CellRef(_)
+        | Expr::Range { .. }
+        | Expr::SheetRef { .. }
+        | Expr::SheetRange { .. } => false,
+    }
+}
+
 fn collect_cross_sheet_refs(expr: &Expr, by_name: &HashMap<String, usize>) -> Vec<CrossSheetRef> {
     let mut out: Vec<CrossSheetRef> = Vec::new();
     collect_cross_sheet_refs_into(expr, by_name, &mut out);
@@ -1403,6 +1795,13 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
 
     fn set_current_cell(&self, addr: Option<CellAddress>) {
         self.current_cell.set(addr);
+    }
+
+    fn lookup_named(&self, name: &str) -> Option<Value> {
+        // Delegate to the workbook's case-insensitive registry. Returns
+        // a clone of the stored value (cheap for `Value::Lambda`, which
+        // wraps an `Arc<dyn LambdaValue>`; constant-time for scalars).
+        self.wb.get_named(name)
     }
 }
 
