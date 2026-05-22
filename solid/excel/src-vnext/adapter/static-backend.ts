@@ -53,11 +53,25 @@ import type {
   FilterSortState,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  cloneFilterSortState,
+  cloneFormat,
+  cloneNamedRange,
+  cloneRange,
   DEFAULT_WORKBOOK_LOCALE,
+  estimateUtf8Bytes,
+  filterRuleMatchesValue,
+  filterSortHasEffect,
   formatNumberValue,
   getFillHandleSourceCoord,
   getFillHandleWriteRange,
   getRichValueText,
+  isCoordInsideRange,
+  keyFor,
+  nextConditionalFormatRuleId,
+  normalizeDimensionSize,
+  normalizeRange,
+  numericValue,
+  rangesIntersect,
   reorderSheetMetadata,
 } from '@einfach/spreadsheet-ui-core'
 import type {
@@ -120,12 +134,6 @@ function cloneRichValue(value: DisplayCellRichValue): DisplayCellRichValue {
   }
 }
 
-function cloneFormat(format: SpreadsheetCellFormat): SpreadsheetCellFormat {
-  const clone: SpreadsheetCellFormat = { ...format }
-  if (format.numberFormat) clone.numberFormat = { ...format.numberFormat }
-  return clone
-}
-
 function normalizeFormat(
   format: SpreadsheetCellFormat | null | undefined,
 ): SpreadsheetCellFormat | undefined {
@@ -167,10 +175,6 @@ function stripCellFormat(cell: DisplayCell): DisplayCell {
   return clone
 }
 
-function keyFor(row: number, col: number): string {
-  return `${row}:${col}`
-}
-
 function parseKey(key: string): { row: number; col: number } | null {
   const [rowPart, colPart] = key.split(':')
   const row = Number(rowPart)
@@ -181,24 +185,6 @@ function parseKey(key: string): { row: number; col: number } | null {
 
 function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
-}
-
-function normalizeRange(range: CellRange): CellRange {
-  return {
-    rowStart: Math.min(range.rowStart, range.rowEnd),
-    rowEnd: Math.max(range.rowStart, range.rowEnd),
-    colStart: Math.min(range.colStart, range.colEnd),
-    colEnd: Math.max(range.colStart, range.colEnd),
-  }
-}
-
-function cloneRange(range: CellRange): CellRange {
-  return {
-    rowStart: range.rowStart,
-    rowEnd: range.rowEnd,
-    colStart: range.colStart,
-    colEnd: range.colEnd,
-  }
 }
 
 function cloneConditionalFormatRule(rule: ConditionalFormatRule): ConditionalFormatRule {
@@ -223,23 +209,6 @@ function cloneConditionalFormatRuleEntry(
     scope: { range: cloneRange(entry.scope.range) },
     rule: cloneConditionalFormatRule(entry.rule),
   }
-}
-
-function cloneNamedRange(range: NamedRange): NamedRange {
-  return {
-    name: range.name,
-    scope: range.scope === 'workbook' ? 'workbook' : { sheetId: range.scope.sheetId },
-    refersTo: { ...range.refersTo },
-  }
-}
-
-function rangesIntersect(left: CellRange, right: CellRange): boolean {
-  return (
-    left.rowStart <= right.rowEnd &&
-    left.rowEnd >= right.rowStart &&
-    left.colStart <= right.colEnd &&
-    left.colEnd >= right.colStart
-  )
 }
 
 function extractMergeRanges(cells: readonly DisplayCell[], sheetId: string): Map<string, CellRange[]> {
@@ -322,18 +291,6 @@ type SparseTsvCell = {
   col: number
   kind: 'number' | 'text' | 'boolean' | 'error' | 'formula'
   value: string | number | boolean
-}
-
-function estimateUtf8Bytes(text: string): number {
-  if (typeof TextEncoder !== 'undefined') {
-    return new TextEncoder().encode(text).length
-  }
-  let bytes = 0
-  for (let index = 0; index < text.length; index += 1) {
-    const code = text.charCodeAt(index)
-    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : 3
-  }
-  return bytes
 }
 
 function sparseTsvCellField(cell: SparseTsvCell): string {
@@ -784,13 +741,6 @@ function hasSameSheetOrder(
   return left.length === right.length && left.every((sheet, index) => sheet.id === right[index]?.id)
 }
 
-function normalizeDimensionSize(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 1
-  }
-  return Math.max(1, Math.round(value))
-}
-
 function shiftDimensionMap(
   sizes: Map<number, number>,
   index: number,
@@ -850,19 +800,6 @@ function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd:
     cell.row <= range.rowEnd &&
     cell.col >= range.colStart &&
     cell.col <= range.colEnd
-  )
-}
-
-function isCoordInsideRange(
-  row: number,
-  col: number,
-  range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
-): boolean {
-  return (
-    row >= range.rowStart &&
-    row <= range.rowEnd &&
-    col >= range.colStart &&
-    col <= range.colEnd
   )
 }
 
@@ -938,31 +875,6 @@ function applyNumberFormatToCell(cell: DisplayCell, workbookLocale: string): voi
   }
 }
 
-function numericValue(text: string): number | null {
-  const value = Number(text)
-  return Number.isFinite(value) ? value : null
-}
-
-function cloneFilterSortRule(rule: ColumnFilterRule): ColumnFilterRule {
-  switch (rule.kind) {
-    case 'list':
-      return { ...rule, values: [...rule.values] }
-    default:
-      return { ...rule }
-  }
-}
-
-function cloneFilterSortState(state: FilterSortState): FilterSortState {
-  return {
-    rules: state.rules.map(cloneFilterSortRule),
-    directives: state.directives.map((directive) => ({ ...directive })),
-  }
-}
-
-function filterSortHasEffect(state: FilterSortState | undefined): boolean {
-  return !!state && (state.rules.length > 0 || state.directives.length > 0)
-}
-
 function readFilterSortValue(
   sheetCells: Map<string, DisplayCell>,
   lookup: EvalCellLookup,
@@ -975,33 +887,6 @@ function readFilterSortValue(
 
   const evaluated = evaluateFormula(cell.formula, lookup)
   return formatEvalResult(evaluated).display
-}
-
-function normalizeFilterText(value: string, caseSensitive: boolean | undefined): string {
-  return caseSensitive ? value : value.toLocaleLowerCase()
-}
-
-function filterRuleMatchesValue(rule: ColumnFilterRule, value: string): boolean {
-  switch (rule.kind) {
-    case 'equals':
-      return (
-        normalizeFilterText(value, rule.caseSensitive) ===
-        normalizeFilterText(rule.value, rule.caseSensitive)
-      )
-    case 'contains':
-      return normalizeFilterText(value, rule.caseSensitive).includes(
-        normalizeFilterText(rule.value, rule.caseSensitive),
-      )
-    case 'range': {
-      const numeric = numericValue(value)
-      if (numeric === null) return false
-      if (rule.min !== undefined && numeric < rule.min) return false
-      if (rule.max !== undefined && numeric > rule.max) return false
-      return true
-    }
-    case 'list':
-      return rule.values.includes(value)
-  }
 }
 
 function filterRowMatchesRules(
@@ -1324,17 +1209,6 @@ function mutationResult(
     revision: request.revision ?? revision,
     ...(affectedRange ? { affectedRange: cloneRange(normalizeRange(affectedRange)) } : {}),
   }
-}
-
-function nextConditionalFormatRuleId(rules: readonly ConditionalFormatRuleEntry[]): string {
-  const used = new Set(rules.map((rule) => rule.id))
-  let index = rules.length + 1
-  let id = `cf-${index}`
-  while (used.has(id)) {
-    index += 1
-    id = `cf-${index}`
-  }
-  return id
 }
 
 function listConditionalFormatRulesForSheet(
