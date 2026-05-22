@@ -1,7 +1,6 @@
 import type {
   BackendMutationResult,
   ClearValidationRuleRequest,
-  ColumnFilterRule,
   ConditionalFormatRule,
   ConditionalFormatRuleEntry,
   ConditionalFormatRulesResult,
@@ -35,7 +34,6 @@ import type {
   SetRowHeightRequest,
   SetValidationRuleRequest,
   SheetMutationResult,
-  SortDirective,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
@@ -45,7 +43,6 @@ import type {
   DeleteNamedRangeRequest,
   ListNamedRangesRequest,
   ListConditionalFormatRulesRequest,
-  SpreadsheetErrorSeverity,
   VisibleProjectionRequest,
   ViewportSizeProjectionRequest,
   ViewportSizeProjectionResult,
@@ -53,13 +50,18 @@ import type {
   FilterSortState,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  cloneCell,
+  cloneConditionalFormatRule,
+  cloneConditionalFormatRuleEntry,
   cloneFilterSortState,
   cloneFormat,
   cloneNamedRange,
   cloneRange,
+  cloneRichValue,
+  compareCellValue,
+  conditionalRuleFormat,
   DEFAULT_WORKBOOK_LOCALE,
   estimateUtf8Bytes,
-  filterRuleMatchesValue,
   filterSortHasEffect,
   formatNumberValue,
   getFillHandleSourceCoord,
@@ -69,10 +71,17 @@ import {
   keyFor,
   nextConditionalFormatRuleId,
   normalizeDimensionSize,
+  normalizeFormat,
   normalizeRange,
   numericValue,
   rangesIntersect,
   reorderSheetMetadata,
+  toA1,
+  validationMessageForRule,
+  validationSeverityForMode,
+  type RangeFormatLayer,
+  getEffectiveFormat,
+  buildFilterSortDisplayRows as buildFilterSortDisplayRowsShared,
 } from '@einfach/spreadsheet-ui-core'
 import type {
   StaticProjectionRequest,
@@ -98,75 +107,6 @@ function isSeedCell(value: unknown): value is DisplayCell {
   )
 }
 
-function cloneCell(cell: DisplayCell): DisplayCell {
-  const clone: DisplayCell = {
-    row: cell.row,
-    col: cell.col,
-    displayValue: cell.displayValue,
-  }
-
-  if (cell.valueKind) clone.valueKind = cell.valueKind
-  if (cell.formula !== undefined) clone.formula = cell.formula
-  if (cell.error) clone.error = cell.error
-  if (cell.formatKey !== undefined) clone.formatKey = cell.formatKey
-  if (cell.format) clone.format = cloneFormat(cell.format)
-  if (cell.conditionalFormat) clone.conditionalFormat = cloneFormat(cell.conditionalFormat)
-  if (cell.validation) clone.validation = { ...cell.validation }
-  if (cell.richValue) clone.richValue = cloneRichValue(cell.richValue)
-  if (cell.mergedSpan) clone.mergedSpan = { ...cell.mergedSpan }
-  if (cell.mergeAnchor) clone.mergeAnchor = { ...cell.mergeAnchor }
-  if (cell.originalRow !== undefined) clone.originalRow = cell.originalRow
-
-  return clone
-}
-
-function cloneRichValue(value: DisplayCellRichValue): DisplayCellRichValue {
-  switch (value.kind) {
-    case 'rich-text':
-      return {
-        kind: value.kind,
-        runs: value.runs.map((run) =>
-          run.format ? { text: run.text, format: { ...run.format } } : { text: run.text },
-        ),
-      }
-    default:
-      return { ...value }
-  }
-}
-
-function normalizeFormat(
-  format: SpreadsheetCellFormat | null | undefined,
-): SpreadsheetCellFormat | undefined {
-  if (!format || isDefaultFormat(format)) return undefined
-  return cloneFormat(format)
-}
-
-function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
-  const numberFormat = format.numberFormat
-  const numberFormatIsDefault = !numberFormat || numberFormat.kind === 'general'
-  const borders = format.borders
-  const bordersAreDefault =
-    !borders || (!borders.top && !borders.right && !borders.bottom && !borders.left)
-
-  return (
-    !format.bold &&
-    !format.italic &&
-    !format.underline &&
-    !format.strikethrough &&
-    !format.wrap &&
-    (format.align === undefined || format.align === 'default') &&
-    (format.verticalAlign === undefined) &&
-    format.fontSize === undefined &&
-    (format.fontFamily === undefined || format.fontFamily.length === 0) &&
-    (format.fgColor === undefined || format.fgColor.length === 0) &&
-    (format.bgColor === undefined || format.bgColor.length === 0) &&
-    (format.indent === undefined || format.indent === 0) &&
-    (format.rotation === undefined || format.rotation === 0) &&
-    numberFormatIsDefault &&
-    bordersAreDefault
-  )
-}
-
 function stripCellFormat(cell: DisplayCell): DisplayCell {
   const clone = cloneCell(cell)
   delete clone.format
@@ -185,30 +125,6 @@ function parseKey(key: string): { row: number; col: number } | null {
 
 function compareCells(left: DisplayCell, right: DisplayCell): number {
   return left.row === right.row ? left.col - right.col : left.row - right.row
-}
-
-function cloneConditionalFormatRule(rule: ConditionalFormatRule): ConditionalFormatRule {
-  switch (rule.kind) {
-    case 'cell-value':
-      return { ...rule, format: cloneFormat(rule.format) }
-    case 'formula':
-      return { ...rule, format: cloneFormat(rule.format) }
-    case 'top-bottom':
-      return { ...rule, format: cloneFormat(rule.format) }
-    default:
-      return { ...rule }
-  }
-}
-
-function cloneConditionalFormatRuleEntry(
-  entry: ConditionalFormatRuleEntry,
-): ConditionalFormatRuleEntry {
-  return {
-    id: entry.id,
-    priority: entry.priority,
-    scope: { range: cloneRange(entry.scope.range) },
-    rule: cloneConditionalFormatRule(entry.rule),
-  }
 }
 
 function extractMergeRanges(cells: readonly DisplayCell[], sheetId: string): Map<string, CellRange[]> {
@@ -314,16 +230,6 @@ function sparseCellsToTsv(cells: SparseTsvCell[], range: CellRange): string {
     rows.push(fieldsInRow.join('\t'))
   }
   return rows.join('\n')
-}
-
-interface RangeFormatLayer {
-  range: {
-    rowStart: number
-    rowEnd: number
-    colStart: number
-    colEnd: number
-  }
-  format: SpreadsheetCellFormat
 }
 
 interface StaticBackendState {
@@ -534,19 +440,6 @@ function buildState(
     undoStack: [],
     redoStack: [],
   }
-}
-
-function toA1(row: number, col: number): string {
-  let current = col + 1
-  let label = ''
-
-  while (current > 0) {
-    const remainder = (current - 1) % 26
-    label = String.fromCharCode(65 + remainder) + label
-    current = Math.floor((current - 1) / 26)
-  }
-
-  return `${label}${row + 1}`
 }
 
 function displayCellToSparseTsvCell(cell: DisplayCell): SparseTsvCell {
@@ -803,24 +696,6 @@ function isCellInsideRange(cell: DisplayCell, range: { rowStart: number; rowEnd:
   )
 }
 
-function getEffectiveFormat(
-  row: number,
-  col: number,
-  cellFormats: Map<string, SpreadsheetCellFormat>,
-  rangeFormats: RangeFormatLayer[],
-): SpreadsheetCellFormat | undefined {
-  const cellFormat = cellFormats.get(keyFor(row, col))
-  if (cellFormat) return cloneFormat(cellFormat)
-
-  for (let index = rangeFormats.length - 1; index >= 0; index -= 1) {
-    const layer = rangeFormats[index]
-    if (!isCoordInsideRange(row, col, layer.range)) continue
-    return isDefaultFormat(layer.format) ? undefined : cloneFormat(layer.format)
-  }
-
-  return undefined
-}
-
 function addFormatOnlyCells(
   resultCells: Map<string, DisplayCell>,
   range: { rowStart: number; rowEnd: number; colStart: number; colEnd: number },
@@ -889,54 +764,6 @@ function readFilterSortValue(
   return formatEvalResult(evaluated).display
 }
 
-function filterRowMatchesRules(
-  sheetCells: Map<string, DisplayCell>,
-  lookup: EvalCellLookup,
-  row: number,
-  rules: readonly ColumnFilterRule[],
-): boolean {
-  for (const rule of rules) {
-    const value = readFilterSortValue(sheetCells, lookup, row, rule.colIndex)
-    if (!filterRuleMatchesValue(rule, value)) {
-      return false
-    }
-  }
-  return true
-}
-
-function compareFilterSortValues(left: string, right: string): number {
-  if (left.length === 0 && right.length === 0) return 0
-  if (left.length === 0) return 1
-  if (right.length === 0) return -1
-
-  const leftNumber = numericValue(left)
-  const rightNumber = numericValue(right)
-  if (leftNumber !== null && rightNumber !== null) {
-    return leftNumber - rightNumber
-  }
-
-  return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
-}
-
-function compareFilterSortRows(
-  sheetCells: Map<string, DisplayCell>,
-  lookup: EvalCellLookup,
-  directives: readonly SortDirective[],
-  leftRow: number,
-  rightRow: number,
-): number {
-  for (const directive of directives) {
-    const valueCompare = compareFilterSortValues(
-      readFilterSortValue(sheetCells, lookup, leftRow, directive.colIndex),
-      readFilterSortValue(sheetCells, lookup, rightRow, directive.colIndex),
-    )
-    if (valueCompare !== 0) {
-      return directive.direction === 'asc' ? valueCompare : -valueCompare
-    }
-  }
-  return 0
-}
-
 function getMaxSourceRow(sheetCells: Map<string, DisplayCell>): number {
   let maxRow = -1
   for (const cell of sheetCells.values()) {
@@ -945,95 +772,17 @@ function getMaxSourceRow(sheetCells: Map<string, DisplayCell>): number {
   return maxRow
 }
 
-function isSummaryRow(
-  sheetCells: Map<string, DisplayCell>,
-  lookup: EvalCellLookup,
-  row: number,
-): boolean {
-  const label = readFilterSortValue(sheetCells, lookup, row, 0).trim().toLocaleLowerCase()
-  return row > 1 && (label === 'total' || label === 'summary')
-}
-
 function buildFilterSortDisplayRows(
   sheetCells: Map<string, DisplayCell>,
   lookup: EvalCellLookup,
   state: FilterSortState | undefined,
 ): number[] | null {
-  if (!filterSortHasEffect(state)) return null
-
   const maxRow = getMaxSourceRow(sheetCells)
-  if (maxRow < 0) return []
-
-  const rows: number[] = []
-  rows[0] = 0
-  const summaryRows = isSummaryRow(sheetCells, lookup, maxRow) ? [maxRow] : []
-  const dataRowEnd = summaryRows.length > 0 ? maxRow - 1 : maxRow
-  const dataRows: Array<{ row: number; index: number }> = []
-  for (let row = 1; row <= dataRowEnd; row += 1) {
-    if (filterRowMatchesRules(sheetCells, lookup, row, state!.rules)) {
-      dataRows.push({ row, index: dataRows.length })
-    }
-  }
-
-  if (state!.directives.length > 0) {
-    dataRows.sort((left, right) => {
-      const valueCompare = compareFilterSortRows(
-        sheetCells,
-        lookup,
-        state!.directives,
-        left.row,
-        right.row,
-      )
-      return valueCompare === 0 ? left.index - right.index : valueCompare
-    })
-  }
-
-  dataRows.forEach((item, index) => {
-    rows[index + 1] = item.row
-  })
-  for (const row of summaryRows) {
-    rows[row] = row
-  }
-  return rows
-}
-
-type CellValueOperator = Extract<ConditionalFormatRule, { kind: 'cell-value' }>['operator']
-
-function compareCellValue(
-  leftText: string,
-  operator: CellValueOperator,
-  rightText: string,
-  secondRightText?: string,
-): boolean {
-  const leftNumber = numericValue(leftText)
-  const rightNumber = numericValue(rightText)
-  const secondRightNumber = secondRightText !== undefined ? numericValue(secondRightText) : null
-  const hasNumberPair = leftNumber !== null && rightNumber !== null
-
-  switch (operator) {
-    case 'eq':
-      return hasNumberPair ? leftNumber === rightNumber : leftText === rightText
-    case 'ne':
-      return hasNumberPair ? leftNumber !== rightNumber : leftText !== rightText
-    case 'gt':
-      return hasNumberPair && leftNumber > rightNumber
-    case 'gte':
-      return hasNumberPair && leftNumber >= rightNumber
-    case 'lt':
-      return hasNumberPair && leftNumber < rightNumber
-    case 'lte':
-      return hasNumberPair && leftNumber <= rightNumber
-    case 'between':
-      return leftNumber !== null && rightNumber !== null && secondRightNumber !== null
-        ? leftNumber >= rightNumber && leftNumber <= secondRightNumber
-        : false
-    case 'not-between':
-      return leftNumber !== null && rightNumber !== null && secondRightNumber !== null
-        ? leftNumber < rightNumber || leftNumber > secondRightNumber
-        : false
-    default:
-      return false
-  }
+  return buildFilterSortDisplayRowsShared(
+    state,
+    { headerRow: 0, startRow: 1, endRow: maxRow + 1 },
+    (row, col) => readFilterSortValue(sheetCells, lookup, row, col),
+  )
 }
 
 function conditionalRuleAppliesToCell(
@@ -1050,19 +799,6 @@ function conditionalRuleAppliesToCell(
     case 'color-scale':
     case 'top-bottom':
       return numericValue(value) !== null
-  }
-}
-
-function conditionalRuleFormat(rule: ConditionalFormatRule): SpreadsheetCellFormat | undefined {
-  switch (rule.kind) {
-    case 'cell-value':
-    case 'formula':
-    case 'top-bottom':
-      return normalizeFormat(rule.format)
-    case 'data-bar':
-      return normalizeFormat({ bgColor: rule.maxColor ?? '#bfdbfe' })
-    case 'color-scale':
-      return normalizeFormat({ bgColor: rule.maxColor })
   }
 }
 
@@ -1127,42 +863,13 @@ function projectSourceCell(
   return clone
 }
 
-function validationSeverityForMode(
-  mode: SetValidationRuleRequest['mode'],
-): SpreadsheetErrorSeverity {
-  return mode === 'reject' ? 'error' : 'warning'
-}
-
-function validationMessageForRule(request: SetValidationRuleRequest): string {
-  const rule = request.rule
-  switch (rule.kind) {
-    case 'list':
-      return rule.values.length > 0
-        ? `Value must be one of: ${rule.values.join(', ')}`
-        : 'Value must match the configured list'
-    case 'range':
-      if (rule.min !== undefined && rule.max !== undefined) {
-        return `Value must be between ${rule.min} and ${rule.max}`
-      }
-      if (rule.min !== undefined) return `Value must be >= ${rule.min}`
-      if (rule.max !== undefined) return `Value must be <= ${rule.max}`
-      return 'Value must be a number'
-    case 'regex':
-      return `Value must match pattern /${rule.pattern}/${rule.flags ?? ''}`
-    case 'formula':
-      return rule.formula.trim().length > 0
-        ? `Value must satisfy ${rule.formula}`
-        : 'Value must satisfy the configured formula'
-  }
-}
-
 function applyValidationRule(state: StaticBackendState, request: SetValidationRuleRequest): number {
   const cells = getOrCreateSheetCells(state, request.sheetId)
   const range = normalizeRange(request.range)
   const validation = {
     code: `validation.${request.rule.kind}`,
     severity: validationSeverityForMode(request.mode),
-    message: validationMessageForRule(request),
+    message: validationMessageForRule(request.rule),
   }
   let changed = 0
 

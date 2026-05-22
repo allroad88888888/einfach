@@ -104,6 +104,17 @@ function resolveProtocolMessage(worker: FakeProtocolWorker, result: unknown) {
   worker.emit({ id: lastProtocolMessage(worker).id, ok: true, result })
 }
 
+function toCellAddressForTest(row: number, col: number): string {
+  let value = col + 1
+  let label = ''
+  while (value > 0) {
+    const remainder = (value - 1) % 26
+    label = String.fromCharCode(65 + remainder) + label
+    value = Math.floor((value - 1) / 26)
+  }
+  return `${label}${row + 1}`
+}
+
 function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
   const cells = new Map<string, CellSnapshotWire>()
   const rangeFormats: Array<SparseRangeWire & { format: CellFormatJSON }> = []
@@ -1024,6 +1035,89 @@ describe('vnext adapter', () => {
     ])
     expect(projected.cells.some((cell) => cell.displayValue === 'South')).toBe(false)
     expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
+  })
+
+  it('produces matching display rows for static and worker backends under identical filter/sort state', async () => {
+    const matrix: (string | number)[][] = [
+      ['Region', 'Q1'],
+      ['North', 120],
+      ['South', 80],
+      ['East', 200],
+      ['West', 140],
+    ]
+
+    const staticBackend = createStaticSpreadsheetBackend({ revision: 1, matrix })
+    const client = createFakeWorkerWorkbookClient()
+    const workerBackend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 1,
+    })
+    await workerBackend.ready()
+
+    matrix.forEach((row, rowIndex) => {
+      row.forEach((value, colIndex) => {
+        const isText = typeof value === 'string'
+        client.putCell({
+          sheet: 0,
+          addr: toCellAddressForTest(rowIndex, colIndex),
+          display: String(value),
+          type: isText ? 'text' : 'number',
+          isError: false,
+          formula: '',
+        })
+      })
+    })
+
+    const filterSortRequest = {
+      kind: 'set-filter-sort' as const,
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'range' as const, colIndex: 1, min: 100 }],
+      directives: [{ colIndex: 1, direction: 'desc' as const }],
+    }
+
+    await staticBackend.setFilterSort?.(filterSortRequest)
+    await workerBackend.setFilterSort?.(filterSortRequest)
+
+    const staticProjected = await staticBackend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 100,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+    const workerProjected = await workerBackend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 101,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    const staticRegions = staticProjected.cells
+      .filter((cell) => cell.col === 0)
+      .sort((left, right) => left.row - right.row)
+      .map((cell) => cell.displayValue)
+    const workerRegions = workerProjected.cells
+      .filter((cell) => cell.col === 0)
+      .sort((left, right) => left.row - right.row)
+      .map((cell) => cell.displayValue)
+
+    expect(staticRegions).toEqual(workerRegions)
+    expect(staticRegions).toEqual(['Region', 'East', 'West', 'North'])
+
+    const staticOriginalRows = staticProjected.cells
+      .filter((cell) => cell.col === 0 && cell.row > 0)
+      .sort((left, right) => left.row - right.row)
+      .map((cell) => cell.originalRow)
+    const workerOriginalRows = workerProjected.cells
+      .filter((cell) => cell.col === 0 && cell.row > 0)
+      .sort((left, right) => left.row - right.row)
+      .map((cell) => cell.originalRow)
+
+    expect(staticOriginalRows).toEqual(workerOriginalRows)
+
+    workerBackend.dispose()
   })
 
   it('persists named range mutations in the static backend', async () => {
