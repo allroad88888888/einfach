@@ -39,3 +39,6 @@ solid/excel/wasm-pkg/
 test-results/
 playwright-report/
 playwright/.cache/
+
+# ad-hoc sanity screenshots dropped at repo root (e.g. w5-*.png, w7-*.png)
+/*.png
