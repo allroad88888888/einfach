@@ -18,6 +18,10 @@ export type MenuCommandKind =
   | 'column.insert'
   | 'column.delete'
   | 'formatting.open'
+  | 'view.freezeRowsHere'
+  | 'view.freezeColsHere'
+  | 'view.freezePanes'
+  | 'view.unfreeze'
 
 export interface MenuPosition {
   x: number

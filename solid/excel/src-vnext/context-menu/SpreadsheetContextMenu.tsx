@@ -13,6 +13,8 @@ import {
   pasteClipboardAtom,
   serializeClipboardTsv,
   setClipboardErrorAtom,
+  setViewportFreezeAtom,
+  viewportFreezeAtom,
   type CellCoord,
   type CellRange,
   type ClipboardTextData,
@@ -26,6 +28,7 @@ import {
   type RangeTsvExportResult,
   type SpreadsheetError,
 } from '@einfach/spreadsheet-ui-core'
+import { useT } from '../../src/i18n'
 
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
@@ -40,23 +43,34 @@ export interface SpreadsheetContextMenuProps {
   'data-testid'?: string
 }
 
-const commandLabels: Record<MenuCommandKind, string> = {
-  'clipboard.copy': 'Copy',
-  'clipboard.cut': 'Cut',
-  'clipboard.paste': 'Paste',
-  'cell.clear': 'Delete',
-  'row.insert': 'Insert row',
-  'row.delete': 'Delete row',
-  'column.insert': 'Insert column',
-  'column.delete': 'Delete column',
-  'formatting.open': 'Formatting',
+const commandLabelKeys: Record<MenuCommandKind, string> = {
+  'clipboard.copy': 'contextMenu.command.copy',
+  'clipboard.cut': 'contextMenu.command.cut',
+  'clipboard.paste': 'contextMenu.command.paste',
+  'cell.clear': 'contextMenu.command.delete',
+  'row.insert': 'contextMenu.command.insertRow',
+  'row.delete': 'contextMenu.command.deleteRow',
+  'column.insert': 'contextMenu.command.insertColumn',
+  'column.delete': 'contextMenu.command.deleteColumn',
+  'formatting.open': 'contextMenu.command.formatting',
+  'view.freezeRowsHere': 'contextMenu.command.freezeRowsHere',
+  'view.freezeColsHere': 'contextMenu.command.freezeColsHere',
+  'view.freezePanes': 'contextMenu.command.freezePanes',
+  'view.unfreeze': 'contextMenu.command.unfreeze',
 }
 
 const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
-  cell: ['clipboard.copy', 'clipboard.cut', 'clipboard.paste', 'cell.clear'],
+  cell: [
+    'clipboard.copy',
+    'clipboard.cut',
+    'clipboard.paste',
+    'cell.clear',
+    'view.freezePanes',
+    'view.unfreeze',
+  ],
   range: ['clipboard.copy', 'clipboard.cut', 'clipboard.paste', 'cell.clear'],
-  row: ['row.insert', 'row.delete'],
-  column: ['column.insert', 'column.delete'],
+  row: ['row.insert', 'row.delete', 'view.freezeRowsHere', 'view.unfreeze'],
+  column: ['column.insert', 'column.delete', 'view.freezeColsHere', 'view.unfreeze'],
   all: ['row.insert', 'row.delete', 'column.insert', 'column.delete'],
   'sheet-tab': [],
 }
@@ -462,6 +476,37 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
           count: 1,
         })
         break
+      case 'view.freezeRowsHere':
+        if (target.kind !== 'row') return
+        store.setter(setViewportFreezeAtom, {
+          sheetId: target.sheetId,
+          rows: target.rowIndex,
+        })
+        return
+      case 'view.freezeColsHere':
+        if (target.kind !== 'column') return
+        store.setter(setViewportFreezeAtom, {
+          sheetId: target.sheetId,
+          cols: target.colIndex,
+        })
+        return
+      case 'view.freezePanes':
+        if (target.kind !== 'cell' && target.kind !== 'range') return
+        {
+          const anchor =
+            target.kind === 'cell'
+              ? { row: target.cell.row, col: target.cell.col }
+              : { row: target.range.rowStart, col: target.range.colStart }
+          store.setter(setViewportFreezeAtom, {
+            sheetId: target.sheetId,
+            rows: anchor.row,
+            cols: anchor.col,
+          })
+        }
+        return
+      case 'view.unfreeze':
+        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, rows: 0, cols: 0 })
+        return
       default:
         return
     }
@@ -526,9 +571,51 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   const canRender = () =>
     menuState().status === 'open' && menuState().target !== null && menuState().position !== null
+
+  const t = useT()
+  const freezeState = useAtomValue(viewportFreezeAtom)
+
+  function labelFor(command: MenuCommandKind, target: MenuTarget): string {
+    const key = commandLabelKeys[command]
+    if (command === 'view.freezeRowsHere' && target.kind === 'row') {
+      return t(key, { count: target.rowIndex })
+    }
+    if (command === 'view.freezeColsHere' && target.kind === 'column') {
+      return t(key, { count: target.colIndex })
+    }
+    return t(key)
+  }
+
+  function isCommandVisibleForTarget(command: MenuCommandKind, target: MenuTarget): boolean {
+    const freeze = freezeState()
+    const rows = freeze.rowsBySheet[target.sheetId] ?? 0
+    const cols = freeze.colsBySheet[target.sheetId] ?? 0
+    const frozen = rows > 0 || cols > 0
+    switch (command) {
+      case 'view.freezeRowsHere':
+        return target.kind === 'row' && target.rowIndex > 0
+      case 'view.freezeColsHere':
+        return target.kind === 'column' && target.colIndex > 0
+      case 'view.freezePanes':
+        // Freezing both at (0,0) would clear; hide the affirmative item there.
+        if (target.kind === 'cell') return target.cell.row > 0 || target.cell.col > 0
+        if (target.kind === 'range') {
+          return target.range.rowStart > 0 || target.range.colStart > 0
+        }
+        return false
+      case 'view.unfreeze':
+        return frozen
+      default:
+        return true
+    }
+  }
+
   const commandList = () => {
     const target = menuState().target
-    return target ? commandsByTargetKind[target.kind] : []
+    if (!target) return [] as MenuCommandKind[]
+    return commandsByTargetKind[target.kind].filter((command) =>
+      isCommandVisibleForTarget(command, target),
+    )
   }
   const targetRow = () => {
     const target = menuState().target
@@ -576,7 +663,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
                 dispatchCommand(command)
               }}
             >
-              {commandLabels[command]}
+              {labelFor(command, menuState().target!)}
             </button>
           )}
         </For>

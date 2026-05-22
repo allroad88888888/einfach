@@ -477,7 +477,6 @@ thead .row-header {
 .spreadsheet-grid-col-header,
 .spreadsheet-grid-row-header,
 .spreadsheet-grid-corner {
-  position: relative;
   background: #f8f9fa;
   color: #444;
   font-weight: 500;
@@ -490,6 +489,49 @@ thead .row-header {
 .spreadsheet-grid-row-header,
 .spreadsheet-grid-corner {
   cursor: pointer;
+}
+
+/* Make column headers / row headers / corner stick to the edges of the scroll
+ * viewport. This unlocks freeze rows/cols because the frozen cells then layer
+ * underneath the always-visible headers, and also fixes a long-standing UX
+ * gap (headers used to scroll out of view). */
+.spreadsheet-grid-col-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+.spreadsheet-grid-row-header {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+}
+.spreadsheet-grid-corner {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 3;
+}
+
+/* Frozen rows / cols / corner — set by SpreadsheetGrid via data attribute.
+ * `top` and `left` offsets are supplied inline because they depend on
+ * cumulative row heights / column widths. Z-index layers above plain cells
+ * (1) and below headers (2/3). */
+.spreadsheet-grid-cell[data-frozen-row] {
+  position: sticky;
+  z-index: 1;
+  background: #fff;
+}
+.spreadsheet-grid-cell[data-frozen-col] {
+  position: sticky;
+  z-index: 1;
+  background: #fff;
+}
+.spreadsheet-grid-cell[data-frozen-row][data-frozen-col] {
+  z-index: 2;
+}
+.spreadsheet-grid-row-header[data-frozen-row] {
+  position: sticky;
+  z-index: 2;
 }
 
 .spreadsheet-grid-header-label {

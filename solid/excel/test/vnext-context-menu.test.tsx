@@ -25,6 +25,7 @@ import {
   menuCommandIntentAtom,
   menuStateAtom,
   openMenuAtom,
+  viewportFreezeAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetContextMenu } from '../src-vnext/context-menu'
 import { spreadsheetProjectionSnapshotAtom, SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -266,8 +267,9 @@ describe('vNext SpreadsheetContextMenu', () => {
     expect(menu.style.top).toBe('8px')
     expect(menu.getAttribute('data-menu-target-kind')).toBe('cell')
     expect(menu.getAttribute('data-menu-target-sheet-id')).toBe('sheet-1')
-    expect(getByTestId('context-menu-command-clipboard.copy').textContent).toBe('Copy')
-    expect(getByTestId('context-menu-command-cell.clear').textContent).toBe('Delete')
+    // Default locale is `zh`; English variants are 'Copy' and 'Delete'.
+    expect(getByTestId('context-menu-command-clipboard.copy').textContent).toBe('复制')
+    expect(getByTestId('context-menu-command-cell.clear').textContent).toBe('删除')
     expect(queryByTestId('context-menu-command-row.insert')).toBeNull()
     expect(queryByTestId('context-menu-command-column.delete')).toBeNull()
   })
@@ -917,5 +919,125 @@ describe('vNext SpreadsheetContextMenu', () => {
       ]),
     )
     await waitFor(() => expect(readVisibleRequests).toHaveLength(2))
+  })
+
+  it('freezes rows above the clicked row from the row header context menu', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 3 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezeRowsHere'))
+
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1']).toBe(3)
+      expect(freeze.colsBySheet['sheet-1'] ?? 0).toBe(0)
+    })
+  })
+
+  it('freezes columns to the left of the clicked column from the col header context menu', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'column', sheetId: 'sheet-1', colIndex: 2 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezeColsHere'))
+
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.colsBySheet['sheet-1']).toBe(2)
+      expect(freeze.rowsBySheet['sheet-1'] ?? 0).toBe(0)
+    })
+  })
+
+  it('freezes panes at the active cell from a cell context menu', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 2, col: 1 } },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezePanes'))
+
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1']).toBe(2)
+      expect(freeze.colsBySheet['sheet-1']).toBe(1)
+    })
+  })
+
+  it('shows Unfreeze only when freeze is active on the target sheet', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 4 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { queryByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    // No freeze yet — Unfreeze is hidden.
+    expect(queryByTestId('context-menu-command-view.unfreeze')).toBeNull()
+
+    // Activate freeze on this sheet, re-open the menu, and the item appears.
+    store.setter(viewportFreezeAtom, {
+      rowsBySheet: { 'sheet-1': 2 },
+      colsBySheet: {},
+    })
+    store.setter(openMenuAtom, {
+      surface: 'header',
+      target: { kind: 'row', sheetId: 'sheet-1', rowIndex: 4 },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    await waitFor(() => expect(queryByTestId('context-menu-command-view.unfreeze')).not.toBeNull())
+
+    fireEvent.click(queryByTestId('context-menu-command-view.unfreeze')!)
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1'] ?? 0).toBe(0)
+      expect(freeze.colsBySheet['sheet-1'] ?? 0).toBe(0)
+    })
   })
 })

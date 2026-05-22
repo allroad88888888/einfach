@@ -455,4 +455,18 @@ export const messages: Record<string, string> = {
   'formatCells.fill.gradientFrom': '渐变起点',
   'formatCells.fill.gradientTo': '渐变终点',
   'formatCells.fill.gradientAngle': '渐变角度',
+  // 右键菜单命令
+  'contextMenu.command.copy': '复制',
+  'contextMenu.command.cut': '剪切',
+  'contextMenu.command.paste': '粘贴',
+  'contextMenu.command.delete': '删除',
+  'contextMenu.command.insertRow': '插入行',
+  'contextMenu.command.deleteRow': '删除行',
+  'contextMenu.command.insertColumn': '插入列',
+  'contextMenu.command.deleteColumn': '删除列',
+  'contextMenu.command.formatting': '格式',
+  'contextMenu.command.freezeRowsHere': '冻结上方 {count} 行',
+  'contextMenu.command.freezeColsHere': '冻结左侧 {count} 列',
+  'contextMenu.command.freezePanes': '冻结窗格',
+  'contextMenu.command.unfreeze': '取消冻结',
 }

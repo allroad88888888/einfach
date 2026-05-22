@@ -78,6 +78,7 @@ import {
   type SelectionState,
   type SpreadsheetCellFormat,
   type ViewportMetrics,
+  viewportFreezeAtom,
   viewportHiddenAtom,
   viewportMetricsAtom,
   viewportShowGridlinesAtom,
@@ -94,6 +95,7 @@ import {
   dispatchUndo,
   notifyDraftTypedChar,
   readActiveFormulaSuggestion,
+  resolveProjectionSourceRange,
   spreadsheetProjectionSnapshotAtom,
   syncFormulaReferenceCaret,
 } from '../provider'
@@ -523,6 +525,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeViewport: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
+  let unsubscribeFreeze: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
   let unsubscribePresence: (() => void) | null = null
   let unsubscribeFilterSort: (() => void) | null = null
@@ -624,10 +627,22 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
             colOverrides,
           )
 
+    // When freeze is active for this sheet, expand the projection window so the
+    // backend returns the frozen rows/cols even if the viewport has scrolled
+    // past them — they need to stay in DOM for `position: sticky` to keep
+    // pinning them. readSparseRange returns only cells that exist, so the
+    // wider window costs nothing for sparse sheets.
+    const freezeState = store.getter(viewportFreezeAtom)
+    const frozenRows = freezeState.rowsBySheet[props.sheetId] ?? 0
+    const frozenCols = freezeState.colsBySheet[props.sheetId] ?? 0
+
+    const expandedRowStart = frozenRows > 0 ? 0 : Math.max(0, rawRowStart - metrics.overscanRows)
+    const expandedColStart = frozenCols > 0 ? 0 : Math.max(0, rawColStart - metrics.overscanCols)
+
     return {
-      rowStart: Math.max(0, rawRowStart - metrics.overscanRows),
+      rowStart: expandedRowStart,
       rowEnd: Math.min(metrics.rowCount - 1, rawRowEnd + metrics.overscanRows),
-      colStart: Math.max(0, rawColStart - metrics.overscanCols),
+      colStart: expandedColStart,
       colEnd: Math.min(metrics.colCount - 1, rawColEnd + metrics.overscanCols),
     }
   }
@@ -635,6 +650,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function hiddenState() {
     renderTick()
     return store.getter(viewportHiddenAtom)
+  }
+
+  function freezeRowCount(): number {
+    renderTick()
+    return store.getter(viewportFreezeAtom).rowsBySheet[props.sheetId] ?? 0
+  }
+
+  function freezeColCount(): number {
+    renderTick()
+    return store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0
   }
 
   function showGridlines() {
@@ -903,6 +928,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
+    unsubscribeFreeze = store.sub(viewportFreezeAtom, () => {
+      // Freeze affects both layout (sticky offsets) and projection (we must
+      // pull rows 0..freezeRowCount-1 into the data set so they survive
+      // scroll). Refresh both.
+      bumpRender()
+      void loadProjection(requestProjection())
+    })
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
     unsubscribePresence = store.sub(presenceStateAtom, bumpRender)
     unsubscribeFilterSort = store.sub(filterSortStateAtom, bumpRender)
@@ -941,6 +973,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeViewport?.()
     unsubscribeSizes?.()
     unsubscribeHidden?.()
+    unsubscribeFreeze?.()
     unsubscribePointer?.()
     unsubscribePresence?.()
     unsubscribeFilterSort?.()
@@ -1910,13 +1943,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     const range = snapshot.range
+    const sourceRange = resolveProjectionSourceRange(store, sheetId, range)
     const current = activeCellFormat()
     const nextFormat: SpreadsheetCellFormat = { ...current, [field]: !current[field] }
 
     const result = await backend.setFormatRange({
       kind: 'set-format-range',
       sheetId,
-      range,
+      range: sourceRange,
       format: nextFormat,
     })
 
@@ -1929,7 +1963,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       kind: 'format.set',
       sheetId,
       projectionRevision: revision,
-      affectedRange: { ...(result?.affectedRange ?? range) },
+      affectedRange: { ...(result?.affectedRange ?? sourceRange) },
     })
 
     await loadProjection(requestProjection())
@@ -2169,13 +2203,39 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getColumnStyle(col: number): Record<string, string> {
-    return {
+    const style: Record<string, string> = {
       width: `${getRenderedColumnWidth(col)}px`,
     }
+    if (col < freezeColCount()) {
+      const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
+      const stackedLeft = col === 0 ? 0 : getColumnSpanWidth(0, col - 1)
+      style.left = `${headingWidth + stackedLeft}px`
+    }
+    return style
+  }
+
+  function getFrozenStickyStyle(row: number, col: number): Record<string, string> {
+    const style: Record<string, string> = {}
+    const frozenRows = freezeRowCount()
+    const frozenCols = freezeColCount()
+    if (frozenRows > 0 && row < frozenRows) {
+      // Stack each frozen row below the column-header band so they line up
+      // visually rather than overlapping the header (z-index 2 vs cell 1).
+      const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
+      const stackedAbove = row === 0 ? 0 : getRowSpanHeight(0, row - 1)
+      style.top = `${headingHeight + stackedAbove}px`
+    }
+    if (frozenCols > 0 && col < frozenCols) {
+      const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
+      const stackedLeft = col === 0 ? 0 : getColumnSpanWidth(0, col - 1)
+      style.left = `${headingWidth + stackedLeft}px`
+    }
+    return style
   }
 
   function getCellBoxStyle(row: number, col: number): Record<string, string> {
     const backgroundStyle = getCellBackgroundStyle(getDisplayCellFormat(getCell(row, col)))
+    const stickyStyle = getFrozenStickyStyle(row, col)
     const mergeRange = getMergeRangeForCoord(row, col)
     if (mergeRange && mergeRange.rowStart === row && mergeRange.colStart === col) {
       const rows = getRows().filter((index) => index >= row && index <= mergeRange.rowEnd)
@@ -2190,6 +2250,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       )
       return {
         ...backgroundStyle,
+        ...stickyStyle,
         height: `${Math.max(getRenderedRowHeight(row), height)}px`,
         width: `${Math.max(getRenderedColumnWidth(col), width)}px`,
       }
@@ -2197,6 +2258,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
     return {
       ...backgroundStyle,
+      ...stickyStyle,
       height: `${getRenderedRowHeight(row)}px`,
       width: `${getRenderedColumnWidth(col)}px`,
     }
@@ -2221,9 +2283,15 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getRowHeaderStyle(row: number): Record<string, string> {
-    return {
+    const style: Record<string, string> = {
       height: `${getRenderedRowHeight(row)}px`,
     }
+    if (row < freezeRowCount()) {
+      const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
+      const stackedAbove = row === 0 ? 0 : getRowSpanHeight(0, row - 1)
+      style.top = `${headingHeight + stackedAbove}px`
+    }
+    return style
   }
 
   function getScrollViewportStyle(): Record<string, string> {
@@ -2487,8 +2555,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return state[props.sheetId]?.rules ?? []
   }
 
+  function getSortDirectivesForSheet() {
+    renderTick()
+    const state = store.getter(filterSortStateAtom)
+    return state[props.sheetId]?.directives ?? []
+  }
+
   function colHasFilterRule(col: number): boolean {
     return getFilterRulesForSheet().some((r) => r.colIndex === col)
+  }
+
+  function getColumnSortDirection(col: number): 'asc' | 'desc' | null {
+    return getSortDirectivesForSheet().find((directive) => directive.colIndex === col)
+      ?.direction ?? null
   }
 
   function getRemoteCursorsForSheet() {
@@ -2708,6 +2787,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       class={`spreadsheet-grid-col-header ${selected() ? 'is-selected' : ''}`.trim()}
                       data-col={col}
                       data-selected={selected() ? 'true' : 'false'}
+                      data-frozen-col={col < freezeColCount() ? 'true' : undefined}
                       style={getColumnStyle(col)}
                       onClick={(event) => {
                         selectColumn(col, event.shiftKey, event.ctrlKey || event.metaKey)
@@ -2717,7 +2797,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       }}
                     >
                       <span class="spreadsheet-grid-header-label">{getColumnLabel(col)}</span>
-                      <Show when={colHasFilterRule(col)}>
+                      <Show when={colHasFilterRule(col) || getColumnSortDirection(col)}>
                         <button
                           type="button"
                           class="spreadsheet-grid-filter-chevron"
@@ -2725,11 +2805,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                           aria-label={`Filter column ${getColumnLabel(col)}`}
                           onClick={(event) => {
                             event.stopPropagation()
-                            store.setter(openFilterDropdownAtom, { sheetId: props.sheetId, colIndex: col })
+                            store.setter(openFilterDropdownAtom, {
+                              sheetId: props.sheetId,
+                              colIndex: col,
+                            })
                             bumpRender()
                           }}
                         >
-                          ▾
+                          {getColumnSortDirection(col) === 'asc'
+                            ? '↑'
+                            : getColumnSortDirection(col) === 'desc'
+                              ? '↓'
+                              : '▾'}
                         </button>
                       </Show>
                       <button
@@ -2776,6 +2863,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                     }`.trim()}
                     data-row={row}
                     data-selected={isRowSelected(row) ? 'true' : 'false'}
+                    data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
                     style={getRowHeaderStyle(row)}
                     onClick={(event) => {
                       selectRow(row, event.shiftKey, event.ctrlKey || event.metaKey)
@@ -2834,6 +2922,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             data-row={row}
                             data-col={col}
                             data-cell-addr={addr}
+                            data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
+                            data-frozen-col={col < freezeColCount() ? 'true' : undefined}
                             data-selected={selected() ? 'true' : 'false'}
                             data-active={active() ? 'true' : 'false'}
                             data-merge-anchor={mergeAnchor() ? 'true' : 'false'}
@@ -3081,6 +3171,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           getSurfaceSize={getOverlaySurfaceSize}
           getCells={getOverlayCells}
           getFreezeOrigin={getOverlayFreezeOrigin}
+          getVisibleRows={getRows}
+          getVisibleCols={getCols}
         />
       </div>
       <For each={getRemoteCursorsForSheet()}>

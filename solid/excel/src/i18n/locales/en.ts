@@ -474,4 +474,18 @@ export const messages: Record<string, string> = {
   'formatCells.fill.gradientFrom': 'Gradient from',
   'formatCells.fill.gradientTo': 'Gradient to',
   'formatCells.fill.gradientAngle': 'Gradient angle',
+  // Context menu commands
+  'contextMenu.command.copy': 'Copy',
+  'contextMenu.command.cut': 'Cut',
+  'contextMenu.command.paste': 'Paste',
+  'contextMenu.command.delete': 'Delete',
+  'contextMenu.command.insertRow': 'Insert row',
+  'contextMenu.command.deleteRow': 'Delete row',
+  'contextMenu.command.insertColumn': 'Insert column',
+  'contextMenu.command.deleteColumn': 'Delete column',
+  'contextMenu.command.formatting': 'Formatting',
+  'contextMenu.command.freezeRowsHere': 'Freeze {count} row(s) above',
+  'contextMenu.command.freezeColsHere': 'Freeze {count} column(s) to left',
+  'contextMenu.command.freezePanes': 'Freeze panes',
+  'contextMenu.command.unfreeze': 'Unfreeze',
 }

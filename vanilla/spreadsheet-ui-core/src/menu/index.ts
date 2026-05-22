@@ -340,6 +340,14 @@ function isCommandAllowedForTarget(command: MenuCommandKind, kind: MenuTargetKin
     case 'clipboard.paste':
     case 'cell.clear':
       return kind !== 'sheet-tab'
+    case 'view.freezeRowsHere':
+      return kind === 'row'
+    case 'view.freezeColsHere':
+      return kind === 'column'
+    case 'view.freezePanes':
+      return kind === 'cell' || kind === 'range'
+    case 'view.unfreeze':
+      return kind !== 'sheet-tab'
     default:
       return assertNever(command)
   }
