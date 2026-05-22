@@ -377,12 +377,26 @@ thead .row-header {
 }
 
 .spreadsheet-grid {
-  overflow: auto;
+  overflow: hidden;
   max-height: 70vh;
+  max-width: 100%;
   border: 1px solid #d0d0d0;
   border-radius: 4px;
   font-size: 13px;
   outline: none;
+}
+
+.spreadsheet-grid-scroll-viewport {
+  overflow: auto;
+  max-height: 70vh;
+  max-width: 100%;
+}
+
+.spreadsheet-grid-overlay-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
 }
 
 .spreadsheet-grid:focus {
@@ -408,6 +422,13 @@ thead .row-header {
 .spreadsheet-grid-table {
   border-collapse: collapse;
   table-layout: fixed;
+}
+
+.spreadsheet-grid-virtual-spacer {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  pointer-events: none;
 }
 
 .spreadsheet-grid-corner,
@@ -2387,6 +2408,24 @@ thead .row-header {
   font-weight: 500;
   text-align: right;
   user-select: none;
+}
+
+.spreadsheet-grid .spreadsheet-grid-corner,
+.spreadsheet-grid .spreadsheet-grid-col-header {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+}
+
+.spreadsheet-grid .spreadsheet-grid-corner,
+.spreadsheet-grid .spreadsheet-grid-row-header {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+}
+
+.spreadsheet-grid .spreadsheet-grid-corner {
+  z-index: 4;
 }
 
 .spreadsheet-grid .spreadsheet-grid-row-header.is-selected {

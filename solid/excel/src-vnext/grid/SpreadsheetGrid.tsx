@@ -79,10 +79,10 @@ import {
   type SpreadsheetCellFormat,
   type ViewportMetrics,
   viewportHiddenAtom,
+  viewportMetricsAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
   viewportSizeOverridesAtom,
-  visibleWindowAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
@@ -119,6 +119,98 @@ function getWindowIndexes(start: number, end: number) {
   return Array.from({ length: end - start + 1 }, (_, index) => start + index)
 }
 
+const GRID_ROW_HEADER_WIDTH = 44
+
+function getAxisOffsetForIndex(
+  index: number,
+  count: number,
+  fallbackSize: number,
+  overrides: Record<string, number> | undefined,
+) {
+  const clampedIndex = Math.max(0, Math.min(count, Math.trunc(index)))
+  let offset = clampedIndex * fallbackSize
+
+  for (const [key, size] of Object.entries(overrides ?? {})) {
+    const overrideIndex = Number(key)
+    if (!Number.isInteger(overrideIndex)) continue
+    if (overrideIndex < 0 || overrideIndex >= clampedIndex) continue
+    offset += size - fallbackSize
+  }
+
+  return Math.max(0, offset)
+}
+
+function getAxisSpanSize(
+  start: number,
+  end: number,
+  count: number,
+  fallbackSize: number,
+  overrides: Record<string, number> | undefined,
+) {
+  if (count <= 0 || end < start) return 0
+  const clampedStart = Math.max(0, Math.min(count, Math.trunc(start)))
+  const clampedEnd = Math.max(0, Math.min(count - 1, Math.trunc(end)))
+  if (clampedEnd < clampedStart) return 0
+  return (
+    getAxisOffsetForIndex(clampedEnd + 1, count, fallbackSize, overrides) -
+    getAxisOffsetForIndex(clampedStart, count, fallbackSize, overrides)
+  )
+}
+
+function getAxisStartIndexAtOffset(
+  offset: number,
+  count: number,
+  fallbackSize: number,
+  overrides: Record<string, number> | undefined,
+) {
+  if (count <= 0) return 0
+
+  const target = Math.max(0, offset)
+  let low = 0
+  let high = count - 1
+  let result = count - 1
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+    const cellEnd = getAxisOffsetForIndex(mid + 1, count, fallbackSize, overrides)
+    if (cellEnd > target) {
+      result = mid
+      high = mid - 1
+    } else {
+      low = mid + 1
+    }
+  }
+
+  return result
+}
+
+function getAxisEndIndexAtOffset(
+  offset: number,
+  count: number,
+  fallbackSize: number,
+  overrides: Record<string, number> | undefined,
+) {
+  if (count <= 0) return -1
+
+  const target = Math.max(0, offset)
+  let low = 0
+  let high = count - 1
+  let result = 0
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2)
+    const cellStart = getAxisOffsetForIndex(mid, count, fallbackSize, overrides)
+    if (cellStart < target) {
+      result = mid
+      low = mid + 1
+    } else {
+      high = mid - 1
+    }
+  }
+
+  return result
+}
+
 function getColumnLabel(index: number): string {
   let n = index + 1
   let label = ''
@@ -140,7 +232,6 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (!format) return {}
 
   const style: Record<string, string> = {}
-  if (format.bgColor) style['background'] = format.bgColor
   if (format.fgColor) style['color'] = format.fgColor
   if (format.bold) style['font-weight'] = '700'
   if (format.italic) style['font-style'] = 'italic'
@@ -235,6 +326,10 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   }
 
   return style
+}
+
+function getCellBackgroundStyle(format: SpreadsheetCellFormat | undefined): Record<string, string> {
+  return format?.bgColor ? { background: format.bgColor } : {}
 }
 
 function getDisplayCellFormat(cell: DisplayCell | undefined): SpreadsheetCellFormat | undefined {
@@ -421,9 +516,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   const backend = useSpreadsheetBackend()
   const [renderTick, setRenderTick] = createSignal(0)
   let gridRoot: HTMLDivElement | undefined
+  let scrollRoot: HTMLDivElement | undefined
   let activeResizeCleanup: (() => void) | null = null
   let activeFillCleanup: (() => void) | null = null
   let unsubscribeProjection: (() => void) | null = null
+  let unsubscribeViewport: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
   let unsubscribePointer: (() => void) | null = null
@@ -435,6 +532,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let unsubscribeSelection: (() => void) | null = null
   let unsubscribeEditing: (() => void) | null = null
   let lastActiveSheetId: string | null = null
+  let resizeObserver: ResizeObserver | null = null
 
   function bumpRender() {
     setRenderTick((value) => value + 1)
@@ -442,7 +540,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   function visibleWindow() {
     renderTick()
-    return store.getter(visibleWindowAtom)
+    return getRenderedVisibleWindow()
+  }
+
+  function viewportMetrics() {
+    renderTick()
+    return store.getter(viewportMetricsAtom)
   }
 
   function projectionSnapshot() {
@@ -475,6 +578,60 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(viewportSizeOverridesAtom)
   }
 
+  function getRenderedVisibleWindow(): CellRange {
+    const metrics = store.getter(viewportMetricsAtom)
+    const overrides = store.getter(viewportSizeOverridesAtom)
+    const rowOverrides = overrides.rowHeightsBySheet[props.sheetId]
+    const colOverrides = overrides.colWidthsBySheet[props.sheetId]
+
+    if (metrics.rowCount === 0 || metrics.colCount === 0) {
+      return {
+        rowStart: 0,
+        rowEnd: -1,
+        colStart: 0,
+        colEnd: -1,
+      }
+    }
+
+    const rawRowStart = getAxisStartIndexAtOffset(
+      metrics.scrollTop,
+      metrics.rowCount,
+      metrics.rowHeight,
+      rowOverrides,
+    )
+    const rawColStart = getAxisStartIndexAtOffset(
+      metrics.scrollLeft,
+      metrics.colCount,
+      metrics.colWidth,
+      colOverrides,
+    )
+    const rawRowEnd =
+      metrics.viewportHeight <= 0
+        ? rawRowStart
+        : getAxisEndIndexAtOffset(
+            metrics.scrollTop + metrics.viewportHeight,
+            metrics.rowCount,
+            metrics.rowHeight,
+            rowOverrides,
+          )
+    const rawColEnd =
+      metrics.viewportWidth <= 0
+        ? rawColStart
+        : getAxisEndIndexAtOffset(
+            metrics.scrollLeft + metrics.viewportWidth,
+            metrics.colCount,
+            metrics.colWidth,
+            colOverrides,
+          )
+
+    return {
+      rowStart: Math.max(0, rawRowStart - metrics.overscanRows),
+      rowEnd: Math.min(metrics.rowCount - 1, rawRowEnd + metrics.overscanRows),
+      colStart: Math.max(0, rawColStart - metrics.overscanCols),
+      colEnd: Math.min(metrics.colCount - 1, rawColEnd + metrics.overscanCols),
+    }
+  }
+
   function hiddenState() {
     renderTick()
     return store.getter(viewportHiddenAtom)
@@ -491,7 +648,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function requestProjection() {
-    const window = store.getter(visibleWindowAtom)
+    const window = getRenderedVisibleWindow()
     if (window.rowEnd < window.rowStart || window.colEnd < window.colStart) {
       store.setter(spreadsheetProjectionSnapshotAtom, {
         status: 'idle',
@@ -563,7 +720,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    const window = store.getter(visibleWindowAtom)
+    const window = getRenderedVisibleWindow()
     if (window.rowEnd < window.rowStart || window.colEnd < window.colStart) {
       return
     }
@@ -596,6 +753,65 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       })
     }
     bumpRender()
+  }
+
+  function syncScrollElementToViewport() {
+    if (!scrollRoot) {
+      return
+    }
+
+    const metrics = store.getter(viewportMetricsAtom)
+    if (Math.abs(scrollRoot.scrollTop - metrics.scrollTop) > 0.5) {
+      scrollRoot.scrollTop = metrics.scrollTop
+    }
+    if (Math.abs(scrollRoot.scrollLeft - metrics.scrollLeft) > 0.5) {
+      scrollRoot.scrollLeft = metrics.scrollLeft
+    }
+  }
+
+  function syncViewportSizeFromElement() {
+    if (!scrollRoot) {
+      return
+    }
+
+    const metrics = store.getter(viewportMetricsAtom)
+    const headingWidth = store.getter(viewportShowHeadingsAtom) ? GRID_ROW_HEADER_WIDTH : 0
+    const headingHeight = store.getter(viewportShowHeadingsAtom) ? metrics.rowHeight : 0
+    const measuredWidth = scrollRoot.clientWidth - headingWidth
+    const measuredHeight = scrollRoot.clientHeight - headingHeight
+    const viewportWidth = measuredWidth > 0 ? measuredWidth : metrics.viewportWidth
+    const viewportHeight = measuredHeight > 0 ? measuredHeight : metrics.viewportHeight
+    if (metrics.viewportWidth === viewportWidth && metrics.viewportHeight === viewportHeight) {
+      return
+    }
+
+    store.setter(viewportMetricsAtom, {
+      ...metrics,
+      viewportWidth,
+      viewportHeight,
+    })
+  }
+
+  function refreshViewportProjection() {
+    syncViewportSizeFromElement()
+    syncScrollElementToViewport()
+    bumpRender()
+    void loadProjection(requestProjection())
+    void hydrateViewportSizeProjection()
+  }
+
+  function handleViewportScroll(event: Event & { currentTarget: HTMLDivElement }) {
+    const target = event.currentTarget
+    const metrics = store.getter(viewportMetricsAtom)
+    if (metrics.scrollTop === target.scrollTop && metrics.scrollLeft === target.scrollLeft) {
+      return
+    }
+
+    store.setter(viewportMetricsAtom, {
+      ...metrics,
+      scrollTop: target.scrollTop,
+      scrollLeft: target.scrollLeft,
+    })
   }
 
   async function persistColumnWidth(colIndex: number, widthPx: number) {
@@ -684,6 +900,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
 
   onMount(() => {
     unsubscribeProjection = store.sub(spreadsheetProjectionSnapshotAtom, bumpRender)
+    unsubscribeViewport = store.sub(viewportMetricsAtom, refreshViewportProjection)
     unsubscribeSizes = store.sub(viewportSizeOverridesAtom, bumpRender)
     unsubscribeHidden = store.sub(viewportHiddenAtom, bumpRender)
     unsubscribePointer = store.sub(pointerSessionAtom, bumpRender)
@@ -708,13 +925,20 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       rowCount: props.viewport.rowCount,
       colCount: props.viewport.colCount,
     })
-    bumpRender()
-    void loadProjection(requestProjection())
-    void hydrateViewportSizeProjection()
+    syncViewportSizeFromElement()
+    syncScrollElementToViewport()
+    if (typeof ResizeObserver !== 'undefined' && scrollRoot) {
+      resizeObserver = new ResizeObserver(() => {
+        syncViewportSizeFromElement()
+      })
+      resizeObserver.observe(scrollRoot)
+    }
   })
 
   onCleanup(() => {
+    resizeObserver?.disconnect()
     unsubscribeProjection?.()
+    unsubscribeViewport?.()
     unsubscribeSizes?.()
     unsubscribeHidden?.()
     unsubscribePointer?.()
@@ -1951,6 +2175,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getCellBoxStyle(row: number, col: number): Record<string, string> {
+    const backgroundStyle = getCellBackgroundStyle(getDisplayCellFormat(getCell(row, col)))
     const mergeRange = getMergeRangeForCoord(row, col)
     if (mergeRange && mergeRange.rowStart === row && mergeRange.colStart === col) {
       const rows = getRows().filter((index) => index >= row && index <= mergeRange.rowEnd)
@@ -1964,12 +2189,14 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         0,
       )
       return {
+        ...backgroundStyle,
         height: `${Math.max(getRenderedRowHeight(row), height)}px`,
         width: `${Math.max(getRenderedColumnWidth(col), width)}px`,
       }
     }
 
     return {
+      ...backgroundStyle,
       height: `${getRenderedRowHeight(row)}px`,
       width: `${getRenderedColumnWidth(col)}px`,
     }
@@ -1997,6 +2224,82 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return {
       height: `${getRenderedRowHeight(row)}px`,
     }
+  }
+
+  function getScrollViewportStyle(): Record<string, string> {
+    const metrics = viewportMetrics()
+    const headingHeight = showHeadings() ? metrics.rowHeight : 0
+    return {
+      width: '100%',
+      height: `${metrics.viewportHeight + headingHeight}px`,
+    }
+  }
+
+  function getRowOverridesForSheet() {
+    return store.getter(viewportSizeOverridesAtom).rowHeightsBySheet[props.sheetId]
+  }
+
+  function getColOverridesForSheet() {
+    return store.getter(viewportSizeOverridesAtom).colWidthsBySheet[props.sheetId]
+  }
+
+  function getRowSpanHeight(start: number, end: number) {
+    const metrics = viewportMetrics()
+    return getAxisSpanSize(
+      start,
+      end,
+      metrics.rowCount,
+      metrics.rowHeight,
+      getRowOverridesForSheet(),
+    )
+  }
+
+  function getColumnSpanWidth(start: number, end: number) {
+    const metrics = viewportMetrics()
+    return getAxisSpanSize(
+      start,
+      end,
+      metrics.colCount,
+      metrics.colWidth,
+      getColOverridesForSheet(),
+    )
+  }
+
+  function getTotalTableWidth() {
+    const metrics = viewportMetrics()
+    const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
+    return headingWidth + getColumnSpanWidth(0, metrics.colCount - 1)
+  }
+
+  function getTopSpacerHeight() {
+    const window = visibleWindow()
+    return getRowSpanHeight(0, window.rowStart - 1)
+  }
+
+  function getBottomSpacerHeight() {
+    const window = visibleWindow()
+    const metrics = viewportMetrics()
+    return getRowSpanHeight(window.rowEnd + 1, metrics.rowCount - 1)
+  }
+
+  function getLeftSpacerWidth() {
+    const window = visibleWindow()
+    return getColumnSpanWidth(0, window.colStart - 1)
+  }
+
+  function getRightSpacerWidth() {
+    const window = visibleWindow()
+    const metrics = viewportMetrics()
+    return getColumnSpanWidth(window.colEnd + 1, metrics.colCount - 1)
+  }
+
+  function getVirtualColumnSpan() {
+    return (
+      (showHeadings() ? 1 : 0) +
+      getCols().length +
+      (getLeftSpacerWidth() > 0 ? 1 : 0) +
+      (getRightSpacerWidth() > 0 ? 1 : 0)
+    )
   }
 
   function startFillHandle(event: PointerEvent) {
@@ -2218,12 +2521,12 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getOverlayCellRect(row: number, col: number): { x: number; y: number; w: number; h: number } | null {
-    if (!gridRoot) return null
+    if (!gridRoot || !scrollRoot) return null
     const td = gridRoot.querySelector(
       `td.spreadsheet-grid-cell[data-row="${row}"][data-col="${col}"]`,
     ) as HTMLElement | null
     if (td) {
-      const rootRect = gridRoot.getBoundingClientRect()
+      const rootRect = scrollRoot.getBoundingClientRect()
       const cellRect = td.getBoundingClientRect()
       return {
         x: cellRect.left - rootRect.left,
@@ -2238,7 +2541,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     // boundary instead of a phantom sub-cell position.
     const anchor = findMergeAnchorCovering(row, col)
     if (anchor) {
-      const rootRect = gridRoot.getBoundingClientRect()
+      const rootRect = scrollRoot.getBoundingClientRect()
       const anchorRect = anchor.el.getBoundingClientRect()
       return {
         x: anchorRect.left - rootRect.left,
@@ -2253,6 +2556,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const rows = getRows()
     const cols = getCols()
     if (rows.length === 0 || cols.length === 0) return null
+    if (!rows.includes(row) || !cols.includes(col)) return null
     const rowsBefore = rows.filter((r) => r < row)
     const colsBefore = cols.filter((c) => c < col)
     let y = 0
@@ -2281,8 +2585,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getOverlaySurfaceSize(): { width: number; height: number } {
-    if (!gridRoot) return { width: 0, height: 0 }
-    const rect = gridRoot.getBoundingClientRect()
+    if (!scrollRoot) return { width: 0, height: 0 }
+    const rect = scrollRoot.getBoundingClientRect()
     return { width: rect.width, height: rect.height }
   }
 
@@ -2291,11 +2595,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   }
 
   function getOverlayFreezeOrigin(): { x: number; y: number } {
-    if (!gridRoot) return { x: 0, y: 0 }
+    if (!gridRoot || !scrollRoot) return { x: 0, y: 0 }
     const corner = gridRoot.querySelector('.spreadsheet-grid-corner') as HTMLElement | null
     if (!corner) return { x: 0, y: 0 }
     const cornerRect = corner.getBoundingClientRect()
-    const rootRect = gridRoot.getBoundingClientRect()
+    const rootRect = scrollRoot.getBoundingClientRect()
     return {
       x: cornerRect.right - rootRect.left,
       y: cornerRect.bottom - rootRect.top,
@@ -2359,7 +2663,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         void handleGridKeyDown(event)
       }}
     >
-      <table class="spreadsheet-grid-table">
+      <div
+        ref={scrollRoot}
+        class="spreadsheet-grid-scroll-viewport"
+        style={getScrollViewportStyle()}
+        onScroll={handleViewportScroll}
+      >
+      <table
+        class="spreadsheet-grid-table"
+        style={{
+          width: `${getTotalTableWidth()}px`,
+          'min-width': `${getTotalTableWidth()}px`,
+        }}
+      >
         <tbody>
           <Show when={getRows().length > 0 && getCols().length > 0}>
             <Show when={showHeadings()}>
@@ -2376,6 +2692,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                   openContextMenu(event, { kind: 'all' })
                 }}
               />
+              <Show when={getLeftSpacerWidth() > 0}>
+                <th
+                  class="spreadsheet-grid-virtual-spacer"
+                  aria-hidden="true"
+                  style={{ width: `${getLeftSpacerWidth()}px` }}
+                />
+              </Show>
               <For each={getCols()}>
                 {(col) => {
                   const selected = () => isColumnSelected(col)
@@ -2425,7 +2748,23 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                   )
                 }}
               </For>
+              <Show when={getRightSpacerWidth() > 0}>
+                <th
+                  class="spreadsheet-grid-virtual-spacer"
+                  aria-hidden="true"
+                  style={{ width: `${getRightSpacerWidth()}px` }}
+                />
+              </Show>
             </tr>
+            </Show>
+            <Show when={getTopSpacerHeight() > 0}>
+              <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
+                <td
+                  class="spreadsheet-grid-virtual-spacer"
+                  colSpan={getVirtualColumnSpan()}
+                  style={{ height: `${getTopSpacerHeight()}px` }}
+                />
+              </tr>
             </Show>
             <For each={getRows()}>
               {(row) => (
@@ -2459,6 +2798,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       }}
                     />
                   </th>
+                  </Show>
+                  <Show when={getLeftSpacerWidth() > 0}>
+                    <td
+                      class="spreadsheet-grid-virtual-spacer"
+                      aria-hidden="true"
+                      style={{ width: `${getLeftSpacerWidth()}px` }}
+                    />
                   </Show>
                   <For each={getCols()}>
                     {(col) => {
@@ -2705,19 +3051,38 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       )
                     }}
                   </For>
+                  <Show when={getRightSpacerWidth() > 0}>
+                    <td
+                      class="spreadsheet-grid-virtual-spacer"
+                      aria-hidden="true"
+                      style={{ width: `${getRightSpacerWidth()}px` }}
+                    />
+                  </Show>
                 </tr>
               )}
             </For>
+            <Show when={getBottomSpacerHeight() > 0}>
+              <tr class="spreadsheet-grid-virtual-spacer-row" aria-hidden="true">
+                <td
+                  class="spreadsheet-grid-virtual-spacer"
+                  colSpan={getVirtualColumnSpan()}
+                  style={{ height: `${getBottomSpacerHeight()}px` }}
+                />
+              </tr>
+            </Show>
           </Show>
         </tbody>
       </table>
-      <SpreadsheetGridOverlay
-        sheetId={props.sheetId}
-        getCellRect={getOverlayCellRect}
-        getSurfaceSize={getOverlaySurfaceSize}
-        getCells={getOverlayCells}
-        getFreezeOrigin={getOverlayFreezeOrigin}
-      />
+      </div>
+      <div class="spreadsheet-grid-overlay-layer" aria-hidden="true">
+        <SpreadsheetGridOverlay
+          sheetId={props.sheetId}
+          getCellRect={getOverlayCellRect}
+          getSurfaceSize={getOverlaySurfaceSize}
+          getCells={getOverlayCells}
+          getFreezeOrigin={getOverlayFreezeOrigin}
+        />
+      </div>
       <For each={getRemoteCursorsForSheet()}>
         {(cursor) => (
           <div

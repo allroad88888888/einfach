@@ -85,6 +85,107 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     await expect(cell(page, 'B2')).toHaveAttribute('data-active', 'true')
   })
 
+  test('grid viewport scrolls to offscreen rows and columns', async ({ page }) => {
+    await gotoWave5(page)
+    const grid = page.getByTestId('wave5-grid')
+    const scroller = grid.locator('.spreadsheet-grid-scroll-viewport')
+    await expect(scroller).toBeVisible()
+
+    await scroller.evaluate((el) => {
+      el.scrollTop = 240
+      el.scrollLeft = 480
+      el.dispatchEvent(new Event('scroll', { bubbles: true }))
+    })
+
+    await expect(cell(page, 'F11')).toBeVisible()
+    await expect(cell(page, 'A1')).toHaveCount(0)
+  })
+
+  test('formula bar keeps selected value when the active cell scrolls out of view', async ({ page }) => {
+    await gotoWave5(page)
+    const grid = page.getByTestId('wave5-grid')
+    const formulaInput = page.getByTestId('formula-bar-input')
+    await cell(page, 'E2').click()
+    await expect(formulaInput).toHaveValue('300')
+
+    await grid.locator('.spreadsheet-grid-scroll-viewport').evaluate((el) => {
+      el.scrollTop = 720
+      el.dispatchEvent(new Event('scroll', { bubbles: true }))
+    })
+
+    await expect(cell(page, 'E2')).toHaveCount(0)
+    await expect(formulaInput).toHaveValue('300')
+  })
+
+  test('cell fill color paints the full cell box', async ({ page }) => {
+    await gotoWave5(page)
+    const filledCell = cell(page, 'E4')
+    await expect(filledCell).toBeVisible()
+
+    const paint = await filledCell.evaluate((el) => {
+      const display = el.querySelector('.cell-display') as HTMLElement
+      return {
+        cellBackground: getComputedStyle(el).backgroundColor,
+        displayBackground: getComputedStyle(display).backgroundColor,
+        paddingLeft: getComputedStyle(el).paddingLeft,
+        paddingRight: getComputedStyle(el).paddingRight,
+      }
+    })
+
+    expect(paint.cellBackground).toBe('rgb(254, 243, 199)')
+    expect(paint.displayBackground).toBe('rgba(0, 0, 0, 0)')
+    expect(paint.paddingLeft).toBe('4px')
+    expect(paint.paddingRight).toBe('4px')
+  })
+
+  test('resized columns extend the horizontal viewport scroll range', async ({ page }) => {
+    await gotoWave5(page)
+    const grid = page.getByTestId('wave5-grid')
+    const result = await grid.evaluate(async (el) => {
+      const scroller = el.querySelector('.spreadsheet-grid-scroll-viewport') as HTMLDivElement
+      const handle = el.querySelector('[data-testid="col-resize-0"]') as HTMLElement
+      const rect = handle.getBoundingClientRect()
+      const startX = rect.left + rect.width / 2
+      const clientY = rect.top + rect.height / 2
+      const firePointer = (target: EventTarget, type: string, clientX: number) => {
+        target.dispatchEvent(
+          new PointerEvent(type, {
+            bubbles: true,
+            cancelable: true,
+            pointerId: 1,
+            pointerType: 'mouse',
+            button: 0,
+            buttons: type === 'pointerup' ? 0 : 1,
+            clientX,
+            clientY,
+          }),
+        )
+      }
+
+      const oldMax = scroller.scrollWidth - scroller.clientWidth
+      firePointer(handle, 'pointerdown', startX)
+      firePointer(window, 'pointermove', startX + 520)
+      firePointer(window, 'pointerup', startX + 520)
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+
+      const newMax = scroller.scrollWidth - scroller.clientWidth
+      scroller.scrollLeft = newMax
+      scroller.dispatchEvent(new Event('scroll', { bubbles: true }))
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+
+      return {
+        oldMax,
+        newMax,
+        scrollLeft: scroller.scrollLeft,
+      }
+    })
+
+    expect(result.newMax).toBeGreaterThan(result.oldMax + 100)
+    expect(result.scrollLeft).toBeGreaterThan(result.oldMax + 100)
+    await expect(cell(page, 'P1')).toBeVisible()
+    await expect(cell(page, 'A1')).toHaveCount(0)
+  })
+
   test('format painter toolbar button arms the painter', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'B2').click()

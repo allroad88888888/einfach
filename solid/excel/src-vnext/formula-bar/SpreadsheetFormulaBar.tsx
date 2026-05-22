@@ -57,8 +57,17 @@ function getSourceTextFromProjection(
   result: VisibleProjectionResult | undefined,
   cell: CellCoord,
   activeSheetId: string,
-): string {
-  if (!result || result.sheetId !== activeSheetId) return ''
+): string | undefined {
+  if (!result || result.sheetId !== activeSheetId) return undefined
+  if (
+    cell.row < result.window.rowStart ||
+    cell.row > result.window.rowEnd ||
+    cell.col < result.window.colStart ||
+    cell.col > result.window.colEnd
+  ) {
+    return undefined
+  }
+
   const draftCell = result.cells.find(
     (projectionCell) => projectionCell.row === cell.row && projectionCell.col === cell.col,
   )
@@ -95,11 +104,21 @@ export function SpreadsheetFormulaBar(props: SpreadsheetFormulaBarProps) {
     const visibleResult = isVisibleProjectionResult(snapshot.result)
       ? snapshot.result
       : undefined
-    const activeSheetId = visibleResult?.sheetId || resolveActiveSheetId()
+    const activeSheetId = resolveActiveSheetId()
+    const draft = getSourceTextFromProjection(visibleResult, selection.activeCell, activeSheetId)
+    if (draft === undefined) {
+      const current = store.getter(formulaBarStateAtom)
+      const sameCell =
+        current.sheetId === activeSheetId &&
+        current.cell?.row === selection.activeCell.row &&
+        current.cell?.col === selection.activeCell.col
+      if (sameCell) return
+    }
+
     const input: FormulaBarSyncInput = {
       sheetId: activeSheetId,
       cell: selection.activeCell,
-      draft: getSourceTextFromProjection(visibleResult, selection.activeCell, activeSheetId),
+      draft: draft ?? '',
       source: 'selection',
       revision: visibleResult?.revision,
     }

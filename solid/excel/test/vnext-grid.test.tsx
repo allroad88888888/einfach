@@ -190,6 +190,62 @@ describe('vNext SpreadsheetGrid', () => {
     })
   })
 
+  it('syncs DOM scrolling into viewport metrics and reloads the visible window', async () => {
+    const store = createStore()
+    const { backend, requests } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 2,
+      viewportWidth: 3,
+      rowHeight: 1,
+      colWidth: 1,
+      rowCount: 10,
+      colCount: 10,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+      </SpreadsheetUiProvider>
+    ))
+
+    await flushMicrotasks()
+
+    const scroller = container.querySelector(
+      '.spreadsheet-grid-scroll-viewport',
+    ) as HTMLDivElement
+    scroller.scrollTop = 4
+    scroller.scrollLeft = 5
+    fireEvent.scroll(scroller)
+
+    await waitFor(() => {
+      expect(requests[requests.length - 1]?.window).toEqual({
+        rowStart: 4,
+        rowEnd: 5,
+        colStart: 5,
+        colEnd: 7,
+      })
+    })
+    expect(store.getter(viewportMetricsAtom)).toMatchObject({
+      scrollTop: 4,
+      scrollLeft: 5,
+    })
+    expect(store.getter(visibleWindowAtom)).toEqual({
+      rowStart: 4,
+      rowEnd: 5,
+      colStart: 5,
+      colEnd: 7,
+    })
+    await waitFor(() => {
+      expect(
+        container.querySelector('[data-row="4"][data-col="5"] .cell-display')?.textContent,
+      ).toBe('4,5')
+    })
+  })
+
   it('renders projected cell format styles without creating cell atoms', async () => {
     const store = createStore()
     const viewport = {
@@ -323,7 +379,8 @@ describe('vNext SpreadsheetGrid', () => {
 
     const cell = container.querySelector('[data-cell-addr="A1"]') as HTMLElement
     const display = cell.querySelector('.cell-display') as HTMLElement
-    expect(display.style.background).toBe('rgb(253, 230, 138)')
+    expect(cell.style.background).toBe('rgb(253, 230, 138)')
+    expect(display.style.background).toBe('')
     expect(display.style.color).toBe('rgb(127, 29, 29)')
     expect(display.style.fontWeight).toBe('700')
     expect(cell.getAttribute('data-has-conditional-format')).toBe('true')
@@ -1174,6 +1231,66 @@ describe('vNext SpreadsheetGrid', () => {
     expect((container.querySelector('[data-cell-addr="B2"]') as HTMLElement).style.height).toBe(
       '36px',
     )
+  })
+
+  it('keeps the horizontal scroll range in sync with resized columns', async () => {
+    const store = createStore()
+    const { backend, requests } = createFakeBackend()
+    const viewport = {
+      scrollTop: 0,
+      scrollLeft: 0,
+      viewportHeight: 20,
+      viewportWidth: 100,
+      rowHeight: 20,
+      colWidth: 50,
+      rowCount: 1,
+      colCount: 4,
+      overscanRows: 0,
+      overscanCols: 0,
+    }
+
+    const { container, getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} data-testid="grid" />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('td.spreadsheet-grid-cell')).toHaveLength(2)
+    })
+
+    dispatchPointerEvent(getByTestId('col-resize-0'), 'pointerdown', { clientX: 100 })
+    dispatchPointerEvent(window, 'pointermove', { clientX: 250 })
+    dispatchPointerEvent(window, 'pointerup', { clientX: 250 })
+
+    await waitFor(() => {
+      expect(
+        (container.querySelector('.spreadsheet-grid-table') as HTMLElement).style.width,
+      ).toBe('394px')
+    })
+
+    const scroller = container.querySelector(
+      '.spreadsheet-grid-scroll-viewport',
+    ) as HTMLDivElement
+    scroller.scrollLeft = 220
+    fireEvent.scroll(scroller)
+
+    await waitFor(() => {
+      expect(requests[requests.length - 1]?.window).toEqual({
+        rowStart: 0,
+        rowEnd: 0,
+        colStart: 1,
+        colEnd: 3,
+      })
+    })
+
+    expect(store.getter(viewportMetricsAtom).scrollLeft).toBe(220)
+    expect(
+      (container.querySelector('.spreadsheet-grid-row .spreadsheet-grid-virtual-spacer') as HTMLElement)
+        .style.width,
+    ).toBe('200px')
+    expect(container.querySelector('[data-cell-addr="B1"]')).not.toBeNull()
+    expect(container.querySelector('[data-cell-addr="D1"]')).not.toBeNull()
   })
 
   it('autofits visible rows and columns through resize handle double-click', async () => {
