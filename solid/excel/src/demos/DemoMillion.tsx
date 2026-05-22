@@ -213,11 +213,12 @@ export function DemoMillion() {
   function importStatsText(state: ImportUiState) {
     const accepted = state.stats?.accepted ?? state.cellsImported
     const errors = state.stats?.errors ?? 0
-    return t('demo.million.import.stats')
-      .replace('{rows}', String(state.rowsRead))
-      .replace('{cells}', String(accepted))
-      .replace('{chunks}', String(state.chunks))
-      .replace('{errors}', String(errors))
+    return t('demo.million.import.stats', {
+      rows: state.rowsRead,
+      cells: accepted,
+      chunks: state.chunks,
+      errors,
+    })
   }
 
   const importing = () => {

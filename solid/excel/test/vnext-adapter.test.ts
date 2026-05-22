@@ -1120,6 +1120,83 @@ describe('vnext adapter', () => {
     workerBackend.dispose()
   })
 
+  it('matches static and worker filter/sort when sorted top rows are sourced from outside the viewport', async () => {
+    // 10 data rows + header. Window only sees rows 0..4 (5 rows). Sort desc should
+    // surface the top 4 Q1 values, which live at source rows 6/8/4/10 — most of
+    // them outside the viewport. Before the worker scope fix this test would have
+    // returned a different result than static because worker only saw rows 0..4.
+    const matrix: (string | number)[][] = [
+      ['Region', 'Q1'],
+      ['R1', 30],
+      ['R2', 50],
+      ['R3', 20],
+      ['R4', 180],
+      ['R5', 40],
+      ['R6', 200],
+      ['R7', 10],
+      ['R8', 190],
+      ['R9', 60],
+      ['R10', 170],
+    ]
+
+    const staticBackend = createStaticSpreadsheetBackend({ revision: 1, matrix })
+    const client = createFakeWorkerWorkbookClient()
+    const workerBackend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 1,
+    })
+    await workerBackend.ready()
+
+    matrix.forEach((row, rowIndex) => {
+      row.forEach((value, colIndex) => {
+        const isText = typeof value === 'string'
+        client.putCell({
+          sheet: 0,
+          addr: toCellAddressForTest(rowIndex, colIndex),
+          display: String(value),
+          type: isText ? 'text' : 'number',
+          isError: false,
+          formula: '',
+        })
+      })
+    })
+
+    const filterSortRequest = {
+      kind: 'set-filter-sort' as const,
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [{ colIndex: 1, direction: 'desc' as const }],
+    }
+
+    await staticBackend.setFilterSort?.(filterSortRequest)
+    await workerBackend.setFilterSort?.(filterSortRequest)
+
+    const window = { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 }
+    const staticProjected = await staticBackend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 100, window }),
+    )
+    const workerProjected = await workerBackend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 101, window }),
+    )
+
+    const collect = (cells: readonly { row: number; col: number; displayValue: string; originalRow?: number }[]) =>
+      cells
+        .filter((cell) => cell.col === 0)
+        .sort((left, right) => left.row - right.row)
+        .map((cell) => ({ row: cell.row, value: cell.displayValue, source: cell.originalRow }))
+
+    const staticRegions = collect(staticProjected.cells)
+    const workerRegions = collect(workerProjected.cells)
+
+    expect(workerRegions).toEqual(staticRegions)
+    // Top-down within the 5-row window: header, then sorted top 4 = source rows 6, 8, 4, 10
+    expect(staticRegions.map((r) => r.value)).toEqual(['Region', 'R6', 'R8', 'R4', 'R10'])
+    expect(staticRegions.map((r) => r.source)).toEqual([0, 6, 8, 4, 10])
+
+    workerBackend.dispose()
+  })
+
   it('persists named range mutations in the static backend', async () => {
     const backend = createStaticSpreadsheetBackend({ revision: 1 })
     expect(backend.setNamedRange).toBeDefined()

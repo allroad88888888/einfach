@@ -15,6 +15,63 @@ pub struct CellFormat {
     /// HTML color string (`#rrggbb` / `red` / etc.); `None` = default.
     pub color: Option<String>,
     pub background: Option<String>,
+    /// Font family name (CSS-style). `None` = workbook default.
+    pub font_family: Option<String>,
+    pub underline: bool,
+    pub strikethrough: bool,
+    pub wrap_text: bool,
+    /// Indent in Excel indent units (0..=15). Stored verbatim for round-trip.
+    pub indent: u8,
+    pub vertical_align: VerticalAlign,
+    pub rotation: Rotation,
+    pub borders: CellBorders,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerticalAlign {
+    #[default]
+    Default,
+    Top,
+    Center,
+    Bottom,
+    Justify,
+    Distributed,
+}
+
+/// Text rotation in degrees `[-90, 90]`, or the special `Vertical` mode for
+/// character-stacked layout. Stored verbatim for JS round-trip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rotation {
+    #[default]
+    None,
+    Degrees(i16),
+    Vertical,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderStyle {
+    #[default]
+    None,
+    Thin,
+    Medium,
+    Thick,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BorderSpec {
+    pub style: BorderStyle,
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellBorders {
+    pub top: Option<BorderSpec>,
+    pub right: Option<BorderSpec>,
+    pub bottom: Option<BorderSpec>,
+    pub left: Option<BorderSpec>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

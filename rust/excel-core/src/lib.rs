@@ -13,7 +13,8 @@ pub use cell::CellAddress;
 pub use csv::{export_csv, import_csv, parse_csv, to_csv};
 pub use eval::{eval_expr, is_builtin_function_name, EvalProvider};
 pub use format::{
-    apply_rules, Align, CellFormat, Condition, ConditionalRule, NumberFormat, StyleOverrides,
+    apply_rules, Align, BorderSpec, BorderStyle, CellBorders, CellFormat, Condition,
+    ConditionalRule, NumberFormat, Rotation, StyleOverrides, VerticalAlign,
 };
 pub use formula::{parse_formula, BinOperator, Expr};
 pub use range::CellRange;

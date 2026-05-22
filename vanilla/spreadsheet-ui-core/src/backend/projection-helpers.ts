@@ -404,6 +404,14 @@ export function buildFilterSortDisplayRows(
 ): number[] | null {
   if (!filterSortHasEffect(state)) return null
 
+  // Header must sit strictly before the data scan range — otherwise the data row
+  // writes at `rows[dataRowStart + index]` below would clobber `rows[headerRow]`.
+  if (options.headerRow !== undefined && options.headerRow >= options.startRow) {
+    throw new Error(
+      `buildFilterSortDisplayRows: headerRow (${options.headerRow}) must be < startRow (${options.startRow})`,
+    )
+  }
+
   const maxRow = options.endRow - 1
   if (maxRow < options.startRow) {
     if (options.headerRow === undefined || maxRow < options.headerRow) return []

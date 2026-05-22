@@ -60,13 +60,16 @@ import {
   cloneRange,
   compareCellValue,
   conditionalRuleFormat,
+  DEFAULT_WORKBOOK_LOCALE,
   estimateUtf8Bytes,
   evaluateValidationLocal,
   filterSortHasEffect,
+  formatNumberValue,
   isCoordInsideRange,
   keyFor,
   nextConditionalFormatRuleId,
   normalizeDimensionSize,
+  normalizeFormat,
   normalizeRange,
   numericValue,
   reorderSheetMetadata,
@@ -130,6 +133,10 @@ const DEFAULT_SHEETS = ['Sheet1']
 const DEFAULT_IMPORT_CELLS_PER_CHUNK = 10_000
 const MIN_IMPORT_CELLS_PER_CHUNK = 1
 const MAX_IMPORT_CELLS_PER_CHUNK = 10_000
+// Excel-compatible max row index. Used as the row end when reading wide data for
+// filter/sort overlays — readSparseRange returns only cells that exist, so this
+// sentinel costs nothing for sparse sheets.
+const EXCEL_MAX_SHEET_ROW = 1_048_575
 
 function normalizeSheetInputs(
   sheets: readonly (string | WorkerWorkbookBackendSheetInput)[] | undefined,
@@ -295,21 +302,20 @@ function readCellValue(cells: Map<string, DisplayCell>, row: number, col: number
 
 function buildFilterSortDisplayRows(
   cells: Map<string, DisplayCell>,
-  range: CellRange,
   state: FilterSortState | undefined,
 ): number[] | null {
-  let maxRow = range.rowStart - 1
+  // Filter/sort always operates over the full sheet — row 0 is the header, rows 1..maxRow
+  // are scanned for filter rules and sort directives. The viewport window has no bearing
+  // on this; cells outside the window must still participate so they can be repositioned
+  // into it.
+  let maxRow = -1
   for (const cell of cells.values()) {
     if (cell.row > maxRow) maxRow = cell.row
   }
-
+  if (maxRow < 0) return filterSortHasEffect(state) ? [] : null
   return buildFilterSortDisplayRowsShared(
     state,
-    {
-      headerRow: range.rowStart === 0 ? 0 : undefined,
-      startRow: Math.max(1, range.rowStart),
-      endRow: maxRow + 1,
-    },
+    { headerRow: 0, startRow: 1, endRow: maxRow + 1 },
     (row, col) => readCellValue(cells, row, col),
   )
 }
@@ -318,10 +324,10 @@ function applyFilterSortOverlay(
   cells: DisplayCell[],
   range: CellRange,
   state: FilterSortState | undefined,
-): DisplayCell[] {
+): { cells: DisplayCell[]; displayRows: number[] | null } {
   const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
-  const displayRows = buildFilterSortDisplayRows(bySource, range, state)
-  if (displayRows === null) return cells
+  const displayRows = buildFilterSortDisplayRows(bySource, state)
+  if (displayRows === null) return { cells, displayRows: null }
 
   const projected: DisplayCell[] = []
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
@@ -338,7 +344,7 @@ function applyFilterSortOverlay(
       })
     }
   }
-  return projected
+  return { cells: projected, displayRows }
 }
 
 function cloneValidationRule(rule: ValidationRule): ValidationRule {
@@ -457,11 +463,16 @@ function preprocessFormatSnapshot(snapshot: FormatRangeSnapshot): {
   cellFormats: Map<string, SpreadsheetCellFormat>
   rangeFormats: RangeFormatLayer[]
 } {
+  // Skip default-looking cell-format entries so they cannot mask an underlying
+  // range layer in getEffectiveFormat. This preserves the semantics of the
+  // pre-refactor worker which ran normalizeFormat on each entry.
   const cellFormats = new Map<string, SpreadsheetCellFormat>()
   for (const entry of snapshot.cellFormats) {
     const coord = parseA1(entry.addr)
     if (!coord) continue
-    cellFormats.set(keyFor(coord.row, coord.col), entry.format)
+    const normalized = normalizeFormat(entry.format)
+    if (!normalized) continue
+    cellFormats.set(keyFor(coord.row, coord.col), normalized)
   }
 
   const rangeFormats: RangeFormatLayer[] = snapshot.rangeFormats.map((layer) => ({
@@ -477,24 +488,32 @@ function preprocessFormatSnapshot(snapshot: FormatRangeSnapshot): {
   return { cellFormats, rangeFormats }
 }
 
-function mergeFormatsIntoCells(
+function attachFormatsToCells(
   cells: DisplayCell[],
-  range: CellRange,
-  snapshot: FormatRangeSnapshot,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: readonly RangeFormatLayer[],
 ): DisplayCell[] {
-  const { cellFormats, rangeFormats } = preprocessFormatSnapshot(snapshot)
-  const cellMap = new Map<string, DisplayCell>()
+  return cells.map((cell) => {
+    const sourceRow = cell.originalRow ?? cell.row
+    const format = getEffectiveFormat(sourceRow, cell.col, cellFormats, rangeFormats)
+    return format ? { ...cell, format } : cell
+  })
+}
 
-  for (const cell of cells) {
-    const format = getEffectiveFormat(cell.row, cell.col, cellFormats, rangeFormats)
-    cellMap.set(keyFor(cell.row, cell.col), format ? { ...cell, format } : cell)
-  }
-
+function fillBlankFormatOnlyCells(
+  cellMap: Map<string, DisplayCell>,
+  range: CellRange,
+  cellFormats: Map<string, SpreadsheetCellFormat>,
+  rangeFormats: readonly RangeFormatLayer[],
+  displayRows: readonly number[] | null,
+): void {
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    const sourceRow = displayRows ? displayRows[row] : row
+    if (sourceRow === undefined) continue
     for (let col = range.colStart; col <= range.colEnd; col += 1) {
       const key = keyFor(row, col)
       if (cellMap.has(key)) continue
-      const format = getEffectiveFormat(row, col, cellFormats, rangeFormats)
+      const format = getEffectiveFormat(sourceRow, col, cellFormats, rangeFormats)
       if (!format) continue
       cellMap.set(key, {
         row,
@@ -502,13 +521,65 @@ function mergeFormatsIntoCells(
         displayValue: '',
         valueKind: 'blank',
         format,
+        ...(displayRows ? { originalRow: sourceRow } : {}),
       })
     }
   }
+}
 
+function mergeFormatsIntoCells(
+  cells: DisplayCell[],
+  range: CellRange,
+  snapshot: FormatRangeSnapshot,
+  displayRows: readonly number[] | null = null,
+): DisplayCell[] {
+  const { cellFormats, rangeFormats } = preprocessFormatSnapshot(snapshot)
+  const formatted = attachFormatsToCells(cells, cellFormats, rangeFormats)
+  const cellMap = new Map<string, DisplayCell>()
+  for (const cell of formatted) cellMap.set(keyFor(cell.row, cell.col), cell)
+  fillBlankFormatOnlyCells(cellMap, range, cellFormats, rangeFormats, displayRows)
   return [...cellMap.values()].sort((left, right) =>
     left.row === right.row ? left.col - right.col : left.row - right.row,
   )
+}
+
+function applyNumberFormatToCell(cell: DisplayCell, workbookLocale: string): DisplayCell {
+  const numberFormat = cell.format?.numberFormat
+  if (!numberFormat) return cell
+  if (cell.valueKind === 'error') return cell
+  if (
+    cell.valueKind !== 'number' &&
+    numberFormat.kind !== 'text' &&
+    numberFormat.kind !== 'custom'
+  ) {
+    return cell
+  }
+
+  const raw = cell.displayValue
+  const numeric = Number(raw)
+  const value =
+    cell.valueKind === 'number' && Number.isFinite(numeric)
+      ? numeric
+      : raw
+  const locale = cell.format?.locale ?? workbookLocale
+  const result = formatNumberValue(numberFormat, value, { locale })
+
+  if (result.text === cell.displayValue && (!result.color || cell.format?.fgColor)) {
+    return cell
+  }
+
+  const next: DisplayCell = { ...cell, displayValue: result.text }
+  if (result.color && !next.format?.fgColor) {
+    next.format = { ...next.format!, fgColor: result.color }
+  }
+  return next
+}
+
+function applyNumberFormatsToCells(
+  cells: DisplayCell[],
+  workbookLocale: string = DEFAULT_WORKBOOK_LOCALE,
+): DisplayCell[] {
+  return cells.map((cell) => applyNumberFormatToCell(cell, workbookLocale))
 }
 
 function snapshotToDisplayCell(snapshot: CellSnapshotWire): DisplayCell | null {
@@ -784,24 +855,33 @@ export function createWorkerWorkbookSpreadsheetBackend(
     requestRevision?: ProjectionRevision,
   ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
     const sheet = await resolveSheet(sheetId)
-    const sparseRange = toSparseRange(sheet.idx, range)
+    const filterSortState = filterSortBySheetId.get(sheetId)
+    // When filter/sort is active, source rows outside the viewport may need to be
+    // repositioned into it. Read a wide row range covering the whole sheet so the
+    // overlay sees every candidate row, then project back to the requested window.
+    const dataRange: CellRange = filterSortHasEffect(filterSortState)
+      ? { rowStart: 0, rowEnd: EXCEL_MAX_SHEET_ROW, colStart: range.colStart, colEnd: range.colEnd }
+      : range
+    const sparseDataRange = toSparseRange(sheet.idx, dataRange)
     const [snapshots, formatSnapshot] = await Promise.all([
-      client.readSparseRange(sparseRange),
-      client.snapshotFormatRange(sparseRange),
+      client.readSparseRange(sparseDataRange),
+      client.snapshotFormatRange(sparseDataRange),
     ])
     const cells = snapshots
       .map(snapshotToDisplayCell)
       .filter((cell): cell is DisplayCell => cell !== null)
       .sort((left, right) => (left.row === right.row ? left.col - right.col : left.row - right.row))
 
-    const formattedCells = mergeFormatsIntoCells(cells, range, formatSnapshot)
-    const filteredCells = applyFilterSortOverlay(
-      formattedCells,
+    const filtered = applyFilterSortOverlay(cells, range, filterSortState)
+    const formattedCells = mergeFormatsIntoCells(
+      filtered.cells,
       range,
-      filterSortBySheetId.get(sheetId),
+      formatSnapshot,
+      filtered.displayRows,
     )
+    const numberFormattedCells = applyNumberFormatsToCells(formattedCells)
     const validatedCells = applyValidationOverlay(
-      filteredCells,
+      numberFormattedCells,
       range,
       validationRulesBySheetId.get(sheetId) ?? [],
     )
