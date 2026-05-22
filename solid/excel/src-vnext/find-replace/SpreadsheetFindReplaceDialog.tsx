@@ -206,10 +206,13 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   function statusText() {
     const c = cursor()
     if (c.status === 'idle') return ''
-    if (c.status === 'searching') return 'Searching…'
-    if (c.status === 'error') return 'Search failed'
-    if (c.totalCount === 0) return 'No matches'
-    return `${c.currentIndex + 1} of ${c.totalCount}`
+    if (c.status === 'searching') return t('findReplace.status.searching')
+    if (c.status === 'error') return t('findReplace.status.failed')
+    if (c.totalCount === 0) return t('findReplace.status.noMatches')
+    return t('findReplace.status.count', {
+      current: c.currentIndex + 1,
+      total: c.totalCount,
+    })
   }
 
   function errorText() {
@@ -225,11 +228,10 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         data-testid={props['data-testid'] ?? 'find-replace-dialog'}
         data-active-tab={activeTab()}
         role="dialog"
-        aria-label="Find and Replace"
+        aria-label={t('findReplace.title')}
       >
-        {/* === Header === */}
         <div class="fr-header">
-          <span class="fr-title">查找和替换</span>
+          <span class="fr-title">{t('findReplace.title')}</span>
           <button
             type="button"
             class="dialog-close-x"
@@ -241,7 +243,6 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
           </button>
         </div>
 
-        {/* === Tab strip === */}
         <div class="fr-tabs" role="tablist">
           <button
             type="button"
@@ -251,7 +252,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             data-testid="find-tab"
             onClick={() => setActiveTab('find')}
           >
-            查找
+            {t('findReplace.findTab')}
           </button>
           <button
             type="button"
@@ -261,15 +262,14 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             data-testid="replace-tab"
             onClick={() => setActiveTab('replace')}
           >
-            替换
+            {t('findReplace.replaceTab')}
           </button>
         </div>
 
-        {/* === Body === */}
         <div class="fr-body">
           <div class="fr-field">
             <label class="fr-field-label" for="find-needle">
-              查找内容
+              {t('findReplace.findWhat')}
             </label>
             <input
               id="find-needle"
@@ -290,8 +290,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 type="button"
                 class="fr-step-btn"
                 data-testid="find-prev-button"
-                aria-label="上一个"
-                title="上一个"
+                aria-label={t('findReplace.prev')}
+                title={t('findReplace.prev')}
                 onClick={() => void handleFindStep(-1)}
               >
                 ↑
@@ -300,8 +300,8 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 type="button"
                 class="fr-step-btn"
                 data-testid="find-next-button"
-                aria-label="下一个"
-                title="下一个"
+                aria-label={t('findReplace.next')}
+                title={t('findReplace.next')}
                 onClick={() => void handleFindStep(1)}
               >
                 ↓
@@ -311,7 +311,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
 
           <div class="fr-field fr-field-replace" data-replace-only="true">
             <label class="fr-field-label" for="find-replacement">
-              替换为
+              {t('findReplace.replaceWith')}
             </label>
             <input
               id="find-replacement"
@@ -331,7 +331,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 checked={caseSensitive()}
                 onChange={(e) => setCaseSensitive(e.currentTarget.checked)}
               />
-              区分大小写
+              {t('findReplace.caseSensitive')}
             </label>
             <label class="fr-option">
               <input
@@ -340,7 +340,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 checked={wholeMatch()}
                 onChange={(e) => setWholeMatch(e.currentTarget.checked)}
               />
-              单元格匹配
+              {t('findReplace.wholeMatch')}
             </label>
             <label class="fr-option">
               <input
@@ -349,7 +349,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 checked={searchFormulas()}
                 onChange={(e) => setSearchFormulas(e.currentTarget.checked)}
               />
-              公式搜索
+              {t('findReplace.searchFormulas')}
             </label>
             <label class="fr-option">
               <input
@@ -358,13 +358,13 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
                 checked={regex()}
                 onChange={(e) => setRegex(e.currentTarget.checked)}
               />
-              正则匹配
+              {t('findReplace.regex')}
             </label>
           </div>
 
           <div class="fr-scope">
             <label class="fr-field-label" for="find-scope-select">
-              范围
+              {t('findReplace.scope')}
             </label>
             <select
               id="find-scope-select"
@@ -373,14 +373,13 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
               value={scope()}
               onChange={(e) => setScope(e.currentTarget.value as FindReplaceScope)}
             >
-              <option value="sheet">工作表</option>
-              <option value="workbook">工作簿</option>
-              <option value="current-selection">当前选区</option>
+              <option value="sheet">{t('findReplace.scope.sheet')}</option>
+              <option value="workbook">{t('findReplace.scope.workbook')}</option>
+              <option value="current-selection">{t('findReplace.scope.selection')}</option>
             </select>
           </div>
         </div>
 
-        {/* === Status / error === */}
         <div class="fr-status" data-testid="find-status-text" aria-live="polite">
           {statusText()}
         </div>
@@ -390,7 +389,6 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
           </div>
         </Show>
 
-        {/* === Footer === */}
         <div class="fr-footer">
           <button
             type="button"
@@ -399,7 +397,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             data-replace-only="true"
             onClick={() => void handleReplaceAll()}
           >
-            全部替换
+            {t('findReplace.replaceAll')}
           </button>
           <button
             type="button"
@@ -408,7 +406,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             data-replace-only="true"
             onClick={() => void handleReplaceCurrent()}
           >
-            替换
+            {t('findReplace.replace')}
           </button>
           <button
             type="button"
@@ -416,7 +414,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
             data-testid="find-close-button"
             onClick={() => store.setter(closeFindReplaceAtom)}
           >
-            关闭
+            {t('findReplace.close')}
           </button>
         </div>
       </div>

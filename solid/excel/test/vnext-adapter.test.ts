@@ -856,6 +856,207 @@ describe('vnext adapter', () => {
     ])
   })
 
+  it('persists validation rule mutations in the static backend projection', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [['Region'], ['North']],
+    })
+    expect(backend.setValidationRule).toBeDefined()
+    expect(backend.clearValidationRule).toBeDefined()
+
+    const range = { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 0 }
+    await backend.setValidationRule?.({
+      kind: 'set-validation-rule',
+      sheetId: 'sheet-1',
+      range,
+      rule: { kind: 'list', values: ['North', 'South'], dropdown: true },
+      mode: 'warn',
+    })
+
+    const projected = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 22,
+        reason: 'test',
+        range,
+      }),
+    )
+    expect(projected.cells[0].validation).toMatchObject({
+      code: 'validation.list',
+      severity: 'warning',
+    })
+
+    await backend.clearValidationRule?.({
+      kind: 'clear-validation-rule',
+      sheetId: 'sheet-1',
+      range,
+    })
+    const cleared = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 23,
+        reason: 'test',
+        range,
+      }),
+    )
+    expect(cleared.cells[0].validation).toBeUndefined()
+  })
+
+  it('persists conditional format rule mutations in the static backend projection', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [['Region', 'Q1'], ['North', 120]],
+    })
+    expect(backend.setConditionalFormatRule).toBeDefined()
+    expect(backend.listConditionalFormatRules).toBeDefined()
+
+    const range = { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 }
+    await backend.setConditionalFormatRule?.({
+      kind: 'set-conditional-format-rule',
+      sheetId: 'sheet-1',
+      scope: { range },
+      rule: {
+        kind: 'cell-value',
+        operator: 'gt',
+        value: '100',
+        format: { bgColor: '#fef3c7', bold: true },
+      },
+    })
+
+    const rules = await backend.listConditionalFormatRules?.({
+      kind: 'list-conditional-format-rules',
+      sheetId: 'sheet-1',
+    })
+    expect(rules?.rules).toHaveLength(1)
+    expect(rules?.rules[0].id).toBeTruthy()
+
+    const projected = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 24,
+        reason: 'test',
+        range,
+      }),
+    )
+    expect(projected.cells[0].conditionalFormat).toMatchObject({
+      bgColor: '#fef3c7',
+      bold: true,
+    })
+
+    await backend.removeConditionalFormatRule?.({
+      kind: 'remove-conditional-format-rule',
+      sheetId: 'sheet-1',
+      ruleId: rules!.rules[0].id,
+    })
+    const afterRemove = await backend.listConditionalFormatRules?.({
+      kind: 'list-conditional-format-rules',
+      sheetId: 'sheet-1',
+    })
+    expect(afterRemove?.rules).toHaveLength(0)
+  })
+
+  it('applies static backend sort directives to visible projections', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['Region', 'Q1'],
+        ['North', 120],
+        ['South', 80],
+        ['East', 200],
+        ['West', 140],
+      ],
+    })
+
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [{ colIndex: 1, direction: 'desc' }],
+    })
+
+    const projected = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 25,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual([
+      'Region',
+      'East',
+      'West',
+      'North',
+      'South',
+    ])
+    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 0)?.originalRow).toBe(3)
+  })
+
+  it('applies static backend filter rules to visible projections', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['Region', 'Q1'],
+        ['North', 120],
+        ['South', 80],
+        ['East', 200],
+      ],
+    })
+
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [{ kind: 'equals', colIndex: 1, value: '120' }],
+      directives: [],
+    })
+
+    const projected = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 26,
+        window: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue)).toEqual([
+      'Region',
+      'North',
+    ])
+    expect(projected.cells.some((cell) => cell.displayValue === 'South')).toBe(false)
+    expect(projected.cells.some((cell) => cell.displayValue === 'East')).toBe(false)
+  })
+
+  it('persists named range mutations in the static backend', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1 })
+    expect(backend.setNamedRange).toBeDefined()
+    expect(backend.deleteNamedRange).toBeDefined()
+    expect(backend.listNamedRanges).toBeDefined()
+
+    await backend.setNamedRange?.({
+      kind: 'set-named-range',
+      name: 'SalesTotal',
+      scope: 'workbook',
+      refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'A1:B2' },
+    })
+
+    const listed = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
+    expect(listed?.names).toEqual([
+      {
+        name: 'SalesTotal',
+        scope: 'workbook',
+        refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'A1:B2' },
+      },
+    ])
+
+    await backend.deleteNamedRange?.({
+      kind: 'delete-named-range',
+      name: 'SalesTotal',
+      scope: 'workbook',
+    })
+    const afterDelete = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
+    expect(afterDelete?.names).toEqual([])
+  })
+
   it('preserves projected rich values in static reads', async () => {
     const backend = createStaticSpreadsheetBackend({
       revision: 2,
@@ -1562,6 +1763,99 @@ describe('vnext adapter', () => {
         formula: '=Sheet1!A1+1',
       },
     ])
+
+    backend.dispose()
+  })
+
+  it('applies worker backend toolbar overlays instead of silently no-oping', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+      revision: 1,
+    })
+    await backend.ready()
+    ;[
+      ['A1', 'Region', 'text'],
+      ['B1', 'Q1', 'text'],
+      ['A2', 'North', 'text'],
+      ['B2', '120', 'number'],
+      ['A3', 'South', 'text'],
+      ['B3', '80', 'number'],
+      ['A4', 'East', 'text'],
+      ['B4', '200', 'number'],
+      ['A5', 'Total', 'text'],
+      ['B5', '400', 'number'],
+    ].forEach(([addr, display, type]) => {
+      client.putCell({
+        sheet: 0,
+        addr,
+        display,
+        type: type as CellSnapshotWire['type'],
+        isError: false,
+        formula: '',
+      })
+    })
+
+    await backend.setNamedRange?.({
+      kind: 'set-named-range',
+      name: 'Q1Sales',
+      scope: 'workbook',
+      refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'B2:B4' },
+    })
+    await backend.setValidationRule?.({
+      kind: 'set-validation-rule',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 1, colStart: 1, colEnd: 1 },
+      rule: { kind: 'list', values: ['120'], dropdown: true },
+      mode: 'warn',
+    })
+    await backend.setConditionalFormatRule?.({
+      kind: 'set-conditional-format-rule',
+      sheetId: 'sheet-1',
+      scope: { range: { rowStart: 1, rowEnd: 3, colStart: 1, colEnd: 1 } },
+      rule: {
+        kind: 'cell-value',
+        operator: 'gt',
+        value: '100',
+        format: { bgColor: '#fef3c7' },
+      },
+    })
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-1',
+      rules: [],
+      directives: [{ colIndex: 1, direction: 'desc' }],
+    })
+
+    const names = await backend.listNamedRanges?.({ kind: 'list-named-ranges' })
+    expect(names?.names).toEqual([
+      {
+        name: 'Q1Sales',
+        scope: 'workbook',
+        refersTo: { kind: 'range', sheetId: 'sheet-1', address: 'B2:B4' },
+      },
+    ])
+
+    const projected = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 13,
+        window: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+      }),
+    )
+
+    expect(projected.cells.filter((cell) => cell.col === 0).map((cell) => cell.displayValue))
+      .toEqual(['Region', 'East', 'North', 'South', 'Total'])
+    expect(projected.cells.find((cell) => cell.row === 2 && cell.col === 1)?.validation)
+      .toMatchObject({
+        code: 'validation.list',
+        severity: 'warning',
+      })
+    expect(projected.cells.find((cell) => cell.row === 1 && cell.col === 1)?.conditionalFormat)
+      .toMatchObject({
+        bgColor: '#fef3c7',
+      })
 
     backend.dispose()
   })
@@ -2797,6 +3091,36 @@ describe('vnext adapter', () => {
       { row: 1, col: 1, displayValue: '', valueKind: 'blank', format: { bgColor: '#ffd966' } },
     ])
     expect(sheet2.cells).toEqual([])
+  })
+
+  it('preserves font-family-only range formats in the static backend', async () => {
+    const backend = createStaticSpreadsheetBackend([['A1']])
+
+    await backend.setFormatRange?.({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      format: { fontFamily: 'Helvetica' },
+    })
+
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 222,
+        reason: 'test',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: 'A1',
+        valueKind: 'string',
+        format: { fontFamily: 'Helvetica' },
+      },
+    ])
   })
 
   it('keeps static backend structural edits scoped to one sheet -- inserting rows on sheet-1 leaves sheet-2 formats intact', async () => {

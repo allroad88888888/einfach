@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it } from '@jest/globals'
+import { afterEach, beforeEach, describe, expect, it } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
@@ -16,9 +16,14 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetDataValidationDialog } from '../src-vnext/data-validation'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import { setLocale } from '../src/i18n'
 
 afterEach(() => {
   cleanup()
+})
+
+beforeEach(() => {
+  setLocale('en')
 })
 
 function createFakeBackend() {

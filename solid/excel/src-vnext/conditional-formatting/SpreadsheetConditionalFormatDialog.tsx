@@ -8,12 +8,17 @@ import {
   conditionalFormatRulesCacheAtom,
   closeConditionalFormatEditorAtom,
   selectionSnapshotAtom,
+  setConditionalFormatRulesAtom,
   workspaceSessionAtom,
   type ConditionalFormatRuleEntry,
   type ConditionalFormatRuleKind,
   type ConditionalFormatScope,
 } from '@einfach/spreadsheet-ui-core'
-import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import {
+  refreshVisibleProjection,
+  useSpreadsheetBackend,
+  useSpreadsheetUiStore,
+} from '../provider'
 
 // Pull in the dialog stylesheet as a side-effect import. Vite picks the
 // dynamic-import target up statically and bundles the CSS into the chunk;
@@ -37,26 +42,18 @@ const ruleKinds: ConditionalFormatRuleKind[] = [
   'top-bottom',
 ]
 
-const kindLabels: Record<ConditionalFormatRuleKind, string> = {
-  'cell-value': 'Cell value',
-  formula: 'Formula',
-  'data-bar': 'Data bar',
-  'color-scale': 'Color scale',
-  'top-bottom': 'Top/Bottom',
-}
-
 function defaultDraftForKind(kind: ConditionalFormatRuleKind): ConditionalFormatRuleEntry['rule'] {
   switch (kind) {
     case 'cell-value':
-      return { kind: 'cell-value', operator: 'eq', value: '', format: {} }
+      return { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#fef3c7' } }
     case 'formula':
-      return { kind: 'formula', formula: '', format: {} }
+      return { kind: 'formula', formula: '=TRUE()', format: { bgColor: '#fef3c7' } }
     case 'data-bar':
       return { kind: 'data-bar' }
     case 'color-scale':
       return { kind: 'color-scale', minColor: '#ff0000', maxColor: '#00ff00' }
     case 'top-bottom':
-      return { kind: 'top-bottom', direction: 'top', count: 10, format: {} }
+      return { kind: 'top-bottom', direction: 'top', count: 10, format: { bgColor: '#fef3c7' } }
   }
 }
 
@@ -73,16 +70,21 @@ export function SpreadsheetConditionalFormatDialog(
 
   const [selectedKind, setSelectedKind] = createSignal<ConditionalFormatRuleKind>('cell-value')
   const [errorText, setErrorText] = createSignal<string | null>(null)
-  let lastSyncedDraftId: string | undefined
+  const [lastSyncedDraftId, setLastSyncedDraftId] = createSignal<string | undefined>(undefined)
+
+  function kindLabel(kind: ConditionalFormatRuleKind): string {
+    return t(`conditionalFormat.kind.${kind}`)
+  }
 
   createEffect((prevOpen: boolean) => {
     const open = isEditing()
     if (open && !prevOpen && !editor().draft) {
       setSelectedKind('cell-value')
-      lastSyncedDraftId = undefined
+      setLastSyncedDraftId(undefined)
     }
     if (!open && prevOpen) {
       setErrorText(null)
+      setLastSyncedDraftId(undefined)
     }
     return open
   }, false)
@@ -99,13 +101,17 @@ export function SpreadsheetConditionalFormatDialog(
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  function currentKind(): ConditionalFormatRuleKind {
+  createEffect(() => {
+    if (!isEditing()) return
     const draft = editor().draft
-    if (draft && draft.id !== lastSyncedDraftId) {
-      lastSyncedDraftId = draft.id
+    if (draft && draft.id !== lastSyncedDraftId()) {
+      setLastSyncedDraftId(draft.id)
       setSelectedKind(draft.rule.kind as ConditionalFormatRuleKind)
     }
-    if (!draft) lastSyncedDraftId = undefined
+    if (!draft && lastSyncedDraftId() !== undefined) setLastSyncedDraftId(undefined)
+  })
+
+  function currentKind(): ConditionalFormatRuleKind {
     return selectedKind()
   }
 
@@ -126,6 +132,22 @@ export function SpreadsheetConditionalFormatDialog(
     store.setter(closeConditionalFormatEditorAtom)
   }
 
+  async function refreshRulesCache(sheetId: string) {
+    if (!backend.listConditionalFormatRules) {
+      const rules = rulesCache().rules
+      store.setter(setConditionalFormatRulesAtom, { sheetId, rules })
+      return
+    }
+    const result = await backend.listConditionalFormatRules({
+      kind: 'list-conditional-format-rules',
+      sheetId,
+    })
+    store.setter(setConditionalFormatRulesAtom, {
+      sheetId: result.sheetId,
+      rules: result.rules,
+    })
+  }
+
   async function handleSave() {
     if (!backend.setConditionalFormatRule) return
     setErrorText(null)
@@ -144,7 +166,9 @@ export function SpreadsheetConditionalFormatDialog(
         priority: draft?.priority,
         rule,
       })
+      await refreshRulesCache(sheetId)
       close()
+      await refreshVisibleProjection(store, backend, sheetId)
     } catch (err) {
       setErrorText(err instanceof Error ? err.message : String(err))
     }
@@ -162,7 +186,9 @@ export function SpreadsheetConditionalFormatDialog(
         sheetId,
         ruleId: draft.id,
       })
+      await refreshRulesCache(sheetId)
       close()
+      await refreshVisibleProjection(store, backend, sheetId)
     } catch (err) {
       setErrorText(err instanceof Error ? err.message : String(err))
     }
@@ -184,10 +210,10 @@ export function SpreadsheetConditionalFormatDialog(
         data-testid={props['data-testid'] ?? 'conditional-format-dialog'}
         role="dialog"
         aria-modal="true"
-        aria-label="Conditional formatting"
+        aria-label={t('conditionalFormat.title')}
       >
         <div class="cf-dialog-header">
-          <span class="cf-dialog-title">Conditional formatting</span>
+          <span class="cf-dialog-title">{t('conditionalFormat.title')}</span>
           <button
             type="button"
             class="dialog-close-x"
@@ -201,12 +227,13 @@ export function SpreadsheetConditionalFormatDialog(
 
         <div class="cf-dialog-body">
           <div class="cf-rules-section">
-            <span class="cf-section-label">Existing rules</span>
+            <span class="cf-section-label">{t('conditionalFormat.existingRules')}</span>
             <ul class="cf-rule-list" data-testid="cf-rule-list">
               <For each={rulesCache().rules}>
                 {(entry) => (
                   <li data-rule-id={entry.id} data-rule-kind={entry.rule.kind}>
-                    {entry.rule.kind} — priority {entry.priority}
+                    {kindLabel(entry.rule.kind)} - {t('conditionalFormat.priority')}{' '}
+                    {entry.priority}
                   </li>
                 )}
               </For>
@@ -216,7 +243,7 @@ export function SpreadsheetConditionalFormatDialog(
           <div class="cf-form">
             <div class="cf-form-row">
               <label class="cf-form-label" for="cf-rule-kind-select">
-                Rule type
+                {t('conditionalFormat.ruleType')}
               </label>
               <select
                 id="cf-rule-kind-select"
@@ -225,7 +252,7 @@ export function SpreadsheetConditionalFormatDialog(
                 onChange={onKindChange}
               >
                 <For each={ruleKinds}>
-                  {(kind) => <option value={kind}>{kindLabels[kind]}</option>}
+                  {(kind) => <option value={kind}>{kindLabel(kind)}</option>}
                 </For>
               </select>
             </div>
@@ -233,7 +260,7 @@ export function SpreadsheetConditionalFormatDialog(
             <div class="cf-rule-preview" aria-hidden="true">
               <span class="cf-rule-preview-swatch" />
               <span class="cf-rule-preview-text">
-                Preview · {kindLabels[currentKind()]}
+                {t('conditionalFormat.preview')} - {kindLabel(currentKind())}
               </span>
             </div>
           </div>
@@ -255,7 +282,7 @@ export function SpreadsheetConditionalFormatDialog(
               void handleRemove()
             }}
           >
-            Remove
+            {t('conditionalFormat.remove')}
           </button>
           <span class="cf-error-spacer" />
           <button
@@ -263,7 +290,7 @@ export function SpreadsheetConditionalFormatDialog(
             data-testid="cf-cancel-button"
             onClick={handleCancel}
           >
-            取消
+            {t('conditionalFormat.cancel')}
           </button>
           <button
             type="button"
@@ -273,7 +300,7 @@ export function SpreadsheetConditionalFormatDialog(
               void handleSave()
             }}
           >
-            确定
+            {t('conditionalFormat.save')}
           </button>
         </div>
       </div>

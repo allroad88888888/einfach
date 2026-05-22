@@ -6,7 +6,6 @@ import {
   copyClipboardAtom,
   createClipboardTsvPastePlan,
   createRangeProjectionRequest,
-  createVisibleProjectionRequest,
   cutClipboardAtom,
   dispatchMenuCommandAtom,
   markClipboardReadyAtom,
@@ -30,7 +29,7 @@ import {
 
 import {
   advanceSpreadsheetProjectionRequestIdAtom,
-  isVisibleProjectionResult,
+  refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -175,67 +174,6 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
 
   function closeMenu(reason: 'dismissed' | 'committed' = 'dismissed') {
     store.setter(closeMenuAtom, reason)
-  }
-
-  function getCurrentWindow() {
-    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (isVisibleProjectionResult(snapshot.result)) {
-      return snapshot.result.window
-    }
-    if (snapshot.request?.kind === 'visible-window') {
-      return snapshot.request.window
-    }
-    return null
-  }
-
-  async function refreshProjection(sheetId: string) {
-    const window = getCurrentWindow()
-    if (!window) {
-      return
-    }
-
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = createVisibleProjectionRequest({
-      sheetId,
-      window,
-      requestId,
-      reason: 'selection',
-    })
-
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'loading',
-      request,
-      result: undefined,
-      error: undefined,
-    })
-
-    try {
-      const result = await backend.readVisibleProjection(request)
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'ready',
-        request,
-        result,
-        error: undefined,
-      })
-    } catch (error: unknown) {
-      const current = store.getter(spreadsheetProjectionSnapshotAtom)
-      if (current.request?.requestId !== requestId) {
-        return
-      }
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'error',
-        request,
-        result: undefined,
-        error:
-          error instanceof Error
-            ? { code: 'BACKEND_ERROR', message: error.message }
-            : { code: 'BACKEND_ERROR', message: 'Spreadsheet projection failed.' },
-      })
-    }
   }
 
   async function readClipboardSource(sheetId: string, range: CellRange) {
@@ -420,7 +358,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     }
 
     store.setter(markClipboardReadyAtom)
-    await refreshProjection(sheetId)
+    await refreshVisibleProjection(store, backend, sheetId, 'selection')
   }
 
   async function executeClipboardCommand(intent: MenuCommandIntent) {
@@ -435,7 +373,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
         if (await copyRangeToClipboard(intent.target.sheetId, range, 'cut')) {
           await clearClipboardSource(intent.target.sheetId, range)
           store.setter(markClipboardReadyAtom)
-          await refreshProjection(intent.target.sheetId)
+          await refreshVisibleProjection(store, backend, intent.target.sheetId, 'selection')
         }
         return
       case 'clipboard.paste':
@@ -527,7 +465,7 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
       default:
         return
     }
-    await refreshProjection(target.sheetId)
+    await refreshVisibleProjection(store, backend, target.sheetId, 'selection')
   }
 
   function reportCommandError(error: unknown) {

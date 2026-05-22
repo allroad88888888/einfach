@@ -6,6 +6,7 @@ import { useT } from '../../src/i18n'
 import {
   nameManagerEditorAtom,
   nameRegistryCacheAtom,
+  setNameRegistryAtom,
   closeNameManagerAtom,
   sheetTabsSheetsAtom,
   type NamedRange,
@@ -77,8 +78,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     setError(null)
   }
 
-  let wasOpen = false
-  createEffect(() => {
+  createEffect((wasOpen: boolean) => {
     const open = isOpen()
     if (open && !wasOpen) {
       const draft = editor().draft
@@ -95,8 +95,8 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
       }
       setError(null)
     }
-    wasOpen = open
-  })
+    return open
+  }, false)
 
   function buildRefersTo(): NamedRangeRefersTo {
     const value = refersTo().trim()
@@ -112,15 +112,26 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     resetForm()
   }
 
+  async function refreshNameRegistry() {
+    if (!backend.listNamedRanges) {
+      store.setter(setNameRegistryAtom, {
+        names: registry(),
+      })
+      return
+    }
+    const result = await backend.listNamedRanges({ kind: 'list-named-ranges' })
+    store.setter(setNameRegistryAtom, result)
+  }
+
   async function handleSave() {
     if (!backend.setNamedRange) return
     const nameVal = (name() || (editor().draft?.name ?? '')).trim()
     if (nameVal.length === 0) {
-      setError('Name is required')
+      setError(t('nameManager.error.nameRequired'))
       return
     }
     if (refersTo().trim().length === 0) {
-      setError('Refers to is required')
+      setError(t('nameManager.error.refersToRequired'))
       return
     }
     try {
@@ -130,6 +141,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
         scope: stringToScope(scope()),
         refersTo: buildRefersTo(),
       })
+      await refreshNameRegistry()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       return
@@ -147,6 +159,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
         name: entry.name,
         scope: entry.scope,
       })
+      await refreshNameRegistry()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       return
@@ -166,7 +179,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
         data-testid={props['data-testid'] ?? 'name-manager-dialog'}
         role="dialog"
         aria-modal="true"
-        aria-label="Name Manager"
+        aria-label={t('nameManager.title')}
       >
         <button
           type="button"
@@ -194,7 +207,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
         </ul>
 
         <div class="nm-form">
-          <label for="name-input">Name</label>
+          <label for="name-input">{t('nameManager.name')}</label>
           <input
             id="name-input"
             data-testid="name-input"
@@ -205,7 +218,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             }}
           />
 
-          <label for="name-scope-select">Scope</label>
+          <label for="name-scope-select">{t('nameManager.scope')}</label>
           <select
             id="name-scope-select"
             data-testid="name-scope-select"
@@ -214,13 +227,13 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
               setScope(e.currentTarget.value)
             }}
           >
-            <option value="workbook">Workbook</option>
+            <option value="workbook">{t('nameManager.scope.workbook')}</option>
             <For each={sheets()}>
               {(sheet) => <option value={sheet.id}>{sheet.name}</option>}
             </For>
           </select>
 
-          <label for="name-refers-to">Refers to</label>
+          <label for="name-refers-to">{t('nameManager.refersTo')}</label>
           <input
             id="name-refers-to"
             data-testid="name-refers-to"
@@ -246,7 +259,7 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
               void handleSave()
             }}
           >
-            Save
+            {t('nameManager.save')}
           </button>
           <button
             type="button"
@@ -256,14 +269,14 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
               void handleDelete()
             }}
           >
-            Delete
+            {t('nameManager.delete')}
           </button>
           <button
             type="button"
             data-testid="name-close-button"
             onClick={handleClose}
           >
-            Close
+            {t('nameManager.close')}
           </button>
         </div>
       </div>

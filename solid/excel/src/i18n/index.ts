@@ -64,9 +64,12 @@ export function setLocale(next: Locale): void {
  * Missing keys fall back to the msgId itself (Lingui default), so a typo
  * is visible at runtime rather than silently rendering empty.
  */
-export function useT(): (id: string) => string {
-  return (id: string) => {
+export function useT(): (id: string, values?: Record<string, unknown>) => string {
+  return (id: string, values?: Record<string, unknown>) => {
     localeSignal() // dep — reactivity hook for Solid
-    return i18n._(id)
+    // Lingui interprets `{name}` as ICU placeholders and strips them when no
+    // values are supplied (so `_( 'a {x} b' )` returns `'a  b'`, breaking any
+    // downstream `.replace()`). Pass `values` here to let Lingui interpolate.
+    return i18n._(id, values)
   }
 }

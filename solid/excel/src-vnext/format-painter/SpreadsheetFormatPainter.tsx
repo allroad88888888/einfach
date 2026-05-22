@@ -14,8 +14,7 @@ import {
   type SpreadsheetCellFormat,
 } from '@einfach/spreadsheet-ui-core'
 import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  isVisibleProjectionResult,
+  refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -52,48 +51,6 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
     })
   }
 
-  function getCurrentWindow() {
-    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (isVisibleProjectionResult(snapshot.result)) {
-      return snapshot.result.window
-    }
-    if (snapshot.request?.kind === 'visible-window') {
-      return snapshot.request.window
-    }
-    return null
-  }
-
-  async function refreshProjection(sheetId: string) {
-    const window = getCurrentWindow()
-    if (!window) return
-
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = {
-      kind: 'visible-window' as const,
-      sheetId,
-      requestId,
-      reason: 'toolbar' as const,
-      window,
-    }
-
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'loading',
-      request,
-      result: undefined,
-      error: undefined,
-    })
-
-    const result = await backend.readVisibleProjection(request)
-    const current = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (current.request?.requestId !== requestId) return
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request,
-      result,
-      error: undefined,
-    })
-  }
-
   async function applyToRange(
     sheetId: string,
     range: CellRange,
@@ -108,7 +65,7 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
       range,
       format,
     })
-    await refreshProjection(sheetId)
+    await refreshVisibleProjection(store, backend, sheetId)
   }
 
   let lastSelectionKey: string | null = null

@@ -16,7 +16,11 @@ import {
   type SortDirective,
 } from '@einfach/spreadsheet-ui-core'
 
-import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
+import {
+  refreshVisibleProjection,
+  useSpreadsheetBackend,
+  useSpreadsheetUiStore,
+} from '../provider'
 
 export interface SpreadsheetFilterDropdownProps {
   class?: string
@@ -65,6 +69,8 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
         rules: next.rules,
         directives: next.directives,
       })
+      if (ticket !== store.getter(filterSortSyncTicketAtom)) return
+      await refreshVisibleProjection(store, backend, sid)
       if (ticket !== store.getter(filterSortSyncTicketAtom)) return
       store.setter(setFilterSortErrorAtom, null)
     } catch (err) {
@@ -130,7 +136,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
         data-sheet-id={sheetId()}
         data-col-index={colIndex()}
         role="dialog"
-        aria-label="Filter and sort"
+        aria-label={t('filterSort.title')}
       >
         <button
           type="button"
@@ -154,7 +160,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           data-testid="filter-sort-asc"
           onClick={() => replaceDirective('asc')}
         >
-          Sort A→Z
+          {t('filterSort.sortAsc')}
         </button>
         <button
           type="button"
@@ -162,7 +168,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           data-testid="filter-sort-desc"
           onClick={() => replaceDirective('desc')}
         >
-          Sort Z→A
+          {t('filterSort.sortDesc')}
         </button>
         <button
           type="button"
@@ -170,11 +176,11 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           data-testid="filter-clear"
           onClick={() => clearColFilter()}
         >
-          Clear filter
+          {t('filterSort.clear')}
         </button>
         <div class="filter-equals-row">
           <label class="filter-equals-label" for="filter-equals-input">
-            Equals
+            {t('filterSort.equals')}
           </label>
           <input
             id="filter-equals-input"
@@ -196,7 +202,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
             data-testid="filter-add-equals"
             onClick={() => applyEqualsFilter()}
           >
-            Add equals filter
+            {t('filterSort.addEquals')}
           </button>
         </div>
         <Show when={errorText().length > 0}>
@@ -210,7 +216,7 @@ export function SpreadsheetFilterDropdown(props: SpreadsheetFilterDropdownProps)
           data-testid="filter-close"
           onClick={() => close()}
         >
-          Close
+          {t('filterSort.close')}
         </button>
       </div>
     </Show>

@@ -67,4 +67,102 @@ describe('i18n', () => {
       dispose()
     })
   })
+
+  it('localizes every toolbar key used by the vNext toolbar', () => {
+    const toolbarKeys = [
+      'toolbar.findReplace.title',
+      'toolbar.condFmt.title',
+      'toolbar.dataValidation.title',
+      'toolbar.filter.title',
+      'toolbar.sort.title',
+      'toolbar.sort.asc',
+      'toolbar.sort.desc',
+      'toolbar.nameManager.title',
+      'toolbar.currencyDropdown',
+      'toolbar.currencyDropdown.title',
+      'findReplace.title',
+      'findReplace.findTab',
+      'findReplace.replaceTab',
+      'findReplace.findWhat',
+      'findReplace.prev',
+      'findReplace.next',
+      'findReplace.replaceWith',
+      'findReplace.caseSensitive',
+      'findReplace.wholeMatch',
+      'findReplace.searchFormulas',
+      'findReplace.regex',
+      'findReplace.scope',
+      'findReplace.scope.sheet',
+      'findReplace.scope.workbook',
+      'findReplace.scope.selection',
+      'findReplace.status.searching',
+      'findReplace.status.failed',
+      'findReplace.status.noMatches',
+      'findReplace.status.count',
+      'findReplace.replaceAll',
+      'findReplace.replace',
+      'findReplace.close',
+      'filterSort.title',
+      'filterSort.sortAsc',
+      'filterSort.sortDesc',
+      'filterSort.clear',
+      'filterSort.equals',
+      'filterSort.addEquals',
+      'filterSort.close',
+      'conditionalFormat.title',
+      'conditionalFormat.existingRules',
+      'conditionalFormat.priority',
+      'conditionalFormat.ruleType',
+      'conditionalFormat.kind.cell-value',
+      'conditionalFormat.kind.formula',
+      'conditionalFormat.kind.data-bar',
+      'conditionalFormat.kind.color-scale',
+      'conditionalFormat.kind.top-bottom',
+      'conditionalFormat.preview',
+      'conditionalFormat.remove',
+      'conditionalFormat.cancel',
+      'conditionalFormat.save',
+      'dataValidation.title',
+      'dataValidation.range',
+      'dataValidation.noRange',
+      'dataValidation.ruleType',
+      'dataValidation.rule.list',
+      'dataValidation.rule.range',
+      'dataValidation.rule.regex',
+      'dataValidation.rule.formula',
+      'dataValidation.values',
+      'dataValidation.minMax',
+      'dataValidation.min',
+      'dataValidation.max',
+      'dataValidation.pattern',
+      'dataValidation.formula',
+      'dataValidation.mode',
+      'dataValidation.mode.warn',
+      'dataValidation.mode.reject',
+      'dataValidation.clear',
+      'dataValidation.cancel',
+      'dataValidation.save',
+      'nameManager.title',
+      'nameManager.name',
+      'nameManager.scope',
+      'nameManager.scope.workbook',
+      'nameManager.refersTo',
+      'nameManager.save',
+      'nameManager.delete',
+      'nameManager.close',
+      'nameManager.error.nameRequired',
+      'nameManager.error.refersToRequired',
+    ]
+
+    const t = useT()
+    for (const key of toolbarKeys) {
+      expect(t(key)).not.toBe(key)
+    }
+
+    setLocale('zh')
+    for (const key of toolbarKeys) {
+      expect(t(key)).not.toBe(key)
+    }
+    expect(t('toolbar.currencyDropdown')).toBe('数字')
+  })
 })

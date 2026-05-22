@@ -6,46 +6,7 @@ import {
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 
-import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  isVisibleProjectionResult,
-  spreadsheetProjectionSnapshotAtom,
-} from './atoms'
-
-async function refreshVisibleProjection(
-  store: Store,
-  backend: SpreadsheetBackend,
-): Promise<void> {
-  if (!backend.readVisibleProjection) return
-  const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-  if (!isVisibleProjectionResult(snapshot.result)) return
-  const window = snapshot.result.window
-  const sheetId = snapshot.result.sheetId
-  const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-  try {
-    const result = await backend.readVisibleProjection({
-      kind: 'visible-window',
-      sheetId,
-      requestId,
-      reason: 'toolbar',
-      window,
-    })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId,
-        requestId,
-        reason: 'toolbar',
-        window,
-      },
-      result,
-      error: undefined,
-    })
-  } catch {
-    // Leave the existing snapshot in place on read failure.
-  }
-}
+import { refreshVisibleProjection } from './projection-refresh'
 
 export async function dispatchUndo(
   store: Store,

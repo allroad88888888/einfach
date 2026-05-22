@@ -1,6 +1,6 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it, jest } from '@jest/globals'
+import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
@@ -14,8 +14,13 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
 import { SpreadsheetNameManagerDialog } from '../src-vnext/named-ranges'
+import { setLocale } from '../src/i18n'
 
 afterEach(cleanup)
+
+beforeEach(() => {
+  setLocale('en')
+})
 
 function createFakeBackend() {
   const setNamedRangeRequests: unknown[] = []

@@ -19,46 +19,7 @@ import {
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 
-import {
-  advanceSpreadsheetProjectionRequestIdAtom,
-  isVisibleProjectionResult,
-  spreadsheetProjectionSnapshotAtom,
-} from './atoms'
-
-async function refreshVisibleProjection(
-  store: Store,
-  backend: SpreadsheetBackend,
-  sheetId: string,
-): Promise<void> {
-  if (!backend.readVisibleProjection) return
-  const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-  if (!isVisibleProjectionResult(snapshot.result)) return
-  const window = snapshot.result.window
-  const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-  try {
-    const result = await backend.readVisibleProjection({
-      kind: 'visible-window',
-      sheetId,
-      requestId,
-      reason: 'formula-bar',
-      window,
-    })
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request: {
-        kind: 'visible-window',
-        sheetId,
-        requestId,
-        reason: 'formula-bar',
-        window,
-      },
-      result,
-      error: undefined,
-    })
-  } catch {
-    // Leave existing snapshot on read failure.
-  }
-}
+import { refreshVisibleProjection } from './projection-refresh'
 
 /**
  * Commit the active editing session by pulling the latest draft, running it
@@ -111,7 +72,15 @@ export async function dispatchEditingCommit(
       colEnd: intent.cell.col,
     },
   })
-  await refreshVisibleProjection(store, backend, intent.sheetId)
+  // The commit has been applied to the backend and the history entry pushed.
+  // A failed post-commit projection refresh (flaky backend read, stale request
+  // id) must not reject the editing-commit promise — the caller would then
+  // think the commit itself failed even though state has already moved on.
+  try {
+    await refreshVisibleProjection(store, backend, intent.sheetId, 'formula-bar')
+  } catch {
+    // swallow — next user-triggered refresh will reconcile the view.
+  }
   return true
 }
 

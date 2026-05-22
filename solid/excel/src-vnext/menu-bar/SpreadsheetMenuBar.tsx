@@ -40,7 +40,6 @@ import {
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
   workspaceSessionAtom,
-  type FilterSortState,
   type MenuBarEntry,
   type MenuItemDescriptor,
   type MenuItemDispatch,
@@ -49,11 +48,9 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 
 import {
-  advanceSpreadsheetProjectionRequestIdAtom,
   dispatchRedo,
   dispatchUndo,
-  isVisibleProjectionResult,
-  spreadsheetProjectionSnapshotAtom,
+  refreshVisibleProjection,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
 } from '../provider'
@@ -152,37 +149,6 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
     if (snap.selection.sheetId) return snap.selection.sheetId
     const ws = store.getter(workspaceSessionAtom)
     return ws.activeSheetId ?? null
-  }
-
-  async function refreshVisibleProjection(sheetId: string): Promise<void> {
-    if (!backend.readVisibleProjection) return
-    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (!isVisibleProjectionResult(snapshot.result)) return
-    const window = snapshot.result.window
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    try {
-      const result = await backend.readVisibleProjection({
-        kind: 'visible-window',
-        sheetId,
-        requestId,
-        reason: 'toolbar',
-        window,
-      })
-      store.setter(spreadsheetProjectionSnapshotAtom, {
-        status: 'ready',
-        request: {
-          kind: 'visible-window',
-          sheetId,
-          requestId,
-          reason: 'toolbar',
-          window,
-        },
-        result,
-        error: undefined,
-      })
-    } catch {
-      // Leave existing snapshot on read failure.
-    }
   }
 
   function routeDispatch(dispatch: MenuItemDispatch) {
@@ -286,7 +252,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
             projectionRevision: rev,
             affectedRange: result?.affectedRange,
           })
-          await refreshVisibleProjection(sheetId)
+          await refreshVisibleProjection(store, backend, sheetId)
         })()
         return
       }
@@ -315,7 +281,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
             projectionRevision: rev,
             affectedRange: result?.affectedRange,
           })
-          await refreshVisibleProjection(sheetId)
+          await refreshVisibleProjection(store, backend, sheetId)
         })()
         return
       }
@@ -402,7 +368,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
           sheetId,
           colIndex,
           direction,
-        }) as FilterSortState
+        })
         if (backend.setFilterSort) {
           const ticket = store.setter(issueFilterSortSyncTicketAtom) as number
           void (async () => {
@@ -415,7 +381,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
               })
               store.setter(setFilterSortErrorAtom, null)
               void ticket
-              await refreshVisibleProjection(sheetId)
+              await refreshVisibleProjection(store, backend, sheetId)
             } catch (err) {
               store.setter(setFilterSortErrorAtom, err)
             }

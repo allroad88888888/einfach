@@ -185,7 +185,8 @@ describe('SpreadsheetFindReplaceDialog', () => {
     ))
 
     const { status } = getEls(container)
-    expect(status?.textContent).toBe('2 of 5')
+    // Default locale is `zh`; the en variant of this key is `'{current} of {total}'`.
+    expect(status?.textContent).toBe('2 / 5')
   })
 
   it('Find next click calls advanceFindCursorAtom(1)', () => {

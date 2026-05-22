@@ -5,13 +5,14 @@ import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type { SpreadsheetBackend } from '@einfach/spreadsheet-ui-core'
 import {
+  createVisibleProjectionRequest,
   filterDropdownAtom,
   filterSortStateAtom,
   openFilterDropdownAtom,
   setFilterSortAtom,
   setWorkspaceActiveSheetAtom,
 } from '@einfach/spreadsheet-ui-core'
-import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetFilterDropdown } from '../src-vnext/filter-sort'
 
 afterEach(cleanup)
@@ -208,6 +209,69 @@ describe('vNext SpreadsheetFilterDropdown', () => {
 
     state = store.getter(filterSortStateAtom)
     expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 4, value: 'beta' }])
+  })
+
+  it('refreshes the current visible projection after applying a filter', async () => {
+    const store = createStore()
+    const readVisibleProjectionCalls: unknown[] = []
+    const window = { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 }
+    const initialRequest = createVisibleProjectionRequest({
+      sheetId: 'sheet-1',
+      requestId: 1,
+      reason: 'viewport',
+      window,
+    })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: initialRequest,
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        revision: 1,
+        window,
+        cells: [{ row: 1, col: 0, displayValue: 'South' }],
+      },
+      error: undefined,
+    })
+    const backend = createFakeBackend({
+      async setFilterSort(req) {
+        return { sheetId: req.sheetId, requestId: undefined, revision: 2 }
+      },
+      async readVisibleProjection(req) {
+        readVisibleProjectionCalls.push(req)
+        return {
+          kind: 'visible-window',
+          sheetId: req.sheetId,
+          requestId: req.requestId,
+          revision: 2,
+          window: req.window,
+          cells: [{ row: 1, col: 0, displayValue: 'North' }],
+        }
+      },
+    })
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    const input = container.querySelector(
+      '[data-testid="filter-equals-input"]',
+    ) as HTMLInputElement
+    fireEvent.input(input, { target: { value: '120' } })
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+
+    await waitFor(() => {
+      const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
+      expect(snapshot.result?.revision).toBe(2)
+      expect(snapshot.result?.cells).toEqual([{ row: 1, col: 0, displayValue: 'North' }])
+    })
+    expect(readVisibleProjectionCalls).toHaveLength(1)
   })
 
   it('surfaces backend error in filter-error-text', async () => {

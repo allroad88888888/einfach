@@ -6,7 +6,6 @@ import {
   armFormatPainterStickyAtom,
   canRedoAtom,
   canUndoAtom,
-  createVisibleProjectionRequest,
   dispatchSortAtom,
   dispatchToolbarFormatCommandAtom,
   exitFormatPainterAtom,
@@ -39,8 +38,8 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 
 import {
-  advanceSpreadsheetProjectionRequestIdAtom,
   isVisibleProjectionResult,
+  refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -524,17 +523,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     dispatchCommand({ command: 'number-format', value: id })
   }
 
-  function getCurrentWindow() {
-    const snapshot = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (isVisibleProjectionResult(snapshot.result)) {
-      return snapshot.result.window
-    }
-    if (snapshot.request?.kind === 'visible-window') {
-      return snapshot.request.window
-    }
-    return null
-  }
-
   function activeCellFormat(): SpreadsheetCellFormat {
     const selection = selectionSnapshot()
     const snapshot = projectionSnapshot()
@@ -725,40 +713,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     }
   }
 
-  async function refreshProjection(sheetId: string) {
-    const window = getCurrentWindow()
-    if (!window) {
-      return
-    }
-
-    const requestId = store.setter(advanceSpreadsheetProjectionRequestIdAtom)
-    const request = createVisibleProjectionRequest({
-      sheetId,
-      window,
-      requestId,
-      reason: 'toolbar',
-    })
-
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'loading',
-      request,
-      result: undefined,
-      error: undefined,
-    })
-
-    const result = await backend.readVisibleProjection(request)
-    const current = store.getter(spreadsheetProjectionSnapshotAtom)
-    if (current.request?.requestId !== requestId) {
-      return
-    }
-    store.setter(spreadsheetProjectionSnapshotAtom, {
-      status: 'ready',
-      request,
-      result,
-      error: undefined,
-    })
-  }
-
   function reportCommandError(error: unknown) {
     const current = store.getter(spreadsheetProjectionSnapshotAtom)
     store.setter(spreadsheetProjectionSnapshotAtom, {
@@ -806,7 +760,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       revision: result?.revision,
       affectedRange: result?.affectedRange ?? range,
     })
-    await refreshProjection(intent.sheetId)
+    await refreshVisibleProjection(store, backend, intent.sheetId)
   }
 
   function dispatchCommand(input: ToolbarFormatCommandInput) {
@@ -879,7 +833,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       affectedRange: range,
     })
 
-    await refreshProjection(sheetId)
+    await refreshVisibleProjection(store, backend, sheetId)
   }
 
   function handleBordersSelect(preset: BordersPreset) {
@@ -977,7 +931,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         revision: result?.revision,
         affectedRange: result?.affectedRange ?? targetRange,
       })
-      await refreshProjection(sheetId)
+      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
 
@@ -1001,7 +955,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         revision: result?.revision,
         affectedRange: result?.affectedRange ?? selectionRange,
       })
-      await refreshProjection(sheetId)
+      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
 
@@ -1030,7 +984,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         revision: undefined,
         affectedRange: lastAffected ?? selectionRange,
       })
-      await refreshProjection(sheetId)
+      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
 
@@ -1059,7 +1013,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         revision: undefined,
         affectedRange: lastAffected ?? selectionRange,
       })
-      await refreshProjection(sheetId)
+      await refreshVisibleProjection(store, backend, sheetId)
       return
     }
   }
@@ -1105,7 +1059,21 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const colIndex = selectionSnapshot().activeCell.col
-    store.setter(dispatchSortAtom, { sheetId, colIndex, direction })
+    const next = store.setter(dispatchSortAtom, { sheetId, colIndex, direction })
+    if (!backend.setFilterSort) return
+    void (async () => {
+      try {
+        await backend.setFilterSort!({
+          kind: 'set-filter-sort',
+          sheetId,
+          rules: next.rules,
+          directives: next.directives,
+        })
+        await refreshVisibleProjection(store, backend, sheetId)
+      } catch (error) {
+        reportCommandError(error)
+      }
+    })()
   }
 
   function handleOpenNameManager() {
@@ -1151,7 +1119,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         revision: result?.revision,
         affectedRange: result?.affectedRange ?? range,
       })
-      await refreshProjection(sheetId)
+      await refreshVisibleProjection(store, backend, sheetId)
     } catch (error) {
       reportCommandError(error)
     }
@@ -1261,7 +1229,7 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           revision: result?.revision,
           affectedRange: result?.affectedRange ?? range,
         })
-        return refreshProjection(sheetId)
+        return refreshVisibleProjection(store, backend, sheetId)
       })
       .catch(reportCommandError)
   }
@@ -1737,7 +1705,9 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         data-testid="toolbar-btn-data-validation"
         data-tooltip={t('toolbar.dataValidation.title')}
         aria-label={t('toolbar.dataValidation.title')}
-        disabled={!availability().sheetId}
+        disabled={
+          !availability().sheetId || availability().editingMode === 'drafting'
+        }
         onClick={handleOpenDataValidation}
       >
         <DataValidationIcon />

@@ -2,7 +2,13 @@ import type {
   BackendMutationResult,
   CellRange,
   ClearRangeRequest,
+  ClearValidationRuleRequest,
+  ColumnFilterRule,
+  ConditionalFormatRule,
+  ConditionalFormatRuleEntry,
+  ConditionalFormatRulesResult,
   DeleteColumnsRequest,
+  DeleteNamedRangeRequest,
   DeleteRowsRequest,
   DisplayCell,
   ImportCellChunksRequest,
@@ -12,27 +18,41 @@ import type {
   ProjectionRevision,
   RangeTsvChunkConsumer,
   RangeTsvChunkExportResult,
+  ListConditionalFormatRulesRequest,
+  ListNamedRangesRequest,
+  NamedRange,
+  NamedRangeListResult,
+  NamedRangeMutationResult,
   RangeProjectionRequest,
   RangeProjectionResult,
   RangeTsvExportRequest,
   RangeTsvExportResult,
   ReorderSheetRequest,
+  RemoveConditionalFormatRuleRequest,
   ResolveDataEdgeRequest,
   ResolveDataEdgeResult,
   SetCellInputRequest,
   SetColumnWidthRequest,
+  SetConditionalFormatRuleRequest,
+  SetFilterSortRequest,
   SetFormatRangeRequest,
+  SetNamedRangeRequest,
   SetRowHeightRequest,
+  SetValidationRuleRequest,
   SheetMutationResult,
+  SortDirective,
   SpreadsheetBackend,
   SpreadsheetCellFormat,
   SpreadsheetSheetMetadata,
+  FilterSortState,
+  ValidationMode,
+  ValidationRule,
   VisibleProjectionRequest,
   ViewportSizeProjectionRequest,
   ViewportSizeProjectionResult,
   VisibleProjectionResult,
 } from '@einfach/spreadsheet-ui-core'
-import { reorderSheetMetadata } from '@einfach/spreadsheet-ui-core'
+import { evaluateValidationLocal, reorderSheetMetadata } from '@einfach/spreadsheet-ui-core'
 
 import {
   createWorkerWorkbook,
@@ -277,10 +297,113 @@ function isDefaultFormat(format: SpreadsheetCellFormat): boolean {
     !format.italic &&
     (format.align === undefined || format.align === 'default') &&
     format.fontSize === undefined &&
+    (format.fontFamily === undefined || format.fontFamily.length === 0) &&
     (format.fgColor === undefined || format.fgColor.length === 0) &&
     (format.bgColor === undefined || format.bgColor.length === 0) &&
     numberFormatIsDefault
   )
+}
+
+function cloneCell(cell: DisplayCell): DisplayCell {
+  const clone: DisplayCell = {
+    row: cell.row,
+    col: cell.col,
+    displayValue: cell.displayValue,
+  }
+  if (cell.valueKind) clone.valueKind = cell.valueKind
+  if (cell.formula !== undefined) clone.formula = cell.formula
+  if (cell.error) clone.error = { ...cell.error }
+  if (cell.formatKey !== undefined) clone.formatKey = cell.formatKey
+  if (cell.format) clone.format = cloneFormat(cell.format)
+  if (cell.conditionalFormat) clone.conditionalFormat = cloneFormat(cell.conditionalFormat)
+  if (cell.validation) clone.validation = { ...cell.validation }
+  if (cell.richValue) clone.richValue = { ...cell.richValue } as DisplayCell['richValue']
+  if (cell.mergedSpan) clone.mergedSpan = { ...cell.mergedSpan }
+  if (cell.mergeAnchor) clone.mergeAnchor = { ...cell.mergeAnchor }
+  if (cell.originalRow !== undefined) clone.originalRow = cell.originalRow
+  return clone
+}
+
+function cloneRange(range: CellRange): CellRange {
+  return {
+    rowStart: range.rowStart,
+    rowEnd: range.rowEnd,
+    colStart: range.colStart,
+    colEnd: range.colEnd,
+  }
+}
+
+function normalizeRange(range: CellRange): CellRange {
+  return {
+    rowStart: Math.min(range.rowStart, range.rowEnd),
+    rowEnd: Math.max(range.rowStart, range.rowEnd),
+    colStart: Math.min(range.colStart, range.colEnd),
+    colEnd: Math.max(range.colStart, range.colEnd),
+  }
+}
+
+function rangesIntersect(left: CellRange, right: CellRange): boolean {
+  return (
+    left.rowStart <= right.rowEnd &&
+    left.rowEnd >= right.rowStart &&
+    left.colStart <= right.colEnd &&
+    left.colEnd >= right.colStart
+  )
+}
+
+function cloneConditionalFormatRule(rule: ConditionalFormatRule): ConditionalFormatRule {
+  switch (rule.kind) {
+    case 'cell-value':
+    case 'formula':
+    case 'top-bottom':
+      return { ...rule, format: cloneFormat(rule.format) }
+    default:
+      return { ...rule }
+  }
+}
+
+function cloneConditionalFormatRuleEntry(
+  entry: ConditionalFormatRuleEntry,
+): ConditionalFormatRuleEntry {
+  return {
+    id: entry.id,
+    priority: entry.priority,
+    scope: { range: cloneRange(entry.scope.range) },
+    rule: cloneConditionalFormatRule(entry.rule),
+  }
+}
+
+function cloneNamedRange(range: NamedRange): NamedRange {
+  return {
+    name: range.name,
+    scope: range.scope === 'workbook' ? 'workbook' : { sheetId: range.scope.sheetId },
+    refersTo: { ...range.refersTo },
+  }
+}
+
+function namedRangeScopeEquals(left: NamedRange['scope'], right: NamedRange['scope']): boolean {
+  if (left === 'workbook' || right === 'workbook') return left === right
+  return left.sheetId === right.sheetId
+}
+
+function cloneFilterSortRule(rule: ColumnFilterRule): ColumnFilterRule {
+  switch (rule.kind) {
+    case 'list':
+      return { ...rule, values: [...rule.values] }
+    default:
+      return { ...rule }
+  }
+}
+
+function cloneFilterSortState(state: FilterSortState): FilterSortState {
+  return {
+    rules: state.rules.map(cloneFilterSortRule),
+    directives: state.directives.map((directive) => ({ ...directive })),
+  }
+}
+
+function filterSortHasEffect(state: FilterSortState | undefined): boolean {
+  return !!state && (state.rules.length > 0 || state.directives.length > 0)
 }
 
 function keyFor(row: number, col: number): string {
@@ -295,6 +418,351 @@ function isCoordInsideRange(
   return (
     row >= range.rowStart && row <= range.rowEnd && col >= range.colStart && col <= range.colEnd
   )
+}
+
+function numericValue(text: string): number | null {
+  const value = Number(text)
+  return Number.isFinite(value) ? value : null
+}
+
+function readCellValue(cells: Map<string, DisplayCell>, row: number, col: number): string {
+  return cells.get(keyFor(row, col))?.displayValue ?? ''
+}
+
+function normalizeFilterText(value: string, caseSensitive: boolean | undefined): string {
+  return caseSensitive ? value : value.toLocaleLowerCase()
+}
+
+function filterRuleMatchesValue(rule: ColumnFilterRule, value: string): boolean {
+  switch (rule.kind) {
+    case 'equals':
+      return (
+        normalizeFilterText(value, rule.caseSensitive) ===
+        normalizeFilterText(rule.value, rule.caseSensitive)
+      )
+    case 'contains':
+      return normalizeFilterText(value, rule.caseSensitive).includes(
+        normalizeFilterText(rule.value, rule.caseSensitive),
+      )
+    case 'range': {
+      const numeric = numericValue(value)
+      if (numeric === null) return false
+      if (rule.min !== undefined && numeric < rule.min) return false
+      if (rule.max !== undefined && numeric > rule.max) return false
+      return true
+    }
+    case 'list':
+      return rule.values.includes(value)
+  }
+}
+
+function rowMatchesFilterRules(
+  cells: Map<string, DisplayCell>,
+  row: number,
+  rules: readonly ColumnFilterRule[],
+): boolean {
+  for (const rule of rules) {
+    if (!filterRuleMatchesValue(rule, readCellValue(cells, row, rule.colIndex))) return false
+  }
+  return true
+}
+
+function compareFilterSortValues(left: string, right: string): number {
+  if (left.length === 0 && right.length === 0) return 0
+  if (left.length === 0) return 1
+  if (right.length === 0) return -1
+
+  const leftNumber = numericValue(left)
+  const rightNumber = numericValue(right)
+  if (leftNumber !== null && rightNumber !== null) return leftNumber - rightNumber
+  return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
+}
+
+function compareFilterSortRows(
+  cells: Map<string, DisplayCell>,
+  directives: readonly SortDirective[],
+  leftRow: number,
+  rightRow: number,
+): number {
+  for (const directive of directives) {
+    const valueCompare = compareFilterSortValues(
+      readCellValue(cells, leftRow, directive.colIndex),
+      readCellValue(cells, rightRow, directive.colIndex),
+    )
+    if (valueCompare !== 0) {
+      return directive.direction === 'asc' ? valueCompare : -valueCompare
+    }
+  }
+  return 0
+}
+
+function isSummaryRow(cells: Map<string, DisplayCell>, row: number): boolean {
+  const label = readCellValue(cells, row, 0).trim().toLocaleLowerCase()
+  return row > 1 && (label === 'total' || label === 'summary')
+}
+
+function buildFilterSortDisplayRows(
+  cells: Map<string, DisplayCell>,
+  range: CellRange,
+  state: FilterSortState | undefined,
+): number[] | null {
+  if (!filterSortHasEffect(state)) return null
+
+  let maxRow = range.rowStart - 1
+  for (const cell of cells.values()) {
+    if (cell.row > maxRow) maxRow = cell.row
+  }
+  if (maxRow < range.rowStart) return []
+
+  const rows: number[] = []
+  if (range.rowStart === 0) rows[0] = 0
+  const summaryRows = isSummaryRow(cells, maxRow) ? [maxRow] : []
+  const dataRowStart = Math.max(1, range.rowStart)
+  const dataRowEnd = summaryRows.length > 0 ? maxRow - 1 : maxRow
+  const dataRows: Array<{ row: number; index: number }> = []
+
+  for (let row = dataRowStart; row <= dataRowEnd; row += 1) {
+    if (rowMatchesFilterRules(cells, row, state!.rules)) {
+      dataRows.push({ row, index: dataRows.length })
+    }
+  }
+  if (state!.directives.length > 0) {
+    dataRows.sort((left, right) => {
+      const valueCompare = compareFilterSortRows(cells, state!.directives, left.row, right.row)
+      return valueCompare === 0 ? left.index - right.index : valueCompare
+    })
+  }
+  dataRows.forEach((item, index) => {
+    rows[dataRowStart + index] = item.row
+  })
+  for (const row of summaryRows) rows[row] = row
+  return rows
+}
+
+function applyFilterSortOverlay(
+  cells: DisplayCell[],
+  range: CellRange,
+  state: FilterSortState | undefined,
+): DisplayCell[] {
+  const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
+  const displayRows = buildFilterSortDisplayRows(bySource, range, state)
+  if (displayRows === null) return cells
+
+  const projected: DisplayCell[] = []
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    const sourceRow = displayRows[row]
+    if (sourceRow === undefined) continue
+    for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      const cell = bySource.get(keyFor(sourceRow, col))
+      if (!cell) continue
+      projected.push({
+        ...cloneCell(cell),
+        row,
+        col,
+        originalRow: sourceRow,
+      })
+    }
+  }
+  return projected
+}
+
+function validationSeverityForMode(mode: ValidationMode): 'error' | 'warning' {
+  return mode === 'reject' ? 'error' : 'warning'
+}
+
+function validationMessageForRule(rule: ValidationRule): string {
+  switch (rule.kind) {
+    case 'list':
+      return rule.values.length > 0
+        ? `Value must be one of: ${rule.values.join(', ')}`
+        : 'Value must match the configured list'
+    case 'range':
+      if (rule.min !== undefined && rule.max !== undefined) {
+        return `Value must be between ${rule.min} and ${rule.max}`
+      }
+      if (rule.min !== undefined) return `Value must be >= ${rule.min}`
+      if (rule.max !== undefined) return `Value must be <= ${rule.max}`
+      return 'Value must be a number'
+    case 'regex':
+      return `Value must match pattern /${rule.pattern}/${rule.flags ?? ''}`
+    case 'formula':
+      return rule.formula.trim().length > 0
+        ? `Value must satisfy ${rule.formula}`
+        : 'Value must satisfy the configured formula'
+  }
+}
+
+function cloneValidationRule(rule: ValidationRule): ValidationRule {
+  return rule.kind === 'list' ? { ...rule, values: [...rule.values] } : { ...rule }
+}
+
+type WorkerValidationRuleLayer = {
+  range: CellRange
+  rule: ValidationRule
+  mode: ValidationMode
+}
+
+function applyValidationOverlay(
+  cells: DisplayCell[],
+  range: CellRange,
+  rules: readonly WorkerValidationRuleLayer[],
+): DisplayCell[] {
+  if (rules.length === 0) return cells
+  const byDisplay = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cloneCell(cell)]))
+
+  for (const layer of rules) {
+    if (!rangesIntersect(layer.range, range)) continue
+
+    for (const cell of byDisplay.values()) {
+      const sourceRow = cell.originalRow ?? cell.row
+      if (!isCoordInsideRange(sourceRow, cell.col, layer.range)) continue
+      const outcome = evaluateValidationLocal(layer.rule, cell.displayValue)
+      const severity = validationSeverityForMode(layer.mode)
+      cell.validation = outcome
+        ? { ...outcome, severity }
+        : {
+            code: `validation.${layer.rule.kind}`,
+            severity,
+            message: validationMessageForRule(layer.rule),
+          }
+    }
+
+    const rowStart = Math.max(range.rowStart, layer.range.rowStart)
+    const rowEnd = Math.min(range.rowEnd, layer.range.rowEnd)
+    const colStart = Math.max(range.colStart, layer.range.colStart)
+    const colEnd = Math.min(range.colEnd, layer.range.colEnd)
+    for (let row = rowStart; row <= rowEnd; row += 1) {
+      for (let col = colStart; col <= colEnd; col += 1) {
+        const key = keyFor(row, col)
+        if (byDisplay.has(key)) continue
+        byDisplay.set(key, {
+          row,
+          col,
+          displayValue: '',
+          valueKind: 'blank',
+          validation: {
+            code: `validation.${layer.rule.kind}`,
+            severity: validationSeverityForMode(layer.mode),
+            message: validationMessageForRule(layer.rule),
+          },
+        })
+      }
+    }
+  }
+  return [...byDisplay.values()]
+}
+
+type CellValueOperator = Extract<ConditionalFormatRule, { kind: 'cell-value' }>['operator']
+
+function compareCellValue(
+  leftText: string,
+  operator: CellValueOperator,
+  rightText: string,
+  secondRightText?: string,
+): boolean {
+  const leftNumber = numericValue(leftText)
+  const rightNumber = numericValue(rightText)
+  const secondRightNumber = secondRightText !== undefined ? numericValue(secondRightText) : null
+  const hasNumberPair = leftNumber !== null && rightNumber !== null
+
+  switch (operator) {
+    case 'eq':
+      return hasNumberPair ? leftNumber === rightNumber : leftText === rightText
+    case 'ne':
+      return hasNumberPair ? leftNumber !== rightNumber : leftText !== rightText
+    case 'gt':
+      return hasNumberPair && leftNumber > rightNumber
+    case 'gte':
+      return hasNumberPair && leftNumber >= rightNumber
+    case 'lt':
+      return hasNumberPair && leftNumber < rightNumber
+    case 'lte':
+      return hasNumberPair && leftNumber <= rightNumber
+    case 'between':
+      return leftNumber !== null && rightNumber !== null && secondRightNumber !== null
+        ? leftNumber >= rightNumber && leftNumber <= secondRightNumber
+        : false
+    case 'not-between':
+      return leftNumber !== null && rightNumber !== null && secondRightNumber !== null
+        ? leftNumber < rightNumber || leftNumber > secondRightNumber
+        : false
+  }
+}
+
+function conditionalRuleAppliesToCell(
+  rule: ConditionalFormatRule,
+  cell: DisplayCell | undefined,
+): boolean {
+  const value = cell?.displayValue ?? ''
+  switch (rule.kind) {
+    case 'cell-value':
+      return compareCellValue(value, rule.operator, rule.value, rule.value2)
+    case 'formula':
+      return rule.formula.trim().length > 0
+    case 'data-bar':
+    case 'color-scale':
+    case 'top-bottom':
+      return numericValue(value) !== null
+  }
+}
+
+function conditionalRuleFormat(rule: ConditionalFormatRule): SpreadsheetCellFormat | undefined {
+  switch (rule.kind) {
+    case 'cell-value':
+    case 'formula':
+    case 'top-bottom':
+      return normalizeFormat(rule.format)
+    case 'data-bar':
+      return normalizeFormat({ bgColor: rule.maxColor ?? '#bfdbfe' })
+    case 'color-scale':
+      return normalizeFormat({ bgColor: rule.maxColor })
+  }
+}
+
+function getConditionalFormatForCell(
+  row: number,
+  col: number,
+  cell: DisplayCell | undefined,
+  rules: readonly ConditionalFormatRuleEntry[],
+): SpreadsheetCellFormat | undefined {
+  const ordered = [...rules].sort((left, right) => left.priority - right.priority)
+  for (const entry of ordered) {
+    if (!isCoordInsideRange(row, col, entry.scope.range)) continue
+    if (!conditionalRuleAppliesToCell(entry.rule, cell)) continue
+    const format = conditionalRuleFormat(entry.rule)
+    if (format) return format
+  }
+  return undefined
+}
+
+function applyConditionalFormatOverlay(
+  cells: DisplayCell[],
+  rules: readonly ConditionalFormatRuleEntry[],
+): DisplayCell[] {
+  if (rules.length === 0) return cells
+  return cells.map((cell) => {
+    const sourceRow = cell.originalRow ?? cell.row
+    const conditionalFormat = getConditionalFormatForCell(sourceRow, cell.col, cell, rules)
+    if (!conditionalFormat) return cell
+    return {
+      ...cell,
+      conditionalFormat: {
+        ...(cell.conditionalFormat ? cloneFormat(cell.conditionalFormat) : {}),
+        ...conditionalFormat,
+      },
+    }
+  })
+}
+
+function nextConditionalFormatRuleId(rules: readonly ConditionalFormatRuleEntry[]): string {
+  const used = new Set(rules.map((rule) => rule.id))
+  let index = rules.length + 1
+  let id = `cf-${index}`
+  while (used.has(id)) {
+    index += 1
+    id = `cf-${index}`
+  }
+  return id
 }
 
 function snapshotCellFormatKey(
@@ -543,6 +1011,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
   let revision = options.revision ?? 0
   let disposed = false
   const client: WorkerWorkbookClient = resolvedClient
+  // Toolbar-overlay metadata (data validation, conditional format, filter/sort, named ranges) is
+  // intentionally kept on the main thread for now: the WASM Workbook does not yet model these and
+  // would not round-trip them through undo/redo or formula evaluation. The host applies them on
+  // top of the worker's projection. Move into the Rust workbook once it grows native support; at
+  // that point these Maps should disappear (not be extended).
+  const validationRulesBySheetId = new Map<string, WorkerValidationRuleLayer[]>()
+  const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
+  const filterSortBySheetId = new Map<string, FilterSortState>()
+  let namedRanges: NamedRange[] = []
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
     .then(async (metas) => {
@@ -651,8 +1128,25 @@ export function createWorkerWorkbookSpreadsheetBackend(
       .filter((cell): cell is DisplayCell => cell !== null)
       .sort((left, right) => (left.row === right.row ? left.col - right.col : left.row - right.row))
 
+    const formattedCells = mergeFormatsIntoCells(cells, range, formatSnapshot)
+    const filteredCells = applyFilterSortOverlay(
+      formattedCells,
+      range,
+      filterSortBySheetId.get(sheetId),
+    )
+    const validatedCells = applyValidationOverlay(
+      filteredCells,
+      range,
+      validationRulesBySheetId.get(sheetId) ?? [],
+    )
+
     return {
-      cells: mergeFormatsIntoCells(cells, range, formatSnapshot),
+      cells: applyConditionalFormatOverlay(
+        validatedCells,
+        conditionalFormatRulesBySheetId.get(sheetId) ?? [],
+      ).sort((left, right) =>
+        left.row === right.row ? left.col - right.col : left.row - right.row,
+      ),
       revision: requestRevision ?? revision,
     }
   }
@@ -1130,6 +1624,159 @@ export function createWorkerWorkbookSpreadsheetBackend(
         activeSheetId: request.sheetId,
         revision: request.revision ?? nextRevision,
       })
+    },
+
+    async listNamedRanges(request: ListNamedRangesRequest): Promise<NamedRangeListResult> {
+      return {
+        requestId: request.requestId,
+        revision: request.revision ?? revision,
+        names: namedRanges.map(cloneNamedRange),
+      }
+    },
+
+    async setNamedRange(request: SetNamedRangeRequest): Promise<NamedRangeMutationResult> {
+      const name = request.name.trim()
+      if (name.length === 0) throw createBackendError('INVALID_NAME', 'name cannot be empty')
+      const entry: NamedRange = {
+        name,
+        scope: request.scope === 'workbook' ? 'workbook' : { sheetId: request.scope.sheetId },
+        refersTo: { ...request.refersTo },
+      }
+      const existingIndex = namedRanges.findIndex(
+        (item) => item.name === name && namedRangeScopeEquals(item.scope, request.scope),
+      )
+      namedRanges =
+        existingIndex >= 0
+          ? namedRanges.map((item, index) => (index === existingIndex ? entry : item))
+          : [...namedRanges, entry]
+      const nextRevision = bumpRevision()
+      return {
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    },
+
+    async deleteNamedRange(request: DeleteNamedRangeRequest): Promise<NamedRangeMutationResult> {
+      const next = namedRanges.filter(
+        (item) => !(item.name === request.name && namedRangeScopeEquals(item.scope, request.scope)),
+      )
+      namedRanges = next
+      const nextRevision = bumpRevision()
+      return {
+        requestId: request.requestId,
+        revision: request.revision ?? nextRevision,
+      }
+    },
+
+    async setValidationRule(request: SetValidationRuleRequest): Promise<BackendMutationResult> {
+      const range = normalizeRange(request.range)
+      const current = validationRulesBySheetId.get(request.sheetId) ?? []
+      const next = current
+        .filter((rule) => !rangesIntersect(rule.range, range))
+        .concat({ range, rule: cloneValidationRule(request.rule), mode: request.mode })
+      validationRulesBySheetId.set(request.sheetId, next)
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+        affectedRange: cloneRange(range),
+      }
+    },
+
+    async clearValidationRule(
+      request: ClearValidationRuleRequest,
+    ): Promise<BackendMutationResult> {
+      const range = normalizeRange(request.range)
+      const current = validationRulesBySheetId.get(request.sheetId) ?? []
+      validationRulesBySheetId.set(
+        request.sheetId,
+        current.filter((rule) => !rangesIntersect(rule.range, range)),
+      )
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+        affectedRange: cloneRange(range),
+      }
+    },
+
+    async listConditionalFormatRules(
+      request: ListConditionalFormatRulesRequest,
+    ): Promise<ConditionalFormatRulesResult> {
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? revision,
+        rules: (conditionalFormatRulesBySheetId.get(request.sheetId) ?? [])
+          .map(cloneConditionalFormatRuleEntry)
+          .sort((left, right) => left.priority - right.priority),
+      }
+    },
+
+    async setConditionalFormatRule(
+      request: SetConditionalFormatRuleRequest,
+    ): Promise<BackendMutationResult> {
+      const current = conditionalFormatRulesBySheetId.get(request.sheetId) ?? []
+      const existingIndex = request.ruleId
+        ? current.findIndex((entry) => entry.id === request.ruleId)
+        : -1
+      const entry: ConditionalFormatRuleEntry = {
+        id:
+          existingIndex >= 0
+            ? current[existingIndex].id
+            : request.ruleId ?? nextConditionalFormatRuleId(current),
+        scope: { range: normalizeRange(request.scope.range) },
+        priority:
+          request.priority ??
+          (existingIndex >= 0 ? current[existingIndex].priority : current.length),
+        rule: cloneConditionalFormatRule(request.rule),
+      }
+      const next =
+        existingIndex >= 0
+          ? current.map((item, index) => (index === existingIndex ? entry : item))
+          : [...current, entry]
+      conditionalFormatRulesBySheetId.set(
+        request.sheetId,
+        next.map((item, index) => ({ ...item, priority: item.priority ?? index })),
+      )
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+        affectedRange: cloneRange(entry.scope.range),
+      }
+    },
+
+    async removeConditionalFormatRule(
+      request: RemoveConditionalFormatRuleRequest,
+    ): Promise<BackendMutationResult> {
+      const current = conditionalFormatRulesBySheetId.get(request.sheetId) ?? []
+      conditionalFormatRulesBySheetId.set(
+        request.sheetId,
+        current.filter((entry) => entry.id !== request.ruleId),
+      )
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+      }
+    },
+
+    async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
+      const next = cloneFilterSortState({
+        rules: request.rules,
+        directives: request.directives,
+      })
+      if (filterSortHasEffect(next)) {
+        filterSortBySheetId.set(request.sheetId, next)
+      } else {
+        filterSortBySheetId.delete(request.sheetId)
+      }
+      return {
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision ?? bumpRevision(),
+      }
     },
 
     ready() {
