@@ -39,6 +39,7 @@ import {
   setFilterSortAtom,
   filterDropdownAtom,
   applyPresenceUpdateAtom,
+  setViewportFreezeAtom,
 } from '@einfach/spreadsheet-ui-core'
 import { SpreadsheetGrid } from '../src-vnext/grid'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
@@ -2837,6 +2838,121 @@ describe('vNext SpreadsheetGrid', () => {
       for (const node of Array.from(wrappers)) {
         expect(node.tagName.toLowerCase()).toBe('div')
       }
+    })
+  })
+
+  describe('freeze boundary attributes', () => {
+    it('flags the last frozen row and column with data-freeze-boundary-* on cells and headers', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 4,
+        viewportWidth: 4,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 8,
+        colCount: 8,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      store.setter(setViewportFreezeAtom, {
+        sheetId: 'sheet-1',
+        rows: 2,
+        cols: 3,
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await flushMicrotasks()
+
+      // Last frozen row index is 1; cells at row=1 should carry the bottom boundary,
+      // and only row=1 — not row=0 (mid-frozen) or row=2 (first scrollable).
+      const bottomCells = container.querySelectorAll(
+        'td.spreadsheet-grid-cell[data-freeze-boundary-bottom="true"]',
+      )
+      const bottomRows = new Set(
+        Array.from(bottomCells).map((n) => n.getAttribute('data-row')),
+      )
+      expect(bottomRows).toEqual(new Set(['1']))
+
+      // Last frozen col index is 2; same check on right boundary.
+      const rightCells = container.querySelectorAll(
+        'td.spreadsheet-grid-cell[data-freeze-boundary-right="true"]',
+      )
+      const rightCols = new Set(
+        Array.from(rightCells).map((n) => n.getAttribute('data-col')),
+      )
+      expect(rightCols).toEqual(new Set(['2']))
+
+      // The single cell at row=1, col=2 sits on both boundaries.
+      expect(
+        container.querySelector(
+          'td.spreadsheet-grid-cell[data-row="1"][data-col="2"][data-freeze-boundary-bottom="true"][data-freeze-boundary-right="true"]',
+        ),
+      ).not.toBeNull()
+
+      // Row header at the last frozen row gets the bottom boundary too.
+      expect(
+        container.querySelector(
+          'th.spreadsheet-grid-row-header[data-row="1"][data-freeze-boundary-bottom="true"]',
+        ),
+      ).not.toBeNull()
+      expect(
+        container.querySelector(
+          'th.spreadsheet-grid-row-header[data-row="0"][data-freeze-boundary-bottom="true"]',
+        ),
+      ).toBeNull()
+
+      // Col header at the last frozen col gets the right boundary too.
+      expect(
+        container.querySelector(
+          'th.spreadsheet-grid-col-header[data-col="2"][data-freeze-boundary-right="true"]',
+        ),
+      ).not.toBeNull()
+      expect(
+        container.querySelector(
+          'th.spreadsheet-grid-col-header[data-col="1"][data-freeze-boundary-right="true"]',
+        ),
+      ).toBeNull()
+    })
+
+    it('does not set boundary attrs when freeze is inactive', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 3,
+        viewportWidth: 3,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 5,
+        colCount: 5,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await flushMicrotasks()
+
+      expect(
+        container.querySelectorAll('[data-freeze-boundary-bottom="true"]'),
+      ).toHaveLength(0)
+      expect(
+        container.querySelectorAll('[data-freeze-boundary-right="true"]'),
+      ).toHaveLength(0)
     })
   })
 })

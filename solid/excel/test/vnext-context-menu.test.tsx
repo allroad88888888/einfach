@@ -999,6 +999,101 @@ describe('vNext SpreadsheetContextMenu', () => {
     })
   })
 
+  it('shows all four freeze actions on a cell right-click and labels them short-form', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 3, col: 2 } },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+    // Pre-activate freeze so Unfreeze is also visible.
+    store.setter(viewportFreezeAtom, {
+      rowsBySheet: { 'sheet-1': 1 },
+      colsBySheet: {},
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    // Default locale is zh; short labels match the screenshot.
+    expect(getByTestId('context-menu-command-view.freezePanes').textContent).toBe('冻结')
+    expect(getByTestId('context-menu-command-view.freezeRowsHere').textContent).toBe('冻结行')
+    expect(getByTestId('context-menu-command-view.freezeColsHere').textContent).toBe('冻结列')
+    expect(getByTestId('context-menu-command-view.unfreeze').textContent).toBe('取消冻结')
+    // Count goes into the tooltip, not the visible label.
+    expect(getByTestId('context-menu-command-view.freezeRowsHere').getAttribute('title')).toBe(
+      '冻结上方 3 行',
+    )
+    expect(getByTestId('context-menu-command-view.freezeColsHere').getAttribute('title')).toBe(
+      '冻结左侧 2 列',
+    )
+  })
+
+  it('freezes rows only via cell-target Freeze row — preserves col freeze', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    // Start with cols already frozen; "Freeze row" must not clear that axis.
+    store.setter(viewportFreezeAtom, {
+      rowsBySheet: {},
+      colsBySheet: { 'sheet-1': 2 },
+    })
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 3, col: 1 } },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezeRowsHere'))
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1']).toBe(3)
+      expect(freeze.colsBySheet['sheet-1']).toBe(2)
+    })
+  })
+
+  it('freezes cols only via cell-target Freeze column — preserves row freeze', async () => {
+    const store = createStore()
+    const { backend } = createFakeBackend()
+
+    store.setter(viewportFreezeAtom, {
+      rowsBySheet: { 'sheet-1': 2 },
+      colsBySheet: {},
+    })
+    store.setter(openMenuAtom, {
+      surface: 'context',
+      target: { kind: 'cell', sheetId: 'sheet-1', cell: { row: 1, col: 4 } },
+      position: { x: 0, y: 0 },
+      source: 'pointer',
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetContextMenu />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getByTestId('context-menu-command-view.freezeColsHere'))
+    await waitFor(() => {
+      const freeze = store.getter(viewportFreezeAtom)
+      expect(freeze.rowsBySheet['sheet-1']).toBe(2)
+      expect(freeze.colsBySheet['sheet-1']).toBe(4)
+    })
+  })
+
   it('shows Unfreeze only when freeze is active on the target sheet', async () => {
     const store = createStore()
     const { backend } = createFakeBackend()

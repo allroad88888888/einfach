@@ -66,9 +66,20 @@ const commandsByTargetKind: Record<MenuTargetKind, MenuCommandKind[]> = {
     'clipboard.paste',
     'cell.clear',
     'view.freezePanes',
+    'view.freezeRowsHere',
+    'view.freezeColsHere',
     'view.unfreeze',
   ],
-  range: ['clipboard.copy', 'clipboard.cut', 'clipboard.paste', 'cell.clear'],
+  range: [
+    'clipboard.copy',
+    'clipboard.cut',
+    'clipboard.paste',
+    'cell.clear',
+    'view.freezePanes',
+    'view.freezeRowsHere',
+    'view.freezeColsHere',
+    'view.unfreeze',
+  ],
   row: ['row.insert', 'row.delete', 'view.freezeRowsHere', 'view.unfreeze'],
   column: ['column.insert', 'column.delete', 'view.freezeColsHere', 'view.unfreeze'],
   all: ['row.insert', 'row.delete', 'column.insert', 'column.delete'],
@@ -476,20 +487,32 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
           count: 1,
         })
         break
-      case 'view.freezeRowsHere':
-        if (target.kind !== 'row') return
-        store.setter(setViewportFreezeAtom, {
-          sheetId: target.sheetId,
-          rows: target.rowIndex,
-        })
+      case 'view.freezeRowsHere': {
+        const rowIndex =
+          target.kind === 'row'
+            ? target.rowIndex
+            : target.kind === 'cell'
+              ? target.cell.row
+              : target.kind === 'range'
+                ? target.range.rowStart
+                : null
+        if (rowIndex === null) return
+        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, rows: rowIndex })
         return
-      case 'view.freezeColsHere':
-        if (target.kind !== 'column') return
-        store.setter(setViewportFreezeAtom, {
-          sheetId: target.sheetId,
-          cols: target.colIndex,
-        })
+      }
+      case 'view.freezeColsHere': {
+        const colIndex =
+          target.kind === 'column'
+            ? target.colIndex
+            : target.kind === 'cell'
+              ? target.cell.col
+              : target.kind === 'range'
+                ? target.range.colStart
+                : null
+        if (colIndex === null) return
+        store.setter(setViewportFreezeAtom, { sheetId: target.sheetId, cols: colIndex })
         return
+      }
       case 'view.freezePanes':
         if (target.kind !== 'cell' && target.kind !== 'range') return
         {
@@ -575,15 +598,39 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
   const t = useT()
   const freezeState = useAtomValue(viewportFreezeAtom)
 
-  function labelFor(command: MenuCommandKind, target: MenuTarget): string {
-    const key = commandLabelKeys[command]
-    if (command === 'view.freezeRowsHere' && target.kind === 'row') {
-      return t(key, { count: target.rowIndex })
+  function labelFor(command: MenuCommandKind): string {
+    return t(commandLabelKeys[command])
+  }
+
+  function tooltipFor(command: MenuCommandKind, target: MenuTarget): string | undefined {
+    switch (command) {
+      case 'view.freezeRowsHere': {
+        const count =
+          target.kind === 'row'
+            ? target.rowIndex
+            : target.kind === 'cell'
+              ? target.cell.row
+              : target.kind === 'range'
+                ? target.range.rowStart
+                : 0
+        return t('contextMenu.command.freezeRowsHere.tooltip', { count })
+      }
+      case 'view.freezeColsHere': {
+        const count =
+          target.kind === 'column'
+            ? target.colIndex
+            : target.kind === 'cell'
+              ? target.cell.col
+              : target.kind === 'range'
+                ? target.range.colStart
+                : 0
+        return t('contextMenu.command.freezeColsHere.tooltip', { count })
+      }
+      case 'view.freezePanes':
+        return t('contextMenu.command.freezePanes.tooltip')
+      default:
+        return undefined
     }
-    if (command === 'view.freezeColsHere' && target.kind === 'column') {
-      return t(key, { count: target.colIndex })
-    }
-    return t(key)
   }
 
   function isCommandVisibleForTarget(command: MenuCommandKind, target: MenuTarget): boolean {
@@ -593,9 +640,15 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
     const frozen = rows > 0 || cols > 0
     switch (command) {
       case 'view.freezeRowsHere':
-        return target.kind === 'row' && target.rowIndex > 0
+        if (target.kind === 'row') return target.rowIndex > 0
+        if (target.kind === 'cell') return target.cell.row > 0
+        if (target.kind === 'range') return target.range.rowStart > 0
+        return false
       case 'view.freezeColsHere':
-        return target.kind === 'column' && target.colIndex > 0
+        if (target.kind === 'column') return target.colIndex > 0
+        if (target.kind === 'cell') return target.cell.col > 0
+        if (target.kind === 'range') return target.range.colStart > 0
+        return false
       case 'view.freezePanes':
         // Freezing both at (0,0) would clear; hide the affirmative item there.
         if (target.kind === 'cell') return target.cell.row > 0 || target.cell.col > 0
@@ -659,11 +712,12 @@ export function SpreadsheetContextMenu(props: SpreadsheetContextMenuProps) {
               class="context-menu-item spreadsheet-context-menu-item"
               data-menu-command={command}
               data-testid={`context-menu-command-${command}`}
+              title={tooltipFor(command, menuState().target!)}
               onClick={() => {
                 dispatchCommand(command)
               }}
             >
-              {labelFor(command, menuState().target!)}
+              {labelFor(command)}
             </button>
           )}
         </For>

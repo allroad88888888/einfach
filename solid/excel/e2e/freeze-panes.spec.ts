@@ -79,6 +79,67 @@ test.describe('Wave 5 — Freeze rows/cols via context menu', () => {
     ).toBeVisible()
   })
 
+  test('cell right-click shows all four freeze items at once', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'B3').click({ button: 'right' })
+
+    await expect(page.getByTestId('context-menu-command-view.freezePanes')).toBeVisible()
+    await expect(page.getByTestId('context-menu-command-view.freezeRowsHere')).toBeVisible()
+    await expect(page.getByTestId('context-menu-command-view.freezeColsHere')).toBeVisible()
+    // Unfreeze hidden until freeze is active.
+    await expect(page.getByTestId('context-menu-command-view.unfreeze')).toHaveCount(0)
+  })
+
+  test('cell right-click → Freeze row only — does not touch col freeze', async ({ page }) => {
+    await gotoWave5(page)
+
+    // First freeze a column via the col header menu so we can verify the
+    // subsequent "Freeze row" leaves it untouched.
+    const colC = page.locator('th.spreadsheet-grid-col-header[data-col="2"]')
+    await colC.click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.freezeColsHere').click()
+    await expect(
+      page.locator('th.spreadsheet-grid-col-header[data-col="1"][data-frozen-col="true"]'),
+    ).toBeVisible()
+
+    // Now right-click B3 and pick "Freeze row" — should freeze 2 rows but
+    // keep the column freeze.
+    await cell(page, 'B3').click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.freezeRowsHere').click()
+
+    await expect(
+      page.locator('th.spreadsheet-grid-row-header[data-row="0"][data-frozen-row="true"]'),
+    ).toBeVisible()
+    await expect(
+      page.locator('th.spreadsheet-grid-col-header[data-col="1"][data-frozen-col="true"]'),
+    ).toBeVisible()
+  })
+
+  test('freezing draws the boundary marker on the last frozen row and column', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'C3').click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.freezePanes').click()
+
+    // freezeRowCount=2, freezeColCount=2 → boundary on row=1 and col=1.
+    await expect(
+      page.locator(
+        'td.spreadsheet-grid-cell[data-row="1"][data-freeze-boundary-bottom="true"]',
+      ).first(),
+    ).toBeVisible()
+    await expect(
+      page.locator(
+        'td.spreadsheet-grid-cell[data-col="1"][data-freeze-boundary-right="true"]',
+      ).first(),
+    ).toBeVisible()
+
+    // The corner cell carries both attributes.
+    await expect(
+      page.locator(
+        'td.spreadsheet-grid-cell[data-row="1"][data-col="1"][data-freeze-boundary-bottom="true"][data-freeze-boundary-right="true"]',
+      ),
+    ).toBeVisible()
+  })
+
   test('Unfreeze clears both axes', async ({ page }) => {
     await gotoWave5(page)
 

@@ -534,6 +534,26 @@ thead .row-header {
   z-index: 2;
 }
 
+/* Freeze boundary divider — a 2px dark inset shadow on the last frozen row's
+ * bottom edge and the last frozen column's right edge, marking the seam
+ * between the pinned and scrollable regions. box-shadow is used instead of
+ * border so it stacks cleanly on top of any user-set cell borders without
+ * fighting border-collapse semantics. */
+.spreadsheet-grid-cell[data-freeze-boundary-bottom='true'],
+.spreadsheet-grid-row-header[data-freeze-boundary-bottom='true'] {
+  box-shadow: inset 0 -2px 0 #5f6368;
+}
+.spreadsheet-grid-cell[data-freeze-boundary-right='true'],
+.spreadsheet-grid-col-header[data-freeze-boundary-right='true'] {
+  box-shadow: inset -2px 0 0 #5f6368;
+}
+/* The corner cell sits at both freeze boundaries — combine the two shadows. */
+.spreadsheet-grid-cell[data-freeze-boundary-bottom='true'][data-freeze-boundary-right='true'] {
+  box-shadow:
+    inset 0 -2px 0 #5f6368,
+    inset -2px 0 0 #5f6368;
+}
+
 .spreadsheet-grid-header-label {
   display: inline-flex;
   align-items: center;

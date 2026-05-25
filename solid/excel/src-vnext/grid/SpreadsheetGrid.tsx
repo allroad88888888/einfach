@@ -2788,6 +2788,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                       data-col={col}
                       data-selected={selected() ? 'true' : 'false'}
                       data-frozen-col={col < freezeColCount() ? 'true' : undefined}
+                      data-freeze-boundary-right={
+                        freezeColCount() > 0 && col === freezeColCount() - 1
+                          ? 'true'
+                          : undefined
+                      }
                       style={getColumnStyle(col)}
                       onClick={(event) => {
                         selectColumn(col, event.shiftKey, event.ctrlKey || event.metaKey)
@@ -2864,6 +2869,11 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                     data-row={row}
                     data-selected={isRowSelected(row) ? 'true' : 'false'}
                     data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
+                    data-freeze-boundary-bottom={
+                      freezeRowCount() > 0 && row === freezeRowCount() - 1
+                        ? 'true'
+                        : undefined
+                    }
                     style={getRowHeaderStyle(row)}
                     onClick={(event) => {
                       selectRow(row, event.shiftKey, event.ctrlKey || event.metaKey)
@@ -2924,6 +2934,16 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
                             data-cell-addr={addr}
                             data-frozen-row={row < freezeRowCount() ? 'true' : undefined}
                             data-frozen-col={col < freezeColCount() ? 'true' : undefined}
+                            data-freeze-boundary-bottom={
+                              freezeRowCount() > 0 && row === freezeRowCount() - 1
+                                ? 'true'
+                                : undefined
+                            }
+                            data-freeze-boundary-right={
+                              freezeColCount() > 0 && col === freezeColCount() - 1
+                                ? 'true'
+                                : undefined
+                            }
                             data-selected={selected() ? 'true' : 'false'}
                             data-active={active() ? 'true' : 'false'}
                             data-merge-anchor={mergeAnchor() ? 'true' : 'false'}

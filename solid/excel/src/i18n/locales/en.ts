@@ -484,8 +484,12 @@ export const messages: Record<string, string> = {
   'contextMenu.command.insertColumn': 'Insert column',
   'contextMenu.command.deleteColumn': 'Delete column',
   'contextMenu.command.formatting': 'Formatting',
-  'contextMenu.command.freezeRowsHere': 'Freeze {count} row(s) above',
-  'contextMenu.command.freezeColsHere': 'Freeze {count} column(s) to left',
-  'contextMenu.command.freezePanes': 'Freeze panes',
+  'contextMenu.command.freezeRowsHere': 'Freeze row',
+  'contextMenu.command.freezeColsHere': 'Freeze column',
+  'contextMenu.command.freezePanes': 'Freeze',
   'contextMenu.command.unfreeze': 'Unfreeze',
+  // Tooltips include the count for context; visible label stays short.
+  'contextMenu.command.freezeRowsHere.tooltip': 'Freeze {count} row(s) above',
+  'contextMenu.command.freezeColsHere.tooltip': 'Freeze {count} column(s) to left',
+  'contextMenu.command.freezePanes.tooltip': 'Freeze rows above and columns to left',
 }

@@ -341,9 +341,9 @@ function isCommandAllowedForTarget(command: MenuCommandKind, kind: MenuTargetKin
     case 'cell.clear':
       return kind !== 'sheet-tab'
     case 'view.freezeRowsHere':
-      return kind === 'row'
+      return kind === 'row' || kind === 'cell' || kind === 'range'
     case 'view.freezeColsHere':
-      return kind === 'column'
+      return kind === 'column' || kind === 'cell' || kind === 'range'
     case 'view.freezePanes':
       return kind === 'cell' || kind === 'range'
     case 'view.unfreeze':

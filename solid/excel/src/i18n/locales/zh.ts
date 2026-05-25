@@ -465,8 +465,12 @@ export const messages: Record<string, string> = {
   'contextMenu.command.insertColumn': '插入列',
   'contextMenu.command.deleteColumn': '删除列',
   'contextMenu.command.formatting': '格式',
-  'contextMenu.command.freezeRowsHere': '冻结上方 {count} 行',
-  'contextMenu.command.freezeColsHere': '冻结左侧 {count} 列',
-  'contextMenu.command.freezePanes': '冻结窗格',
+  'contextMenu.command.freezeRowsHere': '冻结行',
+  'contextMenu.command.freezeColsHere': '冻结列',
+  'contextMenu.command.freezePanes': '冻结',
   'contextMenu.command.unfreeze': '取消冻结',
+  // tooltip 携带数量信息，菜单标签保持简短
+  'contextMenu.command.freezeRowsHere.tooltip': '冻结上方 {count} 行',
+  'contextMenu.command.freezeColsHere.tooltip': '冻结左侧 {count} 列',
+  'contextMenu.command.freezePanes.tooltip': '冻结上方行 + 左侧列',
 }
