@@ -258,6 +258,14 @@ function getCommandShortcutIntent(
         type: 'clipboard.cut',
       }
     case 'v':
+      // Ctrl+Alt+V is reserved for Paste Special (Excel binding). Without
+      // the alt guard, the plain paste intent would fire first and swallow
+      // the dispatch. See keyboard/types.ts: KeyboardClipboardIntent.
+      if (input.altKey) {
+        return {
+          type: 'clipboard.pasteSpecial',
+        }
+      }
       return {
         type: 'clipboard.paste',
       }

@@ -274,6 +274,22 @@ describe('keyboard core', () => {
     expect(store.setter(dispatchKeyboardInputAtom, { key: 'c', ctrlKey: true })).toEqual({
       type: 'clipboard.copy',
     })
+    // Plain Ctrl+V → paste.
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'v', ctrlKey: true })).toEqual({
+      type: 'clipboard.paste',
+    })
+    // Ctrl+Alt+V → paste-special (Excel binding). The alt guard prevents
+    // this from falling through to the plain paste arm.
+    expect(
+      store.setter(dispatchKeyboardInputAtom, { key: 'v', ctrlKey: true, altKey: true }),
+    ).toEqual({
+      type: 'clipboard.pasteSpecial',
+    })
+    expect(
+      store.setter(dispatchKeyboardInputAtom, { key: 'v', metaKey: true, altKey: true }),
+    ).toEqual({
+      type: 'clipboard.pasteSpecial',
+    })
     expect(store.setter(dispatchKeyboardInputAtom, { key: 'PageDown', ctrlKey: true })).toEqual({
       type: 'sheet.activate-adjacent',
       direction: 'next',

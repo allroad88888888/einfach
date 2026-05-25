@@ -466,6 +466,44 @@ export const addSelectionRegionAtom = atom(
 )
 addSelectionRegionAtom.debugLabel = 'spreadsheet.selection.addRegion'
 
+/**
+ * Replace the entire selection with a list of regions in one atomic write.
+ * Used by features like Go To Special that need to surface N matches as a
+ * single multi-region selection without N separate add-region writes — each
+ * of which would fire a separate atom-change notification and re-render
+ * subscribers N times.
+ *
+ * `primaryIndex` defaults to 0 when omitted. Empty input falls back to the
+ * default empty cell selection at (0,0) of the current selection's sheet so
+ * subscribers always observe a well-formed primary region.
+ */
+export interface SetMultiRegionSelectionInput {
+  readonly regions: readonly SelectionState[]
+  readonly primaryIndex?: number
+}
+
+export const setMultiRegionSelectionAtom = atom(
+  (get) => get(_multiSelectionAtom),
+  (get, set, input: SetMultiRegionSelectionInput) => {
+    const bounds = get(selectionBoundsAtom)
+    if (input.regions.length === 0) {
+      const currentSheet = get(_multiSelectionAtom).regions[0]?.sheetId ?? DEFAULT_SELECTION_STATE.sheetId
+      set(_multiSelectionAtom, {
+        regions: [{ ...DEFAULT_SELECTION_STATE, sheetId: currentSheet }],
+        primaryIndex: 0,
+      })
+      return
+    }
+    const regions = input.regions.map(
+      (r) => normalizeSelection(r, bounds) as SelectionRegion,
+    )
+    const requested = input.primaryIndex ?? 0
+    const primaryIndex = Math.max(0, Math.min(regions.length - 1, requested))
+    set(_multiSelectionAtom, { regions, primaryIndex })
+  },
+)
+setMultiRegionSelectionAtom.debugLabel = 'spreadsheet.selection.setMultiRegion'
+
 export const clearNonPrimaryRegionsAtom = atom(
   (get) => get(_multiSelectionAtom),
   (get, set, input?: ClearSelectionRegionsInput) => {

@@ -10,6 +10,7 @@ import {
   selectionRangeAtom,
   selectionRegionsAtom,
   selectionSnapshotAtom,
+  setMultiRegionSelectionAtom,
   setSelectionAtom,
   setSelectionBoundsAtom,
 } from '../src/selection'
@@ -249,5 +250,67 @@ describe('multi-range selection', () => {
     expect(store.getter(activeCellAtom)).toEqual({ sheetId: 'S1', row: 4, col: 3 })
     expect(store.getter(selectionRangeAtom)).toEqual({ rowStart: 2, rowEnd: 4, colStart: 1, colEnd: 3 })
     expect(store.getter(primarySelectionRegionAtom)).toEqual({ kind: 'range', sheetId: 'S1', anchor: { row: 2, col: 1 }, focus: { row: 4, col: 3 } })
+  })
+
+  describe('setMultiRegionSelectionAtom', () => {
+    test('replaces the current selection with the supplied regions in one write', () => {
+      const store = createStore()
+      store.setter(setSelectionBoundsAtom, { rowCount: 20, colCount: 20 })
+      store.setter(setSelectionAtom, { kind: 'cell', sheetId: 'S1', anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } })
+      // Establish a different starting selection so we can assert the replace.
+      store.setter(addSelectionRegionAtom, {
+        region: { kind: 'cell', sheetId: 'S1', anchor: { row: 9, col: 9 }, focus: { row: 9, col: 9 } },
+      })
+      expect(store.getter(selectionRegionsAtom)).toHaveLength(2)
+
+      const matches: SelectionState[] = [
+        { kind: 'cell', sheetId: 'S1', anchor: { row: 2, col: 2 }, focus: { row: 2, col: 2 } },
+        { kind: 'cell', sheetId: 'S1', anchor: { row: 5, col: 1 }, focus: { row: 5, col: 1 } },
+        { kind: 'range', sheetId: 'S1', anchor: { row: 7, col: 3 }, focus: { row: 8, col: 4 } },
+      ]
+      store.setter(setMultiRegionSelectionAtom, { regions: matches })
+
+      expect(store.getter(selectionRegionsAtom)).toHaveLength(3)
+      // primaryIndex defaults to 0 when omitted; activeCell snaps to that.
+      expect(store.getter(activeCellAtom)).toEqual({ sheetId: 'S1', row: 2, col: 2 })
+    })
+
+    test('honors explicit primaryIndex', () => {
+      const store = createStore()
+      store.setter(setSelectionBoundsAtom, { rowCount: 20, colCount: 20 })
+      store.setter(setMultiRegionSelectionAtom, {
+        regions: [
+          { kind: 'cell', sheetId: 'S1', anchor: { row: 0, col: 0 }, focus: { row: 0, col: 0 } },
+          { kind: 'cell', sheetId: 'S1', anchor: { row: 5, col: 5 }, focus: { row: 5, col: 5 } },
+        ],
+        primaryIndex: 1,
+      })
+      expect(store.getter(activeCellAtom)).toEqual({ sheetId: 'S1', row: 5, col: 5 })
+    })
+
+    test('out-of-range primaryIndex clamps into the regions array', () => {
+      const store = createStore()
+      store.setter(setSelectionBoundsAtom, { rowCount: 20, colCount: 20 })
+      store.setter(setMultiRegionSelectionAtom, {
+        regions: [{ kind: 'cell', sheetId: 'S1', anchor: { row: 1, col: 1 }, focus: { row: 1, col: 1 } }],
+        primaryIndex: 99,
+      })
+      expect(store.getter(activeCellAtom)).toEqual({ sheetId: 'S1', row: 1, col: 1 })
+    })
+
+    test('empty regions array resets to a single default empty selection on the current sheet', () => {
+      const store = createStore()
+      store.setter(setSelectionBoundsAtom, { rowCount: 20, colCount: 20 })
+      store.setter(setSelectionAtom, {
+        kind: 'cell',
+        sheetId: 'S2',
+        anchor: { row: 4, col: 4 },
+        focus: { row: 4, col: 4 },
+      })
+      store.setter(setMultiRegionSelectionAtom, { regions: [] })
+      const regions = store.getter(selectionRegionsAtom)
+      expect(regions).toHaveLength(1)
+      expect(regions[0].sheetId).toBe('S2')
+    })
   })
 })

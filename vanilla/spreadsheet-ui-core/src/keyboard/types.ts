@@ -59,7 +59,7 @@ export interface KeyboardEditingCancelIntent {
 }
 
 export interface KeyboardClipboardIntent {
-  type: 'clipboard.copy' | 'clipboard.cut' | 'clipboard.paste'
+  type: 'clipboard.copy' | 'clipboard.cut' | 'clipboard.paste' | 'clipboard.pasteSpecial'
 }
 
 export interface SheetNavigationIntent {
