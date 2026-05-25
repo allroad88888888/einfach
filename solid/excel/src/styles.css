@@ -316,7 +316,14 @@ thead .row-header {
 
 .cell-display {
   display: block;
-  padding: 3px 6px;
+  /* Vertical padding intentionally 0: cell rendered height must equal the
+   * logical metrics.rowHeight (default 24) so virtualization, sticky-top of
+   * frozen rows, and SVG overlay coordinates all agree. Earlier `3px` top/
+   * bottom padded the line-height up to 26 px, which table-cell then expanded
+   * to 28 px including the 2 px border — that mismatch made frozen-row sticky
+   * tops land 4 px above their visual cell bottom, so scrolling exposed a
+   * gap/overlap between the first and second frozen row. */
+  padding: 0 6px;
   height: 100%;
   line-height: 20px;
 }
