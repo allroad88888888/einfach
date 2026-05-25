@@ -2733,3 +2733,22 @@ thead .row-header {
 .spreadsheet-formula-autocomplete-signature-comma {
   color: #555;
 }
+
+/* Marching-ants dashed border for clipboard source (copy / cut). Driven by a
+ * single CSS @keyframes so multiple ants rects share one timeline and never
+ * drift relative to each other. Period 4+3=7px matches the canvas overlay's
+ * setLineDash([4,3]) so visual parity is exact. */
+@keyframes spreadsheet-svg-marching-ants {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -7;
+  }
+}
+
+.spreadsheet-grid-overlay-svg .svg-marching-ants-dash {
+  /* 840ms = 7 dash-period units * 120ms/unit; matches the canvas overlay's
+   * scheduleAntsFrame tick exactly (1px per 120ms in lineDashOffset). */
+  animation: spreadsheet-svg-marching-ants 840ms linear infinite;
+}

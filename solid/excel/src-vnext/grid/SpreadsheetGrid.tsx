@@ -101,6 +101,16 @@ import {
 } from '../provider'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider'
 import { SpreadsheetGridOverlay } from './SpreadsheetGridOverlay'
+import { SpreadsheetGridOverlaySvg } from './SpreadsheetGridOverlaySvg'
+
+function useSvgOverlayEnabled(): boolean {
+  if (typeof window === 'undefined') return false
+  try {
+    return new URLSearchParams(window.location.search).get('svgOverlay') === '1'
+  } catch {
+    return false
+  }
+}
 
 export interface SpreadsheetGridProps {
   sheetId: string
@@ -3256,15 +3266,30 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         </svg>
       </Show>
       <div class="spreadsheet-grid-overlay-layer" aria-hidden="true">
-        <SpreadsheetGridOverlay
-          sheetId={props.sheetId}
-          getCellRect={getOverlayCellRect}
-          getSurfaceSize={getOverlaySurfaceSize}
-          getCells={getOverlayCells}
-          getFreezeOrigin={getOverlayFreezeOrigin}
-          getVisibleRows={getRows}
-          getVisibleCols={getCols}
-        />
+        <Show
+          when={useSvgOverlayEnabled()}
+          fallback={
+            <SpreadsheetGridOverlay
+              sheetId={props.sheetId}
+              getCellRect={getOverlayCellRect}
+              getSurfaceSize={getOverlaySurfaceSize}
+              getCells={getOverlayCells}
+              getFreezeOrigin={getOverlayFreezeOrigin}
+              getVisibleRows={getRows}
+              getVisibleCols={getCols}
+            />
+          }
+        >
+          <SpreadsheetGridOverlaySvg
+            sheetId={props.sheetId}
+            getCellRect={getOverlayCellRect}
+            getSurfaceSize={getOverlaySurfaceSize}
+            getCells={getOverlayCells}
+            getFreezeOrigin={getOverlayFreezeOrigin}
+            getVisibleRows={getRows}
+            getVisibleCols={getCols}
+          />
+        </Show>
       </div>
       <For each={getRemoteCursorsForSheet()}>
         {(cursor) => (

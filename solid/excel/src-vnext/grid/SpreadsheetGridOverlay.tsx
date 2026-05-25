@@ -22,6 +22,7 @@ import { onCleanup, onMount } from 'solid-js'
 import type { Store } from '@einfach/core'
 import { spreadsheetProjectionSnapshotAtom } from '../provider'
 import { useSpreadsheetUiStore } from '../provider'
+import { computeOverlayRectForRange } from './overlayGeometry'
 
 // Stable color palette for formula-reference highlights. Indexed by colorIndex
 // from the parsed token list — same token text → same slot so the box and
@@ -96,6 +97,8 @@ export interface OverlayViewportProvider {
   getSheetId(): string
   getCells(): readonly DisplayCell[]
   getFreezeOrigin(): { x: number; y: number }
+  getVisibleRows?(): readonly number[]
+  getVisibleCols?(): readonly number[]
 }
 
 export type OverlayDirtyReason =
@@ -341,14 +344,12 @@ export class OverlayRenderer {
     viewport: OverlayViewportProvider,
     range: CellRange,
   ): { x: number; y: number; w: number; h: number } | null {
-    const start = viewport.getCellRect(range.rowStart, range.colStart)
-    const end = viewport.getCellRect(range.rowEnd, range.colEnd)
-    if (!start || !end) return null
-    const x = Math.min(start.x, end.x)
-    const y = Math.min(start.y, end.y)
-    const w = Math.max(start.x + start.w, end.x + end.w) - x
-    const h = Math.max(start.y + start.h, end.y + end.h) - y
-    return { x, y, w, h }
+    return computeOverlayRectForRange({
+      range,
+      getCellRect: (row, col) => viewport.getCellRect(row, col),
+      getVisibleRows: viewport.getVisibleRows ? () => viewport.getVisibleRows!() : undefined,
+      getVisibleCols: viewport.getVisibleCols ? () => viewport.getVisibleCols!() : undefined,
+    })
   }
 
   private drawRangeOutline(
@@ -622,6 +623,8 @@ export interface SpreadsheetGridOverlayProps {
   getSurfaceSize: () => { width: number; height: number }
   getCells: () => readonly DisplayCell[]
   getFreezeOrigin?: () => { x: number; y: number }
+  getVisibleRows?: () => readonly number[]
+  getVisibleCols?: () => readonly number[]
   contextFactory?: OverlayContextFactory
   onRendererReady?: (renderer: OverlayRenderer) => void
 }
@@ -639,6 +642,8 @@ export function SpreadsheetGridOverlay(props: SpreadsheetGridOverlayProps) {
       getSheetId: () => props.sheetId,
       getCells: () => props.getCells(),
       getFreezeOrigin: () => props.getFreezeOrigin?.() ?? { x: 0, y: 0 },
+      getVisibleRows: props.getVisibleRows ? () => props.getVisibleRows!() : undefined,
+      getVisibleCols: props.getVisibleCols ? () => props.getVisibleCols!() : undefined,
     }
     renderer.attach(canvas, store, viewport)
     props.onRendererReady?.(renderer)
