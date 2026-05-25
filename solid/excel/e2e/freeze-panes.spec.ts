@@ -140,6 +140,29 @@ test.describe('Wave 5 — Freeze rows/cols via context menu', () => {
     ).toBeVisible()
   })
 
+  test('freezing mounts an SVG boundary overlay with both lines', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'C3').click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.freezePanes').click()
+
+    await expect(page.getByTestId('freeze-boundary')).toBeVisible()
+    await expect(page.getByTestId('freeze-boundary-horizontal')).toHaveCount(1)
+    await expect(page.getByTestId('freeze-boundary-vertical')).toHaveCount(1)
+  })
+
+  test('unfreezing removes the SVG boundary overlay', async ({ page }) => {
+    await gotoWave5(page)
+    await cell(page, 'C3').click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.freezePanes').click()
+    await expect(page.getByTestId('freeze-boundary')).toBeVisible()
+
+    // Right-click anywhere to open the menu while freeze is active, then Unfreeze.
+    await cell(page, 'A1').click({ button: 'right' })
+    await page.getByTestId('context-menu-command-view.unfreeze').click()
+
+    await expect(page.getByTestId('freeze-boundary')).toHaveCount(0)
+  })
+
   test('Unfreeze clears both axes', async ({ page }) => {
     await gotoWave5(page)
 

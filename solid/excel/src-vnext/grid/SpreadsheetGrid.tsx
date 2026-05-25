@@ -662,6 +662,20 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     return store.getter(viewportFreezeAtom).colsBySheet[props.sheetId] ?? 0
   }
 
+  function getFreezeBoundaryY(): number {
+    const rows = freezeRowCount()
+    if (rows <= 0) return 0
+    const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
+    return headingHeight + getRowSpanHeight(0, rows - 1)
+  }
+
+  function getFreezeBoundaryX(): number {
+    const cols = freezeColCount()
+    if (cols <= 0) return 0
+    const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
+    return headingWidth + getColumnSpanWidth(0, cols - 1)
+  }
+
   function showGridlines() {
     renderTick()
     return store.getter(viewportShowGridlinesAtom)
@@ -3184,6 +3198,34 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         </tbody>
       </table>
       </div>
+      <Show when={freezeRowCount() > 0 || freezeColCount() > 0}>
+        <svg
+          class="spreadsheet-grid-freeze-boundary"
+          aria-hidden="true"
+          data-testid="freeze-boundary"
+          width="100%"
+          height="100%"
+        >
+          <Show when={freezeRowCount() > 0}>
+            <line
+              data-testid="freeze-boundary-horizontal"
+              x1={0}
+              x2="100%"
+              y1={getFreezeBoundaryY()}
+              y2={getFreezeBoundaryY()}
+            />
+          </Show>
+          <Show when={freezeColCount() > 0}>
+            <line
+              data-testid="freeze-boundary-vertical"
+              x1={getFreezeBoundaryX()}
+              x2={getFreezeBoundaryX()}
+              y1={0}
+              y2="100%"
+            />
+          </Show>
+        </svg>
+      </Show>
       <div class="spreadsheet-grid-overlay-layer" aria-hidden="true">
         <SpreadsheetGridOverlay
           sheetId={props.sheetId}

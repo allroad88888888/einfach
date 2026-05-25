@@ -2954,5 +2954,113 @@ describe('vNext SpreadsheetGrid', () => {
         container.querySelectorAll('[data-freeze-boundary-right="true"]'),
       ).toHaveLength(0)
     })
+
+    it('renders an SVG overlay with the freeze boundary lines at the cumulative pixel offsets', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 8,
+        viewportWidth: 8,
+        rowHeight: 2,
+        colWidth: 4,
+        rowCount: 12,
+        colCount: 8,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      // Freeze first 2 rows and first 3 cols. With rowHeight=2 / colWidth=4,
+      // the horizontal line should sit at y = headerHeight(2) + 2*2 = 6, and
+      // the vertical line at x = rowHeaderWidth(44) + 3*4 = 56.
+      store.setter(setViewportFreezeAtom, {
+        sheetId: 'sheet-1',
+        rows: 2,
+        cols: 3,
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await flushMicrotasks()
+
+      const overlay = container.querySelector('svg.spreadsheet-grid-freeze-boundary')
+      expect(overlay).not.toBeNull()
+
+      const horizontal = container.querySelector('[data-testid="freeze-boundary-horizontal"]')
+      const vertical = container.querySelector('[data-testid="freeze-boundary-vertical"]')
+      expect(horizontal).not.toBeNull()
+      expect(vertical).not.toBeNull()
+
+      expect(horizontal!.getAttribute('y1')).toBe('6')
+      expect(horizontal!.getAttribute('y2')).toBe('6')
+      expect(vertical!.getAttribute('x1')).toBe('56')
+      expect(vertical!.getAttribute('x2')).toBe('56')
+    })
+
+    it('omits the SVG overlay entirely when freeze is inactive', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 3,
+        viewportWidth: 3,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 5,
+        colCount: 5,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await flushMicrotasks()
+
+      expect(container.querySelector('svg.spreadsheet-grid-freeze-boundary')).toBeNull()
+    })
+
+    it('renders only the horizontal line when only rows are frozen', async () => {
+      const store = createStore()
+      const { backend } = createFakeBackend()
+      const viewport = {
+        scrollTop: 0,
+        scrollLeft: 0,
+        viewportHeight: 4,
+        viewportWidth: 4,
+        rowHeight: 1,
+        colWidth: 1,
+        rowCount: 6,
+        colCount: 6,
+        overscanRows: 0,
+        overscanCols: 0,
+      }
+
+      store.setter(setViewportFreezeAtom, { sheetId: 'sheet-1', rows: 1, cols: 0 })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetGrid sheetId="sheet-1" viewport={viewport} />
+        </SpreadsheetUiProvider>
+      ))
+
+      await flushMicrotasks()
+
+      expect(
+        container.querySelector('[data-testid="freeze-boundary-horizontal"]'),
+      ).not.toBeNull()
+      expect(
+        container.querySelector('[data-testid="freeze-boundary-vertical"]'),
+      ).toBeNull()
+    })
   })
 })
