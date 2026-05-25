@@ -533,9 +533,17 @@ thead .row-header {
 .spreadsheet-grid-cell[data-frozen-row][data-frozen-col] {
   z-index: 2;
 }
+/* Frozen headers must outrank both their non-frozen siblings (which already
+ * sit at z 2/3 thanks to the .spreadsheet-grid scoped sticky rules below)
+ * AND the corner (z 4). Otherwise non-frozen headers scrolling past land on
+ * top in source-order ties. */
+.spreadsheet-grid .spreadsheet-grid-col-header[data-frozen-col='true'],
+.spreadsheet-grid .spreadsheet-grid-row-header[data-frozen-row='true'] {
+  z-index: 5;
+}
 .spreadsheet-grid-row-header[data-frozen-row] {
   position: sticky;
-  z-index: 2;
+  z-index: 5;
 }
 
 /* Freeze boundary divider — single SVG overlay drawn once per grid root
@@ -555,7 +563,9 @@ thead .row-header {
   height: 100%;
   pointer-events: none;
   overflow: visible;
-  z-index: 4;
+  /* Above corner (4) and frozen headers (5) so the seam line is visible
+   * across the entire grid including the frozen header bands. */
+  z-index: 6;
 }
 .spreadsheet-grid-freeze-boundary line {
   stroke: #5f6368;
