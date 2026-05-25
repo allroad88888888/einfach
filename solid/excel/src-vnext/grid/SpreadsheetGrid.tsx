@@ -665,6 +665,24 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function getFreezeBoundaryY(): number {
     const rows = freezeRowCount()
     if (rows <= 0) return 0
+    // Prefer DOM measurement: the rendered cell height in the grid
+    // (border-collapse + line-height + cell padding) does not match
+    // `metrics.rowHeight` exactly, so cumulative math drifts a few pixels
+    // off the actual seam. Reading the last frozen row's getBoundingClientRect
+    // pins the line on the real pixel edge regardless of override / styling.
+    if (gridRoot && scrollRoot) {
+      const rootRect = scrollRoot.getBoundingClientRect()
+      // jsdom returns all-zero rects (no layout). Math fallback is more
+      // useful there for the unit-test asserts.
+      if (rootRect.height > 0) {
+        const lastFrozen = gridRoot.querySelector(
+          `td.spreadsheet-grid-cell[data-row="${rows - 1}"]`,
+        ) as HTMLElement | null
+        if (lastFrozen) {
+          return lastFrozen.getBoundingClientRect().bottom - rootRect.top
+        }
+      }
+    }
     const headingHeight = showHeadings() ? viewportMetrics().rowHeight : 0
     return headingHeight + getRowSpanHeight(0, rows - 1)
   }
@@ -672,6 +690,17 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   function getFreezeBoundaryX(): number {
     const cols = freezeColCount()
     if (cols <= 0) return 0
+    if (gridRoot && scrollRoot) {
+      const rootRect = scrollRoot.getBoundingClientRect()
+      if (rootRect.width > 0) {
+        const lastFrozen = gridRoot.querySelector(
+          `td.spreadsheet-grid-cell[data-col="${cols - 1}"]`,
+        ) as HTMLElement | null
+        if (lastFrozen) {
+          return lastFrozen.getBoundingClientRect().right - rootRect.left
+        }
+      }
+    }
     const headingWidth = showHeadings() ? GRID_ROW_HEADER_WIDTH : 0
     return headingWidth + getColumnSpanWidth(0, cols - 1)
   }
