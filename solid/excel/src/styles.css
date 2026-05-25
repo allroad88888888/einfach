@@ -390,9 +390,10 @@ thead .row-header {
   overflow: auto;
   max-height: 70vh;
   max-width: 100%;
-  /* Contain the scroll chain so reaching the edge does not bounce the
-   * surrounding page or rubber-band the inner viewport (macOS overscroll). */
-  overscroll-behavior: contain;
+  /* `none` disables BOTH the scroll-chain to the parent page AND the
+   * rubber-band overscroll on this element itself. `contain` would only
+   * stop the chain — the inner viewport would still bounce at the edge. */
+  overscroll-behavior: none;
 }
 
 .spreadsheet-grid-overlay-layer {
