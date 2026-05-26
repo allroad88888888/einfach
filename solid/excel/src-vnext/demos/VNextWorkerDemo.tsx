@@ -1,9 +1,11 @@
 import { createEffect, onCleanup, onMount, Show } from 'solid-js'
 import { useAtomValue } from '@einfach/solid'
 import {
+  registerCustomFormulaAtom,
   selectCellAtom,
   selectionAtom,
   setWorkspaceActiveSheetAtom,
+  unregisterCustomFormulaAtom,
   workspaceSessionAtom,
   type ViewportMetrics,
 } from '@einfach/spreadsheet-ui-core'
@@ -175,6 +177,15 @@ function VNextWorkerWorkbook() {
     if (!store.getter(selectionAtom).sheetId) {
       store.setter(selectCellAtom, { sheetId: sid, coord: { row: 0, col: 0 } })
     }
+    const customFormulas = [
+      { name: 'MYTAX', source: 'return Number(args[0]) * 0.2', paramLabels: ['amount'] },
+      { name: 'GREET', source: "return 'Hello, ' + String(args[0] ?? '')", paramLabels: ['name'] },
+      { name: 'CELSIUS', source: 'return (Number(args[0]) - 32) * 5 / 9', paramLabels: ['fahrenheit'] },
+    ]
+    for (const reg of customFormulas) store.setter(registerCustomFormulaAtom, reg)
+    onCleanup(() => {
+      for (const reg of customFormulas) store.setter(unregisterCustomFormulaAtom, reg.name)
+    })
   })
 
   return (
