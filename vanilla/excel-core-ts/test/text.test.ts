@@ -464,3 +464,93 @@ describe('VALUE', () => {
     expect(call('VALUE', [errVal('#N/A')])).toEqual({ kind: 'error', code: '#N/A' })
   })
 })
+
+// =============================================================================
+// SEARCH  (Wave F / F1)
+// =============================================================================
+
+// Helper for SEARCH/FIND tests — strips the optional `message` field
+// on error results so we can compare against `{kind, code}` only.
+function errCodeOf(v: Value): string | undefined {
+  if (v.kind !== 'error') return undefined
+  return v.code
+}
+
+describe('SEARCH', () => {
+  test('case-insensitive position (1-based)', () => {
+    // "LO" appears at index 4 ('l') and 'o' is index 5, "LO" matches starting at 'l' (pos 4).
+    expect(call('SEARCH', [str('LO'), str('hello world')])).toEqual(num(4))
+    expect(call('SEARCH', [str('hello'), str('Hello World')])).toEqual(num(1))
+  })
+
+  test('start argument restricts search window', () => {
+    // 'o' at pos 5 (in 'hello'); next 'o' at pos 8 (in 'world'). start=6 → 8.
+    expect(call('SEARCH', [str('o'), str('hello world'), num(6)])).toEqual(num(8))
+  })
+
+  test('not found → #VALUE!', () => {
+    expect(errCodeOf(call('SEARCH', [str('xyz'), str('hello world')]))).toBe('#VALUE!')
+  })
+
+  test('wildcard ? matches single char', () => {
+    expect(call('SEARCH', [str('h?llo'), str('hello world')])).toEqual(num(1))
+  })
+
+  test('wildcard * matches any run', () => {
+    expect(call('SEARCH', [str('h*o'), str('hello world')])).toEqual(num(1))
+  })
+
+  test('~* escapes wildcard', () => {
+    // 'a*' literal at position 5 in 'abc a* def'.
+    expect(call('SEARCH', [str('a~*'), str('abc a* def')])).toEqual(num(5))
+    expect(errCodeOf(call('SEARCH', [str('a~*'), str('abc def')]))).toBe('#VALUE!')
+  })
+
+  test('start < 1 → #VALUE!', () => {
+    expect(errCodeOf(call('SEARCH', [str('h'), str('hello'), num(0)]))).toBe('#VALUE!')
+  })
+
+  test('error propagation', () => {
+    expect(call('SEARCH', [errVal('#N/A'), str('hello')])).toEqual({
+      kind: 'error',
+      code: '#N/A',
+    })
+  })
+})
+
+// =============================================================================
+// FIND  (Wave F / F1)
+// =============================================================================
+
+describe('FIND', () => {
+  test('case-sensitive position (1-based)', () => {
+    expect(call('FIND', [str('lo'), str('hello world')])).toEqual(num(4))
+  })
+
+  test('case mismatch → #VALUE! (no fallback)', () => {
+    expect(errCodeOf(call('FIND', [str('LO'), str('hello world')]))).toBe('#VALUE!')
+  })
+
+  test('start argument restricts search', () => {
+    expect(call('FIND', [str('o'), str('hello world'), num(6)])).toEqual(num(8))
+  })
+
+  test('wildcards are literal (no expansion)', () => {
+    expect(call('FIND', [str('h*o'), str('hello h*o!')])).toEqual(num(7))
+  })
+
+  test('not found → #VALUE!', () => {
+    expect(errCodeOf(call('FIND', [str('xyz'), str('hello world')]))).toBe('#VALUE!')
+  })
+
+  test('start < 1 → #VALUE!', () => {
+    expect(errCodeOf(call('FIND', [str('h'), str('hello'), num(0)]))).toBe('#VALUE!')
+  })
+
+  test('error propagation', () => {
+    expect(call('FIND', [errVal('#REF!'), str('hello')])).toEqual({
+      kind: 'error',
+      code: '#REF!',
+    })
+  })
+})

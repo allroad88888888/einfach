@@ -22,6 +22,8 @@ import type { FunctionImpl } from '../../types'
 
 import { FUNCTIONS as ARRAY_FUNCTIONS } from './array'
 import { FUNCTIONS as DATE_FUNCTIONS } from './date'
+import { FUNCTIONS as FINANCIAL_FUNCTIONS } from './financial'
+import { FUNCTIONS as INFO_FUNCTIONS } from './info'
 import { FUNCTIONS as LOGICAL_FUNCTIONS } from './logical'
 import { FUNCTIONS as LOOKUP_FUNCTIONS } from './lookup'
 import { FUNCTIONS as MATH_FUNCTIONS } from './math'
@@ -42,6 +44,8 @@ export const BUILTIN_FUNCTIONS: ReadonlyMap<string, FunctionImpl> = Object.freez
     ...Object.entries(DATE_FUNCTIONS),
     ...Object.entries(STATS_FUNCTIONS),
     ...Object.entries(ARRAY_FUNCTIONS),
+    ...Object.entries(INFO_FUNCTIONS),
+    ...Object.entries(FINANCIAL_FUNCTIONS),
   ]),
 )
 

@@ -446,6 +446,141 @@ function parseValueString(raw: string): Value {
 }
 
 // =============================================================================
+// SEARCH / FIND  (Wave F / F1)
+// =============================================================================
+
+/**
+ * Shared substring-search core for SEARCH and FIND. Returns 1-based
+ * position (Excel convention) or `null` if not found. `start` is
+ * 1-based; `start < 1` or `start > length` → `null` (caller surfaces
+ * `#VALUE!`).
+ *
+ * Note on Unicode: we operate on the same code-point split that
+ * LEFT/RIGHT/MID use, so "1-based position" lines up with the LEN we
+ * report. SEARCH/FIND in Excel use UTF-16 code units historically; we
+ * diverge intentionally for consistency with the rest of this module.
+ *
+ * `caseInsensitive=true` for SEARCH, `false` for FIND.
+ *
+ * SEARCH also honors wildcards (`*`, `?`, `~` escape). FIND does NOT.
+ */
+function searchCore(
+  needle: string,
+  haystack: string,
+  start: number,
+  caseInsensitive: boolean,
+  wildcards: boolean,
+): number | null {
+  const hay = codepoints(haystack)
+  if (start < 1 || start > hay.length + 1) return null
+
+  // SEARCH("", x) returns `start` (1-based) — matches Excel.
+  if (needle.length === 0) return start
+
+  if (wildcards && /[*?]/.test(needle)) {
+    // Build a regex from the wildcard pattern. `~` escapes the next
+    // metachar (`~*` literal asterisk, `~?` literal question mark, `~~`
+    // literal tilde).
+    let pattern = ''
+    let i = 0
+    while (i < needle.length) {
+      const ch = needle[i]
+      if (ch === '~' && i + 1 < needle.length) {
+        const next = needle[i + 1]
+        if (next === '*' || next === '?' || next === '~') {
+          pattern += escapeRegExp(next)
+          i += 2
+          continue
+        }
+      }
+      if (ch === '*') {
+        pattern += '.*'
+        i += 1
+      } else if (ch === '?') {
+        pattern += '.'
+        i += 1
+      } else {
+        pattern += escapeRegExp(ch)
+        i += 1
+      }
+    }
+    const flags = caseInsensitive ? 'i' : ''
+    const re = new RegExp(pattern, flags)
+    // Convert start to a JS-string offset (code-unit, but matches what
+    // we're searching against — the raw haystack string).
+    const offset = hay.slice(0, start - 1).join('').length
+    const slice = haystack.slice(offset)
+    const m = slice.match(re)
+    if (!m || m.index === undefined) return null
+    // Convert the JS-string match index back to a code-point index.
+    const matchedAt = offset + m.index
+    return codepoints(haystack.slice(0, matchedAt)).length + 1
+  }
+
+  const hayCmp = caseInsensitive ? haystack.toLowerCase() : haystack
+  const needCmp = caseInsensitive ? needle.toLowerCase() : needle
+  const offset = hay.slice(0, start - 1).join('').length
+  const found = hayCmp.indexOf(needCmp, offset)
+  if (found < 0) return null
+  return codepoints(haystack.slice(0, found)).length + 1
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * SEARCH(find_text, within_text, [start=1]) — case-INsensitive
+ * substring search with wildcard support (`*`, `?`, `~` escape).
+ * Returns the 1-based position or `#VALUE!` if not found / bad start.
+ */
+const SEARCH: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3)
+    return errValue('#VALUE!', 'SEARCH takes 2 or 3 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const findR = coerceText(args[0])
+  if (!findR.ok) return findR.error
+  const withinR = coerceText(args[1])
+  if (!withinR.ok) return withinR.error
+  let start = 1
+  if (args.length === 3) {
+    const s = toNumber(args[2])
+    if (!s.ok) return s.error
+    start = Math.trunc(s.value)
+  }
+  if (start < 1) return errValue('#VALUE!', 'SEARCH start_num must be >= 1')
+  const pos = searchCore(findR.value, withinR.value, start, true, true)
+  if (pos === null) return errValue('#VALUE!', 'SEARCH text not found')
+  return { kind: 'number', value: pos }
+}
+
+/**
+ * FIND(find_text, within_text, [start=1]) — case-SENSITIVE substring
+ * search. Wildcards are treated literally (Excel discipline).
+ */
+const FIND: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3)
+    return errValue('#VALUE!', 'FIND takes 2 or 3 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const findR = coerceText(args[0])
+  if (!findR.ok) return findR.error
+  const withinR = coerceText(args[1])
+  if (!withinR.ok) return withinR.error
+  let start = 1
+  if (args.length === 3) {
+    const s = toNumber(args[2])
+    if (!s.ok) return s.error
+    start = Math.trunc(s.value)
+  }
+  if (start < 1) return errValue('#VALUE!', 'FIND start_num must be >= 1')
+  const pos = searchCore(findR.value, withinR.value, start, false, false)
+  if (pos === null) return errValue('#VALUE!', 'FIND text not found')
+  return { kind: 'number', value: pos }
+}
+
+// =============================================================================
 // Registry
 // =============================================================================
 
@@ -468,4 +603,7 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   TRIM,
   TEXT,
   VALUE,
+  // Wave F / F1 additions
+  SEARCH,
+  FIND,
 }

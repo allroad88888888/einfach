@@ -19,20 +19,25 @@ import { describe, expect, test } from '@jest/globals'
 import {
   ABS,
   AVERAGE,
+  CEILING,
   COUNT,
   COUNTA,
+  FLOOR,
   FUNCTIONS,
   INT,
   MAX,
   MIN,
   MOD,
   POWER,
+  PRODUCT,
   ROUND,
   ROUNDDOWN,
   ROUNDUP,
   SIGN,
   SQRT,
   SUM,
+  SUMPRODUCT,
+  TRUNC,
 } from '../src/eval/functions/math'
 import type { EvalContext, FunctionImpl, Value } from '../src/types'
 import { BLANK } from '../src/types'
@@ -537,25 +542,156 @@ describe('SIGN', () => {
 // Registry
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Wave F / F1 — CEILING / FLOOR / TRUNC / SUMPRODUCT / PRODUCT
+// ---------------------------------------------------------------------------
+
+describe('CEILING', () => {
+  test('round up to nearest multiple of significance', () => {
+    expect(call(CEILING, [NUM(2.5), NUM(1)])).toEqual(NUM(3))
+    expect(call(CEILING, [NUM(2.3), NUM(0.5)])).toEqual(NUM(2.5))
+    expect(call(CEILING, [NUM(7), NUM(3)])).toEqual(NUM(9))
+  })
+
+  test('default significance = 1', () => {
+    expect(call(CEILING, [NUM(2.5)])).toEqual(NUM(3))
+  })
+
+  test('significance = 0 → 0 (Excel CEILING.MATH)', () => {
+    expect(call(CEILING, [NUM(5), NUM(0)])).toEqual(NUM(0))
+  })
+
+  test('error propagation', () => {
+    expect(call(CEILING, [ERR('#DIV/0!'), NUM(1)])).toEqual(ERR('#DIV/0!'))
+  })
+})
+
+describe('FLOOR', () => {
+  test('round down to nearest multiple of significance', () => {
+    expect(call(FLOOR, [NUM(2.5), NUM(1)])).toEqual(NUM(2))
+    expect(call(FLOOR, [NUM(2.7), NUM(0.5)])).toEqual(NUM(2.5))
+    expect(call(FLOOR, [NUM(7), NUM(3)])).toEqual(NUM(6))
+  })
+
+  test('default significance = 1', () => {
+    expect(call(FLOOR, [NUM(2.9)])).toEqual(NUM(2))
+  })
+
+  test('negative value floors toward negative infinity', () => {
+    expect(call(FLOOR, [NUM(-2.5), NUM(1)])).toEqual(NUM(-3))
+  })
+
+  test('significance = 0 → 0', () => {
+    expect(call(FLOOR, [NUM(5), NUM(0)])).toEqual(NUM(0))
+  })
+})
+
+describe('TRUNC', () => {
+  test('default digits=0, truncate toward zero', () => {
+    expect(call(TRUNC, [NUM(3.7)])).toEqual(NUM(3))
+    expect(call(TRUNC, [NUM(-3.7)])).toEqual(NUM(-3))
+  })
+
+  test('digits>0 preserves decimal places', () => {
+    expect(call(TRUNC, [NUM(3.14159), NUM(2)])).toEqual(NUM(3.14))
+  })
+
+  test('digits<0 zeroes out left of decimal', () => {
+    expect(call(TRUNC, [NUM(123.45), NUM(-1)])).toEqual(NUM(120))
+  })
+
+  test('error propagation', () => {
+    expect(call(TRUNC, [ERR('#NUM!')])).toEqual(ERR('#NUM!'))
+  })
+})
+
+describe('SUMPRODUCT', () => {
+  test('element-wise product summed for equal-shape arrays', () => {
+    expect(
+      call(SUMPRODUCT, [
+        ARR([[NUM(1), NUM(2), NUM(3)]]),
+        ARR([[NUM(4), NUM(5), NUM(6)]]),
+      ]),
+    ).toEqual(NUM(1 * 4 + 2 * 5 + 3 * 6))
+  })
+
+  test('shape mismatch → #VALUE!', () => {
+    expect(
+      call(SUMPRODUCT, [ARR([[NUM(1), NUM(2)]]), ARR([[NUM(1), NUM(2), NUM(3)]])]),
+    ).toEqual(ERR('#VALUE!'))
+  })
+
+  test('non-numeric inside array treated as 0 (Excel quirk)', () => {
+    expect(
+      call(SUMPRODUCT, [
+        ARR([[NUM(1), STR('hello'), NUM(3)]]),
+        ARR([[NUM(4), NUM(5), NUM(6)]]),
+      ]),
+    ).toEqual(NUM(1 * 4 + 0 + 3 * 6))
+  })
+
+  test('error inside array propagates', () => {
+    expect(
+      call(SUMPRODUCT, [
+        ARR([[NUM(1), NUM(2), NUM(3)]]),
+        ARR([[NUM(4), ERR('#REF!'), NUM(6)]]),
+      ]),
+    ).toEqual(ERR('#REF!'))
+  })
+
+  test('single-array variant returns straight sum', () => {
+    expect(call(SUMPRODUCT, [ARR([[NUM(1), NUM(2), NUM(3)]])])).toEqual(NUM(6))
+  })
+
+  test('zero args → #VALUE!', () => {
+    expect(call(SUMPRODUCT, [])).toEqual(ERR('#VALUE!'))
+  })
+})
+
+describe('PRODUCT', () => {
+  test('happy path: multiply all numeric scalar args', () => {
+    expect(call(PRODUCT, [NUM(2), NUM(3), NUM(4)])).toEqual(NUM(24))
+  })
+
+  test('ignores non-numeric inside arrays', () => {
+    expect(
+      call(PRODUCT, [ARR([[NUM(2), STR('hi'), BOOL(true)], [BLANK, NUM(3)]])]),
+    ).toEqual(NUM(6))
+  })
+
+  test('empty product → 0 (Excel quirk, not 1)', () => {
+    expect(call(PRODUCT, [])).toEqual(NUM(0))
+  })
+
+  test('error propagation', () => {
+    expect(call(PRODUCT, [NUM(2), ERR('#DIV/0!')])).toEqual(ERR('#DIV/0!'))
+  })
+})
+
 describe('FUNCTIONS registry', () => {
-  test('exposes all 15 v1 math functions by uppercase name', () => {
+  test('exposes all 20 math functions (15 v1 + 5 Wave F/F1)', () => {
     expect(Object.keys(FUNCTIONS).sort()).toEqual(
       [
         'ABS',
         'AVERAGE',
+        'CEILING',
         'COUNT',
         'COUNTA',
+        'FLOOR',
         'INT',
         'MAX',
         'MIN',
         'MOD',
         'POWER',
+        'PRODUCT',
         'ROUND',
         'ROUNDDOWN',
         'ROUNDUP',
         'SIGN',
         'SQRT',
         'SUM',
+        'SUMPRODUCT',
+        'TRUNC',
       ].sort(),
     )
   })

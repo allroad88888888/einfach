@@ -409,6 +409,56 @@ function clampRangeToSheet(range: SparseRangeWire): CellRange {
   }
 }
 
+/**
+ * Enumerate the (row, col) coords of *spill targets* — cells with no own
+ * formula/literal that fall inside the array-region of an anchor in this
+ * sheet. Used by the range projectors so a spilled SEQUENCE/TRANSPOSE/SORT
+ * surface in `readSparseRange` / `snapshotRangeSparse`, not just at the
+ * boundary read path (`readCellValue`).
+ *
+ * The enumeration walks every formula cell once and consults its computed
+ * value through `formulaCellAtom`; if it returns `kind:'array'`, every
+ * coord *other than* the anchor itself that lies inside `bounds` becomes
+ * a target. Cells that have their own entry in `cells` are skipped
+ * (they're handled by the existing loop, which projects via
+ * `readCellValue`'s top-left-collapse).
+ */
+function collectSpillTargets(
+  state: RuntimeState,
+  sheet: SheetEntry,
+  bounds: CellRange,
+): Array<{ row: number; col: number }> {
+  const target = state.workbook.sheet(sheet.id)
+  if (!target) return []
+  const cells = state.workbook.store.getter(target.sheetAtom)
+  const out: Array<{ row: number; col: number }> = []
+  for (const [key, cell] of cells) {
+    if (!cell.input.startsWith('=')) continue
+    const [rowStr, colStr] = key.split(':')
+    const ar = Number(rowStr)
+    const ac = Number(colStr)
+    const atom = target.formulaCellAtom(key)
+    const v = state.workbook.store.getter(atom)
+    if (v.kind !== 'array') continue
+    const rows = v.value.length
+    const cols = v.value[0]?.length ?? 0
+    // The anchor itself is already in the `cells` map and handled by the
+    // outer loop's read pass; we only emit *projected* coords here.
+    for (let r = 0; r < rows; r += 1) {
+      for (let c = 0; c < cols; c += 1) {
+        if (r === 0 && c === 0) continue // anchor
+        const tr = ar + r
+        const tc = ac + c
+        if (tr < bounds.rowStart || tr > bounds.rowEnd) continue
+        if (tc < bounds.colStart || tc > bounds.colEnd) continue
+        if (cells.has(`${tr}:${tc}`)) continue // explicit cell shadows the spill
+        out.push({ row: tr, col: tc })
+      }
+    }
+  }
+  return out
+}
+
 function snapshotRangeSparse(state: RuntimeState, range: SparseRangeWire): SparseCellWire[] {
   const sheet = assertSheetIdx(state, range.sheet)
   const bounds = clampRangeToSheet(range)
@@ -423,6 +473,11 @@ function snapshotRangeSparse(state: RuntimeState, range: SparseRangeWire): Spars
     if (row < bounds.rowStart || row > bounds.rowEnd || col < bounds.colStart || col > bounds.colEnd) {
       continue
     }
+    const sparse = readSparseCell(state, sheet, row, col)
+    if (sparse) out.push(sparse)
+  }
+  // Add spill-projected cells from in-bounds anchors.
+  for (const { row, col } of collectSpillTargets(state, sheet, bounds)) {
     const sparse = readSparseCell(state, sheet, row, col)
     if (sparse) out.push(sparse)
   }
@@ -450,6 +505,10 @@ function readSparseRange(state: RuntimeState, range: SparseRangeWire): CellSnaps
     // these in via fillBlankFormatOnlyCells using the format snapshot).
     const value = readCellValue(state, sheet, row, col)
     if (value.kind === 'blank' && !cell.input.startsWith('=')) continue
+    out.push(readCellSnapshot(state, sheet, row, col))
+  }
+  // Include spill-projected cells (Wave E1 spill from anchors with arrays).
+  for (const { row, col } of collectSpillTargets(state, sheet, bounds)) {
     out.push(readCellSnapshot(state, sheet, row, col))
   }
   out.sort((left, right) => {

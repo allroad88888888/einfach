@@ -36,6 +36,8 @@
 | 2026-05-26 | C5 agent | Wave C / C5 — date + stats functions | done | `vanilla/excel-core-ts/src/eval/functions/date.ts`, `vanilla/excel-core-ts/src/eval/functions/stats.ts`, `vanilla/excel-core-ts/test/date.test.ts`, `vanilla/excel-core-ts/test/stats.test.ts` | CC main session merges `functions/index.ts` registry — all C1..C5 tracks now done |
 | 2026-05-26 | E3+E4 agent | Wave E / E3 — LAMBDA in evaluator + Wave E / E4 — custom formula e2e verify | done | `vanilla/excel-core-ts/src/types.ts` (add `lambdaScope?` to `EvalContext`, additive), `vanilla/excel-core-ts/src/eval/evaluate.ts` (`call` + `name` arms wire LAMBDA scope + dispatch), `vanilla/excel-core-ts/test/lambda.test.ts` (new — 16 specs), `solid/excel/test/excel-core-ts-custom-formulas.test.ts` (new — 9 specs against `worker-runtime-ts`) | hand off — Wave E1 (spill) / E2 (cross-sheet) remain; F2 e2e migration unblocked for LAMBDA/custom-formula scenarios |
 | 2026-05-26 | CC | Wave E / E1 — spill arrays + array functions | done | `vanilla/excel-core-ts/src/eval/functions/array.ts` (new — SEQUENCE/TRANSPOSE/SORT/FILTER/UNIQUE), `vanilla/excel-core-ts/test/array.test.ts` (new — 24 specs), `vanilla/excel-core-ts/src/eval/functions/index.ts` (registry merge), `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` (spill projection helper + readCellValue collapse), `solid/excel/test/excel-core-ts-spill.test.ts` (new — 3 specs) | Wave E complete (E2 cross-sheet was already done by B2) — F2 e2e migration now fully unblocked |
+| 2026-05-26 | F1 agent | Wave F / F1 — function fill-out (info / financial / math+ / text+) | done | `vanilla/excel-core-ts/src/eval/functions/info.ts` (new — 8 fns), `vanilla/excel-core-ts/src/eval/functions/financial.ts` (new — 10 fns), `vanilla/excel-core-ts/src/eval/functions/math.ts` (append CEILING/FLOOR/TRUNC/SUMPRODUCT/PRODUCT — +5 fns), `vanilla/excel-core-ts/src/eval/functions/text.ts` (append SEARCH/FIND — +2 fns), `vanilla/excel-core-ts/src/eval/functions/index.ts` (register info + financial), `vanilla/excel-core-ts/test/info.test.ts` (new — 31 specs), `vanilla/excel-core-ts/test/financial.test.ts` (new — 37 specs), `vanilla/excel-core-ts/test/math.test.ts` (append CEILING/FLOOR/TRUNC/SUMPRODUCT/PRODUCT — +24 specs), `vanilla/excel-core-ts/test/text.test.ts` (append SEARCH/FIND — +15 specs) | total built-in function count now 82 across 8 files; F1 second batch ready for spawn (more info/financial/text/date/stats/lookup follow-ons) |
+| 2026-05-26 | F2 agent | Wave F / F2 — TS-backend e2e parity probe | done | `solid/excel/e2e/vnext-worker-ts.spec.ts` (new — single side-by-side spec, 3 active + 2 fixme) | Filed spill-projection-via-readSparseRange regression (see Handoff below); LAMBDA host-UI gap noted; full e2e suite migration is still F2-followup scope, not blocked by this probe |
 
 ### Handoff: A / 2026-05-26
 
@@ -745,4 +747,151 @@ Tests run:
 Next request:
 - Wave E1 (spill arrays) and Wave E2 (cross-sheet refs) are independent of this handoff and can run in parallel.
 - Wave F2 (e2e migration) is now unblocked for LAMBDA-using fixtures and `custom-formulas.spec.ts` against `?backend=ts`.
+
+---
+
+### Handoff: F.F1 / 2026-05-26
+
+Owner（交付方）: F1 agent
+Status: done
+
+Touched files (whitelist enforced):
+- `vanilla/excel-core-ts/src/eval/functions/info.ts` (new — 8 `FunctionImpl` exports: ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISERR, ISNA, TYPE + `FUNCTIONS` record)
+- `vanilla/excel-core-ts/src/eval/functions/financial.ts` (new — 10 exports: PV, FV, PMT, NPER, RATE, NPV, IRR, IPMT, PPMT, CUMIPMT + `FUNCTIONS` record)
+- `vanilla/excel-core-ts/src/eval/functions/math.ts` (edit — append CEILING / FLOOR / TRUNC / SUMPRODUCT / PRODUCT and update `FUNCTIONS` record; no existing function semantics changed)
+- `vanilla/excel-core-ts/src/eval/functions/text.ts` (edit — append SEARCH / FIND and update `FUNCTIONS` record; no existing function semantics changed)
+- `vanilla/excel-core-ts/src/eval/functions/index.ts` (edit — import + spread `INFO_FUNCTIONS` and `FINANCIAL_FUNCTIONS` into the BUILTIN_FUNCTIONS map)
+- `vanilla/excel-core-ts/test/info.test.ts` (new — 31 specs)
+- `vanilla/excel-core-ts/test/financial.test.ts` (new — 37 specs)
+- `vanilla/excel-core-ts/test/math.test.ts` (edit — append 24 new specs for CEILING/FLOOR/TRUNC/SUMPRODUCT/PRODUCT + update registry enumeration to all 20 names)
+- `vanilla/excel-core-ts/test/text.test.ts` (edit — append 15 new specs for SEARCH/FIND)
+
+Public types changed: **none**. Every new function consumes `Value` / `FunctionImpl` / `EvalContext` from `'../../types'` verbatim. No contract drift.
+
+Atoms added/changed: **none** (all 25 new functions are pure value-in / value-out; ctx is never read).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts --no-coverage` → **777/777 pass** across 16 suites (info 31 + financial 37 + math 112 [88 pre-existing + 24 new] + text 94 [79 pre-existing + 15 new] + logical 61 + lookup 56 + date 41 + stats 53 + parser 102 + refs 87 + workbook 20 + evaluate 21 + array 24 + lambda 16 + functions-registry 9 + types 7).
+- `npx tsc -b vanilla/excel-core-ts` → **clean** (no diagnostics).
+- `npx jest vanilla --no-coverage` → **1729/1729 pass** (no regression in `@einfach/core`, `@einfach/spreadsheet-ui-core`, etc.).
+
+### Total built-in function count
+
+**82 functions** across 8 files (math 20, logical 10, lookup 5, text 13, date 7, stats 4, array 5, info 8, financial 10 — note the merge accounts: 20+10+5+13+7+4+5+8+10 = 82, confirmed by inline registry size check).
+
+### Functions delivered (25)
+
+**Info (8)**:
+- ISNUMBER, ISTEXT, ISBLANK, ISLOGICAL, ISERROR, ISERR, ISNA, TYPE
+- *Critical contract*: these are the ONLY built-ins that bypass `propagateError` — an `error` arg is just another shape to classify (TRUE for ISERROR, etc.).
+
+**Financial (10)**:
+- PV, FV, PMT, NPER, RATE, NPV, IRR, IPMT, PPMT, CUMIPMT
+- Sign convention: positive = received, negative = paid out (Excel standard).
+- RATE + IRR use Newton-Raphson with 50-iteration cap and 1e-7 tolerance. Convergence detected on `|step| < tol` (rate stopped changing) OR `|f| < tol` (residual is zero). Final-pass relaxation accepts `|f| < 1e-3` to handle shallow-derivative roots; non-convergent → `#NUM!`.
+
+**Math (5 new, math file now 20 total)**:
+- CEILING, FLOOR (CEILING.MATH semantics — significance=0 returns 0, magnitude-only direction)
+- TRUNC (toward-zero with optional `digits`)
+- SUMPRODUCT (strict-shape with 1×1 broadcast; non-numeric inside arrays treated as 0 per Excel quirk; errors propagate)
+- PRODUCT (multiply numerics; empty product = 0 per Excel)
+
+**Text (2 new, text file now 13 total)**:
+- SEARCH (case-INsensitive, wildcards: `*` / `?` / `~` escape)
+- FIND (case-sensitive, wildcards literal)
+- Position is 1-based code-point index (matches the LEN/LEFT/MID Unicode discipline already in `text.ts`).
+
+### Excel semantics pinned by test
+
+- **IS* family does NOT propagate errors** — `ISNUMBER(#DIV/0!) === FALSE`, `ISERROR(#N/A) === TRUE`. Single test in `info.test.ts` per function pins this.
+- **TYPE** returns 1/2/4/16/64/0 for number/text/logical/error/array/blank. Excel's TYPE(blank) is 1; we diverge to 0 for diagnostic clarity (documented `TODO(F1)`).
+- **PMT rate=0** falls back to closed-form `-(pv+fv)/nper` (avoids div-by-zero in the general formula).
+- **PMT type=1 (annuity due) < type=0 in magnitude** for an interest-bearing loan — pinned by a comparison test.
+- **NPV starts discounting at period 1** (Excel convention); IRR's internal NPV starts at period 0 — they differ on purpose.
+- **IRR requires both a positive and a negative cash flow** — all-positive or all-negative series → `#NUM!`.
+- **CUMIPMT(1..3, 5%, 10yr, 10000)** equals IPMT(1) + IPMT(2) + IPMT(3) — pinned as the spec-derived consistency check.
+- **CEILING/FLOOR significance=0 returns 0** (Excel CEILING.MATH behavior, not the legacy `#DIV/0!`).
+- **SUMPRODUCT non-numeric-in-array → treated as 0** (Excel-documented quirk).
+- **PRODUCT empty product → 0** (Excel quirk; deviates from math's "empty product = 1").
+- **SEARCH wildcards: `~*` matches literal `*`**, `~?` literal `?`, `~~` literal `~`.
+- **FIND wildcards are literal** (no expansion) — `=FIND("h*o", "h*o!")` returns 1, not 1 via expansion.
+
+### Known limitations / TODOs deliberately punted
+
+- **TYPE(blank) = 0** instead of Excel's 1. Documented inline. If an F2 e2e fixture demands strict parity, flip the switch case.
+- **CEILING/FLOOR with negative significance**: we use `Math.abs(significance)` (CEILING.MATH default). Classic CEILING signals `#NUM!` when signs differ; we accept everything. Inline `TODO(F1)` if a fixture catches it.
+- **CUMPRINC** (cumulative principal) — not in the task brief; would mirror CUMIPMT. Future batch.
+- **RATE convergence on pathological series**: the final-pass relaxation accepts `|f| < 1e-3` to declare success when the rate stopped moving — this can be tightened if a fixture demands stricter parity with Excel's internal solver.
+- **IRR multiple roots**: when a series has multiple real roots, our Newton-Raphson converges to whichever root the initial `guess` is closest to. Matches Excel behavior (also documented). The `guess` argument is the user's escape hatch.
+- **`message` field on error returns**: SEARCH/FIND deliberately include a diagnostic `message` on their `#VALUE!` returns. Tests use `errCodeOf()` helper to compare code-only when needed. Downstream consumers that strictly match `{kind, code}` will not see the `message` unless they look — it's purely additive.
+
+### Numerical-method discipline
+
+For RATE and IRR:
+- Numerical derivative (central difference) with scaled epsilon `max(1e-8, |rate|·1e-6)` keeps the step well-conditioned near both zero and large rates.
+- 50-iteration cap (per task brief). Returns `#NUM!` if neither convergence criterion is met.
+- Two convergence criteria: `|f| < 1e-7` (residual zero) OR `|step| < 1e-7` (rate stopped). Either is enough.
+- Final-pass safety net: if iteration cap is hit but `|f| < 1e-3`, accept the rate (matches Excel's lenient behavior on shallow residual surfaces; tightens easily if F2 surfaces a strict-Excel-parity fixture).
+
+Next request:
+- Next F1 batch (per `docs/PLAN.md §6` phase 8 — "function fill-out to ~200"): 25 more functions, picking from the Rust `eval.rs` inventory. Suggested groupings: more math (LOG/LN/EXP/PI/RADIANS/DEGREES/trig family), more stats (MEDIAN/STDEV/VAR family + percentile basics), more lookup (CHOOSE/OFFSET/INDIRECT), more text (REPLACE/SUBSTITUTE/REPT/EXACT). Each batch under the same single-file pattern, no shared edits.
+- F2 e2e migration unblocked further: most office-grade demo formulas now resolve against the TS worker.
+- Codex review recommended before next 25-function batch lands — particularly the financial precision (IRR/RATE convergence behavior) and SUMPRODUCT shape semantics; per `memory/feedback_codex.md`, F1 is the kind of "real decision point" that benefits from a second pass.
 - If a future agent extends `ErrorCode` to include `#CALC!`, also update the `'name'` arm in `evaluate.ts` (search for "we use `#VALUE!`" comment in the LAMBDA branch).
+
+---
+
+### Handoff: F.F2 / 2026-05-26
+
+Owner（交付方）: F2 agent
+Status: done (scope: single parity probe — full e2e migration intentionally not in this slice)
+
+Touched files (whitelist enforced — exactly one file):
+- `solid/excel/e2e/vnext-worker-ts.spec.ts` (new — single side-by-side spec, 5 test entries: 3 active + 2 `test.fixme`)
+
+Public types changed: none.
+Atoms added/changed: none.
+
+Tests run:
+- `npx playwright test e2e/vnext-worker-ts.spec.ts --reporter=line --workers=1` (from `solid/excel/`)
+  → **3 passed, 2 skipped (fixme)** in ~1.6s against an already-running dev server (`http://localhost:5174`).
+- Dev server: `npm run dev -- --port 5174 --strictPort` (started manually because playwright's `webServer` block didn't auto-fire on the first run; on a fresh checkout the `command` block prepends `build:wasm` which is unnecessary for TS-only probes but doesn't break anything).
+
+Scenarios covered (per F2 task brief):
+1. **Navigate via `getByTestId('nav-tab-vnext-worker-ts')`** + assert `vnext-worker-ts-grid` visible — PASS.
+2. **`vnext-worker-ts-banner` is visible** — PASS.
+3. **B5 = SUM(B2:B4) = 60** — PASS (Wave C/C1 math through real Worker postMessage).
+4. **C2 = UPPER("North") = "NORTH"** — PASS (Wave C/C4 text registry hit).
+5. **D2 = IF(10 > 15, "high", "low") = "low"** — PASS (Wave C/C2 logical short-circuit).
+6. **Live edit: A6 = `=B5*2` → "120"** — PASS (sheetAtom invalidation + projection refresh end-to-end).
+7. **Spill: A7 = `=SEQUENCE(2,2)` → A7..B8 = 1,2,3,4** — **`test.fixme`** (real regression — see below).
+8. **LAMBDA round-trip** — `test.fixme` (no host UI surface — documented in spec docstring).
+Plus one regression guard: `no console errors leak from the TS worker boot or formula edits` — PASS.
+
+Regression found (NOT fixed per F2 scope): **Spill projection only fires through `readCells`, not `readSparseRange`.**
+- `solid/excel/src-vnext/adapter/worker-runtime-ts.ts:434 readSparseRange` iterates `state.workbook.store.getter(target.sheetAtom)` — only existing cells. Spill target coords (B7, A8, B8 for `=SEQUENCE(2,2)` at A7) have no `input` of their own, so the visible-window projection never publishes them.
+- `solid/excel/src-vnext/adapter/worker-runtime-ts.ts:235 readCellValue` *does* call `getSpillProjectedValue` for empty cells — that's why the jest suite `solid/excel/test/excel-core-ts-spill.test.ts` (which uses `readCells` RPC directly) is green while the UI grid is not.
+- Repro: nav-tab vnext-worker-ts → scroll `.spreadsheet-grid-scroll-viewport` 48px → `=SEQUENCE(2,2)` at A7 → A7 displays "1" (anchor scalar collapse OK) but B7/A8/B8 display "" (visible-window publisher gap).
+- Suggested fix (out of F2 scope): teach `readSparseRange` to walk requested bounds and consult `getSpillProjectedValue` for every empty (row, col) in the window, emitting synthetic `CellSnapshotWire`s for hits. Alternative: have anchors emit their full array footprint and let the backend fan-out (closer to WASM's derived-spill-atom pattern, PLAN.md §4.6).
+
+Known limitations of this probe (deliberate):
+- Only one demo viewport scenario tested. The full e2e migration (every spec under `solid/excel/e2e/` re-pointed at `?backend=ts`) is the remaining F2 follow-up — explicitly scoped out of this slice per F2 brief.
+- `webServer` auto-start in `solid/excel/playwright.config.ts` was not exercised in this run (manually started). If a follow-up CI lane wires the suite, that path needs a separate validation.
+- `test.fixme`'d LAMBDA scenario has an empty body — it documents intent only. To make it executable, either (a) extend `SpreadsheetNameManagerDialog` to accept a `kind: 'lambda'` refersTo, or (b) add a `defineName` debug RPC to `worker-runtime-ts` mirroring the WASM worker's debug client and call it from the test via `window.__einfachWorkbookDebugClient`.
+
+### Verdict — TS backend "ready for default flip" per PLAN.md §10?
+
+**Not yet — one blocker plus one parity gap.**
+
+PLAN.md §10 success criteria:
+- ❓ "All e2e suites in `solid/excel/e2e/` pass against the TS worker." — Not exercised by this probe; full migration is the F2 follow-up. Current state is "the demo renders correctly for the seeded fixture and a live edit, but the spill path is broken in the projection layer."
+- ❌ **Spill regression** (above) — would fail any e2e spec that relies on a spilled formula populating empty cells via the visible-window projection.
+- ⬜ Not validated by F2: `million-demo` within 2× wasm time, `demo-budget` / `demo-grades` / `demo-sales` visual parity. Probe scope was minimal.
+- ⬜ Not in scope: rust/excel-core retirement (Phase 10).
+
+Recommendation: ship the spill-projection fix (one ~30-line edit in `worker-runtime-ts.ts:readSparseRange`), then re-run this spec with the `test.fixme` flipped back to `test`. After that passes, the full F2 e2e migration can begin running the existing demo spec inventory through `?backend=ts` and triaging the failures.
+
+Next request:
+- Open a follow-up ticket for the `readSparseRange` spill-projection gap (see "Regression found" above). The fix is small and isolated; doing it before flipping the default keeps the cutover window quiet.
+- Schedule the actual e2e migration as a separate F2-followup once the spill projection is repaired. The migration is mechanical (rename URL flags / nav-tab IDs, run, triage), but its size warrants its own kanban row.
+- LAMBDA host-UI gap remains open as Wave F polish.
