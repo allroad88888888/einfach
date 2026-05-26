@@ -778,6 +778,15 @@ export interface SpreadsheetBackend {
   // omit this method cause the Data > Remove Duplicates menu entry to hide
   // via `removeDuplicatesSupportedAtom` so the surface degrades cleanly.
   removeRows?(request: RemoveRowsRequest): Promise<RemoveRowsResult>
+  // custom-formulas — Wave 8. Optional capability; host adapters that
+  // omit these methods make the `customFormulaRegistryAtom` inert
+  // (writes succeed but no worker side-effect runs). `source` is the
+  // body of a synchronous function whose argument is bound to `args`
+  // (Array) — the adapter is expected to `new Function('args', source)`
+  // it inside whichever runtime owns the formula engine. Errors thrown
+  // during evaluation surface as `#ERROR!` cells.
+  registerCustomFormula?(name: string, source: string): Promise<void>
+  unregisterCustomFormula?(name: string): Promise<void>
 }
 
 export interface ViewportFreezeConfig {

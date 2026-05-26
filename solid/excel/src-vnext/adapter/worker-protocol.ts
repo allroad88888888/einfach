@@ -297,6 +297,15 @@ export interface WorkerWorkbookClient {
   unsubscribeCells(subId: number): Promise<boolean>
   onCellsDirty(callback: (cells: CellRefWire[]) => void): () => void
   onCellsHydrated(callback: (cells: CellSnapshotWire[]) => void): () => void
+  /**
+   * Wave 8 — register a user-defined formula by sending the body source
+   * to the worker, which `new Function('args', source)`s it and binds
+   * the resulting callable to the WASM Workbook. Closure-capture hazards
+   * are avoided by handing the worker a string body rather than a live
+   * function (JS callbacks cannot cross `postMessage`).
+   */
+  registerCustomFormula(name: string, source: string): Promise<boolean>
+  unregisterCustomFormula(name: string): Promise<boolean>
   dispose(): void
 }
 
@@ -635,6 +644,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     onCellsHydrated(callback) {
       hydratedListeners.add(callback)
       return () => hydratedListeners.delete(callback)
+    },
+    registerCustomFormula(name, source) {
+      return request<boolean>('registerCustomFormula', { name, source })
+    },
+    unregisterCustomFormula(name) {
+      return request<boolean>('unregisterCustomFormula', { name })
     },
     dispose() {
       if (disposed) return

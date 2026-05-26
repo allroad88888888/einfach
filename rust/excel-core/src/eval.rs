@@ -684,6 +684,37 @@ pub(crate) fn apply_lambda(
     result
 }
 
+/// Host-side custom-formula registry. Lives behind an `Arc<dyn ...>` on
+/// the `Workbook` so the formula engine can call out to JS-supplied
+/// functions (or any other host code) without `einfach-excel-core` ever
+/// learning what `js_sys::Function` is. The wasm crate ships the canonical
+/// implementation (`WasmCustomFormulaRegistry`); native tests can supply
+/// their own.
+///
+/// Contract:
+///   - `lookup(name, args)` returns `Some(Value)` when a function is
+///     registered under `name` (case-insensitive lookup is the host's
+///     responsibility — both the wasm registry and the in-file unit-test
+///     stubs upper-case keys at insertion AND query). Returns `None` to
+///     mean "no function with this name; fall through to `#NAME?`".
+///   - Args are already evaluated `Value`s. Per the precedence rule in
+///     `eval_named_call`, an error in any arg short-circuits before the
+///     registry is consulted, so a host implementation will never see
+///     `Value::Error(_)` in `args`.
+///   - The host is responsible for catching any panics / exceptions
+///     thrown by the underlying callback and turning them into a
+///     `Value::Error(_)`. The engine treats `Some(Value::Error(_))` as a
+///     successfully-dispatched-but-failed call (the cell shows the error)
+///     and does NOT then try the unknown-function fallback.
+///
+/// `Send + Sync` so a future multi-threaded workbook can keep the
+/// registry on the workbook without re-architecting. The single-threaded
+/// wasm impl wraps `js_sys::Function` in `SendWrapper` (or equivalent) to
+/// satisfy this bound.
+pub trait CustomFunctionRegistry: Send + Sync + std::fmt::Debug {
+    fn lookup(&self, name: &str, args: &[Value]) -> Option<Value>;
+}
+
 /// Address-based evaluation source. Both production (Workbook) and the
 /// legacy `eval_expr(get, cell_map)` shim route through this trait.
 ///
@@ -820,6 +851,35 @@ pub trait EvalProvider {
     /// `sheet_cell_has_formula`.
     fn sheet_cell_formula_text(&self, _sheet: &str, addr: CellAddress) -> Option<String> {
         self.cell_formula_text(addr)
+    }
+
+    // Custom function dispatch hook — see `CustomFunctionRegistry` below
+    // for the host-side contract.
+
+    /// Called when `eval_func` encounters a function name that is NOT a
+    /// built-in and NOT registered as a workbook-level defined name
+    /// (`Value::Lambda`). Lets a host plug in user-defined formulas —
+    /// in the wasm bridge this delegates to a `js_sys::Function` registry
+    /// keyed by upper-cased name (see `CUSTOM_FORMULAS.md`).
+    ///
+    /// Arguments are evaluated EAGERLY in left-to-right order before this
+    /// method runs (no lazy semantics — custom functions can't introduce
+    /// LET-style scoping). If any argument evaluates to `Value::Error`,
+    /// `eval_named_call` propagates that error and `call_custom` is NOT
+    /// invoked, matching the propagation behaviour of `apply_lambda`.
+    ///
+    /// Return contract:
+    ///   - `None` → no custom function registered under `name`;
+    ///     `eval_named_call` then surfaces `#NAME?` exactly as before.
+    ///   - `Some(Value)` → the custom function ran. `Value::Error(_)` is
+    ///     a valid result (the host's choice — e.g. a JS callback that
+    ///     threw is typically wrapped as `Value::Error(InvalidValue)`).
+    ///
+    /// Default `None` so existing providers (`AtomEvalProvider`,
+    /// `SheetEvalProvider`, the sparse / cumulative noop providers in
+    /// this file) keep their current behaviour without code changes.
+    fn call_custom(&self, _name: &str, _args: &[Value]) -> Option<Value> {
+        None
     }
 
     // ===== EVAL_PROVIDER TRAIT METHODS: ADD NEW METHODS BEFORE THIS LINE =====
@@ -8977,25 +9037,55 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 /// Resolve a function call `name(args)` against the workbook's defined
 /// names when no built-in matched. If the registry holds a `Value::Lambda`
 /// under `name`, evaluate args (left-to-right, short-circuiting on the
-/// first error) and apply the lambda. Otherwise surface `#NAME?`.
+/// first error) and apply the lambda. Otherwise consult the host's custom-
+/// formula registry via `provider.call_custom`; if that returns `None`
+/// surface `#NAME?`.
 ///
 /// Wraps `apply_lambda` in the named-call recursion guard so a runaway
 /// recursive definition (`bad` = `LAMBDA(n, bad(n))`) hits `#NUM!` at
 /// `MAX_NAMED_CALL_DEPTH` rather than panicking the thread.
+///
+/// Precedence: built-ins (matched in `eval_func` before this fn is
+/// reached) → defined-name LAMBDA → host custom-formula → `#NAME?`.
+/// Host custom formulas therefore CANNOT shadow built-ins or a
+/// `define_name`-registered LAMBDA. This is intentional: the reserved-name
+/// check in `Workbook::define_name_value` already blocks LAMBDA names from
+/// colliding with built-ins, and we want the same guarantee for custom
+/// formulas — a host that registers `MYFUNC` should not be able to
+/// override `SUM` by accident.
 fn eval_named_call(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
-    let Some(value) = provider.lookup_named(name) else {
-        return Value::Error(ValueError::InvalidName);
-    };
-    match &value {
-        Value::Lambda(_) => {}
-        Value::Error(e) => return Value::Error(e.clone()),
-        _ => {
-            // A defined name like `answer = 42` exists but isn't callable.
-            // Excel surfaces #VALUE! when you try to invoke a non-function;
-            // we mirror that. `=answer` alone still returns 42 via Expr::Name.
-            return Value::Error(ValueError::InvalidValue);
+    if let Some(value) = provider.lookup_named(name) {
+        match &value {
+            Value::Lambda(_) => {}
+            Value::Error(e) => return Value::Error(e.clone()),
+            _ => {
+                // A defined name like `answer = 42` exists but isn't callable.
+                // Excel surfaces #VALUE! when you try to invoke a non-function;
+                // we mirror that. `=answer` alone still returns 42 via Expr::Name.
+                return Value::Error(ValueError::InvalidValue);
+            }
         }
+        let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+        for a in args {
+            let v = eval_expr_with_provider(a, provider);
+            if let Value::Error(e) = &v {
+                return Value::Error(e.clone());
+            }
+            arg_values.push(v);
+        }
+        // `apply_lambda` itself owns the recursion guard (see its body) so a
+        // recursive defined lambda (`fact` = `LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))`)
+        // hits #NUM! at MAX_NAMED_CALL_DEPTH instead of overflowing the stack.
+        return apply_lambda(&value, arg_values, provider);
     }
+
+    // No defined name with this label. Try the host's custom-formula
+    // registry as a last resort before surfacing #NAME?. Args are eagerly
+    // evaluated (custom formulas take Values, not Exprs — no lazy
+    // semantics) and error-short-circuit just like LAMBDA application
+    // above, so a custom `MYFUNC(SUM(BAD), 1)` returns the inner error
+    // rather than handing the JS callback a `#VALUE!` it would have to
+    // know how to handle.
     let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
     for a in args {
         let v = eval_expr_with_provider(a, provider);
@@ -9004,10 +9094,9 @@ fn eval_named_call(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Va
         }
         arg_values.push(v);
     }
-    // `apply_lambda` itself owns the recursion guard (see its body) so a
-    // recursive defined lambda (`fact` = `LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))`)
-    // hits #NUM! at MAX_NAMED_CALL_DEPTH instead of overflowing the stack.
-    apply_lambda(&value, arg_values, provider)
+    provider
+        .call_custom(name, &arg_values)
+        .unwrap_or(Value::Error(ValueError::InvalidName))
 }
 
 /// Streams every arg's numeric values into a local Vec. The Vec is an
@@ -31630,6 +31719,153 @@ mod tests {
         let bad = make_lambda("=LAMBDA(n, bad(n))");
         let v = eval_with_names("=bad(1)", &[("bad", bad)], &cm, &vs);
         assert_eq!(v, Value::Error(ValueError::Overflow));
+    }
+
+    // === Host custom-formula registry: unit tests ===
+    //
+    // Exercises `EvalProvider::call_custom` via a stub provider that wraps
+    // an in-memory `HashMap<String, Box<dyn Fn(&[Value]) -> Value>>`. The
+    // wasm bridge wraps a `js_sys::Function` keyed registry on top of the
+    // same trait method; these tests cover the dispatch glue without
+    // dragging the wasm boundary in.
+
+    type CustomFn = Box<dyn Fn(&[Value]) -> Value>;
+
+    struct CustomFormulaProvider {
+        names: HashMap<String, Value>,
+        customs: HashMap<String, CustomFn>,
+    }
+
+    impl EvalProvider for CustomFormulaProvider {
+        fn cell(&self, _addr: CellAddress) -> Value {
+            Value::Null
+        }
+        fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+            Value::Error(ValueError::InvalidRef)
+        }
+        fn lookup_named(&self, name: &str) -> Option<Value> {
+            self.names.get(&name.to_ascii_uppercase()).cloned()
+        }
+        fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
+            let key = name.to_ascii_uppercase();
+            self.customs.get(&key).map(|f| f(args))
+        }
+    }
+
+    fn eval_with_customs(formula: &str, customs: Vec<(&str, CustomFn)>) -> Value {
+        let expr = parse_formula(formula).expect("parse failed");
+        let provider = CustomFormulaProvider {
+            names: HashMap::new(),
+            customs: customs
+                .into_iter()
+                .map(|(n, f)| (n.to_ascii_uppercase(), f))
+                .collect(),
+        };
+        eval_expr_with_provider(&expr, &provider)
+    }
+
+    /// Custom function `MYFUNC(1, 2)` resolves through the registry and
+    /// returns the host-supplied result — `Value::Number(42.0)` here.
+    #[test]
+    fn custom_function_dispatch_returns_host_value() {
+        let v = eval_with_customs(
+            "=MYFUNC(1, 2)",
+            vec![("MYFUNC", Box::new(|_args| Value::Number(42.0)))],
+        );
+        assert_eq!(v, Value::Number(42.0));
+    }
+
+    /// Args reach the custom callback already evaluated to scalars — the
+    /// stub sums them so we can prove the cell-reference / arithmetic
+    /// inside the call site happens BEFORE `call_custom` runs.
+    #[test]
+    fn custom_function_args_are_eagerly_evaluated() {
+        let v = eval_with_customs(
+            "=ADDER(10, 20+1)",
+            vec![(
+                "ADDER",
+                Box::new(|args| {
+                    let mut sum = 0.0;
+                    for a in args {
+                        if let Value::Number(n) = a {
+                            sum += n;
+                        }
+                    }
+                    Value::Number(sum)
+                }),
+            )],
+        );
+        assert_eq!(v, Value::Number(31.0));
+    }
+
+    /// Unknown function with empty custom registry still surfaces `#NAME?`
+    /// — `call_custom` default returns None, so the fallthrough path is
+    /// preserved.
+    #[test]
+    fn unknown_function_with_empty_custom_registry_returns_name_error() {
+        let expr = parse_formula("=UNKNOWN_FN(1)").expect("parse failed");
+        let provider = CustomFormulaProvider {
+            names: HashMap::new(),
+            customs: HashMap::new(),
+        };
+        let v = eval_expr_with_provider(&expr, &provider);
+        assert_eq!(v, Value::Error(ValueError::InvalidName));
+    }
+
+    /// Custom-function lookup is case-insensitive — registration uses
+    /// upper-case (mirroring `WasmWorkbook::register_custom_formula`),
+    /// and `=myfunc()` still resolves.
+    #[test]
+    fn custom_function_lookup_is_case_insensitive() {
+        let v = eval_with_customs(
+            "=myfunc()",
+            vec![("MYFUNC", Box::new(|_args| Value::Text("hi".into())))],
+        );
+        assert_eq!(v, Value::Text("hi".into()));
+    }
+
+    /// An error in any argument short-circuits — `call_custom` is NOT
+    /// invoked, mirroring `apply_lambda`'s error propagation. The custom
+    /// callback would have no way to handle a `#VALUE!` arg, so we
+    /// surface it before crossing the boundary.
+    #[test]
+    fn custom_function_propagates_arg_errors_without_invoking_callback() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let invoked = Rc::new(Cell::new(false));
+        let invoked_clone = invoked.clone();
+        let v = eval_with_customs(
+            "=MYFUNC(1/0, 1)",
+            vec![(
+                "MYFUNC",
+                Box::new(move |_args| {
+                    invoked_clone.set(true);
+                    Value::Number(0.0)
+                }),
+            )],
+        );
+        assert_eq!(v, Value::Error(ValueError::DivisionByZero));
+        assert!(!invoked.get(), "custom callback must not run when an arg errors");
+    }
+
+    /// Defined-name LAMBDA wins over a custom registration sharing the
+    /// same label. This pins the precedence rule documented on
+    /// `eval_named_call` — host customs cannot shadow LAMBDAs.
+    #[test]
+    fn lambda_defined_name_takes_precedence_over_custom() {
+        let expr = parse_formula("=SHADOW(5)").expect("parse failed");
+        let lambda = {
+            let (cm, vs) = empty_env();
+            eval_str("=LAMBDA(x, x*x)", &cm, &vs)
+        };
+        let mut names = HashMap::new();
+        names.insert("SHADOW".to_string(), lambda);
+        let mut customs: HashMap<String, CustomFn> = HashMap::new();
+        customs.insert("SHADOW".to_string(), Box::new(|_| Value::Number(-1.0)));
+        let provider = CustomFormulaProvider { names, customs };
+        let v = eval_expr_with_provider(&expr, &provider);
+        // Lambda wins → 5*5 = 25, not the custom registration's -1.
+        assert_eq!(v, Value::Number(25.0));
     }
 
     /// `is_builtin_function_name` is exported for the workbook's reserved-name

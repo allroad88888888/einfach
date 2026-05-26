@@ -112,6 +112,23 @@ type WasmWorkbookRuntime = {
   debug_sheet_live_subscription_count?: (sheetIdx: number) => number
   debug_sheet_formula_count?: (sheetIdx: number) => number
   debug_cross_sheet_dependents_count?: () => number
+  /**
+   * Wave 8 — register a synchronous JS callback as a user-defined
+   * formula. The Rust side calls back into JS with a plain `Array` of
+   * arg values and expects a `number | string | boolean | null |
+   * undefined` return. Optional because the WASM crate may not have
+   * landed the bridge yet; the worker runtime stubs gracefully when
+   * missing.
+   *
+   * Method names match agent A's `wasm-bindgen` `js_name` exports:
+   * `registerCustomFormula` / `unregisterCustomFormula`. Register
+   * returns `void`; unregister returns `true` iff an entry was removed.
+   */
+  registerCustomFormula?: (
+    name: string,
+    fn: (args: Array<number | string | boolean | null>) => unknown,
+  ) => void
+  unregisterCustomFormula?: (name: string) => boolean
 }
 
 type RequestMessage = {
@@ -167,6 +184,19 @@ const subscriptionTokens = new Map<number, number[]>()
 const importSessions = new Map<number, ImportSession>()
 const exportSessions = new Map<number, ExportSession>()
 const snapshotSessions = new Map<number, SnapshotSession>()
+
+/**
+ * Wave 8 — compiled custom formulas live in the worker thread. The
+ * source string travels across `postMessage` (closures cannot) and is
+ * `new Function('args', source)`-d here. The compiled callable is then
+ * handed to the WASM Workbook via `register_custom_formula` when that
+ * bridge is available; if the bridge is missing we still remember the
+ * compiled fn so a re-registration cycle is a clean replace.
+ */
+type CustomFormulaCallable = (
+  args: Array<number | string | boolean | null>,
+) => unknown
+const customFormulas = new Map<string, CustomFormulaCallable>()
 let nextExportId = 1
 let nextSnapshotId = 1
 
@@ -270,6 +300,7 @@ function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   importSessions.clear()
   exportSessions.clear()
   snapshotSessions.clear()
+  customFormulas.clear()
   nextExportId = 1
   nextSnapshotId = 1
   const wb = new WasmWorkbook() as unknown as WasmWorkbookRuntime
@@ -813,6 +844,77 @@ function unsubscribeCells(wb: WasmWorkbookRuntime, subId: number) {
     for (const token of tokens) wb.unsubscribe_cell(token)
   }
   subscriptionTokens.delete(subId)
+}
+
+const CUSTOM_FORMULA_NAME_REGEX = /^[A-Z][A-Z0-9_.]*$/
+
+function assertCustomFormulaName(name: unknown): string {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw Object.assign(new Error('custom formula name must be a non-empty string'), {
+      code: 'INVALID_CUSTOM_FORMULA_NAME',
+    })
+  }
+  if (!CUSTOM_FORMULA_NAME_REGEX.test(name)) {
+    throw Object.assign(new Error(`invalid custom formula name: ${name}`), {
+      code: 'INVALID_CUSTOM_FORMULA_NAME',
+    })
+  }
+  return name
+}
+
+function compileCustomFormula(name: string, source: unknown): CustomFormulaCallable {
+  if (typeof source !== 'string') {
+    throw Object.assign(new Error(`custom formula ${name}: source must be a string`), {
+      code: 'INVALID_CUSTOM_FORMULA_SOURCE',
+    })
+  }
+  try {
+    // `new Function` runs in the worker's global scope, NOT the
+    // surrounding lexical scope. That sandboxes the body away from
+    // worker internals — the only references it can resolve are
+    // globals (Math, JSON, Date, etc.) and its single `args`
+    // parameter.
+    const fn = new Function('args', source) as CustomFormulaCallable
+    return fn
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    throw Object.assign(
+      new Error(`custom formula ${name}: failed to compile source — ${reason}`),
+      { code: 'INVALID_CUSTOM_FORMULA_SOURCE' },
+    )
+  }
+}
+
+function registerCustomFormulaInWorker(
+  wb: WasmWorkbookRuntime,
+  name: string,
+  source: unknown,
+): boolean {
+  const validatedName = assertCustomFormulaName(name)
+  const fn = compileCustomFormula(validatedName, source)
+  customFormulas.set(validatedName, fn)
+  if (wb.registerCustomFormula) {
+    wb.registerCustomFormula(validatedName, fn)
+    return true
+  }
+  // Bridge not yet available — remember the source so a later
+  // unregister/re-register works, and signal back `false` so the
+  // adapter can flag this state if it cares. We do NOT throw because
+  // an absent bridge is the expected condition before agent A lands
+  // the WASM side.
+  return false
+}
+
+function unregisterCustomFormulaInWorker(
+  wb: WasmWorkbookRuntime,
+  name: unknown,
+): boolean {
+  if (typeof name !== 'string' || name.length === 0) return false
+  const hadLocal = customFormulas.delete(name)
+  if (wb.unregisterCustomFormula) {
+    return wb.unregisterCustomFormula(name)
+  }
+  return hadLocal
 }
 
 function exportRangeTsv(wb: WasmWorkbookRuntime, range: SparseRangeWire): string {
@@ -1409,6 +1511,12 @@ export function installWorkerRuntime() {
         case 'unsubscribeCells':
           unsubscribeCells(wb, Number(msg.subId))
           postResponse(msg.id, true)
+          break
+        case 'registerCustomFormula':
+          postResponse(msg.id, registerCustomFormulaInWorker(wb, msg.name as string, msg.source))
+          break
+        case 'unregisterCustomFormula':
+          postResponse(msg.id, unregisterCustomFormulaInWorker(wb, msg.name))
           break
         case 'debugCounters':
           postResponse(msg.id, debugCounters(wb))

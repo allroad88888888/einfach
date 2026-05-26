@@ -220,3 +220,151 @@ fn wasm_workbook_chain_dirty_until_read() {
     assert_eq!(wb.get_number(1, "C5"), 105.0);
     assert_eq!(wb.debug_formula_cache_state(1, "C5"), "clean");
 }
+
+// === Wave 8 custom-formula integration tests ===
+
+/// Build a `js_sys::Function` from a Rust closure that takes the args
+/// Array and returns a `JsValue`. The closure is leaked (`forget`) for
+/// the same reason as `counting_callback` — wasm-bindgen-test's scoped
+/// future would otherwise drop the closure while JS still holds the
+/// reference on the workbook side.
+fn make_js_fn<F>(body: F) -> js_sys::Function
+where
+    F: FnMut(js_sys::Array) -> JsValue + 'static,
+{
+    let closure = Closure::wrap(Box::new(body) as Box<dyn FnMut(js_sys::Array) -> JsValue>);
+    let func: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
+    closure.forget();
+    func
+}
+
+/// MYTAX(amount) returns `amount * 0.2`. End-to-end exercise of the
+/// custom-formula path: registration → cell formula references it →
+/// engine dispatches through `WorkbookEvalProvider::call_custom` →
+/// `WasmCustomFormulaRegistry::lookup` → JS callback → marshaled return.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_tax_round_trip() {
+    let mut wb = WasmWorkbook::new();
+
+    let tax = make_js_fn(|args| {
+        let first = args.get(0);
+        let amount = first.as_f64().unwrap_or(0.0);
+        JsValue::from_f64(amount * 0.2)
+    });
+    wb.register_custom_formula("MYTAX".into(), tax);
+
+    wb.set_number(0, "B1", 100.0);
+    assert!(wb.set_formula(0, "C1", "=MYTAX(B1)"));
+
+    assert_eq!(wb.get_number(0, "C1"), 20.0);
+}
+
+/// Lookup is case-insensitive. Register under upper case, reference
+/// with mixed case in the formula.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_case_insensitive() {
+    let mut wb = WasmWorkbook::new();
+    let identity = make_js_fn(|args| args.get(0));
+    wb.register_custom_formula("MYECHO".into(), identity);
+
+    assert!(wb.set_formula(0, "A1", "=myEcho(42)"));
+    assert_eq!(wb.get_number(0, "A1"), 42.0);
+}
+
+/// `unregisterCustomFormula` makes subsequent reads surface `#NAME?`.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_unregister_falls_back_to_name_error() {
+    let mut wb = WasmWorkbook::new();
+    let pi = make_js_fn(|_args| JsValue::from_f64(3.14));
+    wb.register_custom_formula("MYPI".into(), pi);
+
+    assert!(wb.set_formula(0, "A1", "=MYPI()"));
+    assert_eq!(wb.get_number(0, "A1"), 3.14);
+
+    assert!(wb.unregister_custom_formula("MYPI"));
+    // After invalidation + re-eval, the cell now sees #NAME?.
+    assert_eq!(wb.get_display(0, "A1"), "#NAME?");
+}
+
+/// A JS callback that throws surfaces `#VALUE!` in the cell. The wasm
+/// instance stays alive — subsequent calls keep working.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_throw_surfaces_value_error() {
+    let mut wb = WasmWorkbook::new();
+    let thrower = make_js_fn(|_args| {
+        // Construct a JS Error and re-throw via wasm_bindgen's exception
+        // path. We can't `throw` from Rust directly, but returning a
+        // promise that rejects or using js_sys won't reach this code path
+        // — instead we use wasm_bindgen::throw_str which converts to a
+        // JS exception on the callback boundary.
+        wasm_bindgen::throw_str("synthetic error")
+    });
+    wb.register_custom_formula("MYBOOM".into(), thrower);
+
+    assert!(wb.set_formula(0, "A1", "=MYBOOM()"));
+    assert_eq!(wb.get_display(0, "A1"), "#VALUE!");
+
+    // Instance survives — set a number on another cell and read back.
+    wb.set_number(0, "B1", 7.0);
+    assert_eq!(wb.get_number(0, "B1"), 7.0);
+}
+
+/// Returning a string maps to a text cell; returning the literal
+/// `"#DIV/0!"` round-trips as the matching `ValueError`.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_string_and_error_token_returns() {
+    let mut wb = WasmWorkbook::new();
+
+    let hello = make_js_fn(|_args| JsValue::from_str("hello"));
+    wb.register_custom_formula("MYTXT".into(), hello);
+    assert!(wb.set_formula(0, "A1", "=MYTXT()"));
+    assert_eq!(wb.get_display(0, "A1"), "hello");
+
+    let divzero = make_js_fn(|_args| JsValue::from_str("#DIV/0!"));
+    wb.register_custom_formula("MYDIV".into(), divzero);
+    assert!(wb.set_formula(0, "A2", "=MYDIV()"));
+    assert_eq!(wb.get_display(0, "A2"), "#DIV/0!");
+}
+
+/// Re-registering an existing name replaces the callback AND dirties
+/// dependent formulas so the next read reflects the new function.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_re_register_replaces_callback() {
+    let mut wb = WasmWorkbook::new();
+    let plus_one = make_js_fn(|args| {
+        let v = args.get(0).as_f64().unwrap_or(0.0);
+        JsValue::from_f64(v + 1.0)
+    });
+    wb.register_custom_formula("MYOP".into(), plus_one);
+    assert!(wb.set_formula(0, "A1", "=MYOP(10)"));
+    assert_eq!(wb.get_number(0, "A1"), 11.0);
+
+    let times_two = make_js_fn(|args| {
+        let v = args.get(0).as_f64().unwrap_or(0.0);
+        JsValue::from_f64(v * 2.0)
+    });
+    wb.register_custom_formula("MYOP".into(), times_two);
+    // Cache was invalidated by the re-register call.
+    assert_eq!(wb.get_number(0, "A1"), 20.0);
+}
+
+/// `customFormulaCount` reflects registration / unregistration.
+#[wasm_bindgen_test]
+fn wasm_workbook_custom_formula_count_probe() {
+    let mut wb = WasmWorkbook::new();
+    assert_eq!(wb.custom_formula_count(), 0);
+
+    let noop = make_js_fn(|_args| JsValue::null());
+    wb.register_custom_formula("ONE".into(), noop.clone());
+    assert_eq!(wb.custom_formula_count(), 1);
+
+    wb.register_custom_formula("TWO".into(), noop);
+    assert_eq!(wb.custom_formula_count(), 2);
+
+    assert!(wb.unregister_custom_formula("ONE"));
+    assert_eq!(wb.custom_formula_count(), 1);
+
+    // Idempotent unregister of a missing entry returns false.
+    assert!(!wb.unregister_custom_formula("UNKNOWN"));
+    assert_eq!(wb.custom_formula_count(), 1);
+}

@@ -1654,6 +1654,29 @@ export function createWorkerWorkbookSpreadsheetBackend(
       }
     },
 
+    /**
+     * Wave 8 custom-formulas port. The Solid host subscribes to
+     * `customFormulaRegistryAtom` and forwards add/remove edges here;
+     * the worker compiles the source via `new Function('args', source)`
+     * and registers the resulting callable with the WASM Workbook (or
+     * stubs gracefully when the WASM bridge is missing).
+     *
+     * NOT undoable, NOT history-tracked, NOT revision-bumping — the
+     * registry is a workbook-wide capability registration, not a cell
+     * mutation, so a re-evaluation cascade happens on the WASM side
+     * when registered names appear inside existing formulas. No
+     * `affectedRange` exists.
+     */
+    async registerCustomFormula(name: string, source: string): Promise<void> {
+      await readyPromise
+      await client.registerCustomFormula(name, source)
+    },
+
+    async unregisterCustomFormula(name: string): Promise<void> {
+      await readyPromise
+      await client.unregisterCustomFormula(name)
+    },
+
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {
       const next = cloneFilterSortState({
         rules: request.rules,

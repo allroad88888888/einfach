@@ -690,6 +690,12 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
       hydratedListeners.add(callback)
       return () => hydratedListeners.delete(callback)
     },
+    async registerCustomFormula() {
+      return true
+    },
+    async unregisterCustomFormula() {
+      return true
+    },
     dispose() {
       dirtyListeners.clear()
       hydratedListeners.clear()

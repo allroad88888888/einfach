@@ -1,10 +1,13 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use einfach_core::{Value, ValueError};
 
 use crate::cell::CellAddress;
-use crate::eval::{eval_expr_with_provider, is_builtin_function_name, EvalProvider};
+use crate::eval::{
+    eval_expr_with_provider, is_builtin_function_name, CustomFunctionRegistry, EvalProvider,
+};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 use crate::sheet::{RangeDependentIndex, Sheet, SheetError};
@@ -279,6 +282,16 @@ pub struct Workbook {
     /// list at 500, and the workbook-core layer can enforce a similar
     /// cap once a host needs it.
     named_values: BTreeMap<String, NamedEntry>,
+    /// Host-supplied custom-formula registry (Wave 8). When `Some`, formula
+    /// dispatch consults this AFTER built-ins and after defined-name LAMBDAs
+    /// (see precedence note on `eval_named_call`). When `None`, unknown
+    /// function names surface `#NAME?` exactly as before.
+    ///
+    /// The trait object owns the JS callback map in the wasm context;
+    /// native tests can plug in their own implementation. Kept in an
+    /// `Arc` so the per-eval `WorkbookEvalProvider` can clone the handle
+    /// cheaply without taking a `&self` borrow on the workbook.
+    custom_functions: Option<Arc<dyn CustomFunctionRegistry>>,
 }
 
 impl Workbook {
@@ -290,6 +303,7 @@ impl Workbook {
             cross_sheet: CrossSheetDeps::new(),
             cycle_ast_walk_count: Cell::new(0),
             named_values: BTreeMap::new(),
+            custom_functions: None,
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -412,6 +426,57 @@ impl Workbook {
     /// the names doesn't end up cloning every Lambda.
     pub fn named_names(&self) -> impl Iterator<Item = &str> {
         self.named_values.values().map(|e| e.canonical_name.as_str())
+    }
+
+    /// Install (or replace) the host's custom-formula registry. Passing
+    /// `None` detaches the previous registry — subsequent unknown
+    /// function calls fall straight through to `#NAME?` again.
+    ///
+    /// Wave 8 entry point: the wasm bridge wraps a `js_sys::Function`
+    /// hash map in a struct that impls `CustomFunctionRegistry` and
+    /// installs it here. Cells whose formulas reference custom-formula
+    /// names are NOT auto-invalidated by this call — the host is expected
+    /// to invoke `bump_custom_function_revision` (or equivalent) when a
+    /// registration change should re-fire cached cells. (Initial cut:
+    /// registrations are stable per session, so no invalidation hook is
+    /// wired yet.)
+    pub fn set_custom_function_registry(
+        &mut self,
+        registry: Option<Arc<dyn CustomFunctionRegistry>>,
+    ) {
+        self.custom_functions = registry;
+    }
+
+    /// Clone of the currently-installed custom-formula registry handle,
+    /// if any. Returns the `Arc<dyn ...>` so the caller can stash it for
+    /// later (e.g. the per-eval provider snapshots the Arc up-front so
+    /// it survives concurrent re-installs).
+    pub fn custom_function_registry(&self) -> Option<Arc<dyn CustomFunctionRegistry>> {
+        self.custom_functions.clone()
+    }
+
+    /// Force every formula in the workbook to re-evaluate the next time
+    /// it is read. Companion to `set_custom_function_registry`: a host
+    /// that adds / removes / replaces a custom function callback can
+    /// call this to invalidate cached results that depended on
+    /// `MYFUNC(...)` (which the cache marks `clean` after a successful
+    /// first compute, identical to any other formula). Implementation:
+    /// walks every sheet's formula table and flips the cache to dirty,
+    /// then fires per-cell subscribers so reactive hosts repaint.
+    ///
+    /// This is intentionally a sledgehammer — the engine has no
+    /// reverse-dep index keyed on custom-function name. A host that
+    /// hot-swaps registrations frequently can build its own per-name
+    /// invalidation index on top.
+    pub fn invalidate_all_formulas_for_custom_function_change(&self) {
+        for sheet in &self.sheets {
+            let addrs: Vec<CellAddress> =
+                sheet.formula_exprs_iter().keys().copied().collect();
+            for addr in addrs {
+                sheet.mark_dirty_for_addr(addr);
+                sheet.fire_subscribers(addr);
+            }
+        }
     }
 
     fn validate_name(name: &str) -> Result<(), WorkbookError> {
@@ -1879,6 +1944,16 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
 
     fn sheet_count(&self) -> usize {
         self.wb.sheets.len()
+    }
+
+    /// Wave 8 host custom-formula dispatch. Consult the workbook's
+    /// registry handle if one was installed via
+    /// `Workbook::set_custom_function_registry`; otherwise the
+    /// `EvalProvider` default `None` keeps the legacy `#NAME?`
+    /// fallthrough.
+    fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
+        let registry = self.wb.custom_functions.as_ref()?;
+        registry.lookup(name, args)
     }
 }
 

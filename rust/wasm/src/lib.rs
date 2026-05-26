@@ -1,12 +1,13 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
-    CellSubscription, FormatRangeSnapshot, NumberFormat, RangeFormatSnapshotLayer, Rotation, Sheet,
-    SheetError, VerticalAlign, Workbook, WorkbookError,
+    CellSubscription, CustomFunctionRegistry, FormatRangeSnapshot, NumberFormat,
+    RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, VerticalAlign, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
@@ -1292,6 +1293,219 @@ fn remap_sheet_index_after_move(idx: usize, from: usize, to: usize) -> usize {
     idx
 }
 
+// === Wave 8 custom-formula registry ===
+//
+// `CustomFormulaRegistry` holds a map of upper-cased name → `js_sys::Function`
+// (the JS callback the host registered via `registerCustomFormula`). When
+// the formula engine encounters an unknown function name and falls through
+// to `EvalProvider::call_custom`, the WorkbookEvalProvider impl delegates
+// to the registry's `lookup`, which marshals args from `Value` to `JsValue`,
+// invokes the callback, and marshals the return back.
+//
+// Thread safety: `js_sys::Function` is `!Send + !Sync` (it holds a JS-side
+// reference). wasm32-unknown-unknown is single-threaded by default, so we
+// wrap the inner state in `Mutex` (purely to satisfy the `CustomFunctionRegistry`
+// trait's `Sync` bound — the Mutex is never contended in practice) and the
+// outer struct is `Send + Sync` by virtue of the Mutex. The native-only
+// `cargo check --target host` path also compiles because js-sys ships
+// stubs for non-wasm targets.
+
+/// Concrete `CustomFunctionRegistry` impl backed by a `HashMap` of
+/// `js_sys::Function`s. Exposed via `WasmWorkbook::register_custom_formula`
+/// / `unregister_custom_formula`.
+///
+/// All lookups upper-case `name` so JS-side registration is case-
+/// insensitive: `wb.registerCustomFormula("myfunc", fn)` and `=MYFUNC()`
+/// resolve to the same entry. Matches Excel + the defined-name registry.
+struct WasmCustomFormulaRegistry {
+    inner: Mutex<HashMap<String, js_sys::Function>>,
+}
+
+impl std::fmt::Debug for WasmCustomFormulaRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self
+            .inner
+            .lock()
+            .map(|map| map.len())
+            .unwrap_or(0);
+        write!(f, "WasmCustomFormulaRegistry({count} fns)")
+    }
+}
+
+// SAFETY: js_sys::Function is not Send/Sync in general, but on wasm32 the
+// runtime is single-threaded and we never hand the Mutex out across
+// threads — the workbook is owned by a single Worker. The unsafe impls
+// satisfy the CustomFunctionRegistry bound without a third-party
+// `SendWrapper` dep. If/when shared-memory threads (wasm-bindgen-rayon)
+// land for the worker, this needs revisiting.
+unsafe impl Send for WasmCustomFormulaRegistry {}
+unsafe impl Sync for WasmCustomFormulaRegistry {}
+
+impl WasmCustomFormulaRegistry {
+    fn new() -> Self {
+        WasmCustomFormulaRegistry {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn register(&self, name: &str, callback: js_sys::Function) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(name.to_ascii_uppercase(), callback);
+        }
+    }
+
+    fn unregister(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|mut map| map.remove(&name.to_ascii_uppercase()).is_some())
+            .unwrap_or(false)
+    }
+
+    fn registered_names(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|map| map.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn count(&self) -> usize {
+        self.inner.lock().map(|map| map.len()).unwrap_or(0)
+    }
+}
+
+impl CustomFunctionRegistry for WasmCustomFormulaRegistry {
+    fn lookup(&self, name: &str, args: &[Value]) -> Option<Value> {
+        let key = name.to_ascii_uppercase();
+        let callback = {
+            let map = self.inner.lock().ok()?;
+            map.get(&key).cloned()?
+        };
+        Some(invoke_js_custom_formula(&callback, args))
+    }
+}
+
+/// Marshal `args` to a JS Array and invoke `callback`, then marshal the
+/// return value back to a `Value`. Centralized so the conversion rules
+/// stay in one place — see CUSTOM_FORMULAS.md for the wire format.
+fn invoke_js_custom_formula(callback: &js_sys::Function, args: &[Value]) -> Value {
+    let js_args = js_sys::Array::new();
+    for v in args {
+        js_args.push(&value_to_js(v));
+    }
+    match callback.call1(&JsValue::undefined(), &js_args) {
+        Ok(ret) => js_to_value(&ret),
+        Err(err) => {
+            // The JS callback threw. Surface the error message in the
+            // cell. We can't carry the message in `Value::Error` (the
+            // enum is just a tag), so we log it via the panic hook
+            // bridge — host devtools see `Uncaught (in promise)` for the
+            // throw, and the cell value is `#VALUE!`.
+            let _ = err;
+            Value::Error(ValueError::InvalidValue)
+        }
+    }
+}
+
+/// Marshal `Value` → `JsValue`. Scalars round-trip via their natural JS
+/// types; `Value::Array` becomes a 2-D `Array<Array<...>>`; `Value::Error`
+/// becomes a plain string like `"#DIV/0!"` so the JS side has at least
+/// some signal. `Value::Lambda` (which can't reach here in practice — the
+/// engine never passes a Lambda into a custom call) maps to `null`.
+fn value_to_js(value: &Value) -> JsValue {
+    match value {
+        Value::Number(n) => JsValue::from_f64(*n),
+        Value::Text(s) => JsValue::from_str(s),
+        Value::Boolean(b) => JsValue::from_bool(*b),
+        Value::Null => JsValue::null(),
+        Value::Error(e) => JsValue::from_str(&format!("{e}")),
+        Value::Array(arr) => {
+            let outer = js_sys::Array::new();
+            for r in 0..arr.rows {
+                let row = js_sys::Array::new();
+                for c in 0..arr.cols {
+                    let v = arr.get(r, c).cloned().unwrap_or(Value::Null);
+                    row.push(&value_to_js(&v));
+                }
+                outer.push(&row);
+            }
+            outer.into()
+        }
+        Value::Lambda(_) => JsValue::null(),
+    }
+}
+
+/// Marshal `JsValue` → `Value`. The JS callback may return any of:
+///   - `number` → `Value::Number` (NaN / Infinity become `#NUM!`).
+///   - `string` → `Value::Text`. The special tokens `"#DIV/0!"`,
+///     `"#REF!"`, `"#VALUE!"`, `"#NAME?"`, `"#NUM!"`, `"#N/A"`,
+///     `"#CYCLE!"`, `"#TYPE!"`, `"#ARGS!"`, `"#SPILL!"` round-trip as
+///     the matching `ValueError` so a JS-side custom function can
+///     deliberately propagate an Excel-style error.
+///   - `boolean` → `Value::Boolean`.
+///   - `null` / `undefined` → `Value::Null`.
+///   - `{ error: string }` → `Value::Error(_)` parsed from the string
+///     (same token map as above; unknown strings → `#VALUE!`).
+///   - Anything else (Date, function, opaque object) → `#TYPE!`.
+fn js_to_value(js: &JsValue) -> Value {
+    if js.is_null() || js.is_undefined() {
+        return Value::Null;
+    }
+    if let Some(n) = js.as_f64() {
+        if n.is_nan() || n.is_infinite() {
+            return Value::Error(ValueError::Overflow);
+        }
+        return Value::Number(n);
+    }
+    if let Some(b) = js.as_bool() {
+        return Value::Boolean(b);
+    }
+    if let Some(s) = js.as_string() {
+        if let Some(err) = error_token_to_value_error(&s) {
+            return Value::Error(err);
+        }
+        return Value::Text(s);
+    }
+    // Tagged-error escape hatch: `{ error: "..." }`. Used so JS code can
+    // return a structured value-or-error without picking between
+    // overloading `return "#VALUE!"` (ambiguous if a user actually wants
+    // the literal text `"#VALUE!"`) and throwing (which clears the
+    // cell's eval frame).
+    #[cfg(target_arch = "wasm32")]
+    if js.is_object() {
+        if let Ok(error_val) = js_sys::Reflect::get(js, &JsValue::from_str("error")) {
+            if let Some(s) = error_val.as_string() {
+                return Value::Error(
+                    error_token_to_value_error(&s).unwrap_or(ValueError::InvalidValue),
+                );
+            }
+        }
+        // Plain object with no `error` key, or any other non-scalar JS
+        // shape (Date, function, Promise) — surface `#TYPE!`. Custom
+        // formulas are scalar-in / scalar-out in this initial cut.
+        return Value::Error(ValueError::WrongType);
+    }
+    Value::Error(ValueError::WrongType)
+}
+
+/// Translate Excel-style error tokens back to `ValueError`. Used by both
+/// the string return path (`return "#DIV/0!"`) and the tagged-object path
+/// (`return { error: "#DIV/0!" }`). Unknown tokens return `None` so the
+/// caller can decide whether to treat the string as text or `#VALUE!`.
+fn error_token_to_value_error(s: &str) -> Option<ValueError> {
+    match s {
+        "#DIV/0!" => Some(ValueError::DivisionByZero),
+        "#REF!" => Some(ValueError::InvalidRef),
+        "#VALUE!" => Some(ValueError::InvalidValue),
+        "#NAME?" => Some(ValueError::InvalidName),
+        "#NUM!" => Some(ValueError::Overflow),
+        "#CYCLE!" => Some(ValueError::CyclicRef),
+        "#TYPE!" => Some(ValueError::WrongType),
+        "#ARGS!" => Some(ValueError::WrongArgCount),
+        "#SPILL!" => Some(ValueError::Spill),
+        _ => None,
+    }
+}
+
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
 /// evaluate formulas through workbook context, including cross-sheet refs.
 #[wasm_bindgen]
@@ -1312,6 +1526,13 @@ pub struct WasmWorkbook {
     /// point.
     subscriptions: HashMap<u32, WorkbookCellSubscription>,
     next_token: u32,
+    /// Wave 8 custom-formula registry handle. The same `Arc` is installed
+    /// on the inner `Workbook` so the formula engine can reach the JS
+    /// callbacks via `WorkbookEvalProvider::call_custom`. We keep a
+    /// second handle here so `register_custom_formula` /
+    /// `unregister_custom_formula` can mutate the map without going
+    /// through the workbook's borrow.
+    custom_formulas: Arc<WasmCustomFormulaRegistry>,
 }
 
 #[wasm_bindgen]
@@ -1319,10 +1540,19 @@ impl WasmWorkbook {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
         install_panic_hook();
+        let custom_formulas = Arc::new(WasmCustomFormulaRegistry::new());
+        let mut workbook = Workbook::new();
+        // Install the registry on the inner workbook so the formula
+        // engine's `WorkbookEvalProvider::call_custom` can reach it. The
+        // Arc clone is cheap — same map, two handles.
+        workbook.set_custom_function_registry(Some(
+            custom_formulas.clone() as Arc<dyn CustomFunctionRegistry>,
+        ));
         WasmWorkbook {
-            workbook: Workbook::new(),
+            workbook,
             subscriptions: HashMap::new(),
             next_token: 0,
+            custom_formulas,
         }
     }
 
@@ -1838,6 +2068,65 @@ impl WasmWorkbook {
                 sheet.unsubscribe_cell(entry.sub);
             }
         }
+    }
+
+    /// Wave 8: register a JS callback as a workbook-scope custom formula.
+    /// After this call, `=MYFUNC(...)` in any cell resolves through the
+    /// registry: the engine evaluates the args eagerly, then invokes the
+    /// callback with a JS Array of marshaled args. Lookup is case-
+    /// insensitive (the engine receives upper-cased names from the
+    /// formula parser; we upper-case `name` here to match).
+    ///
+    /// JS signature contract:
+    ///   `(args: Array<number|string|boolean|null>) => number | string |`
+    ///   `  boolean | null | { error: "#DIV/0!" | ... }`
+    /// If the callback throws, the cell surfaces `#VALUE!`. If it returns
+    /// a Date, function, or other non-scalar object, the cell surfaces
+    /// `#TYPE!`. NaN / Infinity return values are folded to `#NUM!`.
+    ///
+    /// Registering over an existing name silently replaces the callback.
+    /// All formulas in the workbook are dirtied so cached results re-eval
+    /// against the new registration.
+    #[wasm_bindgen(js_name = "registerCustomFormula")]
+    pub fn register_custom_formula(&mut self, name: String, callback: js_sys::Function) {
+        self.custom_formulas.register(&name, callback);
+        self.workbook
+            .invalidate_all_formulas_for_custom_function_change();
+    }
+
+    /// Remove a previously-registered custom formula. Returns `true` if
+    /// an entry was removed; `false` if no entry existed. Cells that
+    /// referenced the name re-evaluate to `#NAME?` on next read; all
+    /// formulas are dirtied to force that re-evaluation (matching the
+    /// `define_name` / `undefine_name` invalidation contract).
+    #[wasm_bindgen(js_name = "unregisterCustomFormula")]
+    pub fn unregister_custom_formula(&mut self, name: &str) -> bool {
+        let removed = self.custom_formulas.unregister(name);
+        if removed {
+            self.workbook
+                .invalidate_all_formulas_for_custom_function_change();
+        }
+        removed
+    }
+
+    /// Number of currently-registered custom formulas. Debug probe so
+    /// JS tests can assert their register / unregister calls landed.
+    #[wasm_bindgen(js_name = "customFormulaCount")]
+    pub fn custom_formula_count(&self) -> u32 {
+        self.custom_formulas.count() as u32
+    }
+
+    /// List of registered custom-formula names (upper-cased). Stable
+    /// alphabetical ordering not guaranteed — `HashMap::keys()` order.
+    /// Used by hosts that want to render a "registered formulas"
+    /// inspector. Returns a `JsValue::Array<String>`.
+    #[wasm_bindgen(js_name = "customFormulaNames")]
+    pub fn custom_formula_names(&self) -> JsValue {
+        let arr = js_sys::Array::new();
+        for n in self.custom_formulas.registered_names() {
+            arr.push(&JsValue::from_str(&n));
+        }
+        arr.into()
     }
 
     /// Number of cross-sheet dependent edges currently tracked on the

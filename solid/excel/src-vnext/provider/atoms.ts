@@ -46,6 +46,19 @@ export const removeDuplicatesSupportedAtom = atom((get) => {
 removeDuplicatesSupportedAtom.debugLabel = 'spreadsheet.vnext.removeDuplicates.supported'
 
 /**
+ * Derived capability flag: true iff the active backend implements both
+ * `registerCustomFormula` and `unregisterCustomFormula`. Wave 8 — used
+ * by the host provider's effect to decide whether to forward registry
+ * mutations to the worker. No menu entry hangs off this in MVP;
+ * registration is programmatic.
+ */
+export const customFormulasSupportedAtom = atom((get) => {
+  const backend = get(spreadsheetBackendAtom)
+  return Boolean(backend?.registerCustomFormula && backend?.unregisterCustomFormula)
+})
+customFormulasSupportedAtom.debugLabel = 'spreadsheet.vnext.customFormulas.supported'
+
+/**
  * Sheet snapshot captured when the Remove Duplicates dialog opens. The
  * menubar dispatcher writes the current sheetId BEFORE flipping the open
  * flag so the confirm flow operates on the sheet that was active at

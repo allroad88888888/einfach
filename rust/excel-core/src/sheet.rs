@@ -3533,6 +3533,15 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
     fn sheet_count(&self) -> usize {
         self.inner.sheet_count()
     }
+
+    /// Pass-through to the inner provider. No dep edge is recorded — a
+    /// custom function's "dependency" is the registration itself, not a
+    /// cell. When a host changes the custom registry it calls
+    /// `Workbook::invalidate_all_formulas_for_custom_function_change`
+    /// to dirty every formula in one shot.
+    fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
+        self.inner.call_custom(name, args)
+    }
 }
 
 impl Default for Sheet {

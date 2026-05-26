@@ -3,10 +3,12 @@ import { onCleanup, onMount, Show } from 'solid-js'
 import {
   openRemoveDuplicatesAtom,
   openTextToColumnsAtom,
+  registerCustomFormulaAtom,
   selectCellAtom,
   selectionAtom,
   selectionSnapshotAtom,
   setWorkspaceActiveSheetAtom,
+  unregisterCustomFormulaAtom,
   viewportShowFormulaBarAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
@@ -208,6 +210,40 @@ function VNextWave5Workbook() {
   })
 
   /**
+   * Wave 8 — seed three custom formulas so the demo shows the
+   * `=MYTAX(B2)` flow without anyone needing the menubar. The provider
+   * effect diffs the registry and forwards to the worker; the static
+   * backend has no port so the registry stays a no-op there. Tear
+   * down on unmount so a hot-reload does not double-register.
+   */
+  onMount(() => {
+    const seeded = [
+      {
+        name: 'MYTAX',
+        source: 'return Number(args[0]) * 0.2',
+        description: '20% tax on the input amount',
+        paramLabels: ['amount'],
+      },
+      {
+        name: 'GREET',
+        source: "return 'Hello, ' + String(args[0] ?? '')",
+        description: 'Friendly greeting',
+        paramLabels: ['name'],
+      },
+      {
+        name: 'CELSIUS',
+        source: 'return (Number(args[0]) - 32) * 5 / 9',
+        description: 'Convert Fahrenheit to Celsius',
+        paramLabels: ['fahrenheit'],
+      },
+    ]
+    for (const reg of seeded) store.setter(registerCustomFormulaAtom, reg)
+    onCleanup(() => {
+      for (const reg of seeded) store.setter(unregisterCustomFormulaAtom, reg.name)
+    })
+  })
+
+  /**
    * Wave 7.1 test hook — listen for a `spreadsheet:open-text-to-columns`
    * custom event so e2e walks can open the dialog without a visible /
    * focusable trigger button in the demo DOM (the wave5 demo omits the
@@ -325,6 +361,10 @@ export function VNextWave5Demo() {
         <p class="demo-desc">
           演示菜单条、名称框、状态栏聚合（选区的求和/平均/计数）、缩放滑块、格式刷以及画布
           装饰层。预置一张季度销售表，选中 B2:E8 即可看到非平凡的聚合结果。
+        </p>
+        <p class="demo-desc" data-testid="wave5-custom-formulas-banner">
+          Custom formulas registered: <code>MYTAX</code>, <code>GREET</code>,{' '}
+          <code>CELSIUS</code>. Try <code>=MYTAX(B2)</code> in any cell.
         </p>
       </div>
 
