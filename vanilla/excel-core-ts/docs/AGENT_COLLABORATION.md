@@ -26,6 +26,9 @@
 | --- | --- | --- | --- | --- | --- |
 | 2026-05-26 | CC | docs (PLAN / ARCH / 本文档) | done | `vanilla/excel-core-ts/docs/*.md` | — |
 | 2026-05-26 | CC | Wave A — package skeleton + contracts | done | `vanilla/excel-core-ts/{package.json,tsconfig.json,src/types.ts,src/index.ts,test/types.test.ts,README.md}` + root `tsconfig.json` + `jest.config.mjs` moduleNameMapper | Spawn Wave B's 3 tracks (B1 parser / B2 workbook+evaluator skeleton / B3 refs+a1+ranges) |
+| 2026-05-26 | B1 agent | Wave B / B1 — parser | done | `vanilla/excel-core-ts/src/parser/{tokenizer,parser,index}.ts`, `vanilla/excel-core-ts/test/parser.test.ts`, single-line append to `vanilla/excel-core-ts/src/index.ts` (`parseFormula` re-export) | hand off to B2 evaluator for AST consumption |
+| 2026-05-26 | B3 agent | Wave B / B3 — refs / a1 / ranges | done | `vanilla/excel-core-ts/src/refs/{a1,ranges,index}.ts`, `vanilla/excel-core-ts/test/refs.test.ts`, append to `vanilla/excel-core-ts/src/index.ts` (refs re-exports) | unblocks B1 ref parsing + B2 refLookup + Wave C range fns |
+| 2026-05-26 | B2 agent | Wave B / B2 — workbook + evaluator skeleton | done | `vanilla/excel-core-ts/src/{workbook,sheet}.ts`, `vanilla/excel-core-ts/src/eval/{evaluate,coerce,index}.ts`, `vanilla/excel-core-ts/test/{workbook,evaluate}.test.ts`, replace staged `Workbook`/`WorkbookSheet` in `src/types.ts` + append runtime exports to `src/index.ts` | hand off to Wave C function registry |
 
 ### Handoff: A / 2026-05-26
 
@@ -278,3 +281,140 @@ Next request：
 6. **第 22 天起**：Wave F 滚动批，按需展开。
 
 如果哪个 wave 出现延迟（function 实现 bug 多），优先**保住下一 wave 的并发度**而不是抓完美 —— 函数细节可以在 Wave F 阶段补完。
+
+---
+
+### Handoff: B.B1 / 2026-05-26
+
+Owner（交付方）: B1 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/parser/tokenizer.ts` (new — `Token` union + `tokenize`)
+- `vanilla/excel-core-ts/src/parser/parser.ts` (new — Pratt parser + `ParseError`)
+- `vanilla/excel-core-ts/src/parser/index.ts` (replaced the Wave B/B2 stub — `parseFormula`/`tokenize`/`parseTokens`/`ParseError` re-exports)
+- `vanilla/excel-core-ts/test/parser.test.ts` (new — 102 specs)
+- `vanilla/excel-core-ts/src/index.ts` (single-line append: `export { parseFormula } from './parser'`)
+
+Public types changed: none. Parser consumes `Expr` from `../types` verbatim — no contract drift.
+Atoms added/changed: none (parser is pure).
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/parser --no-coverage` → 102/102 pass.
+- `npx jest vanilla/excel-core-ts --no-coverage` → 196/196 pass (includes B3 refs suite + Wave A types smoke).
+- Isolated `tsc --noEmit` over `src/parser/*.ts` + `test/parser.test.ts` → clean.
+- `npx tsc -b vanilla/excel-core-ts` → still reports the two pre-existing errors in `src/eval/evaluate.ts` (`toBoolean` unused) and `src/sheet.ts` (`Expr` unused) — both **outside the B1 file whitelist**. B2 owns those.
+
+Known risks / deviations:
+- Tokenizer cap on column letters is 3 (`XFD`). Anything 4+ letters becomes a `name`. Matches Excel's documented max but means a hypothetical 4-letter column would mis-parse — non-issue for v1.
+- `parseFormula` returns `{kind:'error', code:'#NAME?'}` for empty/whitespace-only input (per task spec). Tokenizer-error and structural-error inputs collapse to `#VALUE!`.
+- `BLANK` is **not** emitted by the parser — leading `=` with no body still produces `#NAME?`, consistent with the task brief.
+- Sheet-prefix identifiers are tokenized into two tokens (`sheet-prefix` + `bang`); evaluator side never sees the raw `!` token because the parser folds them inside `parseCrossSheet`.
+- Right-assoc `^` binding powers are `(60, 59)`; postfix `%` uses bp `55` so `1+2%` parses as `1 + (2%)` (matches Excel).
+- Inline array literals enforce rectangular rows at parse time (mismatched row width → `#VALUE!`). Excel also enforces this but at evaluation time; behavior is observationally identical for callers.
+
+Next request: B2 (evaluator) can now `import { parseFormula } from '@einfach/excel-core-ts'` (or directly from `'../parser'`) to populate `Cell.ast`. The 13 Expr discriminator strings in `src/types.ts` §5 are all exercised by tests in the `Expr kind coverage tripwire` block — if B2 needs to change a tag it will be caught immediately.
+
+---
+
+### Handoff: B.B3 / 2026-05-26
+
+Owner（交付方）: B3 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/refs/a1.ts` (new — `parseA1` / `formatA1` / `colNameToIndex` / `colIndexToName` + `EXCEL_MAX_COL` / `EXCEL_MAX_ROW`)
+- `vanilla/excel-core-ts/src/refs/ranges.ts` (new — `parseRange` / `parseRangeString` / `normalizeRange` / `iterateRange` / `expandRange` / `rangeContains` / `rangesIntersect` / `cellKey` + `RangeTooLargeError`)
+- `vanilla/excel-core-ts/src/refs/index.ts` (new — barrel)
+- `vanilla/excel-core-ts/test/refs.test.ts` (new — 87 specs)
+- `vanilla/excel-core-ts/src/index.ts` (append-only: refs re-exports added alongside B1's `parseFormula` re-export — no conflict)
+
+Public types changed: none broken. **New surface** (additive, no upstream impact):
+- Constants: `EXCEL_MAX_COL = 16383`, `EXCEL_MAX_ROW = 1048575`, `EXPAND_MAX_CELLS = 100_000`.
+- `class RangeTooLargeError extends Error { range: CellRange; cellCount: number }`.
+- `interface ParsedA1 { row, col, absRow, absCol }`, `interface FormatA1Input { row, col, absRow?, absCol? }`.
+- Functions:
+  - `colNameToIndex(name: string): number` ('A'→0, 'XFD'→16383, returns -1 on bad input).
+  - `colIndexToName(idx: number): string` (throws `RangeError` for out-of-bounds — internal helper).
+  - `parseA1(a1: string): ParsedA1 | null` (handles `A1` / `$A$1` / `$A1` / `A$1` / lowercase / boundary `XFD1048576`; null on malformed).
+  - `formatA1(coord: FormatA1Input): string` (round-trip inverse of `parseA1`; emits `$` markers; throws `RangeError` on OOB).
+  - `cellKey(coord: CellCoord): CellKey` (`${row}:${col}` — canonical Map key, **single source of truth** for B1/B2/Wave C).
+  - `parseRange(start, end): CellRange | null` (both endpoints same shape: cell+cell / row+row / col+col; mixed shapes → null; auto-normalized).
+  - `parseRangeString(text): CellRange | null` (splits on `:`, rejects multi-colon).
+  - `normalizeRange(range): CellRange` (idempotent, swaps inverted start/end).
+  - `iterateRange(range): IterableIterator<CellCoord>` (uncapped generator, row-major; safe for whole-column ranges).
+  - `expandRange(range): CellCoord[]` (capped at `EXPAND_MAX_CELLS`; throws `RangeTooLargeError` past it).
+  - `rangeContains(range, coord): boolean`, `rangesIntersect(a, b): boolean` (both inclusive, both auto-normalize).
+
+Atoms added/changed: **none** (B3 is a pure-function module by mandate — no `@einfach/core` import).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/refs --no-coverage` → **87/87 pass** (target was 50+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → **196/196 pass** (full package: 87 refs + 102 parser + 7 types smoke).
+- Isolated tsc over `src/refs/*.ts` + the new `src/index.ts` re-exports → clean.
+- `npx tsc -b vanilla/excel-core-ts` still reports the same two pre-existing errors in B2's dirty files (`src/sheet.ts:26` unused `Expr`, `src/eval/evaluate.ts:41` unused `toBoolean`) — both outside the B3 whitelist; left for B2.
+
+Known risks / TODOs left in code:
+- `parseRange('A1','B')` (anchored-open ranges like `A1:A` or `A:A1`) returns `null`. Excel accepts these; out of scope for v1. Inline `TODO(B3)` comment in `src/refs/ranges.ts`. The parser layer (B1) already rejects these at tokenization so they never reach `parseRange` today.
+- `parseRangeString` does **not** strip cross-sheet prefixes (`Sheet2!A1:B10`). That's the parser/B1 concern; refs only sees the post-prefix slice.
+- Whitespace around the colon (`A1 : B10`) is rejected. Excel formulas are whitespace-strict; B1 pre-trim if needed.
+- Absolute markers (`$`) are tolerated in range endpoints but **discarded** when forming the `CellRange` (the underlying coord is the same regardless). Preserving absolute-ness through range expansion would be an AST/parser concern, not a refs concern.
+
+Next request: B1 + B2 can now import from `'../refs'` (or `'@einfach/excel-core-ts'`) for ref parsing and range materialization. Wave C math/stats/lookup should prefer `iterateRange` for streaming and reserve `expandRange` for cases with a guaranteed-bounded selection.
+
+---
+
+### Handoff: B.B2 / 2026-05-26
+
+Owner（交付方）: B2 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/workbook.ts` (new — `createWorkbook`, `Workbook` interface, mutation API, `recalc`, name/custom registries)
+- `vanilla/excel-core-ts/src/sheet.ts` (new — `createSheet`, `WorkbookSheet` interface, per-sheet `sheetAtom`, lazy `formulaCellAtom` factory, `keyFor`, `applyCell`)
+- `vanilla/excel-core-ts/src/eval/evaluate.ts` (new — `evaluate`, `refLookupGeneric`, `rangeLookupGeneric`, `cycleGuardKey`, A1 thin shims)
+- `vanilla/excel-core-ts/src/eval/coerce.ts` (new — `toNumber` / `toString` / `toBoolean` / `propagateError`, Excel coercion rules)
+- `vanilla/excel-core-ts/src/eval/index.ts` (new — barrel)
+- `vanilla/excel-core-ts/test/workbook.test.ts` (new — 20 specs)
+- `vanilla/excel-core-ts/test/evaluate.test.ts` (new — 21 specs)
+- `vanilla/excel-core-ts/src/types.ts` (edit — section 9 replaced: `Workbook` / `WorkbookSheet` now `export type … from './workbook' / './sheet'`; **all earlier sections unchanged** — `Value`, `Cell`, `Expr`, `SheetMutation`, `EvalContext`, `FunctionImpl`, `NameBinding`, `BinaryOp`, `ErrorCode` field/discriminator names stable)
+- `vanilla/excel-core-ts/src/index.ts` (append-only: `createWorkbook` + `createSheet` + `keyFor` + `applyCell` + `evaluate` + coerce helpers + `parseRefToKey/Coord` re-exports)
+
+Public types changed:
+- `Workbook` and `WorkbookSheet` finalized — now real interfaces (replaces the Wave A `unknown` stage). Re-exports kept on `'./types'` so any earlier B3/D import path stays valid.
+- **Additive surface** (new, no upstream break):
+  - `interface Workbook { store, sheets, sheet, sheetByName, setCell, clearCell, bulkApply, setFormat, recalc, defineName, undefineName, registerCustomFormula, unregisterCustomFormula }`
+  - `interface WorkbookSheet { id, name, sheetAtom, formulaCellAtom(key) }`
+  - `interface CreateWorkbookOptions { parser?, store? }`, `interface SheetSeed { id, name }`, `interface BulkCellInput { row, col, input }`
+  - `interface SheetResolvers { crossSheetCells, callCustom, resolveName }`
+  - `type SheetState = ReadonlyMap<CellKey, Cell>`
+  - `CoerceResult<T> = CoerceOk<T> | CoerceErr`
+  - `function cycleGuardKey(cells, key): CellKey` (for callers that seed the cycle set before invoking `evaluate` directly)
+
+Atoms added/changed:
+- One `sheetAtom` per sheet, `debugLabel = 'excel-core.sheet.<id>.cells'`, holds `ReadonlyMap<CellKey, Cell>`. Writable.
+- Lazy `formulaCellAtom(key)` derives, cached per (sheet, key); `debugLabel = 'excel-core.sheet.<id>.formulaCell.<key>'`. Read-only.
+- **No per-cell, per-row, or per-column atom families** (PLAN §4.1 honored).
+- **The derive registers exactly ONE dep on its own `sheetAtom` per run** (plus one dep per referenced cross-sheet's atom via `crossSheetCells`). The `cells` snapshot is captured once at the top of the derive; subsequent ref/range lookups walk that Map with `Map.get` (ARCH §4).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/workbook vanilla/excel-core-ts/test/evaluate --no-coverage` → **41/41 pass** (20 workbook + 21 evaluate).
+- `npx jest vanilla/excel-core-ts --no-coverage` → **237/237 pass** (full package: 87 refs + 102 parser + 41 B2 + 7 types smoke).
+- `npx tsc -b vanilla/excel-core-ts` → **clean** (no diagnostics).
+- `npx jest vanilla/core vanilla/spreadsheet-ui-core --no-coverage` → **880/880 pass** (no regression).
+
+Coverage of the prompt's required cases:
+- `=1+2*3 → 7`: `evaluate.test.ts` "literals + arithmetic" block.
+- `=A1+B1` with A1=10, B1=20 → 30: `evaluate.test.ts` "refs against a seeded snapshot" + `workbook.test.ts` formula-derive block (uses real parser).
+- `=A1*B1` short-circuits to `#REF!` when A1 holds `{kind:'error', code:'#REF!'}`: both test files.
+- cycle A1=B1+1, B1=A1+1 → `#CIRCULAR!`: both test files; cross-sheet cycle false-collision avoided by `cycleGuardKey` tagging.
+- recalc bumps the atom: `workbook.test.ts` recalc block (asserts fresh Map identity after `recalc()`).
+- `setCell` + `formulaCellAtom` round-trip via vanilla/core's `sub`: `workbook.test.ts` "formulaCellAtom" block (subscribes, mutates A1, observes B1 derive output).
+
+Known risks / TODOs left in code:
+- `defineName` is a synchronous map; mutating a name does **not** automatically invalidate formulas referencing it. Wave E will replace with an atom-backed registry. For now callers needing live name-driven invalidation should call `recalc()`.
+- `evaluator.evaluate` handles `call` by trying `ctx.callCustom`, falling through to `#NAME?`. Wave C's function registry will own the built-in branch.
+- `evaluator.evaluate` for `NameBinding.kind === 'lambda'` returns `#NAME?` — LAMBDA awaits Wave E.
+- `rangeLookupGeneric` materializes full `Value[][]`. Whole-column / whole-row ranges are guarded by `RangeTooLargeError` → `#NUM!`. Wave E (range-fn streaming) will add an iterator path so SUM(A:A) doesn't fall over.
+- Arithmetic on `{kind:'array'}` operands collapses to top-left scalar (Wave E adds broadcast). Comparison ops likewise.
+- Format storage uses the shared `Cell.format` field (PLAN §2.2 alternative chosen for fewer atoms). `setFormat` over an empty range stamps blank cells carrying only format — matches the rust implementation's "format-only cell" concept.
+- Parser injection (`createWorkbook(..., { parser })`) is a testing seam; production code uses the real `parseFormula` from `./parser`.
+- The `cellsMapTags` WeakMap is module-scoped (one global counter for the package). Tags survive across workbook lifetimes; counter could theoretically wrap but at 1 alloc per sheet-snapshot per recalc that's a non-issue for any realistic session.
+
+Next request: Wave C (5-way function-registry fanout) can wire `ctx.callCustom` and a built-in dispatcher inside `evaluate`'s `'call'` branch — same shape, just consults the built-in `Map<string, FunctionImpl>` first per AGENT_COLLABORATION.md §"Wave C". Workbook + sheetAtom + evaluator skeleton are done; Wave D can begin worker-shim work in parallel using the `Workbook` interface as the SpreadsheetBackend target.

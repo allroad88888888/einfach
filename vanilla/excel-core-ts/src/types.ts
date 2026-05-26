@@ -430,18 +430,13 @@ export type FunctionImpl = (args: Value[], ctx: EvalContext) => Value
 // =============================================================================
 // 9. Public types re-exported for downstream packages
 // =============================================================================
+//
+// Real `Workbook` / `WorkbookSheet` interfaces live alongside their
+// implementations in `./workbook.ts` and `./sheet.ts`. We re-export them
+// here so existing imports from `'./types'` keep working. The signatures
+// were staged as `unknown` during Wave A; B2 finalizes them. Field names
+// elsewhere in this file (Value, Cell, Expr, SheetMutation, EvalContext,
+// FunctionImpl, NameBinding, BinaryOp, ErrorCode) are unchanged.
 
-/**
- * The Workbook handle exposed to the worker layer. Shape is finalized
- * in Wave B (`workbook.ts`); declared here only as `unknown` so D-track
- * agents have a name to target without forcing B-track to ship first.
- *
- * When B publishes `Workbook`, replace this with the real interface.
- */
-export type Workbook = unknown
-
-/**
- * A single sheet's reactive handle. Shape finalized in Wave B
- * (`sheet.ts`). Same staging convention as `Workbook` above.
- */
-export type WorkbookSheet = unknown
+export type { Workbook, CreateWorkbookOptions, SheetSeed, BulkCellInput } from './workbook'
+export type { WorkbookSheet, SheetState, SheetResolvers } from './sheet'
