@@ -201,6 +201,9 @@ importers:
       '@einfach/core':
         specifier: workspace:*
         version: link:../../vanilla/core
+      '@einfach/excel-core-ts':
+        specifier: workspace:*
+        version: link:../../vanilla/excel-core-ts
       '@einfach/solid':
         specifier: workspace:*
         version: link:../solid

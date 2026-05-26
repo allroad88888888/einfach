@@ -6,7 +6,7 @@
  * serial 60 and serials >= 61 align with the post-phantom calendar.
  */
 
-import { afterEach, beforeEach, describe, expect, test } from '@jest/globals'
+import { afterEach, beforeEach, describe, expect, jest, test } from '@jest/globals'
 
 import { FUNCTIONS } from '../src/eval/functions/date'
 import type { EvalContext, FunctionImpl, Value } from '../src/types'

@@ -37,6 +37,7 @@
   "sideEffects": false,
   "dependencies": {
     "@einfach/core": "workspace:*",
+    "@einfach/excel-core-ts": "workspace:*",
     "@einfach/solid": "workspace:*",
     "@einfach/spreadsheet-ui-core": "workspace:*",
     "@lingui/core": "^6.0.1",

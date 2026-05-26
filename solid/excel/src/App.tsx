@@ -11,7 +11,7 @@ import { DemoCrossSheetChain } from './demos/DemoCrossSheetChain'
 import { DemoLarge } from './demos/DemoLarge'
 import { DemoWorker } from './demos/DemoWorker'
 import { DemoMillion } from './demos/DemoMillion'
-import { VNextSmokeDemo, VNextWorkerDemo, VNextWave5Demo } from '../src-vnext'
+import { VNextSmokeDemo, VNextWorkerDemo, VNextWorkerTsDemo, VNextWave5Demo } from '../src-vnext'
 import { LocaleSwitcher } from './LocaleSwitcher'
 import { useT } from './i18n'
 import './styles.css'
@@ -68,6 +68,7 @@ const demoGroups: DemoGroup[] = [
     demos: [
       { id: 'vnext', labelKey: 'nav.vnext', component: VNextSmokeDemo },
       { id: 'vnext-worker', labelKey: 'nav.vnextWorker', component: VNextWorkerDemo },
+      { id: 'vnext-worker-ts', labelKey: 'nav.vnextWorkerTs', component: VNextWorkerTsDemo },
       { id: 'vnext-wave5', labelKey: 'nav.vnextWave5', component: VNextWave5Demo },
     ],
   },

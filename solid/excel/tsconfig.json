@@ -16,6 +16,9 @@
     },
     {
       "path": "../../vanilla/spreadsheet-ui-core"
+    },
+    {
+      "path": "../../vanilla/excel-core-ts"
     }
   ]
 }

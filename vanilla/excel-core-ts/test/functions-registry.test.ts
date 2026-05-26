@@ -19,7 +19,6 @@ import {
   listBuiltinNames,
   parseFormula,
   type EvalContext,
-  type Value,
 } from '../src'
 
 describe('@einfach/excel-core-ts — Wave C registry merge', () => {
@@ -85,25 +84,25 @@ describe('@einfach/excel-core-ts — evaluator dispatches Wave C registry', () =
   test('=SUM(1, 2, 3) → 6', () => {
     const ast = parseFormula('=SUM(1, 2, 3)')
     const result = evaluate(ast, makeCtx())
-    expect(result).toEqual<Value>({ kind: 'number', value: 6 })
+    expect(result).toEqual({ kind: 'number', value: 6 })
   })
 
   test('=IF(TRUE, "yes", "no") → "yes"', () => {
     const ast = parseFormula('=IF(TRUE, "yes", "no")')
     const result = evaluate(ast, makeCtx())
-    expect(result).toEqual<Value>({ kind: 'string', value: 'yes' })
+    expect(result).toEqual({ kind: 'string', value: 'yes' })
   })
 
   test('=UPPER(LEFT("hello", 3)) → "HEL"', () => {
     const ast = parseFormula('=UPPER(LEFT("hello", 3))')
     const result = evaluate(ast, makeCtx())
-    expect(result).toEqual<Value>({ kind: 'string', value: 'HEL' })
+    expect(result).toEqual({ kind: 'string', value: 'HEL' })
   })
 
   test('=DATE(2024, 1, 1) → 45292 (Excel pin)', () => {
     const ast = parseFormula('=DATE(2024, 1, 1)')
     const result = evaluate(ast, makeCtx())
-    expect(result).toEqual<Value>({ kind: 'number', value: 45292 })
+    expect(result).toEqual({ kind: 'number', value: 45292 })
   })
 
   test('unknown function name surfaces as #NAME?', () => {
@@ -124,7 +123,7 @@ describe('@einfach/excel-core-ts — evaluator dispatches Wave C registry', () =
     const result = evaluate(ast, ctx)
     // Built-in SUM wins over the custom registry — registry only consulted
     // when name isn't a built-in.
-    expect(result).toEqual<Value>({ kind: 'number', value: 3 })
+    expect(result).toEqual({ kind: 'number', value: 3 })
   })
 })
 
@@ -139,7 +138,7 @@ describe('@einfach/excel-core-ts — workbook + evaluator + registry integration
     const sheet = workbook.sheet('s1')!
     const atom = sheet.formulaCellAtom('3:0')
     const result = workbook.store.getter(atom)
-    expect(result).toEqual<Value>({ kind: 'number', value: 60 })
+    expect(result).toEqual({ kind: 'number', value: 60 })
   })
 
   test('mutation invalidates downstream function-call formula', () => {
@@ -147,9 +146,9 @@ describe('@einfach/excel-core-ts — workbook + evaluator + registry integration
     workbook.setCell('s1', 0, 0, '5')
     workbook.setCell('s1', 1, 0, '=POWER(A1, 2)')
     const atom = workbook.sheet('s1')!.formulaCellAtom('1:0')
-    expect(workbook.store.getter(atom)).toEqual<Value>({ kind: 'number', value: 25 })
+    expect(workbook.store.getter(atom)).toEqual({ kind: 'number', value: 25 })
 
     workbook.setCell('s1', 0, 0, '10')
-    expect(workbook.store.getter(atom)).toEqual<Value>({ kind: 'number', value: 100 })
+    expect(workbook.store.getter(atom)).toEqual({ kind: 'number', value: 100 })
   })
 })

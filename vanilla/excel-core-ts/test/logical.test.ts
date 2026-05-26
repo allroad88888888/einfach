@@ -24,6 +24,7 @@ import {
   FUNCTIONS,
 } from '../src/eval/functions/logical'
 import type { EvalContext, Value } from '../src/types'
+import { describe, expect, it } from '@jest/globals'
 
 // -----------------------------------------------------------------------------
 // Test scaffolding
@@ -33,7 +34,7 @@ const NUM = (n: number): Value => ({ kind: 'number', value: n })
 const STR = (s: string): Value => ({ kind: 'string', value: s })
 const BOOL = (b: boolean): Value => ({ kind: 'boolean', value: b })
 const BLANK: Value = { kind: 'blank' }
-const ERR = (code: Value extends { kind: 'error'; code: infer C } ? C : never): Value => ({
+const ERR = (code: Extract<Value, { kind: 'error' }>['code']): Value => ({
   kind: 'error',
   code,
 })
