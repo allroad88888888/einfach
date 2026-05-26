@@ -97,6 +97,38 @@ export const clearColumnFilterSortAtom = atom(
 )
 clearColumnFilterSortAtom.debugLabel = 'spreadsheet.filterSort.clearColumn'
 
+export const clearColumnFilterRulesAtom = atom(
+  (get) => get(filterSortStateAtom),
+  (get, set, { sheetId, colIndex }: { sheetId: string; colIndex: number }) => {
+    const current = get(filterSortStateAtom)
+    const sheetState = current[sheetId]
+    if (!sheetState) return
+    const nextRules = sheetState.rules.filter((rule) => rule.colIndex !== colIndex)
+    if (nextRules.length === sheetState.rules.length) return
+    set(filterSortStateAtom, {
+      ...current,
+      [sheetId]: { rules: nextRules, directives: sheetState.directives },
+    })
+  },
+)
+clearColumnFilterRulesAtom.debugLabel = 'spreadsheet.filterSort.clearColumnRules'
+
+export const clearColumnSortAtom = atom(
+  (get) => get(filterSortStateAtom),
+  (get, set, { sheetId, colIndex }: { sheetId: string; colIndex: number }) => {
+    const current = get(filterSortStateAtom)
+    const sheetState = current[sheetId]
+    if (!sheetState) return
+    const nextDirectives = sheetState.directives.filter((item) => item.colIndex !== colIndex)
+    if (nextDirectives.length === sheetState.directives.length) return
+    set(filterSortStateAtom, {
+      ...current,
+      [sheetId]: { rules: sheetState.rules, directives: nextDirectives },
+    })
+  },
+)
+clearColumnSortAtom.debugLabel = 'spreadsheet.filterSort.clearColumnSort'
+
 export const openFilterDropdownAtom = atom(
   (get) => get(filterDropdownAtom),
   (_get, set, { sheetId, colIndex }: { sheetId: string; colIndex: number }) => {
@@ -113,8 +145,16 @@ export const closeFilterDropdownAtom = atom(
 )
 closeFilterDropdownAtom.debugLabel = 'spreadsheet.filterSort.closeDropdown'
 
-// Replaces (or appends) the sort directive on `colIndex` with `direction`.
-// Other columns' directives are preserved untouched. Filters are unchanged.
+function prioritizeSortDirective(
+  directives: readonly SortDirective[],
+  directive: SortDirective,
+): SortDirective[] {
+  return [directive, ...directives.filter((item) => item.colIndex !== directive.colIndex)]
+}
+
+// Replaces (or appends) the sort directive on `colIndex` with `direction`,
+// making that column the primary sort. Other columns' directives are kept as
+// tie-breakers. Filters are unchanged.
 // Returns the next FilterSortState so the host can sync it to the backend.
 export const dispatchSortAtom = atom(
   (get) => get(filterSortStateAtom),
@@ -132,10 +172,9 @@ export const dispatchSortAtom = atom(
       colIndex: input.colIndex,
       direction: input.direction,
     }
-    const otherDirectives = sheetState.directives.filter((d) => d.colIndex !== input.colIndex)
     const next: FilterSortState = {
       rules: sheetState.rules,
-      directives: [...otherDirectives, nextDirective],
+      directives: prioritizeSortDirective(sheetState.directives, nextDirective),
     }
     set(filterSortStateAtom, { ...current, [input.sheetId]: next })
     return next

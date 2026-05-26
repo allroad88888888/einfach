@@ -4,8 +4,11 @@ import type { DisplayCell } from '../src'
 import {
   MAX_FILTER_LIST_VALUES,
   clearColumnFilterSortAtom,
+  clearColumnFilterRulesAtom,
+  clearColumnSortAtom,
   clearFilterSortAtom,
   closeFilterDropdownAtom,
+  dispatchSortAtom,
   filterDropdownAtom,
   filterSortErrorAtom,
   filterSortStateAtom,
@@ -160,6 +163,62 @@ describe('clearColumnFilterSortAtom', () => {
   })
 })
 
+describe('clearColumnFilterRulesAtom', () => {
+  test('removes only rules for the column and keeps sort directives', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'A',
+      state: {
+        rules: [
+          { kind: 'equals', colIndex: 1, value: 'x' },
+          { kind: 'equals', colIndex: 2, value: 'y' },
+        ],
+        directives: [
+          { colIndex: 1, direction: 'asc' },
+          { colIndex: 2, direction: 'desc' },
+        ],
+      },
+    })
+
+    store.setter(clearColumnFilterRulesAtom, { sheetId: 'A', colIndex: 1 })
+
+    const state = store.getter(filterSortStateAtom)['A']
+    expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
+    expect(state?.directives).toEqual([
+      { colIndex: 1, direction: 'asc' },
+      { colIndex: 2, direction: 'desc' },
+    ])
+  })
+})
+
+describe('clearColumnSortAtom', () => {
+  test('removes only sort directives for the column and keeps rules', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'A',
+      state: {
+        rules: [
+          { kind: 'equals', colIndex: 1, value: 'x' },
+          { kind: 'equals', colIndex: 2, value: 'y' },
+        ],
+        directives: [
+          { colIndex: 1, direction: 'asc' },
+          { colIndex: 2, direction: 'desc' },
+        ],
+      },
+    })
+
+    store.setter(clearColumnSortAtom, { sheetId: 'A', colIndex: 1 })
+
+    const state = store.getter(filterSortStateAtom)['A']
+    expect(state?.rules).toEqual([
+      { kind: 'equals', colIndex: 1, value: 'x' },
+      { kind: 'equals', colIndex: 2, value: 'y' },
+    ])
+    expect(state?.directives).toEqual([{ colIndex: 2, direction: 'desc' }])
+  })
+})
+
 describe('setFilterSortErrorAtom', () => {
   test('initial error is empty string', () => {
     const store = makeStore()
@@ -229,6 +288,47 @@ describe('closeFilterDropdownAtom', () => {
     store.setter(openFilterDropdownAtom, { sheetId: 'X', colIndex: 0 })
     store.setter(closeFilterDropdownAtom)
     expect(store.getter(filterDropdownAtom)).toEqual({ status: 'closed' })
+  })
+})
+
+describe('dispatchSortAtom', () => {
+  test('makes the latest sorted column primary and preserves old sorts as tie-breakers', () => {
+    const store = makeStore()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'A',
+      state: {
+        rules: [{ kind: 'equals', colIndex: 4, value: 'open' }],
+        directives: [
+          { colIndex: 0, direction: 'desc' },
+          { colIndex: 2, direction: 'asc' },
+        ],
+      },
+    })
+
+    const next = store.setter(dispatchSortAtom, {
+      sheetId: 'A',
+      colIndex: 1,
+      direction: 'asc',
+    })
+
+    expect(next.rules).toEqual([{ kind: 'equals', colIndex: 4, value: 'open' }])
+    expect(next.directives).toEqual([
+      { colIndex: 1, direction: 'asc' },
+      { colIndex: 0, direction: 'desc' },
+      { colIndex: 2, direction: 'asc' },
+    ])
+
+    const replaced = store.setter(dispatchSortAtom, {
+      sheetId: 'A',
+      colIndex: 0,
+      direction: 'asc',
+    })
+
+    expect(replaced.directives).toEqual([
+      { colIndex: 0, direction: 'asc' },
+      { colIndex: 1, direction: 'asc' },
+      { colIndex: 2, direction: 'asc' },
+    ])
   })
 })
 

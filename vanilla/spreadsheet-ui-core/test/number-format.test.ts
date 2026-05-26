@@ -131,6 +131,12 @@ describe('parseSection token parsing', () => {
     expect(timeSection.hasMeridian).toBe(true)
   })
 
+  test('detects localized Chinese meridian tokens', () => {
+    const section = parseSection('上午/下午 h:mm')
+    expect(section.hasTimeTokens).toBe(true)
+    expect(section.hasMeridian).toBe(true)
+  })
+
   test('disambiguates `m` to minutes when adjacent to hour or second tokens', () => {
     const section = parseSection('h:mm:ss')
     const minuteToken = section.tokens.find((t) => t.kind === 'minute')
@@ -189,6 +195,15 @@ describe('formatNumberValue — kinds', () => {
     ).toBe('$1,234.50')
   })
 
+  test('currency honours custom symbol and decimal digits', () => {
+    expect(
+      formatNumberValue({ kind: 'currency', symbol: '¥', digits: 0 }, 1234.56).text,
+    ).toBe('¥1,235')
+    expect(
+      formatNumberValue({ kind: 'currency', symbol: '€', digits: 3 }, 12).text,
+    ).toBe('€12.000')
+  })
+
   test('accounting uses parens for negatives and dash for zero', () => {
     expect(formatNumberValue({ kind: 'accounting', symbol: '$', digits: 2 }, 0).text).toContain('-')
     const neg = formatNumberValue({ kind: 'accounting', symbol: '$', digits: 2 }, -1234)
@@ -234,6 +249,15 @@ describe('formatNumberValue — kinds', () => {
     expect(longMonth.text).toBe('January 1, 2021')
   })
 
+  test('date kind handles custom menu date patterns', () => {
+    expect(formatNumberValue({ kind: 'date', pattern: 'yyyy/MM/dd' }, 44197).text).toBe(
+      '2021/01/01',
+    )
+    expect(formatNumberValue({ kind: 'date', pattern: 'MM-dd' }, 44197).text).toBe('01-01')
+    expect(formatNumberValue({ kind: 'date', pattern: 'M-d' }, 44197).text).toBe('1-1')
+    expect(formatNumberValue({ kind: 'date', pattern: 'M"月"d"日"' }, 44197).text).toBe('1月1日')
+  })
+
   test('time pattern with AM/PM uses 12-hour clock', () => {
     // 0.75 = 18:00:00 -> 6:00:00 PM
     const result = formatNumberValue({ kind: 'time', pattern: 'h:mm AM/PM' }, 0.75)
@@ -243,6 +267,15 @@ describe('formatNumberValue — kinds', () => {
   test('time pattern in 24-hour with padded hours', () => {
     const result = formatNumberValue({ kind: 'time', pattern: 'hh:mm:ss' }, 0.5)
     expect(result.text).toBe('12:00:00')
+  })
+
+  test('time pattern handles localized Chinese meridian', () => {
+    expect(formatNumberValue({ kind: 'time', pattern: '上午/下午 h:mm' }, 0.25).text).toBe(
+      '上午 6:00',
+    )
+    expect(formatNumberValue({ kind: 'time', pattern: '上午/下午 h:mm' }, 0.75).text).toBe(
+      '下午 6:00',
+    )
   })
 
   test('special preset zip-code pads to 5 digits', () => {
@@ -279,6 +312,25 @@ describe('formatNumberValue — kinds', () => {
 
   test('custom pattern with literal currency string and grouping', () => {
     expect(formatCustomNumber('"€"#,##0.00', 1234.5).text).toBe('€1,234.50')
+  })
+
+  test('custom menu number patterns render digits, grouping, parens, and colors', () => {
+    expect(formatNumberValue({ kind: 'custom', pattern: '0' }, 12.6).text).toBe('13')
+    expect(formatNumberValue({ kind: 'custom', pattern: '0.00' }, 12).text).toBe('12.00')
+    expect(formatNumberValue({ kind: 'custom', pattern: '#,##0' }, 1234.4).text).toBe('1,234')
+    expect(formatNumberValue({ kind: 'custom', pattern: '#,##0.00' }, 1234.5).text).toBe(
+      '1,234.50',
+    )
+
+    const negative = formatNumberValue(
+      { kind: 'custom', pattern: '#,##0_);(#,##0)' },
+      -1234,
+    )
+    expect(negative.text).toBe('(1,234)')
+
+    const red = formatNumberValue({ kind: 'custom', pattern: '[Red]#,##0' }, 1234)
+    expect(red.text).toBe('1,234')
+    expect(red.color).toBe('#ff0000')
   })
 })
 

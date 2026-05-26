@@ -24,7 +24,7 @@
  * - `h`, `hh` — hour (24-hour by default; 12-hour when an `AM/PM` token is
  *   present in the same section)
  * - `s`, `ss` — second
- * - `AM/PM`, `am/pm`, `A/P`, `a/p` — meridian (also forces 12-hour for `h`)
+ * - `AM/PM`, `am/pm`, `A/P`, `a/p`, `上午/下午` — meridian (also forces 12-hour for `h`)
  * - `%` — multiplies the value by 100 once per occurrence
  *
  * Known gaps (documented as follow-ups):
@@ -111,8 +111,8 @@ export interface NumberFormatToken {
   text: string
   /** Original repeat count for date tokens (e.g. `'mmm'` -> 3). */
   count?: number
-  /** For meridian — preserves casing of the AM/PM marker. */
-  ampmStyle?: 'AM/PM' | 'am/pm' | 'A/P' | 'a/p'
+  /** For meridian — preserves casing / localized style of the marker. */
+  ampmStyle?: 'AM/PM' | 'am/pm' | 'A/P' | 'a/p' | '上午/下午'
 }
 
 export type NumberFormatCondition =
@@ -378,6 +378,7 @@ function matchAmPm(
   if (input.startsWith('am/pm', i)) return { text: 'am/pm', length: 5, style: 'am/pm' }
   if (input.startsWith('A/P', i)) return { text: 'A/P', length: 3, style: 'A/P' }
   if (input.startsWith('a/p', i)) return { text: 'a/p', length: 3, style: 'a/p' }
+  if (input.startsWith('上午/下午', i)) return { text: '上午/下午', length: 5, style: '上午/下午' }
   return null
 }
 
@@ -841,7 +842,8 @@ function evaluateDateSection(
         if (style === 'AM/PM') out += isPm ? 'PM' : 'AM'
         else if (style === 'am/pm') out += isPm ? 'pm' : 'am'
         else if (style === 'A/P') out += isPm ? 'P' : 'A'
-        else out += isPm ? 'p' : 'a'
+        else if (style === 'a/p') out += isPm ? 'p' : 'a'
+        else out += isPm ? '下午' : '上午'
         break
       }
       default:
