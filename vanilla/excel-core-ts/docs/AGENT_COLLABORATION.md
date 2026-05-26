@@ -34,6 +34,8 @@
 | 2026-05-26 | C1 agent | Wave C / C1 — math functions | done | `vanilla/excel-core-ts/src/eval/functions/math.ts`, `vanilla/excel-core-ts/test/math.test.ts` | wait for sibling C2/C3/C4/C5; CC main session merges `functions/index.ts` registry |
 | 2026-05-26 | C3 agent | Wave C / C3 — lookup functions | done | `vanilla/excel-core-ts/src/eval/functions/lookup.ts`, `vanilla/excel-core-ts/test/lookup.test.ts` | wait for sibling C1/C2/C4/C5; CC main session merges `functions/index.ts` registry |
 | 2026-05-26 | C5 agent | Wave C / C5 — date + stats functions | done | `vanilla/excel-core-ts/src/eval/functions/date.ts`, `vanilla/excel-core-ts/src/eval/functions/stats.ts`, `vanilla/excel-core-ts/test/date.test.ts`, `vanilla/excel-core-ts/test/stats.test.ts` | CC main session merges `functions/index.ts` registry — all C1..C5 tracks now done |
+| 2026-05-26 | E3+E4 agent | Wave E / E3 — LAMBDA in evaluator + Wave E / E4 — custom formula e2e verify | done | `vanilla/excel-core-ts/src/types.ts` (add `lambdaScope?` to `EvalContext`, additive), `vanilla/excel-core-ts/src/eval/evaluate.ts` (`call` + `name` arms wire LAMBDA scope + dispatch), `vanilla/excel-core-ts/test/lambda.test.ts` (new — 16 specs), `solid/excel/test/excel-core-ts-custom-formulas.test.ts` (new — 9 specs against `worker-runtime-ts`) | hand off — Wave E1 (spill) / E2 (cross-sheet) remain; F2 e2e migration unblocked for LAMBDA/custom-formula scenarios |
+| 2026-05-26 | CC | Wave E / E1 — spill arrays + array functions | done | `vanilla/excel-core-ts/src/eval/functions/array.ts` (new — SEQUENCE/TRANSPOSE/SORT/FILTER/UNIQUE), `vanilla/excel-core-ts/test/array.test.ts` (new — 24 specs), `vanilla/excel-core-ts/src/eval/functions/index.ts` (registry merge), `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` (spill projection helper + readCellValue collapse), `solid/excel/test/excel-core-ts-spill.test.ts` (new — 3 specs) | Wave E complete (E2 cross-sheet was already done by B2) — F2 e2e migration now fully unblocked |
 
 ### Handoff: A / 2026-05-26
 
@@ -668,3 +670,79 @@ TODAY / NOW are exercised under `jest.useFakeTimers().setSystemTime(...)` so the
 - Date arithmetic with future date functions (DATEDIF, NETWORKDAYS, EDATE, EOMONTH — to be added in Wave F) will inherit this calendar automatically because they all go through `dateToSerial` / `serialToDate`.
 
 Next request: CC main session can now register `FUNCTIONS` from both `'./date'` and `'./stats'` into the consolidated `src/eval/functions/index.ts` Map alongside C1 math + C2 logical + C3 lookup + C4 text. **All five Wave C tracks (C1..C5) are now done** — Wave D worker-shim can begin once the registry merges. No naming collisions: the 11 names exported by C5 (TODAY, NOW, DATE, YEAR, MONTH, DAY, WEEKDAY, COUNTIF, SUMIF, COUNTIFS, SUMIFS) are disjoint from the math / logical / lookup / text inventories.
+
+---
+
+### Handoff: E.E3 + E.E4 / 2026-05-26
+
+Owner（交付方）: E3+E4 agent
+Status: done
+
+Touched files (whitelist enforced):
+- `vanilla/excel-core-ts/src/types.ts` (edit — additive: added `readonly lambdaScope?: ReadonlyMap<string, Value>` to `EvalContext`; no existing field renamed / removed)
+- `vanilla/excel-core-ts/src/eval/evaluate.ts` (edit — `'name'` arm reads `ctx.lambdaScope` before falling through to `resolveName`; LAMBDA binding without parens now returns `#VALUE!` with a diagnostic; `'call'` arm dispatches to `resolveName(...).kind === 'lambda'` between built-in lookup and host custom)
+- `vanilla/excel-core-ts/test/lambda.test.ts` (new — 16 specs, all green)
+- `solid/excel/test/excel-core-ts-custom-formulas.test.ts` (new — 9 specs against `createWorkerRuntimeTs()`, all green)
+
+Public types changed:
+- `EvalContext.lambdaScope?: ReadonlyMap<string, Value>` — **purely additive**, no consumer needs to update. Default is `undefined` → existing call sites that don't construct lambdaScope keep their behavior. Documented inline in `types.ts §7`.
+
+Atoms added/changed: **none**. LAMBDA dispatch reuses the existing `Workbook.defineName` name registry; the per-cell `formulaCellAtom` derive is the only atom involved and its shape is unchanged.
+
+Engine dispatch order pinned by tests (`'call'` arm in `evaluate.ts`):
+1. built-in registry (`getBuiltinFunction(name)`)
+2. workbook LAMBDA (`ctx.resolveName(name).kind === 'lambda'`)
+3. host custom formula (`ctx.callCustom`)
+4. `#NAME?` with `function '<name>' is not registered`
+
+This is the order documented in `vanilla/spreadsheet-ui-core/src/custom-formulas/README.md` and exercised end-to-end by `solid/excel/test/excel-core-ts-custom-formulas.test.ts` "builtin name shadows" test.
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/lambda solid/excel/test/excel-core-ts-custom-formulas --no-coverage` → **25/25 pass** (16 lambda + 9 custom-formula).
+- `npx jest --no-coverage` (full repo) → **2471/2471 pass** across 167 suites — no regressions.
+- `npx tsc -b` → clean (no diagnostics).
+
+### E3 (LAMBDA) coverage detail
+
+16 specs cover:
+- Direct `lambdaScope` injection on the EvalContext (param shadows defined name).
+- NameExpr fallthrough when scoped entry missing.
+- Bare-LAMBDA reference without parens → `#VALUE!` (we don't model `#CALC!`).
+- Zero-arg LAMBDA (PI → 3.14).
+- Single-arg LAMBDA (DOUBLE(x)=x*2 → DOUBLE(5)=10).
+- Two-arg LAMBDA (ADD(a,b)=a+b → ADD(2,3)=5).
+- LAMBDA body calling a built-in (SQUARE(x)=POWER(x,2) → SQUARE(4)=16).
+- LAMBDA param shadows workbook defined name (ID(7) returns 7 even when X=100 is defined).
+- Missing arg binds to BLANK in body (`=GETX()` returns blank when GETX(x)=x).
+- Extra args silently dropped past declared params (PICK_FIRST(11,22,33) → 11).
+- Nested LAMBDA — outer scope visible inside inner body (lexical closure-style, achieved via spread of `parent.lambdaScope` into the child scope Map).
+- Recursive LAMBDA via IF — **NOT supported** (eager arg eval → JS stack overflow). Test pins the failure mode with `expect(...).toThrow(/Maximum call stack/)` and documents the Wave F escape hatch (lazy IF/IFS/SWITCH dispatcher).
+- Non-recursive LAMBDA nesting — fine (SUMTWOARGS(SUMTWOARGS(1,2),SUMTWOARGS(3,4)) → 10).
+- Cell self-recursion via LAMBDA — `=FOO()` where FOO body reads A1 hits the existing `#CIRCULAR!` cycle guard (proves the cell-level guard still fires even when the recursion is wrapped in a LAMBDA dispatch).
+- LAMBDA body with cell-range refs (SUMTWO(A1, B1) where A1=10, B1=32 → 42).
+- Unregistered name → `#NAME?` (regression guard so the new LAMBDA branch doesn't swallow misses).
+
+### E4 (custom formulas) coverage detail
+
+9 specs cover the worker-runtime-ts contract end-to-end via direct `runtime.handle(...)` RPC calls (no real Worker, jest-only):
+- Scalar arg: `=MYTAX(100)` with source `'return Number(args[0]) * 0.2'` → 20 / type=number.
+- Unregister: after `unregisterCustomFormula`, re-applying the same formula yields `#NAME?` (forced re-eval by re-issuing `setFormulaDetailed` since cell values are sheetAtom-snapshot-cached).
+- **Range arg marshalling** (the critical e2e check requested in the brief): `=SUMSQ2(A1:A3)` with A1=1, A2=2, A3=3 → 14. The custom source flattens `args[0]` via `Array.isArray(args[0]) ? args[0].flat() : [args[0]]`. **Confirmed**: range args arrive at the JS callback as a 2-D JS array — `unwrapForCustom` in `worker-runtime-ts.ts` maps `Value[][]` → JS-primitive `[][]` row-major. No TODO needed.
+- Re-registration replaces the prior callable (last-write-wins by uppercase key).
+- Custom throws → surfaces as `#VALUE!` with the thrown message.
+- Case-insensitive call: `=mytax(5)` hits the `MYTAX` registration (engine uppercases via `name.toUpperCase()`).
+- **Builtin shadowing** — `registerCustomFormula('SUM', ...)` does NOT override built-in SUM (because the engine consults built-ins first; this also doubles as a regression guard for the new LAMBDA branch's ordering).
+- String return → text cell type.
+- Excel-error-token string return → `{kind:'error'}` (e.g. custom returning `'#N/A'` becomes that error code).
+
+### Known limitations / TODOs deliberately punted
+
+- **Recursive LAMBDA via IF**: requires a lazy-branch dispatcher for IF / IFS / SWITCH / IFERROR / AND / OR. Out of scope for E3; pinned by `lambda.test.ts` "recursive LAMBDA via IF is NOT supported" test with explicit Wave F handoff comment.
+- **`#CALC!` error code**: Excel uses `#CALC!` for bare-LAMBDA-without-call. Our `ErrorCode` union does not include `#CALC!` so we use `#VALUE!` with a diagnostic message; if F3 prep wants Excel-exact parity it should be added to the `ERROR_CODES` array in `types.ts` and the evaluator's `'name'` arm switched over.
+- **LAMBDA inside a custom formula**: the JS callback receives unwrapped primitive values; it has no way to invoke a LAMBDA back through the engine. This is consistent with the WASM bridge contract (Wave 8.1 re-entrancy guard) and was not requested. If Wave F wants closures-from-custom, the `EvalContext.callCustom` signature needs an extra "callback-for-callbacks" seam.
+- **Worker-runtime test does not spin a real `Worker`**: same approach as `solid/excel/test/excel-core-ts-runtime.test.ts` (which is the canonical Wave D smoke test). The MCP playwright walkthrough remains the right tool for full UI smoke; that's Wave F2's responsibility, not E3/E4's.
+
+Next request:
+- Wave E1 (spill arrays) and Wave E2 (cross-sheet refs) are independent of this handoff and can run in parallel.
+- Wave F2 (e2e migration) is now unblocked for LAMBDA-using fixtures and `custom-formulas.spec.ts` against `?backend=ts`.
+- If a future agent extends `ErrorCode` to include `#CALC!`, also update the `'name'` arm in `evaluate.ts` (search for "we use `#VALUE!`" comment in the LAMBDA branch).

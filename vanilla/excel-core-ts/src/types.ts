@@ -394,6 +394,21 @@ export interface EvalContext {
    * or AST. Used by `NameExpr` evaluation.
    */
   resolveName(name: string): NameBinding | undefined
+
+  /**
+   * Optional per-call lambda scope. Maps a LAMBDA parameter name to the
+   * already-evaluated argument `Value`. The evaluator checks this map
+   * BEFORE consulting `resolveName` when it hits a `NameExpr`, so a
+   * LAMBDA body that references one of its own parameters resolves to
+   * the call-site argument instead of a workbook-level name.
+   *
+   * Scopes nest naturally via spread: `{ ...parent, lambdaScope: childMap }`
+   * — nested LAMBDA calls (`LAMBDA(x, LAMBDA(y, x+y)(1))(2)`) build on the
+   * outer scope rather than replacing it.
+   *
+   * Wave E (E3) — see `docs/ARCHITECTURE.md §9`.
+   */
+  readonly lambdaScope?: ReadonlyMap<string, Value>
 }
 
 /**

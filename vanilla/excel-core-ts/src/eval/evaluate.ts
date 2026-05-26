@@ -77,6 +77,13 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
     }
 
     case 'name': {
+      // LAMBDA scope wins over workbook-level names — a parameter name
+      // shadowing a defined name is the whole point of LAMBDA parameters.
+      // See ARCH §9 / types.ts `EvalContext.lambdaScope`.
+      if (ctx.lambdaScope) {
+        const scoped = ctx.lambdaScope.get(ast.name)
+        if (scoped !== undefined) return scoped
+      }
       const binding = ctx.resolveName(ast.name)
       if (!binding) return ERR('#NAME?')
       switch (binding.kind) {
@@ -90,7 +97,13 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
           return { kind: 'array', value: rows }
         }
         case 'lambda':
-          return ERR('#NAME?', 'LAMBDA names are not implemented yet (Wave E)')
+          // A LAMBDA name referenced without a call site is a bare
+          // function value. Excel surfaces `#CALC!`; we don't model that
+          // code yet so we use `#VALUE!` with a diagnostic message.
+          return ERR(
+            '#VALUE!',
+            `LAMBDA '${ast.name}' must be invoked with arguments (e.g. =${ast.name}(...))`,
+          )
       }
       // Exhaustiveness fallback.
       return ERR('#NAME?')
@@ -134,12 +147,33 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
     }
 
     case 'call': {
-      // Dispatch order: built-in registry → host custom formula → #NAME?.
-      // Built-ins shadow customs by convention (custom formulas refuse
-      // registration with a builtin name on the host side).
+      // Dispatch order: built-in registry → workbook LAMBDA name →
+      // host custom formula → #NAME?. Built-ins shadow customs by
+      // convention (custom formulas refuse registration with a builtin
+      // name on the host side). LAMBDA names sit between built-ins and
+      // customs so user-defined names can't override SUM but a custom
+      // host callback can't override a LAMBDA definition either.
       const argValues: Value[] = ast.args.map((a) => evaluate(a, ctx))
       const builtin = getBuiltinFunction(ast.name)
       if (builtin) return builtin(argValues, ctx)
+
+      // LAMBDA dispatch: a `NameBinding` of `kind:'lambda'` registered
+      // via `Workbook.defineName(...)` can be invoked with positional
+      // args. The body re-evaluates against the current `ctx` plus a
+      // scope that maps each declared param to its argument value.
+      // Missing args bind to BLANK so partial-application errors surface
+      // inside the body rather than at call site (matches Excel).
+      const binding = ctx.resolveName(ast.name)
+      if (binding && binding.kind === 'lambda') {
+        const scope = new Map<string, Value>(ctx.lambdaScope ?? [])
+        for (let i = 0; i < binding.params.length; i += 1) {
+          const argVal: Value = argValues[i] ?? BLANK
+          scope.set(binding.params[i], argVal)
+        }
+        const subCtx: EvalContext = { ...ctx, lambdaScope: scope }
+        return evaluate(binding.body, subCtx)
+      }
+
       const custom = ctx.callCustom(ast.name, argValues)
       if (custom !== undefined) return custom
       return ERR('#NAME?', `function '${ast.name}' is not registered`)

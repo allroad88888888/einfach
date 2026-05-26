@@ -192,14 +192,66 @@ function valueDisplay(v: Value): string {
   }
 }
 
+/**
+ * Walk up + left within a bounded window looking for a spill anchor whose
+ * `kind:'array'` covers the target. If found, return the projected scalar;
+ * otherwise undefined. The window cap (`SPILL_LOOKBACK`) keeps reads O(1)
+ * even on dense sheets — anchors farther than this aren't projectable.
+ */
+const SPILL_LOOKBACK = 200
+function getSpillProjectedValue(
+  state: RuntimeState,
+  sheet: SheetEntry,
+  row: number,
+  col: number,
+): Value | undefined {
+  const target = state.workbook.sheet(sheet.id)
+  if (!target) return undefined
+  const cells = state.workbook.store.getter(target.sheetAtom)
+  // Self-check: if (row,col) has its own cell, it isn't a spill target.
+  if (cells.has(`${row}:${col}`)) return undefined
+
+  const rowMin = Math.max(0, row - SPILL_LOOKBACK)
+  const colMin = Math.max(0, col - SPILL_LOOKBACK)
+  for (let r = row; r >= rowMin; r -= 1) {
+    for (let c = col; c >= colMin; c -= 1) {
+      if (r === row && c === col) continue
+      const anchor = cells.get(`${r}:${c}`)
+      if (!anchor || !anchor.input?.startsWith('=')) continue
+      const atom = target.formulaCellAtom(`${r}:${c}`)
+      const v = state.workbook.store.getter(atom)
+      if (v.kind !== 'array') continue
+      const dr = row - r
+      const dc = col - c
+      if (dr < v.value.length && dc < (v.value[dr]?.length ?? 0)) {
+        return v.value[dr][dc]
+      }
+      // Anchor exists but its array doesn't cover us — keep searching.
+    }
+  }
+  return undefined
+}
+
 function readCellValue(state: RuntimeState, sheet: SheetEntry, row: number, col: number): Value {
   const target = state.workbook.sheet(sheet.id)
   if (!target) return { kind: 'blank' }
   const key = `${row}:${col}`
-  // Read the formula cell atom (it returns the computed Value, derived
-  // from the sheetAtom snapshot the workbook owns).
-  const atom = target.formulaCellAtom(key)
-  return state.workbook.store.getter(atom)
+  const cells = state.workbook.store.getter(target.sheetAtom)
+  if (cells.has(key)) {
+    // The cell has its own formula / literal. Read the atom and collapse
+    // any returned array to its top-left scalar at the boundary (mirrors
+    // the WASM convention — UI cells project one scalar each).
+    const atom = target.formulaCellAtom(key)
+    const v = state.workbook.store.getter(atom)
+    if (v.kind === 'array') {
+      return v.value[0]?.[0] ?? { kind: 'blank' }
+    }
+    return v
+  }
+  // Empty cell — check if a nearby anchor's array projects into us.
+  const spilled = getSpillProjectedValue(state, sheet, row, col)
+  if (spilled) return spilled
+  return { kind: 'blank' }
 }
 
 function readCellSnapshot(

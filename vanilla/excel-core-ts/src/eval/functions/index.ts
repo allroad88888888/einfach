@@ -20,6 +20,7 @@
  */
 import type { FunctionImpl } from '../../types'
 
+import { FUNCTIONS as ARRAY_FUNCTIONS } from './array'
 import { FUNCTIONS as DATE_FUNCTIONS } from './date'
 import { FUNCTIONS as LOGICAL_FUNCTIONS } from './logical'
 import { FUNCTIONS as LOOKUP_FUNCTIONS } from './lookup'
@@ -40,6 +41,7 @@ export const BUILTIN_FUNCTIONS: ReadonlyMap<string, FunctionImpl> = Object.freez
     ...Object.entries(TEXT_FUNCTIONS),
     ...Object.entries(DATE_FUNCTIONS),
     ...Object.entries(STATS_FUNCTIONS),
+    ...Object.entries(ARRAY_FUNCTIONS),
   ]),
 )
 
