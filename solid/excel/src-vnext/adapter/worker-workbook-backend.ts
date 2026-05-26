@@ -26,6 +26,8 @@ import type {
   RangeProjectionResult,
   RangeTsvExportRequest,
   RangeTsvExportResult,
+  RemoveRowsRequest,
+  RemoveRowsResult,
   ReorderSheetRequest,
   RemoveConditionalFormatRuleRequest,
   ResolveDataEdgeRequest,
@@ -1213,6 +1215,131 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const sheet = await resolveSheet(request.sheetId)
       await client.deleteRows(sheet.idx, request.rowIndex, request.count)
       return structuralMutationResult(request, bumpRevision())
+    },
+
+    /**
+     * Wave 7.5 Remove Duplicates port. The worker protocol does not have
+     * a dedicated batched `removeRows` / `deleteRowsBatch` RPC — the Rust
+     * `Workbook` only exposes single-band `delete_row(at, count)`. We
+     * layer multi-row deletion on top of that primitive by issuing one
+     * descending-order `deleteRows` per target row, so each delete keeps
+     * the remaining indices valid.
+     *
+     * TODO(einfach-excel-core#batch-delete-rows): when the Rust side
+     * grows a batched primitive (`delete_rows_batch(indices: &[u32])`),
+     * switch to a single RPC so the loop below can become atomic. The
+     * surface contract here will not change.
+     *
+     * Atomicity caveat (HIGH #5): because each `client.deleteRows` is
+     * its own RPC, a mid-loop failure leaves the workbook with a partial
+     * deletion that we cannot roll back from this side. We surface this
+     * by counting committed deletes and re-throwing an Error that wraps
+     * the underlying rejection AND carries `removedRows` so the caller
+     * can record an accurate (partial) history entry before re-prompting
+     * the user. The revision is still bumped because the workbook IS
+     * dirty.
+     *
+     * Empty input is a no-op: no RPC, no revision bump, no history-side
+     * effect, so accidentally confirming with zero duplicates leaves the
+     * workbook entirely untouched.
+     */
+    async removeRows(request: RemoveRowsRequest): Promise<RemoveRowsResult> {
+      // LOW: short-circuit BEFORE coercing the array so we never bump
+      // revision on an empty input array.
+      if (request.rows.length === 0) {
+        return {
+          sheetId: request.sheetId,
+          removedRows: 0,
+          revision: request.revision ?? revision,
+        }
+      }
+
+      const unique = Array.from(new Set(request.rows)).filter(
+        (r) => Number.isInteger(r) && r >= 0,
+      )
+      if (unique.length === 0) {
+        return {
+          sheetId: request.sheetId,
+          removedRows: 0,
+          revision: request.revision ?? revision,
+        }
+      }
+
+      const sheet = await resolveSheet(request.sheetId)
+      unique.sort((a, b) => b - a)
+
+      const successfullyRemoved: number[] = []
+      let failureCause: unknown = null
+      for (const rowIdx of unique) {
+        try {
+          await client.deleteRows(sheet.idx, rowIdx, 1)
+          successfullyRemoved.push(rowIdx)
+        } catch (err) {
+          failureCause = err
+          break
+        }
+      }
+
+      if (failureCause !== null) {
+        // At least one delete went through before we hit the failure:
+        // the workbook IS dirty, so bump the revision and let the
+        // caller record a history entry for the partial work. Throw an
+        // Error that carries `removedRows` so the dialog can surface
+        // both the partial success and the underlying RPC rejection.
+        const nextRevision = bumpRevision()
+        const partialMinRow =
+          successfullyRemoved.length > 0
+            ? successfullyRemoved[successfullyRemoved.length - 1]
+            : 0
+        const partialMaxRow =
+          successfullyRemoved.length > 0 ? successfullyRemoved[0] : 0
+        const error = new Error(
+          'removeRows partially failed: deleted ' +
+            String(successfullyRemoved.length) +
+            ' of ' +
+            String(unique.length) +
+            ' rows before the worker rejected — ' +
+            (failureCause instanceof Error
+              ? failureCause.message
+              : String(failureCause)),
+        ) as Error & {
+          cause?: unknown
+          removedRows: number
+          partial: true
+          affectedRange?: RemoveRowsResult['affectedRange']
+          revision: number | string
+        }
+        error.cause = failureCause
+        error.removedRows = successfullyRemoved.length
+        error.partial = true
+        error.revision = request.revision ?? nextRevision
+        if (successfullyRemoved.length > 0) {
+          error.affectedRange = {
+            startRow: partialMinRow,
+            endRow: partialMaxRow,
+            startCol: 0,
+            endCol: Number.MAX_SAFE_INTEGER,
+          }
+        }
+        throw error
+      }
+
+      const minRow = unique[unique.length - 1]
+      const maxRow = unique[0]
+      const nextRevision = bumpRevision()
+      return {
+        sheetId: request.sheetId,
+        removedRows: unique.length,
+        affectedRange: {
+          startRow: minRow,
+          endRow: maxRow,
+          startCol: 0,
+          // Sheet width is workbook-defined; the UI invalidation will be
+          // capped by the next visible-window projection anyway.
+          endCol: Number.MAX_SAFE_INTEGER,
+        },
+        revision: request.revision ?? nextRevision,
+      }
     },
 
     async insertColumns(request: InsertColumnsRequest): Promise<BackendMutationResult> {

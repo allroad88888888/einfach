@@ -72,6 +72,34 @@ export type { SetSheetProtectionRequest, SetRangeLockRequest }
 // --- paste-special ---
 export type { PasteRangeRequest, PasteRangeResult }
 
+// --- remove-duplicates (Wave 7.5) ---
+
+/**
+ * Request body for the Remove Duplicates command. The dialog computes a
+ * sorted set of duplicate row indices via `findDuplicateRows` and the host
+ * adapter dispatches that list through this port. The adapter is expected
+ * to sort + de-dupe the input internally (rows are NOT required to arrive
+ * sorted) and treat an empty array as a no-op rather than an error.
+ */
+export interface RemoveRowsRequest {
+  kind: 'remove-rows'
+  sheetId: string
+  /**
+   * Sheet-absolute row indices to remove. NOT required sorted; adapter
+   * sorts and de-dupes internally. Empty array is a no-op (does NOT error).
+   */
+  rows: ReadonlyArray<number>
+  requestId?: number
+  revision?: number | string
+}
+
+export interface RemoveRowsResult {
+  sheetId: string
+  removedRows: number
+  affectedRange?: { startRow: number; endRow: number; startCol: number; endCol: number }
+  revision: number | string
+}
+
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
 export type ProjectionRequestKind = 'visible-window' | 'range'
@@ -746,6 +774,10 @@ export interface SpreadsheetBackend {
   // omit this method cause the menu entry + dialog to hide via
   // `pasteSpecialSupportedAtom` so the surface degrades cleanly.
   pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
+  // remove-duplicates — Wave 7.5. Optional capability; host adapters that
+  // omit this method cause the Data > Remove Duplicates menu entry to hide
+  // via `removeDuplicatesSupportedAtom` so the surface degrades cleanly.
+  removeRows?(request: RemoveRowsRequest): Promise<RemoveRowsResult>
 }
 
 export interface ViewportFreezeConfig {

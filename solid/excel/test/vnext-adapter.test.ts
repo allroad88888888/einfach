@@ -3407,4 +3407,244 @@ describe('vnext adapter', () => {
 
     backend.dispose()
   })
+
+  // --- Wave 7.1 Text to Columns: per-chunk preserveAsText -----------------
+
+  it('static backend honors preserveAsText: literal text bypasses numeric and formula inference', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+
+    async function* chunks() {
+      yield [
+        { row: 0, col: 0, input: '00123', preserveAsText: true },
+        { row: 0, col: 1, input: '=A1', preserveAsText: true },
+        { row: 0, col: 2, input: '42' },
+      ]
+    }
+
+    await backend.importCellChunks?.({
+      kind: 'import-cell-chunks',
+      sheetId: 'sheet-1',
+      chunks: chunks(),
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 2 },
+    })
+
+    const projection = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 2 },
+      requestId: 1,
+      reason: 'test',
+    })
+
+    const byCol = new Map<number, (typeof projection.cells)[number]>()
+    for (const cell of projection.cells) byCol.set(cell.col, cell)
+
+    expect(byCol.get(0)?.displayValue).toBe('00123')
+    expect(byCol.get(0)?.valueKind).toBe('string')
+    expect(byCol.get(0)?.formula).toBeUndefined()
+
+    expect(byCol.get(1)?.displayValue).toBe('=A1')
+    expect(byCol.get(1)?.valueKind).toBe('string')
+    expect(byCol.get(1)?.formula).toBeUndefined()
+
+    expect(byCol.get(2)?.valueKind).toBe('number')
+  })
+
+  it('static backend without preserveAsText still infers formulas and numbers', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: [{ id: 'sheet-1', name: 'Sheet1' }],
+    })
+
+    await backend.importCells?.({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      cells: [
+        { row: 1, col: 0, input: '=SUM(A1:B1)' },
+        { row: 1, col: 1, input: '00123' },
+      ],
+      range: { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+
+    const projection = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 1, colStart: 0, colEnd: 1 },
+      requestId: 1,
+      reason: 'test',
+    })
+
+    const byCol = new Map<number, (typeof projection.cells)[number]>()
+    for (const cell of projection.cells) byCol.set(cell.col, cell)
+    expect(byCol.get(0)?.formula).toBe('=SUM(A1:B1)')
+    expect(byCol.get(1)?.valueKind).toBe('number')
+  })
+
+  it('worker backend emits kind:text wire entries for preserveAsText, regardless of numeric/formula shape', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 1,
+    })
+
+    await backend.ready()
+    await backend.importCellChunks?.({
+      kind: 'import-cell-chunks',
+      sheetId: 'sheet-1',
+      cellsPerChunk: 8,
+      chunks: [
+        [
+          { row: 0, col: 0, input: '00123', preserveAsText: true },
+          { row: 0, col: 1, input: '=A1', preserveAsText: true },
+          { row: 0, col: 2, input: '42' },
+          { row: 0, col: 3, input: '', preserveAsText: true },
+        ],
+      ],
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 3 },
+    })
+
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [
+          { sheet: 0, row: 0, col: 0, kind: 'text', value: '00123' },
+          { sheet: 0, row: 0, col: 1, kind: 'text', value: '=A1' },
+          { sheet: 0, row: 0, col: 2, kind: 'number', value: 42 },
+          { sheet: 0, row: 0, col: 3, kind: 'null' },
+        ],
+      },
+    ])
+
+    backend.dispose()
+  })
+
+  it('worker backend without preserveAsText routes formulas through kind:formula', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 1,
+    })
+
+    await backend.ready()
+    await backend.importCellChunks?.({
+      kind: 'import-cell-chunks',
+      sheetId: 'sheet-1',
+      cellsPerChunk: 4,
+      chunks: [[{ row: 0, col: 0, input: '=SUM(A1:B1)' }]],
+      range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+    })
+
+    expect(client.calls.importChunk).toEqual([
+      {
+        sessionId: 1,
+        cells: [{ sheet: 0, row: 0, col: 0, kind: 'formula', value: '=SUM(A1:B1)' }],
+      },
+    ])
+
+    backend.dispose()
+  })
+
+  it('worker backend removeRows: empty rows array is a no-op (no RPC, no revision bump)', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 7,
+    })
+    await backend.ready()
+
+    const result = await backend.removeRows!({
+      kind: 'remove-rows',
+      sheetId: 'sheet-1',
+      rows: [],
+    })
+
+    expect(result.removedRows).toBe(0)
+    // Revision stays at 7 — empty input must NOT bump.
+    expect(result.revision).toBe(7)
+    expect(client.calls.deleteRows).toEqual([])
+    expect(result.affectedRange).toBeUndefined()
+
+    backend.dispose()
+  })
+
+  it('worker backend removeRows: deletes unique sorted rows descending and reports affectedRange', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 1,
+    })
+    await backend.ready()
+
+    const result = await backend.removeRows!({
+      kind: 'remove-rows',
+      sheetId: 'sheet-1',
+      rows: [3, 1, 1, 7], // duplicates + unsorted
+    })
+
+    expect(client.calls.deleteRows.map((c) => c.rowIndex)).toEqual([7, 3, 1])
+    expect(result.removedRows).toBe(3)
+    expect(result.affectedRange).toEqual({
+      startRow: 1,
+      endRow: 7,
+      startCol: 0,
+      endCol: Number.MAX_SAFE_INTEGER,
+    })
+
+    backend.dispose()
+  })
+
+  it('worker backend removeRows: mid-loop deleteRows rejection throws with partial removedRows', async () => {
+    // Regression for HIGH #5 — when client.deleteRows fails partway
+    // through, we must NOT silently swallow the failure. The first
+    // delete IS committed; the caller receives an Error carrying the
+    // partial-success count so it can record an accurate history
+    // entry and surface the failure.
+    const client = createFakeWorkerWorkbookClient()
+    let attemptCount = 0
+    const attempts: number[] = []
+    const original = client.deleteRows
+    client.deleteRows = async (sheet, rowIndex, count) => {
+      attemptCount += 1
+      attempts.push(rowIndex)
+      if (attemptCount === 2) {
+        throw new Error('worker rejected delete #2')
+      }
+      return original(sheet, rowIndex, count)
+    }
+
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+    })
+    await backend.ready()
+
+    let thrown: (Error & { removedRows?: number; partial?: boolean }) | null = null
+    try {
+      await backend.removeRows!({
+        kind: 'remove-rows',
+        sheetId: 'sheet-1',
+        rows: [2, 4, 6],
+      })
+    } catch (err) {
+      thrown = err as Error & { removedRows?: number; partial?: boolean }
+    }
+    expect(thrown).not.toBeNull()
+    expect(thrown?.partial).toBe(true)
+    // First descending delete (row 6) succeeded; the second (row 4) threw.
+    expect(thrown?.removedRows).toBe(1)
+    // Both attempts went out to the client, but only the first committed
+    // (the rejecting one isn't recorded by the fake).
+    expect(attempts).toEqual([6, 4])
+    expect(client.calls.deleteRows.map((c) => c.rowIndex)).toEqual([6])
+
+    backend.dispose()
+  })
 })

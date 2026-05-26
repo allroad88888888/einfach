@@ -631,4 +631,40 @@ export const messages: Record<string, string> = {
   'textToColumns.finish': 'Finish',
   'textToColumns.cancel': 'Cancel',
   'textToColumns.error.singleColumn': 'Select a single column first',
+
+  // Remove Duplicates dialog (Wave 7.5)
+  'removeDuplicates.title': 'Remove Duplicates',
+  // Excluding the first row from the scan is opt-in but defaults to on. Two
+  // synonymous keys are exposed so older docs/tests keep working: the dialog
+  // (agent B) calls `excludeHeader`; the original task brief used
+  // `hasHeaders`.
+  'removeDuplicates.excludeHeader': 'My data has headers',
+  'removeDuplicates.hasHeaders': 'My data has headers',
+  // The dialog uses `.legend` (fieldset legend). `.label` is kept as an
+  // alias so a host inserting a standalone label can read either key.
+  'removeDuplicates.columns.legend': 'Select columns to compare',
+  'removeDuplicates.columns.label': 'Select columns to compare:',
+  'removeDuplicates.columns.selectAll': 'Select all',
+  'removeDuplicates.columns.deselectAll': 'Deselect all',
+  'removeDuplicates.columns.empty': 'Select at least one column to continue',
+  'removeDuplicates.comparison.legend': 'Comparison',
+  'removeDuplicates.comparison.label': 'Comparison',
+  'removeDuplicates.comparison.exact': 'Exact match',
+  'removeDuplicates.comparison.caseInsensitive': 'Ignore case',
+  'removeDuplicates.comparison.trim': 'Trim whitespace',
+  'removeDuplicates.comparison.trimAndIgnoreCase': 'Trim + ignore case',
+  'removeDuplicates.preview.label': 'Preview',
+  // Dialog summary uses `{duplicates}/{scanned}/{unique}`. The
+  // `{removed}/{total}/{unique}` shape from the original brief is retained
+  // via `preview.summaryRemoved` for hosts that prefer that wording.
+  'removeDuplicates.preview.summary':
+    'Will remove {duplicates} of {scanned} rows ({unique} unique remain)',
+  'removeDuplicates.preview.summaryRemoved':
+    'Will remove {removed} of {total} rows ({unique} unique remain)',
+  'removeDuplicates.preview.noDuplicates': 'No duplicates found — nothing to remove',
+  'removeDuplicates.preview.noKeyColumns': 'Select at least one column to continue',
+  'removeDuplicates.cancel': 'Cancel',
+  'removeDuplicates.confirm': 'Remove',
+  'removeDuplicates.status.success': 'Removed {count} duplicate rows',
+  'removeDuplicates.status.failed': 'Failed to remove rows',
 }

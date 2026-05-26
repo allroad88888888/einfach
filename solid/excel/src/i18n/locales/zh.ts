@@ -606,4 +606,32 @@ export const messages: Record<string, string> = {
   'textToColumns.finish': '完成',
   'textToColumns.cancel': '取消',
   'textToColumns.error.singleColumn': '请先选择单列',
+
+  // 删除重复项对话框（Wave 7.5）
+  'removeDuplicates.title': '删除重复项',
+  // `excludeHeader` 为对话框使用的键；`hasHeaders` 为别名以兼容早期文档。
+  'removeDuplicates.excludeHeader': '我的数据包含标题',
+  'removeDuplicates.hasHeaders': '我的数据包含标题',
+  'removeDuplicates.columns.legend': '选择用于比较的列',
+  'removeDuplicates.columns.label': '选择用于比较的列：',
+  'removeDuplicates.columns.selectAll': '全选',
+  'removeDuplicates.columns.deselectAll': '全部取消',
+  'removeDuplicates.columns.empty': '请至少选择一列以继续',
+  'removeDuplicates.comparison.legend': '比较方式',
+  'removeDuplicates.comparison.label': '比较方式',
+  'removeDuplicates.comparison.exact': '精确匹配',
+  'removeDuplicates.comparison.caseInsensitive': '忽略大小写',
+  'removeDuplicates.comparison.trim': '去除首尾空格',
+  'removeDuplicates.comparison.trimAndIgnoreCase': '去空格 + 忽略大小写',
+  'removeDuplicates.preview.label': '预览',
+  'removeDuplicates.preview.summary':
+    '将删除 {scanned} 行中的 {duplicates} 行（保留 {unique} 行唯一值）',
+  'removeDuplicates.preview.summaryRemoved':
+    '将删除 {total} 行中的 {removed} 行（保留 {unique} 行唯一值）',
+  'removeDuplicates.preview.noDuplicates': '未发现重复项 —— 无需删除',
+  'removeDuplicates.preview.noKeyColumns': '请至少选择一列以继续',
+  'removeDuplicates.cancel': '取消',
+  'removeDuplicates.confirm': '删除',
+  'removeDuplicates.status.success': '已删除 {count} 行重复项',
+  'removeDuplicates.status.failed': '删除失败',
 }

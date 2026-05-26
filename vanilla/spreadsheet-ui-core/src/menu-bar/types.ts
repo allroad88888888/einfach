@@ -25,6 +25,7 @@ export interface MenuItemDescriptor {
    * `'capability'`. The host's known keys today:
    * - `'pasteSpecial'` → `backend.pasteRange != null`
    * - `'textToColumns'` → `backend.importCellChunks != null`
+   * - `'removeRows'` → `backend.removeRows != null` (Remove Duplicates)
    *
    * TODO(paste-special review LOW #5): tighten this to a union of the
    * known capability literals so typos in registry entries become
@@ -69,6 +70,7 @@ export type MenuItemDispatch =
   | { kind: 'open-conditional-format' }
   | { kind: 'open-data-validation' }
   | { kind: 'open-text-to-columns' }
+  | { kind: 'open-remove-duplicates' }
   | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
   | { kind: 'insert-row-above' }

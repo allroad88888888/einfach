@@ -1,8 +1,8 @@
 /** @jsxImportSource solid-js */
 
-import { afterEach, describe, expect, it } from '@jest/globals'
+import { afterEach, describe, expect, it, jest } from '@jest/globals'
 import { createStore } from '@einfach/core'
-import { cleanup, fireEvent, render } from '@solidjs/testing-library'
+import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import {
   commentSessionAtom,
   filterSortStateAtom,
@@ -12,15 +12,23 @@ import {
   MENU_BAR_ITEMS,
   openTopMenuAtom,
   printPreviewOpenAtom,
+  removeDuplicatesOpenAtom,
   selectionAtom,
+  setWorkspaceActiveSheetAtom,
   topMenuOpenAtom,
   validationRuleEditorAtom,
   viewportShowFormulaBarAtom,
   viewportShowGridlinesAtom,
   viewportShowHeadingsAtom,
+  type DisplayCell,
+  type RangeProjectionRequest,
+  type RangeProjectionResult,
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
-import { SpreadsheetUiProvider } from '../src-vnext/provider'
+import {
+  removeDuplicatesSheetIdAtom,
+  SpreadsheetUiProvider,
+} from '../src-vnext/provider'
 import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
 
 afterEach(cleanup)
@@ -81,7 +89,50 @@ describe('SpreadsheetMenuBar', () => {
     expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'open', menu: 'file' })
   })
 
-  it('Edit > Undo fires undoHistoryAtom when history has an entry', () => {
+  it('Edit > Undo fires undoHistoryAtom when history has an entry and the backend supports undo', async () => {
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async undoTransaction({ transactionId }) {
+        return { transactionId, ok: true, revision: 2 }
+      },
+    }
+
+    store.setter(historyStackAtom, {
+      entries: [
+        {
+          transactionId: 'tx1',
+          kind: 'cell.set-input',
+          sheetId: 'sheet-1',
+          projectionRevision: 1,
+        },
+      ],
+      cursor: 1,
+      inFlight: false,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.undo"]')!)
+
+    await waitFor(() => {
+      const state = store.getter(historyStackAtom)
+      expect(state.cursor).toBe(0)
+      // dispatchUndo resolves inFlight once the backend acks.
+      expect(state.inFlight).toBe(false)
+    })
+    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
+  })
+
+  it('Edit > Undo is a no-op when the backend lacks undoTransaction (history entry preserved, not silently consumed)', () => {
+    // Regression for HIGH #6 — previously dispatchUndo would pop the entry
+    // and "resolve" it silently when undoTransaction was missing, leaving
+    // the workbook mutated but undo lying about its outcome.
     const store = createStore()
     const backend = createBaseBackend()
 
@@ -108,10 +159,10 @@ describe('SpreadsheetMenuBar', () => {
     fireEvent.click(container.querySelector('[data-testid="menu-bar-item-edit.undo"]')!)
 
     const state = store.getter(historyStackAtom)
-    expect(state.cursor).toBe(0)
-    // dispatchUndo resolves inFlight once the backend (or fallback) acks.
+    // Entry stays on the stack; cursor does NOT decrement.
+    expect(state.cursor).toBe(1)
+    expect(state.entries).toHaveLength(1)
     expect(state.inFlight).toBe(false)
-    expect(store.getter(topMenuOpenAtom)).toEqual({ kind: 'idle' })
   })
 
   it('Edit > Find opens the find/replace dialog', () => {
@@ -492,4 +543,152 @@ describe('SpreadsheetMenuBar', () => {
       container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]'),
     ).not.toBeNull()
   })
+
+  it('Data > Remove Duplicates is hidden when backend.removeRows is absent (capability gating)', () => {
+    const store = createStore()
+    // Base backend deliberately omits removeRows.
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
+    ).toBeNull()
+  })
+
+  it('Data > Remove Duplicates is visible when backend.removeRows is present', () => {
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async removeRows() {
+        return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]'),
+    ).not.toBeNull()
+  })
+
+  it(
+    // HIGH bug: projection-failure mass deletion. If readRangeProjection
+    // rejects, the menubar must NOT open the dialog (otherwise the user
+    // sees an empty-cells dialog and a confirm would treat every row in
+    // the range as a blank-tuple duplicate, wiping the selection).
+    'Data > Remove Duplicates does not open the dialog when readRangeProjection rejects',
+    async () => {
+      const store = createStore()
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+      const readSpy = jest.fn(async (_req: RangeProjectionRequest) => {
+        throw new Error('projection unavailable')
+      }) as unknown as SpreadsheetBackend['readRangeProjection']
+      const backend: SpreadsheetBackend = {
+        ...createBaseBackend(),
+        readRangeProjection: readSpy,
+        async removeRows() {
+          return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+        },
+      }
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      store.setter(selectionAtom, {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: 0, col: 0 },
+        focus: { row: 4, col: 1 },
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
+      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
+
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+      fireEvent.click(
+        container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]')!,
+      )
+
+      // Wait for the warn-spy to confirm the rejection path ran.
+      await waitFor(() => {
+        expect(warnSpy).toHaveBeenCalled()
+      })
+
+      // Dialog stayed closed; the captured sheetId atom was never written.
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
+      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
+
+      warnSpy.mockRestore()
+    },
+  )
+
+  it(
+    // HIGH bug: same root cause as the rejection path. If the projection
+    // resolves with `{cells: []}` (empty range / blank rows), we still
+    // must not open — the algorithm has nothing to compare and the user
+    // would otherwise be a confirm-click away from deleting the range.
+    'Data > Remove Duplicates does not open the dialog when readRangeProjection returns no cells',
+    async () => {
+      const store = createStore()
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {})
+      const readSpy = jest.fn(async (_req: RangeProjectionRequest) => {
+        const result: RangeProjectionResult = {
+          kind: 'range',
+          sheetId: 'sheet-1',
+          range: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 1 },
+          requestId: 0,
+          revision: 1,
+          cells: [] as DisplayCell[],
+        }
+        return result
+      }) as unknown as SpreadsheetBackend['readRangeProjection']
+      const backend: SpreadsheetBackend = {
+        ...createBaseBackend(),
+        readRangeProjection: readSpy,
+        async removeRows() {
+          return { sheetId: 'sheet-1', removedRows: 0, revision: 1 }
+        },
+      }
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      store.setter(selectionAtom, {
+        kind: 'range',
+        sheetId: 'sheet-1',
+        anchor: { row: 0, col: 0 },
+        focus: { row: 4, col: 1 },
+      })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetMenuBar />
+        </SpreadsheetUiProvider>
+      ))
+
+      fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+      fireEvent.click(
+        container.querySelector('[data-testid="menu-bar-item-data.removeDuplicates"]')!,
+      )
+
+      await waitFor(() => {
+        expect(warnSpy).toHaveBeenCalled()
+      })
+      expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
+      expect(store.getter(removeDuplicatesSheetIdAtom)).toBeNull()
+
+      warnSpy.mockRestore()
+    },
+  )
 })

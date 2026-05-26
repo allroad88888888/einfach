@@ -32,6 +32,35 @@ export const textToColumnsSupportedAtom = atom((get) => {
 })
 textToColumnsSupportedAtom.debugLabel = 'spreadsheet.vnext.textToColumns.supported'
 
+/**
+ * Derived capability flag: true iff the active backend implements
+ * `removeRows`. Remove Duplicates calls `backend.removeRows` with the
+ * duplicate row indices at confirm time; without it the dialog has no
+ * way to commit, so the Data → Remove Duplicates menu entry hides
+ * entirely (`isAvailable: 'capability'`).
+ */
+export const removeDuplicatesSupportedAtom = atom((get) => {
+  const backend = get(spreadsheetBackendAtom)
+  return Boolean(backend?.removeRows)
+})
+removeDuplicatesSupportedAtom.debugLabel = 'spreadsheet.vnext.removeDuplicates.supported'
+
+/**
+ * Sheet snapshot captured when the Remove Duplicates dialog opens. The
+ * menubar dispatcher writes the current sheetId BEFORE flipping the open
+ * flag so the confirm flow operates on the sheet that was active at
+ * open-time, even if the user navigates to another sheet mid-dialog
+ * (HIGH bug: wrong-sheet deletion race).
+ *
+ * Lives in the Solid host layer (not in `spreadsheet-ui-core`'s remove-
+ * duplicates module) because sheetId is a workbook-backend concept;
+ * leaking it into the framework-agnostic UI core would force-import
+ * workbook semantics. `null` means "no sheet captured" — the confirm
+ * flow refuses to commit in that case.
+ */
+export const removeDuplicatesSheetIdAtom = atom<string | null>(null)
+removeDuplicatesSheetIdAtom.debugLabel = 'spreadsheet.removeDuplicates.sheetId'
+
 export const spreadsheetProjectionSnapshotAtom = atom<ProjectionSnapshot>({
   status: 'idle',
   request: undefined,

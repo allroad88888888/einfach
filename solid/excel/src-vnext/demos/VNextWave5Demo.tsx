@@ -1,6 +1,7 @@
 import { useAtomValue } from '@einfach/solid'
 import { onCleanup, onMount, Show } from 'solid-js'
 import {
+  openRemoveDuplicatesAtom,
   openTextToColumnsAtom,
   selectCellAtom,
   selectionAtom,
@@ -24,6 +25,7 @@ import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
 import { SpreadsheetPasteSpecialDialog } from '../paste-special'
+import { SpreadsheetRemoveDuplicatesDialog } from '../remove-duplicates'
 import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
@@ -156,6 +158,37 @@ function VNextWave5Workbook() {
     })
   }
 
+  /**
+   * Wave 7.5 test trigger — mirrors the menu-bar dispatch path for
+   * `open-remove-duplicates`. The Wave 5 demo omits the menubar, so e2e
+   * walks fire a `spreadsheet:open-remove-duplicates` window event after
+   * selecting the source range. The handler reads the live selection,
+   * fetches a `range` projection (so the dialog can render header labels
+   * and the preview atom has cells to scan), and dispatches the open
+   * command. Empty / single-cell selections are tolerated as no-ops.
+   */
+  async function triggerRemoveDuplicatesForSelection() {
+    const snap = store.getter(selectionSnapshotAtom)
+    const sheetId =
+      snap.selection.sheetId || store.getter(workspaceSessionAtom).activeSheetId || ''
+    if (!sheetId) return
+    const range = snap.range
+    if (range.rowStart > range.rowEnd || range.colStart > range.colEnd) return
+    const projection = await backend.readRangeProjection({
+      kind: 'range',
+      sheetId,
+      range,
+      requestId: 0,
+      reason: 'toolbar',
+    })
+    store.setter(openRemoveDuplicatesAtom, {
+      startRow: range.rowStart,
+      startCol: range.colStart,
+      endRow: range.rowEnd,
+      endCol: range.colEnd,
+    }, projection.cells)
+  }
+
   onMount(() => {
     const activeSheetId =
       store.getter(workspaceSessionAtom).activeSheetId ?? sheets[0].id
@@ -189,6 +222,20 @@ function VNextWave5Workbook() {
     window.addEventListener('spreadsheet:open-text-to-columns', onOpenRequest)
     onCleanup(() => {
       window.removeEventListener('spreadsheet:open-text-to-columns', onOpenRequest)
+    })
+  })
+
+  // Wave 7.5 test hook — symmetric with the text-to-columns listener.
+  onMount(() => {
+    function onOpenRequest() {
+      void triggerRemoveDuplicatesForSelection()
+    }
+    window.addEventListener('spreadsheet:open-remove-duplicates', onOpenRequest)
+    onCleanup(() => {
+      window.removeEventListener(
+        'spreadsheet:open-remove-duplicates',
+        onOpenRequest,
+      )
     })
   })
 
@@ -244,6 +291,7 @@ function VNextWave5Workbook() {
       <SpreadsheetNameManagerDialog data-testid="wave5-name-manager" />
       <SpreadsheetPasteSpecialDialog data-testid="wave5-paste-special" />
       <SpreadsheetTextToColumnsDialog data-testid="wave5-text-to-columns" />
+      <SpreadsheetRemoveDuplicatesDialog data-testid="wave5-remove-duplicates" />
       <SpreadsheetCommentThread data-testid="wave5-comment-thread" />
       <SpreadsheetPrintPreviewOverlay data-testid="wave5-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="wave5-protection-unlock" />

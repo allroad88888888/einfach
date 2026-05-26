@@ -24,6 +24,7 @@ import {
   openHelpOverlayAtom,
   openNameManagerAtom,
   openPasteSpecialAtom,
+  openRemoveDuplicatesAtom,
   openTextToColumnsAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
@@ -57,6 +58,8 @@ import {
   dispatchUndo,
   pasteSpecialSupportedAtom,
   refreshVisibleProjection,
+  removeDuplicatesSheetIdAtom,
+  removeDuplicatesSupportedAtom,
   textToColumnsSupportedAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
@@ -77,6 +80,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
   const pasteSpecialSupported = useAtomValue(pasteSpecialSupportedAtom)
   const textToColumnsSupported = useAtomValue(textToColumnsSupportedAtom)
+  const removeDuplicatesSupported = useAtomValue(removeDuplicatesSupportedAtom)
   let rootRef: HTMLDivElement | undefined
 
   function checkedForDispatch(dispatch: MenuItemDispatch): boolean | undefined {
@@ -96,6 +100,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
    * Resolve a capability-gated menu item. Known keys today:
    *   - `'pasteSpecial'`  → host backend implements `pasteRange`
    *   - `'textToColumns'` → host backend implements `importCellChunks`
+   *   - `'removeRows'`    → host backend implements `removeRows`
+   *                         (Data → Remove Duplicates)
    * Returning false makes the dropdown entry hide entirely (vs.
    * show-as-disabled for the placeholder case).
    */
@@ -106,6 +112,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return pasteSpecialSupported()
       case 'textToColumns':
         return textToColumnsSupported()
+      case 'removeRows':
+        return removeDuplicatesSupported()
       default:
         return false
     }
@@ -287,6 +295,65 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
             anchor: { row: range.rowStart, col: colIndex },
             rows,
           })
+        })()
+        return
+      }
+      case 'open-remove-duplicates': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        const range = snap.range
+        // Sheet-absolute rectangle for the algorithm. Mirrors the
+        // CellRange shape (rowStart/rowEnd/colStart/colEnd) using the
+        // remove-duplicates module's own field names.
+        const rdRange = {
+          startRow: range.rowStart,
+          endRow: range.rowEnd,
+          startCol: range.colStart,
+          endCol: range.colEnd,
+        }
+        // Fetch the projection cells inside the range up-front so the
+        // dialog's preview can run the pure scanner without waiting on
+        // I/O when the user toggles columns. On rejection OR empty
+        // result we do NOT open the dialog (HIGH bug: projection-failure
+        // mass deletion — a stale empty-cells dialog would otherwise let
+        // the user "confirm" deleting every row in the selection as
+        // blank-tuple duplicates).
+        void (async () => {
+          let cells: import('@einfach/spreadsheet-ui-core').DisplayCell[] = []
+          try {
+            const projection = await backend.readRangeProjection({
+              kind: 'range',
+              sheetId,
+              range,
+              requestId: 0,
+              reason: 'toolbar',
+            })
+            cells = projection.cells
+          } catch (error) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[remove-duplicates] readRangeProjection rejected; not opening dialog:',
+              error,
+            )
+            return
+          }
+          if (cells.length === 0) {
+            // eslint-disable-next-line no-console
+            console.warn(
+              '[remove-duplicates] readRangeProjection returned no cells; not opening dialog.',
+            )
+            return
+          }
+          // Two-write transaction: capture the sheetId snapshot BEFORE
+          // flipping the open flag (HIGH bug: wrong-sheet deletion race).
+          // Both writes run synchronously inside the same microtask — no
+          // user interaction can interleave between them — and the dialog
+          // never observes a `open=true` state without a paired sheetId
+          // because it does not subscribe to the open flag transitions
+          // (the consumer body just reads on render).
+          store.setter(removeDuplicatesSheetIdAtom, sheetId)
+          store.setter(openRemoveDuplicatesAtom, rdRange, cells)
         })()
         return
       }

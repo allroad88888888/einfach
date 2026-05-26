@@ -376,9 +376,11 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'data.removeDuplicates',
     label: 'menuBar.data.removeDuplicates',
-    dispatch: { kind: 'placeholder', reason: 'menuBar.placeholder.wave8' },
-    isAvailable: 'placeholder',
-    placeholderMessage: 'menuBar.placeholder.wave8',
+    dispatch: { kind: 'open-remove-duplicates' },
+    // Hides when the host backend does not implement `removeRows`,
+    // which is the port Remove Duplicates uses at confirm time.
+    isAvailable: 'capability',
+    capabilityKey: 'removeRows',
   },
   { kind: 'separator', id: 'data.sep-2' },
   {

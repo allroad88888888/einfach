@@ -187,7 +187,13 @@ describe('SpreadsheetHistoryTimeline', () => {
     expect(undoSpy.mock.calls[2]![0].transactionId).toBe('tx-1')
   })
 
-  it('Undo with no backend method just resolves the entry locally', async () => {
+  it('Undo with no backend.undoTransaction is a no-op: entry stays on the stack (HIGH #6 regression guard)', async () => {
+    // Previously dispatchUndo silently consumed the entry and marked
+    // it ok-resolved when the backend lacked undoTransaction, which
+    // made Ctrl+Z lie about having reverted the workbook. The new
+    // contract: dispatchUndo refuses to touch the stack when the
+    // backend can't undo. Hosts that record an entry must gate on
+    // `recordHistoryEntry` (or call `backendSupportsUndo`).
     const store = createStore()
     seedEntries(store, 1)
     const backend = createBaseBackend() // no undoTransaction
@@ -199,8 +205,12 @@ describe('SpreadsheetHistoryTimeline', () => {
     ))
 
     fireEvent.click(getByTestId('history-timeline-undo'))
-    await waitFor(() => expect(store.getter(historyStackAtom).cursor).toBe(0))
-    expect(store.getter(historyStackAtom).inFlight).toBe(false)
+    // Give the async dispatch a tick to settle.
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const state = store.getter(historyStackAtom)
+    expect(state.cursor).toBe(1)
+    expect(state.entries).toHaveLength(1)
+    expect(state.inFlight).toBe(false)
   })
 
   it('clears the stack when undoTransaction throws', async () => {
