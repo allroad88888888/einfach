@@ -49,6 +49,7 @@ const jestConfig = {
   moduleNameMapper: {
     '^@einfach/core$': '<rootDir>/vanilla/core/src',
     '^@einfach/spreadsheet-ui-core$': '<rootDir>/vanilla/spreadsheet-ui-core/src',
+    '^@einfach/excel-core-ts$': '<rootDir>/vanilla/excel-core-ts/src',
     '^@einfach/utils$': '<rootDir>/vanilla/utils/src',
     '^@einfach/react$': '<rootDir>/react/react/src',
     '^@einfach/react-utils$': '<rootDir>/react/utils/src',

@@ -55,6 +55,9 @@
       "path": "./vanilla/spreadsheet-ui-core/tsconfig.json"
     },
     {
+      "path": "./vanilla/excel-core-ts/tsconfig.json"
+    },
+    {
       "path": "./react/react/tsconfig.json"
     },
     {

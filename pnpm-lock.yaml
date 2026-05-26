@@ -273,6 +273,16 @@ importers:
         specifier: ^20.11.30
         version: 20.17.30
 
+  vanilla/excel-core-ts:
+    dependencies:
+      '@einfach/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@types/node':
+        specifier: ^20.11.30
+        version: 20.17.30
+
   vanilla/spreadsheet-ui-core:
     dependencies:
       '@einfach/core':
