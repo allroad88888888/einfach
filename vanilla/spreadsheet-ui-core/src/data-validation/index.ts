@@ -56,14 +56,14 @@ export function evaluateValidationLocal(rule: ValidationRule, input: string): Va
       return {
         code: 'validation.range_out_of_bounds',
         severity: 'error',
-        message: `Value must be a number`,
+        message: 'Value must be a number',
       }
     }
     if (rule.integerOnly && !Number.isInteger(num)) {
       return {
         code: 'validation.range_not_integer',
         severity: 'error',
-        message: `Value must be an integer`,
+        message: 'Value must be an integer',
       }
     }
     if (rule.min !== undefined && num < rule.min) {

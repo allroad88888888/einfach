@@ -46,7 +46,7 @@ describe('atom', () => {
       const aaAtom = atom(3)
 
       const bAtom = atom((getter) => {
-        console.log(`render more`)
+        console.log('render more')
         getter(aaAtom)
         return getter(aAtom) + 1
       })

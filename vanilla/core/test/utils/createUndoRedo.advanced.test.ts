@@ -19,9 +19,9 @@ describe('createUndoRedo高级测试', () => {
                 value: 'initial',
                 array: [1, 2, 3],
                 deepNested: {
-                    flag: true
-                }
-            }
+                    flag: true,
+                },
+            },
         })
 
         undoRedo.watchAtom(complexAtom)
@@ -31,8 +31,8 @@ describe('createUndoRedo高级测试', () => {
             ...prev,
             nested: {
                 ...prev.nested,
-                value: 'changed'
-            }
+                value: 'changed',
+            },
         }))
 
         expect(store.getter(complexAtom).nested.value).toBe('changed')
@@ -43,9 +43,9 @@ describe('createUndoRedo高级测试', () => {
             nested: {
                 ...prev.nested,
                 deepNested: {
-                    flag: false
-                }
-            }
+                    flag: false,
+                },
+            },
         }))
 
         expect(store.getter(complexAtom).nested.deepNested.flag).toBe(false)

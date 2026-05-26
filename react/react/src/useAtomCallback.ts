@@ -1,6 +1,7 @@
-import { atom, Getter, Setter } from '@einfach/core'
+import type { Getter, Setter } from '@einfach/core';
+import { atom } from '@einfach/core'
 import { useMemo } from 'react'
-import { HookOption } from './type'
+import type { HookOption } from './type'
 import { useSetAtom } from './useSetAtom'
 
 export function useAtomCallback<T extends (...args: any[]) => any>(

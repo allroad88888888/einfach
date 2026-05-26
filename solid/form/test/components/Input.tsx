@@ -1,5 +1,6 @@
 /** @jsxImportSource solid-js */
-import { JSX, splitProps } from 'solid-js'
+import type { JSX } from 'solid-js';
+import { splitProps } from 'solid-js'
 
 interface InputProps extends JSX.InputHTMLAttributes<HTMLInputElement> {
   dataTestid?: string

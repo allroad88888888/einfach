@@ -66,7 +66,7 @@ describe('atom复杂场景测试', () => {
             // 创建一个可能引起循环依赖的派生atom
             const nodeAtom = atom<CircularNode>({
                 value: 1,
-                next: undefined
+                next: undefined,
             })
 
             // 创建一个引用自身的派生atom
@@ -82,7 +82,7 @@ describe('atom复杂场景测试', () => {
                     }
 
                     return node
-                }
+                },
             )
 
             // 使值变化以触发循环逻辑
@@ -144,7 +144,7 @@ describe('atom复杂场景测试', () => {
 
                     set(firstNameAtom, firstName)
                     set(lastNameAtom, lastName)
-                }
+                },
             )
 
             // 创建顶层派生atom
@@ -156,7 +156,7 @@ describe('atom复杂场景测试', () => {
                     // 简单解析，移除"你好，"和"！"
                     const name = newValue.replace(/^你好，|！$/g, '')
                     set(fullNameAtom, name)
-                }
+                },
             )
 
             // 检查初始值
@@ -194,7 +194,7 @@ describe('atom复杂场景测试', () => {
 
                     loggedActions.push(`Counter changed: ${prevValue} -> ${valueToSet}`)
                     set(counterAtom, valueToSet)
-                }
+                },
             )
 
             // 初始状态
@@ -211,7 +211,7 @@ describe('atom复杂场景测试', () => {
             expect(store.getter(loggingCounterAtom)).toBe(8)
             expect(loggedActions).toEqual([
                 'Counter changed: 0 -> 5',
-                'Counter changed: 5 -> 8'
+                'Counter changed: 5 -> 8',
             ])
         })
     })

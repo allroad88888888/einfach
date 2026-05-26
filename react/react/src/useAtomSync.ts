@@ -1,4 +1,4 @@
-import { Store, AtomEntity } from '@einfach/core'
+import type { Store, AtomEntity } from '@einfach/core'
 import { useEffect } from 'react'
 
 type Item<T extends AtomEntity<any>> = {

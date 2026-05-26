@@ -49,12 +49,12 @@ describe('dependenciesChange 对 async atom 无法短路', () => {
 
     const asyncLayer2 = atom(async (get) => {
       layer2GetterCount++
-      return await get(asyncLayer1)
+      return get(asyncLayer1)
     })
 
     const asyncLayer3 = atom(async (get) => {
       layer3GetterCount++
-      return await get(asyncLayer2)
+      return get(asyncLayer2)
     })
 
     // 订阅末端 atom
@@ -200,7 +200,7 @@ describe('dependenciesChange 对 async atom 无法短路', () => {
         layers.push(
           atom(async (get) => {
             getterCounts[idx]++
-            return await get(prev)
+            return get(prev)
           }),
         )
       }

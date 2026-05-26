@@ -72,7 +72,7 @@ describe('性能测试', () => {
             })
             return options
         })
-        optionsAtom.debugLabel = `optionsAtom`
+        optionsAtom.debugLabel = 'optionsAtom'
 
         // 首次计算所有选项
         const initialOptions = store.getter(optionsAtom)
@@ -130,7 +130,7 @@ describe('性能测试', () => {
         randomIndexes.forEach(index => {
             expect(updatedOptions[index]).toEqual({
                 id: index,
-                name: `option next${index}`
+                name: `option next${index}`,
             })
         })
 

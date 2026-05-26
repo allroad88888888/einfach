@@ -1,7 +1,8 @@
 /** @jsxImportSource solid-js */
 import { describe, it, expect, afterEach, beforeEach, jest } from '@jest/globals'
 import { render, cleanup } from '@solidjs/testing-library'
-import { atom, getDefaultStore, Getter } from '@einfach/core'
+import type { Getter } from '@einfach/core';
+import { atom, getDefaultStore } from '@einfach/core'
 import { useAtomValue } from '../src/useAtomValue'
 import { Suspense } from 'solid-js'
 
@@ -99,7 +100,7 @@ describe('useAtomValue与异步atom和Suspense', () => {
     expect(getByTestId('loading').textContent).toBe('加载中...')
     // 等待异步加载完成并检查结果
     const resultElement = await findByTestId('nested-result', undefined, { timeout: 1200 })
-    expect(resultElement.textContent).toBe(`ID: 1, 名称: 测试数据`)
+    expect(resultElement.textContent).toBe('ID: 1, 名称: 测试数据')
 
     // 验证mockFetch被调用了两次（每个atom各一次）
     expect(mockFetch).toHaveBeenCalledTimes(2)

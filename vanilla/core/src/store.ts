@@ -220,7 +220,7 @@ export function createStore(): Store {
   }
 
   function dependenciesChange<Entity extends Atom<unknown>>(atomEntity: Entity) {
-    let backDependencies = backDependenciesMap.get(atomEntity)
+    const backDependencies = backDependenciesMap.get(atomEntity)
     backDependencies?.forEach((depAtomEntity) => {
       const currrnt = getAtomState(depAtomEntity)
       const nextValue = readAtom.call(atomEntity, depAtomEntity)

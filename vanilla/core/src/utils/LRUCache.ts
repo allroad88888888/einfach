@@ -4,6 +4,7 @@
  */
 export class LRUCache<K, V> {
   private cache: Map<K, V>
+
   private maxSize: number
 
   constructor(maxSize: number = Infinity) {

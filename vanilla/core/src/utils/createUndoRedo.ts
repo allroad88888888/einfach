@@ -1,6 +1,6 @@
-import { atom } from "../atom"
-import { Store } from "../type"
-import type { AtomEntity, AtomState } from "../type"
+import { atom } from '../atom'
+import type { Store } from '../type'
+import type { AtomEntity, AtomState } from '../type'
 
 /**
  * 前进回退开关
