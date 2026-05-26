@@ -205,9 +205,15 @@ fn parse_and_eval_failures_propagate() {
 }
 
 /// A non-LAMBDA named value works in `Expr::Name` position (returns
-/// the stored value) but surfaces #VALUE! when invoked as a function.
+/// the stored value). Post Wave 8 codex-review fix #5, invoking it as
+/// a function (`=answer()`) falls through to the custom-formula
+/// registry — with no custom installed, that surfaces #NAME?. Pre-fix
+/// behavior was #VALUE!: any defined name consumed the call site and
+/// triggered a "not callable" error. The new behavior keeps non-LAMBDA
+/// defined names reachable via bare `Expr::Name` without blocking the
+/// registry fallthrough.
 #[test]
-fn non_lambda_named_value_call_is_value_error() {
+fn non_lambda_named_value_call_falls_through_to_name_error() {
     let mut wb = Workbook::new();
     wb.define_name("answer", "=42").unwrap();
     assert!(wb.set_formula(0, "A1", "=answer"));
@@ -215,7 +221,7 @@ fn non_lambda_named_value_call_is_value_error() {
     assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(42.0));
     assert_eq!(
         wb.get_cell("Sheet1", "A2"),
-        Value::Error(ValueError::InvalidValue)
+        Value::Error(ValueError::InvalidName)
     );
 }
 

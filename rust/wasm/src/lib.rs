@@ -1336,9 +1336,19 @@ impl std::fmt::Debug for WasmCustomFormulaRegistry {
 // runtime is single-threaded and we never hand the Mutex out across
 // threads — the workbook is owned by a single Worker. The unsafe impls
 // satisfy the CustomFunctionRegistry bound without a third-party
-// `SendWrapper` dep. If/when shared-memory threads (wasm-bindgen-rayon)
-// land for the worker, this needs revisiting.
+// `SendWrapper` dep.
+//
+// The `cfg(not(target_feature = "atomics"))` guard is a compile-time
+// fuse: if a future build flips on wasm-bindgen-rayon / shared-memory
+// threads (which set the `atomics` target feature), the `Send`/`Sync`
+// impls disappear and `WasmCustomFormulaRegistry` will fail to satisfy
+// the `CustomFunctionRegistry: Send + Sync` bound. That surfaces the
+// unsoundness as a compile error at the boundary rather than silently
+// allowing UB at runtime. Re-enabling threads requires re-architecting
+// the registry around `SendWrapper` / a worker-bound channel.
+#[cfg(not(target_feature = "atomics"))]
 unsafe impl Send for WasmCustomFormulaRegistry {}
+#[cfg(not(target_feature = "atomics"))]
 unsafe impl Sync for WasmCustomFormulaRegistry {}
 
 impl WasmCustomFormulaRegistry {
@@ -1395,15 +1405,50 @@ fn invoke_js_custom_formula(callback: &js_sys::Function, args: &[Value]) -> Valu
     match callback.call1(&JsValue::undefined(), &js_args) {
         Ok(ret) => js_to_value(&ret),
         Err(err) => {
-            // The JS callback threw. Surface the error message in the
-            // cell. We can't carry the message in `Value::Error` (the
-            // enum is just a tag), so we log it via the panic hook
-            // bridge — host devtools see `Uncaught (in promise)` for the
-            // throw, and the cell value is `#VALUE!`.
-            let _ = err;
+            // The JS callback threw. `ValueError` is a flat enum with no
+            // string payload, so we can't carry the message into the
+            // cell value — but we can surface it via `console.warn` so a
+            // host devtools inspection shows the actual JS message
+            // alongside the `#VALUE!` cell. The browser's default error
+            // logging swallows thrown exceptions caught here, so without
+            // this `warn_1` the user sees `#VALUE!` with zero context.
+            let message = extract_js_error_message(&err);
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "[einfach custom formula] callback threw: {message}"
+                )));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = message; // native build: no console, drop the string
+            }
             Value::Error(ValueError::InvalidValue)
         }
     }
+}
+
+/// Best-effort string extraction from a thrown JS value. JS code can
+/// `throw` any value — an Error, a string, a number, an object — so we
+/// try a few shapes in priority order:
+///
+/// 1. `js_sys::Error::message()` for proper Error instances (the common
+///    case: `throw new Error("oops")`).
+/// 2. `JsValue::as_string()` for plain string throws (`throw "oops"`).
+/// 3. The `Debug` format for everything else.
+///
+/// Returned as an owned `String` so the caller can include it in a log
+/// line without juggling lifetimes.
+fn extract_js_error_message(err: &JsValue) -> String {
+    if let Some(error) = err.dyn_ref::<js_sys::Error>() {
+        if let Some(msg) = error.message().as_string() {
+            return msg;
+        }
+    }
+    if let Some(s) = err.as_string() {
+        return s;
+    }
+    format!("{:?}", err)
 }
 
 /// Marshal `Value` → `JsValue`. Scalars round-trip via their natural JS
@@ -1462,6 +1507,26 @@ fn js_to_value(js: &JsValue) -> Value {
     if let Some(s) = js.as_string() {
         if let Some(err) = error_token_to_value_error(&s) {
             return Value::Error(err);
+        }
+        // Hard cap on string size returned from a custom-formula
+        // callback. A 1 GB string would be silently stored in the
+        // formula cache and balloon worker memory before any user-
+        // visible signal. 1 MB is generous for any legitimate Excel-
+        // style text output (the longest sensible cell text is a few
+        // KB); strings beyond this are almost certainly a misuse (e.g.
+        // returning a serialized JSON blob into a cell). Surface
+        // `#VALUE!` with a console warning so the host can debug.
+        const MAX_CUSTOM_STRING_BYTES: usize = 1_048_576;
+        if s.len() > MAX_CUSTOM_STRING_BYTES {
+            #[cfg(target_arch = "wasm32")]
+            {
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "[einfach custom formula] return string of {} bytes exceeds {} byte cap; surfacing #VALUE!",
+                    s.len(),
+                    MAX_CUSTOM_STRING_BYTES
+                )));
+            }
+            return Value::Error(ValueError::InvalidValue);
         }
         return Value::Text(s);
     }
@@ -2870,6 +2935,18 @@ fn sheet_error_to_js(err: SheetError) -> JsValue {
             )
             .ok();
         }
+        SheetError::MutationDuringCustomCall => {
+            // Wave 8 codex-review fix #1. Host code attempted to write
+            // through the workbook from inside a custom-formula JS
+            // callback. See `CUSTOM_FORMULAS.md` § "No mutations during
+            // callback" for the contract.
+            js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("code"),
+                &JsValue::from_str("mutation-during-custom-call"),
+            )
+            .ok();
+        }
     }
     obj.into()
 }
@@ -2889,6 +2966,7 @@ fn workbook_error_to_js(err: WorkbookError) -> JsValue {
         WorkbookError::InvalidName => "invalid-name".to_string(),
         WorkbookError::ParseFailed => "parse-failed".to_string(),
         WorkbookError::EvalFailed(e) => format!("eval-failed: {}", e),
+        WorkbookError::MutationDuringCustomCall => "mutation-during-custom-call".to_string(),
     };
     JsValue::from_str(&msg)
 }

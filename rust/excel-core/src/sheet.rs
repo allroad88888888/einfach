@@ -261,6 +261,12 @@ pub enum SheetError {
     /// the panic that the infallible variants raise; surfaced as an error
     /// in the `try_*` variants so worker hosts don't crash on bad input.
     InvalidAddress,
+    /// Wave 8 re-entrancy guard: the workbook attempted to mutate while
+    /// a host custom-formula JS callback was executing. The mutation is
+    /// rejected so the formula cache state machine stays sound (see
+    /// `Workbook::is_inside_custom_call` and
+    /// `CUSTOM_FORMULAS.md` § "No mutations during callback").
+    MutationDuringCustomCall,
 }
 
 impl std::fmt::Display for SheetError {
@@ -272,6 +278,10 @@ impl std::fmt::Display for SheetError {
                 anchor
             ),
             SheetError::InvalidAddress => write!(f, "invalid cell address"),
+            SheetError::MutationDuringCustomCall => write!(
+                f,
+                "workbook mutations are forbidden while a custom-formula callback is executing"
+            ),
         }
     }
 }

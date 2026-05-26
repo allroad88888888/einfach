@@ -37,14 +37,26 @@ Within `eval_func`, name resolution is tried in this order:
 1. **Built-in dispatch** — the giant `match` in `eval_func`. Names like
    `SUM`, `IF`, `LAMBDA`, `XLOOKUP` win here.
 2. **Defined-name LAMBDA** — `Workbook::define_name("SQUARE", "=LAMBDA(x, x*x)")`
-   makes `=SQUARE(5)` resolve to the registry entry.
+   makes `=SQUARE(5)` resolve to the registry entry. **Only LAMBDA-typed
+   defined names participate in this step.**
 3. **Host custom formula** — `EvalProvider::call_custom`. The Wave 8
    entry point.
 4. **`#NAME?`** — no resolution found.
 
-A host custom formula therefore CANNOT shadow a built-in or a registered
-LAMBDA. `Workbook::define_name` already blocks reserved-name collisions
-on the LAMBDA side; mirror that guarantee for customs.
+A host custom formula therefore CANNOT shadow a built-in or a LAMBDA
+defined name. `Workbook::define_name` already blocks reserved-name
+collisions on the LAMBDA side; the LAMBDA-only filter in `eval_named_call`
+preserves the LAMBDA-over-custom precedence.
+
+**Non-LAMBDA defined names do NOT shadow customs.** Earlier shape:
+any defined name (range refs, scalar literals like `answer = 42`) would
+consume the call site and either error or fall through to `#VALUE!`. Post-
+review fix: non-LAMBDA defined names are only consulted by bare
+`Expr::Name` (`=MYRANGE` returns the range, `=answer` returns 42); a
+call-shaped expression `=MYFUNC(...)` only matches LAMBDA defined names
+at this site, otherwise it falls through to the custom registry. This is
+what lets a host register `MYFUNC` as a custom callback even if the
+workbook happens to also carry `MYFUNC = $A$1:$B$10` as a range alias.
 
 ## Trait surface (engine side)
 
@@ -151,19 +163,106 @@ function name. If host workflows show frequent registration churn,
 adding a `HashMap<String, HashSet<(sheet, addr)>>` index keyed on
 upper-cased name is the obvious optimization.
 
+**TODO: batch invalidation API.** Registering N customs at startup
+currently costs O(N × F) work because each call invalidates every
+formula. The realistic dev workload (3–10 customs registered once at
+load) doesn't hit this — at F ≈ 10 000 cells × 10 customs = 100 000
+mark-dirty ops, all in-memory, that's still sub-millisecond. If a host
+later needs to install hundreds of customs at startup, the lightweight
+fix is a `registerCustomFormulas(names: string[], callbacks: Function[])`
+batch API at the WASM layer that calls
+`Workbook::invalidate_all_formulas_for_custom_function_change` once at
+the end. Defer until a benchmark shows this matters. Benchmark probe:
+add `bench/custom_register_churn.rs` that times N×F mark-dirty cycles
+and reports per-op cost.
+
 ## Limitations (initial cut)
 
 - **Synchronous only.** JS callbacks must return a value, not a
   `Promise`. Async (callback returns Promise → cell shows pending state
   → resolves to a Value when promise settles) is future work.
-- **Scalar args only.** Range arguments like `=MYTAX(A1:A100)` reach the
-  callback as a 2-D array if Excel-style array context applies (see
-  `Value::Array`); the engine does NOT yet introduce a Range arg type
-  that gives the callback access to source addresses.
+- **Range args materialise eagerly.** `=MYTAX(A1:A100)` evaluates the
+  range to a 2-D `Value::Array` (row-major) BEFORE crossing the JS
+  boundary, and the callback receives a `number[][]` / `(number | string
+  | boolean | null)[][]` JS array. The engine does NOT yet introduce a
+  Range arg type that gives the callback access to source addresses or
+  lazy iteration — large ranges are fully copied into JS.
 - **No lambda args.** A custom callback that wants higher-order behavior
   (`MAP`-style) needs to be re-architected.
 - **Replace requires full invalidation.** As noted above; consider per-
   name dep tracking if churn matters.
+- **No mutation during callback execution.** See § "No mutations during
+  callback" below.
+- **String return capped at 1 MB.** A callback returning a larger string
+  surfaces `#VALUE!` and logs to `console.warn`.
+- **Single-threaded only.** `WasmCustomFormulaRegistry` is `Send + Sync`
+  via an `unsafe impl` gated on `cfg(not(target_feature = "atomics"))`.
+  Enabling wasm threads (wasm-bindgen-rayon) flips off the impl and the
+  registry will fail to satisfy the `CustomFunctionRegistry` bound at
+  compile time — the unsoundness surfaces as a build error rather than
+  silent UB. Re-enabling threads requires re-architecting around a
+  worker-bound channel or `SendWrapper`.
+
+## No mutations during callback
+
+A host custom-formula JS callback **MUST NOT** mutate the workbook while
+it runs. The engine enforces this via the `Workbook::is_inside_custom_call`
+re-entrancy guard:
+
+1. `WorkbookEvalProvider::call_custom` enters a `CustomCallScope` that
+   bumps a counter on `Workbook::custom_call_depth` for the duration of
+   the JS callback. The scope's `Drop` impl decrements on exit (so a
+   thrown JS exception still cleans up the counter).
+2. Every public mutation entry point on `Workbook` (`set_cell`,
+   `clear_cell`, `set_formula`, `try_set_*`, `define_name`,
+   `undefine_name`, `set_custom_function_registry`, `add_sheet`,
+   `rename_sheet`, `remove_sheet`, `move_sheet`, `bulk_load`'s loader
+   `set_cell` / `set_formula` / `clear_cell` methods) checks the
+   guard and rejects (via `Err(SheetError::MutationDuringCustomCall)` /
+   `Err(WorkbookError::MutationDuringCustomCall)` on the fallible
+   variants, silent no-op on the infallible ones).
+
+**Why**: a mutation inside the callback dirties the cell whose formula
+triggered the callback. The surrounding `eval_formula_at_with_provider`
+then unconditionally writes `FormulaCache::Clean(value)` on return —
+silently losing the dirty mark. The next read of that cell would return
+a stale value until something else dirtied it. Disallowing mutations
+keeps the cache state machine sound.
+
+**Workarounds**: callbacks that need to "write back" should return a
+value and let the host write it after the read completes. The host has
+full access to the workbook through `&mut WasmWorkbook` outside callback
+frames.
+
+## Security model
+
+The WASM bridge compiles host-supplied JS source via `new Function('args',
+source)` (see `solid/excel/src-vnext/adapter/worker-runtime.ts`). This
+boundary is **NOT a privilege sandbox**:
+
+- `new Function` sandboxes only the *lexical closure*. The compiled
+  function cannot reach `worker-runtime.ts`'s local variables, but it
+  has full access to the worker's global scope: `self`, `postMessage`,
+  `fetch`, `importScripts`, `indexedDB`, the WASM workbook handle, etc.
+- Source registered through this path is therefore **host-trusted
+  code**, not untrusted user input. Acceptable inputs: developer code
+  shipped with the app, formulas loaded from a trusted backend, a
+  curated registry of pre-vetted formulas. **Unacceptable** inputs:
+  arbitrary strings typed by an end user into a UI "JavaScript formula
+  editor" field.
+
+**A future user-input formula editor MUST**:
+
+- Run user code in an iframe sandbox with `sandbox="allow-scripts"` (no
+  `allow-same-origin`) so the iframe's globals are a separate origin.
+- Communicate via `postMessage` with structured-clone-only payloads —
+  never share objects, never `eval`/`new Function` the result.
+- Forward calls back to the worker through that channel rather than
+  letting the user code touch the WASM handle directly.
+
+The current Wave 8 registry deliberately omits this iframe layer because
+the only callers are app-internal. Adding it is a separate arc and
+requires reworking the callback marshaling to be async.
 
 ## Tests
 

@@ -9035,60 +9035,81 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 }
 
 /// Resolve a function call `name(args)` against the workbook's defined
-/// names when no built-in matched. If the registry holds a `Value::Lambda`
-/// under `name`, evaluate args (left-to-right, short-circuiting on the
-/// first error) and apply the lambda. Otherwise consult the host's custom-
-/// formula registry via `provider.call_custom`; if that returns `None`
-/// surface `#NAME?`.
+/// names when no built-in matched. Only a defined name whose value is a
+/// `Value::Lambda` is treated as callable — scalar or range-typed
+/// defined names fall through to the host's custom-formula registry
+/// (and ultimately `#NAME?` if both miss).
+///
+/// **Precedence** (post Wave 8 review fix):
+///   1. Built-ins (matched in `eval_func` before this fn is reached).
+///   2. **Defined-name LAMBDA** — `define_name("SQUARE", "=LAMBDA(x,
+///      x*x)")` makes `=SQUARE(5)` resolve through the registry.
+///   3. **Host custom formula** — `provider.call_custom(...)`.
+///   4. `#NAME?` — no resolution found.
+///
+/// Earlier shape: ANY defined name (including scalar values and range
+/// refs) consumed the name and either applied or returned `#VALUE!`.
+/// That meant a host that registered `MYFUNC` AND a defined name
+/// `MYFUNC = 42` (or `MYFUNC = $A$1:$B$10`) would see the call resolve
+/// to `#VALUE!` instead of falling through to the custom registry. The
+/// new shape consults LAMBDA-only at this site; non-LAMBDA defined
+/// names remain reachable via bare `Expr::Name` (`=MYFUNC` returns 42
+/// or the range) but no longer block the custom-registry fallthrough
+/// for `=MYFUNC(...)`.
 ///
 /// Wraps `apply_lambda` in the named-call recursion guard so a runaway
 /// recursive definition (`bad` = `LAMBDA(n, bad(n))`) hits `#NUM!` at
 /// `MAX_NAMED_CALL_DEPTH` rather than panicking the thread.
 ///
-/// Precedence: built-ins (matched in `eval_func` before this fn is
-/// reached) → defined-name LAMBDA → host custom-formula → `#NAME?`.
-/// Host custom formulas therefore CANNOT shadow built-ins or a
-/// `define_name`-registered LAMBDA. This is intentional: the reserved-name
-/// check in `Workbook::define_name_value` already blocks LAMBDA names from
-/// colliding with built-ins, and we want the same guarantee for custom
-/// formulas — a host that registers `MYFUNC` should not be able to
-/// override `SUM` by accident.
+/// Host custom formulas STILL CANNOT shadow built-ins or a LAMBDA
+/// defined name. The reserved-name check in
+/// `Workbook::define_name_value` blocks LAMBDA names from colliding
+/// with built-ins, and the LAMBDA-only check here preserves the
+/// LAMBDA-over-custom precedence.
 fn eval_named_call(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if let Some(value) = provider.lookup_named(name) {
         match &value {
-            Value::Lambda(_) => {}
+            Value::Lambda(_) => {
+                let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = eval_expr_with_provider(a, provider);
+                    if let Value::Error(e) = &v {
+                        return Value::Error(e.clone());
+                    }
+                    arg_values.push(v);
+                }
+                // `apply_lambda` itself owns the recursion guard (see its
+                // body) so a recursive defined lambda (`fact` =
+                // `LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))`) hits #NUM! at
+                // MAX_NAMED_CALL_DEPTH instead of overflowing the stack.
+                return apply_lambda(&value, arg_values, provider);
+            }
             Value::Error(e) => return Value::Error(e.clone()),
             _ => {
-                // A defined name like `answer = 42` exists but isn't callable.
-                // Excel surfaces #VALUE! when you try to invoke a non-function;
-                // we mirror that. `=answer` alone still returns 42 via Expr::Name.
-                return Value::Error(ValueError::InvalidValue);
+                // Non-LAMBDA defined name (`answer = 42`, `MYRANGE =
+                // $A$1:$B$10`, etc.). Fall through to the custom-formula
+                // registry below so a host's `MYFUNC` registration is
+                // not shadowed by an unrelated defined-name entry that
+                // happens to share the label.
             }
         }
-        let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
-        for a in args {
-            let v = eval_expr_with_provider(a, provider);
-            if let Value::Error(e) = &v {
-                return Value::Error(e.clone());
-            }
-            arg_values.push(v);
-        }
-        // `apply_lambda` itself owns the recursion guard (see its body) so a
-        // recursive defined lambda (`fact` = `LAMBDA(n, IF(n<=1, 1, n*fact(n-1)))`)
-        // hits #NUM! at MAX_NAMED_CALL_DEPTH instead of overflowing the stack.
-        return apply_lambda(&value, arg_values, provider);
     }
 
-    // No defined name with this label. Try the host's custom-formula
+    // No defined LAMBDA with this label. Try the host's custom-formula
     // registry as a last resort before surfacing #NAME?. Args are eagerly
     // evaluated (custom formulas take Values, not Exprs — no lazy
-    // semantics) and error-short-circuit just like LAMBDA application
-    // above, so a custom `MYFUNC(SUM(BAD), 1)` returns the inner error
-    // rather than handing the JS callback a `#VALUE!` it would have to
-    // know how to handle.
+    // semantics) with two range-arg conveniences:
+    //   - A bare `Expr::Range` / `Expr::SheetRange` arg is materialised
+    //     to a `Value::Array` via the same path SUM/COUNT use, so the
+    //     callback receives a 2-D table rather than `#VALUE!`.
+    //   - Any other arg evaluates normally; `Value::Array` results pass
+    //     through untouched.
+    // Errors short-circuit just like LAMBDA application above, so a
+    // custom `MYFUNC(SUM(BAD), 1)` returns the inner error rather than
+    // handing the JS callback a `#VALUE!` it would have to handle.
     let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
     for a in args {
-        let v = eval_expr_with_provider(a, provider);
+        let v = eval_arg_for_custom(a, provider);
         if let Value::Error(e) = &v {
             return Value::Error(e.clone());
         }
@@ -9097,6 +9118,45 @@ fn eval_named_call(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Va
     provider
         .call_custom(name, &arg_values)
         .unwrap_or(Value::Error(ValueError::InvalidName))
+}
+
+/// Argument-evaluator for the custom-formula dispatch arm. Differs from
+/// the default `eval_expr_with_provider` in exactly one way: a bare
+/// range expression (`A1:A10`, `Sheet2!B1:B10`, `OFFSET(...)`) is
+/// materialised to a `Value::Array` so the JS callback receives the
+/// rectangle as a 2-D row-major table. Everything else evaluates to its
+/// scalar `Value` (including embedded `Value::Array` results from
+/// dynamic-array built-ins like `SEQUENCE`).
+///
+/// This mirrors what SUM/COUNT/MIN/etc. do at their arg-evaluation
+/// sites — they stream the range via `for_each_arg_value`. Custom
+/// formulas can't stream (the JS boundary is scalar-in / scalar-out),
+/// so we materialise instead. The wire format is documented in
+/// `CUSTOM_FORMULAS.md` § "Marshaling".
+fn eval_arg_for_custom(arg: &Expr, provider: &dyn EvalProvider) -> Value {
+    // Range-shaped argument: materialise to `Value::Array` via the
+    // shared `arg_to_2d` helper that SUMIF / VLOOKUP / etc. use. The
+    // result becomes a `Value::Array` so the WASM marshaling layer
+    // round-trips it as a 2-D JS array.
+    let is_range_like = matches!(
+        arg,
+        Expr::Range { .. } | Expr::SheetRange { .. }
+    ) || matches!(arg, Expr::FuncCall { name, .. } if name == "OFFSET");
+    if is_range_like {
+        match arg_to_2d(arg, provider) {
+            Ok((0, 0, _)) => {
+                // Empty range (over-bound sentinel or zero-cell
+                // collection). Surface `#REF!` so the callback isn't
+                // handed a 0×0 array it can't reason about.
+                return Value::Error(ValueError::InvalidRef);
+            }
+            Ok((rows, cols, data)) => {
+                return Value::Array(Arc::new(ArrayData::new(rows, cols, data)));
+            }
+            Err(e) => return Value::Error(e),
+        }
+    }
+    eval_expr_with_provider(arg, provider)
 }
 
 /// Streams every arg's numeric values into a local Vec. The Vec is an
@@ -31664,12 +31724,18 @@ mod tests {
         assert_eq!(v, Value::Error(ValueError::InvalidName));
     }
 
-    /// Non-callable defined name invoked as a function surfaces #VALUE!.
+    /// Non-callable defined name invoked as a function falls through to
+    /// the custom-formula registry (Wave 8 codex-review fix #5). With
+    /// no custom registered, the fallthrough surfaces #NAME?. Pre-fix
+    /// behavior was #VALUE!: any defined name consumed the call site
+    /// and triggered a "not callable" error. The new behavior keeps
+    /// non-LAMBDA defined names reachable via bare `Expr::Name` (`=answer`
+    /// still returns 42) without blocking the registry fallthrough.
     #[test]
-    fn non_lambda_name_called_as_function_is_value_error() {
+    fn non_lambda_name_called_as_function_falls_through_to_custom_then_name_error() {
         let (cm, vs) = empty_env();
         let v = eval_with_names("=answer(1)", &[("answer", Value::Number(42.0))], &cm, &vs);
-        assert_eq!(v, Value::Error(ValueError::InvalidValue));
+        assert_eq!(v, Value::Error(ValueError::InvalidName));
     }
 
     /// LET binding shadows a defined name (LET wins over registry).
@@ -31866,6 +31932,132 @@ mod tests {
         let v = eval_expr_with_provider(&expr, &provider);
         // Lambda wins → 5*5 = 25, not the custom registration's -1.
         assert_eq!(v, Value::Number(25.0));
+    }
+
+    /// Wave 8 codex-review fix #5: a scalar (non-LAMBDA) defined name
+    /// does NOT shadow a custom registration sharing the label. Before
+    /// the fix, `lookup_named` returning `Value::Number(42)` would
+    /// short-circuit to `#VALUE!`; after the fix, the call-shaped
+    /// `=MYFN(5)` falls through to the custom registry. Bare
+    /// `Expr::Name` (`=MYFN`) still surfaces the scalar via the
+    /// `Expr::Name` arm — that path is unchanged.
+    #[test]
+    fn scalar_defined_name_does_not_shadow_custom() {
+        let expr = parse_formula("=MYFN(5)").expect("parse failed");
+        let mut names = HashMap::new();
+        // Pretend the workbook has `define_name("MYFN", "=42")`.
+        names.insert("MYFN".to_string(), Value::Number(42.0));
+        let mut customs: HashMap<String, CustomFn> = HashMap::new();
+        customs.insert(
+            "MYFN".to_string(),
+            Box::new(|args| {
+                if let Some(Value::Number(n)) = args.first() {
+                    Value::Number(n + 1.0)
+                } else {
+                    Value::Error(ValueError::InvalidValue)
+                }
+            }),
+        );
+        let provider = CustomFormulaProvider { names, customs };
+        let v = eval_expr_with_provider(&expr, &provider);
+        // Custom wins → 5 + 1 = 6, not the scalar `MYFN` value of 42
+        // (and not #VALUE!).
+        assert_eq!(v, Value::Number(6.0));
+    }
+
+    /// Wave 8 codex-review fix #5 part 2: a defined name holding a
+    /// `Value::Array` (the rough analog of a "named range" — defined-name
+    /// arrays in this engine surface as `Value::Array` via the
+    /// `define_name` eval pass) likewise falls through to the custom
+    /// registry for a call-shaped reference. The bare `Expr::Name`
+    /// (`=MYFN`) still returns the array.
+    #[test]
+    fn array_defined_name_does_not_shadow_custom() {
+        let call_expr = parse_formula("=MYFN()").expect("parse failed");
+        let bare_expr = parse_formula("=MYFN").expect("parse failed");
+        let mut names = HashMap::new();
+        names.insert(
+            "MYFN".to_string(),
+            Value::Array(Arc::new(ArrayData::new(
+                1,
+                2,
+                vec![Value::Number(10.0), Value::Number(20.0)],
+            ))),
+        );
+        let mut customs: HashMap<String, CustomFn> = HashMap::new();
+        customs.insert("MYFN".to_string(), Box::new(|_| Value::Text("from custom".into())));
+        let provider = CustomFormulaProvider { names, customs };
+        // `=MYFN()` is the call form → goes through the custom registry.
+        let call_v = eval_expr_with_provider(&call_expr, &provider);
+        assert_eq!(call_v, Value::Text("from custom".into()));
+        // `=MYFN` is the bare-name form → returns the defined-name
+        // array value verbatim.
+        let bare_v = eval_expr_with_provider(&bare_expr, &provider);
+        match bare_v {
+            Value::Array(arr) => {
+                assert_eq!(arr.rows, 1);
+                assert_eq!(arr.cols, 2);
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
+    }
+
+    /// Wave 8 codex-review fix #6: a literal range argument
+    /// (`=SUMSQ(A1:A3)`) reaches the custom callback as a 2-D
+    /// `Value::Array` rather than `#VALUE!`. The callback sums the
+    /// squares of every element to prove the marshaled array round-
+    /// trips correctly. Uses the AtomEvalProvider-shaped shim from the
+    /// surrounding test module — `A1=1, A2=2, A3=3` via the cm/vs
+    /// fixture.
+    #[test]
+    fn custom_function_receives_range_arg_as_2d_array() {
+        // Wire up a per-cell scalar fixture so `A1:A3` evaluates to the
+        // three rows 1, 2, 3.
+        let mut customs: HashMap<String, CustomFn> = HashMap::new();
+        customs.insert(
+            "SUMSQ".to_string(),
+            Box::new(|args| {
+                let Some(Value::Array(arr)) = args.first() else {
+                    return Value::Error(ValueError::InvalidValue);
+                };
+                let mut total = 0.0;
+                for v in &arr.data {
+                    if let Value::Number(n) = v {
+                        total += n * n;
+                    }
+                }
+                Value::Number(total)
+            }),
+        );
+
+        // Custom EvalProvider that returns the 1/2/3 scalars for A1/A2/A3
+        // (mirrors the shape `AtomEvalProvider` would build for the test
+        // env, but stays self-contained inside this module).
+        struct RangeFixtureProvider {
+            customs: HashMap<String, CustomFn>,
+        }
+        impl EvalProvider for RangeFixtureProvider {
+            fn cell(&self, addr: CellAddress) -> Value {
+                // A1 → row 0 col 0 → 1.0, etc.
+                if addr.col == 0 && addr.row <= 2 {
+                    Value::Number((addr.row + 1) as f64)
+                } else {
+                    Value::Null
+                }
+            }
+            fn sheet_cell(&self, _: &str, _: CellAddress) -> Value {
+                Value::Error(ValueError::InvalidRef)
+            }
+            fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
+                self.customs.get(&name.to_ascii_uppercase()).map(|f| f(args))
+            }
+        }
+
+        let provider = RangeFixtureProvider { customs };
+        let expr = parse_formula("=SUMSQ(A1:A3)").expect("parse failed");
+        let v = eval_expr_with_provider(&expr, &provider);
+        // 1 + 4 + 9 = 14
+        assert_eq!(v, Value::Number(14.0));
     }
 
     /// `is_builtin_function_name` is exported for the workbook's reserved-name

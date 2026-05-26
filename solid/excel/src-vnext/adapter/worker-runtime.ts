@@ -869,11 +869,18 @@ function compileCustomFormula(name: string, source: unknown): CustomFormulaCalla
     })
   }
   try {
-    // `new Function` runs in the worker's global scope, NOT the
-    // surrounding lexical scope. That sandboxes the body away from
-    // worker internals — the only references it can resolve are
-    // globals (Math, JSON, Date, etc.) and its single `args`
-    // parameter.
+    // SECURITY: `new Function` runs in the worker's global scope, NOT
+    // the surrounding lexical scope. That sandboxes the body away from
+    // *this module's* closure variables, but it does NOT sandbox it
+    // away from worker-global authority — the compiled function has
+    // full access to `self`, `postMessage`, `fetch`, `indexedDB`, any
+    // imported scripts, the WASM workbook handle, etc. This is
+    // therefore ONLY safe for HOST-TRUSTED source (developer code
+    // shipped with the app, configuration loaded from a trusted
+    // backend). Untrusted user-input source MUST go through a separate
+    // iframe-sandbox + structured-clone IPC boundary instead. See
+    // `rust/excel-core/src/CUSTOM_FORMULAS.md` § "Security model" for
+    // the full trust contract.
     const fn = new Function('args', source) as CustomFormulaCallable
     return fn
   } catch (err) {

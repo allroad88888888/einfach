@@ -227,4 +227,184 @@ describe('vnext custom formulas — host wiring', () => {
       expect(registerSpy).toHaveBeenCalledWith('PREMOUNT', 'return 1')
     })
   })
+
+  // MED #9 — a failed register MUST leave the `installed` baseline
+  // alone so the next diff replays the missing entry instead of
+  // silently dropping it.
+  it('a failed registerCustomFormula does not advance the baseline', async () => {
+    const store = createStore()
+    let attempts = 0
+    const registerSpy = jest.fn<(name: string, source: string) => Promise<void>>(
+      async () => {
+        attempts++
+        if (attempts === 1) throw new Error('worker boom')
+      },
+    )
+    const unregisterSpy = jest.fn<(name: string) => Promise<void>>(async () => undefined)
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection() {
+        throw new Error('not used')
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      registerCustomFormula: registerSpy,
+      unregisterCustomFormula: unregisterSpy,
+    }
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <div />
+      </SpreadsheetUiProvider>
+    ))
+
+    // First register — backend rejects.
+    store.setter(registerCustomFormulaAtom, {
+      name: 'RETRYME',
+      source: 'return 1',
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(1)
+    })
+
+    // Mutate the registry again with identical content. The diff
+    // helper sees the slot as still-needing-install (baseline did NOT
+    // advance after the failed first call) and replays the register.
+    store.setter(registerCustomFormulaAtom, {
+      name: 'RETRYME',
+      source: 'return 1',
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(2)
+    })
+    // Second call succeeds (attempts > 1) → baseline now advances, so
+    // a no-op mutation should NOT trigger a third call.
+    store.setter(registerCustomFormulaAtom, {
+      name: 'RETRYME',
+      source: 'return 1',
+    })
+    // Give the microtask queue a moment to drain.
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(registerSpy).toHaveBeenCalledTimes(2)
+  })
+
+  // MED #10 — pending unregister→register chains MUST not reinstall a
+  // stale source after the registry is mutated. The new effect uses an
+  // AbortController per batch; a fresh mutation aborts the prior batch
+  // and re-diffs against the up-to-date snapshot.
+  it('quick register → unregister → register collapses to a single final install', async () => {
+    const store = createStore()
+    // Hold registers until we release them so we can interleave a
+    // burst of mutations against an in-flight batch.
+    let releaseFirst: () => void = () => undefined
+    const firstRegister = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    let registerCalls = 0
+    const registerSpy = jest.fn<(name: string, source: string) => Promise<void>>(
+      async () => {
+        registerCalls++
+        if (registerCalls === 1) await firstRegister
+      },
+    )
+    const unregisterSpy = jest.fn<(name: string) => Promise<void>>(async () => undefined)
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection() {
+        throw new Error('not used')
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      registerCustomFormula: registerSpy,
+      unregisterCustomFormula: unregisterSpy,
+    }
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <div />
+      </SpreadsheetUiProvider>
+    ))
+
+    // First register — backend hangs on the in-flight promise.
+    store.setter(registerCustomFormulaAtom, {
+      name: 'BURST',
+      source: 'return 1',
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(1)
+    })
+    // Mutate twice while the first register is still pending.
+    store.setter(unregisterCustomFormulaAtom, 'BURST')
+    store.setter(registerCustomFormulaAtom, {
+      name: 'BURST',
+      source: 'return 2',
+    })
+    // Release the held first register so the chain advances.
+    releaseFirst()
+    // Final state: exactly one install reflecting `'return 2'`. The
+    // intermediate unregister and the original `'return 1'` install
+    // do not get re-fired against the worker.
+    await waitFor(() => {
+      const lastCall = registerSpy.mock.calls[registerSpy.mock.calls.length - 1]
+      expect(lastCall?.[1]).toBe('return 2')
+    })
+  })
+
+  // MED #10 — unmount aborts any in-flight chain so a stale
+  // post-unmount register cannot leak past the cleanup boundary.
+  it('unmount during a pending register aborts the in-flight chain', async () => {
+    const store = createStore()
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const registerSpy = jest.fn<(name: string, source: string) => Promise<void>>(
+      async () => {
+        await gate
+      },
+    )
+    const unregisterSpy = jest.fn<(name: string) => Promise<void>>(async () => undefined)
+    const backend: SpreadsheetBackend = {
+      async readVisibleProjection() {
+        throw new Error('not used')
+      },
+      async readRangeProjection() {
+        throw new Error('not used')
+      },
+      async setCellInput() {
+        throw new Error('not used')
+      },
+      registerCustomFormula: registerSpy,
+      unregisterCustomFormula: unregisterSpy,
+    }
+
+    const { unmount } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <div />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(registerCustomFormulaAtom, {
+      name: 'PENDING',
+      source: 'return 1',
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(1)
+    })
+    // Tear down while the register is still pending.
+    unmount()
+    // Release the gate so the originally-awaited call settles. The
+    // cleanup branch should NOT issue an unregister for `'PENDING'`
+    // since the install never completed (installed map is empty when
+    // the controller aborts mid-await).
+    release()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    expect(unregisterSpy).not.toHaveBeenCalledWith('PENDING')
+  })
 })

@@ -10,13 +10,28 @@
  */
 
 /**
- * Plain-value argument the worker-side body receives. Cells project as
- * `number | string | boolean`, blank cells as `null`. The Rust engine never
- * passes arrays into JS callbacks (`Value::Array` collapses to its
- * top-left scalar at the WASM boundary), so this union is exhaustive for
- * MVP.
+ * Scalar leaf of a custom-formula argument. Cells project as
+ * `number | string | boolean`; blank cells as `null`.
  */
-export type CustomFormulaArg = number | string | boolean | null
+export type CustomFormulaScalar = number | string | boolean | null
+
+/**
+ * Plain-value argument the worker-side body receives.
+ *
+ * Scalar args (`=MYFN(B2)`) arrive as a `CustomFormulaScalar`. Range
+ * args (`=MYFN(A1:B10)`) arrive as a 2-D `ReadonlyArray<ReadonlyArray<scalar>>`
+ * (row-major) because the WASM bridge marshals `Value::Array` directly
+ * to a nested JS array — see `rust/excel-core/src/CUSTOM_FORMULAS.md`
+ * "Marshaling".
+ *
+ * The `Readonly*` wrappers are TypeScript-only — the underlying arrays
+ * are real `Array` instances at runtime, so `.flat()`, `.map()`,
+ * `.reduce()` etc. work normally; the wrappers just discourage
+ * accidental in-place mutation of WASM-owned data.
+ */
+export type CustomFormulaArg =
+  | CustomFormulaScalar
+  | ReadonlyArray<ReadonlyArray<CustomFormulaScalar>>
 
 /**
  * Plain-value return shape. `undefined` is treated as a blank result by

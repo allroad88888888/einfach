@@ -181,6 +181,16 @@ function VNextWorkerWorkbook() {
       { name: 'MYTAX', source: 'return Number(args[0]) * 0.2', paramLabels: ['amount'] },
       { name: 'GREET', source: "return 'Hello, ' + String(args[0] ?? '')", paramLabels: ['name'] },
       { name: 'CELSIUS', source: 'return (Number(args[0]) - 32) * 5 / 9', paramLabels: ['fahrenheit'] },
+      // Exercises the 2-D array marshaling path: a range arg like
+      // `=SUMSQ2(A1:A10)` arrives as `[[v0],[v1],...]`. `.flat()`
+      // flattens to a 1-D scalar list, then sums squares. Named
+      // `SUMSQ2` to avoid shadowing the engine's built-in `SUMSQ`.
+      {
+        name: 'SUMSQ2',
+        source:
+          'const xs = Array.isArray(args[0]) ? args[0].flat() : [args[0]]; return xs.reduce((s,v)=>s+Number(v)*Number(v),0)',
+        paramLabels: ['range'],
+      },
     ]
     for (const reg of customFormulas) store.setter(registerCustomFormulaAtom, reg)
     onCleanup(() => {

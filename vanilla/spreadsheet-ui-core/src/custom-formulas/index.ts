@@ -1,5 +1,6 @@
 import { atom } from '@einfach/core'
 import { FORMULA_FUNCTION_SPECS } from '../formula-functions'
+import { ENGINE_BUILTIN_FORMULA_NAMES } from './engine-builtin-names'
 import type {
   CustomFormulaNameValidation,
   CustomFormulaNameValidationReason,
@@ -7,21 +8,41 @@ import type {
 } from './types'
 
 export * from './types'
+export { ENGINE_BUILTIN_FORMULA_NAMES } from './engine-builtin-names'
 
 const NAME_REGEX = /^[A-Z][A-Z0-9_.]*$/
 
 /**
- * Set of built-in formula names that user code cannot redefine. Built
- * from the seed registry so it stays in sync as the static spec list
- * grows. NOT an exhaustive list of every WASM-side function (the Rust
- * engine ships hundreds), but it covers the names IntelliSense surfaces.
- * Shadowing a Rust-only function not in this list will succeed at
- * register time and silently be overridden on the WASM side; that is
- * Excel-compatible behaviour (last registration wins).
+ * Set of built-in formula names that user code cannot redefine.
+ *
+ * Built from the union of:
+ *   1. `ENGINE_BUILTIN_FORMULA_NAMES` — the authoritative mirror of the
+ *      Rust engine's `is_builtin_function_name` arms (see
+ *      `scripts/extract-builtin-names.mjs`). Covers every name the
+ *      WASM evaluator would dispatch to a built-in arm, including
+ *      `LAMBDA`, `LET`, `IFERROR`, `XLOOKUP`, `MAP`, `REDUCE`, etc.
+ *      that the IntelliSense seed registry does not surface.
+ *   2. `FORMULA_FUNCTION_SPECS` — the IntelliSense seed registry. The
+ *      Rust mirror should already include every name here, but we
+ *      union both so a forgotten extraction never reopens a shadowing
+ *      hole.
+ *
+ * Normalizes to upper-case so callers can use either case in lookups.
  */
-export const BUILTIN_FORMULA_NAMES: ReadonlySet<string> = new Set(
-  FORMULA_FUNCTION_SPECS.map((spec) => spec.name),
-)
+export const BUILTIN_FORMULA_NAMES: ReadonlySet<string> = new Set([
+  ...ENGINE_BUILTIN_FORMULA_NAMES.map((n) => n.toUpperCase()),
+  ...FORMULA_FUNCTION_SPECS.map((spec) => spec.name.toUpperCase()),
+])
+
+/**
+ * Normalize a candidate custom-formula name to the canonical upper-case
+ * form used by both the engine and the registry. Trim incidental
+ * whitespace so hosts that bind to a text input get the expected match
+ * semantics without filtering at every call site.
+ */
+function normalizeCustomFormulaName(name: string): string {
+  return name.trim().toUpperCase()
+}
 
 /**
  * Validate a candidate custom-formula name. Returns a structured result
@@ -31,13 +52,21 @@ export const BUILTIN_FORMULA_NAMES: ReadonlySet<string> = new Set(
  * write atom uses this internally and throws if the result is not ok.
  */
 export function validateCustomFormulaName(name: string): CustomFormulaNameValidation {
-  if (!name || name.length === 0) {
+  if (name === null || name === undefined) {
+    return { ok: false, reason: 'name-empty' }
+  }
+  // Validate the AS-WRITTEN spelling against the format rule so
+  // lower-case / mixed-case names surface a `name-format` error
+  // (Excel-style upper-case required). The shadow check runs on the
+  // normalized form so a lower-case `'sum'` and an upper-case `'SUM'`
+  // both reject the same way.
+  if (name.length === 0) {
     return { ok: false, reason: 'name-empty' }
   }
   if (!NAME_REGEX.test(name)) {
     return { ok: false, reason: 'name-format' }
   }
-  if (BUILTIN_FORMULA_NAMES.has(name)) {
+  if (BUILTIN_FORMULA_NAMES.has(normalizeCustomFormulaName(name))) {
     return { ok: false, reason: 'name-shadows-builtin' }
   }
   return { ok: true }
@@ -85,10 +114,15 @@ export const registerCustomFormulaAtom = atom(
     if (!validation.ok) {
       throw new Error(describeNameError(validation.reason, reg.name))
     }
+    // Normalize on the way in so lookups, replaces, and unregisters
+    // hit the same key the WASM engine uses (case-insensitive,
+    // canonical upper-case). Without this a lower-case unregister
+    // would silently leak the upper-case entry on the worker.
+    const key = normalizeCustomFormulaName(reg.name)
     const current = get(customFormulaRegistryAtom)
     const next = new Map(current)
-    next.set(reg.name, {
-      name: reg.name,
+    next.set(key, {
+      name: key,
       source: reg.source,
       ...(reg.description !== undefined ? { description: reg.description } : {}),
       ...(reg.paramLabels !== undefined ? { paramLabels: [...reg.paramLabels] } : {}),
@@ -106,10 +140,17 @@ registerCustomFormulaAtom.debugLabel = 'spreadsheet.customFormulas.register'
 export const unregisterCustomFormulaAtom = atom(
   null,
   (get, set, name: string) => {
+    // Mirror the register-side normalization. Hosts that bind to a
+    // user-typed input may pass `'mytax'` here even though the engine
+    // (and the registry map) keys on `'MYTAX'`; without normalization
+    // the unregister would silently no-op and leak the entry on the
+    // worker.
+    if (name === null || name === undefined) return
+    const key = normalizeCustomFormulaName(name)
     const current = get(customFormulaRegistryAtom)
-    if (!current.has(name)) return
+    if (!current.has(key)) return
     const next = new Map(current)
-    next.delete(name)
+    next.delete(key)
     set(customFormulaRegistryAtom, next)
   },
 )

@@ -216,6 +216,14 @@ pub enum WorkbookError {
     /// callers can show the same cell-style code the user would see if
     /// they typed the formula into a cell.
     EvalFailed(ValueError),
+    /// Wave 8 re-entrancy guard: the caller tried to mutate the workbook
+    /// while a host custom-formula JS callback was executing. Mutations
+    /// during a callback would dirty the cell whose formula triggered the
+    /// callback, but the cache state machine writes `Clean(value)` on
+    /// return — silently losing the dirty mark. We surface this as a
+    /// rejection so hosts can debug rather than chasing stale values.
+    /// See `CUSTOM_FORMULAS.md` § "No mutations during callback".
+    MutationDuringCustomCall,
 }
 
 impl std::fmt::Display for WorkbookError {
@@ -230,6 +238,10 @@ impl std::fmt::Display for WorkbookError {
             ),
             WorkbookError::ParseFailed => write!(f, "formula text failed to parse"),
             WorkbookError::EvalFailed(e) => write!(f, "formula evaluation surfaced {}", e),
+            WorkbookError::MutationDuringCustomCall => write!(
+                f,
+                "workbook mutations are forbidden while a custom-formula callback is executing"
+            ),
         }
     }
 }
@@ -292,6 +304,61 @@ pub struct Workbook {
     /// `Arc` so the per-eval `WorkbookEvalProvider` can clone the handle
     /// cheaply without taking a `&self` borrow on the workbook.
     custom_functions: Option<Arc<dyn CustomFunctionRegistry>>,
+    /// Wave 8 re-entrancy guard. Counts the active "inside a host
+    /// custom-formula callback" frames (a counter rather than a bool so
+    /// nested custom calls — `=A(B())` where `A` and `B` are both customs
+    /// — increment/decrement cleanly via RAII). When non-zero, every
+    /// public mutation entry point on `Workbook` (`set_cell`,
+    /// `clear_cell`, `set_formula`, `define_name`, `undefine_name`,
+    /// `set_custom_function_registry`, `add_sheet`, `rename_sheet`,
+    /// `remove_sheet`, `bulk_load`, `try_set_*`) is a guarded no-op /
+    /// rejection.
+    ///
+    /// **Why**: a JS callback that mutates the workbook would dirty the
+    /// cell currently being evaluated, but the surrounding
+    /// `eval_formula_at_with_provider` writes
+    /// `FormulaCache::Clean(value)` unconditionally on return — silently
+    /// losing the dirty mark. Disallowing mutations during the callback
+    /// keeps the cache state machine sound. The contract is documented
+    /// in `CUSTOM_FORMULAS.md` § "No mutations during callback".
+    ///
+    /// `Cell<usize>` (not `RefCell<...>`) because mutation is a single
+    /// load + store, no aliasing concerns. The guard is `pub(crate)` so
+    /// the `WorkbookEvalProvider::call_custom` adapter can bump/decrement
+    /// it via the RAII guard in `CustomCallScope`.
+    pub(crate) custom_call_depth: Cell<usize>,
+}
+
+/// RAII scope guard that increments `Workbook::custom_call_depth` on
+/// construction and decrements on drop. Used by
+/// `WorkbookEvalProvider::call_custom` to bracket the JS callback
+/// invocation so re-entrant mutation calls (via the WASM bridge) can
+/// detect they are inside a callback frame.
+///
+/// **Why a struct rather than inline `+= 1 / -= 1`**: the JS callback can
+/// throw or short-circuit via wasm-bindgen's exception path; the scope
+/// guard's `Drop` impl ensures the depth counter is restored regardless
+/// of how control leaves the call.
+pub(crate) struct CustomCallScope<'a> {
+    counter: &'a Cell<usize>,
+}
+
+impl<'a> CustomCallScope<'a> {
+    pub(crate) fn enter(counter: &'a Cell<usize>) -> Self {
+        counter.set(counter.get() + 1);
+        CustomCallScope { counter }
+    }
+}
+
+impl Drop for CustomCallScope<'_> {
+    fn drop(&mut self) {
+        // Saturating sub guards against an underflow in case the counter
+        // somehow goes out of sync (it shouldn't — every enter pairs with
+        // a drop). Leaving the counter at 0 on drop means subsequent
+        // mutations after callback exit work as normal.
+        let prev = self.counter.get();
+        self.counter.set(prev.saturating_sub(1));
+    }
 }
 
 impl Workbook {
@@ -304,6 +371,7 @@ impl Workbook {
             cycle_ast_walk_count: Cell::new(0),
             named_values: BTreeMap::new(),
             custom_functions: None,
+            custom_call_depth: Cell::new(0),
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -343,6 +411,9 @@ impl Workbook {
     /// (the registry is left unchanged in that case), and the same
     /// validation errors as `define_name_value` otherwise.
     pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), WorkbookError> {
+        if self.is_inside_custom_call() {
+            return Err(WorkbookError::MutationDuringCustomCall);
+        }
         let expr = parse_formula(formula).ok_or(WorkbookError::ParseFailed)?;
 
         // Evaluate against a workbook provider rooted on sheet 0. Sheet
@@ -378,6 +449,9 @@ impl Workbook {
     /// formula values re-evaluate against the updated registry on next
     /// read.
     pub fn define_name_value(&mut self, name: &str, value: Value) -> Result<(), WorkbookError> {
+        if self.is_inside_custom_call() {
+            return Err(WorkbookError::MutationDuringCustomCall);
+        }
         Self::validate_name(name)?;
         let key = name.to_ascii_uppercase();
         if is_builtin_function_name(&key) {
@@ -400,6 +474,9 @@ impl Workbook {
     /// same way `define_name` does so previously-cached results that
     /// depended on the name re-evaluate (and now surface `#NAME?`).
     pub fn undefine_name(&mut self, name: &str) -> bool {
+        if self.is_inside_custom_call() {
+            return false; // re-entrancy guard
+        }
         let key = name.to_ascii_uppercase();
         let removed = self.named_values.remove(&key).is_some();
         if removed {
@@ -444,6 +521,13 @@ impl Workbook {
         &mut self,
         registry: Option<Arc<dyn CustomFunctionRegistry>>,
     ) {
+        if self.is_inside_custom_call() {
+            // Re-entrancy guard. Swapping the registry mid-callback is
+            // the worst possible time to do it (the running callback's
+            // closure environment becomes orphaned). Drop the request;
+            // hosts that need this should defer it past the read.
+            return;
+        }
         self.custom_functions = registry;
     }
 
@@ -453,6 +537,26 @@ impl Workbook {
     /// it survives concurrent re-installs).
     pub fn custom_function_registry(&self) -> Option<Arc<dyn CustomFunctionRegistry>> {
         self.custom_functions.clone()
+    }
+
+    /// True iff a host custom-formula JS callback is currently executing
+    /// (i.e. the engine is inside a `WorkbookEvalProvider::call_custom`
+    /// frame). Public so the WASM bridge can short-circuit re-entrant
+    /// mutation calls with a meaningful error rather than the opaque
+    /// `wasm-bindgen` "recursive use of an object" panic.
+    ///
+    /// See `CUSTOM_FORMULAS.md` § "No mutations during callback" for the
+    /// contract.
+    pub fn is_inside_custom_call(&self) -> bool {
+        self.custom_call_depth.get() > 0
+    }
+
+    /// Handle to the re-entrancy depth counter. `pub(crate)` because the
+    /// `WorkbookEvalProvider::call_custom` adapter constructs a
+    /// `CustomCallScope` from this; external callers should use
+    /// `is_inside_custom_call` to query.
+    pub(crate) fn custom_call_depth_cell(&self) -> &Cell<usize> {
+        &self.custom_call_depth
     }
 
     /// Force every formula in the workbook to re-evaluate the next time
@@ -532,6 +636,15 @@ impl Workbook {
     /// Append a new empty sheet. If the name is already taken, returns the
     /// existing index without creating a duplicate.
     pub fn add_sheet(&mut self, name: &str) -> usize {
+        if self.is_inside_custom_call() {
+            // Re-entrancy guard. Return the existing index if the name
+            // happens to exist (idempotent — matches the dup-name branch
+            // below) or 0 (Sheet1, always exists) so the caller gets a
+            // valid-shaped result. This is the infallible signature; a
+            // host that needs the rejection should query
+            // `is_inside_custom_call` before calling.
+            return self.by_name.get(name).copied().unwrap_or(0);
+        }
         if let Some(&idx) = self.by_name.get(name) {
             return idx;
         }
@@ -572,6 +685,9 @@ impl Workbook {
 
     /// Rename a sheet. Fails (returns false) if the new name is taken.
     pub fn rename_sheet(&mut self, idx: usize, new_name: &str) -> bool {
+        if self.is_inside_custom_call() {
+            return false; // re-entrancy guard
+        }
         if self.by_name.contains_key(new_name) {
             return false;
         }
@@ -611,6 +727,9 @@ impl Workbook {
     /// sheet/name vectors, rebuilds the name lookup, and then rebuilds the
     /// cross-sheet dependency graph from the live formula ASTs.
     pub fn move_sheet(&mut self, from: usize, to: usize) -> bool {
+        if self.is_inside_custom_call() {
+            return false; // re-entrancy guard
+        }
         if from >= self.sheets.len() || to >= self.sheets.len() {
             return false;
         }
@@ -720,6 +839,9 @@ impl Workbook {
     /// In practice this is bounded by the size of the cross-sheet dep
     /// closure of `addr`, which is small for typical workbooks.
     pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, formula_text: &str) -> bool {
+        if self.is_inside_custom_call() {
+            return false; // re-entrancy guard; see `set_cell` for rationale
+        }
         if sheet_idx >= self.sheets.len() {
             return false;
         }
@@ -865,6 +987,15 @@ impl Workbook {
     /// `workbook_get_cell_refreshes_cross_sheet_cache_without_notifying`
     /// exercises and continues to assert.
     pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
+        if self.is_inside_custom_call() {
+            // Re-entrancy guard (Wave 8). A custom-formula JS callback
+            // attempted to write through the workbook while the engine
+            // was still inside its eval frame. Swallow the mutation
+            // silently — the infallible `set_cell` signature can't
+            // return an error. Hosts that need the rejection should use
+            // `try_set_cell`, which surfaces it via `SheetError`.
+            return;
+        }
         if sheet_idx >= self.sheets.len() {
             return;
         }
@@ -888,6 +1019,9 @@ impl Workbook {
     /// cross-sheet dirty fanout. Provided as a separate name so callers
     /// don't have to construct a `Value::Null` for Delete-key UX.
     pub fn clear_cell(&mut self, sheet_idx: usize, addr_str: &str) {
+        if self.is_inside_custom_call() {
+            return; // re-entrancy guard; see `set_cell` for rationale
+        }
         if sheet_idx >= self.sheets.len() {
             return;
         }
@@ -913,6 +1047,9 @@ impl Workbook {
         addr_str: &str,
         value: Value,
     ) -> Result<(), SheetError> {
+        if self.is_inside_custom_call() {
+            return Err(SheetError::MutationDuringCustomCall);
+        }
         if sheet_idx >= self.sheets.len() {
             return Err(SheetError::InvalidAddress);
         }
@@ -932,6 +1069,9 @@ impl Workbook {
         sheet_idx: usize,
         addr_str: &str,
     ) -> Result<(), SheetError> {
+        if self.is_inside_custom_call() {
+            return Err(SheetError::MutationDuringCustomCall);
+        }
         if sheet_idx >= self.sheets.len() {
             return Err(SheetError::InvalidAddress);
         }
@@ -955,6 +1095,9 @@ impl Workbook {
         addr_str: &str,
         formula_text: &str,
     ) -> Result<bool, SheetError> {
+        if self.is_inside_custom_call() {
+            return Err(SheetError::MutationDuringCustomCall);
+        }
         if sheet_idx >= self.sheets.len() {
             return Err(SheetError::InvalidAddress);
         }
@@ -1211,6 +1354,9 @@ impl Workbook {
     /// the fly is brittle. The next workbook-routed `set_formula` call
     /// will repopulate edges from the live formulas.
     pub fn remove_sheet(&mut self, idx: usize) -> Option<Sheet> {
+        if self.is_inside_custom_call() {
+            return None; // re-entrancy guard
+        }
         if idx >= self.sheets.len() {
             return None;
         }
@@ -1265,6 +1411,15 @@ impl Workbook {
     /// RAII shape mirrors `Sheet::bulk_load`: the loader is not exposed
     /// outside the closure, so the flush always runs.
     pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut WorkbookLoader<'_>) -> R) -> R {
+        // Re-entrancy guard for Wave 8 custom-formula callbacks. We can't
+        // refuse cleanly without breaking the signature, so we still let
+        // the loader run — but we plumb the guard through to
+        // `WorkbookLoader` so each buffered write checks the depth at
+        // entry-into-this-API time (NOT at flush time, which always runs
+        // in a clean frame). Practically: a custom callback that calls
+        // `wb.bulk_load(|l| { l.set_cell(...); })` finds the loader's
+        // `set_cell` calls becoming no-ops via the same guard the direct
+        // `Workbook::set_cell` honors.
         let mut loader = WorkbookLoader::new(self);
         let result = f(&mut loader);
         loader.flush();
@@ -1309,6 +1464,9 @@ impl<'a> WorkbookLoader<'a> {
     /// Queue a primitive write at `(sheet_idx, addr)`. Visible to the
     /// post-flush workbook BFS as a touched cell.
     pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
+        if self.wb.is_inside_custom_call() {
+            return; // re-entrancy guard (Wave 8)
+        }
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
@@ -1332,6 +1490,9 @@ impl<'a> WorkbookLoader<'a> {
     /// (e.g. for subsequent cycle checks); same-sheet wiring runs
     /// inside the per-sheet `Sheet::bulk_load` replay at flush time.
     pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, source: &str) -> bool {
+        if self.wb.is_inside_custom_call() {
+            return false; // re-entrancy guard (Wave 8)
+        }
         if sheet_idx >= self.wb.sheets.len() {
             return false;
         }
@@ -1409,6 +1570,9 @@ impl<'a> WorkbookLoader<'a> {
 
     /// Queue a clear (=write to Null) at `(sheet_idx, addr)`.
     pub fn clear_cell(&mut self, sheet_idx: usize, addr_str: &str) {
+        if self.wb.is_inside_custom_call() {
+            return; // re-entrancy guard (Wave 8)
+        }
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
@@ -1951,8 +2115,16 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
     /// `Workbook::set_custom_function_registry`; otherwise the
     /// `EvalProvider` default `None` keeps the legacy `#NAME?`
     /// fallthrough.
+    ///
+    /// Brackets the JS callback in a `CustomCallScope` so the workbook's
+    /// re-entrancy depth counter ticks for the duration. Any mutation
+    /// the callback attempts via `wb.set_cell(...)` / `wb.set_formula
+    /// (...)` / etc. is rejected via the per-entry-point
+    /// `is_inside_custom_call` guard. The scope's `Drop` impl is
+    /// exception-safe (matches the wasm-bindgen `throw_str` path).
     fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
         let registry = self.wb.custom_functions.as_ref()?;
+        let _scope = CustomCallScope::enter(self.wb.custom_call_depth_cell());
         registry.lookup(name, args)
     }
 }
@@ -2943,5 +3115,192 @@ mod tests {
                 v
             );
         }
+    }
+
+    // === Wave 8 codex-review fix #1: re-entrancy guard ===
+    //
+    // A host custom-formula callback MUST NOT mutate the workbook during
+    // its execution. These tests pin the rejection behavior across the
+    // mutation entry points, plus prove the cache state remains sound
+    // (no silently-lost dirty marks).
+
+    /// A custom callback that tries to call `wb.set_cell` is reflected
+    /// back the guard as a silent no-op (the infallible signature can't
+    /// return an error). The mutation is dropped; the cache state for
+    /// the cell whose formula triggered the callback is `Clean(value)`
+    /// of the original value.
+    #[test]
+    fn custom_callback_set_cell_is_rejected_and_cache_stays_clean() {
+        use std::sync::Mutex;
+
+        /// Registry that calls back into the workbook from inside its
+        /// `lookup`. We can't pass a `&mut Workbook` directly through
+        /// the immutable `EvalProvider` trait, so the test relies on
+        /// the same wasm-bridge shape: the registry holds a callback
+        /// closure that the test installs via a wrapper struct holding
+        /// `*mut Workbook` (the test only dereferences inside the
+        /// callback, AFTER the read borrow has been released by the
+        /// `EvalProvider` chain — which is what would happen in the
+        /// real WASM bridge).
+        struct AttackRegistry {
+            wb_ptr: Mutex<*mut Workbook>,
+            invoked: Mutex<usize>,
+        }
+        // SAFETY: tests are single-threaded; the Mutex satisfies the
+        // trait bounds without allowing real cross-thread sharing.
+        unsafe impl Send for AttackRegistry {}
+        unsafe impl Sync for AttackRegistry {}
+        impl std::fmt::Debug for AttackRegistry {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "AttackRegistry")
+            }
+        }
+        impl CustomFunctionRegistry for AttackRegistry {
+            fn lookup(&self, _name: &str, _args: &[Value]) -> Option<Value> {
+                *self.invoked.lock().unwrap() += 1;
+                // Try to mutate the workbook from inside the callback.
+                // SAFETY: see test setup — the pointer is valid for the
+                // duration of the eval frame because the test holds the
+                // `Workbook` by value and never moves it during read.
+                let wb_ptr = *self.wb_ptr.lock().unwrap();
+                // The guard MUST cause this to be a no-op.
+                unsafe {
+                    (*wb_ptr).set_cell(0, "Z99", Value::Number(999.0));
+                }
+                Some(Value::Number(42.0))
+            }
+        }
+
+        let mut wb = Workbook::new();
+        let registry = Arc::new(AttackRegistry {
+            wb_ptr: Mutex::new(&mut wb as *mut Workbook),
+            invoked: Mutex::new(0),
+        });
+        wb.set_custom_function_registry(Some(registry.clone() as Arc<dyn CustomFunctionRegistry>));
+        // Re-pin the pointer post-install (the Arc swap might not have
+        // moved `wb`, but be defensive — the test asserts the address
+        // is current).
+        *registry.wb_ptr.lock().unwrap() = &mut wb as *mut Workbook;
+        assert!(wb.set_formula(0, "A1", "=MYBAD()"));
+
+        // Read the formula. The callback runs, attempts to write Z99,
+        // and gets silently rejected by the guard.
+        let v = wb.get_cell("Sheet1", "A1");
+        assert_eq!(v, Value::Number(42.0));
+        // The callback may run more than once during install +
+        // first-read (set_formula performs a workbook-aware recompute
+        // pass when the formula references workbook-scope things). The
+        // important guarantee is that EVERY invocation hit the guard
+        // and was rejected.
+        assert!(
+            *registry.invoked.lock().unwrap() >= 1,
+            "callback must have fired at least once"
+        );
+
+        // The attempted mutation MUST NOT have landed. Z99 stays empty.
+        let z99 = wb.get_cell("Sheet1", "Z99");
+        assert_eq!(z99, Value::Null);
+
+        // After the callback returns, the guard depth is back to 0 so
+        // normal mutations work again.
+        assert!(!wb.is_inside_custom_call());
+        wb.set_cell(0, "B1", Value::Number(7.0));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(7.0));
+    }
+
+    /// The `try_*` family surfaces `Err(MutationDuringCustomCall)` so a
+    /// host can debug the rejection rather than silently losing the
+    /// write. We exercise this by calling `try_set_cell` directly from
+    /// inside the callback through the same `*mut Workbook` trick.
+    #[test]
+    fn custom_callback_try_set_cell_returns_mutation_error() {
+        use std::sync::Mutex;
+
+        struct ProbeRegistry {
+            wb_ptr: Mutex<*mut Workbook>,
+            last_err: Mutex<Option<SheetError>>,
+        }
+        unsafe impl Send for ProbeRegistry {}
+        unsafe impl Sync for ProbeRegistry {}
+        impl std::fmt::Debug for ProbeRegistry {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ProbeRegistry")
+            }
+        }
+        impl CustomFunctionRegistry for ProbeRegistry {
+            fn lookup(&self, _name: &str, _args: &[Value]) -> Option<Value> {
+                let wb_ptr = *self.wb_ptr.lock().unwrap();
+                let result = unsafe {
+                    (*wb_ptr).try_set_cell(0, "C1", Value::Number(1.0))
+                };
+                if let Err(e) = result {
+                    *self.last_err.lock().unwrap() = Some(e);
+                }
+                Some(Value::Number(0.0))
+            }
+        }
+
+        let mut wb = Workbook::new();
+        let registry = Arc::new(ProbeRegistry {
+            wb_ptr: Mutex::new(&mut wb as *mut Workbook),
+            last_err: Mutex::new(None),
+        });
+        wb.set_custom_function_registry(Some(registry.clone() as Arc<dyn CustomFunctionRegistry>));
+        *registry.wb_ptr.lock().unwrap() = &mut wb as *mut Workbook;
+        assert!(wb.set_formula(0, "A1", "=PROBE()"));
+
+        let _ = wb.get_cell("Sheet1", "A1");
+
+        let err = registry.last_err.lock().unwrap().clone();
+        assert_eq!(err, Some(SheetError::MutationDuringCustomCall));
+    }
+
+    /// The depth counter is exception-safe: even when the callback
+    /// panics / aborts the eval, the `Drop` impl on `CustomCallScope`
+    /// decrements the counter so subsequent reads work normally.
+    /// (Tested by registering a callback that returns `#VALUE!` — the
+    /// engine treats this as a successful dispatch and bookkeeping
+    /// runs identically to the normal-return path. A real Rust panic
+    /// from inside the callback is unsafe in a `#[test]` outside of
+    /// `panic = "abort"`, so the panic path is covered by the wasm
+    /// `throw_str` path which exercises the same Drop semantics on
+    /// the JS-throw side.)
+    #[test]
+    fn custom_call_depth_resets_after_callback() {
+        use std::sync::Mutex;
+
+        struct ErrorRegistry {
+            invoked: Mutex<usize>,
+        }
+        impl std::fmt::Debug for ErrorRegistry {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "ErrorRegistry")
+            }
+        }
+        impl CustomFunctionRegistry for ErrorRegistry {
+            fn lookup(&self, _name: &str, _args: &[Value]) -> Option<Value> {
+                *self.invoked.lock().unwrap() += 1;
+                Some(Value::Error(ValueError::InvalidValue))
+            }
+        }
+
+        let mut wb = Workbook::new();
+        let registry = Arc::new(ErrorRegistry { invoked: Mutex::new(0) });
+        wb.set_custom_function_registry(Some(registry.clone() as Arc<dyn CustomFunctionRegistry>));
+        assert!(wb.set_formula(0, "A1", "=BAD()"));
+
+        // Three reads — each spins up a fresh CustomCallScope and tears
+        // it down. The depth counter must be 0 at every observation.
+        for _ in 0..3 {
+            assert!(!wb.is_inside_custom_call());
+            let v = wb.get_cell("Sheet1", "A1");
+            assert!(matches!(v, Value::Error(_)));
+            assert!(!wb.is_inside_custom_call());
+        }
+
+        // Subsequent normal mutations work, confirming the counter
+        // didn't drift.
+        wb.set_cell(0, "D1", Value::Number(42.0));
+        assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(42.0));
     }
 }

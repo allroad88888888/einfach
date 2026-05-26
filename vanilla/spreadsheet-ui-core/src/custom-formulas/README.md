@@ -13,6 +13,12 @@ function travelling across `postMessage`: closures cannot be cloned, and
 state. Asking the host for a body string is both cheaper and safer —
 the only thing the worker can see is the explicit `args` array.
 
+**Authoritative engine contract:** `rust/excel-core/src/CUSTOM_FORMULAS.md`
+documents the WASM-side marshaling, error-token round-tripping, and the
+exact precedence order the evaluator uses to resolve a name. This file
+is the JS-side host API; the Rust doc wins on any disagreement about
+the value boundary.
+
 ## State Decision Template
 
 - Source atom:
@@ -48,14 +54,48 @@ the only thing the worker can see is the explicit `args` array.
 
 ## Name rules
 
-- Regex: `/^[A-Z][A-Z0-9_.]*$/`.
-- Must not shadow a name in `BUILTIN_FORMULA_NAMES` (built from the
-  seed registry under `formula-functions/registry.ts`). The Rust engine
-  ships many more built-ins than this list — shadowing one not in the
-  list will succeed at register time and silently override on the WASM
-  side, which is Excel-compatible (last registration wins).
+- Regex: `/^[A-Z][A-Z0-9_.]*$/`. The register / unregister atoms
+  normalize the name to upper-case before mutating the map, so
+  `'mytax'` and `'MYTAX'` resolve to the same registry slot.
+- Must not shadow a name in `BUILTIN_FORMULA_NAMES`. That set unions
+  two sources:
+  1. `ENGINE_BUILTIN_FORMULA_NAMES` — the authoritative mirror of the
+     Rust evaluator's `is_builtin_function_name` arms, auto-generated
+     by `scripts/extract-builtin-names.mjs` from
+     `rust/excel-core/src/eval.rs` (currently 426 names including
+     `LAMBDA`, `LET`, `IFERROR`, `XLOOKUP`, `MAP`, `REDUCE`, …).
+  2. `FORMULA_FUNCTION_SPECS` — the IntelliSense seed registry under
+     `formula-functions/registry.ts`.
 - Re-registering an existing custom name silently replaces the previous
   source / metadata (Excel semantics).
+
+If the Rust engine adds a new built-in arm, re-run
+`node vanilla/spreadsheet-ui-core/scripts/extract-builtin-names.mjs`
+to refresh `engine-builtin-names.ts`.
+
+## JS callback signature
+
+The worker compiles the registered `source` into:
+
+```ts
+(args: ReadonlyArray<CustomFormulaArg>) => CustomFormulaReturn
+```
+
+A scalar arg (`=MYFN(B2)`) lands in `args[i]` as a
+`CustomFormulaScalar` (`number | string | boolean | null`). A range
+arg (`=MYFN(A1:A10)` / `=MYFN(A1:C5)`) lands in `args[i]` as a 2-D
+`ReadonlyArray<ReadonlyArray<CustomFormulaScalar>>` because the WASM
+bridge marshals `Value::Array` directly to a nested JS array (row-major).
+
+Defensive bodies should branch on `Array.isArray(args[i])` and fall
+back to a single-cell projection — see the `SUMSQ2` demo in
+`solid/excel/src-vnext/demos/VNextWorkerDemo.tsx`:
+
+```js
+// =SUMSQ2(A1:A10)
+const xs = Array.isArray(args[0]) ? args[0].flat() : [args[0]]
+return xs.reduce((s, v) => s + Number(v) * Number(v), 0)
+```
 
 ## Source-string contract
 
@@ -70,11 +110,39 @@ Returning `undefined` is treated the same as returning `null`.
 
 Plain-value contract (see `CustomFormulaArg` / `CustomFormulaReturn`):
 
-| direction | shape                                                  |
-| --------- | ------------------------------------------------------ |
-| in        | `Array<number \| string \| boolean \| null>`           |
-| out       | `number \| string \| boolean \| null \| undefined`     |
+| direction | shape                                                                              |
+| --------- | ---------------------------------------------------------------------------------- |
+| in        | `Array<CustomFormulaScalar \| ReadonlyArray<ReadonlyArray<CustomFormulaScalar>>>`  |
+| out       | `number \| string \| boolean \| null \| undefined`                                 |
 
-The Rust engine never passes a `Value::Array` into a JS callback; array
-results from formulas collapse to their top-left scalar at the WASM
-boundary, so this scalar-only union is exhaustive for MVP.
+where `CustomFormulaScalar = number | string | boolean | null`. See
+`rust/excel-core/src/CUSTOM_FORMULAS.md` "Marshaling" for the full
+JsValue ↔ Value mapping, including the structured-error return form
+(`{ error: '#DIV/0!' }`) and the Excel error tokens that round-trip
+back to `Value::Error`.
+
+## Dependency tracking
+
+Custom formulas track **only the dependencies the parser sees**:
+`=MYFN(B2, C3:C10)` registers `B2` and the `C3:C10` range as deps of
+the cell, so mutating any of those re-evaluates `MYFN`.
+
+Custom callbacks **must not read cells via a side channel**. The MVP
+host API does not expose a workbook getter inside the callback — the
+only inputs are the explicit `args` array — so there's no foot-gun to
+hit today, but the rule is load-bearing for any future API addition:
+
+- A future `args.workbook.getCell('Sheet1!B2')` (or similar) would
+  require the registration site to declare the extra deps explicitly,
+  e.g. via a `deps: string[]` field on `CustomFormulaRegistration`.
+  Without that the engine has no edge to dirty when the side-read cell
+  mutates, and the callback's cached result silently drifts.
+- The Rust evaluator's invalidation path
+  (`invalidate_all_formulas_for_custom_function_change`) only fires on
+  register / unregister, not on cell mutation. It is intentionally
+  a sledgehammer for source-replacement; per-cell dep tracking for
+  side reads is **out of scope** for this wave.
+
+If you find yourself wanting a side-channel read, file an issue
+referencing `TODO(custom-formula-deps)` so the engine + UI tracks the
+new contract together.

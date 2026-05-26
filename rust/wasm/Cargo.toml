@@ -25,6 +25,9 @@ console_error_panic_hook = "0.1"
 # `npm run build:wasm` does not blow up. No-op for non-wasm builds.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
+# `console::warn_1` for the Wave 8 custom-formula error-message bridge.
+# Only used on wasm; native build path drops the log via cfg.
+web-sys = { version = "0.3", features = ["console"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
