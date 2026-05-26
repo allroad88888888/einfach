@@ -19,6 +19,7 @@ import {
   MAX_FIND_PAGE,
 } from '@einfach/spreadsheet-ui-core'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
+import { refreshVisibleProjection } from '../provider/projection-refresh'
 import './find-replace-dialog.css'
 
 export interface SpreadsheetFindReplaceDialogProps {
@@ -175,6 +176,10 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
       })
       return
     }
+    // The grid renders from a cached visible-projection atom and the dialog
+    // bypasses the toolbar's command pipeline, so a manual refresh is needed
+    // to flush the rewritten cells to the DOM after the mutation lands.
+    await refreshVisibleProjection(store, backend, match.sheetId)
     await runSearch()
   }
 
@@ -182,6 +187,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     if (!backend.replaceMatches) return
     const c = cursor()
     if (c.pageMatches.length === 0) return
+    const sheetId = c.pageMatches[0].sheetId
     try {
       await backend.replaceMatches({
         kind: 'replace-matches',
@@ -200,6 +206,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
       })
       return
     }
+    await refreshVisibleProjection(store, backend, sheetId)
     await runSearch()
   }
 

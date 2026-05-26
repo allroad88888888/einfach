@@ -2350,6 +2350,62 @@ export function createStaticSpreadsheetBackend(
         revision: request.revision ?? state.revision,
       }
     },
+    async replaceMatches(request) {
+      beginUndoableMutation(state)
+      // Group coords by sheet so each sheet's cell map is fetched once. We
+      // sort coords within a cell by matchStart DESC so earlier replacements
+      // don't shift later indices — defensive only; searchRange currently
+      // emits one match per cell.
+      const bySheet = new Map<string, typeof request.coords>()
+      for (const c of request.coords) {
+        const list = bySheet.get(c.sheetId) ?? []
+        list.push(c)
+        bySheet.set(c.sheetId, list)
+      }
+      let replacedCount = 0
+      for (const [sheetId, coords] of bySheet) {
+        const cells = getOrCreateSheetCells(state, sheetId)
+        // Bucket by cell key, descending by matchStart.
+        const byKey = new Map<string, typeof coords>()
+        for (const c of coords) {
+          const key = keyFor(c.coord.row, c.coord.col)
+          const list = byKey.get(key) ?? []
+          list.push(c)
+          byKey.set(key, list)
+        }
+        for (const [key, list] of byKey) {
+          const cell = cells.get(key)
+          if (!cell) continue
+          // Decide which string to splice — formula text takes precedence
+          // when present (mirroring `searchRange`'s `searchFormulas` path).
+          const useFormula = cell.formula !== undefined
+          const haystack = useFormula ? (cell.formula as string) : cell.displayValue
+          list.sort((a, b) => b.matchStart - a.matchStart)
+          let next = haystack
+          for (const m of list) {
+            const start = Math.max(0, Math.min(m.matchStart, next.length))
+            const end = Math.max(start, Math.min(m.matchEnd, next.length))
+            next = next.slice(0, start) + request.replacement + next.slice(end)
+            replacedCount += 1
+          }
+          // Re-route through updateCell so formula detection / numeric
+          // inference / blank-on-empty all behave like a fresh edit.
+          updateCell(cells, {
+            kind: 'set-cell-input',
+            sheetId,
+            row: cell.row,
+            col: cell.col,
+            input: next,
+          })
+        }
+      }
+      state.revision = bumpRevision(state.revision)
+      return {
+        replacedCount,
+        requestId: request.requestId,
+        revision: request.revision ?? state.revision,
+      }
+    },
     async fillRange(request) {
       beginUndoableMutation(state)
       applyFillRange(state, request)

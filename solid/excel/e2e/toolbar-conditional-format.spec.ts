@@ -80,4 +80,44 @@ test.describe('Wave 5 toolbar — conditional formatting', () => {
     await dialog.getByTestId('dialog-close-x').click()
     await expect(dialog).toBeHidden()
   })
+
+  /**
+   * Round-trip the default `cell-value gt 0` rule into the projection so
+   * the spec proves the toolbar entry point actually paints cells — not
+   * just that the dialog renders its controls. Selecting B2 (=120) and
+   * saving with the default kind installs a rule scoped to the selection
+   * with `format: { bgColor: '#fef3c7' }`; the static backend's projection
+   * then merges that bgColor onto the cell, and the grid translates it
+   * into a `<td style="background:…">` declaration the assertion can read.
+   */
+  test('saving the default rule paints the matching cell with bgColor #fef3c7', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    const target = 'B2'
+    // Wave 5 seed: B2 = 120 (matrix North/Q1), a positive number that the
+    // default cell-value-gt-0 rule will match.
+    await cell(page, target).click()
+    await conditionalFormatButton(page).click()
+    const dialog = conditionalFormatDialog(page)
+    await expect(dialog).toBeVisible()
+
+    // Default kind is `cell-value` and dialog auto-saves the default
+    // template — no further input needed.
+    await dialog.getByTestId('cf-save-button').click()
+    await expect(dialog).toBeHidden()
+
+    // 1) The cell carries the dataset flag so future per-cell debugging
+    //    can locate it without re-deriving the format mapping.
+    await expect(cell(page, target)).toHaveAttribute('data-has-conditional-format', 'true')
+
+    // 2) The grid's `getCellBackgroundStyle` resolves the rule's bgColor
+    //    onto the `<td>` inline style. Browsers normalize the hex to rgb,
+    //    so we read the computed value rather than asserting the literal.
+    const bg = await cell(page, target).evaluate((el) => {
+      return window.getComputedStyle(el as HTMLElement).backgroundColor
+    })
+    // #fef3c7 → rgb(254, 243, 199)
+    expect(bg).toBe('rgb(254, 243, 199)')
+  })
 })
