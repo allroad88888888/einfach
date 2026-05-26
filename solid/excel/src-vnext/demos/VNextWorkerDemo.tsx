@@ -262,6 +262,11 @@ export function VNextWorkerDemo() {
         <p class="demo-desc">
           vNext UI backed by the Rust workbook worker through the framework-agnostic backend port.
         </p>
+        <p class="demo-desc" data-testid="custom-formulas-banner">
+          Custom formulas registered: <code>MYTAX</code>, <code>GREET</code>, <code>CELSIUS</code>,{' '}
+          <code>SUMSQ2</code>. Try <code>=MYTAX(B4)</code> or <code>=SUMSQ2(B2:B4)</code> in any
+          cell.
+        </p>
       </div>
 
       <SpreadsheetUiProvider backend={backend}>

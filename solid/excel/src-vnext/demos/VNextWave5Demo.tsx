@@ -12,6 +12,7 @@ import {
   viewportShowFormulaBarAtom,
   workspaceSessionAtom,
 } from '@einfach/spreadsheet-ui-core'
+import { removeDuplicatesSheetIdAtom } from '../provider'
 import { createStaticSpreadsheetBackend } from '../adapter'
 import { SpreadsheetCommentThread } from '../comments'
 import { SpreadsheetConditionalFormatDialog } from '../conditional-formatting'
@@ -183,6 +184,12 @@ function VNextWave5Workbook() {
       requestId: 0,
       reason: 'toolbar',
     })
+    // Capture the sheetId BEFORE flipping the open flag so the confirm
+    // flow operates on the sheet the dialog was scanning, even if the
+    // user navigates to another sheet mid-dialog (HIGH bug: wrong-sheet
+    // deletion race). Mirrors the menubar dispatcher's two-write
+    // transaction.
+    store.setter(removeDuplicatesSheetIdAtom, sheetId)
     store.setter(openRemoveDuplicatesAtom, {
       startRow: range.rowStart,
       startCol: range.colStart,

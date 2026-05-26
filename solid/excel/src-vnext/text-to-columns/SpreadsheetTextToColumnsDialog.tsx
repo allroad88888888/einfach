@@ -582,6 +582,7 @@ function Step3(props: Step3Props) {
                   value="date"
                   disabled
                   title={t('textToColumns.step3.format.dateUnsupported')}
+                  data-testid={`ttc-format-${col}-date`}
                 >
                   {t('textToColumns.step3.format.date')}
                 </option>
