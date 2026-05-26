@@ -1,0 +1,299 @@
+/* Go To / Go To Special dialog — Wave 7.4.
+ *
+ * Layout mirrors the Find & Replace dialog (header / tab strip / body /
+ * footer) so users get muscle memory for the chrome. Tab strip toggles
+ * between the simple Go To field and the radio-list Special pane.
+ */
+
+.go-to-dialog {
+  width: 420px;
+  min-width: 420px !important;
+  max-width: 420px !important;
+  min-height: 320px;
+  border-radius: 6px !important;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18) !important;
+  padding: 0 !important;
+}
+
+.vnext-demo .go-to-dialog > *,
+.demo-page .go-to-dialog > *,
+.go-to-dialog > * {
+  padding: 0;
+}
+
+.go-to-dialog .gt-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 40px;
+  padding: 0 14px !important;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+  background: #ffffff;
+}
+
+.go-to-dialog .gt-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-default, #1a1a1a);
+  user-select: none;
+}
+
+.go-to-dialog .dialog-close-x {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #6a6a6a);
+  font-size: 18px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.go-to-dialog .dialog-close-x:hover {
+  background: var(--hover, #f0f0f0);
+  color: var(--text-default, #1a1a1a);
+}
+
+.go-to-dialog .gt-tabs {
+  display: flex;
+  gap: 24px;
+  padding: 0 16px !important;
+  border-bottom: 1px solid var(--border, #e5e5e5);
+  background: #ffffff;
+}
+
+.go-to-dialog .gt-tab {
+  position: relative;
+  height: 36px;
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted, #6a6a6a);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 100ms ease-out;
+}
+
+.go-to-dialog .gt-tab:hover {
+  color: var(--text-default, #1a1a1a);
+}
+
+.go-to-dialog .gt-tab[aria-selected='true'] {
+  color: var(--office-blue, #0078d4);
+  font-weight: 600;
+}
+
+.go-to-dialog .gt-tab[aria-selected='true']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--office-blue, #0078d4);
+  border-radius: 1px;
+}
+
+.go-to-dialog .gt-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px !important;
+  background: #ffffff;
+}
+
+.go-to-dialog .gt-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.go-to-dialog .gt-field-label {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+}
+
+.go-to-dialog .gt-input {
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  color: var(--text-default, #1a1a1a);
+  transition: border-color 100ms ease-out, box-shadow 100ms ease-out;
+}
+
+.go-to-dialog .gt-input:focus {
+  outline: none;
+  border-color: var(--office-blue, #0078d4);
+  box-shadow: 0 0 0 2px rgba(0, 120, 212, 0.18);
+}
+
+.go-to-dialog .gt-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.go-to-dialog .gt-history-label {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+}
+
+.go-to-dialog .gt-history-empty {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+  font-style: italic;
+}
+
+.go-to-dialog .gt-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 4px;
+}
+
+.go-to-dialog .gt-history-item {
+  display: block;
+  width: 100%;
+  padding: 4px 8px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  color: var(--text-default, #1a1a1a);
+  cursor: pointer;
+}
+
+.go-to-dialog .gt-history-item:hover {
+  background: var(--hover, #f0f0f0);
+}
+
+.go-to-dialog .gt-locator-group {
+  border: 1px solid var(--border, #e5e5e5);
+  border-radius: 4px;
+  padding: 8px 12px;
+  margin: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+}
+
+.go-to-dialog .gt-locator-group legend {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+}
+
+.go-to-dialog .gt-radio {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-default, #1a1a1a);
+  cursor: pointer;
+  user-select: none;
+}
+
+.go-to-dialog .gt-radio input[type='radio'] {
+  margin: 0;
+  accent-color: var(--office-blue, #0078d4);
+  cursor: pointer;
+}
+
+.go-to-dialog .gt-radio-disabled {
+  color: var(--text-muted, #9a9a9a);
+  cursor: not-allowed;
+}
+
+.go-to-dialog .gt-radio-disabled input[type='radio'] {
+  cursor: not-allowed;
+}
+
+.go-to-dialog .gt-subtype {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.go-to-dialog .gt-select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  font: inherit;
+  font-size: 13px;
+}
+
+.go-to-dialog .gt-truncated {
+  font-size: 12px;
+  color: var(--text-muted, #6a6a6a);
+  font-style: italic;
+}
+
+.go-to-dialog .gt-error {
+  padding: 0 16px 8px !important;
+  font-size: 12px;
+  color: #c0392b;
+  background: #ffffff;
+}
+
+.go-to-dialog .gt-footer {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  height: 48px;
+  padding: 0 16px !important;
+  border-top: 1px solid var(--border, #e5e5e5);
+  background: var(--bg-chrome-light, #fafafa);
+}
+
+.go-to-dialog .gt-btn {
+  height: 28px;
+  min-width: 64px;
+  padding: 0 14px;
+  border: 1px solid var(--border, #d4d4d4);
+  border-radius: 4px;
+  background: #ffffff;
+  color: var(--text-default, #1a1a1a);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.go-to-dialog .gt-btn:hover:not(:disabled) {
+  background: var(--hover, #f0f0f0);
+  border-color: var(--border-strong, #b0b0b0);
+}
+
+.go-to-dialog .gt-btn-primary {
+  background: var(--office-blue, #0078d4);
+  border-color: var(--office-blue, #0078d4);
+  color: #ffffff;
+}
+
+.go-to-dialog .gt-btn-primary:hover:not(:disabled) {
+  background: #006cbe;
+  border-color: #006cbe;
+}
+
+.go-to-dialog .gt-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

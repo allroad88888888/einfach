@@ -1,8 +1,10 @@
 import { useAtomValue } from '@einfach/solid'
-import { onMount, Show } from 'solid-js'
+import { onCleanup, onMount, Show } from 'solid-js'
 import {
+  openTextToColumnsAtom,
   selectCellAtom,
   selectionAtom,
+  selectionSnapshotAtom,
   setWorkspaceActiveSheetAtom,
   viewportShowFormulaBarAtom,
   workspaceSessionAtom,
@@ -14,18 +16,21 @@ import { SpreadsheetContextMenu } from '../context-menu'
 import { SpreadsheetDataValidationDialog } from '../data-validation'
 import { SpreadsheetFilterDropdown } from '../filter-sort'
 import { SpreadsheetFindReplaceDialog } from '../find-replace'
+import { SpreadsheetGoToDialog } from '../go-to'
 import { SpreadsheetFormatCellsDialog } from '../format-cells'
 import { SpreadsheetFormatPainter } from '../format-painter'
 import { SpreadsheetFormulaBar } from '../formula-bar'
 import { SpreadsheetGrid } from '../grid'
 import { SpreadsheetHistoryTimeline } from '../history'
 import { SpreadsheetNameManagerDialog } from '../named-ranges'
+import { SpreadsheetPasteSpecialDialog } from '../paste-special'
 import { SpreadsheetFormulaAutocomplete } from '../formula-autocomplete'
 import { SpreadsheetPresenceOverlay } from '../presence'
 import { SpreadsheetPrintPreviewOverlay } from '../print'
 import { SpreadsheetProtectionUnlockDialog } from '../protection'
 import { SpreadsheetSheetTabs } from '../sheet-tabs'
 import { SpreadsheetStatusBar } from '../status-bar'
+import { SpreadsheetTextToColumnsDialog } from '../text-to-columns'
 import { SpreadsheetToolbar } from '../toolbar'
 import { acceptFormulaSuggestion, SpreadsheetUiProvider, useSpreadsheetUiStore } from '../provider'
 
@@ -116,6 +121,41 @@ function VNextWave5Workbook() {
   const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
   const activeSheetId = () => workspace().activeSheetId ?? sheets[0].id
 
+  /**
+   * Wave 7.1 test trigger — mirrors the menu-bar dispatch path for
+   * `open-text-to-columns`. The Wave 5 demo intentionally omits the
+   * menubar (Univer parity), so e2e walks click this hidden trigger
+   * after selecting a single source column.
+   */
+  async function triggerTextToColumnsForSelection() {
+    const snap = store.getter(selectionSnapshotAtom)
+    const sheetId = snap.selection.sheetId || store.getter(workspaceSessionAtom).activeSheetId || ''
+    if (!sheetId) return
+    const range = snap.range
+    const rows: { sourceRow: number; text: string }[] = []
+    if (range.colStart === range.colEnd) {
+      const projection = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId,
+        range,
+        requestId: 0,
+        reason: 'toolbar',
+      })
+      const byRow = new Map<number, string>()
+      for (const cell of projection.cells) {
+        if (cell.col === range.colStart) byRow.set(cell.row, cell.displayValue ?? '')
+      }
+      for (let r = range.rowStart; r <= range.rowEnd; r += 1) {
+        rows.push({ sourceRow: r, text: byRow.get(r) ?? '' })
+      }
+    }
+    store.setter(openTextToColumnsAtom, {
+      sheetId,
+      anchor: { row: range.rowStart, col: range.colStart },
+      rows,
+    })
+  }
+
   onMount(() => {
     const activeSheetId =
       store.getter(workspaceSessionAtom).activeSheetId ?? sheets[0].id
@@ -132,6 +172,24 @@ function VNextWave5Workbook() {
         coord: { row: 0, col: 0 },
       })
     }
+  })
+
+  /**
+   * Wave 7.1 test hook — listen for a `spreadsheet:open-text-to-columns`
+   * custom event so e2e walks can open the dialog without a visible /
+   * focusable trigger button in the demo DOM (the wave5 demo omits the
+   * menubar; the production code path is exercised via the menu-bar
+   * dispatch unit test). Production hosts never dispatch this event, so
+   * the listener is inert outside of test.
+   */
+  onMount(() => {
+    function onOpenRequest() {
+      void triggerTextToColumnsForSelection()
+    }
+    window.addEventListener('spreadsheet:open-text-to-columns', onOpenRequest)
+    onCleanup(() => {
+      window.removeEventListener('spreadsheet:open-text-to-columns', onOpenRequest)
+    })
   })
 
   return (
@@ -179,10 +237,13 @@ function VNextWave5Workbook() {
       <SpreadsheetFormatPainter data-testid="wave5-format-painter" />
       <SpreadsheetFormatCellsDialog data-testid="wave5-format-cells" />
       <SpreadsheetFindReplaceDialog data-testid="wave5-find-replace" />
+      <SpreadsheetGoToDialog data-testid="wave5-go-to" />
       <SpreadsheetFilterDropdown data-testid="wave5-filter-dropdown" />
       <SpreadsheetConditionalFormatDialog data-testid="wave5-conditional-format" />
       <SpreadsheetDataValidationDialog data-testid="wave5-data-validation" />
       <SpreadsheetNameManagerDialog data-testid="wave5-name-manager" />
+      <SpreadsheetPasteSpecialDialog data-testid="wave5-paste-special" />
+      <SpreadsheetTextToColumnsDialog data-testid="wave5-text-to-columns" />
       <SpreadsheetCommentThread data-testid="wave5-comment-thread" />
       <SpreadsheetPrintPreviewOverlay data-testid="wave5-print-preview" />
       <SpreadsheetProtectionUnlockDialog data-testid="wave5-protection-unlock" />

@@ -634,7 +634,24 @@ function toCellWire(input: string): CellWire {
   return { type: 'text', value: trimmed }
 }
 
-function toImportCellWire(sheet: number, row: number, col: number, input: string): ImportCellWire {
+function toImportCellWire(
+  sheet: number,
+  row: number,
+  col: number,
+  input: string,
+  preserveAsText?: boolean,
+): ImportCellWire {
+  // preserveAsText: bypass numeric inference and formula detection. The
+  // input is forwarded verbatim as a text cell so `=A1` stays literal and
+  // `00123` keeps its leading zeros. An empty string still clears the
+  // cell.
+  if (preserveAsText) {
+    if (input.length === 0) {
+      return { sheet, row, col, kind: 'null' }
+    }
+    return { sheet, row, col, kind: 'text', value: input }
+  }
+
   const trimmed = input.trim()
   if (trimmed === '') {
     return { sheet, row, col, kind: 'null' }
@@ -976,7 +993,9 @@ export function createWorkerWorkbookSpreadsheetBackend(
     try {
       for await (const sourceChunk of request.chunks) {
         for (const cell of sourceChunk) {
-          wireChunk.push(toImportCellWire(sheet.idx, cell.row, cell.col, cell.input))
+          wireChunk.push(
+            toImportCellWire(sheet.idx, cell.row, cell.col, cell.input, cell.preserveAsText),
+          )
           if (wireChunk.length >= cellsPerChunk) await flush()
         }
       }

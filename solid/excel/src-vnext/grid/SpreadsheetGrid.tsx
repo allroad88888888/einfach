@@ -1,6 +1,7 @@
 import {
   CLIPBOARD_ORIGIN_MARKER_PREFIX,
   cancelPointerAtom,
+  clipboardStateAtom,
   commitPointerAtom,
   commitEditingAtom,
   copyClipboardAtom,
@@ -30,6 +31,7 @@ import {
   markClipboardReadyAtom,
   nextHistoryTransactionId,
   openMenuAtom,
+  openPasteSpecialAtom,
   pasteClipboardAtom,
   pointerSessionAtom,
   pushHistoryAtom,
@@ -60,6 +62,7 @@ import {
   updatePointerAtom,
   activeCellLockedAtom,
   findReplaceOpenAtom,
+  openGoToAtom,
   filterSortStateAtom,
   openFilterDropdownAtom,
   openFormatCellsAtom,
@@ -94,6 +97,7 @@ import {
   dispatchRedo,
   dispatchUndo,
   notifyDraftTypedChar,
+  pasteSpecialSupportedAtom,
   readActiveFormulaSuggestion,
   resolveProjectionSourceRange,
   spreadsheetProjectionSnapshotAtom,
@@ -2119,6 +2123,10 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         await clearSelectionRange(intent.target)
         return
+      case 'go-to.open':
+        event.preventDefault()
+        store.setter(openGoToAtom)
+        return
       case 'clipboard.copy':
         event.preventDefault()
         await copySelectionToClipboard('copy')
@@ -2131,6 +2139,31 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         await pasteFromClipboard()
         return
+      case 'clipboard.pasteSpecial': {
+        // Ctrl+Alt+V — open the Paste Special dialog. The keyboard
+        // dispatcher in `spreadsheet-ui-core/src/keyboard` remains a
+        // pure intent translator; capability + clipboard-readiness
+        // gating belongs here at the host wiring layer. We skip
+        // (without `preventDefault`) when:
+        //   (a) the backend doesn't implement `pasteRange` — the menu
+        //       entry is already hidden in that case, but the shortcut
+        //       fires globally; opening an empty/broken dialog is worse
+        //       than no-op.
+        //   (b) the clipboard has no copyable payload — nothing to
+        //       paste-special, so don't surface the dialog. Mirrors
+        //       how Ctrl+V's `pasteFromClipboard` early-returns when
+        //       the system clipboard is empty.
+        if (!store.getter(pasteSpecialSupportedAtom)) {
+          return
+        }
+        const clipboard = store.getter(clipboardStateAtom)
+        if (!clipboard.source || !clipboard.payload) {
+          return
+        }
+        event.preventDefault()
+        store.setter(openPasteSpecialAtom)
+        return
+      }
       case 'sheet.activate-adjacent': {
         event.preventDefault()
         const nextSheetId = getAdjacentSheetId(

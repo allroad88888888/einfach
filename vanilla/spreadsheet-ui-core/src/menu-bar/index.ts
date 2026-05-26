@@ -143,9 +143,10 @@ const EDIT_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'edit.pasteSpecial',
     label: 'menuBar.edit.pasteSpecial',
-    dispatch: { kind: 'placeholder', reason: 'menuBar.placeholder.wave6' },
-    isAvailable: 'placeholder',
-    placeholderMessage: 'menuBar.placeholder.wave6',
+    shortcut: 'Ctrl+Alt+V',
+    dispatch: { kind: 'edit.pasteSpecial' },
+    isAvailable: 'capability',
+    capabilityKey: 'pasteSpecial',
   },
   { kind: 'separator', id: 'edit.sep-2' },
   {
@@ -167,9 +168,10 @@ const EDIT_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'edit.goTo',
     label: 'menuBar.edit.goTo',
-    dispatch: { kind: 'placeholder', reason: 'menuBar.placeholder.wave7' },
-    isAvailable: 'placeholder',
-    placeholderMessage: 'menuBar.placeholder.wave7',
+    accessKey: 'G',
+    shortcut: 'Ctrl+G',
+    dispatch: { kind: 'edit.goTo' },
+    isAvailable: 'always',
   },
   { kind: 'separator', id: 'edit.sep-3' },
   {
@@ -358,9 +360,11 @@ const DATA_ITEMS: readonly MenuBarEntry[] = [
   {
     id: 'data.textToColumns',
     label: 'menuBar.data.textToColumns',
-    dispatch: { kind: 'placeholder', reason: 'menuBar.placeholder.wave7' },
-    isAvailable: 'placeholder',
-    placeholderMessage: 'menuBar.placeholder.wave7',
+    dispatch: { kind: 'open-text-to-columns' },
+    // Hides when the host backend does not implement `importCellChunks`,
+    // which is the port Text to Columns uses at commit time.
+    isAvailable: 'capability',
+    capabilityKey: 'textToColumns',
   },
   {
     id: 'data.removeDuplicates',

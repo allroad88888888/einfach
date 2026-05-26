@@ -194,15 +194,17 @@ describe('SpreadsheetMenuBar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-edit"]')!)
-    const goTo = container.querySelector('[data-testid="menu-bar-item-edit.goTo"]') as
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-file"]')!)
+    const fileNew = container.querySelector('[data-testid="menu-bar-item-file.new"]') as
       | HTMLButtonElement
       | null
-    expect(goTo).not.toBeNull()
-    expect(goTo!.disabled).toBe(true)
-    expect(goTo!.getAttribute('title')).toContain('Wave 7')
+    expect(fileNew).not.toBeNull()
+    expect(fileNew!.disabled).toBe(true)
+    // The title contains the placeholder message (translated copy) — assert
+    // it is set rather than locking down the wording.
+    expect((fileNew!.getAttribute('title') ?? '').length).toBeGreaterThan(0)
 
-    fireEvent.click(goTo!)
+    fireEvent.click(fileNew!)
     expect(store.getter(topMenuOpenAtom).kind).toBe('open')
   })
 
@@ -451,5 +453,43 @@ describe('SpreadsheetMenuBar', () => {
 
     fireEvent.click(getByTestId('spreadsheet-help-overlay-close'))
     expect(store.getter(helpOverlayAtom)).toBe('closed')
+  })
+
+  it('Data > Text to Columns is hidden when backend.importCellChunks is absent (capability gating)', () => {
+    const store = createStore()
+    // Base backend deliberately omits importCellChunks.
+    const backend = createBaseBackend()
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]'),
+    ).toBeNull()
+  })
+
+  it('Data > Text to Columns is visible when backend.importCellChunks is present', () => {
+    const store = createStore()
+    const backend: SpreadsheetBackend = {
+      ...createBaseBackend(),
+      async importCellChunks() {
+        return { sheetId: 'sheet-1' }
+      },
+    }
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetMenuBar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="menu-bar-button-data"]')!)
+    expect(
+      container.querySelector('[data-testid="menu-bar-item-data.textToColumns"]'),
+    ).not.toBeNull()
   })
 })

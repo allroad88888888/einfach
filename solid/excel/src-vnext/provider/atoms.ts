@@ -8,6 +8,30 @@ import type {
 export const spreadsheetBackendAtom = atom<SpreadsheetBackend | null>(null)
 spreadsheetBackendAtom.debugLabel = 'spreadsheet.vnext.backend'
 
+/**
+ * Derived capability flag: true iff the active backend implements the
+ * optional `pasteRange` port. Wave 7.3 wires this into the Edit menu's
+ * Paste Special entry (`isAvailable: 'capability'`) so the option hides
+ * when the host backend cannot fulfil it.
+ */
+export const pasteSpecialSupportedAtom = atom((get) => {
+  const backend = get(spreadsheetBackendAtom)
+  return Boolean(backend?.pasteRange)
+})
+pasteSpecialSupportedAtom.debugLabel = 'spreadsheet.vnext.pasteSpecial.supported'
+
+/**
+ * Derived capability flag: true iff the active backend implements
+ * `importCellChunks`. Text to Columns rewrites the source column via
+ * this port; without it, the wizard cannot commit, so the menu entry
+ * hides entirely (`isAvailable: 'capability'`).
+ */
+export const textToColumnsSupportedAtom = atom((get) => {
+  const backend = get(spreadsheetBackendAtom)
+  return Boolean(backend?.importCellChunks)
+})
+textToColumnsSupportedAtom.debugLabel = 'spreadsheet.vnext.textToColumns.supported'
+
 export const spreadsheetProjectionSnapshotAtom = atom<ProjectionSnapshot>({
   status: 'idle',
   request: undefined,

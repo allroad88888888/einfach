@@ -7,6 +7,11 @@ export type TopMenuOpenState =
 /**
  * A menu item declaration. The Solid host reads this registry to render
  * the dropdowns and resolve clicks to atom dispatches.
+ *
+ * `isAvailable` is three-state. `'capability'` means the host must
+ * resolve `capabilityKey` against a backend port flag (e.g. for
+ * `pasteSpecial` → `backend.pasteRange != null`) and hide the entry
+ * when the flag is false. Wave 7.3 added this for Paste Special.
  */
 export interface MenuItemDescriptor {
   id: string
@@ -14,7 +19,20 @@ export interface MenuItemDescriptor {
   accessKey?: string
   shortcut?: string
   dispatch: MenuItemDispatch
-  isAvailable?: 'always' | 'placeholder'
+  isAvailable?: 'always' | 'placeholder' | 'capability'
+  /**
+   * Capability key resolved by the host when `isAvailable` is
+   * `'capability'`. The host's known keys today:
+   * - `'pasteSpecial'` → `backend.pasteRange != null`
+   * - `'textToColumns'` → `backend.importCellChunks != null`
+   *
+   * TODO(paste-special review LOW #5): tighten this to a union of the
+   * known capability literals so typos in registry entries become
+   * compile errors. Deferred because it's a cross-cutting menu-bar API
+   * change that touches every host adapter; tracked separately from
+   * Paste Special wave 7.3.
+   */
+  capabilityKey?: string
   placeholderMessage?: string
 }
 
@@ -38,15 +56,18 @@ export type MenuItemDispatch =
   | { kind: 'cut' }
   | { kind: 'copy' }
   | { kind: 'paste' }
+  | { kind: 'edit.pasteSpecial' }
   | { kind: 'select-all' }
   | { kind: 'delete-cells' }
   | { kind: 'open-find-replace' }
   | { kind: 'open-find-replace-replace' }
+  | { kind: 'edit.goTo' }
   | { kind: 'toggle-print-preview' }
   | { kind: 'open-name-manager' }
   | { kind: 'open-comment-session' }
   | { kind: 'open-conditional-format' }
   | { kind: 'open-data-validation' }
+  | { kind: 'open-text-to-columns' }
   | { kind: 'open-format-cells' }
   | { kind: 'open-filter-dropdown' }
   | { kind: 'insert-row-above' }

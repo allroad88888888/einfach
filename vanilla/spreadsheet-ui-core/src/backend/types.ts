@@ -34,6 +34,7 @@ import type {
   ReplaceMatchesResult,
 } from '../find-replace/types'
 import type { SetSheetProtectionRequest, SetRangeLockRequest } from '../protection/types'
+import type { PasteRangeRequest, PasteRangeResult } from '../paste-special/types'
 
 export type {
   ClearNoteRequest,
@@ -67,6 +68,9 @@ export type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigReque
 
 // --- protection ---
 export type { SetSheetProtectionRequest, SetRangeLockRequest }
+
+// --- paste-special ---
+export type { PasteRangeRequest, PasteRangeResult }
 
 export type ProjectionRequestId = number
 export type ProjectionRevision = number | string
@@ -387,6 +391,14 @@ export interface ImportCellInput {
   row: number
   col: number
   input: string
+  /**
+   * When true, the adapter MUST insert `input` as a literal string without
+   * numeric inference or formula parsing. A leading `=` is preserved as
+   * literal text and digit-only strings like `00123` keep their leading
+   * zeros. Used by Text to Columns when the user picks the `text` column
+   * format.
+   */
+  preserveAsText?: boolean
 }
 
 export type ImportCellChunkSource =
@@ -730,6 +742,10 @@ export interface SpreadsheetBackend {
   // protection
   setSheetProtection?(request: SetSheetProtectionRequest): Promise<BackendMutationResult>
   setRangeLock?(request: SetRangeLockRequest): Promise<BackendMutationResult>
+  // paste-special — Wave 7.3. Optional capability: host adapters that
+  // omit this method cause the menu entry + dialog to hide via
+  // `pasteSpecialSupportedAtom` so the surface degrades cleanly.
+  pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
 }
 
 export interface ViewportFreezeConfig {

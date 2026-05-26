@@ -277,6 +277,10 @@ function getCommandShortcutIntent(
       return {
         type: 'history.redo',
       }
+    case 'g':
+      return {
+        type: 'go-to.open',
+      }
     case 'b':
       return {
         type: 'format.toggle',

@@ -20,8 +20,11 @@ import {
   openFilterDropdownAtom,
   openFindReplaceAtom,
   openFormatCellsAtom,
+  openGoToAtom,
   openHelpOverlayAtom,
   openNameManagerAtom,
+  openPasteSpecialAtom,
+  openTextToColumnsAtom,
   openTopMenuAtom,
   openValidationRuleEditorAtom,
   pasteClipboardAtom,
@@ -50,7 +53,9 @@ import {
 import {
   dispatchRedo,
   dispatchUndo,
+  pasteSpecialSupportedAtom,
   refreshVisibleProjection,
+  textToColumnsSupportedAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
 } from '../provider'
@@ -68,6 +73,8 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
   const showGridlines = useAtomValue(viewportShowGridlinesAtom)
   const showHeadings = useAtomValue(viewportShowHeadingsAtom)
   const showFormulaBar = useAtomValue(viewportShowFormulaBarAtom)
+  const pasteSpecialSupported = useAtomValue(pasteSpecialSupportedAtom)
+  const textToColumnsSupported = useAtomValue(textToColumnsSupportedAtom)
   let rootRef: HTMLDivElement | undefined
 
   function checkedForDispatch(dispatch: MenuItemDispatch): boolean | undefined {
@@ -80,6 +87,25 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return showFormulaBar()
       default:
         return undefined
+    }
+  }
+
+  /**
+   * Resolve a capability-gated menu item. Known keys today:
+   *   - `'pasteSpecial'`  → host backend implements `pasteRange`
+   *   - `'textToColumns'` → host backend implements `importCellChunks`
+   * Returning false makes the dropdown entry hide entirely (vs.
+   * show-as-disabled for the placeholder case).
+   */
+  function resolveCapability(key: string | undefined): boolean {
+    if (!key) return false
+    switch (key) {
+      case 'pasteSpecial':
+        return pasteSpecialSupported()
+      case 'textToColumns':
+        return textToColumnsSupported()
+      default:
+        return false
     }
   }
 
@@ -171,6 +197,9 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         else store.setter(pasteClipboardAtom, input)
         return
       }
+      case 'edit.pasteSpecial':
+        store.setter(openPasteSpecialAtom)
+        return
       case 'select-all': {
         const sheetId = getActiveSheetId() ?? undefined
         store.setter(selectAllAtom, sheetId)
@@ -184,6 +213,9 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
         return
       case 'open-find-replace-replace':
         store.setter(openFindReplaceAtom)
+        return
+      case 'edit.goTo':
+        store.setter(openGoToAtom)
         return
       case 'toggle-print-preview':
         store.setter(togglePrintPreviewAtom)
@@ -207,6 +239,42 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'open-data-validation':
         store.setter(openValidationRuleEditorAtom, {})
         return
+      case 'open-text-to-columns': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        // Text to Columns requires a single source column. Surface the
+        // dialog regardless — the dialog itself shows the disable
+        // message when the selection spans multiple columns. We still
+        // forward the (single-col) range so the dialog can hydrate.
+        const range = snap.range
+        const colIndex = range.colStart
+        void (async () => {
+          const rows: { sourceRow: number; text: string }[] = []
+          if (range.colStart === range.colEnd) {
+            const projection = await backend.readRangeProjection({
+              kind: 'range',
+              sheetId,
+              range,
+              requestId: 0,
+              reason: 'toolbar',
+            })
+            const byRow = new Map<number, string>()
+            for (const cell of projection.cells) {
+              if (cell.col === colIndex) byRow.set(cell.row, cell.displayValue ?? '')
+            }
+            for (let r = range.rowStart; r <= range.rowEnd; r += 1) {
+              rows.push({ sourceRow: r, text: byRow.get(r) ?? '' })
+            }
+          }
+          store.setter(openTextToColumnsAtom, {
+            sheetId,
+            anchor: { row: range.rowStart, col: colIndex },
+            rows,
+          })
+        })()
+        return
+      }
       case 'open-format-cells': {
         const snap = store.getter(selectionSnapshotAtom)
         const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
@@ -433,6 +501,7 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
               onHover={() => handleTopButtonHover(menu.id)}
               onItemActivate={dispatchItem}
               getChecked={checkedForDispatch}
+              resolveCapability={resolveCapability}
             />
           )}
         </For>
@@ -449,6 +518,7 @@ interface MenuBarTopButtonProps {
   onHover: () => void
   onItemActivate: (item: MenuItemDescriptor) => void
   getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
+  resolveCapability: (key: string | undefined) => boolean
 }
 
 function MenuBarTopButton(props: MenuBarTopButtonProps) {
@@ -479,6 +549,7 @@ function MenuBarTopButton(props: MenuBarTopButtonProps) {
                 entry={entry}
                 onActivate={props.onItemActivate}
                 getChecked={props.getChecked}
+                resolveCapability={props.resolveCapability}
               />
             )}
           </For>
@@ -492,25 +563,37 @@ interface MenuBarDropdownEntryProps {
   entry: MenuBarEntry
   onActivate: (item: MenuItemDescriptor) => void
   getChecked: (dispatch: MenuItemDispatch) => boolean | undefined
+  resolveCapability: (key: string | undefined) => boolean
 }
 
 function MenuBarDropdownEntry(props: MenuBarDropdownEntryProps) {
+  // Hide capability-gated entries when the host can't fulfil them.
+  // Separators stay visible — they're cosmetic and rare-enough that
+  // hiding them as well would require knowing about adjacent items.
+  const isHidden = () => {
+    if (!isMenuItemDescriptor(props.entry)) return false
+    const item = props.entry as MenuItemDescriptor
+    if (item.isAvailable !== 'capability') return false
+    return !props.resolveCapability(item.capabilityKey)
+  }
   return (
-    <Show
-      when={isMenuItemDescriptor(props.entry)}
-      fallback={
-        <div
-          class="menu-bar-separator"
-          role="separator"
-          data-testid={`menu-bar-separator-${(props.entry as { id: string }).id}`}
+    <Show when={!isHidden()}>
+      <Show
+        when={isMenuItemDescriptor(props.entry)}
+        fallback={
+          <div
+            class="menu-bar-separator"
+            role="separator"
+            data-testid={`menu-bar-separator-${(props.entry as { id: string }).id}`}
+          />
+        }
+      >
+        <DropdownItemButton
+          item={props.entry as MenuItemDescriptor}
+          onActivate={props.onActivate}
+          getChecked={props.getChecked}
         />
-      }
-    >
-      <DropdownItemButton
-        item={props.entry as MenuItemDescriptor}
-        onActivate={props.onActivate}
-        getChecked={props.getChecked}
-      />
+      </Show>
     </Show>
   )
 }
