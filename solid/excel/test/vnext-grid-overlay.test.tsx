@@ -161,9 +161,11 @@ function makeViewportProvider(
     cells?: DisplayCell[]
     rowCount?: number
     colCount?: number
+    visibleRows?: number[]
+    visibleCols?: number[]
   } = {},
 ): OverlayViewportProvider {
-  return {
+  const provider: OverlayViewportProvider = {
     getSheetId: () => options.sheetId ?? 'sheet-1',
     getCells: () => options.cells ?? [],
     getCellRect: (row, col) => ({
@@ -178,6 +180,13 @@ function makeViewportProvider(
     }),
     getFreezeOrigin: () => ({ x: HEADER_W, y: HEADER_H }),
   }
+  if (options.visibleRows) {
+    provider.getVisibleRows = () => options.visibleRows!
+  }
+  if (options.visibleCols) {
+    provider.getVisibleCols = () => options.visibleCols!
+  }
+  return provider
 }
 
 function makeCanvas(): HTMLCanvasElement {
@@ -222,6 +231,37 @@ describe('OverlayRenderer', () => {
     expect(primary.args[1]).toBe(HEADER_H + width / 2)
     expect(primary.args[2]).toBe(2 * CELL_W - width)
     expect(primary.args[3]).toBe(2 * CELL_H - width)
+
+    renderer.detach()
+  })
+
+  it('clips a full-column selection to visible rows before drawing the outline', () => {
+    const store = createStore()
+    store.setter(setSelectionAtom, {
+      kind: 'column',
+      sheetId: 'sheet-1',
+      colAnchor: 2,
+      colFocus: 2,
+    })
+
+    const { ctx, calls } = createRecordingContext()
+    const renderer = new OverlayRenderer(() => ctx)
+    const canvas = makeCanvas()
+    const viewport = makeViewportProvider(store, {
+      visibleRows: [10, 11, 12],
+      visibleCols: [1, 2, 3],
+    })
+
+    renderer.attach(canvas, store, viewport)
+    renderer.renderNow()
+
+    const primary = findStrokeRectForColor(calls, OVERLAY_COLORS.primarySelectionBorder)
+    expect(primary.length).toBeGreaterThanOrEqual(1)
+    const width = OVERLAY_BORDER_WIDTH.primary
+    expect(primary[0].args[0]).toBe(HEADER_W + 2 * CELL_W + width / 2)
+    expect(primary[0].args[1]).toBe(HEADER_H + 10 * CELL_H + width / 2)
+    expect(primary[0].args[2]).toBe(CELL_W - width)
+    expect(primary[0].args[3]).toBe(3 * CELL_H - width)
 
     renderer.detach()
   })

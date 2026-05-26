@@ -119,6 +119,30 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
     await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('')
   })
 
+  test('filter dropdown applies value-list and condition filters, then clears them', async ({
+    page,
+  }) => {
+    await gotoWave5(page)
+    await columnHeader(page, 0).click()
+    await filterButton(page).click()
+    await expect(filterDropdown(page)).toBeVisible()
+    await expect(page.getByTestId('filter-value-South')).toBeVisible()
+
+    await page.getByTestId('filter-value-South').click()
+    await page.getByTestId('filter-add-equals').click()
+    await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('North')
+    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('East')
+
+    await page.getByTestId('filter-clear-filter').click()
+    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('South')
+
+    await page.getByTestId('filter-condition-kind').selectOption('contains')
+    await page.getByTestId('filter-contains-input').fill('st')
+    await page.getByTestId('filter-add-equals').click()
+    await expect(cell(page, 'A2').locator('.cell-display')).toHaveText('East')
+    await expect(cell(page, 'A3').locator('.cell-display')).toHaveText('West')
+  })
+
   test('toolbar-btn-sort is visible, labeled, and opens dropdown', async ({ page }) => {
     await gotoWave5(page)
     await cell(page, 'B2').click()
@@ -155,6 +179,23 @@ test.describe('Wave 5 toolbar — filter and sort', () => {
 
     const afterDesc = await readColumnTexts(page, 'A', 2, 8)
     expect(afterDesc).toEqual(['East', 'Pacific', 'West', 'North', 'Central', 'South', 'Mountain'])
+
+    await columnHeader(page, 2).click()
+    await expect(columnHeader(page, 2)).toHaveAttribute('data-selected', 'true')
+    await sortButton(page).click()
+    await expect(sortDropdown(page)).toBeVisible()
+    await sortAsc(page).click()
+
+    const afterSwitchColumnAsc = await readColumnTexts(page, 'A', 2, 8)
+    expect(afterSwitchColumnAsc).toEqual([
+      'Mountain',
+      'East',
+      'West',
+      'Central',
+      'South',
+      'North',
+      'Pacific',
+    ])
   })
 
   test('sort dropdown closes via Escape and outside click', async ({ page }) => {

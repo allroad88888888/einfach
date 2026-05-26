@@ -42,6 +42,18 @@ function numberFormatItem(page: Page, id: string) {
   return page.getByTestId(`number-format-item-${id}`)
 }
 
+function columnHeader(page: Page, col: number) {
+  return page.getByTestId('wave5-grid').locator(`th.spreadsheet-grid-col-header[data-col="${col}"]`)
+}
+
+function sortButton(page: Page) {
+  return page.getByTestId('toolbar-btn-sort')
+}
+
+function sortAsc(page: Page) {
+  return page.getByTestId('toolbar-sort-asc')
+}
+
 function expectLocalizedLabel(label: string | null) {
   expect(label).toBeTruthy()
   expect(label).not.toContain('toolbar.')
@@ -98,6 +110,25 @@ test.describe('Wave 5 — number-format toolbar', () => {
     await percentShortcutButton(page).click()
     await expect(numberFormatDropdown(page)).toBeHidden()
     await expectCellText(page, 'B2', '12000%')
+  })
+
+  test('percent dropdown applies to the selected visible row after sorting', async ({ page }) => {
+    await gotoWave5(page)
+    await columnHeader(page, 4).click()
+    await sortButton(page).click()
+    await sortAsc(page).click()
+
+    await expectCellText(page, 'A5', 'Central')
+    await expectCellText(page, 'E5', '280')
+    await expectCellText(page, 'A6', 'North')
+    await expectCellText(page, 'E6', '300')
+
+    await cell(page, 'E6').click()
+    await numberFormatButton(page).click()
+    await numberFormatItem(page, 'Percent').click()
+
+    await expectCellText(page, 'E5', '280')
+    await expectCellText(page, 'E6', '30000%')
   })
 
   test('currency shortcut formats directly without opening dropdown', async ({ page }) => {

@@ -1,14 +1,14 @@
 /** @jsxImportSource solid-js */
 
-import { For, Show, createEffect, onCleanup } from 'solid-js'
+import { For, Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import type { JSX } from 'solid-js'
 import { useT } from '../../src/i18n'
 
 /**
  * Stable identifier for each row in the number-format dropdown. The toolbar's
  * `commandFormat` switch maps these back to a `SpreadsheetNumberFormat`. Custom
- * (`'Custom'`) is a sentinel — clicking it opens the Format Cells dialog
- * instead of dispatching a format command.
+ * (`'Custom'`) is a sentinel row: hovering or clicking it reveals the
+ * right-side submenu for the lightweight format dialogs.
  *
  * `WanYuan` is reserved for the CN-specific 10000-unit format. The current
  * `SpreadsheetNumberFormat` union has no first-class kind for it and our
@@ -42,6 +42,32 @@ export interface NumberFormatDropdownItem {
   /** When set, the row is rendered disabled. */
   disabled?: boolean
 }
+
+export type NumberFormatCustomMenuId = 'currency' | 'dateTime' | 'number'
+
+interface NumberFormatCustomMenuItem {
+  id: NumberFormatCustomMenuId
+  labelKey: string
+  testId: string
+}
+
+const CUSTOM_FORMAT_ITEMS: readonly NumberFormatCustomMenuItem[] = [
+  {
+    id: 'currency',
+    labelKey: 'numberFormatDropdown.customCurrency',
+    testId: 'number-format-more-currency',
+  },
+  {
+    id: 'dateTime',
+    labelKey: 'numberFormatDropdown.customDateTime',
+    testId: 'number-format-more-date-time',
+  },
+  {
+    id: 'number',
+    labelKey: 'numberFormatDropdown.customNumber',
+    testId: 'number-format-more-number',
+  },
+]
 
 /**
  * The 16-row catalog, in the order shown in the reference image. Previews are
@@ -89,6 +115,7 @@ export interface NumberFormatDropdownProps {
    */
   anchorEl?: HTMLElement | null
   onSelect: (id: NumberFormatId) => void
+  onCustomSelect: (id: NumberFormatCustomMenuId) => void
   onClose: () => void
   class?: string
   'data-testid'?: string
@@ -97,15 +124,19 @@ export interface NumberFormatDropdownProps {
 /**
  * Floating dropdown anchored beneath the toolbar's number-format button. The
  * caller owns the open-state signal and the anchor rect — the component just
- * paints, wires click-outside / Esc, and surfaces the row choice. Custom is
- * one of the rows; the caller decides what to do with `'Custom'`.
+ * paints, wires click-outside / Esc, and surfaces the row choice. Custom owns a
+ * nested submenu; the caller decides which lightweight dialog to open.
  */
 export function NumberFormatDropdown(props: NumberFormatDropdownProps): JSX.Element {
   const t = useT()
+  const [customMenuOpen, setCustomMenuOpen] = createSignal(false)
   let rootRef: HTMLDivElement | undefined
 
   createEffect(() => {
-    if (!props.open) return
+    if (!props.open) {
+      setCustomMenuOpen(false)
+      return
+    }
 
     function onDocPointerDown(event: MouseEvent) {
       if (!rootRef) return
@@ -146,6 +177,12 @@ export function NumberFormatDropdown(props: NumberFormatDropdownProps): JSX.Elem
     }
   }
 
+  function selectCustomItem(id: NumberFormatCustomMenuId) {
+    setCustomMenuOpen(false)
+    props.onClose()
+    props.onCustomSelect(id)
+  }
+
   return (
     <Show when={props.open}>
       <div
@@ -158,23 +195,80 @@ export function NumberFormatDropdown(props: NumberFormatDropdownProps): JSX.Elem
       >
         <For each={NUMBER_FORMAT_ITEMS}>
           {(item) => (
-            <button
-              type="button"
-              class={`number-format-dropdown-item ${
-                item.disabled ? 'number-format-dropdown-item-disabled' : ''
-              }`.trim()}
-              data-testid={`number-format-item-${item.id}`}
-              data-format-id={item.id}
-              role="menuitem"
-              disabled={item.disabled}
-              onClick={() => {
-                if (item.disabled) return
-                props.onSelect(item.id)
-              }}
+            <Show
+              when={item.id === 'Custom'}
+              fallback={
+                <button
+                  type="button"
+                  class={`number-format-dropdown-item ${
+                    item.disabled ? 'number-format-dropdown-item-disabled' : ''
+                  }`.trim()}
+                  data-testid={`number-format-item-${item.id}`}
+                  data-format-id={item.id}
+                  role="menuitem"
+                  disabled={item.disabled}
+                  onClick={() => {
+                    if (item.disabled) return
+                    props.onSelect(item.id)
+                  }}
+                >
+                  <span class="number-format-dropdown-label">{t(item.labelKey)}</span>
+                  <span class="number-format-dropdown-preview">{item.preview}</span>
+                </button>
+              }
             >
-              <span class="number-format-dropdown-label">{t(item.labelKey)}</span>
-              <span class="number-format-dropdown-preview">{item.preview}</span>
-            </button>
+              <div
+                class={`number-format-dropdown-custom ${
+                  customMenuOpen() ? 'number-format-dropdown-custom-open' : ''
+                }`.trim()}
+                onMouseEnter={() => setCustomMenuOpen(true)}
+                onMouseLeave={() => setCustomMenuOpen(false)}
+              >
+                <button
+                  type="button"
+                  class="number-format-dropdown-item number-format-dropdown-item-with-submenu"
+                  data-testid={`number-format-item-${item.id}`}
+                  data-format-id={item.id}
+                  role="menuitem"
+                  aria-haspopup="menu"
+                  aria-expanded={customMenuOpen()}
+                  onPointerEnter={() => setCustomMenuOpen(true)}
+                  onMouseEnter={() => setCustomMenuOpen(true)}
+                  onClick={() => setCustomMenuOpen(true)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'ArrowRight' || event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault()
+                      setCustomMenuOpen(true)
+                    }
+                  }}
+                >
+                  <span class="number-format-dropdown-label">{t(item.labelKey)}</span>
+                  <span class="number-format-dropdown-submenu-arrow" aria-hidden="true" />
+                </button>
+                <Show when={customMenuOpen()}>
+                  <div
+                    class="number-format-dropdown-submenu"
+                    data-testid="number-format-custom-submenu"
+                    role="menu"
+                    aria-label={t(item.labelKey)}
+                  >
+                    <For each={CUSTOM_FORMAT_ITEMS}>
+                      {(customItem) => (
+                        <button
+                          type="button"
+                          class="number-format-dropdown-submenu-item"
+                          data-testid={customItem.testId}
+                          role="menuitem"
+                          onClick={() => selectCustomItem(customItem.id)}
+                        >
+                          {t(customItem.labelKey)}
+                        </button>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+              </div>
+            </Show>
           )}
         </For>
       </div>

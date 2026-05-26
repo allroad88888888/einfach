@@ -20,6 +20,7 @@ import {
   type SpreadsheetVerticalAlignment,
 } from '@einfach/spreadsheet-ui-core'
 import { useT } from '../../src/i18n'
+import { resolveProjectionSourceRanges } from '../provider/projection-coordinates'
 import { refreshVisibleProjection } from '../provider/projection-refresh'
 import { useSpreadsheetBackend, useSpreadsheetUiStore } from '../provider/hooks'
 import './format-cells-dialog.css'
@@ -163,7 +164,7 @@ function categoryToNumberFormat(category: FormatCellsNumberCategory): Spreadshee
     case 'percentage':
       return { kind: 'percent', digits: 2 }
     case 'date':
-      return { kind: 'date', pattern: 'yyyy-mm-dd' }
+      return { kind: 'date', pattern: 'yyyy-MM-dd' }
     default:
       return { kind: 'general' }
   }
@@ -210,12 +211,19 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
     if (!payload) return
     if (backend.setFormatRange) {
       try {
-        await backend.setFormatRange({
-          kind: 'set-format-range',
-          sheetId: payload.sheetId,
-          range: payload.range,
-          format: payload.format,
-        })
+        const sourceRanges = resolveProjectionSourceRanges(
+          store,
+          payload.sheetId,
+          payload.range,
+        )
+        for (const sourceRange of sourceRanges) {
+          await backend.setFormatRange({
+            kind: 'set-format-range',
+            sheetId: payload.sheetId,
+            range: sourceRange,
+            format: payload.format,
+          })
+        }
         await refreshVisibleProjection(store, backend, payload.sheetId)
       } catch {
         // Surface failure by leaving the editor open. A production build
@@ -435,7 +443,7 @@ export function SpreadsheetFormatCellsDialog(props: SpreadsheetFormatCellsDialog
                     data-testid="format-cells-date-pattern"
                     value={(() => {
                       const nf = draft()?.numberFormat
-                      return nf && nf.kind === 'date' ? (nf.pattern ?? 'yyyy-mm-dd') : 'yyyy-mm-dd'
+                      return nf && nf.kind === 'date' ? (nf.pattern ?? 'yyyy-MM-dd') : 'yyyy-MM-dd'
                     })()}
                     onInput={(event) => {
                       const pattern = event.currentTarget.value

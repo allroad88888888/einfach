@@ -11,9 +11,19 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 import { setLocale } from '../src/i18n'
 import { SpreadsheetUiProvider } from '../src-vnext/provider'
-import { SpreadsheetFormatCellsDialog } from '../src-vnext/format-cells'
+import {
+  SpreadsheetFormatCellsDialog,
+  SpreadsheetNumberFormatDialogs,
+  openNumberFormatDialogAtom,
+} from '../src-vnext/format-cells'
 
-afterEach(cleanup)
+const RAW_I18N_KEY_RE =
+  /\b(?:toolbar|numberFormatDropdown|numberFormatDialog|formatCells)\.[A-Za-z0-9_.-]+/
+
+afterEach(() => {
+  cleanup()
+  setLocale('en')
+})
 
 setLocale('en')
 
@@ -45,6 +55,10 @@ function createFakeBackend() {
   }
 
   return { backend, setFormatRangeRequests }
+}
+
+function expectNoRawI18nKeys(text: string | null | undefined) {
+  expect(text ?? '').not.toMatch(RAW_I18N_KEY_RE)
 }
 
 describe('SpreadsheetFormatCellsDialog', () => {
@@ -83,6 +97,33 @@ describe('SpreadsheetFormatCellsDialog', () => {
     expect(getByTestId('format-cells-tab-font')).toBeTruthy()
     expect(getByTestId('format-cells-tab-border')).toBeTruthy()
     expect(getByTestId('format-cells-tab-fill')).toBeTruthy()
+  })
+
+  it('renders English and Chinese dialog chrome without raw i18n keys', async () => {
+    for (const locale of ['en', 'zh'] as const) {
+      setLocale(locale)
+      const store = createStore()
+      const { backend } = createFakeBackend()
+
+      store.setter(openFormatCellsAtom, {
+        sheetId: 'sheet-1',
+        range: RANGE,
+      })
+
+      const { getByTestId } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetFormatCellsDialog />
+        </SpreadsheetUiProvider>
+      ))
+
+      await waitFor(() => expect(getByTestId('format-cells-dialog')).toBeTruthy())
+      const dialog = getByTestId('format-cells-dialog')
+      const title = dialog.querySelector('.format-cells-title')
+      expect(title?.textContent?.trim()).toBeTruthy()
+      expectNoRawI18nKeys(title?.textContent)
+      expectNoRawI18nKeys(dialog.textContent)
+      cleanup()
+    }
   })
 
   it('opens on the Number tab by default and shows all 12 categories', async () => {
@@ -171,6 +212,192 @@ describe('SpreadsheetFormatCellsDialog', () => {
       const state = store.getter(formatCellsEditorAtom)
       if (state.status !== 'open') throw new Error('editor closed unexpectedly')
       expect(state.draft.numberFormat?.kind).toBe('currency')
+    })
+  })
+
+  it('saves currency number format settings from the Number tab', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('format-cells-category-currency')).toBeTruthy())
+    fireEvent.click(getByTestId('format-cells-category-currency'))
+    await waitFor(() => expect(getByTestId('format-cells-currency-symbol')).toBeTruthy())
+    fireEvent.input(getByTestId('format-cells-currency-symbol'), {
+      target: { value: '$' },
+    })
+    fireEvent.click(getByTestId('format-cells-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'currency', symbol: '$', digits: 2 } },
+    })
+  })
+
+  it('saves yyyy-MM-dd date format settings from the Number tab', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('format-cells-category-date')).toBeTruthy())
+    fireEvent.click(getByTestId('format-cells-category-date'))
+    await waitFor(() => expect(getByTestId('format-cells-date-pattern')).toBeTruthy())
+    fireEvent.input(getByTestId('format-cells-date-pattern'), {
+      target: { value: 'yyyy-MM-dd' },
+    })
+    fireEvent.click(getByTestId('format-cells-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'date', pattern: 'yyyy-MM-dd' } },
+    })
+  })
+
+  it('preserves a #,##0.00 custom number format when saved', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+      initialFormat: { numberFormat: { kind: 'custom', pattern: '#,##0.00' } },
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFormatCellsDialog />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('format-cells-category-custom')).toBeTruthy())
+    expect((getByTestId('format-cells-category-custom') as HTMLInputElement).checked).toBe(true)
+    fireEvent.click(getByTestId('format-cells-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'custom', pattern: '#,##0.00' } },
+    })
+  })
+
+  it('number-format currency dialog saves USD with 2 decimals', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'currency',
+      sheetId: 'sheet-1',
+      range: RANGE,
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetNumberFormatDialogs />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('number-format-dialog')).toBeTruthy())
+    expectNoRawI18nKeys(getByTestId('number-format-dialog').textContent)
+    fireEvent.click(getByTestId('number-format-dialog-option-usd'))
+    fireEvent.input(getByTestId('number-format-dialog-decimals'), {
+      target: { value: '2' },
+    })
+    fireEvent.click(getByTestId('number-format-dialog-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'currency', symbol: '$', digits: 2 } },
+    })
+  })
+
+  it('number-format date/time dialog saves the ISO date pattern', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'dateTime',
+      sheetId: 'sheet-1',
+      range: RANGE,
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetNumberFormatDialogs />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('number-format-dialog')).toBeTruthy())
+    expectNoRawI18nKeys(getByTestId('number-format-dialog').textContent)
+    fireEvent.click(getByTestId('number-format-dialog-option-date-iso'))
+    fireEvent.click(getByTestId('number-format-dialog-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'date', pattern: 'yyyy-MM-dd' } },
+    })
+  })
+
+  it('number-format number dialog saves the #,##0.00 pattern', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeRequests } = createFakeBackend()
+
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'number',
+      sheetId: 'sheet-1',
+      range: RANGE,
+    })
+
+    const { getByTestId } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetNumberFormatDialogs />
+      </SpreadsheetUiProvider>
+    ))
+
+    await waitFor(() => expect(getByTestId('number-format-dialog')).toBeTruthy())
+    expectNoRawI18nKeys(getByTestId('number-format-dialog').textContent)
+    fireEvent.click(getByTestId('number-format-dialog-option-thousands-decimal'))
+    fireEvent.click(getByTestId('number-format-dialog-save'))
+
+    await waitFor(() => expect(setFormatRangeRequests).toHaveLength(1))
+    expect(setFormatRangeRequests[0]).toMatchObject({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: RANGE,
+      format: { numberFormat: { kind: 'number', digits: 2, thousands: true } },
     })
   })
 

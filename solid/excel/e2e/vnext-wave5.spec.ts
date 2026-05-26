@@ -222,6 +222,7 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     await expect(colHeader).toHaveAttribute('data-selected', 'true')
     await expect(cell(page, 'C1')).toHaveAttribute('data-selected', 'true')
     await expect(cell(page, 'C3')).toHaveAttribute('data-selected', 'true')
+    await expect(cell(page, 'C3')).toHaveCSS('background-color', 'rgb(241, 246, 255)')
   })
 
   test('Find next dialog navigates selection to the matched cell', async ({ page }) => {

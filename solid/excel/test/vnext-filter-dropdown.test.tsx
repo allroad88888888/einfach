@@ -67,6 +67,8 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect(container.querySelector('[data-testid="filter-clear"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-add-equals"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-equals-input"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="filter-search-input"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="filter-condition-kind"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="filter-close"]')).not.toBeNull()
   })
 
@@ -97,6 +99,45 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     expect((setFilterSortCalls[0] as { directives: unknown[] }).directives).toEqual([
       { colIndex: 0, direction: 'asc' },
     ])
+  })
+
+  it('sort click makes the dropdown column the primary sort directive', () => {
+    const store = createStore()
+    const setFilterSortCalls: unknown[] = []
+    const backend = createFakeBackend({
+      async setFilterSort(req) {
+        setFilterSortCalls.push(req)
+        return { sheetId: req.sheetId, requestId: undefined, revision: 1 }
+      },
+    })
+
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: {
+        rules: [{ kind: 'equals', colIndex: 4, value: 'open' }],
+        directives: [
+          { colIndex: 0, direction: 'desc' },
+          { colIndex: 2, direction: 'asc' },
+        ],
+      },
+    })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-sort-asc"]') as HTMLElement)
+
+    const expected = [
+      { colIndex: 1, direction: 'asc' },
+      { colIndex: 0, direction: 'desc' },
+      { colIndex: 2, direction: 'asc' },
+    ]
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.directives).toEqual(expected)
+    expect((setFilterSortCalls[0] as { directives: unknown[] }).directives).toEqual(expected)
   })
 
   it('sort desc click dispatches desc directive', () => {
@@ -174,6 +215,131 @@ describe('vNext SpreadsheetFilterDropdown', () => {
     const state = store.getter(filterSortStateAtom)
     expect(state['sheet-1']?.rules).toEqual([])
     expect(state['sheet-1']?.directives).toEqual([{ colIndex: 5, direction: 'desc' }])
+  })
+
+  it('applies value-list draft only after clicking apply', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    const window = { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 1 }
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'viewport',
+        window,
+      }),
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        revision: 1,
+        window,
+        cells: [
+          { row: 0, col: 0, displayValue: 'Region' },
+          { row: 1, col: 0, displayValue: 'North' },
+          { row: 2, col: 0, displayValue: 'South' },
+          { row: 3, col: 0, displayValue: 'Central' },
+        ],
+      },
+      error: undefined,
+    })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 0 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.input(container.querySelector('[data-testid="filter-search-input"]')!, {
+      target: { value: 'south' },
+    })
+    expect(container.querySelectorAll('.filter-value-option[data-filter-value]')).toHaveLength(1)
+    fireEvent.click(container.querySelector('[data-testid="filter-value-South"]') as HTMLElement)
+
+    expect(store.getter(filterSortStateAtom)['sheet-1']).toBeUndefined()
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
+      { kind: 'list', colIndex: 0, values: ['Central', 'North'] },
+    ])
+  })
+
+  it('applies contains and range condition rules from the condition picker', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    const select = container.querySelector(
+      '[data-testid="filter-condition-kind"]',
+    ) as HTMLSelectElement
+    fireEvent.change(select, { target: { value: 'contains' } })
+    fireEvent.input(container.querySelector('[data-testid="filter-contains-input"]')!, {
+      target: { value: 'west' },
+    })
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
+      { kind: 'contains', colIndex: 1, value: 'west' },
+    ])
+
+    fireEvent.change(select, { target: { value: 'range' } })
+    fireEvent.input(container.querySelector('[data-testid="filter-range-min-input"]')!, {
+      target: { value: '10' },
+    })
+    fireEvent.input(container.querySelector('[data-testid="filter-range-max-input"]')!, {
+      target: { value: '20' },
+    })
+    fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
+
+    expect(store.getter(filterSortStateAtom)['sheet-1']?.rules).toEqual([
+      { kind: 'range', colIndex: 1, min: 10, max: 20 },
+    ])
+  })
+
+  it('clears current column filter rules separately from sort directives', () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+    store.setter(setFilterSortAtom, {
+      sheetId: 'sheet-1',
+      state: {
+        rules: [
+          { kind: 'equals', colIndex: 1, value: 'x' },
+          { kind: 'equals', colIndex: 2, value: 'y' },
+        ],
+        directives: [
+          { colIndex: 1, direction: 'asc' },
+          { colIndex: 2, direction: 'desc' },
+        ],
+      },
+    })
+    store.setter(openFilterDropdownAtom, { sheetId: 'sheet-1', colIndex: 1 })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetFilterDropdown />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(container.querySelector('[data-testid="filter-clear-filter"]') as HTMLElement)
+    let state = store.getter(filterSortStateAtom)['sheet-1']
+    expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
+    expect(state?.directives).toEqual([
+      { colIndex: 1, direction: 'asc' },
+      { colIndex: 2, direction: 'desc' },
+    ])
+
+    fireEvent.click(container.querySelector('[data-testid="filter-clear-sort"]') as HTMLElement)
+    state = store.getter(filterSortStateAtom)['sheet-1']
+    expect(state?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: 'y' }])
+    expect(state?.directives).toEqual([{ colIndex: 2, direction: 'desc' }])
   })
 
   it('controlled equals input applies on Enter and on button click', () => {
@@ -375,7 +541,7 @@ describe('vNext SpreadsheetFilterDropdown', () => {
 
     fireEvent.click(container.querySelector('[data-testid="filter-add-equals"]') as HTMLElement)
     const state = store.getter(filterSortStateAtom)
-    expect(state['sheet-1']?.rules).toEqual([{ kind: 'equals', colIndex: 2, value: '' }])
+    expect(state['sheet-1']?.rules).toEqual([])
   })
 
   it('stale apply error does not overwrite a later success', async () => {

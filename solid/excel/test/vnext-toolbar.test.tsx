@@ -19,10 +19,39 @@ import {
   toolbarIntentAtom,
   setSheetProtectionAtom,
 } from '@einfach/spreadsheet-ui-core'
+import { setLocale } from '../src/i18n'
+import { numberFormatDialogAtom } from '../src-vnext/format-cells'
 import { SpreadsheetUiProvider, spreadsheetProjectionSnapshotAtom } from '../src-vnext/provider'
 import { SpreadsheetToolbar } from '../src-vnext/toolbar'
 
-afterEach(cleanup)
+const RAW_I18N_KEY_RE =
+  /\b(?:toolbar|numberFormatDropdown|numberFormatDialog|formatCells)\.[A-Za-z0-9_.-]+/
+
+const MORE_FORMAT_LABELS = {
+  en: {
+    currency: /More currency formats(?:\.\.\.|…)?/,
+    'date-time': /More date (?:&|and) time formats(?:\.\.\.|…)?/,
+    number: /More number formats(?:\.\.\.|…)?/,
+  },
+  zh: {
+    currency: /更多货币格式(?:\.\.\.|…)?/,
+    'date-time': /更多日期(?:与|和)时间格式(?:\.\.\.|…)?/,
+    number: /更多数字格式(?:\.\.\.|…)?/,
+  },
+} as const
+
+const MORE_FORMAT_TEST_IDS = {
+  currency: 'number-format-custom-currency',
+  'date-time': 'number-format-custom-dateTime',
+  number: 'number-format-custom-number',
+} as const
+
+afterEach(() => {
+  cleanup()
+  setLocale('en')
+})
+
+setLocale('en')
 
 function createFakeBackend() {
   const backend: SpreadsheetBackend = {
@@ -115,6 +144,9 @@ function getButtons(container: HTMLElement) {
     numberFormat: container.querySelector(
       '[data-testid="toolbar-btn-number-format"]',
     ) as HTMLButtonElement,
+    percent: container.querySelector(
+      '[data-testid="toolbar-btn-percent-format"]',
+    ) as HTMLButtonElement,
     // Wave 5 merge surface is a single dropdown — the top-level button always
     // opens the menu; the dropdown's four items (merge-center, across-rows,
     // across-cols, unmerge) carry the per-preset disabled state.
@@ -127,6 +159,42 @@ function getButtons(container: HTMLElement) {
       '[data-testid="toolbar-btn-format-painter"]',
     ) as HTMLButtonElement,
   }
+}
+
+function getMoreFormatButton(
+  kind: 'currency' | 'date-time' | 'number',
+  locale: 'en' | 'zh',
+): HTMLButtonElement | null {
+  const customTestId = MORE_FORMAT_TEST_IDS[kind]
+  const byCustomTestId = document.body.querySelector(
+    `[data-testid="${customTestId}"]`,
+  ) as HTMLButtonElement | null
+  if (byCustomTestId) return byCustomTestId
+
+  const byTestId = document.body.querySelector(
+    `[data-testid="number-format-more-${kind}"]`,
+  ) as HTMLButtonElement | null
+  if (byTestId) return byTestId
+
+  const label = MORE_FORMAT_LABELS[locale][kind]
+  const match = Array.from(document.body.querySelectorAll('button,[role="menuitem"]')).find((el) =>
+    label.test(el.textContent ?? ''),
+  )
+  return (match as HTMLButtonElement | undefined) ?? null
+}
+
+async function openCustomFormatSubmenu(container: HTMLElement) {
+  fireEvent.click(getButtons(container).numberFormat)
+  const dropdown = document.body.querySelector('[data-testid="number-format-dropdown"]')
+  expect(dropdown).not.toBeNull()
+  expect(dropdown?.textContent ?? '').not.toMatch(RAW_I18N_KEY_RE)
+
+  const custom = document.body.querySelector(
+    '[data-testid="number-format-item-Custom"]',
+  ) as HTMLButtonElement | null
+  expect(custom).not.toBeNull()
+  fireEvent.pointerEnter(custom!)
+  fireEvent.mouseEnter(custom!)
 }
 
 describe('vNext SpreadsheetToolbar', () => {
@@ -277,6 +345,118 @@ describe('vNext SpreadsheetToolbar', () => {
     })
     expect(store.getter(spreadsheetProjectionSnapshotAtom).result?.cells[0]?.format).toEqual({
       bold: true,
+    })
+  })
+
+  it('maps toolbar number formats from sorted visible rows to source rows', async () => {
+    const store = createStore()
+    const { backend, setFormatRangeCalls } = createRecordingBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 5, col: 4 } })
+    store.setter(spreadsheetProjectionSnapshotAtom, {
+      status: 'ready',
+      request: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        reason: 'test',
+        window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
+      },
+      result: {
+        kind: 'visible-window',
+        sheetId: 'sheet-1',
+        requestId: 1,
+        window: { rowStart: 0, rowEnd: 8, colStart: 0, colEnd: 5 },
+        cells: [
+          {
+            row: 5,
+            col: 4,
+            originalRow: 1,
+            displayValue: '300',
+            valueKind: 'number',
+            format: {},
+          },
+        ],
+      },
+      error: undefined,
+    })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    fireEvent.click(getButtons(container).percent)
+
+    await waitFor(() => expect(setFormatRangeCalls).toHaveLength(1))
+    expect(setFormatRangeCalls[0]).toEqual({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 1, rowEnd: 1, colStart: 4, colEnd: 4 },
+      format: { numberFormat: { kind: 'percent', digits: 0 } },
+    })
+  })
+
+  it('renders localized custom-format submenu entries without raw i18n keys', async () => {
+    for (const locale of ['en', 'zh'] as const) {
+      setLocale(locale)
+      const store = createStore()
+      const backend = createFakeBackend()
+
+      store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+      store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+
+      const { container } = render(() => (
+        <SpreadsheetUiProvider backend={backend} store={store}>
+          <SpreadsheetToolbar />
+        </SpreadsheetUiProvider>
+      ))
+
+      await openCustomFormatSubmenu(container)
+
+      await waitFor(() => {
+        expect(getMoreFormatButton('currency', locale)).not.toBeNull()
+        expect(getMoreFormatButton('date-time', locale)).not.toBeNull()
+        expect(getMoreFormatButton('number', locale)).not.toBeNull()
+      })
+      const text = [
+        getMoreFormatButton('currency', locale)?.textContent,
+        getMoreFormatButton('date-time', locale)?.textContent,
+        getMoreFormatButton('number', locale)?.textContent,
+      ].join(' ')
+      expect(text).toMatch(MORE_FORMAT_LABELS[locale].currency)
+      expect(text).toMatch(MORE_FORMAT_LABELS[locale]['date-time'])
+      expect(text).toMatch(MORE_FORMAT_LABELS[locale].number)
+      expect(text).not.toMatch(RAW_I18N_KEY_RE)
+      cleanup()
+    }
+  })
+
+  it('opens the currency number-format dialog from the custom-format submenu', async () => {
+    const store = createStore()
+    const backend = createFakeBackend()
+
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(selectCellAtom, { sheetId: 'sheet-1', coord: { row: 0, col: 0 } })
+
+    const { container } = render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <SpreadsheetToolbar />
+      </SpreadsheetUiProvider>
+    ))
+
+    await openCustomFormatSubmenu(container)
+    await waitFor(() => expect(getMoreFormatButton('currency', 'en')).not.toBeNull())
+    fireEvent.click(getMoreFormatButton('currency', 'en')!)
+
+    await waitFor(() => {
+      const state = store.getter(numberFormatDialogAtom)
+      if (state.status !== 'open') throw new Error('number-format dialog did not open')
+      expect(state.kind).toBe('currency')
+      expect(state.range).toEqual({ rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 })
+      expect(state.digits).toBe(2)
     })
   })
 

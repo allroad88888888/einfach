@@ -15,7 +15,6 @@ import {
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
-  openFormatCellsAtom,
   openNameManagerAtom,
   openValidationRuleEditorAtom,
   printPreviewOpenAtom,
@@ -39,18 +38,25 @@ import {
 
 import {
   isVisibleProjectionResult,
+  resolveProjectionSourceRange,
+  resolveProjectionSourceRanges,
   refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
   useSpreadsheetUiStore,
 } from '../provider'
+import { SpreadsheetNumberFormatDialogs, openNumberFormatDialogAtom } from '../format-cells'
 import { dispatchRedo, dispatchUndo } from '../provider/history-dispatch'
 import { BordersDropdown, type BordersPreset } from './BordersDropdown'
 import { HAlignDropdown, type HAlignValue } from './HAlignDropdown'
 import { MergeDropdown, type MergePreset } from './MergeDropdown'
 import { VAlignDropdown, type VAlignValue } from './VAlignDropdown'
 import type { SpreadsheetToolbarProps, SpreadsheetToolbarCommand } from './types'
-import { NumberFormatDropdown, type NumberFormatId } from './NumberFormatDropdown'
+import {
+  NumberFormatDropdown,
+  type NumberFormatCustomMenuId,
+  type NumberFormatId,
+} from './NumberFormatDropdown'
 import { FillColorPopover, colorPopoverAtom, type ColorPopoverMode } from './FillColorPopover'
 import { DEFAULT_FONT_FAMILY, FontFamilyDropdown } from './FontFamilyDropdown'
 import {
@@ -241,7 +247,7 @@ function numberFormatForValue(value: string | null): SpreadsheetNumberFormat {
       return { kind: 'currency', symbol: '$', digits: 2 }
     case 'DateShort':
     case 'Date':
-      return { kind: 'date', pattern: 'yyyy-mm-dd' }
+      return { kind: 'date', pattern: 'yyyy-MM-dd' }
     case 'DateLong':
       return { kind: 'date', pattern: 'yyyy"年"m"月"d"日"' }
     case 'Time12':
@@ -249,9 +255,9 @@ function numberFormatForValue(value: string | null): SpreadsheetNumberFormat {
     case 'Time24':
       return { kind: 'time', pattern: 'HH:mm' }
     case 'DateTime12':
-      return { kind: 'custom', pattern: 'yyyy-mm-dd h:mm AM/PM' }
+      return { kind: 'custom', pattern: 'yyyy-MM-dd h:mm AM/PM' }
     case 'DateTime24':
-      return { kind: 'custom', pattern: 'yyyy-mm-dd HH:mm' }
+      return { kind: 'custom', pattern: 'yyyy-MM-dd HH:mm' }
     default:
       return { kind: 'general' }
   }
@@ -506,21 +512,24 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   function onNumberFormatPick(id: NumberFormatId) {
     closeNumberFormatDropdown()
     if (id === 'Custom') {
-      const selection = selectionSnapshot()
-      const sheetId = selection.selection.sheetId || availability().sheetId
-      if (!sheetId) return
-      store.setter(openFormatCellsAtom, {
-        sheetId,
-        range: selection.range,
-        initialTab: 'number',
-        initialFormat: activeCellFormat(),
-      })
       return
     }
     // 'WanYuan' is disabled in the dropdown UI and never reaches here, but
     // guard so a future re-enable does not silently fall through to General.
     if (id === 'WanYuan') return
     dispatchCommand({ command: 'number-format', value: id })
+  }
+
+  function openCustomNumberFormatDialog(kind: NumberFormatCustomMenuId) {
+    const selection = selectionSnapshot()
+    const sheetId = selection.selection.sheetId || availability().sheetId
+    if (!sheetId) return
+    store.setter(openNumberFormatDialogAtom, {
+      kind,
+      sheetId,
+      range: selection.range,
+      initialFormat: activeCellFormat(),
+    })
   }
 
   function activeCellFormat(): SpreadsheetCellFormat {
@@ -748,17 +757,23 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     }
 
     const current = activeCellFormat()
-    const result = await backend.setFormatRange({
-      kind: 'set-format-range',
-      sheetId: intent.sheetId,
-      range,
-      format: commandFormat(intent, current),
-    })
+    const format = commandFormat(intent, current)
+    const sourceRanges = resolveProjectionSourceRanges(store, intent.sheetId, range)
+    let result: Awaited<ReturnType<NonNullable<typeof backend.setFormatRange>>> | undefined
+    for (const sourceRange of sourceRanges) {
+      result = await backend.setFormatRange({
+        kind: 'set-format-range',
+        sheetId: intent.sheetId,
+        range: sourceRange,
+        format,
+      })
+    }
     recordHistoryEntry({
       sheetId: intent.sheetId,
       kind: 'format.set',
       revision: result?.revision,
-      affectedRange: result?.affectedRange ?? range,
+      affectedRange:
+        sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range,
     })
     await refreshVisibleProjection(store, backend, intent.sheetId)
   }
@@ -817,10 +832,16 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         } else {
           nextFormat.borders = nextBorders
         }
+        const sourceRange = resolveProjectionSourceRange(store, sheetId, {
+          rowStart: row,
+          rowEnd: row,
+          colStart: col,
+          colEnd: col,
+        })
         await backend.setFormatRange({
           kind: 'set-format-range',
           sheetId,
-          range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+          range: sourceRange,
           format: nextFormat,
         })
       }
@@ -1106,18 +1127,23 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
+    const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
     try {
-      const result = await backend.setFormatRange({
-        kind: 'set-format-range',
-        sheetId,
-        range,
-        format: {},
-      })
+      let result: Awaited<ReturnType<NonNullable<typeof backend.setFormatRange>>> | undefined
+      for (const sourceRange of sourceRanges) {
+        result = await backend.setFormatRange({
+          kind: 'set-format-range',
+          sheetId,
+          range: sourceRange,
+          format: {},
+        })
+      }
       recordHistoryEntry({
         sheetId,
         kind: 'format.set',
         revision: result?.revision,
-        affectedRange: result?.affectedRange ?? range,
+        affectedRange:
+          sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range,
       })
       await refreshVisibleProjection(store, backend, sheetId)
     } catch (error) {
@@ -1198,10 +1224,12 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
    * path is a no-op there because there is no `digits` to remove.
    */
   function adjustDigits(direction: 'increase' | 'decrease') {
-    if (!backend.setFormatRange) return
+    const setFormatRange = backend.setFormatRange
+    if (!setFormatRange) return
     const sheetId = getMutationSheetId()
     if (!sheetId) return
     const range = selectionSnapshot().range
+    const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
     const currentFormat = activeCellFormat()
     const nf = currentFormat.numberFormat
     const nextFormat: SpreadsheetCellFormat = { ...currentFormat }
@@ -1215,19 +1243,26 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       if (direction === 'decrease') return
       nextFormat.numberFormat = { kind: 'decimal', digits: 1, thousands: false }
     }
-    void backend
-      .setFormatRange({
-        kind: 'set-format-range',
-        sheetId,
-        range,
-        format: nextFormat,
-      })
+    void (async () => {
+      let result: Awaited<ReturnType<typeof setFormatRange>> | undefined
+      for (const sourceRange of sourceRanges) {
+        result = await setFormatRange({
+          kind: 'set-format-range',
+          sheetId,
+          range: sourceRange,
+          format: nextFormat,
+        })
+      }
+      return result
+    })()
       .then((result) => {
+        const affectedRange =
+          sourceRanges.length === 1 ? result?.affectedRange ?? sourceRanges[0] : range
         recordHistoryEntry({
           sheetId,
           kind: 'format.set',
           revision: result?.revision,
-          affectedRange: result?.affectedRange ?? range,
+          affectedRange,
         })
         return refreshVisibleProjection(store, backend, sheetId)
       })
@@ -1859,8 +1894,10 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
         anchorRect={numberFormatAnchor()}
         anchorEl={numberFormatAnchorEl}
         onSelect={onNumberFormatPick}
+        onCustomSelect={openCustomNumberFormatDialog}
         onClose={closeNumberFormatDropdown}
       />
+      <SpreadsheetNumberFormatDialogs />
       <FontFamilyDropdown
         open={fontFamilyOpen()}
         anchorRect={fontFamilyAnchor()}

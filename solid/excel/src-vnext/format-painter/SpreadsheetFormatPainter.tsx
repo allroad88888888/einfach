@@ -14,6 +14,7 @@ import {
   type SpreadsheetCellFormat,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  resolveProjectionSourceRanges,
   refreshVisibleProjection,
   spreadsheetProjectionSnapshotAtom,
   useSpreadsheetBackend,
@@ -59,12 +60,15 @@ export function SpreadsheetFormatPainter(props: SpreadsheetFormatPainterProps) {
     if (!backend.setFormatRange) {
       throw new Error('Range formatting is not supported by this spreadsheet backend.')
     }
-    await backend.setFormatRange({
-      kind: 'set-format-range',
-      sheetId,
-      range,
-      format,
-    })
+    const sourceRanges = resolveProjectionSourceRanges(store, sheetId, range)
+    for (const sourceRange of sourceRanges) {
+      await backend.setFormatRange({
+        kind: 'set-format-range',
+        sheetId,
+        range: sourceRange,
+        format,
+      })
+    }
     await refreshVisibleProjection(store, backend, sheetId)
   }
 
