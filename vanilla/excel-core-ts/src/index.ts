@@ -100,3 +100,11 @@ export {
   parseRefToCoord,
 } from './eval'
 export type { CoerceResult, CoerceOk, CoerceErr } from './eval'
+
+// Wave C — built-in function registry (math / logical / lookup / text /
+// date / stats). Evaluator dispatches against `BUILTIN_FUNCTIONS`.
+export {
+  BUILTIN_FUNCTIONS,
+  getBuiltinFunction,
+  listBuiltinNames,
+} from './eval/functions'

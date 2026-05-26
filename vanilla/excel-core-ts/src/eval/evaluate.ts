@@ -20,7 +20,8 @@
  *  - `binary` → arithmetic / comparison / concat with Excel coercion.
  *  - `percent` (`50%` → `0.5`) → arithmetic coercion + divide by 100.
  *  - `arrayLiteral` → materialize inner exprs into `{ kind: 'array' }`.
- *  - `call` → returns `#NAME?` (Wave C adds the registry).
+ *  - `call` → dispatches via `getBuiltinFunction(name)` first; falls
+ *    through to host custom formula; finally to `#NAME?`.
  *
  * Critical invariant: this function never touches the atom store. It only
  * reads from `ctx.cells` (or `ctx.crossSheetCells(...)` for cross-sheet),
@@ -38,6 +39,7 @@ import type {
   Expr,
   Value,
 } from '../types'
+import { getBuiltinFunction } from './functions'
 import { BLANK } from '../types'
 import { cellKey, iterateRange, parseA1, parseRange, RangeTooLargeError } from '../refs'
 import { propagateError, toNumber, toString as toStr } from './coerce'
@@ -132,12 +134,15 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
     }
 
     case 'call': {
-      // Wave C will register `ctx.callCustom` + built-in dispatch here.
-      // For now: try the custom-formula host, fall through to #NAME?.
+      // Dispatch order: built-in registry → host custom formula → #NAME?.
+      // Built-ins shadow customs by convention (custom formulas refuse
+      // registration with a builtin name on the host side).
       const argValues: Value[] = ast.args.map((a) => evaluate(a, ctx))
+      const builtin = getBuiltinFunction(ast.name)
+      if (builtin) return builtin(argValues, ctx)
       const custom = ctx.callCustom(ast.name, argValues)
       if (custom !== undefined) return custom
-      return ERR('#NAME?', `function '${ast.name}' is not registered (Wave C)`)
+      return ERR('#NAME?', `function '${ast.name}' is not registered`)
     }
   }
 }

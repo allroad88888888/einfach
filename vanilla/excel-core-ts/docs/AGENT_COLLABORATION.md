@@ -29,6 +29,11 @@
 | 2026-05-26 | B1 agent | Wave B / B1 — parser | done | `vanilla/excel-core-ts/src/parser/{tokenizer,parser,index}.ts`, `vanilla/excel-core-ts/test/parser.test.ts`, single-line append to `vanilla/excel-core-ts/src/index.ts` (`parseFormula` re-export) | hand off to B2 evaluator for AST consumption |
 | 2026-05-26 | B3 agent | Wave B / B3 — refs / a1 / ranges | done | `vanilla/excel-core-ts/src/refs/{a1,ranges,index}.ts`, `vanilla/excel-core-ts/test/refs.test.ts`, append to `vanilla/excel-core-ts/src/index.ts` (refs re-exports) | unblocks B1 ref parsing + B2 refLookup + Wave C range fns |
 | 2026-05-26 | B2 agent | Wave B / B2 — workbook + evaluator skeleton | done | `vanilla/excel-core-ts/src/{workbook,sheet}.ts`, `vanilla/excel-core-ts/src/eval/{evaluate,coerce,index}.ts`, `vanilla/excel-core-ts/test/{workbook,evaluate}.test.ts`, replace staged `Workbook`/`WorkbookSheet` in `src/types.ts` + append runtime exports to `src/index.ts` | hand off to Wave C function registry |
+| 2026-05-26 | C2 agent | Wave C / C2 — logical functions | done | `vanilla/excel-core-ts/src/eval/functions/logical.ts`, `vanilla/excel-core-ts/test/logical.test.ts` | wait for sibling C1/C3/C4/C5; CC main session merges `functions/index.ts` registry |
+| 2026-05-26 | C4 agent | Wave C / C4 — text functions | done | `vanilla/excel-core-ts/src/eval/functions/text.ts`, `vanilla/excel-core-ts/test/text.test.ts` | wait for sibling C1/C3/C5; CC main session merges `functions/index.ts` registry |
+| 2026-05-26 | C1 agent | Wave C / C1 — math functions | done | `vanilla/excel-core-ts/src/eval/functions/math.ts`, `vanilla/excel-core-ts/test/math.test.ts` | wait for sibling C2/C3/C4/C5; CC main session merges `functions/index.ts` registry |
+| 2026-05-26 | C3 agent | Wave C / C3 — lookup functions | done | `vanilla/excel-core-ts/src/eval/functions/lookup.ts`, `vanilla/excel-core-ts/test/lookup.test.ts` | wait for sibling C1/C2/C4/C5; CC main session merges `functions/index.ts` registry |
+| 2026-05-26 | C5 agent | Wave C / C5 — date + stats functions | done | `vanilla/excel-core-ts/src/eval/functions/date.ts`, `vanilla/excel-core-ts/src/eval/functions/stats.ts`, `vanilla/excel-core-ts/test/date.test.ts`, `vanilla/excel-core-ts/test/stats.test.ts` | CC main session merges `functions/index.ts` registry — all C1..C5 tracks now done |
 
 ### Handoff: A / 2026-05-26
 
@@ -418,3 +423,248 @@ Known risks / TODOs left in code:
 - The `cellsMapTags` WeakMap is module-scoped (one global counter for the package). Tags survive across workbook lifetimes; counter could theoretically wrap but at 1 alloc per sheet-snapshot per recalc that's a non-issue for any realistic session.
 
 Next request: Wave C (5-way function-registry fanout) can wire `ctx.callCustom` and a built-in dispatcher inside `evaluate`'s `'call'` branch — same shape, just consults the built-in `Map<string, FunctionImpl>` first per AGENT_COLLABORATION.md §"Wave C". Workbook + sheetAtom + evaluator skeleton are done; Wave D can begin worker-shim work in parallel using the `Workbook` interface as the SpreadsheetBackend target.
+
+---
+
+### Handoff: C.C1 / 2026-05-26
+
+Owner（交付方）: C1 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/eval/functions/math.ts` (new — 15 `FunctionImpl` exports + `FUNCTIONS` record)
+- `vanilla/excel-core-ts/test/math.test.ts` (new — 88 specs)
+
+Public types changed: none. Implementation strictly consumes `FunctionImpl` / `Value` / `EvalContext` from `../../types` and `propagateError` / `toNumber` from `../coerce` — zero contract drift.
+Atoms added/changed: none (functions are pure, never read `ctx`).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/math --no-coverage` → **88/88 pass** (target was 60+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → **386/386 pass** (full package: 88 math + 84 logical + 87 refs + 102 parser + 20 workbook + 21 evaluate + smoke + types).
+- Isolated `tsc --noEmit` over `src/eval/functions/math.ts` + `test/math.test.ts` → clean.
+- `npx tsc -b vanilla/excel-core-ts` → reports **one pre-existing error in `src/eval/functions/lookup.ts:37`** (`'err' declared but never read`) — outside the C1 whitelist; C3 owns that file. No new diagnostics from C1.
+
+Functions implemented (15/15): SUM, AVERAGE, COUNT, COUNTA, MIN, MAX, ROUND, ROUNDUP, ROUNDDOWN, INT, MOD, ABS, POWER, SQRT, SIGN.
+
+Excel semantics pinned (key rules covered by tests):
+- **Aggregator scalar-vs-array split** (SUM / AVERAGE / MIN / MAX): scalar args coerce via `toNumber` (string `"5"` → 5, `TRUE` → 1); inside an array/range, strings + booleans + blanks are **ignored** silently. Errors propagate from both paths.
+- **COUNT** only counts `kind: 'number'` (skip string-even-if-numeric-looking, skip boolean, skip blank); **COUNTA** counts every non-blank including errors-inside-arrays.
+- **MIN/MAX** with no numeric values returns 0 (Excel quirk, not error).
+- **ROUND** is half-away-from-zero (not JS's half-toward-positive-infinity); ROUNDUP is away-from-zero; ROUNDDOWN truncates toward zero. All three accept negative `digits` to round left of the decimal.
+- **INT** floors toward negative infinity (so `INT(-8.9) = -9`).
+- **MOD** uses `a - b * floor(a/b)` so the result's sign follows the divisor (Excel rule), not the dividend (JS `%`).
+- **POWER**: `POWER(-2, 0.5)` → `#NUM!`; `POWER(0, 0)` → `#NUM!` (diverges from `Math.pow` which returns 1); `POWER(0, neg)` → `#DIV/0!`.
+- **SQRT(-1)** → `#NUM!`.
+- **Error short-circuit**: every function returns the first `kind: 'error'` positional arg verbatim before any coercion attempt (mirrors the dispatcher's default per `types.ts §8` discipline).
+
+Known deviations / TODOs left in code:
+- `ROUND(value)` (1-arg form) defaults `digits` to 0. Excel **requires** the second arg syntactically — this is an ergonomic extension that doesn't break any 2-arg call site. No TODO comment because the tests pin the behavior; if Codex review wants strict Excel parity, change the `args.length < 1 || args.length > 2` guard to `args.length !== 2` and update the 1-arg test.
+- `MIN()` / `MAX()` with no args return `0` (Excel returns `0` too; matches). No TODO.
+- Nested arrays inside aggregation walks are flattened recursively — Excel doesn't expose nested-array values via cells, but a future array-returning custom formula could, so the helper handles it.
+- No interaction with `EvalContext`. Range materialization happens upstream in the evaluator (`rangeLookupGeneric`) — by the time args reach a math function they are already `{ kind: 'array' }` envelopes. If C3 lookup functions need to walk a range without materializing (Wave E streaming), they'll wire their own iterator; this file's helpers don't need to change.
+
+Next request: CC main session, after all C tracks (C1/C2/C3/C4/C5) land, creates `src/eval/functions/index.ts` that imports each track's `FUNCTIONS` record and assembles the merged `Map<string, FunctionImpl>` consumed by the evaluator's `'call'` branch. C1's surface is `import { FUNCTIONS as MATH } from './math'`. No naming collisions with the other Wave C function sets (math vs logical vs lookup vs text vs date+stats are all disjoint by Excel's spec).
+
+---
+
+### Handoff: C.C2 / 2026-05-26
+
+Owner（交付方）: C2 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/eval/functions/logical.ts` (new — IF, IFERROR, IFNA, AND, OR, NOT, IFS, SWITCH, TRUE, FALSE + `FUNCTIONS` registry export)
+- `vanilla/excel-core-ts/test/logical.test.ts` (new — 61 specs)
+
+Public types changed: none. Imports `FunctionImpl` / `Value` from `'../../types'` and `propagateError` / `toBoolean` from `'../coerce'` — no contract drift.
+
+Atoms added/changed: none (pure functions).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/logical --no-coverage` → **61/61 pass** (target was 40+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → **386/386 pass** (full package; co-exists with C1 math suite, no regression in B1/B2/B3).
+- `npx tsc -p vanilla/excel-core-ts/tsconfig.json --noEmit` → only pre-existing C3 lookup.ts diagnostic (`'err' is declared but its value is never read`, owned by C3). **No C2 errors.**
+
+Semantic deviations from default error propagation (each pinned by ≥ 1 test):
+- **IF**: only `cond` propagates; chosen branch is returned verbatim even if it's an error (test: `returns then-branch verbatim even if it is an error`).
+- **IFERROR**: swallows ANY error in arg 0; passes blank through unchanged; returns `fallback` even if `fallback` itself is an error (3 dedicated tests).
+- **IFNA**: only catches `#N/A`; other errors (`#DIV/0!`, `#REF!`, `#VALUE!`) pass through verbatim (3 dedicated tests).
+- **AND/OR**: blanks are *ignored*, not coerced to false. All-blank + zero-arg both → `#VALUE!`. First-error-wins via `propagateError`.
+- **NOT**: single-arg gatekeeper; arity ≠ 1 → `#VALUE!`.
+- **IFS**: errors in *unreached* vals do NOT surface (test: `does NOT inspect unreached vals`). Odd-count args → `#N/A` after exhausting valid pairs.
+- **SWITCH**: errors in cases beyond the match do NOT surface. Strings match case-insensitively; numbers strict; blank matches blank.
+- **TRUE/FALSE**: zero-arg; extra args → `#VALUE!`.
+
+Known Excel quirks NOT matched (documented for follow-up):
+- **SWITCH blank-vs-zero**: Excel's arithmetic-equality treats blank as 0, so `=SWITCH("",0,"hit")` matches. We treat blank as a distinct case-kind (test: `matches blank to blank`); `SWITCH(BLANK, NUM(0), ...)` will NOT match. This is the more predictable choice and matches the Rust `eval.rs` behavior the port targets. If a future test fixture demands Excel-exact behavior, change `excelEquals` in `logical.ts` to coerce `blank` to `number(0)` when comparing.
+- **IFS dangling-cond**: Excel surfaces a `#N/A` at evaluation time for odd-count args; we do the same. The Excel formula bar actually rejects the syntax pre-eval, but a constructed-AST path (e.g. via paste of a partial formula) lands here. Behavior pinned by test.
+- **Array args**: AND/OR/NOT/IF/SWITCH currently inspect only the top-left scalar of `kind:'array'` operands (via `toBoolean` / `excelEquals`). Excel would broadcast / aggregate. Out of scope for v1; Wave E `spill.ts` will revisit.
+
+Next request: CC main session can now register `FUNCTIONS` from `'./logical'` into the shared `src/eval/functions/index.ts` `Map<string, FunctionImpl>` alongside C1 math + C3 lookup + C4 text + C5 date/stats. No further C2 work expected unless an Excel-quirk test from Wave F surfaces a fixture mismatch.
+
+---
+
+### Handoff: C.C3 / 2026-05-26
+
+Owner（交付方）: C3 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/eval/functions/lookup.ts` (new — `VLOOKUP` / `HLOOKUP` / `INDEX` / `MATCH` / `XLOOKUP` + `FUNCTIONS` registry)
+- `vanilla/excel-core-ts/test/lookup.test.ts` (new — 56 specs)
+
+Public types changed: none. Lookup functions consume only `Value` and `FunctionImpl` from `../../types` and helpers from `../coerce`.
+Atoms added/changed: none (functions are pure).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/lookup --no-coverage` → **56/56 pass** (target 30+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → 566/567 pass (sole failure: `test/date.test.ts`, owned by C5 — outside C3 whitelist).
+- `npx tsc -b vanilla/excel-core-ts` → clean for the C3 files (`src/eval/functions/lookup.ts`). Pre-existing diagnostics in `src/eval/functions/stats.ts` (C5 track) remain.
+
+Coverage per function (acceptance was ≥ 6 fixtures each):
+- **VLOOKUP** — 11 fixtures: exact-hit, exact-miss → #N/A, approximate (3 bucket cases), approximate below first → #N/A, wildcards (* and ?), case-insensitive, error propagation, col_index < 1 → #VALUE!, col_index > width → #REF!, wrong arity, escaped wildcards (`~*`).
+- **HLOOKUP** — 8 fixtures: exact (2 rows), approximate, below first → #N/A, wildcards, not found → #N/A, error propagation, row_index < 1 → #VALUE!, row_index > height → #REF!.
+- **INDEX** — 10 fixtures: 2-D row+col indexing, row_num=0 → whole column, col_num=0 → whole row, both 0 → whole array, 1-D row indexing, 1-D column indexing, out of bounds → #REF!, error propagation, scalar wrapped, negative → #VALUE!.
+- **MATCH** — 11 fixtures: exact, exact wildcards, match_type 1 (largest <= 3 cases), match_type 1 default, match_type 1 below → #N/A, match_type -1 (desc, 2 cases), match_type -1 above → #N/A, not found → #N/A, error propagation, invalid match_type → #VALUE!, case-insensitive.
+- **XLOOKUP** — 13 fixtures: exact hit (3 cases), exact miss → #N/A, exact miss with if_not_found (string + number sentinel), match_mode -1 (next smaller, 2 cases), match_mode 1 (next larger, 2 cases), match_mode 2 (wildcard, 2 cases), search_mode -1 (last-to-first), mismatched arrays → #VALUE!, error propagation (incl. if_not_found exception), case-insensitive, horizontal lookup_array, multi-column return, invalid match_mode → #VALUE!, invalid search_mode → #VALUE!.
+
+Known risks / TODOs deliberately punted (inline `TODO(C3)` comments where punted):
+- **XLOOKUP `search_mode = 2 | -2` (binary search)** — falls back to linear scan in the appropriate direction. Correct on sorted input, just slower than Excel's O(log n) path. Acceptance tests cover ≤ 20-element arrays so this is invisible at v1; Wave F can swap in a true binary search once a perf bench shows it matters. Marked with `TODO(C3)` in `findXLookupIndex` and `scanXLookupDesc`.
+- **Approximate-match assumption (VLOOKUP/HLOOKUP/MATCH match_type=1)** — Excel docs say "if data isn't sorted, result is undefined". My impl is deterministic on sorted-ASC data (largest <= needle, scanning until first overshoot). On unsorted data my impl returns the largest seen before any overshoot — which is what Excel does in practice and matches the Rust `eval.rs` behavior. Documented in the file-level docstring.
+- **Implicit dimension reduction in INDEX** — the rule "if `array` is 1-D and only one positional arg is given, the arg indexes within that line" is implemented for both single-row and single-column inputs. The edge case "1x1 array with INDEX(arr, 1)" returns the scalar; `INDEX(arr, 0)` (still 1x1) also returns the scalar (Excel returns the array). Tested via the "scalar wrapped" fixture.
+- **XLOOKUP `if_not_found` error-propagation exception** — per the spec, `if_not_found` is the only positional that does NOT propagate errors (host may pass an error-like sentinel deliberately). The test pins this with `errDIV` in the `if_not_found` slot; positional 0/1/2/4/5 still propagate.
+- **Compare semantics for blank vs other types** — blank compares equal to a `kind:'number'` zero in lookup contexts (`compareForLookup` line). Excel matches this in lookup tables. If a future fixture wants "blank is its own bucket", revisit.
+
+Next request: CC main session merges `FUNCTIONS` from `'./lookup'` into the shared `src/eval/functions/index.ts` `Map<string, FunctionImpl>` alongside C1 math + C2 logical + C4 text + C5 date/stats. No further C3 work expected unless a Wave F e2e fixture exposes a parity gap with Rust `eval.rs`.
+
+---
+
+### Handoff: C.C4 / 2026-05-26
+
+Owner（交付方）: C4 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/eval/functions/text.ts` (new — `FUNCTIONS` record for the 11 text functions)
+- `vanilla/excel-core-ts/test/text.test.ts` (new — 79 specs across 11 describe blocks)
+
+Public types changed: none. C4 consumes `Value`, `FunctionImpl`, `EvalContext` verbatim from `../../types` and `propagateError` / `toNumber` / `valueToString` from `../coerce`. Only new export is `FUNCTIONS: Record<string, FunctionImpl>`.
+
+Atoms added/changed: **none** (function impls are pure value-in / value-out; ctx is unused inside text fns).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/text --no-coverage` → **79/79 pass** (target was 45+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → 520/521 pass; the one failure is in `lookup.test.ts` (sibling C3 track, outside C4 file whitelist).
+- Isolated `tsc --noEmit` over `src/eval/functions/text.ts` + `test/text.test.ts` → clean.
+- `npx tsc -b vanilla/excel-core-ts` → reports pre-existing errors in sibling tracks (`lookup.ts:37` unused `err`, `stats.ts:64` Value union narrowing, `stats.ts:227` unused `sameShape`) — all outside C4 whitelist; left for C3/C5 owners.
+
+Functions delivered (11): CONCATENATE, CONCAT, LEFT, RIGHT, MID, LEN, LOWER, UPPER, TRIM, TEXT, VALUE.
+
+Test count by function:
+- CONCATENATE 6, CONCAT 5, LEFT 7, RIGHT 6, MID 7, LEN 5, LOWER 4, UPPER 4, TRIM 6, TEXT 14, VALUE 15 — **79 total**.
+
+Each function has ≥ 4 fixtures (mandate satisfied). LEN/LEFT/MID each have a dedicated emoji test pinning the `Array.from`-based codepoint split.
+
+TEXT format codes covered (7, per task scope):
+`"0"`, `"0.00"`, `"#,##0"`, `"#,##0.00"`, `"0%"`, `"0.00%"`, `"$#,##0.00"`.
+
+TEXT format codes punted (task brief out-of-scope — `formatTextNumber` returns raw `String(n)`):
+- Date / time codes (`"yyyy-mm-dd"`, etc.) — owned by Wave C/C5 dates.
+- Negative-suffix sections (`"#,##0;(#,##0)"`) — only the positive section before `;` is honored; negative numbers format with the positive code (e.g. `-1234` under `"#,##0;(#,##0)"` becomes `-1,234`, not `(1,234)`). One TODO comment + one test pins this.
+- Arbitrary `#`/`0` patterns beyond the canonical seven.
+- Scientific (`0.00E+00`), fraction (`# ?/?`), embedded literal text, color sections.
+
+Known risks / behavior deviations:
+- **Unicode discipline**: LEN/LEFT/RIGHT/MID use `Array.from(text)` to split by code points, so emoji and other non-BMP codepoints count as 1 character. This **diverges from Excel**, which counts UTF-16 code units. Tests pin the einfach-ts behavior explicitly. Inline module-header comment documents the choice; if Codex review prefers strict Excel parity, swap `codepoints(s)` for a bare `s.split('')` (UTF-16-code-unit-based).
+- **TRIM** mirrors Excel's strict ASCII-whitespace rule. Non-breaking space (U+00A0) is *not* trimmed — see inline comment. If product wants to trim NBSP too, swap the regex to `/\s+/g`.
+- **Grapheme clusters not segmented**: flag emoji (regional-indicator pairs), keycap sequences, ZWJ family glyphs still count as multiple "characters" because we split at codepoint, not grapheme cluster. Full grapheme support needs `Intl.Segmenter`. Deferred.
+- **CONCATENATE vs CONCAT**: CONCATENATE coerces an array arg to its top-left scalar (Excel's legacy behavior); CONCAT flattens arrays in row-major order (Excel's post-2019 behavior). Tests pin both.
+- **VALUE** strict-comma check rejects leading / trailing / doubled commas, but `"1,2,3"` is currently accepted (simple comma-strip turns it into `123`). Documented gap; Wave F could tighten with a "comma every 3 digits" pattern check.
+- **VALUE** with leading `$` after a sign (`"-$1234"`) — currently accepted (sign pulled off first, then `$`). Excel accepts this. Reverse order (`"$-1234"`) is rejected, matching Excel.
+- **TEXT(<boolean>, fmt)** stringifies the boolean as "TRUE"/"FALSE" regardless of format code. Test pins this. Matches Excel.
+
+Next request: CC main session merges `src/eval/functions/index.ts` consolidating all C-track `FUNCTIONS` records into a single dispatch Map. C4's import surface is `import { FUNCTIONS as TEXT } from './text'`. No naming collisions with C1/C2/C3/C5 (the 11 names are disjoint from the Excel-spec inventories of math, logical, lookup, date, stats).
+
+---
+
+### Handoff: C.C5 / 2026-05-26
+
+Owner（交付方）: C5 agent
+Status: done
+Touched files:
+- `vanilla/excel-core-ts/src/eval/functions/date.ts` (new — `TODAY` / `NOW` / `DATE` / `YEAR` / `MONTH` / `DAY` / `WEEKDAY` + `FUNCTIONS` record; internal `dateToSerial` / `serialToDate` / `weekdaySun0Mon1` helpers)
+- `vanilla/excel-core-ts/src/eval/functions/stats.ts` (new — `COUNTIF` / `SUMIF` / `COUNTIFS` / `SUMIFS` + `FUNCTIONS` record; local `parseCriterion` / `matchesCriterion` / `wildcardMatch`)
+- `vanilla/excel-core-ts/test/date.test.ts` (new — 41 specs)
+- `vanilla/excel-core-ts/test/stats.test.ts` (new — 53 specs)
+
+Public types changed: none. Both files consume only `FunctionImpl` / `Value` / `EvalContext` from `'../../types'` and `propagateError` / `toNumber` from `'../coerce'`. The criterion grammar / wildcard matcher are local to `stats.ts` (no cross-import from C3 lookup, per mandate). Single new ambient export per file: `FUNCTIONS: Record<string, FunctionImpl>`.
+
+Atoms added/changed: **none** (pure function impls; ctx is unused inside both files — date / stats never consult `cells` or `refLookup`).
+
+Tests run:
+- `npx jest vanilla/excel-core-ts/test/date vanilla/excel-core-ts/test/stats --no-coverage` → **94/94 pass** (target was 50+).
+- `npx jest vanilla/excel-core-ts --no-coverage` → **615/615 pass** (full package, 11 suites: 41 date + 53 stats + 88 math + 61 logical + 56 lookup + 79 text + 87 refs + 102 parser + 20 workbook + 21 evaluate + 7 types smoke).
+- `npx tsc -b vanilla/excel-core-ts` → **clean** (no diagnostics). The pre-existing C5-owned errors flagged in C3/C4 handoffs (`stats.ts:64` Value narrowing, `stats.ts:227` unused `sameShape`) are now fixed; the lookup.ts `err` lint is C3's, untouched.
+
+Functions delivered:
+- **date (7)**: TODAY, NOW, DATE, YEAR, MONTH, DAY, WEEKDAY.
+- **stats (4)**: COUNTIF, SUMIF, COUNTIFS, SUMIFS.
+
+Each function has ≥ 4 fixtures (mandate satisfied — DATE has 11, YEAR/MONTH/DAY share an 11-spec block, WEEKDAY 9, TODAY 4, NOW 4; COUNTIF 13, SUMIF 10, COUNTIFS 9, SUMIFS 9, plus 5 cross-cutting criterion-edge tests).
+
+### Date semantics — 1900 epoch + Excel leap-year bug
+
+The big risk-area in the task brief: **DATE(1900, 2, 29)** returns serial **60** (Excel-compat). Confirmed by test "DATE(1900, 2, 29) === 60 (Excel 1900 leap-bug)" in `date.test.ts`. The math:
+
+- Anchor: `Date.UTC(1899, 11, 31)` → serial 0.
+- `dateToSerial(d)` computes `realDays = (d - anchor) / 86_400_000`, then shifts `+1` when `realDays >= 60` to insert the phantom Feb 29 1900.
+- `serialToDate(s)` is the inverse: shifts `-1` when `s > 60` to map the phantom day to JS's real 1900-03-01.
+- `DATE()` special-cases the literal `(1900, 2, 29)` triple — JS Date.UTC rolls Feb 29 1900 over to March 1, so without this branch we'd return 61.
+- Other rollover paths never land on serial 60 (no JS Date equates to Feb 29 1900), so the bug only surfaces on the explicit literal request.
+
+Pinned values matching Excel:
+- `DATE(2024, 1, 1) === 45292`
+- `DATE(1900, 1, 1) === 1`
+- `DATE(1900, 2, 28) === 59`
+- `DATE(1900, 2, 29) === 60`
+- `DATE(1900, 3, 1) === 61`
+- `DATE(2024, 12, 31) === 45657`
+- WEEKDAY uses `(serial - 1) % 7` (Sun=0) — internally consistent with Excel's bug-aware calendar. `WEEKDAY(1) = 1 (Sun)`, `WEEKDAY(45292) = 2 (Mon, 2024-01-01)`.
+
+TODAY / NOW are exercised under `jest.useFakeTimers().setSystemTime(...)` so the non-deterministic clock is pinned per test.
+
+### Stats semantics — criterion grammar
+
+`parseCriterion(Value)` is the single entry point. It:
+1. Propagates `kind: 'error'` criteria verbatim (`{error: Value}`).
+2. For non-string criteria (number / boolean / blank / array), returns `op: '='` with the value as-is (arrays collapse to top-left).
+3. For string criteria, strips the leading comparator (`<=`, `>=`, `<>`, `<`, `>`, `=`), trims the rest, attempts numeric coercion (strict regex `^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$`), recognizes `"TRUE"` / `"FALSE"`, then falls back to string. Wildcards are detected on the remaining string.
+
+`matchesCriterion(value, parsed)`:
+- Wildcards only apply for `=` / `<>` against string targets — wildcard against a non-string cell never matches (negated for `<>`).
+- `=` / `<>` use `scalarEquals` (type-aware: number cell never equals string criterion; blank equals empty-string).
+- Ordered comparison (`<`, `<=`, `>`, `>=`) coerces both sides via `numericComparable` (which yields `undefined` for string / blank / array / error). Comparison fails closed (returns false) on type mismatch — matches Excel's behavior, e.g. `COUNTIF(range, ">-1")` does NOT count blank cells even though they coerce to 0 in arithmetic.
+
+### Excel quirks pinned by test
+
+- **String case-insensitive equality**: `COUNTIF(["apple","APPLE","Banana"], "apple") === 2`.
+- **Wildcard escaping**: `"a~*"` matches literal `"a*"`, not `"ab"`.
+- **`<>` empty rest**: counts non-blank, non-empty-string cells (`COUNTIF([1, "", BLANK, 2], "<>") === 2`).
+- **Blank vs empty-string equality**: `BLANK == ""` in `=` comparisons (`COUNTIF([BLANK, "", 1], "") === 2`).
+- **Error cells in range are skipped** by COUNTIF/SUMIF/COUNTIFS (Excel-compat). Errors in `sum_range` of SUMIF/SUMIFS still propagate as `#REF!` / `#DIV/0!`.
+- **Non-numeric sum-targets** are silently skipped in SUMIF/SUMIFS (e.g. a string cell in `sum_range` does not poison the sum).
+- **Number criterion vs numeric-looking string cell**: `COUNTIF([5, "5"], 5) === 1` (only the real number).
+
+### Known limitations / deviations
+
+- **SUMIF unequal range sizes**: when `range` and `sum_range` differ in length, we pair index-by-index up to `min(len)` rather than auto-extending. Excel silently extends `sum_range` to match `range`'s shape — close enough for v1; tests pin both equal-length and shape-mismatch cases.
+- **SUMIFS / COUNTIFS require exact shape match across criterion ranges** — `#VALUE!` when any pair differs. Matches Excel.
+- **Wildcards only fire when the criterion is a string** that contains `*` or `?`. A bare-number criterion (e.g. cell-ref that resolves to a number) never engages wildcard logic. Matches Excel.
+- **Boolean criteria**: passing `bool(true)` directly as the criterion does direct equality against boolean cells. Passing `str("TRUE")` also matches boolean `true` cells (via the `parseCriterion` boolean-keyword branch).
+- **DATE year < 1900** → `#NUM!`. Excel's actual behavior shifts years 0..1899 by +1900 (`DATE(24, 1, 1)` → 2024-01-01) — we follow the simpler rule documented in the task brief; the shift is a Wave F polish, not a parity break.
+- **WEEKDAY return_type 11..17** (Excel extension) — not implemented; only types 1, 2, 3 are accepted. Anything else → `#NUM!`.
+
+### 1900 leap-year bug — final verdict
+
+**`DATE(1900, 2, 29)` returns serial 60** (matches Excel verbatim). The bug is replicated mathematically (not bypassed) so:
+- The phantom day participates in the calendar (serial 60 reports as 1900-02-29 via YEAR/MONTH/DAY).
+- All real dates on or after 1900-03-01 are shifted up by 1 day relative to a "clean" calendar — `DATE(2024, 1, 1) === 45292`, the canonical Excel value.
+- Date arithmetic with future date functions (DATEDIF, NETWORKDAYS, EDATE, EOMONTH — to be added in Wave F) will inherit this calendar automatically because they all go through `dateToSerial` / `serialToDate`.
+
+Next request: CC main session can now register `FUNCTIONS` from both `'./date'` and `'./stats'` into the consolidated `src/eval/functions/index.ts` Map alongside C1 math + C2 logical + C3 lookup + C4 text. **All five Wave C tracks (C1..C5) are now done** — Wave D worker-shim can begin once the registry merges. No naming collisions: the 11 names exported by C5 (TODAY, NOW, DATE, YEAR, MONTH, DAY, WEEKDAY, COUNTIF, SUMIF, COUNTIFS, SUMIFS) are disjoint from the math / logical / lookup / text inventories.
