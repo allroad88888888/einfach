@@ -250,6 +250,15 @@ function getCommandShortcutIntent(
         ),
       }
     case 'c':
+      // Ctrl+Shift+C → Copy As (HTML / Markdown / plain text bundle). Sits
+      // alongside the plain Ctrl+C copy intent; the host wires the actual
+      // encoder + clipboard.write call at the dispatcher case. Mirrors how
+      // Ctrl+Alt+V reuses 'v' below as a different intent under a modifier.
+      if (input.shiftKey) {
+        return {
+          type: 'clipboard.copyAs',
+        }
+      }
       return {
         type: 'clipboard.copy',
       }

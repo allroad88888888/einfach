@@ -104,8 +104,8 @@ PivotTable stay excluded per project scope.
 |---|---|---|
 | 5 | [wave-5-shell-and-canvas-overlay](./wave-5-shell-and-canvas-overlay.md) | Top menubar (Luckysheet style, not Excel ribbon) + Name Box + Status Bar aggregates + Format Painter + canvas overlay for selection/decorations (DOM stays for cell text) |
 | 6 | [wave-6-cell-format-complete](./wave-6-cell-format-complete.md) | Format Cells 5-tab dialog + text rotation / overflow / wrap + complete Number Format (12 categories + custom strings) |
-| 7 | [wave-7-data-ops-and-navigation](./wave-7-data-ops-and-navigation.md) | Text to Columns + Remove Duplicates + Paste Special + Go To (Ctrl+G) + complete Data Validation |
-| 8 | [wave-8-formula-extension-and-export](./wave-8-formula-extension-and-export.md) | Remote formulas + custom formulas + array/matrix enhancements + range screenshot + copy as HTML/PNG/MD |
+| 7 | [wave-7-data-ops-and-navigation](./wave-7-data-ops-and-navigation.md) | Text to Columns + Remove Duplicates + Paste Special + Go To (Ctrl+G) + complete Data Validation + Copy as HTML/Markdown (7.4, pulled from Wave 8) |
+| 8 | [wave-8-formula-extension-and-export](./wave-8-formula-extension-and-export.md) | Remote formulas + custom formulas + array/matrix enhancements + range screenshot + copy as PNG (HTML/MD shipped early in Wave 7.4) |
 
 **Cross-cutting decisions** (locked before implementation):
 
@@ -122,6 +122,14 @@ PivotTable stay excluded per project scope.
   differently.
 - jsdom tests for canvas overlay use a mockable 2D context abstraction, not
   the `canvas` npm package.
+- **Wave 7.4 — Copy as HTML / Markdown** (in progress). Framework-agnostic
+  encoders live in `src/copy-as/` (`encodeSelectionAsHtml`,
+  `encodeSelectionAsMarkdown`, `encodeSelectionAsPlainText`,
+  `encodeSelectionForClipboard`) plus a `lastCopyAsAtom` source atom. Solid
+  host binds Ctrl+Shift+C → `navigator.clipboard.write` of an `ItemList`
+  with `text/html`, `text/markdown`, and `text/plain` flavours, falling
+  back to `writeText` of the TSV when `ClipboardItem` is rejected. The PNG
+  flavour stays in Wave 8 (depends on `exportRangeAsImage`).
 
 ## Dependency map
 

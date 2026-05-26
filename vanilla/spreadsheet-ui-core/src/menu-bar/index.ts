@@ -133,6 +133,13 @@ const EDIT_ITEMS: readonly MenuBarEntry[] = [
     isAvailable: 'always',
   },
   {
+    id: 'edit.copyAs',
+    label: 'menuBar.edit.copyAs',
+    shortcut: 'Ctrl+Shift+C',
+    dispatch: { kind: 'edit.copyAs' },
+    isAvailable: 'always',
+  },
+  {
     id: 'edit.paste',
     label: 'menuBar.edit.paste',
     accessKey: 'P',

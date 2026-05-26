@@ -55,6 +55,7 @@ export type MenuItemDispatch =
   | { kind: 'redo' }
   | { kind: 'cut' }
   | { kind: 'copy' }
+  | { kind: 'edit.copyAs' }
   | { kind: 'paste' }
   | { kind: 'edit.pasteSpecial' }
   | { kind: 'select-all' }

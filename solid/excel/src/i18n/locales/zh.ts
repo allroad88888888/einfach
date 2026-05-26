@@ -95,6 +95,7 @@ export const messages: Record<string, string> = {
   'menuBar.edit.copy': '复制',
   'menuBar.edit.paste': '粘贴',
   'menuBar.edit.pasteSpecial': '选择性粘贴…',
+  'menuBar.edit.copyAs': '复制为…',
   'menuBar.edit.find': '查找…',
   'menuBar.edit.replace': '替换…',
   'menuBar.edit.goTo': '定位…',
@@ -149,6 +150,22 @@ export const messages: Record<string, string> = {
   // 编辑菜单 — 选择性粘贴 (Wave 7.3)
   'editMenu.pasteSpecial': '选择性粘贴…',
   'editMenu.pasteSpecial.shortcut': 'Ctrl+Alt+V',
+
+  // 编辑菜单 — 复制为 HTML/Markdown (Wave 7.4)
+  // 菜单标签使用上方的 `menuBar.edit.copyAs`，与编辑菜单其它项保持一致；
+  // 这里仅保留快捷键键名，与 pasteSpecial.shortcut 约定对齐。
+  'editMenu.copyAs.shortcut': 'Ctrl+Shift+C',
+  // 多 MIME 剪贴板写入成功后的状态栏反馈。
+  'copyAs.status.success': '已复制为 HTML + Markdown + 纯文本',
+  // 回退状态：ClipboardItem 写入被拒（如权限），主机已回退到
+  // navigator.clipboard.writeText 写入 TSV。
+  'copyAs.status.fallback': '已仅复制纯文本（当前环境不支持 HTML/Markdown）',
+  // 错误状态：两条写入路径都失败（罕见 — 例如无权限的 http:// 页面）。
+  'copyAs.status.failed': '复制失败 — 剪贴板访问被拒绝',
+  // 选区尺寸上限：选区超过 `MAX_COPY_AS_CELLS` 时触发。主机会回退到
+  // 仅写入（被裁剪后的）纯文本，避免按键无反应。
+  'copyAs.status.tooLarge':
+    '选区过大，无法复制为 HTML/Markdown（{cells} 单元格；上限 {limit}）。仅复制纯文本。',
 
   // 选择性粘贴对话框
   'pasteSpecial.title': '选择性粘贴',

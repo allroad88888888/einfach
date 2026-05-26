@@ -59,7 +59,12 @@ export interface KeyboardEditingCancelIntent {
 }
 
 export interface KeyboardClipboardIntent {
-  type: 'clipboard.copy' | 'clipboard.cut' | 'clipboard.paste' | 'clipboard.pasteSpecial'
+  type:
+    | 'clipboard.copy'
+    | 'clipboard.cut'
+    | 'clipboard.paste'
+    | 'clipboard.pasteSpecial'
+    | 'clipboard.copyAs'
 }
 
 export interface SheetNavigationIntent {
@@ -83,6 +88,10 @@ export type ClearCellsTarget = 'values' | 'formats' | 'all'
 export interface ClearCellsIntent {
   type: 'cell.clear'
   target: ClearCellsTarget
+}
+
+export interface GoToOpenIntent {
+  type: 'go-to.open'
 }
 
 export interface NoneKeyboardIntent {
@@ -114,6 +123,7 @@ export type KeyboardCommandIntent =
   | HistoryIntent
   | FormatToggleIntent
   | ClearCellsIntent
+  | GoToOpenIntent
   | FormulaReferenceArrowPickIntent
   | FormulaReferenceExitIntent
   | NoneKeyboardIntent

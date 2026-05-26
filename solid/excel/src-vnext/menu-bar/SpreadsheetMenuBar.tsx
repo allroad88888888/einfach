@@ -51,6 +51,8 @@ import {
 } from '@einfach/spreadsheet-ui-core'
 
 import {
+  copyAsErrorAtom,
+  dispatchCopyAs,
   dispatchRedo,
   dispatchUndo,
   pasteSpecialSupportedAtom,
@@ -200,6 +202,19 @@ export function SpreadsheetMenuBar(props: SpreadsheetMenuBarProps) {
       case 'edit.pasteSpecial':
         store.setter(openPasteSpecialAtom)
         return
+      case 'edit.copyAs': {
+        const snap = store.getter(selectionSnapshotAtom)
+        const sheetId = snap.selection.sheetId || getActiveSheetId() || ''
+        if (!sheetId) return
+        // Match the toolbar pattern: surface async failure via the
+        // error atom rather than letting a rejection float up as an
+        // unhandled promise (Firefox / file:// can reject the backend
+        // projection if the worker is mid-restart).
+        void dispatchCopyAs(store, backend, { sheetId, range: snap.range }).catch(() => {
+          store.setter(copyAsErrorAtom, { kind: 'failed' })
+        })
+        return
+      }
       case 'select-all': {
         const sheetId = getActiveSheetId() ?? undefined
         store.setter(selectAllAtom, sheetId)

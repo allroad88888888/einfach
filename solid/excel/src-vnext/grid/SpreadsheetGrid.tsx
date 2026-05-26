@@ -93,6 +93,7 @@ import { createSignal, For, onCleanup, onMount, Show } from 'solid-js'
 import {
   acceptFormulaSuggestion,
   advanceSpreadsheetProjectionRequestIdAtom,
+  dispatchCopyAs,
   dispatchEditingCancel,
   dispatchRedo,
   dispatchUndo,
@@ -2131,6 +2132,18 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
         event.preventDefault()
         await copySelectionToClipboard('copy')
         return
+      case 'clipboard.copyAs': {
+        event.preventDefault()
+        const snap = selectionSnapshot()
+        if (snap.selection.sheetId !== props.sheetId) {
+          return
+        }
+        await dispatchCopyAs(store, backend, {
+          sheetId: props.sheetId,
+          range: snap.range,
+        })
+        return
+      }
       case 'clipboard.cut':
         event.preventDefault()
         await copySelectionToClipboard('cut')

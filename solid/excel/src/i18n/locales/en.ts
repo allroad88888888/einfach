@@ -104,6 +104,7 @@ export const messages: Record<string, string> = {
   'menuBar.edit.copy': 'Copy',
   'menuBar.edit.paste': 'Paste',
   'menuBar.edit.pasteSpecial': 'Paste Special…',
+  'menuBar.edit.copyAs': 'Copy as…',
   'menuBar.edit.find': 'Find…',
   'menuBar.edit.replace': 'Replace…',
   'menuBar.edit.goTo': 'Go To…',
@@ -164,6 +165,25 @@ export const messages: Record<string, string> = {
   // Edit menu — Paste Special (Wave 7.3)
   'editMenu.pasteSpecial': 'Paste Special…',
   'editMenu.pasteSpecial.shortcut': 'Ctrl+Alt+V',
+
+  // Edit menu — Copy as HTML/Markdown (Wave 7.4)
+  // The menu entry uses `menuBar.edit.copyAs` (above) for parity with the
+  // other items in the Edit menu. The shortcut key is kept here under the
+  // `editMenu.*` prefix to match the pasteSpecial.shortcut convention.
+  'editMenu.copyAs.shortcut': 'Ctrl+Shift+C',
+  // Status-bar feedback after a successful multi-MIME clipboard write.
+  'copyAs.status.success': 'Copied as HTML + Markdown + Plain text',
+  // Fallback status: ClipboardItem write rejected (e.g. permission), the
+  // host fell back to navigator.clipboard.writeText with the TSV flavour.
+  'copyAs.status.fallback':
+    'Copied as plain text only (HTML/Markdown unavailable in this context)',
+  // Error status: both write paths failed (rare — http:// without permission).
+  'copyAs.status.failed': 'Copy failed — clipboard access blocked',
+  // Selection-size cap: emitted when the user tries to Copy as on a region
+  // wider than `MAX_COPY_AS_CELLS`. Host falls back to writing the (clipped)
+  // plain-text flavour only so the keystroke doesn't appear to no-op.
+  'copyAs.status.tooLarge':
+    'Selection too large to copy as HTML/Markdown ({cells} cells; limit {limit}). Copied plain text only.',
 
   // Paste Special dialog
   'pasteSpecial.title': 'Paste Special',

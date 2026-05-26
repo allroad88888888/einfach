@@ -1,5 +1,6 @@
 export * from './atoms'
 export * from './context'
+export * from './copy-as-dispatch'
 export * from './edit-dispatch'
 export * from './history-dispatch'
 export * from './hooks'
