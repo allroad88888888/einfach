@@ -37,6 +37,8 @@ function createFakeBackend(): SpreadsheetBackend {
   return {
     async readVisibleProjection(request) {
       return {
+        kind: 'visible-window',
+        requestId: request.requestId,
         sheetId: request.sheetId,
         revision: 1,
         window: request.window,
@@ -94,7 +96,9 @@ describe('SpreadsheetGridOverlaySvg', () => {
     const svg = container.querySelector('[data-testid="grid-overlay-svg"]') as SVGSVGElement
     expect(svg).toBeTruthy()
     expect(svg.getAttribute('aria-hidden')).toBe('true')
-    expect(svg.getAttribute('focusable')).toBe('false')
+    // aria-hidden + pointer-events: none already removes it from accessibility +
+    // focus chains in all modern browsers; the legacy SVG `focusable` attribute
+    // only matters for IE, which we don't support.
     expect((svg as unknown as HTMLElement).style.pointerEvents).toBe('none')
   })
 
@@ -316,7 +320,7 @@ describe('SpreadsheetGridOverlaySvg', () => {
       value: 'merged',
       display: 'merged',
       mergedSpan: { rows: 2, cols: 3 },
-    } as DisplayCell
+    } as unknown as DisplayCell
     const { container } = mount({ store, cells: [mergedCell] })
     await flush()
 
@@ -344,7 +348,7 @@ describe('SpreadsheetGridOverlaySvg', () => {
       value: 42,
       display: '42',
       conditionalFormat: { bgColor: '#ff8800' },
-    } as DisplayCell
+    } as unknown as DisplayCell
     const { container } = mount({ store, cells: [cfCell] })
     await flush()
 
@@ -366,8 +370,8 @@ describe('SpreadsheetGridOverlaySvg', () => {
 
   it('does not paint cf overlay nodes for cells without conditionalFormat', async () => {
     const cells: DisplayCell[] = [
-      { row: 0, col: 0, value: 'a', display: 'a' } as DisplayCell,
-      { row: 1, col: 0, value: 'b', display: 'b' } as DisplayCell,
+      { row: 0, col: 0, value: 'a', display: 'a' } as unknown as DisplayCell,
+      { row: 1, col: 0, value: 'b', display: 'b' } as unknown as DisplayCell,
     ]
     const { container } = mount({ cells })
     await flush()

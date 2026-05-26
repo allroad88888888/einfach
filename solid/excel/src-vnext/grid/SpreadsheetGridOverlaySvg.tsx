@@ -269,7 +269,6 @@ export function SpreadsheetGridOverlaySvg(props: SpreadsheetGridOverlaySvgProps)
       class="spreadsheet-grid-overlay-svg"
       data-testid="grid-overlay-svg"
       aria-hidden="true"
-      focusable="false"
       width={size().width || '100%'}
       height={size().height || '100%'}
       style={{
