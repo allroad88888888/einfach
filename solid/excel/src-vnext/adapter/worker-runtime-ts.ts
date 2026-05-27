@@ -264,7 +264,11 @@ function readCellSnapshot(
   const target = state.workbook.sheet(sheet.id)
   const cells = target ? state.workbook.store.getter(target.sheetAtom) : undefined
   const cell = cells?.get(`${row}:${col}`)
-  const formula = cell?.input?.startsWith('=') ? cell.input : ''
+  // A cell is a formula iff its parsed `ast` is set — NOT just because
+  // the raw `input` starts with `=`. Text cells (P1.1 codex fix) can
+  // carry a literal `=A1` string and must report formula:'' so the UI
+  // doesn't misclassify them as formulas.
+  const formula = cell?.ast ? cell.input : ''
   return {
     sheet: sheet.idx,
     addr: formatA1({ row, col }),
@@ -285,10 +289,11 @@ function readSparseCell(
   if (!target) return undefined
   const cells = state.workbook.store.getter(target.sheetAtom)
   const cell = cells.get(`${row}:${col}`)
-  if (!cell) return undefined
   // Formula cells emit a 'formula' SparseCellWire with the source so the
   // backend layer can detect formula-vs-literal — matches the WASM path.
-  if (cell.input.startsWith('=')) {
+  // Key off `cell.ast` (not `cell.input.startsWith('=')`) so a text cell
+  // whose value happens to be `"=A1"` (P1.1 codex fix) stays text.
+  if (cell && cell.ast) {
     return {
       sheet: sheet.idx,
       addr: formatA1({ row, col }),
@@ -298,6 +303,11 @@ function readSparseCell(
       value: cell.input,
     }
   }
+  // If `cell` is undefined this may be a spill target (no own entry but
+  // a nearby anchor's array covers (row, col)). `readCellValue` already
+  // handles that — fall through and let it return the projected scalar.
+  // If `readCellValue` then returns blank, we drop the cell (sparse
+  // snapshots omit blanks; that's the existing contract).
   const value = readCellValue(state, sheet, row, col)
   switch (value.kind) {
     case 'number':
@@ -333,19 +343,29 @@ function setCellFromWire(
   col: number,
   value: CellWire,
 ): boolean {
+  // Pre-classified wires must go through `setCellValue`, NOT
+  // `setCell(input)`. Otherwise text like `"00123"`, `"TRUE"`, `"#N/A"`,
+  // or `"=A1"` gets re-inferred by the parser and corrupted:
+  //  - `00123` → number 123 (leading zero lost)
+  //  - `TRUE`  → boolean (intent was a string)
+  //  - `#N/A`  → error literal (intent was a string)
+  //  - `=A1`   → formula (intent was a string)
+  // The wire type carries the producer's classification — respect it.
   switch (value.type) {
     case 'number':
-      applyCellInput(state, sheet, row, col, String(value.value))
+      state.workbook.setCellValue(sheet.id, row, col, { kind: 'number', value: value.value })
       return true
     case 'text':
-      applyCellInput(state, sheet, row, col, value.value)
+      state.workbook.setCellValue(sheet.id, row, col, { kind: 'string', value: value.value })
       return true
     case 'boolean':
-      applyCellInput(state, sheet, row, col, value.value ? 'TRUE' : 'FALSE')
+      state.workbook.setCellValue(sheet.id, row, col, { kind: 'boolean', value: value.value })
       return true
-    case 'error':
-      applyCellInput(state, sheet, row, col, value.value)
+    case 'error': {
+      const code = value.value as ErrorCode
+      state.workbook.setCellValue(sheet.id, row, col, { kind: 'error', code })
       return true
+    }
     case 'null':
       clearCell(state, sheet, row, col)
       return true
@@ -367,14 +387,20 @@ function setFormulaDetailed(
   const source = formula.startsWith('=') ? formula : `=${formula}`
   try {
     applyCellInput(state, sheet, row, col, source)
-    // Read the resulting value to surface cycle / parse errors.
+    // Read the resulting value to surface cycle errors. Formulas that
+    // evaluate to a normal Excel error (`=1/0`, `=NA()`, `=#REF!`,
+    // lookups returning `#N/A`, etc.) are **valid formulas** — the cell
+    // is supposed to display the error code. Only structural failures
+    // (cycle, parse error caught upstream) should reject the mutation.
     const value = readCellValue(state, sheet, row, col)
-    if (value.kind === 'error') {
-      if (value.code === '#CIRCULAR!') {
-        return { ok: false, code: 'FORMULA_CYCLE', message: 'formula would create a cycle', display: value.code }
-      }
-      return { ok: false, code: 'INVALID_FORMULA', message: value.message ?? value.code, display: value.code }
+    if (value.kind === 'error' && value.code === '#CIRCULAR!') {
+      return { ok: false, code: 'FORMULA_CYCLE', message: 'formula would create a cycle', display: value.code }
     }
+    // A formula that evaluates to an error is still a valid mutation —
+    // the cell projects the error code at the read boundary. We
+    // intentionally do NOT carry a `display` in the result envelope
+    // (the protocol's `ok:true` variant doesn't have that field; the
+    // cell read path delivers the display).
     return { ok: true }
   } catch (err) {
     return {
@@ -1077,26 +1103,17 @@ function rebuildPreservingCells(
     cellsBySheetName.set(sheet.name, previousWorkbook.store.getter(handle.sheetAtom))
   }
 
-  // Build a name-keyed lookup of the previous sheet's name so renames
-  // can find the snapshot. We zip nextNames against the *previous*
-  // surviving order — both lists are positionally aligned.
-  const survivingPreviousNames = previousSheets
-    .filter((s) => removedIdx === undefined || s.idx !== removedIdx)
-    .map((s) => s.name)
-
   const { wb, sheets } = makeWorkbookFor(nextNames)
   state.workbook = wb
   state.sheets = sheets
 
-  // Re-apply each surviving sheet's cells under the new sheet id.
-  for (let i = 0; i < survivingPreviousNames.length; i += 1) {
-    const oldName = survivingPreviousNames[i]
-    const newName = nextNames[i]
-    if (newName === undefined) break
-    const oldCells = cellsBySheetName.get(oldName)
+  // Re-apply each surviving sheet's cells under its (renamed) sheet id.
+  // We key by NAME — never by positional index — because move/reorder
+  // changes positions but keeps names. Zipping `survivingPreviousNames`
+  // against `nextNames` by index would swap contents on a move.
+  for (const newSheet of sheets) {
+    const oldCells = cellsBySheetName.get(newSheet.name)
     if (!oldCells || oldCells.size === 0) continue
-    const newSheet = sheets.find((s) => s.name === newName)
-    if (!newSheet) continue
     const inputs: { row: number; col: number; input: string }[] = []
     for (const [key, cell] of oldCells) {
       const [rowStr, colStr] = key.split(':')

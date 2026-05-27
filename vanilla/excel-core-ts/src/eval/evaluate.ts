@@ -247,6 +247,19 @@ export function rangeLookupGeneric(
   if (!range) return [[ERR('#REF!')]]
   const rowCount = range.rowEnd - range.rowStart + 1
   const colCount = range.colEnd - range.colStart + 1
+  // Bound materialization. `iterateRange` is uncapped (it's a lazy
+  // generator), and `expandRange`'s `RangeTooLargeError` doesn't fire
+  // when we walk via iterateRange. Materializing `A:XFD` (16M cells)
+  // or `A:A` (1M cells) here would hang the worker. We surface `#NUM!`
+  // with a hint instead — formulas that need to scan an entire column
+  // must use COUNTIF / SUMIF (which iterate the existing cell map, not
+  // the abstract range) for now.
+  const totalCells = rowCount * colCount
+  // Use the same 100k cap as expandRange (refs/ranges.ts EXPAND_MAX_CELLS).
+  // Picked to match Go-To-Special's convention across the codebase.
+  if (totalCells > 100_000) {
+    return [[ERR('#NUM!', `range too large to materialize (${rowCount}x${colCount} = ${totalCells} cells; cap 100000)`)]]
+  }
   const rows: Value[][] = new Array(rowCount)
   try {
     let rIdx = 0

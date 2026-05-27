@@ -63,6 +63,16 @@ export interface Workbook {
   /** Mutate a single cell. Parses formula input on the fly. */
   setCell(sheetId: string, row: number, col: number, input: string): void
   /**
+   * Write a cell with an already-typed `Value`. Used by paste / import
+   * paths that arrive with already-classified values (e.g. wire-typed
+   * `{ type: 'text', value: '=A1' }` must NOT be re-parsed as a formula,
+   * and `{ type: 'text', value: '00123' }` must NOT lose its leading zero).
+   *
+   * Distinct from `setCell` which always runs the formula parser +
+   * numeric inference on the input string.
+   */
+  setCellValue(sheetId: string, row: number, col: number, value: Value): void
+  /**
    * Clear a single cell. `target` controls whether format also clears
    * (mirrors the `ClearCellMutation` envelope in `types.ts`).
    */
@@ -205,6 +215,49 @@ export function createWorkbook(
     setCell(sheetId, row, col, input) {
       const sheet = requireSheet(sheetId)
       setCellInternal(sheet, row, col, input)
+    },
+    setCellValue(sheetId, row, col, value) {
+      const sheet = requireSheet(sheetId)
+      const key = keyFor(row, col)
+      const prev = store.getter(sheet.sheetAtom) as SheetState
+      const next = applyCell(prev, key, (existing) => {
+        if (value.kind === 'blank') {
+          if (!existing) return undefined
+          if (existing.format) {
+            return { input: '', value: { kind: 'blank' }, format: existing.format }
+          }
+          return undefined
+        }
+        // Keep `input` as the canonical string repr so things like the
+        // formula bar still surface something readable, but the parsed
+        // `value` overrides any inference the parser might otherwise do.
+        let input: string
+        switch (value.kind) {
+          case 'number':
+            input = String(value.value)
+            break
+          case 'string':
+            input = value.value
+            break
+          case 'boolean':
+            input = value.value ? 'TRUE' : 'FALSE'
+            break
+          case 'error':
+            input = value.code
+            break
+          case 'array':
+            // Array-typed literals don't have a single-cell representation;
+            // collapse to top-left for display, keep the array as the value.
+            input = ''
+            break
+        }
+        return {
+          input,
+          value,
+          format: existing?.format,
+        }
+      })
+      writeSheetState(sheet, next)
     },
     clearCell(sheetId, row, col, target = 'value') {
       const sheet = requireSheet(sheetId)
