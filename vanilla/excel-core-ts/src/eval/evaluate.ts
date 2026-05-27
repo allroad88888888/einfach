@@ -40,9 +40,9 @@ import type {
   Value,
 } from '../types'
 import { getBuiltinFunction } from './functions'
-import { BLANK } from '../types'
+import { BLANK, MAX_LAMBDA_CALL_DEPTH } from '../types'
 import { cellKey, iterateRange, parseA1, parseRange, RangeTooLargeError } from '../refs'
-import { propagateError, toNumber, toString as toStr } from './coerce'
+import { propagateError, toBoolean, toNumber, toString as toStr } from './coerce'
 
 const ERR = (code: ErrorCode, message?: string): Value =>
   message === undefined ? { kind: 'error', code } : { kind: 'error', code, message }
@@ -98,10 +98,10 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
         }
         case 'lambda':
           // A LAMBDA name referenced without a call site is a bare
-          // function value. Excel surfaces `#CALC!`; we don't model that
-          // code yet so we use `#VALUE!` with a diagnostic message.
+          // function value. Excel surfaces `#CALC!` (the calc engine
+          // cannot reduce a function value to a scalar).
           return ERR(
-            '#VALUE!',
+            '#CALC!',
             `LAMBDA '${ast.name}' must be invoked with arguments (e.g. =${ast.name}(...))`,
           )
       }
@@ -147,6 +147,36 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
     }
 
     case 'call': {
+      // ---------------------------------------------------------------
+      // Lazy short-circuit: `IF` must NOT pre-evaluate both branches.
+      //
+      // Without this, a textbook recursive LAMBDA like
+      //   FACT(n) = IF(n<=1, 1, n*FACT(n-1))
+      // recurses into the unreachable else-branch on every call and
+      // blows the JS stack. Special-casing `IF` here matches the Rust
+      // engine (see `rust/excel-core/src/eval.rs` § `"IF"`) which
+      // receives raw `&[Expr]` and lazily evaluates the chosen branch.
+      //
+      // Only `IF` is short-circuited for now. `IFS`, `SWITCH`,
+      // `IFERROR`, `IFNA`, `AND`, `OR` are also short-circuit in Excel
+      // but no existing fixture currently depends on their laziness;
+      // see report notes for the deferred list.
+      // ---------------------------------------------------------------
+      const upper = ast.name.toUpperCase()
+      if (upper === 'IF') {
+        if (ast.args.length < 2 || ast.args.length > 3) {
+          return ERR('#VALUE!', 'IF expects 2 or 3 arguments')
+        }
+        const cond = evaluate(ast.args[0], ctx)
+        if (cond.kind === 'error') return cond
+        const coerced = toBoolean(cond)
+        if (!coerced.ok) return coerced.error
+        if (coerced.value) return evaluate(ast.args[1], ctx)
+        return ast.args.length === 3
+          ? evaluate(ast.args[2], ctx)
+          : { kind: 'boolean', value: false }
+      }
+
       // Dispatch order: built-in registry → workbook LAMBDA name →
       // host custom formula → #NAME?. Built-ins shadow customs by
       // convention (custom formulas refuse registration with a builtin
@@ -163,15 +193,37 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
       // scope that maps each declared param to its argument value.
       // Missing args bind to BLANK so partial-application errors surface
       // inside the body rather than at call site (matches Excel).
+      //
+      // Recursion guard: each LAMBDA application bumps a shared depth
+      // counter and surfaces `#NUM!` past `MAX_LAMBDA_CALL_DEPTH` (Rust
+      // parity, see `NAMED_CALL_DEPTH` in `rust/excel-core/src/eval.rs`).
+      // Without this, a pathological recursion like `bad(n) = bad(n)`
+      // would blow the JS stack instead of yielding a sensible error.
       const binding = ctx.resolveName(ast.name)
       if (binding && binding.kind === 'lambda') {
+        const depth = ctx.lambdaCallDepth ?? { count: 0 }
+        if (depth.count >= MAX_LAMBDA_CALL_DEPTH) {
+          return ERR(
+            '#NUM!',
+            `LAMBDA recursion depth exceeded (${MAX_LAMBDA_CALL_DEPTH}); aborting to avoid stack overflow`,
+          )
+        }
         const scope = new Map<string, Value>(ctx.lambdaScope ?? [])
         for (let i = 0; i < binding.params.length; i += 1) {
           const argVal: Value = argValues[i] ?? BLANK
           scope.set(binding.params[i], argVal)
         }
-        const subCtx: EvalContext = { ...ctx, lambdaScope: scope }
-        return evaluate(binding.body, subCtx)
+        const subCtx: EvalContext = {
+          ...ctx,
+          lambdaScope: scope,
+          lambdaCallDepth: depth,
+        }
+        depth.count += 1
+        try {
+          return evaluate(binding.body, subCtx)
+        } finally {
+          depth.count -= 1
+        }
       }
 
       const custom = ctx.callCustom(ast.name, argValues)

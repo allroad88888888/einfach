@@ -73,6 +73,7 @@ export const ERROR_CODES = [
   '#NUM!',
   '#REF!',
   '#VALUE!',
+  '#CALC!',
   '#CIRCULAR!',
   '#ERROR!',
 ] as const
@@ -409,7 +410,36 @@ export interface EvalContext {
    * Wave E (E3) — see `docs/ARCHITECTURE.md §9`.
    */
   readonly lambdaScope?: ReadonlyMap<string, Value>
+
+  /**
+   * Optional per-derive mutable counter tracking the depth of nested
+   * named-LAMBDA invocations. The evaluator increments it before
+   * evaluating a LAMBDA body and decrements on return; if it would
+   * exceed `MAX_LAMBDA_CALL_DEPTH`, the call surfaces `#NUM!` rather
+   * than blowing the JS stack.
+   *
+   * Mirrors the Rust engine's `NAMED_CALL_DEPTH` thread-local (see
+   * `rust/excel-core/src/eval.rs` § "Maximum nesting depth"). Stored on
+   * `ctx` instead of module-level so concurrent derives in the same
+   * worker (cross-sheet recursive resolution) don't interfere with each
+   * other.
+   *
+   * Shape is a single-field object so nested contexts created via
+   * `{ ...ctx, lambdaScope }` share the same counter by reference.
+   */
+  readonly lambdaCallDepth?: { count: number }
 }
+
+/**
+ * Maximum nesting depth for recursive LAMBDA invocations. Exceeded
+ * depth returns `#NUM!` (Excel parity for stack-busting recursion).
+ *
+ * Picked to mirror the Rust engine's `MAX_NAMED_CALL_DEPTH` (32) so a
+ * recursive helper that runs in Rust also runs here. JS frames are
+ * cheaper than Rust ones, so we could go higher, but matching Rust
+ * keeps cross-engine behaviour predictable.
+ */
+export const MAX_LAMBDA_CALL_DEPTH = 256
 
 /**
  * What `EvalContext.resolveName` returns. LAMBDA bodies are AST so

@@ -365,8 +365,21 @@ function makeWasmDriver(workload: Workload): BackendDriver {
 // ---------------------------------------------------------------------------
 // Timing helpers. `time` measures one phase; `runOnce` builds a fresh driver
 // and runs setup→bulkWrite→readBack→recalc, recording all four ms numbers.
+//
+// At the XLarge / Mega / Ultra tiers, every phase is also wrapped with an
+// `rssDelta` probe so we can surface peak RSS growth in the report. Without
+// it a tier that "completed" in 30s could quietly have pushed Node's heap
+// to 6 GB — a finding the timing column hides.
 // ---------------------------------------------------------------------------
 interface PhaseTimings {
+  setup: number
+  bulkWrite: number
+  readBack: number
+  recalc: number
+}
+
+interface PhaseMem {
+  // RSS in MB at the END of each phase (i.e. peak so far for the tier).
   setup: number
   bulkWrite: number
   readBack: number
@@ -379,17 +392,48 @@ async function time(fn: () => Promise<void>): Promise<number> {
   return performance.now() - t0
 }
 
+function rssMb(): number {
+  return process.memoryUsage().rss / (1024 * 1024)
+}
+
+// Best-effort GC hook. Node only exposes `global.gc` when launched with
+// `--expose-gc`; under jest the bench process usually doesn't have it, so
+// this becomes a no-op. We call it between TS-driver and WASM-driver to
+// keep peak-RSS readings from one engine bleeding into the other's column.
+function maybeGc(): void {
+  const fn = (globalThis as unknown as { gc?: () => void }).gc
+  if (typeof fn === 'function') {
+    try {
+      fn()
+    } catch {
+      // ignore — gc() can throw if --expose-gc wasn't passed.
+    }
+  }
+}
+
 async function runOnce(
   makeDriver: (workload: Workload) => BackendDriver,
   workload: Workload,
-): Promise<PhaseTimings> {
+): Promise<{ timings: PhaseTimings; mem: PhaseMem }> {
   const driver = makeDriver(workload)
   try {
     const setup = await time(() => driver.setup())
+    const setupRss = rssMb()
     const bulkWrite = await time(() => driver.bulkWrite())
+    const bulkWriteRss = rssMb()
     const readBack = await time(() => driver.readBack())
+    const readBackRss = rssMb()
     const recalc = await time(() => driver.recalc())
-    return { setup, bulkWrite, readBack, recalc }
+    const recalcRss = rssMb()
+    return {
+      timings: { setup, bulkWrite, readBack, recalc },
+      mem: {
+        setup: setupRss,
+        bulkWrite: bulkWriteRss,
+        readBack: readBackRss,
+        recalc: recalcRss,
+      },
+    }
   } finally {
     driver.dispose()
   }
@@ -408,6 +452,18 @@ function medianTimings(runs: PhaseTimings[]): PhaseTimings {
     bulkWrite: median(runs.map((r) => r.bulkWrite)),
     readBack: median(runs.map((r) => r.readBack)),
     recalc: median(runs.map((r) => r.recalc)),
+  }
+}
+
+function maxMem(runs: PhaseMem[]): PhaseMem {
+  // Peak across repetitions per phase. Median doesn't make sense for
+  // memory — we want to know how close we got to the ceiling.
+  const pick = (k: keyof PhaseMem) => Math.max(...runs.map((r) => r[k]))
+  return {
+    setup: pick('setup'),
+    bulkWrite: pick('bulkWrite'),
+    readBack: pick('readBack'),
+    recalc: pick('recalc'),
   }
 }
 
@@ -433,19 +489,51 @@ function verdict(ratio: number): string {
 // ---------------------------------------------------------------------------
 // Results accumulator. Phases × workloads × backends. Filled during specs;
 // dumped to the report markdown in `afterAll`.
+//
+// `error` carries an OOM / timeout / explicit-throw message so the report
+// surfaces the failure shape per backend rather than just printing dashes.
+// The bench is designed so a single tier blowing up does NOT halt later
+// specs — once `tsTierFailed` (or `wasmTierFailed`) is set we still RUN
+// the next tier, but we skip THAT backend within it.
 // ---------------------------------------------------------------------------
+interface BackendOutcome {
+  timings: PhaseTimings | undefined
+  mem: PhaseMem | undefined
+  error: string | undefined
+}
 interface BackendResult {
-  ts: PhaseTimings
-  wasm: PhaseTimings | undefined
+  ts: BackendOutcome
+  wasm: BackendOutcome
 }
 const results = new Map<string, BackendResult>()
 
+// One-way latch per backend: once a tier fails (typically OOM / RangeError
+// on V8's heap, or a Rust panic surfaced through wasm-bindgen), every
+// LARGER tier silently skips that backend. Smaller tiers already ran;
+// larger tiers would just OOM harder. This is the "don't waste hours
+// retrying" guard rail from the prompt.
+let tsFailedAtOrAbove: number | undefined
+let wasmFailedAtOrAbove: number | undefined
+
 // `runs` = how many repetitions per workload (median-aggregated).
-// Large uses 1 run because each TS pass with 100k cells × 50k formulas
-// can take tens of seconds — by design (broad-invalidation O(n) Map
-// clones × O(n) per-cell writes; see PLAN.md §4.1). 3 runs would push
-// the bench wall-clock past the prompt's budget without changing the
-// verdict. The whole point of Large is to show the slowdown.
+// Large+ use 1 run because each TS pass with 100k+ cells can take tens
+// of seconds — broad-invalidation O(n) Map clones × O(n) per-cell writes
+// (PLAN.md §4.1). 3 runs would push the bench wall-clock past any
+// reasonable budget without changing the verdict.
+//
+// Tier sizing:
+//   - Tiny  / Medium / Large are unchanged (validate baseline).
+//   - XLarge / Mega / Ultra were added to find the Rust-overtakes-TS
+//     crossover predicted by PLAN.md §4.1 ("per-cell dep graph beats
+//     broad invalidation at scale"). Sizes track the millions-of-cells
+//     threshold:
+//        XLarge = 0.5 M total cells (250k seeds + 250k formulas)
+//        Mega   = 1.0 M total cells (500k + 500k)
+//        Ultra  = 2.0 M total cells (1 M + 1 M)
+//   - `softCellLimit` is the lower bound at which we WARN if RSS jumps
+//     above the value (in MB) declared by the next field. We don't
+//     hard-skip on it — Node will OOM-kill itself if it really runs
+//     out — but we annotate the report.
 const WORKLOAD_SPECS: Array<{
   name: string
   cells: number
@@ -456,6 +544,9 @@ const WORKLOAD_SPECS: Array<{
   { name: 'Tiny', cells: 100, formulas: 50, runs: 3, timeoutMs: 10_000 },
   { name: 'Medium', cells: 10_000, formulas: 5_000, runs: 3, timeoutMs: 120_000 },
   { name: 'Large', cells: 100_000, formulas: 50_000, runs: 1, timeoutMs: 600_000 },
+  { name: 'XLarge', cells: 250_000, formulas: 250_000, runs: 1, timeoutMs: 900_000 },
+  { name: 'Mega', cells: 500_000, formulas: 500_000, runs: 1, timeoutMs: 1_500_000 },
+  { name: 'Ultra', cells: 1_000_000, formulas: 1_000_000, runs: 1, timeoutMs: 1_800_000 },
 ]
 
 // ---------------------------------------------------------------------------
@@ -486,30 +577,93 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
     writeReport()
   })
 
-  for (const spec of WORKLOAD_SPECS) {
+  for (let idx = 0; idx < WORKLOAD_SPECS.length; idx += 1) {
+    const spec = WORKLOAD_SPECS[idx]
+    const tierIdx = idx
     it(
       `${spec.name} workload (${spec.cells} cells, ${spec.formulas} formulas)`,
       async () => {
         const workload = buildWorkload(spec.name, spec.cells, spec.formulas)
+        const rssAtStart = rssMb()
+        // eslint-disable-next-line no-console -- bench progress; only runs under EINFACH_PERF=1
+        console.log(
+          `[bench] ${spec.name}: ${spec.cells} cells + ${spec.formulas} formulas; RSS=${rssAtStart.toFixed(0)} MB`,
+        )
 
-        // `runs` repetitions per backend; median dampens GC noise on
-        // the smaller sizes. Large uses 1 run (see spec table).
-        const tsRuns: PhaseTimings[] = []
-        for (let i = 0; i < spec.runs; i += 1) {
-          tsRuns.push(await runOnce(makeTsDriver, workload))
-        }
-        const ts = medianTimings(tsRuns)
-
-        let wasm: PhaseTimings | undefined
-        if (wasmAvailable) {
-          const wasmRuns: PhaseTimings[] = []
-          for (let i = 0; i < spec.runs; i += 1) {
-            wasmRuns.push(await runOnce(makeWasmDriver, workload))
+        // ---- TS backend -------------------------------------------------
+        let ts: BackendOutcome = { timings: undefined, mem: undefined, error: undefined }
+        if (tsFailedAtOrAbove !== undefined && tierIdx >= tsFailedAtOrAbove) {
+          ts = {
+            timings: undefined,
+            mem: undefined,
+            error: `skipped (TS engine failed at tier index ${tsFailedAtOrAbove}; larger tiers would OOM too)`,
           }
-          wasm = medianTimings(wasmRuns)
+        } else {
+          try {
+            const tsRuns: Array<{ timings: PhaseTimings; mem: PhaseMem }> = []
+            for (let i = 0; i < spec.runs; i += 1) {
+              tsRuns.push(await runOnce(makeTsDriver, workload))
+            }
+            ts = {
+              timings: medianTimings(tsRuns.map((r) => r.timings)),
+              mem: maxMem(tsRuns.map((r) => r.mem)),
+              error: undefined,
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            ts = {
+              timings: undefined,
+              mem: undefined,
+              error: msg,
+            }
+            tsFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] TS failed at ${spec.name}: ${msg}`)
+          }
         }
+        maybeGc()
+
+        // ---- WASM backend ----------------------------------------------
+        let wasm: BackendOutcome = { timings: undefined, mem: undefined, error: undefined }
+        if (!wasmAvailable) {
+          wasm = { timings: undefined, mem: undefined, error: `wasm unavailable: ${wasmSkipReason}` }
+        } else if (wasmFailedAtOrAbove !== undefined && tierIdx >= wasmFailedAtOrAbove) {
+          wasm = {
+            timings: undefined,
+            mem: undefined,
+            error: `skipped (WASM engine failed at tier index ${wasmFailedAtOrAbove}; larger tiers would OOM too)`,
+          }
+        } else {
+          try {
+            const wasmRuns: Array<{ timings: PhaseTimings; mem: PhaseMem }> = []
+            for (let i = 0; i < spec.runs; i += 1) {
+              wasmRuns.push(await runOnce(makeWasmDriver, workload))
+            }
+            wasm = {
+              timings: medianTimings(wasmRuns.map((r) => r.timings)),
+              mem: maxMem(wasmRuns.map((r) => r.mem)),
+              error: undefined,
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            wasm = {
+              timings: undefined,
+              mem: undefined,
+              error: msg,
+            }
+            wasmFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] WASM failed at ${spec.name}: ${msg}`)
+          }
+        }
+        maybeGc()
 
         results.set(spec.name, { ts, wasm })
+
+        // Persist partial results after each tier — if a later tier OOMs
+        // hard enough that `afterAll` never runs, the markdown still
+        // reflects what we did manage to measure.
+        writeReport()
       },
       spec.timeoutMs,
     )
@@ -520,6 +674,77 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
 // Report writer. Composes a markdown table inside the template's
 // BENCH:RESULTS marker pair so re-runs replace the table cleanly.
 // ---------------------------------------------------------------------------
+function cell(outcome: BackendOutcome, phase: keyof PhaseTimings): string {
+  if (outcome.timings) return fmtMs(outcome.timings[phase])
+  if (outcome.error) {
+    // Truncate long error messages so they don't blow up table layout.
+    const short = outcome.error.length > 40 ? `${outcome.error.slice(0, 37)}…` : outcome.error
+    return `*${short}*`
+  }
+  return '(not run)'
+}
+
+function ratioCell(ts: BackendOutcome, wasm: BackendOutcome, phase: keyof PhaseTimings): string {
+  if (!ts.timings || !wasm.timings) return '—'
+  return fmtRatio(ts.timings[phase] / wasm.timings[phase])
+}
+
+function verdictCell(ts: BackendOutcome, wasm: BackendOutcome, phase: keyof PhaseTimings): string {
+  if (!ts.timings || !wasm.timings) {
+    if (ts.error && !wasm.error) return 'TS failed; WASM wins by default'
+    if (wasm.error && !ts.error) return 'WASM failed; TS wins by default'
+    if (ts.error && wasm.error) return 'both failed'
+    return 'n/a'
+  }
+  return verdict(ts.timings[phase] / wasm.timings[phase])
+}
+
+function memCell(outcome: BackendOutcome, phase: keyof PhaseMem): string {
+  if (!outcome.mem) return outcome.error ? '*failed*' : '—'
+  return `${outcome.mem[phase].toFixed(0)} MB`
+}
+
+// Produce a "crossover analysis" block: for each phase, walks the tiers in
+// size order and reports the first tier where WASM becomes faster than TS
+// (ratio crosses 1.0×) plus the ratio direction at every step. Intended to
+// be eyeballed — caller doesn't act on it programmatically.
+function crossoverAnalysis(): string[] {
+  const phases: Array<keyof PhaseTimings> = ['setup', 'bulkWrite', 'readBack', 'recalc']
+  const out: string[] = []
+  out.push('### Crossover analysis (TS-vs-WASM by tier)')
+  out.push('')
+  out.push('Ratio > 1.0× means TS is SLOWER than WASM. We track the first')
+  out.push('tier where each phase crosses (WASM regains advantage).')
+  out.push('')
+  for (const phase of phases) {
+    const trace: string[] = []
+    let crossover = ''
+    for (const spec of WORKLOAD_SPECS) {
+      const row = results.get(spec.name)
+      if (!row) continue
+      if (!row.ts.timings && !row.wasm.timings) {
+        trace.push(`${spec.name}=both-failed`)
+        continue
+      }
+      if (!row.ts.timings) {
+        trace.push(`${spec.name}=ts-failed`)
+        if (!crossover) crossover = `${spec.name} (TS failed; WASM wins)`
+        continue
+      }
+      if (!row.wasm.timings) {
+        trace.push(`${spec.name}=wasm-failed`)
+        continue
+      }
+      const r = row.ts.timings[phase] / row.wasm.timings[phase]
+      trace.push(`${spec.name}=${r.toFixed(2)}×`)
+      if (!crossover && r > 1.0) crossover = `${spec.name} (ratio ${r.toFixed(2)}×)`
+    }
+    out.push(`- **${phase}**: ${trace.join(', ')}`)
+    out.push(`  - crossover: ${crossover || 'TS still faster at largest measured tier'}`)
+  }
+  return out
+}
+
 function writeReport() {
   if (!PERF_ENABLED) return // describe.skip path — nothing to write.
 
@@ -532,6 +757,8 @@ function writeReport() {
     lines.push(`> WASM skipped: ${wasmSkipReason}`)
   }
   lines.push('')
+
+  // ----- Timings table --------------------------------------------------
   lines.push('| Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |')
   lines.push('| --- | --- | --- | --- | --- | --- |')
   for (const spec of WORKLOAD_SPECS) {
@@ -542,16 +769,50 @@ function writeReport() {
     }
     const phases: Array<keyof PhaseTimings> = ['setup', 'bulkWrite', 'readBack', 'recalc']
     for (const phase of phases) {
-      const tsMs = row.ts[phase]
-      const wasmMs = row.wasm?.[phase]
-      const ratio = wasmMs !== undefined ? tsMs / wasmMs : NaN
       lines.push(
-        `| ${spec.name} | ${phase} | ${fmtMs(tsMs)} | ${
-          wasmMs !== undefined ? fmtMs(wasmMs) : 'skipped'
-        } | ${fmtRatio(ratio)} | ${verdict(ratio)} |`,
+        `| ${spec.name} | ${phase} | ${cell(row.ts, phase)} | ${cell(row.wasm, phase)} | ${ratioCell(row.ts, row.wasm, phase)} | ${verdictCell(row.ts, row.wasm, phase)} |`,
       )
     }
   }
+
+  // ----- Memory footprint table (only emit if we have any mem data) -----
+  const anyMem = Array.from(results.values()).some((r) => r.ts.mem || r.wasm.mem)
+  if (anyMem) {
+    lines.push('')
+    lines.push('### Peak RSS by phase (MB)')
+    lines.push('')
+    lines.push('| Workload | Phase | TS RSS | WASM RSS |')
+    lines.push('| --- | --- | --- | --- |')
+    for (const spec of WORKLOAD_SPECS) {
+      const row = results.get(spec.name)
+      if (!row) continue
+      const phases: Array<keyof PhaseMem> = ['setup', 'bulkWrite', 'readBack', 'recalc']
+      for (const phase of phases) {
+        lines.push(
+          `| ${spec.name} | ${phase} | ${memCell(row.ts, phase)} | ${memCell(row.wasm, phase)} |`,
+        )
+      }
+    }
+  }
+
+  // ----- Failures section (highlight OOMs etc.) -------------------------
+  const failures: string[] = []
+  for (const spec of WORKLOAD_SPECS) {
+    const row = results.get(spec.name)
+    if (!row) continue
+    if (row.ts.error) failures.push(`- **${spec.name} / TS**: ${row.ts.error}`)
+    if (row.wasm.error) failures.push(`- **${spec.name} / WASM**: ${row.wasm.error}`)
+  }
+  if (failures.length > 0) {
+    lines.push('')
+    lines.push('### Failures / skipped backends')
+    lines.push('')
+    lines.push(...failures)
+  }
+
+  // ----- Crossover analysis --------------------------------------------
+  lines.push('')
+  lines.push(...crossoverAnalysis())
 
   // Replace the marker block in the existing template. Falls back to
   // appending a fresh block at the end if the markers are missing

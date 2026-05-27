@@ -26,7 +26,8 @@
  *     because cycle detection at the cell-derive level catches the
  *     re-entry into the same formula cell.
  *   - LAMBDA referenced by name without parens (bare `NameExpr`) →
- *     returns `#VALUE!` with a diagnostic message (we don't model `#CALC!`).
+ *     returns `#CALC!` with a diagnostic message (Excel parity — the
+ *     calc engine cannot reduce a function value to a scalar).
  *
  * Plus a couple of scope-edge cases:
  *
@@ -98,7 +99,7 @@ describe('LAMBDA scope (NameExpr resolution)', () => {
     expect(evaluate(nameRef('Y'), ctx)).toEqual({ kind: 'number', value: 7 })
   })
 
-  test('LAMBDA name referenced without parens surfaces #VALUE! (we use #VALUE! in lieu of #CALC!)', () => {
+  test('LAMBDA name referenced without parens surfaces #CALC!', () => {
     const ctx = makeCtx(new Map(), {
       resolveName: (n) =>
         n === 'F'
@@ -108,7 +109,7 @@ describe('LAMBDA scope (NameExpr resolution)', () => {
     const res = evaluate(nameRef('F'), ctx)
     expect(res.kind).toBe('error')
     if (res.kind === 'error') {
-      expect(res.code).toBe('#VALUE!')
+      expect(res.code).toBe('#CALC!')
       expect(res.message).toContain('LAMBDA')
     }
   })
@@ -215,22 +216,15 @@ describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
     expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 12 })
   })
 
-  test('recursive LAMBDA via IF is NOT supported (eager arg evaluation causes infinite recursion → JS stack overflow)', () => {
-    // DESIGN NOTE — pinning behavior, not aspiration:
-    //
-    // Excel's IF is lazy in its branches (each branch is only evaluated
-    // when chosen). Our evaluator is *eager*: the `'call'` arm computes
-    // all arg Values up front, then dispatches. That means a textbook
-    // recursive LAMBDA like `FACT(n) = IF(n<=1, 1, n*FACT(n-1))` will
-    // recurse into the unreachable else-branch on every call, hit the
-    // JS stack limit, and throw `RangeError: Maximum call stack size
-    // exceeded` — there is no cell-level re-entry for the cycle guard
-    // to catch (each LAMBDA dispatch builds a fresh sub-context).
-    //
-    // Wave F can introduce a short-list of *lazy* built-ins (IF / IFS /
-    // SWITCH / IFERROR / AND-OR-with-shortcircuit) whose dispatcher
-    // accepts the raw AST args + ctx and decides which to evaluate.
-    // Until then we pin the current behavior so a regression is visible.
+  test('recursive LAMBDA via IF terminates (lazy IF + depth guard) — FACT(5) → 120', () => {
+    // Excel's IF is lazy in its branches: each branch is only evaluated
+    // when chosen. The evaluator's `'call'` arm special-cases `IF` so a
+    // textbook recursive LAMBDA like
+    //   FACT(n) = IF(n<=1, 1, n*FACT(n-1))
+    // doesn't recurse into the unreachable else-branch and blow the JS
+    // stack. A depth guard (MAX_LAMBDA_CALL_DEPTH) catches pathological
+    // self-reference; see `test/lambda-recursive.test.ts` for end-to-end
+    // coverage (FACT / Fibonacci / mutual recursion / stack-overflow).
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.defineName('FACT', {
       kind: 'lambda',
@@ -258,7 +252,7 @@ describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
       ),
     })
     wb.setCell('s1', 0, 0, '=FACT(5)')
-    expect(() => readCell(wb, 's1', 0, 0)).toThrow(/Maximum call stack/)
+    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 120 })
   })
 
   test('NON-recursive LAMBDA nesting is fine — chain ADD(ADD(1,2),ADD(3,4)) → 10', () => {

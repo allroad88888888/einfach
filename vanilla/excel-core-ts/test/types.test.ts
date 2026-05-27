@@ -30,6 +30,7 @@ describe('@einfach/excel-core-ts — Wave A contracts', () => {
     expect(ERROR_CODES).toContain('#NAME?')
     expect(ERROR_CODES).toContain('#REF!')
     expect(ERROR_CODES).toContain('#VALUE!')
+    expect(ERROR_CODES).toContain('#CALC!')
     expect(ERROR_CODES).toContain('#CIRCULAR!')
   })
 

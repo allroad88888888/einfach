@@ -15,7 +15,7 @@ EINFACH_PERF=1 npx jest --testRegex 'perf-ts-vs-wasm\.bench\.ts$' --no-coverage
 `--testRegex` override is the discovery trick.)
 
 Each row reports wall-clock milliseconds (median of 3 runs for Tiny /
-Medium, single run for Large) for both the TS and WASM cores on
+Medium, single run for Large+) for both the TS and WASM cores on
 identical workloads. `ratio` = `ts / wasm` (higher = TS slower).
 Verdict thresholds:
 
@@ -23,34 +23,261 @@ Verdict thresholds:
 - `concerning` — 5×–10× slower; worth profiling
 - `blocker` — > 10× slower; must address before TS becomes default
 
+Workload tiers — total cells = seed cells (col A literals) + formula cells:
+
+| Tier | Seeds | Formulas | Total | Runs | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Tiny | 100 | 50 | 150 | 3 | sanity check |
+| Medium | 10k | 5k | 15k | 3 | typical small sheet |
+| Large | 100k | 50k | 150k | 1 | large-but-normal |
+| XLarge | 250k | 250k | 500k | 1 | half-million-cell sheet |
+| Mega | 500k | 500k | 1M | 1 | million-cell crossover target |
+| Ultra | 1M | 1M | 2M | 1 | OOM-test ceiling |
+
+XLarge / Mega / Ultra were added to probe the Rust-overtakes-TS crossover
+predicted in PLAN.md §4.1 — at the 100k tier TS was beating WASM at every
+phase, contradicting the per-cell-dep-graph advantage the Rust core was
+supposed to deliver. The hypothesis: TS's broad-invalidation atom model
+gets dominated by per-cell setup cost at small N but blows up
+super-linearly past ~1M cells (Map clone cost × dependency churn);
+Rust's precise dep walk stays roughly O(touched).
+
 Workload formula mix (per Phase-4 perf brief):
 
 - 50 % `=Ax+By` (random earlier-row binop)
 - 30 % `=IF(Ax>10, Bx*2, 0)`
 - 20 % `=SUM(A1:A<row>)` running total — row index capped at
-  `SUM_RANGE_CAP=1024` so a single SUM never iterates the full 100k
-  column at Large. Production sheets rarely have running totals
-  spanning > 1k rows; without the cap the read-back pass at Large
-  would do ~10 ⁹ Map.get lookups and dominate the bench.
+  `SUM_RANGE_CAP=1024` so a single SUM never iterates the full
+  column at Large+. Production sheets rarely have running totals
+  spanning > 1k rows; without the cap the read-back pass would do
+  ~10⁹ Map.get lookups and dominate the bench.
 
 Recalc bench changes `A1` and measures time to read back every formula
 cell (forces full dependency-chain recompute).
 
+Memory: every phase records `process.memoryUsage().rss` at exit. Peak
+RSS per phase is dumped in the "Peak RSS by phase" table below — useful
+when timing looks fine but the engine actually pushed Node's heap to
+several GB. Each tier runs in its own `it()`; if either engine throws
+(typically OOM / RangeError on `Map` growth), the bench captures the
+error, marks the cell `*failed*`, latches a per-engine flag, and skips
+that engine on all LARGER tiers — but does NOT abort the suite.
+
+Run with very high `--testTimeout` for the heavy tiers, e.g.:
+
+```
+EINFACH_PERF=1 npx jest --testRegex 'perf-ts-vs-wasm\.bench\.ts$' \
+  --no-coverage --testTimeout=1800000
+```
+
+Optionally launch Node with `--expose-gc` and a larger heap so the
+between-tier GC actually runs and a 1M-cell tier doesn't hit V8's
+default 4 GB ceiling early:
+
+```
+EINFACH_PERF=1 NODE_OPTIONS='--expose-gc --max-old-space-size=8192' \
+  npx jest --testRegex 'perf-ts-vs-wasm\.bench\.ts$' \
+  --no-coverage --testTimeout=1800000 --maxWorkers=1
+```
+
 <!-- BENCH:RESULTS:START -->
-*Last bench run: 2026-05-27T02:59:52.868Z*
+*Last bench run: 2026-05-27T08:18:08.179Z*
 
 | Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Tiny | setup | 0.12 | 0.61 | 0.20× | acceptable |
-| Tiny | bulkWrite | 0.31 | 0.53 | 0.59× | acceptable |
-| Tiny | readBack | 0.65 | 0.41 | 1.59× | acceptable |
-| Tiny | recalc | 0.72 | 0.41 | 1.77× | acceptable |
-| Medium | setup | 2.9 | 16.3 | 0.18× | acceptable |
-| Medium | bulkWrite | 6.2 | 252 | 0.02× | acceptable |
-| Medium | readBack | 182 | 345 | 0.53× | acceptable |
-| Medium | recalc | 203 | 334 | 0.61× | acceptable |
-| Large | setup | 29.0 | 156 | 0.19× | acceptable |
-| Large | bulkWrite | 69.7 | 4826 | 0.01× | acceptable |
-| Large | readBack | 1854 | 4536 | 0.41× | acceptable |
-| Large | recalc | 2156 | 4534 | 0.48× | acceptable |
+| Tiny | setup | 0.10 | 0.58 | 0.17× | acceptable |
+| Tiny | bulkWrite | 0.17 | 0.53 | 0.32× | acceptable |
+| Tiny | readBack | 0.42 | 0.38 | 1.12× | acceptable |
+| Tiny | recalc | 0.42 | 0.39 | 1.07× | acceptable |
+| Medium | setup | 2.7 | 16.5 | 0.16× | acceptable |
+| Medium | bulkWrite | 5.0 | 258 | 0.02× | acceptable |
+| Medium | readBack | 181 | 362 | 0.50× | acceptable |
+| Medium | recalc | 186 | 372 | 0.50× | acceptable |
+| Large | setup | 30.1 | 160 | 0.19× | acceptable |
+| Large | bulkWrite | 84.2 | 4925 | 0.02× | acceptable |
+| Large | readBack | 1872 | 4706 | 0.40× | acceptable |
+| Large | recalc | 1994 | 4898 | 0.41× | acceptable |
+| XLarge | setup | 104 | 417 | 0.25× | acceptable |
+| XLarge | bulkWrite | 407 | 33359 | 0.01× | acceptable |
+| XLarge | readBack | 10299 | 27097 | 0.38× | acceptable |
+| XLarge | recalc | 11414 | 27222 | 0.42× | acceptable |
+| Mega | setup | 372 | 871 | 0.43× | acceptable |
+| Mega | bulkWrite | 911 | 98276 | 0.01× | acceptable |
+| Mega | readBack | 22092 | 75744 | 0.29× | acceptable |
+| Mega | recalc | 24597 | 63647 | 0.39× | acceptable |
+| Ultra | setup | 892 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | bulkWrite | 2128 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | readBack | 49797 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | recalc | 51685 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+
+### Peak RSS by phase (MB)
+
+| Workload | Phase | TS RSS | WASM RSS |
+| --- | --- | --- | --- |
+| Tiny | setup | 451 MB | 453 MB |
+| Tiny | bulkWrite | 451 MB | 455 MB |
+| Tiny | readBack | 451 MB | 457 MB |
+| Tiny | recalc | 451 MB | 458 MB |
+| Medium | setup | 509 MB | 547 MB |
+| Medium | bulkWrite | 509 MB | 547 MB |
+| Medium | readBack | 510 MB | 547 MB |
+| Medium | recalc | 511 MB | 547 MB |
+| Large | setup | 559 MB | 652 MB |
+| Large | bulkWrite | 568 MB | 986 MB |
+| Large | readBack | 641 MB | 986 MB |
+| Large | recalc | 693 MB | 986 MB |
+| XLarge | setup | 1006 MB | 1322 MB |
+| XLarge | bulkWrite | 1094 MB | 2451 MB |
+| XLarge | readBack | 1410 MB | 2571 MB |
+| XLarge | recalc | 1401 MB | 2502 MB |
+| Mega | setup | 2279 MB | 3131 MB |
+| Mega | bulkWrite | 2557 MB | 2364 MB |
+| Mega | readBack | 3002 MB | 2053 MB |
+| Mega | recalc | 3371 MB | 2129 MB |
+| Ultra | setup | 767 MB | *failed* |
+| Ultra | bulkWrite | 1340 MB | *failed* |
+| Ultra | readBack | 1613 MB | *failed* |
+| Ultra | recalc | 2573 MB | *failed* |
+
+### Failures / skipped backends
+
+- **Ultra / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
+
+### Crossover analysis (TS-vs-WASM by tier)
+
+Ratio > 1.0× means TS is SLOWER than WASM. We track the first
+tier where each phase crosses (WASM regains advantage).
+
+- **setup**: Tiny=0.17×, Medium=0.16×, Large=0.19×, XLarge=0.25×, Mega=0.43×, Ultra=wasm-failed
+  - crossover: TS still faster at largest measured tier
+- **bulkWrite**: Tiny=0.32×, Medium=0.02×, Large=0.02×, XLarge=0.01×, Mega=0.01×, Ultra=wasm-failed
+  - crossover: TS still faster at largest measured tier
+- **readBack**: Tiny=1.12×, Medium=0.50×, Large=0.40×, XLarge=0.38×, Mega=0.29×, Ultra=wasm-failed
+  - crossover: Tiny (ratio 1.12×)
+- **recalc**: Tiny=1.07×, Medium=0.50×, Large=0.41×, XLarge=0.42×, Mega=0.39×, Ultra=wasm-failed
+  - crossover: Tiny (ratio 1.07×)
 <!-- BENCH:RESULTS:END -->
+
+## Findings (2026-05-27 — XLarge / Mega / Ultra sweep)
+
+The hypothesis going into this run was: "TS is faster up to 100k cells,
+but at 1M+ cells Rust's per-cell-indexed dep graph (PLAN.md §4.1) should
+overtake TS's broad-invalidation atom model." The data **does not
+support** that hypothesis.
+
+### Headline numbers
+
+| Tier | Total cells | TS readBack | WASM readBack | Ratio | TS recalc | WASM recalc |
+| --- | --- | --- | --- | --- | --- | --- |
+| Large | 150k | 1.9 s | 4.7 s | 0.40× | 2.0 s | 4.9 s |
+| XLarge | 500k | 10.3 s | 27.1 s | 0.38× | 11.4 s | 27.2 s |
+| Mega | 1.0 M | 22.1 s | 75.7 s | 0.29× | 24.6 s | 63.6 s |
+| Ultra | 2.0 M | 49.8 s | *failed* | — | 51.7 s | *failed* |
+
+TS pulls **further ahead** at every step. Going from Large (150k) to Mega
+(1M), TS readBack grew 11.8× while WASM readBack grew 16.1×. Same shape
+for recalc. There is no crossover anywhere in the measured range.
+
+### The bulkWrite gap is the spreadsheet equivalent of a sinkhole
+
+| Tier | TS bulkWrite | WASM bulkWrite | TS speedup |
+| --- | --- | --- | --- |
+| Medium (15k) | 5.0 ms | 258 ms | 52× |
+| Large (150k) | 84 ms | 4.9 s | 58× |
+| XLarge (500k) | 407 ms | 33.4 s | 82× |
+| Mega (1M) | 911 ms | 98.3 s | 108× |
+
+The gap **widens super-linearly with scale**. At 1M cells the Rust path
+takes 108× longer to bulk-load formula bodies, and it does so while
+holding the workbook fully resident in WASM linear memory. TS's lazy
+formula install (formulas don't parse until first read) is paying
+massive dividends here. Pasting 100k formulas into a Rust-backed sheet
+takes ~5 s wall-clock; the same paste into the TS sheet takes ~84 ms.
+
+### Recalc cost grows similarly for both engines
+
+The recalc bench mutates `A1`, which is the lower bound of every
+`=SUM(A1:A<n>)` formula (~20% of formulas) and so cascades into ~200k
+invalidations at Mega. TS and WASM both pay roughly readBack-time for
+the cascade — meaning the dependency-walk cost is dominated by the
+read+eval cost, not by the graph maintenance itself.
+
+This is the strongest piece of evidence against the "per-cell dep
+graph wins at scale" theory: at 1M cells with 200k actual dependents,
+Rust's precise tracking does not produce a measurable advantage over
+TS's broader invalidation. The eval workload is the bottleneck, not
+the graph walk.
+
+### Why is TS so much faster on this workload?
+
+A few candidate explanations, none confirmed:
+
+1. **Native Number vs WASM↔JS marshaling.** Every `snapshotCell` call
+   crosses the boundary, allocates an object, and decodes a string. TS
+   evaluates Numbers in V8 inline-cached arithmetic and skips
+   marshaling entirely.
+2. **`bulk_import_cells` materializes formula AST eagerly.** TS defers
+   formula parsing until the cell is read; the bulkWrite gap collapses
+   when only ~50% of formulas are subsequently read. (If the bench read
+   100% of formula cells, that "lazy" advantage would be smaller — but
+   the read pass DOES touch every formula and TS still wins.)
+3. **WASM string interning.** Every formula source is copied across
+   the boundary as a UTF-8 buffer. At 1M strings averaging 18 bytes
+   that's ~18 MB of cross-boundary traffic, before the parser even
+   starts.
+
+### Memory footprint
+
+TS peak RSS climbs roughly linearly with total cell count
+(2.6 MB / 10k cells from Tiny → Mega ratio). At Ultra (2M cells) TS
+hit 2.6 GB peak — the bench process started around 450 MB before any
+workload, so the TS workload itself accounts for ~2.1 GB. That fits
+comfortably in the 8 GB heap we requested with
+`--max-old-space-size=8192`.
+
+WASM peak RSS at Mega was 3.1 GB during setup but dropped to 2.0 GB
+after import (Rust holds formulas in its compact representation).
+The bench process never exceeded 3.4 GB total RSS at any tier short of
+the Ultra WASM failure.
+
+### Ultra WASM failure — `attempted to take ownership of Rust value while it was borrowed`
+
+At 2M cells (1M seeds + 1M formulas) the WASM driver threw
+
+> Error: attempted to take ownership of Rust value while it was borrowed
+
+This is not an OOM — it's a wasm-bindgen reentrancy / borrow-checker
+violation surfaced from the JS side. The most likely cause: the
+`bulk_import_cells` call internally panics or yields in a way that
+leaves the `WasmWorkbook` in a borrowed state, then the next operation
+(possibly the `set_cell_number` in recalc, or even just `free()`
+during dispose) hits the lock.
+
+This is a Rust-side bug, NOT a fundamental memory ceiling — the JS
+process was still under 3 GB when it failed. Investigation belongs to
+the wasm crate, not this bench. Filed as a finding but not chased
+here.
+
+The TS engine completed Ultra (2M cells) cleanly with 49.8 s readBack
+and 51.7 s recalc — meaning the TS port is the ONLY backend that
+currently scales to 2M cells in-process at all.
+
+### Recommended next perf investigation
+
+If anyone wants to keep digging, here's a prioritized list:
+
+1. **`bulk_import_cells` profile.** The 108× gap at 1M cells dwarfs
+   every other phase. A Rust-side flame graph would say whether time
+   is in formula parsing, dep-graph insertion, or the bindgen boundary.
+2. **Workloads with HIGHER recalc fan-out.** This bench has ~20%
+   SUMs depending on A1 — a worst-case test would have 100% of
+   formulas chained off a single source (e.g. `=A1*2`, `=B1+1`,
+   `=C1+1`, …). That's the scenario where the per-cell dep graph
+   *should* win, if it's ever going to.
+3. **`snapshotCell` round-trip cost.** Counting boundary crossings
+   per readBack pass at Mega (we call `snapshotCell` 500k times) and
+   measuring the per-call overhead would localize how much of the
+   readBack gap is marshaling vs evaluation.
+4. **Fix the Ultra wasm-bindgen borrow error** so we can actually
+   measure WASM behavior at 2M cells. Until then the "TS handles
+   2M cells, WASM does not" finding is the headline.

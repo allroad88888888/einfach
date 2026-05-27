@@ -501,6 +501,8 @@ function parseLiteral(input: string): Value {
       return { kind: 'error', code: '#REF!' }
     case '#VALUE!':
       return { kind: 'error', code: '#VALUE!' }
+    case '#CALC!':
+      return { kind: 'error', code: '#CALC!' }
   }
   const num = Number(trimmed)
   if (Number.isFinite(num) && /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) {
