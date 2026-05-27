@@ -1,3 +1,4 @@
+pub mod bulk_import_trace;
 pub mod cell;
 pub mod csv;
 pub mod eval;

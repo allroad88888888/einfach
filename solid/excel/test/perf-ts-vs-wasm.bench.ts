@@ -98,6 +98,7 @@ interface WasmWorkbookLike {
       | { sheet: number; row: number; col: number; kind: 'formula'; value: string }
     >,
   ): unknown
+  debug_formula_eval_count(sheetIdx: number): number
   free(): void
 }
 
@@ -670,6 +671,428 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
   }
 })
 
+// ===========================================================================
+// CHAIN DEPENDENCY WORKLOAD
+//
+// Orthogonal to the size tiers above. Builds a single pure chain
+// (`A1=1`, `A2=A1+1`, …, `An=A(n-1)+1`) and measures the four phases below.
+// This is the worst case for "broad invalidation" engines (the TS port) and
+// the best case for "per-cell precise dep tracking" (the Rust port) — if
+// Rust ever beats TS, this is where it should happen.
+//
+// Phases (mirrors existing bench shape but with chain-specific intent):
+//
+//   - setup: create the workbook (no cells yet)
+//   - bulkWrite: install all `n` formulas in one bulk_apply / bulk_import
+//   - firstRecalc: read `An`. Forces full chain evaluation top→bottom.
+//                  evalCount delta should be ~n on both backends.
+//   - mutateThenRecalc: set `A1=2`, read `An`. This is THE interesting
+//                  number — Rust's precise graph should walk exactly
+//                  `n-1` deps; TS's broad invalidation marks everything
+//                  dirty, but the eval cost on read is what matters.
+//                  Repeated 5×, median taken.
+//   - steadyState: read `An` again with no mutation. Expected to be a
+//                  cache hit (evalCount delta ≈ 0) — confirms the engine
+//                  isn't re-evaluating on every read.
+//
+// Per-phase diagnostics: ms (perf.now delta), evalCount delta
+// (debugFormulaEvalCount probe), RSS at phase exit. Read `An` only — no
+// readBack-style fan-out, so the eval/timing numbers reflect chain walk
+// cost alone.
+// ===========================================================================
+
+interface ChainSpec {
+  name: string
+  depth: number
+  runs: number // how many mutate+read iterations to take median over
+  timeoutMs: number
+}
+
+const CHAIN_SPECS: ChainSpec[] = [
+  { name: 'Chain100', depth: 100, runs: 5, timeoutMs: 30_000 },
+  { name: 'Chain1k', depth: 1_000, runs: 5, timeoutMs: 60_000 },
+  { name: 'Chain10k', depth: 10_000, runs: 5, timeoutMs: 300_000 },
+  { name: 'Chain100k', depth: 100_000, runs: 5, timeoutMs: 1_800_000 },
+]
+
+interface ChainPhaseTimings {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  // Median across `runs` iterations.
+  mutateThenRecalc: number
+  steadyState: number
+}
+
+interface ChainPhaseEvalDelta {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  // Median across `runs` iterations.
+  mutateThenRecalc: number
+  steadyState: number
+}
+
+interface ChainPhaseMem {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  mutateThenRecalc: number
+  steadyState: number
+}
+
+interface ChainBackendOutcome {
+  timings: ChainPhaseTimings | undefined
+  evals: ChainPhaseEvalDelta | undefined
+  mem: ChainPhaseMem | undefined
+  error: string | undefined
+}
+
+interface ChainResult {
+  ts: ChainBackendOutcome
+  wasm: ChainBackendOutcome
+}
+
+const chainResults = new Map<string, ChainResult>()
+
+// One-way latches mirror the size-tier bench: once a chain depth blows up
+// a backend, every deeper tier silently skips that backend.
+let tsChainFailedAtOrAbove: number | undefined
+let wasmChainFailedAtOrAbove: number | undefined
+
+// Build the `n` formula inputs (`A1=1`, `A2=A1+1`, …). Returns also the
+// final-cell address for the read pass.
+function buildChain(depth: number): {
+  seedInput: string
+  formulas: Array<{ row: number; col: number; input: string }>
+  lastAddr: string
+} {
+  // Row 0 is A1 = 1 (number literal — feeds the chain).
+  // Rows 1..depth-1 are formulas. The first formula at row 1 is `=A1+1`.
+  const formulas: Array<{ row: number; col: number; input: string }> = []
+  for (let row = 1; row < depth; row += 1) {
+    formulas.push({
+      row,
+      col: 0,
+      input: `=${a1(row - 1, 0)}+1`,
+    })
+  }
+  return {
+    seedInput: '1',
+    formulas,
+    lastAddr: a1(depth - 1, 0),
+  }
+}
+
+interface ChainDriver {
+  setup(): Promise<void>
+  bulkWrite(): Promise<void>
+  readLast(): Promise<void>
+  mutateA1(value: number): Promise<void>
+  evalCount(): number
+  dispose(): void
+}
+
+function makeTsChainDriver(chain: ReturnType<typeof buildChain>): ChainDriver {
+  let runtime: ExcelCoreTsWorkerRuntime
+  let rpcId = 0
+  const rpc = async (msg: Record<string, unknown>) => {
+    rpcId += 1
+    const resp = await runtime.handle({ id: rpcId, ...msg })
+    if (!resp.ok) {
+      throw new Error(`ts rpc ${String(msg.cmd)} failed: ${resp.error.code} ${resp.error.message}`)
+    }
+    return resp.result
+  }
+
+  return {
+    async setup() {
+      runtime = createWorkerRuntimeTs()
+      await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+      // Seed A1=1 as a literal so the chain has a base value.
+      const state = runtime.state()
+      const sheet = state.sheets[0]
+      state.workbook.bulkApply(sheet.id, [{ row: 0, col: 0, input: chain.seedInput }])
+    },
+    async bulkWrite() {
+      const state = runtime.state()
+      const sheet = state.sheets[0]
+      state.workbook.bulkApply(sheet.id, chain.formulas)
+    },
+    async readLast() {
+      await rpc({
+        cmd: 'readCells',
+        cells: [{ sheet: 0, addr: chain.lastAddr }],
+      })
+    },
+    async mutateA1(value: number) {
+      await rpc({
+        cmd: 'setCell',
+        sheet: 0,
+        addr: 'A1',
+        value: { type: 'number', value },
+      })
+    },
+    evalCount() {
+      // sheet idx 0; debugFormulaEvalCount is a direct workbook accessor.
+      return runtime.state().workbook.debugFormulaEvalCount(0)
+    },
+    dispose() {
+      // No-op — runtime is GC'd along with the closure.
+    },
+  }
+}
+
+function makeWasmChainDriver(chain: ReturnType<typeof buildChain>): ChainDriver {
+  let wb: WasmWorkbookLike | undefined
+
+  return {
+    async setup() {
+      if (!WasmModule) throw new Error('wasm module not loaded')
+      wb = new WasmModule.WasmWorkbook()
+      // Seed A1=1 via the bulk import so the path matches TS.
+      wb.bulk_import_cells([
+        { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+      ])
+    },
+    async bulkWrite() {
+      if (!wb) throw new Error('wasm wb not initialized')
+      const imports = chain.formulas.map((f) => ({
+        sheet: 0,
+        row: f.row,
+        col: f.col,
+        kind: 'formula' as const,
+        value: f.input,
+      }))
+      wb.bulk_import_cells(imports)
+    },
+    async readLast() {
+      if (!wb) throw new Error('wasm wb not initialized')
+      wb.snapshotCell(0, chain.lastAddr)
+    },
+    async mutateA1(value: number) {
+      if (!wb) throw new Error('wasm wb not initialized')
+      wb.set_cell_number(0, 'A1', value)
+    },
+    evalCount() {
+      if (!wb) return 0
+      return wb.debug_formula_eval_count(0)
+    },
+    dispose() {
+      if (wb) wb.free()
+      wb = undefined
+    },
+  }
+}
+
+// Run a single chain workload through a backend, recording ms, eval-count
+// delta, and RSS per phase. `runs` controls how many mutate+read iterations
+// we take the median over for the `mutateThenRecalc` phase.
+async function runChainOnce(
+  makeDriver: (chain: ReturnType<typeof buildChain>) => ChainDriver,
+  chain: ReturnType<typeof buildChain>,
+  runs: number,
+): Promise<{
+  timings: ChainPhaseTimings
+  evals: ChainPhaseEvalDelta
+  mem: ChainPhaseMem
+}> {
+  const driver = makeDriver(chain)
+  try {
+    // ---- setup --------------------------------------------------------
+    let evalBefore = 0 // pre-construction; no driver yet
+    const setupMs = await time(() => driver.setup())
+    const setupEval = driver.evalCount() - evalBefore
+    const setupRss = rssMb()
+
+    // ---- bulkWrite ----------------------------------------------------
+    evalBefore = driver.evalCount()
+    const bulkWriteMs = await time(() => driver.bulkWrite())
+    const bulkWriteEval = driver.evalCount() - evalBefore
+    const bulkWriteRss = rssMb()
+
+    // ---- firstRecalc --------------------------------------------------
+    evalBefore = driver.evalCount()
+    const firstRecalcMs = await time(() => driver.readLast())
+    const firstRecalcEval = driver.evalCount() - evalBefore
+    const firstRecalcRss = rssMb()
+
+    // ---- mutateThenRecalc (median over `runs`) ------------------------
+    const mutMs: number[] = []
+    const mutEval: number[] = []
+    let mutRssMax = 0
+    for (let i = 0; i < runs; i += 1) {
+      // Each iteration: change A1 to a new value so the engine can't
+      // short-circuit on "value unchanged". Use `i+2` so first mutation
+      // moves off the seed value of 1.
+      const newValue = i + 2
+      evalBefore = driver.evalCount()
+      const ms = await time(async () => {
+        await driver.mutateA1(newValue)
+        await driver.readLast()
+      })
+      const delta = driver.evalCount() - evalBefore
+      mutMs.push(ms)
+      mutEval.push(delta)
+      const r = rssMb()
+      if (r > mutRssMax) mutRssMax = r
+    }
+    const mutateThenRecalcMs = median(mutMs)
+    const mutateThenRecalcEval = Math.round(median(mutEval))
+
+    // ---- steadyState --------------------------------------------------
+    // No mutation; just re-read `An`. Expected to be cache-hit on both
+    // engines (evalCount delta ≈ 0).
+    evalBefore = driver.evalCount()
+    const steadyMs = await time(() => driver.readLast())
+    const steadyEval = driver.evalCount() - evalBefore
+    const steadyRss = rssMb()
+
+    return {
+      timings: {
+        setup: setupMs,
+        bulkWrite: bulkWriteMs,
+        firstRecalc: firstRecalcMs,
+        mutateThenRecalc: mutateThenRecalcMs,
+        steadyState: steadyMs,
+      },
+      evals: {
+        setup: setupEval,
+        bulkWrite: bulkWriteEval,
+        firstRecalc: firstRecalcEval,
+        mutateThenRecalc: mutateThenRecalcEval,
+        steadyState: steadyEval,
+      },
+      mem: {
+        setup: setupRss,
+        bulkWrite: bulkWriteRss,
+        firstRecalc: firstRecalcRss,
+        mutateThenRecalc: mutRssMax,
+        steadyState: steadyRss,
+      },
+    }
+  } finally {
+    driver.dispose()
+  }
+}
+
+describePerf('Chain dependency workload (EINFACH_PERF=1)', () => {
+  // Re-run the wasm-module bootstrap here so this suite works when run in
+  // isolation (e.g. `-t "Chain dependency"`). Idempotent: if the size-tier
+  // suite already loaded the module, this block skips the init.
+  beforeAll(async () => {
+    if (WasmModule || !PERF_ENABLED) return
+    if (!existsSync(WASM_PKG_JS) || !existsSync(WASM_PKG_BIN)) {
+      wasmSkipReason = `wasm-pkg missing at ${WASM_PKG_JS}; run \`npm --prefix solid/excel run build:wasm\` first`
+      return
+    }
+    try {
+      const mod = (await import(WASM_PKG_JS)) as WasmModule
+      const bytes = readFileSync(WASM_PKG_BIN)
+      await mod.default({
+        module_or_path: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      })
+      WasmModule = mod
+      wasmAvailable = true
+    } catch (err) {
+      wasmSkipReason = `wasm load failed: ${err instanceof Error ? err.message : String(err)}`
+    }
+  })
+
+  afterAll(() => {
+    writeReport()
+  })
+
+  for (let idx = 0; idx < CHAIN_SPECS.length; idx += 1) {
+    const spec = CHAIN_SPECS[idx]
+    const tierIdx = idx
+    it(
+      `${spec.name} (${spec.depth}-deep chain)`,
+      async () => {
+        const chain = buildChain(spec.depth)
+        const rssAtStart = rssMb()
+        // eslint-disable-next-line no-console -- bench progress; only runs under EINFACH_PERF=1
+        console.log(
+          `[bench] ${spec.name}: depth=${spec.depth}; RSS=${rssAtStart.toFixed(0)} MB`,
+        )
+
+        // ---- TS backend -------------------------------------------------
+        let ts: ChainBackendOutcome = {
+          timings: undefined,
+          evals: undefined,
+          mem: undefined,
+          error: undefined,
+        }
+        if (tsChainFailedAtOrAbove !== undefined && tierIdx >= tsChainFailedAtOrAbove) {
+          ts = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `skipped (TS chain failed at tier index ${tsChainFailedAtOrAbove})`,
+          }
+        } else {
+          try {
+            const r = await runChainOnce(makeTsChainDriver, chain, spec.runs)
+            ts = { timings: r.timings, evals: r.evals, mem: r.mem, error: undefined }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            ts = { timings: undefined, evals: undefined, mem: undefined, error: msg }
+            tsChainFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] TS chain failed at ${spec.name}: ${msg}`)
+          }
+        }
+        maybeGc()
+
+        // ---- WASM backend ----------------------------------------------
+        let wasm: ChainBackendOutcome = {
+          timings: undefined,
+          evals: undefined,
+          mem: undefined,
+          error: undefined,
+        }
+        if (!wasmAvailable) {
+          wasm = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `wasm unavailable: ${wasmSkipReason}`,
+          }
+        } else if (
+          wasmChainFailedAtOrAbove !== undefined &&
+          tierIdx >= wasmChainFailedAtOrAbove
+        ) {
+          wasm = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `skipped (WASM chain failed at tier index ${wasmChainFailedAtOrAbove})`,
+          }
+        } else {
+          try {
+            const r = await runChainOnce(makeWasmChainDriver, chain, spec.runs)
+            wasm = { timings: r.timings, evals: r.evals, mem: r.mem, error: undefined }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            wasm = { timings: undefined, evals: undefined, mem: undefined, error: msg }
+            wasmChainFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] WASM chain failed at ${spec.name}: ${msg}`)
+          }
+        }
+        maybeGc()
+
+        chainResults.set(spec.name, { ts, wasm })
+
+        // Persist partial chain results after each tier in case a deeper
+        // tier OOMs hard enough to skip `afterAll`.
+        writeReport()
+      },
+      spec.timeoutMs,
+    )
+  }
+})
+
 // ---------------------------------------------------------------------------
 // Report writer. Composes a markdown table inside the template's
 // BENCH:RESULTS marker pair so re-runs replace the table cleanly.
@@ -745,94 +1168,315 @@ function crossoverAnalysis(): string[] {
   return out
 }
 
-function writeReport() {
-  if (!PERF_ENABLED) return // describe.skip path — nothing to write.
-
-  const reportPath = path.join(__dirname, 'perf-ts-vs-wasm-report.md')
-  const lines: string[] = []
-  const stamp = new Date().toISOString()
-  lines.push(`*Last bench run: ${stamp}*`)
-  if (!wasmAvailable) {
-    lines.push('')
-    lines.push(`> WASM skipped: ${wasmSkipReason}`)
+// Chain workload section — formats four tables (ms timings, ms ratio,
+// evalCount deltas, peak RSS) and a one-line verdict per phase. Mirrors
+// the size-tier output style but with chain-specific phase names.
+function chainCell(outcome: ChainBackendOutcome, phase: keyof ChainPhaseTimings): string {
+  if (outcome.timings) return fmtMs(outcome.timings[phase])
+  if (outcome.error) {
+    const short = outcome.error.length > 40 ? `${outcome.error.slice(0, 37)}…` : outcome.error
+    return `*${short}*`
   }
-  lines.push('')
+  return '(not run)'
+}
 
-  // ----- Timings table --------------------------------------------------
-  lines.push('| Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |')
-  lines.push('| --- | --- | --- | --- | --- | --- |')
-  for (const spec of WORKLOAD_SPECS) {
-    const row = results.get(spec.name)
+function chainRatioCell(
+  ts: ChainBackendOutcome,
+  wasm: ChainBackendOutcome,
+  phase: keyof ChainPhaseTimings,
+): string {
+  if (!ts.timings || !wasm.timings) return '—'
+  return fmtRatio(ts.timings[phase] / wasm.timings[phase])
+}
+
+function chainVerdictCell(
+  ts: ChainBackendOutcome,
+  wasm: ChainBackendOutcome,
+  phase: keyof ChainPhaseTimings,
+): string {
+  if (!ts.timings || !wasm.timings) {
+    if (ts.error && !wasm.error) return 'TS failed; WASM wins by default'
+    if (wasm.error && !ts.error) return 'WASM failed; TS wins by default'
+    if (ts.error && wasm.error) return 'both failed'
+    return 'n/a'
+  }
+  const r = ts.timings[phase] / wasm.timings[phase]
+  if (!Number.isFinite(r)) return 'n/a'
+  // For chain workload, ratio > 1.0 means TS slower (= WASM wins). Phrase
+  // explicitly because this is the FIRST place we want Rust to win.
+  if (r > 1.5) return 'WASM wins'
+  if (r > 1.0) return 'WASM edges'
+  if (r > 0.66) return 'roughly tied'
+  return 'TS wins'
+}
+
+function chainEvalCell(
+  outcome: ChainBackendOutcome,
+  phase: keyof ChainPhaseEvalDelta,
+): string {
+  if (!outcome.evals) return outcome.error ? '*failed*' : '—'
+  return outcome.evals[phase].toLocaleString()
+}
+
+function chainMemCell(outcome: ChainBackendOutcome, phase: keyof ChainPhaseMem): string {
+  if (!outcome.mem) return outcome.error ? '*failed*' : '—'
+  return `${outcome.mem[phase].toFixed(0)} MB`
+}
+
+function chainSection(): string[] {
+  const phases: Array<keyof ChainPhaseTimings> = [
+    'setup',
+    'bulkWrite',
+    'firstRecalc',
+    'mutateThenRecalc',
+    'steadyState',
+  ]
+  const out: string[] = []
+  out.push('## Chain dependency workload')
+  out.push('')
+  out.push('Single-column chain (`A1=1`, `A2=A1+1`, …, `An=A(n-1)+1`) — the')
+  out.push('worst case for broad-invalidation engines and the best case for')
+  out.push('per-cell precise dep tracking. Phases:')
+  out.push('')
+  out.push('- **setup**: create the workbook + seed `A1=1`.')
+  out.push('- **bulkWrite**: install all `n-1` formulas via `bulkApply` / `bulk_import_cells`.')
+  out.push('- **firstRecalc**: read `An` once. Forces full chain evaluation.')
+  out.push("- **mutateThenRecalc**: set `A1` to a new value, then read `An`.")
+  out.push('  Repeated 5×, median taken. THIS is the chain-workload diagnostic.')
+  out.push('- **steadyState**: read `An` again without mutating. Cache-hit check.')
+  out.push('')
+  out.push('### ms per phase')
+  out.push('')
+  out.push('| Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |')
+  out.push('| --- | --- | --- | --- | --- | --- |')
+  for (const spec of CHAIN_SPECS) {
+    const row = chainResults.get(spec.name)
     if (!row) {
-      lines.push(`| ${spec.name} | — | (not run) | (not run) | — | — |`)
+      out.push(`| ${spec.name} | — | (not run) | (not run) | — | — |`)
       continue
     }
-    const phases: Array<keyof PhaseTimings> = ['setup', 'bulkWrite', 'readBack', 'recalc']
     for (const phase of phases) {
-      lines.push(
-        `| ${spec.name} | ${phase} | ${cell(row.ts, phase)} | ${cell(row.wasm, phase)} | ${ratioCell(row.ts, row.wasm, phase)} | ${verdictCell(row.ts, row.wasm, phase)} |`,
+      out.push(
+        `| ${spec.name} | ${phase} | ${chainCell(row.ts, phase)} | ${chainCell(row.wasm, phase)} | ${chainRatioCell(row.ts, row.wasm, phase)} | ${chainVerdictCell(row.ts, row.wasm, phase)} |`,
       )
     }
   }
 
-  // ----- Memory footprint table (only emit if we have any mem data) -----
-  const anyMem = Array.from(results.values()).some((r) => r.ts.mem || r.wasm.mem)
+  // ---- evalCount delta table ------------------------------------------
+  out.push('')
+  out.push('### evalCount delta per phase')
+  out.push('')
+  out.push(
+    'For a depth-`n` chain, full re-evaluation = `n-1` formula evals. ' +
+      'A delta of `0` on steadyState (or on mutateThenRecalc) means the ' +
+      'engine cached the result.',
+  )
+  out.push('')
+  out.push('| Tier | Phase | TS evals | WASM evals |')
+  out.push('| --- | --- | --- | --- |')
+  for (const spec of CHAIN_SPECS) {
+    const row = chainResults.get(spec.name)
+    if (!row) continue
+    const evalPhases: Array<keyof ChainPhaseEvalDelta> = [
+      'setup',
+      'bulkWrite',
+      'firstRecalc',
+      'mutateThenRecalc',
+      'steadyState',
+    ]
+    for (const phase of evalPhases) {
+      out.push(
+        `| ${spec.name} | ${phase} | ${chainEvalCell(row.ts, phase)} | ${chainEvalCell(row.wasm, phase)} |`,
+      )
+    }
+  }
+
+  // ---- RSS table ------------------------------------------------------
+  const anyMem = Array.from(chainResults.values()).some((r) => r.ts.mem || r.wasm.mem)
   if (anyMem) {
-    lines.push('')
-    lines.push('### Peak RSS by phase (MB)')
-    lines.push('')
-    lines.push('| Workload | Phase | TS RSS | WASM RSS |')
-    lines.push('| --- | --- | --- | --- |')
-    for (const spec of WORKLOAD_SPECS) {
-      const row = results.get(spec.name)
+    out.push('')
+    out.push('### Peak RSS by phase (MB)')
+    out.push('')
+    out.push('| Tier | Phase | TS RSS | WASM RSS |')
+    out.push('| --- | --- | --- | --- |')
+    for (const spec of CHAIN_SPECS) {
+      const row = chainResults.get(spec.name)
       if (!row) continue
-      const phases: Array<keyof PhaseMem> = ['setup', 'bulkWrite', 'readBack', 'recalc']
-      for (const phase of phases) {
-        lines.push(
-          `| ${spec.name} | ${phase} | ${memCell(row.ts, phase)} | ${memCell(row.wasm, phase)} |`,
+      const memPhases: Array<keyof ChainPhaseMem> = [
+        'setup',
+        'bulkWrite',
+        'firstRecalc',
+        'mutateThenRecalc',
+        'steadyState',
+      ]
+      for (const phase of memPhases) {
+        out.push(
+          `| ${spec.name} | ${phase} | ${chainMemCell(row.ts, phase)} | ${chainMemCell(row.wasm, phase)} |`,
         )
       }
     }
   }
 
-  // ----- Failures section (highlight OOMs etc.) -------------------------
-  const failures: string[] = []
-  for (const spec of WORKLOAD_SPECS) {
-    const row = results.get(spec.name)
-    if (!row) continue
-    if (row.ts.error) failures.push(`- **${spec.name} / TS**: ${row.ts.error}`)
-    if (row.wasm.error) failures.push(`- **${spec.name} / WASM**: ${row.wasm.error}`)
-  }
-  if (failures.length > 0) {
-    lines.push('')
-    lines.push('### Failures / skipped backends')
-    lines.push('')
-    lines.push(...failures)
+  // ---- Chain-specific crossover trace --------------------------------
+  out.push('')
+  out.push('### Chain crossover trace (mutateThenRecalc)')
+  out.push('')
+  out.push('Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.')
+  out.push('This is THE chain-workload diagnostic. If Rust ever beats TS in this')
+  out.push('repo, it should show up here first.')
+  out.push('')
+  {
+    const trace: string[] = []
+    let crossover = ''
+    for (const spec of CHAIN_SPECS) {
+      const row = chainResults.get(spec.name)
+      if (!row) continue
+      if (!row.ts.timings && !row.wasm.timings) {
+        trace.push(`${spec.name}=both-failed`)
+        continue
+      }
+      if (!row.ts.timings) {
+        trace.push(`${spec.name}=ts-failed`)
+        if (!crossover) crossover = `${spec.name} (TS failed; WASM wins by default)`
+        continue
+      }
+      if (!row.wasm.timings) {
+        trace.push(`${spec.name}=wasm-failed`)
+        continue
+      }
+      const r = row.ts.timings.mutateThenRecalc / row.wasm.timings.mutateThenRecalc
+      trace.push(`${spec.name}=${r.toFixed(2)}×`)
+      if (!crossover && r > 1.0) crossover = `${spec.name} (ratio ${r.toFixed(2)}×)`
+    }
+    out.push(`- ${trace.join(', ')}`)
+    out.push(`- crossover: ${crossover || 'TS still faster at deepest measured chain'}`)
   }
 
-  // ----- Crossover analysis --------------------------------------------
-  lines.push('')
-  lines.push(...crossoverAnalysis())
+  return out
+}
 
-  // Replace the marker block in the existing template. Falls back to
-  // appending a fresh block at the end if the markers are missing
-  // (e.g. someone wiped the template).
-  const start = '<!-- BENCH:RESULTS:START -->'
-  const end = '<!-- BENCH:RESULTS:END -->'
+// Replace the content between `<!-- ${name}:START -->` and `<!-- ${name}:END -->`
+// in the given template. Appends a fresh block at the end if the markers are
+// missing. Used so the size-tier and chain suites can each own their own
+// marker block — running one suite in isolation must not clobber the other's
+// previously-persisted data.
+function replaceBlock(template: string, name: string, body: string): string {
+  const start = `<!-- ${name}:START -->`
+  const end = `<!-- ${name}:END -->`
+  const block = `${start}\n${body}\n${end}`
+  if (template.includes(start) && template.includes(end)) {
+    const before = template.slice(0, template.indexOf(start))
+    const after = template.slice(template.indexOf(end) + end.length)
+    return `${before}${block}${after}`
+  }
+  return `${template}\n\n${block}\n`
+}
+
+function writeReport() {
+  if (!PERF_ENABLED) return // describe.skip path — nothing to write.
+
+  const reportPath = path.join(__dirname, 'perf-ts-vs-wasm-report.md')
   let template: string
   try {
     template = readFileSync(reportPath, 'utf8')
   } catch {
-    template = `# TS vs WASM Backend — Perf Report\n\n${start}\n${end}\n`
+    template =
+      '# TS vs WASM Backend — Perf Report\n\n' +
+      '<!-- BENCH:RESULTS:START -->\n<!-- BENCH:RESULTS:END -->\n\n' +
+      '<!-- BENCH:CHAIN:START -->\n<!-- BENCH:CHAIN:END -->\n'
   }
-  const block = `${start}\n${lines.join('\n')}\n${end}`
-  let next: string
-  if (template.includes(start) && template.includes(end)) {
-    const before = template.slice(0, template.indexOf(start))
-    const after = template.slice(template.indexOf(end) + end.length)
-    next = `${before}${block}${after}`
-  } else {
-    next = `${template}\n\n${block}\n`
+
+  // ----- Size-tier block (only refreshed if we have any size-tier data
+  // this run; otherwise the previously-persisted block stays as-is) -----
+  if (results.size > 0) {
+    const lines: string[] = []
+    const stamp = new Date().toISOString()
+    lines.push(`*Last bench run: ${stamp}*`)
+    if (!wasmAvailable) {
+      lines.push('')
+      lines.push(`> WASM skipped: ${wasmSkipReason}`)
+    }
+    lines.push('')
+    lines.push('| Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |')
+    lines.push('| --- | --- | --- | --- | --- | --- |')
+    for (const spec of WORKLOAD_SPECS) {
+      const row = results.get(spec.name)
+      if (!row) continue
+      const phases: Array<keyof PhaseTimings> = ['setup', 'bulkWrite', 'readBack', 'recalc']
+      for (const phase of phases) {
+        lines.push(
+          `| ${spec.name} | ${phase} | ${cell(row.ts, phase)} | ${cell(row.wasm, phase)} | ${ratioCell(row.ts, row.wasm, phase)} | ${verdictCell(row.ts, row.wasm, phase)} |`,
+        )
+      }
+    }
+
+    const anyMem = Array.from(results.values()).some((r) => r.ts.mem || r.wasm.mem)
+    if (anyMem) {
+      lines.push('')
+      lines.push('### Peak RSS by phase (MB)')
+      lines.push('')
+      lines.push('| Workload | Phase | TS RSS | WASM RSS |')
+      lines.push('| --- | --- | --- | --- |')
+      for (const spec of WORKLOAD_SPECS) {
+        const row = results.get(spec.name)
+        if (!row) continue
+        const phases: Array<keyof PhaseMem> = ['setup', 'bulkWrite', 'readBack', 'recalc']
+        for (const phase of phases) {
+          lines.push(
+            `| ${spec.name} | ${phase} | ${memCell(row.ts, phase)} | ${memCell(row.wasm, phase)} |`,
+          )
+        }
+      }
+    }
+
+    const failures: string[] = []
+    for (const spec of WORKLOAD_SPECS) {
+      const row = results.get(spec.name)
+      if (!row) continue
+      if (row.ts.error) failures.push(`- **${spec.name} / TS**: ${row.ts.error}`)
+      if (row.wasm.error) failures.push(`- **${spec.name} / WASM**: ${row.wasm.error}`)
+    }
+    if (failures.length > 0) {
+      lines.push('')
+      lines.push('### Failures / skipped backends')
+      lines.push('')
+      lines.push(...failures)
+    }
+
+    lines.push('')
+    lines.push(...crossoverAnalysis())
+
+    template = replaceBlock(template, 'BENCH:RESULTS', lines.join('\n'))
   }
-  writeFileSync(reportPath, next)
+
+  // ----- Chain block (independent: only refreshed if chain suite ran) --
+  if (chainResults.size > 0) {
+    const lines: string[] = []
+    const stamp = new Date().toISOString()
+    lines.push(`*Last chain bench run: ${stamp}*`)
+    if (!wasmAvailable) {
+      lines.push('')
+      lines.push(`> WASM skipped: ${wasmSkipReason}`)
+    }
+    lines.push('')
+    lines.push(...chainSection())
+
+    const chainFailures: string[] = []
+    for (const spec of CHAIN_SPECS) {
+      const row = chainResults.get(spec.name)
+      if (!row) continue
+      if (row.ts.error) chainFailures.push(`- **${spec.name} / TS**: ${row.ts.error}`)
+      if (row.wasm.error) chainFailures.push(`- **${spec.name} / WASM**: ${row.wasm.error}`)
+    }
+    if (chainFailures.length > 0) {
+      lines.push('')
+      lines.push('### Chain failures / skipped backends')
+      lines.push('')
+      lines.push(...chainFailures)
+    }
+
+    template = replaceBlock(template, 'BENCH:CHAIN', lines.join('\n'))
+  }
+
+  writeFileSync(reportPath, template)
 }

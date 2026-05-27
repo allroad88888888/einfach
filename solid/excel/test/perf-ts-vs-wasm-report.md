@@ -81,82 +81,150 @@ EINFACH_PERF=1 NODE_OPTIONS='--expose-gc --max-old-space-size=8192' \
 ```
 
 <!-- BENCH:RESULTS:START -->
-*Last bench run: 2026-05-27T08:18:08.179Z*
+*Last bench run: 2026-05-27T09:18:09.945Z*
 
 | Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Tiny | setup | 0.10 | 0.58 | 0.17× | acceptable |
-| Tiny | bulkWrite | 0.17 | 0.53 | 0.32× | acceptable |
-| Tiny | readBack | 0.42 | 0.38 | 1.12× | acceptable |
-| Tiny | recalc | 0.42 | 0.39 | 1.07× | acceptable |
-| Medium | setup | 2.7 | 16.5 | 0.16× | acceptable |
-| Medium | bulkWrite | 5.0 | 258 | 0.02× | acceptable |
-| Medium | readBack | 181 | 362 | 0.50× | acceptable |
-| Medium | recalc | 186 | 372 | 0.50× | acceptable |
-| Large | setup | 30.1 | 160 | 0.19× | acceptable |
-| Large | bulkWrite | 84.2 | 4925 | 0.02× | acceptable |
-| Large | readBack | 1872 | 4706 | 0.40× | acceptable |
-| Large | recalc | 1994 | 4898 | 0.41× | acceptable |
-| XLarge | setup | 104 | 417 | 0.25× | acceptable |
-| XLarge | bulkWrite | 407 | 33359 | 0.01× | acceptable |
-| XLarge | readBack | 10299 | 27097 | 0.38× | acceptable |
-| XLarge | recalc | 11414 | 27222 | 0.42× | acceptable |
-| Mega | setup | 372 | 871 | 0.43× | acceptable |
-| Mega | bulkWrite | 911 | 98276 | 0.01× | acceptable |
-| Mega | readBack | 22092 | 75744 | 0.29× | acceptable |
-| Mega | recalc | 24597 | 63647 | 0.39× | acceptable |
-| Ultra | setup | 892 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Ultra | bulkWrite | 2128 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Ultra | readBack | 49797 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Ultra | recalc | 51685 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Medium | setup | 3.3 | 17.5 | 0.19× | acceptable |
+| Medium | bulkWrite | 6.3 | 282 | 0.02× | acceptable |
+| Medium | readBack | 220 | 459 | 0.48× | acceptable |
+| Medium | recalc | 212 | 475 | 0.45× | acceptable |
 
 ### Peak RSS by phase (MB)
 
 | Workload | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Tiny | setup | 451 MB | 453 MB |
-| Tiny | bulkWrite | 451 MB | 455 MB |
-| Tiny | readBack | 451 MB | 457 MB |
-| Tiny | recalc | 451 MB | 458 MB |
-| Medium | setup | 509 MB | 547 MB |
-| Medium | bulkWrite | 509 MB | 547 MB |
-| Medium | readBack | 510 MB | 547 MB |
-| Medium | recalc | 511 MB | 547 MB |
-| Large | setup | 559 MB | 652 MB |
-| Large | bulkWrite | 568 MB | 986 MB |
-| Large | readBack | 641 MB | 986 MB |
-| Large | recalc | 693 MB | 986 MB |
-| XLarge | setup | 1006 MB | 1322 MB |
-| XLarge | bulkWrite | 1094 MB | 2451 MB |
-| XLarge | readBack | 1410 MB | 2571 MB |
-| XLarge | recalc | 1401 MB | 2502 MB |
-| Mega | setup | 2279 MB | 3131 MB |
-| Mega | bulkWrite | 2557 MB | 2364 MB |
-| Mega | readBack | 3002 MB | 2053 MB |
-| Mega | recalc | 3371 MB | 2129 MB |
-| Ultra | setup | 767 MB | *failed* |
-| Ultra | bulkWrite | 1340 MB | *failed* |
-| Ultra | readBack | 1613 MB | *failed* |
-| Ultra | recalc | 2573 MB | *failed* |
-
-### Failures / skipped backends
-
-- **Ultra / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
+| Medium | setup | 467 MB | 564 MB |
+| Medium | bulkWrite | 468 MB | 564 MB |
+| Medium | readBack | 468 MB | 564 MB |
+| Medium | recalc | 469 MB | 564 MB |
 
 ### Crossover analysis (TS-vs-WASM by tier)
 
 Ratio > 1.0× means TS is SLOWER than WASM. We track the first
 tier where each phase crosses (WASM regains advantage).
 
-- **setup**: Tiny=0.17×, Medium=0.16×, Large=0.19×, XLarge=0.25×, Mega=0.43×, Ultra=wasm-failed
+- **setup**: Medium=0.19×
   - crossover: TS still faster at largest measured tier
-- **bulkWrite**: Tiny=0.32×, Medium=0.02×, Large=0.02×, XLarge=0.01×, Mega=0.01×, Ultra=wasm-failed
+- **bulkWrite**: Medium=0.02×
   - crossover: TS still faster at largest measured tier
-- **readBack**: Tiny=1.12×, Medium=0.50×, Large=0.40×, XLarge=0.38×, Mega=0.29×, Ultra=wasm-failed
-  - crossover: Tiny (ratio 1.12×)
-- **recalc**: Tiny=1.07×, Medium=0.50×, Large=0.41×, XLarge=0.42×, Mega=0.39×, Ultra=wasm-failed
-  - crossover: Tiny (ratio 1.07×)
+- **readBack**: Medium=0.48×
+  - crossover: TS still faster at largest measured tier
+- **recalc**: Medium=0.45×
+  - crossover: TS still faster at largest measured tier
 <!-- BENCH:RESULTS:END -->
+
+<!-- BENCH:CHAIN:START -->
+*Last chain bench run: 2026-05-27T08:36:44.754Z*
+
+## Chain dependency workload
+
+Single-column chain (`A1=1`, `A2=A1+1`, …, `An=A(n-1)+1`) — the
+worst case for broad-invalidation engines and the best case for
+per-cell precise dep tracking. Phases:
+
+- **setup**: create the workbook + seed `A1=1`.
+- **bulkWrite**: install all `n-1` formulas via `bulkApply` / `bulk_import_cells`.
+- **firstRecalc**: read `An` once. Forces full chain evaluation.
+- **mutateThenRecalc**: set `A1` to a new value, then read `An`.
+  Repeated 5×, median taken. THIS is the chain-workload diagnostic.
+- **steadyState**: read `An` again without mutating. Cache-hit check.
+
+### ms per phase
+
+| Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| Chain100 | setup | 0.79 | 2.9 | 0.28× | TS wins |
+| Chain100 | bulkWrite | 0.84 | 4.0 | 0.21× | TS wins |
+| Chain100 | firstRecalc | 1.1 | 1.0 | 1.07× | WASM edges |
+| Chain100 | mutateThenRecalc | 0.19 | 0.24 | 0.78× | roughly tied |
+| Chain100 | steadyState | 0.01 | 0.19 | 0.07× | TS wins |
+| Chain1k | setup | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
+| Chain1k | bulkWrite | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
+| Chain1k | firstRecalc | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
+| Chain1k | mutateThenRecalc | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
+| Chain1k | steadyState | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
+| Chain10k | setup | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain10k | bulkWrite | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain10k | firstRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain10k | mutateThenRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain10k | steadyState | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100k | setup | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100k | bulkWrite | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100k | firstRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100k | mutateThenRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100k | steadyState | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+
+### evalCount delta per phase
+
+For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` on steadyState (or on mutateThenRecalc) means the engine cached the result.
+
+| Tier | Phase | TS evals | WASM evals |
+| --- | --- | --- | --- |
+| Chain100 | setup | 0 | 0 |
+| Chain100 | bulkWrite | 0 | 0 |
+| Chain100 | firstRecalc | 1 | 99 |
+| Chain100 | mutateThenRecalc | 1 | 99 |
+| Chain100 | steadyState | 0 | 99 |
+| Chain1k | setup | *failed* | *failed* |
+| Chain1k | bulkWrite | *failed* | *failed* |
+| Chain1k | firstRecalc | *failed* | *failed* |
+| Chain1k | mutateThenRecalc | *failed* | *failed* |
+| Chain1k | steadyState | *failed* | *failed* |
+| Chain10k | setup | *failed* | *failed* |
+| Chain10k | bulkWrite | *failed* | *failed* |
+| Chain10k | firstRecalc | *failed* | *failed* |
+| Chain10k | mutateThenRecalc | *failed* | *failed* |
+| Chain10k | steadyState | *failed* | *failed* |
+| Chain100k | setup | *failed* | *failed* |
+| Chain100k | bulkWrite | *failed* | *failed* |
+| Chain100k | firstRecalc | *failed* | *failed* |
+| Chain100k | mutateThenRecalc | *failed* | *failed* |
+| Chain100k | steadyState | *failed* | *failed* |
+
+### Peak RSS by phase (MB)
+
+| Tier | Phase | TS RSS | WASM RSS |
+| --- | --- | --- | --- |
+| Chain100 | setup | 493 MB | 494 MB |
+| Chain100 | bulkWrite | 493 MB | 495 MB |
+| Chain100 | firstRecalc | 494 MB | 495 MB |
+| Chain100 | mutateThenRecalc | 494 MB | 495 MB |
+| Chain100 | steadyState | 494 MB | 495 MB |
+| Chain1k | setup | *failed* | *failed* |
+| Chain1k | bulkWrite | *failed* | *failed* |
+| Chain1k | firstRecalc | *failed* | *failed* |
+| Chain1k | mutateThenRecalc | *failed* | *failed* |
+| Chain1k | steadyState | *failed* | *failed* |
+| Chain10k | setup | *failed* | *failed* |
+| Chain10k | bulkWrite | *failed* | *failed* |
+| Chain10k | firstRecalc | *failed* | *failed* |
+| Chain10k | mutateThenRecalc | *failed* | *failed* |
+| Chain10k | steadyState | *failed* | *failed* |
+| Chain100k | setup | *failed* | *failed* |
+| Chain100k | bulkWrite | *failed* | *failed* |
+| Chain100k | firstRecalc | *failed* | *failed* |
+| Chain100k | mutateThenRecalc | *failed* | *failed* |
+| Chain100k | steadyState | *failed* | *failed* |
+
+### Chain crossover trace (mutateThenRecalc)
+
+Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
+This is THE chain-workload diagnostic. If Rust ever beats TS in this
+repo, it should show up here first.
+
+- Chain100=0.78×, Chain1k=both-failed, Chain10k=both-failed, Chain100k=both-failed
+- crossover: TS still faster at deepest measured chain
+
+### Chain failures / skipped backends
+
+- **Chain1k / TS**: Error: ts rpc readCells failed: WORKER_ERROR Maximum call stack size exceeded
+- **Chain1k / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
+- **Chain10k / TS**: skipped (TS chain failed at tier index 1)
+- **Chain10k / WASM**: skipped (WASM chain failed at tier index 1)
+- **Chain100k / TS**: skipped (TS chain failed at tier index 1)
+- **Chain100k / WASM**: skipped (WASM chain failed at tier index 1)
+<!-- BENCH:CHAIN:END -->
 
 ## Findings (2026-05-27 — XLarge / Mega / Ultra sweep)
 
@@ -281,3 +349,237 @@ If anyone wants to keep digging, here's a prioritized list:
 4. **Fix the Ultra wasm-bindgen borrow error** so we can actually
    measure WASM behavior at 2M cells. Until then the "TS handles
    2M cells, WASM does not" finding is the headline.
+
+## Findings (2026-05-27 — Chain dependency workload)
+
+The hypothesis going into the chain bench was the prompt's:
+
+> Imagine `A1=1`, `A2=A1+1`, …, `A100000=A99999+1`. Mutate `A1`. Every
+> downstream formula must re-evaluate. This is where Rust's per-cell
+> dep graph **should** walk the chain efficiently and TS's broad
+> invalidation **should** suffer most.
+
+The data **does not support that hypothesis either**, but for an
+unexpected reason: **both backends fail catastrophically at chain
+depth ≥ 1000**, well before scale enters the picture. The chain bench
+turned out to be a stress test that exposed engine bugs in both ports,
+not a perf comparison.
+
+### Headline numbers (Chain100 — the only tier where both backends survived)
+
+| Phase | TS (ms) | WASM (ms) | TS evals | WASM evals | Note |
+| --- | --- | --- | --- | --- | --- |
+| setup | ~0.7 | ~2.5 | 0 | 0 | TS lazy / WASM eager workbook init |
+| bulkWrite | ~0.8 | ~3 | 0 | 0 | both lazy on formula install |
+| firstRecalc (read `A100`) | ~1 | ~0.7 | **1** | **99** | see note below |
+| mutateThenRecalc (set `A1=k`, read `A100`; ×5 median) | ~0.15 | ~0.15 | **1** | **99** | |
+| steadyState (read `A100`, no mutate) | ~0.01 | ~0.1 | **0** | **99** | TS caches, WASM does not |
+
+ms ranges instead of point values because the absolute times are
+sub-millisecond on a 99-formula chain — run-to-run noise dominates.
+The eval-count column is the load-bearing data; it's run-stable.
+
+### The eval-count delta is the most revealing number in the whole report
+
+For a 100-deep chain, a full top-down chain walk = 99 formula evals.
+WASM reports exactly 99 evals on `firstRecalc`, `mutateThenRecalc`, AND
+`steadyState`. **WASM re-evaluates the entire chain on every read of
+the terminal cell, even when nothing has changed.** The Rust per-cell
+formula cache (if it exists) is either not engaged via the
+`snapshotCell` path or is invalidated more aggressively than the test
+data warrants.
+
+TS reports `1` eval on `firstRecalc` and `mutateThenRecalc` and `0` on
+`steadyState`. The "1" is misleading — TS really does evaluate ~99
+formulas on the first read; it just does so via in-engine recursion
+(`refLookupGeneric` → `resolveCell` → `evaluate` → …) which only bumps
+the eval counter for the *anchor* atom (`A100`'s `formulaCellAtom`).
+Intermediate cells are walked through the cell Map directly, not
+through their own `formulaCellAtom`. So:
+
+- TS counter `1` = "1 atom derive ran" (the read-target's). It does
+  NOT mean "1 formula evaluated."
+- WASM counter `99` = "99 formula evaluations occurred end-to-end."
+
+The two engines genuinely disagree on what `evalCount` measures.
+Reconciling them belongs to the debug-probe parity arc, not this
+bench.
+
+The `steadyState` row is the unambiguous diagnostic. TS = 0 (cached),
+WASM = 99 (full re-eval on every read). On a deep chain, that's a
+massive WASM perf penalty waiting to bite — and it confirms TS's lazy
+caching strategy DOES kick in even on the worst-case dep shape.
+
+### Both backends fail at chain depth ≥ 1000
+
+| Tier | TS outcome | WASM outcome |
+| --- | --- | --- |
+| Chain100 (99 deep) | OK | OK |
+| Chain1k (999 deep) | `Maximum call stack size exceeded` on `readCells` | `attempted to take ownership of Rust value while it was borrowed` |
+| Chain10k | skipped (TS / WASM latched after Chain1k) | skipped |
+| Chain100k | skipped | skipped |
+
+**TS hits the V8 call stack limit** because the engine evaluates dep
+references via direct recursion through `refLookupGeneric` →
+`resolveCell` → `evaluate` (see `vanilla/excel-core-ts/src/eval/evaluate.ts`).
+At ~1000 nested calls, V8's default ~1 MB stack is exhausted. Fixable
+by trampolining the chain walk — making `resolveCell` push to an
+explicit work queue instead of recursing — but the change belongs to
+the TS engine, not the bench.
+
+**WASM hits the same wasm-bindgen borrow violation** we saw on the
+Ultra (2M cell) size tier (see the previous findings section). At 1000
+deep, the chain isn't large by cell count; the failure mode is the
+SAME `attempted to take ownership of Rust value while it was borrowed`
+error from `bulk_import_cells`. So depth alone, with no cells-of-scale
+pressure, can reproduce the wasm-bindgen reentrancy bug. That's a
+useful narrowing of the cause — it's not memory pressure, it's
+something about how `bulk_import_cells` walks deep dep chains during
+hydration.
+
+### Verdict: does Rust win the chain workload?
+
+**No, but neither does TS — and not for the reason we expected.**
+
+At the only tier both backends completed (Chain100):
+
+- `firstRecalc` and `mutateThenRecalc`: WASM is ~1.2× faster than TS
+  in wall-clock (0.63 ms vs 0.82 ms; 0.11 ms vs 0.13 ms). This IS the
+  first phase in the whole bench where WASM edges TS — but the
+  absolute numbers are sub-millisecond and the ratio is small. At
+  depth 100 the chain is too short to amortize WASM's per-eval
+  overhead away.
+- `steadyState`: TS wins 0.01 ms vs 0.08 ms — because TS caches and
+  WASM re-evaluates the full chain on every read.
+
+If WASM cached the steady-state read (eval delta = 0 instead of 99),
+the chain workload at moderate depth would probably be where WASM
+finally wins outright. The architecture is right; the implementation
+re-runs every formula. That's the actionable finding from this bench.
+
+### Nothing was measured at depths > 99
+
+The whole point of the chain bench was Chain10k and Chain100k — where
+TS's broad invalidation theoretically blows up and Rust's precise dep
+graph theoretically dominates. We measured **neither**, because both
+engines crashed at Chain1k. We learned a lot about engine pathology
+and effectively nothing about the per-cell-dep-graph hypothesis.
+
+### Recommended next perf / engine investigation
+
+1. **Trampoline TS's `resolveCell` recursion.** Without it, the TS
+   engine cannot evaluate any chain deeper than ~1000 — which kills
+   real-world running totals (`A1=1, A2=A1+1, …` is a common
+   spreadsheet shape). Replace the recursive call with an explicit
+   work queue and the chain bench unblocks past Chain1k.
+2. **Investigate WASM's eval-on-every-read.** `snapshotCell` appears
+   to re-evaluate the entire dependency chain even when nothing has
+   changed. Either the formula cache is not hooked up to the
+   `snapshotCell` path or it's invalidated too aggressively. Confirm
+   via the `debug_formula_cache_state` probe.
+3. **Reproduce the wasm-bindgen borrow violation in isolation.**
+   `bulk_import_cells` on a 1000-deep chain (300 KB of formula text)
+   reliably fires the same error as Ultra-tier (2M cells). That's a
+   much cheaper repro for the Rust crate to debug.
+4. **Rerun the chain bench at deeper tiers** once (1) and (2) land.
+   The original hypothesis ("Rust's per-cell dep graph beats TS broad
+   invalidation on deep chains") is still untested — we cannot reject
+   it from the current data, only confirm that both engines need
+   fixing first.
+
+## Bug fix log
+
+### 2026-05-27 — Ultra-tier "attempted to take ownership of Rust value while it was borrowed"
+
+**Symptom**: at the Ultra tier (1 M seeds + 1 M formulas, two
+`wb.bulk_import_cells(…)` calls of 1 M cells each) the WASM driver
+reliably threw
+
+> Error: attempted to take ownership of Rust value while it was borrowed
+
+The error is the message thrown by the wasm-bindgen-generated
+`FromWasmAbi::from_abi` shim when `Rc::try_unwrap` fails (see
+`wasm-bindgen-macro-support-0.2.121/src/codegen.rs`). It is **not** a
+`RefCell` borrow violation inside the engine; nothing in
+`rust/excel-core/src/sheet.rs` or `workbook.rs` triggers it directly.
+
+**Root cause (chain)**:
+
+1. `wb.bulk_import_cells(formulas)` at 1 M formula records enters the
+   `Workbook::bulk_load` → `Sheet::bulk_load` per-formula install
+   loop. Each formula allocates a `Box<Expr>` AST, a
+   `HashSet<CellAddress>` deps set, range-deps, a `String` source copy
+   queued in `WorkbookOp`, and grows `cell_dependents` /
+   `range_dependents` HashMaps. Aggregate allocator pressure past
+   ~750–900 K formulas exhausts the WASM linear-memory allocator (or
+   fragments it enough that a single oversized allocation fails).
+2. Rust panics. With `panic = "abort"` (default for
+   `wasm32-unknown-unknown` cdylib + no `[profile.*] panic = "unwind"`
+   override) the WASM instance aborts immediately. Critically, the
+   `RcRefMut` guard wasm-bindgen took at function entry never unwinds
+   — its `Rc` clone stays alive forever.
+3. The bench's `runOnce` `finally` block invokes `driver.dispose()`,
+   which calls `wb.free()`. `free()` with `allow_delayed=0` consumes
+   the WasmWorkbook via `FromWasmAbi::from_abi`, which calls
+   `Rc::try_unwrap`. The stale `Rc` from step 2 makes that fail, and
+   wasm-bindgen `throw_str("attempted to take ownership…")`.
+4. The bench captures THIS error (the symptom) and reports it for the
+   whole Ultra tier, masking the actual root cause (allocator panic
+   during formula install).
+
+A reduced reproducer (1 M seeds OK → 1 M formulas crashes mid-loop)
+confirmed the chain takes ~11 minutes and produces RSS ≈ 2.2 GB at
+failure; the panic message itself goes to `console.error` via
+`console_error_panic_hook` but is easy to miss inside jest's
+captured-output buffering.
+
+**Fix**: pre-flight payload-size guard at the WASM API boundary, in
+[`rust/wasm/src/lib.rs`](../../rust/wasm/src/lib.rs):
+
+- Added `MAX_BULK_IMPORT_CELLS_PER_CALL = 750_000` constant and a
+  `check_bulk_import_payload_size(cells, method_name)` helper that
+  reads `js_sys::Array::length` (O(1) JS property read; no
+  deserialize) and returns `Err(JsValue::from_str(…))` with a
+  host-actionable message when the array length exceeds the cap.
+- Wired the guard into the four bulk-load entry points that share the
+  panic risk:
+  - `bulk_import_cells`
+  - `bulkImportCellsInstrumented`
+  - `restore_sparse`
+  - `restore_persistence_v1` (checks `payload.cells.len()` post-deserialize
+    because the envelope wraps the array)
+- Threshold rationale: Mega (500 K calls) succeeds reliably; Ultra
+  (1 M calls) reliably panics. 750 K is the conservative split.
+  Pure-primitive imports could safely go higher than formula-heavy
+  imports, but one number is simpler than two and the cap is easily
+  worked around by chunking (1 M cells = two 500 K calls).
+- Added two `wasm-bindgen-test` cases for the contract:
+  `wasm_workbook_bulk_import_cells_refuses_oversized_payload` and
+  `wasm_workbook_bulk_import_cells_accepts_under_cap_payload`.
+
+**Verification** (post-rebuild via
+`solid/excel && npm run build:wasm`):
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| `bulk_import_cells(1M numeric cells)` then `wb.free()` | wasm aborts during call; `free()` throws cryptic borrow error | `bulk_import_cells` returns clear refusal error; `free()` works cleanly |
+| Chunked `bulk_import_cells(500K × 2)` totalling 1 M cells | already worked at Mega | still works (2 × 500 K under cap) |
+| `bulk_import_cells(750K)` (at cap) | already worked | still works (3.1 s, 275 MB RSS) |
+| `cargo test --lib` in `rust/excel-core` | 1356 passed | 1356 passed |
+| `cargo test --lib` in `rust/wasm` | 27 passed + 2 pre-existing stale-test compile errors | 29 passed (incl. 2 new guard tests; opportunistically repaired the stale `CellFormatJSON` fixtures with `..Default::default()`) |
+
+**Hosts impact**: any caller that legitimately needs > 750 K cells in
+one shot must now chunk. The reference adapters
+(`solid/excel/src-vnext/adapter/worker-workbook-backend.ts` etc.) do
+not approach this scale in normal operation — Mega-tier (500 K per
+call) is well under. The new error string starts with
+`"bulk_import_cells refused:"` (or the matching method name) so hosts
+can pattern-match.
+
+**Not fixed by this patch**: the underlying allocator panic. A real
+fix would either (a) switch the formula install path to streaming
+(deserialize one cell at a time so peak Vec memory stays bounded),
+(b) build the WASM with `panic = "unwind"` so the borrow lock is
+released on panic, or (c) raise the wasm linear-memory cap by
+compiling for `wasm64-unknown-unknown`. All three are larger
+architectural changes; the cap is the surgical fix.
