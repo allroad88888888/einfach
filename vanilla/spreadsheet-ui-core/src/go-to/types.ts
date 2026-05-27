@@ -107,6 +107,12 @@ export interface GoToParseContext {
 /**
  * Slim view of a NamedRange the parser actually needs (avoids a circular
  * import between go-to and named-ranges).
+ *
+ * Mirrors the full `NamedRangeRefersTo` union from `../named-ranges/types`
+ * so a `NamedRange` is structurally assignable to `NamedRangeLite`. The
+ * Go-To locator silently skips entries whose refersTo isn't a `'range'` —
+ * a `'lambda'` binding has no addressable target, and `'constant'` is
+ * routed through value parsing in the locator engine.
  */
 export interface NamedRangeLite {
   name: string
@@ -114,6 +120,7 @@ export interface NamedRangeLite {
   refersTo:
     | { kind: 'range'; sheetId: string; address: string }
     | { kind: 'constant'; value: string }
+    | { kind: 'lambda'; params: string[]; body: string }
 }
 
 /**

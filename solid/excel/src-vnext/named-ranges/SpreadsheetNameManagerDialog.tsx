@@ -1,14 +1,21 @@
 /** @jsxImportSource solid-js */
 
-import { Show, For, createEffect, createSignal, onCleanup } from 'solid-js'
+import { Show, For, createEffect, onCleanup } from 'solid-js'
+import { atom } from '@einfach/core'
 import { useAtomValue } from '@einfach/solid'
 import { useT } from '../../src/i18n'
 import {
   nameManagerEditorAtom,
+  nameManagerKindDraftAtom,
+  nameManagerNameDraftAtom,
+  nameManagerParamsDraftAtom,
+  nameManagerRefersToDraftAtom,
+  nameManagerScopeDraftAtom,
   nameRegistryCacheAtom,
   setNameRegistryAtom,
   closeNameManagerAtom,
   sheetTabsSheetsAtom,
+  type NameManagerKind,
   type NamedRange,
   type NamedRangeScope,
   type NamedRangeRefersTo,
@@ -20,6 +27,11 @@ export interface SpreadsheetNameManagerDialogProps {
   'data-testid'?: string
 }
 
+// Per-instance dialog state that need not survive 1.9.12 Provider remount
+// hazards (resolved in `2b7d65e` but we keep atom-backing as the standard
+// pattern — see `project_solid_provider_remount.md`). These atoms are
+// instantiated alongside the dialog component below.
+
 function scopeToString(scope: NamedRangeScope): string {
   if (scope === 'workbook') return 'workbook'
   return scope.sheetId
@@ -30,6 +42,31 @@ function stringToScope(value: string): NamedRangeScope {
   return { sheetId: value }
 }
 
+function refersToToFormFields(rt: NamedRangeRefersTo): {
+  kind: NameManagerKind
+  refersTo: string
+  params: string
+} {
+  if (rt.kind === 'range') {
+    return { kind: 'range', refersTo: `${rt.sheetId}!${rt.address}`, params: '' }
+  }
+  if (rt.kind === 'lambda') {
+    return { kind: 'lambda', refersTo: rt.body, params: rt.params.join(', ') }
+  }
+  // constant / value
+  return { kind: 'value', refersTo: rt.value, params: '' }
+}
+
+// Local error atom (per-dialog instance, not exported — would normally live
+// in `spreadsheet-ui-core` but the error string is purely UI state).
+const errorAtom = atom<string | null>(null)
+errorAtom.debugLabel = 'spreadsheet.nameManager.error.local'
+
+// Locally-tracked selected entry — needed to know which row the Delete
+// button targets. Identity by name + scope-stringified.
+const selectedEntryAtom = atom<NamedRange | null>(null)
+selectedEntryAtom.debugLabel = 'spreadsheet.nameManager.selectedEntry'
+
 export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialogProps) {
   const t = useT()
   const store = useSpreadsheetUiStore()
@@ -37,6 +74,13 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
   const editor = useAtomValue(nameManagerEditorAtom)
   const registry = useAtomValue(nameRegistryCacheAtom)
   const sheets = useAtomValue(sheetTabsSheetsAtom)
+  const name = useAtomValue(nameManagerNameDraftAtom)
+  const scope = useAtomValue(nameManagerScopeDraftAtom)
+  const refersTo = useAtomValue(nameManagerRefersToDraftAtom)
+  const kind = useAtomValue(nameManagerKindDraftAtom)
+  const params = useAtomValue(nameManagerParamsDraftAtom)
+  const selectedEntry = useAtomValue(selectedEntryAtom)
+  const error = useAtomValue(errorAtom)
 
   const isOpen = () => editor().status !== 'closed'
 
@@ -52,21 +96,36 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     onCleanup(() => document.removeEventListener('keydown', onKeyDown))
   })
 
-  const [name, setName] = createSignal('')
-  const [scope, setScope] = createSignal<string>('workbook')
-  const [refersTo, setRefersTo] = createSignal('')
-  const [selectedEntry, setSelectedEntry] = createSignal<NamedRange | null>(null)
-  const [error, setError] = createSignal<string | null>(null)
-
-  function refersToString(rt: NamedRangeRefersTo): string {
-    return rt.kind === 'range' ? `${rt.sheetId}!${rt.address}` : rt.value
+  function setName(value: string) {
+    store.setter(nameManagerNameDraftAtom, value)
+  }
+  function setScope(value: string) {
+    store.setter(nameManagerScopeDraftAtom, value)
+  }
+  function setRefersTo(value: string) {
+    store.setter(nameManagerRefersToDraftAtom, value)
+  }
+  function setKind(value: NameManagerKind) {
+    store.setter(nameManagerKindDraftAtom, value)
+  }
+  function setParams(value: string) {
+    store.setter(nameManagerParamsDraftAtom, value)
+  }
+  function setSelectedEntry(value: NamedRange | null) {
+    store.setter(selectedEntryAtom, value)
+  }
+  function setError(value: string | null) {
+    store.setter(errorAtom, value)
   }
 
   function populateFromEntry(entry: NamedRange) {
+    const form = refersToToFormFields(entry.refersTo)
     setSelectedEntry(entry)
     setName(entry.name)
     setScope(scopeToString(entry.scope))
-    setRefersTo(refersToString(entry.refersTo))
+    setKind(form.kind)
+    setParams(form.params)
+    setRefersTo(form.refersTo)
     setError(null)
   }
 
@@ -74,23 +133,34 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     setSelectedEntry(null)
     setName('')
     setScope('workbook')
+    setKind('range')
+    setParams('')
     setRefersTo('')
     setError(null)
   }
 
+  // Reset on the closed→open edge. Uses the atoms directly so the
+  // per-instance state survives any consumer remount (1.9.12 hazard:
+  // historically the component body could re-execute, dropping `let`
+  // locals; atom values persist).
   createEffect((wasOpen: boolean) => {
     const open = isOpen()
     if (open && !wasOpen) {
       const draft = editor().draft
       if (draft) {
+        const form = refersToToFormFields(draft.refersTo)
         setSelectedEntry(draft)
         setName(draft.name)
         setScope(scopeToString(draft.scope))
-        setRefersTo(refersToString(draft.refersTo))
+        setKind(form.kind)
+        setParams(form.params)
+        setRefersTo(form.refersTo)
       } else {
         setSelectedEntry(null)
         setName('')
         setScope('workbook')
+        setKind('range')
+        setParams('')
         setRefersTo('')
       }
       setError(null)
@@ -98,11 +168,28 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
     return open
   }, false)
 
-  function buildRefersTo(): NamedRangeRefersTo {
+  function buildRefersTo(): NamedRangeRefersTo | null {
     const value = refersTo().trim()
-    const sep = value.indexOf('!')
-    if (sep !== -1) {
-      return { kind: 'range', sheetId: value.slice(0, sep), address: value.slice(sep + 1) }
+    const currentKind = kind()
+    if (currentKind === 'lambda') {
+      const paramList = params()
+        .split(',')
+        .map((p) => p.trim())
+        .filter((p) => p.length > 0)
+      const body = value.startsWith('=') ? value : `=${value}`
+      if (body.length <= 1) return null
+      return { kind: 'lambda', params: paramList, body }
+    }
+    if (currentKind === 'range') {
+      const sep = value.indexOf('!')
+      if (sep !== -1) {
+        return { kind: 'range', sheetId: value.slice(0, sep), address: value.slice(sep + 1) }
+      }
+      // Treat range-without-sheet-prefix as the active scope sheet, or the
+      // first sheet for workbook-scoped names.
+      const scopeVal = scope()
+      const sheetId = scopeVal === 'workbook' ? sheets()[0]?.id ?? '' : scopeVal
+      return { kind: 'range', sheetId, address: value }
     }
     return { kind: 'constant', value }
   }
@@ -134,12 +221,21 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
       setError(t('nameManager.error.refersToRequired'))
       return
     }
+    const built = buildRefersTo()
+    if (!built) {
+      setError(t('nameManager.error.refersToRequired'))
+      return
+    }
+    if (built.kind === 'lambda' && built.params.length === 0) {
+      setError(t('nameManager.error.paramsRequired'))
+      return
+    }
     try {
       await backend.setNamedRange({
         kind: 'set-named-range',
         name: nameVal,
         scope: stringToScope(scope()),
-        refersTo: buildRefersTo(),
+        refersTo: built,
       })
       await refreshNameRegistry()
     } catch (err) {
@@ -170,6 +266,10 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
 
   function handleClose() {
     close()
+  }
+
+  function refersToLabel(): string {
+    return kind() === 'lambda' ? t('nameManager.lambdaBody') : t('nameManager.refersTo')
   }
 
   return (
@@ -233,7 +333,35 @@ export function SpreadsheetNameManagerDialog(props: SpreadsheetNameManagerDialog
             </For>
           </select>
 
-          <label for="name-refers-to">{t('nameManager.refersTo')}</label>
+          <label for="name-mgr-kind-select">{t('nameManager.kind')}</label>
+          <select
+            id="name-mgr-kind-select"
+            data-testid="name-mgr-kind-select"
+            value={kind()}
+            onChange={(e) => {
+              setKind(e.currentTarget.value as NameManagerKind)
+            }}
+          >
+            <option value="range">{t('nameManager.kind.range')}</option>
+            <option value="value">{t('nameManager.kind.value')}</option>
+            <option value="lambda">{t('nameManager.kind.lambda')}</option>
+          </select>
+
+          <Show when={kind() === 'lambda'}>
+            <label for="name-mgr-params-input">{t('nameManager.params')}</label>
+            <input
+              id="name-mgr-params-input"
+              data-testid="name-mgr-params-input"
+              type="text"
+              placeholder="x, y, z"
+              value={params()}
+              onInput={(e) => {
+                setParams(e.currentTarget.value)
+              }}
+            />
+          </Show>
+
+          <label for="name-refers-to">{refersToLabel()}</label>
           <input
             id="name-refers-to"
             data-testid="name-refers-to"

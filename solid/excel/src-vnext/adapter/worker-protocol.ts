@@ -306,8 +306,34 @@ export interface WorkerWorkbookClient {
    */
   registerCustomFormula(name: string, source: string): Promise<boolean>
   unregisterCustomFormula(name: string): Promise<boolean>
+  /**
+   * Wave F follow-up — register a workbook-level name binding inside the
+   * worker engine. Currently implemented only by the TS worker runtime;
+   * the WASM runtime returns an `UNSUPPORTED` error code via
+   * `defineNameUnsupported` so the host adapter can fall back to a
+   * cache-only registration (range / value still work via the existing
+   * `setNamedRange` flow; lambda requires worker-side AST parsing).
+   *
+   * The binding wire shape mirrors `NameBinding` from `@einfach/excel-core-ts`
+   * but keeps the lambda `body` as a **formula source string** since AST
+   * objects do not survive `postMessage`. The worker parses the body into
+   * an `Expr` before calling `workbook.defineName(...)`.
+   */
+  defineName(name: string, binding: NameBindingWire): Promise<boolean>
+  undefineName(name: string): Promise<boolean>
   dispose(): void
 }
+
+/**
+ * Wire-format `NameBinding`. The TS engine's in-process `NameBinding`
+ * (see `vanilla/excel-core-ts/src/types.ts`) carries a parsed `Expr` for
+ * lambda bodies; this wire variant carries the source string and the
+ * worker runtime parses on receive.
+ */
+export type NameBindingWire =
+  | { kind: 'range'; sheetName: string; start: string; end: string }
+  | { kind: 'value'; literal: string }
+  | { kind: 'lambda'; params: string[]; body: string }
 
 type PendingRequest = {
   resolve: (value: unknown) => void
@@ -650,6 +676,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
     },
     unregisterCustomFormula(name) {
       return request<boolean>('unregisterCustomFormula', { name })
+    },
+    defineName(name, binding) {
+      return request<boolean>('defineName', { name, binding })
+    },
+    undefineName(name) {
+      return request<boolean>('undefineName', { name })
     },
     dispose() {
       if (disposed) return

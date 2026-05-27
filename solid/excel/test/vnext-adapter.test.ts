@@ -696,6 +696,12 @@ function createFakeWorkerWorkbookClient(): FakeWorkerWorkbookClient {
     async unregisterCustomFormula() {
       return true
     },
+    async defineName() {
+      return true
+    },
+    async undefineName() {
+      return true
+    },
     dispose() {
       dirtyListeners.clear()
       hydratedListeners.clear()

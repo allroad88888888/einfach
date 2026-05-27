@@ -58,9 +58,11 @@ import {
   createWorkbook,
   formatA1,
   parseA1,
+  parseFormula,
   type CellCoord,
   type CellRange,
   type ErrorCode,
+  type NameBinding,
   type Value,
   type Workbook,
 } from '@einfach/excel-core-ts'
@@ -683,6 +685,112 @@ function unregisterCustomFormulaInWorker(state: RuntimeState, name: unknown): bo
   return state.workbook.unregisterCustomFormula(name)
 }
 
+/**
+ * Wave F follow-up — wire `defineName` from the host through the worker
+ * to the engine. The wire `binding` carries lambda bodies as a **formula
+ * source string** (AST cannot cross postMessage); we parse the body via
+ * `parseFormula` here and forward the resulting `NameBinding`.
+ *
+ * After registration we bump every sheet via `recalc()` so formulas that
+ * already reference the name re-evaluate. Cheap — just a Map clone per
+ * sheet — and matches the engine's broad-invalidation discipline (PLAN
+ * §4.4).
+ */
+function defineNameInWorker(state: RuntimeState, name: string, rawBinding: unknown): boolean {
+  if (typeof name !== 'string' || name.length === 0) {
+    throw rpcError('INVALID_NAME', 'name must be a non-empty string')
+  }
+  if (!rawBinding || typeof rawBinding !== 'object') {
+    throw rpcError('INVALID_NAME_BINDING', 'binding must be an object')
+  }
+  const binding = rawBinding as { kind?: unknown }
+  let parsed: NameBinding
+  switch (binding.kind) {
+    case 'range': {
+      const b = rawBinding as { sheetName?: unknown; start?: unknown; end?: unknown }
+      if (typeof b.start !== 'string' || typeof b.end !== 'string') {
+        throw rpcError('INVALID_NAME_BINDING', 'range binding requires start + end strings')
+      }
+      parsed = {
+        kind: 'range',
+        sheetName: typeof b.sheetName === 'string' ? b.sheetName : undefined,
+        start: b.start,
+        end: b.end,
+      }
+      break
+    }
+    case 'value': {
+      const b = rawBinding as { literal?: unknown }
+      const literal = typeof b.literal === 'string' ? b.literal : String(b.literal ?? '')
+      // Inference matches the workbook's literal coercion: prefer numeric,
+      // then boolean, then string. Empty string → blank.
+      let value: Value
+      if (literal.length === 0) {
+        value = { kind: 'blank' }
+      } else if (/^-?\d+(?:\.\d+)?$/.test(literal)) {
+        value = { kind: 'number', value: Number(literal) }
+      } else if (literal.toUpperCase() === 'TRUE' || literal.toUpperCase() === 'FALSE') {
+        value = { kind: 'boolean', value: literal.toUpperCase() === 'TRUE' }
+      } else {
+        value = { kind: 'string', value: literal }
+      }
+      parsed = { kind: 'value', value }
+      break
+    }
+    case 'lambda': {
+      const b = rawBinding as { params?: unknown; body?: unknown }
+      if (!Array.isArray(b.params) || b.params.some((p) => typeof p !== 'string')) {
+        throw rpcError('INVALID_NAME_BINDING', 'lambda binding requires params: string[]')
+      }
+      if (typeof b.body !== 'string' || b.body.length === 0) {
+        throw rpcError('INVALID_NAME_BINDING', 'lambda binding requires body: non-empty string')
+      }
+      const params = (b.params as string[]).map((p) => p.trim()).filter((p) => p.length > 0)
+      // `parseFormula` accepts a source string with or without the leading
+      // `=` — the host UI may pass either form. Normalize so the parser
+      // sees a formula start.
+      const body = b.body.startsWith('=') ? b.body : `=${b.body}`
+      let ast
+      try {
+        ast = parseFormula(body)
+      } catch (err) {
+        throw rpcError(
+          'INVALID_LAMBDA_BODY',
+          err instanceof Error ? err.message : `failed to parse lambda body: ${String(err)}`,
+        )
+      }
+      // `parseFormula` is total — it returns an `ErrorLiteral` AST on
+      // parse failure instead of throwing. Surface that as a structured
+      // RPC error so the host UI can show a meaningful message instead
+      // of silently storing a name that always evaluates to `#VALUE!`.
+      if (ast.kind === 'error') {
+        throw rpcError(
+          'INVALID_LAMBDA_BODY',
+          `failed to parse lambda body: ${ast.code}`,
+        )
+      }
+      parsed = { kind: 'lambda', params, body: ast }
+      break
+    }
+    default:
+      throw rpcError('INVALID_NAME_BINDING', `unknown binding kind: ${String(binding.kind)}`)
+  }
+  state.workbook.defineName(name, parsed)
+  // Force every formula derive to dirty so cells that already reference
+  // the new name pick it up. The TS engine's `defineName` itself does not
+  // bump any atom (names live outside the sheet atoms), so we must trigger
+  // the recompute here.
+  state.workbook.recalc()
+  return true
+}
+
+function undefineNameInWorker(state: RuntimeState, name: string): boolean {
+  if (typeof name !== 'string' || name.length === 0) return false
+  const removed = state.workbook.undefineName(name)
+  if (removed) state.workbook.recalc()
+  return removed
+}
+
 function unwrapForCustom(value: Value): unknown {
   switch (value.kind) {
     case 'blank':
@@ -1062,6 +1170,10 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
         return registerCustomFormulaInWorker(state, String(msg.name ?? ''), String(msg.source ?? ''))
       case 'unregisterCustomFormula':
         return unregisterCustomFormulaInWorker(state, msg.name)
+      case 'defineName':
+        return defineNameInWorker(state, String(msg.name ?? ''), msg.binding)
+      case 'undefineName':
+        return undefineNameInWorker(state, String(msg.name ?? ''))
       case 'debugCounters':
         return debugCountersStub(state)
       case 'debugFormulaCacheState':
@@ -1181,7 +1293,9 @@ function isMutatingCommand(cmd: unknown): boolean {
     cmd === 'addSheet' ||
     cmd === 'removeSheet' ||
     cmd === 'renameSheet' ||
-    cmd === 'moveSheet'
+    cmd === 'moveSheet' ||
+    cmd === 'defineName' ||
+    cmd === 'undefineName'
   )
 }
 

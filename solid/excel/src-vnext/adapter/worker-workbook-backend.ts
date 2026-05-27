@@ -1541,6 +1541,47 @@ export function createWorkerWorkbookSpreadsheetBackend(
         existingIndex >= 0
           ? namedRanges.map((item, index) => (index === existingIndex ? entry : item))
           : [...namedRanges, entry]
+      // Forward to the worker engine so formulas can actually resolve the
+      // name at evaluation time. Lambda bindings are TS-runtime only — the
+      // WASM runtime refuses with NAME_BINDING_UNSUPPORTED (graceful path);
+      // we swallow that error so range/value bindings still cache host-side
+      // and the dialog stays functional on the wasm backend.
+      await readyPromise
+      try {
+        const refersTo = request.refersTo
+        if (refersTo.kind === 'lambda') {
+          await client.defineName(name, {
+            kind: 'lambda',
+            params: refersTo.params,
+            body: refersTo.body,
+          })
+        } else if (refersTo.kind === 'range') {
+          // Look up the sheet name for the engine. The wire shape expects
+          // the human-readable name (e.g. "Sheet1"), not the host sheet id.
+          const sheet = lookup.sheets.find((s) => s.id === refersTo.sheetId)
+          if (sheet) {
+            await client.defineName(name, {
+              kind: 'range',
+              sheetName: sheet.name,
+              start: refersTo.address,
+              end: refersTo.address,
+            })
+          }
+        } else {
+          await client.defineName(name, {
+            kind: 'value',
+            literal: refersTo.value,
+          })
+        }
+      } catch (err) {
+        const code = (err as Error & { code?: string })?.code
+        // Wasm runtime refuses with NAME_BINDING_UNSUPPORTED for any defineName.
+        // The host-side cache (`namedRanges` array) still records the entry so
+        // the dialog UI lists it; engine resolution is the TS runtime's job.
+        if (code !== 'NAME_BINDING_UNSUPPORTED' && code !== 'UNKNOWN_COMMAND') {
+          throw err
+        }
+      }
       const nextRevision = bumpRevision()
       return {
         requestId: request.requestId,
@@ -1553,6 +1594,15 @@ export function createWorkerWorkbookSpreadsheetBackend(
         (item) => !(item.name === request.name && namedRangeScopeEquals(item.scope, request.scope)),
       )
       namedRanges = next
+      await readyPromise
+      try {
+        await client.undefineName(request.name)
+      } catch (err) {
+        const code = (err as Error & { code?: string })?.code
+        if (code !== 'NAME_BINDING_UNSUPPORTED' && code !== 'UNKNOWN_COMMAND') {
+          throw err
+        }
+      }
       const nextRevision = bumpRevision()
       return {
         requestId: request.requestId,

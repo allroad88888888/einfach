@@ -21,9 +21,9 @@ What the TS backend gives us **in addition to** the Rust backend (both stay; use
 
 What the Rust backend keeps doing better — and why we **don't** remove it:
 
-- **Throughput on large recalc storms.** Rust eval is ~3–10× faster per call than JIT'd TS. For 100k+ formula recalc the Rust path is the right choice.
-- **Memory layout discipline.** Contiguous numeric buffers, no boxed numbers.
-- **Coverage maturity.** 400-function evaluator hardened by years of fixture tests.
+- ~~**Throughput on large recalc storms.** Rust eval is ~3–10× faster per call than JIT'd TS. For 100k+ formula recalc the Rust path is the right choice.~~ **REVISED 2026-05-27 — the perf bench (`solid/excel/test/perf-ts-vs-wasm-report.md`) shows TS is *faster* than WASM at every measured workload (Tiny / Medium / Large, all 4 phases), ratio 0.01–1.05×. The TS broad-invalidation model (one sheetAtom per sheet) skips the per-cell dep-graph maintenance Rust performs at bulk-install time, and the wasm-bindgen string-marshalling per RPC eats the per-call advantage on read paths. The original 3-10× estimate did NOT survive contact with the bench. Rust still wins on memory layout for true 1M-cell sheets — not validated by the bench (Large = 100k cells / 50k formulas).**
+- **Memory layout discipline.** Contiguous numeric buffers, no boxed numbers. Matters at the 1M-cell scale we did not benchmark.
+- **Coverage maturity.** 400-function evaluator hardened by years of fixture tests; TS at 82 functions.
 - **Reference implementation.** When the TS engine produces an unexpected result, diffing against the Rust output isolates whether it's a porting bug or a shared misreading of Excel semantics.
 
 The two paths coexist permanently. `?backend=ts` is the developer-default; `?backend=wasm` is the perf / parity-check default.

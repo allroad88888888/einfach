@@ -584,6 +584,13 @@ export const messages: Record<string, string> = {
   'nameManager.close': 'Close',
   'nameManager.error.nameRequired': 'Name is required',
   'nameManager.error.refersToRequired': 'Refers to is required',
+  'nameManager.error.paramsRequired': 'Lambda params are required',
+  'nameManager.kind': 'Kind',
+  'nameManager.kind.range': 'Range',
+  'nameManager.kind.value': 'Value',
+  'nameManager.kind.lambda': 'Lambda',
+  'nameManager.params': 'Params',
+  'nameManager.lambdaBody': 'Body formula',
 
   // Status bar
   'status.aggregate.sum': 'Sum',

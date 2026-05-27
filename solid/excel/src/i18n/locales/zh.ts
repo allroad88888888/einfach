@@ -561,6 +561,13 @@ export const messages: Record<string, string> = {
   'nameManager.close': '关闭',
   'nameManager.error.nameRequired': '名称不能为空',
   'nameManager.error.refersToRequired': '引用位置不能为空',
+  'nameManager.error.paramsRequired': 'Lambda 参数不能为空',
+  'nameManager.kind': '类型',
+  'nameManager.kind.range': '区域',
+  'nameManager.kind.value': '常量',
+  'nameManager.kind.lambda': 'Lambda',
+  'nameManager.params': '参数',
+  'nameManager.lambdaBody': '函数体公式',
 
   'status.aggregate.sum': '求和',
   'status.aggregate.average': '平均',

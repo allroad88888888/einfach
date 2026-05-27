@@ -1525,6 +1525,18 @@ export function installWorkerRuntime() {
         case 'unregisterCustomFormula':
           postResponse(msg.id, unregisterCustomFormulaInWorker(wb, msg.name))
           break
+        case 'defineName':
+        case 'undefineName':
+          // The WASM engine (`rust/excel-core`) does not implement
+          // LAMBDA name bindings. Range / value bindings are tracked
+          // host-side by `worker-workbook-backend.ts` directly; the
+          // worker only sees `defineName` when a host wants the engine
+          // to learn about a LAMBDA. We refuse with a structured error
+          // so the adapter can fall back gracefully.
+          throw Object.assign(
+            new Error('LAMBDA name bindings are not supported by the WASM runtime — use the TS backend (?backend=ts).'),
+            { code: 'NAME_BINDING_UNSUPPORTED' },
+          )
         case 'debugCounters':
           postResponse(msg.id, debugCounters(wb))
           break

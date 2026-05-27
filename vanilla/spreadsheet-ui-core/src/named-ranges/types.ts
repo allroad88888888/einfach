@@ -1,8 +1,25 @@
 export type NamedRangeScope = 'workbook' | { sheetId: string }
 
+/**
+ * A name binding's referent.
+ *
+ *  - `range`   — an A1-style range on a specific sheet.
+ *  - `constant`— a literal value (string, number-as-text, etc.).
+ *  - `lambda`  — a callable body. `params` are the declared parameter
+ *                identifiers (e.g. `['x', 'y']`). `body` is the **formula
+ *                source string** (e.g. `'=x + y * 2'`) — the AST itself
+ *                does not cross the `postMessage` worker boundary, so the
+ *                wire format keeps the source verbatim. The TS worker
+ *                runtime parses the body into an `Expr` AST before calling
+ *                `workbook.defineName(...)`. The WASM runtime does not
+ *                implement LAMBDA — adapters route lambda bindings only
+ *                when the backend port advertises support; see
+ *                `vanilla/spreadsheet-ui-core/docs/named-ranges.md`.
+ */
 export type NamedRangeRefersTo =
   | { kind: 'range'; sheetId: string; address: string }
   | { kind: 'constant'; value: string }
+  | { kind: 'lambda'; params: string[]; body: string }
 
 export interface NamedRange {
   name: string

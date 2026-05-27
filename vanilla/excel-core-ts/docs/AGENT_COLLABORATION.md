@@ -38,6 +38,52 @@
 | 2026-05-26 | CC | Wave E / E1 — spill arrays + array functions | done | `vanilla/excel-core-ts/src/eval/functions/array.ts` (new — SEQUENCE/TRANSPOSE/SORT/FILTER/UNIQUE), `vanilla/excel-core-ts/test/array.test.ts` (new — 24 specs), `vanilla/excel-core-ts/src/eval/functions/index.ts` (registry merge), `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` (spill projection helper + readCellValue collapse), `solid/excel/test/excel-core-ts-spill.test.ts` (new — 3 specs) | Wave E complete (E2 cross-sheet was already done by B2) — F2 e2e migration now fully unblocked |
 | 2026-05-26 | F1 agent | Wave F / F1 — function fill-out (info / financial / math+ / text+) | done | `vanilla/excel-core-ts/src/eval/functions/info.ts` (new — 8 fns), `vanilla/excel-core-ts/src/eval/functions/financial.ts` (new — 10 fns), `vanilla/excel-core-ts/src/eval/functions/math.ts` (append CEILING/FLOOR/TRUNC/SUMPRODUCT/PRODUCT — +5 fns), `vanilla/excel-core-ts/src/eval/functions/text.ts` (append SEARCH/FIND — +2 fns), `vanilla/excel-core-ts/src/eval/functions/index.ts` (register info + financial), `vanilla/excel-core-ts/test/info.test.ts` (new — 31 specs), `vanilla/excel-core-ts/test/financial.test.ts` (new — 37 specs), `vanilla/excel-core-ts/test/math.test.ts` (append CEILING/FLOOR/TRUNC/SUMPRODUCT/PRODUCT — +24 specs), `vanilla/excel-core-ts/test/text.test.ts` (append SEARCH/FIND — +15 specs) | total built-in function count now 82 across 8 files; F1 second batch ready for spawn (more info/financial/text/date/stats/lookup follow-ons) |
 | 2026-05-26 | F2 agent | Wave F / F2 — TS-backend e2e parity probe | done | `solid/excel/e2e/vnext-worker-ts.spec.ts` (new — single side-by-side spec, 3 active + 2 fixme) | Filed spill-projection-via-readSparseRange regression (see Handoff below); LAMBDA host-UI gap noted; full e2e suite migration is still F2-followup scope, not blocked by this probe |
+| 2026-05-27 | F-LAMBDA agent | Wave F follow-up — LAMBDA host-UI surface in the Name Manager | done | `vanilla/spreadsheet-ui-core/src/named-ranges/types.ts` (extend `NamedRangeRefersTo` with `kind:'lambda'` variant), `vanilla/spreadsheet-ui-core/src/named-ranges/index.ts` (5 atom-backed dialog drafts: kind / params / name / scope / refersTo), `vanilla/spreadsheet-ui-core/src/go-to/types.ts` (widen `NamedRangeLite.refersTo` so `NamedRange` stays assignable — Go-To silently skips lambdas), `solid/excel/src-vnext/named-ranges/SpreadsheetNameManagerDialog.tsx` (kind selector + params input; per-instance state migrated from `createSignal` locals to `@einfach/core` atoms per Solid 1.9.12 Provider memory), `solid/excel/src-vnext/adapter/worker-protocol.ts` (`NameBindingWire` union + `defineName` / `undefineName` on `WorkerWorkbookClient`), `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` (`defineName` / `undefineName` dispatch — parses lambda body via `parseFormula`, recalc-fires on success; mutating-cmd list updated), `solid/excel/src-vnext/adapter/worker-runtime.ts` (wasm worker gracefully refuses `defineName` / `undefineName` with `NAME_BINDING_UNSUPPORTED`), `solid/excel/src-vnext/adapter/worker-workbook-backend.ts` (forwards `setNamedRange` / `deleteNamedRange` to the worker, swallows `NAME_BINDING_UNSUPPORTED` + `UNKNOWN_COMMAND` so range/value cache still works on wasm), `solid/excel/src/i18n/locales/{en,zh}.ts` (kind / params / lambdaBody / paramsRequired strings), `solid/excel/test/excel-core-ts-lambda-ui.test.ts` (new — 10 specs), `solid/excel/e2e/vnext-worker-ts-lambda.spec.ts` (new — 2 specs, replaces the `test.fixme` in `vnext-worker-ts.spec.ts`), test fakes in `solid/excel/test/{vnext-adapter,worker-workbook-store}.test.ts` extended | TS worker handles LAMBDA end-to-end; wasm worker refuses gracefully (range/value still work on both backends via the host-side `namedRanges` cache); existing `name-refers-to` / `name-save-button` testids preserved for back-compat |
+| 2026-05-27 | perf-bench agent | Wave F follow-up — TS vs WASM perf bench | done | `solid/excel/test/perf-ts-vs-wasm.bench.ts` (new — in-process bench against both `createWorkerRuntimeTs()` and `WasmWorkbook`, gated on `EINFACH_PERF=1`, `.bench.ts` suffix keeps it out of default `testMatch`), `solid/excel/test/perf-ts-vs-wasm-report.md` (new — auto-written by bench `afterAll` between `<!-- BENCH:RESULTS:* -->` markers) | TS is **faster** than WASM on every phase at all 3 sizes — Tiny ~0.1-1×, Medium ~0.02-0.62×, Large ~0.01-0.46× (TS/WASM). The big surprise: TS bulkApply install is 40-73× **faster** than WASM `bulk_import_cells` (66 ms vs 4.7 s at 100k cells × 50k formulas), because TS's broad-invalidation model (PLAN.md §4.1) needs no per-cell dep-graph update at install time, whereas Rust's `WorkbookLoader::flush` walks the dep index for every formula. PLAN.md §2's "TS ~3-10× slower" assumption needs revisiting — the actual perf wall is at recalc time, where TS still wins ~2× because read-back amortizes the lazy eval evenly. Recalc on Large is 2.1 s TS vs 4.6 s WASM. Bench wall-clock 22.5 s, well within prompt budget. Invocation: `EINFACH_PERF=1 npx jest --testRegex 'perf-ts-vs-wasm\.bench\.ts$' --no-coverage` (filename suffix means default `npx jest` ignores it). |
+
+### Handoff: F-LAMBDA / 2026-05-27
+
+Owner: F-LAMBDA agent (CC subagent)
+Status: done
+
+Touched files:
+- `vanilla/spreadsheet-ui-core/src/named-ranges/types.ts` (extend `NamedRangeRefersTo`)
+- `vanilla/spreadsheet-ui-core/src/named-ranges/index.ts` (atom drafts)
+- `vanilla/spreadsheet-ui-core/src/go-to/types.ts` (widen `NamedRangeLite`)
+- `solid/excel/src-vnext/named-ranges/SpreadsheetNameManagerDialog.tsx` (kind selector + params; atom-backed)
+- `solid/excel/src-vnext/adapter/worker-protocol.ts` (`NameBindingWire` + RPC method)
+- `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` (defineName/undefineName dispatch)
+- `solid/excel/src-vnext/adapter/worker-runtime.ts` (wasm graceful refusal)
+- `solid/excel/src-vnext/adapter/worker-workbook-backend.ts` (forward to worker)
+- `solid/excel/src/i18n/locales/{en,zh}.ts` (i18n keys)
+- `solid/excel/test/{vnext-adapter,worker-workbook-store}.test.ts` (fake-client stubs)
+- `solid/excel/test/excel-core-ts-lambda-ui.test.ts` (new — 10 specs)
+- `solid/excel/e2e/vnext-worker-ts-lambda.spec.ts` (new — 2 specs)
+
+Public types changed:
+- `NamedRangeRefersTo` gains a `{ kind: 'lambda'; params: string[]; body: string }` variant. Existing consumers that exhaustively switched on `kind` will need a `lambda` arm (Go-To already gates on `'range'` so it skips silently — no behavioural change).
+- `NamedRangeLite.refersTo` widens to mirror `NamedRangeRefersTo` (additive — `NamedRange` is structurally assignable).
+- `WorkerWorkbookClient` gains `defineName(name, NameBindingWire)` and `undefineName(name)`. Test fakes need to be extended.
+
+Atoms added: `nameManagerKindDraftAtom`, `nameManagerParamsDraftAtom`,
+`nameManagerRefersToDraftAtom`, `nameManagerNameDraftAtom`,
+`nameManagerScopeDraftAtom` (all `spreadsheet.namedRanges.*Draft`
+debugLabel-prefixed). The dialog now resets these atoms on the
+closed→open edge, replacing the prior `createSignal` locals — closes the
+Solid 1.9.12 Provider remount window for this dialog even though the
+underlying bug is resolved (`2b7d65e`).
+
+Tests run:
+- `npx jest solid/excel/test/excel-core-ts-lambda-ui --no-coverage` → 10/10 pass
+- `npx jest --no-coverage` → 2628/2628 pass (no regressions)
+- `npx playwright test e2e/vnext-worker-ts-lambda.spec.ts` → 2/2 pass
+- `npx playwright test e2e/vnext-worker-ts.spec.ts e2e/toolbar-name-manager.spec.ts e2e/vnext-worker-ts-lambda.spec.ts` → 11 pass + 1 pre-existing `test.fixme` skipped
+- `npx tsc -b` clean
+
+Known risks / follow-ups:
+- The `test.fixme` in `vnext-worker-ts.spec.ts:166` ("LAMBDA registration round-trips through the TS worker (no host UI surface yet)") is now testable but was not modified (file boundary). A follow-up wave can remove the fixme and either drop the placeholder or extend it with additional assertions.
+- The wasm worker's `defineName` refusal is structural (`NAME_BINDING_UNSUPPORTED`). If a future host wants range/value bindings to ALSO route through the engine on wasm, the `rust/excel-core` side needs `defineName` support; until then range/value resolution on the wasm backend remains host-cache-only (existing behaviour, no regression).
+- `parseFormula` is total — it returns `{kind:'error', code:'#VALUE!'}` on parse failure instead of throwing. The worker handler now checks for `ast.kind === 'error'` and surfaces `INVALID_LAMBDA_BODY` so the host can show a meaningful error rather than silently storing a binding that always evaluates to `#VALUE!`.
 
 ### Handoff: A / 2026-05-26
 
