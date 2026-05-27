@@ -11,26 +11,31 @@ The reactive layer (cell dependency tracking, invalidation, recompute scheduling
 
 ## 2. Why
 
-Tradeoffs we accept by porting to TS:
+What the TS backend gives us **in addition to** the Rust backend (both stay; user toggles via `?backend=` URL flag):
 
-- **One reactive engine, not two.** Today `sheet.rs` re-implements an atom-like dep / invalidation framework inside Rust, parallel to `vanilla/core`. That duplication is the cleanest thing this port removes.
 - **Iteration speed.** No `cargo build` + `wasm-pack` cycle. Hot-reload in vite is instant.
 - **AI / agent friendliness.** Rust files like `eval.rs` (~38k lines) are heavy on context budget; TS function bodies are easier for a model to edit, and the type system is closer to the rest of the repo.
 - **Stack traces.** Errors crossing `postMessage` today surface as wasm panic strings. TS throws keep filenames + line numbers all the way up.
-- **Custom formulas land naturally.** The Wave 8.1 re-entrancy guard exists because Rust can't safely call a JS host that may call back. In TS, host=core; the guard collapses to a normal evaluator-side `currentlyEvaluating` set.
+- **Reactive layer unified at the UI side.** The TS path delegates dep tracking to `@einfach/core`, the same atom engine the UI already uses. The Rust path still owns its own internal dep graph in `sheet.rs` — that's fine, but on the TS side we get a single reactive model end-to-end.
+- **Custom formulas land naturally on TS.** The Wave 8.1 re-entrancy guard exists because Rust can't safely call a JS host that may call back. In TS, host=core; the guard collapses to a normal evaluator-side `currentlyEvaluating` set.
 
-What we lose:
+What the Rust backend keeps doing better — and why we **don't** remove it:
 
-- **Throughput on large recalc storms.** Rust eval is ~3–10× faster per call than JIT'd TS. Acceptable for typical sheets (< 10k formulas, < 1M cells); 100k+ formula recalc will be visibly slower. Not a v1 deal-breaker.
-- **Memory layout discipline.** Rust's contiguous numeric buffers are gone. Sparse maps + boxed numbers add overhead.
+- **Throughput on large recalc storms.** Rust eval is ~3–10× faster per call than JIT'd TS. For 100k+ formula recalc the Rust path is the right choice.
+- **Memory layout discipline.** Contiguous numeric buffers, no boxed numbers.
+- **Coverage maturity.** 400-function evaluator hardened by years of fixture tests.
+- **Reference implementation.** When the TS engine produces an unexpected result, diffing against the Rust output isolates whether it's a porting bug or a shared misreading of Excel semantics.
 
-## 3. Non-Goals (v1)
+The two paths coexist permanently. `?backend=ts` is the developer-default; `?backend=wasm` is the perf / parity-check default.
 
-- Replace the worker boundary. Worker stays. Backend port signatures stay.
+## 3. Non-Goals (any phase)
+
+- Replace the worker boundary. Worker stays.
 - Change UI atom topology. `vnext` UI atoms are untouched.
 - Ship a new xlsx I/O layer. Import / export ports stay TBD or stub.
 - Match every one of the 400+ functions in `eval.rs` on day one. See §6 for v1 function set.
 - Replace the existing `static-backend.ts` (which is the static-data demo backend, not formula-capable). The new core sits behind the **worker** backend, like the WASM one does today.
+- **Retire the Rust backend.** `rust/excel-core/`, `rust/wasm/`, `solid/excel/wasm-pkg/`, `build:wasm` and the wasm-pack toolchain step all stay. The TS core is **additive**.
 
 ## 4. Architectural decisions
 
@@ -149,10 +154,11 @@ Phases are ordered for **shippable-at-the-end-of-each** delivery — every phase
 | 6 | Cross-sheet refs + named ranges | ~800 | All e2e specs that exercise `Sheet2!A1` pass on the TS worker |
 | 7 | Custom formulas port (host callbacks) | ~400 | `custom-formulas.spec.ts` passes against the TS worker |
 | 8 | Function fill-out: target 200 functions (matches typical "office-grade" coverage) | ~10k | Curated e2e + jest |
-| 9 | TS worker becomes default; rust worker kept behind `?backend=wasm` flag for 1 release | — | Soak-test window |
-| 10 | rust/excel-core archived; wasm-pack step removed from build | — | Build time drop |
+| 9 | TS worker becomes the **default** for vnext demos; wasm worker stays reachable behind `?backend=wasm` indefinitely | — | Soak-test window; nothing removed |
 
-Phases 0–4 are the minimum for "we have a TS core that can render a non-trivial sheet." Phases 5–7 close functional parity. Phases 8–10 are the cutover.
+> **Note** — earlier drafts of this plan included a Phase 10 "rust/excel-core archived" step. That step has been **removed**: the Rust core is a long-term asset (perf headroom for million-row recalc storms, mature 400-function evaluator, hardened against malformed input). Phase 9 is the terminal phase — both backends coexist permanently, and either can be promoted to default per `?backend=` URL toggle / config. If the TS path ever hits a performance wall the Rust path is the fallback.
+
+Phases 0–4 are the minimum for "we have a TS core that can render a non-trivial sheet." Phases 5–7 close functional parity. Phases 8–9 are the cutover.
 
 ### 6.1 v1 function set (Phase 3)
 
@@ -197,7 +203,7 @@ These must be answered before Phase 0:
    - **Side-by-side with `?backend=ts` opt-in (recommended).** Both workers live in `solid/excel`; user toggles via URL or settings. Lets us soak-test against real demos before cutover.
 3. **Custom formula source-string vs closure.** Wave 8.1 stores formulas as **strings** to survive `postMessage`. In a TS-only worker we no longer need string serialization — host can pass a real closure. Do we keep the string contract for backward compat or simplify? Recommend: keep string for the host-registration atom contract (UI side), unwrap to closure at the worker boundary inside the TS core. Zero UI changes.
 4. **xlsx I/O.** Not in scope for v1, but the contract has to be stable enough that a v2 importer can call into the core. Recommend: defer; revisit after Phase 6.
-5. **Should the new package ship to npm?** Probably not until after Phase 10 — internal package only, no externally-stable surface yet.
+5. **Should the new package ship to npm?** Not until after Phase 9 soak — internal package only, no externally-stable surface yet.
 
 ## 10. Success criteria for "done with the port"
 
@@ -205,7 +211,9 @@ These must be answered before Phase 0:
 - All jest suites under `solid/excel/test/` pass.
 - `million-demo` renders within 2× the wasm-backed time.
 - `demo-budget`, `demo-grades`, `demo-sales` are visually and behaviorally identical.
-- `rust/excel-core/`, `rust/wasm/`, `solid/excel/wasm-pkg/`, the `build:wasm` script and the `wasm-pack` toolchain step are removed from the build.
+- `?backend=ts` is the default URL state for vnext demos; `?backend=wasm` is still reachable and rendering the same demos correctly.
+
+**Explicit non-goal**: removing `rust/excel-core/`, `rust/wasm/`, `solid/excel/wasm-pkg/`, the `build:wasm` script, or the wasm-pack toolchain step. All of these stay — the Rust path is the permanent fallback for perf-sensitive scenarios and the reference implementation against which TS-core diffs are diagnosed.
 
 ## 11. What this plan deliberately does **not** answer
 

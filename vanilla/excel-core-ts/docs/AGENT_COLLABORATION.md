@@ -201,15 +201,17 @@ E4 与 D1 共用一个文件 `worker-runtime-ts.ts`。**E4 owner 必须在 in-fl
 
 ---
 
-### Wave F — 函数填充 + 切换 + 退役（mostly sequential）
+### Wave F — 函数填充 + 切换（mostly sequential）
 
 | Task | Owner | 说明 |
 | --- | --- | --- |
 | **F1** 函数扩到 ~200 | 多 agent 滚动批 | 每批 10-20 个函数，跟 Wave C 同模式扇出；不再列单条 acceptance，按 Rust eval.rs 的 spec 一对一 port + jest 对照 |
 | **F2** e2e 套件迁移 | 1 agent | `solid/excel/e2e/*` 所有 demo / formula spec 切到 `?backend=ts` 跑；记下 diff，回灌 fix |
-| **F3** flip 默认 + Rust 退役 | 1 agent，最后做 | 把 TS worker 设为默认；rust/excel-core/ + rust/wasm/ + solid/excel/wasm-pkg/ + build:wasm 脚本 + wasm-pack toolchain step 全部移除 |
+| **F3** flip 默认 | 1 agent，最后做 | 把 TS worker 设为 vnext 的默认 backend；**`?backend=wasm` 仍然保留**，rust/excel-core / rust/wasm / solid/excel/wasm-pkg / build:wasm 脚本 / wasm-pack toolchain **不删不动**。Rust 路径是长期 fallback + 参考实现 |
 
-F3 是不可逆操作，**做之前必须 codex 全面 review**（参考 memory `feedback_codex.md`）。
+**显式不做**：删除 rust/excel-core 或任何 wasm 产物。两条路径长期共存。
+
+F3 改默认 backend 也属于影响面较广的操作（demo 行为切换 / 部分 e2e 期望可能变），**做之前需要 codex review**（参考 memory `feedback_codex.md`）。
 
 ---
 
