@@ -154,7 +154,13 @@ Phases are ordered for **shippable-at-the-end-of-each** delivery — every phase
 | 6 | Cross-sheet refs + named ranges | ~800 | All e2e specs that exercise `Sheet2!A1` pass on the TS worker |
 | 7 | Custom formulas port (host callbacks) | ~400 | `custom-formulas.spec.ts` passes against the TS worker |
 | 8 | Function fill-out: target 200 functions (matches typical "office-grade" coverage) | ~10k | Curated e2e + jest |
-| 9 | TS worker becomes the **default** for vnext demos; wasm worker stays reachable behind `?backend=wasm` indefinitely | — | Soak-test window; nothing removed |
+| 9 | TS worker becomes the **default** for vnext demos; wasm worker stays reachable behind `?backend=wasm` indefinitely | — | **BLOCKED on debug-probe parity** — see below |
+
+> **Phase 9 is blocked, but not by removing the option**. Codex review on 2026-05-27 caught a real regression: the existing `VNextWorkerDemo` uses `debugFormulaCacheState` / `debugFormulaEvalCount` probes that the WASM runtime implements and the TS runtime stubs as `'unknown'` / `0`. Existing e2e (`vnext-worker-backend.spec.ts`) relies on the dirty→clean transition. Flipping the default would break those specs. Two paths to unblock:
+> - (a) Implement parallel dirty-tracking in the TS runtime just for the probe. Overkill for diagnostics; not a code-correctness need.
+> - (b) Update the e2e + lazy-probe-logger to be backend-agnostic (skip the probe-specific assertion when running on TS).
+>
+> Until either lands, `vnext-worker` stays on WASM by default, and TS lives in its dedicated `vnext-worker-ts` tab. Both backends coexist permanently per §3.
 
 > **Note** — earlier drafts of this plan included a Phase 10 "rust/excel-core archived" step. That step has been **removed**: the Rust core is a long-term asset (perf headroom for million-row recalc storms, mature 400-function evaluator, hardened against malformed input). Phase 9 is the terminal phase — both backends coexist permanently, and either can be promoted to default per `?backend=` URL toggle / config. If the TS path ever hits a performance wall the Rust path is the fallback.
 
