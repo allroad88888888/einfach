@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
+import { gotoRoot } from './helpers'
 
 /**
  * Wave 8.1 — Custom formulas e2e.
@@ -33,7 +34,10 @@ const WORKER_GRID = '[data-testid="vnext-worker-grid"]'
 const WAVE5_GRID = '[data-testid="wave5-grid"]'
 
 async function gotoWorker(page: Page) {
-  await page.goto('/')
+  // gotoRoot preserves the active project's `?backend=` selector so a
+  // `--project=ts` run lands on the TS-backed vNext Worker demo
+  // instead of silently falling back to WASM.
+  await gotoRoot(page)
   await page.getByTestId('nav-tab-vnext-worker').click()
   await expect(page.getByTestId('vnext-worker-grid')).toBeVisible({ timeout: 30_000 })
   // Wait for the seeded projection to land — C2 is `=Sheet2!C2+1` and
@@ -42,7 +46,10 @@ async function gotoWorker(page: Page) {
 }
 
 async function gotoWave5(page: Page) {
-  await page.goto('/')
+  // Wave 5 demo is a static-backend host and does not consult
+  // `?backend=`, but `gotoRoot` is still the consistent choice so
+  // the URL shape stays uniform.
+  await gotoRoot(page)
   await page.getByTestId('nav-tab-vnext-wave5').click()
   await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
 }

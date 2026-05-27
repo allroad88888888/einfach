@@ -3,6 +3,7 @@ import {
   cell,
   cellDisplay,
   expectNoConsoleErrors,
+  gotoRoot,
   grantClipboard,
   guardConsoleErrors,
   selectSheet,
@@ -78,9 +79,19 @@ declare global {
 }
 
 test.describe('Solid Excel vNext worker backend', () => {
+  // Runs identically on both wasm and ts projects after the Phase 4 vite
+  // alias for @einfach/excel-core-ts. Any per-test failures observed on ts
+  // also reproduce on wasm — they're pre-existing demo-side regressions
+  // (visible-cells count mismatch, sparse-facts shape drift) tracked
+  // separately, not a backend-parity gap.
+
   async function gotoVNextWorkerDemo(page: Page) {
     guardConsoleErrors(page)
-    await page.goto('/?debug=1')
+    // gotoRoot preserves the active project's `?backend=` selector
+    // (Phase 3b dual-backend audit). Without it, a `--project=ts` run
+    // would land on the WASM-default page and the suite would silently
+    // run twice against the same backend.
+    await gotoRoot(page, 'debug=1')
     await page.getByRole('button', { name: 'vNext Worker', exact: true }).click()
     await expect(page.getByTestId('vnext-worker-grid')).toBeVisible({ timeout: 30_000 })
     await expect(cellDisplay(page, 'C2')).toHaveText('13', { timeout: 30_000 })

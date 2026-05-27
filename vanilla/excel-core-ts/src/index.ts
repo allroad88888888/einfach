@@ -87,9 +87,14 @@ export { parseFormula } from './parser'
 
 // Wave B / B2 — workbook + sheet + minimal evaluator.
 export { createWorkbook } from './workbook'
-export type { CreateWorkbookOptions, SheetSeed, BulkCellInput } from './workbook'
+export type {
+  CreateWorkbookOptions,
+  SheetSeed,
+  BulkCellInput,
+  FormulaCacheState,
+} from './workbook'
 export { createSheet, keyFor, applyCell } from './sheet'
-export type { SheetState, SheetResolvers } from './sheet'
+export type { SheetState, SheetResolvers, SheetDebugProviders } from './sheet'
 export {
   evaluate,
   toNumber,

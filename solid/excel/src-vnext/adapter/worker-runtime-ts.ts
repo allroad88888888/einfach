@@ -837,24 +837,38 @@ function wrapCustomResult(result: unknown): Value {
   return { kind: 'string', value: String(result) }
 }
 
-function debugCountersStub(state: RuntimeState) {
+function debugCountersFor(state: RuntimeState) {
+  // Mirror the WASM debugCounters shape so tooling reading either
+  // backend's payload sees identical keys. Subscription counters,
+  // crossSheetDependents, exportSessionCount and snapshotSessionCount
+  // remain 0 — those features aren't tracked by the TS runtime, but
+  // the wire shape stays stable for the dashboard.
+  let formulaCountTotal = 0
+  let formulaEvalCountTotal = 0
+  const sheets = state.sheets.map((sheet) => {
+    const formulaCount = state.workbook.debugFormulaCount(sheet.idx)
+    const formulaEvalCount = state.workbook.debugFormulaEvalCount(sheet.idx)
+    formulaCountTotal += formulaCount
+    formulaEvalCountTotal += formulaEvalCount
+    return {
+      idx: sheet.idx,
+      name: sheet.name,
+      formulaCount,
+      formulaEvalCount,
+      liveSubscriptionCount: 0,
+    }
+  })
   return {
     sheetCount: state.sheets.length,
     crossSheetDependents: 0,
-    formulaCount: 0,
-    formulaEvalCountTotal: 0,
+    formulaCount: formulaCountTotal,
+    formulaEvalCountTotal,
     liveSubscriptionCount: 0,
     workerSubscriptionCount: 0,
     importSessionCount: state.importSessions.size,
     exportSessionCount: 0,
     snapshotSessionCount: 0,
-    sheets: state.sheets.map((sheet) => ({
-      idx: sheet.idx,
-      name: sheet.name,
-      formulaCount: 0,
-      formulaEvalCount: 0,
-      liveSubscriptionCount: 0,
-    })),
+    sheets,
   }
 }
 
@@ -1175,11 +1189,14 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
       case 'undefineName':
         return undefineNameInWorker(state, String(msg.name ?? ''))
       case 'debugCounters':
-        return debugCountersStub(state)
+        return debugCountersFor(state)
       case 'debugFormulaCacheState':
-        return 'unknown'
+        // Pass the raw address through without forcing normalization —
+        // the workbook returns 'invalid' for unparseable input, which
+        // the e2e probe distinguishes from 'none'/'dirty'/'clean'/'computing'.
+        return state.workbook.debugFormulaCacheState(Number(msg.sheet), String(msg.addr ?? ''))
       case 'debugFormulaEvalCount':
-        return 0
+        return state.workbook.debugFormulaEvalCount(Number(msg.sheet))
       default:
         throw rpcError('UNKNOWN_COMMAND', `unknown command: ${String(msg.cmd)}`)
     }

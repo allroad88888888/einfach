@@ -24,6 +24,7 @@ import type { Store } from '@einfach/core'
 import { createStore } from '@einfach/core'
 
 import { parseFormula as defaultParseFormula } from './parser'
+import { parseA1 } from './refs'
 import { applyCell, createSheet, keyFor, type SheetResolvers, type SheetState, type WorkbookSheet } from './sheet'
 import type {
   Cell,
@@ -33,6 +34,11 @@ import type {
   NameBinding,
   Value,
 } from './types'
+
+/** Cache-state vocabulary returned by `debugFormulaCacheState`. Mirrors
+ * the Rust side's `Sheet::debug_formula_cache_state` return values so the
+ * e2e probe suite reads identically against either backend. */
+export type FormulaCacheState = 'dirty' | 'computing' | 'clean' | 'none' | 'invalid'
 
 export interface CreateWorkbookOptions {
   /**
@@ -98,6 +104,50 @@ export interface Workbook {
   /** Register a host custom formula. Synchronous callback only for B2. */
   registerCustomFormula(name: string, fn: (args: Value[]) => Value): void
   unregisterCustomFormula(name: string): boolean
+  /**
+   * Probe the cache state of a formula cell WITHOUT triggering an
+   * evaluation. Returns one of `'dirty' | 'computing' | 'clean' | 'none'
+   * | 'invalid'`. Mirrors Rust `Sheet::debug_formula_cache_state` so the
+   * e2e parity suite can compare TS-core and WASM backends identically.
+   *
+   *  - `'invalid'`: `addrStr` failed A1 parsing
+   *  - `'none'`:    no cell at the address, OR cell is literal-only
+   *  - `'computing'`: the formula derive is currently on the JS stack
+   *  - `'clean'`:   the formula's last eval ran under the current
+   *                  workbook revision
+   *  - `'dirty'`:   the cell has a formula but its last eval (if any)
+   *                  predates the current revision
+   *
+   * @internal
+   */
+  debugFormulaCacheState(sheetIdx: number, addrStr: string): FormulaCacheState
+  /**
+   * Cumulative count of formula evaluations on `sheetIdx`. Bumped once
+   * per cache-miss derive run. Resets to zero only on workbook
+   * re-creation. Mirrors Rust `Sheet::debug_formula_eval_count`.
+   *
+   * Cross-sheet semantics: the counter belongs to the sheet that owns
+   * the anchor formula (whose `formulaCellAtom` runs), NOT the sheet
+   * the formula's deps live on. E.g. `Sheet2!A1=Sheet1!A1` increments
+   * Sheet2's counter when read.
+   *
+   * Returns 0 for an out-of-range sheet index (matches the Rust
+   * adapter's safe-fallback behavior).
+   *
+   * @internal
+   */
+  debugFormulaEvalCount(sheetIdx: number): number
+  /**
+   * Count of formula cells (cells with a parsed AST) on `sheetIdx`.
+   * Mirrors Rust `Sheet::debug_formula_count` so the worker-side
+   * `debugCounters` RPC can report formulaCount accurately on the
+   * TS backend.
+   *
+   * Returns 0 for an out-of-range sheet index.
+   *
+   * @internal
+   */
+  debugFormulaCount(sheetIdx: number): number
 }
 
 export interface SheetSeed {
@@ -118,6 +168,14 @@ export function createWorkbook(
   // dirtiness — for B2 a manual recalc covers the contract.
   const names = new Map<string, NameBinding>()
   const customFormulas = new Map<string, (args: Value[]) => Value>()
+
+  // Workbook-scope revision counter. Bumped once per mutation in
+  // `writeSheetState` (the centralized choke point). Sheets read it via
+  // the `revisionProvider` callback to stamp `lastEvalRevision` on each
+  // formula derive run. One global counter (not per-sheet) so a Sheet1
+  // mutation also marks Sheet2 formulas dirty — over-conservative but
+  // correct, and matches vanilla/core's broad dirty propagation.
+  let revisionCounter = 0
 
   // Build the sheet handles eagerly. The `sheets` array order matches
   // `initialSheets` for deterministic iteration.
@@ -142,8 +200,29 @@ export function createWorkbook(
     },
   }
 
+  // Workbook-scope revision read shared across every sheet's debug
+  // probe. Wrapped in a function so the loop below doesn't capture
+  // `revisionCounter` directly (which would trip
+  // `no-loop-func` for `let`-mutated state).
+  const readRevision = (): number => revisionCounter
+
   for (const seed of initialSheets) {
-    const sheet = createSheet(seed.id, seed.name, resolvers)
+    // Each sheet's debug helpers need a live revision read and a live
+    // SheetState read. The revision is workbook-scope; the cells are
+    // per-sheet — we close over the sheet handle inside a tiny
+    // attach-helper that takes the handle as an argument so the
+    // closure body never references a mutable loop-local.
+    const sheetRef: { current: WorkbookSheet | null } = { current: null }
+    const debugProviders = {
+      revisionProvider: readRevision,
+      cellsProvider: (): SheetState => {
+        const target = sheetRef.current
+        if (!target) return new Map<string, Cell>() as SheetState
+        return store.getter(target.sheetAtom) as SheetState
+      },
+    }
+    const sheet = createSheet(seed.id, seed.name, resolvers, debugProviders)
+    sheetRef.current = sheet
     sheetsList.push(sheet)
     sheetsById.set(seed.id, sheet)
     sheetsByName.set(seed.name, sheet)
@@ -158,6 +237,31 @@ export function createWorkbook(
   }
 
   function writeSheetState(sheet: WorkbookSheet, next: SheetState): void {
+    // Bump the workbook revision BEFORE writing. The order matters
+    // because vanilla/core's `setter` synchronously runs `flushPending`,
+    // which walks every back-dep and re-evaluates any cached formula
+    // derive whose dep value changed (`store.ts` `dependenciesChange`).
+    //
+    // That auto-flush is the central engine difference between TS-core
+    // and Rust-core: Rust is purely lazy — a formula goes dirty on dep
+    // change and stays dirty until the next read — while TS eagerly
+    // re-derives cached formulas at the moment of mutation. For probe
+    // semantics that means:
+    //
+    //   * "Never-read" formulas stay dirty across writes (their derive
+    //     isn't in the cache, so `flushPending` doesn't touch them).
+    //   * "Already-read" formulas auto-recover to clean on every
+    //     mutation. The probe will report `'clean'` post-mutation, not
+    //     `'dirty'`.
+    //
+    // The bulk-load → snapshot → restore → probe use case (the main
+    // consumer of this probe in the WAVE3 plan) only ever observes
+    // never-read formulas, so it lines up with Rust's reported state.
+    // Tests that catch the engine mid-flight (mutate then probe before
+    // re-read) will see TS-core report `'clean'` where Rust reports
+    // `'dirty'` — see `excel-core-ts-debug-probes.test.ts` for the
+    // pinned behavior.
+    revisionCounter += 1
     store.setter(sheet.sheetAtom, next)
   }
 
@@ -340,6 +444,27 @@ export function createWorkbook(
     },
     unregisterCustomFormula(name) {
       return customFormulas.delete(name.toUpperCase())
+    },
+    debugFormulaCacheState(sheetIdx, addrStr) {
+      if (!Number.isInteger(sheetIdx) || sheetIdx < 0 || sheetIdx >= sheetsList.length) {
+        return 'invalid'
+      }
+      const parsed = parseA1(addrStr)
+      if (!parsed) return 'invalid'
+      const sheet = sheetsList[sheetIdx]
+      return sheet._debug.cellState(keyFor(parsed.row, parsed.col))
+    },
+    debugFormulaEvalCount(sheetIdx) {
+      if (!Number.isInteger(sheetIdx) || sheetIdx < 0 || sheetIdx >= sheetsList.length) {
+        return 0
+      }
+      return sheetsList[sheetIdx]._debug.evalCount()
+    },
+    debugFormulaCount(sheetIdx) {
+      if (!Number.isInteger(sheetIdx) || sheetIdx < 0 || sheetIdx >= sheetsList.length) {
+        return 0
+      }
+      return sheetsList[sheetIdx]._debug.formulaCount()
     },
   }
 }

@@ -53,6 +53,34 @@ export interface WorkbookSheet {
    * snapshot once and walks the formula AST against that snapshot.
    */
   formulaCellAtom(key: CellKey): AtomEntity<Value>
+  /**
+   * Internal debug accessors used by the worker-side probes
+   * (`debugFormulaCacheState` / `debugFormulaEvalCount`). Not part of the
+   * documented public API and not for production reads — they only exist
+   * so the e2e parity probe spec can verify lazy evaluation against the
+   * TS backend the same way it does against Rust.
+   *
+   * `cellState`:
+   *  - `'computing'` while the formula derive is on the stack for `key`
+   *  - `'none'` when no cell exists at `key`, or the cell has no AST
+   *    (literal-only — matches Rust `formula_cells.get` returning `None`)
+   *  - `'clean'` when the cell has been evaluated against the current
+   *    workbook revision
+   *  - `'dirty'` when the cell has a formula but was last evaluated under
+   *    an older workbook revision (or has never been evaluated)
+   *
+   * `formulaCount`: count of cells in the current snapshot whose `ast` is
+   * defined (i.e. the cell has a parsed formula). Mirrors Rust's
+   * `Sheet::debug_formula_count` (size of `formula_cells`). Returns 0 if
+   * the sheet was constructed without a `cellsProvider`.
+   *
+   * @internal
+   */
+  readonly _debug: {
+    cellState(key: CellKey): 'dirty' | 'computing' | 'clean' | 'none'
+    evalCount(): number
+    formulaCount(): number
+  }
 }
 
 /**
@@ -73,16 +101,50 @@ export interface SheetResolvers {
   resolveName(name: string): import('./types').NameBinding | undefined
 }
 
+/**
+ * Optional debug-probe wiring. The workbook injects both providers; tests
+ * exercising `createSheet` directly can leave them off, in which case the
+ * sheet still works — `_debug.cellState` reports `'none'` for everything
+ * (no live cell snapshot) and `_debug.evalCount()` still tracks runs.
+ */
+export interface SheetDebugProviders {
+  /** Current workbook revision (bumped on every mutation). */
+  revisionProvider: () => number
+  /** Current SheetState (read via the host store, NOT via the atom getter). */
+  cellsProvider: () => SheetState
+}
+
 export function createSheet(
   id: string,
   name: string,
   resolvers: SheetResolvers,
+  debugProviders?: SheetDebugProviders,
 ): WorkbookSheet {
   const sheetAtom: AtomEntity<SheetState> = atom<SheetState>(new Map())
   sheetAtom.debugLabel = `excel-core.sheet.${id}.cells`
 
   // Per-key derived atom cache. Map (not WeakMap) — keys are short strings.
   const formulaAtomCache = new Map<CellKey, AtomEntity<Value>>()
+
+  // Debug-probe side tables. None participate in vanilla/core dependency
+  // tracking — they're pure observation, modeled after Rust's
+  // `FormulaCache` and `formula_eval_count`.
+  //
+  //  - `computing`: cells whose derive is currently on the JS stack.
+  //  - `lastEvalRevision`: revision at the time the derive last completed.
+  //    A `clean` cell is one whose entry equals the current revision.
+  //  - `evalCount`: cache-miss counter. Each derive run bumps it — this
+  //    includes both the first read of a formula AND vanilla/core's
+  //    eager `flushPending` re-runs that happen synchronously on dep
+  //    mutation (see workbook.ts `writeSheetState` for the order-of-
+  //    operations discussion). Tests should treat `evalCount` as
+  //    "derive runs performed", not "explicit user reads."
+  const computing = new Set<CellKey>()
+  const lastEvalRevision = new Map<CellKey, number>()
+  let evalCount = 0
+
+  const revisionProvider = debugProviders?.revisionProvider ?? (() => 0)
+  const cellsProvider = debugProviders?.cellsProvider
 
   function formulaCellAtom(key: CellKey): AtomEntity<Value> {
     const cached = formulaAtomCache.get(key)
@@ -95,6 +157,12 @@ export function createSheet(
       const cell = cells.get(key)
       if (!cell) return BLANK
       if (!cell.ast) return cell.value
+      // Probe accounting: we're entering a real formula evaluation. This
+      // is a vanilla/core cache miss by definition (the derive only runs
+      // when a tracked dep changed). Bump the counter and mark this cell
+      // `computing` so a probe taken mid-eval reads `'computing'`.
+      computing.add(key)
+      evalCount += 1
       // Fresh cycle set per derive run. Seed it with the entry-point
       // cell using a cells-tagged composite key so cross-sheet evals
       // don't false-collide on `0:0`.
@@ -114,6 +182,11 @@ export function createSheet(
         return evaluate(cell.ast, ctx)
       } finally {
         currentlyEvaluating.delete(seed)
+        computing.delete(key)
+        // Stamp the revision AFTER the derive completed. A probe that
+        // catches the derive mid-stack sees `computing.has(key) === true`
+        // and short-circuits to `'computing'` before reading the stamp.
+        lastEvalRevision.set(key, revisionProvider())
       }
     }) as AtomEntity<Value>
     a.debugLabel = `excel-core.sheet.${id}.formulaCell.${key}`
@@ -121,11 +194,43 @@ export function createSheet(
     return a
   }
 
+  function cellState(key: CellKey): 'dirty' | 'computing' | 'clean' | 'none' {
+    // Computing must win — a probe taken while the derive is on the
+    // stack should see `'computing'` regardless of the stamp's value.
+    if (computing.has(key)) return 'computing'
+    if (!cellsProvider) return 'none'
+    const cells = cellsProvider()
+    const cell = cells.get(key)
+    // No cell, or cell is literal-only (no AST): Rust's
+    // `formula_cells.get(addr)` returns `None` for literals — we match
+    // that with `'none'`. Probes thus distinguish "this cell isn't a
+    // formula" from "this formula hasn't been evaluated yet."
+    if (!cell || !cell.ast) return 'none'
+    const stamped = lastEvalRevision.get(key)
+    if (stamped === undefined) return 'dirty'
+    return stamped === revisionProvider() ? 'clean' : 'dirty'
+  }
+
+  function formulaCount(): number {
+    if (!cellsProvider) return 0
+    const cells = cellsProvider()
+    let n = 0
+    for (const c of cells.values()) {
+      if (c.ast) n += 1
+    }
+    return n
+  }
+
   return {
     id,
     name,
     sheetAtom,
     formulaCellAtom,
+    _debug: {
+      cellState,
+      evalCount: () => evalCount,
+      formulaCount,
+    },
   }
 }
 

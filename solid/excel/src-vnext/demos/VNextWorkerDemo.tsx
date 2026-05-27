@@ -9,7 +9,10 @@ import {
   workspaceSessionAtom,
   type ViewportMetrics,
 } from '@einfach/spreadsheet-ui-core'
-import { defaultVNextWorkbookWorkerFactory } from '../adapter/worker-factory'
+import {
+  defaultExcelCoreTsWorkerFactory,
+  defaultVNextWorkbookWorkerFactory,
+} from '../adapter/worker-factory'
 import {
   createWorkerWorkbookSpreadsheetBackend,
   type WorkerWorkbookBackendSheet,
@@ -242,9 +245,25 @@ function VNextWorkerWorkbook() {
   )
 }
 
+type BackendChoice = 'ts' | 'wasm'
+
+function readBackendChoice(): BackendChoice {
+  if (typeof window === 'undefined') return 'wasm'
+  const choice = new URLSearchParams(window.location.search).get('backend')
+  return choice === 'ts' ? 'ts' : 'wasm'
+}
+
+function pickWorkerFactory(choice: BackendChoice) {
+  return choice === 'ts' ? defaultExcelCoreTsWorkerFactory : defaultVNextWorkbookWorkerFactory
+}
+
 export function VNextWorkerDemo() {
+  const backendChoice = readBackendChoice()
+  const backendDescription =
+    backendChoice === 'ts' ? 'the in-process TS core' : 'the Rust workbook worker'
+
   const backend = createWorkerWorkbookSpreadsheetBackend({
-    workerFactory: defaultVNextWorkbookWorkerFactory,
+    workerFactory: pickWorkerFactory(backendChoice),
     sheets,
     afterInit: seedWorkerWorkbook,
   })
@@ -260,7 +279,7 @@ export function VNextWorkerDemo() {
       <div class="demo-header">
         <h3>vNext Worker Spreadsheet</h3>
         <p class="demo-desc">
-          vNext UI backed by the Rust workbook worker through the framework-agnostic backend port.
+          vNext UI backed by {backendDescription} through the framework-agnostic backend port.
         </p>
         <p class="demo-desc" data-testid="custom-formulas-banner">
           Custom formulas registered: <code>MYTAX</code>, <code>GREET</code>, <code>CELSIUS</code>,{' '}

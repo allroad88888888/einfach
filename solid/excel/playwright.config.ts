@@ -22,13 +22,22 @@ export default defineConfig({
   workers: 1,
   reporter: 'list',
   use: {
-    baseURL: BASE_URL,
     trace: 'on-first-retry',
   },
   projects: [
     {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      name: 'wasm',
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: `${BASE_URL}/?backend=wasm`,
+      },
+    },
+    {
+      name: 'ts',
+      use: {
+        ...devices['Desktop Chrome'],
+        baseURL: `${BASE_URL}/?backend=ts`,
+      },
     },
   ],
   webServer: {

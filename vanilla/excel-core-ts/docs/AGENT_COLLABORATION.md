@@ -253,11 +253,18 @@ E4 与 D1 共用一个文件 `worker-runtime-ts.ts`。**E4 owner 必须在 in-fl
 | --- | --- | --- |
 | **F1** 函数扩到 ~200 | 多 agent 滚动批 | 每批 10-20 个函数，跟 Wave C 同模式扇出；不再列单条 acceptance，按 Rust eval.rs 的 spec 一对一 port + jest 对照 |
 | **F2** e2e 套件迁移 | 1 agent | `solid/excel/e2e/*` 所有 demo / formula spec 切到 `?backend=ts` 跑；记下 diff，回灌 fix |
-| **F3** flip 默认 | 1 agent，最后做 | 把 TS worker 设为 vnext 的默认 backend；**`?backend=wasm` 仍然保留**，rust/excel-core / rust/wasm / solid/excel/wasm-pkg / build:wasm 脚本 / wasm-pack toolchain **不删不动**。Rust 路径是长期 fallback + 参考实现 |
+| **F3** ~~flip 默认~~ → 双 backend 矩阵 | 2 并发 agent + 主线 audit | **完成 2026-05-27**。原计划 flip 默认被 codex blocked，改为做 dual-project：`?backend=ts\|wasm` URL routing + `playwright.config.ts` 两个 project。WASM 留作默认（保护既有用户），TS 通过 query 显式选；e2e 在两个 project 上都跑。**`?backend=wasm` / rust/excel-core / rust/wasm / solid/excel/wasm-pkg / build:wasm 脚本 / wasm-pack toolchain 全保留不动**。 |
 
 **显式不做**：删除 rust/excel-core 或任何 wasm 产物。两条路径长期共存。
 
-F3 改默认 backend 也属于影响面较广的操作（demo 行为切换 / 部分 e2e 期望可能变），**做之前需要 codex review**（参考 memory `feedback_codex.md`）。
+F3 实际产出（2026-05-27 commit 待定）：
+1. `vanilla/excel-core-ts/src/{sheet,workbook}.ts` — 真正的 `debugFormulaCacheState` / `EvalCount` / `Count`
+2. `worker-runtime-ts.ts` — 调真实现，不再 stub
+3. `VNextWorkerDemo.tsx` — 读 `?backend=` URL 选 factory
+4. `playwright.config.ts` — `wasm` / `ts` 两个 project
+5. `e2e/helpers.ts` — `gotoRoot` 保留 project query
+6. `e2e/BACKEND_PARITY.md` — 双 backend 矩阵
+7. `vite.config.ts` — alias `@einfach/excel-core-ts` 到 src（codex 二次 review 找到的 P2 修复，否则 worker bundle 用旧 esm/ 出错）
 
 ---
 

@@ -154,13 +154,15 @@ Phases are ordered for **shippable-at-the-end-of-each** delivery — every phase
 | 6 | Cross-sheet refs + named ranges | ~800 | All e2e specs that exercise `Sheet2!A1` pass on the TS worker |
 | 7 | Custom formulas port (host callbacks) | ~400 | `custom-formulas.spec.ts` passes against the TS worker |
 | 8 | Function fill-out: target 200 functions (matches typical "office-grade" coverage) | ~10k | Curated e2e + jest |
-| 9 | TS worker becomes the **default** for vnext demos; wasm worker stays reachable behind `?backend=wasm` indefinitely | — | **BLOCKED on debug-probe parity** — see below |
+| 9 | TS worker reachable via `?backend=ts` on `VNextWorkerDemo`; WASM stays default. Probe parity + dual-project e2e shipped (2026-05-27). | — | DONE |
 
-> **Phase 9 is blocked, but not by removing the option**. Codex review on 2026-05-27 caught a real regression: the existing `VNextWorkerDemo` uses `debugFormulaCacheState` / `debugFormulaEvalCount` probes that the WASM runtime implements and the TS runtime stubs as `'unknown'` / `0`. Existing e2e (`vnext-worker-backend.spec.ts`) relies on the dirty→clean transition. Flipping the default would break those specs. Two paths to unblock:
-> - (a) Implement parallel dirty-tracking in the TS runtime just for the probe. Overkill for diagnostics; not a code-correctness need.
-> - (b) Update the e2e + lazy-probe-logger to be backend-agnostic (skip the probe-specific assertion when running on TS).
+> **Phase 9 — landed 2026-05-27.** Did both unblock paths from the earlier blocked draft:
+> - (a) `Workbook.debugFormulaCacheState` / `EvalCount` / `Count` implemented in `vanilla/excel-core-ts/src/{sheet,workbook}.ts`; wired through `worker-runtime-ts.ts`. Probe state machine = per-cell `lastEvalRevision` vs workbook-scope `revisionCounter`. Verified by 22 jest cases in `solid/excel/test/excel-core-ts-debug-probes.test.ts`.
+> - (b) Dual-project Playwright: `wasm` / `ts` projects in `playwright.config.ts` map to `?backend=wasm` / `?backend=ts` baseURLs. `helpers.ts` `gotoRoot` preserves the project query through nav. `BACKEND_PARITY.md` is the live matrix.
 >
-> Until either lands, `vnext-worker` stays on WASM by default, and TS lives in its dedicated `vnext-worker-ts` tab. Both backends coexist permanently per §3.
+> Codex caught one more issue post-implementation: vite was resolving `@einfach/excel-core-ts` to the published `esm/` build, which lagged source and was missing the new probe methods. Fix: alias `@einfach/excel-core-ts` → `vanilla/excel-core-ts/src` in `solid/excel/vite.config.ts` (mirrors how `@einfach/spreadsheet-ui-core` is already aliased). Worker bundle now ships fresh source.
+>
+> The earlier "flip default to TS" framing was abandoned — with dual-project e2e, the default no longer matters functionally. WASM stays default; TS reachable via `?backend=ts`. Both backends coexist per §3.
 
 > **Note** — earlier drafts of this plan included a Phase 10 "rust/excel-core archived" step. That step has been **removed**: the Rust core is a long-term asset (perf headroom for million-row recalc storms, mature 400-function evaluator, hardened against malformed input). Phase 9 is the terminal phase — both backends coexist permanently, and either can be promoted to default per `?backend=` URL toggle / config. If the TS path ever hits a performance wall the Rust path is the fallback.
 

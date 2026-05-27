@@ -1,4 +1,4 @@
-import { expect, type BrowserContext, type Dialog, type Page } from '@playwright/test'
+import { expect, test, type BrowserContext, type Dialog, type Page } from '@playwright/test'
 
 /**
  * Shared e2e helpers. The smoke suite + per-feature spec files all import
@@ -38,6 +38,34 @@ export function cellInput(page: Page, addr: string) {
 // ============================================================================
 
 /**
+ * Read the active Playwright project name and translate it into the
+ * `backend=` URL param the vNext demos understand. Returns an empty
+ * string when the project name isn't one of `wasm` / `ts` (e.g. a
+ * future project the demos don't gate on, or single-project local
+ * runs). Helpers below merge this in transparently so a spec author
+ * doesn't have to thread the project name through every nav call.
+ *
+ * Phase 3b dual-backend audit: `playwright.config.ts` defines `wasm`
+ * and `ts` projects with a baseURL of `http://…/?backend=<name>`.
+ * Calling `page.goto('/?locale=en')` against that baseURL replaces the
+ * query string (standard URL resolution), dropping `?backend=`. The
+ * helpers below rebuild the query so both `locale` and `backend`
+ * survive every navigation.
+ */
+function backendQueryFromProject(): string {
+  try {
+    const name = test.info().project.name
+    if (name === 'ts' || name === 'wasm') return `backend=${name}`
+    return ''
+  } catch {
+    // test.info() throws outside an active test (e.g. when this helper
+    // is called from a module-level evaluator). Fail open — the legacy
+    // single-project behavior was to omit the param entirely.
+    return ''
+  }
+}
+
+/**
  * Open a demo by name and wait for its table to render. `name` is the
  * exact English button text in App.tsx's demo nav (e.g. "Blank",
  * "Formulas", "Multi-Sheet", "3-Sheet Chain").
@@ -50,7 +78,7 @@ export function cellInput(page: Page, addr: string) {
  *
  * Pass `query` when you need debug params (e.g. `?debug=1` for the
  * render-counter probe). The query string is appended verbatim and we
- * tack `locale=en` onto it.
+ * tack `locale=en` (and the project's `backend=` selector) onto it.
  */
 export async function gotoDemo(page: Page, name: string, query = '') {
   await page.goto(withEnglishLocale(query))
@@ -59,18 +87,51 @@ export async function gotoDemo(page: Page, name: string, query = '') {
 }
 
 /**
- * Build a URL with `locale=en` appended to the query string. Idempotent —
- * if the caller already supplied a `locale=` param we don't duplicate it.
- * Used by `gotoDemo` and by any spec-local nav helper that bypasses
- * `gotoDemo` but still needs the EN catalog.
+ * Build a URL with `locale=en` (and the active project's `backend=`
+ * selector) appended to the query string. Idempotent — if the caller
+ * already supplied a `locale=` or `backend=` param we don't duplicate
+ * it. Used by `gotoDemo` and by any spec-local nav helper that
+ * bypasses `gotoDemo` but still needs the EN catalog or the dual-
+ * backend selector.
  */
 export function withEnglishLocale(query = ''): string {
   const cleaned = query.replace(/^\?/, '')
-  if (/(^|&)locale=/.test(cleaned)) {
-    return cleaned ? `/?${cleaned}` : '/'
+  const parts: string[] = []
+  if (cleaned) parts.push(cleaned)
+  if (!/(^|&)locale=/.test(cleaned)) {
+    parts.push('locale=en')
   }
-  const merged = cleaned ? `${cleaned}&locale=en` : 'locale=en'
-  return `/?${merged}`
+  const backend = backendQueryFromProject()
+  if (backend && !/(^|&)backend=/.test(cleaned)) {
+    parts.push(backend)
+  }
+  const merged = parts.join('&')
+  return merged ? `/?${merged}` : '/'
+}
+
+/**
+ * Navigate to `/` while preserving the active project's `backend=`
+ * selector. Use this from spec-local helpers that don't need the
+ * English catalog (most vNext worker specs land here — they assert on
+ * `data-testid` strings rather than i18n labels). `extra` is appended
+ * verbatim, e.g. `'debug=1'` for the render-counter probe.
+ *
+ * Phase 3b: the dual-backend e2e suite uses this everywhere the legacy
+ * code used `page.goto('/')` or `page.goto('/?debug=1')`. Without it,
+ * Playwright's URL resolution would replace the baseURL query string
+ * and drop `?backend=ts`, silently sending every `--project=ts` test
+ * to the WASM default.
+ */
+export async function gotoRoot(page: Page, extra = '') {
+  const cleaned = extra.replace(/^\?/, '')
+  const parts: string[] = []
+  if (cleaned) parts.push(cleaned)
+  const backend = backendQueryFromProject()
+  if (backend && !/(^|&)backend=/.test(cleaned)) {
+    parts.push(backend)
+  }
+  const merged = parts.join('&')
+  await page.goto(merged ? `/?${merged}` : '/')
 }
 
 /**
