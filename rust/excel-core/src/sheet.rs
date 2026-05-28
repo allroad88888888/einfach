@@ -935,13 +935,25 @@ impl Sheet {
     /// `RangeDependentIndex::candidates_for` plus the small wide-range
     /// fallback — O(matches + wide_count) per call, not the Phase 1
     /// O(range_count) scan.
-    fn dependents_of(&self, addr: CellAddress) -> HashSet<CellAddress> {
-        let mut out: HashSet<CellAddress> = self
-            .cell_dependents
-            .borrow()
-            .get(&addr)
-            .cloned()
-            .unwrap_or_default();
+    ///
+    /// Append every formula address that depends on `addr` into the
+    /// caller-supplied `Vec` (BFS worklist style). Duplicates are
+    /// possible when point-cell deps and range deps both list the
+    /// same formula, or when multiple matching ranges share
+    /// dependents — callers dedup downstream via the BFS `dirty` /
+    /// `notified` set, which is cheaper than allocating a fresh
+    /// `HashSet` per call.
+    ///
+    /// Used by `BulkLoader::flush` and `Sheet::mark_dependents_dirty`
+    /// to keep the dependents traversal at O(1) `HashSet` allocations
+    /// across the entire walk instead of one per visited cell. At
+    /// 500k touched cells the per-call allocation was 82-91% of
+    /// `bulk_import` wall time before this refactor (see
+    /// `vanilla/excel-core-ts/docs/PERF_BULK_IMPORT.md`).
+    fn dependents_of_into(&self, addr: CellAddress, out: &mut Vec<CellAddress>) {
+        if let Some(set) = self.cell_dependents.borrow().get(&addr) {
+            out.extend(set.iter().copied());
+        }
         let range_dependents = self.range_dependents.borrow();
         for range in range_dependents.candidates_for(addr) {
             if range.contains(addr) {
@@ -950,7 +962,6 @@ impl Sheet {
                 }
             }
         }
-        out
     }
 
     /// Workbook-facing helper: flip the formula cache for `addr` to
@@ -990,7 +1001,8 @@ impl Sheet {
 
     fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
         let mut notified = HashSet::new();
-        let mut stack: Vec<CellAddress> = self.dependents_of(root).into_iter().collect();
+        let mut stack: Vec<CellAddress> = Vec::new();
+        self.dependents_of_into(root, &mut stack);
 
         while let Some(addr) = stack.pop() {
             if !notified.insert(addr) {
@@ -1001,7 +1013,7 @@ impl Sheet {
             }
             self.notify_address_subscribers(addr);
 
-            stack.extend(self.dependents_of(addr));
+            self.dependents_of_into(addr, &mut stack);
         }
 
         notified
@@ -3005,7 +3017,11 @@ impl<'a> BulkLoader<'a> {
         let mut dirty: HashSet<CellAddress> = HashSet::new();
         let mut stack: Vec<CellAddress> = Vec::new();
         for &addr in &self.touched {
-            stack.extend(self.sheet.dependents_of(addr));
+            // `dependents_of_into` appends directly into `stack`;
+            // dedup happens via the `dirty.insert` check below.
+            // This kills the per-call `HashSet` allocation that
+            // dominated bulk_import wall time at 500k+ cells.
+            self.sheet.dependents_of_into(addr, &mut stack);
         }
         while let Some(addr) = stack.pop() {
             if !dirty.insert(addr) {
@@ -3014,7 +3030,7 @@ impl<'a> BulkLoader<'a> {
             if let Some(record) = self.sheet.formula_cells.get(&addr) {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
-            stack.extend(self.sheet.dependents_of(addr));
+            self.sheet.dependents_of_into(addr, &mut stack);
         }
 
         // 2. Reattach fanouts on touched addresses so future writes notify

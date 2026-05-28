@@ -1382,6 +1382,17 @@ impl Workbook {
         self.cross_sheet.debug_reverse_edge_count()
     }
 
+    /// Cheap "are there any cross-sheet formula edges registered anywhere
+    /// in this workbook?" check. Used by `WorkbookEvalProvider::force_
+    /// formula_recompute` to scope the read-time bypass: when no formula
+    /// references another sheet, the bypass is unnecessary and every
+    /// `wb.get_cell` read can hit `FormulaCache::Clean`. Single-sheet
+    /// chains (the bench's Chain100 etc.) take this fast path and only
+    /// pay for full chain evaluation on the first read.
+    pub(crate) fn has_any_cross_sheet_edges(&self) -> bool {
+        !self.cross_sheet.formula_refs.is_empty()
+    }
+
     /// Debug-only: per-workbook count of `collect_workbook_refs` AST walks
     /// performed by `cross_sheet_cycle`. Used by the Phase 3 Track J test
     /// to assert that visited-node edges come from
@@ -1999,7 +2010,16 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
     }
 
     fn force_formula_recompute(&self) -> bool {
-        true
+        // Safety net for the "raw" `wb.sheet_mut(idx).set_cell(...)` path,
+        // which bypasses cross-sheet dirty fanout (see
+        // `raw_sheet_write_does_not_fire_cross_sheet_subscriber`). When the
+        // workbook has zero cross-sheet edges, no formula can have a stale
+        // cross-sheet cache, so the bypass is unnecessary and every
+        // `wb.get_cell` read can hit `FormulaCache::Clean`. This is the
+        // common case for single-sheet workbooks (the chain perf bench's
+        // Chain100/1k/10k/100k all live on Sheet1 only) and turns the
+        // steady-state read from O(formulas) re-evals into O(1).
+        self.wb.has_any_cross_sheet_edges()
     }
 
     /// Sparse override for the workbook context. Routes the formula-cell
@@ -2262,7 +2282,11 @@ mod tests {
             .unwrap()
             .set_cell("A1", Value::Number(50.0));
         // Sheet1!B1 = =Data!A1 * 2 — formula sits on Sheet1 but reads Data.
-        wb.sheet_mut(0).unwrap().set_formula("B1", "=Data!A1*2");
+        // Install via the workbook API so the cross-sheet edge gets
+        // registered (the raw `sheet_mut().set_formula` path skips that
+        // registration and relies on the read-time `force_formula_recompute`
+        // safety net; canonical hosts always go through the workbook).
+        assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
 
         // wb.get_cell evaluates through WorkbookEvalProvider.
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(100.0));
@@ -2362,8 +2386,11 @@ mod tests {
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(3.0));
-        wb.sheet_mut(0).unwrap().set_formula("B1", "=Data!A1*2");
-        wb.sheet_mut(0).unwrap().set_formula("C1", "=B1+100");
+        // Install via the workbook API so the cross-sheet edge gets
+        // registered — `force_formula_recompute` keys off
+        // `has_any_cross_sheet_edges()`.
+        assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
+        assert!(wb.set_formula(0, "C1", "=B1+100"));
 
         // Initial read: B1 should resolve to 6, C1 to 106.
         assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(106.0));
@@ -2398,6 +2425,44 @@ mod tests {
         wb.sheet_mut(0).unwrap().set_cell("A1", Value::Number(3.0));
         wb.sheet_mut(0).unwrap().set_formula("B1", "=A1*4");
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(12.0));
+    }
+
+    /// Steady-state read through `wb.get_cell` must hit the formula cache —
+    /// no upstream mutation, so the chain should not re-evaluate. This guards
+    /// the chain perf bench (Chain100 / Chain1k / ... steadyState evalCount)
+    /// against `WorkbookEvalProvider::force_formula_recompute` regressing to
+    /// "always recompute". With the bypass scoped to cross-sheet expressions
+    /// the second read of A100 on a 100-deep same-sheet chain evaluates ZERO
+    /// formulas.
+    #[test]
+    fn chain_read_uses_cache_when_unchanged() {
+        let mut wb = Workbook::new();
+        // Build A1=1, A2=A1+1, ..., A100=A99+1 on Sheet1 (single sheet).
+        wb.sheet_mut(0).unwrap().set_cell("A1", Value::Number(1.0));
+        for i in 2..=100 {
+            let addr = format!("A{i}");
+            let src = format!("=A{}+1", i - 1);
+            assert!(
+                wb.set_formula(0, &addr, &src),
+                "set_formula failed for {addr}={src}"
+            );
+        }
+        // First read forces full chain eval.
+        let v1 = wb.get_cell("Sheet1", "A100");
+        let count1 = wb.debug_formula_eval_count(0);
+        // Second read with no mutation MUST hit cache on every formula.
+        let v2 = wb.get_cell("Sheet1", "A100");
+        let count2 = wb.debug_formula_eval_count(0);
+        assert_eq!(v1, v2);
+        assert_eq!(
+            v2,
+            Value::Number(100.0),
+            "A100 should be A1 + 99 = 100"
+        );
+        assert_eq!(
+            count2, count1,
+            "steadyState read must not re-eval (cache miss bug); first={count1} second={count2}"
+        );
     }
 
     #[test]

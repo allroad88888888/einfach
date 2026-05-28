@@ -40,11 +40,13 @@ export const EXPAND_MAX_CELLS = 100_000
 /** Thrown by `expandRange` when the range exceeds `EXPAND_MAX_CELLS`. */
 export class RangeTooLargeError extends Error {
   readonly range: CellRange
+
   readonly cellCount: number
+
   constructor(range: CellRange, cellCount: number) {
     super(
       `expandRange refused to materialize ${cellCount} cells (cap ${EXPAND_MAX_CELLS}); ` +
-        `use iterateRange for unbounded streaming.`,
+        'use iterateRange for unbounded streaming.',
     )
     this.name = 'RangeTooLargeError'
     this.range = range

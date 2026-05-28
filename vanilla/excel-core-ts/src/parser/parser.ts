@@ -41,14 +41,17 @@ export class ParseError extends Error {
 
 class TokenCursor {
   constructor(public tokens: Token[], public i = 0) {}
+
   peek(offset = 0): Token {
     return this.tokens[this.i + offset] ?? { kind: 'eof', pos: -1 }
   }
+
   next(): Token {
     const t = this.tokens[this.i] ?? { kind: 'eof', pos: -1 }
     if (this.tokens[this.i]) this.i += 1
     return t
   }
+
   consume(kind: Token['kind']): Token {
     const t = this.peek()
     if (t.kind !== kind) {
@@ -56,6 +59,7 @@ class TokenCursor {
     }
     return this.next()
   }
+
   eof(): boolean {
     return this.peek().kind === 'eof'
   }
@@ -278,14 +282,14 @@ function parseCrossSheet(cur: TokenCursor): Expr {
   if (next.kind === 'ref') {
     const inner = parseRefOrRange(cur)
     if (inner.kind !== 'ref' && inner.kind !== 'range') {
-      throw new ParseError(`cross-sheet inner must be ref or range`, head.pos)
+      throw new ParseError('cross-sheet inner must be ref or range', head.pos)
     }
     return { kind: 'crossSheet', sheetName: head.name, inner }
   }
   if (next.kind === 'whole-col' || next.kind === 'whole-row') {
     const inner = parseWholeAxisRange(cur)
     if (inner.kind !== 'range') {
-      throw new ParseError(`cross-sheet inner must be ref or range`, head.pos)
+      throw new ParseError('cross-sheet inner must be ref or range', head.pos)
     }
     return { kind: 'crossSheet', sheetName: head.name, inner }
   }
@@ -297,7 +301,7 @@ function parseArrayLiteral(cur: TokenCursor): ArrayLiteralExpr {
   const rows: Expr[][] = []
   // Empty `{}` is invalid in Excel — require at least one element.
   if (cur.peek().kind === 'rbrace') {
-    throw new ParseError(`empty array literal`, cur.peek().pos)
+    throw new ParseError('empty array literal', cur.peek().pos)
   }
   let row: Expr[] = []
   row.push(parseExpr(cur, 0))
@@ -323,7 +327,7 @@ function parseArrayLiteral(cur: TokenCursor): ArrayLiteralExpr {
   const cols = rows[0].length
   for (const r of rows) {
     if (r.length !== cols) {
-      throw new ParseError(`array literal rows must be the same length`, cur.peek().pos)
+      throw new ParseError('array literal rows must be the same length', cur.peek().pos)
     }
   }
   return { kind: 'arrayLiteral', rows }

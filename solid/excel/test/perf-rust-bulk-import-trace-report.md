@@ -1,36 +1,34 @@
 # Rust bulk-import phase-decomposition
 
-*Last run: 2026-05-27T09:18:26.899Z*
+*Last run: 2026-05-27T09:46:13.540Z*
 
 ## Per-tier phase breakdown
 
 | Tier | total cells | JS wall (ms) | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100k | 100000 | 10523 | 110 | 34.0 | 17.0 | 798 | 9552 | 10367 | 46.2 |
-| 250k | 250000 | 20703 | 414 | 197 | 109 | 2843 | 17112 | 20064 | 225 |
-| 500k | 500000 | 40602 | 457 | 117 | 49.0 | 3223 | 36734 | 40006 | 139 |
+| 100k | 100000 | 6512 | 99.0 | 30.0 | 14.0 | 765 | 5595 | 6374 | 39.4 |
+| 250k | 250000 | 10527 | 239 | 66.0 | 27.0 | 1658 | 8518 | 10203 | 84.6 |
 
 ## Phase share (% of JS wall)
 
 | Tier | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100k | 1.0% | 0.3% | 0.2% | 7.6% | 90.8% | 98.5% | 0.4% |
-| 250k | 2.0% | 1.0% | 0.5% | 13.7% | 82.7% | 96.9% | 1.1% |
-| 500k | 1.1% | 0.3% | 0.1% | 7.9% | 90.5% | 98.5% | 0.3% |
+| 100k | 1.5% | 0.5% | 0.2% | 11.7% | 85.9% | 97.9% | 0.6% |
+| 250k | 2.3% | 0.6% | 0.3% | 15.8% | 80.9% | 96.9% | 0.8% |
 
-## Super-linearity (ratio of `500k` to `100k` phase ms)
+## Super-linearity (ratio of `250k` to `100k` phase ms)
 
-Cell-count ratio = 5.00×. A linear phase grows at the same ratio; >cellRatio = super-linear.
+Cell-count ratio = 2.50×. A linear phase grows at the same ratio; >cellRatio = super-linear.
 
-| Phase | 100k (ms) | 500k (ms) | Ratio | Verdict |
+| Phase | 100k (ms) | 250k (ms) | Ratio | Verdict |
 | --- | --- | --- | --- | --- |
-| deserialize | 110 | 457 | 4.15× | sub-linear |
-| parse-only | 34.0 | 117 | 3.44× | sub-linear |
-| set_cell loop | 17.0 | 49.0 | 2.88× | sub-linear |
-| set_formula loop | 798 | 3223 | 4.04× | sub-linear |
-| flush | 9552 | 36734 | 3.85× | sub-linear |
-| engine total | 10367 | 40006 | 3.86× | sub-linear |
-| JS wall | 10523 | 40602 | 3.86× | sub-linear |
+| deserialize | 99.0 | 239 | 2.41× | linear-ish |
+| parse-only | 30.0 | 66.0 | 2.20× | sub-linear |
+| set_cell loop | 14.0 | 27.0 | 1.93× | sub-linear |
+| set_formula loop | 765 | 1658 | 2.17× | sub-linear |
+| flush | 5595 | 8518 | 1.52× | sub-linear |
+| engine total | 6374 | 10203 | 1.60× | sub-linear |
+| JS wall | 6512 | 10527 | 1.62× | sub-linear |
 
 ## Notes
 

@@ -33,6 +33,7 @@
 
 import type {
   BinaryOp,
+  Cell,
   CellKey,
   ErrorCode,
   EvalContext,
@@ -374,6 +375,17 @@ export function cycleGuardKey(
  *
  * The cycle-set key is composite — `<mapTag>:<cellKey>` — so the same
  * `0:0` CellKey on different sheets doesn't false-positive.
+ *
+ * **Recursion note (Chain-eval bug):** prior to the trampoline introduced
+ * in `evaluateCellTrampolined`, a 1000-deep dependency chain
+ * (`A2=A1+1, A3=A2+1, …`) blew V8's ~1 MB call stack here, because every
+ * `ref` lookup walked back through `evaluate → refLookupGeneric →
+ * resolveCell → evaluate` on the JS stack. This recursive `resolveCell`
+ * is preserved for cycle-detection compatibility and for the
+ * cross-sheet shim's foreign-sheet entry path, but the per-cell entry
+ * point in `sheet.ts` now goes through `evaluateCellTrampolined`, which
+ * processes the same dependency graph using an explicit work stack
+ * (Option B in the bug report).
  */
 function resolveCell(
   key: CellKey,
@@ -405,6 +417,328 @@ function resolveCell(
   } finally {
     ctx.currentlyEvaluating.delete(guardKey)
   }
+}
+
+// ----------------------------------------------------------------------------
+// Trampolined per-cell evaluation (Chain-eval fix).
+//
+// Goal: evaluate the formula at `rootKey` against `rootCells` without
+// blowing V8's ~1 MB call stack on deep cross-cell dependency chains
+// (e.g. `A2=A1+1, A3=A2+1, …, A1000=A999+1`).
+//
+// Strategy (Option B from the bug report): keep an explicit work stack
+// of cells to resolve. When the in-flight evaluation of a cell's AST
+// reaches a `ref` / `range` / `crossSheet` whose value is not yet in the
+// `cache`, throw a `NeedsDep` sentinel. The trampoline catches it,
+// pushes the missing deps onto the work stack, and re-attempts the
+// current cell on the next iteration once those deps have been
+// resolved. Each cell's AST is evaluated at most `1 + (# of distinct
+// refs it depends on)` times in the worst case; for the canonical
+// `=A(n-1)+1` chain that's 2 evaluations per cell.
+//
+// AST traversal inside a single cell still uses the existing recursive
+// `evaluate`, but since AST depth is bounded by formula complexity (not
+// chain length), it never touches the deep-recursion ceiling. The
+// trampoline only flattens the *cross-cell* recursion that was the
+// source of the stack overflow.
+//
+// Cycle detection moves from `currentlyEvaluating` (the set passed
+// through nested `evaluate` calls) to the trampoline's `inProgress`
+// set, keyed by the same `cycleGuardKey(cells, key)` so cross-sheet
+// chains remain disjoint. A cycle is detected when a `refLookup` hits a
+// dep whose guard key is already in `inProgress` — that dep is stamped
+// `#CIRCULAR!` in the cache and short-circuits future lookups.
+//
+// Crucially, dep discovery is *lazy* — we throw on the first missing
+// dep encountered during AST walk, not by pre-walking the AST to
+// collect every reference. This preserves `IF`'s short-circuit
+// semantics: a `=IF(TRUE, 0, A1)` cell will never request `A1` because
+// the AST walk never reaches the else branch. Pre-walking would
+// regress that.
+// ----------------------------------------------------------------------------
+
+/**
+ * Sentinel thrown by the trampoline's shim `refLookup` / `rangeLookup`
+ * to signal "this dep isn't in the cache yet; please resolve it first
+ * and retry the current cell." Carries the list of missing deps so a
+ * single `rangeLookup` covering N cells can request all of them at
+ * once instead of forcing N retries.
+ */
+class NeedsDep {
+  constructor(
+    readonly deps: ReadonlyArray<{
+      readonly cells: ReadonlyMap<CellKey, Cell>
+      readonly key: CellKey
+      readonly guardKey: CellKey
+    }>,
+  ) {}
+}
+
+interface TrampolineFrame {
+  readonly cells: ReadonlyMap<CellKey, Cell>
+  readonly key: CellKey
+  readonly guardKey: CellKey
+}
+
+/**
+ * Build the trampoline's shim `EvalContext`. The shim is a thin wrapper
+ * around the host `ctx` (which still owns `callCustom`, `resolveName`,
+ * `lambdaScope`, `lambdaCallDepth`); only the ref / range / crossSheet
+ * lookups are intercepted to consult the cache instead of recursing.
+ *
+ * `currentlyEvaluating` is still passed through for compatibility with
+ * any code path that wants to check it, but it's the trampoline's
+ * `inProgress` set that actually drives cycle detection now.
+ */
+function makeTrampolineCtx(
+  cells: ReadonlyMap<CellKey, Cell>,
+  hostCtx: EvalContext,
+  cache: Map<CellKey, Value>,
+  inProgress: Set<CellKey>,
+): EvalContext {
+  const lookupKey = (
+    targetCells: ReadonlyMap<CellKey, Cell>,
+    key: CellKey,
+  ): Value => {
+    const guardKey = cycleGuardKey(targetCells, key)
+    const cached = cache.get(guardKey)
+    if (cached !== undefined) return cached
+    if (inProgress.has(guardKey)) {
+      // The dep is still on the work stack — by definition, evaluating
+      // it again here would recurse into a cycle. Stamp it #CIRCULAR!
+      // so the in-flight cell sees the error this iteration; the dep's
+      // own work-stack frame will pick up the same cached value when it
+      // pops.
+      const circ = ERR('#CIRCULAR!')
+      cache.set(guardKey, circ)
+      return circ
+    }
+    throw new NeedsDep([{ cells: targetCells, key, guardKey }])
+  }
+
+  const ctx: EvalContext = {
+    cells,
+    currentlyEvaluating: hostCtx.currentlyEvaluating,
+    refLookup: (a1) => {
+      const coord = parseRefToKey(a1)
+      if (!coord) return ERR('#REF!')
+      return lookupKey(cells, coord)
+    },
+    rangeLookup: (start, end) => {
+      const range = parseRange(start, end)
+      if (!range) return [[ERR('#REF!')]]
+      const rowCount = range.rowEnd - range.rowStart + 1
+      const colCount = range.colEnd - range.colStart + 1
+      const totalCells = rowCount * colCount
+      if (totalCells > 100_000) {
+        const msg =
+          `range too large to materialize (${rowCount}x${colCount} = ` +
+          `${totalCells} cells; cap 100000)`
+        return [[ERR('#NUM!', msg)]]
+      }
+      // Walk the range twice if needed: first collect every missing
+      // dep into one NeedsDep batch (so a SUM(A1:A100) on a chained
+      // column doesn't fault 100 times — once is enough). Only resort
+      // to actual materialization once every cell in the range is
+      // resolved.
+      const missing: { cells: typeof cells; key: CellKey; guardKey: CellKey }[] = []
+      for (const coord of iterateRange(range)) {
+        const k = cellKey(coord)
+        const gk = cycleGuardKey(cells, k)
+        if (cache.has(gk) || inProgress.has(gk)) continue
+        // We need this dep. Only push if the cell exists with an AST —
+        // literal / missing cells resolve inline below.
+        const cell = cells.get(k)
+        if (cell && cell.ast) {
+          missing.push({ cells, key: k, guardKey: gk })
+        }
+      }
+      if (missing.length > 0) {
+        throw new NeedsDep(missing)
+      }
+      const rows: Value[][] = new Array(rowCount)
+      try {
+        let rIdx = 0
+        let buf: Value[] | null = null
+        let lastRow = -1
+        for (const coord of iterateRange(range)) {
+          if (coord.row !== lastRow) {
+            buf = new Array(colCount)
+            rows[rIdx] = buf
+            rIdx += 1
+            lastRow = coord.row
+          }
+          const k = cellKey(coord)
+          // Either the cell is a non-ast literal/missing (resolve
+          // inline) or its value is in cache (via the previous pass).
+          const cell = cells.get(k)
+          if (!cell) {
+            buf![coord.col - range.colStart] = BLANK
+          } else if (!cell.ast) {
+            buf![coord.col - range.colStart] = cell.value
+          } else {
+            const gk = cycleGuardKey(cells, k)
+            const cached = cache.get(gk)
+            if (cached !== undefined) {
+              buf![coord.col - range.colStart] = cached
+            } else if (inProgress.has(gk)) {
+              const circ = ERR('#CIRCULAR!')
+              cache.set(gk, circ)
+              buf![coord.col - range.colStart] = circ
+            } else {
+              // Shouldn't happen — we just verified above. Defensive
+              // fallback: throw NeedsDep so the trampoline pushes it.
+              throw new NeedsDep([{ cells, key: k, guardKey: gk }])
+            }
+          }
+        }
+      } catch (err) {
+        if (err instanceof RangeTooLargeError) {
+          return [[ERR('#NUM!', err.message)]]
+        }
+        throw err
+      }
+      return rows
+    },
+    crossSheetCells: hostCtx.crossSheetCells,
+    callCustom: hostCtx.callCustom,
+    resolveName: hostCtx.resolveName,
+    lambdaScope: hostCtx.lambdaScope,
+    lambdaCallDepth: hostCtx.lambdaCallDepth,
+  }
+  return ctx
+}
+
+/**
+ * Public entry: evaluate the cell at `rootKey` inside `rootCells` to a
+ * concrete `Value`. The trampoline removes the cross-cell recursion
+ * that previously blew V8's stack on deep dependency chains.
+ *
+ * If `rootKey` does not exist in `rootCells`, returns `BLANK` (Excel
+ * convention). If the cell exists but has no AST, returns the stored
+ * literal value verbatim — no trampoline machinery is involved in that
+ * common case.
+ *
+ * `hostCtx` provides the host-level pieces the trampoline can't
+ * synthesize: `crossSheetCells`, `callCustom`, `resolveName`, and the
+ * shared `currentlyEvaluating` set (kept for back-compat, though cycle
+ * detection is driven by `inProgress` internally).
+ */
+export function evaluateCellTrampolined(
+  rootKey: CellKey,
+  rootCells: ReadonlyMap<CellKey, Cell>,
+  hostCtx: EvalContext,
+): Value {
+  const rootCell = rootCells.get(rootKey)
+  if (!rootCell) return BLANK
+  if (!rootCell.ast) return rootCell.value
+
+  const cache = new Map<CellKey, Value>()
+  // `inProgress` marks cells whose AST is currently mid-walk (started
+  // evaluating but waiting on deps before it can finish). A cycle is
+  // detected when `refLookup` hits a dep already in `inProgress`.
+  //
+  // Subtle: cells that have been *pushed* onto the work stack but not
+  // yet started must NOT be in `inProgress`. Otherwise, when a single
+  // range-lookup batch (`SUM(B1:B100)`) pushes 99 deps at once, every
+  // pair within that batch would mark each other as in-progress and
+  // false-positive a cycle. Membership in `inProgress` is bound to
+  // "AST eval has started but not finished for this guard key."
+  //
+  // `queued` is a separate set that tracks "has been pushed onto the
+  // stack at least once" so we don't re-push the same dep N times when
+  // a cell's AST evaluation faults out repeatedly while bringing in
+  // its deps one at a time.
+  const inProgress = new Set<CellKey>()
+  const queued = new Set<CellKey>()
+  const stack: TrampolineFrame[] = []
+
+  const rootGuard = cycleGuardKey(rootCells, rootKey)
+  stack.push({ cells: rootCells, key: rootKey, guardKey: rootGuard })
+  queued.add(rootGuard)
+
+  // Bound on iterations as a defense against accidental infinite
+  // re-trying. Worst case the trampoline visits each cell `1 + deps`
+  // times; for a 100k chain with single-ref formulas that's 2*100k =
+  // 200k. Use a 10× margin (2M iterations) before bailing with a
+  // diagnostic error — anything past that signals a logic bug in the
+  // sentinel-retry loop, not a legitimate workload.
+  const maxIter = 20_000_000
+  let iter = 0
+
+  while (stack.length > 0) {
+    iter += 1
+    if (iter > maxIter) {
+      return ERR(
+        '#NUM!',
+        `evaluateCellTrampolined exceeded ${maxIter} work-stack iterations (possible logic bug)`,
+      )
+    }
+    const top = stack[stack.length - 1]
+    if (cache.has(top.guardKey)) {
+      inProgress.delete(top.guardKey)
+      queued.delete(top.guardKey)
+      stack.pop()
+      continue
+    }
+    const cell = top.cells.get(top.key)
+    if (!cell) {
+      cache.set(top.guardKey, BLANK)
+      inProgress.delete(top.guardKey)
+      queued.delete(top.guardKey)
+      stack.pop()
+      continue
+    }
+    if (!cell.ast) {
+      cache.set(top.guardKey, cell.value)
+      inProgress.delete(top.guardKey)
+      queued.delete(top.guardKey)
+      stack.pop()
+      continue
+    }
+    // About to start (or resume) walking this cell's AST — mark
+    // inProgress so a back-edge through this guard key surfaces
+    // #CIRCULAR! instead of falling into infinite re-trying.
+    inProgress.add(top.guardKey)
+    const shimCtx = makeTrampolineCtx(top.cells, hostCtx, cache, inProgress)
+    try {
+      const value = evaluate(cell.ast, shimCtx)
+      cache.set(top.guardKey, value)
+      inProgress.delete(top.guardKey)
+      queued.delete(top.guardKey)
+      stack.pop()
+    } catch (err) {
+      if (err instanceof NeedsDep) {
+        // The cell isn't done — it faulted out partway through AST
+        // evaluation when it hit a dep that wasn't in the cache yet.
+        // Leave it in `inProgress` (it's a paused ancestor whose work
+        // depends on the deps about to be pushed); when one of those
+        // deps tries to refer back to us, the refLookup shim will
+        // surface #CIRCULAR! against this still-in-progress entry.
+        // Push deps in *reverse* iteration order so the first dep in
+        // `err.deps` ends up on TOP of the stack (LIFO → processed
+        // next). This matters for range batches whose deps form a
+        // chain: `SUM(B1:B100)` with `B(k)=B(k-1)+1` lists deps as
+        // [B2, B3, …, B100]; to evaluate them bottom-up we want B2
+        // popped first, so push B100 first and B2 last.
+        for (let i = err.deps.length - 1; i >= 0; i -= 1) {
+          const dep = err.deps[i]
+          if (cache.has(dep.guardKey)) continue
+          if (queued.has(dep.guardKey)) continue
+          queued.add(dep.guardKey)
+          stack.push({ cells: dep.cells, key: dep.key, guardKey: dep.guardKey })
+        }
+        // Loop continues; the newly-pushed deps will be evaluated
+        // first, and `top` will be retried once they cache out.
+        continue
+      }
+      // Any other throw is a real bug — surface it.
+      inProgress.delete(top.guardKey)
+      throw err
+    }
+  }
+
+  return cache.get(rootGuard) ?? BLANK
 }
 
 /**

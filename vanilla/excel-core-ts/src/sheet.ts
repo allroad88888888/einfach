@@ -26,8 +26,7 @@ import { atom, type AtomEntity } from '@einfach/core'
 import type { Cell, CellKey, Value } from './types'
 import { BLANK } from './types'
 import {
-  cycleGuardKey,
-  evaluate,
+  evaluateCellTrampolined,
   rangeLookupGeneric,
   refLookupGeneric,
 } from './eval/evaluate'
@@ -163,12 +162,13 @@ export function createSheet(
       // `computing` so a probe taken mid-eval reads `'computing'`.
       computing.add(key)
       evalCount += 1
-      // Fresh cycle set per derive run. Seed it with the entry-point
-      // cell using a cells-tagged composite key so cross-sheet evals
-      // don't false-collide on `0:0`.
+      // Fresh cycle set per derive run. Note that with the trampolined
+      // entry path (`evaluateCellTrampolined`), cycle detection is
+      // driven by the trampoline's internal `inProgress` set; the
+      // shared `currentlyEvaluating` Set is preserved here for the
+      // benefit of host-supplied `refLookup` / `rangeLookup` callbacks
+      // that may still consult it.
       const currentlyEvaluating = new Set<CellKey>()
-      const seed = cycleGuardKey(cells, key)
-      currentlyEvaluating.add(seed)
       const ctx: import('./types').EvalContext = {
         cells,
         currentlyEvaluating,
@@ -179,9 +179,13 @@ export function createSheet(
         resolveName: resolvers.resolveName,
       }
       try {
-        return evaluate(cell.ast, ctx)
+        // The trampoline removes cross-cell recursion that previously
+        // blew V8's ~1 MB call stack on deep dependency chains (the
+        // canonical `=A(n-1)+1` reproducer past ~1000 cells). See the
+        // long comment block in `eval/evaluate.ts` near
+        // `evaluateCellTrampolined` for the design rationale.
+        return evaluateCellTrampolined(key, cells, ctx)
       } finally {
-        currentlyEvaluating.delete(seed)
         computing.delete(key)
         // Stamp the revision AFTER the derive completed. A probe that
         // catches the derive mid-stack sees `computing.has(key) === true`

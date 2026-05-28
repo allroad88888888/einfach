@@ -81,41 +81,41 @@ EINFACH_PERF=1 NODE_OPTIONS='--expose-gc --max-old-space-size=8192' \
 ```
 
 <!-- BENCH:RESULTS:START -->
-*Last bench run: 2026-05-27T09:18:09.945Z*
+*Last bench run: 2026-05-27T09:57:33.424Z*
 
 | Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Medium | setup | 3.3 | 17.5 | 0.19× | acceptable |
-| Medium | bulkWrite | 6.3 | 282 | 0.02× | acceptable |
-| Medium | readBack | 220 | 459 | 0.48× | acceptable |
-| Medium | recalc | 212 | 475 | 0.45× | acceptable |
+| Mega | setup | 221 | 1087 | 0.20× | acceptable |
+| Mega | bulkWrite | 919 | 479312 | 0.00× | acceptable |
+| Mega | readBack | 29985 | 60211 | 0.50× | acceptable |
+| Mega | recalc | 31634 | 62851 | 0.50× | acceptable |
 
 ### Peak RSS by phase (MB)
 
 | Workload | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Medium | setup | 467 MB | 564 MB |
-| Medium | bulkWrite | 468 MB | 564 MB |
-| Medium | readBack | 468 MB | 564 MB |
-| Medium | recalc | 469 MB | 564 MB |
+| Mega | setup | 643 MB | 2012 MB |
+| Mega | bulkWrite | 1179 MB | 2663 MB |
+| Mega | readBack | 1689 MB | 2809 MB |
+| Mega | recalc | 2086 MB | 3349 MB |
 
 ### Crossover analysis (TS-vs-WASM by tier)
 
 Ratio > 1.0× means TS is SLOWER than WASM. We track the first
 tier where each phase crosses (WASM regains advantage).
 
-- **setup**: Medium=0.19×
+- **setup**: Mega=0.20×
   - crossover: TS still faster at largest measured tier
-- **bulkWrite**: Medium=0.02×
+- **bulkWrite**: Mega=0.00×
   - crossover: TS still faster at largest measured tier
-- **readBack**: Medium=0.48×
+- **readBack**: Mega=0.50×
   - crossover: TS still faster at largest measured tier
-- **recalc**: Medium=0.45×
+- **recalc**: Mega=0.50×
   - crossover: TS still faster at largest measured tier
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
-*Last chain bench run: 2026-05-27T08:36:44.754Z*
+*Last chain bench run: 2026-05-27T09:40:10.331Z*
 
 ## Chain dependency workload
 
@@ -134,26 +134,26 @@ per-cell precise dep tracking. Phases:
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Chain100 | setup | 0.79 | 2.9 | 0.28× | TS wins |
-| Chain100 | bulkWrite | 0.84 | 4.0 | 0.21× | TS wins |
-| Chain100 | firstRecalc | 1.1 | 1.0 | 1.07× | WASM edges |
-| Chain100 | mutateThenRecalc | 0.19 | 0.24 | 0.78× | roughly tied |
-| Chain100 | steadyState | 0.01 | 0.19 | 0.07× | TS wins |
-| Chain1k | setup | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
-| Chain1k | bulkWrite | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
-| Chain1k | firstRecalc | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
-| Chain1k | mutateThenRecalc | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
-| Chain1k | steadyState | *Error: ts rpc readCells failed: WORKE…* | *Error: attempted to take ownership of…* | — | both failed |
-| Chain10k | setup | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain10k | bulkWrite | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain10k | firstRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain10k | mutateThenRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain10k | steadyState | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain100k | setup | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain100k | bulkWrite | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain100k | firstRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain100k | mutateThenRecalc | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
-| Chain100k | steadyState | *skipped (TS chain failed at tier inde…* | *skipped (WASM chain failed at tier in…* | — | both failed |
+| Chain100 | setup | 0.56 | 2.1 | 0.27× | TS wins |
+| Chain100 | bulkWrite | 0.73 | 2.5 | 0.30× | TS wins |
+| Chain100 | firstRecalc | 1.1 | 0.56 | 1.88× | WASM wins |
+| Chain100 | mutateThenRecalc | 0.41 | 0.13 | 3.12× | WASM wins |
+| Chain100 | steadyState | 0.01 | 0.01 | 1.20× | WASM edges |
+| Chain1k | setup | 0.12 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain1k | bulkWrite | 1.5 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain1k | firstRecalc | 2.6 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain1k | mutateThenRecalc | 1.2 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain1k | steadyState | 0.00 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain10k | setup | 0.09 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain10k | bulkWrite | 8.0 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain10k | firstRecalc | 12.5 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain10k | mutateThenRecalc | 9.3 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain10k | steadyState | 0.00 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100k | setup | 0.12 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100k | bulkWrite | 65.8 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100k | firstRecalc | 136 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100k | mutateThenRecalc | 142 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100k | steadyState | 0.01 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
 
 ### evalCount delta per phase
 
@@ -165,47 +165,47 @@ For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` 
 | Chain100 | bulkWrite | 0 | 0 |
 | Chain100 | firstRecalc | 1 | 99 |
 | Chain100 | mutateThenRecalc | 1 | 99 |
-| Chain100 | steadyState | 0 | 99 |
-| Chain1k | setup | *failed* | *failed* |
-| Chain1k | bulkWrite | *failed* | *failed* |
-| Chain1k | firstRecalc | *failed* | *failed* |
-| Chain1k | mutateThenRecalc | *failed* | *failed* |
-| Chain1k | steadyState | *failed* | *failed* |
-| Chain10k | setup | *failed* | *failed* |
-| Chain10k | bulkWrite | *failed* | *failed* |
-| Chain10k | firstRecalc | *failed* | *failed* |
-| Chain10k | mutateThenRecalc | *failed* | *failed* |
-| Chain10k | steadyState | *failed* | *failed* |
-| Chain100k | setup | *failed* | *failed* |
-| Chain100k | bulkWrite | *failed* | *failed* |
-| Chain100k | firstRecalc | *failed* | *failed* |
-| Chain100k | mutateThenRecalc | *failed* | *failed* |
-| Chain100k | steadyState | *failed* | *failed* |
+| Chain100 | steadyState | 0 | 0 |
+| Chain1k | setup | 0 | *failed* |
+| Chain1k | bulkWrite | 0 | *failed* |
+| Chain1k | firstRecalc | 1 | *failed* |
+| Chain1k | mutateThenRecalc | 1 | *failed* |
+| Chain1k | steadyState | 0 | *failed* |
+| Chain10k | setup | 0 | *failed* |
+| Chain10k | bulkWrite | 0 | *failed* |
+| Chain10k | firstRecalc | 1 | *failed* |
+| Chain10k | mutateThenRecalc | 1 | *failed* |
+| Chain10k | steadyState | 0 | *failed* |
+| Chain100k | setup | 0 | *failed* |
+| Chain100k | bulkWrite | 0 | *failed* |
+| Chain100k | firstRecalc | 1 | *failed* |
+| Chain100k | mutateThenRecalc | 1 | *failed* |
+| Chain100k | steadyState | 0 | *failed* |
 
 ### Peak RSS by phase (MB)
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Chain100 | setup | 493 MB | 494 MB |
-| Chain100 | bulkWrite | 493 MB | 495 MB |
-| Chain100 | firstRecalc | 494 MB | 495 MB |
-| Chain100 | mutateThenRecalc | 494 MB | 495 MB |
-| Chain100 | steadyState | 494 MB | 495 MB |
-| Chain1k | setup | *failed* | *failed* |
-| Chain1k | bulkWrite | *failed* | *failed* |
-| Chain1k | firstRecalc | *failed* | *failed* |
-| Chain1k | mutateThenRecalc | *failed* | *failed* |
-| Chain1k | steadyState | *failed* | *failed* |
-| Chain10k | setup | *failed* | *failed* |
-| Chain10k | bulkWrite | *failed* | *failed* |
-| Chain10k | firstRecalc | *failed* | *failed* |
-| Chain10k | mutateThenRecalc | *failed* | *failed* |
-| Chain10k | steadyState | *failed* | *failed* |
-| Chain100k | setup | *failed* | *failed* |
-| Chain100k | bulkWrite | *failed* | *failed* |
-| Chain100k | firstRecalc | *failed* | *failed* |
-| Chain100k | mutateThenRecalc | *failed* | *failed* |
-| Chain100k | steadyState | *failed* | *failed* |
+| Chain100 | setup | 474 MB | 475 MB |
+| Chain100 | bulkWrite | 474 MB | 475 MB |
+| Chain100 | firstRecalc | 474 MB | 476 MB |
+| Chain100 | mutateThenRecalc | 474 MB | 476 MB |
+| Chain100 | steadyState | 474 MB | 476 MB |
+| Chain1k | setup | 481 MB | *failed* |
+| Chain1k | bulkWrite | 482 MB | *failed* |
+| Chain1k | firstRecalc | 482 MB | *failed* |
+| Chain1k | mutateThenRecalc | 500 MB | *failed* |
+| Chain1k | steadyState | 500 MB | *failed* |
+| Chain10k | setup | 503 MB | *failed* |
+| Chain10k | bulkWrite | 509 MB | *failed* |
+| Chain10k | firstRecalc | 511 MB | *failed* |
+| Chain10k | mutateThenRecalc | 532 MB | *failed* |
+| Chain10k | steadyState | 532 MB | *failed* |
+| Chain100k | setup | 539 MB | *failed* |
+| Chain100k | bulkWrite | 564 MB | *failed* |
+| Chain100k | firstRecalc | 599 MB | *failed* |
+| Chain100k | mutateThenRecalc | 707 MB | *failed* |
+| Chain100k | steadyState | 660 MB | *failed* |
 
 ### Chain crossover trace (mutateThenRecalc)
 
@@ -213,16 +213,13 @@ Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
 This is THE chain-workload diagnostic. If Rust ever beats TS in this
 repo, it should show up here first.
 
-- Chain100=0.78×, Chain1k=both-failed, Chain10k=both-failed, Chain100k=both-failed
-- crossover: TS still faster at deepest measured chain
+- Chain100=3.12×, Chain1k=wasm-failed, Chain10k=wasm-failed, Chain100k=wasm-failed
+- crossover: Chain100 (ratio 3.12×)
 
 ### Chain failures / skipped backends
 
-- **Chain1k / TS**: Error: ts rpc readCells failed: WORKER_ERROR Maximum call stack size exceeded
 - **Chain1k / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
-- **Chain10k / TS**: skipped (TS chain failed at tier index 1)
 - **Chain10k / WASM**: skipped (WASM chain failed at tier index 1)
-- **Chain100k / TS**: skipped (TS chain failed at tier index 1)
 - **Chain100k / WASM**: skipped (WASM chain failed at tier index 1)
 <!-- BENCH:CHAIN:END -->
 

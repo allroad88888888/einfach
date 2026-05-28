@@ -124,7 +124,7 @@ describe('copy-as / HTML escaping', () => {
   test('quote and ampersand characters are escaped', () => {
     const input = {
       rect: rect(0, 0, 0, 0),
-      cells: [cell(0, 0, `A & "B" 'C'`)],
+      cells: [cell(0, 0, 'A & "B" \'C\'')],
     }
     const html = encodeSelectionAsHtml(input)
     expect(html).toContain('A &amp; &quot;B&quot; &#39;C&#39;')
@@ -402,7 +402,7 @@ describe('copy-as / CSS-injection defence', () => {
           format: {
             fgColor: '#ff00ff',
             bgColor: 'rgb(255, 0, 0)',
-            fontFamily: `Arial, sans-serif`,
+            fontFamily: 'Arial, sans-serif',
             fontSize: 14,
           },
         }),
