@@ -1458,9 +1458,27 @@ impl Workbook {
 /// inside `Sheet::bulk_load`. The owning sheet is the HashMap key in
 /// `ops_by_sheet`, so individual variants don't repeat `sheet_idx`.
 enum WorkbookOp {
-    SetCell { addr_str: String, value: Value },
-    SetFormula { addr_str: String, source: String },
-    ClearCell { addr_str: String },
+    SetCell {
+        addr_str: String,
+        value: Value,
+    },
+    /// `expr` is `Some` when the workbook-side parse succeeded — the
+    /// sheet-side flush installs directly without re-parsing. `None`
+    /// covers the parse-failure path: the sheet's `set_formula` sees a
+    /// malformed string, writes `#VALUE!`, and never touches the AST.
+    /// Eliminating the double-parse was the dominant constant-factor
+    /// win for the wasm32 Chain100k bulkWrite tier — `parse_formula`
+    /// allocates a `Vec<char>` per source character plus boxed nodes
+    /// for every binop / cellref, and was running twice per formula
+    /// (workbook + sheet) before this variant.
+    SetFormula {
+        addr_str: String,
+        source: String,
+        expr: Option<Expr>,
+    },
+    ClearCell {
+        addr_str: String,
+    },
 }
 
 /// In-progress workbook bulk-load session. Buffers operations until
@@ -1541,6 +1559,7 @@ impl<'a> WorkbookLoader<'a> {
                 .push(WorkbookOp::SetFormula {
                     addr_str: addr_str.to_string(),
                     source: source.to_string(),
+                    expr: None,
                 });
             return false;
         };
@@ -1590,6 +1609,7 @@ impl<'a> WorkbookLoader<'a> {
             .push(WorkbookOp::SetFormula {
                 addr_str: addr_str.to_string(),
                 source: source.to_string(),
+                expr: Some(expr),
             });
 
         true
@@ -1633,23 +1653,51 @@ impl<'a> WorkbookLoader<'a> {
             let Some(sheet) = wb.sheets.get_mut(sheet_idx) else {
                 continue;
             };
+            // Pre-grow the per-sheet formula HashMaps to the known
+            // batch size. Saves ~log2(N) rehashes during the replay
+            // loop below (each rehash is O(current entries), so they
+            // amortize to ~2× the final size in wasted copies on a
+            // cold start).
+            sheet.reserve_for_bulk_install(ops.len());
             sheet.bulk_load(|loader| {
                 for op in ops {
                     match op {
                         WorkbookOp::SetCell { addr_str, value } => {
                             loader.set_cell(&addr_str, value);
                         }
-                        WorkbookOp::SetFormula { addr_str, source } => {
-                            // Whether the workbook layer accepted or
-                            // rejected the formula, hand it to the
-                            // sheet's bulk loader: it writes `#VALUE!`
-                            // on parse-fail, `#CYCLE!` on same-sheet
-                            // cycle, and the live record otherwise.
+                        WorkbookOp::SetFormula {
+                            addr_str,
+                            source,
+                            expr,
+                        } => {
+                            // Hand the pre-parsed AST through when we
+                            // have one — skips the sheet-loader's
+                            // re-parse (the same AST was just produced
+                            // by the workbook-side cycle check).
+                            //
+                            // `expr=None` is the parse-failure path:
+                            // the source was unparseable on the
+                            // workbook side too, so route through the
+                            // string form and let the sheet writer
+                            // produce `#VALUE!` via its own parse-fail
+                            // arm (consistency: same `#VALUE!` error
+                            // payload either way).
+                            //
                             // Cross-sheet cycle was already handled by
                             // the `set_formula` queue path inserting a
                             // follow-up `SetCell` to override with
                             // `Value::Error(CyclicRef)`.
-                            loader.set_formula(&addr_str, &source);
+                            match expr {
+                                Some(expr) => {
+                                    // Move `source` so the sheet loader
+                                    // stores the original allocation
+                                    // instead of cloning.
+                                    loader.set_formula_pre_parsed(&addr_str, expr, source);
+                                }
+                                None => {
+                                    loader.set_formula(&addr_str, &source);
+                                }
+                            }
                         }
                         WorkbookOp::ClearCell { addr_str } => {
                             loader.set_cell(&addr_str, Value::Null);

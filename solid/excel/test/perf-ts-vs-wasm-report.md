@@ -115,7 +115,7 @@ tier where each phase crosses (WASM regains advantage).
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
-*Last chain bench run: 2026-05-28T03:54:48.626Z*
+*Last chain bench run: 2026-05-28T04:35:25.133Z*
 
 ## Chain dependency workload
 
@@ -134,26 +134,26 @@ per-cell precise dep tracking. Phases:
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Chain100 | setup | 0.58 | 3.3 | 0.18× | TS wins |
-| Chain100 | bulkWrite | 0.73 | 1.7 | 0.43× | TS wins |
-| Chain100 | firstRecalc | 1.0 | 0.65 | 1.57× | WASM wins |
-| Chain100 | mutateThenRecalc | 0.39 | 0.21 | 1.85× | WASM wins |
-| Chain100 | steadyState | 0.01 | 0.01 | 1.34× | WASM edges |
-| Chain1k | setup | 0.11 | 0.10 | 1.15× | WASM edges |
-| Chain1k | bulkWrite | 1.2 | 6.1 | 0.20× | TS wins |
-| Chain1k | firstRecalc | 2.6 | 0.85 | 2.98× | WASM wins |
-| Chain1k | mutateThenRecalc | 1.1 | 0.95 | 1.10× | WASM edges |
-| Chain1k | steadyState | 0.00 | 0.00 | 0.77× | roughly tied |
-| Chain10k | setup | 0.11 | 0.07 | 1.63× | WASM wins |
-| Chain10k | bulkWrite | 6.5 | 34.3 | 0.19× | TS wins |
-| Chain10k | firstRecalc | 14.5 | 6.5 | 2.23× | WASM wins |
-| Chain10k | mutateThenRecalc | 9.4 | 8.7 | 1.08× | WASM edges |
-| Chain10k | steadyState | 0.00 | 0.01 | 0.58× | TS wins |
-| Chain100k | setup | 0.11 | 0.08 | 1.39× | WASM edges |
-| Chain100k | bulkWrite | 70.3 | 501 | 0.14× | TS wins |
-| Chain100k | firstRecalc | 131 | 118 | 1.11× | WASM edges |
-| Chain100k | mutateThenRecalc | 148 | 211 | 0.70× | roughly tied |
-| Chain100k | steadyState | 0.01 | 0.02 | 0.43× | TS wins |
+| Chain100 | setup | 0.63 | 2.1 | 0.29× | TS wins |
+| Chain100 | bulkWrite | 0.79 | 1.6 | 0.48× | TS wins |
+| Chain100 | firstRecalc | 1.1 | 0.71 | 1.54× | WASM wins |
+| Chain100 | mutateThenRecalc | 0.49 | 0.17 | 2.97× | WASM wins |
+| Chain100 | steadyState | 0.02 | 0.01 | 4.13× | WASM wins |
+| Chain1k | setup | 0.13 | 0.11 | 1.27× | WASM edges |
+| Chain1k | bulkWrite | 1.5 | 5.0 | 0.30× | TS wins |
+| Chain1k | firstRecalc | 3.2 | 0.83 | 3.89× | WASM wins |
+| Chain1k | mutateThenRecalc | 1.8 | 1.00 | 1.76× | WASM wins |
+| Chain1k | steadyState | 0.00 | 0.04 | 0.11× | TS wins |
+| Chain10k | setup | 0.08 | 0.07 | 1.25× | WASM edges |
+| Chain10k | bulkWrite | 7.2 | 29.8 | 0.24× | TS wins |
+| Chain10k | firstRecalc | 27.9 | 6.4 | 4.37× | WASM wins |
+| Chain10k | mutateThenRecalc | 14.4 | 8.8 | 1.65× | WASM wins |
+| Chain10k | steadyState | 0.01 | 0.01 | 0.68× | roughly tied |
+| Chain100k | setup | 0.11 | 0.08 | 1.34× | WASM edges |
+| Chain100k | bulkWrite | 71.1 | 278 | 0.26× | TS wins |
+| Chain100k | firstRecalc | 159 | 66.6 | 2.39× | WASM wins |
+| Chain100k | mutateThenRecalc | 161 | 113 | 1.42× | WASM edges |
+| Chain100k | steadyState | 0.01 | 0.01 | 0.58× | TS wins |
 
 ### evalCount delta per phase
 
@@ -186,26 +186,26 @@ For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` 
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Chain100 | setup | 519 MB | 520 MB |
-| Chain100 | bulkWrite | 519 MB | 520 MB |
-| Chain100 | firstRecalc | 519 MB | 521 MB |
-| Chain100 | mutateThenRecalc | 519 MB | 521 MB |
-| Chain100 | steadyState | 519 MB | 521 MB |
-| Chain1k | setup | 527 MB | 527 MB |
-| Chain1k | bulkWrite | 527 MB | 528 MB |
-| Chain1k | firstRecalc | 527 MB | 528 MB |
-| Chain1k | mutateThenRecalc | 527 MB | 528 MB |
-| Chain1k | steadyState | 527 MB | 528 MB |
-| Chain10k | setup | 528 MB | 553 MB |
-| Chain10k | bulkWrite | 530 MB | 560 MB |
-| Chain10k | firstRecalc | 542 MB | 560 MB |
-| Chain10k | mutateThenRecalc | 553 MB | 560 MB |
-| Chain10k | steadyState | 553 MB | 560 MB |
-| Chain100k | setup | 567 MB | 669 MB |
-| Chain100k | bulkWrite | 597 MB | 717 MB |
-| Chain100k | firstRecalc | 621 MB | 717 MB |
-| Chain100k | mutateThenRecalc | 741 MB | 717 MB |
-| Chain100k | steadyState | 669 MB | 717 MB |
+| Chain100 | setup | 500 MB | 501 MB |
+| Chain100 | bulkWrite | 500 MB | 502 MB |
+| Chain100 | firstRecalc | 500 MB | 502 MB |
+| Chain100 | mutateThenRecalc | 500 MB | 502 MB |
+| Chain100 | steadyState | 500 MB | 502 MB |
+| Chain1k | setup | 507 MB | 508 MB |
+| Chain1k | bulkWrite | 508 MB | 510 MB |
+| Chain1k | firstRecalc | 508 MB | 510 MB |
+| Chain1k | mutateThenRecalc | 508 MB | 511 MB |
+| Chain1k | steadyState | 508 MB | 509 MB |
+| Chain10k | setup | 509 MB | 517 MB |
+| Chain10k | bulkWrite | 510 MB | 524 MB |
+| Chain10k | firstRecalc | 512 MB | 524 MB |
+| Chain10k | mutateThenRecalc | 521 MB | 524 MB |
+| Chain10k | steadyState | 517 MB | 524 MB |
+| Chain100k | setup | 527 MB | 997 MB |
+| Chain100k | bulkWrite | 562 MB | 985 MB |
+| Chain100k | firstRecalc | 677 MB | 985 MB |
+| Chain100k | mutateThenRecalc | 997 MB | 986 MB |
+| Chain100k | steadyState | 997 MB | 986 MB |
 
 ### Chain crossover trace (mutateThenRecalc)
 
@@ -213,9 +213,225 @@ Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
 This is THE chain-workload diagnostic. If Rust ever beats TS in this
 repo, it should show up here first.
 
-- Chain100=1.85×, Chain1k=1.10×, Chain10k=1.08×, Chain100k=0.70×
-- crossover: Chain100 (ratio 1.85×)
+- Chain100=2.97×, Chain1k=1.76×, Chain10k=1.65×, Chain100k=1.42×
+- crossover: Chain100 (ratio 2.97×)
 <!-- BENCH:CHAIN:END -->
+
+<!-- BENCH:RANGE:START -->
+*Last range bench run: 2026-05-28T04:40:00.359Z*
+
+## Range-heavy workloads
+
+Three patterns exercising the dep graph at different angles:
+
+- **FanOut**: `A1` → `B1..BN = A1 * k`. Mutating `A1` invalidates
+  N point-cell dependents through the `cell_dependents` map.
+  Stresses the cell→cell BFS half.
+- **FanIn**: `A1..AN` literals → `B1 = SUM(A1:AN)`, `B2 = AVERAGE(…)`,
+  `B3 = COUNTIF(…)`. Mutating one A cell pulls all aggregators dirty.
+  Stresses the range-contains-cell path in `dependents_of`.
+- **Stripe**: `B_i = SUM(A_i : A_{i+9})` for i in 1..N — overlapping
+  10-cell windows. Bulk import installs N ranges into the bucket
+  index; mutate one A cell to dirty up to 10 SUMs in one BFS step.
+  This is the workload the BFS range-coalescing change targets.
+
+Phases match the chain suite: setup → bulkWrite → firstRecalc →
+mutateThenRecalc (median of `runs`).
+
+### ms per phase
+
+| Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| FanOut1k | setup | 0.55 | 2.2 | 0.25× | TS wins |
+| FanOut1k | bulkWrite | 1.9 | 6.1 | 0.32× | TS wins |
+| FanOut1k | firstRecalc | 6.7 | 4.0 | 1.69× | WASM wins |
+| FanOut1k | mutateThenRecalc | 4.3 | 2.6 | 1.64× | WASM wins |
+| FanOut10k | setup | 0.14 | 0.10 | 1.44× | WASM edges |
+| FanOut10k | bulkWrite | 12.1 | 27.0 | 0.45× | TS wins |
+| FanOut10k | firstRecalc | 38.9 | 19.2 | 2.02× | WASM wins |
+| FanOut10k | mutateThenRecalc | 42.6 | 20.9 | 2.04× | WASM wins |
+| FanOut100k | setup | 0.10 | 0.08 | 1.30× | WASM edges |
+| FanOut100k | bulkWrite | 71.0 | 227 | 0.31× | TS wins |
+| FanOut100k | firstRecalc | 405 | 184 | 2.20× | WASM wins |
+| FanOut100k | mutateThenRecalc | 595 | 234 | 2.55× | WASM wins |
+| FanIn1k | setup | 0.60 | 1.9 | 0.32× | TS wins |
+| FanIn1k | bulkWrite | 0.21 | 0.81 | 0.26× | TS wins |
+| FanIn1k | firstRecalc | 1.9 | 3.5 | 0.54× | TS wins |
+| FanIn1k | mutateThenRecalc | 0.78 | 0.94 | 0.82× | roughly tied |
+| FanIn10k | setup | 2.9 | 16.4 | 0.17× | TS wins |
+| FanIn10k | bulkWrite | 0.53 | 4.5 | 0.12× | TS wins |
+| FanIn10k | firstRecalc | 7.2 | 8.9 | 0.81× | roughly tied |
+| FanIn10k | mutateThenRecalc | 6.9 | 8.6 | 0.80× | roughly tied |
+| FanIn100k | setup | 30.1 | 162 | 0.19× | TS wins |
+| FanIn100k | bulkWrite | 5.4 | 50.1 | 0.11× | TS wins |
+| FanIn100k | firstRecalc | 81.8 | 113 | 0.73× | roughly tied |
+| FanIn100k | mutateThenRecalc | 81.9 | 122 | 0.67× | roughly tied |
+| Stripe1k | setup | 0.29 | 1.6 | 0.18× | TS wins |
+| Stripe1k | bulkWrite | 1.3 | 5.5 | 0.25× | TS wins |
+| Stripe1k | firstRecalc | 6.1 | 5.3 | 1.13× | WASM edges |
+| Stripe1k | mutateThenRecalc | 6.5 | 1.2 | 5.58× | WASM wins |
+| Stripe10k | setup | 5.2 | 15.5 | 0.34× | TS wins |
+| Stripe10k | bulkWrite | 9.1 | 51.0 | 0.18× | TS wins |
+| Stripe10k | firstRecalc | 63.6 | 51.2 | 1.24× | WASM edges |
+| Stripe10k | mutateThenRecalc | 70.6 | 11.3 | 6.24× | WASM wins |
+| Stripe100k | setup | 27.5 | 156 | 0.18× | TS wins |
+| Stripe100k | bulkWrite | 109 | 815 | 0.13× | TS wins |
+| Stripe100k | firstRecalc | 699 | 541 | 1.29× | WASM edges |
+| Stripe100k | mutateThenRecalc | 914 | 124 | 7.36× | WASM wins |
+
+### evalCount delta per phase
+
+| Tier | Phase | TS evals | WASM evals |
+| --- | --- | --- | --- |
+| FanOut1k | setup | 0 | 0 |
+| FanOut1k | bulkWrite | 0 | 0 |
+| FanOut1k | firstRecalc | 1,000 | 1,000 |
+| FanOut1k | mutateThenRecalc | 1,000 | 1,000 |
+| FanOut10k | setup | 0 | 0 |
+| FanOut10k | bulkWrite | 0 | 0 |
+| FanOut10k | firstRecalc | 10,000 | 10,000 |
+| FanOut10k | mutateThenRecalc | 10,000 | 10,000 |
+| FanOut100k | setup | 0 | 0 |
+| FanOut100k | bulkWrite | 0 | 0 |
+| FanOut100k | firstRecalc | 100,000 | 100,000 |
+| FanOut100k | mutateThenRecalc | 100,000 | 100,000 |
+| FanIn1k | setup | 0 | 0 |
+| FanIn1k | bulkWrite | 0 | 0 |
+| FanIn1k | firstRecalc | 3 | 3 |
+| FanIn1k | mutateThenRecalc | 3 | 3 |
+| FanIn10k | setup | 0 | 0 |
+| FanIn10k | bulkWrite | 0 | 0 |
+| FanIn10k | firstRecalc | 3 | 3 |
+| FanIn10k | mutateThenRecalc | 3 | 3 |
+| FanIn100k | setup | 0 | 0 |
+| FanIn100k | bulkWrite | 0 | 0 |
+| FanIn100k | firstRecalc | 3 | 3 |
+| FanIn100k | mutateThenRecalc | 3 | 3 |
+| Stripe1k | setup | 0 | 0 |
+| Stripe1k | bulkWrite | 0 | 0 |
+| Stripe1k | firstRecalc | 1,000 | 1,000 |
+| Stripe1k | mutateThenRecalc | 1,000 | 10 |
+| Stripe10k | setup | 0 | 0 |
+| Stripe10k | bulkWrite | 0 | 0 |
+| Stripe10k | firstRecalc | 10,000 | 10,000 |
+| Stripe10k | mutateThenRecalc | 10,000 | 10 |
+| Stripe100k | setup | 0 | 0 |
+| Stripe100k | bulkWrite | 0 | 0 |
+| Stripe100k | firstRecalc | 100,000 | 100,000 |
+| Stripe100k | mutateThenRecalc | 100,000 | 10 |
+
+### Peak RSS by phase (MB)
+
+| Tier | Phase | TS RSS | WASM RSS |
+| --- | --- | --- | --- |
+| FanOut1k | setup | 543 MB | 546 MB |
+| FanOut1k | bulkWrite | 544 MB | 548 MB |
+| FanOut1k | firstRecalc | 545 MB | 548 MB |
+| FanOut1k | mutateThenRecalc | 545 MB | 548 MB |
+| FanOut10k | setup | 553 MB | 606 MB |
+| FanOut10k | bulkWrite | 572 MB | 611 MB |
+| FanOut10k | firstRecalc | 582 MB | 611 MB |
+| FanOut10k | mutateThenRecalc | 606 MB | 611 MB |
+| FanOut100k | setup | 620 MB | 790 MB |
+| FanOut100k | bulkWrite | 654 MB | 844 MB |
+| FanOut100k | firstRecalc | 769 MB | 791 MB |
+| FanOut100k | mutateThenRecalc | 790 MB | 791 MB |
+| FanIn1k | setup | 791 MB | 791 MB |
+| FanIn1k | bulkWrite | 791 MB | 791 MB |
+| FanIn1k | firstRecalc | 791 MB | 792 MB |
+| FanIn1k | mutateThenRecalc | 791 MB | 792 MB |
+| FanIn10k | setup | 792 MB | 793 MB |
+| FanIn10k | bulkWrite | 793 MB | 793 MB |
+| FanIn10k | firstRecalc | 793 MB | 793 MB |
+| FanIn10k | mutateThenRecalc | 794 MB | 793 MB |
+| FanIn100k | setup | 803 MB | 808 MB |
+| FanIn100k | bulkWrite | 810 MB | 809 MB |
+| FanIn100k | firstRecalc | 801 MB | 809 MB |
+| FanIn100k | mutateThenRecalc | 805 MB | 809 MB |
+| Stripe1k | setup | 809 MB | 809 MB |
+| Stripe1k | bulkWrite | 809 MB | 809 MB |
+| Stripe1k | firstRecalc | 809 MB | 817 MB |
+| Stripe1k | mutateThenRecalc | 809 MB | 830 MB |
+| Stripe10k | setup | 831 MB | 864 MB |
+| Stripe10k | bulkWrite | 850 MB | 864 MB |
+| Stripe10k | firstRecalc | 856 MB | 864 MB |
+| Stripe10k | mutateThenRecalc | 864 MB | 864 MB |
+| Stripe100k | setup | 876 MB | 898 MB |
+| Stripe100k | bulkWrite | 883 MB | 950 MB |
+| Stripe100k | firstRecalc | 876 MB | 950 MB |
+| Stripe100k | mutateThenRecalc | 898 MB | 950 MB |
+<!-- BENCH:RANGE:END -->
+
+## Findings (2026-05-28 — Range workloads + bulk_import flush coalescing)
+
+Three new workload patterns were added to exercise the dep-graph range
+half:
+
+- **FanOut** — `A1` → `B1..BN = A1 * k`. Mutating `A1` cascades through
+  the point-cell dep map; zero range deps registered. Probes
+  `cell_dependents` BFS purity.
+- **FanIn** — `A1..AN` → `B1 = SUM(A1:AN)` + AVERAGE + COUNTIF over the
+  same wide range. Mutating one A cell dirties three aggregators
+  through `range_dependents`.
+- **Stripe** — `B_i = SUM(A_i : A_{i+9})` for `i = 1..N`. The most
+  range-heavy pattern: every A cell sits inside ~10 overlapping
+  windows, and bulk_import registers N narrow ranges into the
+  bucket index.
+
+### bulk_import flush coalescing — investigated, not landed
+
+Agent C's earlier `perf-rust-bulk-import-trace` profile flagged the
+per-touched-cell `candidates_for(addr)` walk in `BulkLoader::flush` as
+the next O(T·R) target. The plan: replace the per-address range walk
+with a single pass over `range_dependents.formulas`, intersected with
+a row-bucketed view of `(touched ∪ dirty)`. Implemented as
+`RangeDependentIndex::coalesced_dirty_into` and a two-pass BFS gated
+on `range_count > threshold && touched_len > threshold`.
+
+The coalescing implementation produces the **same dirty closure** as
+the legacy BFS (verified by `range_dep_coalesced_matches_per_address`
+and `bulk_load_stripe_range_coalesce_matches_legacy`), but on the
+Stripe100k tier it was consistently 5–8% **slower** than the legacy
+path. Reason: Track-E's bucket index already makes
+`candidates_for(addr)` essentially allocation-free + hashmap-cheap for
+narrow ranges. The per-pass `dirty_by_row` construction and
+per-range scan in the coalesced path overshoots its savings.
+
+What DID help: amortizing the candidate-range `Vec` allocation across
+the BFS via a new `candidates_for_into` / `dependents_of_into_with_scratch`
+pair. The same scratch `Vec<CellRange>` lives across every visited
+address in `BulkLoader::flush`. Result on the new range tiers (WASM,
+median across runs):
+
+| Tier | bulkWrite baseline | with scratch | Δ |
+| --- | --- | --- | --- |
+| FanOut100k | 266 ms | 227 ms | -15 % |
+| FanIn100k | 58 ms | 50 ms | -14 % |
+| Stripe100k | 877 ms | 815 ms | -7 % |
+
+`firstRecalc` and `mutateThenRecalc` are unchanged within noise — those
+phases hit the per-address `mark_dependents_dirty` path, which only
+touches one cell at a time and so doesn't benefit from the scratch
+buffer.
+
+The coalesced two-pass implementation is left in place (gated off by
+default) so future workloads dominated by `wide_ranges` — where the
+bucket index degenerates to a linear scan — can flip it on without
+re-deriving the design. `sheet.rs::BulkLoader::flush` has the
+threshold knob.
+
+### Stripe diagnostic (the workload the coalescing was meant for)
+
+| Phase | TS (ms) | WASM (ms) | Ratio | Note |
+| --- | --- | --- | --- | --- |
+| bulkWrite | 109 | 815 | 7.5× | WASM still 7× slower at bulk install |
+| firstRecalc | 699 | 541 | 1.29× | WASM edges TS |
+| mutateThenRecalc | 914 | 124 | 7.36× | WASM wins decisively — 10 evals vs 100k |
+
+The `mutateThenRecalc` column is the WASM win: precise per-cell
+dependency tracking lets it re-evaluate exactly the 10 SUMs whose
+window contains the mutated cell, vs TS's broad-invalidation 100k
+formula re-evaluations.
 
 ## Findings (2026-05-27 — XLarge / Mega / Ultra sweep)
 
@@ -730,3 +946,56 @@ The remaining ~14× super-linear step from Chain10k → Chain100k
 (34→501 ms) is consistent with HashMap rehash + per-cell scaffold
 costs (O(n log n) territory), not the cycle check. That's the next
 target if/when chain bulkWrite needs further compression.
+
+## Follow-up (2026-05-28) — Chain100k bulkWrite scaffold-alloc compression
+
+Native scaling tracer (`chain_install_scaling_trace_workbook`, runs in
+release; gated `#[ignore]`) showed `Workbook::bulk_load` scales near-
+linearly on x86_64 — 1k=4 ms, 10k=26 ms, 100k=149 ms (5.7× per 10×).
+The WASM-only super-linearity at 10k→100k therefore wasn't algorithmic
+— it was constant-factor wasm32 allocator pressure stacking on top of
+the per-cell scaffolding work.
+
+Three surgical fixes target the per-formula scaffold cost:
+
+1. **Drop the workbook-side double-parse.** `Workbook::bulk_load` already
+   parses every formula to run its cross-sheet cycle check, then the
+   sheet-side `BulkLoader::set_formula` re-parsed it from scratch.
+   Now the workbook queues the already-parsed `Expr` alongside the
+   source string; `Sheet::set_formula_pre_parsed` consumes it
+   directly. `parse_formula` allocates a `Vec<char>` per source
+   character plus boxed `Expr` nodes per binop / cellref / funccall,
+   so 100k formulas saved 100k+ allocs.
+
+2. **Skip the per-formula `HashSet::clone` pair.** `BulkLoader::set_formula`
+   was cloning `deps` and `range_deps` to feed both the dep-index
+   inserts and the new `FormulaRecord`. Now the indexes consume `&`
+   borrows first, then the original sets *move* into the record —
+   killing 200k single-bucket HashSet allocations per 100k-formula
+   batch. Mirrored in the non-bulk `Sheet::set_formula` path for
+   consistency.
+
+3. **Pre-size HashMaps once per batch.** `Workbook::bulk_load` flush
+   now calls `Sheet::reserve_for_bulk_install(ops.len())` before
+   replaying per-sheet ops. `cell_dependents` / `formula_exprs` /
+   `formula_texts` all skip the ~log2(N) rehashes that previously
+   ran inside the install hot loop. (Each rehash is O(current
+   entries), so cumulative wasted copies were ~2× the final size.)
+
+| Tier | WASM bulkWrite post-cycle-fix | WASM bulkWrite post-scaffold-fix | Speedup |
+| --- | ---: | ---: | ---: |
+| Chain100 | 1.7 ms | 1.6 ms | 1.06× |
+| Chain1k | 6.1 ms | 5.1 ms | 1.20× |
+| Chain10k | 34.3 ms | 31 ms | 1.11× |
+| Chain100k | 501 ms | 275 ms | 1.82× |
+
+Step ratio per 10× cells, post-fix: 3.2× → 6.0× → 9.0×. The 14.6×
+step at 10k→100k is gone; the remaining sub-linearity at the small
+tiers is constant overhead amortizing. Native (x86_64) 100k Workbook
+bulk_load = 143 ms post-fix, so the WASM/native ratio is now 1.92× —
+typical wasm32 overhead, no longer a target.
+
+Pinned natively by `chain_install_scaling_trace` (Sheet) and
+`chain_install_scaling_trace_workbook` (Workbook); both
+`#[ignore]`'d, run with
+`cargo test --release chain_install_scaling_trace -- --ignored --nocapture`.

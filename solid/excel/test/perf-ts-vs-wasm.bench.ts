@@ -1093,6 +1093,647 @@ describePerf('Chain dependency workload (EINFACH_PERF=1)', () => {
   }
 })
 
+// ===========================================================================
+// RANGE-HEAVY WORKLOADS
+//
+// Orthogonal to the size tiers above and to the chain workload. These tiers
+// exist to exercise the `range_dependents` index — the bookkeeping the dep
+// graph uses for formulas referring to ranges (SUM, AVERAGE, COUNTIF, …) —
+// in three patterns that real spreadsheets see:
+//
+//   - FanOut: one source cell drives many dependents (`B1..Bn = =A1*k`).
+//     Pure point-cell deps, no range deps. Validates the cell_dependents
+//     half of the dirty BFS.
+//   - FanIn: one wide range feeds a small number of aggregators
+//     (`B1 = =SUM(A1:An)`, B2 = AVERAGE, B3 = COUNTIF). Mutating one A cell
+//     pulls all aggregators dirty. Validates the `candidates_for` lookup
+//     and one-range-contains-cell path.
+//   - Stripe: every row has a SUM over a 10-cell window overlapping the
+//     previous row's window. The result is a sheet with hundreds /
+//     thousands of overlapping ranges; mutating one A cell can touch up
+//     to 10 SUMs, and bulk_import populates the range_dependents bucket
+//     index heavily. This is the workload the BFS coalescing was
+//     designed for.
+//
+// Phases (shared by all three patterns):
+//   - setup: create the workbook + seed the A column with literals.
+//   - bulkWrite: install all dependent formulas in one bulk import.
+//   - firstRecalc: read every dependent cell once. Forces evaluation.
+//   - mutateThenRecalc: change one A cell, re-read every dependent.
+//     Median over `runs`.
+//
+// Per-phase diagnostics: ms (perf.now delta), evalCount delta, RSS at
+// phase exit.
+// ===========================================================================
+
+type RangeWorkloadKind = 'fanOut' | 'fanIn' | 'stripe'
+
+interface RangeSpec {
+  kind: RangeWorkloadKind
+  name: string
+  /// FanOut: dependent count. FanIn: A-column size. Stripe: row count.
+  size: number
+  runs: number
+  timeoutMs: number
+}
+
+const RANGE_SPECS: RangeSpec[] = [
+  // FanOut tiers: 1 source, N point-cell dependents.
+  { kind: 'fanOut', name: 'FanOut1k', size: 1_000, runs: 3, timeoutMs: 60_000 },
+  { kind: 'fanOut', name: 'FanOut10k', size: 10_000, runs: 3, timeoutMs: 300_000 },
+  { kind: 'fanOut', name: 'FanOut100k', size: 100_000, runs: 1, timeoutMs: 900_000 },
+  // FanIn tiers: 1 wide range, 3 aggregators.
+  { kind: 'fanIn', name: 'FanIn1k', size: 1_000, runs: 3, timeoutMs: 60_000 },
+  { kind: 'fanIn', name: 'FanIn10k', size: 10_000, runs: 3, timeoutMs: 300_000 },
+  { kind: 'fanIn', name: 'FanIn100k', size: 100_000, runs: 1, timeoutMs: 900_000 },
+  // Stripe tiers: N overlapping SUMs over a window of 10.
+  { kind: 'stripe', name: 'Stripe1k', size: 1_000, runs: 3, timeoutMs: 60_000 },
+  { kind: 'stripe', name: 'Stripe10k', size: 10_000, runs: 3, timeoutMs: 300_000 },
+  { kind: 'stripe', name: 'Stripe100k', size: 100_000, runs: 1, timeoutMs: 900_000 },
+]
+
+const STRIPE_WINDOW = 10
+
+interface RangeWorkload {
+  kind: RangeWorkloadKind
+  name: string
+  size: number
+  /// Initial seed cells (A column).
+  seeds: SeedCell[]
+  /// Formulas to install in bulkWrite.
+  formulas: FormulaCell[]
+  /// Addresses read during firstRecalc / mutateThenRecalc.
+  readAddrs: string[]
+  /// Address mutated in mutateThenRecalc.
+  mutateAddr: string
+}
+
+function buildRangeWorkload(spec: RangeSpec): RangeWorkload {
+  const seeds: SeedCell[] = []
+  const formulas: FormulaCell[] = []
+  const readAddrs: string[] = []
+  // A small deterministic seed pool that's still reproducible across runs.
+  const rng = makeRng(0xfa11ce + spec.size)
+
+  if (spec.kind === 'fanOut') {
+    // A1 = 1, then B1..BN = =A1*k. Mutating A1 invalidates all N
+    // dependents through the cell_dependents map.
+    seeds.push({ row: 0, col: 0, value: 1 })
+    for (let i = 0; i < spec.size; i += 1) {
+      formulas.push({ row: i, col: 1, formula: `=${a1(0, 0)}*${i + 1}` })
+      readAddrs.push(a1(i, 1))
+    }
+    return {
+      kind: spec.kind,
+      name: spec.name,
+      size: spec.size,
+      seeds,
+      formulas,
+      readAddrs,
+      mutateAddr: a1(0, 0),
+    }
+  }
+
+  if (spec.kind === 'fanIn') {
+    // A1..AN literals, B1 = SUM(A1:AN), B2 = AVERAGE(A1:AN),
+    // B3 = COUNTIF(A1:AN,">50"). Mutating one A cell pulls all three
+    // aggregators dirty.
+    for (let row = 0; row < spec.size; row += 1) {
+      seeds.push({ row, col: 0, value: Math.floor(rng() * 100) })
+    }
+    const last = a1(spec.size - 1, 0)
+    formulas.push({ row: 0, col: 1, formula: `=SUM(${a1(0, 0)}:${last})` })
+    formulas.push({ row: 1, col: 1, formula: `=AVERAGE(${a1(0, 0)}:${last})` })
+    formulas.push({ row: 2, col: 1, formula: `=COUNTIF(${a1(0, 0)}:${last},">50")` })
+    readAddrs.push(a1(0, 1), a1(1, 1), a1(2, 1))
+    return {
+      kind: spec.kind,
+      name: spec.name,
+      size: spec.size,
+      seeds,
+      formulas,
+      readAddrs,
+      // Mutate a mid-column cell so the bucket lookup walks deeper
+      // into the index than picking row 0 would.
+      mutateAddr: a1(Math.floor(spec.size / 2), 0),
+    }
+  }
+
+  // Stripe: A1..AN seeded, B_i = SUM(A_i:A_{i+window-1}). Each A cell
+  // sits in up to `STRIPE_WINDOW` overlapping ranges; mutating any one
+  // A cell pulls up to that many SUMs dirty in a single BFS step.
+  for (let row = 0; row < spec.size; row += 1) {
+    seeds.push({ row, col: 0, value: Math.floor(rng() * 100) })
+  }
+  for (let i = 0; i < spec.size; i += 1) {
+    const lo = i
+    const hi = Math.min(spec.size - 1, i + STRIPE_WINDOW - 1)
+    formulas.push({
+      row: i,
+      col: 1,
+      formula: `=SUM(${a1(lo, 0)}:${a1(hi, 0)})`,
+    })
+    readAddrs.push(a1(i, 1))
+  }
+  return {
+    kind: spec.kind,
+    name: spec.name,
+    size: spec.size,
+    seeds,
+    formulas,
+    readAddrs,
+    // Mutate a mid-column cell: this address sits inside ~STRIPE_WINDOW
+    // ranges, so the dirty BFS will exercise the range-dependent walk
+    // hardest at that row.
+    mutateAddr: a1(Math.floor(spec.size / 2), 0),
+  }
+}
+
+interface RangePhaseTimings {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  mutateThenRecalc: number
+}
+
+interface RangePhaseEvalDelta {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  mutateThenRecalc: number
+}
+
+interface RangePhaseMem {
+  setup: number
+  bulkWrite: number
+  firstRecalc: number
+  mutateThenRecalc: number
+}
+
+interface RangeBackendOutcome {
+  timings: RangePhaseTimings | undefined
+  evals: RangePhaseEvalDelta | undefined
+  mem: RangePhaseMem | undefined
+  error: string | undefined
+}
+
+interface RangeResult {
+  ts: RangeBackendOutcome
+  wasm: RangeBackendOutcome
+}
+
+const rangeResults = new Map<string, RangeResult>()
+
+let tsRangeFailedAtOrAbove: number | undefined
+let wasmRangeFailedAtOrAbove: number | undefined
+
+interface RangeDriver {
+  setup(): Promise<void>
+  bulkWrite(): Promise<void>
+  readAll(): Promise<void>
+  mutateOne(value: number): Promise<void>
+  evalCount(): number
+  dispose(): void
+}
+
+function makeTsRangeDriver(workload: RangeWorkload): RangeDriver {
+  let runtime: ExcelCoreTsWorkerRuntime
+  let rpcId = 0
+  const rpc = async (msg: Record<string, unknown>) => {
+    rpcId += 1
+    const resp = await runtime.handle({ id: rpcId, ...msg })
+    if (!resp.ok) {
+      throw new Error(`ts rpc ${String(msg.cmd)} failed: ${resp.error.code} ${resp.error.message}`)
+    }
+    return resp.result
+  }
+
+  return {
+    async setup() {
+      runtime = createWorkerRuntimeTs()
+      await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+      const state = runtime.state()
+      const sheet = state.sheets[0]
+      const inputs = workload.seeds.map((seed) => ({
+        row: seed.row,
+        col: seed.col,
+        input: String(seed.value),
+      }))
+      state.workbook.bulkApply(sheet.id, inputs)
+    },
+    async bulkWrite() {
+      const state = runtime.state()
+      const sheet = state.sheets[0]
+      const inputs = workload.formulas.map((f) => ({
+        row: f.row,
+        col: f.col,
+        input: f.formula,
+      }))
+      state.workbook.bulkApply(sheet.id, inputs)
+    },
+    async readAll() {
+      await rpc({
+        cmd: 'readCells',
+        cells: workload.readAddrs.map((addr) => ({ sheet: 0, addr })),
+      })
+    },
+    async mutateOne(value: number) {
+      await rpc({
+        cmd: 'setCell',
+        sheet: 0,
+        addr: workload.mutateAddr,
+        value: { type: 'number', value },
+      })
+    },
+    evalCount() {
+      return runtime.state().workbook.debugFormulaEvalCount(0)
+    },
+    dispose() {
+      // No-op — runtime is GC'd along with the closure.
+    },
+  }
+}
+
+function makeWasmRangeDriver(workload: RangeWorkload): RangeDriver {
+  let wb: WasmWorkbookLike | undefined
+
+  return {
+    async setup() {
+      if (!WasmModule) throw new Error('wasm module not loaded')
+      wb = new WasmModule.WasmWorkbook()
+      const imports = workload.seeds.map((seed) => ({
+        sheet: 0,
+        row: seed.row,
+        col: seed.col,
+        kind: 'number' as const,
+        value: seed.value,
+      }))
+      wb.bulk_import_cells(imports)
+    },
+    async bulkWrite() {
+      if (!wb) throw new Error('wasm wb not initialized')
+      const imports = workload.formulas.map((f) => ({
+        sheet: 0,
+        row: f.row,
+        col: f.col,
+        kind: 'formula' as const,
+        value: f.formula,
+      }))
+      wb.bulk_import_cells(imports)
+    },
+    async readAll() {
+      if (!wb) throw new Error('wasm wb not initialized')
+      for (const addr of workload.readAddrs) {
+        wb.snapshotCell(0, addr)
+      }
+    },
+    async mutateOne(value: number) {
+      if (!wb) throw new Error('wasm wb not initialized')
+      wb.set_cell_number(0, workload.mutateAddr, value)
+    },
+    evalCount() {
+      if (!wb) return 0
+      return wb.debug_formula_eval_count(0)
+    },
+    dispose() {
+      if (wb) wb.free()
+      wb = undefined
+    },
+  }
+}
+
+async function runRangeOnce(
+  makeDriver: (workload: RangeWorkload) => RangeDriver,
+  workload: RangeWorkload,
+  runs: number,
+): Promise<{
+  timings: RangePhaseTimings
+  evals: RangePhaseEvalDelta
+  mem: RangePhaseMem
+}> {
+  const driver = makeDriver(workload)
+  try {
+    // ---- setup -------------------------------------------------------
+    let evalBefore = 0
+    const setupMs = await time(() => driver.setup())
+    const setupEval = driver.evalCount() - evalBefore
+    const setupRss = rssMb()
+
+    // ---- bulkWrite ---------------------------------------------------
+    evalBefore = driver.evalCount()
+    const bulkWriteMs = await time(() => driver.bulkWrite())
+    const bulkWriteEval = driver.evalCount() - evalBefore
+    const bulkWriteRss = rssMb()
+
+    // ---- firstRecalc -------------------------------------------------
+    evalBefore = driver.evalCount()
+    const firstRecalcMs = await time(() => driver.readAll())
+    const firstRecalcEval = driver.evalCount() - evalBefore
+    const firstRecalcRss = rssMb()
+
+    // ---- mutateThenRecalc (median over `runs`) ----------------------
+    const mutMs: number[] = []
+    const mutEval: number[] = []
+    let mutRssMax = 0
+    for (let i = 0; i < runs; i += 1) {
+      const newValue = i + 2
+      evalBefore = driver.evalCount()
+      const ms = await time(async () => {
+        await driver.mutateOne(newValue)
+        await driver.readAll()
+      })
+      const delta = driver.evalCount() - evalBefore
+      mutMs.push(ms)
+      mutEval.push(delta)
+      const r = rssMb()
+      if (r > mutRssMax) mutRssMax = r
+    }
+    const mutateThenRecalcMs = median(mutMs)
+    const mutateThenRecalcEval = Math.round(median(mutEval))
+
+    return {
+      timings: {
+        setup: setupMs,
+        bulkWrite: bulkWriteMs,
+        firstRecalc: firstRecalcMs,
+        mutateThenRecalc: mutateThenRecalcMs,
+      },
+      evals: {
+        setup: setupEval,
+        bulkWrite: bulkWriteEval,
+        firstRecalc: firstRecalcEval,
+        mutateThenRecalc: mutateThenRecalcEval,
+      },
+      mem: {
+        setup: setupRss,
+        bulkWrite: bulkWriteRss,
+        firstRecalc: firstRecalcRss,
+        mutateThenRecalc: mutRssMax,
+      },
+    }
+  } finally {
+    driver.dispose()
+  }
+}
+
+describePerf('Range-heavy workloads (EINFACH_PERF=1)', () => {
+  // Same lazy WASM bootstrap as the chain suite — keeps the range bench
+  // runnable in isolation via `-t "FanOut|FanIn|Stripe"`.
+  beforeAll(async () => {
+    if (WasmModule || !PERF_ENABLED) return
+    if (!existsSync(WASM_PKG_JS) || !existsSync(WASM_PKG_BIN)) {
+      wasmSkipReason = `wasm-pkg missing at ${WASM_PKG_JS}; run \`npm --prefix solid/excel run build:wasm\` first`
+      return
+    }
+    try {
+      const mod = (await import(WASM_PKG_JS)) as WasmModule
+      const bytes = readFileSync(WASM_PKG_BIN)
+      await mod.default({
+        module_or_path: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      })
+      WasmModule = mod
+      wasmAvailable = true
+    } catch (err) {
+      wasmSkipReason = `wasm load failed: ${err instanceof Error ? err.message : String(err)}`
+    }
+  })
+
+  afterAll(() => {
+    writeReport()
+  })
+
+  for (let idx = 0; idx < RANGE_SPECS.length; idx += 1) {
+    const spec = RANGE_SPECS[idx]
+    const tierIdx = idx
+    it(
+      `${spec.name} (${spec.kind} size=${spec.size})`,
+      async () => {
+        const workload = buildRangeWorkload(spec)
+        const rssAtStart = rssMb()
+        // eslint-disable-next-line no-console -- bench progress
+        console.log(
+          `[bench] ${spec.name}: kind=${spec.kind} size=${spec.size}; RSS=${rssAtStart.toFixed(0)} MB`,
+        )
+
+        // ---- TS backend ------------------------------------------------
+        let ts: RangeBackendOutcome = {
+          timings: undefined,
+          evals: undefined,
+          mem: undefined,
+          error: undefined,
+        }
+        if (tsRangeFailedAtOrAbove !== undefined && tierIdx >= tsRangeFailedAtOrAbove) {
+          ts = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `skipped (TS range failed at tier index ${tsRangeFailedAtOrAbove})`,
+          }
+        } else {
+          try {
+            const r = await runRangeOnce(makeTsRangeDriver, workload, spec.runs)
+            ts = { timings: r.timings, evals: r.evals, mem: r.mem, error: undefined }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            ts = { timings: undefined, evals: undefined, mem: undefined, error: msg }
+            tsRangeFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] TS range failed at ${spec.name}: ${msg}`)
+          }
+        }
+        maybeGc()
+
+        // ---- WASM backend ---------------------------------------------
+        let wasm: RangeBackendOutcome = {
+          timings: undefined,
+          evals: undefined,
+          mem: undefined,
+          error: undefined,
+        }
+        if (!wasmAvailable) {
+          wasm = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `wasm unavailable: ${wasmSkipReason}`,
+          }
+        } else if (
+          wasmRangeFailedAtOrAbove !== undefined &&
+          tierIdx >= wasmRangeFailedAtOrAbove
+        ) {
+          wasm = {
+            timings: undefined,
+            evals: undefined,
+            mem: undefined,
+            error: `skipped (WASM range failed at tier index ${wasmRangeFailedAtOrAbove})`,
+          }
+        } else {
+          try {
+            const r = await runRangeOnce(makeWasmRangeDriver, workload, spec.runs)
+            wasm = { timings: r.timings, evals: r.evals, mem: r.mem, error: undefined }
+          } catch (err) {
+            const msg = err instanceof Error ? `${err.name}: ${err.message}` : String(err)
+            wasm = { timings: undefined, evals: undefined, mem: undefined, error: msg }
+            wasmRangeFailedAtOrAbove = tierIdx
+            // eslint-disable-next-line no-console -- bench progress
+            console.error(`[bench] WASM range failed at ${spec.name}: ${msg}`)
+          }
+        }
+        maybeGc()
+
+        rangeResults.set(spec.name, { ts, wasm })
+
+        // Persist partial range results after each tier.
+        writeReport()
+      },
+      spec.timeoutMs,
+    )
+  }
+})
+
+function rangeCell(outcome: RangeBackendOutcome, phase: keyof RangePhaseTimings): string {
+  if (outcome.timings) return fmtMs(outcome.timings[phase])
+  if (outcome.error) {
+    const short = outcome.error.length > 40 ? `${outcome.error.slice(0, 37)}…` : outcome.error
+    return `*${short}*`
+  }
+  return '(not run)'
+}
+
+function rangeRatioCell(
+  ts: RangeBackendOutcome,
+  wasm: RangeBackendOutcome,
+  phase: keyof RangePhaseTimings,
+): string {
+  if (!ts.timings || !wasm.timings) return '—'
+  return fmtRatio(ts.timings[phase] / wasm.timings[phase])
+}
+
+function rangeVerdictCell(
+  ts: RangeBackendOutcome,
+  wasm: RangeBackendOutcome,
+  phase: keyof RangePhaseTimings,
+): string {
+  if (!ts.timings || !wasm.timings) {
+    if (ts.error && !wasm.error) return 'TS failed; WASM wins by default'
+    if (wasm.error && !ts.error) return 'WASM failed; TS wins by default'
+    if (ts.error && wasm.error) return 'both failed'
+    return 'n/a'
+  }
+  const r = ts.timings[phase] / wasm.timings[phase]
+  if (!Number.isFinite(r)) return 'n/a'
+  if (r > 1.5) return 'WASM wins'
+  if (r > 1.0) return 'WASM edges'
+  if (r > 0.66) return 'roughly tied'
+  return 'TS wins'
+}
+
+function rangeEvalCell(
+  outcome: RangeBackendOutcome,
+  phase: keyof RangePhaseEvalDelta,
+): string {
+  if (!outcome.evals) return outcome.error ? '*failed*' : '—'
+  return outcome.evals[phase].toLocaleString()
+}
+
+function rangeMemCell(outcome: RangeBackendOutcome, phase: keyof RangePhaseMem): string {
+  if (!outcome.mem) return outcome.error ? '*failed*' : '—'
+  return `${outcome.mem[phase].toFixed(0)} MB`
+}
+
+function rangeSection(): string[] {
+  const phases: Array<keyof RangePhaseTimings> = [
+    'setup',
+    'bulkWrite',
+    'firstRecalc',
+    'mutateThenRecalc',
+  ]
+  const out: string[] = []
+  out.push('## Range-heavy workloads')
+  out.push('')
+  out.push('Three patterns exercising the dep graph at different angles:')
+  out.push('')
+  out.push('- **FanOut**: `A1` → `B1..BN = A1 * k`. Mutating `A1` invalidates')
+  out.push('  N point-cell dependents through the `cell_dependents` map.')
+  out.push('  Stresses the cell→cell BFS half.')
+  out.push('- **FanIn**: `A1..AN` literals → `B1 = SUM(A1:AN)`, `B2 = AVERAGE(…)`,')
+  out.push('  `B3 = COUNTIF(…)`. Mutating one A cell pulls all aggregators dirty.')
+  out.push('  Stresses the range-contains-cell path in `dependents_of`.')
+  out.push('- **Stripe**: `B_i = SUM(A_i : A_{i+9})` for i in 1..N — overlapping')
+  out.push('  10-cell windows. Bulk import installs N ranges into the bucket')
+  out.push('  index; mutate one A cell to dirty up to 10 SUMs in one BFS step.')
+  out.push('  This is the workload the BFS range-coalescing change targets.')
+  out.push('')
+  out.push('Phases match the chain suite: setup → bulkWrite → firstRecalc →')
+  out.push('mutateThenRecalc (median of `runs`).')
+  out.push('')
+  out.push('### ms per phase')
+  out.push('')
+  out.push('| Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |')
+  out.push('| --- | --- | --- | --- | --- | --- |')
+  for (const spec of RANGE_SPECS) {
+    const row = rangeResults.get(spec.name)
+    if (!row) {
+      out.push(`| ${spec.name} | — | (not run) | (not run) | — | — |`)
+      continue
+    }
+    for (const phase of phases) {
+      out.push(
+        `| ${spec.name} | ${phase} | ${rangeCell(row.ts, phase)} | ${rangeCell(row.wasm, phase)} | ${rangeRatioCell(row.ts, row.wasm, phase)} | ${rangeVerdictCell(row.ts, row.wasm, phase)} |`,
+      )
+    }
+  }
+
+  // ---- eval delta -----------------------------------------------------
+  out.push('')
+  out.push('### evalCount delta per phase')
+  out.push('')
+  out.push('| Tier | Phase | TS evals | WASM evals |')
+  out.push('| --- | --- | --- | --- |')
+  for (const spec of RANGE_SPECS) {
+    const row = rangeResults.get(spec.name)
+    if (!row) continue
+    const evalPhases: Array<keyof RangePhaseEvalDelta> = [
+      'setup',
+      'bulkWrite',
+      'firstRecalc',
+      'mutateThenRecalc',
+    ]
+    for (const phase of evalPhases) {
+      out.push(
+        `| ${spec.name} | ${phase} | ${rangeEvalCell(row.ts, phase)} | ${rangeEvalCell(row.wasm, phase)} |`,
+      )
+    }
+  }
+
+  // ---- RSS ------------------------------------------------------------
+  const anyMem = Array.from(rangeResults.values()).some((r) => r.ts.mem || r.wasm.mem)
+  if (anyMem) {
+    out.push('')
+    out.push('### Peak RSS by phase (MB)')
+    out.push('')
+    out.push('| Tier | Phase | TS RSS | WASM RSS |')
+    out.push('| --- | --- | --- | --- |')
+    for (const spec of RANGE_SPECS) {
+      const row = rangeResults.get(spec.name)
+      if (!row) continue
+      const memPhases: Array<keyof RangePhaseMem> = [
+        'setup',
+        'bulkWrite',
+        'firstRecalc',
+        'mutateThenRecalc',
+      ]
+      for (const phase of memPhases) {
+        out.push(
+          `| ${spec.name} | ${phase} | ${rangeMemCell(row.ts, phase)} | ${rangeMemCell(row.wasm, phase)} |`,
+        )
+      }
+    }
+  }
+
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // Report writer. Composes a markdown table inside the template's
 // BENCH:RESULTS marker pair so re-runs replace the table cleanly.
@@ -1383,7 +2024,8 @@ function writeReport() {
     template =
       '# TS vs WASM Backend — Perf Report\n\n' +
       '<!-- BENCH:RESULTS:START -->\n<!-- BENCH:RESULTS:END -->\n\n' +
-      '<!-- BENCH:CHAIN:START -->\n<!-- BENCH:CHAIN:END -->\n'
+      '<!-- BENCH:CHAIN:START -->\n<!-- BENCH:CHAIN:END -->\n\n' +
+      '<!-- BENCH:RANGE:START -->\n<!-- BENCH:RANGE:END -->\n'
   }
 
   // ----- Size-tier block (only refreshed if we have any size-tier data
@@ -1476,6 +2118,35 @@ function writeReport() {
     }
 
     template = replaceBlock(template, 'BENCH:CHAIN', lines.join('\n'))
+  }
+
+  // ----- Range block (independent: only refreshed if range suite ran) --
+  if (rangeResults.size > 0) {
+    const lines: string[] = []
+    const stamp = new Date().toISOString()
+    lines.push(`*Last range bench run: ${stamp}*`)
+    if (!wasmAvailable) {
+      lines.push('')
+      lines.push(`> WASM skipped: ${wasmSkipReason}`)
+    }
+    lines.push('')
+    lines.push(...rangeSection())
+
+    const rangeFailures: string[] = []
+    for (const spec of RANGE_SPECS) {
+      const row = rangeResults.get(spec.name)
+      if (!row) continue
+      if (row.ts.error) rangeFailures.push(`- **${spec.name} / TS**: ${row.ts.error}`)
+      if (row.wasm.error) rangeFailures.push(`- **${spec.name} / WASM**: ${row.wasm.error}`)
+    }
+    if (rangeFailures.length > 0) {
+      lines.push('')
+      lines.push('### Range failures / skipped backends')
+      lines.push('')
+      lines.push(...rangeFailures)
+    }
+
+    template = replaceBlock(template, 'BENCH:RANGE', lines.join('\n'))
   }
 
   writeFileSync(reportPath, template)
