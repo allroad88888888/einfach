@@ -116,3 +116,23 @@ The Rust broadcast hunk is already landed as a real commit. The visual-regressio
 3. **Five stashes target the abandoned W6 P1 single-canvas arc** (0, 2-grid-hunk, 4, plus stash 2's pieces touching `SpreadsheetGridContent`). The architectural decision in `c62428f` makes them unapplyable to current code without a manual port.
 4. **Stash 8** is the largest "sibling-wip" (26 files, +1325 lines) — superficially scary, but the dialog-close pattern it codifies is now the project's canonical shape (per CLAUDE.md "Provider and dialog component pattern"). All real value is already on disk.
 5. **No stash contains unique work that is missing from disk AND alignable with the current branch.** The two KEEP candidates (2, 4) preserve architectural alternatives — they belong in an archive, not on the active stack.
+
+## 2026-05-28 update — stash@{2} resolved
+
+stash@{2} (ui-wip-during-f-commit) — **DROPPED**. The visual regression
+harness is well-designed (200-line capture.mjs + 8 state recipes +
+pixelmatch baselines) but tied to the canvas-overlay rendering direction
+that was reverted off-branch. Specific blockers:
+
+- References `test/canvas-grid-smoke.md` which doesn't exist on this
+  branch (only on dead agent worktrees under `.claude/worktrees/`)
+- Pixelmatch baselines were captured against the canvas-rendered grid;
+  current DOM-rendering would diff out on every state
+- Some recipes (data-merge-anchor selectors) still match current code,
+  but most reference canvas-overlay artefacts
+
+The pattern is preserved in the stash audit doc; future visual regression
+work should re-capture baselines against the current DOM rendering rather
+than salvaging this stash.
+
+Remaining stash count: 15 (was 16).
