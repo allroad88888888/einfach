@@ -1872,23 +1872,60 @@ impl Sheet {
         &self.formula_exprs
     }
 
-    /// Static cycle detection (B.2). Walks the AST of the new formula,
-    /// then BFS through dependencies of any referenced formula cells.
-    /// Returns true if `target` is reachable.
+    /// Static cycle detection (B.2). Returns true iff installing `expr` at
+    /// `target` would close a same-sheet dep cycle.
+    ///
+    /// Algorithm: a cycle is created exactly when one of `expr`'s referenced
+    /// cells already transitively depends on `target`. Equivalently, when
+    /// some `ref ∈ collect_refs(expr)` is reachable forward through the
+    /// reverse-dep map starting at `target`. We BFS through
+    /// `cell_dependents` (target → cells that depend on target → ...) and
+    /// short-circuit the moment we encounter any of the new formula's refs.
+    ///
+    /// Why this beats the previous forward walk: a chain `A2 = A1+1`,
+    /// `A3 = A2+1`, … installed in increasing order has an empty
+    /// `cell_dependents[An]` at install time (nothing yet depends on the
+    /// brand-new cell), so the check is O(1) per insert. The old forward
+    /// walk through `formula_exprs` from each new ref's expr was O(n)
+    /// per insert because the back-chain grew with each step — total
+    /// O(n²). See `chain_bulk_install_is_linear` for the regression
+    /// pin.
+    ///
+    /// Parity: `cell_dependents` is built off `formula_deps_for` /
+    /// `collect_refs`, which expand bounded ranges into point cells but
+    /// skip unbounded ranges (matches the old forward-walk parity — the
+    /// pre-existing path also did not chase through unbounded ranges and
+    /// relied on the runtime guard to surface cross-sheet / unbounded
+    /// cycles).
     fn would_create_cycle(&self, target: CellAddress, expr: &Expr) -> bool {
-        let mut to_visit: Vec<CellAddress> = Vec::new();
-        collect_refs(expr, &mut to_visit);
+        let mut refs: Vec<CellAddress> = Vec::new();
+        collect_refs(expr, &mut refs);
+        if refs.is_empty() {
+            return false;
+        }
+        // Self-reference (target == one of its own refs) is the trivial
+        // cycle case; catch it before the BFS so we don't depend on the
+        // (possibly empty) `cell_dependents[target]` to surface it.
+        if refs.iter().any(|r| *r == target) {
+            return true;
+        }
+        let refs_set: HashSet<CellAddress> = refs.into_iter().collect();
 
+        let dependents = self.cell_dependents.borrow();
         let mut seen: HashSet<CellAddress> = HashSet::new();
+        let mut to_visit: Vec<CellAddress> = Vec::new();
+        if let Some(set) = dependents.get(&target) {
+            to_visit.extend(set.iter().copied());
+        }
         while let Some(c) = to_visit.pop() {
-            if c == target {
-                return true;
-            }
             if !seen.insert(c) {
                 continue;
             }
-            if let Some(child_expr) = self.formula_exprs.get(&c) {
-                collect_refs(child_expr, &mut to_visit);
+            if refs_set.contains(&c) {
+                return true;
+            }
+            if let Some(set) = dependents.get(&c) {
+                to_visit.extend(set.iter().copied());
             }
         }
         false
@@ -5292,6 +5329,41 @@ mod tests {
         );
         // B1 holds the cycle error; reading it must not stack-overflow.
         assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::CyclicRef));
+    }
+
+    /// Regression: `=A(n-1)+1` chain install must scale linearly. The old
+    /// `would_create_cycle` walked all of `formula_exprs` from the new
+    /// expr's refs, which gave O(n²) total across n inserts (chain n=100k
+    /// took 776s in the WASM bench). The reverse-deps walk drops that
+    /// per-insert work to O(direct dependents of the new cell) — which is
+    /// zero for the chain pattern installed in increasing order — so 10k
+    /// finishes in tens of ms on a dev laptop in --release.
+    ///
+    /// Threshold reasoning: 10k took 2.9s pre-fix (clear O(n²) trend
+    /// extrapolating to 290s+ at 100k). The 500ms ceiling here is still
+    /// 20× slack over the observed 20-25ms baseline but small enough to
+    /// catch a regression long before it scales out to the 100k tier.
+    #[test]
+    fn chain_bulk_install_is_linear() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        let n: u32 = 10_000;
+        let start = std::time::Instant::now();
+        sheet.bulk_load(|loader| {
+            for i in 2..=n {
+                let addr = format!("A{i}");
+                let src = format!("=A{}+1", i - 1);
+                let ok = loader.set_formula(&addr, &src);
+                assert!(ok, "chain formula must not be rejected at {}", addr);
+            }
+        });
+        let dur = start.elapsed();
+        eprintln!("chain_bulk_install_is_linear: 10k installs in {:?}", dur);
+        assert!(
+            dur.as_millis() < 500,
+            "chain install took {:?} — possible O(n²) regression",
+            dur
+        );
     }
 
     #[test]
