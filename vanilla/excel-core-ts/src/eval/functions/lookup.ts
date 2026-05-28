@@ -664,6 +664,150 @@ function numericRank(v: Value): number | null {
 }
 
 // ----------------------------------------------------------------------------
+// Phase 8 additions — CHOOSE, ROW/ROWS/COLUMN/COLUMNS, ADDRESS
+// ----------------------------------------------------------------------------
+
+/**
+ * CHOOSE(index, val1, val2, ...) — pick the index-th value (1-based).
+ * Out of range → #VALUE!. Index is truncated to integer.
+ */
+export const CHOOSE: FunctionImpl = (args, _ctx) => {
+  if (args.length < 2) return ERR_VALUE
+  const ix = args[0]
+  if (ix.kind === 'error') return ix
+  const ic = toNumber(ix)
+  if (!ic.ok) return ic.error
+  const idx = Math.trunc(ic.value)
+  if (idx < 1 || idx > args.length - 1) return ERR_VALUE
+  return args[idx]
+}
+
+/**
+ * ROWS(array) — number of rows in the array. Scalar → 1.
+ */
+export const ROWS: FunctionImpl = (args, _ctx) => {
+  if (args.length !== 1) return ERR_VALUE
+  const a = args[0]
+  if (a.kind === 'error') return a
+  if (a.kind === 'array') return { kind: 'number', value: a.value.length }
+  return { kind: 'number', value: 1 }
+}
+
+/**
+ * COLUMNS(array) — number of columns in the array. Scalar → 1.
+ */
+export const COLUMNS: FunctionImpl = (args, _ctx) => {
+  if (args.length !== 1) return ERR_VALUE
+  const a = args[0]
+  if (a.kind === 'error') return a
+  if (a.kind === 'array') return { kind: 'number', value: a.value[0]?.length ?? 0 }
+  return { kind: 'number', value: 1 }
+}
+
+/**
+ * ROW([reference]) — zero-arg variant returns 1 (we don't have the current
+ * cell's row at this layer; the evaluator may patch this for ref-aware
+ * usage). With an array arg, returns the row count's vertical sequence
+ * 1..N for compatibility with simple `=ROW()` spreadsheet idioms.
+ *
+ * Real ref-aware ROW() requires evaluator integration — flagged as TODO.
+ */
+export const ROW: FunctionImpl = (args, _ctx) => {
+  if (args.length === 0) return { kind: 'number', value: 1 }
+  if (args.length !== 1) return ERR_VALUE
+  const a = args[0]
+  if (a.kind === 'error') return a
+  if (a.kind === 'array') {
+    // Excel returns 1..N as a column array.
+    const n = a.value.length
+    const out: Value[][] = []
+    for (let i = 1; i <= n; i++) out.push([{ kind: 'number', value: i }])
+    return { kind: 'array', value: out }
+  }
+  return { kind: 'number', value: 1 }
+}
+
+/**
+ * COLUMN([reference]) — zero-arg variant returns 1 (same limitation as ROW).
+ */
+export const COLUMN: FunctionImpl = (args, _ctx) => {
+  if (args.length === 0) return { kind: 'number', value: 1 }
+  if (args.length !== 1) return ERR_VALUE
+  const a = args[0]
+  if (a.kind === 'error') return a
+  if (a.kind === 'array') {
+    const n = a.value[0]?.length ?? 0
+    const row: Value[] = []
+    for (let i = 1; i <= n; i++) row.push({ kind: 'number', value: i })
+    return { kind: 'array', value: [row] }
+  }
+  return { kind: 'number', value: 1 }
+}
+
+/**
+ * ADDRESS(row, col, [abs=1], [a1=TRUE], [sheet]) — produce an A1 (or R1C1) reference string.
+ *   abs: 1=absolute (default), 2=row abs col rel, 3=row rel col abs, 4=both rel
+ */
+export const ADDRESS: FunctionImpl = (args, _ctx) => {
+  if (args.length < 2 || args.length > 5) return ERR_VALUE
+  const errProp = propagateError(args.slice(0, Math.min(args.length, 4)))
+  if (errProp) return errProp
+  const rRow = toNumber(args[0])
+  if (!rRow.ok) return rRow.error
+  const rCol = toNumber(args[1])
+  if (!rCol.ok) return rCol.error
+  const row = Math.trunc(rRow.value)
+  const col = Math.trunc(rCol.value)
+  if (row < 1 || col < 1) return ERR_VALUE
+  let abs = 1
+  if (args.length >= 3) {
+    const a = toNumber(args[2])
+    if (!a.ok) return a.error
+    abs = Math.trunc(a.value)
+    if (abs < 1 || abs > 4) return ERR_VALUE
+  }
+  let a1 = true
+  if (args.length >= 4) {
+    const v = args[3]
+    if (v.kind === 'boolean') a1 = v.value
+    else if (v.kind === 'number') a1 = v.value !== 0
+    else if (v.kind !== 'blank') return ERR_VALUE
+  }
+  let sheet: string | undefined
+  if (args.length === 5) {
+    const v = args[4]
+    if (v.kind === 'string') sheet = v.value
+    else if (v.kind !== 'blank') return ERR_VALUE
+  }
+  // Build column letter (1 → A, 27 → AA).
+  let n = col
+  let letters = ''
+  while (n > 0) {
+    n -= 1
+    letters = String.fromCharCode(65 + (n % 26)) + letters
+    n = Math.floor(n / 26)
+  }
+  let body: string
+  if (a1) {
+    const rowAbs = abs === 1 || abs === 2
+    const colAbs = abs === 1 || abs === 3
+    body = `${colAbs ? '$' : ''}${letters}${rowAbs ? '$' : ''}${row}`
+  } else {
+    const rowAbs = abs === 1 || abs === 2
+    const colAbs = abs === 1 || abs === 3
+    const r = rowAbs ? `R${row}` : `R[${row}]`
+    const c = colAbs ? `C${col}` : `C[${col}]`
+    body = r + c
+  }
+  if (sheet !== undefined) {
+    // Quote if sheet name has spaces or non-letters.
+    const needsQuote = /[^A-Za-z0-9_]/.test(sheet)
+    body = `${needsQuote ? `'${sheet}'` : sheet}!${body}`
+  }
+  return { kind: 'string', value: body }
+}
+
+// ----------------------------------------------------------------------------
 // Registry
 // ----------------------------------------------------------------------------
 
@@ -673,4 +817,11 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   INDEX,
   MATCH,
   XLOOKUP,
+  // Phase 8 additions
+  CHOOSE,
+  ROWS,
+  COLUMNS,
+  ROW,
+  COLUMN,
+  ADDRESS,
 }

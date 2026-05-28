@@ -381,10 +381,12 @@ describe('FALSE', () => {
 // -----------------------------------------------------------------------------
 
 describe('FUNCTIONS registry', () => {
-  it('exports all ten functions under uppercase keys', () => {
-    expect(Object.keys(FUNCTIONS).sort()).toEqual(
-      ['AND', 'FALSE', 'IF', 'IFERROR', 'IFNA', 'IFS', 'NOT', 'OR', 'SWITCH', 'TRUE'].sort(),
-    )
+  it('exports the v1 baseline under uppercase keys (extensible)', () => {
+    const keys = new Set(Object.keys(FUNCTIONS))
+    const baseline = ['AND', 'FALSE', 'IF', 'IFERROR', 'IFNA', 'IFS', 'NOT', 'OR', 'SWITCH', 'TRUE']
+    for (const name of baseline) {
+      expect(keys.has(name)).toBe(true)
+    }
   })
 
   it('every registry value is a function', () => {

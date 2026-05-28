@@ -669,42 +669,37 @@ describe('PRODUCT', () => {
 })
 
 describe('FUNCTIONS registry', () => {
-  test('exposes all 20 math functions (15 v1 + 5 Wave F/F1)', () => {
-    expect(Object.keys(FUNCTIONS).sort()).toEqual(
-      [
-        'ABS',
-        'AVERAGE',
-        'CEILING',
-        'COUNT',
-        'COUNTA',
-        'FLOOR',
-        'INT',
-        'MAX',
-        'MIN',
-        'MOD',
-        'POWER',
-        'PRODUCT',
-        'ROUND',
-        'ROUNDDOWN',
-        'ROUNDUP',
-        'SIGN',
-        'SQRT',
-        'SUM',
-        'SUMPRODUCT',
-        'TRUNC',
-      ].sort(),
-    )
+  test('exposes a baseline set of math functions (extensible as new ones land)', () => {
+    const keys = new Set(Object.keys(FUNCTIONS))
+    // Spot-check the v1 + F1 baseline is intact. New phase-8 additions
+    // expand the registry over time; this test guards against regressions
+    // (removing baseline names) without rewriting on every addition.
+    const baseline = [
+      'ABS', 'AVERAGE', 'CEILING', 'COUNT', 'COUNTA', 'FLOOR', 'INT',
+      'MAX', 'MIN', 'MOD', 'POWER', 'PRODUCT', 'ROUND', 'ROUNDDOWN',
+      'ROUNDUP', 'SIGN', 'SQRT', 'SUM', 'SUMPRODUCT', 'TRUNC',
+    ]
+    for (const name of baseline) {
+      expect(keys.has(name)).toBe(true)
+    }
   })
 
   test('every entry satisfies FunctionImpl shape', () => {
+    // Zero-arity functions (PI, RAND) intentionally reject any args
+    // including a leading error — they fail the arity gate before
+    // looking at args. Exclude from the propagation spot check.
+    const zeroArityOnly = new Set(['PI', 'RAND'])
     for (const [name, fn] of Object.entries(FUNCTIONS)) {
       expect(typeof fn).toBe('function')
       // Spot check: every fn should accept an empty args array without
       // throwing — it may return an error Value, but never throw.
       expect(() => fn([], ctx)).not.toThrow()
-      // And every fn should propagate a leading scalar error.
-      const result = fn([{ kind: 'error', code: '#REF!' }], ctx)
-      expect(result.kind === 'error' && result.code).toBe('#REF!')
+      // And every fn (except zero-arity) should propagate a leading
+      // scalar error.
+      if (!zeroArityOnly.has(name)) {
+        const result = fn([{ kind: 'error', code: '#REF!' }], ctx)
+        expect(result.kind === 'error' && result.code).toBe('#REF!')
+      }
       expect(name).toBe(name.toUpperCase())
     }
   })

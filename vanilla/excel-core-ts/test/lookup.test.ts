@@ -406,8 +406,12 @@ describe('XLOOKUP', () => {
 // ============================================================================
 
 describe('FUNCTIONS registry', () => {
-  test('exports all 5 lookup functions', () => {
-    expect(Object.keys(FUNCTIONS).sort()).toEqual(['HLOOKUP', 'INDEX', 'MATCH', 'VLOOKUP', 'XLOOKUP'])
+  test('exports the v1 lookup baseline (extensible)', () => {
+    const keys = new Set(Object.keys(FUNCTIONS))
+    const baseline = ['HLOOKUP', 'INDEX', 'MATCH', 'VLOOKUP', 'XLOOKUP']
+    for (const name of baseline) {
+      expect(keys.has(name)).toBe(true)
+    }
   })
 
   test('each entry is callable', () => {

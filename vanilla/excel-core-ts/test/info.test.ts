@@ -242,23 +242,26 @@ describe('TYPE', () => {
 // ---------------------------------------------------------------------------
 
 describe('FUNCTIONS registry', () => {
-  test('exposes all 8 info functions', () => {
-    expect(Object.keys(FUNCTIONS).sort()).toEqual([
-      'ISBLANK',
-      'ISERR',
-      'ISERROR',
-      'ISLOGICAL',
-      'ISNA',
-      'ISNUMBER',
-      'ISTEXT',
-      'TYPE',
-    ])
+  test('exposes the IS* baseline (extensible for phase-8 additions)', () => {
+    const keys = new Set(Object.keys(FUNCTIONS))
+    const baseline = [
+      'ISBLANK', 'ISERR', 'ISERROR', 'ISLOGICAL', 'ISNA',
+      'ISNUMBER', 'ISTEXT', 'TYPE',
+    ]
+    for (const name of baseline) {
+      expect(keys.has(name)).toBe(true)
+    }
   })
 
-  test('every entry satisfies FunctionImpl shape and does NOT propagate errors', () => {
+  test('IS* family does NOT propagate errors (classifies them instead)', () => {
+    // The IS* family is the entire reason for an exception to "first-error
+    // wins". Functions like N, NA, ISEVEN/ISODD that propagate the error
+    // (or are zero-arity like NA) are excluded.
+    const propagatesErrors = new Set(['N', 'NA', 'ISEVEN', 'ISODD'])
     for (const [name, fn] of Object.entries(FUNCTIONS)) {
       expect(typeof fn).toBe('function')
       expect(name).toBe(name.toUpperCase())
+      if (propagatesErrors.has(name)) continue
       // The critical contract: feeding an error returns an actual answer,
       // not the error verbatim.
       const result = fn([ERR('#N/A')], ctx)

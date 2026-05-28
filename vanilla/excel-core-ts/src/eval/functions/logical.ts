@@ -295,6 +295,44 @@ function excelEquals(a: Value, b: Value): boolean {
 }
 
 // =============================================================================
+// Phase 8 additions — XOR
+// =============================================================================
+
+/**
+ * `XOR(arg1, arg2, ...)` — odd parity of TRUE values.
+ * Coerces each arg via `toBoolean`. Blanks skipped. Errors propagate.
+ */
+export const XOR: FunctionImpl = (args) => {
+  if (args.length === 0) return ERR_VALUE
+  const errFirst = propagateError(args)
+  if (errFirst) return errFirst
+  let trueCount = 0
+  let sawAny = false
+  for (const a of args) {
+    if (a.kind === 'blank') continue
+    if (a.kind === 'array') {
+      for (const row of a.value) {
+        for (const cell of row) {
+          if (cell.kind === 'error') return cell
+          if (cell.kind === 'blank') continue
+          const c = toBoolean(cell)
+          if (!c.ok) return c.error
+          sawAny = true
+          if (c.value) trueCount++
+        }
+      }
+      continue
+    }
+    sawAny = true
+    const c = toBoolean(a)
+    if (!c.ok) return c.error
+    if (c.value) trueCount++
+  }
+  if (!sawAny) return ERR_VALUE
+  return trueCount % 2 === 1 ? TRUE_VALUE : FALSE_VALUE
+}
+
+// =============================================================================
 // Registry
 // =============================================================================
 
@@ -309,4 +347,6 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   SWITCH,
   TRUE,
   FALSE,
+  // Phase 8 additions
+  XOR,
 }

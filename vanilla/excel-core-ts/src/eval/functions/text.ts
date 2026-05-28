@@ -584,6 +584,231 @@ const FIND: FunctionImpl = (args) => {
 // Registry
 // =============================================================================
 
+// =============================================================================
+// Phase 8 additions
+// =============================================================================
+
+/** REPLACE(text, start, num_chars, new_text) — replace a substring by position. */
+const REPLACE: FunctionImpl = (args) => {
+  if (args.length !== 4) return errValue('#VALUE!', 'REPLACE requires 4 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  const sr = toNumber(args[1])
+  if (!sr.ok) return sr.error
+  const nr = toNumber(args[2])
+  if (!nr.ok) return nr.error
+  const newR = coerceText(args[3])
+  if (!newR.ok) return newR.error
+  const start = Math.trunc(sr.value)
+  const num = Math.trunc(nr.value)
+  if (start < 1 || num < 0) return ERR_VALUE
+  const chars = codepoints(ts.value)
+  const before = chars.slice(0, start - 1).join('')
+  const after = chars.slice(start - 1 + num).join('')
+  return { kind: 'string', value: before + newR.value + after }
+}
+
+/**
+ * SUBSTITUTE(text, old, new, [instance]) — replace all (or nth) instances
+ * of `old` within `text`. Case-sensitive (unlike SEARCH).
+ */
+const SUBSTITUTE: FunctionImpl = (args) => {
+  if (args.length < 3 || args.length > 4)
+    return errValue('#VALUE!', 'SUBSTITUTE requires 3 or 4 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  const oldR = coerceText(args[1])
+  if (!oldR.ok) return oldR.error
+  const newR = coerceText(args[2])
+  if (!newR.ok) return newR.error
+  let instance = -1 // -1 means all
+  if (args.length === 4) {
+    const ic = toNumber(args[3])
+    if (!ic.ok) return ic.error
+    instance = Math.trunc(ic.value)
+    if (instance < 1) return ERR_VALUE
+  }
+  if (oldR.value.length === 0) return { kind: 'string', value: ts.value }
+  if (instance === -1) {
+    // Replace all — use split/join, no regex needed.
+    return { kind: 'string', value: ts.value.split(oldR.value).join(newR.value) }
+  }
+  let count = 0
+  let idx = 0
+  let out = ''
+  const old = oldR.value
+  while (idx < ts.value.length) {
+    const found = ts.value.indexOf(old, idx)
+    if (found < 0) {
+      out += ts.value.slice(idx)
+      break
+    }
+    count++
+    if (count === instance) {
+      out += ts.value.slice(idx, found) + newR.value + ts.value.slice(found + old.length)
+      return { kind: 'string', value: out }
+    }
+    out += ts.value.slice(idx, found + old.length)
+    idx = found + old.length
+  }
+  return { kind: 'string', value: out }
+}
+
+/** REPT(text, n) — repeat text n times. */
+const REPT: FunctionImpl = (args) => {
+  if (args.length !== 2) return errValue('#VALUE!', 'REPT requires 2 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  const nr = toNumber(args[1])
+  if (!nr.ok) return nr.error
+  const n = Math.trunc(nr.value)
+  if (n < 0) return ERR_VALUE
+  if (n === 0) return { kind: 'string', value: '' }
+  // Excel caps REPT output at ~32K chars.
+  if (n * ts.value.length > 32_767) return errValue('#VALUE!', 'REPT result too large')
+  return { kind: 'string', value: ts.value.repeat(n) }
+}
+
+/** CHAR(n) — Unicode code point → char. */
+const CHAR: FunctionImpl = (args) => {
+  if (args.length !== 1) return errValue('#VALUE!', 'CHAR requires 1 argument')
+  const err = propagateError(args)
+  if (err) return err
+  const nr = toNumber(args[0])
+  if (!nr.ok) return nr.error
+  const n = Math.trunc(nr.value)
+  if (n < 1 || n > 0x10ffff) return ERR_VALUE
+  return { kind: 'string', value: String.fromCodePoint(n) }
+}
+
+/** CODE(text) — first code point as number. */
+const CODE: FunctionImpl = (args) => {
+  if (args.length !== 1) return errValue('#VALUE!', 'CODE requires 1 argument')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  if (ts.value.length === 0) return ERR_VALUE
+  const cp = ts.value.codePointAt(0)
+  if (cp === undefined) return ERR_VALUE
+  return { kind: 'number', value: cp }
+}
+
+/** EXACT(a, b) — strict case-sensitive equality. */
+const EXACT: FunctionImpl = (args) => {
+  if (args.length !== 2) return errValue('#VALUE!', 'EXACT requires 2 arguments')
+  const err = propagateError(args)
+  if (err) return err
+  const a = coerceText(args[0])
+  if (!a.ok) return a.error
+  const b = coerceText(args[1])
+  if (!b.ok) return b.error
+  return { kind: 'boolean', value: a.value === b.value }
+}
+
+/** PROPER(text) — Title Case. */
+const PROPER: FunctionImpl = (args) => {
+  if (args.length !== 1) return errValue('#VALUE!', 'PROPER requires 1 argument')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  // Capitalize after every non-letter boundary.
+  let out = ''
+  let upper = true
+  for (const ch of ts.value) {
+    if (/\p{L}/u.test(ch)) {
+      out += upper ? ch.toUpperCase() : ch.toLowerCase()
+      upper = false
+    } else {
+      out += ch
+      upper = true
+    }
+  }
+  return { kind: 'string', value: out }
+}
+
+/** T(value) — passthrough for strings, "" for everything else. */
+const T: FunctionImpl = (args) => {
+  if (args.length !== 1) return errValue('#VALUE!', 'T requires 1 argument')
+  const v = args[0]
+  // Errors propagate.
+  if (v.kind === 'error') return v
+  if (v.kind === 'string') return v
+  return { kind: 'string', value: '' }
+}
+
+/** CLEAN(text) — strip non-printable ASCII (0..31). */
+const CLEAN: FunctionImpl = (args) => {
+  if (args.length !== 1) return errValue('#VALUE!', 'CLEAN requires 1 argument')
+  const err = propagateError(args)
+  if (err) return err
+  const ts = coerceText(args[0])
+  if (!ts.ok) return ts.error
+  // Strip ASCII control chars 0-31 (and DEL 127).
+  return { kind: 'string', value: ts.value.replace(/[\x00-\x1F\x7F]/g, '') }
+}
+
+/**
+ * TEXTJOIN(delimiter, ignore_empty, ...args) — concatenate with delimiter.
+ * `ignore_empty=TRUE` skips blank cells and empty strings.
+ */
+const TEXTJOIN: FunctionImpl = (args) => {
+  if (args.length < 3) return errValue('#VALUE!', 'TEXTJOIN requires 3+ arguments')
+  // Errors in args propagate.
+  const err = propagateError(args)
+  if (err) return err
+  const delR = coerceText(args[0])
+  if (!delR.ok) return delR.error
+  const ig = args[1]
+  let ignoreEmpty = true
+  if (ig.kind === 'boolean') ignoreEmpty = ig.value
+  else if (ig.kind === 'number') ignoreEmpty = ig.value !== 0
+  else if (ig.kind === 'blank') ignoreEmpty = false
+  // Collect strings.
+  const parts: string[] = []
+  for (let i = 2; i < args.length; i++) {
+    const a = args[i]
+    if (a.kind === 'array') {
+      for (const row of a.value) {
+        for (const cell of row) {
+          if (cell.kind === 'error') return cell
+          if (cell.kind === 'blank') {
+            if (!ignoreEmpty) parts.push('')
+            continue
+          }
+          const s = coerceText(cell)
+          if (!s.ok) return s.error
+          if (ignoreEmpty && s.value === '') continue
+          parts.push(s.value)
+        }
+      }
+    } else {
+      if (a.kind === 'blank') {
+        if (!ignoreEmpty) parts.push('')
+        continue
+      }
+      const s = coerceText(a)
+      if (!s.ok) return s.error
+      if (ignoreEmpty && s.value === '') continue
+      parts.push(s.value)
+    }
+  }
+  return { kind: 'string', value: parts.join(delR.value) }
+}
+
+/** UNICODE(text) — same as CODE for first character. */
+const UNICODE: FunctionImpl = CODE
+
+/** UNICHAR(n) — same as CHAR. */
+const UNICHAR: FunctionImpl = CHAR
+
 /**
  * Wave C contract: each function file exports a `FUNCTIONS` record. The
  * evaluator's central index merges these into one dispatch Map.
@@ -606,4 +831,17 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   // Wave F / F1 additions
   SEARCH,
   FIND,
+  // Phase 8 additions
+  REPLACE,
+  SUBSTITUTE,
+  REPT,
+  CHAR,
+  CODE,
+  EXACT,
+  PROPER,
+  T,
+  CLEAN,
+  TEXTJOIN,
+  UNICODE,
+  UNICHAR,
 }

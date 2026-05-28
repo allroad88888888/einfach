@@ -526,6 +526,355 @@ export const PRODUCT: FunctionImpl = (args) => {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8 additions — trig, log, rounding, combinatorics, constants
+// ---------------------------------------------------------------------------
+
+/** Generic 1-arg numeric helper. */
+function unaryNumber(args: ReadonlyArray<Value>, fn: (n: number) => number): Value {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 1) return ERR('#VALUE!')
+  const v = toNumber(args[0])
+  if (!v.ok) return v.error
+  const out = fn(v.value)
+  if (!Number.isFinite(out) || Number.isNaN(out)) return ERR('#NUM!')
+  return NUM(out)
+}
+
+/** Generic 2-arg numeric helper. */
+function binaryNumber(args: ReadonlyArray<Value>, fn: (a: number, b: number) => number): Value {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const a = toNumber(args[0])
+  if (!a.ok) return a.error
+  const b = toNumber(args[1])
+  if (!b.ok) return b.error
+  const out = fn(a.value, b.value)
+  if (!Number.isFinite(out) || Number.isNaN(out)) return ERR('#NUM!')
+  return NUM(out)
+}
+
+// Trig & inverse trig
+export const SIN: FunctionImpl = (args) => unaryNumber(args, Math.sin)
+export const COS: FunctionImpl = (args) => unaryNumber(args, Math.cos)
+export const TAN: FunctionImpl = (args) => unaryNumber(args, Math.tan)
+export const ASIN: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n < -1 || n > 1) return Number.NaN
+  return Math.asin(n)
+})
+export const ACOS: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n < -1 || n > 1) return Number.NaN
+  return Math.acos(n)
+})
+export const ATAN: FunctionImpl = (args) => unaryNumber(args, Math.atan)
+export const ATAN2: FunctionImpl = (args) =>
+  // Excel: ATAN2(x, y) — note arg order is (x, y), not Math.atan2's (y, x).
+  binaryNumber(args, (x, y) => {
+    if (x === 0 && y === 0) return Number.NaN
+    return Math.atan2(y, x)
+  })
+
+// Hyperbolic
+export const SINH: FunctionImpl = (args) => unaryNumber(args, Math.sinh)
+export const COSH: FunctionImpl = (args) => unaryNumber(args, Math.cosh)
+export const TANH: FunctionImpl = (args) => unaryNumber(args, Math.tanh)
+export const ASINH: FunctionImpl = (args) => unaryNumber(args, Math.asinh)
+export const ACOSH: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n < 1) return Number.NaN
+  return Math.acosh(n)
+})
+export const ATANH: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n <= -1 || n >= 1) return Number.NaN
+  return Math.atanh(n)
+})
+
+// Reciprocal trig
+export const CSC: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  const s = Math.sin(n)
+  if (s === 0) return Number.NaN
+  return 1 / s
+})
+export const SEC: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  const c = Math.cos(n)
+  if (c === 0) return Number.NaN
+  return 1 / c
+})
+export const COT: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  const t = Math.tan(n)
+  if (t === 0) return Number.NaN
+  return 1 / t
+})
+
+// Angle conversion
+export const RADIANS: FunctionImpl = (args) => unaryNumber(args, (d) => (d * Math.PI) / 180)
+export const DEGREES: FunctionImpl = (args) => unaryNumber(args, (r) => (r * 180) / Math.PI)
+
+// Exponential / logarithmic
+export const EXP: FunctionImpl = (args) => unaryNumber(args, Math.exp)
+export const LN: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n <= 0) return Number.NaN
+  return Math.log(n)
+})
+export const LOG10: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n <= 0) return Number.NaN
+  return Math.log10(n)
+})
+/** LOG(number, [base=10]) — like LOG10 by default; second arg = base. */
+export const LOG: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length < 1 || args.length > 2) return ERR('#VALUE!')
+  const n = toNumber(args[0])
+  if (!n.ok) return n.error
+  if (n.value <= 0) return ERR('#NUM!')
+  let base = 10
+  if (args.length === 2) {
+    const b = toNumber(args[1])
+    if (!b.ok) return b.error
+    if (b.value <= 0 || b.value === 1) return ERR('#NUM!')
+    base = b.value
+  }
+  return NUM(Math.log(n.value) / Math.log(base))
+}
+
+// Constants
+export const PI: FunctionImpl = (args) => {
+  if (args.length !== 0) return ERR('#VALUE!')
+  return NUM(Math.PI)
+}
+
+// Random
+export const RAND: FunctionImpl = (args) => {
+  if (args.length !== 0) return ERR('#VALUE!')
+  return NUM(Math.random())
+}
+
+export const RANDBETWEEN: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const lo = toNumber(args[0])
+  if (!lo.ok) return lo.error
+  const hi = toNumber(args[1])
+  if (!hi.ok) return hi.error
+  const low = Math.ceil(lo.value)
+  const high = Math.floor(hi.value)
+  if (low > high) return ERR('#NUM!')
+  return NUM(Math.floor(Math.random() * (high - low + 1)) + low)
+}
+
+// Other rounding
+/** MROUND(number, multiple) — round to nearest multiple. */
+export const MROUND: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const n = toNumber(args[0])
+  if (!n.ok) return n.error
+  const m = toNumber(args[1])
+  if (!m.ok) return m.error
+  if (m.value === 0) return NUM(0)
+  // Excel requires same sign.
+  if ((n.value > 0 && m.value < 0) || (n.value < 0 && m.value > 0)) return ERR('#NUM!')
+  return NUM(Math.round(n.value / m.value) * m.value)
+}
+
+/** QUOTIENT(numerator, denominator) — integer division (truncate toward zero). */
+export const QUOTIENT: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const a = toNumber(args[0])
+  if (!a.ok) return a.error
+  const b = toNumber(args[1])
+  if (!b.ok) return b.error
+  if (b.value === 0) return ERR('#DIV/0!')
+  return NUM(Math.trunc(a.value / b.value))
+}
+
+/** EVEN(n) — round away from zero to next even integer. */
+export const EVEN: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  const sign = n >= 0 ? 1 : -1
+  const abs = Math.abs(n)
+  const ceiled = Math.ceil(abs)
+  return sign * (ceiled % 2 === 0 ? ceiled : ceiled + 1)
+})
+
+/** ODD(n) — round away from zero to next odd integer. */
+export const ODD: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  const sign = n >= 0 ? 1 : -1
+  const abs = Math.abs(n)
+  const ceiled = Math.ceil(abs)
+  return sign * (ceiled % 2 === 1 ? ceiled : ceiled + 1)
+})
+
+// Combinatorics
+/** FACT(n) — n factorial. n must be >= 0. Truncates fractional. */
+export const FACT: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 1) return ERR('#VALUE!')
+  const v = toNumber(args[0])
+  if (!v.ok) return v.error
+  const n = Math.trunc(v.value)
+  if (n < 0) return ERR('#NUM!')
+  if (n > 170) return ERR('#NUM!') // overflow past Number.MAX_VALUE
+  let out = 1
+  for (let i = 2; i <= n; i++) out *= i
+  return NUM(out)
+}
+
+/** FACTDOUBLE(n) — double factorial n!! */
+export const FACTDOUBLE: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 1) return ERR('#VALUE!')
+  const v = toNumber(args[0])
+  if (!v.ok) return v.error
+  const n = Math.trunc(v.value)
+  if (n < -1) return ERR('#NUM!')
+  if (n <= 0) return NUM(1)
+  let out = 1
+  for (let i = n; i > 0; i -= 2) out *= i
+  if (!Number.isFinite(out)) return ERR('#NUM!')
+  return NUM(out)
+}
+
+/** COMBIN(n, k) — combinations C(n, k). */
+export const COMBIN: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const nv = toNumber(args[0])
+  if (!nv.ok) return nv.error
+  const kv = toNumber(args[1])
+  if (!kv.ok) return kv.error
+  const n = Math.trunc(nv.value)
+  const k = Math.trunc(kv.value)
+  if (n < 0 || k < 0 || k > n) return ERR('#NUM!')
+  if (k === 0 || k === n) return NUM(1)
+  // Compute C(n,k) iteratively to avoid overflow as long as possible.
+  const r = Math.min(k, n - k)
+  let out = 1
+  for (let i = 0; i < r; i++) {
+    out = (out * (n - i)) / (i + 1)
+  }
+  if (!Number.isFinite(out)) return ERR('#NUM!')
+  return NUM(Math.round(out))
+}
+
+/** PERMUT(n, k) — n! / (n-k)! */
+export const PERMUT: FunctionImpl = (args) => {
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const nv = toNumber(args[0])
+  if (!nv.ok) return nv.error
+  const kv = toNumber(args[1])
+  if (!kv.ok) return kv.error
+  const n = Math.trunc(nv.value)
+  const k = Math.trunc(kv.value)
+  if (n < 0 || k < 0 || k > n) return ERR('#NUM!')
+  let out = 1
+  for (let i = 0; i < k; i++) out *= n - i
+  if (!Number.isFinite(out)) return ERR('#NUM!')
+  return NUM(out)
+}
+
+/** GCD(a, b, ...) — greatest common divisor. */
+export const GCD: FunctionImpl = (args) => {
+  if (args.length === 0) return ERR('#VALUE!')
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  const nums: number[] = []
+  const walk = forEachNumericArg(args, (n) => {
+    nums.push(Math.trunc(Math.abs(n)))
+  })
+  if (!walk.ok) return walk.error
+  if (nums.length === 0) return NUM(0)
+  for (const n of nums) {
+    if (n < 0) return ERR('#NUM!')
+  }
+  const gcd2 = (a: number, b: number): number => {
+    while (b !== 0) {
+      ;[a, b] = [b, a % b]
+    }
+    return a
+  }
+  let g = nums[0]
+  for (let i = 1; i < nums.length; i++) g = gcd2(g, nums[i])
+  return NUM(g)
+}
+
+/** LCM(a, b, ...) — least common multiple. */
+export const LCM: FunctionImpl = (args) => {
+  if (args.length === 0) return ERR('#VALUE!')
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  const nums: number[] = []
+  const walk = forEachNumericArg(args, (n) => {
+    nums.push(Math.trunc(Math.abs(n)))
+  })
+  if (!walk.ok) return walk.error
+  if (nums.length === 0) return NUM(0)
+  for (const n of nums) {
+    if (n < 0) return ERR('#NUM!')
+  }
+  if (nums.some((n) => n === 0)) return NUM(0)
+  const gcd2 = (a: number, b: number): number => {
+    while (b !== 0) {
+      ;[a, b] = [b, a % b]
+    }
+    return a
+  }
+  let l = nums[0]
+  for (let i = 1; i < nums.length; i++) {
+    l = (l / gcd2(l, nums[i])) * nums[i]
+    if (!Number.isFinite(l)) return ERR('#NUM!')
+  }
+  return NUM(l)
+}
+
+/** COUNTBLANK(range) — count blank cells in a range. */
+export const COUNTBLANK: FunctionImpl = (args) => {
+  if (args.length !== 1) return ERR('#VALUE!')
+  const arg = args[0]
+  let count = 0
+  if (arg.kind === 'error') return arg
+  if (arg.kind === 'array') {
+    for (const row of arg.value) {
+      for (const cell of row) {
+        if (cell.kind === 'blank') count++
+        // Excel also counts empty strings as blank for COUNTBLANK.
+        else if (cell.kind === 'string' && cell.value === '') count++
+      }
+    }
+  } else {
+    if (arg.kind === 'blank') count = 1
+    else if (arg.kind === 'string' && arg.value === '') count = 1
+  }
+  return NUM(count)
+}
+
+/** SUMSQ(...args) — sum of squares. */
+export const SUMSQ: FunctionImpl = (args) => {
+  let total = 0
+  const walk = forEachNumericArg(args, (n) => {
+    total += n * n
+  })
+  if (!walk.ok) return walk.error
+  if (!Number.isFinite(total)) return ERR('#NUM!')
+  return NUM(total)
+}
+
+/** SQRTPI(n) — sqrt(n * π). */
+export const SQRTPI: FunctionImpl = (args) => unaryNumber(args, (n) => {
+  if (n < 0) return Number.NaN
+  return Math.sqrt(n * Math.PI)
+})
+
+// ---------------------------------------------------------------------------
 // Registry
 //
 // `index.ts` (assembled by CC after all C tracks finish) imports
@@ -555,5 +904,44 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   TRUNC,
   SUMPRODUCT,
   PRODUCT,
+  // Phase 8 additions
+  SIN,
+  COS,
+  TAN,
+  ASIN,
+  ACOS,
+  ATAN,
+  ATAN2,
+  SINH,
+  COSH,
+  TANH,
+  ASINH,
+  ACOSH,
+  ATANH,
+  CSC,
+  SEC,
+  COT,
+  RADIANS,
+  DEGREES,
+  EXP,
+  LN,
+  LOG,
+  LOG10,
+  PI,
+  RAND,
+  RANDBETWEEN,
+  MROUND,
+  QUOTIENT,
+  EVEN,
+  ODD,
+  FACT,
+  FACTDOUBLE,
+  COMBIN,
+  PERMUT,
+  GCD,
+  LCM,
+  COUNTBLANK,
+  SUMSQ,
+  SQRTPI,
 }
 

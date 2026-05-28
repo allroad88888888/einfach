@@ -116,10 +116,13 @@ describe('LAMBDA scope (NameExpr resolution)', () => {
 })
 
 describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
-  test('zero-arg LAMBDA: PI() returns 3.14', () => {
+  test('zero-arg LAMBDA: MYK() returns 3.14 (uses a non-builtin name)', () => {
+    // Renamed from PI — phase-8 added PI() as a built-in, and built-ins
+    // take dispatch precedence over user-defined names, so the original
+    // assertion is no longer realistic. MYK avoids the collision.
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
-    wb.defineName('PI', { kind: 'lambda', params: [], body: num(3.14) })
-    wb.setCell('s1', 0, 0, '=PI()')
+    wb.defineName('MYK', { kind: 'lambda', params: [], body: num(3.14) })
+    wb.setCell('s1', 0, 0, '=MYK()')
     expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 3.14 })
   })
 

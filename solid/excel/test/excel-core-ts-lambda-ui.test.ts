@@ -130,16 +130,19 @@ describe('worker-runtime-ts defineName — LAMBDA + range + value bindings', () 
     ).rejects.toMatchObject({ code: 'INVALID_LAMBDA_BODY' })
   })
 
-  test('defineName(LAMBDA): empty params array — DOUBLE() with no args binds nothing', async () => {
+  test('defineName(LAMBDA): empty params array — MYK() with no args binds nothing', async () => {
+    // Renamed from PI — phase-8 added PI() as a built-in, and built-ins
+    // win dispatch over user-defined names. Use MYK to keep this test
+    // focused on the empty-params case without colliding with a builtin.
     const runtime = createWorkerRuntimeTs()
     const { rpc, sheetIdx } = await initSheet(runtime)
 
     await rpc({
       cmd: 'defineName',
-      name: 'PI',
+      name: 'MYK',
       binding: { kind: 'lambda', params: [], body: '=3.14' },
     })
-    await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'A1', formula: '=PI()' })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'A1', formula: '=MYK()' })
     expect((await readCellDisplay(rpc, sheetIdx, 'A1')).display).toBe('3.14')
   })
 

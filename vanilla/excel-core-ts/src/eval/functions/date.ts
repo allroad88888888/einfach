@@ -268,6 +268,369 @@ const WEEKDAY: FunctionImpl = (args) => {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 8 additions — TIME, HOUR/MINUTE/SECOND, EOMONTH/EDATE, DAYS, WEEKNUM, etc.
+// ---------------------------------------------------------------------------
+
+/** TIME(hour, minute, second) — fractional day. */
+const TIME: FunctionImpl = (args) => {
+  if (args.length !== 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const h = coerceNumber(args[0])
+  if (!h.ok) return h.error
+  const m = coerceNumber(args[1])
+  if (!m.ok) return m.error
+  const s = coerceNumber(args[2])
+  if (!s.ok) return s.error
+  const totalSeconds = Math.trunc(h.value) * 3600 + Math.trunc(m.value) * 60 + Math.trunc(s.value)
+  if (totalSeconds < 0) return { kind: 'error', code: '#NUM!' }
+  // Fractional day, taking modulo 24h.
+  const frac = (totalSeconds % 86400) / 86400
+  return { kind: 'number', value: frac }
+}
+
+function fracPartHMS(serial: number): { h: number; m: number; s: number } {
+  const frac = serial - Math.floor(serial)
+  // Use rounding to avoid float drift on second boundaries.
+  const totalSeconds = Math.round(frac * 86400)
+  const h = Math.floor(totalSeconds / 3600) % 24
+  const m = Math.floor((totalSeconds % 3600) / 60)
+  const s = totalSeconds % 60
+  return { h, m, s }
+}
+
+/** HOUR(serial) — 0..23 */
+const HOUR: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  return { kind: 'number', value: fracPartHMS(s.value).h }
+}
+
+/** MINUTE(serial) — 0..59 */
+const MINUTE: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  return { kind: 'number', value: fracPartHMS(s.value).m }
+}
+
+/** SECOND(serial) — 0..59 */
+const SECOND: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  return { kind: 'number', value: fracPartHMS(s.value).s }
+}
+
+/** EDATE(start_date, months) — add N months. */
+const EDATE: FunctionImpl = (args) => {
+  if (args.length !== 2) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  const m = coerceNumber(args[1])
+  if (!m.ok) return m.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  const p = partsOf(s.value)
+  const newMonthIdx = (p.month - 1) + Math.trunc(m.value)
+  const newYear = p.year + Math.floor(newMonthIdx / 12)
+  const monthMod = ((newMonthIdx % 12) + 12) % 12
+  // Cap day to month length.
+  const daysInMonth = new Date(Date.UTC(newYear, monthMod + 1, 0)).getUTCDate()
+  const newDay = Math.min(p.day, daysInMonth)
+  if (newYear < 1900) return { kind: 'error', code: '#NUM!' }
+  const ms = Date.UTC(newYear, monthMod, newDay)
+  if (!Number.isFinite(ms)) return { kind: 'error', code: '#NUM!' }
+  return { kind: 'number', value: dateToSerial(new Date(ms)) }
+}
+
+/** EOMONTH(start_date, months) — last day of month after adding months. */
+const EOMONTH: FunctionImpl = (args) => {
+  if (args.length !== 2) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  const m = coerceNumber(args[1])
+  if (!m.ok) return m.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  const p = partsOf(s.value)
+  const newMonthIdx = (p.month - 1) + Math.trunc(m.value)
+  const newYear = p.year + Math.floor(newMonthIdx / 12)
+  const monthMod = ((newMonthIdx % 12) + 12) % 12
+  // Last day of that month
+  const last = new Date(Date.UTC(newYear, monthMod + 1, 0))
+  if (newYear < 1900) return { kind: 'error', code: '#NUM!' }
+  return { kind: 'number', value: dateToSerial(last) }
+}
+
+/** DAYS(end_date, start_date) — end - start. */
+const DAYS: FunctionImpl = (args) => {
+  if (args.length !== 2) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const e = coerceNumber(args[0])
+  if (!e.ok) return e.error
+  const s = coerceNumber(args[1])
+  if (!s.ok) return s.error
+  return { kind: 'number', value: Math.floor(e.value) - Math.floor(s.value) }
+}
+
+/** DATEVALUE(text) — parse ISO-like dates (YYYY-MM-DD, MM/DD/YYYY). */
+const DATEVALUE: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const v = args[0]
+  if (v.kind !== 'string') return { kind: 'error', code: '#VALUE!' }
+  const text = v.value.trim()
+  // Try YYYY-MM-DD
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(text)
+  if (m) {
+    const y = parseInt(m[1], 10)
+    const mo = parseInt(m[2], 10)
+    const d = parseInt(m[3], 10)
+    if (y < 1900) return { kind: 'error', code: '#NUM!' }
+    return { kind: 'number', value: dateToSerial(new Date(Date.UTC(y, mo - 1, d))) }
+  }
+  // Try MM/DD/YYYY
+  m = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/.exec(text)
+  if (m) {
+    const mo = parseInt(m[1], 10)
+    const d = parseInt(m[2], 10)
+    let y = parseInt(m[3], 10)
+    if (y < 100) y += 2000
+    if (y < 1900) return { kind: 'error', code: '#NUM!' }
+    return { kind: 'number', value: dateToSerial(new Date(Date.UTC(y, mo - 1, d))) }
+  }
+  return { kind: 'error', code: '#VALUE!' }
+}
+
+/** TIMEVALUE(text) — parse HH:MM:SS or HH:MM. */
+const TIMEVALUE: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const v = args[0]
+  if (v.kind !== 'string') return { kind: 'error', code: '#VALUE!' }
+  const text = v.value.trim()
+  const m = /^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/.exec(text)
+  if (!m) return { kind: 'error', code: '#VALUE!' }
+  const h = parseInt(m[1], 10)
+  const mi = parseInt(m[2], 10)
+  const s = m[3] ? parseInt(m[3], 10) : 0
+  if (h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+    return { kind: 'error', code: '#VALUE!' }
+  }
+  return { kind: 'number', value: (h * 3600 + mi * 60 + s) / 86400 }
+}
+
+/** WEEKNUM(serial, [return_type=1]) — week-number per system. */
+const WEEKNUM: FunctionImpl = (args) => {
+  if (args.length < 1 || args.length > 2) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  let returnType = 1
+  if (args.length === 2) {
+    const t = coerceNumber(args[1])
+    if (!t.ok) return t.error
+    returnType = Math.trunc(t.value)
+  }
+  // System 1 (default): week containing Jan 1 is week 1; week starts Sunday (returnType=1).
+  // System 2: weeks start Monday (returnType=2).
+  let startDow = 0 // 0 = Sunday
+  if (returnType === 2) startDow = 1
+  else if (returnType === 1) startDow = 0
+  else return { kind: 'error', code: '#NUM!' }
+  const p = partsOf(s.value)
+  // Compute serial of Jan 1 of that year.
+  const jan1 = dateToSerial(new Date(Date.UTC(p.year, 0, 1)))
+  const dowJan1 = weekdaySun0Mon1(jan1)
+  // Day-of-year for the input.
+  const doy = Math.floor(s.value) - jan1 + 1
+  const week = Math.floor((doy + ((dowJan1 - startDow + 7) % 7) - 1) / 7) + 1
+  return { kind: 'number', value: week }
+}
+
+/** ISOWEEKNUM(serial) — ISO 8601 week number. */
+const ISOWEEKNUM: FunctionImpl = (args) => {
+  if (args.length !== 1) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const s = coerceNumber(args[0])
+  if (!s.ok) return s.error
+  if (s.value < 0) return { kind: 'error', code: '#NUM!' }
+  // ISO: Thursday-anchored week. Easiest: use JS Date.
+  const p = partsOf(s.value)
+  const d = new Date(Date.UTC(p.year, p.month - 1, p.day))
+  // Shift to Thursday of this week.
+  const dow = d.getUTCDay() || 7 // ISO: Mon=1..Sun=7
+  d.setUTCDate(d.getUTCDate() + 4 - dow)
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1))
+  const week = Math.ceil(((d.getTime() - yearStart.getTime()) / MS_PER_DAY + 1) / 7)
+  return { kind: 'number', value: week }
+}
+
+/** DATEDIF(start, end, unit) — Excel's hidden DATEDIF. */
+const DATEDIF: FunctionImpl = (args) => {
+  if (args.length !== 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args)
+  if (err) return err
+  const sa = coerceNumber(args[0])
+  if (!sa.ok) return sa.error
+  const sb = coerceNumber(args[1])
+  if (!sb.ok) return sb.error
+  if (args[2].kind !== 'string') return { kind: 'error', code: '#VALUE!' }
+  const unit = args[2].value.toUpperCase()
+  const start = Math.floor(sa.value)
+  const end = Math.floor(sb.value)
+  if (start > end) return { kind: 'error', code: '#NUM!' }
+  const pStart = partsOf(start)
+  const pEnd = partsOf(end)
+  switch (unit) {
+    case 'D':
+      return { kind: 'number', value: end - start }
+    case 'Y': {
+      let years = pEnd.year - pStart.year
+      // Subtract if end date hasn't passed start's anniversary.
+      if (
+        pEnd.month < pStart.month ||
+        (pEnd.month === pStart.month && pEnd.day < pStart.day)
+      ) {
+        years -= 1
+      }
+      return { kind: 'number', value: years }
+    }
+    case 'M': {
+      let months = (pEnd.year - pStart.year) * 12 + (pEnd.month - pStart.month)
+      if (pEnd.day < pStart.day) months -= 1
+      return { kind: 'number', value: months }
+    }
+    case 'YM': {
+      let months = pEnd.month - pStart.month
+      if (months < 0) months += 12
+      if (pEnd.day < pStart.day) {
+        months -= 1
+        if (months < 0) months += 12
+      }
+      return { kind: 'number', value: months }
+    }
+    case 'YD': {
+      // Days ignoring years.
+      const anchor = new Date(Date.UTC(pEnd.year, pStart.month - 1, pStart.day))
+      let anchorSerial = dateToSerial(anchor)
+      if (anchorSerial > end) {
+        anchorSerial = dateToSerial(new Date(Date.UTC(pEnd.year - 1, pStart.month - 1, pStart.day)))
+      }
+      return { kind: 'number', value: end - anchorSerial }
+    }
+    case 'MD': {
+      // Days of month difference ignoring months/years.
+      let d = pEnd.day - pStart.day
+      if (d < 0) {
+        // Add prev month's day count
+        const prev = new Date(Date.UTC(pEnd.year, pEnd.month - 1, 0))
+        d += prev.getUTCDate()
+      }
+      return { kind: 'number', value: d }
+    }
+    default:
+      return { kind: 'error', code: '#NUM!' }
+  }
+}
+
+/** NETWORKDAYS(start, end, [holidays]) — count weekdays Mon-Fri, excluding holidays. */
+const NETWORKDAYS: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const sa = coerceNumber(args[0])
+  if (!sa.ok) return sa.error
+  const sb = coerceNumber(args[1])
+  if (!sb.ok) return sb.error
+  const start = Math.floor(sa.value)
+  const end = Math.floor(sb.value)
+  // Collect holidays as a Set of serials.
+  const holidays = new Set<number>()
+  if (args.length === 3) {
+    const h = args[2]
+    if (h.kind === 'error') return h
+    if (h.kind === 'array') {
+      for (const row of h.value) {
+        for (const cell of row) {
+          if (cell.kind === 'error') return cell
+          if (cell.kind === 'number') holidays.add(Math.floor(cell.value))
+        }
+      }
+    } else if (h.kind === 'number') {
+      holidays.add(Math.floor(h.value))
+    }
+  }
+  const lo = Math.min(start, end)
+  const hi = Math.max(start, end)
+  const sign = start <= end ? 1 : -1
+  let count = 0
+  for (let s = lo; s <= hi; s++) {
+    const dow = weekdaySun0Mon1(s) // Sun=0..Sat=6
+    if (dow === 0 || dow === 6) continue
+    if (holidays.has(s)) continue
+    count++
+  }
+  return { kind: 'number', value: sign * count }
+}
+
+/** WORKDAY(start, days, [holidays]) — add business days. */
+const WORKDAY: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const sa = coerceNumber(args[0])
+  if (!sa.ok) return sa.error
+  const dc = coerceNumber(args[1])
+  if (!dc.ok) return dc.error
+  let days = Math.trunc(dc.value)
+  let serial = Math.floor(sa.value)
+  const holidays = new Set<number>()
+  if (args.length === 3) {
+    const h = args[2]
+    if (h.kind === 'error') return h
+    if (h.kind === 'array') {
+      for (const row of h.value) {
+        for (const cell of row) {
+          if (cell.kind === 'number') holidays.add(Math.floor(cell.value))
+        }
+      }
+    } else if (h.kind === 'number') {
+      holidays.add(Math.floor(h.value))
+    }
+  }
+  const step = days >= 0 ? 1 : -1
+  let remaining = Math.abs(days)
+  while (remaining > 0) {
+    serial += step
+    const dow = weekdaySun0Mon1(serial)
+    if (dow === 0 || dow === 6) continue
+    if (holidays.has(serial)) continue
+    remaining--
+  }
+  return { kind: 'number', value: serial }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -279,4 +642,19 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   MONTH,
   DAY,
   WEEKDAY,
+  // Phase 8 additions
+  TIME,
+  HOUR,
+  MINUTE,
+  SECOND,
+  EDATE,
+  EOMONTH,
+  DAYS,
+  DATEVALUE,
+  TIMEVALUE,
+  WEEKNUM,
+  ISOWEEKNUM,
+  DATEDIF,
+  NETWORKDAYS,
+  WORKDAY,
 }

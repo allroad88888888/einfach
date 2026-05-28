@@ -2034,11 +2034,32 @@ impl Sheet {
         let refs_set: HashSet<CellAddress> = refs.into_iter().collect();
 
         let dependents = self.cell_dependents.borrow();
+        let range_dependents = self.range_dependents.borrow();
         let mut seen: HashSet<CellAddress> = HashSet::new();
         let mut to_visit: Vec<CellAddress> = Vec::new();
-        if let Some(set) = dependents.get(&target) {
-            to_visit.extend(set.iter().copied());
-        }
+        let mut range_scratch: Vec<CellRange> = Vec::new();
+        // Seed the BFS with both point-cell and range dependents of `target`.
+        // Range-only deps survive `replace_formula_deps` cleanup of empty
+        // points (e.g. =SUM(A1:A100) after read drops empty A_i from
+        // cell_dependents but keeps them in range_dependents), so omitting
+        // them lets `set_formula(empty_range_cell, "=ranged_formula")` slip
+        // through as a non-cycle and install circular eval state. Codex P1
+        // fix.
+        let mut seed = |addr: CellAddress, out: &mut Vec<CellAddress>| {
+            if let Some(set) = dependents.get(&addr) {
+                out.extend(set.iter().copied());
+            }
+            range_scratch.clear();
+            range_dependents.candidates_for_into(addr, &mut range_scratch);
+            for range in range_scratch.iter() {
+                if range.contains(addr) {
+                    if let Some(formulas) = range_dependents.formulas_for(range) {
+                        out.extend(formulas.iter().copied());
+                    }
+                }
+            }
+        };
+        seed(target, &mut to_visit);
         while let Some(c) = to_visit.pop() {
             if !seen.insert(c) {
                 continue;
@@ -2046,9 +2067,7 @@ impl Sheet {
             if refs_set.contains(&c) {
                 return true;
             }
-            if let Some(set) = dependents.get(&c) {
-                to_visit.extend(set.iter().copied());
-            }
+            seed(c, &mut to_visit);
         }
         false
     }
@@ -5661,6 +5680,25 @@ mod tests {
     /// extrapolating to 290s+ at 100k). The 500ms ceiling here is still
     /// 20× slack over the observed 20-25ms baseline but small enough to
     /// catch a regression long before it scales out to the 100k tier.
+    /// Codex P1 regression: would_create_cycle must consult range_dependents,
+    /// not just cell_dependents. After `=SUM(A1:A100)` evaluates with empty
+    /// A2..A100, sparse-eval narrows `cell_dependents` to just `A1`, but the
+    /// range registration `(A1:A100, B1)` survives in `range_dependents`. A
+    /// subsequent `set_formula("A50", "=B1")` is a real cycle (A50 → B1 →
+    /// SUM(A1..A100) including A50) and must be rejected.
+    #[test]
+    fn range_cycle_detected_after_sparse_eval() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert!(sheet.set_formula("B1", "=SUM(A1:A100)"));
+        // Read forces eval, which narrows cell_dependents.
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+        // A50 is inside A1:A100 and is empty — register a back-edge to B1.
+        // This forms a cycle through the range dep.
+        let ok = sheet.set_formula("A50", "=B1");
+        assert!(!ok, "set_formula should reject the range-mediated cycle");
+    }
+
     #[test]
     fn chain_bulk_install_is_linear() {
         let mut sheet = Sheet::new();

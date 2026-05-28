@@ -125,6 +125,107 @@ export const TYPE: FunctionImpl = (args) => {
 }
 
 // =============================================================================
+// Phase 8 additions — ISNONTEXT, ISEVEN, ISODD, N, NA
+// =============================================================================
+
+/** ISNONTEXT — TRUE unless arg is a string. */
+export const ISNONTEXT: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  return BOOL(args[0].kind !== 'string')
+}
+
+/** ISEVEN(n) — TRUE if n truncated is even. */
+export const ISEVEN: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  const v = args[0]
+  if (v.kind === 'error') return v
+  // Only numbers (and booleans coerced to number) make sense.
+  let n: number
+  if (v.kind === 'number') n = v.value
+  else if (v.kind === 'boolean') n = v.value ? 1 : 0
+  else if (v.kind === 'blank') n = 0
+  else return ERR_VALUE()
+  return BOOL(Math.trunc(Math.abs(n)) % 2 === 0)
+}
+
+/** ISODD(n) — TRUE if n truncated is odd. */
+export const ISODD: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  const v = args[0]
+  if (v.kind === 'error') return v
+  let n: number
+  if (v.kind === 'number') n = v.value
+  else if (v.kind === 'boolean') n = v.value ? 1 : 0
+  else if (v.kind === 'blank') n = 0
+  else return ERR_VALUE()
+  return BOOL(Math.trunc(Math.abs(n)) % 2 === 1)
+}
+
+/**
+ * N(value) — convert a value to its numeric representation.
+ *   number → itself
+ *   boolean → 1 / 0
+ *   blank → 0
+ *   string → 0
+ *   error → the error (propagate)
+ *   array → top-left, recursively
+ */
+export const N: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  const v = args[0]
+  switch (v.kind) {
+    case 'number':
+      return v
+    case 'boolean':
+      return NUM(v.value ? 1 : 0)
+    case 'blank':
+      return NUM(0)
+    case 'string':
+      return NUM(0)
+    case 'error':
+      return v
+    case 'array': {
+      const row = v.value[0]
+      if (!row || row.length === 0) return NUM(0)
+      return N([row[0]], _ctxIgnored)
+    }
+  }
+}
+
+const _ctxIgnored = new Proxy({}, {
+  get(_, prop) {
+    throw new Error(`info fn unexpectedly read ctx.${String(prop)}`)
+  },
+}) as unknown as Parameters<FunctionImpl>[1]
+
+/** NA() — return #N/A unconditionally. */
+export const NA: FunctionImpl = (args) => {
+  if (args.length !== 0) return ERR_VALUE()
+  return { kind: 'error', code: '#N/A' }
+}
+
+/** ISFORMULA — without ref info available at this layer, always returns FALSE. */
+export const ISFORMULA: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  // The dispatcher pre-resolves refs into values, so we never see the
+  // formula flag here. Returning FALSE matches the "value is not a
+  // formula" interpretation. A future evaluator-aware impl can do better.
+  return BOOL(false)
+}
+
+/** ISREF — same limitation; refs are pre-resolved before reaching us. */
+export const ISREF: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  return BOOL(false)
+}
+
+// =============================================================================
 // Registry
 // =============================================================================
 
@@ -137,4 +238,12 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   ISERR,
   ISNA,
   TYPE,
+  // Phase 8 additions
+  ISNONTEXT,
+  ISEVEN,
+  ISODD,
+  N,
+  NA,
+  ISFORMULA,
+  ISREF,
 }
