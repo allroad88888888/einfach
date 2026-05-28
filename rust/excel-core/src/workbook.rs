@@ -1382,15 +1382,31 @@ impl Workbook {
         self.cross_sheet.debug_reverse_edge_count()
     }
 
-    /// Cheap "are there any cross-sheet formula edges registered anywhere
-    /// in this workbook?" check. Used by `WorkbookEvalProvider::force_
-    /// formula_recompute` to scope the read-time bypass: when no formula
-    /// references another sheet, the bypass is unnecessary and every
-    /// `wb.get_cell` read can hit `FormulaCache::Clean`. Single-sheet
-    /// chains (the bench's Chain100 etc.) take this fast path and only
-    /// pay for full chain evaluation on the first read.
+    /// Cheap "does any sheet in this workbook host a formula that
+    /// references another sheet?" check. Used by
+    /// `WorkbookEvalProvider::force_formula_recompute` to scope the
+    /// read-time bypass: when no formula references another sheet, the
+    /// bypass is unnecessary and every `wb.get_cell` read can hit
+    /// `FormulaCache::Clean`. Single-sheet chains (the bench's Chain100
+    /// etc.) take this fast path and only pay for full chain evaluation
+    /// on the first read.
+    ///
+    /// Combines two signals:
+    ///   1. `CrossSheetDeps::formula_refs` — registered by the workbook-
+    ///      routed `Workbook::set_formula` / bulk-load paths.
+    ///   2. Each sheet's `has_cross_sheet_refs` latch — set by the
+    ///      per-sheet `Sheet::set_formula` flow regardless of whether
+    ///      the workbook ever saw the install. This captures formulas
+    ///      installed via the raw `wb.sheet_mut(idx).set_formula(...)`
+    ///      bypass (which skips edge registration) and survives
+    ///      `Workbook::remove_sheet` clearing `cross_sheet` — both cases
+    ///      codex flagged as "force_recompute should still fire". The
+    ///      latch is one-way (never cleared), so the bypass may stay
+    ///      armed slightly longer than strictly necessary but never
+    ///      under-fires.
     pub(crate) fn has_any_cross_sheet_edges(&self) -> bool {
         !self.cross_sheet.formula_refs.is_empty()
+            || self.sheets.iter().any(|s| s.has_cross_sheet_refs())
     }
 
     /// Debug-only: per-workbook count of `collect_workbook_refs` AST walks
@@ -2013,12 +2029,20 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         // Safety net for the "raw" `wb.sheet_mut(idx).set_cell(...)` path,
         // which bypasses cross-sheet dirty fanout (see
         // `raw_sheet_write_does_not_fire_cross_sheet_subscriber`). When the
-        // workbook has zero cross-sheet edges, no formula can have a stale
+        // workbook has zero cross-sheet state, no formula can have a stale
         // cross-sheet cache, so the bypass is unnecessary and every
         // `wb.get_cell` read can hit `FormulaCache::Clean`. This is the
         // common case for single-sheet workbooks (the chain perf bench's
         // Chain100/1k/10k/100k all live on Sheet1 only) and turns the
         // steady-state read from O(formulas) re-evals into O(1).
+        //
+        // `has_any_cross_sheet_edges` ORs the registered-edge map with
+        // each sheet's `has_cross_sheet_refs` latch, so the bypass also
+        // stays armed when a formula is installed via the raw
+        // `wb.sheet_mut(idx).set_formula(...)` path (which skips edge
+        // registration) — without that OR, codex's repro
+        // (`raw_path_cross_sheet_recompute_stays_correct`) leaked the
+        // stale cached value.
         self.wb.has_any_cross_sheet_edges()
     }
 
@@ -2463,6 +2487,77 @@ mod tests {
             count2, count1,
             "steadyState read must not re-eval (cache miss bug); first={count1} second={count2}"
         );
+    }
+
+    /// Regression: codex P1 — `WorkbookEvalProvider::force_formula_recompute`
+    /// must keep firing when a cross-sheet formula is installed via the
+    /// raw `wb.sheet_mut(idx).set_formula(...)` path. That path bypasses
+    /// `CrossSheetDeps::formula_refs` registration, so a `formula_refs`-
+    /// only check leaks the stale cached value after the cross-sheet
+    /// source mutates. The per-sheet `has_cross_sheet_refs` latch fixes
+    /// it: the latch is set inside `Sheet::set_formula` (regardless of
+    /// who called it) and OR'd into `has_any_cross_sheet_edges`.
+    #[test]
+    fn raw_path_cross_sheet_recompute_stays_correct() {
+        let mut wb = Workbook::new();
+        wb.add_sheet("Data");
+        wb.sheet_by_name_mut("Data")
+            .unwrap()
+            .set_cell("A1", Value::Number(5.0));
+        // Raw path — bypasses workbook-level edge registration. Formula
+        // still parses as cross-sheet so the sheet-level latch fires.
+        assert!(wb.sheet_mut(0).unwrap().set_formula("B1", "=Data!A1*2"));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
+        // Mutate the cross-sheet source. Pre-fix: `formula_refs` is
+        // empty, `force_formula_recompute` returns false, B1's cached
+        // value (10) leaks through. Post-fix: the sheet-1 latch flips
+        // the gate true and the cached value is rechecked.
+        wb.sheet_by_name_mut("Data")
+            .unwrap()
+            .set_cell("A1", Value::Number(7.0));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
+    }
+
+    /// Regression: codex P1 — `Workbook::remove_sheet` clears the
+    /// cross-sheet dep graph (indices shift; rewriting every edge in
+    /// place is brittle). Formulas on surviving sheets that referenced
+    /// the removed sheet still exist; they now resolve to `#REF!` (or
+    /// blank), but they remain cross-sheet AST shapes. Re-reading them
+    /// after a source mutation must NOT trust the pre-removal cached
+    /// value: the sheet-level latch on the formula's host sheet is
+    /// still set, so `force_formula_recompute` keeps firing.
+    #[test]
+    fn remove_sheet_then_recompute_stays_correct() {
+        let mut wb = Workbook::new();
+        // Sheet1 hosts B1 = =Data!A1*2; Data is a second sheet.
+        wb.add_sheet("Data"); // idx 1
+        wb.sheet_by_name_mut("Data")
+            .unwrap()
+            .set_cell("A1", Value::Number(5.0));
+        assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
+
+        // Drop the Data sheet. `cross_sheet` is cleared (see
+        // `Workbook::remove_sheet`); the host sheet's latch survives.
+        wb.remove_sheet(1);
+
+        // Now install a NEW Data sheet at the same name. Without the
+        // latch, `has_any_cross_sheet_edges()` would still return false
+        // here (formula_refs is empty, nothing repopulates it until the
+        // next workbook-routed set_formula on B1). The latch keeps the
+        // bypass armed so the cache stays honest as the new Data!A1
+        // surfaces through B1.
+        wb.add_sheet("Data");
+        wb.sheet_by_name_mut("Data")
+            .unwrap()
+            .set_cell("A1", Value::Number(3.0));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(6.0));
+
+        // Mutate the new source. Must propagate.
+        wb.sheet_by_name_mut("Data")
+            .unwrap()
+            .set_cell("A1", Value::Number(11.0));
+        assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(22.0));
     }
 
     #[test]

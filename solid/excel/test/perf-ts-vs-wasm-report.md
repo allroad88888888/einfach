@@ -115,7 +115,7 @@ tier where each phase crosses (WASM regains advantage).
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
-*Last chain bench run: 2026-05-28T02:50:25.718Z*
+*Last chain bench run: 2026-05-28T03:20:15.661Z*
 
 ## Chain dependency workload
 
@@ -134,26 +134,26 @@ per-cell precise dep tracking. Phases:
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Chain100 | setup | 0.60 | 2.5 | 0.23× | TS wins |
-| Chain100 | bulkWrite | 0.78 | 2.5 | 0.31× | TS wins |
-| Chain100 | firstRecalc | 1.1 | 0.65 | 1.73× | WASM wins |
-| Chain100 | mutateThenRecalc | 0.50 | 0.13 | 3.88× | WASM wins |
-| Chain100 | steadyState | 0.01 | 0.01 | 2.47× | WASM wins |
-| Chain1k | setup | 0.13 | 0.10 | 1.32× | WASM edges |
-| Chain1k | bulkWrite | 1.8 | 41.6 | 0.04× | TS wins |
-| Chain1k | firstRecalc | 2.9 | 0.78 | 3.68× | WASM wins |
-| Chain1k | mutateThenRecalc | 1.2 | 0.94 | 1.25× | WASM edges |
-| Chain1k | steadyState | 0.00 | 0.00 | 0.78× | roughly tied |
-| Chain10k | setup | 0.09 | 0.07 | 1.28× | WASM edges |
-| Chain10k | bulkWrite | 6.4 | 3943 | 0.00× | TS wins |
-| Chain10k | firstRecalc | 14.1 | 6.5 | 2.16× | WASM wins |
-| Chain10k | mutateThenRecalc | 12.7 | 8.6 | 1.49× | WASM edges |
-| Chain10k | steadyState | 0.01 | 0.01 | 1.03× | WASM edges |
-| Chain100k | setup | 0.10 | 0.07 | 1.31× | WASM edges |
-| Chain100k | bulkWrite | 74.7 | 776944 | 0.00× | TS wins |
-| Chain100k | firstRecalc | 143 | 82.9 | 1.72× | WASM wins |
-| Chain100k | mutateThenRecalc | 159 | 136 | 1.17× | WASM edges |
-| Chain100k | steadyState | 0.01 | 0.02 | 0.37× | TS wins |
+| Chain100 | setup | 0.70 | 2.4 | 0.29× | TS wins |
+| Chain100 | bulkWrite | 0.80 | 2.6 | 0.31× | TS wins |
+| Chain100 | firstRecalc | 1.2 | 0.74 | 1.59× | WASM wins |
+| Chain100 | mutateThenRecalc | 0.43 | 0.14 | 3.09× | WASM wins |
+| Chain100 | steadyState | 0.01 | 0.01 | 2.71× | WASM wins |
+| Chain1k | setup | 0.13 | 0.14 | 0.94× | roughly tied |
+| Chain1k | bulkWrite | 1.6 | 43.2 | 0.04× | TS wins |
+| Chain1k | firstRecalc | 2.6 | 0.81 | 3.26× | WASM wins |
+| Chain1k | mutateThenRecalc | 1.2 | 0.96 | 1.27× | WASM edges |
+| Chain1k | steadyState | 0.00 | 0.00 | 0.92× | roughly tied |
+| Chain10k | setup | 0.09 | 0.09 | 1.01× | WASM edges |
+| Chain10k | bulkWrite | 7.9 | 4258 | 0.00× | TS wins |
+| Chain10k | firstRecalc | 14.9 | 6.3 | 2.36× | WASM wins |
+| Chain10k | mutateThenRecalc | 9.7 | 8.5 | 1.14× | WASM edges |
+| Chain10k | steadyState | 0.01 | 0.01 | 1.93× | WASM wins |
+| Chain100k | setup | 0.11 | 0.07 | 1.59× | WASM wins |
+| Chain100k | bulkWrite | 73.6 | 715331 | 0.00× | TS wins |
+| Chain100k | firstRecalc | 280 | 68.5 | 4.08× | WASM wins |
+| Chain100k | mutateThenRecalc | 124 | 121 | 1.03× | WASM edges |
+| Chain100k | steadyState | 0.01 | 0.01 | 0.42× | TS wins |
 
 ### evalCount delta per phase
 
@@ -186,26 +186,26 @@ For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` 
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Chain100 | setup | 487 MB | 488 MB |
-| Chain100 | bulkWrite | 488 MB | 489 MB |
-| Chain100 | firstRecalc | 488 MB | 489 MB |
-| Chain100 | mutateThenRecalc | 488 MB | 489 MB |
-| Chain100 | steadyState | 488 MB | 489 MB |
-| Chain1k | setup | 493 MB | 495 MB |
-| Chain1k | bulkWrite | 494 MB | 496 MB |
-| Chain1k | firstRecalc | 495 MB | 496 MB |
-| Chain1k | mutateThenRecalc | 495 MB | 496 MB |
-| Chain1k | steadyState | 495 MB | 496 MB |
-| Chain10k | setup | 496 MB | 509 MB |
-| Chain10k | bulkWrite | 497 MB | 516 MB |
-| Chain10k | firstRecalc | 500 MB | 516 MB |
-| Chain10k | mutateThenRecalc | 509 MB | 516 MB |
-| Chain10k | steadyState | 509 MB | 516 MB |
-| Chain100k | setup | 519 MB | 859 MB |
-| Chain100k | bulkWrite | 513 MB | 223 MB |
-| Chain100k | firstRecalc | 574 MB | 223 MB |
-| Chain100k | mutateThenRecalc | 859 MB | 224 MB |
-| Chain100k | steadyState | 859 MB | 224 MB |
+| Chain100 | setup | 472 MB | 473 MB |
+| Chain100 | bulkWrite | 472 MB | 474 MB |
+| Chain100 | firstRecalc | 472 MB | 474 MB |
+| Chain100 | mutateThenRecalc | 472 MB | 474 MB |
+| Chain100 | steadyState | 472 MB | 474 MB |
+| Chain1k | setup | 479 MB | 500 MB |
+| Chain1k | bulkWrite | 481 MB | 501 MB |
+| Chain1k | firstRecalc | 481 MB | 501 MB |
+| Chain1k | mutateThenRecalc | 500 MB | 501 MB |
+| Chain1k | steadyState | 500 MB | 501 MB |
+| Chain10k | setup | 501 MB | 522 MB |
+| Chain10k | bulkWrite | 505 MB | 449 MB |
+| Chain10k | firstRecalc | 507 MB | 449 MB |
+| Chain10k | mutateThenRecalc | 525 MB | 449 MB |
+| Chain10k | steadyState | 522 MB | 449 MB |
+| Chain100k | setup | 456 MB | 522 MB |
+| Chain100k | bulkWrite | 467 MB | 198 MB |
+| Chain100k | firstRecalc | 483 MB | 198 MB |
+| Chain100k | mutateThenRecalc | 522 MB | 199 MB |
+| Chain100k | steadyState | 522 MB | 199 MB |
 
 ### Chain crossover trace (mutateThenRecalc)
 
@@ -213,8 +213,8 @@ Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
 This is THE chain-workload diagnostic. If Rust ever beats TS in this
 repo, it should show up here first.
 
-- Chain100=3.88×, Chain1k=1.25×, Chain10k=1.49×, Chain100k=1.17×
-- crossover: Chain100 (ratio 3.88×)
+- Chain100=3.09×, Chain1k=1.27×, Chain10k=1.14×, Chain100k=1.03×
+- crossover: Chain100 (ratio 3.09×)
 <!-- BENCH:CHAIN:END -->
 
 ## Findings (2026-05-27 — XLarge / Mega / Ultra sweep)

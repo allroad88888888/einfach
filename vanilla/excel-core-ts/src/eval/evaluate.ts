@@ -645,17 +645,23 @@ export function evaluateCellTrampolined(
   // false-positive a cycle. Membership in `inProgress` is bound to
   // "AST eval has started but not finished for this guard key."
   //
-  // `queued` is a separate set that tracks "has been pushed onto the
-  // stack at least once" so we don't re-push the same dep N times when
-  // a cell's AST evaluation faults out repeatedly while bringing in
-  // its deps one at a time.
+  // We do NOT maintain a separate `queued` "already pushed" set. An
+  // earlier revision tried to skip re-pushing deps already on the
+  // stack, but that broke a corner case: when a range batch like
+  // `=SUM(B1:B3)` with `B1=B2+1, B2=B3+1, B3=1` pre-pushes [B3, B2, B1]
+  // (B1 on top), B1's AST walk faults on B2 — which is queued lower on
+  // the stack but hasn't started yet. Short-circuiting the re-push left
+  // B1 stuck on top, retrying forever until `maxIter`. The correctness
+  // invariant is the cache check at the top of the loop: re-pushing a
+  // dep that's already in the stack costs O(1) per duplicate pop (the
+  // cache-hit branch immediately drops it), and the duplicate count is
+  // bounded by the number of distinct refs in each in-flight cell's
+  // AST — not by chain depth.
   const inProgress = new Set<CellKey>()
-  const queued = new Set<CellKey>()
   const stack: TrampolineFrame[] = []
 
   const rootGuard = cycleGuardKey(rootCells, rootKey)
   stack.push({ cells: rootCells, key: rootKey, guardKey: rootGuard })
-  queued.add(rootGuard)
 
   // Bound on iterations as a defense against accidental infinite
   // re-trying. Worst case the trampoline visits each cell `1 + deps`
@@ -677,7 +683,6 @@ export function evaluateCellTrampolined(
     const top = stack[stack.length - 1]
     if (cache.has(top.guardKey)) {
       inProgress.delete(top.guardKey)
-      queued.delete(top.guardKey)
       stack.pop()
       continue
     }
@@ -685,14 +690,12 @@ export function evaluateCellTrampolined(
     if (!cell) {
       cache.set(top.guardKey, BLANK)
       inProgress.delete(top.guardKey)
-      queued.delete(top.guardKey)
       stack.pop()
       continue
     }
     if (!cell.ast) {
       cache.set(top.guardKey, cell.value)
       inProgress.delete(top.guardKey)
-      queued.delete(top.guardKey)
       stack.pop()
       continue
     }
@@ -705,7 +708,6 @@ export function evaluateCellTrampolined(
       const value = evaluate(cell.ast, shimCtx)
       cache.set(top.guardKey, value)
       inProgress.delete(top.guardKey)
-      queued.delete(top.guardKey)
       stack.pop()
     } catch (err) {
       if (err instanceof NeedsDep) {
@@ -721,11 +723,14 @@ export function evaluateCellTrampolined(
         // chain: `SUM(B1:B100)` with `B(k)=B(k-1)+1` lists deps as
         // [B2, B3, …, B100]; to evaluate them bottom-up we want B2
         // popped first, so push B100 first and B2 last.
+        //
+        // We deliberately do NOT skip deps already on the stack — see
+        // the comment near `inProgress` for the corner case (range
+        // batch faulting on a queued-but-not-started dep). Duplicates
+        // are O(1) at pop time via the cache-hit branch.
         for (let i = err.deps.length - 1; i >= 0; i -= 1) {
           const dep = err.deps[i]
           if (cache.has(dep.guardKey)) continue
-          if (queued.has(dep.guardKey)) continue
-          queued.add(dep.guardKey)
           stack.push({ cells: dep.cells, key: dep.key, guardKey: dep.guardKey })
         }
         // Loop continues; the newly-pushed deps will be evaluated

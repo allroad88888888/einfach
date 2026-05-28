@@ -602,6 +602,27 @@ pub struct Sheet {
     /// does not derive `Ord` — atom-id ordering carries no semantic
     /// meaning and we never iterate this map in order.
     spill_targets: HashMap<AtomId, Vec<CellAddress>>,
+    /// One-way latch: set to `true` the first time a formula whose AST
+    /// contains a `Expr::SheetRef` / `Expr::SheetRange` is installed on
+    /// this sheet, never cleared. Drives
+    /// `Workbook::has_any_cross_sheet_state` so the read-time
+    /// `WorkbookEvalProvider::force_formula_recompute` safety net still
+    /// fires for cross-sheet formulas installed through the raw
+    /// `wb.sheet_mut(idx).set_formula(...)` path (which bypasses
+    /// `CrossSheetDeps::formula_refs` registration) or after
+    /// `Workbook::remove_sheet` clears the cross-sheet dep graph but
+    /// other sheets still hold formulas that referenced the removed
+    /// sheet.
+    ///
+    /// Why a latch rather than a precise counter / set? Clearing on
+    /// formula replacement / deletion would require re-scanning every
+    /// remaining formula's AST to know whether ANY cross-sheet ref still
+    /// lives on the sheet — too much work for the read-time fast path's
+    /// gating decision. The latch is conservative in the safe direction:
+    /// `force_formula_recompute` stays armed slightly longer than
+    /// strictly necessary, which costs one cache-miss recompute per read
+    /// (the pre-bypass status quo) and never under-fires.
+    has_cross_sheet_refs: Cell<bool>,
 }
 
 impl Sheet {
@@ -624,6 +645,24 @@ impl Sheet {
             formula_eval_count: Cell::new(0),
             imported_formula_count: Cell::new(0),
             spill_targets: HashMap::new(),
+            has_cross_sheet_refs: Cell::new(false),
+        }
+    }
+
+    /// Read the one-way cross-sheet latch. See `has_cross_sheet_refs`
+    /// field docs for the contract. `pub(crate)` so
+    /// `Workbook::has_any_cross_sheet_state` can OR it across sheets.
+    pub(crate) fn has_cross_sheet_refs(&self) -> bool {
+        self.has_cross_sheet_refs.get()
+    }
+
+    /// Inline helper: set the cross-sheet latch if `expr` contains any
+    /// `SheetRef` / `SheetRange`. Called from every formula-installation
+    /// path in this module so the raw `wb.sheet_mut(...).set_formula(...)`
+    /// flow keeps the read-time bypass armed.
+    fn note_cross_sheet_if_any(&self, expr: &Expr) {
+        if !self.has_cross_sheet_refs.get() && expr_has_sheet_ref(expr) {
+            self.has_cross_sheet_refs.set(true);
         }
     }
 
@@ -1790,6 +1829,7 @@ impl Sheet {
             ));
             sheet.add_formula_deps(addr, &deps);
             sheet.add_formula_range_deps(addr, &range_deps);
+            sheet.note_cross_sheet_if_any(&expr);
             sheet.formula_cells.insert(addr, record);
             sheet.formula_exprs.insert(addr, expr);
             sheet.formula_texts.insert(addr, formula_str.to_string());
@@ -2088,38 +2128,47 @@ impl Sheet {
                 FormulaCache::Clean(_) | FormulaCache::Dirty => {}
             }
 
-            // Re-push self with ready_to_eval=true, then push each point-cell
-            // dep that points to a formula cell. The dep list is the union of
-            // (a) the cached eval-time deps from the last successful eval and
-            // (b) the statically-collected deps installed at `set_formula`
-            // time (re-derived here from the AST), so a freshly-installed
-            // formula that has never been evaluated still gets its chain
-            // pre-warmed. After the first eval the cache holds the narrowed
-            // eval-tracked set; we accept that narrowing — branch-skipped
-            // cells will simply be re-discovered on the next dirty-and-eval
-            // cycle through this same prewarm pass.
+            // Re-push self with ready_to_eval=true, then push each
+            // point-cell dep that points to a formula cell.
+            //
+            // We derive the dep set from a short-circuit-aware AST walk
+            // (`collect_prewarm_refs`) rather than `record.deps` or an
+            // unfiltered `collect_refs` traversal. Codex P2 finding:
+            // walking the raw AST descends into both `IF` branches, so
+            // `=IF(TRUE, 0, B1)` would pre-warm B1 even though IF never
+            // takes the else branch. That regresses lazy-branch
+            // semantics — volatile functions, custom formulas with
+            // state, and expensive chains the user explicitly guarded
+            // out would all run unnecessarily.
+            //
+            // `record.deps` is no better as a stand-alone source:
+            // pre-first-eval it's seeded from the full AST via
+            // `formula_deps_for` (so the dependent graph subscribes to
+            // every cell mentioned, including branches that might be
+            // taken later); post-eval it's the narrowed actually-touched
+            // set. Using it here would just re-leak the unsafe
+            // install-time set on the very first read — exactly the
+            // path the regression exercises.
+            //
+            // Skipping `record.deps` is safe because prewarm is an
+            // optional cache-fill — if the evaluator later takes a
+            // branch we didn't pre-warm, recursive `compute_formula_at`
+            // resolves it. Worst case adds a few stack frames per AST
+            // level; the unbounded-chain risk that `prewarm` exists to
+            // mitigate lives in *uniform* chains (`A2=A1+1`,
+            // `A3=A2+1`, …) which use no short-circuit ops at all and
+            // therefore get the full prewarm treatment as before. See
+            // `if_true_does_not_prewarm_unused_branch` and siblings for
+            // the pinned regressions, and `chain_10000_native_read_does_not_panic`
+            // for the WASM-stack regression we are not allowed to
+            // regress.
             stack.push((addr, true));
 
-            // Direct (post-eval) deps. Cheap clone — these are usually a
-            // handful of cells per formula.
-            let direct_deps = record.deps.borrow().clone();
-            for dep in &direct_deps {
-                if !self.formula_cells.contains_key(dep) {
-                    continue;
-                }
-                stack.push((*dep, false));
-            }
-
-            // Static deps from the AST. Necessary for first-ever evals where
-            // `record.deps` is the install-time set (already correct here),
-            // and also for force-recompute paths where the cached set may
-            // have been narrowed. We deduplicate by relying on the cache
-            // state check at the top of the loop — a Clean cell pushed
-            // twice falls out on the second visit.
             let mut ast_refs: Vec<CellAddress> = Vec::new();
-            collect_refs(&record.expr, &mut ast_refs);
+            collect_prewarm_refs(&record.expr, &mut ast_refs);
+            let mut enqueued: HashSet<CellAddress> = HashSet::new();
             for dep in ast_refs {
-                if direct_deps.contains(&dep) {
+                if !enqueued.insert(dep) {
                     continue;
                 }
                 if !self.formula_cells.contains_key(&dep) {
@@ -2922,6 +2971,7 @@ impl Sheet {
         ));
         self.add_formula_deps(addr, &deps);
         self.add_formula_range_deps(addr, &range_deps);
+        self.note_cross_sheet_if_any(&expr);
         self.formula_cells.insert(addr, record);
         self.formula_exprs.insert(addr, expr);
         self.formula_texts.insert(addr, formula_str);
@@ -3119,6 +3169,7 @@ impl<'a> BulkLoader<'a> {
         ));
         self.sheet.add_formula_deps(addr, &deps);
         self.sheet.add_formula_range_deps(addr, &range_deps);
+        self.sheet.note_cross_sheet_if_any(&expr);
         self.sheet.formula_cells.insert(addr, record);
         self.sheet.formula_exprs.insert(addr, expr);
         self.sheet
@@ -3342,6 +3393,137 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         Expr::MultiArea(parts) => {
             for p in parts {
                 collect_refs(p, out);
+            }
+        }
+    }
+}
+
+/// Variant of `collect_refs` that respects evaluator short-circuit
+/// semantics — used by `prewarm_formula_chain` to fill the formula cache
+/// without pre-warming branches the evaluator would skip.
+///
+/// `collect_refs` blindly walks every child of every `FuncCall`. Plumbing
+/// its output through prewarm caused a bug (codex P2): `=IF(TRUE, 0, B1)`
+/// would pre-warm B1 because the static AST mentions it, even though the
+/// `IF` evaluator never touches the else branch. That regressed lazy-eval
+/// for any formula guarding a volatile / custom / large chain behind an
+/// `IF` / `IFS` / `SWITCH` / `IFERROR` / `IFNA`.
+///
+/// The fix: when we encounter one of those short-circuit calls, only
+/// descend into the args that are *guaranteed* to be evaluated. The
+/// branches reached only when a runtime condition holds are left out;
+/// if eval later does take that branch, the recursive `compute_formula_at`
+/// path will still resolve those cells correctly. The prewarm is just an
+/// optional cache-fill, so missing a cell is never a correctness issue —
+/// it only means an extra recursive frame at eval time.
+///
+/// Args we treat as "always evaluated":
+///
+/// - `IF(cond, then, else)` → `cond` only.
+/// - `IFS(c1, v1, c2, v2, ...)` → `c1` only (each subsequent cond is
+///   guarded by the prior ones being false).
+/// - `SWITCH(expr, c1, v1, ...)` → `expr` and `c1` (the leading
+///   discriminant and the first case are always touched by the
+///   evaluator; later cases stop as soon as one matches).
+/// - `IFERROR(primary, fallback)` / `IFNA(primary, fallback)` →
+///   `primary` only.
+///
+/// Everything else (other built-ins, lambda calls, binops, ranges, …)
+/// stays exhaustive — those are not short-circuit functions in this
+/// engine. Notably `AND` / `OR` are *not* listed: this implementation
+/// evaluates all of their args (see `for_each_arg_value`), matching
+/// Excel's "evaluates all arguments" contract, so prewarm should still
+/// see their refs.
+fn collect_prewarm_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
+    match expr {
+        Expr::CellRef(addr) => out.push(*addr),
+        Expr::Range {
+            start,
+            end,
+            unbounded,
+        } => {
+            if !matches!(unbounded, RangeBounds::None) {
+                return;
+            }
+            let min_row = start.row.min(end.row);
+            let max_row = start.row.max(end.row);
+            let min_col = start.col.min(end.col);
+            let max_col = start.col.max(end.col);
+            for row in min_row..=max_row {
+                for col in min_col..=max_col {
+                    out.push(CellAddress::new(row, col));
+                }
+            }
+        }
+        Expr::BinOp { left, right, .. } => {
+            collect_prewarm_refs(left, out);
+            collect_prewarm_refs(right, out);
+        }
+        Expr::Negate(inner) => collect_prewarm_refs(inner, out),
+        Expr::FuncCall { name, args } => {
+            // `FuncCall` names are normalized to upper-case by the parser
+            // (see `is_builtin_function_name` in eval.rs), so an exact
+            // match is sufficient here — no `eq_ignore_ascii_case`.
+            match name.as_str() {
+                // IF(cond, then, else) — only `cond` is always evaluated.
+                "IF" => {
+                    if let Some(cond) = args.first() {
+                        collect_prewarm_refs(cond, out);
+                    }
+                }
+                // IFS(c1, v1, c2, v2, ...) — only `c1` is always
+                // evaluated; every later (cond, val) pair is gated by
+                // the previous conds being false.
+                "IFS" => {
+                    if let Some(first_cond) = args.first() {
+                        collect_prewarm_refs(first_cond, out);
+                    }
+                }
+                // SWITCH(expr, c1, v1, c2, v2, ..., [default]) — the
+                // discriminant `expr` and the first case `c1` are always
+                // evaluated. Later cases stop when one matches; values
+                // and the trailing default are skipped on a hit.
+                "SWITCH" => {
+                    if let Some(disc) = args.first() {
+                        collect_prewarm_refs(disc, out);
+                    }
+                    if let Some(first_case) = args.get(1) {
+                        collect_prewarm_refs(first_case, out);
+                    }
+                }
+                // IFERROR / IFNA — fallback only runs when the primary
+                // arg yields an error. Static prewarm of `fallback` would
+                // be an eager evaluation of the recovery path.
+                "IFERROR" | "IFNA" => {
+                    if let Some(primary) = args.first() {
+                        collect_prewarm_refs(primary, out);
+                    }
+                }
+                _ => {
+                    for a in args {
+                        collect_prewarm_refs(a, out);
+                    }
+                }
+            }
+        }
+        Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Name(_) => {}
+        // Immediate-call form — the callee and every arg are evaluated
+        // before the lambda body runs, so they're all "always" touched.
+        // The lambda body itself is opaque to static analysis (it could
+        // contain short-circuit nodes, but we have no way to see through
+        // a runtime `Value::Lambda` here).
+        Expr::Call(callee, args) => {
+            collect_prewarm_refs(callee, out);
+            for a in args {
+                collect_prewarm_refs(a, out);
+            }
+        }
+        Expr::ArrayLit { .. } => {}
+        Expr::MultiArea(parts) => {
+            for p in parts {
+                collect_prewarm_refs(p, out);
             }
         }
     }
@@ -5661,6 +5843,97 @@ mod tests {
         }
         let v = sheet.get_cell("A10000");
         assert_eq!(v, Value::Number(10_000.0));
+    }
+
+    /// Regression for the codex P2 prewarm/short-circuit interaction:
+    /// `prewarm_formula_chain` walks the static AST to gather deps for cells
+    /// that have never been evaluated. Before the fix, the static walk
+    /// descended into every IF branch, so `=IF(TRUE,0,B1)` pre-warmed B1
+    /// even though IF never takes the else branch — bumping the eval
+    /// counter from 1 (the IF cell) to 2 (IF + B1). After the fix the
+    /// static walk skips short-circuit branches and only A1 evaluates.
+    #[test]
+    fn if_true_does_not_prewarm_unused_branch() {
+        let mut sheet = Sheet::new();
+        sheet.set_formula("B1", "=1+1");
+        sheet.set_formula("A1", "=IF(TRUE,0,B1)");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            1,
+            "prewarm should not have evaluated B1 — IF(TRUE,...) skips it"
+        );
+    }
+
+    /// Mirror of `if_true_does_not_prewarm_unused_branch` for the
+    /// false branch path. `=IF(FALSE, B1, 0)` selects the else branch; B1
+    /// must not be pre-warmed (it's on the never-taken then-branch).
+    #[test]
+    fn if_false_does_not_prewarm_unused_branch() {
+        let mut sheet = Sheet::new();
+        sheet.set_formula("B1", "=1+1");
+        sheet.set_formula("A1", "=IF(FALSE,B1,0)");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            1,
+            "prewarm should not have evaluated B1 — IF(FALSE,...) skips the then-branch"
+        );
+    }
+
+    /// IFS — variadic short-circuit. Only the first matching (cond, val)
+    /// pair runs at eval time. Prewarm must not greedily evaluate any
+    /// of the (cond_i, val_i) pairs beyond the first condition.
+    #[test]
+    fn ifs_does_not_prewarm_unused_branches() {
+        let mut sheet = Sheet::new();
+        sheet.set_formula("B1", "=1+1");
+        sheet.set_formula("C1", "=2+2");
+        sheet.set_formula("D1", "=3+3");
+        // First condition is TRUE → only `0` is taken.
+        sheet.set_formula("A1", "=IFS(TRUE,0,FALSE,B1,FALSE,C1)");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            1,
+            "prewarm should not have evaluated B1/C1 — IFS short-circuits on the first true cond"
+        );
+        assert!(matches!(sheet.get_cell("D1"), Value::Number(_)));
+    }
+
+    /// IFERROR's second arg is only evaluated when the first errors. With
+    /// a non-error primary, prewarm must skip the fallback expression.
+    #[test]
+    fn iferror_does_not_prewarm_fallback() {
+        let mut sheet = Sheet::new();
+        sheet.set_formula("B1", "=1+1");
+        sheet.set_formula("A1", "=IFERROR(0,B1)");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            1,
+            "prewarm should not have evaluated B1 — IFERROR fallback only runs on error"
+        );
+    }
+
+    /// SWITCH: only the matching case (or default) runs. Prewarm must
+    /// not greedily evaluate any of the non-leading value expressions.
+    /// First (case, value) pair always evaluates the case at eval time,
+    /// but the value cells should not be prewarmed.
+    #[test]
+    fn switch_does_not_prewarm_unused_branches() {
+        let mut sheet = Sheet::new();
+        sheet.set_formula("B1", "=1+1");
+        sheet.set_formula("C1", "=2+2");
+        // SWITCH(1, 1, 0, 2, B1, C1) — first case matches → value is 0.
+        // B1 (val for case 2) and C1 (default) must not be pre-warmed.
+        sheet.set_formula("A1", "=SWITCH(1,1,0,2,B1,C1)");
+        assert_eq!(sheet.get_cell("A1"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            1,
+            "prewarm should not have evaluated B1/C1 — SWITCH only runs the matched value / default"
+        );
     }
 
     /// Re-read after a chain is fully populated: the second read should hit

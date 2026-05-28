@@ -188,6 +188,46 @@ describe('chain-eval — deep cross-cell dependency chains', () => {
     expect(readNumber(wb.store.getter(atom))).toBe(5050)
   })
 
+  test(
+    'range batch with reverse-order chain: A1=SUM(B1:B3), B1=B2+1, B2=B3+1, B3=1 → 6',
+    () => {
+      // Codex P1 regression. The range batch pre-pushes [B3, B2, B1]
+      // (B1 on top). B1's AST walk faults on B2, which is queued lower
+      // on the stack but hasn't started. An earlier `queued` short-
+      // circuit refused to re-push B2, leaving B1 stuck on top retrying
+      // until `maxIter` and returning `#NUM!` instead of the correct
+      // sum (1 + 2 + 3 = 6).
+      const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+      wb.bulkApply('s1', [
+        { row: 0, col: 0, input: '=SUM(B1:B3)' }, // A1
+        { row: 0, col: 1, input: '=B2+1' },        // B1
+        { row: 1, col: 1, input: '=B3+1' },        // B2
+        { row: 2, col: 1, input: '1' },            // B3
+      ])
+      const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+      // B3=1, B2=2, B1=3, SUM=6.
+      expect(wb.store.getter(atom)).toEqual({ kind: 'number', value: 6 })
+    },
+  )
+
+  test('range batch with cyclic chain inside: A1=SUM(B1:B3), B1=B2+1, B2=B1+1 → #CIRCULAR!', () => {
+    // Companion to the reverse-order test above. The range batch
+    // pushes [B3, B2, B1]; B1 needs B2, B2 needs B1. The trampoline
+    // must detect the cycle and surface `#CIRCULAR!` rather than
+    // spinning until `maxIter`.
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.bulkApply('s1', [
+      { row: 0, col: 0, input: '=SUM(B1:B3)' }, // A1
+      { row: 0, col: 1, input: '=B2+1' },        // B1
+      { row: 1, col: 1, input: '=B1+1' },        // B2 (cycles with B1)
+      { row: 2, col: 1, input: '1' },            // B3
+    ])
+    const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    const value = wb.store.getter(atom)
+    expect(value.kind).toBe('error')
+    if (value.kind === 'error') expect(value.code).toBe('#CIRCULAR!')
+  })
+
   test('IF short-circuit preserved inside the trampoline (no spurious cycle)', () => {
     // A1 = IF(TRUE, 0, A2); A2 = A1. With short-circuit, A1 should
     // resolve to 0 — the else branch (A2) is never visited, so the
