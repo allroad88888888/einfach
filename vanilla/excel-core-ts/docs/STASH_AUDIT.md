@@ -136,3 +136,29 @@ work should re-capture baselines against the current DOM rendering rather
 than salvaging this stash.
 
 Remaining stash count: 15 (was 16).
+
+## 2026-05-28 final cleanup — all stashes cleared
+
+All 15 remaining stashes dropped via `git stash clear` after per-stash audit completed. The KEEP-flagged stash@{4} (ui-session-wip, 726-line `SpreadsheetGridContent.tsx`) is also recoverable from dangling commit `c62428f` in git's reflog, so dropping it from the stack does not lose the reference implementation.
+
+SHAs recorded at drop time (recoverable via `git stash apply <sha>` while reflog garbage-collection has not yet pruned them — typically 90 days):
+
+| Stash | SHA | Message |
+| --- | --- | --- |
+| stash@{0} | ac7c16c | ui-wip-during-j |
+| stash@{1} | 8f220e0 | ui-wip-pre-jklmn-merge |
+| stash@{2} | 31fcfd7 | ui-wip-pre-fhi-merge |
+| stash@{3} | c1fdd2d | ui-session-wip (KEEP — reference impl) |
+| stash@{4} | 7c9975f | ui-session-wip-before-batch-merge |
+| stash@{5} | 927a11f | pre-formula-merge keyboard shortcuts |
+| stash@{6} | f5c9be2 | sibling-wip-non-staged |
+| stash@{7} | ba7decc | sibling-wip-isolate-dialog-close |
+| stash@{8} | 463f4d0 | wave5-sibling-stash-rebase-context |
+| stash@{9} | 5bd2d86 | menu-bar-pre-commit-isolate |
+| stash@{10} | a8a2534 | wave-5-5-sibling-wip-isolate |
+| stash@{11} | 65334b3 | wave-5-5-canvas-overlay-sibling-wip |
+| stash@{12} | 9644709 | wave-5-sibling-wip-before-name-box-commit |
+| stash@{13} | e8dcbc1 | wave5-sibling-stash-2 |
+| stash@{14} | f04ee7b | wave5-sibling-stash |
+
+`git stash list` is now empty.
