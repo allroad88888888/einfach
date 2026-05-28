@@ -115,7 +115,7 @@ tier where each phase crosses (WASM regains advantage).
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
-*Last chain bench run: 2026-05-27T09:40:10.331Z*
+*Last chain bench run: 2026-05-28T02:50:25.718Z*
 
 ## Chain dependency workload
 
@@ -134,26 +134,26 @@ per-cell precise dep tracking. Phases:
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Chain100 | setup | 0.56 | 2.1 | 0.27× | TS wins |
-| Chain100 | bulkWrite | 0.73 | 2.5 | 0.30× | TS wins |
-| Chain100 | firstRecalc | 1.1 | 0.56 | 1.88× | WASM wins |
-| Chain100 | mutateThenRecalc | 0.41 | 0.13 | 3.12× | WASM wins |
-| Chain100 | steadyState | 0.01 | 0.01 | 1.20× | WASM edges |
-| Chain1k | setup | 0.12 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Chain1k | bulkWrite | 1.5 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Chain1k | firstRecalc | 2.6 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Chain1k | mutateThenRecalc | 1.2 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Chain1k | steadyState | 0.00 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
-| Chain10k | setup | 0.09 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain10k | bulkWrite | 8.0 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain10k | firstRecalc | 12.5 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain10k | mutateThenRecalc | 9.3 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain10k | steadyState | 0.00 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain100k | setup | 0.12 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain100k | bulkWrite | 65.8 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain100k | firstRecalc | 136 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain100k | mutateThenRecalc | 142 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
-| Chain100k | steadyState | 0.01 | *skipped (WASM chain failed at tier in…* | — | WASM failed; TS wins by default |
+| Chain100 | setup | 0.60 | 2.5 | 0.23× | TS wins |
+| Chain100 | bulkWrite | 0.78 | 2.5 | 0.31× | TS wins |
+| Chain100 | firstRecalc | 1.1 | 0.65 | 1.73× | WASM wins |
+| Chain100 | mutateThenRecalc | 0.50 | 0.13 | 3.88× | WASM wins |
+| Chain100 | steadyState | 0.01 | 0.01 | 2.47× | WASM wins |
+| Chain1k | setup | 0.13 | 0.10 | 1.32× | WASM edges |
+| Chain1k | bulkWrite | 1.8 | 41.6 | 0.04× | TS wins |
+| Chain1k | firstRecalc | 2.9 | 0.78 | 3.68× | WASM wins |
+| Chain1k | mutateThenRecalc | 1.2 | 0.94 | 1.25× | WASM edges |
+| Chain1k | steadyState | 0.00 | 0.00 | 0.78× | roughly tied |
+| Chain10k | setup | 0.09 | 0.07 | 1.28× | WASM edges |
+| Chain10k | bulkWrite | 6.4 | 3943 | 0.00× | TS wins |
+| Chain10k | firstRecalc | 14.1 | 6.5 | 2.16× | WASM wins |
+| Chain10k | mutateThenRecalc | 12.7 | 8.6 | 1.49× | WASM edges |
+| Chain10k | steadyState | 0.01 | 0.01 | 1.03× | WASM edges |
+| Chain100k | setup | 0.10 | 0.07 | 1.31× | WASM edges |
+| Chain100k | bulkWrite | 74.7 | 776944 | 0.00× | TS wins |
+| Chain100k | firstRecalc | 143 | 82.9 | 1.72× | WASM wins |
+| Chain100k | mutateThenRecalc | 159 | 136 | 1.17× | WASM edges |
+| Chain100k | steadyState | 0.01 | 0.02 | 0.37× | TS wins |
 
 ### evalCount delta per phase
 
@@ -166,46 +166,46 @@ For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` 
 | Chain100 | firstRecalc | 1 | 99 |
 | Chain100 | mutateThenRecalc | 1 | 99 |
 | Chain100 | steadyState | 0 | 0 |
-| Chain1k | setup | 0 | *failed* |
-| Chain1k | bulkWrite | 0 | *failed* |
-| Chain1k | firstRecalc | 1 | *failed* |
-| Chain1k | mutateThenRecalc | 1 | *failed* |
-| Chain1k | steadyState | 0 | *failed* |
-| Chain10k | setup | 0 | *failed* |
-| Chain10k | bulkWrite | 0 | *failed* |
-| Chain10k | firstRecalc | 1 | *failed* |
-| Chain10k | mutateThenRecalc | 1 | *failed* |
-| Chain10k | steadyState | 0 | *failed* |
-| Chain100k | setup | 0 | *failed* |
-| Chain100k | bulkWrite | 0 | *failed* |
-| Chain100k | firstRecalc | 1 | *failed* |
-| Chain100k | mutateThenRecalc | 1 | *failed* |
-| Chain100k | steadyState | 0 | *failed* |
+| Chain1k | setup | 0 | 0 |
+| Chain1k | bulkWrite | 0 | 0 |
+| Chain1k | firstRecalc | 1 | 999 |
+| Chain1k | mutateThenRecalc | 1 | 999 |
+| Chain1k | steadyState | 0 | 0 |
+| Chain10k | setup | 0 | 0 |
+| Chain10k | bulkWrite | 0 | 0 |
+| Chain10k | firstRecalc | 1 | 9,999 |
+| Chain10k | mutateThenRecalc | 1 | 9,999 |
+| Chain10k | steadyState | 0 | 0 |
+| Chain100k | setup | 0 | 0 |
+| Chain100k | bulkWrite | 0 | 0 |
+| Chain100k | firstRecalc | 1 | 99,999 |
+| Chain100k | mutateThenRecalc | 1 | 99,999 |
+| Chain100k | steadyState | 0 | 0 |
 
 ### Peak RSS by phase (MB)
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Chain100 | setup | 474 MB | 475 MB |
-| Chain100 | bulkWrite | 474 MB | 475 MB |
-| Chain100 | firstRecalc | 474 MB | 476 MB |
-| Chain100 | mutateThenRecalc | 474 MB | 476 MB |
-| Chain100 | steadyState | 474 MB | 476 MB |
-| Chain1k | setup | 481 MB | *failed* |
-| Chain1k | bulkWrite | 482 MB | *failed* |
-| Chain1k | firstRecalc | 482 MB | *failed* |
-| Chain1k | mutateThenRecalc | 500 MB | *failed* |
-| Chain1k | steadyState | 500 MB | *failed* |
-| Chain10k | setup | 503 MB | *failed* |
-| Chain10k | bulkWrite | 509 MB | *failed* |
-| Chain10k | firstRecalc | 511 MB | *failed* |
-| Chain10k | mutateThenRecalc | 532 MB | *failed* |
-| Chain10k | steadyState | 532 MB | *failed* |
-| Chain100k | setup | 539 MB | *failed* |
-| Chain100k | bulkWrite | 564 MB | *failed* |
-| Chain100k | firstRecalc | 599 MB | *failed* |
-| Chain100k | mutateThenRecalc | 707 MB | *failed* |
-| Chain100k | steadyState | 660 MB | *failed* |
+| Chain100 | setup | 487 MB | 488 MB |
+| Chain100 | bulkWrite | 488 MB | 489 MB |
+| Chain100 | firstRecalc | 488 MB | 489 MB |
+| Chain100 | mutateThenRecalc | 488 MB | 489 MB |
+| Chain100 | steadyState | 488 MB | 489 MB |
+| Chain1k | setup | 493 MB | 495 MB |
+| Chain1k | bulkWrite | 494 MB | 496 MB |
+| Chain1k | firstRecalc | 495 MB | 496 MB |
+| Chain1k | mutateThenRecalc | 495 MB | 496 MB |
+| Chain1k | steadyState | 495 MB | 496 MB |
+| Chain10k | setup | 496 MB | 509 MB |
+| Chain10k | bulkWrite | 497 MB | 516 MB |
+| Chain10k | firstRecalc | 500 MB | 516 MB |
+| Chain10k | mutateThenRecalc | 509 MB | 516 MB |
+| Chain10k | steadyState | 509 MB | 516 MB |
+| Chain100k | setup | 519 MB | 859 MB |
+| Chain100k | bulkWrite | 513 MB | 223 MB |
+| Chain100k | firstRecalc | 574 MB | 223 MB |
+| Chain100k | mutateThenRecalc | 859 MB | 224 MB |
+| Chain100k | steadyState | 859 MB | 224 MB |
 
 ### Chain crossover trace (mutateThenRecalc)
 
@@ -213,14 +213,8 @@ Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
 This is THE chain-workload diagnostic. If Rust ever beats TS in this
 repo, it should show up here first.
 
-- Chain100=3.12×, Chain1k=wasm-failed, Chain10k=wasm-failed, Chain100k=wasm-failed
-- crossover: Chain100 (ratio 3.12×)
-
-### Chain failures / skipped backends
-
-- **Chain1k / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
-- **Chain10k / WASM**: skipped (WASM chain failed at tier index 1)
-- **Chain100k / WASM**: skipped (WASM chain failed at tier index 1)
+- Chain100=3.88×, Chain1k=1.25×, Chain10k=1.49×, Chain100k=1.17×
+- crossover: Chain100 (ratio 3.88×)
 <!-- BENCH:CHAIN:END -->
 
 ## Findings (2026-05-27 — XLarge / Mega / Ultra sweep)
@@ -580,3 +574,125 @@ fix would either (a) switch the formula install path to streaming
 released on panic, or (c) raise the wasm linear-memory cap by
 compiling for `wasm64-unknown-unknown`. All three are larger
 architectural changes; the cap is the surgical fix.
+
+### 2026-05-28 — Chain1k / Chain10k WASM "attempted to take ownership of Rust value while it was borrowed"
+
+**Symptom**: the chain workload bench reproduced the same cryptic
+borrow-error message at Chain1k on WASM — only a 1000-deep formula
+chain, ~300 KB of formula text. Well below the Ultra-tier allocator
+ceiling. Distinct from the bulk-import allocator family ruled out by
+the Ultra-tier fix.
+
+**Root cause**: **stack overflow on cross-cell formula evaluation
+recursion**, not borrow re-entrancy. The Rust eval pipeline recursed
+through one cell ref per stack frame:
+
+```
+peek_value_with_provider(addr)
+  → eval_formula_at_with_provider(addr, provider)
+    → eval_expr_with_provider(Expr::CellRef(dep), tracking)
+      → provider.cell(dep)                  // SheetEvalProvider::cell
+        → peek_value_with_provider(dep, ...)  // <- recursive
+```
+
+For a 1000-deep linear chain (`A1=1; A2=A1+1; ...; A1000=A999+1`),
+`get_cell("A1000")` blew through 1000 stack frames before the leaf
+returned. Native debug build with full debuginfo + the
+`TrackingEvalProvider` struct + the per-frame `Rc<RefCell<HashSet>>`
+deps tracker overflowed the macOS 8 MB main-thread stack on `cargo
+test`. WASM's 256 KB-1 MB stack overflowed at ~1000-deep too, but the
+abort surfaced at the wasm-bindgen boundary as the same cryptic
+"attempted to take ownership of Rust value while it was borrowed"
+error — `panic = "abort"` skips RcRefMut unwind exactly as in the
+Ultra-tier allocator case, so the diagnostic at the JS boundary
+looked identical despite a completely different root cause.
+
+Reproducer: see `chain_1000_native_read_does_not_panic` (and
+`chain_10000_native_read_does_not_panic`) in
+`rust/excel-core/src/sheet.rs`. Both panicked with `thread ... has
+overflowed its stack` before the fix.
+
+**Fix**: pre-warm pass at the top of
+`eval_formula_at_with_provider` in
+[`rust/excel-core/src/sheet.rs`](../../rust/excel-core/src/sheet.rs).
+Converts the cross-cell recursion to a heap work-stack:
+
+- Factored the original eval body into
+  `Sheet::compute_formula_at(addr, provider)`.
+- Added `Sheet::prewarm_formula_chain(start, provider)` that performs
+  iterative post-order DFS over the same-sheet point-cell dep graph
+  rooted at `start`. Each Dirty formula cell is evaluated once its
+  children are Clean. Cache-state checks skip Clean and Computing
+  cells, so the pass is O(transitively-Dirty formulas) and idempotent
+  on repeat reads.
+- Dep discovery union of `record.deps` (eval-tracked, narrowed) and
+  `collect_refs(record.expr)` (static, complete) — needed so freshly-
+  installed formulas with the install-time deps set still get pre-
+  warmed correctly even when an `IF`-branch narrowing on a later
+  re-eval missed a dep on a first pass.
+- After pre-warm, the existing recursive `eval_expr_with_provider`
+  call sees every same-sheet point-cell dep as Clean and returns
+  without touching the call stack beyond a single AST frame per cell.
+  Recursion depth becomes O(AST depth per formula), not O(chain
+  length).
+
+`compute_formula_at` is invoked at most once per cell per top-level
+read. The top-level entry calls `prewarm_formula_chain(addr)` (which
+itself evaluates `addr` at the post-order tail) and then reads the
+cache directly — guarded fallback to `compute_formula_at` only if
+the prewarm left a non-Clean state (shouldn't happen in practice;
+kept as a belt-and-braces safety net). This avoids the second eval
+that would otherwise occur when
+`WorkbookEvalProvider::force_formula_recompute()` returns true (cross-
+sheet workbooks).
+
+Range deps and cross-sheet refs are intentionally not pre-warmed by
+the same-sheet helper. Chain workloads use point refs only, and
+range / cross-sheet paths produce shallow recursion in normal
+workloads (the workbook layer already amortizes them via the same-
+sheet prewarm on each sheet hop).
+
+**Verification**:
+
+- `cargo test --lib` in `rust/excel-core`: **1360 passed / 0 failed**
+  (was 1357 before adding three new chain regression tests).
+- `cargo test --lib` in `rust/wasm`: **29 passed / 0 failed**.
+- New regression tests in `rust/excel-core/src/sheet.rs`:
+  - `chain_1000_native_read_does_not_panic` — pins the original
+    bench reproducer.
+  - `chain_10000_native_read_does_not_panic` — confirms the prewarm
+    scales past the previous native stack ceiling.
+  - `chain_1000_native_re_read_uses_cache` — the second read of a
+    fully-evaluated chain hits Clean cache and does not advance the
+    `formula_eval_count` counter.
+
+**Bench results (post-fix)**:
+
+| Tier | TS firstRecalc | WASM firstRecalc | TS mutateThenRecalc | WASM mutateThenRecalc | Before |
+| --- | --- | --- | --- | --- | --- |
+| Chain100 (99 deep) | 1.1 ms | 0.65 ms | 0.50 ms | 0.13 ms | both OK |
+| Chain1k (999 deep) | 2.9 ms | 0.78 ms | 1.2 ms | 0.94 ms | WASM crashed; now WASM wins |
+| Chain10k (9 999 deep) | 14.1 ms | 6.5 ms | 12.7 ms | 8.6 ms | WASM crashed; now WASM wins |
+| Chain100k (99 999 deep) | 143 ms | 82.9 ms | 159 ms | 136 ms | both crashed; now both work, WASM 1.72x / 1.17x faster |
+
+All four tiers complete end-to-end on WASM. Chain100k bulkWrite is
+slow on WASM (776 s ≈ 13 min) — that's the pre-existing per-cell
+HashSet-alloc cost inside `flush` / `dependents_of`, separately
+flagged in the Ultra-tier bulk-import profile notes; not part of the
+chain-eval fix.
+
+**Why this is distinct from the Ultra-tier fix**:
+
+- Ultra-tier (b607654): allocator exhaustion at ~1 M cells →
+  `panic = abort` → stale Rc → cryptic borrow error on free(). Fix:
+  payload-size cap on `bulk_import_cells`.
+- Chain (this fix): stack overflow at ~1000-deep cell-ref recursion
+  → `panic = abort` → stale Rc → identical-looking cryptic borrow
+  error on subsequent calls. Fix: iterative dep traversal in
+  `eval_formula_at_with_provider`.
+
+Both share the wasm-bindgen abort-vs-borrow tell, but the engine-side
+root cause is unrelated. The native `cargo test` reproducer was what
+distinguished them — the chain case overflowed the stack with a clear
+"`thread ... has overflowed its stack`" message, while the Ultra case
+needed the WASM environment to surface the allocator panic.

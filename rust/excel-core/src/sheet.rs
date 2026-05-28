@@ -1941,10 +1941,74 @@ impl Sheet {
         addr: CellAddress,
         provider: &dyn EvalProvider,
     ) -> Value {
+        // Cheap early-out for cache hit (mirrors the original behavior).
+        // Done before `prewarm_formula_chain` so a Clean cache short-circuits
+        // before we allocate the work-stack.
+        if let Some(record) = self.formula_cells.get(&addr) {
+            match record.cache.borrow().clone() {
+                FormulaCache::Clean(value) if !provider.force_formula_recompute() => {
+                    return value
+                }
+                FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
+                FormulaCache::Clean(_) | FormulaCache::Dirty => {}
+            }
+        } else {
+            return self.primitive_value_at(addr);
+        }
+
+        // Iteratively pre-evaluate every Dirty formula cell transitively
+        // reachable via point-cell deps — INCLUDING `addr` itself, which the
+        // post-order pass evaluates last once its dep chain is Clean. This
+        // converts a recursion that scales with chain depth into a heap-
+        // allocated work-stack that scales with chain depth on the heap,
+        // where it doesn't matter. Fixes a stack overflow on long linear
+        // chains (e.g. `A1=1; A2=A1+1; ... A1000=A999+1`) where the natural
+        // recursion depth scales with chain length and overflows the WASM
+        // stack (and even the native debug stack at ~1000 deep).
+        //
+        // Only same-sheet point-cell deps are pre-warmed: those are
+        // sufficient for chain-style workloads and avoid having to traverse
+        // range deps / cross-sheet edges in this same-sheet helper. Anything
+        // not pre-warmed (range cells, cross-sheet refs) falls back to the
+        // existing recursive descent — those paths produce shallow recursion
+        // in normal workloads.
+        //
+        // The pre-warm guarantees that by the time the post-order eval
+        // reaches `addr`, its same-sheet point-cell deps already have a
+        // Clean cache, so the inner `eval_expr_with_provider` returns
+        // without recursing back into `peek_value_with_provider`. Reading
+        // the cache afterwards yields the just-computed value (or, if
+        // `force_formula_recompute` is set and `compute_formula_at` was
+        // skipped by the inner provider, fall back to a single direct
+        // `compute_formula_at` call as the safety net).
+        self.prewarm_formula_chain(addr, provider);
+
+        // After prewarm, the cache should be Clean. Read it directly so we
+        // don't double-evaluate when `force_formula_recompute()` is true —
+        // the provider's recompute hint applies to deciding whether to
+        // recompute *new* dirty cells, not to revisiting a value we just
+        // computed inside the prewarm pass. If for any reason the prewarm
+        // left the cache in a non-Clean state (e.g. a primitive_value_at
+        // detour), fall back to compute_formula_at.
+        if let Some(record) = self.formula_cells.get(&addr) {
+            if let FormulaCache::Clean(value) = record.cache.borrow().clone() {
+                return value;
+            }
+        }
+        self.compute_formula_at(addr, provider)
+    }
+
+    /// Inner step that actually evaluates `addr`'s formula expression and
+    /// caches the result. Called by `eval_formula_at_with_provider` once the
+    /// dep chain has been pre-warmed, and by `prewarm_formula_chain` for each
+    /// dirty node visited in post-order. The Computing state is set/cleared
+    /// here so `FormulaCache::Computing` correctly traps both the recursive-
+    /// eval cycle case and the (already-impossible by static check) prewarm
+    /// cycle case.
+    fn compute_formula_at(&self, addr: CellAddress, provider: &dyn EvalProvider) -> Value {
         let Some(record) = self.formula_cells.get(&addr).cloned() else {
             return self.primitive_value_at(addr);
         };
-
         match record.cache.borrow().clone() {
             FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
             FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
@@ -1977,6 +2041,93 @@ impl Sheet {
         *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
         self.replace_formula_deps(addr, &record, deps.borrow().clone());
         value
+    }
+
+    /// Iterative post-order DFS over the same-sheet point-cell dep graph
+    /// rooted at `start`. For each visited Dirty formula cell, evaluates it
+    /// once its children are Clean — converting a recursion that scales with
+    /// chain depth into a heap-allocated work-stack that scales with chain
+    /// depth on the heap, where it doesn't matter.
+    ///
+    /// Skips cells in `FormulaCache::Computing` (would be a cycle — let the
+    /// recursive eval surface `#CYCLE!` via the existing
+    /// `FormulaCache::Computing => CyclicRef` arm). Skips Clean cells (their
+    /// deps are already evaluated). Skips primitive cells (no eval needed).
+    /// Range deps are intentionally NOT traversed here — chain workloads use
+    /// point refs only, and walking ranges would require expanding sparse
+    /// cells while holding immutable borrows of `formula_cells`. The eval
+    /// pass that runs after this prewarm will still handle range deps
+    /// through `for_each_range_cell` exactly as before, just with bounded
+    /// recursion.
+    fn prewarm_formula_chain(&self, start: CellAddress, provider: &dyn EvalProvider) {
+        // Sentinel value for the visited-children flag on the work-stack:
+        // `false` = "enter this node, push its deps", `true` = "deps done,
+        // now eval this node". Standard iterative post-order pattern.
+        let mut stack: Vec<(CellAddress, bool)> = Vec::new();
+        stack.push((start, false));
+
+        while let Some((addr, ready_to_eval)) = stack.pop() {
+            // Fetch the record. Skip primitives (they have no FormulaRecord).
+            let Some(record) = self.formula_cells.get(&addr).cloned() else {
+                continue;
+            };
+
+            if ready_to_eval {
+                // Children pushed before us have already been popped and
+                // (if they were Dirty formulas) evaluated to Clean. Now
+                // compute this node.
+                self.compute_formula_at(addr, provider);
+                continue;
+            }
+
+            // First visit: decide whether to enqueue.
+            let cache_state = record.cache.borrow().clone();
+            match cache_state {
+                FormulaCache::Clean(_) if !provider.force_formula_recompute() => continue,
+                FormulaCache::Computing => continue,
+                FormulaCache::Clean(_) | FormulaCache::Dirty => {}
+            }
+
+            // Re-push self with ready_to_eval=true, then push each point-cell
+            // dep that points to a formula cell. The dep list is the union of
+            // (a) the cached eval-time deps from the last successful eval and
+            // (b) the statically-collected deps installed at `set_formula`
+            // time (re-derived here from the AST), so a freshly-installed
+            // formula that has never been evaluated still gets its chain
+            // pre-warmed. After the first eval the cache holds the narrowed
+            // eval-tracked set; we accept that narrowing — branch-skipped
+            // cells will simply be re-discovered on the next dirty-and-eval
+            // cycle through this same prewarm pass.
+            stack.push((addr, true));
+
+            // Direct (post-eval) deps. Cheap clone — these are usually a
+            // handful of cells per formula.
+            let direct_deps = record.deps.borrow().clone();
+            for dep in &direct_deps {
+                if !self.formula_cells.contains_key(dep) {
+                    continue;
+                }
+                stack.push((*dep, false));
+            }
+
+            // Static deps from the AST. Necessary for first-ever evals where
+            // `record.deps` is the install-time set (already correct here),
+            // and also for force-recompute paths where the cached set may
+            // have been narrowed. We deduplicate by relying on the cache
+            // state check at the top of the loop — a Clean cell pushed
+            // twice falls out on the second visit.
+            let mut ast_refs: Vec<CellAddress> = Vec::new();
+            collect_refs(&record.expr, &mut ast_refs);
+            for dep in ast_refs {
+                if direct_deps.contains(&dep) {
+                    continue;
+                }
+                if !self.formula_cells.contains_key(&dep) {
+                    continue;
+                }
+                stack.push((dep, false));
+            }
+        }
     }
 
     /// Get the AtomId for a cell (creating if needed).
@@ -5464,5 +5615,71 @@ mod tests {
         // dirty-write path consults wide_ranges and re-evaluates B1.
         sheet.set_cell("A1000000", Value::Number(100.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(103.0));
+    }
+
+    /// Linear formula chain `A1 = 1; A2 = =A1+1; ... A1000 = =A999+1`.
+    ///
+    /// On native the 8MB main-thread stack swallows the 1000-deep
+    /// `eval_formula_at_with_provider` ↔ `eval_expr_with_provider`
+    /// recursion fine. On WASM the much smaller stack (default ~1MB,
+    /// often 256KB after wasm-bindgen frames) blows up — and the
+    /// blow-up surfaces at the wasm-bindgen boundary as the cryptic
+    /// "attempted to take ownership of Rust value while it was
+    /// borrowed" error because the panic aborts mid-eval with the
+    /// FormulaCache::Computing guard still held.
+    ///
+    /// Pinned regression for the iterative `prewarm_formula_chain`
+    /// pass added to `eval_formula_at_with_provider`. With the
+    /// recursion converted to a heap work-stack, even debug builds
+    /// resolve a 1000-deep chain without touching the call stack
+    /// beyond a single AST eval level per cell.
+    #[test]
+    fn chain_1000_native_read_does_not_panic() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        for i in 2..=1000 {
+            let addr = format!("A{i}");
+            let src = format!("=A{}+1", i - 1);
+            assert!(sheet.set_formula(&addr, &src), "set_formula failed for {addr}");
+        }
+        let v = sheet.get_cell("A1000");
+        assert_eq!(v, Value::Number(1000.0));
+    }
+
+    /// Same chain shape, but at a depth that would also overflow even a
+    /// release-mode native stack with the recursive code. Confirms the
+    /// prewarm pass scales: dep-graph traversal is heap-bound, eval
+    /// recursion depth stays O(AST depth) per cell.
+    #[test]
+    fn chain_10000_native_read_does_not_panic() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        for i in 2..=10_000 {
+            let addr = format!("A{i}");
+            let src = format!("=A{}+1", i - 1);
+            assert!(sheet.set_formula(&addr, &src), "set_formula failed for {addr}");
+        }
+        let v = sheet.get_cell("A10000");
+        assert_eq!(v, Value::Number(10_000.0));
+    }
+
+    /// Re-read after a chain is fully populated: the second read should hit
+    /// the Clean cache (no re-eval) and complete in trivial time. Also
+    /// pins that the prewarm's early-out for Clean cells works correctly.
+    #[test]
+    fn chain_1000_native_re_read_uses_cache() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        for i in 2..=1000 {
+            let addr = format!("A{i}");
+            let src = format!("=A{}+1", i - 1);
+            assert!(sheet.set_formula(&addr, &src));
+        }
+        assert_eq!(sheet.get_cell("A1000"), Value::Number(1000.0));
+        let count_before = sheet.debug_formula_eval_count();
+        // Second read: cache hit at the top level should short-circuit
+        // entirely (no prewarm needed). Counter must NOT advance.
+        assert_eq!(sheet.get_cell("A1000"), Value::Number(1000.0));
+        assert_eq!(sheet.debug_formula_eval_count(), count_before);
     }
 }
