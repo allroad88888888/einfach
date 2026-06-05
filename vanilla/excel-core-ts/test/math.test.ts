@@ -39,8 +39,10 @@ import {
   SUMPRODUCT,
   TRUNC,
 } from '../src/eval/functions/math'
-import type { EvalContext, FunctionImpl, Value } from '../src/types'
+import { keyFor } from '../src/sheet'
+import type { EvalContext, FunctionImpl, Value, Workbook } from '../src/types'
 import { BLANK } from '../src/types'
+import { createWorkbook } from '../src/workbook'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -702,5 +704,57 @@ describe('FUNCTIONS registry', () => {
       }
       expect(name).toBe(name.toUpperCase())
     }
+  })
+})
+
+// Fermat P2 — whole-column multi-area aggregation must route each sub-area
+// through the same sparse path that single-area whole-column SUM/COUNTIF/SUMIF
+// use. Without this, `SUM((A:A,C:C))` falls into the materializing path and
+// trips the per-range materialization cap (or returns 0 for criterion-based).
+//
+// This needs the evaluator (not bare FunctionImpls in `FUNCTIONS`) because the
+// sparse path lives in `evaluate.ts` next to the sheet snapshot.
+describe('whole-column multi-area sparse aggregation', () => {
+  function makeWorkbook(): Workbook {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    // Sparse data in A and C; everything else blank — the whole-column path
+    // would materialize 2,097,152 cells without the multi-area sparse routing.
+    wb.setCell('s1', 0, 0, '1')
+    wb.setCell('s1', 5, 0, '5')
+    wb.setCell('s1', 0, 2, '10')
+    wb.setCell('s1', 5, 2, '50')
+    return wb
+  }
+
+  function readCell(wb: Workbook, sheetId: string, row: number, col: number): Value {
+    const sheet = wb.sheet(sheetId)
+    if (!sheet) throw new Error(`missing sheet ${sheetId}`)
+    return wb.store.getter(sheet.formulaCellAtom(keyFor(row, col)))
+  }
+
+  test('SUM((A:A,C:C)) sums each whole column via sparse iteration', () => {
+    const wb = makeWorkbook()
+    wb.setCell('s1', 0, 5, '=SUM((A:A,C:C))')
+    expect(readCell(wb, 's1', 0, 5)).toEqual({ kind: 'number', value: 66 })
+  })
+
+  test('SUMIF((A:A,C:C), ">0") routes each area through SUMIF sparse path', () => {
+    const wb = makeWorkbook()
+    wb.setCell('s1', 0, 5, '=SUMIF((A:A,C:C), ">0")')
+    expect(readCell(wb, 's1', 0, 5)).toEqual({ kind: 'number', value: 66 })
+  })
+
+  test('COUNTIF((A:A,C:C), ">0") counts via sparse iteration', () => {
+    const wb = makeWorkbook()
+    wb.setCell('s1', 0, 5, '=COUNTIF((A:A,C:C), ">0")')
+    expect(readCell(wb, 's1', 0, 5)).toEqual({ kind: 'number', value: 4 })
+  })
+
+  test('COUNTA((A:A,C:C)) and COUNT((A:A,C:C)) count populated numeric cells', () => {
+    const wb = makeWorkbook()
+    wb.setCell('s1', 0, 5, '=COUNTA((A:A,C:C))')
+    wb.setCell('s1', 1, 5, '=COUNT((A:A,C:C))')
+    expect(readCell(wb, 's1', 0, 5)).toEqual({ kind: 'number', value: 4 })
+    expect(readCell(wb, 's1', 1, 5)).toEqual({ kind: 'number', value: 4 })
   })
 })

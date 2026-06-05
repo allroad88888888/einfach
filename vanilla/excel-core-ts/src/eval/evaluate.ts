@@ -639,7 +639,35 @@ function evaluateSwitch(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   return hasDefault ? evaluateFunctionArg(args[args.length - 1], ctx) : ERR('#N/A')
 }
 
-function evaluateSparseSum(args: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
+/**
+ * Expand any `multiArea` args into their constituent sub-areas so the sparse
+ * aggregators below can route each whole-column / whole-row sub-area through
+ * the existing sparse-iteration path. Non-multiArea args pass through unchanged.
+ * Without this, `SUM((A:A,C:C))` would fall through to the materializing path
+ * and trip the per-range materialization cap.
+ */
+function expandSparseArgs(args: ReadonlyArray<Expr>): ReadonlyArray<Expr> {
+  let hasMultiArea = false
+  for (const arg of args) {
+    if (arg.kind === 'multiArea') {
+      hasMultiArea = true
+      break
+    }
+  }
+  if (!hasMultiArea) return args
+  const expanded: Expr[] = []
+  for (const arg of args) {
+    if (arg.kind === 'multiArea') {
+      for (const area of arg.areas) expanded.push(area)
+    } else {
+      expanded.push(arg)
+    }
+  }
+  return expanded
+}
+
+function evaluateSparseSum(rawArgs: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
+  const args = expandSparseArgs(rawArgs)
   let usedSparseRef = false
   let total = 0
 
@@ -692,10 +720,11 @@ function evaluateSparseSum(args: ReadonlyArray<Expr>, ctx: EvalContext): Value |
 type SparseAggregateKind = 'count' | 'average' | 'min' | 'max'
 
 function evaluateSparseNumericAggregate(
-  args: ReadonlyArray<Expr>,
+  rawArgs: ReadonlyArray<Expr>,
   ctx: EvalContext,
   kind: SparseAggregateKind,
 ): Value | undefined {
+  const args = expandSparseArgs(rawArgs)
   let usedSparseRef = false
   let total = 0
   let count = 0
@@ -769,7 +798,8 @@ function evaluateSparseNumericAggregate(
   }
 }
 
-function evaluateSparseCountA(args: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
+function evaluateSparseCountA(rawArgs: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
+  const args = expandSparseArgs(rawArgs)
   let usedSparseRef = false
   let count = 0
 
@@ -827,6 +857,20 @@ function evaluateSparseCountBlank(args: ReadonlyArray<Expr>, ctx: EvalContext): 
 
 function evaluateSparseCountIf(args: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
   if (args.length !== 2) return undefined
+
+  // Multi-area first arg: COUNTIF((A:A,C:C), crit) = COUNTIF(A:A, crit) + COUNTIF(C:C, crit).
+  if (args[0].kind === 'multiArea') {
+    let total = 0
+    for (const area of args[0].areas) {
+      const sub = evaluateSparseCountIf([area, args[1]], ctx)
+      if (sub === undefined) return undefined
+      if (sub.kind === 'error') return sub
+      if (sub.kind !== 'number') return undefined
+      total += sub.value
+    }
+    return { kind: 'number', value: total }
+  }
+
   const ref = runtimeRefFromExpr(args[0], ctx)
   if (!ref.ok || !canSparseIterate(ref.ref)) return undefined
 
@@ -846,6 +890,30 @@ function evaluateSparseCountIf(args: ReadonlyArray<Expr>, ctx: EvalContext): Val
 
 function evaluateSparseSumIf(args: ReadonlyArray<Expr>, ctx: EvalContext): Value | undefined {
   if (args.length < 2 || args.length > 3) return undefined
+
+  // Multi-area check range: SUMIF((A:A,C:C), crit) = SUMIF(A:A, crit) + SUMIF(C:C, crit).
+  // For 3-arg form, the sum-range may also be multi-area with matching shape.
+  if (args[0].kind === 'multiArea') {
+    const checkAreas = args[0].areas
+    let sumAreas: ReadonlyArray<Expr> | undefined
+    if (args.length === 3) {
+      if (args[2].kind !== 'multiArea') return undefined
+      if (args[2].areas.length !== checkAreas.length) return undefined
+      sumAreas = args[2].areas
+    }
+    let total = 0
+    for (let i = 0; i < checkAreas.length; i += 1) {
+      const subArgs: Expr[] = [checkAreas[i], args[1]]
+      if (sumAreas) subArgs.push(sumAreas[i])
+      const sub = evaluateSparseSumIf(subArgs, ctx)
+      if (sub === undefined) return undefined
+      if (sub.kind === 'error') return sub
+      if (sub.kind !== 'number') return undefined
+      total += sub.value
+    }
+    return { kind: 'number', value: total }
+  }
+
   const checkRef = runtimeRefFromExpr(args[0], ctx)
   if (!checkRef.ok || !canSparseIterate(checkRef.ref)) return undefined
 

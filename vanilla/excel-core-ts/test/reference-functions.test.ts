@@ -429,4 +429,42 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 4, 0)).toEqual(str('G'))
     expect(read(wb, 's1', 5, 0)).toEqual(num(0))
   })
+
+  // Fermat P2 — when `index_num` is an array, CHOOSE broadcasts: each cell of
+  // the index array picks from the corresponding `args[i]` (1-indexed). With
+  // refs, each picked source contributes its cell at the same (r,c) in the
+  // result. `{1;2}` is a 2-row column vector → result is `{A1; B2}` (top of
+  // arg-1, bottom of arg-2). Out-of-range indices surface `#VALUE!` per cell.
+  test('CHOOSE with column-vector index broadcasts per-element pick on refs', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '1')
+    wb.setCell('s1', 1, 0, '2')
+    wb.setCell('s1', 0, 1, '10')
+    wb.setCell('s1', 1, 1, '20')
+
+    wb.setCell('s1', 0, 5, '=CHOOSE({1;2}, A1:A2, B1:B2)')
+
+    expect(read(wb, 's1', 0, 5)).toEqual(arr([[num(1)], [num(20)]]))
+  })
+
+  test('CHOOSE with row-vector index over scalar args returns an array', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 5, '=CHOOSE({1,2,3}, "a", "b", "c")')
+
+    expect(read(wb, 's1', 0, 5)).toEqual(arr([[str('a'), str('b'), str('c')]]))
+  })
+
+  // Fermat P2 — `INDEX(...):INDEX(...)` builds a dynamic range from the two
+  // INDEX results. The parser threads the colon through `dynamicRange` and the
+  // evaluator materializes both endpoints to runtime refs.
+  test('INDEX:INDEX dynamic-range endpoints form a runtime range', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    for (let i = 0; i < 10; i += 1) wb.setCell('s1', i, 0, String(i + 1))
+
+    wb.setCell('s1', 0, 5, '=SUM(INDEX(A1:A10,3):INDEX(A1:A10,8))')
+    wb.setCell('s1', 1, 5, '=COUNT(INDEX(A1:A5,1):INDEX(A1:A5,3))')
+
+    expect(read(wb, 's1', 0, 5)).toEqual(num(33))
+    expect(read(wb, 's1', 1, 5)).toEqual(num(3))
+  })
 })
