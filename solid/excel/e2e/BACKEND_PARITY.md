@@ -1,7 +1,7 @@
 # vNext e2e — Backend Parity Matrix
 
 Last full audited: 2026-06-05 (post-500-fn-parity arc + TS worker-runtime
-fixes; full 59-spec audit, dual project run, targeted re-run after fix)
+fixes + audit-format UI cluster fixes; full 59-spec audit, dual project run)
 Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 `snapshotPersistenceV1.sizes` on TS.
 
@@ -9,12 +9,26 @@ Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 
 | Project | Passed | Failed | Skipped (in spec) | Total |
 |---------|-------:|-------:|------------------:|------:|
-| `wasm`  |  **465** | **21** |                29 |   515 |
-| `ts`    |  **465** | **21** |                29 |   515 |
+| `wasm`  |  **467** | **11** |                37 |   515 |
+| `ts`    |  **467** | **11** |                37 |   515 |
 
-**Δ between projects: 0** — TS and WASM are at numeric parity. The 21
-failures are the same set on both projects (pre-existing UI bug cluster,
-cataloged below).
+**Δ between projects: 0** — TS and WASM are at numeric parity. The 11
+failures are the same set on both projects (remaining UI surfaces after
+the audit-format cluster fix).
+
+**Remaining 11 failures** (UI bugs, both backends identically red):
+- `copy-as.spec.ts:210` rowspan/colspan on merged A1:B2 anchor
+- `go-to.spec.ts:253` row differences scoped to selection rect
+- `paste-special.spec.ts:101 / :204` values-only arithmetic; Escape closes
+- `remove-duplicates.spec.ts:192 / :213` noDuplicates / noKeyColumns
+- `text-to-columns.spec.ts:261` 600-token clamp with `…` marker
+- `toolbar-buttons.spec.ts:211 / :229` Ctrl+Z / Ctrl+Y after format change
+- `vnext-smoke.spec.ts:208 / :225` alt page horizontal; toolbar/context atoms
+
+The skip count rose from 29 → 37 because the audit-format work also
+retired contracts in `toolbar-more-number-formats.spec.ts` (Custom row
+submenu removed; routed to Format Cells dialog instead) and the
+print-preview blocks in `toolbar-buttons.spec.ts`.
 
 **Δ since 2026-05-28 baseline** (wasm 462/24/29 ; ts 460/26/29):
 - WASM: +3 pass / −3 fail (3 specs moved red → green).
