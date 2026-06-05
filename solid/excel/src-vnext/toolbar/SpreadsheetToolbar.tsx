@@ -1340,6 +1340,27 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       class={`format-toolbar spreadsheet-toolbar ${props.class ?? ''}`.trim()}
       role="toolbar"
       data-testid={props['data-testid'] ?? 'spreadsheet-toolbar'}
+      // `preventDefault` on mousedown keeps the grid (or active editor) as the
+      // focused element so post-click keyboard shortcuts (Ctrl+Z, Ctrl+Y,
+      // arrows, etc.) reach the grid's keydown handler instead of stranding on
+      // the toolbar button. Without this, a `toolbar-btn-bold` click moves
+      // browser focus to the button, and the very next `keyboard.press('Control+z')`
+      // is swallowed by the button (no handler) instead of dispatching the
+      // grid's `history.undo` intent. Pinned by `toolbar-buttons.spec.ts`
+      // 'Ctrl+Z drives the undo button after a format change'.
+      onMouseDown={(event) => {
+        // Don't preventDefault for inputs/textareas (e.g. font-size editable
+        // input) where the click needs to focus the input for typing.
+        const target = event.target as HTMLElement | null
+        if (
+          target instanceof HTMLInputElement ||
+          target instanceof HTMLTextAreaElement ||
+          (target && target.isContentEditable)
+        ) {
+          return
+        }
+        event.preventDefault()
+      }}
     >
       {/* Group 1 — History + format painter + clear */}
       <button
