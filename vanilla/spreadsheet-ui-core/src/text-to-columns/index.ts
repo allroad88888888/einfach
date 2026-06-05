@@ -20,12 +20,15 @@ export * from './types'
  * Bounded cache caps: the preview pane shows at most the first
  * `TEXT_TO_COLUMNS_PREVIEW_CAP` source rows tokenized with the active
  * wizard config, and emits at most
- * `TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP` tokens across the whole preview
- * grid. The token cap protects the renderer against a single
- * pathological row carrying 10k+ delimiters — without it a 100-row
- * preview could explode into millions of DOM cells. When a row is
- * truncated mid-flight we append a `'…'` sentinel so the user can see
- * the cut visually. Documented in `text-to-columns/README.md`.
+ * `TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP` *cells* (tokens **plus** the
+ * trailing `…` marker, if any) across the whole preview grid. The cap
+ * protects the renderer against a single pathological row carrying
+ * 10k+ delimiters — without it a 100-row preview could explode into
+ * millions of DOM cells. When a row is truncated mid-flight we replace
+ * the trailing token with a `'…'` sentinel so the user can see the
+ * cut visually; the sentinel counts against the cap so the renderer's
+ * total cell count is strictly `≤ TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP`.
+ * Documented in `text-to-columns/README.md`.
  */
 export const TEXT_TO_COLUMNS_PREVIEW_CAP = 100
 export const TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP = 500
@@ -96,7 +99,10 @@ export const textToColumnsPreviewAtom = atom((get): readonly TextToColumnsPrevie
   // pathological row cannot blow the renderer. Once the budget is
   // exhausted we still emit subsequent rows (so the user keeps row
   // anchoring) but with an empty token list — except the first
-  // truncated row, which gets a single `…` marker.
+  // truncated row, which gets a single `…` marker. The marker counts
+  // against the cap (so a truncated row emits at most `cap` cells,
+  // including the marker — this keeps the renderer's total cell count
+  // strictly ≤ TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP across all rows).
   const out: TextToColumnsPreviewRow[] = []
   let budget = TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP
   for (const row of capped) {
@@ -110,7 +116,9 @@ export const textToColumnsPreviewAtom = atom((get): readonly TextToColumnsPrevie
       budget -= tokens.length
       continue
     }
-    const sliced = tokens.slice(0, budget)
+    // Reserve one slot for the truncation marker so the total cell
+    // count for this row equals the remaining budget exactly.
+    const sliced = tokens.slice(0, Math.max(0, budget - 1))
     sliced.push(TEXT_TO_COLUMNS_PREVIEW_TRUNCATION_MARK)
     out.push({ sourceRow: row.sourceRow, tokens: sliced })
     budget = 0

@@ -278,9 +278,11 @@ describe('text-to-columns', () => {
       }))
       const preview = store.getter(textToColumnsPreviewAtom)
       expect(preview).toHaveLength(1)
-      // The row should have at most TOKEN_CAP + 1 (the … marker) tokens.
-      expect(preview[0]!.tokens.length).toBe(TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP + 1)
-      expect(preview[0]!.tokens[TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP]).toBe(
+      // The row's total cell count (including the trailing `…` marker)
+      // must equal the cap exactly — the marker counts against the cap
+      // so the renderer never emits more than TOKEN_CAP cells per row.
+      expect(preview[0]!.tokens.length).toBe(TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP)
+      expect(preview[0]!.tokens[TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP - 1]).toBe(
         TEXT_TO_COLUMNS_PREVIEW_TRUNCATION_MARK,
       )
     })

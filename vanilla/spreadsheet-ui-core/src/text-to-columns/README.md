@@ -18,10 +18,13 @@ emits a single `importCellChunks` plan so undo collapses into one entry.
 - **Derived atoms:**
   - `textToColumnsPreviewAtom` — first `TEXT_TO_COLUMNS_PREVIEW_CAP` (100)
     source rows tokenized under the current wizard config. Bounded cache
-    cap: **100 rows × 500 total tokens** (`TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP`).
-    A row that exceeds the remaining token budget gets a trailing
-    `TEXT_TO_COLUMNS_PREVIEW_TRUNCATION_MARK` (`'…'`); rows past the
-    budget emit an empty `tokens` list (so row anchoring is preserved).
+    cap: **100 rows × 500 total cells** (`TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP`).
+    A row that exceeds the remaining budget gets a trailing
+    `TEXT_TO_COLUMNS_PREVIEW_TRUNCATION_MARK` (`'…'`); the marker
+    counts against the cap so a truncated row emits at most
+    `TEXT_TO_COLUMNS_PREVIEW_TOKEN_CAP` cells (marker included). Rows
+    past the budget emit an empty `tokens` list (so row anchoring is
+    preserved).
 - **Commands:**
   - `openTextToColumnsAtom({ sheetId, anchor, rows })`
   - `closeTextToColumnsAtom`
