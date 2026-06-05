@@ -281,6 +281,48 @@ describe('ERF / ERFC', () => {
     expect(call(ERFC, [NUM(1), NUM(2)])).toEqual(ERR('#VALUE!'))
     expect(call(ERF, [NUM(Number.NaN)])).toEqual(ERR('#NUM!'))
   })
+
+  // High-precision regression — Cody's rational Chebyshev kernel should match
+  // reference values (Wolfram / glibc __erf) to within ~1 ULP across the
+  // sub-1 and small-x ranges where the previous A&S 7.1.26 fit only gave 1.5e-7.
+  test('ERF matches IEEE 754 double-precision reference values', () => {
+    expectNumberClose(call(ERF, [NUM(0.1)]), 0.1124629160182849, 15)
+    expectNumberClose(call(ERF, [NUM(0.5)]), 0.5204998778130465, 15)
+    expectNumberClose(call(ERF, [NUM(1)]), 0.8427007929497149, 15)
+    expectNumberClose(call(ERF, [NUM(1.5)]), 0.9661051464753108, 15)
+    expectNumberClose(call(ERF, [NUM(2)]), 0.9953222650189527, 15)
+    expectNumberClose(call(ERF, [NUM(3)]), 0.9999779095030014, 15)
+    // erf(5) ≠ 1 in IEEE 754 double — the erfc tail of ~1.54e-12 is still
+    // representable. erf(10) saturates fully because exp(-100) underflows.
+    expectNumberClose(call(ERF, [NUM(5)]), 0.9999999999984625, 15)
+    expect(numberValue(call(ERF, [NUM(10)]))).toBe(1)
+    expect(numberValue(call(ERF, [NUM(-10)]))).toBe(-1)
+  })
+
+  test('ERFC matches IEEE 754 double-precision reference values', () => {
+    expectNumberClose(call(ERFC, [NUM(0.1)]), 0.8875370839817151, 15)
+    expectNumberClose(call(ERFC, [NUM(0.5)]), 0.4795001221869535, 15)
+    expectNumberClose(call(ERFC, [NUM(1)]), 0.1572992070502851, 15)
+    expectNumberClose(call(ERFC, [NUM(2)]), 0.004677734981047266, 17)
+    expectNumberClose(call(ERFC, [NUM(3)]), 2.2090496998585441e-5, 19)
+    // Large argument: previous polynomial fit returned ~0; Cody's kernel
+    // still produces the right exp(-x^2)/x*sqrt(pi) tail.
+    expectNumberClose(call(ERFC, [NUM(5)]), 1.5374597944280351e-12, 25)
+  })
+
+  test('ERF.PRECISE matches ERF for the same reference points', () => {
+    for (const x of [0.1, 0.5, 1, 1.5, 2, 3, -0.5, -2]) {
+      expect(call(ERF_PRECISE, [NUM(x)])).toEqual(call(ERF, [NUM(x)]))
+    }
+  })
+
+  test('ERF is exactly antisymmetric around zero', () => {
+    for (const x of [0.1, 0.25, 0.5, 0.8, 1, 2, 3]) {
+      const pos = numberValue(call(ERF, [NUM(x)]))
+      const neg = numberValue(call(ERF, [NUM(-x)]))
+      expect(neg).toBe(-pos)
+    }
+  })
 })
 
 describe('CONVERT', () => {
