@@ -29,7 +29,10 @@ import { test, expect, type Page } from '@playwright/test'
 const WAVE5_GRID = '[data-testid="wave5-grid"]'
 
 async function gotoWave5(page: Page) {
-  await page.goto('/')
+  // Force the English locale so preview-empty-state / noKeyColumns
+  // string assertions are stable across the bundled DEFAULT_LOCALE.
+  // Mirrors the helper in `text-to-columns.spec.ts`.
+  await page.goto('/?locale=en')
   await page.getByTestId('nav-tab-vnext-wave5').click()
   await expect(page.getByTestId('wave5-grid')).toBeVisible({ timeout: 30_000 })
   await expect(
