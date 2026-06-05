@@ -94,6 +94,23 @@ describe('INFO / ERROR.TYPE', () => {
     if (system.kind === 'string') expect(['mac', 'pc', 'other']).toContain(system.value)
   })
 
+  test('INFO("directory") returns the runtime working directory or origin', () => {
+    // Pin only the shape (non-empty string in a Node/jsdom runtime).
+    // Exact value varies by host: process.cwd() in Node, location.origin
+    // in a browser/worker. Both are non-empty.
+    const directory = info('INFO', [STR('directory')])
+    expect(directory.kind).toBe('string')
+    if (directory.kind === 'string') expect(directory.value.length).toBeGreaterThan(0)
+  })
+
+  test('INFO("osversion") returns the runtime OS / user-agent string', () => {
+    // Pin only the shape. In Node we get `${platform} ${version}`,
+    // in a browser/worker we get navigator.userAgent. Both are non-empty.
+    const osversion = info('INFO', [STR('osversion')])
+    expect(osversion.kind).toBe('string')
+    if (osversion.kind === 'string') expect(osversion.value.length).toBeGreaterThan(0)
+  })
+
   test('INFO propagates errors and rejects unknown keys', () => {
     expect(info('INFO', [ERR('#N/A')])).toEqual(ERR('#N/A'))
     expect(info('INFO', [STR('unknown')])).toEqual(ERR('#VALUE!'))

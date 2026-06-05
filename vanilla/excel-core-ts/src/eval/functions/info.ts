@@ -242,16 +242,64 @@ function valueToInfoKey(value: Value): string {
   }
 }
 
-function hostSystem(): string {
-  const host = globalThis as {
-    process?: { platform?: string }
-    navigator?: { platform?: string; userAgent?: string }
+type InfoHost = {
+  process?: {
+    platform?: string
+    version?: string
+    cwd?: () => string
   }
+  navigator?: { platform?: string; userAgent?: string }
+  location?: { origin?: string; href?: string }
+}
+
+function infoHost(): InfoHost {
+  return globalThis as InfoHost
+}
+
+function hostSystem(): string {
+  const host = infoHost()
   const platform = host.process?.platform ?? host.navigator?.platform ?? host.navigator?.userAgent ?? ''
   const lower = platform.toLowerCase()
   if (lower.includes('darwin') || lower.includes('mac')) return 'mac'
   if (lower.includes('win')) return 'pc'
   return 'other'
+}
+
+/**
+ * INFO("directory") — Excel returns the current working directory in a
+ * desktop host. In a Node runtime we mirror that with `process.cwd()`;
+ * in a browser/worker we fall back to `location.origin` (the closest
+ * analog of "the place this workbook is anchored to"), then to "".
+ */
+function hostDirectory(): string {
+  const host = infoHost()
+  if (host.process?.cwd) {
+    try {
+      return host.process.cwd()
+    } catch {
+      // Some sandboxes throw on cwd(); fall through.
+    }
+  }
+  if (host.location?.origin) return host.location.origin
+  if (host.location?.href) return host.location.href
+  return ''
+}
+
+/**
+ * INFO("osversion") — Excel returns a platform-specific OS version
+ * string. In Node we synthesize `<platform> <version>`
+ * (e.g. `darwin v22.0.0`); in a browser/worker we use the
+ * `navigator.userAgent`. Empty string only if neither surface exists.
+ */
+function hostOsVersion(): string {
+  const host = infoHost()
+  const platform = host.process?.platform
+  const version = host.process?.version
+  if (platform && version) return `${platform} ${version}`
+  if (platform) return platform
+  if (host.navigator?.userAgent) return host.navigator.userAgent
+  if (host.navigator?.platform) return host.navigator.platform
+  return ''
 }
 
 /** INFO(type_text) — stable runtime metadata for formula compatibility. */
@@ -262,11 +310,11 @@ export const INFO: FunctionImpl = (args) => {
   if (v.kind === 'error') return v
   switch (valueToInfoKey(v)) {
     case 'directory':
-      return STR('')
+      return STR(hostDirectory())
     case 'numfile':
       return NUM(1)
     case 'osversion':
-      return STR('')
+      return STR(hostOsVersion())
     case 'recalc':
       return STR('Automatic')
     case 'release':
