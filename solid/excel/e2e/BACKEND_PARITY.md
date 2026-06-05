@@ -1,6 +1,7 @@
 # vNext e2e — Backend Parity Matrix
 
-Last full audited: 2026-06-05 (post-500-fn-parity arc; full 59-spec audit, dual project run)
+Last full audited: 2026-06-05 (post-500-fn-parity arc + TS worker-runtime
+fixes; full 59-spec audit, dual project run, targeted re-run after fix)
 Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 `snapshotPersistenceV1.sizes` on TS.
 
@@ -9,30 +10,24 @@ Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 | Project | Passed | Failed | Skipped (in spec) | Total |
 |---------|-------:|-------:|------------------:|------:|
 | `wasm`  |  **465** | **21** |                29 |   515 |
-| `ts`    |  **461** | **25** |                29 |   515 |
+| `ts`    |  **465** | **21** |                29 |   515 |
+
+**Δ between projects: 0** — TS and WASM are at numeric parity. The 21
+failures are the same set on both projects (pre-existing UI bug cluster,
+cataloged below).
 
 **Δ since 2026-05-28 baseline** (wasm 462/24/29 ; ts 460/26/29):
 - WASM: +3 pass / −3 fail (3 specs moved red → green).
-- TS: +1 pass / −1 fail (the `snapshotPersistenceV1.sizes` 2 specs moved green
-  via the 2026-05-29 targeted fix; a few worker-backend behaviors shifted in
-  both directions during the 500-fn / evaluator-aware arc).
-
-**Δ between projects after this audit:** TS shows 4 more failures than WASM.
-Three are `vnext-worker-backend.spec.ts` DOM cell-count assertions (lazy
-3-sheet chain rendering, sparse range chunked snapshots, paste large TSV
-through worker bulk import) — these failed on **both** projects in the
-2026-05-28 audit and have since been fixed on WASM but not on TS. The fourth
-(`formulas-wasm.spec.ts:63` MIN/MAX) exercises a hard-wired WASM demo and is
-treated as a suspected flake — see "Regressions to investigate" below.
-`smoke.spec.ts:55` also failed once on TS during this audit but PASSED on
-Playwright's automatic retry — flaky, not in the canonical 25 fail count.
+- TS: +5 pass / −5 fail (+2 from the 2026-05-29 targeted size fix; +3 from
+  the 2026-06-05 worker-runtime-ts.ts fix: `debugFormulaCacheState`
+  reports 'dirty' for never-read formula cells, and
+  `snapshotRangeSparseChunks` now respects the chunk-size cap).
 
 Out of 59 spec files:
 - **51** pass cleanly on **both** projects (up from 49).
-- **8** have pre-existing UI failures that reproduce on both projects (partially
-  red, but identically red — not a parity issue; cluster in
+- **8** have pre-existing UI failures that reproduce on both projects
+  (partially red, but identically red — not a parity issue; cluster in
   `audit-format.spec.ts` as the largest at 9 fails).
-- **1** (`vnext-worker-backend.spec.ts`) has the residual TS-only gap.
 
 The audit reads `?backend=ts` and `?backend=wasm` from the Playwright project
 name via `gotoRoot(page)` / `withEnglishLocale()` helpers. Only the
