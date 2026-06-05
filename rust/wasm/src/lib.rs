@@ -18,7 +18,11 @@ use wasm_bindgen::JsCast;
 /// digits: 0 }, bold: true }`) without learning Rust's serde tags.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct CellFormatJSON {
-    #[serde(default, rename = "numberFormat", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "numberFormat",
+        skip_serializing_if = "Option::is_none"
+    )]
     number_format: Option<NumberFormatJSON>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     bold: Option<bool>,
@@ -42,7 +46,11 @@ struct CellFormatJSON {
         skip_serializing_if = "Option::is_none"
     )]
     bg_color: Option<String>,
-    #[serde(default, rename = "fontFamily", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "fontFamily",
+        skip_serializing_if = "Option::is_none"
+    )]
     font_family: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     underline: Option<bool>,
@@ -52,7 +60,11 @@ struct CellFormatJSON {
     wrap: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indent: Option<u8>,
-    #[serde(default, rename = "verticalAlign", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "verticalAlign",
+        skip_serializing_if = "Option::is_none"
+    )]
     vertical_align: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rotation: Option<RotationJSON>,
@@ -91,14 +103,14 @@ struct BorderSpecJSON {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct NumberFormatJSON {
-    /// One of "general" | "decimal" | "percent" | "currency" | "date".
+    /// One of "general" | "decimal" | "percent" | "currency" | "date" | "custom".
     kind: String,
     #[serde(default)]
     digits: Option<u8>,
     /// Currency symbol — used when `kind == "currency"`.
     #[serde(default)]
     symbol: Option<String>,
-    /// Strftime-style pattern — used when `kind == "date"`.
+    /// Pattern — used when `kind == "date"` or `kind == "custom"`.
     #[serde(default)]
     pattern: Option<String>,
     /// Render thousands separators for `decimal`.
@@ -146,7 +158,10 @@ impl CellFormatJSON {
             indent: self.indent.unwrap_or(0),
             vertical_align,
             rotation,
-            borders: self.borders.map(CellBordersJSON::into_borders).unwrap_or_default(),
+            borders: self
+                .borders
+                .map(CellBordersJSON::into_borders)
+                .unwrap_or_default(),
         }
     }
 
@@ -168,7 +183,11 @@ impl CellFormatJSON {
             underline: if fmt.underline { Some(true) } else { None },
             strikethrough: if fmt.strikethrough { Some(true) } else { None },
             wrap: if fmt.wrap_text { Some(true) } else { None },
-            indent: if fmt.indent > 0 { Some(fmt.indent) } else { None },
+            indent: if fmt.indent > 0 {
+                Some(fmt.indent)
+            } else {
+                None
+            },
             vertical_align: match fmt.vertical_align {
                 VerticalAlign::Default => None,
                 VerticalAlign::Top => Some("top".into()),
@@ -221,7 +240,10 @@ impl BorderSpecJSON {
             "double" => BorderStyle::Double,
             _ => BorderStyle::None,
         };
-        BorderSpec { style, color: self.color }
+        BorderSpec {
+            style,
+            color: self.color,
+        }
     }
 
     fn from_spec(spec: &BorderSpec) -> Self {
@@ -479,6 +501,10 @@ impl NumberFormatJSON {
                 digits: self.digits.unwrap_or(2),
             },
             "date" => NumberFormat::Date(self.pattern.unwrap_or_else(|| "yyyy-mm-dd".into())),
+            "custom" => self
+                .pattern
+                .map(NumberFormat::Custom)
+                .unwrap_or(NumberFormat::General),
             _ => NumberFormat::General,
         }
     }
@@ -515,6 +541,13 @@ impl NumberFormatJSON {
             },
             NumberFormat::Date(p) => NumberFormatJSON {
                 kind: "date".into(),
+                digits: None,
+                symbol: None,
+                pattern: Some(p.clone()),
+                thousands: None,
+            },
+            NumberFormat::Custom(p) => NumberFormatJSON {
+                kind: "custom".into(),
                 digits: None,
                 symbol: None,
                 pattern: Some(p.clone()),
@@ -1015,13 +1048,7 @@ impl WasmSheet {
     /// Set a cell to an error value by its display code. Unknown codes fall
     /// back to #VALUE!, matching the generic invalid-value error.
     pub fn set_error(&mut self, addr: &str, value: &str) {
-        let err = match value {
-            "#DIV/0!" => ValueError::DivisionByZero,
-            "#REF!" => ValueError::InvalidRef,
-            "#NAME?" => ValueError::InvalidName,
-            "#CYCLE!" => ValueError::CyclicRef,
-            _ => ValueError::InvalidValue,
-        };
+        let err = error_token_to_value_error(value).unwrap_or(ValueError::InvalidValue);
         self.sheet.set_cell(addr, Value::Error(err));
     }
 
@@ -1323,11 +1350,7 @@ struct WasmCustomFormulaRegistry {
 
 impl std::fmt::Debug for WasmCustomFormulaRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self
-            .inner
-            .lock()
-            .map(|map| map.len())
-            .unwrap_or(0);
+        let count = self.inner.lock().map(|map| map.len()).unwrap_or(0);
         write!(f, "WasmCustomFormulaRegistry({count} fns)")
     }
 }
@@ -1481,11 +1504,11 @@ fn value_to_js(value: &Value) -> JsValue {
 
 /// Marshal `JsValue` → `Value`. The JS callback may return any of:
 ///   - `number` → `Value::Number` (NaN / Infinity become `#NUM!`).
-///   - `string` → `Value::Text`. The special tokens `"#DIV/0!"`,
-///     `"#REF!"`, `"#VALUE!"`, `"#NAME?"`, `"#NUM!"`, `"#N/A"`,
-///     `"#CYCLE!"`, `"#TYPE!"`, `"#ARGS!"`, `"#SPILL!"` round-trip as
-///     the matching `ValueError` so a JS-side custom function can
-///     deliberately propagate an Excel-style error.
+///   - `string` → `Value::Text`. The special tokens `"#NULL!"`,
+///     `"#DIV/0!"`, `"#N/A"`, `"#REF!"`, `"#VALUE!"`, `"#NAME?"`,
+///     `"#NUM!"`, `"#CYCLE!"`, `"#TYPE!"`, `"#ARGS!"`, `"#SPILL!"`,
+///     `"#CALC!"` round-trip as the matching `ValueError` so a JS-side
+///     custom function can deliberately propagate an Excel-style error.
 ///   - `boolean` → `Value::Boolean`.
 ///   - `null` / `undefined` → `Value::Null`.
 ///   - `{ error: string }` → `Value::Error(_)` parsed from the string
@@ -1558,7 +1581,9 @@ fn js_to_value(js: &JsValue) -> Value {
 /// caller can decide whether to treat the string as text or `#VALUE!`.
 fn error_token_to_value_error(s: &str) -> Option<ValueError> {
     match s {
+        "#NULL!" => Some(ValueError::Null),
         "#DIV/0!" => Some(ValueError::DivisionByZero),
+        "#N/A" => Some(ValueError::NotAvailable),
         "#REF!" => Some(ValueError::InvalidRef),
         "#VALUE!" => Some(ValueError::InvalidValue),
         "#NAME?" => Some(ValueError::InvalidName),
@@ -1567,6 +1592,7 @@ fn error_token_to_value_error(s: &str) -> Option<ValueError> {
         "#TYPE!" => Some(ValueError::WrongType),
         "#ARGS!" => Some(ValueError::WrongArgCount),
         "#SPILL!" => Some(ValueError::Spill),
+        "#CALC!" => Some(ValueError::Calc),
         _ => None,
     }
 }
@@ -1687,7 +1713,7 @@ impl WasmWorkbook {
         // engine's `WorkbookEvalProvider::call_custom` can reach it. The
         // Arc clone is cheap — same map, two handles.
         workbook.set_custom_function_registry(Some(
-            custom_formulas.clone() as Arc<dyn CustomFunctionRegistry>,
+            custom_formulas.clone() as Arc<dyn CustomFunctionRegistry>
         ));
         WasmWorkbook {
             workbook,
@@ -1799,10 +1825,7 @@ impl WasmWorkbook {
     /// `defineName` call individually.
     #[wasm_bindgen(js_name = "definedNames")]
     pub fn defined_names(&self) -> Vec<String> {
-        self.workbook
-            .named_names()
-            .map(|s| s.to_string())
-            .collect()
+        self.workbook.named_names().map(|s| s.to_string()).collect()
     }
 
     pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str) {
@@ -2049,7 +2072,10 @@ impl WasmWorkbook {
         addr: &str,
         value: f64,
     ) -> Result<JsValue, JsValue> {
-        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Number(value)))
+        try_set_cell_result(
+            self.workbook
+                .try_set_cell(sheet_idx, addr, Value::Number(value)),
+        )
     }
 
     #[wasm_bindgen(js_name = "trySetCellText")]
@@ -2073,7 +2099,10 @@ impl WasmWorkbook {
         addr: &str,
         value: bool,
     ) -> Result<JsValue, JsValue> {
-        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Boolean(value)))
+        try_set_cell_result(
+            self.workbook
+                .try_set_cell(sheet_idx, addr, Value::Boolean(value)),
+        )
     }
 
     #[wasm_bindgen(js_name = "trySetCellError")]
@@ -2084,15 +2113,14 @@ impl WasmWorkbook {
         value: &str,
     ) -> Result<JsValue, JsValue> {
         let err = value_error_from_display(value);
-        try_set_cell_result(self.workbook.try_set_cell(sheet_idx, addr, Value::Error(err)))
+        try_set_cell_result(
+            self.workbook
+                .try_set_cell(sheet_idx, addr, Value::Error(err)),
+        )
     }
 
     #[wasm_bindgen(js_name = "tryClearCellAt")]
-    pub fn try_clear_cell_at(
-        &mut self,
-        sheet_idx: usize,
-        addr: &str,
-    ) -> Result<JsValue, JsValue> {
+    pub fn try_clear_cell_at(&mut self, sheet_idx: usize, addr: &str) -> Result<JsValue, JsValue> {
         try_set_cell_result(self.workbook.try_clear_cell(sheet_idx, addr))
     }
 
@@ -2525,7 +2553,9 @@ impl WasmWorkbook {
                     _ => None,
                 },
                 "formula" => match &cell.value {
-                    Some(BulkImportValueJSON::Text(s)) => Some(BulkImportCellKind::Formula(s.clone())),
+                    Some(BulkImportValueJSON::Text(s)) => {
+                        Some(BulkImportCellKind::Formula(s.clone()))
+                    }
                     _ => None,
                 },
                 "null" => Some(BulkImportCellKind::Null),
@@ -2541,11 +2571,8 @@ impl WasmWorkbook {
         }
 
         // ---- Phase: engine work (driver records its own phase split) -
-        let timings = run_bulk_import_with_phase_timings(
-            &mut self.workbook,
-            &inputs,
-            js_sys::Date::now,
-        );
+        let timings =
+            run_bulk_import_with_phase_timings(&mut self.workbook, &inputs, js_sys::Date::now);
 
         // ---- Stash for the debug accessor ------------------------------
         self.last_bulk_import_phase_ms.set(Some([
@@ -3244,9 +3271,7 @@ fn workbook_error_to_js(err: WorkbookError) -> JsValue {
 /// contract: see `rust/excel-core/src/sheet.rs` § "Spill infrastructure".
 fn collapse_array_for_js(val: &Value) -> std::borrow::Cow<'_, Value> {
     match val {
-        Value::Array(arr) => std::borrow::Cow::Owned(
-            arr.get(0, 0).cloned().unwrap_or(Value::Null),
-        ),
+        Value::Array(arr) => std::borrow::Cow::Owned(arr.get(0, 0).cloned().unwrap_or(Value::Null)),
         _ => std::borrow::Cow::Borrowed(val),
     }
 }
@@ -3334,13 +3359,7 @@ fn sparse_cell_from_sheet_no_eval(
 }
 
 fn value_error_from_display(value: &str) -> ValueError {
-    match value {
-        "#DIV/0!" => ValueError::DivisionByZero,
-        "#REF!" => ValueError::InvalidRef,
-        "#NAME?" => ValueError::InvalidName,
-        "#CYCLE!" => ValueError::CyclicRef,
-        _ => ValueError::InvalidValue,
-    }
+    error_token_to_value_error(value).unwrap_or(ValueError::InvalidValue)
 }
 
 #[cfg(test)]
@@ -3423,6 +3442,31 @@ mod tests {
         sheet.set_formula("C1", "=A1/B1");
         assert!(sheet.is_error("C1"));
         assert_eq!(sheet.get_display("C1"), "#DIV/0!");
+    }
+
+    #[test]
+    fn wasm_calc_error_token_round_trips() {
+        assert_eq!(error_token_to_value_error("#NULL!"), Some(ValueError::Null));
+        assert_eq!(
+            error_token_to_value_error("#N/A"),
+            Some(ValueError::NotAvailable)
+        );
+        assert_eq!(error_token_to_value_error("#CALC!"), Some(ValueError::Calc));
+        assert_eq!(value_error_from_display("#NULL!"), ValueError::Null);
+        assert_eq!(value_error_from_display("#N/A"), ValueError::NotAvailable);
+        assert_eq!(value_error_from_display("#CALC!"), ValueError::Calc);
+        assert_eq!(value_to_display(&Value::Error(ValueError::Calc)), "#CALC!");
+
+        let mut sheet = WasmSheet::new();
+        sheet.set_error("A1", "#CALC!");
+        assert!(sheet.is_error("A1"));
+        assert_eq!(sheet.get_display("A1"), "#CALC!");
+        sheet.set_error("A2", "#N/A");
+        assert!(sheet.is_error("A2"));
+        assert_eq!(sheet.get_display("A2"), "#N/A");
+        sheet.set_error("A3", "#NULL!");
+        assert!(sheet.is_error("A3"));
+        assert_eq!(sheet.get_display("A3"), "#NULL!");
     }
 
     #[test]
@@ -3595,6 +3639,20 @@ mod tests {
             CellRange::new(CellAddress::new(0, 0), CellAddress::new(2, 0)),
             number_fmt.clone().into_format(),
         );
+        let custom_fmt = CellFormatJSON {
+            number_format: Some(NumberFormatJSON {
+                kind: "custom".into(),
+                digits: None,
+                symbol: None,
+                pattern: Some("#,##0.0\" kg\"".into()),
+                thousands: None,
+            }),
+            ..Default::default()
+        };
+        source.workbook.sheet_mut(1).unwrap().set_format_range(
+            CellRange::new(CellAddress::new(0, 0), CellAddress::new(0, 0)),
+            custom_fmt.into_format(),
+        );
 
         assert_eq!(source.debug_formula_cache_state(0, "C3"), "dirty");
         assert_eq!(source.debug_formula_eval_count(0), 0);
@@ -3659,6 +3717,25 @@ mod tests {
                 thousands: true
             }
         ));
+
+        let restored_custom_fmt =
+            restored
+                .workbook
+                .sheet(1)
+                .unwrap()
+                .snapshot_format_range(CellRange::new(
+                    CellAddress::new(0, 0),
+                    CellAddress::new(0, 0),
+                ));
+        assert_eq!(restored_custom_fmt.range_formats.len(), 1);
+        match &restored_custom_fmt.range_formats[0].fmt.number_format {
+            NumberFormat::Custom(pattern) => assert_eq!(pattern, "#,##0.0\" kg\""),
+            other => panic!("expected custom number format, got {other:?}"),
+        }
+        assert_eq!(
+            restored.workbook.sheet(1).unwrap().formatted_display("A1"),
+            "100.0 kg"
+        );
     }
 
     #[test]
@@ -4130,8 +4207,7 @@ mod tests {
             kind: "number",
             value: TestBulkImportValue::Number(42.0),
         }];
-        let import_value =
-            serde_wasm_bindgen::to_value(&cells).expect("serialize import cells");
+        let import_value = serde_wasm_bindgen::to_value(&cells).expect("serialize import cells");
         let mut wb = WasmWorkbook::new();
         let _ = wb
             .bulk_import_cells(import_value)

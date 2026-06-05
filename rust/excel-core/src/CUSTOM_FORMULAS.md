@@ -148,8 +148,8 @@ type CustomFormulaFn = (args: CustomFormulaArg[]) => CustomFormulaReturn
 
 ### Error tokens that round-trip
 
-`#DIV/0!`, `#REF!`, `#VALUE!`, `#NAME?`, `#NUM!`, `#CYCLE!`, `#TYPE!`,
-`#ARGS!`, `#SPILL!`.
+`#NULL!`, `#DIV/0!`, `#N/A`, `#REF!`, `#VALUE!`, `#NAME?`, `#NUM!`,
+`#CYCLE!`, `#TYPE!`, `#ARGS!`, `#SPILL!`, `#CALC!`.
 
 ### Registry invalidation
 

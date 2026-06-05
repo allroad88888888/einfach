@@ -58,6 +58,14 @@ fn defined_lambda_works_inside_map() {
     assert_eq!(wb.get_cell("Sheet1", "A3"), Value::Number(4.0));
 }
 
+#[test]
+fn workbook_context_array_candidate_normalizes_bare_lambda() {
+    let mut wb = Workbook::new();
+    wb.define_name_value("flag", Value::Boolean(true)).unwrap();
+    assert!(wb.set_formula(0, "A1", "=IF(flag,LAMBDA(x,x),SEQUENCE(1))"));
+    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Error(ValueError::Calc));
+}
+
 /// Removing a defined name dirties cells that referenced it, so the
 /// next read returns `#NAME?` instead of the cached value.
 #[test]

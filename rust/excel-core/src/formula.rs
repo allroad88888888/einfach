@@ -1,4 +1,5 @@
 use crate::cell::CellAddress;
+use einfach_core::ValueError;
 
 /// Which axes of an `Expr::Range` are unbounded (Excel-style `A:A`, `1:1`).
 ///
@@ -52,6 +53,8 @@ pub enum Expr {
     Text(String),
     /// Literal TRUE / FALSE.
     Bool(bool),
+    /// Literal Excel error token, e.g. `#N/A`, `#VALUE!`, `#CALC!`.
+    Error(ValueError),
     /// A cell reference, e.g. A1
     CellRef(CellAddress),
     /// Binary operation: left op right
@@ -85,6 +88,12 @@ pub enum Expr {
         end: CellAddress,
         unbounded: RangeBounds,
     },
+    /// Dynamic-array spill reference: `A1#` / `Sheet1!A1#`. The anchor is
+    /// restricted to a single-cell reference at parse time.
+    SpillRef(Box<Expr>),
+    /// Range operator with a reference-returning expression endpoint, e.g.
+    /// `A1:INDEX(A:A,3)`. Static `A1:B2` stays as `Expr::Range`.
+    DynamicRange { start: Box<Expr>, end: Box<Expr> },
     /// A bare identifier that doesn't parse as a cell ref, function call,
     /// or boolean literal — e.g. `x` in `LET(x, 5, x*x)`. The evaluator
     /// resolves the name against the current LET scope (and, in future,
@@ -108,7 +117,7 @@ pub enum Expr {
     /// columns, `;` separates rows. `data` is row-major, so the cell at
     /// `(row, col)` lives at `data[row * cols + col]`. The parser
     /// restricts cell expressions to literals (numbers, text, booleans,
-    /// or `Negate(Number)` for signed numerics); cell refs, function
+    /// errors, or `Negate(Number)` for signed numerics); cell refs, function
     /// calls, ranges, etc. inside the literal are a parse error — those
     /// are not the Excel constant-array form. Eval lowers this directly
     /// to `Value::Array`.
@@ -159,15 +168,13 @@ pub enum BinOperator {
 /// - `Expr::Number(_)` — `1`, `3.14`, etc.
 /// - `Expr::Text(_)` — `"foo"`.
 /// - `Expr::Bool(_)` — `TRUE` / `FALSE`.
-/// - `Expr::Negate(inner)` where `inner` is one of the above (numeric
-///   only is what Excel itself accepts, but we mirror the parser:
-///   unary minus already wraps any unary expression, so we permit it
-///   over a `Number`).
+/// - `Expr::Error(_)` — `#N/A`, `#VALUE!`, etc.
+/// - `Expr::Negate(inner)` where `inner` is a `Number`.
 ///
 /// Cell refs, function calls, ranges, names, and binops are rejected.
 fn is_valid_array_lit_element(expr: &Expr) -> bool {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => true,
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => true,
         Expr::Negate(inner) => matches!(inner.as_ref(), Expr::Number(_)),
         _ => false,
     }
@@ -184,6 +191,8 @@ fn is_ref_expr(expr: &Expr) -> bool {
             | Expr::Range { .. }
             | Expr::SheetRef { .. }
             | Expr::SheetRange { .. }
+            | Expr::SpillRef(_)
+            | Expr::DynamicRange { .. }
     )
 }
 
@@ -415,7 +424,22 @@ impl Parser {
             Some(Expr::Negate(Box::new(expr)))
         } else {
             let primary = self.parse_primary()?;
-            self.parse_call_suffix(primary)
+            let called = self.parse_call_suffix(primary)?;
+            self.parse_spill_suffix(called)
+        }
+    }
+
+    fn parse_spill_suffix(&mut self, mut expr: Expr) -> Option<Expr> {
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some('#') {
+                return Some(expr);
+            }
+            if !matches!(expr, Expr::CellRef(_) | Expr::SheetRef { .. }) {
+                return None;
+            }
+            self.advance();
+            expr = Expr::SpillRef(Box::new(expr));
         }
     }
 
@@ -451,7 +475,7 @@ impl Parser {
         }
     }
 
-    /// primary = number | string | func_call | cell_ref_or_range | '(' expr ')' | '{' array_lit '}'
+    /// primary = number | string | error | func_call | cell_ref_or_range | '(' expr ')' | '{' array_lit '}'
     fn parse_primary(&mut self) -> Option<Expr> {
         self.skip_whitespace();
 
@@ -504,6 +528,7 @@ impl Parser {
             }
             '{' => self.parse_array_literal(),
             '"' => self.parse_string(),
+            '#' => self.parse_error_literal(),
             c if c.is_ascii_digit() || c == '.' => {
                 // Disambiguate `<digits>:<digits>` (whole-row range) from a
                 // plain number. We scan a digit run; if the next non-digit
@@ -520,6 +545,44 @@ impl Parser {
             c if c.is_ascii_alphabetic() => self.parse_identifier(),
             _ => None,
         }
+    }
+
+    fn matches_literal(&self, token: &str) -> bool {
+        let mut offset = 0;
+        for expected in token.chars() {
+            let Some(actual) = self.chars.get(self.pos + offset).copied() else {
+                return false;
+            };
+            if !actual.eq_ignore_ascii_case(&expected) {
+                return false;
+            }
+            offset += 1;
+        }
+        true
+    }
+
+    fn parse_error_literal(&mut self) -> Option<Expr> {
+        let tokens = [
+            ("#DIV/0!", ValueError::DivisionByZero),
+            ("#VALUE!", ValueError::InvalidValue),
+            ("#NAME?", ValueError::InvalidName),
+            ("#SPILL!", ValueError::Spill),
+            ("#CALC!", ValueError::Calc),
+            ("#NULL!", ValueError::Null),
+            ("#CYCLE!", ValueError::CyclicRef),
+            ("#TYPE!", ValueError::WrongType),
+            ("#ARGS!", ValueError::WrongArgCount),
+            ("#REF!", ValueError::InvalidRef),
+            ("#NUM!", ValueError::Overflow),
+            ("#N/A", ValueError::NotAvailable),
+        ];
+        for (token, err) in tokens {
+            if self.matches_literal(token) {
+                self.pos += token.chars().count();
+                return Some(Expr::Error(err));
+            }
+        }
+        None
     }
 
     /// Speculative parse for `<digits>:<digits>` whole-row syntax. On
@@ -631,7 +694,7 @@ impl Parser {
     /// Cell expressions inside the literal are parsed via `parse_expr`
     /// (so unary minus on a number works: `={-1, 2}`) and then validated
     /// against the constant-array contract: only `Number`, `Text`,
-    /// `Bool`, and `Negate(Number)` are accepted. Anything else (cell
+    /// `Bool`, `Error`, and `Negate(Number)` are accepted. Anything else (cell
     /// refs, function calls, ranges, nested literals, binops other than
     /// the single Negate-of-Number form) is rejected by returning
     /// `None`, which surfaces as a parse error at the top level. This
@@ -792,6 +855,7 @@ impl Parser {
             if self.peek() == Some(':') {
                 self.advance();
                 self.skip_whitespace();
+                let after_colon = self.pos;
                 let end_start = self.pos;
                 while let Some(c) = self.peek() {
                     if c.is_ascii_alphanumeric() {
@@ -801,12 +865,19 @@ impl Parser {
                     }
                 }
                 let end_str: String = self.chars[end_start..self.pos].iter().collect();
-                let end = CellAddress::parse(&end_str)?;
-                return Some(Expr::SheetRange {
-                    sheet: ident,
-                    start: addr,
-                    end,
-                    unbounded: RangeBounds::None,
+                if let Some(end) = CellAddress::parse(&end_str) {
+                    return Some(Expr::SheetRange {
+                        sheet: ident,
+                        start: addr,
+                        end,
+                        unbounded: RangeBounds::None,
+                    });
+                }
+                self.pos = after_colon;
+                let end = self.parse_unary()?;
+                return Some(Expr::DynamicRange {
+                    start: Box::new(Expr::SheetRef { sheet: ident, addr }),
+                    end: Box::new(end),
                 });
             }
             return Some(Expr::SheetRef { sheet: ident, addr });
@@ -819,6 +890,7 @@ impl Parser {
             if self.peek() == Some(':') {
                 self.advance();
                 self.skip_whitespace();
+                let after_colon = self.pos;
                 let range_start = self.pos;
                 while let Some(c) = self.peek() {
                     if c.is_ascii_alphanumeric() {
@@ -828,11 +900,18 @@ impl Parser {
                     }
                 }
                 let end_ident: String = self.chars[range_start..self.pos].iter().collect();
-                let end_addr = CellAddress::parse(&end_ident)?;
-                return Some(Expr::Range {
-                    start: addr,
-                    end: end_addr,
-                    unbounded: RangeBounds::None,
+                if let Some(end_addr) = CellAddress::parse(&end_ident) {
+                    return Some(Expr::Range {
+                        start: addr,
+                        end: end_addr,
+                        unbounded: RangeBounds::None,
+                    });
+                }
+                self.pos = after_colon;
+                let end = self.parse_unary()?;
+                return Some(Expr::DynamicRange {
+                    start: Box::new(Expr::CellRef(addr)),
+                    end: Box::new(end),
                 });
             }
             return Some(Expr::CellRef(addr));
@@ -1180,6 +1259,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_literals() {
+        assert_eq!(
+            parse_formula("=#CALC!"),
+            Some(Expr::Error(ValueError::Calc))
+        );
+        assert_eq!(
+            parse_formula("=#N/A"),
+            Some(Expr::Error(ValueError::NotAvailable))
+        );
+        assert_eq!(
+            parse_formula("=#DIV/0!"),
+            Some(Expr::Error(ValueError::DivisionByZero))
+        );
+        assert_eq!(
+            parse_formula("=#value!"),
+            Some(Expr::Error(ValueError::InvalidValue))
+        );
+    }
+
+    #[test]
     fn parse_cross_sheet_ref() {
         let result = parse_formula("=Sheet2!A1").unwrap();
         assert_eq!(
@@ -1211,6 +1310,65 @@ mod tests {
     #[test]
     fn parse_cross_sheet_range_rejects_missing_end() {
         assert!(parse_formula("=SUM(Sheet2!A1:)").is_none());
+    }
+
+    #[test]
+    fn parse_spill_ref() {
+        assert_eq!(
+            parse_formula("=A1#"),
+            Some(Expr::SpillRef(Box::new(Expr::CellRef(CellAddress::new(
+                0, 0
+            )))))
+        );
+    }
+
+    #[test]
+    fn spill_ref_does_not_swallow_error_literal_suffix() {
+        assert!(parse_formula("=A1#CALC!").is_none());
+    }
+
+    #[test]
+    fn parse_cross_sheet_spill_ref() {
+        assert_eq!(
+            parse_formula("=Sheet2!A1#"),
+            Some(Expr::SpillRef(Box::new(Expr::SheetRef {
+                sheet: "Sheet2".into(),
+                addr: CellAddress::new(0, 0),
+            })))
+        );
+    }
+
+    #[test]
+    fn parse_dynamic_range_endpoint() {
+        let result = parse_formula("=A1:INDEX(A:A,3)").unwrap();
+        match result {
+            Expr::DynamicRange { start, end } => {
+                assert_eq!(*start, Expr::CellRef(CellAddress::new(0, 0)));
+                assert!(matches!(*end, Expr::FuncCall { .. }));
+            }
+            other => panic!("expected DynamicRange, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_dynamic_range_binds_tighter_than_multiply() {
+        let result = parse_formula("=A1:INDEX(A:A,3)*2").unwrap();
+        match result {
+            Expr::BinOp {
+                op: BinOperator::Mul,
+                left,
+                right,
+            } => {
+                assert!(matches!(*left, Expr::DynamicRange { .. }));
+                assert_eq!(*right, Expr::Number(2.0));
+            }
+            other => panic!("expected multiply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_spill_rejects_range_anchor() {
+        assert!(parse_formula("=A1:B2#").is_none());
     }
 
     #[test]
@@ -1379,7 +1537,10 @@ mod tests {
         match result {
             Expr::Call(callee, args) => {
                 match *callee {
-                    Expr::FuncCall { name, args: lam_args } => {
+                    Expr::FuncCall {
+                        name,
+                        args: lam_args,
+                    } => {
                         assert_eq!(name, "LAMBDA");
                         assert_eq!(lam_args[0], Expr::Name("x".into()));
                     }
@@ -1514,10 +1675,7 @@ mod tests {
             Expr::ArrayLit {
                 rows: 1,
                 cols: 2,
-                data: vec![
-                    Expr::Negate(Box::new(Expr::Number(1.0))),
-                    Expr::Number(2.0),
-                ],
+                data: vec![Expr::Negate(Box::new(Expr::Number(1.0))), Expr::Number(2.0),],
             }
         );
     }
@@ -1531,6 +1689,22 @@ mod tests {
                 rows: 1,
                 cols: 2,
                 data: vec![Expr::Bool(true), Expr::Bool(false)],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_array_lit_error_literals_allowed() {
+        let result = parse_formula("={#N/A,#CALC!}").unwrap();
+        assert_eq!(
+            result,
+            Expr::ArrayLit {
+                rows: 1,
+                cols: 2,
+                data: vec![
+                    Expr::Error(ValueError::NotAvailable),
+                    Expr::Error(ValueError::Calc),
+                ],
             }
         );
     }

@@ -102,6 +102,18 @@ fn sequence_spill_collision_surfaces_spill_error() {
     assert_eq!(sheet.spill_info(parsed), None);
 }
 
+#[test]
+fn sequence_spill_beyond_sheet_edge_surfaces_spill_error() {
+    let mut sheet = Sheet::new();
+
+    assert!(sheet.set_formula("A1", "=SEQUENCE(1,16385)"));
+
+    assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::Spill));
+    assert_eq!(sheet.get_cell("B1"), Value::Null);
+    let parsed = CellAddress::parse("A1").unwrap();
+    assert_eq!(sheet.spill_info(parsed), None);
+}
+
 // === UNIQUE round-trip ===
 
 /// `=UNIQUE(A1:A5)` over [1, 2, 2, 3, 1] spills to [1, 2, 3] at the

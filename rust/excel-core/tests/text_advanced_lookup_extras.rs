@@ -8,7 +8,7 @@
 //! detection in `expr_may_produce_array` for TEXTSPLIT).
 
 use einfach_core::{Value, ValueError};
-use einfach_excel_core::Workbook;
+use einfach_excel_core::{Sheet, Workbook};
 
 /// TEXTSPLIT spills horizontally: a single source cell holding the
 /// formula populates the cells to its right via the dynamic-array spill
@@ -54,6 +54,62 @@ fn text_before_after_split_a_path() {
     );
 }
 
+#[test]
+fn text_before_after_empty_delimiter_and_match_end() {
+    let mut wb = Workbook::new();
+    wb.set_formula(0, "A1", "=TEXTBEFORE(\"abc\", \"\")");
+    wb.set_formula(0, "A2", "=TEXTAFTER(\"abc\", \"\")");
+    wb.set_formula(0, "A3", "=TEXTBEFORE(\"abc\", \"\", -1)");
+    wb.set_formula(0, "A4", "=TEXTAFTER(\"abc\", \"\", -1)");
+    wb.set_formula(0, "A5", "=TEXTBEFORE(\"Socrates\", \" \", 1, 0, 1)");
+    wb.set_formula(0, "A6", "=TEXTBEFORE(\"abc\", \"-\", 1, 0, 2)");
+    wb.set_formula(0, "A7", "=TEXTBEFORE(\"abc\", \"-\")");
+
+    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Text(String::new()));
+    assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Text("abc".into()));
+    assert_eq!(wb.get_cell("Sheet1", "A3"), Value::Text("abc".into()));
+    assert_eq!(wb.get_cell("Sheet1", "A4"), Value::Text(String::new()));
+    assert_eq!(wb.get_cell("Sheet1", "A5"), Value::Text("Socrates".into()));
+    assert_eq!(
+        wb.get_cell("Sheet1", "A6"),
+        Value::Error(ValueError::InvalidValue)
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "A7"),
+        Value::Error(ValueError::NotAvailable)
+    );
+}
+
+#[test]
+fn regex_extract_and_replace_excel_edges() {
+    let mut wb = Workbook::new();
+    wb.set_formula(
+        0,
+        "A1",
+        "=REGEXEXTRACT(\"SoniaBrown\", \"([A-Z][a-z]+)([A-Z][a-z]+)\", 2)",
+    );
+    wb.set_formula(0, "A2", "=REGEXREPLACE(\"a1 b2 c3\", \"[0-9]\", \"X\", -1)");
+    wb.set_formula(
+        0,
+        "A3",
+        "=REGEXREPLACE(\"John Smith\", \"(\\w+) (\\w+)\", \"$2, $1\", 1)",
+    );
+
+    match wb.get_cell("Sheet1", "A1") {
+        Value::Array(arr) => {
+            assert_eq!(arr.shape(), (1, 2));
+            assert_eq!(arr.get(0, 0), Some(&Value::Text("Sonia".into())));
+            assert_eq!(arr.get(0, 1), Some(&Value::Text("Brown".into())));
+        }
+        other => panic!("expected REGEXEXTRACT capture array, got {:?}", other),
+    }
+    assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Text("a1 b2 cX".into()));
+    assert_eq!(
+        wb.get_cell("Sheet1", "A3"),
+        Value::Text("Smith, John".into())
+    );
+}
+
 /// LOOKUP vector form with 3 arguments. The keys vector is sorted and
 /// the result vector parallels it; LOOKUP picks the largest key ≤
 /// needle.
@@ -91,15 +147,48 @@ fn formulatext_in_workbook_and_cross_sheet() {
     assert!(wb.set_formula(0, "D2", "=FORMULATEXT(A1)"));
     // Cross-sheet: FORMULATEXT(Data!C1) → "=42+1".
     assert!(wb.set_formula(0, "D3", "=FORMULATEXT(Data!C1)"));
+    // Missing sheet is an invalid reference, not a primitive/no-formula cell.
+    assert!(wb.set_formula(0, "D4", "=FORMULATEXT(Missing!C1)"));
 
     assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Text("=A1*3".into()));
     assert_eq!(
         wb.get_cell("Sheet1", "D2"),
-        Value::Error(ValueError::InvalidValue)
+        Value::Error(ValueError::NotAvailable)
     );
+    assert_eq!(wb.get_cell("Sheet1", "D3"), Value::Text("=42+1".into()));
     assert_eq!(
-        wb.get_cell("Sheet1", "D3"),
-        Value::Text("=42+1".into())
+        wb.get_cell("Sheet1", "D4"),
+        Value::Error(ValueError::InvalidRef)
+    );
+}
+
+#[test]
+fn formulatext_cross_sheet_ref_needs_workbook_context() {
+    let mut sheet = Sheet::new();
+    assert!(sheet.set_formula("C1", "=1+1"));
+    assert!(sheet.set_formula("A1", "=FORMULATEXT(Data!C1)"));
+
+    assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::InvalidRef));
+}
+
+#[test]
+fn textsplit_default_pad_is_not_available() {
+    let mut wb = Workbook::new();
+    assert!(wb.set_formula(0, "A1", "=TEXTSPLIT(\"a,b;c\", \",\", \";\")"));
+
+    match wb.get_cell("Sheet1", "A1") {
+        Value::Array(arr) => {
+            assert_eq!(arr.shape(), (2, 2));
+            assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+            assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+            assert_eq!(arr.get(1, 0), Some(&Value::Text("c".into())));
+            assert_eq!(arr.get(1, 1), Some(&Value::Error(ValueError::NotAvailable)));
+        }
+        other => panic!("expected Array anchor at A1, got {:?}", other),
+    }
+    assert_eq!(
+        wb.get_cell("Sheet1", "B2"),
+        Value::Error(ValueError::NotAvailable)
     );
 }
 

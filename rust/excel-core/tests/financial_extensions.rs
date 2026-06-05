@@ -7,6 +7,7 @@
 //! real `Sheet`.
 
 use einfach_core::Value;
+use einfach_core::ValueError;
 use einfach_excel_core::Workbook;
 
 fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
@@ -65,6 +66,21 @@ fn npv_irr_over_cash_flow_column() {
         Value::Number(n) => assert!(approx_eq(n, 0.08896, 1e-4), "IRR = {}", n),
         other => panic!("IRR: {:?}", other),
     }
+}
+
+#[test]
+fn xnpv_rejects_dates_before_first_schedule_date() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(100.0));
+    wb.set_cell(0, "A2", Value::Number(-50.0));
+    wb.set_cell(0, "B1", Value::Number(43832.0));
+    wb.set_cell(0, "B2", Value::Number(43831.0));
+    wb.set_formula(0, "C1", "=XNPV(0.1,A1:A2,B1:B2)");
+
+    assert_eq!(
+        wb.get_cell("Sheet1", "C1"),
+        Value::Error(ValueError::Overflow)
+    );
 }
 
 /// IPMT + PPMT = PMT identity, period-by-period across a small loan.

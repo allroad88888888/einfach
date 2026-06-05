@@ -118,9 +118,25 @@ fn error_type_round_trip() {
     let mut wb = Workbook::new();
     wb.set_formula(0, "A1", "=ERROR.TYPE(1/0)");
     wb.set_formula(0, "A2", "=ERROR.TYPE(MATCH(99, {1,2,3}, 0))");
+    wb.set_formula(0, "A3", "=ERROR.TYPE(NA())");
+    wb.set_formula(0, "A4", "=ERROR.TYPE(FILTER({1},{FALSE}))");
+    wb.set_formula(0, "B1", "=SEQUENCE(1,16384)");
+    wb.set_formula(0, "A5", "=ERROR.TYPE(B1)");
+    wb.set_formula(0, "A6", "=ERROR.TYPE(#VALUE!)");
+    wb.set_formula(0, "A7", "=ERROR.TYPE(42)");
+    wb.set_formula(0, "A8", "=IFNA(ERROR.TYPE(42), \"x\")");
 
     assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(2.0));
     assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Number(7.0));
+    assert_eq!(wb.get_cell("Sheet1", "A3"), Value::Number(7.0));
+    assert_eq!(wb.get_cell("Sheet1", "A4"), Value::Number(14.0));
+    assert_eq!(wb.get_cell("Sheet1", "A5"), Value::Number(9.0));
+    assert_eq!(wb.get_cell("Sheet1", "A6"), Value::Number(3.0));
+    assert_eq!(
+        wb.get_cell("Sheet1", "A7"),
+        Value::Error(ValueError::NotAvailable)
+    );
+    assert_eq!(wb.get_cell("Sheet1", "A8"), Value::Text("x".into()));
 }
 
 // ---- DOLLAR / FIXED ----
@@ -133,7 +149,10 @@ fn dollar_round_trip() {
     wb.set_formula(0, "A3", "=DOLLAR(1234.567, 0)");
 
     assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Text("$1,234.57".into()));
-    assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Text("($1,234.50)".into()));
+    assert_eq!(
+        wb.get_cell("Sheet1", "A2"),
+        Value::Text("($1,234.50)".into())
+    );
     assert_eq!(wb.get_cell("Sheet1", "A3"), Value::Text("$1,235".into()));
 }
 
@@ -229,14 +248,8 @@ fn dstdev_dvar_round_trip() {
         other => panic!("expected number, got {:?}", other),
     }
     // sample var = 2·7500² / 1 = 112_500_000; pop var = 2·7500² / 2 = 56_250_000.
-    assert_eq!(
-        wb.get_cell("Sheet1", "G3"),
-        Value::Number(112_500_000.0)
-    );
-    assert_eq!(
-        wb.get_cell("Sheet1", "G4"),
-        Value::Number(56_250_000.0)
-    );
+    assert_eq!(wb.get_cell("Sheet1", "G3"), Value::Number(112_500_000.0));
+    assert_eq!(wb.get_cell("Sheet1", "G4"), Value::Number(56_250_000.0));
 }
 
 // ---- EXPAND (spilled into surrounding cells) ----
@@ -260,6 +273,29 @@ fn expand_round_trip_spill() {
     assert_eq!(sheet.get_cell("B4"), Value::Number(99.0));
 }
 
+#[test]
+fn expand_default_pad_is_not_available() {
+    use einfach_excel_core::Sheet;
+    let mut sheet = Sheet::new();
+    sheet.set_cell("A1", Value::Number(1.0));
+    sheet.set_cell("A2", Value::Number(2.0));
+    assert!(sheet.set_formula("B1", "=EXPAND(A1:A2, 4)"));
+
+    match sheet.get_cell("B1") {
+        Value::Array(a) => {
+            assert_eq!(a.shape(), (4, 1));
+            assert_eq!(a.get(0, 0), Some(&Value::Number(1.0)));
+            assert_eq!(a.get(1, 0), Some(&Value::Number(2.0)));
+            assert_eq!(a.get(2, 0), Some(&Value::Error(ValueError::NotAvailable)));
+            assert_eq!(a.get(3, 0), Some(&Value::Error(ValueError::NotAvailable)));
+        }
+        other => panic!("expected Array at B1, got {:?}", other),
+    }
+    assert_eq!(sheet.get_cell("B2"), Value::Number(2.0));
+    assert_eq!(sheet.get_cell("B3"), Value::Error(ValueError::NotAvailable));
+    assert_eq!(sheet.get_cell("B4"), Value::Error(ValueError::NotAvailable));
+}
+
 // ---- XMATCH ----
 
 #[test]
@@ -278,7 +314,7 @@ fn xmatch_round_trip() {
     wb.set_formula(0, "B2", "=XMATCH(99, A1:A4)");
     assert_eq!(
         wb.get_cell("Sheet1", "B2"),
-        Value::Error(ValueError::InvalidValue)
+        Value::Error(ValueError::NotAvailable)
     );
 
     // Exact-or-next-larger: 25 in {10,20,30,40} → 3 (value 30).

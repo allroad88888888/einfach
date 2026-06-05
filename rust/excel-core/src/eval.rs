@@ -631,11 +631,7 @@ impl LambdaValue for ExcelLambda {
 /// Errors from the body propagate out as-is. The frame is popped via a
 /// guard so the LET stack stays balanced even when the body
 /// short-circuits.
-pub(crate) fn apply_lambda(
-    lambda: &Value,
-    args: Vec<Value>,
-    provider: &dyn EvalProvider,
-) -> Value {
+pub(crate) fn apply_lambda(lambda: &Value, args: Vec<Value>, provider: &dyn EvalProvider) -> Value {
     let arc = match lambda {
         Value::Lambda(a) => a.clone(),
         Value::Error(e) => return Value::Error(e.clone()),
@@ -684,6 +680,18 @@ pub(crate) fn apply_lambda(
     result
 }
 
+fn apply_lambda_for_array_cell(
+    lambda: &Value,
+    args: Vec<Value>,
+    provider: &dyn EvalProvider,
+) -> Result<Value, ValueError> {
+    let value = apply_lambda(lambda, args, provider);
+    match value {
+        Value::Array(_) | Value::Lambda(_) => Err(ValueError::Calc),
+        other => Ok(other),
+    }
+}
+
 /// Host-side custom-formula registry. Lives behind an `Arc<dyn ...>` on
 /// the `Workbook` so the formula engine can call out to JS-supplied
 /// functions (or any other host code) without `einfach-excel-core` ever
@@ -729,6 +737,18 @@ pub trait EvalProvider {
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
     fn force_formula_recompute(&self) -> bool {
         false
+    }
+
+    /// Read a cell without implicit-intersection collapse of dynamic-array
+    /// anchors. Most evaluators want `cell()`; spill references (`A1#`) need
+    /// the raw anchor array shape.
+    fn raw_cell(&self, addr: CellAddress) -> Value {
+        self.cell(addr)
+    }
+
+    /// Cross-sheet raw-cell variant for spill references such as `Data!A1#`.
+    fn raw_sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        self.sheet_cell(sheet, addr)
     }
 
     /// Iterate every cell address in `range`, yielding `(addr, value)` to
@@ -810,10 +830,11 @@ pub trait EvalProvider {
         false
     }
 
-    /// Does the cell at `(sheet, addr)` contain a formula? Cross-sheet
-    /// variant. Default delegates to local `cell_has_formula`.
+    /// Does the cell at `(sheet, addr)` contain a formula? Providers without
+    /// workbook context cannot resolve a sheet name, so the default is false.
     fn sheet_cell_has_formula(&self, _sheet: &str, addr: CellAddress) -> bool {
-        self.cell_has_formula(addr)
+        let _ = addr;
+        false
     }
 
     /// 0-based index of the sheet that owns the currently-active eval
@@ -846,11 +867,12 @@ pub trait EvalProvider {
         None
     }
 
-    /// Cross-sheet variant of `cell_formula_text`. Default delegates to
-    /// the local lookup, dropping the sheet name — same shape as
-    /// `sheet_cell_has_formula`.
+    /// Cross-sheet variant of `cell_formula_text`. Providers without workbook
+    /// context cannot resolve a sheet name, so the default reports no formula
+    /// instead of accidentally reading the same address on the current sheet.
     fn sheet_cell_formula_text(&self, _sheet: &str, addr: CellAddress) -> Option<String> {
-        self.cell_formula_text(addr)
+        let _ = addr;
+        None
     }
 
     // Custom function dispatch hook — see `CustomFunctionRegistry` below
@@ -925,6 +947,7 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
         Expr::Number(n) => Value::Number(*n),
         Expr::Text(s) => Value::Text(s.clone()),
         Expr::Bool(b) => Value::Boolean(*b),
+        Expr::Error(e) => Value::Error(e.clone()),
 
         Expr::CellRef(addr) => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
@@ -965,6 +988,13 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             // If we get here, collect all values into... just return an error
             let _ = (start, end);
             Value::Error(ValueError::InvalidValue)
+        }
+
+        Expr::SpillRef(_) | Expr::DynamicRange { .. } => {
+            match runtime_ref_from_expr(expr, provider) {
+                Ok(r) => runtime_ref_to_value(&r, provider),
+                Err(e) => Value::Error(e),
+            }
         }
 
         Expr::SheetRef { sheet, addr } => {
@@ -1021,11 +1051,10 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
 
         Expr::ArrayLit { rows, cols, data } => {
             // Excel constant-array literal: evaluate every element
-            // (each is a Number / Text / Bool / Negate(Number) per the
-            // parser's invariant) and pack the row-major `Vec<Value>`
-            // into a `Value::Array`. The first error encountered
-            // short-circuits the whole literal so `={1/0, 2}` surfaces
-            // as #DIV/0!.
+            // (each is a Number / Text / Bool / Error / Negate(Number) per
+            // the parser's invariant) and pack the row-major `Vec<Value>`
+            // into a `Value::Array`. Error literals stay as error cells in
+            // the array instead of collapsing the whole literal.
             //
             // No provider reads are needed (no cell refs inside), and
             // the resulting Array flows into the existing spill /
@@ -1033,9 +1062,12 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             // would.
             let mut values: Vec<Value> = Vec::with_capacity(data.len());
             for e in data {
+                let is_error_literal = matches!(e, Expr::Error(_));
                 let v = eval_expr_with_provider(e, provider);
-                if let Value::Error(err) = v {
-                    return Value::Error(err);
+                if !is_error_literal {
+                    if let Value::Error(err) = v {
+                        return Value::Error(err);
+                    }
                 }
                 values.push(v);
             }
@@ -1140,17 +1172,31 @@ fn coerce_to_text(v: &Value) -> String {
         // already iterates Array elements). Falling back to top-left
         // keeps Excel parity (`=A1 & ""` when A1 is a 3x1 spill produces
         // the first element's text).
-        Value::Array(arr) => arr
-            .get(0, 0)
-            .map(coerce_to_text)
-            .unwrap_or_default(),
-        // A lambda has no scalar text rendering — Excel surfaces `#CALC!`
-        // when text contexts hit a lambda. We don't have CALC! in our
-        // enum, so a generic placeholder keeps the function pure (no
-        // error injection at coercion time) and any operator that
-        // actually needed a numeric/boolean lambda will fail via the
-        // usual WrongType path.
+        Value::Array(arr) => arr.get(0, 0).map(coerce_to_text).unwrap_or_default(),
+        // A lambda has no scalar text rendering. Keep coercion pure here;
+        // operators that need numeric/boolean lambda values fail through
+        // the usual WrongType path, while higher-order array callbacks use
+        // Calc for nested dynamic-array results.
         Value::Lambda(_) => "<lambda>".into(),
+    }
+}
+
+fn coerce_to_text_result(v: &Value) -> Result<String, ValueError> {
+    match v {
+        Value::Error(e) => Err(e.clone()),
+        Value::Array(arr) => match arr.get(0, 0) {
+            Some(cell) => coerce_to_text_result(cell),
+            None => Err(ValueError::InvalidValue),
+        },
+        _ => Ok(coerce_to_text(v)),
+    }
+}
+
+fn eval_text_arg(arg: &Expr, provider: &dyn EvalProvider) -> Result<String, ValueError> {
+    let (_, _, data) = arg_to_2d(arg, provider)?;
+    match data.first() {
+        Some(value) => coerce_to_text_result(value),
+        None => Err(ValueError::InvalidValue),
     }
 }
 
@@ -1190,59 +1236,10 @@ fn eval_compare(op: BinOperator, l: &Value, r: &Value) -> bool {
 /// `Value::Array`, but a single-cell range collapses to its scalar so
 /// `=A1+1` keeps the scalar-arithmetic fast path.
 fn eval_operand_for_binop(expr: &Expr, provider: &dyn EvalProvider) -> Value {
-    let range_parts: Option<(Option<&str>, &CellAddress, &CellAddress)> = match expr {
-        Expr::Range { start, end, .. } => Some((None, start, end)),
-        Expr::SheetRange {
-            sheet, start, end, ..
-        } => Some((Some(sheet.as_str()), start, end)),
-        _ => None,
-    };
-    if let Some((sheet_opt, start, end)) = range_parts {
-        let r = CellRange::new(*start, *end).normalize();
-        // Reject full-column / full-row sentinels: a binop over those
-        // would balloon the (rows * cols) loop. Excel surfaces #VALUE!
-        // for that pattern.
-        if r.end.row > EXCEL_MAX_ROWS || r.end.col > EXCEL_MAX_COLS {
-            return Value::Error(ValueError::InvalidValue);
-        }
-        let rows = r.end.row - r.start.row + 1;
-        let cols = r.end.col - r.start.col + 1;
-        // Single-cell range: collapse to scalar to preserve the scalar
-        // arithmetic path. `=A1:A1+1` then behaves exactly like `=A1+1`.
-        if rows == 1 && cols == 1 {
-            return match sheet_opt {
-                Some(s) => provider.sheet_cell(s, r.start),
-                None => provider.cell(r.start),
-            };
-        }
-        // Multi-cell range: materialize a dense 2D buffer pre-filled with
-        // `Null` and let the provider populate the cells it knows about
-        // (sparse-aware providers don't visit empty cells). Matches
-        // `collect_range_2d`'s semantics for VLOOKUP / INDEX.
-        let n = (rows as usize).saturating_mul(cols as usize);
-        let mut data: Vec<Value> = vec![Value::Null; n];
-        let range = CellRange::new(*start, *end);
-        let min_row = r.start.row;
-        let min_col = r.start.col;
-        let max_row = r.end.row;
-        let max_col = r.end.col;
-        let cols_usize = cols as usize;
-        let mut fill = |addr: CellAddress, v: Value| {
-            if addr.row < min_row || addr.row > max_row {
-                return;
-            }
-            if addr.col < min_col || addr.col > max_col {
-                return;
-            }
-            let dr = (addr.row - min_row) as usize;
-            let dc = (addr.col - min_col) as usize;
-            data[dr * cols_usize + dc] = v;
-        };
-        match sheet_opt {
-            Some(s) => provider.for_each_sheet_range_cell(s, range, &mut fill),
-            None => provider.for_each_range_cell(range, &mut fill),
-        }
-        return Value::Array(Arc::new(ArrayData::new(rows, cols, data)));
+    match runtime_ref_from_expr(expr, provider) {
+        Ok(r) => return runtime_ref_to_value(&r, provider),
+        Err(ValueError::InvalidValue) => {}
+        Err(e) => return Value::Error(e),
     }
     // Non-range operand: defer to the normal evaluator. `Value::Array`
     // results (constant-array literals, SEQUENCE, etc.) flow through and
@@ -1346,8 +1343,11 @@ fn broadcast_binop(op: BinOperator, l: Value, r: Value) -> Value {
         Some(s) => s,
         None => return Value::Error(ValueError::InvalidValue),
     };
-    let n = (rows as usize).saturating_mul(cols as usize);
-    let mut out: Vec<Value> = Vec::with_capacity(n);
+    let cap = match checked_array_len(rows as u64, cols as u64) {
+        Ok(cap) => cap,
+        Err(e) => return Value::Error(e),
+    };
+    let mut out: Vec<Value> = Vec::with_capacity(cap);
     for i in 0..rows {
         for j in 0..cols {
             let lv = pick_for_broadcast(&l, i, j);
@@ -1388,55 +1388,21 @@ fn stream_range(
     provider.for_each_range_cell(range, f);
 }
 
-/// Collect a range as a row-major 2D grid (rows × cols). Used by
-/// VLOOKUP / HLOOKUP / INDEX where the algorithm itself requires random
-/// access by (row, col). The grid is sized by the range's nominal
-/// rectangle and pre-filled with `Null`; only addresses that the
-/// provider actually visits get populated. For sparse providers this
-/// skips visiting empty cells; for dense ones every cell is visited and
-/// behavior matches the pre-streaming implementation.
 /// Excel maximum dimensions. Full-column (`A:A`) and full-row (`1:1`)
 /// ranges use `u32::MAX` as a sentinel on the unbounded axis. Allocating
 /// a grid of that size would overflow in debug builds and attempt a
-/// multi-billion-cell allocation in release. We reject such ranges with
-/// `#REF!` before any allocation; callers that need streaming over
-/// unbounded ranges should use `for_each_arg_value` / `for_each_range_cell`
-/// instead of `collect_range_2d`.
+/// multi-billion-cell allocation in release, so dense materialization paths
+/// reject these sentinels before allocation.
 const EXCEL_MAX_ROWS: u32 = 1_048_576;
 const EXCEL_MAX_COLS: u32 = 16_384;
+const DYNAMIC_ARRAY_CELL_CAP: u64 = EXCEL_MAX_ROWS as u64;
 
-fn collect_range_2d(
-    start: &CellAddress,
-    end: &CellAddress,
-    provider: &dyn EvalProvider,
-) -> Vec<Vec<Value>> {
-    let min_row = start.row.min(end.row);
-    let max_row = start.row.max(end.row);
-    let min_col = start.col.min(end.col);
-    let max_col = start.col.max(end.col);
-    // Guard against unbounded sentinel coordinates (u32::MAX on either axis
-    // produced by full-column `A:A` or full-row `1:1` range syntax). Such
-    // ranges cannot be materialised as a 2D grid; return an empty sentinel
-    // that lookup_2d will turn into #REF!.
-    if max_row > EXCEL_MAX_ROWS || max_col > EXCEL_MAX_COLS {
-        return vec![];
+fn checked_array_len(rows: u64, cols: u64) -> Result<usize, ValueError> {
+    let total = rows.checked_mul(cols).ok_or(ValueError::InvalidValue)?;
+    if total > DYNAMIC_ARRAY_CELL_CAP {
+        return Err(ValueError::InvalidValue);
     }
-    let rows = (max_row - min_row + 1) as usize;
-    let cols = (max_col - min_col + 1) as usize;
-    let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
-    let range = CellRange::new(*start, *end);
-    provider.for_each_range_cell(range, &mut |addr, value| {
-        if addr.row < min_row || addr.row > max_row {
-            return;
-        }
-        if addr.col < min_col || addr.col > max_col {
-            return;
-        }
-        let r = (addr.row - min_row) as usize;
-        let c = (addr.col - min_col) as usize;
-        grid[r][c] = value;
-    });
-    grid
+    usize::try_from(total).map_err(|_| ValueError::InvalidValue)
 }
 
 /// Shared inner loop for VLOOKUP / HLOOKUP. `index` is 1-based; for
@@ -1500,7 +1466,7 @@ fn lookup_2d(
 
     let p = match pos {
         Some(p) => p,
-        None => return Value::Error(ValueError::InvalidValue),
+        None => return Value::Error(ValueError::NotAvailable),
     };
 
     // Return the cell at the requested row/column from the matched line.
@@ -1539,7 +1505,8 @@ fn arg_to_2d(
         }
         let rows = grid.len() as u32;
         let cols = grid[0].len() as u32;
-        let mut data: Vec<Value> = Vec::with_capacity(grid.len() * (cols as usize));
+        let cap = checked_array_len(rows as u64, cols as u64)?;
+        let mut data: Vec<Value> = Vec::with_capacity(cap);
         for row in grid {
             data.extend(row);
         }
@@ -1550,6 +1517,7 @@ fn arg_to_2d(
     match v {
         Value::Array(arr) => {
             let (rows, cols) = arr.shape();
+            checked_array_len(rows as u64, cols as u64)?;
             let data = arr.data.clone();
             Ok((rows, cols, data))
         }
@@ -1567,17 +1535,294 @@ fn compare_lookup(a: &Value, b: &Value) -> std::cmp::Ordering {
     }
 }
 
-/// Extract the start/end addresses and optional sheet name from a range
-/// argument. Handles both `Expr::Range` (same-sheet) and `Expr::SheetRange`
-/// (cross-sheet) so that VLOOKUP / HLOOKUP / INDEX can accept either form.
-fn arg_as_range<'a>(arg: &'a Expr) -> Option<(Option<&'a str>, &'a CellAddress, &'a CellAddress)> {
+fn runtime_ref_from_expr(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<RuntimeRef, ValueError> {
     match arg {
-        Expr::Range { start, end, .. } => Some((None, start, end)),
+        Expr::CellRef(addr) => Ok(RuntimeRef {
+            sheet: None,
+            range: CellRange::single(*addr),
+            materialized: None,
+        }),
+        Expr::Range { start, end, .. } => Ok(RuntimeRef {
+            sheet: None,
+            range: CellRange::new(*start, *end),
+            materialized: None,
+        }),
+        Expr::SheetRef { sheet, addr } => Ok(RuntimeRef {
+            sheet: Some(sheet.clone()),
+            range: CellRange::single(*addr),
+            materialized: None,
+        }),
         Expr::SheetRange {
             sheet, start, end, ..
-        } => Some((Some(sheet.as_str()), start, end)),
-        _ => None,
+        } => Ok(RuntimeRef {
+            sheet: Some(sheet.clone()),
+            range: CellRange::new(*start, *end),
+            materialized: None,
+        }),
+        Expr::SpillRef(anchor) => runtime_ref_from_spill(anchor, provider),
+        Expr::DynamicRange { start, end } => {
+            let start_ref = top_left_runtime_ref(runtime_ref_from_expr(start, provider)?);
+            let end_ref = top_left_runtime_ref(runtime_ref_from_expr(end, provider)?);
+            if start_ref.sheet != end_ref.sheet {
+                return Err(ValueError::InvalidValue);
+            }
+            Ok(RuntimeRef {
+                sheet: start_ref.sheet,
+                range: CellRange::new(start_ref.range.start, end_ref.range.start),
+                materialized: None,
+            })
+        }
+        Expr::FuncCall { name, args } if name == "OFFSET" => {
+            let range = eval_offset_as_range(args, provider).ok_or(ValueError::InvalidRef)?;
+            Ok(RuntimeRef {
+                sheet: None,
+                range,
+                materialized: None,
+            })
+        }
+        Expr::FuncCall { name, args } if name == "INDIRECT" => {
+            runtime_ref_from_indirect(args, provider)
+        }
+        Expr::FuncCall { name, args } if name == "INDEX" => runtime_ref_from_index(args, provider),
+        _ => Err(ValueError::InvalidValue),
     }
+}
+
+fn top_left_runtime_ref(mut r: RuntimeRef) -> RuntimeRef {
+    let n = r.normalized();
+    let materialized = r.materialized.take().map(|arr| {
+        Arc::new(ArrayData::new(
+            1,
+            1,
+            vec![arr.get(0, 0).cloned().unwrap_or(Value::Null)],
+        ))
+    });
+    RuntimeRef {
+        sheet: r.sheet,
+        range: CellRange::single(n.start),
+        materialized,
+    }
+}
+
+fn runtime_ref_from_spill(
+    anchor: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<RuntimeRef, ValueError> {
+    let (sheet, addr) = match anchor {
+        Expr::CellRef(addr) => (None, *addr),
+        Expr::SheetRef { sheet, addr } => (Some(sheet.clone()), *addr),
+        _ => return Err(ValueError::InvalidRef),
+    };
+    let raw = match &sheet {
+        Some(s) => provider.raw_sheet_cell(s, addr),
+        None => provider.raw_cell(addr),
+    };
+    match raw {
+        Value::Array(arr) => {
+            let (rows, cols) = arr.shape();
+            if rows == 0 || cols == 0 {
+                return Err(ValueError::InvalidRef);
+            }
+            let end = CellAddress::new(addr.row + rows - 1, addr.col + cols - 1);
+            Ok(RuntimeRef {
+                sheet,
+                range: CellRange::new(addr, end),
+                materialized: Some(arr),
+            })
+        }
+        Value::Error(e) => Err(e),
+        _ => Err(ValueError::InvalidRef),
+    }
+}
+
+fn runtime_ref_from_indirect(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> Result<RuntimeRef, ValueError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(ValueError::WrongArgCount);
+    }
+    let ref_v = eval_expr_with_provider(&args[0], provider);
+    if let Value::Error(e) = ref_v {
+        return Err(e);
+    }
+    let a1 = if args.len() == 2 {
+        let v = eval_expr_with_provider(&args[1], provider);
+        if let Value::Error(e) = v {
+            return Err(e);
+        }
+        coerce_to_bool(&v).ok_or(ValueError::WrongType)?
+    } else {
+        true
+    };
+    if !a1 {
+        return Err(ValueError::InvalidRef);
+    }
+    let text = coerce_to_text(&ref_v);
+    let (sheet, start, end) = parse_indirect_ref(&text).ok_or(ValueError::InvalidRef)?;
+    Ok(RuntimeRef {
+        sheet,
+        range: CellRange::new(start, end),
+        materialized: None,
+    })
+}
+
+fn runtime_ref_from_index(
+    args: &[Expr],
+    provider: &dyn EvalProvider,
+) -> Result<RuntimeRef, ValueError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(ValueError::WrongArgCount);
+    }
+    let source = runtime_ref_from_expr(&args[0], provider)?;
+    let (height, width) = source.bounded_shape().ok_or(ValueError::InvalidValue)?;
+    let row = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
+        Some(n) if n.is_finite() => n.trunc() as i64,
+        _ => return Err(ValueError::WrongType),
+    };
+    let col_explicit = args.len() == 3;
+    let col = if col_explicit {
+        match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
+            Some(n) if n.is_finite() => n.trunc() as i64,
+            _ => return Err(ValueError::WrongType),
+        }
+    } else {
+        1
+    };
+    if row < 0 || col < 0 {
+        return Err(ValueError::InvalidRef);
+    }
+    let row = u32::try_from(row).map_err(|_| ValueError::InvalidRef)?;
+    let col = u32::try_from(col).map_err(|_| ValueError::InvalidRef)?;
+
+    if !col_explicit {
+        if height == 1 {
+            if row == 0 {
+                return Ok(source);
+            }
+            if row > width {
+                return Err(ValueError::InvalidRef);
+            }
+            return source.slice(0, 1, row - 1, 1).ok_or(ValueError::InvalidRef);
+        }
+        if width == 1 {
+            if row == 0 {
+                return Ok(source);
+            }
+            if row > height {
+                return Err(ValueError::InvalidRef);
+            }
+            return source.slice(row - 1, 1, 0, 1).ok_or(ValueError::InvalidRef);
+        }
+        return Err(ValueError::InvalidValue);
+    }
+
+    match (row, col) {
+        (0, 0) => Ok(source),
+        (0, c) => {
+            if c > width {
+                return Err(ValueError::InvalidRef);
+            }
+            source
+                .slice(0, height, c - 1, 1)
+                .ok_or(ValueError::InvalidRef)
+        }
+        (r, 0) => {
+            if r > height {
+                return Err(ValueError::InvalidRef);
+            }
+            source
+                .slice(r - 1, 1, 0, width)
+                .ok_or(ValueError::InvalidRef)
+        }
+        (r, c) => {
+            if r > height || c > width {
+                return Err(ValueError::InvalidRef);
+            }
+            source
+                .slice(r - 1, 1, c - 1, 1)
+                .ok_or(ValueError::InvalidRef)
+        }
+    }
+}
+
+fn runtime_ref_to_grid(r: &RuntimeRef, provider: &dyn EvalProvider) -> Option<Vec<Vec<Value>>> {
+    if let Some(arr) = &r.materialized {
+        let (rows, cols) = arr.shape();
+        if checked_array_len(rows as u64, cols as u64).is_err() {
+            return Some(vec![]);
+        }
+        let mut grid = Vec::with_capacity(rows as usize);
+        for row in 0..rows {
+            let mut cells = Vec::with_capacity(cols as usize);
+            for col in 0..cols {
+                cells.push(arr.get(row, col).cloned().unwrap_or(Value::Null));
+            }
+            grid.push(cells);
+        }
+        return Some(grid);
+    }
+
+    let n = r.normalized();
+    if n.end.row > EXCEL_MAX_ROWS || n.end.col > EXCEL_MAX_COLS {
+        return Some(vec![]);
+    }
+    let rows = (n.end.row - n.start.row + 1) as usize;
+    let cols = (n.end.col - n.start.col + 1) as usize;
+    if checked_array_len(rows as u64, cols as u64).is_err() {
+        return Some(vec![]);
+    }
+    let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
+    let mut fill = |addr: CellAddress, value: Value| {
+        if addr.row < n.start.row || addr.row > n.end.row {
+            return;
+        }
+        if addr.col < n.start.col || addr.col > n.end.col {
+            return;
+        }
+        let dr = (addr.row - n.start.row) as usize;
+        let dc = (addr.col - n.start.col) as usize;
+        grid[dr][dc] = value;
+    };
+    match &r.sheet {
+        Some(sheet) => provider.for_each_sheet_range_cell(sheet, r.range, &mut fill),
+        None => provider.for_each_range_cell(r.range, &mut fill),
+    }
+    Some(grid)
+}
+
+fn runtime_ref_to_value(r: &RuntimeRef, provider: &dyn EvalProvider) -> Value {
+    let Some((rows, cols)) = r.bounded_shape() else {
+        return Value::Error(ValueError::InvalidValue);
+    };
+    if rows == 1 && cols == 1 {
+        if let Some(arr) = &r.materialized {
+            return arr.get(0, 0).cloned().unwrap_or(Value::Null);
+        }
+        let addr = r.normalized().start;
+        return match &r.sheet {
+            Some(sheet) => provider.sheet_cell(sheet, addr),
+            None => provider.cell(addr),
+        };
+    }
+    if r.normalized().end.row > EXCEL_MAX_ROWS || r.normalized().end.col > EXCEL_MAX_COLS {
+        return Value::Error(ValueError::InvalidValue);
+    }
+    let cap = match checked_array_len(rows as u64, cols as u64) {
+        Ok(cap) => cap,
+        Err(e) => return Value::Error(e),
+    };
+    let Some(grid) = runtime_ref_to_grid(r, provider) else {
+        return Value::Error(ValueError::InvalidValue);
+    };
+    let mut data = Vec::with_capacity(cap);
+    for row in grid {
+        data.extend(row);
+    }
+    Value::Array(Arc::new(ArrayData::new(rows, cols, data)))
 }
 
 /// Build a 2D grid from an argument expression that is either a same-sheet
@@ -1588,45 +1833,10 @@ fn arg_as_range<'a>(arg: &'a Expr) -> Option<(Option<&'a str>, &'a CellAddress, 
 /// Also handles dynamic range expressions: if the argument is `OFFSET(...)`,
 /// it is evaluated to a runtime `CellRange` which is then materialised as a
 /// 2D grid — so `VLOOKUP(x, OFFSET(A1,0,0,10,2), 2, FALSE)` works correctly.
-fn collect_range_2d_for_arg(
-    arg: &Expr,
-    provider: &dyn EvalProvider,
-) -> Option<Vec<Vec<Value>>> {
-    // Dynamic range via OFFSET.
-    if let Expr::FuncCall { name, args: fn_args } = arg {
-        if name == "OFFSET" {
-            let range = eval_offset_as_range(fn_args, provider)?;
-            return Some(collect_range_2d(&range.start, &range.end, provider));
-        }
-    }
-    match arg_as_range(arg)? {
-        (None, start, end) => Some(collect_range_2d(start, end, provider)),
-        (Some(sheet), start, end) => {
-            let min_row = start.row.min(end.row);
-            let max_row = start.row.max(end.row);
-            let min_col = start.col.min(end.col);
-            let max_col = start.col.max(end.col);
-            if max_row > EXCEL_MAX_ROWS || max_col > EXCEL_MAX_COLS {
-                return Some(vec![]);
-            }
-            let rows = (max_row - min_row + 1) as usize;
-            let cols = (max_col - min_col + 1) as usize;
-            let mut grid: Vec<Vec<Value>> = (0..rows).map(|_| vec![Value::Null; cols]).collect();
-            let range = CellRange::new(*start, *end);
-            provider.for_each_sheet_range_cell(sheet, range, &mut |addr, value| {
-                if addr.row < min_row || addr.row > max_row {
-                    return;
-                }
-                if addr.col < min_col || addr.col > max_col {
-                    return;
-                }
-                let r = (addr.row - min_row) as usize;
-                let c = (addr.col - min_col) as usize;
-                grid[r][c] = value;
-            });
-            Some(grid)
-        }
-    }
+fn collect_range_2d_for_arg(arg: &Expr, provider: &dyn EvalProvider) -> Option<Vec<Vec<Value>>> {
+    runtime_ref_from_expr(arg, provider)
+        .ok()
+        .and_then(|r| runtime_ref_to_grid(&r, provider))
 }
 
 /// Evaluate an `OFFSET(ref, row_off, col_off[, height[, width]])` call and
@@ -1684,6 +1894,83 @@ struct ResolvedRange {
     start_col: u32,
     rows: u32,
     cols: u32,
+    materialized: Option<Arc<ArrayData>>,
+}
+
+#[derive(Clone)]
+struct RuntimeRef {
+    sheet: Option<String>,
+    range: CellRange,
+    materialized: Option<Arc<ArrayData>>,
+}
+
+impl RuntimeRef {
+    fn normalized(&self) -> CellRange {
+        self.range.normalize()
+    }
+
+    fn materialized_shape(&self) -> Option<(u32, u32)> {
+        self.materialized.as_ref().map(|arr| arr.shape())
+    }
+
+    fn bounded_shape(&self) -> Option<(u32, u32)> {
+        if let Some(shape) = self.materialized_shape() {
+            return Some(shape);
+        }
+        let n = self.normalized();
+        let end_row = if n.end.row > EXCEL_MAX_ROWS {
+            EXCEL_MAX_ROWS.checked_sub(1)?
+        } else {
+            n.end.row
+        };
+        let end_col = if n.end.col > EXCEL_MAX_COLS {
+            EXCEL_MAX_COLS.checked_sub(1)?
+        } else {
+            n.end.col
+        };
+        if end_row < n.start.row || end_col < n.start.col {
+            return None;
+        }
+        Some((end_row - n.start.row + 1, end_col - n.start.col + 1))
+    }
+
+    fn slice(&self, row_offset: u32, rows: u32, col_offset: u32, cols: u32) -> Option<RuntimeRef> {
+        if rows == 0 || cols == 0 {
+            return None;
+        }
+        let (src_rows, src_cols) = self.bounded_shape()?;
+        if row_offset.checked_add(rows)? > src_rows || col_offset.checked_add(cols)? > src_cols {
+            return None;
+        }
+        let cap = checked_array_len(rows as u64, cols as u64).ok()?;
+        let n = self.normalized();
+        let start = CellAddress::new(
+            n.start.row.checked_add(row_offset)?,
+            n.start.col.checked_add(col_offset)?,
+        );
+        let end = CellAddress::new(
+            start.row.checked_add(rows - 1)?,
+            start.col.checked_add(cols - 1)?,
+        );
+        let materialized = self.materialized.as_ref().map(|arr| {
+            let mut data = Vec::with_capacity(cap);
+            for r in 0..rows {
+                for c in 0..cols {
+                    data.push(
+                        arr.get(row_offset + r, col_offset + c)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            }
+            Arc::new(ArrayData::new(rows, cols, data))
+        });
+        Some(RuntimeRef {
+            sheet: self.sheet.clone(),
+            range: CellRange::new(start, end),
+            materialized,
+        })
+    }
 }
 
 /// Resolve a function-argument expression to a normalized range. Accepts
@@ -1691,47 +1978,24 @@ struct ResolvedRange {
 /// returns `None` — the caller surfaces `InvalidValue` to keep parity with
 /// Excel's `#VALUE!`.
 fn resolve_range_arg(arg: &Expr, provider: &dyn EvalProvider) -> Option<ResolvedRange> {
-    // OFFSET(...) → runtime range.
-    if let Expr::FuncCall { name, args: fn_args } = arg {
-        if name == "OFFSET" {
-            let r = eval_offset_as_range(fn_args, provider)?;
-            let n = r.normalize();
-            return Some(ResolvedRange {
-                sheet: None,
-                start_row: n.start.row,
-                start_col: n.start.col,
-                rows: n.end.row - n.start.row + 1,
-                cols: n.end.col - n.start.col + 1,
-            });
-        }
-    }
-    match arg_as_range(arg)? {
-        (sheet, start, end) => {
-            let r = CellRange::new(*start, *end).normalize();
-            // Guard: full-column / full-row sentinel ranges would balloon
-            // the (rows, cols) loop. Reject them — the caller surfaces
-            // InvalidValue, consistent with VLOOKUP's full-column guard.
-            if r.end.row > EXCEL_MAX_ROWS || r.end.col > EXCEL_MAX_COLS {
-                return None;
-            }
-            Some(ResolvedRange {
-                sheet: sheet.map(|s| s.to_string()),
-                start_row: r.start.row,
-                start_col: r.start.col,
-                rows: r.end.row - r.start.row + 1,
-                cols: r.end.col - r.start.col + 1,
-            })
-        }
-    }
+    let r = runtime_ref_from_expr(arg, provider).ok()?;
+    let n = r.normalized();
+    let (rows, cols) = r.bounded_shape()?;
+    Some(ResolvedRange {
+        sheet: r.sheet,
+        start_row: n.start.row,
+        start_col: n.start.col,
+        rows,
+        cols,
+        materialized: r.materialized,
+    })
 }
 
 /// Look up a single cell within a `ResolvedRange` by (dr, dc) offset.
-fn fetch_range_cell(
-    range: &ResolvedRange,
-    dr: u32,
-    dc: u32,
-    provider: &dyn EvalProvider,
-) -> Value {
+fn fetch_range_cell(range: &ResolvedRange, dr: u32, dc: u32, provider: &dyn EvalProvider) -> Value {
+    if let Some(arr) = &range.materialized {
+        return arr.get(dr, dc).cloned().unwrap_or(Value::Null);
+    }
     let addr = CellAddress::new(range.start_row + dr, range.start_col + dc);
     match &range.sheet {
         Some(s) => provider.sheet_cell(s, addr),
@@ -1788,36 +2052,34 @@ fn for_each_arg_value(
     provider: &dyn EvalProvider,
     f: &mut dyn FnMut(Option<CellAddress>, Value),
 ) {
-    match arg {
-        Expr::Range { start, end, .. } => {
-            stream_range(start, end, provider, &mut |addr, v| f(Some(addr), v));
-        }
-        Expr::SheetRange {
-            sheet, start, end, ..
-        } => {
-            let range = CellRange::new(*start, *end);
-            provider.for_each_sheet_range_cell(sheet, range, &mut |addr, v| f(Some(addr), v));
-        }
-        // Dynamic range: OFFSET(...) used in place of a literal range arg.
-        Expr::FuncCall { name, args: fn_args } if name == "OFFSET" => {
-            match eval_offset_as_range(fn_args, provider) {
-                Some(range) => {
-                    provider.for_each_range_cell(range, &mut |addr, v| f(Some(addr), v));
+    match runtime_ref_from_expr(arg, provider) {
+        Ok(r) => {
+            let n = r.normalized();
+            if let Some(arr) = &r.materialized {
+                let (rows, cols) = arr.shape();
+                for row in 0..rows {
+                    for col in 0..cols {
+                        let addr = CellAddress::new(n.start.row + row, n.start.col + col);
+                        f(
+                            Some(addr),
+                            arr.get(row, col).cloned().unwrap_or(Value::Null),
+                        );
+                    }
                 }
-                None => f(None, Value::Error(ValueError::InvalidRef)),
+                return;
+            }
+            match &r.sheet {
+                Some(sheet) => {
+                    provider
+                        .for_each_sheet_range_cell(sheet, r.range, &mut |addr, v| f(Some(addr), v))
+                }
+                None => stream_range(&r.range.start, &r.range.end, provider, &mut |addr, v| {
+                    f(Some(addr), v)
+                }),
             }
         }
-        _ => {
+        Err(ValueError::InvalidValue) => {
             let v = eval_expr_with_provider(arg, provider);
-            // Dynamic-array path: when a sub-expression evaluates to a
-            // `Value::Array`, iterate every element so aggregate-like
-            // callers (SUM, AVERAGE, COUNT, ...) see the elements rather
-            // than a single opaque Array value. Synthetic positions yield
-            // `None` for the address — only literal range refs get a
-            // `Some(addr)` (see the `Range` and `SheetRange` arms above).
-            // This is the Phase 1 plumbing; no built-in function produces
-            // `Value::Array` yet (Phase 3 work), so this branch is dead
-            // until a constructor function exists.
             if let Value::Array(arr) = v {
                 for elem in arr.data.iter() {
                     f(None, elem.clone());
@@ -1826,6 +2088,7 @@ fn for_each_arg_value(
                 f(None, v);
             }
         }
+        Err(e) => f(None, Value::Error(e)),
     }
 }
 
@@ -3023,27 +3286,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             )
         }
 
-        "INDEX" => {
-            // INDEX(range, row, col) — 1-based
-            if args.len() != 3 {
-                return Value::Error(ValueError::WrongArgCount);
-            }
-            let grid = match collect_range_2d_for_arg(&args[0], provider) {
-                Some(g) => g,
-                None => return Value::Error(ValueError::InvalidValue),
-            };
-            let r = match coerce_to_number(&eval_expr_with_provider(&args[1], provider)) {
-                Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::WrongType),
-            };
-            let c = match coerce_to_number(&eval_expr_with_provider(&args[2], provider)) {
-                Some(n) if n >= 1.0 => n as usize,
-                _ => return Value::Error(ValueError::WrongType),
-            };
-            grid.get(r - 1)
-                .and_then(|row| row.get(c - 1).cloned())
-                .unwrap_or(Value::Error(ValueError::InvalidRef))
-        }
+        "INDEX" => match runtime_ref_from_index(args, provider) {
+            Ok(r) => runtime_ref_to_value(&r, provider),
+            Err(e) => Value::Error(e),
+        },
 
         "MATCH" => {
             // MATCH(value, range, [match_type])
@@ -3116,7 +3362,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             });
             match found {
                 Some(p) => Value::Number(p as f64),
-                None => Value::Error(ValueError::InvalidValue),
+                None => Value::Error(ValueError::NotAvailable),
             }
         }
 
@@ -3867,10 +4113,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         // === Error / type guards (Batch B1) ===
         //
-        // IFERROR / IFNA: ValueError has no dedicated NA variant. Excel's
-        // #N/A surfaces here as `InvalidValue` (lookup misses) or
-        // `InvalidRef` (broken refs). IFNA catches those two; IFERROR
-        // catches every error.
+        // IFERROR catches every error. IFNA catches only the dedicated #N/A
+        // variant.
         "IFERROR" => {
             if args.len() != 2 {
                 return Value::Error(ValueError::WrongArgCount);
@@ -3882,14 +4126,12 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
         }
         "IFNA" => {
-            // Our enum has no dedicated NA — treat InvalidValue / InvalidRef
-            // as the closest NA-equivalents (lookup misses, broken refs).
             if args.len() != 2 {
                 return Value::Error(ValueError::WrongArgCount);
             }
             let v = eval_expr_with_provider(&args[0], provider);
             match v {
-                Value::Error(ValueError::InvalidValue) | Value::Error(ValueError::InvalidRef) => {
+                Value::Error(ValueError::NotAvailable) => {
                     eval_expr_with_provider(&args[1], provider)
                 }
                 other => other,
@@ -3898,7 +4140,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "IFS" => {
             // IFS(cond1, val1, cond2, val2, ...) — variadic; pairs only.
             if args.is_empty() || args.len() % 2 != 0 {
-                return Value::Error(ValueError::WrongArgCount);
+                return Value::Error(ValueError::InvalidValue);
             }
             let mut i = 0;
             while i < args.len() {
@@ -4016,25 +4258,19 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             Value::Boolean(matches!(v, Value::Error(_)))
         }
         "ISERR" => {
-            // Excel: ISERR = ISERROR and not #N/A. With our mapping treat
-            // InvalidValue as the NA-equivalent (same caveat as IFNA/ISNA).
+            // Excel: ISERR = ISERROR and not #N/A.
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
             let v = eval_expr_with_provider(&args[0], provider);
-            Value::Boolean(matches!(
-                v,
-                Value::Error(e) if !matches!(e, ValueError::InvalidValue)
-            ))
+            Value::Boolean(matches!(v, Value::Error(e) if !matches!(e, ValueError::NotAvailable)))
         }
         "ISNA" => {
-            // No dedicated NA in our enum — closest equivalent is
-            // InvalidValue (same caveat as IFNA).
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
             let v = eval_expr_with_provider(&args[0], provider);
-            Value::Boolean(matches!(v, Value::Error(ValueError::InvalidValue)))
+            Value::Boolean(matches!(v, Value::Error(ValueError::NotAvailable)))
         }
         "ISLOGICAL" => {
             if args.len() != 1 {
@@ -4327,7 +4563,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let text_chars: Vec<char> = text.chars().collect();
             let len = text_chars.len();
             let start_idx = start - 1; // 1-based -> 0-based
-            // start past end → append.
+                                       // start past end → append.
             let prefix_end = start_idx.min(len);
             let cut_end = (start_idx + num).min(len);
             let mut out = String::new();
@@ -4625,16 +4861,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
-            match arg_as_range(&args[0]) {
-                Some((_, start, end)) => {
-                    let min = start.row.min(end.row);
-                    let max = start.row.max(end.row);
-                    Value::Number((max - min + 1) as f64)
-                }
-                None => match &args[0] {
-                    Expr::CellRef(_) | Expr::SheetRef { .. } => Value::Number(1.0),
-                    _ => Value::Error(ValueError::WrongType),
+            match runtime_ref_from_expr(&args[0], provider) {
+                Ok(r) => match r.bounded_shape() {
+                    Some((rows, _)) => Value::Number(rows as f64),
+                    None => Value::Error(ValueError::InvalidValue),
                 },
+                Err(ValueError::InvalidValue) => Value::Error(ValueError::WrongType),
+                Err(e) => Value::Error(e),
             }
         }
 
@@ -4643,16 +4876,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
-            match arg_as_range(&args[0]) {
-                Some((_, start, end)) => {
-                    let min = start.col.min(end.col);
-                    let max = start.col.max(end.col);
-                    Value::Number((max - min + 1) as f64)
-                }
-                None => match &args[0] {
-                    Expr::CellRef(_) | Expr::SheetRef { .. } => Value::Number(1.0),
-                    _ => Value::Error(ValueError::WrongType),
+            match runtime_ref_from_expr(&args[0], provider) {
+                Ok(r) => match r.bounded_shape() {
+                    Some((_, cols)) => Value::Number(cols as f64),
+                    None => Value::Error(ValueError::InvalidValue),
                 },
+                Err(ValueError::InvalidValue) => Value::Error(ValueError::WrongType),
+                Err(e) => Value::Error(e),
             }
         }
 
@@ -4915,10 +5145,14 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 Some(g) => g,
                 None => return Value::Error(ValueError::InvalidValue),
             };
-            let lookup_flat: Vec<Value> =
-                lookup_grid.into_iter().flat_map(|r| r.into_iter()).collect();
-            let return_flat: Vec<Value> =
-                return_grid.into_iter().flat_map(|r| r.into_iter()).collect();
+            let lookup_flat: Vec<Value> = lookup_grid
+                .into_iter()
+                .flat_map(|r| r.into_iter())
+                .collect();
+            let return_flat: Vec<Value> = return_grid
+                .into_iter()
+                .flat_map(|r| r.into_iter())
+                .collect();
             if lookup_flat.len() != return_flat.len() || lookup_flat.is_empty() {
                 return Value::Error(ValueError::InvalidValue);
             }
@@ -4935,7 +5169,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 if this_args.len() >= 4 {
                     eval_expr_with_provider(&this_args[3], provider)
                 } else {
-                    Value::Error(ValueError::InvalidValue)
+                    Value::Error(ValueError::NotAvailable)
                 }
             };
 
@@ -4943,26 +5177,18 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // combination.
             let found: Option<usize> = match (match_mode, search_mode) {
                 // --- Exact match -----------------------------------------
-                (0, 1) => lookup_flat
-                    .iter()
-                    .position(|k| values_equal(k, &needle)),
-                (0, -1) => lookup_flat
-                    .iter()
-                    .rposition(|k| values_equal(k, &needle)),
+                (0, 1) => lookup_flat.iter().position(|k| values_equal(k, &needle)),
+                (0, -1) => lookup_flat.iter().rposition(|k| values_equal(k, &needle)),
                 (0, 2) => {
                     // Binary search ascending for the first exact match.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(probe, &needle))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(probe, &needle)) {
                         Ok(i) => Some(i),
                         Err(_) => None,
                     }
                 }
                 (0, -2) => {
                     // Binary search descending: reverse the comparator.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(&needle, probe))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(&needle, probe)) {
                         Ok(i) => Some(i),
                         Err(_) => None,
                     }
@@ -4978,12 +5204,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     // tie-break: forward keeps the first qualifying index,
                     // reverse keeps the last.
                     let mut best: Option<(usize, &Value)> = None;
-                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> =
-                        if search_mode == 1 {
-                            Box::new(lookup_flat.iter().enumerate())
-                        } else {
-                            Box::new(lookup_flat.iter().enumerate().rev())
-                        };
+                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> = if search_mode == 1 {
+                        Box::new(lookup_flat.iter().enumerate())
+                    } else {
+                        Box::new(lookup_flat.iter().enumerate().rev())
+                    };
                     let mut exact: Option<usize> = None;
                     for (i, k) in iter {
                         if values_equal(k, &needle) {
@@ -5005,9 +5230,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 (-1, 2) => {
                     // Ascending binary search for exact-or-next-smaller.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(probe, &needle))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(probe, &needle)) {
                         Ok(i) => Some(i),
                         Err(i) => {
                             // Insertion point: everything below i is < needle.
@@ -5023,9 +5246,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     // Descending binary search for exact-or-next-smaller.
                     // In a descending array, the first element <= needle is
                     // the insertion point.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(&needle, probe))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(&needle, probe)) {
                         Ok(i) => Some(i),
                         Err(i) => {
                             if i >= n {
@@ -5039,12 +5260,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 // --- Approximate next-larger (1) -------------------------
                 (1, 1) | (1, -1) => {
                     let mut best: Option<(usize, &Value)> = None;
-                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> =
-                        if search_mode == 1 {
-                            Box::new(lookup_flat.iter().enumerate())
-                        } else {
-                            Box::new(lookup_flat.iter().enumerate().rev())
-                        };
+                    let iter: Box<dyn Iterator<Item = (usize, &Value)>> = if search_mode == 1 {
+                        Box::new(lookup_flat.iter().enumerate())
+                    } else {
+                        Box::new(lookup_flat.iter().enumerate().rev())
+                    };
                     let mut exact: Option<usize> = None;
                     for (i, k) in iter {
                         if values_equal(k, &needle) {
@@ -5066,9 +5286,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 (1, 2) => {
                     // Ascending binary search for exact-or-next-larger.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(probe, &needle))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(probe, &needle)) {
                         Ok(i) => Some(i),
                         Err(i) => {
                             // Insertion point: everything at i and above is
@@ -5083,9 +5301,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 (1, -2) => {
                     // Descending binary search for exact-or-next-larger.
-                    match lookup_flat
-                        .binary_search_by(|probe| compare_lookup(&needle, probe))
-                    {
+                    match lookup_flat.binary_search_by(|probe| compare_lookup(&needle, probe)) {
                         Ok(i) => Some(i),
                         Err(i) => {
                             // In a descending array, the element just before
@@ -5121,7 +5337,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 None => not_found(args),
             }
         }
-
 
         // HOUR(serial) — extract hour 0..23 from fractional-day serial.
         // Uses only the fractional part of the serial. For negative serials
@@ -5195,7 +5410,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if let Value::Error(e) = s {
                 return Value::Error(e);
             }
-            match (coerce_to_number(&h), coerce_to_number(&m), coerce_to_number(&s)) {
+            match (
+                coerce_to_number(&h),
+                coerce_to_number(&m),
+                coerce_to_number(&s),
+            ) {
                 (Some(h), Some(m), Some(s)) => {
                     if h < 0.0 || m < 0.0 || s < 0.0 {
                         return Value::Error(ValueError::InvalidValue);
@@ -5237,7 +5456,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // Sunday=0..Saturday=6 in our intermediate.
             let dow = ((serial.floor() as i64) + 4).rem_euclid(7);
             let result = match return_type {
-                1 => dow + 1,            // Sun=1..Sat=7
+                1 => dow + 1,             // Sun=1..Sat=7
                 2 => ((dow + 6) % 7) + 1, // Mon=1..Sun=7
                 3 => (dow + 6) % 7,       // Mon=0..Sun=6
                 _ => return Value::Error(ValueError::InvalidValue),
@@ -5584,7 +5803,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             Value::Number(result)
         }
 
-
         // === Statistical extensions ===
         //
         // AVERAGEA(...) — variadic. Like AVERAGE but Boolean(true) = 1,
@@ -5786,7 +6004,6 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
         // INTERCEPT(y_array, x_array) — ȳ - slope * x̄.
         "INTERCEPT" => slope_intercept_impl(args, provider, true),
-
 
         // === Financial / time-value-of-money ===
         //
@@ -6501,10 +6718,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         "FLOOR.PRECISE" => floor_ceiling_precise(args, provider, true),
         "CEILING.PRECISE" => floor_ceiling_precise(args, provider, false),
 
-        // ROMAN / ARABIC — round-trip between integers and Roman
-        // numerals. Only the classic form (form=0) is implemented; other
-        // form values are rejected with #VALUE!.
-        // note: only classic form supported.
+        // ROMAN / ARABIC — round-trip between integers and Roman numerals.
+        // ROMAN supports Excel's classic and simplified forms 0..4.
         "ROMAN" => fn_roman(args, provider),
         "ARABIC" => fn_arabic(args, provider),
 
@@ -6750,7 +6965,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             // Cap total elements to keep allocations bounded.
             let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
-            if total > 1_048_576 {
+            if total > DYNAMIC_ARRAY_CELL_CAP {
                 return Value::Error(ValueError::InvalidValue);
             }
             let rows = rows as u32;
@@ -6801,15 +7016,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let unit = |i: u32| -> Vec<Value> {
                 if by_col {
                     (0..rows)
-                        .map(|r| {
-                            data[(r as usize) * (cols as usize) + (i as usize)].clone()
-                        })
+                        .map(|r| data[(r as usize) * (cols as usize) + (i as usize)].clone())
                         .collect()
                 } else {
                     (0..cols)
-                        .map(|c| {
-                            data[(i as usize) * (cols as usize) + (c as usize)].clone()
-                        })
+                        .map(|c| data[(i as usize) * (cols as usize) + (c as usize)].clone())
                         .collect()
                 }
             };
@@ -6836,9 +7047,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 .map(|(u, _)| u)
                 .collect();
             if keep.is_empty() {
-                // Excel surfaces #CALC! here. We don't have CALC; use
-                // InvalidValue (#VALUE!) so the test signal is unambiguous.
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
             // Re-assemble.
             if by_col {
@@ -6933,7 +7142,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     let va = &data[key_row * (cols as usize) + (a as usize)];
                     let vb = &data[key_row * (cols as usize) + (b as usize)];
                     let c = compare_lookup(va, vb);
-                    if sort_order == -1 { c.reverse() } else { c }
+                    if sort_order == -1 {
+                        c.reverse()
+                    } else {
+                        c
+                    }
                 });
                 let mut out: Vec<Value> = Vec::with_capacity(data.len());
                 for r in 0..rows {
@@ -6956,7 +7169,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     let va = &data[(a as usize) * (cols as usize) + key_col];
                     let vb = &data[(b as usize) * (cols as usize) + key_col];
                     let c = compare_lookup(va, vb);
-                    if sort_order == -1 { c.reverse() } else { c }
+                    if sort_order == -1 {
+                        c.reverse()
+                    } else {
+                        c
+                    }
                 });
                 let mut out: Vec<Value> = Vec::with_capacity(data.len());
                 for &r in &order {
@@ -7024,7 +7241,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     // surfaces the error inside the spill).
                     return Value::Array(Arc::new(ArrayData::new(1, 1, vec![v])));
                 }
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
             if filter_rows {
                 let out_rows = kept.len() as u32;
@@ -7058,7 +7275,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // Common patterns:
         //   - Lambda arg evaluated first; non-lambda → WrongType.
         //   - Arity matched at call time; mismatch → WrongArgCount.
-        //   - Per-element errors propagate from the lambda body.
+        //   - Per-element scalar errors stay in result arrays; nested array
+        //     callback results are rejected as #CALC!.
 
         // MAP(array1, ..., arrayN, lambda)
         //
@@ -7109,7 +7327,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             // Cap matches SEQUENCE — keep allocations bounded.
             let total = (rows as u64) * (cols as u64);
-            if total > 1_048_576 {
+            if total > DYNAMIC_ARRAY_CELL_CAP {
                 return Value::Error(ValueError::InvalidValue);
             }
             let mut out: Vec<Value> = Vec::with_capacity(total as usize);
@@ -7118,10 +7336,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     let idx = (i as usize) * (cols as usize) + (j as usize);
                     let cell_args: Vec<Value> =
                         grids.iter().map(|(_, _, d)| d[idx].clone()).collect();
-                    let v = apply_lambda(&lambda_v, cell_args, provider);
-                    if let Value::Error(e) = v {
-                        return Value::Error(e);
-                    }
+                    let v = match apply_lambda_for_array_cell(&lambda_v, cell_args, provider) {
+                        Ok(v) => v,
+                        Err(e) => return Value::Error(e),
+                    };
                     out.push(v);
                 }
             }
@@ -7208,7 +7426,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::InvalidValue);
             }
             let total = (rows as u64) * (cols as u64);
-            if total > 1_048_576 {
+            if total > DYNAMIC_ARRAY_CELL_CAP {
                 return Value::Error(ValueError::InvalidValue);
             }
             let mut out: Vec<Value> = Vec::with_capacity(total as usize);
@@ -7217,10 +7435,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 for j in 0..cols {
                     let idx = (i as usize) * (cols as usize) + (j as usize);
                     let v = data[idx].clone();
-                    acc = apply_lambda(&lambda_v, vec![acc, v], provider);
-                    if let Value::Error(e) = &acc {
-                        return Value::Error(e.clone());
-                    }
+                    acc = match apply_lambda_for_array_cell(&lambda_v, vec![acc, v], provider) {
+                        Ok(v) => v,
+                        Err(e) => return Value::Error(e),
+                    };
                     out.push(acc.clone());
                 }
             }
@@ -7265,10 +7483,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 let row_data: Vec<Value> =
                     data[base..base + (cols as usize)].iter().cloned().collect();
                 let row_arr = Value::Array(Arc::new(ArrayData::new(1, cols, row_data)));
-                let v = apply_lambda(&lambda_v, vec![row_arr], provider);
-                if let Value::Error(e) = v {
-                    return Value::Error(e);
-                }
+                let v = match apply_lambda_for_array_cell(&lambda_v, vec![row_arr], provider) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(e),
+                };
                 out.push(v);
             }
             Value::Array(Arc::new(ArrayData::new(rows, 1, out)))
@@ -7305,10 +7523,10 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     col_data.push(data[idx].clone());
                 }
                 let col_arr = Value::Array(Arc::new(ArrayData::new(rows, 1, col_data)));
-                let v = apply_lambda(&lambda_v, vec![col_arr], provider);
-                if let Value::Error(e) = v {
-                    return Value::Error(e);
-                }
+                let v = match apply_lambda_for_array_cell(&lambda_v, vec![col_arr], provider) {
+                    Ok(v) => v,
+                    Err(e) => return Value::Error(e),
+                };
                 out.push(v);
             }
             Value::Array(Arc::new(ArrayData::new(1, cols, out)))
@@ -7341,7 +7559,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 _ => return Value::Error(ValueError::InvalidValue),
             };
             let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
-            if total > 1_048_576 {
+            if total > DYNAMIC_ARRAY_CELL_CAP {
                 return Value::Error(ValueError::InvalidValue);
             }
             let lambda_v = eval_expr_with_provider(&args[2], provider);
@@ -7361,14 +7579,14 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let mut out: Vec<Value> = Vec::with_capacity(total as usize);
             for i in 1..=rows_u {
                 for j in 1..=cols_u {
-                    let v = apply_lambda(
+                    let v = match apply_lambda_for_array_cell(
                         &lambda_v,
                         vec![Value::Number(i as f64), Value::Number(j as f64)],
                         provider,
-                    );
-                    if let Value::Error(e) = v {
-                        return Value::Error(e);
-                    }
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => return Value::Error(e),
+                    };
                     out.push(v);
                 }
             }
@@ -7422,10 +7640,8 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     // coerces to a scalar 1 / -1 is taken as the order.
                     // Evaluate without consuming: if it's a range/array, treat
                     // as the next key.
-                    let is_range = matches!(
-                        &args[idx + 1],
-                        Expr::Range { .. } | Expr::SheetRange { .. }
-                    );
+                    let is_range =
+                        matches!(&args[idx + 1], Expr::Range { .. } | Expr::SheetRange { .. });
                     if is_range {
                         // Definitely another key; no explicit order.
                         1i32
@@ -7550,7 +7766,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 return Value::Error(ValueError::InvalidValue);
             }
             let total = rows.checked_mul(cols).unwrap_or(u64::MAX);
-            if total > 1_048_576 {
+            if total > DYNAMIC_ARRAY_CELL_CAP {
                 return Value::Error(ValueError::InvalidValue);
             }
             // Seed from system clock + a tiny mix so two rapid calls don't
@@ -7566,7 +7782,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 // same shape still vary.
                 nanos ^ ((rows as u64) << 32) ^ (cols as u64)
             };
-            let mut state: u64 = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+            let mut state: u64 = if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            };
             let next_u64 = |s: &mut u64| -> u64 {
                 // xorshift64
                 let mut x = *s;
@@ -7618,7 +7838,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 None => return Value::Error(ValueError::WrongType),
             };
             if rows_arg == 0 {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
             let cols_arg = if args.len() == 3 {
                 let v = eval_expr_with_provider(&args[2], provider);
@@ -7630,7 +7850,7 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                     None => return Value::Error(ValueError::WrongType),
                 };
                 if n == 0 {
-                    return Value::Error(ValueError::InvalidValue);
+                    return Value::Error(ValueError::Calc);
                 }
                 Some(n)
             } else {
@@ -7655,8 +7875,11 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             };
             let out_rows = r_end - r_start;
             let out_cols = c_end - c_start;
-            let mut out: Vec<Value> =
-                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            let cap = match checked_array_len(out_rows as u64, out_cols as u64) {
+                Ok(cap) => cap,
+                Err(e) => return Value::Error(e),
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(cap);
             for r in r_start..r_end {
                 for c in c_start..c_end {
                     out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
@@ -7713,12 +7936,15 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
             };
             if r_end <= r_start || c_end <= c_start {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
             let out_rows = r_end - r_start;
             let out_cols = c_end - c_start;
-            let mut out: Vec<Value> =
-                Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            let cap = match checked_array_len(out_rows as u64, out_cols as u64) {
+                Ok(cap) => cap,
+                Err(e) => return Value::Error(e),
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(cap);
             for r in r_start..r_end {
                 for c in c_start..c_end {
                     out.push(data[(r as usize) * (cols as usize) + (c as usize)].clone());
@@ -7742,15 +7968,26 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 blocks.push((r, c, d));
             }
             let out_cols = blocks.iter().map(|(_, c, _)| *c).max().unwrap_or(0);
-            let out_rows: u32 = blocks.iter().map(|(r, _, _)| *r).sum();
-            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            let out_rows_u64 = blocks
+                .iter()
+                .try_fold(0u64, |acc, (r, _, _)| acc.checked_add(*r as u64))
+                .unwrap_or(u64::MAX);
+            let cap = match checked_array_len(out_rows_u64, out_cols as u64) {
+                Ok(cap) => cap,
+                Err(e) => return Value::Error(e),
+            };
+            let out_rows = match u32::try_from(out_rows_u64) {
+                Ok(v) => v,
+                Err(_) => return Value::Error(ValueError::InvalidValue),
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(cap);
             for (br, bc, bd) in &blocks {
                 for r in 0..*br {
                     for c in 0..out_cols {
                         if c < *bc {
                             out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
                         } else {
-                            out.push(Value::Error(ValueError::InvalidValue));
+                            out.push(Value::Error(ValueError::NotAvailable));
                         }
                     }
                 }
@@ -7773,15 +8010,26 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 blocks.push((r, c, d));
             }
             let out_rows = blocks.iter().map(|(r, _, _)| *r).max().unwrap_or(0);
-            let out_cols: u32 = blocks.iter().map(|(_, c, _)| *c).sum();
-            let mut out: Vec<Value> = Vec::with_capacity((out_rows as usize) * (out_cols as usize));
+            let out_cols_u64 = blocks
+                .iter()
+                .try_fold(0u64, |acc, (_, c, _)| acc.checked_add(*c as u64))
+                .unwrap_or(u64::MAX);
+            let cap = match checked_array_len(out_rows as u64, out_cols_u64) {
+                Ok(cap) => cap,
+                Err(e) => return Value::Error(e),
+            };
+            let out_cols = match u32::try_from(out_cols_u64) {
+                Ok(v) => v,
+                Err(_) => return Value::Error(ValueError::InvalidValue),
+            };
+            let mut out: Vec<Value> = Vec::with_capacity(cap);
             for r in 0..out_rows {
                 for (br, bc, bd) in &blocks {
                     for c in 0..*bc {
                         if r < *br {
                             out.push(bd[(r as usize) * (*bc as usize) + (c as usize)].clone());
                         } else {
-                            out.push(Value::Error(ValueError::InvalidValue));
+                            out.push(Value::Error(ValueError::NotAvailable));
                         }
                     }
                 }
@@ -7920,20 +8168,29 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if by_col {
                 for c in 0..cols {
                     for r in 0..rows {
-                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                        push(
+                            &data[(r as usize) * (cols as usize) + (c as usize)],
+                            &mut out,
+                        );
                     }
                 }
             } else {
                 for r in 0..rows {
                     for c in 0..cols {
-                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                        push(
+                            &data[(r as usize) * (cols as usize) + (c as usize)],
+                            &mut out,
+                        );
                     }
                 }
             }
             if out.is_empty() {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
-            let out_cols = out.len() as u32;
+            let out_cols = match u32::try_from(out.len()) {
+                Ok(v) => v,
+                Err(_) => return Value::Error(ValueError::InvalidValue),
+            };
             Value::Array(Arc::new(ArrayData::new(1, out_cols, out)))
         }
         "TOCOL" => {
@@ -7984,20 +8241,29 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if by_col {
                 for c in 0..cols {
                     for r in 0..rows {
-                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                        push(
+                            &data[(r as usize) * (cols as usize) + (c as usize)],
+                            &mut out,
+                        );
                     }
                 }
             } else {
                 for r in 0..rows {
                     for c in 0..cols {
-                        push(&data[(r as usize) * (cols as usize) + (c as usize)], &mut out);
+                        push(
+                            &data[(r as usize) * (cols as usize) + (c as usize)],
+                            &mut out,
+                        );
                     }
                 }
             }
             if out.is_empty() {
-                return Value::Error(ValueError::InvalidValue);
+                return Value::Error(ValueError::Calc);
             }
-            let out_rows = out.len() as u32;
+            let out_rows = match u32::try_from(out.len()) {
+                Ok(v) => v,
+                Err(_) => return Value::Error(ValueError::InvalidValue),
+            };
             Value::Array(Arc::new(ArrayData::new(out_rows, 1, out)))
         }
         "NORM.DIST" => stat_norm_dist(args, provider),
@@ -8461,22 +8727,16 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // implementations stay in lockstep.
         "JIS" | "DBCS" => text_unary(args, provider, |s| jis_convert(s)),
         // PHONETIC returns ruby/furigana annotation that Excel attaches to
-        // cells via an out-of-band sidecar. We don't yet store ruby
-        // metadata anywhere in the workbook model — when we do, the body
-        // here will reach into that sidecar via `provider`.
-        // note: PHONETIC requires ruby annotation data we don't store yet
+        // cells via an out-of-band sidecar. We don't store ruby metadata, so
+        // match the no-annotation fallback and return the source text.
         "PHONETIC" => {
             if args.len() != 1 {
                 return Value::Error(ValueError::WrongArgCount);
             }
-            // Evaluate the arg to honour error propagation; if it's an
-            // error, surface that, otherwise return InvalidValue to
-            // signal the feature is unavailable on this build.
-            let v = eval_expr_with_provider(&args[0], provider);
-            if let Value::Error(e) = v {
-                return Value::Error(e);
+            match eval_text_arg(&args[0], provider) {
+                Ok(text) => Value::Text(text),
+                Err(e) => Value::Error(e),
             }
-            Value::Error(ValueError::InvalidValue)
         }
         // HYPERLINK(link_location, [friendly_name]) — 1 or 2 args.
         // The formula's RESULT is the `friendly_name` (or `link_location` if
@@ -8631,7 +8891,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
                 }
                 (None, None)
             };
-            Value::Text(format_image_payload(&source, alt.as_deref(), sizing, height, width))
+            Value::Text(format_image_payload(
+                &source,
+                alt.as_deref(),
+                sizing,
+                height,
+                width,
+            ))
         }
         // === Bessel family ===
         // BESSELJ / BESSELY / BESSELI / BESSELK all follow the same shape:
@@ -8901,13 +9167,13 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
             Value::Boolean(false)
         }
 
-        // NA() — zero-arg. Returns our #N/A sentinel (`InvalidValue`).
+        // NA() — zero-arg. Returns the #N/A sentinel.
         // Useful as a placeholder while sketching a sheet.
         "NA" => {
             if !args.is_empty() {
                 return Value::Error(ValueError::WrongArgCount);
             }
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         }
 
         // ISREF(value) — TRUE iff the argument expression is a
@@ -8971,20 +9237,43 @@ fn eval_func(name: &str, args: &[Expr], provider: &dyn EvalProvider) -> Value {
         // implementation.
         "CONCAT" => eval_func("CONCATENATE", args, provider),
 
-        // TRANSLATE(text, source_lang, target_lang) — Excel routes
-        // this to a Microsoft Translator service. With no network
-        // available, we surface #N/A. Three args required; errors
-        // propagate.
+        // TRANSLATE(text, find, replace) — map each codepoint found in
+        // `find` to the codepoint at the same index in `replace`. A `find`
+        // codepoint with no replacement is deleted; duplicate `find`
+        // codepoints keep the first mapping.
         "TRANSLATE" => {
             if args.len() != 3 {
                 return Value::Error(ValueError::WrongArgCount);
             }
-            for arg in args {
-                if let Value::Error(e) = eval_expr_with_provider(arg, provider) {
-                    return Value::Error(e);
+            let text = match eval_text_arg(&args[0], provider) {
+                Ok(text) => text,
+                Err(e) => return Value::Error(e),
+            };
+            let find = match eval_text_arg(&args[1], provider) {
+                Ok(text) => text,
+                Err(e) => return Value::Error(e),
+            };
+            let replace = match eval_text_arg(&args[2], provider) {
+                Ok(text) => text,
+                Err(e) => return Value::Error(e),
+            };
+
+            let replace_chars: Vec<char> = replace.chars().collect();
+            let mut map: HashMap<char, Option<char>> = HashMap::new();
+            for (idx, ch) in find.chars().enumerate() {
+                map.entry(ch)
+                    .or_insert_with(|| replace_chars.get(idx).copied());
+            }
+
+            let mut out = String::new();
+            for ch in text.chars() {
+                match map.get(&ch) {
+                    Some(Some(mapped)) => out.push(*mapped),
+                    Some(None) => {}
+                    None => out.push(ch),
                 }
             }
-            Value::Error(ValueError::InvalidValue)
+            Value::Text(out)
         }
 
         // ===== ARMS REGISTRY: ADD NEW MATCH ARMS BEFORE THIS LINE =====
@@ -9138,10 +9427,8 @@ fn eval_arg_for_custom(arg: &Expr, provider: &dyn EvalProvider) -> Value {
     // shared `arg_to_2d` helper that SUMIF / VLOOKUP / etc. use. The
     // result becomes a `Value::Array` so the WASM marshaling layer
     // round-trips it as a 2-D JS array.
-    let is_range_like = matches!(
-        arg,
-        Expr::Range { .. } | Expr::SheetRange { .. }
-    ) || matches!(arg, Expr::FuncCall { name, .. } if name == "OFFSET");
+    let is_range_like = matches!(arg, Expr::Range { .. } | Expr::SheetRange { .. })
+        || matches!(arg, Expr::FuncCall { name, .. } if name == "OFFSET");
     if is_range_like {
         match arg_to_2d(arg, provider) {
             Ok((0, 0, _)) => {
@@ -9214,16 +9501,52 @@ fn parse_indirect_ref(text: &str) -> Option<(Option<String>, CellAddress, CellAd
         }
         None => (None, text),
     };
+    let (start, end) = parse_indirect_body(body)?;
+    Some((sheet, start, end))
+}
+
+fn parse_indirect_body(body: &str) -> Option<(CellAddress, CellAddress)> {
     let (start_str, end_str) = match body.find(':') {
         Some(i) => (&body[..i], Some(&body[i + 1..])),
         None => (body, None),
     };
+    if let Some(end_str) = end_str {
+        let start_part = strip_abs_markers(start_str);
+        let end_part = strip_abs_markers(end_str);
+        if !start_part.is_empty()
+            && !end_part.is_empty()
+            && start_part.chars().all(|c| c.is_ascii_alphabetic())
+            && end_part.chars().all(|c| c.is_ascii_alphabetic())
+        {
+            let start_col = CellAddress::parse(&format!("{}1", start_part))?.col;
+            let end_col = CellAddress::parse(&format!("{}1", end_part))?.col;
+            return Some((
+                CellAddress::new(0, start_col),
+                CellAddress::new(u32::MAX, end_col),
+            ));
+        }
+        if !start_part.is_empty()
+            && !end_part.is_empty()
+            && start_part.chars().all(|c| c.is_ascii_digit())
+            && end_part.chars().all(|c| c.is_ascii_digit())
+        {
+            let start_row: u32 = start_part.parse().ok()?;
+            let end_row: u32 = end_part.parse().ok()?;
+            if start_row == 0 || end_row == 0 {
+                return None;
+            }
+            return Some((
+                CellAddress::new(start_row - 1, 0),
+                CellAddress::new(end_row - 1, u32::MAX),
+            ));
+        }
+        return Some((
+            parse_indirect_addr(start_str)?,
+            parse_indirect_addr(end_str)?,
+        ));
+    }
     let start = parse_indirect_addr(start_str)?;
-    let end = match end_str {
-        Some(s) => parse_indirect_addr(s)?,
-        None => start,
-    };
-    Some((sheet, start, end))
+    Some((start, start))
 }
 
 /// Parse a single A1-style cell ref, tolerating the `$` absolute markers
@@ -9234,8 +9557,12 @@ fn parse_indirect_addr(s: &str) -> Option<CellAddress> {
         return None;
     }
     // Strip leading $ (column absolute) and any $ before the row digits.
-    let stripped: String = s.chars().filter(|c| *c != '$').collect();
+    let stripped = strip_abs_markers(s);
     CellAddress::parse(&stripped)
+}
+
+fn strip_abs_markers(s: &str) -> String {
+    s.trim().chars().filter(|c| *c != '$').collect()
 }
 
 /// Gregorian leap-year rule. Mirrors the local helper inside `date_serial`
@@ -9510,11 +9837,7 @@ fn covar_impl(args: &[Expr], provider: &dyn EvalProvider, sample: bool) -> Value
 
 /// Shared SLOPE / INTERCEPT body. Args are (y_array, x_array).
 /// `as_intercept = true` returns ȳ - slope * x̄; otherwise returns slope.
-fn slope_intercept_impl(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    as_intercept: bool,
-) -> Value {
+fn slope_intercept_impl(args: &[Expr], provider: &dyn EvalProvider, as_intercept: bool) -> Value {
     if args.len() != 2 {
         return Value::Error(ValueError::WrongArgCount);
     }
@@ -9671,7 +9994,11 @@ fn fn_pv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Err(e) => return Value::Error(e),
     };
     // Solve `pv*(1+r)^n + pmt*(1+r*type)*comp + fv = 0` for pv.
-    let factor = if rate == 0.0 { 1.0 } else { (1.0 + rate).powf(nper) };
+    let factor = if rate == 0.0 {
+        1.0
+    } else {
+        (1.0 + rate).powf(nper)
+    };
     let comp = annuity_compound(rate, nper);
     if rate == 0.0 {
         let r = -(pmt * nper + fv);
@@ -9722,7 +10049,11 @@ fn fn_fv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Err(e) => return Value::Error(e),
     };
     // Solve `pv*(1+r)^n + pmt*(1+r*type)*comp + fv = 0` for fv.
-    let factor = if rate == 0.0 { 1.0 } else { (1.0 + rate).powf(nper) };
+    let factor = if rate == 0.0 {
+        1.0
+    } else {
+        (1.0 + rate).powf(nper)
+    };
     let comp = annuity_compound(rate, nper);
     let r = if rate == 0.0 {
         -(pv + pmt * nper)
@@ -10236,7 +10567,11 @@ pub(crate) fn format_base_n_signed(
 
     let digit_char = |d: u32| -> char {
         let c = char::from_digit(d, base).unwrap_or('0');
-        if upper_hex { c.to_ascii_uppercase() } else { c }
+        if upper_hex {
+            c.to_ascii_uppercase()
+        } else {
+            c
+        }
     };
 
     if v < 0 {
@@ -10517,7 +10852,9 @@ fn eval_bit_shift(args: &[Expr], provider: &dyn EvalProvider, reverse: bool) -> 
         av
     } else if effective > 0 {
         // Left shift: result must still fit in the safe-integer range.
-        let r = (av as u128).checked_shl(effective as u32).unwrap_or(u128::MAX);
+        let r = (av as u128)
+            .checked_shl(effective as u32)
+            .unwrap_or(u128::MAX);
         if r > BIT_OP_MAX as u128 {
             return Value::Error(ValueError::Overflow);
         }
@@ -10538,11 +10875,7 @@ fn eval_bit_shift(args: &[Expr], provider: &dyn EvalProvider, reverse: bool) -> 
 /// Shared body for SUMX2MY2 / SUMX2PY2 / SUMXMY2. Collects (x,y) pairs
 /// via `collect_paired_numbers` (which enforces same-shape and skips
 /// non-numeric cells per offset), then folds with `f`.
-fn sum_pair_impl(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    f: impl Fn(f64, f64) -> f64,
-) -> Value {
+fn sum_pair_impl(args: &[Expr], provider: &dyn EvalProvider, f: impl Fn(f64, f64) -> f64) -> Value {
     if args.len() != 2 {
         return Value::Error(ValueError::WrongArgCount);
     }
@@ -10719,9 +11052,126 @@ fn floor_ceiling_precise(args: &[Expr], provider: &dyn EvalProvider, is_floor: b
     }
 }
 
+const ROMAN_FORM_0: &[(i64, &str)] = &[
+    (1000, "M"),
+    (900, "CM"),
+    (500, "D"),
+    (400, "CD"),
+    (100, "C"),
+    (90, "XC"),
+    (50, "L"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+const ROMAN_FORM_1: &[(i64, &str)] = &[
+    (1000, "M"),
+    (950, "LM"),
+    (900, "CM"),
+    (500, "D"),
+    (450, "LD"),
+    (400, "CD"),
+    (100, "C"),
+    (95, "VC"),
+    (90, "XC"),
+    (50, "L"),
+    (45, "VL"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+const ROMAN_FORM_2: &[(i64, &str)] = &[
+    (1000, "M"),
+    (990, "XM"),
+    (950, "LM"),
+    (900, "CM"),
+    (500, "D"),
+    (490, "XD"),
+    (450, "LD"),
+    (400, "CD"),
+    (100, "C"),
+    (99, "IC"),
+    (95, "VC"),
+    (90, "XC"),
+    (50, "L"),
+    (49, "IL"),
+    (45, "VL"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+const ROMAN_FORM_3: &[(i64, &str)] = &[
+    (1000, "M"),
+    (995, "VM"),
+    (990, "XM"),
+    (950, "LM"),
+    (900, "CM"),
+    (500, "D"),
+    (495, "VD"),
+    (490, "XD"),
+    (450, "LD"),
+    (400, "CD"),
+    (100, "C"),
+    (99, "IC"),
+    (95, "VC"),
+    (90, "XC"),
+    (50, "L"),
+    (49, "IL"),
+    (45, "VL"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+const ROMAN_FORM_4: &[(i64, &str)] = &[
+    (1000, "M"),
+    (999, "IM"),
+    (995, "VM"),
+    (990, "XM"),
+    (950, "LM"),
+    (900, "CM"),
+    (500, "D"),
+    (499, "ID"),
+    (495, "VD"),
+    (490, "XD"),
+    (450, "LD"),
+    (400, "CD"),
+    (100, "C"),
+    (99, "IC"),
+    (95, "VC"),
+    (90, "XC"),
+    (50, "L"),
+    (49, "IL"),
+    (45, "VL"),
+    (40, "XL"),
+    (10, "X"),
+    (9, "IX"),
+    (5, "V"),
+    (4, "IV"),
+    (1, "I"),
+];
+const ROMAN_FORMS: [&[(i64, &str)]; 5] = [
+    ROMAN_FORM_0,
+    ROMAN_FORM_1,
+    ROMAN_FORM_2,
+    ROMAN_FORM_3,
+    ROMAN_FORM_4,
+];
+
 /// ROMAN(num[, form]) — convert integer 1..=3999 into a Roman numeral.
-/// `form` defaults to 0 (classic). Only classic form is supported;
-/// other values yield #VALUE!.
+/// `form` defaults to 0 (classic). Forms 1..4 progressively simplify
+/// subtractive notation; TRUE aliases classic and FALSE aliases form 4.
 fn fn_roman(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.is_empty() || args.len() > 2 {
         return Value::Error(ValueError::WrongArgCount);
@@ -10744,35 +11194,26 @@ fn fn_roman(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         if let Value::Error(e) = fv {
             return Value::Error(e);
         }
-        let form = match coerce_to_number(&fv) {
-            Some(f) => f.trunc() as i64,
-            // Boolean TRUE/FALSE coerce to 1/0 — both fall under "non-classic".
-            None => return Value::Error(ValueError::WrongType),
+        let form = match fv {
+            Value::Boolean(true) => 0,
+            Value::Boolean(false) => 4,
+            other => match coerce_to_number(&other) {
+                Some(f) => f.trunc() as i64,
+                None => return Value::Error(ValueError::WrongType),
+            },
         };
-        if form != 0 {
-            // note: only classic form supported.
+        if !(0..=4).contains(&form) {
             return Value::Error(ValueError::InvalidValue);
         }
+        return roman_with_form(n, form as usize);
     }
-    // Classic table.
-    const TABLE: [(i64, &str); 13] = [
-        (1000, "M"),
-        (900, "CM"),
-        (500, "D"),
-        (400, "CD"),
-        (100, "C"),
-        (90, "XC"),
-        (50, "L"),
-        (40, "XL"),
-        (10, "X"),
-        (9, "IX"),
-        (5, "V"),
-        (4, "IV"),
-        (1, "I"),
-    ];
+    roman_with_form(n, 0)
+}
+
+fn roman_with_form(n: i64, form: usize) -> Value {
     let mut rem = n;
     let mut out = String::new();
-    for (v, sym) in TABLE.iter() {
+    for (v, sym) in ROMAN_FORMS[form].iter() {
         while rem >= *v {
             out.push_str(sym);
             rem -= *v;
@@ -12348,60 +12789,18 @@ fn stat_fisherinv(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     stat_finite((e2y - 1.0) / (e2y + 1.0))
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 fn yearfrac_basis(start: f64, end: f64, basis: i64) -> Result<f64, ValueError> {
-    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    let (lo, hi) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
     match basis {
         0 | 4 => {
             let (y1, m1, d1) = date_from_serial(lo);
             let (y2, m2, d2) = date_from_serial(hi);
-            let num = (y2 - y1) as f64 * 360.0
-                + (m2 as f64 - m1 as f64) * 30.0
-                + (d2 as f64 - d1 as f64);
+            let num =
+                (y2 - y1) as f64 * 360.0 + (m2 as f64 - m1 as f64) * 30.0 + (d2 as f64 - d1 as f64);
             Ok(num / 360.0)
         }
         1 => Ok((hi - lo) / 365.0),
@@ -12411,11 +12810,7 @@ fn yearfrac_basis(start: f64, end: f64, basis: i64) -> Result<f64, ValueError> {
     }
 }
 
-fn fin_basis(
-    args: &[Expr],
-    idx: usize,
-    provider: &dyn EvalProvider,
-) -> Result<i64, ValueError> {
+fn fin_basis(args: &[Expr], idx: usize, provider: &dyn EvalProvider) -> Result<i64, ValueError> {
     if args.len() <= idx {
         return Ok(0);
     }
@@ -12726,11 +13121,7 @@ impl EvalProvider for CumNoopProvider {
 const XIRR_TOL: f64 = 1e-7;
 const XIRR_MAX_ITER: usize = 100;
 
-fn cumulative_pmt<F>(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    per_call: F,
-) -> Value
+fn cumulative_pmt<F>(args: &[Expr], provider: &dyn EvalProvider, per_call: F) -> Value
 where
     F: Fn(f64, f64, f64, f64, f64) -> Value,
 {
@@ -13242,9 +13633,11 @@ fn collect_xirr_pairs(
     if vs.len() != ds.len() || vs.len() < 2 {
         return Err(ValueError::InvalidValue);
     }
-    // Pair them. Sort by date to keep the first date as the anchor.
-    let mut paired: Vec<(f64, f64)> = ds.into_iter().zip(vs.into_iter()).collect();
-    paired.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let paired: Vec<(f64, f64)> = ds.into_iter().zip(vs.into_iter()).collect();
+    let d0 = paired[0].0;
+    if paired.iter().any(|(d, _)| *d < d0) {
+        return Err(ValueError::Overflow);
+    }
     Ok(paired)
 }
 
@@ -13606,7 +13999,9 @@ fn fn_price(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if rate < 0.0 || yld < 0.0 || redemption <= 0.0 || settlement >= maturity {
         return Value::Error(ValueError::Overflow);
     }
-    match price_from_yield(settlement, maturity, rate, yld, redemption, frequency, basis) {
+    match price_from_yield(
+        settlement, maturity, rate, yld, redemption, frequency, basis,
+    ) {
         Ok(p) => Value::Number(p),
         Err(e) => Value::Error(e),
     }
@@ -14611,7 +15006,8 @@ fn fn_arraytotext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let range = CellRange::new(*start, *end).normalize();
             let rows = range.end.row - range.start.row + 1;
             let cols = range.end.col - range.start.col + 1;
-            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols as usize]; rows as usize];
+            let mut grid: Vec<Vec<String>> =
+                vec![vec![String::new(); cols as usize]; rows as usize];
             let mut err: Option<ValueError> = None;
             for_each_arg_value(&args[0], provider, &mut |addr, v| {
                 if err.is_some() {
@@ -14636,7 +15032,8 @@ fn fn_arraytotext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let range = CellRange::new(*start, *end).normalize();
             let rows = range.end.row - range.start.row + 1;
             let cols = range.end.col - range.start.col + 1;
-            let mut grid: Vec<Vec<String>> = vec![vec![String::new(); cols as usize]; rows as usize];
+            let mut grid: Vec<Vec<String>> =
+                vec![vec![String::new(); cols as usize]; rows as usize];
             let mut err: Option<ValueError> = None;
             for_each_arg_value(&args[0], provider, &mut |addr, v| {
                 if err.is_some() {
@@ -14722,6 +15119,62 @@ fn read_case_arg(arg: &Expr, provider: &dyn EvalProvider) -> Result<bool, Value>
         Some(n) => Ok(n.trunc() != 0.0),
         None => Err(Value::Error(ValueError::WrongType)),
     }
+}
+
+fn expand_regex_replacement(
+    replacement: &str,
+    caps: &regex::Captures<'_>,
+    full_text: &str,
+) -> String {
+    let Some(full) = caps.get(0) else {
+        return replacement.to_string();
+    };
+    let mut out = String::new();
+    let mut chars = replacement.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '$' {
+            out.push(ch);
+            continue;
+        }
+        let Some(marker) = chars.next() else {
+            out.push('$');
+            break;
+        };
+        match marker {
+            '$' => out.push('$'),
+            '&' => out.push_str(full.as_str()),
+            '`' => out.push_str(&full_text[..full.start()]),
+            '\'' => out.push_str(&full_text[full.end()..]),
+            d if d.is_ascii_digit() => {
+                let mut token = String::from("$");
+                token.push(d);
+                let mut digits = String::new();
+                digits.push(d);
+                if let Some(next) = chars.peek().copied() {
+                    if next.is_ascii_digit() {
+                        chars.next();
+                        token.push(next);
+                        digits.push(next);
+                    }
+                }
+                let idx = digits.parse::<usize>().ok();
+                if let Some(i) = idx {
+                    if i > 0 && i < caps.len() {
+                        out.push_str(caps.get(i).map(|m| m.as_str()).unwrap_or(""));
+                    } else {
+                        out.push_str(&token);
+                    }
+                } else {
+                    out.push_str(&token);
+                }
+            }
+            other => {
+                out.push('$');
+                out.push(other);
+            }
+        }
+    }
+    out
 }
 
 fn fn_regextest(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -14812,8 +15265,18 @@ fn fn_regexextract(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             // when the pattern has no capture groups in mode 1.
             Value::Array(Arc::new(ArrayData::new(n, 1, matches)))
         }
-        // Mode 2 (capture groups as a row array): TODO. Documented at
-        // the function entry above.
+        2 => {
+            let Some(caps) = re.captures(&text) else {
+                return Value::Error(ValueError::InvalidValue);
+            };
+            if caps.len() <= 1 {
+                return Value::Error(ValueError::InvalidValue);
+            }
+            let data: Vec<Value> = (1..caps.len())
+                .map(|i| Value::Text(caps.get(i).map(|m| m.as_str()).unwrap_or("").to_string()))
+                .collect();
+            Value::Array(Arc::new(ArrayData::new(1, data.len() as u32, data)))
+        }
         _ => Value::Error(ValueError::InvalidValue),
     }
 }
@@ -14834,19 +15297,13 @@ fn fn_regexreplace(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if let Value::Error(e) = rep_v {
         return Value::Error(e);
     }
-    let occurrence = if args.len() >= 4 {
+    let occurrence: i64 = if args.len() >= 4 {
         let ov = eval_expr_with_provider(&args[3], provider);
         if let Value::Error(e) = ov {
             return Value::Error(e);
         }
         match coerce_to_number(&ov) {
-            Some(n) => {
-                let n = n.trunc();
-                if n < 0.0 {
-                    return Value::Error(ValueError::InvalidValue);
-                }
-                n as u64
-            }
+            Some(n) => n.trunc() as i64,
             None => return Value::Error(ValueError::WrongType),
         }
     } else {
@@ -14868,32 +15325,35 @@ fn fn_regexreplace(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Err(_) => return Value::Error(ValueError::InvalidValue),
     };
     if occurrence == 0 {
-        Value::Text(re.replace_all(&text, replacement.as_str()).into_owned())
+        Value::Text(
+            re.replace_all(&text, |caps: &regex::Captures<'_>| {
+                expand_regex_replacement(&replacement, caps, &text)
+            })
+            .into_owned(),
+        )
     } else {
-        // Replace just the nth (1-based) match. Walk match indexes and
-        // splice in `replacement` at the matching span.
-        let mut out = String::with_capacity(text.len());
-        let mut last_end = 0usize;
-        let mut count: u64 = 0;
-        let mut done = false;
-        for m in re.find_iter(&text) {
-            count += 1;
-            if count == occurrence {
-                out.push_str(&text[last_end..m.start()]);
-                out.push_str(&replacement);
-                last_end = m.end();
-                done = true;
-                break;
-            }
-        }
-        if !done {
+        let matches: Vec<regex::Captures<'_>> = re.captures_iter(&text).collect();
+        let idx = if occurrence > 0 {
+            occurrence - 1
+        } else {
+            matches.len() as i64 + occurrence
+        };
+        if idx < 0 || idx >= matches.len() as i64 {
             // Occurrence not reached → return original text untouched
             // (Excel returns the original string when the nth match
             // doesn't exist; the formula isn't an error).
-            return Value::Text(text);
+            return Value::Text(text.clone());
         }
-        out.push_str(&text[last_end..]);
-        Value::Text(out)
+        let caps = &matches[idx as usize];
+        let Some(m) = caps.get(0) else {
+            return Value::Text(text.clone());
+        };
+        Value::Text(format!(
+            "{}{}{}",
+            &text[..m.start()],
+            expand_regex_replacement(&replacement, caps, &text),
+            &text[m.end()..]
+        ))
     }
 }
 
@@ -14916,11 +15376,17 @@ fn fn_isformula(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
+            if provider.sheet_index_of(sheet).is_none() {
+                return Value::Error(ValueError::InvalidRef);
+            }
             Value::Boolean(provider.sheet_cell_has_formula(sheet, *addr))
         }
         Expr::SheetRange {
             sheet, start, end, ..
         } => {
+            if provider.sheet_index_of(sheet).is_none() {
+                return Value::Error(ValueError::InvalidRef);
+            }
             let r = CellRange::new(*start, *end).normalize();
             Value::Boolean(provider.sheet_cell_has_formula(sheet, r.start))
         }
@@ -15148,7 +15614,10 @@ fn coerce_to_complex(v: &Value) -> Result<(f64, f64, char), ValueError> {
     }
 }
 
-fn eval_complex_arg(arg: &Expr, provider: &dyn EvalProvider) -> Result<(f64, f64, char), ValueError> {
+fn eval_complex_arg(
+    arg: &Expr,
+    provider: &dyn EvalProvider,
+) -> Result<(f64, f64, char), ValueError> {
     let v = eval_expr_with_provider(arg, provider);
     coerce_to_complex(&v)
 }
@@ -15698,7 +16167,7 @@ fn bessel_j_n(x: f64, n: i64) -> Option<f64> {
     // values, including the J_n captured along the way.
     let m_start = (n_us + ((40.0 * n_us as f64).sqrt() as usize)).max(2 * n_us + 8);
     let mut j_higher: f64 = 0.0; // unnormalised J_{k+1}
-    let mut j_high: f64 = 1.0;   // unnormalised J_k (starts at k = m_start)
+    let mut j_high: f64 = 1.0; // unnormalised J_k (starts at k = m_start)
     let mut value_at_n: f64 = 0.0;
     // Iterate k = m_start, m_start - 1, ..., 1 and compute J_{k-1}.
     for k in (1..=m_start).rev() {
@@ -15775,7 +16244,7 @@ fn bessel_i_n(x: f64, n: i64) -> Option<f64> {
     // then renormalise via the true I_0(x).
     let m_start = (n_us + ((40.0 * n_us as f64).sqrt() as usize)).max(2 * n_us + 8);
     let mut i_higher: f64 = 0.0; // unnormalised I_{k+1}
-    let mut i_high: f64 = 1.0;   // unnormalised I_k (starts at k = m_start)
+    let mut i_high: f64 = 1.0; // unnormalised I_k (starts at k = m_start)
     let mut value_at_n: f64 = 0.0;
     for k in (1..=m_start).rev() {
         let i_lower = (2.0 * (k as f64) / ax) * i_high + i_higher;
@@ -15831,23 +16300,19 @@ fn bessel_j0(x: f64) -> f64 {
         let y = x * x;
         let p = 57568490574.0
             + y * (-13362590354.0
-                + y * (651619640.7
-                    + y * (-11214424.18 + y * (77392.33017 + y * -184.9052456))));
+                + y * (651619640.7 + y * (-11214424.18 + y * (77392.33017 + y * -184.9052456))));
         let q = 57568490411.0
-            + y * (1029532985.0
-                + y * (9494680.718 + y * (59272.64853 + y * (267.8532712 + y))));
+            + y * (1029532985.0 + y * (9494680.718 + y * (59272.64853 + y * (267.8532712 + y))));
         p / q
     } else {
         let z = 8.0 / ax;
         let y = z * z;
         let p1 = 1.0
             + y * (-0.1098628627e-2
-                + y * (0.2734510407e-4
-                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+                + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
         let q1 = -0.1562499995e-1
             + y * (0.1430488765e-3
-                + y * (-0.6911147651e-5
-                    + y * (0.7621095161e-6 + y * -0.934935152e-7)));
+                + y * (-0.6911147651e-5 + y * (0.7621095161e-6 + y * -0.934935152e-7)));
         let xx = ax - std::f64::consts::FRAC_PI_4;
         (2.0 / (std::f64::consts::PI * ax)).sqrt() * (xx.cos() * p1 - z * xx.sin() * q1)
     }
@@ -15864,23 +16329,24 @@ fn bessel_j1(x: f64) -> f64 {
                     + y * (242396853.1
                         + y * (-2972611.439 + y * (15704.48260 + y * -30.16036606)))));
         let q = 144725228442.0
-            + y * (2300535178.0
-                + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y))));
+            + y * (2300535178.0 + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y))));
         p / q
     } else {
         let z = 8.0 / ax;
         let y = z * z;
         let p1 = 1.0
             + y * (0.183105e-2
-                + y * (-0.3516396496e-4
-                    + y * (0.2457520174e-5 + y * -0.240337019e-6)));
+                + y * (-0.3516396496e-4 + y * (0.2457520174e-5 + y * -0.240337019e-6)));
         let q1 = 0.04687499995
             + y * (-0.2002690873e-3
-                + y * (0.8449199096e-5
-                    + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+                + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
         let xx = ax - 3.0 * std::f64::consts::FRAC_PI_4;
         let s = (2.0 / (std::f64::consts::PI * ax)).sqrt() * (xx.cos() * p1 - z * xx.sin() * q1);
-        if x < 0.0 { -s } else { s }
+        if x < 0.0 {
+            -s
+        } else {
+            s
+        }
     };
     result
 }
@@ -15891,23 +16357,19 @@ fn bessel_y0(x: f64) -> f64 {
         let y = x * x;
         let p = -2957821389.0
             + y * (7062834065.0
-                + y * (-512359803.6
-                    + y * (10879881.29 + y * (-86327.92757 + y * 228.4622733))));
+                + y * (-512359803.6 + y * (10879881.29 + y * (-86327.92757 + y * 228.4622733))));
         let q = 40076544269.0
-            + y * (745249964.8
-                + y * (7189466.438 + y * (47447.26470 + y * (226.1030244 + y))));
+            + y * (745249964.8 + y * (7189466.438 + y * (47447.26470 + y * (226.1030244 + y))));
         p / q + 0.636619772 * bessel_j0(x) * x.ln()
     } else {
         let z = 8.0 / x;
         let y = z * z;
         let p1 = 1.0
             + y * (-0.1098628627e-2
-                + y * (0.2734510407e-4
-                    + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+                + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
         let q1 = -0.1562499995e-1
             + y * (0.1430488765e-3
-                + y * (-0.6911147651e-5
-                    + y * (0.7621095161e-6 + y * -0.934935152e-7)));
+                + y * (-0.6911147651e-5 + y * (0.7621095161e-6 + y * -0.934935152e-7)));
         let xx = x - std::f64::consts::FRAC_PI_4;
         (2.0 / (std::f64::consts::PI * x)).sqrt() * (xx.sin() * p1 + z * xx.cos() * q1)
     }
@@ -15921,25 +16383,21 @@ fn bessel_y1(x: f64) -> f64 {
             * (-4.900604943e13
                 + y * (1.275274390e13
                     + y * (-5.153438139e11
-                        + y * (7.349264551e9
-                            + y * (-4.237922726e7 + y * 8.511937935e4)))));
+                        + y * (7.349264551e9 + y * (-4.237922726e7 + y * 8.511937935e4)))));
         let q = 2.499580570e14
             + y * (4.244419664e12
                 + y * (3.733650367e10
-                    + y * (2.245904002e8
-                        + y * (1.020426050e6 + y * (3.549632885e3 + y)))));
+                    + y * (2.245904002e8 + y * (1.020426050e6 + y * (3.549632885e3 + y)))));
         p / q + 0.636619772 * (bessel_j1(x) * x.ln() - 1.0 / x)
     } else {
         let z = 8.0 / x;
         let y = z * z;
         let p1 = 1.0
             + y * (0.183105e-2
-                + y * (-0.3516396496e-4
-                    + y * (0.2457520174e-5 + y * -0.240337019e-6)));
+                + y * (-0.3516396496e-4 + y * (0.2457520174e-5 + y * -0.240337019e-6)));
         let q1 = 0.04687499995
             + y * (-0.2002690873e-3
-                + y * (0.8449199096e-5
-                    + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+                + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
         let xx = x - 3.0 * std::f64::consts::FRAC_PI_4;
         (2.0 / (std::f64::consts::PI * x)).sqrt() * (xx.sin() * p1 + z * xx.cos() * q1)
     }
@@ -15953,8 +16411,7 @@ fn bessel_i0(x: f64) -> f64 {
         1.0 + y
             * (3.5156229
                 + y * (3.0899424
-                    + y * (1.2067492
-                        + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
+                    + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
     } else {
         let y = 3.75 / ax;
         (ax.exp() / ax.sqrt())
@@ -15964,8 +16421,7 @@ fn bessel_i0(x: f64) -> f64 {
                         + y * (-0.00157565
                             + y * (0.00916281
                                 + y * (-0.02057706
-                                    + y * (0.02635537
-                                        + y * (-0.01647633 + y * 0.00392377))))))))
+                                    + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))))
     }
 }
 
@@ -15977,8 +16433,7 @@ fn bessel_i1(x: f64) -> f64 {
         ax * (0.5
             + y * (0.87890594
                 + y * (0.51498869
-                    + y * (0.15084934
-                        + y * (0.02658733 + y * (0.00301532 + y * 0.00032411))))))
+                    + y * (0.15084934 + y * (0.02658733 + y * (0.00301532 + y * 0.00032411))))))
     } else {
         let y = 3.75 / ax;
         let p = 0.39894228
@@ -15987,11 +16442,14 @@ fn bessel_i1(x: f64) -> f64 {
                     + y * (0.00163801
                         + y * (-0.01031555
                             + y * (0.02282967
-                                + y * (-0.02895312
-                                    + y * (0.01787654 + y * -0.00420059)))))));
+                                + y * (-0.02895312 + y * (0.01787654 + y * -0.00420059)))))));
         (ax.exp() / ax.sqrt()) * p
     };
-    if x < 0.0 { -result } else { result }
+    if x < 0.0 {
+        -result
+    } else {
+        result
+    }
 }
 
 /// K_0(x). A&S 9.8.5 / 9.8.6. Caller must pass x > 0.
@@ -16002,8 +16460,7 @@ fn bessel_k0(x: f64) -> f64 {
             + (-0.57721566
                 + y * (0.42278420
                     + y * (0.23069756
-                        + y * (0.03488590
-                            + y * (0.00262698 + y * (0.00010750 + y * 0.00000740))))))
+                        + y * (0.03488590 + y * (0.00262698 + y * (0.00010750 + y * 0.00000740))))))
     } else {
         let y = 2.0 / x;
         ((-x).exp() / x.sqrt())
@@ -16025,8 +16482,7 @@ fn bessel_k1(x: f64) -> f64 {
                     + y * (0.15443144
                         + y * (-0.67278579
                             + y * (-0.18156897
-                                + y * (-0.01919402
-                                    + y * (-0.00110404 + y * -0.00004686))))))
+                                + y * (-0.01919402 + y * (-0.00110404 + y * -0.00004686))))))
     } else {
         let y = 2.0 / x;
         ((-x).exp() / x.sqrt())
@@ -16034,8 +16490,7 @@ fn bessel_k1(x: f64) -> f64 {
                 + y * (0.23498619
                     + y * (-0.03655620
                         + y * (0.01504268
-                            + y * (-0.00780353
-                                + y * (0.00325614 + y * -0.00068245))))))
+                            + y * (-0.00780353 + y * (0.00325614 + y * -0.00068245))))))
     }
 }
 
@@ -16134,15 +16589,15 @@ fn convert_unit_factor(unit: &str) -> Option<(ConvertCategory, f64)> {
 fn convert_temperature(value: f64, from_tag: f64, to_tag: f64) -> f64 {
     // Go via Celsius as the pivot.
     let c = match from_tag as i32 {
-        0 => value,                          // C
-        1 => (value - 32.0) * 5.0 / 9.0,     // F -> C
-        2 => value - 273.15,                 // K -> C
+        0 => value,                      // C
+        1 => (value - 32.0) * 5.0 / 9.0, // F -> C
+        2 => value - 273.15,             // K -> C
         _ => f64::NAN,
     };
     match to_tag as i32 {
-        0 => c,                          // C
-        1 => c * 9.0 / 5.0 + 32.0,       // C -> F
-        2 => c + 273.15,                 // C -> K
+        0 => c,                    // C
+        1 => c * 9.0 / 5.0 + 32.0, // C -> F
+        2 => c + 273.15,           // C -> K
         _ => f64::NAN,
     }
 }
@@ -17091,10 +17546,7 @@ fn dbcs_find_byte_index(
     }
     let needle_chars: Vec<char> = needle.chars().collect();
     let n_norm: Vec<char> = if case_insensitive {
-        needle_chars
-            .iter()
-            .flat_map(|c| c.to_lowercase())
-            .collect()
+        needle_chars.iter().flat_map(|c| c.to_lowercase()).collect()
     } else {
         needle_chars
     };
@@ -17142,10 +17594,7 @@ fn dbcs_find_byte_index(
 /// Materialise a 2D argument as a `Vec<Vec<f64>>` matrix, propagating
 /// errors and rejecting non-numeric cells. `Null` → 0.0, `Boolean` →
 /// 0/1, `Text` / `Lambda` → `WrongType`.
-fn arg_to_f64_matrix(
-    arg: &Expr,
-    provider: &dyn EvalProvider,
-) -> Result<Vec<Vec<f64>>, ValueError> {
+fn arg_to_f64_matrix(arg: &Expr, provider: &dyn EvalProvider) -> Result<Vec<Vec<f64>>, ValueError> {
     let (rows, cols, data) = arg_to_2d(arg, provider)?;
     if rows == 0 || cols == 0 {
         return Ok(Vec::new());
@@ -17818,8 +18267,7 @@ fn stat_t_test(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             let t = (mx - my) / se_sq.sqrt();
             // Welch-Satterthwaite df.
             let df_num = se_sq.powi(2);
-            let df_den =
-                (vx / n1).powi(2) / (n1 - 1.0) + (vy / n2).powi(2) / (n2 - 1.0);
+            let df_den = (vx / n1).powi(2) / (n1 - 1.0) + (vy / n2).powi(2) / (n2 - 1.0);
             if df_den <= 0.0 {
                 return Value::Error(ValueError::DivisionByZero);
             }
@@ -17957,11 +18405,7 @@ struct LinRegFit {
     k_vars: usize,
 }
 
-fn linreg_core(
-    xs: &[Vec<f64>],
-    ys: &[f64],
-    with_intercept: bool,
-) -> Result<LinRegFit, ValueError> {
+fn linreg_core(xs: &[Vec<f64>], ys: &[f64], with_intercept: bool) -> Result<LinRegFit, ValueError> {
     let n = ys.len();
     if n == 0 {
         return Err(ValueError::InvalidValue);
@@ -18055,7 +18499,11 @@ fn linreg_core(
     }
     let betas = bvec; // length p_eff
     let slopes: Vec<f64> = (0..k).map(|i| betas[i]).collect();
-    let intercept = if with_intercept { betas[p_eff - 1] } else { 0.0 };
+    let intercept = if with_intercept {
+        betas[p_eff - 1]
+    } else {
+        0.0
+    };
     // Predicted ŷ.
     let mut predicted = vec![0.0_f64; n];
     for r in 0..n {
@@ -18097,7 +18545,11 @@ fn linreg_core(
                 let se_int = if with_intercept {
                     let last = p_eff - 1;
                     let var_int = inv[last][last] * mse;
-                    if var_int > 0.0 { var_int.sqrt() } else { 0.0 }
+                    if var_int > 0.0 {
+                        var_int.sqrt()
+                    } else {
+                        0.0
+                    }
                 } else {
                     0.0
                 };
@@ -18205,7 +18657,7 @@ fn linest_array(fit: &LinRegFit, stats: bool, exp_coefs: bool) -> Value {
     data.push(Value::Number(r2));
     data.push(Value::Number(se_y));
     for _ in 2..cols {
-        data.push(Value::Error(ValueError::InvalidValue));
+        data.push(Value::Error(ValueError::NotAvailable));
     }
     // Row 3: F-stat, df.
     let p = k as f64;
@@ -18222,7 +18674,7 @@ fn linest_array(fit: &LinRegFit, stats: bool, exp_coefs: bool) -> Value {
     data.push(Value::Number(f_stat));
     data.push(Value::Number(fit.df));
     for _ in 2..cols {
-        data.push(Value::Error(ValueError::InvalidValue));
+        data.push(Value::Error(ValueError::NotAvailable));
     }
     // Row 4: SS_reg, SS_resid.
     let ss_reg = if fit.ss_tot > fit.ss_res {
@@ -18233,7 +18685,7 @@ fn linest_array(fit: &LinRegFit, stats: bool, exp_coefs: bool) -> Value {
     data.push(Value::Number(ss_reg));
     data.push(Value::Number(fit.ss_res));
     for _ in 2..cols {
-        data.push(Value::Error(ValueError::InvalidValue));
+        data.push(Value::Error(ValueError::NotAvailable));
     }
     Value::Array(Arc::new(ArrayData::new(5, cols as u32, data)))
 }
@@ -18321,7 +18773,11 @@ fn fn_linest(args: &[Expr], provider: &dyn EvalProvider, log_y: bool) -> Value {
         }
     }
     let n = ys.len();
-    let x_arg = if args.len() >= 2 { Some(&args[1]) } else { None };
+    let x_arg = if args.len() >= 2 {
+        Some(&args[1])
+    } else {
+        None
+    };
     let xs = match extract_known_x(x_arg, n, y_vertical, provider) {
         Ok(m) => m,
         Err(e) => return Value::Error(e),
@@ -18356,7 +18812,11 @@ fn fn_trend_growth(args: &[Expr], provider: &dyn EvalProvider, log_y: bool) -> V
         }
     }
     let n = ys.len();
-    let x_arg = if args.len() >= 2 { Some(&args[1]) } else { None };
+    let x_arg = if args.len() >= 2 {
+        Some(&args[1])
+    } else {
+        None
+    };
     let xs = match extract_known_x(x_arg, n, y_vertical, provider) {
         Ok(m) => m,
         Err(e) => return Value::Error(e),
@@ -18584,11 +19044,7 @@ fn stat_percentrank_exc(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     percentrank_common(args, provider, /*exclusive=*/ true)
 }
 
-fn percentrank_common(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    exclusive: bool,
-) -> Value {
+fn percentrank_common(args: &[Expr], provider: &dyn EvalProvider, exclusive: bool) -> Value {
     if args.len() < 2 || args.len() > 3 {
         return Value::Error(ValueError::WrongArgCount);
     }
@@ -18701,10 +19157,7 @@ fn stat_mode_mult(args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
 /// Collect numbers + logical + text for the A-variants. Empty cells are
 /// skipped; text contributes 0; logical TRUE/FALSE contributes 1/0.
-fn collect_numbers_a(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-) -> (Vec<f64>, Option<ValueError>) {
+fn collect_numbers_a(args: &[Expr], provider: &dyn EvalProvider) -> (Vec<f64>, Option<ValueError>) {
     let mut nums: Vec<f64> = Vec::new();
     let mut err: Option<ValueError> = None;
     for arg in args {
@@ -18749,12 +19202,7 @@ fn stat_max_min_a(args: &[Expr], provider: &dyn EvalProvider, want_max: bool) ->
 
 /// STDEVA / STDEVPA / VARA / VARPA. `sample` selects n-1 vs n; `sqrt`
 /// selects STDEV* (return s.d.) vs VAR* (return variance).
-fn stat_var_a(
-    args: &[Expr],
-    provider: &dyn EvalProvider,
-    sample: bool,
-    sqrt: bool,
-) -> Value {
+fn stat_var_a(args: &[Expr], provider: &dyn EvalProvider, sample: bool, sqrt: bool) -> Value {
     let (nums, err) = collect_numbers_a(args, provider);
     if let Some(e) = err {
         return Value::Error(e);
@@ -18846,7 +19294,7 @@ fn fn_mmult(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::InvalidValue);
     }
     let total = (ra as u64).checked_mul(cb as u64).unwrap_or(u64::MAX);
-    if total > 1_048_576 {
+    if total > DYNAMIC_ARRAY_CELL_CAP {
         return Value::Error(ValueError::InvalidValue);
     }
     let mut data: Vec<Value> = Vec::with_capacity(ra * cb);
@@ -18907,7 +19355,7 @@ fn fn_munit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         Some(n) if n >= 1.0 => n.trunc() as u32,
         _ => return Value::Error(ValueError::InvalidValue),
     };
-    if (n as u64) * (n as u64) > 1_048_576 {
+    if checked_array_len(n as u64, n as u64).is_err() {
         return Value::Error(ValueError::InvalidValue);
     }
     let mut data: Vec<Value> = Vec::with_capacity((n as usize) * (n as usize));
@@ -18933,7 +19381,7 @@ fn fn_transpose(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::InvalidValue);
     }
     let total = (rows as u64) * (cols as u64);
-    if total > 1_048_576 {
+    if total > DYNAMIC_ARRAY_CELL_CAP {
         return Value::Error(ValueError::InvalidValue);
     }
     let mut out: Vec<Value> = vec![Value::Null; (rows as usize) * (cols as usize)];
@@ -19026,7 +19474,6 @@ fn stat_phi(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let two_pi = std::f64::consts::TAU; // 2π
     stat_finite((-0.5 * x * x).exp() / two_pi.sqrt())
 }
-
 
 /// Shared body for SUBTOTAL function_num ∈ 1..=11. Walks every
 /// `data_args` element via `for_each_arg_value` so streaming numeric
@@ -19217,7 +19664,6 @@ fn run_subtotal(fn_num: u32, data_args: &[Expr], provider: &dyn EvalProvider) ->
     }
 }
 
-
 /// SUBTOTAL(function_num, ref1, [ref2…]).
 fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() < 2 {
@@ -19244,7 +19690,6 @@ fn fn_subtotal(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     };
     run_subtotal(fn_norm, &args[1..], provider)
 }
-
 
 /// AGGREGATE(function_num, options, ref1, [ref2…]).
 fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19557,7 +20002,6 @@ fn fn_aggregate(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
 }
 
-
 /// EVEN(n) — round AWAY from zero to the nearest even integer.
 fn fn_even(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 1 {
@@ -19582,7 +20026,6 @@ fn fn_even(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
     Value::Number(sign * rounded)
 }
-
 
 /// FACTDOUBLE(n) — double factorial: n · (n-2) · (n-4) · … down to 2 or 1.
 fn fn_factdouble(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19617,7 +20060,6 @@ fn fn_factdouble(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
     Value::Number(acc)
 }
-
 
 /// COMBINA(n, k) — combinations with repetition = C(n + k - 1, k).
 fn fn_combina(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19660,7 +20102,6 @@ fn fn_combina(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
     Value::Number(acc.round())
 }
-
 
 /// MULTINOMIAL(n1, n2, …).
 fn fn_multinomial(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19732,7 +20173,6 @@ fn fn_multinomial(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
 }
 
-
 /// SERIESSUM(x, n, m, coefs).
 fn fn_seriessum(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 4 {
@@ -19799,9 +20239,7 @@ fn fn_seriessum(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
 }
 
-
-/// ERROR.TYPE(error_value) — see top-of-arm comment for the
-/// ValueError → 1..=8 mapping.
+/// ERROR.TYPE(error_value) — map ValueError to Excel-style numeric tags.
 fn fn_error_type(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::WrongArgCount);
@@ -19809,18 +20247,20 @@ fn fn_error_type(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let v = eval_expr_with_provider(&args[0], provider);
     match v {
         Value::Error(ValueError::DivisionByZero) => Value::Number(2.0),
-        Value::Error(ValueError::InvalidValue) => Value::Number(7.0),
+        Value::Error(ValueError::Null) => Value::Number(1.0),
+        Value::Error(ValueError::NotAvailable) => Value::Number(7.0),
+        Value::Error(ValueError::InvalidValue) => Value::Number(3.0),
         Value::Error(ValueError::InvalidRef) => Value::Number(4.0),
         Value::Error(ValueError::InvalidName) => Value::Number(5.0),
         Value::Error(ValueError::Overflow) => Value::Number(6.0),
         Value::Error(ValueError::CyclicRef) => Value::Number(4.0),
         Value::Error(ValueError::WrongType) => Value::Number(3.0),
         Value::Error(ValueError::WrongArgCount) => Value::Number(3.0),
-        Value::Error(ValueError::Spill) => Value::Number(3.0),
-        _ => Value::Error(ValueError::InvalidValue),
+        Value::Error(ValueError::Spill) => Value::Number(9.0),
+        Value::Error(ValueError::Calc) => Value::Number(14.0),
+        _ => Value::Error(ValueError::NotAvailable),
     }
 }
-
 
 /// Format an absolute-value number with thousands separators and the
 /// requested fractional precision. Used by DOLLAR and FIXED. `decimals`
@@ -19854,7 +20294,6 @@ fn format_thousands(value: f64, decimals: i64, use_commas: bool) -> String {
     }
 }
 
-
 fn insert_commas(digits: &str) -> String {
     let bytes = digits.as_bytes();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -19867,7 +20306,6 @@ fn insert_commas(digits: &str) -> String {
     }
     out
 }
-
 
 /// DOLLAR(number, [decimals=2]).
 fn fn_dollar(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19902,7 +20340,6 @@ fn fn_dollar(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     };
     Value::Text(result)
 }
-
 
 /// FIXED(number, [decimals=2], [no_commas=FALSE]).
 fn fn_fixed(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -19939,14 +20376,9 @@ fn fn_fixed(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         false
     };
     let body = format_thousands(n, decimals, !no_commas);
-    let result = if n < 0.0 {
-        format!("-{}", body)
-    } else {
-        body
-    };
+    let result = if n < 0.0 { format!("-{}", body) } else { body };
     Value::Text(result)
 }
-
 
 /// ODD(number) — round AWAY from zero to nearest odd integer.
 fn fn_odd(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -20010,7 +20442,7 @@ fn fn_expand(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let pad = if args.len() == 4 {
         eval_expr_with_provider(&args[3], provider)
     } else {
-        Value::Error(ValueError::InvalidValue)
+        Value::Error(ValueError::NotAvailable)
     };
     if new_rows < rows || new_cols < cols {
         return Value::Error(ValueError::InvalidValue);
@@ -20027,7 +20459,6 @@ fn fn_expand(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
     Value::Array(Arc::new(ArrayData::new(new_rows, new_cols, out)))
 }
-
 
 /// XMATCH(needle, lookup_array, [match_mode=0], [search_mode=1]).
 fn fn_xmatch(args: &[Expr], provider: &dyn EvalProvider) -> Value {
@@ -20124,7 +20555,7 @@ fn fn_xmatch(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
         }
         if match_mode == 0 || match_mode == 2 {
-            return Value::Error(ValueError::InvalidValue);
+            return Value::Error(ValueError::NotAvailable);
         }
     }
 
@@ -20162,7 +20593,7 @@ fn fn_xmatch(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     }
     match best {
         Some(i) => Value::Number((i + 1) as f64),
-        None => Value::Error(ValueError::InvalidValue),
+        None => Value::Error(ValueError::NotAvailable),
     }
 }
 
@@ -20374,8 +20805,7 @@ fn date_days360(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             d2 = 30;
         }
     }
-    let result =
-        (y2 - y1) as f64 * 360.0 + (m2 as f64 - m1 as f64) * 30.0 + (d2 - d1) as f64;
+    let result = (y2 - y1) as f64 * 360.0 + (m2 as f64 - m1 as f64) * 30.0 + (d2 - d1) as f64;
     Value::Number(result)
 }
 
@@ -20766,7 +21196,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 /// order. Empty / Null array slots are silently dropped — TEXTSPLIT can't
 /// split on an empty string anyway, and Excel ignores blanks in the
 /// delimiter array.
-fn collect_textsplit_delims(v: &Value) -> Result<Vec<String>, ValueError> {
+fn collect_textsplit_delims(v: &Value, include_empty: bool) -> Result<Vec<String>, ValueError> {
     match v {
         Value::Error(e) => Err(e.clone()),
         Value::Array(arr) => {
@@ -20774,10 +21204,14 @@ fn collect_textsplit_delims(v: &Value) -> Result<Vec<String>, ValueError> {
             for elem in arr.data.iter() {
                 match elem {
                     Value::Error(e) => return Err(e.clone()),
-                    Value::Null => {}
+                    Value::Null => {
+                        if include_empty {
+                            out.push(String::new());
+                        }
+                    }
                     other => {
                         let s = coerce_to_text(other);
-                        if !s.is_empty() {
+                        if !s.is_empty() || include_empty {
                             out.push(s);
                         }
                     }
@@ -20785,10 +21219,16 @@ fn collect_textsplit_delims(v: &Value) -> Result<Vec<String>, ValueError> {
             }
             Ok(out)
         }
-        Value::Null => Ok(Vec::new()),
+        Value::Null => {
+            if include_empty {
+                Ok(vec![String::new()])
+            } else {
+                Ok(Vec::new())
+            }
+        }
         other => {
             let s = coerce_to_text(other);
-            if s.is_empty() {
+            if s.is_empty() && !include_empty {
                 Ok(Vec::new())
             } else {
                 Ok(vec![s])
@@ -20912,6 +21352,17 @@ fn textsplit_one_axis(
     out
 }
 
+fn eval_optional_value_arg(
+    arg: Option<&Expr>,
+    provider: &dyn EvalProvider,
+    default: Value,
+) -> Value {
+    match arg {
+        Some(expr) => eval_expr_with_provider(expr, provider),
+        None => default,
+    }
+}
+
 fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.is_empty() || args.len() > 6 {
         return Value::Error(ValueError::WrongArgCount);
@@ -20925,7 +21376,7 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
 
     // col_delim
     let col_v = eval_expr_with_provider(&args[1], provider);
-    let col_delims = match collect_textsplit_delims(&col_v) {
+    let col_delims = match collect_textsplit_delims(&col_v, false) {
         Ok(v) => v,
         Err(e) => return Value::Error(e),
     };
@@ -20935,7 +21386,7 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         let v = eval_expr_with_provider(&args[2], provider);
         match v {
             Value::Null => Vec::new(),
-            v => match collect_textsplit_delims(&v) {
+            v => match collect_textsplit_delims(&v, false) {
                 Ok(d) => d,
                 Err(e) => return Value::Error(e),
             },
@@ -20972,20 +21423,13 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         return Value::Error(ValueError::InvalidValue);
     }
 
-    // pad_with (default #N/A-equivalent)
-    let pad: Value = if args.len() == 6 {
-        let v = eval_expr_with_provider(&args[5], provider);
-        if let Value::Error(e) = &v {
-            return Value::Error(e.clone());
-        }
-        v
-    } else {
-        Value::Error(ValueError::InvalidValue)
-    };
-
     // Empty text — Excel returns a 1×1 with "" regardless of delims.
     if text.is_empty() {
-        return Value::Array(Arc::new(ArrayData::new(1, 1, vec![Value::Text(String::new())])));
+        return Value::Array(Arc::new(ArrayData::new(
+            1,
+            1,
+            vec![Value::Text(String::new())],
+        )));
     }
 
     if row_delims.is_empty() {
@@ -21010,7 +21454,11 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
         grid.push(cols);
     }
     if grid.is_empty() {
-        return Value::Array(Arc::new(ArrayData::new(1, 1, vec![Value::Text(String::new())])));
+        return Value::Array(Arc::new(ArrayData::new(
+            1,
+            1,
+            vec![Value::Text(String::new())],
+        )));
     }
     if max_cols == 0 {
         max_cols = 1;
@@ -21018,12 +21466,23 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     let r = grid.len() as u32;
     let c = max_cols as u32;
     let mut data: Vec<Value> = Vec::with_capacity((r as usize) * (c as usize));
+    let pad_arg = args.get(5);
+    let mut pad: Option<Value> = None;
     for row in grid {
         for j in 0..max_cols {
             if j < row.len() {
                 data.push(Value::Text(row[j].clone()));
             } else {
-                data.push(pad.clone());
+                let pad_value = pad
+                    .get_or_insert_with(|| {
+                        eval_optional_value_arg(
+                            pad_arg,
+                            provider,
+                            Value::Error(ValueError::NotAvailable),
+                        )
+                    })
+                    .clone();
+                data.push(pad_value);
             }
         }
     }
@@ -21042,7 +21501,7 @@ fn fn_textsplit(args: &[Expr], provider: &dyn EvalProvider) -> Value {
 /// - `match_end`: 1 treats start- or end-of-string as an implicit match.
 ///   Then asking for the last occurrence with end-of-string-match returns
 ///   the tail / "" (TEXTAFTER) or whole text / before-tail (TEXTBEFORE).
-/// - `if_not_found`: returned on miss (default `#N/A` → `InvalidValue`).
+/// - `if_not_found`: returned on miss (default `#N/A`).
 fn fn_text_before_after(args: &[Expr], provider: &dyn EvalProvider, before: bool) -> Value {
     if args.len() < 2 || args.len() > 6 {
         return Value::Error(ValueError::WrongArgCount);
@@ -21054,7 +21513,7 @@ fn fn_text_before_after(args: &[Expr], provider: &dyn EvalProvider, before: bool
     let text = coerce_to_text(&text_v);
 
     let delim_v = eval_expr_with_provider(&args[1], provider);
-    let delims = match collect_textsplit_delims(&delim_v) {
+    let delims = match collect_textsplit_delims(&delim_v, true) {
         Ok(d) => d,
         Err(e) => return Value::Error(e),
     };
@@ -21103,30 +21562,30 @@ fn fn_text_before_after(args: &[Expr], provider: &dyn EvalProvider, before: bool
     } else {
         0
     };
+    if !matches!(match_end, 0 | 1) {
+        return Value::Error(ValueError::InvalidValue);
+    }
 
-    let not_found: Value = if args.len() == 6 {
-        let v = eval_expr_with_provider(&args[5], provider);
-        if let Value::Error(e) = &v {
-            return Value::Error(e.clone());
-        }
-        v
-    } else {
-        Value::Error(ValueError::InvalidValue)
+    let not_found_arg = args.get(5);
+    let not_found = || {
+        eval_optional_value_arg(
+            not_found_arg,
+            provider,
+            Value::Error(ValueError::NotAvailable),
+        )
     };
 
-    if delims.iter().all(|d| d.is_empty()) {
-        // No usable delimiter — treat as miss.
-        return not_found;
+    if delims.iter().any(|d| d.is_empty()) {
+        return match instance {
+            1 => Value::Text(if before { String::new() } else { text.clone() }),
+            -1 => Value::Text(if before { text.clone() } else { String::new() }),
+            _ => not_found(),
+        };
     }
 
     // Enumerate every match position as (start, end). With `match_end`,
-    // we virtually prepend a "match" at byte 0 and append one at
-    // byte text.len(); these synthetic entries map to "the start/end of
-    // the string" and have zero width.
+    // Excel treats only the end of the string as an implicit match.
     let mut matches: Vec<(usize, usize)> = Vec::new();
-    if match_end == 1 {
-        matches.push((0, 0));
-    }
     let mut pos = 0usize;
     while let Some((s, e, _)) = find_first_textsplit_delim(&text, &delims, pos, match_mode) {
         matches.push((s, e));
@@ -21169,7 +21628,7 @@ fn fn_text_before_after(args: &[Expr], provider: &dyn EvalProvider, before: bool
                 Value::Text(text[e..].to_string())
             }
         }
-        None => not_found,
+        None => not_found(),
     }
 }
 
@@ -21321,15 +21780,15 @@ fn lookup_vector_walk(keys: &[Value], result: &[Value], needle: &Value) -> Value
     }
     match best {
         Some(i) => result[i].clone(),
-        None => Value::Error(ValueError::InvalidValue),
+        None => Value::Error(ValueError::NotAvailable),
     }
 }
 
 /// FORMULATEXT(ref). Walk the supported reference-shaped expressions and
 /// consult the provider for the cell's source formula text. A
-/// `Value::Error(ValueError::InvalidValue)` (≈ `#N/A`) is returned when
-/// the referenced cell holds a primitive — Excel returns `#N/A` for
-/// "this cell has no formula".
+/// `Value::Error(ValueError::NotAvailable)` is returned when the
+/// referenced cell holds a primitive — Excel returns `#N/A` for "this
+/// cell has no formula".
 fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
     if args.len() != 1 {
         return Value::Error(ValueError::WrongArgCount);
@@ -21341,32 +21800,38 @@ fn fn_formulatext(args: &[Expr], provider: &dyn EvalProvider) -> Value {
             }
             match provider.cell_formula_text(*addr) {
                 Some(s) => Value::Text(s),
-                None => Value::Error(ValueError::InvalidValue),
+                None => Value::Error(ValueError::NotAvailable),
             }
         }
         Expr::Range { start, end, .. } => {
             let r = CellRange::new(*start, *end).normalize();
             match provider.cell_formula_text(r.start) {
                 Some(s) => Value::Text(s),
-                None => Value::Error(ValueError::InvalidValue),
+                None => Value::Error(ValueError::NotAvailable),
             }
         }
         Expr::SheetRef { sheet, addr } => {
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
+            if provider.sheet_index_of(sheet).is_none() {
+                return Value::Error(ValueError::InvalidRef);
+            }
             match provider.sheet_cell_formula_text(sheet, *addr) {
                 Some(s) => Value::Text(s),
-                None => Value::Error(ValueError::InvalidValue),
+                None => Value::Error(ValueError::NotAvailable),
             }
         }
         Expr::SheetRange {
             sheet, start, end, ..
         } => {
+            if provider.sheet_index_of(sheet).is_none() {
+                return Value::Error(ValueError::InvalidRef);
+            }
             let r = CellRange::new(*start, *end).normalize();
             match provider.sheet_cell_formula_text(sheet, r.start) {
                 Some(s) => Value::Text(s),
-                None => Value::Error(ValueError::InvalidValue),
+                None => Value::Error(ValueError::NotAvailable),
             }
         }
         _ => Value::Error(ValueError::WrongType),
@@ -21779,7 +22244,7 @@ mod tests {
             eval_str("=VLOOKUP(12000,A1:B4,2)", &cm, &vs),
             Value::Number(30.0)
         );
-        // Below smallest -> #N/A (returned as InvalidValue)
+        // Below smallest -> #N/A.
         assert!(matches!(
             eval_str("=VLOOKUP(-1,A1:B4,2)", &cm, &vs),
             Value::Error(_)
@@ -21904,10 +22369,7 @@ mod tests {
     fn eval_match_non_text_needle_no_wildcard() {
         // Numbers don't trigger wildcard interpretation.
         let (cm, vs) = make_lookup_env();
-        assert_eq!(
-            eval_str("=MATCH(2,A1:A3,0)", &cm, &vs),
-            Value::Number(2.0)
-        );
+        assert_eq!(eval_str("=MATCH(2,A1:A3,0)", &cm, &vs), Value::Number(2.0));
     }
 
     #[test]
@@ -22388,7 +22850,10 @@ mod tests {
         assert_eq!(eval_str("=TRUNC(-2.5)", &cm, &vs), Value::Number(-2.0));
         assert_eq!(eval_str("=TRUNC(3.14159,2)", &cm, &vs), Value::Number(3.14));
         // Negative digits truncate to the left of the decimal point.
-        assert_eq!(eval_str("=TRUNC(123.45,-1)", &cm, &vs), Value::Number(120.0));
+        assert_eq!(
+            eval_str("=TRUNC(123.45,-1)", &cm, &vs),
+            Value::Number(120.0)
+        );
         assert_eq!(
             eval_str("=TRUNC()", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
@@ -22552,7 +23017,10 @@ mod tests {
     #[test]
     fn eval_pi() {
         let (cm, vs) = make_test_env();
-        assert_eq!(eval_str("=PI()", &cm, &vs), Value::Number(std::f64::consts::PI));
+        assert_eq!(
+            eval_str("=PI()", &cm, &vs),
+            Value::Number(std::f64::consts::PI)
+        );
         // PI takes no args.
         assert_eq!(
             eval_str("=PI(1)", &cm, &vs),
@@ -22575,7 +23043,10 @@ mod tests {
         // Away from zero on both signs.
         assert_eq!(eval_str("=ROUNDUP(3.2,0)", &cm, &vs), Value::Number(4.0));
         assert_eq!(eval_str("=ROUNDUP(-3.2,0)", &cm, &vs), Value::Number(-4.0));
-        assert_eq!(eval_str("=ROUNDUP(3.14159,2)", &cm, &vs), Value::Number(3.15));
+        assert_eq!(
+            eval_str("=ROUNDUP(3.14159,2)", &cm, &vs),
+            Value::Number(3.15)
+        );
         // Negative digits round to multiples of 10/100/...
         assert_eq!(eval_str("=ROUNDUP(123,-1)", &cm, &vs), Value::Number(130.0));
         assert_eq!(
@@ -22597,7 +23068,10 @@ mod tests {
         let (cm, vs) = make_test_env();
         // Toward zero on both signs.
         assert_eq!(eval_str("=ROUNDDOWN(3.7,0)", &cm, &vs), Value::Number(3.0));
-        assert_eq!(eval_str("=ROUNDDOWN(-3.7,0)", &cm, &vs), Value::Number(-3.0));
+        assert_eq!(
+            eval_str("=ROUNDDOWN(-3.7,0)", &cm, &vs),
+            Value::Number(-3.0)
+        );
         assert_eq!(
             eval_str("=ROUNDDOWN(3.14159,2)", &cm, &vs),
             Value::Number(3.14)
@@ -22672,7 +23146,10 @@ mod tests {
             Value::Number(1000.0)
         );
         // Text values are skipped (B2 is text); 10*20 = 200.
-        assert_eq!(eval_str("=PRODUCT(A1,B1,B2)", &cm, &vs), Value::Number(200.0));
+        assert_eq!(
+            eval_str("=PRODUCT(A1,B1,B2)", &cm, &vs),
+            Value::Number(200.0)
+        );
         // No numeric args → 0 (Excel convention for PRODUCT).
         assert_eq!(eval_str("=PRODUCT(B2)", &cm, &vs), Value::Number(0.0));
         // Variadic accepts >= 0 args, but supplying nothing returns 0.
@@ -22849,10 +23326,7 @@ mod tests {
         // No args → 0.
         assert_eq!(eval_str("=COUNTA()", &cm, &vs), Value::Number(0.0));
         // Per spec: COUNTA counts errors too — they're "not blank".
-        assert_eq!(
-            eval_str("=COUNTA(A1/C1,A1)", &cm, &vs),
-            Value::Number(2.0)
-        );
+        assert_eq!(eval_str("=COUNTA(A1/C1,A1)", &cm, &vs), Value::Number(2.0));
     }
 
     #[test]
@@ -23148,7 +23622,7 @@ mod tests {
     #[test]
     fn eval_ifna() {
         let (cm, vs) = make_test_env();
-        // VLOOKUP miss surfaces as InvalidValue → caught by IFNA.
+        // VLOOKUP miss surfaces as #N/A → caught by IFNA.
         assert_eq!(
             eval_str("=IFNA(VLOOKUP(999,A1:B2,2,FALSE),0)", &cm, &vs),
             Value::Number(0.0)
@@ -23157,6 +23631,11 @@ mod tests {
         assert_eq!(
             eval_str("=IFNA(1/0,0)", &cm, &vs),
             Value::Error(ValueError::DivisionByZero)
+        );
+        // Real #VALUE! is not #N/A and must not be caught.
+        assert_eq!(
+            eval_str("=IFNA(TEXTBEFORE(\"abc\",\"-\",1,0,2),0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
         );
         // Non-error passes through.
         assert_eq!(eval_str("=IFNA(A1,0)", &cm, &vs), Value::Number(10.0));
@@ -23180,10 +23659,14 @@ mod tests {
             eval_str("=IFS(A1>100,1,A1<0,2)", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
-        // Odd arg count → WrongArgCount.
+        // Odd/empty arg count → InvalidValue (#VALUE!).
         assert_eq!(
             eval_str("=IFS(A1>0,1,A1>0)", &cm, &vs),
-            Value::Error(ValueError::WrongArgCount)
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=IFS()", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
         );
         // Error in a condition propagates.
         assert_eq!(
@@ -23325,6 +23808,11 @@ mod tests {
             eval_str("=ISERR(VLOOKUP(999,A1:B2,2,FALSE))", &cm, &vs),
             Value::Boolean(false)
         );
+        // Real #VALUE! is an error other than #N/A.
+        assert_eq!(
+            eval_str("=ISERR(TEXTBEFORE(\"abc\",\"-\",1,0,2))", &cm, &vs),
+            Value::Boolean(true)
+        );
         // Non-errors are false.
         assert_eq!(eval_str("=ISERR(A1)", &cm, &vs), Value::Boolean(false));
         assert_eq!(
@@ -23336,13 +23824,18 @@ mod tests {
     #[test]
     fn eval_isna() {
         let (cm, vs) = make_test_env();
-        // VLOOKUP miss surfaces as InvalidValue → ISNA true.
+        // VLOOKUP miss surfaces as #N/A → ISNA true.
         assert_eq!(
             eval_str("=ISNA(VLOOKUP(999,A1:B2,2,FALSE))", &cm, &vs),
             Value::Boolean(true)
         );
         // DivisionByZero is an error, but not NA-like.
         assert_eq!(eval_str("=ISNA(1/0)", &cm, &vs), Value::Boolean(false));
+        // Real #VALUE! is not #N/A.
+        assert_eq!(
+            eval_str("=ISNA(TEXTBEFORE(\"abc\",\"-\",1,0,2))", &cm, &vs),
+            Value::Boolean(false)
+        );
         // Non-error → false.
         assert_eq!(eval_str("=ISNA(A1)", &cm, &vs), Value::Boolean(false));
         assert_eq!(
@@ -23665,10 +24158,7 @@ mod tests {
             Value::Text("aaa".into())
         );
         // Empty text edge.
-        assert_eq!(
-            eval_str("=REPT(\"\",5)", &cm, &vs),
-            Value::Text("".into())
-        );
+        assert_eq!(eval_str("=REPT(\"\",5)", &cm, &vs), Value::Text("".into()));
         // n < 0 → InvalidValue.
         assert_eq!(
             eval_str("=REPT(\"a\",-1)", &cm, &vs),
@@ -23794,10 +24284,7 @@ mod tests {
         // ASCII.
         assert_eq!(eval_str("=CHAR(65)", &cm, &vs), Value::Text("A".into()));
         // Unicode round-trip: 20013 → "中".
-        assert_eq!(
-            eval_str("=CHAR(20013)", &cm, &vs),
-            Value::Text("中".into())
-        );
+        assert_eq!(eval_str("=CHAR(20013)", &cm, &vs), Value::Text("中".into()));
         // Truncation: 65.9 → 'A'.
         assert_eq!(eval_str("=CHAR(65.9)", &cm, &vs), Value::Text("A".into()));
         // Out of range low.
@@ -23835,10 +24322,7 @@ mod tests {
         // First char only.
         assert_eq!(eval_str("=CODE(\"ABC\")", &cm, &vs), Value::Number(65.0));
         // Unicode round-trip: "中" → 20013.
-        assert_eq!(
-            eval_str("=CODE(\"中\")", &cm, &vs),
-            Value::Number(20013.0)
-        );
+        assert_eq!(eval_str("=CODE(\"中\")", &cm, &vs), Value::Number(20013.0));
         // Empty text → InvalidValue.
         assert_eq!(
             eval_str("=CODE(\"\")", &cm, &vs),
@@ -23883,10 +24367,7 @@ mod tests {
             Value::Text("xy".into())
         );
         // Empty text edge.
-        assert_eq!(
-            eval_str("=CLEAN(\"\")", &cm, &vs),
-            Value::Text("".into())
-        );
+        assert_eq!(eval_str("=CLEAN(\"\")", &cm, &vs), Value::Text("".into()));
         // Wrong arg count.
         assert_eq!(
             eval_str("=CLEAN(\"a\",\"b\")", &cm, &vs),
@@ -23923,10 +24404,7 @@ mod tests {
             Value::Text("Abc 123 Def".into())
         );
         // Empty text edge.
-        assert_eq!(
-            eval_str("=PROPER(\"\")", &cm, &vs),
-            Value::Text("".into())
-        );
+        assert_eq!(eval_str("=PROPER(\"\")", &cm, &vs), Value::Text("".into()));
         // Wrong arg count.
         assert_eq!(
             eval_str("=PROPER(\"a\",\"b\")", &cm, &vs),
@@ -24115,11 +24593,8 @@ mod tests {
             &Value::Text("x".into()),
             &Value::Text("<>y".into())
         )); // legacy: "x" != "y" → false (existing quirk; not a wildcard case)
-        // Bare equality on numbers.
-        assert!(matches_criterion(
-            &Value::Number(7.0),
-            &Value::Number(7.0)
-        ));
+            // Bare equality on numbers.
+        assert!(matches_criterion(&Value::Number(7.0), &Value::Number(7.0)));
     }
 
     // === Multi-criteria aggregate tests ===
@@ -24361,11 +24836,7 @@ mod tests {
         let (cm, vs) = make_multi_env();
         // Sum B where color=red AND B>=30 → 30+40 = 70.
         assert_eq!(
-            eval_str(
-                "=SUMIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=SUMIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")", &cm, &vs),
             Value::Number(70.0)
         );
     }
@@ -24437,11 +24908,7 @@ mod tests {
         let (cm, vs) = make_multi_env();
         // Avg B where color=red AND B>=30 → (30+40)/2 = 35.
         assert_eq!(
-            eval_str(
-                "=AVERAGEIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=AVERAGEIFS(B1:B5,C1:C5,\"red\",B1:B5,\">=30\")", &cm, &vs),
             Value::Number(35.0)
         );
     }
@@ -24882,10 +25349,7 @@ mod tests {
             eval_str("=CELL(\"column\",A1)", &cm, &vs),
             Value::Number(1.0)
         );
-        assert_eq!(
-            eval_str("=CELL(\"col\",B2)", &cm, &vs),
-            Value::Number(2.0)
-        );
+        assert_eq!(eval_str("=CELL(\"col\",B2)", &cm, &vs), Value::Number(2.0));
     }
 
     #[test]
@@ -25052,10 +25516,10 @@ mod tests {
             eval_str("=XLOOKUP(10,A1:C1,A2:C2)", &cm, &vs),
             Value::Number(5.0)
         );
-        // Not found without default → InvalidValue.
+        // Not found without default → #N/A.
         assert_eq!(
             eval_str("=XLOOKUP(999,A1:C1,A2:C2)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         );
         // Not found with default → the default.
         assert_eq!(
@@ -25620,62 +26084,34 @@ mod tests {
         let (cm, vs) = make_test_env();
         // start = 2020-01-15, end = 2021-03-20.
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"Y\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"Y\")", &cm, &vs),
             Value::Number(1.0)
         );
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"M\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"M\")", &cm, &vs),
             Value::Number(14.0)
         );
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"YM\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"YM\")", &cm, &vs),
             Value::Number(2.0)
         );
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2020,1,20),\"D\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2020,1,20),\"D\")", &cm, &vs),
             Value::Number(5.0)
         );
         // MD: same months, different days.
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"MD\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"MD\")", &cm, &vs),
             Value::Number(5.0)
         );
         // Unknown unit.
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"ZZ\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2020,1,15),DATE(2021,3,20),\"ZZ\")", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
         // start > end → Overflow.
         assert_eq!(
-            eval_str(
-                "=DATEDIF(DATE(2021,3,20),DATE(2020,1,15),\"D\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=DATEDIF(DATE(2021,3,20),DATE(2020,1,15),\"D\")", &cm, &vs),
             Value::Error(ValueError::Overflow)
         );
         // Wrong arg count.
@@ -25777,18 +26213,14 @@ mod tests {
         );
         // basis 3 (actual/365): 366 actual days / 365.
         let expected = 366.0 / 365.0;
-        if let Value::Number(n) =
-            eval_str("=YEARFRAC(DATE(2020,1,1),DATE(2021,1,1),3)", &cm, &vs)
-        {
+        if let Value::Number(n) = eval_str("=YEARFRAC(DATE(2020,1,1),DATE(2021,1,1),3)", &cm, &vs) {
             assert!((n - expected).abs() < 1e-12);
         } else {
             panic!("YEARFRAC basis 3 returned non-number");
         }
         // basis 2 (actual/360): 366 / 360.
         let expected = 366.0 / 360.0;
-        if let Value::Number(n) =
-            eval_str("=YEARFRAC(DATE(2020,1,1),DATE(2021,1,1),2)", &cm, &vs)
-        {
+        if let Value::Number(n) = eval_str("=YEARFRAC(DATE(2020,1,1),DATE(2021,1,1),2)", &cm, &vs) {
             assert!((n - expected).abs() < 1e-12);
         } else {
             panic!("YEARFRAC basis 2 returned non-number");
@@ -25835,10 +26267,12 @@ mod tests {
         let mut cell_map = HashMap::new();
         let mut values = HashMap::new();
         let mut next_id: u64 = 0;
-        let insert = |row: u32, col: u32, v: Value,
-                          cm: &mut HashMap<CellAddress, AtomId>,
-                          vs: &mut HashMap<AtomId, Value>,
-                          next: &mut u64| {
+        let insert = |row: u32,
+                      col: u32,
+                      v: Value,
+                      cm: &mut HashMap<CellAddress, AtomId>,
+                      vs: &mut HashMap<AtomId, Value>,
+                      next: &mut u64| {
             let id = AtomId::from_raw(*next);
             *next += 1;
             cm.insert(CellAddress::new(row, col), id);
@@ -25846,26 +26280,96 @@ mod tests {
         };
         // Column A: 2, 4, 6, 8, 10.
         for (i, n) in [2.0, 4.0, 6.0, 8.0, 10.0].iter().enumerate() {
-            insert(i as u32, 0, Value::Number(*n), &mut cell_map, &mut values, &mut next_id);
+            insert(
+                i as u32,
+                0,
+                Value::Number(*n),
+                &mut cell_map,
+                &mut values,
+                &mut next_id,
+            );
         }
         // Column B = 2*A: 4, 8, 12, 16, 20 (perfect positive correlation).
         for (i, n) in [4.0, 8.0, 12.0, 16.0, 20.0].iter().enumerate() {
-            insert(i as u32, 1, Value::Number(*n), &mut cell_map, &mut values, &mut next_id);
+            insert(
+                i as u32,
+                1,
+                Value::Number(*n),
+                &mut cell_map,
+                &mut values,
+                &mut next_id,
+            );
         }
         // Column C = inverse of A: 10, 8, 6, 4, 2 (perfect negative correlation).
         for (i, n) in [10.0, 8.0, 6.0, 4.0, 2.0].iter().enumerate() {
-            insert(i as u32, 2, Value::Number(*n), &mut cell_map, &mut values, &mut next_id);
+            insert(
+                i as u32,
+                2,
+                Value::Number(*n),
+                &mut cell_map,
+                &mut values,
+                &mut next_id,
+            );
         }
         // Column D: mixed-type column for AVERAGEA.
-        insert(0, 3, Value::Boolean(true), &mut cell_map, &mut values, &mut next_id);
-        insert(1, 3, Value::Boolean(false), &mut cell_map, &mut values, &mut next_id);
-        insert(2, 3, Value::Text("hello".into()), &mut cell_map, &mut values, &mut next_id);
+        insert(
+            0,
+            3,
+            Value::Boolean(true),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
+        insert(
+            1,
+            3,
+            Value::Boolean(false),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
+        insert(
+            2,
+            3,
+            Value::Text("hello".into()),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
         // D4 intentionally absent → Null.
-        insert(4, 3, Value::Number(5.0), &mut cell_map, &mut values, &mut next_id);
+        insert(
+            4,
+            3,
+            Value::Number(5.0),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
         // Column E: contains ties for RANK.AVG (10, 10, 5).
-        insert(0, 4, Value::Number(10.0), &mut cell_map, &mut values, &mut next_id);
-        insert(1, 4, Value::Number(10.0), &mut cell_map, &mut values, &mut next_id);
-        insert(2, 4, Value::Number(5.0), &mut cell_map, &mut values, &mut next_id);
+        insert(
+            0,
+            4,
+            Value::Number(10.0),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
+        insert(
+            1,
+            4,
+            Value::Number(10.0),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
+        insert(
+            2,
+            4,
+            Value::Number(5.0),
+            &mut cell_map,
+            &mut values,
+            &mut next_id,
+        );
         (cell_map, values)
     }
 
@@ -26054,11 +26558,20 @@ mod tests {
         let (cm, vs) = make_stat_env();
         // A1..A5 = 2,4,6,8,10 sorted asc.
         // k=0 → min = 2.
-        assert_eq!(eval_str("=PERCENTILE(A1:A5,0)", &cm, &vs), Value::Number(2.0));
+        assert_eq!(
+            eval_str("=PERCENTILE(A1:A5,0)", &cm, &vs),
+            Value::Number(2.0)
+        );
         // k=1 → max = 10.
-        assert_eq!(eval_str("=PERCENTILE(A1:A5,1)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=PERCENTILE(A1:A5,1)", &cm, &vs),
+            Value::Number(10.0)
+        );
         // k=0.5 → median = 6.
-        assert_eq!(eval_str("=PERCENTILE(A1:A5,0.5)", &cm, &vs), Value::Number(6.0));
+        assert_eq!(
+            eval_str("=PERCENTILE(A1:A5,0.5)", &cm, &vs),
+            Value::Number(6.0)
+        );
         // k=0.25 → pos = 1.0 → exact index 1 → value 4.
         assert_eq!(
             eval_str("=PERCENTILE(A1:A5,0.25)", &cm, &vs),
@@ -26124,7 +26637,10 @@ mod tests {
         // A1..A5 sorted = 2,4,6,8,10.
         // quart=0 → min = 2; quart=4 → max = 10; quart=2 → median = 6.
         assert_eq!(eval_str("=QUARTILE(A1:A5,0)", &cm, &vs), Value::Number(2.0));
-        assert_eq!(eval_str("=QUARTILE(A1:A5,4)", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=QUARTILE(A1:A5,4)", &cm, &vs),
+            Value::Number(10.0)
+        );
         assert_eq!(eval_str("=QUARTILE(A1:A5,2)", &cm, &vs), Value::Number(6.0));
         // quart=2 should equal PERCENTILE(k=0.5).
         assert_eq!(
@@ -26442,10 +26958,7 @@ mod tests {
             other => panic!("PV: {:?}", other),
         }
         // rate=0 linear: PV(0, 10, -100, 0) = -(-100*10 + 0) = 1000.
-        assert_eq!(
-            eval_str("=PV(0,10,-100)", &cm, &vs),
-            Value::Number(1000.0)
-        );
+        assert_eq!(eval_str("=PV(0,10,-100)", &cm, &vs), Value::Number(1000.0));
         assert_eq!(
             eval_str("=PV(0.005)", &cm, &vs),
             Value::Error(ValueError::WrongArgCount)
@@ -26466,10 +26979,7 @@ mod tests {
             other => panic!("FV: {:?}", other),
         }
         // rate=0 linear: FV(0, 10, -100, 0) = -(0 + -100*10) = 1000.
-        assert_eq!(
-            eval_str("=FV(0,10,-100)", &cm, &vs),
-            Value::Number(1000.0)
-        );
+        assert_eq!(eval_str("=FV(0,10,-100)", &cm, &vs), Value::Number(1000.0));
         // pv=1000 included: FV(0, 10, -100, 1000) = -(1000 + -1000) = 0.
         // Value::PartialEq compares f64 by to_bits so `-0.0 != 0.0`; we
         // accept either sign for the zero result via an approx check.
@@ -26642,10 +27152,7 @@ mod tests {
             Value::Number(0.0)
         );
         // rate=0 → interest is 0 for every period.
-        assert_eq!(
-            eval_str("=IPMT(0,1,10,1000)", &cm, &vs),
-            Value::Number(0.0)
-        );
+        assert_eq!(eval_str("=IPMT(0,1,10,1000)", &cm, &vs), Value::Number(0.0));
         // per out of range → InvalidValue.
         assert_eq!(
             eval_str("=IPMT(0.005,0,360,200000)", &cm, &vs),
@@ -27045,7 +27552,13 @@ mod tests {
         put(&mut cell_map, &mut values, 0, 0, Value::Text("Name".into()));
         put(&mut cell_map, &mut values, 0, 1, Value::Text("Age".into()));
         put(&mut cell_map, &mut values, 0, 2, Value::Text("Dept".into()));
-        put(&mut cell_map, &mut values, 0, 3, Value::Text("Salary".into()));
+        put(
+            &mut cell_map,
+            &mut values,
+            0,
+            3,
+            Value::Text("Salary".into()),
+        );
 
         // Database rows.
         let rows: [(&str, f64, &str, f64); 4] = [
@@ -27056,9 +27569,21 @@ mod tests {
         ];
         for (i, (name, age, dept, salary)) in rows.iter().enumerate() {
             let r = (i + 1) as u32;
-            put(&mut cell_map, &mut values, r, 0, Value::Text((*name).into()));
+            put(
+                &mut cell_map,
+                &mut values,
+                r,
+                0,
+                Value::Text((*name).into()),
+            );
             put(&mut cell_map, &mut values, r, 1, Value::Number(*age));
-            put(&mut cell_map, &mut values, r, 2, Value::Text((*dept).into()));
+            put(
+                &mut cell_map,
+                &mut values,
+                r,
+                2,
+                Value::Text((*dept).into()),
+            );
             put(&mut cell_map, &mut values, r, 3, Value::Number(*salary));
         }
 
@@ -27422,10 +27947,7 @@ mod tests {
         // (95000-87500)^2) / (2-1)) = sqrt(112_500_000) ≈ 10606.6017.
         let v = eval_str("=DSTDEV(A1:D5,\"Salary\",F1:G2)", &cm, &vs);
         match v {
-            Value::Number(n) => assert!(
-                (n - 112_500_000.0_f64.sqrt()).abs() < 1e-6,
-                "got {n}"
-            ),
+            Value::Number(n) => assert!((n - 112_500_000.0_f64.sqrt()).abs() < 1e-6, "got {n}"),
             other => panic!("expected number, got {other:?}"),
         }
         // 1-based field.
@@ -27636,10 +28158,7 @@ mod tests {
         // OCT: 10 chars, 3 bits/digit (30-bit total).
         assert_eq!(parse_base_n_text("777", 8, 10, 3), Ok(511.0));
         // Width-10 top digit 4 → bit 29 set → negative (subtract 2^30).
-        assert_eq!(
-            parse_base_n_text("7777777777", 8, 10, 3),
-            Ok(-1.0)
-        );
+        assert_eq!(parse_base_n_text("7777777777", 8, 10, 3), Ok(-1.0));
         assert_eq!(
             parse_base_n_text("4000000000", 8, 10, 3),
             Ok(-(1i64 << 29) as f64),
@@ -27647,10 +28166,7 @@ mod tests {
         // HEX: 10 chars, 4 bits/digit (40-bit total). Case-insensitive.
         assert_eq!(parse_base_n_text("F", 16, 10, 4), Ok(15.0));
         assert_eq!(parse_base_n_text("ff", 16, 10, 4), Ok(255.0));
-        assert_eq!(
-            parse_base_n_text("FFFFFFFFFF", 16, 10, 4),
-            Ok(-1.0)
-        );
+        assert_eq!(parse_base_n_text("FFFFFFFFFF", 16, 10, 4), Ok(-1.0));
         // Width-10 with top hex digit 8 → bit 39 set → most-negative.
         assert_eq!(
             parse_base_n_text("8000000000", 16, 10, 4),
@@ -27755,7 +28271,10 @@ mod tests {
     #[test]
     fn eval_bin2dec() {
         let (cm, vs) = make_test_env();
-        assert_eq!(eval_str("=BIN2DEC(\"1010\")", &cm, &vs), Value::Number(10.0));
+        assert_eq!(
+            eval_str("=BIN2DEC(\"1010\")", &cm, &vs),
+            Value::Number(10.0)
+        );
         assert_eq!(
             eval_str("=BIN2DEC(\"1111111111\")", &cm, &vs),
             Value::Number(-1.0)
@@ -28063,10 +28582,7 @@ mod tests {
     fn eval_bitxor() {
         let (cm, vs) = make_test_env();
         assert_eq!(eval_str("=BITXOR(5,3)", &cm, &vs), Value::Number(6.0));
-        assert_eq!(
-            eval_str("=BITXOR(255,170)", &cm, &vs),
-            Value::Number(85.0)
-        );
+        assert_eq!(eval_str("=BITXOR(255,170)", &cm, &vs), Value::Number(85.0));
     }
 
     #[test]
@@ -28608,7 +29124,9 @@ mod tests {
         let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
         let mut vs: HashMap<AtomId, Value> = HashMap::new();
         let mut next: u64 = 0;
-        let mut put = |row: u32, col: u32, v: Value,
+        let mut put = |row: u32,
+                       col: u32,
+                       v: Value,
                        cm: &mut HashMap<CellAddress, AtomId>,
                        vs: &mut HashMap<AtomId, Value>| {
             let id = AtomId::from_raw(next);
@@ -28785,7 +29303,10 @@ mod tests {
             Value::Number(10.0),
         );
         // sig=0 → 0.
-        assert_eq!(eval_str("=FLOOR.MATH(10.5,0)", &cm, &vs), Value::Number(0.0));
+        assert_eq!(
+            eval_str("=FLOOR.MATH(10.5,0)", &cm, &vs),
+            Value::Number(0.0)
+        );
         // Type error.
         assert_eq!(
             eval_str("=FLOOR.MATH(D1)", &cm, &vs),
@@ -28915,7 +29436,10 @@ mod tests {
         // Edge values.
         assert_eq!(eval_str("=ROMAN(1)", &cm, &vs), Value::Text("I".into()));
         assert_eq!(eval_str("=ROMAN(4)", &cm, &vs), Value::Text("IV".into()));
-        assert_eq!(eval_str("=ROMAN(3999)", &cm, &vs), Value::Text("MMMCMXCIX".into()));
+        assert_eq!(
+            eval_str("=ROMAN(3999)", &cm, &vs),
+            Value::Text("MMMCMXCIX".into())
+        );
         // Out of range.
         assert_eq!(
             eval_str("=ROMAN(0)", &cm, &vs),
@@ -28925,10 +29449,30 @@ mod tests {
             eval_str("=ROMAN(4000)", &cm, &vs),
             Value::Error(ValueError::InvalidValue),
         );
-        // Non-classic form rejected.
+        // Simplified forms and boolean aliases.
         assert_eq!(
-            eval_str("=ROMAN(1994,1)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue),
+            eval_str("=ROMAN(499,1)", &cm, &vs),
+            Value::Text("LDVLIV".into()),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(499,2)", &cm, &vs),
+            Value::Text("XDIX".into()),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(499,3)", &cm, &vs),
+            Value::Text("VDIV".into()),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(499,4)", &cm, &vs),
+            Value::Text("ID".into()),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(1999,TRUE)", &cm, &vs),
+            Value::Text("MCMXCIX".into()),
+        );
+        assert_eq!(
+            eval_str("=ROMAN(1999,FALSE)", &cm, &vs),
+            Value::Text("MIM".into()),
         );
         // Type error.
         assert_eq!(
@@ -29017,7 +29561,10 @@ mod tests {
     fn eval_base() {
         let (cm, vs) = make_math_env();
         // BASE(255, 16) = "FF".
-        assert_eq!(eval_str("=BASE(255,16)", &cm, &vs), Value::Text("FF".into()));
+        assert_eq!(
+            eval_str("=BASE(255,16)", &cm, &vs),
+            Value::Text("FF".into())
+        );
         // Padded.
         assert_eq!(
             eval_str("=BASE(7,2,8)", &cm, &vs),
@@ -29051,10 +29598,7 @@ mod tests {
     fn eval_mdeterm() {
         let (cm, vs) = make_math_env();
         // 2×2: det([[1,2],[3,4]]) = 1*4 - 2*3 = -2.
-        assert_eq!(
-            eval_str("=MDETERM(E1:F2)", &cm, &vs),
-            Value::Number(-2.0),
-        );
+        assert_eq!(eval_str("=MDETERM(E1:F2)", &cm, &vs), Value::Number(-2.0),);
         // 3×3 identity → 1.
         match eval_str("=MDETERM(G1:I3)", &cm, &vs) {
             Value::Number(n) => assert!((n - 1.0).abs() < 1e-12, "det(I) = {n}"),
@@ -29082,20 +29626,12 @@ mod tests {
         // Mon 2024-01-01 (start) to Sun 2024-01-07 (end): 5 workdays
         // Mon..Fri.
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,7))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,7))", &cm, &vs),
             Value::Number(5.0)
         );
         // Mon 2024-01-01 to Fri 2024-01-05 inclusive: 5 workdays.
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,5))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,5))", &cm, &vs),
             Value::Number(5.0)
         );
         // Whole calendar week with one holiday inside (Wed 2024-01-03):
@@ -29110,29 +29646,17 @@ mod tests {
         );
         // start > end → negative result.
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS(DATE(2024,1,7),DATE(2024,1,1))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS(DATE(2024,1,7),DATE(2024,1,1))", &cm, &vs),
             Value::Number(-5.0)
         );
         // Same day, working day → 1.
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,1))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS(DATE(2024,1,1),DATE(2024,1,1))", &cm, &vs),
             Value::Number(1.0)
         );
         // Same day, weekend → 0.
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS(DATE(2024,1,6),DATE(2024,1,6))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS(DATE(2024,1,6),DATE(2024,1,6))", &cm, &vs),
             Value::Number(0.0)
         );
         // Arg-count error: zero args.
@@ -29203,11 +29727,7 @@ mod tests {
         );
         // Default code 1: same Fri..Sat range yields 1 workday (Fri).
         assert_eq!(
-            eval_str(
-                "=NETWORKDAYS.INTL(DATE(2024,1,5),DATE(2024,1,6))",
-                &cm,
-                &vs
-            ),
+            eval_str("=NETWORKDAYS.INTL(DATE(2024,1,5),DATE(2024,1,6))", &cm, &vs),
             Value::Number(1.0)
         );
         // Mask "0000011" = Sat+Sun weekend, equivalent to default.
@@ -29314,11 +29834,7 @@ mod tests {
         // Mon 2024-01-01 + 2 workdays would normally → Wed 2024-01-03.
         // Mark Wed 2024-01-03 as holiday → result must be Thu 2024-01-04.
         assert_eq!(
-            eval_str(
-                "=WORKDAY(DATE(2024,1,1),2,DATE(2024,1,3))",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY(DATE(2024,1,1),2,DATE(2024,1,3))", &cm, &vs),
             Value::Number(date_serial(2024, 1, 4))
         );
         // Arg-count error.
@@ -29338,51 +29854,31 @@ mod tests {
         let (cm, vs) = make_test_env();
         // Default weekend (Sat+Sun): Mon 2024-01-01 + 5 → Mon 2024-01-08.
         assert_eq!(
-            eval_str(
-                "=WORKDAY.INTL(DATE(2024,1,1),5,1)",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1),5,1)", &cm, &vs),
             Value::Number(date_serial(2024, 1, 8))
         );
         // Weekend code 7 (Fri+Sat). Mon 2024-01-01 + 4 → step through
         // Tue Wed Thu Sun (Sun is a workday under code 7), landing on
         // Sun 2024-01-07.
         assert_eq!(
-            eval_str(
-                "=WORKDAY.INTL(DATE(2024,1,1),4,7)",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1),4,7)", &cm, &vs),
             Value::Number(date_serial(2024, 1, 7))
         );
         // Mask "0000011" matches default.
         assert_eq!(
-            eval_str(
-                "=WORKDAY.INTL(DATE(2024,1,1),5,\"0000011\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1),5,\"0000011\")", &cm, &vs),
             Value::Number(date_serial(2024, 1, 8))
         );
         // Holiday under code 7: Mon + 4 normally → Sun 2024-01-07.
         // Mark that day as holiday; next workday under code 7 is
         // Mon 2024-01-08.
         assert_eq!(
-            eval_str(
-                "=WORKDAY.INTL(DATE(2024,1,1),4,7,DATE(2024,1,7))",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1),4,7,DATE(2024,1,7))", &cm, &vs),
             Value::Number(date_serial(2024, 1, 8))
         );
         // Invalid weekend mask → InvalidValue.
         assert_eq!(
-            eval_str(
-                "=WORKDAY.INTL(DATE(2024,1,1),5,\"1111111\")",
-                &cm,
-                &vs
-            ),
+            eval_str("=WORKDAY.INTL(DATE(2024,1,1),5,\"1111111\")", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
         // Arg-count error.
@@ -29507,7 +30003,11 @@ mod tests {
         assert_eq!((r, c), (3, 1));
         assert_eq!(
             data,
-            vec![Value::Number(10.0), Value::Number(12.0), Value::Number(14.0)]
+            vec![
+                Value::Number(10.0),
+                Value::Number(12.0),
+                Value::Number(14.0)
+            ]
         );
     }
 
@@ -29642,9 +30142,9 @@ mod tests {
     }
 
     #[test]
-    fn eval_unique_exactly_once_all_dropped_invalid() {
+    fn eval_unique_exactly_once_all_dropped_calc() {
         // Build a column where everything is duplicated → exactly_once
-        // drops everything → InvalidValue.
+        // drops everything → #CALC!.
         let mut cell_map = HashMap::new();
         let mut values = HashMap::new();
         for (row, n) in [1.0, 2.0, 1.0, 2.0].iter().enumerate() {
@@ -29654,7 +30154,7 @@ mod tests {
         }
         assert_eq!(
             eval_str("=UNIQUE(A1:A4, FALSE, TRUE)", &cell_map, &values),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::Calc)
         );
     }
 
@@ -29776,7 +30276,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_filter_all_false_no_if_empty_invalid() {
+    fn eval_filter_all_false_no_if_empty_calc() {
         // Mask: A1..A4 = [10, 20, 30, 40], include: B1..B4 = [FALSE,FALSE,FALSE,FALSE].
         let mut cm = HashMap::new();
         let mut vs = HashMap::new();
@@ -29792,7 +30292,7 @@ mod tests {
         }
         assert_eq!(
             eval_str("=FILTER(A1:A4, B1:B4)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::Calc)
         );
     }
 
@@ -29810,8 +30310,7 @@ mod tests {
             cm.insert(CellAddress::new(row, 1), id);
             vs.insert(id, Value::Boolean(false));
         }
-        let (r, c, data) =
-            unwrap_array(eval_str("=FILTER(A1:A4, B1:B4, \"none\")", &cm, &vs));
+        let (r, c, data) = unwrap_array(eval_str("=FILTER(A1:A4, B1:B4, \"none\")", &cm, &vs));
         assert_eq!((r, c), (1, 1));
         assert_eq!(data, vec![Value::Text("none".into())]);
     }
@@ -29893,7 +30392,10 @@ mod tests {
     fn eval_let_uses_cells() {
         let (cm, vs) = make_test_env();
         // A1 = 10 in make_test_env; t = 10 + 1 = 11; body = t*2 = 22.
-        assert_eq!(eval_str("=LET(t, A1+1, t*2)", &cm, &vs), Value::Number(22.0));
+        assert_eq!(
+            eval_str("=LET(t, A1+1, t*2)", &cm, &vs),
+            Value::Number(22.0)
+        );
     }
 
     #[test]
@@ -29963,7 +30465,10 @@ mod tests {
     fn eval_name_unbound() {
         let (cm, vs) = make_test_env();
         // Bare `x` with no LET scope → #NAME?.
-        assert_eq!(eval_str("=x", &cm, &vs), Value::Error(ValueError::InvalidName));
+        assert_eq!(
+            eval_str("=x", &cm, &vs),
+            Value::Error(ValueError::InvalidName)
+        );
     }
 
     #[test]
@@ -29984,7 +30489,10 @@ mod tests {
         // A subsequent bare `x` outside any LET should still surface
         // #NAME?, not pick up a leaked binding.
         let _ = eval_str("=LET(x, 1/0, x)", &cm, &vs);
-        assert_eq!(eval_str("=x", &cm, &vs), Value::Error(ValueError::InvalidName));
+        assert_eq!(
+            eval_str("=x", &cm, &vs),
+            Value::Error(ValueError::InvalidName)
+        );
     }
 
     // ── LAMBDA + immediate-call (Part A of L2) ───────────────────────
@@ -30075,10 +30583,7 @@ mod tests {
         // Note: bare `=LAMBDA(42)` would be a 0-param lambda with body
         // = 42 since LAMBDA needs ≥ 1 arg (the body). Immediate-apply
         // returns 42.
-        assert_eq!(
-            eval_str("=LAMBDA(42)()", &cm, &vs),
-            Value::Number(42.0)
-        );
+        assert_eq!(eval_str("=LAMBDA(42)()", &cm, &vs), Value::Number(42.0));
     }
 
     /// Bad LAMBDA: < 2 args → WrongArgCount (just a body, no params is
@@ -30148,7 +30653,11 @@ mod tests {
     #[test]
     fn eval_map_binary_zip() {
         let (cm, vs) = make_test_env();
-        let v = eval_str("=MAP(SEQUENCE(3), SEQUENCE(3), LAMBDA(a, b, a+b))", &cm, &vs);
+        let v = eval_str(
+            "=MAP(SEQUENCE(3), SEQUENCE(3), LAMBDA(a, b, a+b))",
+            &cm,
+            &vs,
+        );
         match v {
             Value::Array(arr) => {
                 assert_eq!(arr.shape(), (3, 1));
@@ -30179,7 +30688,11 @@ mod tests {
         let (cm, vs) = make_test_env();
         // SEQUENCE(3) is 3×1; SEQUENCE(5) is 5×1.
         assert_eq!(
-            eval_str("=MAP(SEQUENCE(3), SEQUENCE(5), LAMBDA(a, b, a+b))", &cm, &vs),
+            eval_str(
+                "=MAP(SEQUENCE(3), SEQUENCE(5), LAMBDA(a, b, a+b))",
+                &cm,
+                &vs
+            ),
             Value::Error(ValueError::WrongType)
         );
     }
@@ -30219,6 +30732,81 @@ mod tests {
                 }
             }
             _ => panic!("expected Array, got {:?}", v),
+        }
+    }
+
+    #[test]
+    fn eval_higher_order_array_callbacks_keep_scalar_errors() {
+        let (cm, vs) = make_test_env();
+
+        let mapped = eval_str("=MAP({1,-1}, LAMBDA(x, SQRT(x)))", &cm, &vs);
+        match mapped {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Error(ValueError::Overflow)));
+            }
+            _ => panic!("expected Array, got {:?}", mapped),
+        }
+
+        let scanned = eval_str("=SCAN(0, {1,-1}, LAMBDA(acc, x, SQRT(x)))", &cm, &vs);
+        match scanned {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Number(1.0)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Error(ValueError::Overflow)));
+            }
+            _ => panic!("expected Array, got {:?}", scanned),
+        }
+
+        let byrow = eval_str("=BYROW({-1;4}, LAMBDA(r, SQRT(SUM(r))))", &cm, &vs);
+        match byrow {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 1));
+                assert_eq!(arr.get(0, 0), Some(&Value::Error(ValueError::Overflow)));
+                assert_eq!(arr.get(1, 0), Some(&Value::Number(2.0)));
+            }
+            _ => panic!("expected Array, got {:?}", byrow),
+        }
+
+        let bycol = eval_str("=BYCOL({-1,4}, LAMBDA(c, SQRT(SUM(c))))", &cm, &vs);
+        match bycol {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Error(ValueError::Overflow)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(2.0)));
+            }
+            _ => panic!("expected Array, got {:?}", bycol),
+        }
+
+        let made = eval_str("=MAKEARRAY(1,2,LAMBDA(r,c,SQRT(c-2)))", &cm, &vs);
+        match made {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Error(ValueError::Overflow)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Number(0.0)));
+            }
+            _ => panic!("expected Array, got {:?}", made),
+        }
+    }
+
+    #[test]
+    fn eval_higher_order_array_callbacks_reject_nested_arrays() {
+        let (cm, vs) = make_test_env();
+        for formula in [
+            "=MAP({1,2}, LAMBDA(x, SEQUENCE(1,2)))",
+            "=SCAN(0,{1,2},LAMBDA(acc,x,SEQUENCE(1,2)))",
+            "=BYROW({1;2}, LAMBDA(r, SEQUENCE(1,2)))",
+            "=BYCOL({1,2}, LAMBDA(c, SEQUENCE(2,1)))",
+            "=MAKEARRAY(1,1,LAMBDA(r,c,SEQUENCE(1,2)))",
+            "=MAP({1}, LAMBDA(x, LAMBDA(y,y)))",
+            "=MAKEARRAY(1,1,LAMBDA(r,c,LAMBDA(x,x)))",
+        ] {
+            assert_eq!(
+                eval_str(formula, &cm, &vs),
+                Value::Error(ValueError::Calc),
+                "{formula}"
+            );
         }
     }
 
@@ -30297,11 +30885,7 @@ mod tests {
     #[test]
     fn eval_lambda_named_via_let_then_mapped() {
         let (cm, vs) = make_test_env();
-        let v = eval_str(
-            "=LET(sq, LAMBDA(x, x*x), MAP(SEQUENCE(4), sq))",
-            &cm,
-            &vs,
-        );
+        let v = eval_str("=LET(sq, LAMBDA(x, x*x), MAP(SEQUENCE(4), sq))", &cm, &vs);
         match v {
             Value::Array(arr) => {
                 assert_eq!(arr.shape(), (4, 1));
@@ -30357,8 +30941,7 @@ mod tests {
         // Within B=1: prefer C=10 → row 1 first, then row 0.
         // Within B=2: prefer C=10 → row 3 first, then row 2.
         // Expected order: x, w, z, y.
-        let (r, c, data) =
-            unwrap_array(eval_str("=SORTBY(A1:A4, B1:B4, 1, C1:C4, 1)", &cm, &vs));
+        let (r, c, data) = unwrap_array(eval_str("=SORTBY(A1:A4, B1:B4, 1, C1:C4, 1)", &cm, &vs));
         assert_eq!((r, c), (4, 1));
         assert_eq!(
             data,
@@ -30525,11 +31108,11 @@ mod tests {
     }
 
     #[test]
-    fn eval_take_zero_rows_invalid() {
+    fn eval_take_zero_rows_calc() {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=TAKE(SEQUENCE(3), 0)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::Calc)
         );
     }
 
@@ -30585,11 +31168,32 @@ mod tests {
     }
 
     #[test]
-    fn eval_drop_all_rows_invalid() {
+    fn eval_drop_all_rows_calc() {
         let (cm, vs) = make_test_env();
-        // Dropping all rows → empty → InvalidValue.
+        // Dropping all rows → empty → #CALC!.
         assert_eq!(
             eval_str("=DROP(SEQUENCE(3), 99)", &cm, &vs),
+            Value::Error(ValueError::Calc)
+        );
+    }
+
+    #[test]
+    fn eval_dynamic_array_cap_blocks_large_materialization() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=VSTACK(SEQUENCE(1024,1024),0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=HSTACK(SEQUENCE(1024,1024),0)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=TOROW(A1:B1048576)", &cm, &vs),
+            Value::Error(ValueError::InvalidValue)
+        );
+        assert_eq!(
+            eval_str("=A1:B1048576+1", &cm, &vs),
             Value::Error(ValueError::InvalidValue)
         );
     }
@@ -30598,8 +31202,11 @@ mod tests {
     fn eval_vstack_equal_shapes() {
         let (cm, vs) = make_test_env();
         // VSTACK(SEQUENCE(2), SEQUENCE(2, 1, 10)) → 4×1.
-        let (r, c, data) =
-            unwrap_array(eval_str("=VSTACK(SEQUENCE(2), SEQUENCE(2, 1, 10))", &cm, &vs));
+        let (r, c, data) = unwrap_array(eval_str(
+            "=VSTACK(SEQUENCE(2), SEQUENCE(2, 1, 10))",
+            &cm,
+            &vs,
+        ));
         assert_eq!((r, c), (4, 1));
         assert_eq!(
             data,
@@ -30617,7 +31224,7 @@ mod tests {
         let (cm, vs) = make_test_env();
         // VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99)) → result cols = 3.
         // First block fills row 0: [1, 2, 3].
-        // Second block's row 0 has only 1 col [99]; pad cols 1, 2 with #VALUE!.
+        // Second block's row 0 has only 1 col [99]; pad cols 1, 2 with #N/A.
         let (r, c, data) = unwrap_array(eval_str(
             "=VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99))",
             &cm,
@@ -30631,8 +31238,8 @@ mod tests {
                 Value::Number(2.0),
                 Value::Number(3.0),
                 Value::Number(99.0),
-                Value::Error(ValueError::InvalidValue),
-                Value::Error(ValueError::InvalidValue),
+                Value::Error(ValueError::NotAvailable),
+                Value::Error(ValueError::NotAvailable),
             ]
         );
     }
@@ -30671,7 +31278,7 @@ mod tests {
     fn eval_hstack_unequal_rows_pads_with_error() {
         let (cm, vs) = make_test_env();
         // HSTACK(SEQUENCE(3,1), SEQUENCE(1,1,99)) → result rows = 3, cols = 2.
-        // Row 0: [1, 99]. Row 1: [2, #VALUE!]. Row 2: [3, #VALUE!].
+        // Row 0: [1, 99]. Row 1: [2, #N/A]. Row 2: [3, #N/A].
         let (r, c, data) = unwrap_array(eval_str(
             "=HSTACK(SEQUENCE(3, 1), SEQUENCE(1, 1, 99))",
             &cm,
@@ -30684,9 +31291,9 @@ mod tests {
                 Value::Number(1.0),
                 Value::Number(99.0),
                 Value::Number(2.0),
-                Value::Error(ValueError::InvalidValue),
+                Value::Error(ValueError::NotAvailable),
                 Value::Number(3.0),
-                Value::Error(ValueError::InvalidValue),
+                Value::Error(ValueError::NotAvailable),
             ]
         );
     }
@@ -30778,8 +31385,7 @@ mod tests {
     fn eval_choosecols_negative_indices() {
         let (cm, vs) = make_test_env();
         // -1 = last col. SEQUENCE(2,3) → CHOOSECOLS(-1, -2) → last & second-to-last.
-        let (r, c, data) =
-            unwrap_array(eval_str("=CHOOSECOLS(SEQUENCE(2, 3), -1, -2)", &cm, &vs));
+        let (r, c, data) = unwrap_array(eval_str("=CHOOSECOLS(SEQUENCE(2, 3), -1, -2)", &cm, &vs));
         assert_eq!((r, c), (2, 2));
         assert_eq!(
             data,
@@ -30824,8 +31430,7 @@ mod tests {
     fn eval_torow_by_column() {
         let (cm, vs) = make_test_env();
         // Same array, scan_by_column=TRUE → 1,4,2,5,3,6.
-        let (r, c, data) =
-            unwrap_array(eval_str("=TOROW(SEQUENCE(2, 3), 0, TRUE)", &cm, &vs));
+        let (r, c, data) = unwrap_array(eval_str("=TOROW(SEQUENCE(2, 3), 0, TRUE)", &cm, &vs));
         assert_eq!((r, c), (1, 6));
         assert_eq!(
             data,
@@ -30873,6 +31478,14 @@ mod tests {
                 Value::Error(ValueError::DivisionByZero),
                 Value::Number(4.0),
             ]
+        );
+        assert_eq!(
+            eval_str("=TOROW(B1:C1, 3)", &cm, &vs),
+            Value::Error(ValueError::Calc)
+        );
+        assert_eq!(
+            eval_str("=TOCOL(B1:C1, 3)", &cm, &vs),
+            Value::Error(ValueError::Calc)
         );
     }
 
@@ -30967,14 +31580,8 @@ mod tests {
 
     #[test]
     fn eval_norm_inv_p_out_of_range() {
-        assert_eq!(
-            ev("=NORM.INV(0, 0, 1)"),
-            Value::Error(ValueError::Overflow)
-        );
-        assert_eq!(
-            ev("=NORM.INV(1, 0, 1)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=NORM.INV(0, 0, 1)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=NORM.INV(1, 0, 1)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -30994,10 +31601,7 @@ mod tests {
 
     #[test]
     fn eval_norm_s_inv_wrong_arg_count() {
-        assert_eq!(
-            ev("=NORM.S.INV()"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=NORM.S.INV()"), Value::Error(ValueError::WrongArgCount));
     }
 
     #[test]
@@ -31027,10 +31631,7 @@ mod tests {
 
     #[test]
     fn eval_t_dist_rt_negative_x_is_error() {
-        assert_eq!(
-            ev("=T.DIST.RT(-1, 10)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=T.DIST.RT(-1, 10)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31136,10 +31737,7 @@ mod tests {
 
     #[test]
     fn eval_chisq_inv_df_zero_is_error() {
-        assert_eq!(
-            ev("=CHISQ.INV(0.5, 0)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=CHISQ.INV(0.5, 0)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31407,10 +32005,7 @@ mod tests {
 
     #[test]
     fn eval_kurt_too_few_args_is_error() {
-        assert_eq!(
-            ev("=KURT(1, 2, 3)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=KURT(1, 2, 3)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31426,10 +32021,7 @@ mod tests {
 
     #[test]
     fn eval_skew_too_few_args_is_error() {
-        assert_eq!(
-            ev("=SKEW(1, 2)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=SKEW(1, 2)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31457,18 +32049,12 @@ mod tests {
 
     #[test]
     fn eval_geomean_negative_is_error() {
-        assert_eq!(
-            ev("=GEOMEAN(1, -1, 2)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=GEOMEAN(1, -1, 2)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn eval_geomean_zero_is_error() {
-        assert_eq!(
-            ev("=GEOMEAN(1, 0, 2)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=GEOMEAN(1, 0, 2)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31479,10 +32065,7 @@ mod tests {
 
     #[test]
     fn eval_harmean_negative_is_error() {
-        assert_eq!(
-            ev("=HARMEAN(1, -1, 2)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=HARMEAN(1, -1, 2)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -31911,7 +32494,10 @@ mod tests {
             )],
         );
         assert_eq!(v, Value::Error(ValueError::DivisionByZero));
-        assert!(!invoked.get(), "custom callback must not run when an arg errors");
+        assert!(
+            !invoked.get(),
+            "custom callback must not run when an arg errors"
+        );
     }
 
     /// Defined-name LAMBDA wins over a custom registration sharing the
@@ -31985,7 +32571,10 @@ mod tests {
             ))),
         );
         let mut customs: HashMap<String, CustomFn> = HashMap::new();
-        customs.insert("MYFN".to_string(), Box::new(|_| Value::Text("from custom".into())));
+        customs.insert(
+            "MYFN".to_string(),
+            Box::new(|_| Value::Text("from custom".into())),
+        );
         let provider = CustomFormulaProvider { names, customs };
         // `=MYFN()` is the call form → goes through the custom registry.
         let call_v = eval_expr_with_provider(&call_expr, &provider);
@@ -32049,7 +32638,9 @@ mod tests {
                 Value::Error(ValueError::InvalidRef)
             }
             fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
-                self.customs.get(&name.to_ascii_uppercase()).map(|f| f(args))
+                self.customs
+                    .get(&name.to_ascii_uppercase())
+                    .map(|f| f(args))
             }
         }
 
@@ -32136,35 +32727,18 @@ mod tests {
         }
     }
 
-    /// An error inside the literal propagates as the literal's value —
-    /// `={1/0, 2}` surfaces #DIV/0!.
+    /// Error literals inside the array stay as per-cell error values.
     #[test]
-    fn eval_array_literal_error_propagates() {
+    fn eval_array_literal_error_cell_is_preserved() {
         let (cm, vs) = make_test_env();
-        // `1/0` is a binop — but our parser rejects binops inside the
-        // literal. To exercise error propagation we use a divisor cell
-        // (C1=0 in make_test_env) outside the literal, then a
-        // synthesized literal pulls just the result back via SUM:
-        // here we instead use ArrayLit directly with a synthetic Error
-        // element via constructing the AST manually.
-        let arr_expr = Expr::ArrayLit {
-            rows: 1,
-            cols: 2,
-            data: vec![
-                // Number that the parser would have produced — replaced
-                // here by a sub-expression that evaluates to #DIV/0!.
-                Expr::BinOp {
-                    op: BinOperator::Div,
-                    left: Box::new(Expr::Number(1.0)),
-                    right: Box::new(Expr::Number(0.0)),
-                },
-                Expr::Number(2.0),
-            ],
-        };
-        let get =
-            |id: AtomId| -> Value { vs.get(&id).cloned().unwrap_or(Value::Null) };
-        let result = eval_expr(&arr_expr, &get, &cm);
-        assert_eq!(result, Value::Error(ValueError::DivisionByZero));
+        match eval_str("={#N/A,#CALC!}", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Error(ValueError::NotAvailable)));
+                assert_eq!(arr.get(0, 1), Some(&Value::Error(ValueError::Calc)));
+            }
+            other => panic!("expected Value::Array, got {:?}", other),
+        }
     }
     fn make_xirr_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
         // Cash flows: -100 on Jan 1 2020, +50 on Jun 1 2020, +70 on Dec 31 2020.
@@ -32608,7 +33182,8 @@ mod tests {
         // basis=0 (US 30/360): yearfrac = 0.5, so accrued = 1000 * 0.1 * 0.5 = 50.
         match eval_str(
             "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,2)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!(approx(n, 50.0, 1e-2), "ACCRINT got {}", n),
             other => panic!("ACCRINT: {:?}", other),
@@ -32620,7 +33195,8 @@ mod tests {
         // basis=3 (actual/365): 182 days / 365 * 1000 * 0.1 ≈ 49.863.
         match eval_str(
             "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,2,3)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!(approx(n, 49.863, 1e-2), "ACCRINT basis3 got {}", n),
             other => panic!("ACCRINT basis3: {:?}", other),
@@ -32641,7 +33217,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=ACCRINT(DATE(2020,1,1),DATE(2020,7,1),DATE(2020,7,1),0.1,1000,3)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -32652,7 +33229,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=ACCRINT(DATE(2020,7,1),DATE(2020,1,1),DATE(2020,1,1),0.1,1000,2)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -32662,7 +33240,11 @@ mod tests {
         let (cm, vs) = make_test_env();
         // ACCRINTM(DATE(2020,1,1), DATE(2021,1,1), 0.1, 1000)
         // basis=0: yearfrac = 1.0 → 100.
-        match eval_str("=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),0.1,1000)", &cm, &vs) {
+        match eval_str(
+            "=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),0.1,1000)",
+            &cm,
+            &vs,
+        ) {
             Value::Number(n) => assert!(approx(n, 100.0, 1e-2), "ACCRINTM got {}", n),
             other => panic!("ACCRINTM: {:?}", other),
         }
@@ -32679,10 +33261,7 @@ mod tests {
     fn eval_accrintm_type_error() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),B2,1000)",
-                &cm, &vs
-            ),
+            eval_str("=ACCRINTM(DATE(2020,1,1),DATE(2021,1,1),B2,1000)", &cm, &vs),
             Value::Error(ValueError::WrongType)
         );
     }
@@ -32717,7 +33296,11 @@ mod tests {
         let (cm, vs) = make_test_env();
         // INTRATE(DATE(2020,1,1), DATE(2021,1,1), 1000, 1100) at basis 0:
         // (1100-1000)/1000/1 = 0.1.
-        match eval_str("=INTRATE(DATE(2020,1,1),DATE(2021,1,1),1000,1100)", &cm, &vs) {
+        match eval_str(
+            "=INTRATE(DATE(2020,1,1),DATE(2021,1,1),1000,1100)",
+            &cm,
+            &vs,
+        ) {
             Value::Number(n) => assert!(approx(n, 0.1, 1e-7), "INTRATE got {}", n),
             other => panic!("INTRATE: {:?}", other),
         }
@@ -32726,10 +33309,7 @@ mod tests {
     fn eval_intrate_type_error() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=INTRATE(DATE(2020,1,1),DATE(2021,1,1),B2,1100)",
-                &cm, &vs
-            ),
+            eval_str("=INTRATE(DATE(2020,1,1),DATE(2021,1,1),B2,1100)", &cm, &vs),
             Value::Error(ValueError::WrongType)
         );
     }
@@ -32740,7 +33320,8 @@ mod tests {
         // 1000 / (1 - 0.1 * 1) = 1000 / 0.9 ≈ 1111.11.
         match eval_str(
             "=RECEIVED(DATE(2020,1,1),DATE(2021,1,1),1000,0.1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!(approx(n, 1111.11, 1e-2), "RECEIVED got {}", n),
             other => panic!("RECEIVED: {:?}", other),
@@ -32753,7 +33334,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=RECEIVED(DATE(2020,1,1),DATE(2021,1,1),1000,1.5)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -32816,7 +33398,11 @@ mod tests {
         let (cm, vs) = make_test_env();
         // TBILLYIELD(DATE(2020,1,1), DATE(2020,7,1), 97.4722): days=182
         // (100 - 97.4722) / 97.4722 * 360 / 182 ≈ 0.05130.
-        match eval_str("=TBILLYIELD(DATE(2020,1,1),DATE(2020,7,1),97.4722)", &cm, &vs) {
+        match eval_str(
+            "=TBILLYIELD(DATE(2020,1,1),DATE(2020,7,1),97.4722)",
+            &cm,
+            &vs,
+        ) {
             Value::Number(n) => assert!(approx(n, 0.05130, 1e-4), "TBILLYIELD got {}", n),
             other => panic!("TBILLYIELD: {:?}", other),
         }
@@ -32986,21 +33572,12 @@ mod tests {
     }
     #[test]
     fn eval_unichar_arg_count() {
-        assert_eq!(
-            ev("=UNICHAR()"),
-            Value::Error(ValueError::WrongArgCount)
-        );
-        assert_eq!(
-            ev("=UNICHAR(1,2)"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=UNICHAR()"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(ev("=UNICHAR(1,2)"), Value::Error(ValueError::WrongArgCount));
     }
     #[test]
     fn eval_unichar_type_error() {
-        assert_eq!(
-            ev("=UNICHAR(\"abc\")"),
-            Value::Error(ValueError::WrongType)
-        );
+        assert_eq!(ev("=UNICHAR(\"abc\")"), Value::Error(ValueError::WrongType));
     }
     #[test]
     fn eval_unicode_happy() {
@@ -33010,17 +33587,11 @@ mod tests {
     }
     #[test]
     fn eval_unicode_empty_is_error() {
-        assert_eq!(
-            ev("=UNICODE(\"\")"),
-            Value::Error(ValueError::InvalidValue)
-        );
+        assert_eq!(ev("=UNICODE(\"\")"), Value::Error(ValueError::InvalidValue));
     }
     #[test]
     fn eval_unicode_arg_count() {
-        assert_eq!(
-            ev("=UNICODE()"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=UNICODE()"), Value::Error(ValueError::WrongArgCount));
     }
     #[test]
     fn eval_numbervalue_default_seps() {
@@ -33117,10 +33688,7 @@ mod tests {
     }
     #[test]
     fn eval_arraytotext_scalar_strict_braced() {
-        assert_eq!(
-            ev("=ARRAYTOTEXT(\"x\", 1)"),
-            Value::Text("{\"x\"}".into())
-        );
+        assert_eq!(ev("=ARRAYTOTEXT(\"x\", 1)"), Value::Text("{\"x\"}".into()));
     }
     #[test]
     fn eval_arraytotext_arg_count() {
@@ -33255,10 +33823,7 @@ mod tests {
     }
     #[test]
     fn eval_isformula_arg_count() {
-        assert_eq!(
-            ev("=ISFORMULA()"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=ISFORMULA()"), Value::Error(ValueError::WrongArgCount));
         assert_eq!(
             ev("=ISFORMULA(A1,B1)"),
             Value::Error(ValueError::WrongArgCount)
@@ -33334,8 +33899,8 @@ mod tests {
             Value::Text(s) => s,
             other => panic!("expected complex Text, got {:?}", other),
         };
-        let (r, i, _) = parse_complex(&s)
-            .unwrap_or_else(|_| panic!("could not parse result {:?}", s));
+        let (r, i, _) =
+            parse_complex(&s).unwrap_or_else(|_| panic!("could not parse result {:?}", s));
         assert!(
             (r - exp_r).abs() < eps,
             "real mismatch: got {} expected {} (full: {:?})",
@@ -33407,14 +33972,8 @@ mod tests {
             eval_str("=COMPLEX(3,4,\"j\")", &cm, &vs),
             Value::Text("3+4j".into())
         );
-        assert_eq!(
-            eval_str("=COMPLEX(3,0)", &cm, &vs),
-            Value::Text("3".into())
-        );
-        assert_eq!(
-            eval_str("=COMPLEX(0,1)", &cm, &vs),
-            Value::Text("i".into())
-        );
+        assert_eq!(eval_str("=COMPLEX(3,0)", &cm, &vs), Value::Text("3".into()));
+        assert_eq!(eval_str("=COMPLEX(0,1)", &cm, &vs), Value::Text("i".into()));
         // Bad suffix → #VALUE!.
         assert_eq!(
             eval_str("=COMPLEX(3,4,\"k\")", &cm, &vs),
@@ -33450,10 +34009,16 @@ mod tests {
     fn eval_imreal_imag_accessors() {
         let (cm, vs) = make_test_env();
         assert_eq!(eval_str("=IMREAL(\"3+4i\")", &cm, &vs), Value::Number(3.0));
-        assert_eq!(eval_str("=IMAGINARY(\"3+4i\")", &cm, &vs), Value::Number(4.0));
+        assert_eq!(
+            eval_str("=IMAGINARY(\"3+4i\")", &cm, &vs),
+            Value::Number(4.0)
+        );
         // Pure imaginary, no coefficient.
         assert_eq!(eval_str("=IMREAL(\"-i\")", &cm, &vs), Value::Number(0.0));
-        assert_eq!(eval_str("=IMAGINARY(\"-i\")", &cm, &vs), Value::Number(-1.0));
+        assert_eq!(
+            eval_str("=IMAGINARY(\"-i\")", &cm, &vs),
+            Value::Number(-1.0)
+        );
     }
     #[test]
     fn eval_imconjugate() {
@@ -33579,19 +34144,9 @@ mod tests {
         let formula = format!("=IMLN(\"{}\")", e);
         assert_complex_near(eval_str(&formula, &cm, &vs), 1.0, 0.0, 1e-12);
         // log10(100) = 2
-        assert_complex_near(
-            eval_str("=IMLOG10(\"100\")", &cm, &vs),
-            2.0,
-            0.0,
-            1e-12,
-        );
+        assert_complex_near(eval_str("=IMLOG10(\"100\")", &cm, &vs), 2.0, 0.0, 1e-12);
         // log2(8) = 3
-        assert_complex_near(
-            eval_str("=IMLOG2(\"8\")", &cm, &vs),
-            3.0,
-            0.0,
-            1e-12,
-        );
+        assert_complex_near(eval_str("=IMLOG2(\"8\")", &cm, &vs), 3.0, 0.0, 1e-12);
         // ln(0) is #NUM!
         assert_eq!(
             eval_str("=IMLN(\"0\")", &cm, &vs),
@@ -33607,12 +34162,7 @@ mod tests {
             Value::Text("2".into())
         );
         // sqrt(-1) = i (pure imaginary)
-        assert_complex_near(
-            eval_str("=IMSQRT(\"-1\")", &cm, &vs),
-            0.0,
-            1.0,
-            1e-12,
-        );
+        assert_complex_near(eval_str("=IMSQRT(\"-1\")", &cm, &vs), 0.0, 1.0, 1e-12);
         // sqrt(0) = 0
         assert_eq!(
             eval_str("=IMSQRT(\"0\")", &cm, &vs),
@@ -33623,19 +34173,9 @@ mod tests {
     fn eval_impower_de_moivre() {
         let (cm, vs) = make_test_env();
         // (1+i)^2 = 2i
-        assert_complex_near(
-            eval_str("=IMPOWER(\"1+i\",2)", &cm, &vs),
-            0.0,
-            2.0,
-            1e-12,
-        );
+        assert_complex_near(eval_str("=IMPOWER(\"1+i\",2)", &cm, &vs), 0.0, 2.0, 1e-12);
         // i^4 = 1
-        assert_complex_near(
-            eval_str("=IMPOWER(\"i\",4)", &cm, &vs),
-            1.0,
-            0.0,
-            1e-12,
-        );
+        assert_complex_near(eval_str("=IMPOWER(\"i\",4)", &cm, &vs), 1.0, 0.0, 1e-12);
         // 0^0 = 1 (matches POWER).
         assert_eq!(
             eval_str("=IMPOWER(\"0\",0)", &cm, &vs),
@@ -33703,7 +34243,8 @@ mod tests {
         // boundary A=0 and DSC=E.
         match eval_str(
             "=PRICE(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,100,2,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!((n - 100.0).abs() < 1e-2, "PRICE par got {}", n),
             other => panic!("PRICE par: {:?}", other),
@@ -33723,7 +34264,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICE(DATE(2020,1,1),DATE(2025,1,1),B2,0.05,100,2,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -33734,7 +34276,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICE(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,100,3,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -33745,7 +34288,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICE(DATE(2025,1,1),DATE(2020,1,1),0.05,0.05,100,2,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -33757,7 +34301,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICE(DATE(2020,1,1),DATE(2025,1,1),1/0,0.05,100,2,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::DivisionByZero)
         );
@@ -33788,7 +34333,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=YIELD(DATE(2020,1,1),DATE(2025,1,1),0.05,B2,100,2)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -33799,7 +34345,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=YIELD(DATE(2025,1,1),DATE(2020,1,1),0.05,100,100,2)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -33810,7 +34357,8 @@ mod tests {
         // 5-year semi-annual bond: Macaulay duration < life and > 0.
         match eval_str(
             "=DURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.05,2,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => {
                 assert!(n > 0.0 && n < 5.0, "DURATION out of range: {}", n);
@@ -33832,7 +34380,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=DURATION(DATE(2020,1,1),DATE(2025,1,1),B2,0.05,2)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -33845,11 +34394,13 @@ mod tests {
         match (
             eval_str(
                 "=DURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.06,2,0)",
-                &cm, &vs,
+                &cm,
+                &vs,
             ),
             eval_str(
                 "=MDURATION(DATE(2020,1,1),DATE(2025,1,1),0.05,0.06,2,0)",
-                &cm, &vs,
+                &cm,
+                &vs,
             ),
         ) {
             (Value::Number(d), Value::Number(m)) => {
@@ -33874,7 +34425,8 @@ mod tests {
         // discount 0.05, red 100 → 100*(1 - 0.025) = 97.5.
         match eval_str(
             "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),0.05,100,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!((n - 97.5).abs() < 1e-2, "PRICEDISC got {}", n),
             other => panic!("PRICEDISC: {:?}", other),
@@ -33892,10 +34444,7 @@ mod tests {
     fn eval_pricedisc_type_error() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),B2,100)",
-                &cm, &vs
-            ),
+            eval_str("=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),B2,100)", &cm, &vs),
             Value::Error(ValueError::WrongType)
         );
     }
@@ -33905,7 +34454,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICEDISC(DATE(2020,7,1),DATE(2020,1,1),0.05,100)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -33916,7 +34466,8 @@ mod tests {
         // YIELDDISC: (red - pr)/pr/yf. 97.5 -> 100 over 0.5y = 0.05128205...
         match eval_str(
             "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),97.5,100,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!(
                 (n - (100.0 - 97.5) / 97.5 / 0.5).abs() < 1e-7,
@@ -33938,10 +34489,7 @@ mod tests {
     fn eval_yielddisc_negative_price() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),-1,100)",
-                &cm, &vs
-            ),
+            eval_str("=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),-1,100)", &cm, &vs),
             Value::Error(ValueError::Overflow)
         );
     }
@@ -33954,9 +34502,14 @@ mod tests {
         //       = 110/1.05 - 5 ≈ 99.7619.
         match eval_str(
             "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,0.05,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
-            Value::Number(n) => assert!((n - (110.0 / 1.05 - 5.0)).abs() < 1e-2, "PRICEMAT got {}", n),
+            Value::Number(n) => assert!(
+                (n - (110.0 / 1.05 - 5.0)).abs() < 1e-2,
+                "PRICEMAT got {}",
+                n
+            ),
             other => panic!("PRICEMAT: {:?}", other),
         }
     }
@@ -33974,7 +34527,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),B2,0.05)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -33985,7 +34539,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=PRICEMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2020,6,1),0.05,0.05)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34016,7 +34571,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=YIELDMAT(DATE(2020,1,1),DATE(2021,1,1),DATE(2019,1,1),0.05,-1)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34092,10 +34648,7 @@ mod tests {
         let (cm, vs) = make_test_env();
         // Maturity 2020-07-01, frequency 2 → coupons on 01-Jan and 01-Jul.
         // Settlement 2020-04-01 → days since 01-Jan = 91 (actual days).
-        match eval_str(
-            "=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),2,1)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),2,1)", &cm, &vs) {
             Value::Number(n) => assert!(n >= 89.0 && n <= 92.0, "COUPDAYBS got {}", n),
             other => panic!("COUPDAYBS: {:?}", other),
         }
@@ -34112,10 +34665,7 @@ mod tests {
     fn eval_coupdaybs_invalid_frequency() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),3)",
-                &cm, &vs
-            ),
+            eval_str("=COUPDAYBS(DATE(2020,4,1),DATE(2025,1,1),3)", &cm, &vs),
             Value::Error(ValueError::Overflow)
         );
     }
@@ -34123,10 +34673,7 @@ mod tests {
     fn eval_coupdays_basis_0() {
         let (cm, vs) = make_test_env();
         // basis 0 → 360/freq. freq=2 → 180.
-        match eval_str(
-            "=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),2,0)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),2,0)", &cm, &vs) {
             Value::Number(n) => assert!((n - 180.0).abs() < 1e-9, "COUPDAYS basis0 got {}", n),
             other => panic!("COUPDAYS basis0: {:?}", other),
         }
@@ -34143,10 +34690,7 @@ mod tests {
     fn eval_coupdays_type_error() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),B2)",
-                &cm, &vs
-            ),
+            eval_str("=COUPDAYS(DATE(2020,4,1),DATE(2025,1,1),B2)", &cm, &vs),
             Value::Error(ValueError::WrongType)
         );
     }
@@ -34154,10 +34698,7 @@ mod tests {
     fn eval_coupnum_5_years_semiannual() {
         let (cm, vs) = make_test_env();
         // 5 years × 2 = 10 coupons remaining.
-        match eval_str(
-            "=COUPNUM(DATE(2020,1,1),DATE(2025,1,1),2,0)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPNUM(DATE(2020,1,1),DATE(2025,1,1),2,0)", &cm, &vs) {
             Value::Number(n) => assert!((n - 10.0).abs() < 1e-9, "COUPNUM got {}", n),
             other => panic!("COUPNUM: {:?}", other),
         }
@@ -34174,10 +34715,7 @@ mod tests {
     fn eval_coupnum_settlement_after_maturity() {
         let (cm, vs) = make_test_env();
         assert_eq!(
-            eval_str(
-                "=COUPNUM(DATE(2025,1,1),DATE(2020,1,1),2)",
-                &cm, &vs
-            ),
+            eval_str("=COUPNUM(DATE(2025,1,1),DATE(2020,1,1),2)", &cm, &vs),
             Value::Error(ValueError::Overflow)
         );
     }
@@ -34207,7 +34745,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15,1)",
-                &cm, &vs,
+                &cm,
+                &vs,
             ),
             Value::Number(776.0)
         );
@@ -34219,7 +34758,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,0.15,1)",
-                &cm, &vs,
+                &cm,
+                &vs,
             ),
             Value::Number(330.0)
         );
@@ -34253,7 +34793,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,20,0.15,1)",
-                &cm, &vs,
+                &cm,
+                &vs,
             ),
             Value::Number(0.0)
         );
@@ -34267,7 +34808,8 @@ mod tests {
         // basis 1, full year:
         match eval_str(
             "=AMORDEGRC(1000,DATE(2020,1,1),DATE(2021,1,1),0,0,0.25,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => {
                 // 1000 * 0.25 * 1.5 * (366/365) ≈ 376; allow ±2 for leap-year edge.
@@ -34282,7 +34824,8 @@ mod tests {
         let (cm, vs) = make_test_env();
         match eval_str(
             "=AMORDEGRC(1000,DATE(2020,1,1),DATE(2021,1,1),0,0,0.2,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => {
                 // 1000 * 0.2 * 2.0 * ≈1.0027 ≈ 401; ±2 for leap.
@@ -34297,7 +34840,8 @@ mod tests {
         let (cm, vs) = make_test_env();
         match eval_str(
             "=AMORDEGRC(1000,DATE(2020,1,1),DATE(2021,1,1),0,0,1/7,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => {
                 // 1000 * (1/7) * 2.5 * ≈1.0027 ≈ 358; ±2 for leap.
@@ -34312,7 +34856,8 @@ mod tests {
         let (cm, vs) = make_test_env();
         match eval_str(
             "=AMORDEGRC(1000,DATE(2020,1,1),DATE(2021,1,1),0,0,1/3,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => {
                 // 1000 * (1/3) * 1.0 * ≈1.0027 ≈ 334; ±2 for leap.
@@ -34328,7 +34873,8 @@ mod tests {
             eval_str(
                 // purchased = 2009-01-01 > first_period = 2008-12-31.
                 "=AMORDEGRC(2400,DATE(2009,1,1),DATE(2008,12,31),300,0,0.15,1)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34339,7 +34885,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34350,7 +34897,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,-0.1)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34362,14 +34910,16 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,1)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,1.5)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34380,14 +34930,16 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(0,DATE(2008,8,19),DATE(2008,12,31),0,0,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(-100,DATE(2008,8,19),DATE(2008,12,31),0,0,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34398,7 +34950,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),-1,0,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34409,7 +34962,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,-1,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34421,7 +34975,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,0.15,5)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::InvalidValue)
         );
@@ -34457,7 +35012,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(B2,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -34468,7 +35024,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(100,DATE(2008,8,19),DATE(2008,12,31),200,1,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34480,7 +35037,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORDEGRC(100,DATE(2008,8,19),DATE(2008,12,31),100,1,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34504,7 +35062,8 @@ mod tests {
         }
         let last = match eval_str(
             "=AMORDEGRC(2400,DATE(2008,8,19),DATE(2008,12,31),300,7,0.15,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => n,
             other => panic!("period 7: {:?}", other),
@@ -34526,7 +35085,8 @@ mod tests {
         // depreciation should be cost*rate*frac.
         match eval_str(
             "=AMORLINC(2400,DATE(2008,8,19),DATE(2008,12,31),300,0,0.15,1)",
-            &cm, &vs,
+            &cm,
+            &vs,
         ) {
             Value::Number(n) => assert!(n > 0.0 && n < 2400.0, "AMORLINC got {}", n),
             other => panic!("AMORLINC: {:?}", other),
@@ -34546,7 +35106,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORLINC(B2,DATE(2008,8,19),DATE(2008,12,31),300,1,0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::WrongType)
         );
@@ -34557,7 +35118,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=AMORLINC(2400,DATE(2008,8,19),DATE(2008,12,31),300,1,-0.15)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -34635,7 +35197,11 @@ mod tests {
         // 10+1, 20+2, 30+3
         assert_eq!(
             data,
-            vec![Value::Number(11.0), Value::Number(22.0), Value::Number(33.0)]
+            vec![
+                Value::Number(11.0),
+                Value::Number(22.0),
+                Value::Number(33.0)
+            ]
         );
     }
 
@@ -34669,10 +35235,42 @@ mod tests {
                 assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
                 assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
                 // Padded slot.
-                assert_eq!(arr.get(0, 2), Some(&Value::Error(ValueError::InvalidValue)));
+                assert_eq!(arr.get(0, 2), Some(&Value::Error(ValueError::NotAvailable)));
                 assert_eq!(arr.get(1, 0), Some(&Value::Text("c".into())));
                 assert_eq!(arr.get(1, 1), Some(&Value::Text("d".into())));
                 assert_eq!(arr.get(1, 2), Some(&Value::Text("e".into())));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_textsplit_pad_error_literal_is_cell_value() {
+        let (cm, vs) = make_test_env();
+        match eval_str(
+            "=TEXTSPLIT(\"a,b;c\", \",\", \";\", FALSE, 0, #N/A)",
+            &cm,
+            &vs,
+        ) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (2, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
+                assert_eq!(arr.get(1, 0), Some(&Value::Text("c".into())));
+                assert_eq!(arr.get(1, 1), Some(&Value::Error(ValueError::NotAvailable)));
+            }
+            other => panic!("expected array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn eval_textsplit_unused_pad_error_is_not_evaluated() {
+        let (cm, vs) = make_test_env();
+        match eval_str("=TEXTSPLIT(\"a,b\", \",\", \";\", FALSE, 0, 1/0)", &cm, &vs) {
+            Value::Array(arr) => {
+                assert_eq!(arr.shape(), (1, 2));
+                assert_eq!(arr.get(0, 0), Some(&Value::Text("a".into())));
+                assert_eq!(arr.get(0, 1), Some(&Value::Text("b".into())));
             }
             other => panic!("expected array, got {:?}", other),
         }
@@ -34797,7 +35395,11 @@ mod tests {
         assert_eq!((rows, cols), (3, 1));
         assert_eq!(
             data,
-            vec![Value::Number(11.0), Value::Number(21.0), Value::Number(31.0)]
+            vec![
+                Value::Number(11.0),
+                Value::Number(21.0),
+                Value::Number(31.0)
+            ]
         );
     }
 
@@ -34815,9 +35417,7 @@ mod tests {
         // row 0: 10*10, 10*1, 10*7 = 100, 10, 70
         // row 1: 20*10, 20*1, 20*7 = 200, 20, 140
         // row 2: 30*10, 30*1, 30*7 = 300, 30, 210
-        let expected = [
-            100.0, 10.0, 70.0, 200.0, 20.0, 140.0, 300.0, 30.0, 210.0,
-        ];
+        let expected = [100.0, 10.0, 70.0, 200.0, 20.0, 140.0, 300.0, 30.0, 210.0];
         for (i, want) in expected.iter().enumerate() {
             assert_eq!(data[i], Value::Number(*want));
         }
@@ -34833,7 +35433,11 @@ mod tests {
         // 10*2, 20*3, 30*4
         assert_eq!(
             data,
-            vec![Value::Number(20.0), Value::Number(60.0), Value::Number(120.0)]
+            vec![
+                Value::Number(20.0),
+                Value::Number(60.0),
+                Value::Number(120.0)
+            ]
         );
     }
 
@@ -34875,18 +35479,35 @@ mod tests {
         );
     }
 
-    /// Not-found surfaces `#N/A` (≈ InvalidValue) when no `if_not_found`
-    /// arg is supplied, and the custom value when one is.
+    /// Not-found surfaces `#N/A` when no `if_not_found` arg is supplied,
+    /// and the custom value when one is.
     #[test]
     fn eval_textbefore_not_found_default_and_custom() {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=TEXTBEFORE(\"abc\", \"-\")", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         );
         assert_eq!(
             eval_str("=TEXTBEFORE(\"abc\", \"-\", 1, 0, 0, \"miss\")", &cm, &vs),
             Value::Text("miss".into())
+        );
+    }
+
+    #[test]
+    fn eval_textbefore_after_lazy_error_fallback() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"a-b\", \"-\", 1, 0, 0, #N/A)", &cm, &vs),
+            Value::Text("a".into())
+        );
+        assert_eq!(
+            eval_str("=TEXTAFTER(\"a-b\", \"-\", 1, 0, 0, 1/0)", &cm, &vs),
+            Value::Text("b".into())
+        );
+        assert_eq!(
+            eval_str("=TEXTBEFORE(\"ab\", \"-\", 1, 0, 0, #N/A)", &cm, &vs),
+            Value::Error(ValueError::NotAvailable)
         );
     }
 
@@ -34901,7 +35522,7 @@ mod tests {
         // Without insensitive mode, no match.
         assert_eq!(
             eval_str("=TEXTBEFORE(\"axb\", \"X\")", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         );
     }
 
@@ -35002,7 +35623,7 @@ mod tests {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=LOOKUP(0, {1,2,3}, {\"a\",\"b\",\"c\"})", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         );
     }
 
@@ -35104,7 +35725,11 @@ mod tests {
     fn eval_hyperlink_with_friendly_name() {
         let (cm, vs) = make_link_env();
         assert_eq!(
-            eval_str("=HYPERLINK(\"https://example.com\", \"click me\")", &cm, &vs),
+            eval_str(
+                "=HYPERLINK(\"https://example.com\", \"click me\")",
+                &cm,
+                &vs
+            ),
             Value::Text("click me".into())
         );
     }
@@ -35294,9 +35919,7 @@ mod tests {
                 &cm,
                 &vs
             ),
-            Value::Text(
-                "<IMAGE: https://example.com/cat.jpg alt=\"a cat\">".into()
-            )
+            Value::Text("<IMAGE: https://example.com/cat.jpg alt=\"a cat\">".into())
         );
     }
 
@@ -35349,7 +35972,7 @@ mod tests {
 
     // === FORMULATEXT ===
 
-    /// FORMULATEXT on a primitive cell surfaces `#N/A` (InvalidValue) via
+    /// FORMULATEXT on a primitive cell surfaces `#N/A` via
     /// the AtomEvalProvider's default `cell_formula_text` returning None.
     /// (Sheet/Workbook round-trip is exercised in the integration tests.)
     #[test]
@@ -35357,7 +35980,7 @@ mod tests {
         let (cm, vs) = make_test_env();
         assert_eq!(
             eval_str("=FORMULATEXT(A1)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Error(ValueError::NotAvailable)
         );
     }
 
@@ -35366,9 +35989,7 @@ mod tests {
         let (cm, vs) = make_link_env();
         assert_eq!(
             eval_str("=IMAGE(\"u\", \"a\", 3, 120, 240)", &cm, &vs),
-            Value::Text(
-                "<IMAGE: u alt=\"a\" sizing=3 height=120 width=240>".into()
-            )
+            Value::Text("<IMAGE: u alt=\"a\" sizing=3 height=120 width=240>".into())
         );
     }
 
@@ -35419,13 +36040,54 @@ mod tests {
     }
 
     #[test]
-    fn eval_phonetic_stub_returns_invalid_value() {
+    fn eval_phonetic_returns_text_without_ruby_metadata() {
         let (cm, vs) = make_test_env();
-        // We don't carry ruby annotation data — PHONETIC stubs as
-        // #VALUE! until that sidecar exists.
+        // We don't carry ruby annotation data, so PHONETIC degrades to
+        // the source cell's text rendering.
         assert_eq!(
             eval_str("=PHONETIC(A1)", &cm, &vs),
-            Value::Error(ValueError::InvalidValue)
+            Value::Text("10".into())
+        );
+        assert_eq!(
+            eval_str("=PHONETIC(\"かな\")", &cm, &vs),
+            Value::Text("かな".into())
+        );
+        assert_eq!(
+            eval_str("=PHONETIC(D4)", &cm, &vs),
+            Value::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn eval_phonetic_range_uses_top_left() {
+        let (cm, vs) = make_test_env();
+        assert_eq!(
+            eval_str("=PHONETIC(A1:B1)", &cm, &vs),
+            Value::Text("10".into())
+        );
+    }
+
+    #[test]
+    fn eval_phonetic_range_ignores_non_top_left_error() {
+        let (cm, mut vs) = make_test_env();
+        let a1 = *cm.get(&CellAddress::new(0, 0)).unwrap();
+        let b1 = *cm.get(&CellAddress::new(0, 1)).unwrap();
+        vs.insert(a1, Value::Text("first".into()));
+        vs.insert(b1, Value::Error(ValueError::InvalidRef));
+        assert_eq!(
+            eval_str("=PHONETIC(A1:B1)", &cm, &vs),
+            Value::Text("first".into())
+        );
+    }
+
+    #[test]
+    fn eval_phonetic_range_propagates_top_left_error() {
+        let (cm, mut vs) = make_test_env();
+        let a1 = *cm.get(&CellAddress::new(0, 0)).unwrap();
+        vs.insert(a1, Value::Error(ValueError::InvalidRef));
+        assert_eq!(
+            eval_str("=PHONETIC(A1:B1)", &cm, &vs),
+            Value::Error(ValueError::InvalidRef)
         );
     }
 
@@ -35716,28 +36378,16 @@ mod tests {
         // n is truncated toward zero, so 1.9 -> 1.
         assert_approx_eq(ev("=BESSELJ(1, 1.9)"), 0.4400505857, BESSEL_TOL);
         // Negative n is `#NUM!`.
-        assert_eq!(
-            ev("=BESSELJ(1, -1)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=BESSELJ(1, -1)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn bessel_y_basic() {
         // Y is singular at x=0 for every n -> `#NUM!`.
-        assert_eq!(
-            ev("=BESSELY(0, 0)"),
-            Value::Error(ValueError::Overflow)
-        );
-        assert_eq!(
-            ev("=BESSELY(0, 3)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=BESSELY(0, 0)"), Value::Error(ValueError::Overflow));
+        assert_eq!(ev("=BESSELY(0, 3)"), Value::Error(ValueError::Overflow));
         // Y is undefined for x < 0 -> `#NUM!`.
-        assert_eq!(
-            ev("=BESSELY(-1, 0)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=BESSELY(-1, 0)"), Value::Error(ValueError::Overflow));
         // Reference: Y_0(1) ≈ 0.08825696, Y_1(1) ≈ -0.78121282.
         assert_approx_eq(ev("=BESSELY(1, 0)"), 0.0882569642, 1e-4);
         assert_approx_eq(ev("=BESSELY(1, 1)"), -0.7812128213, 1e-4);
@@ -35757,19 +36407,13 @@ mod tests {
         // I_3(2) ≈ 0.2127836 (Miller-downward range).
         assert_approx_eq(ev("=BESSELI(2, 3)"), 0.2127836, 1e-4);
         // Negative n -> `#NUM!`.
-        assert_eq!(
-            ev("=BESSELI(1, -1)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=BESSELI(1, -1)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn bessel_k_basic() {
         // Singular at x=0 -> `#NUM!`.
-        assert_eq!(
-            ev("=BESSELK(0, 0)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=BESSELK(0, 0)"), Value::Error(ValueError::Overflow));
         // K_0(1) ≈ 0.42102443, K_1(1) ≈ 0.60190723.
         assert_approx_eq(ev("=BESSELK(1, 0)"), 0.42102443, 1e-4);
         assert_approx_eq(ev("=BESSELK(1, 1)"), 0.60190723, 1e-4);
@@ -35977,7 +36621,8 @@ mod tests {
         // mid-period, yield == rate → price ≈ 100 + ~half-period accrued.
         let v = eval_str(
             "=ODDLPRICE(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,0.05,100,2,0)",
-            &cm, &vs,
+            &cm,
+            &vs,
         );
         match v {
             Value::Number(n) => assert!(n > 95.0 && n < 105.0, "ODDLPRICE got {}", n),
@@ -35998,7 +36643,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=ODDLPRICE(DATE(2024,1,1),DATE(2025,1,1),DATE(2024,7,1),0.05,0.05,100,2,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -36054,7 +36700,8 @@ mod tests {
         assert_eq!(
             eval_str(
                 "=ODDLYIELD(DATE(2024,7,1),DATE(2025,1,1),DATE(2024,1,1),0.05,0,100,2,0)",
-                &cm, &vs
+                &cm,
+                &vs
             ),
             Value::Error(ValueError::Overflow)
         );
@@ -36065,10 +36712,7 @@ mod tests {
     fn eval_coupncd_basic() {
         let (cm, vs) = make_test_env();
         // Settlement mid-period; NCD should be > settlement.
-        match eval_str(
-            "=COUPNCD(DATE(2024,4,1),DATE(2025,1,1),2,0)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPNCD(DATE(2024,4,1),DATE(2025,1,1),2,0)", &cm, &vs) {
             Value::Number(n) => {
                 let settle = eval_str("=DATE(2024,4,1)", &cm, &vs);
                 if let Value::Number(s) = settle {
@@ -36081,10 +36725,7 @@ mod tests {
     #[test]
     fn eval_couppcd_basic() {
         let (cm, vs) = make_test_env();
-        match eval_str(
-            "=COUPPCD(DATE(2024,4,1),DATE(2025,1,1),2,0)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPPCD(DATE(2024,4,1),DATE(2025,1,1),2,0)", &cm, &vs) {
             Value::Number(n) => {
                 let settle = eval_str("=DATE(2024,4,1)", &cm, &vs);
                 if let Value::Number(s) = settle {
@@ -36098,10 +36739,7 @@ mod tests {
     fn eval_coupdaysnc_basis_0() {
         let (cm, vs) = make_test_env();
         // Same setup as COUPDAYS / COUPDAYBS — DSC should be positive.
-        match eval_str(
-            "=COUPDAYSNC(DATE(2024,4,1),DATE(2025,1,1),2,0)",
-            &cm, &vs,
-        ) {
+        match eval_str("=COUPDAYSNC(DATE(2024,4,1),DATE(2025,1,1),2,0)", &cm, &vs) {
             Value::Number(n) => assert!(n > 0.0 && n <= 180.0, "COUPDAYSNC got {}", n),
             other => panic!("COUPDAYSNC: {:?}", other),
         }
@@ -36155,7 +36793,10 @@ mod tests {
                 break;
             }
         }
-        assert!(any_diff, "RAND produced identical values across 100 paired draws");
+        assert!(
+            any_diff,
+            "RAND produced identical values across 100 paired draws"
+        );
     }
 
     #[test]
@@ -36188,10 +36829,7 @@ mod tests {
     fn randbetween_single_point() {
         // low == high → always returns that value.
         let (cm, vs) = make_test_env();
-        assert_eq!(
-            eval_str("=RANDBETWEEN(7, 7)", &cm, &vs),
-            Value::Number(7.0)
-        );
+        assert_eq!(eval_str("=RANDBETWEEN(7, 7)", &cm, &vs), Value::Number(7.0));
         assert_eq!(
             eval_str("=RANDBETWEEN(-3, -3)", &cm, &vs),
             Value::Number(-3.0)
@@ -36215,11 +36853,17 @@ mod tests {
     }
     #[test]
     fn eval_pduration_zero_rate() {
-        assert_eq!(ev("=PDURATION(0,1000,2000)"), Value::Error(ValueError::Overflow));
+        assert_eq!(
+            ev("=PDURATION(0,1000,2000)"),
+            Value::Error(ValueError::Overflow)
+        );
     }
     #[test]
     fn eval_pduration_negative_pv() {
-        assert_eq!(ev("=PDURATION(0.05,-1000,2000)"), Value::Error(ValueError::Overflow));
+        assert_eq!(
+            ev("=PDURATION(0.05,-1000,2000)"),
+            Value::Error(ValueError::Overflow)
+        );
     }
 
     #[test]
@@ -36265,7 +36909,10 @@ mod tests {
     }
     #[test]
     fn eval_fvschedule_wrong_arg_count() {
-        assert_eq!(ev("=FVSCHEDULE(1000)"), Value::Error(ValueError::WrongArgCount));
+        assert_eq!(
+            ev("=FVSCHEDULE(1000)"),
+            Value::Error(ValueError::WrongArgCount)
+        );
     }
 
     // LENB / LEFTB / RIGHTB / MIDB / FINDB / SEARCHB / REPLACEB
@@ -36415,10 +37062,7 @@ mod tests {
 
     #[test]
     fn eval_legacy_chidist_df_zero_is_error() {
-        assert_eq!(
-            ev("=CHIDIST(3, 0)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=CHIDIST(3, 0)"), Value::Error(ValueError::Overflow));
     }
 
     // --- QUARTILE / QUARTILE.INC ---
@@ -36443,10 +37087,7 @@ mod tests {
 
     #[test]
     fn eval_legacy_chidist_negative_x_is_error() {
-        assert_eq!(
-            ev("=CHIDIST(-1, 5)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=CHIDIST(-1, 5)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -36870,10 +37511,7 @@ mod tests {
         // The empty-input path is hard to hit purely with literals; use a
         // single empty arg through Null coercion (literal "")=text counts
         // as 0, so check that path too.
-        assert_eq!(
-            eval_str(r#"=MAXA("")"#, &cm, &vs),
-            Value::Number(0.0)
-        );
+        assert_eq!(eval_str(r#"=MAXA("")"#, &cm, &vs), Value::Number(0.0));
     }
 
     // --- STDEVA / STDEVPA / VARA / VARPA ---
@@ -37212,18 +37850,12 @@ mod tests {
 
     #[test]
     fn eval_legacy_fdist_negative_x_is_error() {
-        assert_eq!(
-            ev("=FDIST(-1, 5, 10)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=FDIST(-1, 5, 10)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn eval_legacy_fdist_wrong_arg_count() {
-        assert_eq!(
-            ev("=FDIST(1, 5)"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=FDIST(1, 5)"), Value::Error(ValueError::WrongArgCount));
     }
 
     #[test]
@@ -37241,18 +37873,12 @@ mod tests {
 
     #[test]
     fn eval_legacy_finv_p_zero_is_error() {
-        assert_eq!(
-            ev("=FINV(0, 5, 10)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=FINV(0, 5, 10)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn eval_legacy_finv_invalid_df() {
-        assert_eq!(
-            ev("=FINV(0.5, 0, 10)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=FINV(0.5, 0, 10)"), Value::Error(ValueError::Overflow));
     }
 
     fn ftest_env() -> (HashMap<CellAddress, AtomId>, HashMap<AtomId, Value>) {
@@ -37329,10 +37955,7 @@ mod tests {
 
     #[test]
     fn eval_f_test_wrong_arg_count() {
-        assert_eq!(
-            ev("=F.TEST(1)"),
-            Value::Error(ValueError::WrongArgCount)
-        );
+        assert_eq!(ev("=F.TEST(1)"), Value::Error(ValueError::WrongArgCount));
     }
 
     // --- FREQUENCY ---
@@ -37346,11 +37969,7 @@ mod tests {
         assert_eq!((r, c), (3, 1));
         assert_eq!(
             data,
-            vec![
-                Value::Number(2.0),
-                Value::Number(2.0),
-                Value::Number(1.0)
-            ]
+            vec![Value::Number(2.0), Value::Number(2.0), Value::Number(1.0)]
         );
     }
 
@@ -37422,11 +38041,7 @@ mod tests {
     fn eval_legacy_hypgeomdist_pmf() {
         // 4-arg form (no cumulative); matches the cumulative=FALSE arm
         // of HYPGEOM.DIST.
-        assert_approx_eq(
-            ev("=HYPGEOMDIST(2, 5, 6, 20)"),
-            15.0 * 364.0 / 15504.0,
-            TOL,
-        );
+        assert_approx_eq(ev("=HYPGEOMDIST(2, 5, 6, 20)"), 15.0 * 364.0 / 15504.0, TOL);
     }
 
     #[test]
@@ -37450,7 +38065,10 @@ mod tests {
         // LOGNORM.DIST(e, 1, 0.5, TRUE) — median of lognormal(μ=1, σ=0.5)
         // is e^1 = e, so CDF at e is exactly 0.5.
         assert_approx_eq(
-            ev(&format!("=LOGNORM.DIST({}, 1, 0.5, TRUE)", std::f64::consts::E)),
+            ev(&format!(
+                "=LOGNORM.DIST({}, 1, 0.5, TRUE)",
+                std::f64::consts::E
+            )),
             0.5,
             TOL,
         );
@@ -37669,18 +38287,12 @@ mod tests {
 
     #[test]
     fn eval_legacy_tdist_negative_x_is_error() {
-        assert_eq!(
-            ev("=TDIST(-1, 10, 1)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=TDIST(-1, 10, 1)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
     fn eval_legacy_tdist_bad_tails_is_error() {
-        assert_eq!(
-            ev("=TDIST(1, 10, 3)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=TDIST(1, 10, 3)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -37808,7 +38420,11 @@ mod tests {
         use einfach_core::AtomId;
         let mut cm: HashMap<CellAddress, AtomId> = HashMap::new();
         let mut vs: HashMap<AtomId, Value> = HashMap::new();
-        let mk = |row: u32, col: u32, val: Value, cm: &mut HashMap<CellAddress, AtomId>, vs: &mut HashMap<AtomId, Value>| {
+        let mk = |row: u32,
+                  col: u32,
+                  val: Value,
+                  cm: &mut HashMap<CellAddress, AtomId>,
+                  vs: &mut HashMap<AtomId, Value>| {
             let id = AtomId::from_raw(row as u64 * 100 + col as u64);
             cm.insert(CellAddress::new(row, col), id);
             vs.insert(id, val);
@@ -38006,14 +38622,44 @@ mod tests {
     fn legacy_aliases_registered_as_builtins() {
         // Smoke test the alphabetised reserved-name list.
         for name in [
-            "BETADIST", "BETAINV", "BINOMDIST", "CHIDIST", "CHIINV",
-            "CHITEST", "CHISQ.TEST", "CONFIDENCE", "CONFIDENCE.NORM",
-            "COVAR", "COVAR.P", "COVARIANCE.P", "COVARIANCE.S",
-            "CRITBINOM", "EXPONDIST", "FDIST", "FINV", "F.TEST", "FTEST",
-            "GAMMADIST", "GAMMAINV", "HYPGEOMDIST", "LOGINV",
-            "LOGNORM.DIST", "LOGNORM.INV", "LOGNORMDIST", "NEGBINOMDIST",
-            "NORMDIST", "NORMINV", "NORMSDIST", "NORMSINV", "POISSON",
-            "TDIST", "TINV", "T.TEST", "TTEST", "WEIBULL", "Z.TEST",
+            "BETADIST",
+            "BETAINV",
+            "BINOMDIST",
+            "CHIDIST",
+            "CHIINV",
+            "CHITEST",
+            "CHISQ.TEST",
+            "CONFIDENCE",
+            "CONFIDENCE.NORM",
+            "COVAR",
+            "COVAR.P",
+            "COVARIANCE.P",
+            "COVARIANCE.S",
+            "CRITBINOM",
+            "EXPONDIST",
+            "FDIST",
+            "FINV",
+            "F.TEST",
+            "FTEST",
+            "GAMMADIST",
+            "GAMMAINV",
+            "HYPGEOMDIST",
+            "LOGINV",
+            "LOGNORM.DIST",
+            "LOGNORM.INV",
+            "LOGNORMDIST",
+            "NEGBINOMDIST",
+            "NORMDIST",
+            "NORMINV",
+            "NORMSDIST",
+            "NORMSINV",
+            "POISSON",
+            "TDIST",
+            "TINV",
+            "T.TEST",
+            "TTEST",
+            "WEIBULL",
+            "Z.TEST",
             "ZTEST",
         ] {
             assert!(
@@ -38117,8 +38763,15 @@ mod tests {
     }
 
     #[test]
-    fn na_returns_invalid_value_error() {
-        assert_eq!(ev("=NA()"), Value::Error(ValueError::InvalidValue));
+    fn na_returns_not_available_error() {
+        assert_eq!(ev("=NA()"), Value::Error(ValueError::NotAvailable));
+    }
+
+    #[test]
+    fn error_literals_evaluate_to_matching_errors() {
+        assert_eq!(ev("=#CALC!"), Value::Error(ValueError::Calc));
+        assert_eq!(ev("=#N/A"), Value::Error(ValueError::NotAvailable));
+        assert_eq!(ev("=#DIV/0!"), Value::Error(ValueError::DivisionByZero));
     }
 
     #[test]
@@ -38240,11 +38893,7 @@ mod tests {
     #[test]
     fn binom_dist_range_partial_sum() {
         // Σ_{k=0}^{3} C(10,k) 0.5^10 = (1+10+45+120)/1024 = 176/1024 ≈ 0.171875.
-        assert_num_close(
-            "=BINOM.DIST.RANGE(10, 0.5, 0, 3)",
-            176.0 / 1024.0,
-            1e-9,
-        );
+        assert_num_close("=BINOM.DIST.RANGE(10, 0.5, 0, 3)", 176.0 / 1024.0, 1e-9);
     }
 
     #[test]
@@ -38292,10 +38941,7 @@ mod tests {
 
     #[test]
     fn permut_k_too_large() {
-        assert_eq!(
-            ev("=PERMUT(3, 5)"),
-            Value::Error(ValueError::Overflow)
-        );
+        assert_eq!(ev("=PERMUT(3, 5)"), Value::Error(ValueError::Overflow));
     }
 
     #[test]
@@ -38441,11 +39087,38 @@ mod tests {
     // --- TRANSLATE ---
 
     #[test]
-    fn translate_returns_na() {
-        // No translator available — return #N/A.
+    fn translate_maps_codepoints() {
         assert_eq!(
-            ev("=TRANSLATE(\"hello\", \"en\", \"es\")"),
-            Value::Error(ValueError::InvalidValue)
+            ev("=TRANSLATE(\"hello\", \"el\", \"ip\")"),
+            Value::Text("hippo".into())
+        );
+        assert_eq!(
+            ev("=TRANSLATE(\"hello\", \"l\", \"L\")"),
+            Value::Text("heLLo".into())
+        );
+        assert_eq!(
+            ev("=TRANSLATE(\"hello world\", \"lo\", \"L\")"),
+            Value::Text("heLL wrLd".into())
+        );
+        assert_eq!(
+            ev("=TRANSLATE(\"a😀b\", \"😀\", \"Z\")"),
+            Value::Text("aZb".into())
+        );
+    }
+
+    #[test]
+    fn translate_deletes_unpaired_find_codepoints() {
+        assert_eq!(
+            ev("=TRANSLATE(\"abcde\", \"bd\", \"X\")"),
+            Value::Text("aXce".into())
+        );
+    }
+
+    #[test]
+    fn translate_first_find_mapping_wins() {
+        assert_eq!(
+            ev("=TRANSLATE(\"aaa\", \"aa\", \"xy\")"),
+            Value::Text("xxx".into())
         );
     }
 
@@ -38463,8 +39136,7 @@ mod tests {
 
     #[test]
     fn translate_propagates_error() {
-        // 1/0 inside an arg → error short-circuits before the stub
-        // result.
+        // 1/0 inside an arg → error short-circuits before translation.
         assert_eq!(
             ev("=TRANSLATE(\"x\", 1/0, \"en\")"),
             Value::Error(ValueError::DivisionByZero)
@@ -38476,10 +39148,23 @@ mod tests {
     #[test]
     fn t_batch_names_registered_as_builtins() {
         for name in [
-            "ACOTH", "TRUE", "FALSE", "NA", "ISREF", "STDEVP", "VARP",
-            "CONFIDENCE.T", "BINOM.DIST.RANGE", "PERMUT", "PERMUTATIONA",
-            "DAYS360", "ERF.PRECISE", "ERFC.PRECISE", "GAMMALN.PRECISE",
-            "CONCAT", "TRANSLATE",
+            "ACOTH",
+            "TRUE",
+            "FALSE",
+            "NA",
+            "ISREF",
+            "STDEVP",
+            "VARP",
+            "CONFIDENCE.T",
+            "BINOM.DIST.RANGE",
+            "PERMUT",
+            "PERMUTATIONA",
+            "DAYS360",
+            "ERF.PRECISE",
+            "ERFC.PRECISE",
+            "GAMMALN.PRECISE",
+            "CONCAT",
+            "TRANSLATE",
         ] {
             assert!(
                 is_builtin_function_name(name),

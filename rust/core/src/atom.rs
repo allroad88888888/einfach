@@ -12,7 +12,9 @@ impl AtomId {
 /// Error types that can occur in cell formulas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueError {
+    Null,           // #NULL!
     DivisionByZero, // #DIV/0!
+    NotAvailable,   // #N/A
     InvalidRef,     // #REF!
     InvalidValue,   // #VALUE!
     InvalidName,    // #NAME?
@@ -36,12 +38,18 @@ pub enum ValueError {
     /// Excel shows this as `#SPILL!`. The anchor cell holds this error and
     /// the would-be spill targets remain unchanged.
     Spill, // #SPILL!
+    /// Excel calculation-engine error for results that cannot be represented
+    /// in the current scalar/array context, such as a nested dynamic array
+    /// returned from a higher-order array callback.
+    Calc, // #CALC!
 }
 
 impl std::fmt::Display for ValueError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ValueError::Null => write!(f, "#NULL!"),
             ValueError::DivisionByZero => write!(f, "#DIV/0!"),
+            ValueError::NotAvailable => write!(f, "#N/A"),
             ValueError::InvalidRef => write!(f, "#REF!"),
             ValueError::InvalidValue => write!(f, "#VALUE!"),
             ValueError::InvalidName => write!(f, "#NAME?"),
@@ -50,6 +58,7 @@ impl std::fmt::Display for ValueError {
             ValueError::WrongType => write!(f, "#TYPE!"),
             ValueError::WrongArgCount => write!(f, "#ARGS!"),
             ValueError::Spill => write!(f, "#SPILL!"),
+            ValueError::Calc => write!(f, "#CALC!"),
         }
     }
 }
@@ -339,7 +348,10 @@ mod tests {
     #[test]
     fn error_display() {
         assert_eq!(format!("{}", ValueError::DivisionByZero), "#DIV/0!");
+        assert_eq!(format!("{}", ValueError::Null), "#NULL!");
+        assert_eq!(format!("{}", ValueError::NotAvailable), "#N/A");
         assert_eq!(format!("{}", ValueError::InvalidRef), "#REF!");
         assert_eq!(format!("{}", ValueError::CyclicRef), "#CYCLE!");
+        assert_eq!(format!("{}", ValueError::Calc), "#CALC!");
     }
 }

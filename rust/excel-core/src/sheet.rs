@@ -12,6 +12,9 @@ use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 
+const EXCEL_MAX_ROWS: u32 = 1_048_576;
+const EXCEL_MAX_COLS: u32 = 16_384;
+
 /// Row-major sparse map over `(row, col) → V`. Wraps a
 /// `BTreeMap<row, BTreeMap<col, V>>` so range scans cost
 /// O(visited cells) instead of O(total entries). Drop-in replacement
@@ -213,6 +216,13 @@ impl FormulaRecord {
             range_deps: RefCell::new(range_deps),
             cache: RefCell::new(FormulaCache::Dirty),
         }
+    }
+}
+
+fn normalize_formula_cell_result(value: Value) -> Value {
+    match value {
+        Value::Lambda(_) => Value::Error(ValueError::Calc),
+        other => other,
     }
 }
 
@@ -1287,12 +1297,22 @@ impl Sheet {
             self.spill_targets.insert(anchor_atom, Vec::new());
             return Ok(());
         }
+        let end_row = anchor_addr
+            .row
+            .checked_add(rows - 1)
+            .ok_or(ValueError::Spill)?;
+        let end_col = anchor_addr
+            .col
+            .checked_add(cols - 1)
+            .ok_or(ValueError::Spill)?;
+        if end_row >= EXCEL_MAX_ROWS || end_col >= EXCEL_MAX_COLS {
+            return Err(ValueError::Spill);
+        }
 
         // First pass: collision detection. We compute every target
         // (skipping (0, 0) which is the anchor) and ensure no obstruction.
-        let mut targets: Vec<CellAddress> = Vec::with_capacity(
-            (rows as usize) * (cols as usize) - 1,
-        );
+        let mut targets: Vec<CellAddress> =
+            Vec::with_capacity((rows as usize) * (cols as usize) - 1);
         for di in 0..rows {
             for dj in 0..cols {
                 if di == 0 && dj == 0 {
@@ -1321,17 +1341,18 @@ impl Sheet {
                 let anchor_atom_for_read = anchor_atom;
                 let row_off = di;
                 let col_off = dj;
-                let derived = self.store.create_derived(move |get| match get(anchor_atom_for_read) {
-                    Value::Array(inner) => inner
-                        .get(row_off, col_off)
-                        .cloned()
-                        .unwrap_or(Value::Null),
-                    // Anchor switched off Array (e.g. became #SPILL! after
-                    // a later remap that hasn't yet cleared us). Return
-                    // Null defensively — the parent re-spill will
-                    // re-install a fresh derived atom anyway.
-                    _ => Value::Null,
-                });
+                let derived =
+                    self.store
+                        .create_derived(move |get| match get(anchor_atom_for_read) {
+                            Value::Array(inner) => {
+                                inner.get(row_off, col_off).cloned().unwrap_or(Value::Null)
+                            }
+                            // Anchor switched off Array (e.g. became #SPILL! after
+                            // a later remap that hasn't yet cleared us). Return
+                            // Null defensively — the parent re-spill will
+                            // re-install a fresh derived atom anyway.
+                            _ => Value::Null,
+                        });
 
                 // If there was a stale primitive at this address (e.g.
                 // empty `Value::Null` placeholder created by a previous
@@ -1561,8 +1582,7 @@ impl Sheet {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
                         if let Some(record) = self.formula_cells.get(&addr) {
-                            *record.cache.borrow_mut() =
-                                FormulaCache::Clean(Value::Error(other));
+                            *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
                 }
@@ -1647,6 +1667,8 @@ impl Sheet {
             return;
         }
 
+        let value = normalize_formula_cell_result(value);
+
         // Stamp the workbook-aware value into the formula cache so
         // subsequent reads bypass the sheet-local SheetEvalProvider
         // path that would re-surface #NAME? for named-value references.
@@ -1671,8 +1693,7 @@ impl Sheet {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
                         if let Some(record) = self.formula_cells.get(&addr) {
-                            *record.cache.borrow_mut() =
-                                FormulaCache::Clean(Value::Error(other));
+                            *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
                 }
@@ -1706,11 +1727,7 @@ impl Sheet {
     /// can distinguish "spilled cleanly" from "collision, anchor now
     /// `#SPILL!`". Either outcome leaves the sheet in a consistent
     /// state — the anchor cell always reflects the result.
-    pub fn set_array(
-        &mut self,
-        addr_str: &str,
-        arr: Arc<ArrayData>,
-    ) -> Result<(), SheetError> {
+    pub fn set_array(&mut self, addr_str: &str, arr: Arc<ArrayData>) -> Result<(), SheetError> {
         let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
         // Reject writes into another anchor's spill range — same
         // contract as `try_set_cell`. The user must clear that anchor
@@ -1745,8 +1762,7 @@ impl Sheet {
         match self.register_spill(addr, anchor_atom, &arr) {
             Ok(()) => {}
             Err(ValueError::Spill) => {
-                self.store
-                    .set(anchor_atom, Value::Error(ValueError::Spill));
+                self.store.set(anchor_atom, Value::Error(ValueError::Spill));
             }
             Err(other) => {
                 // register_spill currently only returns Spill, but
@@ -2164,9 +2180,7 @@ impl Sheet {
         // before we allocate the work-stack.
         if let Some(record) = self.formula_cells.get(&addr) {
             match record.cache.borrow().clone() {
-                FormulaCache::Clean(value) if !provider.force_formula_recompute() => {
-                    return value
-                }
+                FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
                 FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
                 FormulaCache::Clean(_) | FormulaCache::Dirty => {}
             }
@@ -2254,7 +2268,7 @@ impl Sheet {
         // current cell ignore both calls (default no-op impls).
         let prev_current = provider.current_cell();
         provider.set_current_cell(Some(addr));
-        let value = eval_expr_with_provider(&record.expr, &tracking);
+        let value = normalize_formula_cell_result(eval_expr_with_provider(&record.expr, &tracking));
         provider.set_current_cell(prev_current);
         *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
         self.replace_formula_deps(addr, &record, deps.borrow().clone());
@@ -2776,8 +2790,7 @@ impl Sheet {
     pub fn set_format_range(&mut self, range: CellRange, fmt: CellFormat) -> usize {
         let normalized = range.normalize();
 
-        self.formats
-            .retain(|addr, _| !normalized.contains(*addr));
+        self.formats.retain(|addr, _| !normalized.contains(*addr));
         self.range_formats.push(RangeFormat {
             range: normalized,
             fmt,
@@ -2833,8 +2846,7 @@ impl Sheet {
     /// exact for undo/redo.
     pub fn restore_format_range_snapshot(&mut self, snapshot: FormatRangeSnapshot) -> usize {
         let normalized = snapshot.range.normalize();
-        self.formats
-            .retain(|addr, _| !normalized.contains(*addr));
+        self.formats.retain(|addr, _| !normalized.contains(*addr));
         for (addr, fmt) in snapshot.cell_formats {
             if fmt == CellFormat::default() {
                 self.formats.remove(&addr);
@@ -3511,8 +3523,11 @@ impl<'a> BulkLoader<'a> {
             let mut stack: Vec<CellAddress> = Vec::new();
             let mut candidate_scratch: Vec<CellRange> = Vec::new();
             for &addr in &self.touched {
-                self.sheet
-                    .dependents_of_into_with_scratch(addr, &mut stack, &mut candidate_scratch);
+                self.sheet.dependents_of_into_with_scratch(
+                    addr,
+                    &mut stack,
+                    &mut candidate_scratch,
+                );
             }
             while let Some(addr) = stack.pop() {
                 if !dirty.insert(addr) {
@@ -3521,8 +3536,11 @@ impl<'a> BulkLoader<'a> {
                 if let Some(record) = self.sheet.formula_cells.get(&addr) {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
-                self.sheet
-                    .dependents_of_into_with_scratch(addr, &mut stack, &mut candidate_scratch);
+                self.sheet.dependents_of_into_with_scratch(
+                    addr,
+                    &mut stack,
+                    &mut candidate_scratch,
+                );
             }
         } else {
             // Coalesced two-pass strategy:
@@ -3560,8 +3578,7 @@ impl<'a> BulkLoader<'a> {
             // Row-bucketed view of (touched ∪ dirty). Pass B consults
             // this so the range-intersection test is O(rows-in-range)
             // instead of O(|dirty|) — critical when both are large.
-            let mut dirty_by_row: HashMap<u32, Vec<u32>> =
-                HashMap::with_capacity(touched_len);
+            let mut dirty_by_row: HashMap<u32, Vec<u32>> = HashMap::with_capacity(touched_len);
             for &addr in &self.touched {
                 dirty_by_row.entry(addr.row).or_default().push(addr.col);
             }
@@ -3681,7 +3698,13 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
         | Expr::Number(_)
         | Expr::Text(_)
         | Expr::Bool(_)
+        | Expr::Error(_)
         | Expr::Name(_) => {}
+        Expr::SpillRef(anchor) => collect_range_refs_into(anchor, out),
+        Expr::DynamicRange { start, end } => {
+            collect_range_refs_into(start, out);
+            collect_range_refs_into(end, out);
+        }
         // Immediate-call form — descend into callee + args so ranges
         // hidden inside the lambda body or arg list still register.
         Expr::Call(callee, args) => {
@@ -3750,9 +3773,14 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
         // Cross-sheet refs are out-of-scope for static cycle detection on
         // this sheet (cross-sheet cycles need workbook-level analysis).
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         // LET-bound names don't reference cells.
         Expr::Name(_) => {}
+        Expr::SpillRef(anchor) => collect_refs(anchor, out),
+        Expr::DynamicRange { start, end } => {
+            collect_refs(start, out);
+            collect_refs(end, out);
+        }
         // Immediate-call form — descend into callee + args.
         Expr::Call(callee, args) => {
             collect_refs(callee, out);
@@ -3881,8 +3909,13 @@ fn collect_prewarm_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
             }
         }
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         Expr::Name(_) => {}
+        Expr::SpillRef(anchor) => collect_prewarm_refs(anchor, out),
+        Expr::DynamicRange { start, end } => {
+            collect_prewarm_refs(start, out);
+            collect_prewarm_refs(end, out);
+        }
         // Immediate-call form — the callee and every arg are evaluated
         // before the lambda body runs, so they're all "always" touched.
         // The lambda body itself is opaque to static analysis (it could
@@ -3968,9 +4001,14 @@ fn collect_formula_refs_into(
         // SheetRef points outside this sheet — handled by the resolver, not
         // by local BFS.
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         // LET-bound names don't reference cells in the formula graph.
         Expr::Name(_) => {}
+        Expr::SpillRef(anchor) => collect_formula_refs_into(anchor, formula_exprs, out),
+        Expr::DynamicRange { start, end } => {
+            collect_formula_refs_into(start, formula_exprs, out);
+            collect_formula_refs_into(end, formula_exprs, out);
+        }
         // Immediate-call form — descend into callee + args.
         Expr::Call(callee, args) => {
             collect_formula_refs_into(callee, formula_exprs, out);
@@ -3999,10 +4037,15 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
         Expr::Negate(inner) => expr_has_sheet_ref(inner),
         Expr::FuncCall { args, .. } => args.iter().any(expr_has_sheet_ref),
-        Expr::CellRef(_) | Expr::Range { .. } | Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {
-            false
-        }
+        Expr::CellRef(_)
+        | Expr::Range { .. }
+        | Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_)
+        | Expr::Error(_) => false,
         Expr::Name(_) => false,
+        Expr::SpillRef(anchor) => expr_has_sheet_ref(anchor),
+        Expr::DynamicRange { start, end } => expr_has_sheet_ref(start) || expr_has_sheet_ref(end),
         // Immediate-call could resolve to a LAMBDA whose body references
         // another sheet; descend conservatively.
         Expr::Call(callee, args) => {
@@ -4082,12 +4125,8 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
             // is a `Range` / `SheetRange` — the broadcast path on the
             // eval side handles the single-cell range collapse so we
             // only over-flag, never under-flag.
-            let operand_is_range = |e: &Expr| {
-                matches!(
-                    e,
-                    Expr::Range { .. } | Expr::SheetRange { .. }
-                )
-            };
+            let operand_is_range =
+                |e: &Expr| matches!(e, Expr::Range { .. } | Expr::SheetRange { .. });
             operand_is_range(left)
                 || operand_is_range(right)
                 || expr_may_produce_array(left)
@@ -4104,6 +4143,7 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
         // so a top-level `={1,2,3}` must take the eager spill re-eval
         // path just like a SEQUENCE / UNIQUE call would.
         Expr::ArrayLit { .. } => true,
+        Expr::SpillRef(_) | Expr::DynamicRange { .. } => true,
         // Multi-area evaluates to `#VALUE!` (error scalar) anywhere
         // other than as an `AREAS` argument — it never produces a
         // spillable `Value::Array`.
@@ -4142,6 +4182,14 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     }
 
     fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        Value::Error(ValueError::InvalidRef)
+    }
+
+    fn raw_cell(&self, addr: CellAddress) -> Value {
+        self.sheet.peek_value_with_provider(addr, self)
+    }
+
+    fn raw_sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
         Value::Error(ValueError::InvalidRef)
     }
 
@@ -4193,6 +4241,15 @@ impl<'a> EvalProvider for TrackingEvalProvider<'a> {
 
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
         self.inner.sheet_cell(sheet, addr)
+    }
+
+    fn raw_cell(&self, addr: CellAddress) -> Value {
+        self.deps.borrow_mut().insert(addr);
+        self.inner.raw_cell(addr)
+    }
+
+    fn raw_sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        self.inner.raw_sheet_cell(sheet, addr)
     }
 
     fn force_formula_recompute(&self) -> bool {
@@ -5945,7 +6002,11 @@ mod tests {
         let mut per_addr_set: HashSet<CellAddress> = HashSet::new();
         let dirty_cells: Vec<CellAddress> = dirty_by_row
             .iter()
-            .flat_map(|(row, cols)| cols.iter().map(|c| CellAddress::new(*row, *c)).collect::<Vec<_>>())
+            .flat_map(|(row, cols)| {
+                cols.iter()
+                    .map(|c| CellAddress::new(*row, *c))
+                    .collect::<Vec<_>>()
+            })
             .collect();
         for addr in &dirty_cells {
             let idx = sheet.range_dependents.borrow();
@@ -6522,7 +6583,10 @@ mod tests {
         for i in 2..=1000 {
             let addr = format!("A{i}");
             let src = format!("=A{}+1", i - 1);
-            assert!(sheet.set_formula(&addr, &src), "set_formula failed for {addr}");
+            assert!(
+                sheet.set_formula(&addr, &src),
+                "set_formula failed for {addr}"
+            );
         }
         let v = sheet.get_cell("A1000");
         assert_eq!(v, Value::Number(1000.0));
@@ -6539,7 +6603,10 @@ mod tests {
         for i in 2..=10_000 {
             let addr = format!("A{i}");
             let src = format!("=A{}+1", i - 1);
-            assert!(sheet.set_formula(&addr, &src), "set_formula failed for {addr}");
+            assert!(
+                sheet.set_formula(&addr, &src),
+                "set_formula failed for {addr}"
+            );
         }
         let v = sheet.get_cell("A10000");
         assert_eq!(v, Value::Number(10_000.0));

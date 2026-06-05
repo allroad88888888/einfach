@@ -13,7 +13,7 @@
 //! lookups.
 
 use einfach_core::{Value, ValueError};
-use einfach_excel_core::Workbook;
+use einfach_excel_core::{Sheet, Workbook};
 
 /// ISFORMULA TRUE on a real formula cell and FALSE on a primitive cell.
 /// Mirrors the contract Excel ships: ISFORMULA(A1) is TRUE iff A1's
@@ -47,9 +47,23 @@ fn isformula_cross_sheet_reference() {
 
     assert!(wb.set_formula(0, "C1", "=ISFORMULA(Data!A1)"));
     assert!(wb.set_formula(0, "C2", "=ISFORMULA(Data!B1)"));
+    assert!(wb.set_formula(0, "C3", "=ISFORMULA(Missing!B1)"));
 
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Boolean(false));
     assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Boolean(true));
+    assert_eq!(
+        wb.get_cell("Sheet1", "C3"),
+        Value::Error(ValueError::InvalidRef)
+    );
+}
+
+#[test]
+fn standalone_isformula_cross_sheet_ref_needs_workbook_context() {
+    let mut sheet = Sheet::new();
+    assert!(sheet.set_formula("B1", "=1+1"));
+    assert!(sheet.set_formula("C1", "=ISFORMULA(Data!B1)"));
+
+    assert_eq!(sheet.get_cell("C1"), Value::Error(ValueError::InvalidRef));
 }
 
 /// SHEET with a cross-sheet reference returns the 1-based index of the

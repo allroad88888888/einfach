@@ -93,6 +93,10 @@ pub enum NumberFormat {
     },
     /// Custom strftime-like date format, e.g. "yyyy-mm-dd".
     Date(String),
+    /// Excel-style custom numeric pattern. The formatter intentionally covers
+    /// a small display subset while preserving the raw pattern for WASM/JS
+    /// round-trip.
+    Custom(String),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,6 +122,9 @@ impl CellFormat {
                 format!("{}{}", symbol, body)
             }
             NumberFormat::Date(_) => default_number_string(n),
+            NumberFormat::Custom(pattern) => {
+                format_custom_number(pattern, n).unwrap_or_else(|| default_number_string(n))
+            }
         }
     }
 }
@@ -151,6 +158,280 @@ fn format_fixed(n: f64, digits: u8, thousands: bool, suffix: &str) -> String {
         formatted
     };
     format!("{}{}", body, suffix)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CustomFormatToken {
+    Pattern(char),
+    Literal(String),
+}
+
+fn format_custom_number(pattern: &str, n: f64) -> Option<String> {
+    if !n.is_finite() {
+        return None;
+    }
+
+    let sections = split_custom_sections(pattern);
+    if sections.is_empty() {
+        return None;
+    }
+
+    let (section, value) = if n < 0.0 && sections.len() > 1 {
+        (sections[1].as_str(), -n)
+    } else if n == 0.0 && sections.len() > 2 {
+        (sections[2].as_str(), n)
+    } else {
+        (sections[0].as_str(), n)
+    };
+
+    format_custom_number_section(&strip_custom_bracket_tags(section), value)
+}
+
+fn split_custom_sections(pattern: &str) -> Vec<String> {
+    let mut sections = Vec::new();
+    let mut buffer = String::new();
+    let mut in_string = false;
+    let mut in_bracket = false;
+
+    for ch in pattern.chars() {
+        if ch == '"' {
+            in_string = !in_string;
+            buffer.push(ch);
+            continue;
+        }
+        if !in_string && ch == '[' {
+            in_bracket = true;
+            buffer.push(ch);
+            continue;
+        }
+        if !in_string && ch == ']' {
+            in_bracket = false;
+            buffer.push(ch);
+            continue;
+        }
+        if ch == ';' && !in_string && !in_bracket {
+            sections.push(buffer);
+            buffer = String::new();
+            continue;
+        }
+        buffer.push(ch);
+    }
+
+    sections.push(buffer);
+    sections
+}
+
+fn strip_custom_bracket_tags(section: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < section.len() {
+        let ch = section[i..].chars().next().unwrap();
+        if ch == '[' {
+            if let Some(relative_end) = section[i + ch.len_utf8()..].find(']') {
+                let end = i + ch.len_utf8() + relative_end;
+                let tag = &section[i + ch.len_utf8()..end];
+                if is_ignored_custom_bracket_tag(tag) {
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn is_ignored_custom_bracket_tag(tag: &str) -> bool {
+    let trimmed = tag.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "black" | "white" | "red" | "green" | "blue" | "yellow" | "magenta" | "cyan"
+    ) || lower.starts_with("color")
+        || trimmed.starts_with('$')
+        || matches!(trimmed.as_bytes().first(), Some(b'<' | b'>' | b'='))
+}
+
+fn format_custom_number_section(section: &str, n: f64) -> Option<String> {
+    let tokens = tokenize_custom_number_section(section)?;
+    let Some(first_pattern) = tokens
+        .iter()
+        .position(|token| matches!(token, CustomFormatToken::Pattern(_)))
+    else {
+        return Some(render_custom_literals(&tokens));
+    };
+    let last_pattern = tokens
+        .iter()
+        .rposition(|token| matches!(token, CustomFormatToken::Pattern(_)))
+        .unwrap();
+
+    if tokens[first_pattern..=last_pattern]
+        .iter()
+        .any(|token| !matches!(token, CustomFormatToken::Pattern(_)))
+    {
+        return None;
+    }
+
+    let prefix = render_custom_literals(&tokens[..first_pattern]);
+    let suffix = render_custom_literals(&tokens[last_pattern + 1..]);
+    let numeric_pattern: String = tokens[first_pattern..=last_pattern]
+        .iter()
+        .filter_map(|token| match token {
+            CustomFormatToken::Pattern(ch) => Some(*ch),
+            CustomFormatToken::Literal(_) => None,
+        })
+        .collect();
+    let body = format_custom_number_pattern(n, &numeric_pattern)?;
+    Some(format!("{prefix}{body}{suffix}"))
+}
+
+fn tokenize_custom_number_section(section: &str) -> Option<Vec<CustomFormatToken>> {
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < section.len() {
+        let ch = section[i..].chars().next().unwrap();
+        if ch == '"' {
+            i += ch.len_utf8();
+            let mut literal = String::new();
+            let mut closed = false;
+            while i < section.len() {
+                let next = section[i..].chars().next().unwrap();
+                if next == '"' {
+                    let next_i = i + next.len_utf8();
+                    if section[next_i..].starts_with('"') {
+                        literal.push('"');
+                        i = next_i + 1;
+                        continue;
+                    }
+                    i = next_i;
+                    closed = true;
+                    break;
+                }
+                literal.push(next);
+                i += next.len_utf8();
+            }
+            if !closed {
+                return None;
+            }
+            tokens.push(CustomFormatToken::Literal(literal));
+            continue;
+        }
+        if ch == '\\' {
+            let next_i = i + ch.len_utf8();
+            if next_i < section.len() {
+                let next = section[next_i..].chars().next().unwrap();
+                tokens.push(CustomFormatToken::Literal(next.to_string()));
+                i = next_i + next.len_utf8();
+            } else {
+                tokens.push(CustomFormatToken::Literal("\\".into()));
+                i = next_i;
+            }
+            continue;
+        }
+        if ch == '_' {
+            let next_i = i + ch.len_utf8();
+            if next_i < section.len() {
+                let next = section[next_i..].chars().next().unwrap();
+                i = next_i + next.len_utf8();
+            } else {
+                i = next_i;
+            }
+            tokens.push(CustomFormatToken::Literal(" ".into()));
+            continue;
+        }
+        if ch == '*' {
+            let next_i = i + ch.len_utf8();
+            if next_i < section.len() {
+                let next = section[next_i..].chars().next().unwrap();
+                i = next_i + next.len_utf8();
+            } else {
+                i = next_i;
+            }
+            continue;
+        }
+        if matches!(ch, '0' | '#' | ',' | '.' | '%') {
+            tokens.push(CustomFormatToken::Pattern(ch));
+        } else {
+            tokens.push(CustomFormatToken::Literal(ch.to_string()));
+        }
+        i += ch.len_utf8();
+    }
+    Some(tokens)
+}
+
+fn render_custom_literals(tokens: &[CustomFormatToken]) -> String {
+    tokens
+        .iter()
+        .filter_map(|token| match token {
+            CustomFormatToken::Literal(s) => Some(s.as_str()),
+            CustomFormatToken::Pattern(_) => None,
+        })
+        .collect()
+}
+
+fn format_custom_number_pattern(n: f64, pattern: &str) -> Option<String> {
+    let percent_count = pattern.chars().filter(|ch| *ch == '%').count();
+    let numeric_pattern: String = pattern.chars().filter(|ch| *ch != '%').collect();
+    if numeric_pattern.chars().filter(|ch| *ch == '.').count() > 1 {
+        return None;
+    }
+
+    let (mut int_pattern, frac_pattern) = match numeric_pattern.split_once('.') {
+        Some((int_part, frac_part)) => (int_part.to_string(), frac_part),
+        None => (numeric_pattern, ""),
+    };
+
+    let mut scale_commas = 0;
+    while int_pattern.ends_with(',') {
+        scale_commas += 1;
+        int_pattern.pop();
+    }
+
+    if int_pattern.is_empty()
+        || !int_pattern.chars().all(|ch| matches!(ch, '0' | '#' | ','))
+        || !frac_pattern.chars().all(|ch| matches!(ch, '0' | '#'))
+    {
+        return None;
+    }
+
+    let int_digits: String = int_pattern.chars().filter(|ch| *ch != ',').collect();
+    if !int_digits.chars().any(|ch| matches!(ch, '0' | '#')) {
+        return None;
+    }
+
+    let min_int_digits = int_digits.chars().filter(|ch| *ch == '0').count().max(1);
+    let max_frac_digits = frac_pattern.chars().count().min(15);
+    let required_frac_digits = frac_pattern
+        .chars()
+        .filter(|ch| *ch == '0')
+        .count()
+        .min(max_frac_digits);
+    let scaled = (n * 100f64.powi(percent_count as i32)) / 1000f64.powi(scale_commas);
+    let negative = scaled < 0.0;
+    let rounded = format!("{:.*}", max_frac_digits, scaled.abs());
+    let (mut whole, mut frac) = match rounded.split_once('.') {
+        Some((whole, frac)) => (whole.to_string(), frac.to_string()),
+        None => (rounded, String::new()),
+    };
+
+    if whole.len() < min_int_digits {
+        whole = format!("{}{}", "0".repeat(min_int_digits - whole.len()), whole);
+    }
+    if int_pattern.contains(',') {
+        whole = insert_commas(&whole);
+    }
+    while frac.len() > required_frac_digits && frac.ends_with('0') {
+        frac.pop();
+    }
+
+    let sign = if negative { "-" } else { "" };
+    let percent_suffix = "%".repeat(percent_count);
+    if frac.is_empty() {
+        Some(format!("{sign}{whole}{percent_suffix}"))
+    } else {
+        Some(format!("{sign}{whole}.{frac}{percent_suffix}"))
+    }
 }
 
 /// Conditional formatting rule. Multiple rules apply in order — the first
@@ -292,12 +573,35 @@ mod tests {
     }
 
     #[test]
+    fn fixed_decimal_zero_digits_rounds_before_grouping() {
+        let f = CellFormat {
+            number_format: NumberFormat::Decimal {
+                digits: 0,
+                thousands: true,
+            },
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(1234.6), "1,235");
+        assert_eq!(f.format_number(-1234.4), "-1,234");
+    }
+
+    #[test]
     fn percent() {
         let f = CellFormat {
             number_format: NumberFormat::Percent { digits: 1 },
             ..Default::default()
         };
         assert_eq!(f.format_number(0.125), "12.5%");
+    }
+
+    #[test]
+    fn percent_zero_digits_scales_and_preserves_sign() {
+        let f = CellFormat {
+            number_format: NumberFormat::Percent { digits: 0 },
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(0.1234), "12%");
+        assert_eq!(f.format_number(-0.5), "-50%");
     }
 
     #[test]
@@ -372,5 +676,49 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(f.format_number(1234.56), "¥1,234.56");
+    }
+
+    #[test]
+    fn currency_uses_symbol_grouping_and_configured_digits() {
+        let f = CellFormat {
+            number_format: NumberFormat::Currency {
+                symbol: "$".into(),
+                digits: 0,
+            },
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(1234.6), "$1,235");
+    }
+
+    #[test]
+    fn custom_number_format_literals_scaling_and_bracket_tags() {
+        let f = CellFormat {
+            number_format: NumberFormat::Custom("#,##0.00\" kg\"".into()),
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(1234.5), "1,234.50 kg");
+
+        let f = CellFormat {
+            number_format: NumberFormat::Custom("#,##0,,".into()),
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(1_234_567_890.0), "1,235");
+
+        let f = CellFormat {
+            number_format: NumberFormat::Custom("[Red][$¥-411]#,##0.0".into()),
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(1234.56), "1,234.6");
+    }
+
+    #[test]
+    fn custom_number_format_sections() {
+        let f = CellFormat {
+            number_format: NumberFormat::Custom("0;[Red](0);\"-\"".into()),
+            ..Default::default()
+        };
+        assert_eq!(f.format_number(12.0), "12");
+        assert_eq!(f.format_number(-12.0), "(12)");
+        assert_eq!(f.format_number(0.0), "-");
     }
 }

@@ -75,14 +75,11 @@ fn drop_round_trip() {
 // === VSTACK / HSTACK end-to-end ===
 
 /// `=VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99))` at A1 spills into a
-/// 2×3 rectangle with the missing cells padded as #VALUE!.
+/// 2×3 rectangle with the missing cells padded as #N/A.
 #[test]
-fn vstack_pads_with_value_error() {
+fn vstack_pads_with_not_available() {
     let mut sheet = Sheet::new();
-    assert!(sheet.set_formula(
-        "A1",
-        "=VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99))",
-    ));
+    assert!(sheet.set_formula("A1", "=VSTACK(SEQUENCE(1, 3), SEQUENCE(1, 1, 99))",));
     match sheet.get_cell("A1") {
         Value::Array(a) => assert_eq!(a.shape(), (2, 3)),
         other => panic!("expected Array, got {:?}", other),
@@ -90,8 +87,8 @@ fn vstack_pads_with_value_error() {
     assert_eq!(sheet.get_cell("B1"), Value::Number(2.0));
     assert_eq!(sheet.get_cell("C1"), Value::Number(3.0));
     assert_eq!(sheet.get_cell("A2"), Value::Number(99.0));
-    assert_eq!(sheet.get_cell("B2"), Value::Error(ValueError::InvalidValue));
-    assert_eq!(sheet.get_cell("C2"), Value::Error(ValueError::InvalidValue));
+    assert_eq!(sheet.get_cell("B2"), Value::Error(ValueError::NotAvailable));
+    assert_eq!(sheet.get_cell("C2"), Value::Error(ValueError::NotAvailable));
 }
 
 // === CHOOSEROWS end-to-end via Workbook ===

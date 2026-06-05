@@ -502,7 +502,9 @@ impl Workbook {
     /// `get_named` if they need it) so a future host that needs only
     /// the names doesn't end up cloning every Lambda.
     pub fn named_names(&self) -> impl Iterator<Item = &str> {
-        self.named_values.values().map(|e| e.canonical_name.as_str())
+        self.named_values
+            .values()
+            .map(|e| e.canonical_name.as_str())
     }
 
     /// Install (or replace) the host's custom-formula registry. Passing
@@ -574,8 +576,7 @@ impl Workbook {
     /// invalidation index on top.
     pub fn invalidate_all_formulas_for_custom_function_change(&self) {
         for sheet in &self.sheets {
-            let addrs: Vec<CellAddress> =
-                sheet.formula_exprs_iter().keys().copied().collect();
+            let addrs: Vec<CellAddress> = sheet.formula_exprs_iter().keys().copied().collect();
             for addr in addrs {
                 sheet.mark_dirty_for_addr(addr);
                 sheet.fire_subscribers(addr);
@@ -937,11 +938,7 @@ impl Workbook {
     /// provider inside a block, snapshot the Value the provider
     /// produced, drop the borrow, then hand the Value to a mutating
     /// install path on the sheet.
-    fn recompute_array_spill_with_workbook_context(
-        &mut self,
-        sheet_idx: usize,
-        addr: CellAddress,
-    ) {
+    fn recompute_array_spill_with_workbook_context(&mut self, sheet_idx: usize, addr: CellAddress) {
         // Evaluate the formula through the workbook provider so named-
         // value / cross-sheet lookups resolve. The value is returned by
         // copy so we can drop the immutable borrow before mutating.
@@ -1064,11 +1061,7 @@ impl Workbook {
     /// Returns `Err(SpillCellWrite { anchor })` when the target is
     /// inside an active spill range and `clear` was attempted on a
     /// non-anchor target.
-    pub fn try_clear_cell(
-        &mut self,
-        sheet_idx: usize,
-        addr_str: &str,
-    ) -> Result<(), SheetError> {
+    pub fn try_clear_cell(&mut self, sheet_idx: usize, addr_str: &str) -> Result<(), SheetError> {
         if self.is_inside_custom_call() {
             return Err(SheetError::MutationDuringCustomCall);
         }
@@ -1127,11 +1120,7 @@ impl Workbook {
     /// out-of-range sheet indexes. Used by the JS UI to draw the
     /// spill outline around the anchor's bounding rectangle even when
     /// the anchor itself is outside the visible window.
-    pub fn spill_anchor(
-        &self,
-        sheet_idx: usize,
-        addr_str: &str,
-    ) -> Option<CellAddress> {
+    pub fn spill_anchor(&self, sheet_idx: usize, addr_str: &str) -> Option<CellAddress> {
         let sheet = self.sheets.get(sheet_idx)?;
         let addr = CellAddress::parse(addr_str)?;
         sheet.spill_anchor_for(addr)
@@ -1797,9 +1786,16 @@ fn formula_needs_workbook_context(expr: &Expr) -> bool {
             formula_needs_workbook_context(callee)
                 || args.iter().any(formula_needs_workbook_context)
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::CellRef(_) | Expr::Range { .. } => {
-            false
+        Expr::SpillRef(anchor) => formula_needs_workbook_context(anchor),
+        Expr::DynamicRange { start, end } => {
+            formula_needs_workbook_context(start) || formula_needs_workbook_context(end)
         }
+        Expr::Number(_)
+        | Expr::Text(_)
+        | Expr::Bool(_)
+        | Expr::Error(_)
+        | Expr::CellRef(_)
+        | Expr::Range { .. } => false,
         Expr::ArrayLit { data, .. } => data.iter().any(formula_needs_workbook_context),
         // Multi-area: a cross-sheet ref inside the union still demands
         // workbook context. Same-sheet-only unions stay sheet-local.
@@ -1833,9 +1829,14 @@ fn formula_references_name(expr: &Expr, key: &str) -> bool {
             formula_references_name(callee, key)
                 || args.iter().any(|a| formula_references_name(a, key))
         }
+        Expr::SpillRef(anchor) => formula_references_name(anchor, key),
+        Expr::DynamicRange { start, end } => {
+            formula_references_name(start, key) || formula_references_name(end, key)
+        }
         Expr::Number(_)
         | Expr::Text(_)
         | Expr::Bool(_)
+        | Expr::Error(_)
         | Expr::CellRef(_)
         | Expr::Range { .. }
         | Expr::SheetRef { .. }
@@ -1862,6 +1863,11 @@ fn collect_cross_sheet_refs_into(
     match expr {
         Expr::CellRef(_) | Expr::Range { .. } => {
             // Same-sheet refs/ranges are owned by `Sheet::set_formula`.
+        }
+        Expr::SpillRef(anchor) => collect_cross_sheet_refs_into(anchor, by_name, out),
+        Expr::DynamicRange { start, end } => {
+            collect_cross_sheet_refs_into(start, by_name, out);
+            collect_cross_sheet_refs_into(end, by_name, out);
         }
         Expr::SheetRef { sheet, addr } => {
             if let Some(&idx) = by_name.get(sheet) {
@@ -1890,7 +1896,7 @@ fn collect_cross_sheet_refs_into(
                 collect_cross_sheet_refs_into(a, by_name, out);
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         // LET-bound names don't reference cross-sheet cells.
         Expr::Name(_) => {}
         // Immediate-call: descend into callee + args so cross-sheet refs
@@ -2001,9 +2007,14 @@ fn collect_workbook_refs(
                 }
             }
         }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => {}
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
         // LET-bound names don't reference cells in the cross-sheet graph.
         Expr::Name(_) => {}
+        Expr::SpillRef(anchor) => collect_workbook_refs(anchor, current_idx, by_name, out),
+        Expr::DynamicRange { start, end } => {
+            collect_workbook_refs(start, current_idx, by_name, out);
+            collect_workbook_refs(end, current_idx, by_name, out);
+        }
         // Immediate-call: descend into callee + args.
         Expr::Call(callee, args) => {
             collect_workbook_refs(callee, current_idx, by_name, out);
@@ -2070,6 +2081,20 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
             crate::sheet::collapse_array_for_eval(
                 self.wb.sheets[idx].peek_value_with_provider(addr, self),
             )
+        })
+    }
+
+    fn raw_cell(&self, addr: CellAddress) -> Value {
+        let idx = self.current.get();
+        self.wb.sheets[idx].peek_value_with_provider(addr, self)
+    }
+
+    fn raw_sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        let Some(idx) = self.wb.by_name.get(sheet).copied() else {
+            return Value::Error(ValueError::InvalidRef);
+        };
+        self.with_current(idx, || {
+            self.wb.sheets[idx].peek_value_with_provider(addr, self)
         })
     }
 
@@ -2526,11 +2551,7 @@ mod tests {
         let v2 = wb.get_cell("Sheet1", "A100");
         let count2 = wb.debug_formula_eval_count(0);
         assert_eq!(v1, v2);
-        assert_eq!(
-            v2,
-            Value::Number(100.0),
-            "A100 should be A1 + 99 = 100"
-        );
+        assert_eq!(v2, Value::Number(100.0), "A100 should be A1 + 99 = 100");
         assert_eq!(
             count2, count1,
             "steadyState read must not re-eval (cache miss bug); first={count1} second={count2}"
@@ -3438,9 +3459,7 @@ mod tests {
         impl CustomFunctionRegistry for ProbeRegistry {
             fn lookup(&self, _name: &str, _args: &[Value]) -> Option<Value> {
                 let wb_ptr = *self.wb_ptr.lock().unwrap();
-                let result = unsafe {
-                    (*wb_ptr).try_set_cell(0, "C1", Value::Number(1.0))
-                };
+                let result = unsafe { (*wb_ptr).try_set_cell(0, "C1", Value::Number(1.0)) };
                 if let Err(e) = result {
                     *self.last_err.lock().unwrap() = Some(e);
                 }
@@ -3493,7 +3512,9 @@ mod tests {
         }
 
         let mut wb = Workbook::new();
-        let registry = Arc::new(ErrorRegistry { invoked: Mutex::new(0) });
+        let registry = Arc::new(ErrorRegistry {
+            invoked: Mutex::new(0),
+        });
         wb.set_custom_function_registry(Some(registry.clone() as Arc<dyn CustomFunctionRegistry>));
         assert!(wb.set_formula(0, "A1", "=BAD()"));
 

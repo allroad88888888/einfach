@@ -50,6 +50,10 @@ pub fn contains_invalid_ref(expr: &Expr) -> bool {
             contains_invalid_ref(left) || contains_invalid_ref(right)
         }
         Expr::FuncCall { args, .. } => args.iter().any(contains_invalid_ref),
+        Expr::SpillRef(anchor) => contains_invalid_ref(anchor),
+        Expr::DynamicRange { start, end } => {
+            contains_invalid_ref(start) || contains_invalid_ref(end)
+        }
         // Constant-array literal: the parser already rejected any cell
         // ref / range / func call inside, so the elements can't carry a
         // #REF! sentinel.
@@ -118,7 +122,7 @@ pub fn shift_addr_col_delete(addr: CellAddress, at: u32, count: u32) -> CellAddr
 /// still seen by the bounded axis.
 pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
     match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(f(*addr)),
         Expr::Range {
             start,
@@ -134,6 +138,11 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
         }
         // Cross-sheet refs aren't shifted by within-sheet structural edits.
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => expr.clone(),
+        Expr::SpillRef(anchor) => Expr::SpillRef(Box::new(map_addrs(anchor, f))),
+        Expr::DynamicRange { start, end } => Expr::DynamicRange {
+            start: Box::new(map_addrs(start, f)),
+            end: Box::new(map_addrs(end, f)),
+        },
         Expr::Negate(inner) => Expr::Negate(Box::new(map_addrs(inner, f))),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
@@ -159,9 +168,7 @@ pub fn map_addrs(expr: &Expr, f: &dyn Fn(CellAddress) -> CellAddress) -> Expr {
         // node as-is.
         Expr::ArrayLit { .. } => expr.clone(),
         // Multi-area: every part is a reference subject to retargeting.
-        Expr::MultiArea(parts) => {
-            Expr::MultiArea(parts.iter().map(|p| map_addrs(p, f)).collect())
-        }
+        Expr::MultiArea(parts) => Expr::MultiArea(parts.iter().map(|p| map_addrs(p, f)).collect()),
     }
 }
 
@@ -234,7 +241,7 @@ fn shift_range_corners(
 /// becomes `B:B`; shifted down it stays `A:A`).
 pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
     Ok(match expr {
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) => expr.clone(),
+        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => expr.clone(),
         Expr::CellRef(addr) => Expr::CellRef(shift_addr(*addr, drow, dcol)?),
         Expr::Range {
             start,
@@ -251,6 +258,11 @@ pub fn shift_refs(expr: &Expr, drow: i32, dcol: i32) -> Result<Expr, ()> {
         // Cross-sheet refs aren't shifted on copy/paste — they point to a
         // fixed location on a different sheet regardless of paste target.
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => expr.clone(),
+        Expr::SpillRef(anchor) => Expr::SpillRef(Box::new(shift_refs(anchor, drow, dcol)?)),
+        Expr::DynamicRange { start, end } => Expr::DynamicRange {
+            start: Box::new(shift_refs(start, drow, dcol)?),
+            end: Box::new(shift_refs(end, drow, dcol)?),
+        },
         Expr::Negate(inner) => Expr::Negate(Box::new(shift_refs(inner, drow, dcol)?)),
         Expr::BinOp { op, left, right } => Expr::BinOp {
             op: *op,
@@ -421,6 +433,7 @@ fn render_into(expr: &Expr, out: &mut String) {
             out.push('"');
         }
         Expr::Bool(b) => out.push_str(if *b { "TRUE" } else { "FALSE" }),
+        Expr::Error(e) => out.push_str(&e.to_string()),
         Expr::CellRef(addr) => {
             if is_invalid(*addr) {
                 out.push_str("#REF!");
@@ -465,6 +478,15 @@ fn render_into(expr: &Expr, out: &mut String) {
                 out.push('!');
                 render_range_body(*start, *end, *unbounded, out);
             }
+        }
+        Expr::SpillRef(anchor) => {
+            render_into(anchor, out);
+            out.push('#');
+        }
+        Expr::DynamicRange { start, end } => {
+            render_into(start, out);
+            out.push(':');
+            render_into(end, out);
         }
         Expr::Negate(inner) => {
             out.push('-');
@@ -638,6 +660,7 @@ mod tests {
             "={1;2;3}",
             "={1,2;3,4}",
             "={-1,2}",
+            "={#N/A,#CALC!}",
             "=SUM({10,20,30})",
         ] {
             let parsed = parse_formula(syntax).unwrap();

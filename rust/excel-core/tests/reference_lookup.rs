@@ -2,7 +2,7 @@
 //! COLUMNS / CHOOSE / ADDRESS / INDIRECT / XLOOKUP). These round-trip through
 //! a real `Workbook` so we cover parse + dependency tracking + eval + cache.
 
-use einfach_core::Value;
+use einfach_core::{Value, ValueError};
 use einfach_excel_core::Workbook;
 
 /// ROW / COLUMN / ROWS / COLUMNS used inside cells, exercising parse + eval.
@@ -56,6 +56,103 @@ fn choose_address_indirect_compose() {
     assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Text("$B$2".into()));
 }
 
+#[test]
+fn indirect_supports_absolute_whole_axis_refs() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(1.0));
+    wb.set_cell(0, "A3", Value::Number(3.0));
+    wb.set_cell(0, "B1", Value::Number(10.0));
+
+    wb.set_formula(0, "D2", "=SUM(INDIRECT(\"$A:$A\"))");
+    wb.set_formula(0, "D3", "=SUM(INDIRECT(\"$1:$1\"))");
+
+    assert_eq!(wb.get_cell("Sheet1", "D2"), Value::Number(4.0));
+    assert_eq!(wb.get_cell("Sheet1", "D3"), Value::Number(11.0));
+}
+
+#[test]
+fn spill_refs_round_trip_through_reference_functions() {
+    let mut wb = Workbook::new();
+    assert!(wb.set_formula(0, "A1", "=SEQUENCE(2,2)"));
+    wb.set_formula(0, "D1", "=SUM(A1#)");
+    wb.set_formula(0, "D2", "=ROWS(A1#)");
+    wb.set_formula(0, "D3", "=COLUMNS(A1#)");
+    wb.set_formula(0, "D4", "=INDEX(A1#,2,2)");
+
+    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(10.0));
+    assert_eq!(wb.get_cell("Sheet1", "D2"), Value::Number(2.0));
+    assert_eq!(wb.get_cell("Sheet1", "D3"), Value::Number(2.0));
+    assert_eq!(wb.get_cell("Sheet1", "D4"), Value::Number(4.0));
+}
+
+#[test]
+fn spill_ref_tracks_anchor_shape_changes() {
+    let mut wb = Workbook::new();
+    assert!(wb.set_formula(0, "A1", "=SEQUENCE(2,1)"));
+    wb.set_formula(0, "D1", "=SUM(A1#)");
+    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(3.0));
+
+    assert!(wb.set_formula(0, "A1", "=SEQUENCE(3,1)"));
+    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(6.0));
+}
+
+#[test]
+fn cross_sheet_spill_ref_is_materialized() {
+    let mut wb = Workbook::new();
+    let data_idx = wb.add_sheet("Data");
+    assert!(wb.set_formula(data_idx, "A1", "=SEQUENCE(2,2)"));
+    wb.set_formula(0, "D1", "=SUM(Data!A1#)");
+
+    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(10.0));
+}
+
+#[test]
+fn scalar_spill_anchor_returns_ref_error() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(1.0));
+    wb.set_formula(0, "D1", "=SUM(A1#)");
+
+    assert_eq!(
+        wb.get_cell("Sheet1", "D1"),
+        Value::Error(ValueError::InvalidRef)
+    );
+}
+
+#[test]
+fn dynamic_range_endpoint_uses_reference_returning_index() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(1.0));
+    wb.set_cell(0, "A2", Value::Number(2.0));
+    wb.set_cell(0, "A3", Value::Number(3.0));
+    wb.set_cell(0, "A4", Value::Number(4.0));
+
+    wb.set_formula(0, "D1", "=SUM(A1:INDEX(A:A,3))");
+    wb.set_formula(0, "D2", "=ROWS(A1:INDEX(A:A,3))");
+    wb.set_formula(0, "D3", "=ROWS(INDEX(A1:A3,0))");
+
+    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(6.0));
+    assert_eq!(wb.get_cell("Sheet1", "D2"), Value::Number(3.0));
+    assert_eq!(wb.get_cell("Sheet1", "D3"), Value::Number(3.0));
+}
+
+#[test]
+fn index_rejects_out_of_bounds_indices_before_u32_cast() {
+    let mut wb = Workbook::new();
+    wb.set_cell(0, "A1", Value::Number(123.0));
+
+    wb.set_formula(0, "D1", "=INDEX(A:A,4294967297)");
+    wb.set_formula(0, "D2", "=INDEX(1:1,1,4294967297)");
+
+    assert_eq!(
+        wb.get_cell("Sheet1", "D1"),
+        Value::Error(ValueError::InvalidRef)
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "D2"),
+        Value::Error(ValueError::InvalidRef)
+    );
+}
+
 /// XLOOKUP round-trip: build a lookup table, query exact matches, then
 /// confirm the not-found-default path.
 #[test]
@@ -76,9 +173,8 @@ fn xlookup_round_trip() {
 
     assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(20.0));
     assert_eq!(wb.get_cell("Sheet1", "D2"), Value::Number(-1.0));
-    // Not found, no default → InvalidValue (#VALUE!-shaped error).
-    match wb.get_cell("Sheet1", "D3") {
-        Value::Error(_) => {}
-        v => panic!("expected error, got {:?}", v),
-    }
+    assert_eq!(
+        wb.get_cell("Sheet1", "D3"),
+        Value::Error(ValueError::NotAvailable)
+    );
 }

@@ -13,7 +13,7 @@
 //!   `LAMBDA` / `MAP` / `REDUCE` / `SCAN` / `BYROW` / `BYCOL` /
 //!   `MAKEARRAY` / `ISOMITTED` arms
 
-use einfach_core::Value;
+use einfach_core::{Value, ValueError};
 use einfach_excel_core::Workbook;
 
 /// `=MAP(A1:A5, LAMBDA(x, x*x))` at B1 should spill the squares of
@@ -61,11 +61,7 @@ fn let_named_lambda_then_map() {
     for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
         wb.set_cell(0, &format!("A{}", i + 1), Value::Number(*v));
     }
-    assert!(wb.set_formula(
-        0,
-        "B1",
-        "=LET(square, LAMBDA(x, x*x), MAP(A1:A3, square))"
-    ));
+    assert!(wb.set_formula(0, "B1", "=LET(square, LAMBDA(x, x*x), MAP(A1:A3, square))"));
     // Anchor is the Array; targets are scalars.
     match wb.get_cell("Sheet1", "B1") {
         Value::Array(arr) => {
@@ -92,11 +88,7 @@ fn closure_captures_outer_let_through_map() {
     for (i, v) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
         wb.set_cell(0, &format!("A{}", i + 1), Value::Number(*v));
     }
-    assert!(wb.set_formula(
-        0,
-        "B1",
-        "=LET(mult, 3, MAP(A1:A4, LAMBDA(x, x*mult)))"
-    ));
+    assert!(wb.set_formula(0, "B1", "=LET(mult, 3, MAP(A1:A4, LAMBDA(x, x*mult)))"));
     // Anchor returns the Array; spilled targets B2..B4 each return
     // their scalar element.
     match wb.get_cell("Sheet1", "B1") {
@@ -121,6 +113,16 @@ fn lambda_immediate_invocation_round_trip() {
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(25.0));
 }
 
+/// A lambda literal that is not immediately invoked is not displayable as
+/// a cell value. Excel surfaces this as #CALC!, while the evaluator still
+/// keeps `Value::Lambda` available internally for LET and defined names.
+#[test]
+fn bare_lambda_cell_value_is_calc_error() {
+    let mut wb = Workbook::new();
+    assert!(wb.set_formula(0, "B1", "=LAMBDA(x, x*x)"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Error(ValueError::Calc));
+}
+
 /// REDUCE returns a scalar (sum of A1:A5). Verifies that:
 ///   1. The lambda body sees the accumulator + current value,
 ///   2. The final accumulator is returned without being wrapped in
@@ -136,20 +138,12 @@ fn reduce_and_scan_complement() {
         wb.set_cell(0, &format!("A{}", i + 1), Value::Number(*v));
     }
     // REDUCE: scalar final sum = 15.
-    assert!(wb.set_formula(
-        0,
-        "C1",
-        "=REDUCE(0, A1:A5, LAMBDA(acc, x, acc+x))"
-    ));
+    assert!(wb.set_formula(0, "C1", "=REDUCE(0, A1:A5, LAMBDA(acc, x, acc+x))"));
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(15.0));
 
     // SCAN: 5×1 array of running sums. Anchor D1 returns the Array;
     // D2..D5 return their scalar elements.
-    assert!(wb.set_formula(
-        0,
-        "D1",
-        "=SCAN(0, A1:A5, LAMBDA(acc, x, acc+x))"
-    ));
+    assert!(wb.set_formula(0, "D1", "=SCAN(0, A1:A5, LAMBDA(acc, x, acc+x))"));
     match wb.get_cell("Sheet1", "D1") {
         Value::Array(arr) => {
             assert_eq!(arr.shape(), (5, 1));

@@ -309,8 +309,8 @@ fn wasm_workbook_custom_formula_throw_surfaces_value_error() {
     assert_eq!(wb.get_number(0, "B1"), 7.0);
 }
 
-/// Returning a string maps to a text cell; returning the literal
-/// `"#DIV/0!"` round-trips as the matching `ValueError`.
+/// Returning a string maps to a text cell; returning canonical error tokens
+/// round-trips as the matching `ValueError`.
 #[wasm_bindgen_test]
 fn wasm_workbook_custom_formula_string_and_error_token_returns() {
     let mut wb = WasmWorkbook::new();
@@ -324,6 +324,21 @@ fn wasm_workbook_custom_formula_string_and_error_token_returns() {
     wb.register_custom_formula("MYDIV".into(), divzero);
     assert!(wb.set_formula(0, "A2", "=MYDIV()"));
     assert_eq!(wb.get_display(0, "A2"), "#DIV/0!");
+
+    let calc = make_js_fn(|_args| JsValue::from_str("#CALC!"));
+    wb.register_custom_formula("MYCALC".into(), calc);
+    assert!(wb.set_formula(0, "A3", "=MYCALC()"));
+    assert_eq!(wb.get_display(0, "A3"), "#CALC!");
+
+    let na = make_js_fn(|_args| JsValue::from_str("#N/A"));
+    wb.register_custom_formula("MYNA".into(), na);
+    assert!(wb.set_formula(0, "A4", "=MYNA()"));
+    assert_eq!(wb.get_display(0, "A4"), "#N/A");
+
+    let null = make_js_fn(|_args| JsValue::from_str("#NULL!"));
+    wb.register_custom_formula("MYNULL".into(), null);
+    assert!(wb.set_formula(0, "A5", "=MYNULL()"));
+    assert_eq!(wb.get_display(0, "A5"), "#NULL!");
 }
 
 /// Re-registering an existing name replaces the callback AND dirties
