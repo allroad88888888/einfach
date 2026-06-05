@@ -121,16 +121,21 @@ describe('array scalar-cell and shape guards', () => {
   test('WRAPROWS and WRAPCOLS reject nested array pad values', () => {
     const vector = arr([[n(1), n(2), n(3)]])
     const pad = arr([[s('pad')]])
-    expectError(WRAPROWS([vector, n(2), pad], ctx), '#CALC!')
-    expectError(WRAPCOLS([vector, n(2), pad], ctx), '#CALC!')
+    // Excel requires pad_with to be a scalar; rejecting up front surfaces
+    // `#VALUE!`. (Previously this was caught incidentally as `#CALC!` only
+    // when the pad cell actually appeared in the output.)
+    expectError(WRAPROWS([vector, n(2), pad], ctx), '#VALUE!')
+    expectError(WRAPCOLS([vector, n(2), pad], ctx), '#VALUE!')
   })
 
   test('rejects results wider than the Excel column limit', () => {
-    expectError(SEQUENCE([n(1), n(16_385)], ctx), '#VALUE!')
+    // Excel's column bound (XFD == 16,384) yields `#NUM!`, distinct from
+    // the engine cell-cap which surfaces `#VALUE!`.
+    expectError(SEQUENCE([n(1), n(16_385)], ctx), '#NUM!')
 
     const vector = SEQUENCE([n(16_385)], ctx)
     expect(vector.kind).toBe('array')
-    expectError(WRAPCOLS([vector, n(1)], ctx), '#VALUE!')
+    expectError(WRAPCOLS([vector, n(1)], ctx), '#NUM!')
   })
 })
 
@@ -548,6 +553,44 @@ describe('EXPAND', () => {
 
   test('error propagation for required args', () => {
     expect(EXPAND([arr([[n(1)]]), err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+  })
+
+  // Issue 4 (Hume): pad_with must be a scalar. An array argument leaks
+  // nested arrays into the result, which downstream rendering cannot
+  // handle — reject up front with `#VALUE!`.
+  test('rejects array-typed pad_with', () => {
+    expectError(
+      EXPAND([arr([[n(1)]]), n(2), n(2), arr([[n(99), n(99)]])], ctx),
+      '#VALUE!',
+    )
+  })
+})
+
+// Issue 4 (Hume) consolidated coverage: every pad-bearing array
+// function rejects an array-typed pad argument up front.
+describe('Hume — array-typed pad_with is rejected at the call site', () => {
+  test('WRAPROWS rejects array pad', () => {
+    expectError(
+      WRAPROWS([arr([[n(1), n(2)]]), n(2), arr([[n(99)]])], ctx),
+      '#VALUE!',
+    )
+  })
+
+  test('WRAPCOLS rejects array pad', () => {
+    expectError(
+      WRAPCOLS([arr([[n(1), n(2)]]), n(2), arr([[n(99)]])], ctx),
+      '#VALUE!',
+    )
+  })
+
+  test('EXPAND rejects array pad even when source fills the target', () => {
+    // 2x2 source filling a 2x2 target — pad is never used in the
+    // output. Without the explicit guard, the pad would slip through;
+    // the explicit guard surfaces the error regardless.
+    expectError(
+      EXPAND([arr([[n(1), n(2)], [n(3), n(4)]]), n(2), n(2), arr([[n(99)]])], ctx),
+      '#VALUE!',
+    )
   })
 })
 

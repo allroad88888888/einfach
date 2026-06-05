@@ -87,6 +87,30 @@ function tooLarge(rows: number, cols: number): boolean {
   )
 }
 
+/**
+ * Classify shape overflow: row/col exceeds the Excel grid surfaces
+ * `#NUM!`; only the engine cell-cap (`MAX_ARRAY_CELLS`) surfaces
+ * `#VALUE!`. Used by the array-result construction helpers and the
+ * per-function guards.
+ */
+function shapeOverflowCode(rows: number, cols: number): '#NUM!' | '#VALUE!' {
+  if (rows > MAX_ARRAY_ROWS || cols > MAX_ARRAY_COLS) return '#NUM!'
+  return '#VALUE!'
+}
+
+/**
+ * Reject a pad_with value that is itself an array. Excel requires
+ * `pad_with` to be a scalar (the value broadcasts cell-by-cell into
+ * the padded region); allowing an array leaks nested arrays into the
+ * result, which downstream rendering cannot handle.
+ */
+function rejectArrayPad(pad: Value | undefined): ErrorValue | undefined {
+  if (pad && pad.kind === 'array') {
+    return ERR('#VALUE!', 'pad_with must be a scalar')
+  }
+  return undefined
+}
+
 function scalarCellError(value: Value): ErrorValue | undefined {
   return value.kind === 'array' ? ERR('#CALC!', 'array result was not expanded') : undefined
 }
@@ -105,7 +129,9 @@ function arrayResult(matrix: Value[][]): Value {
   const rows = matrix.length
   const cols = matrixCols(matrix)
   if (rows < 1 || cols < 1) return ERR('#VALUE!')
-  if (tooLarge(rows, cols)) return ERR('#VALUE!', `array result too large (${rows}x${cols})`)
+  if (tooLarge(rows, cols)) {
+    return ERR(shapeOverflowCode(rows, cols), `array result too large (${rows}x${cols})`)
+  }
   return matrixScalarCellError(matrix) ?? { kind: 'array', value: matrix }
 }
 
@@ -275,7 +301,7 @@ const SEQUENCE: FunctionImpl = (args) => {
 
   // Guard rail — SEQUENCE(10000, 10000) would allocate 100M cells.
   if (tooLarge(rows, cols)) {
-    return ERR('#VALUE!', `SEQUENCE result too large (${rows}x${cols})`)
+    return ERR(shapeOverflowCode(rows, cols), `SEQUENCE result too large (${rows}x${cols})`)
   }
 
   const out: Value[][] = []
@@ -560,9 +586,14 @@ const WRAPROWS: FunctionImpl = (args) => {
   const values = vector.values
   const cols = Math.min(wrapCount.value, values.length)
   const rows = Math.ceil(values.length / wrapCount.value)
-  if (tooLarge(rows, cols)) return ERR('#VALUE!', `WRAPROWS result too large (${rows}x${cols})`)
+  if (tooLarge(rows, cols)) {
+    return ERR(shapeOverflowCode(rows, cols), `WRAPROWS result too large (${rows}x${cols})`)
+  }
 
-  const pad = args.length === 3 ? args[2] : ERR('#N/A')
+  const padArg = args.length === 3 ? args[2] : undefined
+  const padError = rejectArrayPad(padArg)
+  if (padError) return padError
+  const pad: Value = padArg ?? ERR('#N/A')
   const out: Value[][] = []
   for (let r = 0; r < rows; r += 1) {
     const row: Value[] = []
@@ -591,9 +622,14 @@ const WRAPCOLS: FunctionImpl = (args) => {
   const values = vector.values
   const rows = Math.min(wrapCount.value, values.length)
   const cols = Math.ceil(values.length / wrapCount.value)
-  if (tooLarge(rows, cols)) return ERR('#VALUE!', `WRAPCOLS result too large (${rows}x${cols})`)
+  if (tooLarge(rows, cols)) {
+    return ERR(shapeOverflowCode(rows, cols), `WRAPCOLS result too large (${rows}x${cols})`)
+  }
 
-  const pad = args.length === 3 ? args[2] : ERR('#N/A')
+  const padArg = args.length === 3 ? args[2] : undefined
+  const padError = rejectArrayPad(padArg)
+  if (padError) return padError
+  const pad: Value = padArg ?? ERR('#N/A')
   const out: Value[][] = []
   for (let r = 0; r < rows; r += 1) {
     const row: Value[] = []
@@ -762,10 +798,16 @@ const EXPAND: FunctionImpl = (args) => {
     }
   }
   if (tooLarge(targetRows.value, targetCols)) {
-    return ERR('#VALUE!', `EXPAND result too large (${targetRows.value}x${targetCols})`)
+    return ERR(
+      shapeOverflowCode(targetRows.value, targetCols),
+      `EXPAND result too large (${targetRows.value}x${targetCols})`,
+    )
   }
 
-  const pad = args.length === 4 ? args[3] : ERR('#N/A')
+  const padArg = args.length === 4 ? args[3] : undefined
+  const padError = rejectArrayPad(padArg)
+  if (padError) return padError
+  const pad: Value = padArg ?? ERR('#N/A')
   const out: Value[][] = []
   for (let r = 0; r < targetRows.value; r += 1) {
     const row: Value[] = []
@@ -945,7 +987,9 @@ const RANDARRAY: FunctionImpl = (args) => {
     cols = parsedCols.value
   }
   if (rows < 1 || cols < 1) return ERR('#VALUE!', 'RANDARRAY dimensions must be >= 1')
-  if (tooLarge(rows, cols)) return ERR('#VALUE!', `RANDARRAY result too large (${rows}x${cols})`)
+  if (tooLarge(rows, cols)) {
+    return ERR(shapeOverflowCode(rows, cols), `RANDARRAY result too large (${rows}x${cols})`)
+  }
 
   let min = 0
   if (args.length >= 3) {

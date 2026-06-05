@@ -353,8 +353,10 @@ describe('higher-order LAMBDA array functions', () => {
   })
 
   test('MAKEARRAY rejects results wider than the Excel column limit', () => {
+    // 16,385 exceeds Excel's XFD column bound (16,384) — `#NUM!` per
+    // Excel-compatible shape guard.
     const result = evaluate(parseFormula('=MAKEARRAY(1, 16385, LAMBDA(r, c, c))'), makeCtx())
-    expect(result).toMatchObject({ kind: 'error', code: '#VALUE!' })
+    expect(result).toMatchObject({ kind: 'error', code: '#NUM!' })
   })
 
   test('MAP and SCAN keep scalar callback errors inside result cells', () => {
@@ -419,5 +421,68 @@ describe('higher-order LAMBDA array functions', () => {
     wb.setCell('s1', 2, 0, '4')
     wb.setCell('s1', 0, 1, '=MAP(A1:A3, LAMBDA(x, x))')
     expect(expectArray(readCell(wb, 's1', 0, 1))).toEqual([[num(2)], [BLANK], [num(4)]])
+  })
+
+  // -------------------------------------------------------------------
+  // Issue 1 (Hume): MAP/FILTER with whole-column input must iterate the
+  // non-empty cells sparsely from the sheet snapshot rather than
+  // materializing 1,048,576 blanks.
+  // -------------------------------------------------------------------
+
+  test('MAP over a whole-column ref iterates only non-empty cells', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '1')
+    wb.setCell('s1', 1, 0, '2')
+    wb.setCell('s1', 99, 0, '3')
+    wb.setCell('s1', 0, 1, '=MAP(A:A, LAMBDA(x, x*10))')
+    const started = Date.now()
+    const result = readCell(wb, 's1', 0, 1)
+    const elapsed = Date.now() - started
+    // Sparse iteration must complete fast — materializing 1M blanks
+    // would push elapsed well above this bound.
+    expect(elapsed).toBeLessThan(100)
+    expect(expectArray(result)).toEqual([[num(10)], [num(20)], [num(30)]])
+  })
+
+  test('FILTER over a whole-column ref iterates only non-empty cells', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '1')
+    wb.setCell('s1', 1, 0, '2')
+    wb.setCell('s1', 99, 0, '3')
+    wb.setCell('s1', 0, 1, '=FILTER(A:A, A:A > 1)')
+    const started = Date.now()
+    const result = readCell(wb, 's1', 0, 1)
+    const elapsed = Date.now() - started
+    expect(elapsed).toBeLessThan(100)
+    expect(expectArray(result)).toEqual([[num(2)], [num(3)]])
+  })
+
+  // -------------------------------------------------------------------
+  // Issue 2 (Hume): REDUCE/BYROW/BYCOL enforce ARRAY_CELL_CAP on input.
+  // The existing 1025x1024 fixture exercises the matrix-array path; this
+  // case exercises the chained input where the inner producer would
+  // itself need to overflow the grid first.
+  // -------------------------------------------------------------------
+
+  test('REDUCE rejects a chained over-cap input from MAKEARRAY', () => {
+    const result = evaluate(
+      parseFormula('=REDUCE(0, MAKEARRAY(2000000, 1, LAMBDA(r, c, r)), LAMBDA(a, v, a + v))'),
+      makeCtx(),
+    )
+    // MAKEARRAY surfaces `#NUM!` (rows > Excel grid bound) and REDUCE
+    // propagates it.
+    expect(result.kind).toBe('error')
+    expect(result).toMatchObject({ kind: 'error', code: '#NUM!' })
+  })
+
+  // -------------------------------------------------------------------
+  // Issue 3 (Hume): 16,384 column bound enforced consistently.
+  // -------------------------------------------------------------------
+
+  test('SEQUENCE/MAKEARRAY column-bound surfaces #NUM!', () => {
+    expect(evaluate(parseFormula('=SEQUENCE(1, 16385)'), makeCtx()))
+      .toMatchObject({ kind: 'error', code: '#NUM!' })
+    expect(evaluate(parseFormula('=MAKEARRAY(1, 16385, LAMBDA(r, c, c))'), makeCtx()))
+      .toMatchObject({ kind: 'error', code: '#NUM!' })
   })
 })

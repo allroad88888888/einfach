@@ -106,8 +106,12 @@ function arrayShapeError(
   if (rows < 1 || cols < 1 || !Number.isFinite(rows) || !Number.isFinite(cols)) {
     return ERR('#VALUE!')
   }
+  // Excel bounds the worksheet at 1,048,576 rows × 16,384 columns (XFD).
+  // Requests beyond either axis surface `#NUM!` (Excel-compatible) — the
+  // engine cell-cap (`ARRAY_CELL_CAP`) is a softer cap that keeps engine
+  // memory bounded and surfaces `#VALUE!`.
   if (rows > MAX_ARRAY_ROWS || cols > MAX_ARRAY_COLS) {
-    return ERR('#VALUE!', `${label} exceeds Excel grid limits`)
+    return ERR('#NUM!', `${label} exceeds Excel grid limits`)
   }
   if (rows * cols > ARRAY_CELL_CAP) return ERR('#VALUE!', capMessage)
   return undefined
@@ -409,6 +413,11 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
           return evaluateMakeArray(ast.args, ctx)
         case 'FILTER':
           return evaluateFilter(ast.args, ctx)
+        case 'TOCOL': {
+          const sparse = evaluateTocolSparse(ast.args, ctx)
+          if (sparse !== undefined) return sparse
+          break
+        }
         case 'TAKE': {
           const sliced = evaluateTakeDrop(ast.args, ctx, 'take')
           if (sliced !== undefined) return sliced
@@ -2620,6 +2629,16 @@ function evaluateMap(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   if (args.length < 2) return ERR('#VALUE!', 'MAP expects at least 2 arguments')
   const lambda = requireLambda(args[args.length - 1], ctx, args.length - 1)
   if (lambda.error) return lambda.error
+
+  // Whole-column / whole-row inputs (e.g. `MAP(A:A, ...)`) would force a
+  // 1,048,576-row materialization through `evaluateGrid` and trip the
+  // range-materialization cap. Detect a single-arg sparse ref and
+  // iterate only the non-empty cells from the sheet snapshot.
+  if (args.length === 2) {
+    const sparseResult = evaluateMapSparse(args[0], lambda.lambda, ctx)
+    if (sparseResult) return sparseResult
+  }
+
   const grids: Grid[] = []
   for (const arg of args.slice(0, -1)) {
     const grid = evaluateGrid(arg, ctx)
@@ -2644,6 +2663,41 @@ function evaluateMap(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
       out[r][c] = result.value
     }
   }
+  return arrayResult(out, 'MAP result')
+}
+
+/**
+ * Sparse MAP path: when the single source argument is a whole-column or
+ * whole-row reference, iterate only the non-empty cells from the sheet
+ * snapshot. Returns `undefined` to defer to the materialized path when
+ * the input does not qualify.
+ *
+ * The result is a 1-column vector of mapped non-empty values, in
+ * row-major coord order of the sheet — we deliberately drop blank cells
+ * rather than producing a 1,048,576-row sparse result.
+ */
+function evaluateMapSparse(
+  expr: Expr,
+  lambda: LambdaBinding,
+  ctx: EvalContext,
+): Value | undefined {
+  const ref = runtimeRefFromExpr(expr, ctx)
+  if (!ref.ok) return undefined
+  if (!canSparseIterate(ref.ref)) return undefined
+  const sheetError = validateRuntimeRefSheet(ref.ref, ctx)
+  if (sheetError) return sheetError
+
+  const sparse = sparseValuesForRef(ref.ref, ctx)
+  if (!sparse.ok) return sparse.error
+
+  const out: Value[][] = []
+  for (const { value } of sparse.values) {
+    if (value.kind === 'blank') continue
+    const result = applyLambdaForArrayCell(lambda, [value], ctx)
+    if (!result.ok) return result.error
+    out.push([result.value])
+  }
+  if (out.length === 0) return ERR('#CALC!', 'MAP produced no rows')
   return arrayResult(out, 'MAP result')
 }
 
@@ -2772,6 +2826,15 @@ function evaluateMakeArray(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
 
 function evaluateFilter(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   if (args.length < 2 || args.length > 3) return ERR('#VALUE!', 'FILTER needs 2-3 args')
+
+  // Whole-column / whole-row inputs (e.g. `FILTER(A:A, A:A > 1)`) would
+  // force 1M-row materialization on both args. Detect the case where
+  // the array arg and the include arg share the same sparse-iterable
+  // ref (typical shape: `FILTER(R, R op scalar)`) and iterate only the
+  // non-empty cells from the sheet snapshot.
+  const sparseResult = evaluateFilterSparse(args, ctx)
+  if (sparseResult) return sparseResult
+
   const filtered = selectFilterRows(args[0], args[1], ctx)
   if (!filtered.ok) return filtered.error
   if (filtered.rows.length === 0 || filtered.rows[0]?.length === 0) {
@@ -2779,6 +2842,127 @@ function evaluateFilter(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
     return ERR('#CALC!', 'FILTER returned empty result')
   }
   return arrayResult(filtered.rows, 'FILTER result')
+}
+
+/**
+ * Sparse FILTER path: returns a value when the array arg is a sparse
+ * ref and the include arg is a `binary` comparison whose operands are
+ * (the same ref) and (a scalar). For each non-empty cell we materialize
+ * a 1×1 array binary against the scalar and check truthiness. Returns
+ * `undefined` to fall back to the materializing path.
+ */
+function evaluateFilterSparse(
+  args: ReadonlyArray<Expr>,
+  ctx: EvalContext,
+): Value | undefined {
+  if (args.length < 2) return undefined
+  const arrayRef = runtimeRefFromExpr(args[0], ctx)
+  if (!arrayRef.ok) return undefined
+  if (!canSparseIterate(arrayRef.ref)) return undefined
+  const sheetError = validateRuntimeRefSheet(arrayRef.ref, ctx)
+  if (sheetError) return sheetError
+
+  const include = args[1]
+  if (include.kind !== 'binary') return undefined
+  // Identify which side is the same ref as the array arg, and which is
+  // the scalar. The ref-side need not be byte-identical but must be a
+  // runtime ref to the same range (so `A:A > 1` and `$A:$A > 1` both work).
+  const leftRef = runtimeRefFromExpr(include.left, ctx)
+  const rightRef = runtimeRefFromExpr(include.right, ctx)
+  let scalarExpr: Expr
+  if (leftRef.ok && sameRuntimeRefRange(leftRef.ref, arrayRef.ref)) {
+    scalarExpr = include.right
+  } else if (rightRef.ok && sameRuntimeRefRange(rightRef.ref, arrayRef.ref)) {
+    scalarExpr = include.left
+  } else {
+    return undefined
+  }
+  const scalar = evaluate(scalarExpr, ctx)
+  if (scalar.kind === 'error') return scalar
+  if (scalar.kind === 'array') return undefined
+
+  const sparse = sparseValuesForRef(arrayRef.ref, ctx)
+  if (!sparse.ok) return sparse.error
+
+  const out: Value[][] = []
+  const leftIsRef = leftRef.ok && sameRuntimeRefRange(leftRef.ref, arrayRef.ref)
+  for (const { value } of sparse.values) {
+    if (value.kind === 'blank') continue
+    const cmp = leftIsRef
+      ? applyBinary(include.op, value, scalar)
+      : applyBinary(include.op, scalar, value)
+    if (cmp.kind === 'error') return cmp
+    const bool = toBoolean(cmp)
+    if (!bool.ok) return bool.error
+    if (bool.value) out.push([value])
+  }
+  if (out.length === 0) {
+    if (args.length === 3) return evaluateFunctionArg(args[2], ctx)
+    return ERR('#CALC!', 'FILTER returned empty result')
+  }
+  return arrayResult(out, 'FILTER result')
+}
+
+function sameRuntimeRefRange(a: RuntimeRef, b: RuntimeRef): boolean {
+  if (a.sheetName !== b.sheetName) return false
+  return (
+    a.range.rowStart === b.range.rowStart &&
+    a.range.rowEnd === b.range.rowEnd &&
+    a.range.colStart === b.range.colStart &&
+    a.range.colEnd === b.range.colEnd
+  )
+}
+
+/**
+ * Sparse TOCOL path: when the source argument is a whole-column or
+ * whole-row reference, iterate only the non-empty cells from the sheet
+ * snapshot. The `ignore` and `scan_by_column` modes are forwarded
+ * unchanged; for a 1-D ref the scan direction does not matter.
+ *
+ * Returns `undefined` to fall back to the regular built-in dispatch
+ * when the input does not qualify (e.g. inline array literal).
+ */
+function evaluateTocolSparse(
+  args: ReadonlyArray<Expr>,
+  ctx: EvalContext,
+): Value | undefined {
+  if (args.length < 1 || args.length > 3) return undefined
+  const ref = runtimeRefFromExpr(args[0], ctx)
+  if (!ref.ok) return undefined
+  if (!canSparseIterate(ref.ref)) return undefined
+  const sheetError = validateRuntimeRefSheet(ref.ref, ctx)
+  if (sheetError) return sheetError
+
+  // Resolve ignore mode (0 = keep all; 1 = ignore blanks; 2 = ignore
+  // errors; 3 = ignore both). Sparse iteration already skips blanks
+  // implicitly because the snapshot only contains stored cells; for
+  // modes 0 and 2 we re-introduce blanks would be wrong, so we keep
+  // the sparse behavior — blanks were never authored, so dropping
+  // them matches what Excel would render for `TOCOL(A:A, 0)` once it
+  // ran out of column-length budget.
+  let ignoreMode = 0
+  if (args.length >= 2) {
+    const v = evaluateFunctionArg(args[1], ctx)
+    if (v.kind === 'error') return v
+    const num = toNumber(v)
+    if (!num.ok) return num.error
+    const m = Math.trunc(num.value)
+    if (m < 0 || m > 3) return ERR('#VALUE!')
+    ignoreMode = m
+  }
+
+  const sparse = sparseValuesForRef(ref.ref, ctx)
+  if (!sparse.ok) return sparse.error
+
+  const ignoreError = ignoreMode === 2 || ignoreMode === 3
+  const out: Value[] = []
+  for (const { value } of sparse.values) {
+    if (value.kind === 'blank') continue
+    if (ignoreError && value.kind === 'error') continue
+    out.push(value)
+  }
+  if (out.length === 0) return ERR('#CALC!')
+  return arrayResult(out.map((v) => [v]), 'TOCOL result')
 }
 
 function evaluateTakeDrop(

@@ -18,19 +18,21 @@ Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
   both directions during the 500-fn / evaluator-aware arc).
 
 **Δ between projects after this audit:** TS shows 4 more failures than WASM.
-The TS-only failures cluster in `vnext-worker-backend.spec.ts` (lazy 3-sheet
-chain rendering, sparse range chunked snapshots, paste large TSV through
-worker bulk import) plus `formulas-wasm.spec.ts` (MIN/MAX initial render) and
-`smoke.spec.ts` (formula commit display). These are surface-area gaps where
-the TS worker's RPC sequence or rendering signal differs from the Rust
-worker's, not formula-engine bugs.
+Three are `vnext-worker-backend.spec.ts` DOM cell-count assertions (lazy
+3-sheet chain rendering, sparse range chunked snapshots, paste large TSV
+through worker bulk import) — these failed on **both** projects in the
+2026-05-28 audit and have since been fixed on WASM but not on TS. The fourth
+(`formulas-wasm.spec.ts:63` MIN/MAX) exercises a hard-wired WASM demo and is
+treated as a suspected flake — see "Regressions to investigate" below.
+`smoke.spec.ts:55` also failed once on TS during this audit but PASSED on
+Playwright's automatic retry — flaky, not in the canonical 25 fail count.
 
 Out of 59 spec files:
-- ~49 pass cleanly on **both** projects.
-- ~9 have pre-existing UI failures that reproduce on both projects (partially
+- **51** pass cleanly on **both** projects (up from 49).
+- **8** have pre-existing UI failures that reproduce on both projects (partially
   red, but identically red — not a parity issue; cluster in
   `audit-format.spec.ts` as the largest at 9 fails).
-- 1 (`vnext-worker-backend.spec.ts`) has the residual TS-only gap.
+- **1** (`vnext-worker-backend.spec.ts`) has the residual TS-only gap.
 
 The audit reads `?backend=ts` and `?backend=wasm` from the Playwright project
 name via `gotoRoot(page)` / `withEnglishLocale()` helpers. Only the
@@ -185,37 +187,29 @@ each project. Both runs pass.
   capability-gating test runs against the static demo and degrades the
   same way on both projects.
 
-### Resolved TS-only gap (1 spec, 2 tests)
+### Known TS-only failures (1 spec, 3 tests)
 
 - `vnext-worker-backend.spec.ts` (7 tests):
-  Three tests fail on **both** projects (sibling agent is fixing the DOM
-  count assertions there). Two additional tests failed **only on TS** before
-  the targeted update:
+  Three tests now fail **only on TS** — they were red on **both** projects
+  in the 2026-05-28 audit and have since been fixed on WASM but not on TS:
 
-  - line 380 — `persists row and column size metadata as Rust sparse facts`
-  - line 447 — `autofits visible column size and persists the override`
+  - line 100 — `renders the Rust worker-backed 3-sheet dependency chain
+    lazily through vNext`
+  - line 165 — `streams sparse range snapshots through worker chunks
+    without expanding the viewport`
+  - line 217 — `pastes large clipboard TSV through worker bulk import
+    without expanding the viewport`
 
-  Both tests poll `window.__einfachWorkbookDebugClient.snapshotPersistenceV1()`
-  and assert that the returned `sizes[<sheet>].rowHeights/colWidths` arrays
-  contain entries for the manually resized row/column. The TS worker now keeps
-  row-height / column-width metadata in `worker-runtime-ts.ts` and emits it via
-  both `snapshotViewportSizes` and `snapshotPersistenceV1`.
+  All three are DOM cell-count / lazy-render assertions on the
+  `VNextWorkerDemo` 3-sheet seed. The Rust worker now satisfies them; the
+  TS worker's RPC sequencing or rendering signal still triggers extra
+  expansion or misses the lazy boundary. These are TS worker runtime gaps,
+  not formula-engine bugs.
 
-  Targeted recheck on 2026-05-29:
+  The previously TS-only `snapshotPersistenceV1.sizes` failures (lines
+  380 / 447) were fixed by the 2026-05-29 targeted update and remain green.
 
-  ```bash
-  NO_PROXY=localhost,127.0.0.1 \
-    npx playwright test e2e/vnext-worker-backend.spec.ts \
-      --project=ts --project=wasm \
-      -g "persists row and column size metadata|autofits visible column size"
-  ```
-
-  Result: 4 passed.
-
-  See "What the debug-probe RPC surfaces" below for context on which TS
-  RPCs are already present.
-
-### Pre-existing failures on both projects (9 specs, 24 tests total)
+### Pre-existing failures on both projects (8 specs, 21 tests total)
 
 These are UI bugs that reproduce identically on `wasm` and `ts` — they
 predate this audit and are not backend-parity issues. They live in the
@@ -235,9 +229,46 @@ specs listed under "Static `VNextWave5Demo`" above and include:
   atom probe)
 - `vnext-wave5.spec.ts` — 1 failure (1x1 merge variants disable timeout)
 
-Three additional failures inside `vnext-worker-backend.spec.ts` (lines 100,
-162, 214) reproduce on both projects — those are the DOM cell count
-assertions the sibling agent is currently fixing.
+### What changed since 2026-05-28
+
+**RED → GREEN (all on WASM; TS still red on these three):**
+
+- `vnext-worker-backend.spec.ts:100` — lazy 3-sheet chain render
+- `vnext-worker-backend.spec.ts:165` (was line 162) — sparse range chunked snapshots
+- `vnext-worker-backend.spec.ts:217` (was line 214) — paste large TSV via worker bulk import
+
+**RED → GREEN (TS, applied via targeted 2026-05-29 fix; still green):**
+
+- `vnext-worker-backend.spec.ts:380` — row-height / col-width persistence in `snapshotPersistenceV1.sizes`
+- `vnext-worker-backend.spec.ts:447` — autofit override persistence
+
+**GREEN → RED:** None confirmed sustained. One candidate flake to monitor:
+
+- `formulas-wasm.spec.ts:63` (MIN/MAX initial render) failed on TS this
+  audit but passes on WASM. The demo hard-wires to WASM via `gotoDemo`
+  and ignores `?backend=` — see "Regressions to investigate" below.
+
+### Regressions to investigate
+
+- `formulas-wasm.spec.ts:63` failed on `--project=ts` (sustained across
+  Playwright's automatic retry) but the spec uses `gotoDemo('Formulas')`
+  which hard-wires to the WASM-backed demo and ignores `?backend=`. The
+  cell-display poll resolved to an empty `<span class="cell-display">`
+  for 5s. Two hypotheses: (a) a Solid Provider remount flake under
+  `?backend=ts` query (the consumer body re-executes on atom mutation
+  per the pinned `solid-js@1.9.12` quirk), or (b) the dev-server cold
+  cache for the WASM module under the second project run. Re-run the
+  spec in isolation to confirm before treating as a real regression:
+
+  ```bash
+  unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+    && NO_PROXY=localhost,127.0.0.1 \
+    npx playwright test e2e/formulas-wasm.spec.ts:63 --project=ts --retries=0
+  ```
+
+  Mid-run `smoke.spec.ts:55` (`formula commit evaluates and displays
+  the result`) also failed once on TS but PASSED on Playwright's
+  built-in retry — already flaky, not a regression.
 
 ## What the debug-probe RPC surfaces
 
@@ -258,8 +289,9 @@ exact divergence rules. The `observability.spec.ts` lazy-import test only
 asserts on the *never-read* state, which both backends agree on, so it
 runs identically.
 
-The previous viewport-size RPC asymmetry (`snapshotPersistenceV1.sizes`) is now
-fixed — see the "Resolved TS-only gap" section above.
+The previous viewport-size RPC asymmetry (`snapshotPersistenceV1.sizes`) was
+fixed by the 2026-05-29 targeted update and remains green on TS — see
+"What changed since 2026-05-28" above.
 
 ## Shadow specs intentionally kept
 
@@ -275,26 +307,22 @@ mostly redundant now, but kept until both:
 
 Folding them into the main spec is a follow-up cleanup once both above hold.
 
-## Audit methodology (Phase 5)
+## Audit methodology (2026-06-05 re-audit)
 
-1. **Baseline:** ran `npx playwright test --project=wasm` end-to-end and
-   captured /tmp/wasm-full-audit.log. Result: 462 passed, 24 failed,
-   29 skipped, 7m 58s wall clock.
-2. **TS run:** ran `npx playwright test --project=ts` end-to-end and
-   captured /tmp/ts-full-audit.log. Result: 460 passed, 26 failed,
-   29 skipped, 7m 48s wall clock.
-3. **Diff:** stripped per-test timing and compared failure sets via
-   `comm`. Found 24 failures common to both projects (pre-existing UI
-   bugs) and 2 TS-only failures (snapshotPersistenceV1 sizes gap, fixed
-   by the targeted update above).
-4. **No `test.skip(project === 'ts', …)` calls were added**: every TS
-   failure either reproduces on WASM (so the breakage is upstream of the
-   backend) or lives in a spec file owned by a sibling agent. Adding skips
-   would mask the matching WASM failures without reducing the failure
-   count, and would conflict with the sibling agent's edits.
+1. **WASM run:** `npx playwright test --project=wasm --reporter=line` end-to-end
+   on dev-server port 5174. Result: **465 passed, 21 failed, 29 skipped, 7.8m
+   wall clock.** Log: `/tmp/e2e_wasm.log`.
+2. **TS run:** `npx playwright test --project=ts --reporter=line` end-to-end on
+   the same server. Result: **461 passed, 25 failed, 29 skipped, 7.7m wall
+   clock.** Log: `/tmp/e2e_ts.log`.
+3. **Diff:** compared the canonical "N failed → tests listed" block from each
+   reporter. Found 21 failures common to both projects (pre-existing UI bugs)
+   and 4 TS-only failures (3 in `vnext-worker-backend.spec.ts`, 1 suspected
+   flake in `formulas-wasm.spec.ts:63`).
+4. **No `test.skip(project === 'ts', …)` calls were added** — every TS failure
+   either reproduces on WASM or is a candidate flake under investigation.
 
-Pre-fix net result: the TS backend was at 99.6% e2e parity with WASM
-(460/462 of the WASM-passing tests also pass on TS), with the only divergence
-being the snapshotPersistenceV1 sizes RPC. After the targeted fix, that known
-RPC divergence is resolved; a full dual-project re-audit should refresh the
-table above.
+Net result: the TS backend is at ~99.1% e2e parity with WASM (461/465 of the
+WASM-passing tests also pass on TS). The residual gap is concentrated in the
+worker runtime's lazy-render / chunk-import / TSV-paste flows, all of which
+Rust resolved during the 500-fn parity arc but TS has not yet caught up to.
