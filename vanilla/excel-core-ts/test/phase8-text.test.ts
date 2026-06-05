@@ -317,6 +317,17 @@ describe('ROMAN / ARABIC', () => {
     expect(call('ARABIC', [STR('hello')])).toEqual(ERR('#VALUE!'))
     expect(call('ARABIC', [NUM(123)])).toEqual(ERR('#VALUE!'))
   })
+
+  test('ARABIC supports a leading minus sign', () => {
+    // Excel: ARABIC("-IV") returns -4, ARABIC("-MMXXIV") returns -2024.
+    expect(call('ARABIC', [STR('-IV')])).toEqual(NUM(-4))
+    expect(call('ARABIC', [STR('-mmxxiv')])).toEqual(NUM(-2024))
+    expect(call('ARABIC', [STR('  -IX')])).toEqual(NUM(-9))
+  })
+
+  test('ARABIC lone minus is #VALUE!', () => {
+    expect(call('ARABIC', [STR('-')])).toEqual(ERR('#VALUE!'))
+  })
 })
 
 describe('VALUETOTEXT / ARRAYTOTEXT', () => {

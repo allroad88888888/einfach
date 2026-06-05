@@ -113,8 +113,9 @@ export const IFNA: FunctionImpl = (args) => {
  *  - At least one non-blank arg required; all-blank or empty → `#VALUE!`.
  *  - Each arg coerced via `toBoolean`; coercion failure → propagate that error.
  *  - Errors in any positional arg propagate (first one wins).
- *
- * `array` args: top-left scalar is used (matches `toBoolean`'s behavior).
+ *  - `array` / range args: every cell is inspected — Excel treats AND/OR
+ *    as descending into ranges. Strings inside arrays are silently
+ *    skipped (Excel quirk); errors inside arrays propagate.
  */
 export const AND: FunctionImpl = (args) => {
   if (args.length === 0) return ERR_VALUE
@@ -123,6 +124,15 @@ export const AND: FunctionImpl = (args) => {
   let sawAny = false
   for (const a of args) {
     if (a.kind === 'blank') continue
+    if (a.kind === 'array') {
+      const r = reduceArrayBoolean(a.value, true)
+      if (r.kind === 'error') return r
+      if (r.sawAny) {
+        sawAny = true
+        if (!r.result) return FALSE_VALUE
+      }
+      continue
+    }
     sawAny = true
     const c = toBoolean(a)
     if (!c.ok) return c.error
@@ -132,6 +142,43 @@ export const AND: FunctionImpl = (args) => {
   return TRUE_VALUE
 }
 
+/**
+ * Reduce an array's cells to a single boolean for AND (`mode=true`) or
+ * OR (`mode=false`). Excel rules for in-array values:
+ *  - errors propagate (return as-is via { kind: 'error' } discriminant)
+ *  - blanks skipped
+ *  - strings skipped (silently — even strings like "true" / "false"
+ *    are ignored inside ranges, unlike scalar args)
+ *  - numbers / booleans coerced via toBoolean
+ */
+function reduceArrayBoolean(
+  cells: Value[][],
+  isAnd: boolean,
+): (Value & { kind: 'error' }) | { kind: 'ok'; sawAny: boolean; result: boolean } {
+  let sawAny = false
+  let result = isAnd
+  for (const row of cells) {
+    for (const cell of row) {
+      if (cell.kind === 'error') return cell
+      if (cell.kind === 'blank' || cell.kind === 'string') continue
+      const c = toBoolean(cell)
+      if (!c.ok) {
+        // For range cells, coercion failure is silent in Excel (unlike scalar).
+        // Numbers/booleans always coerce; only string failures would arrive here
+        // and strings are filtered above — so this branch is defensive.
+        continue
+      }
+      sawAny = true
+      if (isAnd) {
+        if (!c.value) return { kind: 'ok', sawAny: true, result: false }
+      } else {
+        if (c.value) return { kind: 'ok', sawAny: true, result: true }
+      }
+    }
+  }
+  return { kind: 'ok', sawAny, result }
+}
+
 // =============================================================================
 // OR
 // =============================================================================
@@ -139,7 +186,7 @@ export const AND: FunctionImpl = (args) => {
 /**
  * `OR(arg1, arg2, ...)` — any truthy → TRUE.
  *
- * Same blank/empty/error rules as AND.
+ * Same blank/empty/error rules as AND. Arrays descend into every cell.
  */
 export const OR: FunctionImpl = (args) => {
   if (args.length === 0) return ERR_VALUE
@@ -148,6 +195,15 @@ export const OR: FunctionImpl = (args) => {
   let sawAny = false
   for (const a of args) {
     if (a.kind === 'blank') continue
+    if (a.kind === 'array') {
+      const r = reduceArrayBoolean(a.value, false)
+      if (r.kind === 'error') return r
+      if (r.sawAny) {
+        sawAny = true
+        if (r.result) return TRUE_VALUE
+      }
+      continue
+    }
     sawAny = true
     const c = toBoolean(a)
     if (!c.ok) return c.error

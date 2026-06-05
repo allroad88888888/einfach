@@ -139,6 +139,50 @@ describe('WEEKNUM', () => {
     expect(call('WEEKNUM', [NUM(s)])).toEqual(NUM(2))
   })
   test('error propagates', () => expect(call('WEEKNUM', [ERR('#N/A')])).toEqual(ERR('#N/A')))
+
+  // 2024 calendar: Jan 1 = Monday. Verify each weekday-anchored mode.
+  test('return_type 11 (Mon start) — alias of 2', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(11)])).toEqual(NUM(1))
+    // Jan 7 is Sun: still in week 1 with Mon-start.
+    expect(call('WEEKNUM', [NUM(jan1 + 6), NUM(11)])).toEqual(NUM(1))
+    // Jan 8 is Mon: starts week 2.
+    expect(call('WEEKNUM', [NUM(jan1 + 7), NUM(11)])).toEqual(NUM(2))
+  })
+
+  test('return_type 12 (Tue start)', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    // Jan 1 is Mon — last day of pre-Tue week. So Mon→week 1.
+    expect(call('WEEKNUM', [NUM(jan1), NUM(12)])).toEqual(NUM(1))
+    // Jan 2 (Tue) starts a new week.
+    expect(call('WEEKNUM', [NUM(jan1 + 1), NUM(12)])).toEqual(NUM(2))
+  })
+
+  test('return_type 16 (Sat start)', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    // Sat = Jan 6.
+    expect(call('WEEKNUM', [NUM(jan1 + 5), NUM(16)])).toEqual(NUM(2))
+  })
+
+  test('return_type 17 (Sun start) — alias of 1', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(17)])).toEqual(NUM(1))
+    expect(call('WEEKNUM', [NUM(jan1 + 6), NUM(17)])).toEqual(NUM(2))
+  })
+
+  test('return_type 21 (ISO 8601) — delegates to ISOWEEKNUM', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(21)])).toEqual(NUM(1))
+    const dec31_2023 = asNumber(call('DATE', [NUM(2023), NUM(12), NUM(31)]))
+    expect(call('WEEKNUM', [NUM(dec31_2023), NUM(21)])).toEqual(NUM(52))
+  })
+
+  test('invalid return_type → #NUM!', () => {
+    const jan1 = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(0)])).toEqual(ERR('#NUM!'))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(99)])).toEqual(ERR('#NUM!'))
+    expect(call('WEEKNUM', [NUM(jan1), NUM(20)])).toEqual(ERR('#NUM!'))
+  })
 })
 
 describe('ISOWEEKNUM', () => {

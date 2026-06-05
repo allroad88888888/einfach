@@ -2867,8 +2867,13 @@ const ARABIC: FunctionImpl = (args) => {
   const err = propagateError(args)
   if (err) return err
   if (args[0].kind !== 'string' && args[0].kind !== 'blank') return ERR_VALUE
-  const s = (args[0].kind === 'string' ? args[0].value : '').trim().toUpperCase()
-  if (s === '') return { kind: 'number', value: 0 }
+  const raw = (args[0].kind === 'string' ? args[0].value : '').trim().toUpperCase()
+  if (raw === '') return { kind: 'number', value: 0 }
+  // Excel ARABIC accepts a leading minus sign for negative numerals
+  // (e.g. ARABIC("-MMXXIV") → -2024).
+  const negative = raw[0] === '-'
+  const s = negative ? raw.slice(1) : raw
+  if (s === '') return ERR_VALUE
   let total = 0
   let prev = 0
   for (let i = s.length - 1; i >= 0; i--) {
@@ -2886,7 +2891,7 @@ const ARABIC: FunctionImpl = (args) => {
     total += value < prev ? -value : value
     prev = value
   }
-  return { kind: 'number', value: total }
+  return { kind: 'number', value: negative ? -total : total }
 }
 
 // =============================================================================

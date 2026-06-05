@@ -201,6 +201,45 @@ describe('WEEKDAY', () => {
   test('invalid return_type → #NUM!', () => {
     expect(call(WEEKDAY, [num(1), num(0)])).toMatchObject({ kind: 'error', code: '#NUM!' })
     expect(call(WEEKDAY, [num(1), num(99)])).toMatchObject({ kind: 'error', code: '#NUM!' })
+    expect(call(WEEKDAY, [num(1), num(10)])).toMatchObject({ kind: 'error', code: '#NUM!' })
+    expect(call(WEEKDAY, [num(1), num(18)])).toMatchObject({ kind: 'error', code: '#NUM!' })
+  })
+
+  // 2024-01-01 = Monday, serial 45292. Walk through types 11..17 — each
+  // type N anchors weekday (N-11) as "1" (Mon=0..Sun=6).
+  test('WEEKDAY return_type 11 (Mon=1..Sun=7) — alias of 2', () => {
+    expect(call(WEEKDAY, [num(45292), num(11)])).toEqual(num(1)) // Mon → 1
+    expect(call(WEEKDAY, [num(45292 + 6), num(11)])).toEqual(num(7)) // Sun → 7
+  })
+
+  test('WEEKDAY return_type 12 (Tue=1..Mon=7)', () => {
+    expect(call(WEEKDAY, [num(45292), num(12)])).toEqual(num(7)) // Mon → 7
+    expect(call(WEEKDAY, [num(45292 + 1), num(12)])).toEqual(num(1)) // Tue → 1
+  })
+
+  test('WEEKDAY return_type 13 (Wed=1..Tue=7)', () => {
+    expect(call(WEEKDAY, [num(45292), num(13)])).toEqual(num(6)) // Mon → 6
+    expect(call(WEEKDAY, [num(45292 + 2), num(13)])).toEqual(num(1)) // Wed → 1
+  })
+
+  test('WEEKDAY return_type 14 (Thu=1..Wed=7)', () => {
+    expect(call(WEEKDAY, [num(45292 + 3), num(14)])).toEqual(num(1)) // Thu → 1
+    expect(call(WEEKDAY, [num(45292), num(14)])).toEqual(num(5)) // Mon → 5
+  })
+
+  test('WEEKDAY return_type 15 (Fri=1..Thu=7)', () => {
+    expect(call(WEEKDAY, [num(45292 + 4), num(15)])).toEqual(num(1)) // Fri → 1
+    expect(call(WEEKDAY, [num(45292), num(15)])).toEqual(num(4)) // Mon → 4
+  })
+
+  test('WEEKDAY return_type 16 (Sat=1..Fri=7)', () => {
+    expect(call(WEEKDAY, [num(45292 + 5), num(16)])).toEqual(num(1)) // Sat → 1
+    expect(call(WEEKDAY, [num(45292), num(16)])).toEqual(num(3)) // Mon → 3
+  })
+
+  test('WEEKDAY return_type 17 (Sun=1..Sat=7) — alias of 1', () => {
+    expect(call(WEEKDAY, [num(45292 + 6), num(17)])).toEqual(num(1)) // Sun → 1
+    expect(call(WEEKDAY, [num(45292), num(17)])).toEqual(num(2)) // Mon → 2
   })
 
   test('error arg propagates', () => {

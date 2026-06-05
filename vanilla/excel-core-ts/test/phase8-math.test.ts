@@ -145,7 +145,10 @@ describe('ATAN / ATAN2', () => {
   test('ATAN(1) = PI/4', () => expect(asNumber(call(ATAN, [NUM(1)]))).toBeCloseTo(Math.PI / 4, 10))
   test('ATAN2(1, 1) = PI/4 (note: Excel arg order is (x, y))', () =>
     expect(asNumber(call(ATAN2, [NUM(1), NUM(1)]))).toBeCloseTo(Math.PI / 4, 10))
-  test('ATAN2(0, 0) → #NUM!', () => expect(call(ATAN2, [NUM(0), NUM(0)])).toEqual(ERR('#NUM!')))
+  // Excel returns #DIV/0! when both args are zero (atan2 is undefined at origin).
+  // See Microsoft Office docs for ATAN2.
+  test('ATAN2(0, 0) → #DIV/0!', () =>
+    expect(call(ATAN2, [NUM(0), NUM(0)])).toEqual(ERR('#DIV/0!')))
 })
 
 describe('SINH / COSH / TANH', () => {

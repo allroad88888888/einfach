@@ -565,12 +565,22 @@ export const ACOS: FunctionImpl = (args) => unaryNumber(args, (n) => {
   return Math.acos(n)
 })
 export const ATAN: FunctionImpl = (args) => unaryNumber(args, Math.atan)
-export const ATAN2: FunctionImpl = (args) =>
-  // Excel: ATAN2(x, y) — note arg order is (x, y), not Math.atan2's (y, x).
-  binaryNumber(args, (x, y) => {
-    if (x === 0 && y === 0) return Number.NaN
-    return Math.atan2(y, x)
-  })
+export const ATAN2: FunctionImpl = (args) => {
+  // Excel: ATAN2(x, y) — arg order is (x, y), not Math.atan2's (y, x).
+  // Per Microsoft docs, ATAN2(0, 0) yields #DIV/0! (atan2 is undefined at
+  // the origin); other args use the standard math.atan2 result.
+  const propagated = propagateError(args)
+  if (propagated) return propagated
+  if (args.length !== 2) return ERR('#VALUE!')
+  const a = toNumber(args[0])
+  if (!a.ok) return a.error
+  const b = toNumber(args[1])
+  if (!b.ok) return b.error
+  if (a.value === 0 && b.value === 0) return ERR('#DIV/0!')
+  const out = Math.atan2(b.value, a.value)
+  if (!Number.isFinite(out) || Number.isNaN(out)) return ERR('#NUM!')
+  return NUM(out)
+}
 
 // Hyperbolic
 export const SINH: FunctionImpl = (args) => unaryNumber(args, Math.sinh)

@@ -173,6 +173,35 @@ describe('AND', () => {
   it('returns #VALUE! when a string arg fails to coerce', () => {
     expect(AND([BOOL(true), STR('nope')], ctx)).toEqual(ERR('#VALUE!'))
   })
+
+  // Excel descends into ranges — every cell counts, not just the top-left.
+  it('descends into array args (every cell)', () => {
+    const arr = (vs: Value[][]): Value => ({ kind: 'array', value: vs })
+    // All TRUE inside the array.
+    expect(AND([arr([[BOOL(true), BOOL(true)], [BOOL(true), BOOL(true)]])], ctx)).toEqual(
+      BOOL(true),
+    )
+    // One FALSE cell anywhere → FALSE.
+    expect(AND([arr([[BOOL(true), BOOL(false)], [BOOL(true), BOOL(true)]])], ctx)).toEqual(
+      BOOL(false),
+    )
+    // Number 0 cell coerces to false.
+    expect(AND([arr([[NUM(1), NUM(0), NUM(1)]])], ctx)).toEqual(BOOL(false))
+    // Mixed scalar + array.
+    expect(AND([BOOL(true), arr([[BOOL(true), BOOL(false)]])], ctx)).toEqual(BOOL(false))
+  })
+
+  it('strings inside arrays are silently skipped (Excel quirk)', () => {
+    const arr = (vs: Value[][]): Value => ({ kind: 'array', value: vs })
+    // String "TRUE" inside a range is ignored — so AND with only a string
+    // sees no non-blank cells.
+    expect(AND([arr([[STR('hello'), BOOL(true)]])], ctx)).toEqual(BOOL(true))
+  })
+
+  it('propagates errors found inside arrays', () => {
+    const arr = (vs: Value[][]): Value => ({ kind: 'array', value: vs })
+    expect(AND([arr([[BOOL(true), ERR('#N/A')]])], ctx)).toEqual(ERR('#N/A'))
+  })
 })
 
 // -----------------------------------------------------------------------------
@@ -202,6 +231,27 @@ describe('OR', () => {
 
   it('propagates the first error', () => {
     expect(OR([BOOL(false), ERR('#REF!'), ERR('#N/A')], ctx)).toEqual(ERR('#REF!'))
+  })
+
+  it('descends into array args (every cell)', () => {
+    const arr = (vs: Value[][]): Value => ({ kind: 'array', value: vs })
+    // All FALSE inside the array.
+    expect(OR([arr([[BOOL(false), BOOL(false)], [BOOL(false), BOOL(false)]])], ctx)).toEqual(
+      BOOL(false),
+    )
+    // One TRUE cell anywhere → TRUE.
+    expect(OR([arr([[BOOL(false), BOOL(false)], [BOOL(true), BOOL(false)]])], ctx)).toEqual(
+      BOOL(true),
+    )
+    // Non-zero number cell coerces to true.
+    expect(OR([arr([[NUM(0), NUM(0), NUM(7)]])], ctx)).toEqual(BOOL(true))
+    // Mixed scalar + array.
+    expect(OR([BOOL(false), arr([[BOOL(false), BOOL(true)]])], ctx)).toEqual(BOOL(true))
+  })
+
+  it('propagates errors found inside arrays', () => {
+    const arr = (vs: Value[][]): Value => ({ kind: 'array', value: vs })
+    expect(OR([arr([[BOOL(false), ERR('#REF!')]])], ctx)).toEqual(ERR('#REF!'))
   })
 })
 

@@ -211,9 +211,16 @@ const DAY: FunctionImpl = (args) => extractPart(args, (p) => p.day)
  * `WEEKDAY(serial, [return_type=1])`
  *
  * return_type:
- *   1 → Sunday=1 .. Saturday=7   (default)
- *   2 → Monday=1 .. Sunday=7
- *   3 → Monday=0 .. Sunday=6
+ *   1  → Sunday=1 .. Saturday=7   (default)
+ *   2  → Monday=1 .. Sunday=7
+ *   3  → Monday=0 .. Sunday=6
+ *   11 → Monday=1 .. Sunday=7     (alias of 2)
+ *   12 → Tuesday=1 .. Monday=7
+ *   13 → Wednesday=1 .. Tuesday=7
+ *   14 → Thursday=1 .. Wednesday=7
+ *   15 → Friday=1 .. Thursday=7
+ *   16 → Saturday=1 .. Friday=7
+ *   17 → Sunday=1 .. Saturday=7   (alias of 1)
  *
  * Reference anchor: 1900-01-01 is a Sunday in Excel's 1900-leap-bug world
  * (and 1900-01-07 is Saturday). For serials >= 61 (real dates after the
@@ -269,9 +276,11 @@ const WEEKDAY: FunctionImpl = (args) => {
   let out: number
   switch (returnType) {
     case 1:
+    case 17:
       out = sun0 + 1 // Sun=1 .. Sat=7
       break
     case 2:
+    case 11:
       // Mon=1 .. Sun=7
       out = ((sun0 + 6) % 7) + 1
       break
@@ -279,8 +288,23 @@ const WEEKDAY: FunctionImpl = (args) => {
       // Mon=0 .. Sun=6
       out = (sun0 + 6) % 7
       break
+    case 12: // Tuesday=1 .. Monday=7
+    case 13: // Wednesday=1 .. Tuesday=7
+    case 14: // Thursday=1 .. Wednesday=7
+    case 15: // Friday=1 .. Thursday=7
+    case 16: // Saturday=1 .. Friday=7
+      // Each step from type 11 shifts the anchor forward one weekday.
+      // Type N (11..17) anchors weekday (N-11) (Mon=0..Sun=6) to "1".
+      // Using sun0 (Sun=0..Sat=6): convert to Mon=0..Sun=6 via (sun0+6)%7,
+      // then subtract the anchor offset (N-11), wrap mod 7, +1.
+      out = (((sun0 + 6) % 7) - (returnType - 11) + 7) % 7 + 1
+      break
     default:
-      return { kind: 'error', code: '#NUM!', message: 'WEEKDAY return_type must be 1, 2, or 3' }
+      return {
+        kind: 'error',
+        code: '#NUM!',
+        message: 'WEEKDAY return_type must be 1, 2, 3, or 11..17',
+      }
   }
   return { kind: 'number', value: out }
 }
@@ -464,7 +488,21 @@ const TIMEVALUE: FunctionImpl = (args) => {
   return { kind: 'number', value: (h * 3600 + mi * 60 + s) / 86400 }
 }
 
-/** WEEKNUM(serial, [return_type=1]) — week-number per system. */
+/**
+ * WEEKNUM(serial, [return_type=1]) — week-number per system.
+ *
+ * return_type maps to the week's start-of-week (Sun=0..Sat=6):
+ *   1  → Sunday    (default, "System 1")
+ *   2  → Monday    ("System 2")
+ *   11 → Monday
+ *   12 → Tuesday
+ *   13 → Wednesday
+ *   14 → Thursday
+ *   15 → Friday
+ *   16 → Saturday
+ *   17 → Sunday
+ *   21 → ISO 8601 (delegates to ISOWEEKNUM)
+ */
 const WEEKNUM: FunctionImpl = (args) => {
   if (args.length < 1 || args.length > 2) return { kind: 'error', code: '#VALUE!' }
   const err = propagateError(args)
@@ -478,12 +516,39 @@ const WEEKNUM: FunctionImpl = (args) => {
     if (!t.ok) return t.error
     returnType = Math.trunc(t.value)
   }
-  // System 1 (default): week containing Jan 1 is week 1; week starts Sunday (returnType=1).
-  // System 2: weeks start Monday (returnType=2).
-  let startDow = 0 // 0 = Sunday
-  if (returnType === 2) startDow = 1
-  else if (returnType === 1) startDow = 0
-  else return { kind: 'error', code: '#NUM!' }
+  // Type 21 is ISO 8601 — same computation as ISOWEEKNUM.
+  if (returnType === 21) {
+    return ISOWEEKNUM([args[0]], _ctxIgnored)
+  }
+  // Map return_type → start-of-week day (Sun=0..Sat=6).
+  let startDow: number
+  switch (returnType) {
+    case 1:
+    case 17:
+      startDow = 0
+      break // Sunday
+    case 2:
+    case 11:
+      startDow = 1
+      break // Monday
+    case 12:
+      startDow = 2
+      break // Tuesday
+    case 13:
+      startDow = 3
+      break // Wednesday
+    case 14:
+      startDow = 4
+      break // Thursday
+    case 15:
+      startDow = 5
+      break // Friday
+    case 16:
+      startDow = 6
+      break // Saturday
+    default:
+      return { kind: 'error', code: '#NUM!' }
+  }
   const p = partsOf(s.value)
   // Compute serial of Jan 1 of that year.
   const jan1 = dateToSerial(new Date(Date.UTC(p.year, 0, 1)))
@@ -493,6 +558,13 @@ const WEEKNUM: FunctionImpl = (args) => {
   const week = Math.floor((doy + ((dowJan1 - startDow + 7) % 7) - 1) / 7) + 1
   return { kind: 'number', value: week }
 }
+
+// Marker for forwarded calls — see WEEKNUM type 21 → ISOWEEKNUM delegation.
+const _ctxIgnored = new Proxy({}, {
+  get(_, prop) {
+    throw new Error(`date fn unexpectedly read ctx.${String(prop)}`)
+  },
+}) as unknown as Parameters<FunctionImpl>[1]
 
 /** ISOWEEKNUM(serial) — ISO 8601 week number. */
 const ISOWEEKNUM: FunctionImpl = (args) => {
