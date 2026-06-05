@@ -521,6 +521,27 @@ function sumSquaredDeviations(values: ReadonlyArray<number>, mean: number): numb
   return values.reduce((sum, value) => sum + (value - mean) * (value - mean), 0)
 }
 
+/**
+ * Welford's single-pass online algorithm for the sum of squared deviations (M2).
+ * Numerically stable for large-mean / tiny-spread inputs where the two-pass
+ * formula loses precision to catastrophic cancellation.
+ *
+ * Returns { n, mean, M2 } so callers pick sample (M2/(n-1)) vs population (M2/n).
+ */
+function welfordM2(values: ReadonlyArray<number>): { n: number; mean: number; M2: number } {
+  let n = 0
+  let mean = 0
+  let M2 = 0
+  for (const x of values) {
+    n += 1
+    const delta = x - mean
+    mean += delta / n
+    const delta2 = x - mean
+    M2 += delta * delta2
+  }
+  return { n, mean, M2 }
+}
+
 function finiteNumber(value: number): Value {
   return Number.isFinite(value) ? NUM(value) : ERR_VAL('#NUM!')
 }
@@ -576,44 +597,40 @@ const MODE_MULT: FunctionImpl = (args) => {
   return { kind: 'array', value: rows }
 }
 
-/** STDEV — sample standard deviation (Bessel correction n-1). */
+/** STDEV — sample standard deviation (Bessel correction n-1). Welford's algorithm. */
 const STDEV: FunctionImpl = (args) => {
   const r = collectNumbers(args)
   if (!r.ok) return r.err
   if (r.values.length < 2) return ERR_VAL('#DIV/0!')
-  const mean = r.values.reduce((s, n) => s + n, 0) / r.values.length
-  const sumSq = r.values.reduce((s, n) => s + (n - mean) * (n - mean), 0)
-  return NUM(Math.sqrt(sumSq / (r.values.length - 1)))
+  const { n, M2 } = welfordM2(r.values)
+  return NUM(Math.sqrt(M2 / (n - 1)))
 }
 
-/** STDEVP — population standard deviation (divide by n). */
+/** STDEVP — population standard deviation (divide by n). Welford's algorithm. */
 const STDEVP: FunctionImpl = (args) => {
   const r = collectNumbers(args)
   if (!r.ok) return r.err
   if (r.values.length === 0) return ERR_VAL('#DIV/0!')
-  const mean = r.values.reduce((s, n) => s + n, 0) / r.values.length
-  const sumSq = r.values.reduce((s, n) => s + (n - mean) * (n - mean), 0)
-  return NUM(Math.sqrt(sumSq / r.values.length))
+  const { n, M2 } = welfordM2(r.values)
+  return NUM(Math.sqrt(M2 / n))
 }
 
-/** VAR — sample variance. */
+/** VAR — sample variance. Welford's algorithm. */
 const VAR: FunctionImpl = (args) => {
   const r = collectNumbers(args)
   if (!r.ok) return r.err
   if (r.values.length < 2) return ERR_VAL('#DIV/0!')
-  const mean = r.values.reduce((s, n) => s + n, 0) / r.values.length
-  const sumSq = r.values.reduce((s, n) => s + (n - mean) * (n - mean), 0)
-  return NUM(sumSq / (r.values.length - 1))
+  const { n, M2 } = welfordM2(r.values)
+  return NUM(M2 / (n - 1))
 }
 
-/** VARP — population variance. */
+/** VARP — population variance. Welford's algorithm. */
 const VARP: FunctionImpl = (args) => {
   const r = collectNumbers(args)
   if (!r.ok) return r.err
   if (r.values.length === 0) return ERR_VAL('#DIV/0!')
-  const mean = r.values.reduce((s, n) => s + n, 0) / r.values.length
-  const sumSq = r.values.reduce((s, n) => s + (n - mean) * (n - mean), 0)
-  return NUM(sumSq / r.values.length)
+  const { n, M2 } = welfordM2(r.values)
+  return NUM(M2 / n)
 }
 
 /** LARGE(array, k) — k-th largest. */
@@ -1060,7 +1077,9 @@ function varianceA(args: ReadonlyArray<Value>, sample: boolean, sqrt: boolean): 
   if (!r.ok) return r.err
   const n = r.values.length
   if ((sample && n < 2) || (!sample && n < 1)) return ERR_VAL('#DIV/0!')
-  const variance = sumSquaredDeviations(r.values, meanOf(r.values)) / (sample ? n - 1 : n)
+  // Welford's online algorithm — see welfordM2 for rationale.
+  const { M2 } = welfordM2(r.values)
+  const variance = M2 / (sample ? n - 1 : n)
   return finiteNumber(sqrt ? Math.sqrt(variance) : variance)
 }
 
@@ -1556,6 +1575,28 @@ function studentTCdf(t: number, df: number): number {
 
 function studentTInv(p: number, df: number): number {
   if (p === 0.5) return 0
+  // Cauchy closed form for df = 1.
+  if (df === 1) return Math.tan(Math.PI * (p - 0.5))
+  // Newton-Raphson seeded from the standard-normal inverse (valid as df → ∞).
+  // Falls back to bisection on divergence.
+  let x = standardNormalInv(p)
+  if (!Number.isFinite(x)) x = 0
+  const tol = 1e-12
+  let lastErr = Number.POSITIVE_INFINITY
+  for (let i = 0; i < 50; i++) {
+    const cdf = studentTCdf(x, df)
+    const err = cdf - p
+    if (Math.abs(err) <= tol * Math.max(1, Math.abs(p))) return x
+    const pdf = studentTPdf(x, df)
+    if (!Number.isFinite(pdf) || pdf <= 0) break
+    const step = err / pdf
+    const next = x - step
+    if (!Number.isFinite(next)) break
+    if (Math.abs(err) > lastErr) break
+    lastErr = Math.abs(err)
+    x = next
+  }
+  // Bisection fallback — bracket and refine.
   let lo = -1
   let hi = 1
   while (studentTCdf(lo, df) > p) {
@@ -1809,9 +1850,7 @@ function betaPdfUnit(x: number, a: number, b: number): number {
   return Math.exp((a - 1) * Math.log(x) + (b - 1) * Math.log1p(-x) - logBeta(a, b))
 }
 
-function betaInvUnit(p: number, a: number, b: number): number {
-  if (p <= 0) return 0
-  if (p >= 1) return 1
+function betaInvUnitBisection(p: number, a: number, b: number): number {
   let lo = 0
   let hi = 1
   for (let i = 0; i < 100; i++) {
@@ -1820,6 +1859,37 @@ function betaInvUnit(p: number, a: number, b: number): number {
     else hi = mid
   }
   return (lo + hi) / 2
+}
+
+function betaInvUnit(p: number, a: number, b: number): number {
+  if (p <= 0) return 0
+  if (p >= 1) return 1
+  // Newton-Raphson seeded from the analytical mean a/(a+b); fall back to
+  // bisection on divergence or non-finite PDF. The CDF derivative is the PDF.
+  let x = a / (a + b)
+  if (!(x > 0 && x < 1)) x = 0.5
+  const tol = 1e-12
+  let lastErr = Number.POSITIVE_INFINITY
+  for (let i = 0; i < 50; i++) {
+    const cdf = regularizedBeta(x, a, b)
+    const err = cdf - p
+    if (Math.abs(err) <= tol * Math.max(1, Math.abs(p))) return x
+    const pdf = betaPdfUnit(x, a, b)
+    if (!Number.isFinite(pdf) || pdf <= 0) break
+    let step = err / pdf
+    // Damp the step to stay strictly inside (0, 1).
+    let next = x - step
+    while ((next <= 0 || next >= 1) && Math.abs(step) > 0) {
+      step /= 2
+      next = x - step
+    }
+    if (!(next > 0 && next < 1)) break
+    // Divergence guard: |err| growing for 2 steps → bisection.
+    if (Math.abs(err) > lastErr) break
+    lastErr = Math.abs(err)
+    x = next
+  }
+  return betaInvUnitBisection(p, a, b)
 }
 
 function gammaValue(x: number): number {
@@ -1853,6 +1923,41 @@ function inversePositiveCdf(p: number, cdf: (x: number) => number): number {
     else hi = mid
   }
   return (lo + hi) / 2
+}
+
+/**
+ * Newton-Raphson on a positive-support CDF, falling back to bisection.
+ * Both `cdf` and `pdf` (its derivative) must be defined for x > 0.
+ * `seed` is the initial guess (e.g. mean of the distribution).
+ */
+function inversePositiveCdfNewton(
+  p: number,
+  seed: number,
+  cdf: (x: number) => number,
+  pdf: (x: number) => number,
+): number {
+  if (p <= 0) return 0
+  let x = seed > 0 && Number.isFinite(seed) ? seed : 1
+  const tol = 1e-12
+  let lastErr = Number.POSITIVE_INFINITY
+  for (let i = 0; i < 50; i++) {
+    const c = cdf(x)
+    const err = c - p
+    if (Math.abs(err) <= tol * Math.max(1, Math.abs(p))) return x
+    const d = pdf(x)
+    if (!Number.isFinite(d) || d <= 0) break
+    let step = err / d
+    let next = x - step
+    while (next <= 0 && Math.abs(step) > 0) {
+      step /= 2
+      next = x - step
+    }
+    if (!(next > 0) || !Number.isFinite(next)) break
+    if (Math.abs(err) > lastErr) break
+    lastErr = Math.abs(err)
+    x = next
+  }
+  return inversePositiveCdf(p, cdf)
 }
 
 function studentTPdf(x: number, df: number): number {
@@ -2041,7 +2146,16 @@ const GAMMA_INV: FunctionImpl = (args) => {
   const beta = numberArg(args[2])
   if (!beta.ok) return beta.err
   if (p.value < 0 || p.value >= 1 || alpha.value <= 0 || beta.value <= 0) return ERR_VAL('#NUM!')
-  return finiteNumber(inversePositiveCdf(p.value, (x) => gammaCdf(x, alpha.value, beta.value)))
+  // Newton seed = distribution mean (alpha * beta); falls back to bisection.
+  const seed = alpha.value * beta.value
+  return finiteNumber(
+    inversePositiveCdfNewton(
+      p.value,
+      seed,
+      (x) => gammaCdf(x, alpha.value, beta.value),
+      (x) => gammaPdf(x, alpha.value, beta.value),
+    ),
+  )
 }
 
 const BINOM_DIST: FunctionImpl = (args) => {
@@ -2168,6 +2282,23 @@ const F_DIST_RT: FunctionImpl = (args) => {
   return probability(1 - fCdf(x.value, df1.value, df2.value))
 }
 
+/**
+ * Wilson-Hilferty seed for F.INV: maps p through the standard normal then
+ * builds an approximation good enough for Newton-Raphson to converge in a
+ * handful of iterations.
+ */
+function fInvWilsonHilfertySeed(p: number, df1: number, df2: number): number {
+  const z = standardNormalInv(Math.min(Math.max(p, 1e-12), 1 - 1e-12))
+  const a = 2 / (9 * df1)
+  const b = 2 / (9 * df2)
+  const num = 1 - b - z * Math.sqrt(b + a - a * b - (a + b) * z * z / 3)
+  const den = 1 - a - z * Math.sqrt(a)
+  // Approximation can produce non-positive numerator at extreme tails; clamp.
+  const ratio = num / den
+  const guess = ratio > 0 ? ratio ** 3 : 1
+  return Number.isFinite(guess) && guess > 0 ? guess : 1
+}
+
 const F_INV: FunctionImpl = (args) => {
   if (args.length !== 3) return ERR_VAL('#VALUE!')
   const p = numberArg(args[0])
@@ -2177,7 +2308,15 @@ const F_INV: FunctionImpl = (args) => {
   const df2 = numberArg(args[2])
   if (!df2.ok) return df2.err
   if (p.value < 0 || p.value >= 1 || df1.value <= 0 || df2.value <= 0) return ERR_VAL('#NUM!')
-  return finiteNumber(inversePositiveCdf(p.value, (x) => fCdf(x, df1.value, df2.value)))
+  const seed = fInvWilsonHilfertySeed(p.value, df1.value, df2.value)
+  return finiteNumber(
+    inversePositiveCdfNewton(
+      p.value,
+      seed,
+      (x) => fCdf(x, df1.value, df2.value),
+      (x) => fPdf(x, df1.value, df2.value),
+    ),
+  )
 }
 
 const F_INV_RT: FunctionImpl = (args) => {
@@ -2189,7 +2328,16 @@ const F_INV_RT: FunctionImpl = (args) => {
   const df2 = numberArg(args[2])
   if (!df2.ok) return df2.err
   if (p.value <= 0 || p.value > 1 || df1.value <= 0 || df2.value <= 0) return ERR_VAL('#NUM!')
-  return finiteNumber(inversePositiveCdf(1 - p.value, (x) => fCdf(x, df1.value, df2.value)))
+  const q = 1 - p.value
+  const seed = fInvWilsonHilfertySeed(q, df1.value, df2.value)
+  return finiteNumber(
+    inversePositiveCdfNewton(
+      q,
+      seed,
+      (x) => fCdf(x, df1.value, df2.value),
+      (x) => fPdf(x, df1.value, df2.value),
+    ),
+  )
 }
 
 const T_DIST: FunctionImpl = (args) => {
