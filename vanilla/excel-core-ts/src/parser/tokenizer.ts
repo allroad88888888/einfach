@@ -41,6 +41,7 @@ export type Token =
   | { kind: 'semicolon'; pos: number }
   | { kind: 'colon'; pos: number }
   | { kind: 'percent'; pos: number }
+  | { kind: 'spill'; pos: number }
   | { kind: 'bang'; pos: number }
   | { kind: 'eof'; pos: number }
   | { kind: 'tokenizer-error'; message: string; pos: number }
@@ -421,11 +422,8 @@ export function tokenize(src: string): Token[] {
     }
 
     // ---------- numbers (must come before refs to avoid `1:1` ambiguity) ----------
-    // But we have to also support `1:1` whole-row, so peek both ways:
-    //   - if the digits run is immediately followed by `:` AND another
-    //     row digit run, it's `<row>:<row>`.
-    if (isDigit(ch)) {
-      // Look ahead for whole-row pattern `<digits>:<digits>` with NO letter prefix.
+    // But we have to also support `1:1` / `$1:$1` whole-row, so peek both ways.
+    if (ch === '$' || isDigit(ch)) {
       const rowProbe = tryReadWholeRow(src, i)
       if (rowProbe && src[rowProbe.next] === ':') {
         const endRow = tryReadWholeRow(src, rowProbe.next + 1)
@@ -442,11 +440,13 @@ export function tokenize(src: string): Token[] {
           continue
         }
       }
-      const num = readNumber(src, i)
-      if (num) {
-        out.push({ kind: 'number', value: num.value, pos })
-        i = num.next
-        continue
+      if (isDigit(ch)) {
+        const num = readNumber(src, i)
+        if (num) {
+          out.push({ kind: 'number', value: num.value, pos })
+          i = num.next
+          continue
+        }
       }
     }
 
@@ -458,8 +458,9 @@ export function tokenize(src: string): Token[] {
         i = err.next
         continue
       }
-      out.push({ kind: 'tokenizer-error', message: `unknown error literal at ${i}`, pos })
-      return out
+      out.push({ kind: 'spill', pos })
+      i += 1
+      continue
     }
 
     // ---------- refs / ranges / whole-col / names / booleans ----------

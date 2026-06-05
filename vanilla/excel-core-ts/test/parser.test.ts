@@ -182,6 +182,13 @@ describe('parseFormula — ranges', () => {
       end: '1',
     })
   })
+  test('$1:$1 absolute whole row', () => {
+    expect(parseFormula('$1:$1')).toEqual({
+      kind: 'range',
+      start: '1',
+      end: '1',
+    })
+  })
   test('1:5 whole row span', () => {
     expect(parseFormula('1:5')).toEqual({
       kind: 'range',
@@ -227,6 +234,135 @@ describe('parseFormula — cross-sheet', () => {
       kind: 'crossSheet',
       sheetName: 'Sheet2',
       inner: { kind: 'range', start: 'A', end: 'A' },
+    })
+  })
+})
+
+// ---------- 7a. Dynamic references ----------
+
+describe('parseFormula — dynamic references', () => {
+  test('A1# spill reference', () => {
+    expect(parseFormula('A1#')).toEqual({
+      kind: 'spillRef',
+      anchor: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+    })
+  })
+
+  test('Sheet2!A1# cross-sheet spill reference', () => {
+    expect(parseFormula('Sheet2!A1#')).toEqual({
+      kind: 'spillRef',
+      anchor: {
+        kind: 'crossSheet',
+        sheetName: 'Sheet2',
+        inner: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+      },
+    })
+  })
+
+  test('A1:INDEX(A:A,3) dynamic range endpoint', () => {
+    expect(parseFormula('A1:INDEX(A:A,3)')).toEqual({
+      kind: 'dynamicRange',
+      start: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+      end: {
+        kind: 'call',
+        name: 'INDEX',
+        args: [
+          { kind: 'range', start: 'A', end: 'A' },
+          { kind: 'number', value: 3 },
+        ],
+      },
+    })
+  })
+
+  test('INDEX(A:A,1):INDEX(A:A,3) dynamic range endpoints', () => {
+    expect(parseFormula('INDEX(A:A,1):INDEX(A:A,3)')).toEqual({
+      kind: 'dynamicRange',
+      start: {
+        kind: 'call',
+        name: 'INDEX',
+        args: [
+          { kind: 'range', start: 'A', end: 'A' },
+          { kind: 'number', value: 1 },
+        ],
+      },
+      end: {
+        kind: 'call',
+        name: 'INDEX',
+        args: [
+          { kind: 'range', start: 'A', end: 'A' },
+          { kind: 'number', value: 3 },
+        ],
+      },
+    })
+  })
+
+  test('cross-sheet literal start with dynamic endpoint', () => {
+    expect(parseFormula('Data!A1:INDEX(Data!A:A,3)')).toEqual({
+      kind: 'dynamicRange',
+      start: {
+        kind: 'crossSheet',
+        sheetName: 'Data',
+        inner: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+      },
+      end: {
+        kind: 'call',
+        name: 'INDEX',
+        args: [
+          {
+            kind: 'crossSheet',
+            sheetName: 'Data',
+            inner: { kind: 'range', start: 'A', end: 'A' },
+          },
+          { kind: 'number', value: 3 },
+        ],
+      },
+    })
+  })
+
+  test('dynamic range binds tighter than arithmetic', () => {
+    expect(parseFormula('A1:INDEX(A:A,3)*2')).toEqual({
+      kind: 'binary',
+      op: '*',
+      left: {
+        kind: 'dynamicRange',
+        start: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+        end: {
+          kind: 'call',
+          name: 'INDEX',
+          args: [
+            { kind: 'range', start: 'A', end: 'A' },
+            { kind: 'number', value: 3 },
+          ],
+        },
+      },
+      right: { kind: 'number', value: 2 },
+    })
+  })
+})
+
+// ---------- 7b. Multi-area references ----------
+
+describe('parseFormula — multi-area references', () => {
+  test('(A1:B2,C1:D2)', () => {
+    expect(parseFormula('(A1:B2,C1:D2)')).toEqual({
+      kind: 'multiArea',
+      areas: [
+        { kind: 'range', start: 'A1', end: 'B2' },
+        { kind: 'range', start: 'C1', end: 'D2' },
+      ],
+    })
+  })
+  test("(A1,'Data Sheet'!B2:C3)", () => {
+    expect(parseFormula("(A1,'Data Sheet'!B2:C3)")).toEqual({
+      kind: 'multiArea',
+      areas: [
+        { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+        {
+          kind: 'crossSheet',
+          sheetName: 'Data Sheet',
+          inner: { kind: 'range', start: 'B2', end: 'C3' },
+        },
+      ],
     })
   })
 })
@@ -465,6 +601,33 @@ describe('parseFormula — calls', () => {
     expect(ast.kind).toBe('call')
     if (ast.kind === 'call') expect(ast.name).toBe('BETA.DIST')
   })
+  test('inline LAMBDA immediate call: LAMBDA(x, x + 1)(4)', () => {
+    expect(parseFormula('LAMBDA(x,x+1)(4)')).toEqual({
+      kind: 'lambdaCall',
+      callee: {
+        kind: 'call',
+        name: 'LAMBDA',
+        args: [
+          { kind: 'name', name: 'x' },
+          {
+            kind: 'binary',
+            op: '+',
+            left: { kind: 'name', name: 'x' },
+            right: { kind: 'number', value: 1 },
+          },
+        ],
+      },
+      args: [{ kind: 'number', value: 4 }],
+    })
+  })
+  test('parenthesized inline LAMBDA immediate call', () => {
+    const ast = parseFormula('(LAMBDA(x,x))(5)') as Expr
+    expect(ast.kind).toBe('lambdaCall')
+    if (ast.kind === 'lambdaCall') {
+      expect(ast.args).toEqual([{ kind: 'number', value: 5 }])
+      expect(ast.callee.kind).toBe('call')
+    }
+  })
 })
 
 // ---------- 13. Array literals ----------
@@ -591,7 +754,7 @@ describe('parseFormula — whitespace', () => {
 
 describe('parseFormula — Expr kind coverage tripwire', () => {
   // This block intentionally enumerates fixtures keyed by `Expr.kind`
-  // so a future grep `kind:` confirms 13/13 are exercised. If a kind
+  // so a future grep `kind:` confirms every Expr variant is exercised. If a kind
   // disappears, this suite catches it.
   const fixtures: Array<{ src: string; kind: Expr['kind'] }> = [
     { src: '1', kind: 'number' },
@@ -606,8 +769,14 @@ describe('parseFormula — Expr kind coverage tripwire', () => {
     { src: '$Z$99', kind: 'ref' },
     { src: 'A1:B2', kind: 'range' },
     { src: 'A:C', kind: 'range' },
+    { src: 'A1:INDEX(A:A,3)', kind: 'dynamicRange' },
+    { src: 'B2:OFFSET(B2,1,0)', kind: 'dynamicRange' },
+    { src: 'A1#', kind: 'spillRef' },
+    { src: 'Sheet2!A1#', kind: 'spillRef' },
     { src: 'Sheet2!A1', kind: 'crossSheet' },
     { src: "'has space'!B2:C3", kind: 'crossSheet' },
+    { src: '(A1,B1)', kind: 'multiArea' },
+    { src: '(A1:B2,C1:D2)', kind: 'multiArea' },
     { src: 'NAMED_RANGE', kind: 'name' },
     { src: 'pi', kind: 'name' },
     { src: '-1', kind: 'unary' },
@@ -618,6 +787,8 @@ describe('parseFormula — Expr kind coverage tripwire', () => {
     { src: 'A1%', kind: 'percent' },
     { src: 'SUM(1)', kind: 'call' },
     { src: 'TODAY()', kind: 'call' },
+    { src: 'LAMBDA(x,x)(1)', kind: 'lambdaCall' },
+    { src: '(LAMBDA(x,x))(2)', kind: 'lambdaCall' },
     { src: '{1}', kind: 'arrayLiteral' },
     { src: '{1;2}', kind: 'arrayLiteral' },
   ]

@@ -31,6 +31,10 @@ describe('@einfach/excel-core-ts — Wave A contracts', () => {
     expect(ERROR_CODES).toContain('#REF!')
     expect(ERROR_CODES).toContain('#VALUE!')
     expect(ERROR_CODES).toContain('#CALC!')
+    expect(ERROR_CODES).toContain('#CYCLE!')
+    expect(ERROR_CODES).toContain('#TYPE!')
+    expect(ERROR_CODES).toContain('#ARGS!')
+    expect(ERROR_CODES).toContain('#SPILL!')
     expect(ERROR_CODES).toContain('#CIRCULAR!')
   })
 
@@ -94,9 +98,25 @@ describe('@einfach/excel-core-ts — Wave A contracts', () => {
       { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
       { kind: 'range', start: 'A1', end: 'B2' },
       {
+        kind: 'dynamicRange',
+        start: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+        end: { kind: 'call', name: 'INDEX', args: [{ kind: 'range', start: 'A', end: 'A' }] },
+      },
+      {
+        kind: 'spillRef',
+        anchor: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+      },
+      {
         kind: 'crossSheet',
         sheetName: 'Sheet2',
         inner: { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+      },
+      {
+        kind: 'multiArea',
+        areas: [
+          { kind: 'ref', a1: 'A1', absCol: false, absRow: false },
+          { kind: 'range', start: 'B1', end: 'C2' },
+        ],
       },
       { kind: 'name', name: 'MY_RANGE' },
       { kind: 'unary', op: '-', operand: { kind: 'number', value: 1 } },
@@ -109,11 +129,16 @@ describe('@einfach/excel-core-ts — Wave A contracts', () => {
       { kind: 'percent', operand: { kind: 'number', value: 50 } },
       { kind: 'call', name: 'SUM', args: [{ kind: 'number', value: 1 }] },
       {
+        kind: 'lambdaCall',
+        callee: { kind: 'call', name: 'LAMBDA', args: [{ kind: 'name', name: 'x' }] },
+        args: [{ kind: 'number', value: 1 }],
+      },
+      {
         kind: 'arrayLiteral',
         rows: [[{ kind: 'number', value: 1 }]],
       },
     ]
-    expect(exprs).toHaveLength(13)
+    expect(exprs).toHaveLength(17)
   })
 
   test('FunctionImpl + EvalContext shapes are callable', () => {

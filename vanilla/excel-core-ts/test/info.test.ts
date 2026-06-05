@@ -228,8 +228,8 @@ describe('TYPE', () => {
     expect(call(TYPE, [ARR([[NUM(1), NUM(2)]])])).toEqual(NUM(64))
   })
 
-  test('returns 0 for blank (einfach extension)', () => {
-    expect(call(TYPE, [BLANK])).toEqual(NUM(0))
+  test('returns 1 for blank', () => {
+    expect(call(TYPE, [BLANK])).toEqual(NUM(1))
   })
 
   test('wrong arity → #VALUE!', () => {
@@ -257,7 +257,7 @@ describe('FUNCTIONS registry', () => {
     // The IS* family is the entire reason for an exception to "first-error
     // wins". Functions like N, NA, ISEVEN/ISODD that propagate the error
     // (or are zero-arity like NA) are excluded.
-    const propagatesErrors = new Set(['N', 'NA', 'ISEVEN', 'ISODD'])
+    const propagatesErrors = new Set(['N', 'NA', 'ISEVEN', 'ISODD', 'INFO'])
     for (const [name, fn] of Object.entries(FUNCTIONS)) {
       expect(typeof fn).toBe('function')
       expect(name).toBe(name.toUpperCase())

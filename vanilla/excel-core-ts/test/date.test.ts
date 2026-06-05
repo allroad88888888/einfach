@@ -70,8 +70,12 @@ describe('DATE', () => {
     expect(call(DATE, [num(2024), num(1), num(32)])).toEqual(call(DATE, [num(2024), num(2), num(1)]))
   })
 
-  test('year < 1900 returns #NUM!', () => {
-    expect(call(DATE, [num(1899), num(12), num(31)])).toEqual(err('#NUM!'))
+  test('years 0..1899 add 1900 and negative years return #NUM!', () => {
+    expect(call(DATE, [num(99), num(1), num(1)])).toEqual(
+      call(DATE, [num(1999), num(1), num(1)]),
+    )
+    expect(call(DATE, [num(0), num(1), num(1)])).toEqual(num(1))
+    expect(call(DATE, [num(-1), num(1), num(1)])).toEqual(err('#NUM!'))
   })
 
   test('arity mismatch returns #VALUE!', () => {

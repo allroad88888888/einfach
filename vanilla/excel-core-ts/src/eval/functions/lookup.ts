@@ -34,6 +34,11 @@ const ERR_VALUE: Value = { kind: 'error', code: '#VALUE!' }
 const ERR_REF: Value = { kind: 'error', code: '#REF!' }
 const ERR_NA: Value = { kind: 'error', code: '#N/A' }
 
+export type XLookupCoreResult =
+  | { readonly kind: 'value'; readonly value: Value }
+  | { readonly kind: 'notFound' }
+  | { readonly kind: 'error'; readonly error: Value }
+
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
@@ -142,11 +147,28 @@ function compareForLookup(needle: Value, hay: Value): number | null {
  */
 function exactMatch(needle: Value, hay: Value, useWildcards: boolean): boolean {
   if (useWildcards && needle.kind === 'string') {
-    if (hay.kind !== 'string') return false
-    return wildcardMatch(needle.value, hay.value)
+    const hayText = wildcardHaystackText(hay)
+    if (hayText === undefined) return false
+    return wildcardMatch(needle.value, hayText)
   }
   const cmp = compareForLookup(needle, hay)
   return cmp === 0
+}
+
+function wildcardHaystackText(value: Value): string | undefined {
+  switch (value.kind) {
+    case 'string':
+      return value.value
+    case 'number':
+      return String(value.value)
+    case 'boolean':
+      return value.value ? 'TRUE' : 'FALSE'
+    case 'blank':
+      return ''
+    case 'array':
+    case 'error':
+      return undefined
+  }
 }
 
 /**
@@ -461,28 +483,47 @@ export const MATCH: FunctionImpl = (args, _ctx) => {
 export const XLOOKUP: FunctionImpl = (args, _ctx) => {
   if (args.length < 3 || args.length > 6) return ERR_VALUE
 
-  // We DON'T propagate errors over `if_not_found` (args[3]) since the host
-  // may want to substitute a "not found" sentinel that's itself error-like.
-  // But we DO propagate over the others.
-  for (let i = 0; i < args.length; i += 1) {
-    if (i === 3) continue
-    if (args[i].kind === 'error') return args[i]
+  const ifNotFound = args[3] !== undefined && args[3].kind !== 'blank' ? args[3] : null
+  const result = resolveXLookupValue(args[0], args[1], args[2], args[4], args[5])
+  switch (result.kind) {
+    case 'value':
+      return result.value
+    case 'error':
+      return result.error
+    case 'notFound':
+      return ifNotFound ?? ERR_NA
+  }
+}
+
+export function resolveXLookupValue(
+  needle: Value,
+  lookupValue: Value,
+  returnValue: Value,
+  matchModeArg?: Value,
+  searchModeArg?: Value,
+): XLookupCoreResult {
+  for (const arg of [needle, lookupValue, returnValue, matchModeArg, searchModeArg]) {
+    if (arg?.kind === 'error') return { kind: 'error', error: arg }
   }
 
-  const needle = args[0]
-  const lookupArr = asArray(args[1])
-  const returnArr = asArray(args[2])
-  if (!lookupArr || !returnArr) return ERR_VALUE
+  const lookupArr = asArray(lookupValue)
+  const returnArr = asArray(returnValue)
+  if (!lookupArr || !returnArr) return { kind: 'error', error: ERR_VALUE }
 
-  const ifNotFound = args[3] !== undefined && args[3].kind !== 'blank' ? args[3] : null
+  const matchMode = pullNumber(matchModeArg, 0)
+  if (matchMode === null) return { kind: 'error', error: ERR_VALUE }
+  if (matchMode !== 0 && matchMode !== -1 && matchMode !== 1 && matchMode !== 2) {
+    return { kind: 'error', error: ERR_VALUE }
+  }
 
-  const matchMode = pullNumber(args[4], 0)
-  if (matchMode === null) return ERR_VALUE
-  if (matchMode !== 0 && matchMode !== -1 && matchMode !== 1 && matchMode !== 2) return ERR_VALUE
-
-  const searchMode = pullNumber(args[5], 1)
-  if (searchMode === null) return ERR_VALUE
-  if (searchMode !== 1 && searchMode !== -1 && searchMode !== 2 && searchMode !== -2) return ERR_VALUE
+  const searchMode = pullNumber(searchModeArg, 1)
+  if (searchMode === null) return { kind: 'error', error: ERR_VALUE }
+  if (searchMode !== 1 && searchMode !== -1 && searchMode !== 2 && searchMode !== -2) {
+    return { kind: 'error', error: ERR_VALUE }
+  }
+  if (matchMode === 2 && (searchMode === 2 || searchMode === -2)) {
+    return { kind: 'error', error: ERR_VALUE }
+  }
 
   // Flatten lookup_array + return_array — must have matching length.
   const lookupFlat: Value[] = []
@@ -497,31 +538,28 @@ export const XLOOKUP: FunctionImpl = (args, _ctx) => {
 
   // Validate matching dimension.
   if (isColumnLookup) {
-    if (returnArr.length !== lookupLen) return ERR_VALUE
+    if (returnArr.length !== lookupLen) return { kind: 'error', error: ERR_VALUE }
   } else {
-    if (returnArr[0].length !== lookupLen) return ERR_VALUE
+    if (returnArr[0].length !== lookupLen) return { kind: 'error', error: ERR_VALUE }
   }
 
   const matchIdx = findXLookupIndex(needle, lookupFlat, matchMode, searchMode)
-  if (matchIdx === -1) {
-    if (ifNotFound !== null) return ifNotFound
-    return ERR_NA
-  }
+  if (matchIdx === -1) return { kind: 'notFound' }
 
   // Pull the corresponding return value(s).
   if (isColumnLookup) {
     const row = returnArr[matchIdx]
-    if (row.length === 1) return row[0]
+    if (row.length === 1) return { kind: 'value', value: row[0] }
     // Multi-column return → return a 1xN array
-    return { kind: 'array', value: [row.slice()] }
+    return { kind: 'value', value: { kind: 'array', value: [row.slice()] } }
   } else {
     // Row lookup: pull the column at matchIdx out of returnArr
-    if (returnArr.length === 1) return returnArr[0][matchIdx]
+    if (returnArr.length === 1) return { kind: 'value', value: returnArr[0][matchIdx] }
     const col: Value[][] = []
     for (let r = 0; r < returnArr.length; r += 1) {
       col.push([returnArr[r][matchIdx]])
     }
-    return { kind: 'array', value: col }
+    return { kind: 'value', value: { kind: 'array', value: col } }
   }
 }
 
@@ -595,11 +633,9 @@ function scanXLookup(
   iterate((i) => {
     const hay = arr[i]
     if (useWildcards && needle.kind === 'string') {
-      if (hay.kind === 'string' && wildcardMatch(needle.value, hay.value)) {
-        exactIdx = i
-        return true
-      }
-      return false
+      if (!exactMatch(needle, hay, true)) return false
+      exactIdx = i
+      return true
     }
     const cmp = compareForLookup(hay, needle)
     if (cmp === null) return false
@@ -663,6 +699,141 @@ function numericRank(v: Value): number | null {
   return null
 }
 
+function gridToVector(grid: Value[][]): Value[] | null {
+  if (grid.length === 1) return grid[0].slice()
+  if (grid[0].length === 1) return grid.map((row) => row[0])
+  return null
+}
+
+function hasWildcardPattern(value: Value): boolean {
+  if (value.kind !== 'string') return false
+  for (let i = 0; i < value.value.length; i += 1) {
+    const ch = value.value[i]
+    if (ch === '~') {
+      i += 1
+      continue
+    }
+    if (ch === '*' || ch === '?') return true
+  }
+  return false
+}
+
+function lookupVectorWalk(keys: Value[], result: Value[], needle: Value): Value {
+  if (keys.length === 0 || keys.length !== result.length) return ERR_VALUE
+  let best = -1
+  for (let i = 0; i < keys.length; i += 1) {
+    const key = keys[i]
+    if (key.kind === 'error') return key
+    const cmp = compareForLookup(key, needle)
+    if (cmp !== null && cmp <= 0) best = i
+  }
+  return best === -1 ? ERR_NA : result[best]
+}
+
+// ----------------------------------------------------------------------------
+// LOOKUP / XMATCH
+// ----------------------------------------------------------------------------
+
+/**
+ * LOOKUP(lookup_value, lookup_vector, [result_vector]) — approximate
+ * exact-or-next-smaller lookup. The two-argument array form searches the
+ * first row/column and returns from the opposite edge, matching Excel's
+ * legacy array form.
+ */
+export const LOOKUP: FunctionImpl = (args, _ctx) => {
+  if (args.length < 2 || args.length > 3) return ERR_VALUE
+  if (args[0].kind === 'error') return args[0]
+  if (args[1].kind === 'error') return args[1]
+  if (args[2]?.kind === 'error') return args[2]
+
+  const lookupGrid = asArray(args[1])
+  if (!lookupGrid) return ERR_VALUE
+  const rows = lookupGrid.length
+  const cols = lookupGrid[0].length
+
+  if (args.length === 2) {
+    if (rows === 1 || cols === 1) {
+      const vector = gridToVector(lookupGrid)
+      if (!vector) return ERR_VALUE
+      return lookupVectorWalk(vector, vector, args[0])
+    }
+    if (cols >= rows) {
+      return lookupVectorWalk(lookupGrid[0], lookupGrid[rows - 1], args[0])
+    }
+    return lookupVectorWalk(
+      lookupGrid.map((row) => row[0]),
+      lookupGrid.map((row) => row[cols - 1]),
+      args[0],
+    )
+  }
+
+  const lookupVector = gridToVector(lookupGrid)
+  if (!lookupVector) return ERR_VALUE
+  const resultGrid = asArray(args[2])
+  if (!resultGrid) return ERR_VALUE
+  const resultVector = gridToVector(resultGrid)
+  if (!resultVector) return ERR_VALUE
+  return lookupVectorWalk(lookupVector, resultVector, args[0])
+}
+
+/**
+ * XMATCH(lookup_value, lookup_array, [match_mode], [search_mode]) — returns
+ * the 1-based match position. Binary modes are accepted but resolved via the
+ * same linear scan used by XLOOKUP in this TS runtime.
+ */
+export const XMATCH: FunctionImpl = (args, _ctx) => {
+  if (args.length < 2 || args.length > 4) return ERR_VALUE
+  if (args[0].kind === 'error') return args[0]
+  if (args[1].kind === 'error') return args[1]
+
+  const matchMode = pullNumber(args[2], 0)
+  if (matchMode === null) return ERR_VALUE
+  if (matchMode !== -1 && matchMode !== 0 && matchMode !== 1 && matchMode !== 2) return ERR_VALUE
+
+  const searchMode = pullNumber(args[3], 1)
+  if (searchMode === null) return ERR_VALUE
+  if (searchMode !== -2 && searchMode !== -1 && searchMode !== 1 && searchMode !== 2) return ERR_VALUE
+  if (matchMode === 2 && (searchMode === 2 || searchMode === -2)) return ERR_VALUE
+
+  const grid = asArray(args[1])
+  if (!grid) return ERR_VALUE
+  const items: Value[] = []
+  for (const row of grid) {
+    for (const item of row) {
+      if (item.kind === 'error') return item
+      items.push(item)
+    }
+  }
+  if (items.length === 0) return ERR_VALUE
+
+  const needle = args[0]
+  const useWildcards = matchMode === 2 || (matchMode === 0 && hasWildcardPattern(needle))
+  const indices: number[] = []
+  if (searchMode === -1) {
+    for (let i = items.length - 1; i >= 0; i -= 1) indices.push(i)
+  } else {
+    for (let i = 0; i < items.length; i += 1) indices.push(i)
+  }
+
+  let best = -1
+  let bestDiff = Infinity
+  const needleRank = numericRank(needle)
+  for (const i of indices) {
+    const item = items[i]
+    if (exactMatch(needle, item, useWildcards)) return { kind: 'number', value: i + 1 }
+    if (matchMode !== -1 && matchMode !== 1) continue
+    const itemRank = numericRank(item)
+    if (needleRank === null || itemRank === null) continue
+    const diff = matchMode === -1 ? needleRank - itemRank : itemRank - needleRank
+    if (diff >= 0 && diff < bestDiff) {
+      best = i
+      bestDiff = diff
+    }
+  }
+
+  return best === -1 ? ERR_NA : { kind: 'number', value: best + 1 }
+}
+
 // ----------------------------------------------------------------------------
 // Phase 8 additions — CHOOSE, ROW/ROWS/COLUMN/COLUMNS, ADDRESS
 // ----------------------------------------------------------------------------
@@ -706,11 +877,10 @@ export const COLUMNS: FunctionImpl = (args, _ctx) => {
 
 /**
  * ROW([reference]) — zero-arg variant returns 1 (we don't have the current
- * cell's row at this layer; the evaluator may patch this for ref-aware
- * usage). With an array arg, returns the row count's vertical sequence
+ * cell's row at this plain FunctionImpl layer; workbook-backed evaluation
+ * handles ref/current-cell-aware ROW in the evaluator. With an array arg,
+ * returns the row count's vertical sequence
  * 1..N for compatibility with simple `=ROW()` spreadsheet idioms.
- *
- * Real ref-aware ROW() requires evaluator integration — flagged as TODO.
  */
 export const ROW: FunctionImpl = (args, _ctx) => {
   if (args.length === 0) return { kind: 'number', value: 1 }
@@ -728,7 +898,8 @@ export const ROW: FunctionImpl = (args, _ctx) => {
 }
 
 /**
- * COLUMN([reference]) — zero-arg variant returns 1 (same limitation as ROW).
+ * COLUMN([reference]) — zero-arg variant returns 1 in the plain FunctionImpl
+ * layer; workbook-backed evaluation handles ref/current-cell-aware COLUMN.
  */
 export const COLUMN: FunctionImpl = (args, _ctx) => {
   if (args.length === 0) return { kind: 'number', value: 1 }
@@ -817,6 +988,8 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   INDEX,
   MATCH,
   XLOOKUP,
+  LOOKUP,
+  XMATCH,
   // Phase 8 additions
   CHOOSE,
   ROWS,

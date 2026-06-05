@@ -182,16 +182,11 @@ export const NOT: FunctionImpl = (args) => {
  *
  * Returns the val whose cond is the first TRUE. No match → `#N/A`.
  *
- * Excel quirk: an odd arg count is technically a syntax error in Excel
- * itself, but when the engine evaluates a malformed IFS at runtime it
- * surfaces `#N/A` after exhausting the valid pairs (the dangling cond
- * without a val is treated as "no match"). We follow that behavior.
- *
  * Errors in evaluated conds propagate. Errors in *unreached* vals do
  * not — only the matched val is returned.
  */
 export const IFS: FunctionImpl = (args) => {
-  if (args.length === 0) return ERR_VALUE
+  if (args.length === 0 || args.length % 2 !== 0) return ERR_VALUE
   // Walk pairs; only inspect the cond + matched val (Excel doesn't
   // evaluate later vals — args here are already evaluated by the
   // dispatcher, so we just don't *return* unreached errors).
@@ -203,7 +198,6 @@ export const IFS: FunctionImpl = (args) => {
     if (!c.ok) return c.error
     if (c.value) return args[i * 2 + 1]
   }
-  // No match (including the dangling-cond case).
   return ERR_NA
 }
 
@@ -272,7 +266,7 @@ export const FALSE: FunctionImpl = (args) => {
  *    Rust eval handles it (no implicit blank-to-0 inside SWITCH).
  *  - everything else: mismatched kinds → not equal.
  */
-function excelEquals(a: Value, b: Value): boolean {
+export function excelEquals(a: Value, b: Value): boolean {
   if (a.kind !== b.kind) return false
   switch (a.kind) {
     case 'blank':

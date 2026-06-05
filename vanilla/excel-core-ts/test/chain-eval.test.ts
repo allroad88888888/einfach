@@ -188,6 +188,53 @@ describe('chain-eval — deep cross-cell dependency chains', () => {
     expect(readNumber(wb.store.getter(atom))).toBe(5050)
   })
 
+  test('whole-column SUM streams existing formula cells through the trampoline', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.bulkApply('s1', [
+      { row: 0, col: 0, input: '=SUM(B:B)' },
+      { row: 0, col: 1, input: '=B2+1' },
+      { row: 1, col: 1, input: '=B3+1' },
+      { row: 2, col: 1, input: '1' },
+    ])
+    const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    expect(readNumber(wb.store.getter(atom))).toBe(6)
+  })
+
+  test('cross-sheet single-ref chain enters the trampoline', () => {
+    const wb = createWorkbook([
+      { id: 's1', name: 'Sheet1' },
+      { id: 's2', name: 'Data' },
+    ])
+    buildChain(wb, 's2', 3_000)
+    wb.setCell('s1', 0, 0, '=Data!A3000')
+    const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    expect(readNumber(wb.store.getter(atom))).toBe(3_000)
+  })
+
+  test('cross-sheet range materialization enters the trampoline', () => {
+    const wb = createWorkbook([
+      { id: 's1', name: 'Sheet1' },
+      { id: 's2', name: 'Data' },
+    ])
+    buildChain(wb, 's2', 3_000)
+    wb.setCell('s1', 0, 0, '=SUM(Data!A3000:A3000)')
+    const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    expect(readNumber(wb.store.getter(atom))).toBe(3_000)
+  })
+
+  test('cross-sheet cycle surfaces #CIRCULAR!', () => {
+    const wb = createWorkbook([
+      { id: 's1', name: 'Sheet1' },
+      { id: 's2', name: 'Data' },
+    ])
+    wb.setCell('s1', 0, 0, '=Data!A1')
+    wb.setCell('s2', 0, 0, '=Sheet1!A1')
+    const atom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    const value = wb.store.getter(atom)
+    expect(value.kind).toBe('error')
+    if (value.kind === 'error') expect(value.code).toBe('#CIRCULAR!')
+  })
+
   test(
     'range batch with reverse-order chain: A1=SUM(B1:B3), B1=B2+1, B2=B3+1, B3=1 → 6',
     () => {

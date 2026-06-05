@@ -74,6 +74,10 @@ export const ERROR_CODES = [
   '#REF!',
   '#VALUE!',
   '#CALC!',
+  '#CYCLE!',
+  '#TYPE!',
+  '#ARGS!',
+  '#SPILL!',
   '#CIRCULAR!',
   '#ERROR!',
 ] as const
@@ -175,12 +179,16 @@ export type Expr =
   | ErrorLiteral
   | ReferenceExpr
   | RangeExpr
+  | DynamicRangeExpr
+  | SpillReferenceExpr
   | CrossSheetExpr
+  | MultiAreaExpr
   | NameExpr
   | UnaryExpr
   | BinaryExpr
   | PercentExpr
   | CallExpr
+  | LambdaCallExpr
   | ArrayLiteralExpr
 
 export interface NumberLiteral {
@@ -220,12 +228,31 @@ export interface RangeExpr {
   readonly end: string
 }
 
+/** A range whose endpoints can be computed by reference-returning expressions. */
+export interface DynamicRangeExpr {
+  readonly kind: 'dynamicRange'
+  readonly start: Expr
+  readonly end: Expr
+}
+
+/** A spilled-range reference like `A1#`. */
+export interface SpillReferenceExpr {
+  readonly kind: 'spillRef'
+  readonly anchor: ReferenceExpr | CrossSheetExpr
+}
+
 /** A cross-sheet ref like `Sheet2!A1` or `Sheet2!A1:B10`. */
 export interface CrossSheetExpr {
   readonly kind: 'crossSheet'
   readonly sheetName: string
   /** Inner expression as parsed *without* the sheet prefix. Always a `ref` or `range`. */
   readonly inner: ReferenceExpr | RangeExpr
+}
+
+/** A parenthesized area union like `(A1:B2,C1:D2)`, primarily for `AREAS`. */
+export interface MultiAreaExpr {
+  readonly kind: 'multiArea'
+  readonly areas: ReadonlyArray<ReferenceExpr | RangeExpr | CrossSheetExpr>
 }
 
 /** A bare identifier — named range, defined name, or LAMBDA. */
@@ -273,6 +300,13 @@ export interface PercentExpr {
 export interface CallExpr {
   readonly kind: 'call'
   readonly name: string
+  readonly args: ReadonlyArray<Expr>
+}
+
+/** Expression-level LAMBDA invocation: `LAMBDA(x, x + 1)(4)`. */
+export interface LambdaCallExpr {
+  readonly kind: 'lambdaCall'
+  readonly callee: Expr
   readonly args: ReadonlyArray<Expr>
 }
 
@@ -397,6 +431,18 @@ export interface EvalContext {
   resolveName(name: string): NameBinding | undefined
 
   /**
+   * Optional workbook/cell metadata for evaluator-aware reference
+   * functions (SHEET, SHEETS, CELL, FORMULATEXT, INDIRECT, OFFSET).
+   * Direct unit tests may omit these; workbook-backed evaluation fills
+   * them from the owning sheet and formula cell.
+   */
+  readonly currentCell?: CellCoord
+  readonly currentSheetName?: string
+  readonly currentSheetIndex?: number
+  readonly sheetCount?: number
+  sheetIndexOf?(sheetName: string): number | undefined
+
+  /**
    * Optional per-call lambda scope. Maps a LAMBDA parameter name to the
    * already-evaluated argument `Value`. The evaluator checks this map
    * BEFORE consulting `resolveName` when it hits a `NameExpr`, so a
@@ -410,6 +456,23 @@ export interface EvalContext {
    * Wave E (E3) — see `docs/ARCHITECTURE.md §9`.
    */
   readonly lambdaScope?: ReadonlyMap<string, Value>
+
+  /**
+   * Optional per-call function-valued lambda scope. `lambdaScope` above
+   * stores parameter / LET scalar values; this map stores LET-bound
+   * LAMBDA values so evaluator-aware functions can pass them to MAP /
+   * REDUCE / SCAN / BYROW / BYCOL / MAKEARRAY without widening `Value`
+   * to a public first-class function type yet.
+   */
+  readonly lambdaFunctionScope?: ReadonlyMap<string, LambdaBinding>
+
+  /**
+   * Names of LAMBDA parameters omitted at the current call site. Used by
+   * the evaluator-aware `ISOMITTED(name)` special form. Missing args still
+   * bind to `BLANK` in `lambdaScope` for backward compatibility; this set
+   * keeps the extra omission bit available when the body asks for it.
+   */
+  readonly lambdaOmittedParams?: ReadonlySet<string>
 
   /**
    * Optional per-derive mutable counter tracking the depth of nested
@@ -442,13 +505,26 @@ export interface EvalContext {
 export const MAX_LAMBDA_CALL_DEPTH = 256
 
 /**
+ * Internal lambda payload used by evaluator-aware special forms. The
+ * public cell `Value` union intentionally remains scalar/array/error
+ * only; LAMBDA values move through `lambdaFunctionScope` instead.
+ */
+export interface LambdaBinding {
+  readonly params: ReadonlyArray<string>
+  readonly body: Expr
+  readonly closureScope?: ReadonlyMap<string, Value>
+  readonly closureFunctionScope?: ReadonlyMap<string, LambdaBinding>
+  readonly closureOmittedParams?: ReadonlySet<string>
+}
+
+/**
  * What `EvalContext.resolveName` returns. LAMBDA bodies are AST so
  * `CallExpr` against a LAMBDA-bound name can re-evaluate with args.
  */
 export type NameBinding =
   | { kind: 'range'; start: string; end: string; sheetName?: string }
   | { kind: 'value'; value: Value }
-  | { kind: 'lambda'; params: ReadonlyArray<string>; body: Expr }
+  | ({ kind: 'lambda' } & LambdaBinding)
 
 // =============================================================================
 // 8. FunctionImpl — the contract every Wave C function file satisfies

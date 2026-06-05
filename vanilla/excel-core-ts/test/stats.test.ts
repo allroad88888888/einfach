@@ -56,7 +56,7 @@ describe('COUNTIF', () => {
   })
 
   test('comparison criterion ">3" counts cells greater than 3', () => {
-    const range = range1D([num(1), num(2), num(3), num(4), num(5)])
+    const range = range1D([num(1), num(2), num(3), num(4), str('5')])
     expect(call(COUNTIF, [range, str('>3')])).toEqual(num(2))
   })
 
@@ -108,6 +108,12 @@ describe('COUNTIF', () => {
     expect(call(COUNTIF, [range, str('TRUE')])).toEqual(num(2))
   })
 
+  test('numeric criteria match numeric strings', () => {
+    const range = range1D([num(5), str('5'), str('05'), str('hello')])
+    expect(call(COUNTIF, [range, str('5')])).toEqual(num(3))
+    expect(call(COUNTIF, [range, num(5)])).toEqual(num(3))
+  })
+
   test('arity mismatch returns #VALUE!', () => {
     expect(call(COUNTIF, [num(1)])).toMatchObject({ kind: 'error', code: '#VALUE!' })
     expect(call(COUNTIF, [num(1), num(2), num(3)])).toMatchObject({
@@ -136,8 +142,15 @@ describe('SUMIF', () => {
   })
 
   test('SUMIF with ">5" criterion', () => {
-    const range = range1D([num(1), num(6), num(7), num(2), num(10)])
+    const range = range1D([num(1), num(6), str('7'), num(2), num(10)])
     expect(call(SUMIF, [range, str('>5')])).toEqual(num(23))
+  })
+
+  test('SUMIF numeric criteria match numeric strings', () => {
+    const check = range1D([num(5), str('5'), str('05'), str('x')])
+    const sum = range1D([num(10), num(20), num(30), num(40)])
+    expect(call(SUMIF, [check, str('5'), sum])).toEqual(num(60))
+    expect(call(SUMIF, [check, num(5), sum])).toEqual(num(60))
   })
 
   test('SUMIF with wildcard on string check, numeric sum_range', () => {
@@ -218,11 +231,19 @@ describe('COUNTIFS', () => {
     })
   })
 
-  test('error cell in any range disqualifies that row', () => {
+  test('same flat length but different shape → #VALUE!', () => {
+    const r1 = range2D([[num(1), num(2)]])
+    const r2 = range2D([[num(1)], [num(2)]])
+    expect(call(COUNTIFS, [r1, num(1), r2, num(1)])).toMatchObject({
+      kind: 'error',
+      code: '#VALUE!',
+    })
+  })
+
+  test('error cell in any range propagates', () => {
     const r1 = range1D([num(1), errVal('#REF!'), num(1)])
     const r2 = range1D([str('a'), str('a'), str('a')])
-    // Row 0: 1 & a → match. Row 1: error → skip. Row 2: 1 & a → match. = 2.
-    expect(call(COUNTIFS, [r1, num(1), r2, str('a')])).toEqual(num(2))
+    expect(call(COUNTIFS, [r1, num(1), r2, str('a')])).toEqual(errVal('#REF!'))
   })
 
   test('criterion error propagates', () => {
@@ -285,11 +306,16 @@ describe('SUMIFS', () => {
     expect(call(SUMIFS, [sum, r1, num(1)])).toMatchObject({ kind: 'error', code: '#VALUE!' })
   })
 
-  test('SUMIFS skips error cells in criterion range, propagates sum_range errors', () => {
+  test('SUMIFS rejects same flat length with different shape', () => {
+    const sum = range2D([[num(10), num(20)]])
+    const r1 = range2D([[num(1)], [num(2)]])
+    expect(call(SUMIFS, [sum, r1, num(1)])).toMatchObject({ kind: 'error', code: '#VALUE!' })
+  })
+
+  test('SUMIFS propagates error cells in criterion range', () => {
     const sum = range1D([num(10), num(20), num(30)])
     const r1 = range1D([num(1), errVal('#REF!'), num(1)])
-    // Index 1 is skipped (error in r1). Index 0 and 2 sum_range are valid.
-    expect(call(SUMIFS, [sum, r1, num(1)])).toEqual(num(40))
+    expect(call(SUMIFS, [sum, r1, num(1)])).toEqual(errVal('#REF!'))
   })
 
   test('SUMIFS with comparison criterion', () => {
@@ -345,18 +371,18 @@ describe('criterion edge cases', () => {
     expect(call(COUNTIF, [range, str('>-1')])).toEqual(num(1))
   })
 
-  test('number criterion does not match a string cell that looks numeric', () => {
+  test('number criterion matches a string cell that looks numeric', () => {
     const range = range1D([num(5), str('5'), str('hello')])
-    expect(call(COUNTIF, [range, num(5)])).toEqual(num(1))
+    expect(call(COUNTIF, [range, num(5)])).toEqual(num(2))
   })
 
   test('"=5" string criterion behaves identically to bare 5', () => {
-    const range = range1D([num(5), num(5), num(6)])
-    expect(call(COUNTIF, [range, str('=5')])).toEqual(num(2))
+    const range = range1D([num(5), str('5'), num(5), num(6)])
+    expect(call(COUNTIF, [range, str('=5')])).toEqual(num(3))
   })
 
   test('"<>5" excludes the 5s', () => {
-    const range = range1D([num(5), num(5), num(6), num(7)])
+    const range = range1D([num(5), str('5'), num(5), num(6), num(7)])
     expect(call(COUNTIF, [range, str('<>5')])).toEqual(num(2))
   })
 

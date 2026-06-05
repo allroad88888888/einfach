@@ -327,6 +327,13 @@ describe('TRIM', () => {
   test('all-whitespace → empty', () => {
     expect(call('TRIM', [str('     ')])).toEqual(str(''))
   })
+
+  test('does not trim tabs, newlines, or non-breaking spaces', () => {
+    expect(call('TRIM', [str('\thello   world\n')])).toEqual(str('\thello world\n'))
+    expect(call('TRIM', [str('\u00a0 hello  world \u00a0')])).toEqual(
+      str('\u00a0 hello world \u00a0'),
+    )
+  })
 })
 
 // =============================================================================
@@ -342,6 +349,14 @@ describe('TEXT', () => {
     expect(call('TEXT', [num(42.7), str('0')])).toEqual(str('43'))
   })
 
+  test('"0" rounds negative halves away from zero', () => {
+    expect(call('TEXT', [num(-2.5), str('0')])).toEqual(str('-3'))
+  })
+
+  test('"000" pads integer width', () => {
+    expect(call('TEXT', [num(7), str('000')])).toEqual(str('007'))
+  })
+
   test('"0.00" pads to two decimals', () => {
     expect(call('TEXT', [num(3.1), str('0.00')])).toEqual(str('3.10'))
   })
@@ -350,8 +365,30 @@ describe('TEXT', () => {
     expect(call('TEXT', [num(3.14159), str('0.00')])).toEqual(str('3.14'))
   })
 
+  test('custom format appends quoted literal text', () => {
+    expect(call('TEXT', [num(12.34), str('0.0" kg"')])).toEqual(str('12.3 kg'))
+  })
+
+  test('custom format preserves literal spaces and spacing controls', () => {
+    expect(call('TEXT', [num(12), str(' 0 ')])).toEqual(str(' 12 '))
+    expect(call('TEXT', [num(12), str('0.0_);(0.0)')])).toEqual(str('12.0 '))
+    expect(call('TEXT', [num(12), str('0*x')])).toEqual(str('12'))
+  })
+
+  test('custom format sections ignore semicolons inside quoted literals', () => {
+    expect(call('TEXT', [num(12), str('0";kg";0')])).toEqual(str('12;kg'))
+  })
+
   test('"#,##0" inserts thousands separator', () => {
     expect(call('TEXT', [num(1234567), str('#,##0')])).toEqual(str('1,234,567'))
+  })
+
+  test('custom format trailing comma scales by thousands', () => {
+    expect(call('TEXT', [num(1234567), str('#,##0,')])).toEqual(str('1,235'))
+  })
+
+  test('custom format multiple trailing commas scale by millions', () => {
+    expect(call('TEXT', [num(1234567890), str('#,##0,,')])).toEqual(str('1,235'))
   })
 
   test('"#,##0.00" thousands + 2 decimals', () => {
@@ -360,6 +397,7 @@ describe('TEXT', () => {
 
   test('"0%" multiplies by 100 and appends %', () => {
     expect(call('TEXT', [num(0.5), str('0%')])).toEqual(str('50%'))
+    expect(call('TEXT', [num(-0.025), str('0%')])).toEqual(str('-3%'))
   })
 
   test('"0.00%" two-decimal percent', () => {
@@ -370,24 +408,119 @@ describe('TEXT', () => {
     expect(call('TEXT', [num(1234.5), str('$#,##0.00')])).toEqual(str('$1,234.50'))
   })
 
+  test('custom format strips bracket color and currency tags', () => {
+    expect(call('TEXT', [num(12.34), str('[Red]0.0')])).toEqual(str('12.3'))
+    expect(call('TEXT', [num(1234.5), str('[$$-409]#,##0.00')])).toEqual(str('$1,234.50'))
+    expect(call('TEXT', [num(1234.5), str('[$¥-411]#,##0.00')])).toEqual(str('¥1,234.50'))
+  })
+
   test('negative number formats with leading sign for thousands format', () => {
     expect(call('TEXT', [num(-1234.5), str('#,##0.00')])).toEqual(str('-1,234.50'))
   })
 
-  test('text input passes through unchanged (Excel rule)', () => {
+  test('text input passes through unchanged without text section', () => {
     expect(call('TEXT', [str('already text'), str('0.00')])).toEqual(str('already text'))
   })
 
-  test('unknown format code falls back to String(n) (TODO: broader parser)', () => {
-    // We document this as a punt — out-of-scope format codes return raw String(n).
-    expect(call('TEXT', [num(42), str('yyyy-mm-dd')])).toEqual(str('42'))
+  test('text input applies @ placeholder formats', () => {
+    expect(call('TEXT', [str('abc'), str('@')])).toEqual(str('abc'))
+    expect(call('TEXT', [str('abc'), str('prefix @ suffix')])).toEqual(
+      str('prefix abc suffix'),
+    )
   })
 
-  test('negative-format suffix punted: positive section applied (out of scope)', () => {
-    // "#,##0;(#,##0)" is the negative-suffix form; we keep only the positive
-    // section per task brief. Negative values format with the positive
-    // format (so `-1234` → `-1,234`, not `(1,234)`).
-    expect(call('TEXT', [num(-1234), str('#,##0;(#,##0)')])).toEqual(str('-1,234'))
+  test('text input uses the fourth custom-format section', () => {
+    const accounting = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
+
+    expect(call('TEXT', [str('abc'), str('0;-0;0;text: @')])).toEqual(str('text: abc'))
+    expect(call('TEXT', [str('abc'), str('0;-0;0;')])).toEqual(str(''))
+    expect(call('TEXT', [str('abc'), str(accounting)])).toEqual(str(' abc '))
+  })
+
+  test('@ text placeholders do not make numeric formats valid', () => {
+    expect(call('TEXT', [num(42), str('@')])).toEqual(errVal('#VALUE!'))
+    expect(call('TEXT', [num(42), str('prefix @ suffix')])).toEqual(errVal('#VALUE!'))
+    expect(call('TEXT', [num(42), str('unsupported')])).toEqual(errVal('#VALUE!'))
+  })
+
+  test('date format code formats Excel serials', () => {
+    expect(call('TEXT', [num(45306), str('yyyy-mm-dd')])).toEqual(str('2024-01-15'))
+  })
+
+  test('date format handles month and weekday names plus quoted literals', () => {
+    expect(call('TEXT', [num(44197), str('d-mmm-yyyy')])).toEqual(str('1-Jan-2021'))
+    expect(call('TEXT', [num(44197), str('mmmm d, yyyy')])).toEqual(str('January 1, 2021'))
+    expect(call('TEXT', [num(44197), str('ddd, mmmm d')])).toEqual(str('Fri, January 1'))
+    expect(call('TEXT', [num(44197), str('m"月"d"日"')])).toEqual(str('1月1日'))
+  })
+
+  test('time format handles 24-hour and AM/PM clocks', () => {
+    expect(call('TEXT', [num(0.5), str('hh:mm:ss')])).toEqual(str('12:00:00'))
+    expect(call('TEXT', [num(0.75), str('h:mm AM/PM')])).toEqual(str('6:00 PM'))
+    expect(call('TEXT', [num(0.25), str('h:mm A/P')])).toEqual(str('6:00 A'))
+    expect(call('TEXT', [num(44197.75), str('yyyy-mm-dd h:mm AM/PM')])).toEqual(
+      str('2021-01-01 6:00 PM'),
+    )
+  })
+
+  test('time format handles elapsed duration and fractional seconds', () => {
+    expect(call('TEXT', [num(1.5), str('[h]:mm:ss')])).toEqual(str('36:00:00'))
+    expect(call('TEXT', [num(1.5), str('[m]:ss')])).toEqual(str('2160:00'))
+    expect(call('TEXT', [num(1.5), str('[s]')])).toEqual(str('129600'))
+    expect(call('TEXT', [num(0.5 + 0.123 / 86400), str('hh:mm:ss.000')])).toEqual(
+      str('12:00:00.123'),
+    )
+    expect(call('TEXT', [num(3735.8 / 86400), str('[ss].00')])).toEqual(str('3735.80'))
+  })
+
+  test('unknown numeric format code returns #VALUE!', () => {
+    expect(call('TEXT', [num(42), str('unsupported')])).toEqual(errVal('#VALUE!'))
+  })
+
+  test('negative-format suffix uses the negative section', () => {
+    expect(call('TEXT', [num(-1234), str('#,##0;(#,##0)')])).toEqual(str('(1,234)'))
+  })
+
+  test('custom format supports conditional and literal-only sections', () => {
+    const size = '[>100]"large";[<=100]"small"'
+    expect(call('TEXT', [num(150), str(size)])).toEqual(str('large'))
+    expect(call('TEXT', [num(50), str(size)])).toEqual(str('small'))
+    expect(call('TEXT', [num(0), str('#,##0;-#,##0;"zero"')])).toEqual(str('zero'))
+    expect(call('TEXT', [num(0), str('0;-0;;@')])).toEqual(str(''))
+    expect(call('TEXT', [num(-5), str('0;;0')])).toEqual(str(''))
+  })
+
+  test('custom optional digit placeholders can suppress leading zero', () => {
+    expect(call('TEXT', [num(0), str('#')])).toEqual(str(''))
+    expect(call('TEXT', [num(0.5), str('#.##')])).toEqual(str('.5'))
+    expect(call('TEXT', [num(12), str('###')])).toEqual(str('12'))
+  })
+
+  test('custom special masks preserve internal separators', () => {
+    expect(call('TEXT', [num(123456789), str('000-00-0000')])).toEqual(str('123-45-6789'))
+    expect(call('TEXT', [num(1234), str('000-00-0000')])).toEqual(str('000-00-1234'))
+    expect(call('TEXT', [num(4155551234), str('(000) 000-0000')])).toEqual(
+      str('(415) 555-1234'),
+    )
+    expect(call('TEXT', [num(1234), str('00000-0000')])).toEqual(str('00000-1234'))
+  })
+
+  test('"0.00E+00" formats scientific notation', () => {
+    expect(call('TEXT', [num(12200000), str('0.00E+00')])).toEqual(str('1.22E+07'))
+    expect(call('TEXT', [num(0.0122), str('0.00E+00')])).toEqual(str('1.22E-02'))
+    expect(call('TEXT', [num(-1234), str('0.00E+00')])).toEqual(str('-1.23E+03'))
+  })
+
+  test('"# ?/?" formats simple one-digit fractions', () => {
+    expect(call('TEXT', [num(4.34), str('# ?/?')])).toEqual(str('4 1/3'))
+    expect(call('TEXT', [num(0.34), str('# ?/?')])).toEqual(str(' 1/3'))
+    expect(call('TEXT', [num(2.25), str('# ?/?')])).toEqual(str('2 1/4'))
+  })
+
+  test('bracket color tags preserve date, scientific, and fraction paths', () => {
+    expect(call('TEXT', [num(45306), str('[Red]yyyy-mm-dd')])).toEqual(str('2024-01-15'))
+    expect(call('TEXT', [num(12200000), str('[Red]0.00E+00')])).toEqual(str('1.22E+07'))
+    expect(call('TEXT', [num(4.34), str('[Red]# ?/?')])).toEqual(str('4 1/3'))
   })
 
   test('error propagation', () => {
@@ -552,5 +685,128 @@ describe('FIND', () => {
       kind: 'error',
       code: '#REF!',
     })
+  })
+})
+
+// =============================================================================
+// LEFTB / RIGHTB / MIDB / LENB
+// =============================================================================
+
+describe('LEFTB / RIGHTB / MIDB / LENB', () => {
+  test('ASCII text behaves like character-based variants', () => {
+    expect(call('LENB', [str('abcdef')])).toEqual(num(6))
+    expect(call('LEFTB', [str('abcdef'), num(3)])).toEqual(str('abc'))
+    expect(call('RIGHTB', [str('abcdef'), num(3)])).toEqual(str('def'))
+    expect(call('MIDB', [str('abcdef'), num(2), num(3)])).toEqual(str('bcd'))
+  })
+
+  test('Japanese full-width characters count as two bytes', () => {
+    expect(call('LENB', [str('AあBい')])).toEqual(num(6))
+    expect(call('LEFTB', [str('あいA'), num(3)])).toEqual(str('あ'))
+    expect(call('RIGHTB', [str('AあBい'), num(3)])).toEqual(str('Bい'))
+    expect(call('MIDB', [str('AあBいC'), num(2), num(3)])).toEqual(str('あB'))
+  })
+
+  test('partial double-byte boundary is not returned', () => {
+    expect(call('LEFTB', [str('あ'), num(1)])).toEqual(str(''))
+    expect(call('RIGHTB', [str('あい'), num(3)])).toEqual(str('い'))
+  })
+
+  test('MIDB start beyond length returns empty', () => {
+    expect(call('MIDB', [str('Aあ'), num(99), num(2)])).toEqual(str(''))
+  })
+
+  test('byte counts truncate toward zero', () => {
+    expect(call('LEFTB', [str('abcdef'), num(2.9)])).toEqual(str('ab'))
+    expect(call('MIDB', [str('abcdef'), num(2.9), num(2.9)])).toEqual(str('bc'))
+  })
+
+  test('invalid byte arguments → #VALUE!', () => {
+    expect(errCodeOf(call('LEFTB', [str('abc'), num(-1)]))).toBe('#VALUE!')
+    expect(errCodeOf(call('RIGHTB', [str('abc'), num(-1)]))).toBe('#VALUE!')
+    expect(errCodeOf(call('MIDB', [str('abc'), num(0), num(1)]))).toBe('#VALUE!')
+    expect(errCodeOf(call('MIDB', [str('abc'), num(1), num(-1)]))).toBe('#VALUE!')
+  })
+})
+
+// =============================================================================
+// SEARCHB / FINDB
+// =============================================================================
+
+describe('SEARCHB', () => {
+  test('returns DBCS byte position and ignores case', () => {
+    expect(call('SEARCHB', [str('a'), str('あA')])).toEqual(num(3))
+  })
+
+  test('supports SEARCH wildcards with byte positions', () => {
+    expect(call('SEARCHB', [str('あ?'), str('xxあB')])).toEqual(num(3))
+  })
+
+  test('start byte skips earlier matches', () => {
+    expect(call('SEARCHB', [str('あ'), str('あxあ'), num(3)])).toEqual(num(4))
+  })
+
+  test('not found → #VALUE!', () => {
+    expect(errCodeOf(call('SEARCHB', [str('zz'), str('あA')]))).toBe('#VALUE!')
+  })
+
+  test('start byte out of range → #VALUE!', () => {
+    expect(errCodeOf(call('SEARCHB', [str('A'), str('あA'), num(0)]))).toBe('#VALUE!')
+    expect(errCodeOf(call('SEARCHB', [str('A'), str('あA'), num(99)]))).toBe('#VALUE!')
+  })
+})
+
+describe('FINDB', () => {
+  test('returns DBCS byte position and remains case-sensitive', () => {
+    expect(call('FINDB', [str('本'), str('熊本A')])).toEqual(num(3))
+    expect(errCodeOf(call('FINDB', [str('a'), str('熊本A')]))).toBe('#VALUE!')
+  })
+
+  test('start byte skips earlier matches', () => {
+    expect(call('FINDB', [str('熊'), str('熊本熊'), num(3)])).toEqual(num(5))
+  })
+
+  test('wildcards are literal', () => {
+    expect(call('FINDB', [str('A*'), str('あA*')])).toEqual(num(3))
+  })
+
+  test('not found → #VALUE!', () => {
+    expect(errCodeOf(call('FINDB', [str('xyz'), str('熊本A')]))).toBe('#VALUE!')
+  })
+
+  test('start byte out of range → #VALUE!', () => {
+    expect(errCodeOf(call('FINDB', [str('A'), str('熊本A'), num(0)]))).toBe('#VALUE!')
+    expect(errCodeOf(call('FINDB', [str('A'), str('熊本A'), num(99)]))).toBe('#VALUE!')
+  })
+})
+
+// =============================================================================
+// REPLACEB
+// =============================================================================
+
+describe('REPLACEB', () => {
+  test('ASCII text behaves like REPLACE', () => {
+    expect(call('REPLACEB', [str('abcdef'), num(2), num(3), str('X')])).toEqual(str('aXef'))
+  })
+
+  test('replaces Japanese full-width character by byte range', () => {
+    expect(call('REPLACEB', [str('AあBいC'), num(2), num(2), str('X')])).toEqual(
+      str('AXBいC'),
+    )
+  })
+
+  test('zero bytes inserts at byte boundary', () => {
+    expect(call('REPLACEB', [str('AあB'), num(2), num(0), str('-')])).toEqual(str('A-あB'))
+  })
+
+  test('start beyond length appends replacement', () => {
+    expect(call('REPLACEB', [str('Aあ'), num(99), num(2), str('Z')])).toEqual(str('AあZ'))
+  })
+
+  test('invalid byte arguments → #VALUE!', () => {
+    expect(errCodeOf(call('REPLACEB', [str('abc'), num(0), num(1), str('X')]))).toBe('#VALUE!')
+    expect(errCodeOf(call('REPLACEB', [str('abc'), num(1), num(-1), str('X')]))).toBe(
+      '#VALUE!',
+    )
   })
 })

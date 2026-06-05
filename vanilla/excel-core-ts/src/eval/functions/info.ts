@@ -21,10 +21,11 @@
  *   https://support.microsoft.com/en-us/office/type-function-45b4e688-4bc3-48b3-a105-ffa892995899
  */
 
-import type { FunctionImpl, Value } from '../../types'
+import type { ErrorCode, FunctionImpl, Value } from '../../types'
 
 const BOOL = (b: boolean): Value => ({ kind: 'boolean', value: b })
 const NUM = (n: number): Value => ({ kind: 'number', value: n })
+const STR = (s: string): Value => ({ kind: 'string', value: s })
 const ERR_VALUE = (): Value => ({ kind: 'error', code: '#VALUE!' })
 
 /**
@@ -99,10 +100,7 @@ export const ISNA: FunctionImpl = (args) => {
  *   4  = logical (boolean)
  *  16  = error
  *  64  = array
- *   0  = blank  (this is einfach-ts addition; Excel returns 1 for
- *               blank because it coerces blank → 0 → number. We diverge
- *               for diagnostic clarity. TODO(F1): consider matching
- *               Excel verbatim if any user-visible test demands it.)
+ *   1  = blank (Excel/Rust treat blank as a coerced numeric zero)
  */
 export const TYPE: FunctionImpl = (args) => {
   const e = arity1Check(args)
@@ -120,7 +118,7 @@ export const TYPE: FunctionImpl = (args) => {
     case 'array':
       return NUM(64)
     case 'blank':
-      return NUM(0)
+      return NUM(1)
   }
 }
 
@@ -225,6 +223,88 @@ export const ISREF: FunctionImpl = (args) => {
   return BOOL(false)
 }
 
+function valueToInfoKey(value: Value): string {
+  switch (value.kind) {
+    case 'string':
+      return value.value.trim().toLowerCase()
+    case 'number':
+      return String(value.value).toLowerCase()
+    case 'boolean':
+      return value.value ? 'true' : 'false'
+    case 'blank':
+      return ''
+    case 'array': {
+      const row = value.value[0]
+      return valueToInfoKey(row?.[0] ?? { kind: 'blank' })
+    }
+    case 'error':
+      return ''
+  }
+}
+
+function hostSystem(): string {
+  const host = globalThis as {
+    process?: { platform?: string }
+    navigator?: { platform?: string; userAgent?: string }
+  }
+  const platform = host.process?.platform ?? host.navigator?.platform ?? host.navigator?.userAgent ?? ''
+  const lower = platform.toLowerCase()
+  if (lower.includes('darwin') || lower.includes('mac')) return 'mac'
+  if (lower.includes('win')) return 'pc'
+  return 'other'
+}
+
+/** INFO(type_text) — stable runtime metadata for formula compatibility. */
+export const INFO: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  const v = args[0]
+  if (v.kind === 'error') return v
+  switch (valueToInfoKey(v)) {
+    case 'directory':
+      return STR('')
+    case 'numfile':
+      return NUM(1)
+    case 'osversion':
+      return STR('')
+    case 'recalc':
+      return STR('Automatic')
+    case 'release':
+      return STR('einfach-ts')
+    case 'system':
+      return STR(hostSystem())
+    default:
+      return ERR_VALUE()
+  }
+}
+
+const ERROR_TYPE_CODES: Partial<Record<ErrorCode, number>> = {
+  '#NULL!': 1,
+  '#DIV/0!': 2,
+  '#VALUE!': 3,
+  '#REF!': 4,
+  '#NAME?': 5,
+  '#NUM!': 6,
+  '#N/A': 7,
+  '#SPILL!': 9,
+  '#CALC!': 14,
+  '#CYCLE!': 4,
+  '#TYPE!': 3,
+  '#ARGS!': 3,
+  '#CIRCULAR!': 4,
+  '#ERROR!': 3,
+}
+
+/** ERROR.TYPE(error_value) — map an error value to Excel's numeric tag. */
+export const ERROR_TYPE: FunctionImpl = (args) => {
+  const e = arity1Check(args)
+  if (e) return e
+  const v = args[0]
+  if (v.kind !== 'error') return ERR_VALUE()
+  const code = ERROR_TYPE_CODES[v.code]
+  return code === undefined ? ERR_VALUE() : NUM(code)
+}
+
 // =============================================================================
 // Registry
 // =============================================================================
@@ -246,4 +326,6 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   NA,
   ISFORMULA,
   ISREF,
+  INFO,
+  'ERROR.TYPE': ERROR_TYPE,
 }

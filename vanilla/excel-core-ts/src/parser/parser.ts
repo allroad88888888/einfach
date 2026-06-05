@@ -23,9 +23,14 @@
 
 import type {
   Expr,
+  DynamicRangeExpr,
+  SpillReferenceExpr,
   RangeExpr,
   ReferenceExpr,
   CallExpr,
+  CrossSheetExpr,
+  LambdaCallExpr,
+  MultiAreaExpr,
   ArrayLiteralExpr,
   BinaryOp,
 } from '../types'
@@ -92,6 +97,9 @@ function infixBindingPower(op: OpLexeme): [number, number] {
 
 const PREFIX_BP = 50 // higher than `+`/`-`/`*`/`/`, lower than `^`
 const POSTFIX_BP = 55 // `%` binds tighter than infix arithmetic but looser than `^`
+const RANGE_BP = 65 // reference range operator binds tighter than scalar infix ops
+const CALL_BP = 70 // expression-level LAMBDA calls bind tighter than all infix ops
+const SPILL_BP = 75 // spill references are syntactic anchors, not scalar arithmetic
 
 // ---- entry ----
 
@@ -115,15 +123,18 @@ export function parseTokens(tokens: Token[]): Expr {
 function parseExpr(cur: TokenCursor, minBp: number): Expr {
   let lhs = parsePrefix(cur)
 
-  // Postfix `%` binds tighter than infix arithmetic, so loop here first.
-  while (cur.peek().kind === 'percent' && POSTFIX_BP >= minBp) {
-    cur.next()
-    lhs = { kind: 'percent', operand: lhs }
-  }
+  lhs = parsePostfix(cur, lhs, minBp)
 
   // Infix loop.
   while (true) {
     const t = cur.peek()
+    if (t.kind === 'colon') {
+      if (RANGE_BP < minBp) break
+      cur.next()
+      const rhs = parseExpr(cur, RANGE_BP + 1)
+      lhs = makeRange(lhs, rhs)
+      continue
+    }
     if (t.kind === 'op') {
       const [lbp, rbp] = infixBindingPower(t.value)
       if (lbp < minBp) break
@@ -141,6 +152,31 @@ function parseExpr(cur: TokenCursor, minBp: number): Expr {
   }
 
   return lhs
+}
+
+function parsePostfix(cur: TokenCursor, lhs: Expr, minBp: number): Expr {
+  let out = lhs
+  while (true) {
+    const t = cur.peek()
+    if (t.kind === 'lparen' && CALL_BP >= minBp) {
+      cur.next()
+      const args = parseArgList(cur)
+      cur.consume('rparen')
+      out = { kind: 'lambdaCall', callee: out, args } satisfies LambdaCallExpr
+      continue
+    }
+    if (t.kind === 'percent' && POSTFIX_BP >= minBp) {
+      cur.next()
+      out = { kind: 'percent', operand: out }
+      continue
+    }
+    if (t.kind === 'spill' && SPILL_BP >= minBp) {
+      cur.next()
+      out = makeSpillRef(out, t.pos)
+      continue
+    }
+    return out
+  }
 }
 
 function parsePrefix(cur: TokenCursor): Expr {
@@ -183,6 +219,17 @@ function parseAtom(cur: TokenCursor): Expr {
     case 'lparen': {
       cur.next()
       const inner = parseExpr(cur, 0)
+      if (cur.peek().kind === 'comma') {
+        const areas: Array<ReferenceExpr | RangeExpr | CrossSheetExpr> = [
+          requireArea(inner, t.pos),
+        ]
+        while (cur.peek().kind === 'comma') {
+          cur.next()
+          areas.push(requireArea(parseExpr(cur, 0), t.pos))
+        }
+        cur.consume('rparen')
+        return { kind: 'multiArea', areas } satisfies MultiAreaExpr
+      }
       cur.consume('rparen')
       return inner
     }
@@ -217,30 +264,53 @@ function parseAtom(cur: TokenCursor): Expr {
   }
 }
 
+function requireArea(expr: Expr, pos: number): ReferenceExpr | RangeExpr | CrossSheetExpr {
+  if (expr.kind === 'ref' || expr.kind === 'range' || expr.kind === 'crossSheet') {
+    return expr
+  }
+  throw new ParseError('multi-area references must contain refs or ranges', pos)
+}
+
+function makeSpillRef(expr: Expr, pos: number): SpillReferenceExpr {
+  if (expr.kind === 'ref') return { kind: 'spillRef', anchor: expr }
+  if (expr.kind === 'crossSheet' && expr.inner.kind === 'ref') {
+    return { kind: 'spillRef', anchor: expr }
+  }
+  throw new ParseError('spill references require a single-cell anchor', pos)
+}
+
+function makeRange(start: Expr, end: Expr): RangeExpr | DynamicRangeExpr {
+  if (start.kind === 'ref' && end.kind === 'ref') {
+    return { kind: 'range', start: start.a1, end: end.a1 }
+  }
+  return { kind: 'dynamicRange', start, end } satisfies DynamicRangeExpr
+}
+
+function makeRefExpr(t: Extract<Token, { kind: 'ref' }>): ReferenceExpr {
+  return {
+    kind: 'ref',
+    a1: t.a1,
+    absCol: t.absCol,
+    absRow: t.absRow,
+  }
+}
+
 function parseRefOrRange(cur: TokenCursor): Expr {
   const t = cur.peek()
   if (t.kind !== 'ref') {
     throw new ParseError(`expected ref, got ${t.kind}`, t.pos)
   }
   cur.next()
-  const start: ReferenceExpr = {
-    kind: 'ref',
-    a1: t.a1,
-    absCol: t.absCol,
-    absRow: t.absRow,
-  }
+  const start = makeRefExpr(t)
   if (cur.peek().kind === 'colon') {
     cur.next()
     const endTok = cur.peek()
-    if (endTok.kind !== 'ref') {
-      throw new ParseError(`expected ref after ':', got ${endTok.kind}`, endTok.pos)
+    if (endTok.kind === 'ref') {
+      cur.next()
+      return makeRange(start, makeRefExpr(endTok))
     }
-    cur.next()
-    return {
-      kind: 'range',
-      start: t.a1,
-      end: endTok.a1,
-    } satisfies RangeExpr
+    const end = parseExpr(cur, RANGE_BP + 1)
+    return makeRange(start, end)
   }
   return start
 }
@@ -280,11 +350,19 @@ function parseCrossSheet(cur: TokenCursor): Expr {
   const next = cur.peek()
   // Cross-sheet inner must be a ref or range.
   if (next.kind === 'ref') {
-    const inner = parseRefOrRange(cur)
-    if (inner.kind !== 'ref' && inner.kind !== 'range') {
-      throw new ParseError('cross-sheet inner must be ref or range', head.pos)
+    cur.next()
+    const start = makeRefExpr(next)
+    const endTok = cur.peek(1)
+    if (cur.peek().kind === 'colon' && endTok.kind === 'ref') {
+      cur.next()
+      cur.next()
+      return {
+        kind: 'crossSheet',
+        sheetName: head.name,
+        inner: { kind: 'range', start: start.a1, end: endTok.a1 },
+      }
     }
-    return { kind: 'crossSheet', sheetName: head.name, inner }
+    return { kind: 'crossSheet', sheetName: head.name, inner: start }
   }
   if (next.kind === 'whole-col' || next.kind === 'whole-row') {
     const inner = parseWholeAxisRange(cur)

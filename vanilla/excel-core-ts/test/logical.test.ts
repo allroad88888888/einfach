@@ -254,13 +254,12 @@ describe('IFS', () => {
     expect(IFS([NUM(0), STR('zero'), NUM(1), STR('one')], ctx)).toEqual(STR('one'))
   })
 
-  it('returns #N/A on odd-count args (dangling cond) when no earlier pair matched', () => {
-    // 3 args: (cond1, val1, danglingCond) → exhaust pair (1), miss → #N/A.
-    expect(IFS([BOOL(false), STR('a'), BOOL(true)], ctx)).toEqual(ERR('#N/A'))
+  it('returns #VALUE! on odd-count args', () => {
+    expect(IFS([BOOL(false), STR('a'), BOOL(true)], ctx)).toEqual(ERR('#VALUE!'))
   })
 
-  it('still returns first-matched val even when dangling cond follows', () => {
-    expect(IFS([BOOL(true), STR('hit'), BOOL(false)], ctx)).toEqual(STR('hit'))
+  it('rejects odd-count args even when an earlier pair would match', () => {
+    expect(IFS([BOOL(true), STR('hit'), BOOL(false)], ctx)).toEqual(ERR('#VALUE!'))
   })
 
   it('propagates errors from evaluated conds', () => {

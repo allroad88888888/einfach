@@ -150,6 +150,14 @@ describe('AVERAGEIF', () => {
         ARR([[NUM(10), NUM(20), NUM(30)]]),
       ]),
     ).toEqual(NUM(25)))
+  test('criteria range errors propagate', () =>
+    expect(call('AVERAGEIF', [ARR([[ERR('#VALUE!')]]), STR('x'), ARR([[NUM(10)]])])).toEqual(
+      ERR('#VALUE!'),
+    ))
+  test('averageRange must match criteria range shape', () =>
+    expect(
+      call('AVERAGEIF', [ARR([[STR('x'), STR('x')]]), STR('x'), ARR([[NUM(10)]])]),
+    ).toEqual(ERR('#VALUE!')))
   test('no matches → #DIV/0!', () =>
     expect(call('AVERAGEIF', [ARR([[NUM(1)]]), STR('>5')])).toEqual(ERR('#DIV/0!')))
 })
@@ -172,6 +180,14 @@ describe('AVERAGEIFS', () => {
   test('mismatched shapes → #VALUE!', () =>
     expect(
       call('AVERAGEIFS', [ARR([[NUM(10), NUM(20)]]), ARR([[NUM(1)]]), STR('>0')]),
+    ).toEqual(ERR('#VALUE!')))
+  test('same flat length but different shape → #VALUE!', () =>
+    expect(
+      call('AVERAGEIFS', [ARR([[NUM(10)], [NUM(20)]]), ARR([[NUM(1), NUM(2)]]), STR('>0')]),
+    ).toEqual(ERR('#VALUE!')))
+  test('criteria range errors propagate', () =>
+    expect(
+      call('AVERAGEIFS', [ARR([[NUM(10)]]), ARR([[ERR('#VALUE!')]]), STR('x')]),
     ).toEqual(ERR('#VALUE!')))
 })
 
@@ -196,6 +212,16 @@ describe('MAXIFS / MINIFS', () => {
     expect(
       call('MAXIFS', [ARR([[NUM(1), NUM(2)]]), ARR([[NUM(5), NUM(6)]]), STR('>99')]),
     ).toEqual(NUM(0)))
+  test('MAXIFS / MINIFS reject shape transposes', () => {
+    const args = [ARR([[NUM(10)], [NUM(20)]]), ARR([[NUM(1), NUM(2)]]), STR('>0')]
+    expect(call('MAXIFS', args)).toEqual(ERR('#VALUE!'))
+    expect(call('MINIFS', args)).toEqual(ERR('#VALUE!'))
+  })
+  test('MAXIFS / MINIFS propagate criteria range errors', () => {
+    const args = [ARR([[NUM(10)]]), ARR([[ERR('#VALUE!')]]), STR('x')]
+    expect(call('MAXIFS', args)).toEqual(ERR('#VALUE!'))
+    expect(call('MINIFS', args)).toEqual(ERR('#VALUE!'))
+  })
 })
 
 describe('CORREL', () => {
@@ -213,6 +239,15 @@ describe('CORREL', () => {
     ).toBeCloseTo(-1, 6))
   test('mismatched lengths → #N/A', () =>
     expect(call('CORREL', [ARR([[NUM(1), NUM(2)]]), ARR([[NUM(1)]])])).toEqual(ERR('#N/A')))
+  test('filters non-numeric values pairwise', () =>
+    expect(
+      asNumber(
+        call('CORREL', [
+          ARR([[NUM(1), STR('skip'), NUM(3)]]),
+          ARR([[NUM(10), NUM(999), NUM(30)]]),
+        ]),
+      ),
+    ).toBeCloseTo(1, 6))
 })
 
 describe('SLOPE / INTERCEPT', () => {
@@ -230,6 +265,21 @@ describe('SLOPE / INTERCEPT', () => {
     expect(call('SLOPE', [ARR([[NUM(1), NUM(2)]]), ARR([[NUM(5), NUM(5)]])])).toEqual(
       ERR('#DIV/0!'),
     ))
+  test('filters non-numeric known_y / known_x pairs together', () => {
+    const ys = ARR([[NUM(3), STR('skip'), NUM(7)]])
+    const xs = ARR([[NUM(1), NUM(2), NUM(3)]])
+    expect(asNumber(call('SLOPE', [ys, xs]))).toBeCloseTo(2, 6)
+    expect(asNumber(call('INTERCEPT', [ys, xs]))).toBeCloseTo(1, 6)
+  })
+})
+
+describe('COVARIANCE', () => {
+  test('filters non-numeric values pairwise', () => {
+    const a = ARR([[NUM(1), STR('skip'), NUM(3)]])
+    const b = ARR([[NUM(10), NUM(999), NUM(30)]])
+    expect(asNumber(call('COVARIANCE.P', [a, b]))).toBeCloseTo(10, 6)
+    expect(asNumber(call('COVARIANCE.S', [a, b]))).toBeCloseTo(20, 6)
+  })
 })
 
 describe('AVERAGEA', () => {

@@ -294,9 +294,27 @@ describe('custom formulas — registered host callbacks', () => {
     expect(result.kind).toBe('error')
     expect((result as { code: string }).code).toBe('#NAME?')
   })
+
+  test('registering and unregistering a custom formula invalidates cached formulas', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '=MYDOUBLE(21)')
+    const formulaAtom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    expect(wb.store.getter(formulaAtom)).toMatchObject({ kind: 'error', code: '#NAME?' })
+
+    wb.registerCustomFormula('MYDOUBLE', (args) => {
+      const a = args[0]
+      return a?.kind === 'number'
+        ? { kind: 'number', value: a.value * 2 }
+        : { kind: 'error', code: '#VALUE!' }
+    })
+    expect(wb.store.getter(formulaAtom)).toEqual({ kind: 'number', value: 42 })
+
+    expect(wb.unregisterCustomFormula('MYDOUBLE')).toBe(true)
+    expect(wb.store.getter(formulaAtom)).toMatchObject({ kind: 'error', code: '#NAME?' })
+  })
 })
 
-describe('defineName — Wave E seam wired in B2', () => {
+describe('defineName — workbook defined names', () => {
   test('a value binding resolves through NameExpr', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.defineName('PI', { kind: 'value', value: { kind: 'number', value: 3.14 } })
@@ -304,5 +322,171 @@ describe('defineName — Wave E seam wired in B2', () => {
     expect(
       wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:0')),
     ).toEqual({ kind: 'number', value: 6.28 })
+  })
+
+  test('defining and undefining a name invalidates cached formulas', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '=PI*2')
+    const formulaAtom = wb.sheet('s1')!.formulaCellAtom('0:0')
+    expect(wb.store.getter(formulaAtom)).toMatchObject({ kind: 'error', code: '#NAME?' })
+
+    wb.defineName('PI', { kind: 'value', value: { kind: 'number', value: 3.14 } })
+    expect(wb.store.getter(formulaAtom)).toEqual({ kind: 'number', value: 6.28 })
+
+    expect(wb.undefineName('PI')).toBe(true)
+    expect(wb.store.getter(formulaAtom)).toMatchObject({ kind: 'error', code: '#NAME?' })
+  })
+
+  test('a cross-sheet range binding resolves values and reference metadata', () => {
+    const wb = createWorkbook([
+      { id: 's1', name: 'Sheet1' },
+      { id: 'data', name: 'Data' },
+    ])
+    wb.setCell('data', 0, 0, '1')
+    wb.setCell('data', 1, 0, '2')
+    wb.setCell('data', 2, 0, '=A2+1')
+    wb.defineName('DATA_COL', {
+      kind: 'range',
+      sheetName: 'Data',
+      start: 'A1',
+      end: 'A3',
+    })
+    wb.setCell('s1', 0, 0, '=SUM(DATA_COL)')
+    wb.setCell('s1', 1, 0, '=ROWS(DATA_COL)')
+    wb.setCell('s1', 2, 0, '=CELL("address",DATA_COL)')
+    wb.setCell('s1', 3, 0, '=FORMULATEXT(INDEX(DATA_COL,3,1))')
+
+    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:0'))).toEqual({
+      kind: 'number',
+      value: 6,
+    })
+    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('1:0'))).toEqual({
+      kind: 'number',
+      value: 3,
+    })
+    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('2:0'))).toEqual({
+      kind: 'string',
+      value: 'Data!$A$1',
+    })
+    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('3:0'))).toEqual({
+      kind: 'string',
+      value: '=A2+1',
+    })
+
+    wb.setCell('data', 1, 0, '20')
+    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:0'))).toEqual({
+      kind: 'number',
+      value: 42,
+    })
+  })
+})
+
+describe('createWorkbook — withBatch deferral', () => {
+  test('collapses N name registrations into ONE downstream recalc', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    // Seed at least one prior write so the atom has a value to observe.
+    wb.setCell('s1', 0, 0, '1')
+
+    let fires = 0
+    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+      fires += 1
+    })
+
+    wb.withBatch(() => {
+      wb.defineName('FOO1', { kind: 'value', value: { kind: 'number', value: 1 } })
+      wb.defineName('FOO2', { kind: 'value', value: { kind: 'number', value: 2 } })
+      wb.defineName('FOO3', { kind: 'value', value: { kind: 'number', value: 3 } })
+      wb.defineName('FOO4', { kind: 'value', value: { kind: 'number', value: 4 } })
+      wb.defineName('FOO5', { kind: 'value', value: { kind: 'number', value: 5 } })
+    })
+
+    unsubscribe()
+    // Five defines normally trigger five recalcs (one per sheet × 5
+    // = 5 sub fires here). With batching, the outermost exit fires
+    // exactly one recalc → one sub fire.
+    expect(fires).toBe(1)
+  })
+
+  test('nested withBatch only recalcs once on outermost exit', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '1')
+
+    let fires = 0
+    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+      fires += 1
+    })
+
+    wb.withBatch(() => {
+      wb.defineName('OUTER', { kind: 'value', value: { kind: 'number', value: 1 } })
+      wb.withBatch(() => {
+        wb.defineName('INNER', { kind: 'value', value: { kind: 'number', value: 2 } })
+      })
+      // Inner exit must NOT have fired — only outer does.
+      expect(fires).toBe(0)
+    })
+
+    unsubscribe()
+    expect(fires).toBe(1)
+  })
+
+  test('throw inside withBatch propagates and suppresses pending recalc', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '1')
+
+    let fires = 0
+    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+      fires += 1
+    })
+
+    expect(() => {
+      wb.withBatch(() => {
+        wb.defineName('ABORT', { kind: 'value', value: { kind: 'number', value: 99 } })
+        throw new Error('test-abort')
+      })
+    }).toThrow('test-abort')
+
+    unsubscribe()
+    expect(fires).toBe(0)
+
+    // After abort, batch state must be fully unwound — a subsequent
+    // direct (non-batched) defineName must still fire its immediate
+    // recalc through the normal path.
+    let postFires = 0
+    const unsubscribe2 = wb.store.sub(sheet.sheetAtom, () => {
+      postFires += 1
+    })
+    wb.defineName('AFTER', { kind: 'value', value: { kind: 'number', value: 7 } })
+    unsubscribe2()
+    expect(postFires).toBe(1)
+  })
+
+  test('no-batch path: direct defineName still triggers immediate recalc', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '1')
+
+    let fires = 0
+    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+      fires += 1
+    })
+
+    wb.defineName('DIRECT', { kind: 'value', value: { kind: 'number', value: 1 } })
+    wb.defineName('DIRECT2', { kind: 'value', value: { kind: 'number', value: 2 } })
+
+    unsubscribe()
+    // Two direct calls outside any batch → two recalcs → two sub fires.
+    expect(fires).toBe(2)
+  })
+
+  test('withBatch returns fn result', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const result = wb.withBatch(() => {
+      wb.defineName('X', { kind: 'value', value: { kind: 'number', value: 1 } })
+      return 'returned-value'
+    })
+    expect(result).toBe('returned-value')
   })
 })

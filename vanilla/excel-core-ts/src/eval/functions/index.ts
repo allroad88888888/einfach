@@ -21,6 +21,7 @@
 import type { FunctionImpl } from '../../types'
 
 import { FUNCTIONS as ARRAY_FUNCTIONS } from './array'
+import { FUNCTIONS as DATABASE_FUNCTIONS } from './database'
 import { FUNCTIONS as DATE_FUNCTIONS } from './date'
 import { FUNCTIONS as ENGINEERING_FUNCTIONS } from './engineering'
 import { FUNCTIONS as FINANCIAL_FUNCTIONS } from './financial'
@@ -30,6 +31,31 @@ import { FUNCTIONS as LOOKUP_FUNCTIONS } from './lookup'
 import { FUNCTIONS as MATH_FUNCTIONS } from './math'
 import { FUNCTIONS as STATS_FUNCTIONS } from './stats'
 import { FUNCTIONS as TEXT_FUNCTIONS } from './text'
+
+const evaluatorAwareOnly: FunctionImpl = () => ({
+  kind: 'error',
+  code: '#VALUE!',
+  message: 'function requires evaluator-aware dispatch',
+})
+
+const EVALUATOR_AWARE_FUNCTIONS: Record<string, FunctionImpl> = {
+  LET: evaluatorAwareOnly,
+  LAMBDA: evaluatorAwareOnly,
+  ISOMITTED: evaluatorAwareOnly,
+  MAP: evaluatorAwareOnly,
+  REDUCE: evaluatorAwareOnly,
+  SCAN: evaluatorAwareOnly,
+  BYROW: evaluatorAwareOnly,
+  BYCOL: evaluatorAwareOnly,
+  MAKEARRAY: evaluatorAwareOnly,
+  SHEET: evaluatorAwareOnly,
+  SHEETS: evaluatorAwareOnly,
+  AREAS: evaluatorAwareOnly,
+  FORMULATEXT: evaluatorAwareOnly,
+  CELL: evaluatorAwareOnly,
+  INDIRECT: evaluatorAwareOnly,
+  OFFSET: evaluatorAwareOnly,
+}
 
 /**
  * The canonical name→impl map the evaluator dispatches against. Keys are
@@ -48,6 +74,8 @@ export const BUILTIN_FUNCTIONS: ReadonlyMap<string, FunctionImpl> = Object.freez
     ...Object.entries(INFO_FUNCTIONS),
     ...Object.entries(FINANCIAL_FUNCTIONS),
     ...Object.entries(ENGINEERING_FUNCTIONS),
+    ...Object.entries(DATABASE_FUNCTIONS),
+    ...Object.entries(EVALUATOR_AWARE_FUNCTIONS),
   ]),
 )
 

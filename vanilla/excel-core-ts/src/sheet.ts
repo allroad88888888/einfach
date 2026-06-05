@@ -1,5 +1,5 @@
 /**
- * Wave B/B2: per-sheet reactive state.
+ * Per-sheet reactive state.
  *
  * Each sheet owns:
  *  - a single `sheetAtom` holding `ReadonlyMap<CellKey, Cell>` (PLAN §4.1,
@@ -41,7 +41,6 @@ export const keyFor = (row: number, col: number): CellKey => `${row}:${col}`
  *
  * The `crossSheet` callback is wired by the workbook so the derive can
  * register deps on *other* sheet atoms when a formula crosses sheets.
- * Implementation deferred to Wave E for full coverage; B2 wires the seam.
  */
 export interface WorkbookSheet {
   readonly id: string
@@ -94,10 +93,14 @@ export interface SheetResolvers {
     sheetName: string,
     get: <T>(atom: AtomEntity<T>) => T,
   ): ReadonlyMap<CellKey, Cell> | undefined
-  /** Resolve a custom-formula host call. Wave C/E wires this. */
+  /** Resolve a custom-formula host call. */
   callCustom(name: string, args: Value[]): Value | undefined
-  /** Resolve a named range / defined name. Wave E wires this. */
+  /** Resolve a named range / defined name. */
   resolveName(name: string): import('./types').NameBinding | undefined
+  /** Resolve a sheet name to its 0-based workbook index. */
+  sheetIndexOf?(sheetName: string): number | undefined
+  /** Current workbook sheet count. */
+  sheetCount?(): number
 }
 
 /**
@@ -177,6 +180,10 @@ export function createSheet(
         crossSheetCells: (sheetName) => resolvers.crossSheetCells(sheetName, get),
         callCustom: resolvers.callCustom,
         resolveName: resolvers.resolveName,
+        currentSheetName: name,
+        currentSheetIndex: resolvers.sheetIndexOf?.(name),
+        sheetCount: resolvers.sheetCount?.(),
+        sheetIndexOf: resolvers.sheetIndexOf,
       }
       try {
         // The trampoline removes cross-cell recursion that previously

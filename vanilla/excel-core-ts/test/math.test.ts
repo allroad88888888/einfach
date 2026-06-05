@@ -304,10 +304,10 @@ describe('ROUND', () => {
     expect(call(ROUND, [STR('3.14159'), NUM(2)])).toEqual(NUM(3.14))
   })
 
-  test('digits arg defaults to 0 when omitted (1-arg form)', () => {
-    // Excel actually requires 2 args, but many engines accept 1-arg
-    // ROUND. We accept 1 (digits=0) for ergonomics; document deviation.
-    expect(call(ROUND, [NUM(2.7)])).toEqual(NUM(3))
+  test('requires digits argument', () => {
+    expect(call(ROUND, [NUM(2.7)])).toEqual(ERR('#VALUE!'))
+    expect(call(ROUNDUP, [NUM(2.1)])).toEqual(ERR('#VALUE!'))
+    expect(call(ROUNDDOWN, [NUM(2.9)])).toEqual(ERR('#VALUE!'))
   })
 })
 

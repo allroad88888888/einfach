@@ -1,5 +1,5 @@
 /**
- * Wave B/B2: workbook root.
+ * Workbook root.
  *
  * `createWorkbook` builds a `Workbook` handle that owns:
  *  - a vanilla/core `Store` (created internally — host code can opt-in to a
@@ -11,9 +11,9 @@
  *
  * Mutations always route through the writable `sheetAtom`. We never expose
  * the raw setter to the outside world — the public API is `setCell`,
- * `clearCell`, `bulkApply`, `setFormat`. Each one parses input (if needed)
- * and produces a new `Map` reference. Wave C/E will extend this surface
- * with named-range / custom-formula registration.
+ * `clearCell`, `bulkApply`, `setFormat`, name registration, and custom
+ * formula registration. Each data mutation parses input when needed and
+ * produces a new `Map` reference.
  *
  * Recalc / F9 (PLAN §4.4): `recalc()` bumps every sheet's atom to a fresh
  * `Map` clone. Same contents, new identity → vanilla/core marks every
@@ -26,10 +26,12 @@ import { createStore } from '@einfach/core'
 import { parseFormula as defaultParseFormula } from './parser'
 import { parseA1 } from './refs'
 import { applyCell, createSheet, keyFor, type SheetResolvers, type SheetState, type WorkbookSheet } from './sheet'
+import { ERROR_CODES } from './types'
 import type {
   Cell,
   CellFormat,
   CellRange,
+  ErrorCode,
   Expr,
   NameBinding,
   Value,
@@ -42,7 +44,7 @@ export type FormulaCacheState = 'dirty' | 'computing' | 'clean' | 'none' | 'inva
 
 export interface CreateWorkbookOptions {
   /**
-   * Inject a parser. Defaults to `parseFormula` from `./parser` (Wave B/B1).
+   * Inject a parser. Defaults to `parseFormula` from `./parser`.
    * Tests use this to seed pre-parsed ASTs without spinning up the real
    * tokenizer; production code should leave it unset.
    */
@@ -60,6 +62,8 @@ export interface BulkCellInput {
   readonly col: number
   readonly input: string
 }
+
+const ERROR_CODE_SET = new Set<string>(ERROR_CODES)
 
 export interface Workbook {
   readonly store: Store
@@ -95,8 +99,7 @@ export interface Workbook {
   /** Manual F9 — bump every sheetAtom to a fresh Map reference. */
   recalc(): void
   /**
-   * Register a named range / value / LAMBDA. Wave E expands this; B2
-   * exposes the seam so the evaluator's `resolveName` path is exercised.
+   * Register a named range / value / LAMBDA.
    */
   defineName(name: string, binding: NameBinding): void
   /** Remove a previously defined name. */
@@ -104,6 +107,29 @@ export interface Workbook {
   /** Register a host custom formula. Synchronous callback only for B2. */
   registerCustomFormula(name: string, fn: (args: Value[]) => Value): void
   unregisterCustomFormula(name: string): boolean
+  /**
+   * Run `fn` inside a batch window. While the batch is open, calls to
+   * `defineName`, `undefineName`, `registerCustomFormula`, and
+   * `unregisterCustomFormula` defer their normal post-mutation
+   * `recalculateAllSheets()` pass. When the OUTERMOST batch exits
+   * normally, a single recalc fires if any participating mutation
+   * occurred — collapsing N name/custom-formula registrations into one
+   * sheet-wide invalidation pass.
+   *
+   * Scope: ONLY the four name / custom-formula registration methods
+   * participate. Cell-level mutations (`setCell`, `setCellValue`,
+   * `clearCell`, `bulkApply`, `setFormat`) write through the existing
+   * `writeSheetState` path and are unaffected by the batch flag.
+   *
+   * Nesting: nested `withBatch` calls share the same pending flag; only
+   * the outermost exit triggers the deferred recalc.
+   *
+   * Exceptions: if `fn` throws, the batch depth still unwinds and the
+   * pending-recalc flag is cleared without firing a recalc — the throw
+   * is treated as the host aborting its intent. The exception
+   * propagates to the caller.
+   */
+  withBatch<T>(fn: () => T): T
   /**
    * Probe the cache state of a formula cell WITHOUT triggering an
    * evaluation. Returns one of `'dirty' | 'computing' | 'clean' | 'none'
@@ -163,11 +189,11 @@ export function createWorkbook(
   const parser = options.parser ?? defaultParseFormula
 
   // Names + custom formula tables live on the workbook root. They are
-  // looked up from every sheet's resolver hook. Wave E will replace the
-  // plain Map with an atom-backed registry so name mutations broadcast
-  // dirtiness — for B2 a manual recalc covers the contract.
+  // looked up from every sheet's resolver hook. Registration changes
+  // invalidate formulas through the existing broad sheetAtom recalc path.
   const names = new Map<string, NameBinding>()
   const customFormulas = new Map<string, (args: Value[]) => Value>()
+  const canonicalName = (name: string): string => name.toUpperCase()
 
   // Workbook-scope revision counter. Bumped once per mutation in
   // `writeSheetState` (the centralized choke point). Sheets read it via
@@ -176,6 +202,21 @@ export function createWorkbook(
   // mutation also marks Sheet2 formulas dirty — over-conservative but
   // correct, and matches vanilla/core's broad dirty propagation.
   let revisionCounter = 0
+
+  // Batch state for `withBatch`. `batchDepth` tracks nested invocations
+  // so only the outermost exit triggers the deferred recalc.
+  // `pendingRecalc` is sticky across the batch — any participating
+  // mutation flips it true; the outermost exit reads + clears it.
+  let batchDepth = 0
+  let pendingRecalc = false
+
+  function requestRecalc(): void {
+    if (batchDepth > 0) {
+      pendingRecalc = true
+    } else {
+      recalculateAllSheets()
+    }
+  }
 
   // Build the sheet handles eagerly. The `sheets` array order matches
   // `initialSheets` for deterministic iteration.
@@ -196,7 +237,14 @@ export function createWorkbook(
       return fn(args)
     },
     resolveName(name) {
-      return names.get(name)
+      return names.get(canonicalName(name))
+    },
+    sheetIndexOf(sheetName) {
+      const idx = sheetsList.findIndex((sheet) => sheet.name === sheetName)
+      return idx >= 0 ? idx : undefined
+    },
+    sheetCount() {
+      return sheetsList.length
     },
   }
 
@@ -263,6 +311,15 @@ export function createWorkbook(
     // pinned behavior.
     revisionCounter += 1
     store.setter(sheet.sheetAtom, next)
+  }
+
+  function recalculateAllSheets(): void {
+    for (const sheet of sheetsList) {
+      const prev = store.getter(sheet.sheetAtom) as SheetState
+      // Clone to a fresh Map identity — every derive sees a new dep value
+      // and marks dirty.
+      writeSheetState(sheet, new Map(prev))
+    }
   }
 
   function buildCell(input: string, existing: Cell | undefined): Cell {
@@ -423,27 +480,48 @@ export function createWorkbook(
       writeSheetState(sheet, next)
     },
     recalc() {
-      for (const sheet of sheetsList) {
-        const prev = store.getter(sheet.sheetAtom) as SheetState
-        // Clone to a fresh Map identity — every derive sees a new dep value
-        // and marks dirty.
-        writeSheetState(sheet, new Map(prev))
-      }
+      recalculateAllSheets()
     },
     defineName(name, binding) {
-      names.set(name, binding)
-      // No atom-level invalidation yet — Wave E. Callers can chase with
-      // `recalc()` if they need formulas already referencing this name to
-      // re-evaluate.
+      names.set(canonicalName(name), binding)
+      requestRecalc()
     },
     undefineName(name) {
-      return names.delete(name)
+      const removed = names.delete(canonicalName(name))
+      if (removed) requestRecalc()
+      return removed
     },
     registerCustomFormula(name, fn) {
       customFormulas.set(name.toUpperCase(), fn)
+      requestRecalc()
     },
     unregisterCustomFormula(name) {
-      return customFormulas.delete(name.toUpperCase())
+      const removed = customFormulas.delete(name.toUpperCase())
+      if (removed) requestRecalc()
+      return removed
+    },
+    withBatch(fn) {
+      batchDepth += 1
+      try {
+        const result = fn()
+        // Successful exit: only the outermost frame drains the pending
+        // flag and fires the deferred recalc. Inner frames just decrement.
+        if (batchDepth === 1 && pendingRecalc) {
+          pendingRecalc = false
+          recalculateAllSheets()
+        }
+        return result
+      } catch (err) {
+        // Throw aborts the host's intent — clear pending without firing
+        // so we don't leak a half-applied batch's recalc out to the
+        // caller. Re-raise unchanged.
+        if (batchDepth === 1) {
+          pendingRecalc = false
+        }
+        throw err
+      } finally {
+        batchDepth -= 1
+      }
     },
     debugFormulaCacheState(sheetIdx, addrStr) {
       if (!Number.isInteger(sheetIdx) || sheetIdx < 0 || sheetIdx >= sheetsList.length) {
@@ -483,27 +561,7 @@ function parseLiteral(input: string): Value {
   const upper = trimmed.toUpperCase()
   if (upper === 'TRUE') return { kind: 'boolean', value: true }
   if (upper === 'FALSE') return { kind: 'boolean', value: false }
-  // Common Excel error tokens — accept the canonical uppercase form only;
-  // the tokenizer's `readError` does case-insensitive matching for in-
-  // formula error literals.
-  switch (upper) {
-    case '#DIV/0!':
-      return { kind: 'error', code: '#DIV/0!' }
-    case '#N/A':
-      return { kind: 'error', code: '#N/A' }
-    case '#NAME?':
-      return { kind: 'error', code: '#NAME?' }
-    case '#NULL!':
-      return { kind: 'error', code: '#NULL!' }
-    case '#NUM!':
-      return { kind: 'error', code: '#NUM!' }
-    case '#REF!':
-      return { kind: 'error', code: '#REF!' }
-    case '#VALUE!':
-      return { kind: 'error', code: '#VALUE!' }
-    case '#CALC!':
-      return { kind: 'error', code: '#CALC!' }
-  }
+  if (ERROR_CODE_SET.has(upper)) return { kind: 'error', code: upper as ErrorCode }
   const num = Number(trimmed)
   if (Number.isFinite(num) && /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) {
     return { kind: 'number', value: num }

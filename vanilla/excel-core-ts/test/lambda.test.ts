@@ -187,7 +187,7 @@ describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
     expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'blank' })
   })
 
-  test('extra args past declared params are silently ignored (last-binding-wins is moot — no overflow slot)', () => {
+  test('extra args past declared params return #VALUE!', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     // Avoid names that look like A1-style refs (parser would tokenize
     // `ID1` as a cell reference, not a name).
@@ -196,14 +196,14 @@ describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
       params: ['x'],
       body: nameRef('x'),
     })
-    wb.setCell('s1', 0, 0, '=PICK_FIRST(11, 22, 33)')
-    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 11 })
+    wb.setCell('s1', 0, 0, '=PICK_FIRST(11, 1/0)')
+    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'error', code: '#VALUE!' })
   })
 
-  test('nested LAMBDA: outer scope visible inside inner body (closure-style)', () => {
+  test('workbook named LAMBDA does not dynamically capture caller params', () => {
     // OUTER(a) = INNER(2) where INNER(b) = a + b
-    // Expected: OUTER(10) → INNER(2) sees b=2 from inner scope, a=10
-    // from outer scope (spread of parent.lambdaScope).
+    // Workbook-level INNER is not an inline closure, so it cannot see
+    // OUTER's local `a`.
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.defineName('INNER', {
       kind: 'lambda',
@@ -216,7 +216,18 @@ describe('LAMBDA dispatch via Workbook.defineName + formulaCellAtom', () => {
       body: callExpr('INNER', num(2)),
     })
     wb.setCell('s1', 0, 0, '=OUTER(10)')
-    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 12 })
+    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'error', code: '#NAME?' })
+  })
+
+  test('workbook defined LAMBDA names are case-insensitive', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.defineName('DOUBLE', {
+      kind: 'lambda',
+      params: ['x'],
+      body: { kind: 'binary', op: '*', left: nameRef('x'), right: num(2) },
+    })
+    wb.setCell('s1', 0, 0, '=double(5)')
+    expect(readCell(wb, 's1', 0, 0)).toEqual({ kind: 'number', value: 10 })
   })
 
   test('recursive LAMBDA via IF terminates (lazy IF + depth guard) — FACT(5) → 120', () => {

@@ -16,7 +16,7 @@
  */
 
 import type { FunctionImpl, Value } from '../../types'
-import { toNumber, propagateError } from '../coerce'
+import { toBoolean, toNumber, propagateError } from '../coerce'
 
 // ---------------------------------------------------------------------------
 // Internal date <-> serial helpers
@@ -61,12 +61,29 @@ function midnightUtc(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()))
 }
 
+function datePartsToSerial(y: number, mo: number, d: number): Value {
+  if (y < 1900) return { kind: 'error', code: '#NUM!' }
+  if (!Number.isInteger(mo) || !Number.isInteger(d) || mo < 1 || mo > 12 || d < 1) {
+    return { kind: 'error', code: '#VALUE!' }
+  }
+  if (y === 1900 && mo === 2 && d === 29) return { kind: 'number', value: 60 }
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate()
+  if (d > daysInMonth) return { kind: 'error', code: '#VALUE!' }
+  return { kind: 'number', value: dateToSerial(new Date(Date.UTC(y, mo - 1, d))) }
+}
+
 // ---------------------------------------------------------------------------
 // Argument helpers
 // ---------------------------------------------------------------------------
 
 function coerceNumber(v: Value): { ok: true; value: number } | { ok: false; error: Value } {
   const r = toNumber(v)
+  if (!r.ok) return { ok: false, error: r.error }
+  return { ok: true, value: r.value }
+}
+
+function coerceBoolean(v: Value): { ok: true; value: boolean } | { ok: false; error: Value } {
+  const r = toBoolean(v)
   if (!r.ok) return { ok: false, error: r.error }
   return { ok: true, value: r.value }
 }
@@ -129,11 +146,12 @@ const DATE: FunctionImpl = (args) => {
   const d = coerceNumber(args[2])
   if (!d.ok) return d.error
 
-  const year = Math.trunc(y.value)
+  const yearInput = Math.trunc(y.value)
   const month = Math.trunc(m.value)
   const day = Math.trunc(d.value)
 
-  if (year < 1900) return { kind: 'error', code: '#NUM!' }
+  if (yearInput < 0 || yearInput >= 10000) return { kind: 'error', code: '#NUM!' }
+  const year = yearInput < 1900 ? yearInput + 1900 : yearInput
 
   // Excel-compat: literal (1900, 2, 29) request → serial 60.
   if (year === 1900 && month === 2 && day === 29) {
@@ -282,8 +300,20 @@ const TIME: FunctionImpl = (args) => {
   if (!m.ok) return m.error
   const s = coerceNumber(args[2])
   if (!s.ok) return s.error
-  const totalSeconds = Math.trunc(h.value) * 3600 + Math.trunc(m.value) * 60 + Math.trunc(s.value)
-  if (totalSeconds < 0) return { kind: 'error', code: '#NUM!' }
+  const hours = Math.trunc(h.value)
+  const minutes = Math.trunc(m.value)
+  const seconds = Math.trunc(s.value)
+  if (
+    hours < 0 ||
+    minutes < 0 ||
+    seconds < 0 ||
+    hours > 32767 ||
+    minutes > 32767 ||
+    seconds > 32767
+  ) {
+    return { kind: 'error', code: '#NUM!' }
+  }
+  const totalSeconds = hours * 3600 + minutes * 60 + seconds
   // Fractional day, taking modulo 24h.
   const frac = (totalSeconds % 86400) / 86400
   return { kind: 'number', value: frac }
@@ -401,8 +431,7 @@ const DATEVALUE: FunctionImpl = (args) => {
     const y = parseInt(m[1], 10)
     const mo = parseInt(m[2], 10)
     const d = parseInt(m[3], 10)
-    if (y < 1900) return { kind: 'error', code: '#NUM!' }
-    return { kind: 'number', value: dateToSerial(new Date(Date.UTC(y, mo - 1, d))) }
+    return datePartsToSerial(y, mo, d)
   }
   // Try MM/DD/YYYY
   m = /^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/.exec(text)
@@ -411,8 +440,7 @@ const DATEVALUE: FunctionImpl = (args) => {
     const d = parseInt(m[2], 10)
     let y = parseInt(m[3], 10)
     if (y < 100) y += 2000
-    if (y < 1900) return { kind: 'error', code: '#NUM!' }
-    return { kind: 'number', value: dateToSerial(new Date(Date.UTC(y, mo - 1, d))) }
+    return datePartsToSerial(y, mo, d)
   }
   return { kind: 'error', code: '#VALUE!' }
 }
@@ -593,6 +621,131 @@ const NETWORKDAYS: FunctionImpl = (args) => {
   return { kind: 'number', value: sign * count }
 }
 
+type WeekendMask = [boolean, boolean, boolean, boolean, boolean, boolean, boolean]
+
+const DEFAULT_WEEKEND: WeekendMask = [false, false, false, false, false, true, true]
+
+function mondayIndexedDow(serial: number): number {
+  return (weekdaySun0Mon1(serial) + 6) % 7
+}
+
+function parseWeekendArg(value: Value): { ok: true; mask: WeekendMask } | { ok: false; error: Value } {
+  if (value.kind === 'string') {
+    const chars = [...value.value]
+    if (chars.length !== 7) return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
+    const mask: WeekendMask = [false, false, false, false, false, false, false]
+    let allWeekend = true
+    for (let i = 0; i < chars.length; i += 1) {
+      if (chars[i] === '0') {
+        allWeekend = false
+      } else if (chars[i] === '1') {
+        mask[i] = true
+      } else {
+        return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
+      }
+    }
+    if (allWeekend) return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
+    return { ok: true, mask }
+  }
+
+  const code = coerceNumber(value)
+  if (!code.ok) return { ok: false, error: code.error }
+  if (!Number.isInteger(code.value)) {
+    return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
+  }
+  const n = code.value
+  const twoDayPairs = [
+    [5, 6],
+    [6, 0],
+    [0, 1],
+    [1, 2],
+    [2, 3],
+    [3, 4],
+    [4, 5],
+  ] as const
+  if (n >= 1 && n <= 7) {
+    const mask: WeekendMask = [false, false, false, false, false, false, false]
+    const pair = twoDayPairs[n - 1]
+    mask[pair[0]] = true
+    mask[pair[1]] = true
+    return { ok: true, mask }
+  }
+  if (n >= 11 && n <= 17) {
+    const mask: WeekendMask = [false, false, false, false, false, false, false]
+    const day = ((n - 12) % 7 + 7) % 7
+    mask[day] = true
+    return { ok: true, mask }
+  }
+  return { ok: false, error: { kind: 'error', code: '#VALUE!' } }
+}
+
+function collectHolidaySerials(value: Value | undefined): { ok: true; holidays: Set<number> } | { ok: false; error: Value } {
+  const holidays = new Set<number>()
+  if (!value) return { ok: true, holidays }
+  if (value.kind === 'error') return { ok: false, error: value }
+  if (value.kind === 'array') {
+    for (const row of value.value) {
+      for (const cell of row) {
+        if (cell.kind === 'error') return { ok: false, error: cell }
+        if (cell.kind === 'number') holidays.add(Math.floor(cell.value))
+      }
+    }
+    return { ok: true, holidays }
+  }
+  if (value.kind === 'number') holidays.add(Math.floor(value.value))
+  return { ok: true, holidays }
+}
+
+function countWorkdays(start: number, end: number, weekend: WeekendMask, holidays: Set<number>): number {
+  const lo = Math.min(start, end)
+  const hi = Math.max(start, end)
+  const sign = start <= end ? 1 : -1
+  let count = 0
+  for (let serial = lo; serial <= hi; serial += 1) {
+    if (weekend[mondayIndexedDow(serial)]) continue
+    if (holidays.has(serial)) continue
+    count += 1
+  }
+  return sign * count
+}
+
+function advanceWorkdays(start: number, days: number, weekend: WeekendMask, holidays: Set<number>): number {
+  if (days === 0) return start
+  const step = days > 0 ? 1 : -1
+  let serial = start
+  let remaining = Math.abs(days)
+  while (remaining > 0) {
+    serial += step
+    if (weekend[mondayIndexedDow(serial)]) continue
+    if (holidays.has(serial)) continue
+    remaining -= 1
+  }
+  return serial
+}
+
+/** NETWORKDAYS.INTL(start, end, [weekend], [holidays]) */
+const NETWORKDAYS_INTL: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 4) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const sa = coerceNumber(args[0])
+  if (!sa.ok) return sa.error
+  const sb = coerceNumber(args[1])
+  if (!sb.ok) return sb.error
+  let weekend = DEFAULT_WEEKEND
+  if (args.length >= 3) {
+    const parsed = parseWeekendArg(args[2])
+    if (!parsed.ok) return parsed.error
+    weekend = parsed.mask
+  }
+  const holidays = collectHolidaySerials(args[3])
+  if (!holidays.ok) return holidays.error
+  return {
+    kind: 'number',
+    value: countWorkdays(Math.floor(sa.value), Math.floor(sb.value), weekend, holidays.holidays),
+  }
+}
+
 /** WORKDAY(start, days, [holidays]) — add business days. */
 const WORKDAY: FunctionImpl = (args) => {
   if (args.length < 2 || args.length > 3) return { kind: 'error', code: '#VALUE!' }
@@ -630,6 +783,155 @@ const WORKDAY: FunctionImpl = (args) => {
   return { kind: 'number', value: serial }
 }
 
+/** WORKDAY.INTL(start, days, [weekend], [holidays]) */
+const WORKDAY_INTL: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 4) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const sa = coerceNumber(args[0])
+  if (!sa.ok) return sa.error
+  const dc = coerceNumber(args[1])
+  if (!dc.ok) return dc.error
+  let weekend = DEFAULT_WEEKEND
+  if (args.length >= 3) {
+    const parsed = parseWeekendArg(args[2])
+    if (!parsed.ok) return parsed.error
+    weekend = parsed.mask
+  }
+  const holidays = collectHolidaySerials(args[3])
+  if (!holidays.ok) return holidays.error
+  return {
+    kind: 'number',
+    value: advanceWorkdays(
+      Math.floor(sa.value),
+      Math.trunc(dc.value),
+      weekend,
+      holidays.holidays,
+    ),
+  }
+}
+
+function days360(start: number, end: number, european: boolean): number {
+  const startParts = partsOf(start)
+  const endParts = partsOf(end)
+  let d1 = startParts.day
+  let d2 = endParts.day
+  if (european) {
+    if (d1 === 31) d1 = 30
+    if (d2 === 31) d2 = 30
+  } else {
+    if (d1 === 31) d1 = 30
+    if (d1 === 30 && d2 === 31) d2 = 30
+  }
+  return (endParts.year - startParts.year) * 360 + (endParts.month - startParts.month) * 30 + (d2 - d1)
+}
+
+function daysInYear(year: number): number {
+  return Date.UTC(year + 1, 0, 1) - Date.UTC(year, 0, 1) === 366 * MS_PER_DAY ? 366 : 365
+}
+
+function yearFracActualActual(start: number, end: number): number {
+  const startParts = partsOf(start)
+  const endParts = partsOf(end)
+  let yearLength: number
+  if (isGreaterThanOneYear(startParts, endParts)) {
+    yearLength = averageYearLength(startParts.year, endParts.year)
+  } else if (shouldCountFeb29(startParts, endParts)) {
+    yearLength = 366
+  } else {
+    yearLength = 365
+  }
+  return (end - start) / yearLength
+}
+
+function averageYearLength(startYear: number, endYear: number): number {
+  let days = 0
+  for (let year = startYear; year <= endYear; year += 1) {
+    days += daysInYear(year)
+  }
+  return days / (endYear - startYear + 1)
+}
+
+function isGreaterThanOneYear(
+  start: ReturnType<typeof partsOf>,
+  end: ReturnType<typeof partsOf>,
+): boolean {
+  if (start.year === end.year) return false
+  if (start.year + 1 !== end.year) return true
+  if (start.month > end.month) return false
+  if (start.month < end.month) return true
+  return start.day < end.day
+}
+
+function shouldCountFeb29(
+  start: ReturnType<typeof partsOf>,
+  end: ReturnType<typeof partsOf>,
+): boolean {
+  if (daysInYear(start.year) === 366) {
+    if (start.year === end.year) return true
+    return start.month <= 2
+  }
+  if (daysInYear(end.year) === 366) {
+    if (end.month === 1) return false
+    if (end.month === 2) return end.day === 29
+    return true
+  }
+  return false
+}
+
+/** DAYS360(start_date, end_date, [method]) */
+const DAYS360: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const start = coerceNumber(args[0])
+  if (!start.ok) return start.error
+  const end = coerceNumber(args[1])
+  if (!end.ok) return end.error
+  if (start.value < 0 || end.value < 0) return { kind: 'error', code: '#VALUE!' }
+  let european = false
+  if (args.length === 3) {
+    const method = coerceBoolean(args[2])
+    if (!method.ok) return method.error
+    european = method.value
+  }
+  return { kind: 'number', value: days360(Math.floor(start.value), Math.floor(end.value), european) }
+}
+
+/** YEARFRAC(start_date, end_date, [basis]) */
+const YEARFRAC: FunctionImpl = (args) => {
+  if (args.length < 2 || args.length > 3) return { kind: 'error', code: '#VALUE!' }
+  const err = propagateError(args.slice(0, 2))
+  if (err) return err
+  const start = coerceNumber(args[0])
+  if (!start.ok) return start.error
+  const end = coerceNumber(args[1])
+  if (!end.ok) return end.error
+  let basis = 0
+  if (args.length === 3) {
+    const basisArg = coerceNumber(args[2])
+    if (!basisArg.ok) return basisArg.error
+    basis = Math.trunc(basisArg.value)
+  }
+  if (basis < 0 || basis > 4) return { kind: 'error', code: '#NUM!' }
+  const lo = Math.min(Math.floor(start.value), Math.floor(end.value))
+  const hi = Math.max(Math.floor(start.value), Math.floor(end.value))
+  switch (basis) {
+    case 0:
+      return { kind: 'number', value: days360(lo, hi, false) / 360 }
+    case 4:
+      return { kind: 'number', value: days360(lo, hi, true) / 360 }
+    case 2:
+      return { kind: 'number', value: (hi - lo) / 360 }
+    case 1:
+      return { kind: 'number', value: yearFracActualActual(lo, hi) }
+    case 3:
+      return { kind: 'number', value: (hi - lo) / 365 }
+    default:
+      return { kind: 'error', code: '#VALUE!' }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -656,5 +958,9 @@ export const FUNCTIONS: Record<string, FunctionImpl> = {
   ISOWEEKNUM,
   DATEDIF,
   NETWORKDAYS,
+  'NETWORKDAYS.INTL': NETWORKDAYS_INTL,
   WORKDAY,
+  'WORKDAY.INTL': WORKDAY_INTL,
+  DAYS360,
+  YEARFRAC,
 }

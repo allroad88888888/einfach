@@ -46,6 +46,10 @@ describe('TIME', () => {
     expect(asNumber(call('TIME', [NUM(12), NUM(0), NUM(0)]))).toBeCloseTo(0.5, 6))
   test('TIME(6, 0, 0) = 0.25', () =>
     expect(asNumber(call('TIME', [NUM(6), NUM(0), NUM(0)]))).toBeCloseTo(0.25, 6))
+  test('negative or oversized components return #NUM!', () => {
+    expect(call('TIME', [NUM(1), NUM(-30), NUM(0)])).toEqual(ERR('#NUM!'))
+    expect(call('TIME', [NUM(0), NUM(0), NUM(32768)])).toEqual(ERR('#NUM!'))
+  })
   test('wrong arity → #VALUE!', () =>
     expect(call('TIME', [NUM(1), NUM(2)])).toEqual(ERR('#VALUE!')))
 })
@@ -107,6 +111,13 @@ describe('DATEVALUE', () => {
   })
   test('invalid text → #VALUE!', () =>
     expect(call('DATEVALUE', [STR('not a date')])).toEqual(ERR('#VALUE!')))
+  test('invalid calendar date → #VALUE!', () => {
+    expect(call('DATEVALUE', [STR('2024-02-31')])).toEqual(ERR('#VALUE!'))
+    expect(call('DATEVALUE', [STR('13/15/2024')])).toEqual(ERR('#VALUE!'))
+  })
+  test('preserves Excel 1900 leap-year serial quirk', () => {
+    expect(call('DATEVALUE', [STR('1900-02-29')])).toEqual(NUM(60))
+  })
 })
 
 describe('TIMEVALUE', () => {
@@ -184,6 +195,27 @@ describe('NETWORKDAYS', () => {
   })
 })
 
+describe('NETWORKDAYS.INTL', () => {
+  test('weekend code 11 makes only Sunday a weekend', () => {
+    const sat = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(6)]))
+    const sun = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(7)]))
+    expect(call('NETWORKDAYS.INTL', [NUM(sat), NUM(sun), NUM(11)])).toEqual(NUM(1))
+  })
+
+  test('text weekend mask uses Monday-first 0/1 flags', () => {
+    const mon = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    const fri = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(5)]))
+    expect(call('NETWORKDAYS.INTL', [NUM(mon), NUM(fri), STR('1000000')])).toEqual(NUM(4))
+  })
+
+  test('invalid all-weekend mask returns #VALUE!', () => {
+    const mon = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    expect(call('NETWORKDAYS.INTL', [NUM(mon), NUM(mon), STR('1111111')])).toEqual(
+      ERR('#VALUE!'),
+    )
+  })
+})
+
 describe('WORKDAY', () => {
   test('add 5 workdays to Mon → next Mon', () => {
     const mon = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
@@ -195,4 +227,75 @@ describe('WORKDAY', () => {
     expect(call('WORKDAY', [NUM(mon), NUM(0)])).toEqual(NUM(mon))
   })
   test('error propagates', () => expect(call('WORKDAY', [ERR('#N/A'), NUM(1)])).toEqual(ERR('#N/A')))
+})
+
+describe('WORKDAY.INTL', () => {
+  test('custom single Sunday weekend counts Saturday as a workday', () => {
+    const fri = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(5)]))
+    const sat = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(6)]))
+    expect(call('WORKDAY.INTL', [NUM(fri), NUM(1), NUM(11)])).toEqual(NUM(sat))
+  })
+
+  test('mask and holidays both exclude days', () => {
+    const mon = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(1)]))
+    const wed = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(3)]))
+    const thu = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(4)]))
+    expect(
+      call('WORKDAY.INTL', [
+        NUM(mon),
+        NUM(2),
+        STR('0000011'),
+        { kind: 'array', value: [[NUM(wed)]] },
+      ]),
+    ).toEqual(NUM(thu))
+  })
+})
+
+describe('DAYS360', () => {
+  test('US 30/360 clamps end day when start day is 31', () => {
+    const start = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(31)]))
+    const end = asNumber(call('DATE', [NUM(2024), NUM(2), NUM(29)]))
+    expect(call('DAYS360', [NUM(start), NUM(end)])).toEqual(NUM(29))
+  })
+
+  test('European 30/360 clamps both month ends', () => {
+    const start = asNumber(call('DATE', [NUM(2024), NUM(1), NUM(31)]))
+    const end = asNumber(call('DATE', [NUM(2024), NUM(3), NUM(31)]))
+    expect(call('DAYS360', [NUM(start), NUM(end), { kind: 'boolean', value: true }])).toEqual(
+      NUM(60),
+    )
+  })
+})
+
+describe('YEARFRAC', () => {
+  test('default basis 0 uses 30/360', () => {
+    const start = asNumber(call('DATE', [NUM(2020), NUM(1), NUM(1)]))
+    const end = asNumber(call('DATE', [NUM(2021), NUM(1), NUM(1)]))
+    expect(call('YEARFRAC', [NUM(start), NUM(end)])).toEqual(NUM(1))
+  })
+
+  test('basis 2 and 3 use actual day denominators', () => {
+    const start = asNumber(call('DATE', [NUM(2020), NUM(1), NUM(1)]))
+    const end = asNumber(call('DATE', [NUM(2021), NUM(1), NUM(1)]))
+    expect(asNumber(call('YEARFRAC', [NUM(start), NUM(end), NUM(2)]))).toBeCloseTo(366 / 360, 12)
+    expect(asNumber(call('YEARFRAC', [NUM(start), NUM(end), NUM(3)]))).toBeCloseTo(366 / 365, 12)
+  })
+
+  test('basis 1 uses Excel-compatible actual/actual year length', () => {
+    const start = asNumber(call('DATE', [NUM(2020), NUM(1), NUM(1)]))
+    const end = asNumber(call('DATE', [NUM(2021), NUM(1), NUM(1)]))
+    const nextDay = asNumber(call('DATE', [NUM(2021), NUM(1), NUM(2)]))
+    const feb2019 = asNumber(call('DATE', [NUM(2019), NUM(2), NUM(28)]))
+    const feb2020 = asNumber(call('DATE', [NUM(2020), NUM(2), NUM(28)]))
+    expect(asNumber(call('YEARFRAC', [NUM(start), NUM(end), NUM(1)]))).toBeCloseTo(1, 12)
+    expect(asNumber(call('YEARFRAC', [NUM(start), NUM(nextDay), NUM(1)]))).toBeCloseTo(
+      367 / 365.5,
+      12,
+    )
+    expect(asNumber(call('YEARFRAC', [NUM(feb2019), NUM(feb2020), NUM(1)]))).toBeCloseTo(1, 12)
+  })
+
+  test('invalid basis returns #NUM!', () => {
+    expect(call('YEARFRAC', [NUM(1), NUM(2), NUM(99)])).toEqual(ERR('#NUM!'))
+  })
 })

@@ -84,6 +84,32 @@ describe('ISFORMULA / ISREF', () => {
     expect(info('ISFORMULA', [NUM(1), NUM(2)])).toEqual(ERR('#VALUE!')))
 })
 
+describe('INFO / ERROR.TYPE', () => {
+  test('INFO returns stable runtime metadata', () => {
+    expect(info('INFO', [STR('recalc')])).toEqual(STR('Automatic'))
+    expect(info('INFO', [STR('numfile')])).toEqual(NUM(1))
+    expect(info('INFO', [STR('release')])).toEqual(STR('einfach-ts'))
+    const system = info('INFO', [STR('system')])
+    expect(system.kind).toBe('string')
+    if (system.kind === 'string') expect(['mac', 'pc', 'other']).toContain(system.value)
+  })
+
+  test('INFO propagates errors and rejects unknown keys', () => {
+    expect(info('INFO', [ERR('#N/A')])).toEqual(ERR('#N/A'))
+    expect(info('INFO', [STR('unknown')])).toEqual(ERR('#VALUE!'))
+  })
+
+  test('ERROR.TYPE maps error codes', () => {
+    expect(info('ERROR.TYPE', [ERR('#N/A')])).toEqual(NUM(7))
+    expect(info('ERROR.TYPE', [ERR('#REF!')])).toEqual(NUM(4))
+    expect(info('ERROR.TYPE', [ERR('#VALUE!')])).toEqual(NUM(3))
+  })
+
+  test('ERROR.TYPE rejects non-errors', () => {
+    expect(info('ERROR.TYPE', [NUM(5)])).toEqual(ERR('#VALUE!'))
+  })
+})
+
 // ---------------------------------------------------------------------------
 // Logical
 // ---------------------------------------------------------------------------

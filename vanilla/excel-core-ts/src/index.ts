@@ -30,13 +30,17 @@ export type {
   ErrorLiteral,
   ReferenceExpr,
   RangeExpr,
+  DynamicRangeExpr,
+  SpillReferenceExpr,
   CrossSheetExpr,
+  MultiAreaExpr,
   NameExpr,
   UnaryExpr,
   BinaryExpr,
   BinaryOp,
   PercentExpr,
   CallExpr,
+  LambdaCallExpr,
   ArrayLiteralExpr,
 
   // 6. Mutations

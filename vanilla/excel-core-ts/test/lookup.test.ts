@@ -13,7 +13,16 @@
 
 import { describe, expect, test } from '@jest/globals'
 
-import { VLOOKUP, HLOOKUP, INDEX, MATCH, XLOOKUP, FUNCTIONS } from '../src/eval/functions/lookup'
+import {
+  VLOOKUP,
+  HLOOKUP,
+  INDEX,
+  MATCH,
+  XLOOKUP,
+  LOOKUP,
+  XMATCH,
+  FUNCTIONS,
+} from '../src/eval/functions/lookup'
 import type { EvalContext, Value } from '../src/types'
 
 // Minimal ctx — lookup functions don't consult any of these but the impls
@@ -90,6 +99,14 @@ describe('VLOOKUP', () => {
     expect(VLOOKUP([s('Al*'), byName, n(2), b(false)], ctx)).toEqual(n(50000))
     expect(VLOOKUP([s('?ob'), byName, n(2), b(false)], ctx)).toEqual(n(60000))
     expect(VLOOKUP([s('Ch?rl*'), byName, n(2), b(false)], ctx)).toEqual(n(70000))
+  })
+
+  test('wildcard matching coerces numeric candidates to text', () => {
+    const table = arr([
+      [n(42), s('x')],
+      [n(30), s('y')],
+    ])
+    expect(VLOOKUP([s('4?'), table, n(2), b(false)], ctx)).toEqual(s('x'))
   })
 
   test('case-insensitive exact matching', () => {
@@ -266,6 +283,10 @@ describe('MATCH', () => {
     expect(MATCH([s('?herry'), strings, n(0)], ctx)).toEqual(n(3))
   })
 
+  test('match_type 0 wildcard coerces numeric candidates to text', () => {
+    expect(MATCH([s('4?'), arr([[n(42), n(30)]]), n(0)], ctx)).toEqual(n(1))
+  })
+
   test('match_type 1 (default, asc): largest <= needle', () => {
     expect(MATCH([n(7), numericAsc, n(1)], ctx)).toEqual(n(3)) // 4 is largest <= 7
     expect(MATCH([n(8), numericAsc, n(1)], ctx)).toEqual(n(4)) // exact
@@ -349,6 +370,19 @@ describe('XLOOKUP', () => {
     expect(XLOOKUP([s('?herry'), fruit, prices, blank, n(2)], ctx)).toEqual(n(3))
   })
 
+  test('match_mode 2 coerces numeric candidates to text', () => {
+    const keys = arr([[n(42)], [n(30)]])
+    const values = arr([[s('x')], [s('y')]])
+    expect(XLOOKUP([s('4?'), keys, values, blank, n(2)], ctx)).toEqual(s('x'))
+  })
+
+  test('match_mode 2 rejects binary search modes', () => {
+    const fruit = arr([[s('apple')], [s('banana')]])
+    const prices = arr([[n(1)], [n(2)]])
+    expect(XLOOKUP([s('b*'), fruit, prices, blank, n(2), n(2)], ctx)).toEqual(errVAL)
+    expect(XLOOKUP([s('b*'), fruit, prices, blank, n(2), n(-2)], ctx)).toEqual(errVAL)
+  })
+
   test('search_mode -1: last-to-first scan', () => {
     // Duplicate values — last-to-first should pick the later index.
     const lookups = arr([[n(1)], [n(2)], [n(1)], [n(3)]])
@@ -402,13 +436,96 @@ describe('XLOOKUP', () => {
 })
 
 // ============================================================================
+// LOOKUP
+// ============================================================================
+
+describe('LOOKUP', () => {
+  const keys = arr([[n(1), n(3), n(5), n(7)]])
+  const labels = arr([[s('one'), s('three'), s('five'), s('seven')]])
+
+  test('three-arg vector form returns exact-or-next-smaller result', () => {
+    expect(LOOKUP([n(5), keys, labels], ctx)).toEqual(s('five'))
+    expect(LOOKUP([n(6), keys, labels], ctx)).toEqual(s('five'))
+    expect(LOOKUP([n(99), keys, labels], ctx)).toEqual(s('seven'))
+  })
+
+  test('two-arg vector form returns from the lookup vector itself', () => {
+    expect(LOOKUP([n(4), keys], ctx)).toEqual(n(3))
+  })
+
+  test('two-arg horizontal array form returns from last row', () => {
+    const table = arr([
+      [n(1), n(2), n(3)],
+      [s('a'), s('b'), s('c')],
+    ])
+    expect(LOOKUP([n(2), table], ctx)).toEqual(s('b'))
+  })
+
+  test('two-arg vertical array form returns from last column', () => {
+    const table = arr([
+      [n(1), s('a')],
+      [n(2), s('b')],
+      [n(3), s('c')],
+    ])
+    expect(LOOKUP([n(3), table], ctx)).toEqual(s('c'))
+  })
+
+  test('no qualifying key → #N/A and length mismatch → #VALUE!', () => {
+    expect(LOOKUP([n(0), keys, labels], ctx)).toEqual(errNA)
+    expect(LOOKUP([n(1), keys, arr([[s('only one')]])], ctx)).toEqual(errVAL)
+  })
+})
+
+// ============================================================================
+// XMATCH
+// ============================================================================
+
+describe('XMATCH', () => {
+  const values = arr([[n(10), n(20), n(30), n(40)]])
+
+  test('default exact match returns 1-based position', () => {
+    expect(XMATCH([n(30), values], ctx)).toEqual(n(3))
+  })
+
+  test('match_mode -1 / 1 choose nearest numeric neighbor', () => {
+    expect(XMATCH([n(25), values, n(-1)], ctx)).toEqual(n(2))
+    expect(XMATCH([n(25), values, n(1)], ctx)).toEqual(n(3))
+  })
+
+  test('search_mode -1 scans from the end', () => {
+    expect(XMATCH([n(1), arr([[n(1), n(2), n(1)]]), n(0), n(-1)], ctx)).toEqual(n(3))
+  })
+
+  test('wildcard mode matches text patterns', () => {
+    const fruit = arr([[s('apple'), s('banana'), s('cherry')]])
+    expect(XMATCH([s('ban*'), fruit, n(2)], ctx)).toEqual(n(2))
+  })
+
+  test('wildcard mode coerces numeric candidates to text', () => {
+    expect(XMATCH([s('4?'), arr([[n(42), n(30)]]), n(2)], ctx)).toEqual(n(1))
+  })
+
+  test('wildcard mode rejects binary search modes', () => {
+    const fruit = arr([[s('apple'), s('banana')]])
+    expect(XMATCH([s('b*'), fruit, n(2), n(2)], ctx)).toEqual(errVAL)
+    expect(XMATCH([s('b*'), fruit, n(2), n(-2)], ctx)).toEqual(errVAL)
+  })
+
+  test('not found and invalid modes surface errors', () => {
+    expect(XMATCH([n(99), values], ctx)).toEqual(errNA)
+    expect(XMATCH([n(10), values, n(99)], ctx)).toEqual(errVAL)
+    expect(XMATCH([n(10), values, n(0), n(99)], ctx)).toEqual(errVAL)
+  })
+})
+
+// ============================================================================
 // Registry sanity
 // ============================================================================
 
 describe('FUNCTIONS registry', () => {
   test('exports the v1 lookup baseline (extensible)', () => {
     const keys = new Set(Object.keys(FUNCTIONS))
-    const baseline = ['HLOOKUP', 'INDEX', 'MATCH', 'VLOOKUP', 'XLOOKUP']
+    const baseline = ['HLOOKUP', 'INDEX', 'LOOKUP', 'MATCH', 'VLOOKUP', 'XLOOKUP', 'XMATCH']
     for (const name of baseline) {
       expect(keys.has(name)).toBe(true)
     }

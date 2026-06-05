@@ -8,7 +8,26 @@ import { describe, expect, test } from '@jest/globals'
 import { BLANK, type EvalContext, type Value } from '../src'
 import { FUNCTIONS } from '../src/eval/functions/array'
 
-const { SEQUENCE, TRANSPOSE, SORT, FILTER, UNIQUE } = FUNCTIONS
+const {
+  SEQUENCE,
+  TRANSPOSE,
+  SORT,
+  FILTER,
+  UNIQUE,
+  WRAPROWS,
+  WRAPCOLS,
+  CHOOSECOLS,
+  CHOOSEROWS,
+  TAKE,
+  DROP,
+  EXPAND,
+  HSTACK,
+  VSTACK,
+  TOCOL,
+  TOROW,
+  RANDARRAY,
+  SORTBY,
+} = FUNCTIONS
 
 const ctx: EvalContext = {
   cells: new Map(),
@@ -24,7 +43,17 @@ const n = (value: number): Value => ({ kind: 'number', value })
 const s = (value: string): Value => ({ kind: 'string', value })
 const b = (value: boolean): Value => ({ kind: 'boolean', value })
 const arr = (matrix: Value[][]): Value => ({ kind: 'array', value: matrix })
-const err = (code: '#VALUE!' | '#DIV/0!' | '#N/A'): Value => ({ kind: 'error', code })
+const err = (code: Extract<Value, { kind: 'error' }>['code']): Value => ({ kind: 'error', code })
+
+function expectError(value: Value, code: Extract<Value, { kind: 'error' }>['code']): void {
+  expect(value).toMatchObject({ kind: 'error', code })
+}
+
+function expectArray(value: Value): Value[][] {
+  expect(value.kind).toBe('array')
+  if (value.kind !== 'array') return []
+  return value.value
+}
 
 describe('SEQUENCE', () => {
   test('3x1 default', () => {
@@ -48,9 +77,60 @@ describe('SEQUENCE', () => {
     expect(SEQUENCE([n(0)], ctx).kind).toBe('error')
   })
 
-  test('overflow guard rejects rows*cols > 100k', () => {
-    const res = SEQUENCE([n(1000), n(1000)], ctx)
+  test('overflow guard rejects rows*cols above the Excel grid cap', () => {
+    const res = SEQUENCE([n(1025), n(1024)], ctx)
     expect(res.kind).toBe('error')
+  })
+})
+
+describe('array result cap guards', () => {
+  const overCapColumns = 1_048_577
+  const wideBlank = () => arr([Array.from({ length: overCapColumns }, () => BLANK)])
+  const wideNumbers = () => arr([Array.from({ length: overCapColumns }, (_, index) => n(index))])
+
+  test('TRANSPOSE and SORT reject over-cap shaped results', () => {
+    const wide = wideBlank()
+    expectError(TRANSPOSE([wide], ctx), '#VALUE!')
+    expectError(SORT([wide, n(1), n(1), b(true)], ctx), '#VALUE!')
+  })
+
+  test('FILTER and UNIQUE reject over-cap shaped results', () => {
+    const wide = wideBlank()
+    const mask = arr([Array.from({ length: overCapColumns }, () => b(true))])
+    expectError(FILTER([wide, mask], ctx), '#VALUE!')
+    expectError(UNIQUE([wideNumbers(), b(true)], ctx), '#VALUE!')
+  })
+
+  test('TAKE, DROP, and SORTBY reject over-cap shaped results', () => {
+    const wideRow = Array.from({ length: overCapColumns }, () => BLANK)
+    const wide = arr([wideRow])
+    expectError(TAKE([wide, n(1)], ctx), '#VALUE!')
+    expectError(DROP([arr([wideRow, wideRow]), n(1)], ctx), '#VALUE!')
+    const keys = arr([Array.from({ length: overCapColumns }, (_, index) => n(index))])
+    expectError(SORTBY([wide, keys], ctx), '#VALUE!')
+  })
+})
+
+describe('array scalar-cell and shape guards', () => {
+  test('TOCOL and TOROW reject nested array cells', () => {
+    const nested = arr([[arr([[n(1)], [n(2)]]), n(3)]])
+    expectError(TOCOL([nested], ctx), '#CALC!')
+    expectError(TOROW([nested], ctx), '#CALC!')
+  })
+
+  test('WRAPROWS and WRAPCOLS reject nested array pad values', () => {
+    const vector = arr([[n(1), n(2), n(3)]])
+    const pad = arr([[s('pad')]])
+    expectError(WRAPROWS([vector, n(2), pad], ctx), '#CALC!')
+    expectError(WRAPCOLS([vector, n(2), pad], ctx), '#CALC!')
+  })
+
+  test('rejects results wider than the Excel column limit', () => {
+    expectError(SEQUENCE([n(1), n(16_385)], ctx), '#VALUE!')
+
+    const vector = SEQUENCE([n(16_385)], ctx)
+    expect(vector.kind).toBe('array')
+    expectError(WRAPCOLS([vector, n(1)], ctx), '#VALUE!')
   })
 })
 
@@ -135,6 +215,13 @@ describe('SORT', () => {
       ]),
     )
   })
+
+  test('sort_order must be 1 or -1 after truncation', () => {
+    const m = arr([[n(2)], [n(1)]])
+    expectError(SORT([m, n(1), n(0)], ctx), '#VALUE!')
+    expectError(SORT([m, n(1), n(2)], ctx), '#VALUE!')
+    expect(SORT([m, n(1), n(-1.9)], ctx)).toEqual(arr([[n(2)], [n(1)]]))
+  })
 })
 
 describe('FILTER', () => {
@@ -162,7 +249,7 @@ describe('FILTER', () => {
   test('all false without if_empty returns error', () => {
     const m = arr([[n(1)], [n(2)]])
     const mask = arr([[b(false)], [b(false)]])
-    expect(FILTER([m, mask], ctx).kind).toBe('error')
+    expectError(FILTER([m, mask], ctx), '#CALC!')
   })
 
   test('shape mismatch → #VALUE!', () => {
@@ -173,6 +260,16 @@ describe('FILTER', () => {
 
   test('error propagation', () => {
     expect(FILTER([err('#N/A'), arr([[b(true)]])], ctx)).toEqual(err('#N/A'))
+  })
+
+  test('if_empty is only observed when the filtered result is empty', () => {
+    const m = arr([[n(1)], [n(2)]])
+    expect(FILTER([m, arr([[b(true)], [b(false)]]), err('#DIV/0!')], ctx)).toEqual(
+      arr([[n(1)]]),
+    )
+    expect(FILTER([m, arr([[b(false)], [b(false)]]), err('#DIV/0!')], ctx)).toEqual(
+      err('#DIV/0!'),
+    )
   })
 })
 
@@ -216,5 +313,469 @@ describe('UNIQUE', () => {
 
   test('error propagation', () => {
     expect(UNIQUE([err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+  })
+
+  test('exactly_once with no remaining rows returns #CALC!', () => {
+    const m = arr([[n(1)], [n(1)]])
+    expectError(UNIQUE([m, b(false), b(true)], ctx), '#CALC!')
+  })
+})
+
+describe('WRAPROWS', () => {
+  test('wraps a row vector by rows with default #N/A padding', () => {
+    expect(WRAPROWS([arr([[n(1), n(2), n(3), n(4), n(5)]]), n(2)], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(3), n(4)],
+        [n(5), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('wraps a column vector and uses custom padding', () => {
+    expect(WRAPROWS([arr([[n(1)], [n(2)], [n(3)]]), n(2), s('x')], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(3), s('x')],
+      ]),
+    )
+  })
+
+  test('wrap count greater than vector length returns one unpadded row', () => {
+    expect(WRAPROWS([arr([[n(1), n(2), n(3)]]), n(5)], ctx)).toEqual(
+      arr([[n(1), n(2), n(3)]]),
+    )
+  })
+
+  test('rejects non-vectors and wrap_count less than one', () => {
+    expectError(WRAPROWS([arr([[n(1), n(2)], [n(3), n(4)]]), n(2)], ctx), '#VALUE!')
+    expectError(WRAPROWS([arr([[n(1), n(2)]]), n(0)], ctx), '#NUM!')
+  })
+})
+
+describe('WRAPCOLS', () => {
+  test('wraps a row vector by columns with default #N/A padding', () => {
+    expect(WRAPCOLS([arr([[n(1), n(2), n(3), n(4), n(5)]]), n(2)], ctx)).toEqual(
+      arr([
+        [n(1), n(3), n(5)],
+        [n(2), n(4), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('wraps a column vector and uses custom padding', () => {
+    expect(WRAPCOLS([arr([[n(1)], [n(2)], [n(3)]]), n(2), s('x')], ctx)).toEqual(
+      arr([
+        [n(1), n(3)],
+        [n(2), s('x')],
+      ]),
+    )
+  })
+
+  test('wrap count greater than vector length returns one unpadded column', () => {
+    expect(WRAPCOLS([arr([[n(1), n(2), n(3)]]), n(5)], ctx)).toEqual(
+      arr([[n(1)], [n(2)], [n(3)]]),
+    )
+  })
+
+  test('rejects non-vectors and wrap_count less than one', () => {
+    expectError(WRAPCOLS([arr([[n(1), n(2)], [n(3), n(4)]]), n(2)], ctx), '#VALUE!')
+    expectError(WRAPCOLS([arr([[n(1), n(2)]]), n(0)], ctx), '#NUM!')
+  })
+})
+
+describe('CHOOSECOLS', () => {
+  const input = arr([
+    [n(1), n(2), n(3)],
+    [n(4), n(5), n(6)],
+  ])
+
+  test('picks and reorders positive and negative columns', () => {
+    expect(CHOOSECOLS([input, n(3), n(1), n(-1)], ctx)).toEqual(
+      arr([
+        [n(3), n(1), n(3)],
+        [n(6), n(4), n(6)],
+      ]),
+    )
+  })
+
+  test('selector array expands in row-major order', () => {
+    expect(CHOOSECOLS([input, arr([[n(2), n(1)]])], ctx)).toEqual(
+      arr([
+        [n(2), n(1)],
+        [n(5), n(4)],
+      ]),
+    )
+  })
+
+  test('zero or out-of-range selector returns #VALUE!', () => {
+    expectError(CHOOSECOLS([input, n(0)], ctx), '#VALUE!')
+    expectError(CHOOSECOLS([input, n(4)], ctx), '#VALUE!')
+  })
+
+  test('error propagation', () => {
+    expect(CHOOSECOLS([err('#DIV/0!'), n(1)], ctx)).toEqual(err('#DIV/0!'))
+  })
+})
+
+describe('CHOOSEROWS', () => {
+  const input = arr([
+    [n(1), s('a')],
+    [n(2), s('b')],
+    [n(3), s('c')],
+  ])
+
+  test('picks and reorders positive and negative rows', () => {
+    expect(CHOOSEROWS([input, n(3), n(1), n(-1)], ctx)).toEqual(
+      arr([
+        [n(3), s('c')],
+        [n(1), s('a')],
+        [n(3), s('c')],
+      ]),
+    )
+  })
+
+  test('selector array preserves selected row width', () => {
+    expect(CHOOSEROWS([input, arr([[n(2), n(1)]])], ctx)).toEqual(
+      arr([
+        [n(2), s('b')],
+        [n(1), s('a')],
+      ]),
+    )
+  })
+
+  test('zero or out-of-range selector returns #VALUE!', () => {
+    expectError(CHOOSEROWS([input, n(0)], ctx), '#VALUE!')
+    expectError(CHOOSEROWS([input, n(-4)], ctx), '#VALUE!')
+  })
+
+  test('error propagation', () => {
+    expect(CHOOSEROWS([err('#N/A'), n(1)], ctx)).toEqual(err('#N/A'))
+  })
+})
+
+describe('TAKE', () => {
+  const input = arr([
+    [n(1), n(2), n(3)],
+    [n(4), n(5), n(6)],
+    [n(7), n(8), n(9)],
+  ])
+
+  test('takes leading rows and columns', () => {
+    expect(TAKE([input, n(2), n(2)], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(4), n(5)],
+      ]),
+    )
+  })
+
+  test('negative counts take from the end', () => {
+    expect(TAKE([input, n(-2), n(-2)], ctx)).toEqual(
+      arr([
+        [n(5), n(6)],
+        [n(8), n(9)],
+      ]),
+    )
+  })
+
+  test('zero count returns #CALC!', () => {
+    expectError(TAKE([input, n(0)], ctx), '#CALC!')
+  })
+
+  test('error propagation', () => {
+    expect(TAKE([err('#DIV/0!'), n(1)], ctx)).toEqual(err('#DIV/0!'))
+  })
+})
+
+describe('DROP', () => {
+  const input = arr([
+    [n(1), n(2), n(3)],
+    [n(4), n(5), n(6)],
+    [n(7), n(8), n(9)],
+  ])
+
+  test('drops leading rows and columns', () => {
+    expect(DROP([input, n(1), n(1)], ctx)).toEqual(
+      arr([
+        [n(5), n(6)],
+        [n(8), n(9)],
+      ]),
+    )
+  })
+
+  test('negative counts drop from the end', () => {
+    expect(DROP([input, n(-1), n(-1)], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(4), n(5)],
+      ]),
+    )
+  })
+
+  test('dropping all rows returns #CALC!', () => {
+    expectError(DROP([input, n(3)], ctx), '#CALC!')
+  })
+
+  test('error propagation', () => {
+    expect(DROP([err('#N/A'), n(1)], ctx)).toEqual(err('#N/A'))
+  })
+})
+
+describe('EXPAND', () => {
+  test('expands with default #N/A padding', () => {
+    expect(EXPAND([arr([[n(1)], [n(2)]]), n(3), n(2)], ctx)).toEqual(
+      arr([
+        [n(1), err('#N/A')],
+        [n(2), err('#N/A')],
+        [err('#N/A'), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('custom pad value fills new cells', () => {
+    expect(EXPAND([arr([[n(1), n(2)]]), n(2), n(3), s('pad')], ctx)).toEqual(
+      arr([
+        [n(1), n(2), s('pad')],
+        [s('pad'), s('pad'), s('pad')],
+      ]),
+    )
+  })
+
+  test('smaller target shape returns #VALUE!', () => {
+    expectError(EXPAND([arr([[n(1), n(2)]]), n(1), n(1)], ctx), '#VALUE!')
+  })
+
+  test('error propagation for required args', () => {
+    expect(EXPAND([arr([[n(1)]]), err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+  })
+})
+
+describe('HSTACK', () => {
+  test('combines arrays horizontally', () => {
+    expect(HSTACK([arr([[n(1)], [n(2)]]), arr([[n(3), n(4)], [n(5), n(6)]])], ctx)).toEqual(
+      arr([
+        [n(1), n(3), n(4)],
+        [n(2), n(5), n(6)],
+      ]),
+    )
+  })
+
+  test('pads shorter inputs with #N/A', () => {
+    expect(HSTACK([arr([[n(1)], [n(2)]]), arr([[n(3)]])], ctx)).toEqual(
+      arr([
+        [n(1), n(3)],
+        [n(2), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('scalar input wraps to 1x1', () => {
+    expect(HSTACK([n(1), arr([[n(2)], [n(3)]])], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [err('#N/A'), n(3)],
+      ]),
+    )
+  })
+
+  test('error propagation', () => {
+    expect(HSTACK([arr([[n(1)]]), err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+  })
+})
+
+describe('VSTACK', () => {
+  test('combines arrays vertically', () => {
+    expect(VSTACK([arr([[n(1), n(2)]]), arr([[n(3), n(4)], [n(5), n(6)]])], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(3), n(4)],
+        [n(5), n(6)],
+      ]),
+    )
+  })
+
+  test('pads narrower inputs with #N/A', () => {
+    expect(VSTACK([arr([[n(1), n(2)]]), arr([[n(3)]])], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(3), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('scalar input wraps to 1x1', () => {
+    expect(VSTACK([arr([[n(1), n(2)]]), n(3)], ctx)).toEqual(
+      arr([
+        [n(1), n(2)],
+        [n(3), err('#N/A')],
+      ]),
+    )
+  })
+
+  test('error propagation', () => {
+    expect(VSTACK([arr([[n(1)]]), err('#N/A')], ctx)).toEqual(err('#N/A'))
+  })
+})
+
+describe('TOCOL', () => {
+  const input = arr([
+    [n(1), BLANK, err('#DIV/0!')],
+    [n(2), n(3), n(4)],
+  ])
+
+  test('flattens row-major into a column', () => {
+    expect(TOCOL([arr([[n(1), n(2)], [n(3), n(4)]])], ctx)).toEqual(
+      arr([[n(1)], [n(2)], [n(3)], [n(4)]]),
+    )
+  })
+
+  test('scan_by_column flattens column-major', () => {
+    expect(TOCOL([arr([[n(1), n(2)], [n(3), n(4)]]), n(0), b(true)], ctx)).toEqual(
+      arr([[n(1)], [n(3)], [n(2)], [n(4)]]),
+    )
+  })
+
+  test('ignore mode 3 skips blanks and errors', () => {
+    expect(TOCOL([input, n(3)], ctx)).toEqual(arr([[n(1)], [n(2)], [n(3)], [n(4)]]))
+  })
+
+  test('invalid ignore mode and scalar error propagate', () => {
+    expectError(TOCOL([input, n(4)], ctx), '#VALUE!')
+    expect(TOCOL([err('#N/A')], ctx)).toEqual(err('#N/A'))
+    expectError(TOCOL([err('#N/A'), n(2)], ctx), '#CALC!')
+  })
+})
+
+describe('TOROW', () => {
+  const input = arr([
+    [n(1), BLANK, err('#DIV/0!')],
+    [n(2), n(3), n(4)],
+  ])
+
+  test('flattens row-major into a row', () => {
+    expect(TOROW([arr([[n(1), n(2)], [n(3), n(4)]])], ctx)).toEqual(
+      arr([[n(1), n(2), n(3), n(4)]]),
+    )
+  })
+
+  test('scan_by_column flattens column-major', () => {
+    expect(TOROW([arr([[n(1), n(2)], [n(3), n(4)]]), n(0), b(true)], ctx)).toEqual(
+      arr([[n(1), n(3), n(2), n(4)]]),
+    )
+  })
+
+  test('ignore mode 2 skips errors but keeps blanks', () => {
+    expect(TOROW([input, n(2)], ctx)).toEqual(arr([[n(1), BLANK, n(2), n(3), n(4)]]))
+  })
+
+  test('invalid ignore mode and scalar error propagate', () => {
+    expectError(TOROW([input, n(-1)], ctx), '#VALUE!')
+    expect(TOROW([err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+    expectError(TOROW([err('#DIV/0!'), n(3)], ctx), '#CALC!')
+  })
+})
+
+describe('RANDARRAY', () => {
+  test('default returns a 1x1 number in [0, 1)', () => {
+    const value = expectArray(RANDARRAY([], ctx))
+    expect(value).toHaveLength(1)
+    expect(value[0]).toHaveLength(1)
+    expect(value[0][0].kind).toBe('number')
+    if (value[0][0].kind === 'number') {
+      expect(value[0][0].value).toBeGreaterThanOrEqual(0)
+      expect(value[0][0].value).toBeLessThan(1)
+    }
+  })
+
+  test('whole_number returns integers inside the requested shape and bounds', () => {
+    const value = expectArray(RANDARRAY([n(2), n(3), n(5), n(7), b(true)], ctx))
+    expect(value).toHaveLength(2)
+    expect(value[0]).toHaveLength(3)
+    for (const row of value) {
+      for (const cell of row) {
+        expect(cell.kind).toBe('number')
+        if (cell.kind === 'number') {
+          expect(Number.isInteger(cell.value)).toBe(true)
+          expect(cell.value).toBeGreaterThanOrEqual(5)
+          expect(cell.value).toBeLessThanOrEqual(7)
+        }
+      }
+    }
+  })
+
+  test('invalid dimensions or reversed bounds return errors', () => {
+    expectError(RANDARRAY([n(0)], ctx), '#VALUE!')
+    expectError(RANDARRAY([n(1), n(1), n(2), n(1)], ctx), '#NUM!')
+  })
+
+  test('error propagation', () => {
+    expect(RANDARRAY([err('#DIV/0!')], ctx)).toEqual(err('#DIV/0!'))
+  })
+})
+
+describe('SORTBY', () => {
+  test('sorts rows by a matching key column', () => {
+    const data = arr([
+      [s('c'), n(3)],
+      [s('a'), n(1)],
+      [s('b'), n(2)],
+    ])
+    const keys = arr([[n(3)], [n(1)], [n(2)]])
+    expect(SORTBY([data, keys], ctx)).toEqual(
+      arr([
+        [s('a'), n(1)],
+        [s('b'), n(2)],
+        [s('c'), n(3)],
+      ]),
+    )
+  })
+
+  test('uses multiple keys and sort orders', () => {
+    const data = arr([
+      [s('a'), n(2)],
+      [s('b'), n(1)],
+      [s('c'), n(3)],
+    ])
+    const group = arr([[n(1)], [n(1)], [n(2)]])
+    const score = arr([[n(2)], [n(1)], [n(3)]])
+    expect(SORTBY([data, group, n(1), score, n(-1)], ctx)).toEqual(
+      arr([
+        [s('a'), n(2)],
+        [s('b'), n(1)],
+        [s('c'), n(3)],
+      ]),
+    )
+  })
+
+  test('sorts columns when by_array is a row vector', () => {
+    const data = arr([
+      [s('b'), s('a'), s('c')],
+      [n(2), n(1), n(3)],
+    ])
+    const keys = arr([[n(2), n(1), n(3)]])
+    expect(SORTBY([data, keys], ctx)).toEqual(
+      arr([
+        [s('a'), s('b'), s('c')],
+        [n(1), n(2), n(3)],
+      ]),
+    )
+  })
+
+  test('invalid by_array shape and key errors propagate', () => {
+    expectError(SORTBY([arr([[n(1)], [n(2)]]), arr([[n(1), n(2)], [n(3), n(4)]])], ctx), '#VALUE!')
+    expect(SORTBY([arr([[n(1)], [n(2)]]), arr([[n(1)], [err('#N/A')]])], ctx)).toEqual(err('#N/A'))
+  })
+})
+
+describe('FUNCTIONS registry', () => {
+  test('exposes dynamic array additions', () => {
+    const keys = new Set(Object.keys(FUNCTIONS))
+    for (const name of [
+      'CHOOSECOLS', 'CHOOSEROWS', 'TAKE', 'DROP', 'EXPAND', 'HSTACK',
+      'VSTACK', 'TOCOL', 'TOROW', 'RANDARRAY', 'SORTBY', 'WRAPROWS', 'WRAPCOLS',
+    ]) {
+      expect(keys.has(name)).toBe(true)
+    }
   })
 })
