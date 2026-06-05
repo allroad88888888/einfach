@@ -2096,6 +2096,25 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
     }
 
+    // PageUp/PageDown (and Alt+PageUp/PageDown for horizontal paging) move by
+    // the host-declared viewport window — `props.viewport.viewportWidth /
+    // colWidth` rather than the measured rendered count. The grid's
+    // `syncViewportSizeFromElement` will widen `metrics.viewportWidth` to the
+    // browser-measured `clientWidth`, which would make `getCols().length`
+    // depend on the actual browser size and break deterministic paging across
+    // environments. The host's viewport prop is the contract for "one page";
+    // the unit test (`vnext-grid.test.tsx` 'passes visible column count into
+    // horizontal page keyboard movement') and the e2e
+    // (`vnext-smoke.spec.ts:208` 'alt page keys move horizontally by the
+    // visible column window') both rely on this prop-derived semantic.
+    const pageRows = Math.max(
+      1,
+      Math.floor(props.viewport.viewportHeight / Math.max(1, props.viewport.rowHeight)),
+    )
+    const pageCols = Math.max(
+      1,
+      Math.floor(props.viewport.viewportWidth / Math.max(1, props.viewport.colWidth)),
+    )
     const intent = store.setter(dispatchKeyboardInputAtom, {
       key: event.key,
       shiftKey: event.shiftKey,
@@ -2103,8 +2122,8 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       metaKey: event.metaKey,
       altKey: event.altKey,
       isComposing: event.isComposing,
-      pageRowDelta: Math.max(1, getRows().length),
-      pageColDelta: Math.max(1, getCols().length),
+      pageRowDelta: pageRows,
+      pageColDelta: pageCols,
     })
 
     switch (intent.type) {
