@@ -10,6 +10,7 @@ import {
   nameBoxModeAtom,
   rangeToA1,
   revertNameBoxAtom,
+  scrollToCellAtom,
   selectionSnapshotAtom,
   workspaceSessionAtom,
   type NameBoxCommitTarget,
@@ -97,6 +98,24 @@ export function SpreadsheetNameBox(props: SpreadsheetNameBoxProps) {
     })
     if (target.kind === 'define-name') {
       await maybeDefineName(target)
+    } else if (target.kind === 'cell' || target.kind === 'range' || target.kind === 'named-range') {
+      // Scroll the virtualized grid so the resolved cell/range top-left
+      // is in the viewport. Without this the name-box jump only mutates
+      // selection state — the user can land on a cell that's off-screen
+      // (and, for a virtualized grid, not even in the DOM). The viewport
+      // window handles the actual scroll offset via its window metrics
+      // atom; nothing is dispatched if the cell is already visible.
+      const coord =
+        target.kind === 'cell'
+          ? target.coord
+          : target.kind === 'range'
+            ? { row: target.range.rowStart, col: target.range.colStart }
+            : target.range
+              ? { row: target.range.rowStart, col: target.range.colStart }
+              : target.coord
+      if (coord) {
+        store.setter(scrollToCellAtom, { coord })
+      }
     }
     setLastCommittedValue(store.getter(nameBoxInputAtom))
   }

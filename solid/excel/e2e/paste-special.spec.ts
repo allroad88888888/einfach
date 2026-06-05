@@ -67,6 +67,22 @@ async function typeIntoCellAddr(page: Page, addr: string, value: string) {
   await expect(input).toHaveCount(0)
 }
 
+/**
+ * Jump the selection (and the grid viewport) to `addr` via the name box.
+ * Necessary when an earlier `typeIntoCellAddr` call scrolled the
+ * virtualized grid off the column we want to click next (e.g. seeding
+ * column J then needing to copy from column B — B falls out of the
+ * rendered DOM because the grid follows the active selection).
+ */
+async function navigateViaNameBox(page: Page, addr: string) {
+  const input = page.getByTestId('name-box-input')
+  await input.click()
+  await input.fill(addr)
+  await input.press('Enter')
+  // Wait for the target cell to be rendered after the scroll.
+  await expect(cell(page, addr)).toBeVisible()
+}
+
 test.describe('paste-special — Ctrl+Alt+V opens dialog and confirm closes it', () => {
   test('Ctrl+Alt+V opens the dialog, choosing "values" + Paste closes it', async ({
     page,
@@ -105,11 +121,17 @@ test.describe('paste-special — Ctrl+Alt+V opens dialog and confirm closes it',
     // the wave5 sales seed). B2 already holds 120 from the seed.
     await typeIntoCellAddr(page, 'J3', '50')
 
+    // The seed in column J scrolled the virtualized grid right; B falls
+    // off the rendered viewport. Jump back via the name box so B2 is in
+    // the DOM before we copy from it.
+    await navigateViaNameBox(page, 'B2')
+
     // Copy B2 → source clipboard.
     await cell(page, 'B2').click()
     await pressCtrlC(page)
 
     // Target J3, open the paste-special dialog.
+    await navigateViaNameBox(page, 'J3')
     await cell(page, 'J3').click()
     await pressCtrlAltV(page)
 
@@ -207,9 +229,13 @@ test.describe('paste-special — Ctrl+Alt+V opens dialog and confirm closes it',
     // Seed: target J3 starts as 99. Copy B2 (120) so the dialog has a
     // payload to potentially paste from.
     await typeIntoCellAddr(page, 'J3', '99')
+    // Restore the viewport to a position where B2 is rendered (the J3
+    // seed scrolled the virtualized grid right).
+    await navigateViaNameBox(page, 'B2')
     await cell(page, 'B2').click()
     await pressCtrlC(page)
 
+    await navigateViaNameBox(page, 'J3')
     await cell(page, 'J3').click()
     await pressCtrlAltV(page)
 
