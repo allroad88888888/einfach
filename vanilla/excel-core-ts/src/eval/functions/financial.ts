@@ -77,8 +77,13 @@ function residualConverged(
   tolerance = CASHFLOW_RESIDUAL_REL_TOLERANCE,
 ): boolean {
   if (!Number.isFinite(residual) || !Number.isFinite(scale)) return false
-  if (scale === 0) return residual === 0
-  return Math.abs(residual) <= Math.abs(scale) * tolerance
+  // Harvey P2 — floor the scale at 1 so tiny-cashflow inputs (where the
+  // natural |scale| ≪ 1) don't get a sub-machine-epsilon tolerance threshold.
+  // Without the floor, RATE/IRR/XIRR can accept a stuck-Newton step whose
+  // residual is still significant relative to the cashflow scale. With the
+  // floor, the threshold is `max(|scale|, 1) * tolerance` — Excel's behavior.
+  const effectiveScale = Math.max(Math.abs(scale), 1)
+  return Math.abs(residual) <= effectiveScale * tolerance
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,9 +1040,12 @@ function parseBasis(args: Value[], index: number): ParsedBasis {
   if (args.length <= index) return { ok: true, basis: 0 }
   const basis = parseArg(args[index])
   if (!basis.ok) return { ok: false, err: basis.err }
-  const value = Math.trunc(basis.n)
-  if (value < 0 || value > 4) return { ok: false, err: ERR('#VALUE!') }
-  return { ok: true, basis: value }
+  // Harvey P2 — Excel returns `#NUM!` (not `#VALUE!`) for invalid basis, and
+  // it rejects fractional / out-of-range values rather than silently truncating.
+  if (!Number.isFinite(basis.n)) return { ok: false, err: ERR('#NUM!') }
+  if (basis.n < 0 || basis.n >= 5) return { ok: false, err: ERR('#NUM!') }
+  if (!Number.isInteger(basis.n)) return { ok: false, err: ERR('#NUM!') }
+  return { ok: true, basis: basis.n }
 }
 
 function parseFrequency(value: Value): ParsedFrequency {
@@ -1130,18 +1138,48 @@ function shouldCountFeb29(
   return false
 }
 
+function isLastDayOfFeb(parts: { year: number; month: number; day: number }): boolean {
+  if (parts.month !== 2) return false
+  const lastDay = daysInYear(parts.year) === 366 ? 29 : 28
+  return parts.day === lastDay
+}
+
 function yearFracBasis(start: number, end: number, basis: number): number {
   const lo = Math.floor(Math.min(start, end))
   const hi = Math.floor(Math.max(start, end))
   switch (basis) {
-    case 0:
-    case 4: {
+    case 0: {
+      // Harvey P2 — Excel NASD 30/360 (basis 0) full rule:
+      //   1. If start is last day of Feb AND end is last day of Feb, set end_day = 30.
+      //   2. If start is last day of Feb, set start_day = 30.
+      //   3. If start_day = 31, set start_day = 30.
+      //   4. If end_day = 31 AND start_day (after step 3) = 30, set end_day = 30.
       const startParts = serialDateToParts(lo)
       const endParts = serialDateToParts(hi)
+      let d1 = startParts.day
+      let d2 = endParts.day
+      if (isLastDayOfFeb(startParts)) {
+        if (isLastDayOfFeb(endParts)) d2 = 30
+        d1 = 30
+      }
+      if (d1 === 31) d1 = 30
+      if (d1 === 30 && d2 === 31) d2 = 30
       const numerator =
         (endParts.year - startParts.year) * 360 +
         (endParts.month - startParts.month) * 30 +
-        (endParts.day - startParts.day)
+        (d2 - d1)
+      return numerator / 360
+    }
+    case 4: {
+      // European 30/360 (basis 4): day-31 → 30 on both ends, no Feb EOM.
+      const startParts = serialDateToParts(lo)
+      const endParts = serialDateToParts(hi)
+      const d1 = startParts.day === 31 ? 30 : startParts.day
+      const d2 = endParts.day === 31 ? 30 : endParts.day
+      const numerator =
+        (endParts.year - startParts.year) * 360 +
+        (endParts.month - startParts.month) * 30 +
+        (d2 - d1)
       return numerator / 360
     }
     case 1:

@@ -298,4 +298,36 @@ describe('YEARFRAC', () => {
   test('invalid basis returns #NUM!', () => {
     expect(call('YEARFRAC', [NUM(1), NUM(2), NUM(99)])).toEqual(ERR('#NUM!'))
   })
+
+  test('NASD basis 0 applies Feb EOM rule for last-Feb dates', () => {
+    // Harvey P2 — Excel's NASD (basis 0) has a Feb EOM refinement:
+    //   - start last-Feb AND end last-Feb → end_day = 30
+    //   - start last-Feb → start_day = 30
+    // Without the refinement, YEARFRAC(2020-02-29, 2021-02-28, 0) gives
+    // (1*360 + 0*30 + (28-29))/360 = (360-1)/360 ≈ 0.9972 instead of 1.0.
+    const feb29_2020 = asNumber(call('DATE', [NUM(2020), NUM(2), NUM(29)]))
+    const feb28_2021 = asNumber(call('DATE', [NUM(2021), NUM(2), NUM(28)]))
+    expect(asNumber(call('YEARFRAC', [NUM(feb29_2020), NUM(feb28_2021), NUM(0)]))).toBeCloseTo(
+      1,
+      12,
+    )
+
+    // Start is last-Feb (non-leap year), end is later non-Feb day-31.
+    // With refinement: start_day → 30, then d1=30 & d2=31 → d2=30,
+    //                  so (1*360 + 6*30 + (30-30))/360 = 540/360 = 1.5.
+    const feb28_2019 = asNumber(call('DATE', [NUM(2019), NUM(2), NUM(28)]))
+    const aug31_2020 = asNumber(call('DATE', [NUM(2020), NUM(8), NUM(31)]))
+    expect(asNumber(call('YEARFRAC', [NUM(feb28_2019), NUM(aug31_2020), NUM(0)]))).toBeCloseTo(
+      1.5,
+      12,
+    )
+  })
+
+  test('invalid basis (negative / out of range / fractional) returns #NUM!', () => {
+    const start = asNumber(call('DATE', [NUM(2020), NUM(1), NUM(1)]))
+    const end = asNumber(call('DATE', [NUM(2021), NUM(1), NUM(1)]))
+    expect(call('YEARFRAC', [NUM(start), NUM(end), NUM(5)])).toEqual(ERR('#NUM!'))
+    expect(call('YEARFRAC', [NUM(start), NUM(end), NUM(-1)])).toEqual(ERR('#NUM!'))
+    expect(call('YEARFRAC', [NUM(start), NUM(end), NUM(1.5)])).toEqual(ERR('#NUM!'))
+  })
 })

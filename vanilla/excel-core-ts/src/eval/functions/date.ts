@@ -811,7 +811,7 @@ const WORKDAY_INTL: FunctionImpl = (args) => {
   }
 }
 
-function days360(start: number, end: number, european: boolean): number {
+function days360(start: number, end: number, european: boolean, applyFebEom = false): number {
   const startParts = partsOf(start)
   const endParts = partsOf(end)
   let d1 = startParts.day
@@ -820,10 +820,26 @@ function days360(start: number, end: number, european: boolean): number {
     if (d1 === 31) d1 = 30
     if (d2 === 31) d2 = 30
   } else {
+    // NASD 30/360.
+    //
+    // `DAYS360(start, end, FALSE)` applies only the day-31 rule (Microsoft's
+    // documented behavior, matches the legacy SIA spec; no Feb EOM).
+    // `YEARFRAC(start, end, 0)` additionally applies the Feb EOM refinement
+    // (Harvey P2). `applyFebEom` threads the distinction.
+    if (applyFebEom && isLastDayOfFeb(startParts)) {
+      if (isLastDayOfFeb(endParts)) d2 = 30
+      d1 = 30
+    }
     if (d1 === 31) d1 = 30
     if (d1 === 30 && d2 === 31) d2 = 30
   }
   return (endParts.year - startParts.year) * 360 + (endParts.month - startParts.month) * 30 + (d2 - d1)
+}
+
+function isLastDayOfFeb(parts: { year: number; month: number; day: number }): boolean {
+  if (parts.month !== 2) return false
+  const lastDay = daysInYear(parts.year) === 366 ? 29 : 28
+  return parts.day === lastDay
 }
 
 function daysInYear(year: number): number {
@@ -911,14 +927,19 @@ const YEARFRAC: FunctionImpl = (args) => {
   if (args.length === 3) {
     const basisArg = coerceNumber(args[2])
     if (!basisArg.ok) return basisArg.error
-    basis = Math.trunc(basisArg.value)
+    // Harvey P2 — Excel rejects fractional / out-of-range basis with `#NUM!`.
+    if (!Number.isFinite(basisArg.value)) return { kind: 'error', code: '#NUM!' }
+    if (basisArg.value < 0 || basisArg.value >= 5) return { kind: 'error', code: '#NUM!' }
+    if (!Number.isInteger(basisArg.value)) return { kind: 'error', code: '#NUM!' }
+    basis = basisArg.value
   }
   if (basis < 0 || basis > 4) return { kind: 'error', code: '#NUM!' }
   const lo = Math.min(Math.floor(start.value), Math.floor(end.value))
   const hi = Math.max(Math.floor(start.value), Math.floor(end.value))
   switch (basis) {
     case 0:
-      return { kind: 'number', value: days360(lo, hi, false) / 360 }
+      // YEARFRAC basis 0 applies the NASD Feb EOM refinement (DAYS360 does not).
+      return { kind: 'number', value: days360(lo, hi, false, true) / 360 }
     case 4:
       return { kind: 'number', value: days360(lo, hi, true) / 360 }
     case 2:
