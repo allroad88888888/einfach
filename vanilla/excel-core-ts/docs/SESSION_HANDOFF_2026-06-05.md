@@ -105,10 +105,11 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 | `solid/excel` | 56 | **840** | ✅ |
 | Total monorepo jest | 186 | **3584** | ✅ |
 | `cargo test --lib` (rust/excel-core) | — | **1396** + 3 ignored | ✅ |
+| `cargo test --tests` (integration suites) | — | all green (15+ suites) | ✅ |
 | `cargo test --lib` (rust/wasm) | — | 29+ | ✅ |
 | `tsc -b` | — | — | ✅ clean |
-| e2e WASM | 515 | **465 / 21 / 29** | ✅ |
-| e2e TS | 515 | **465 / 21 / 29** | ✅ Δ=0 vs WASM |
+| e2e WASM | 515 | **478 / 0 / 37** | ✅ all green |
+| e2e TS | 515 | **478 / 0 / 37** | ✅ Δ=0 vs WASM, all green |
 
 ### Follow-up arc (2026-06-05) — landed since the v2 doc was written
 
@@ -116,6 +117,26 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 - **Harvey (financial)** `86ff484`: RATE/IRR/XIRR residual tolerance floored at 1; NASD 30/360 February EOM adjustment; 25 bond/depreciation functions reject invalid `basis` with `#NUM!` (was `#VALUE!`).
 - **Hume (dynamic arrays)** `b14a817` (mixed with parity doc): MAP/FILTER/TOCOL whole-column sparse iteration; REDUCE/BYROW/BYCOL input cap; MAKEARRAY/SEQUENCE/RANDARRAY/EXPAND 16384-column guard; TAKE/DROP/EXPAND/WRAPROWS/WRAPCOLS reject array-typed pad_with.
 - **Worker runtime parity** `173120f` + `77731bf`: TS worker `debugFormulaCacheState` reports 'dirty' for never-read formula cells; `snapshotRangeSparseChunks` respects the chunk-size cap; bulk-import collapses per-chunk writes into one `bulkApply` per sheet. Closes the 3 TS-only `vnext-worker-backend.spec.ts` failures (lines 100/165/217). **TS = WASM at 465/21/29.**
+
+### Wave 5/6/7 UI cluster closure (2026-06-05 final batch — `d7f3017`)
+
+After backend parity, 21 remaining e2e fails were UI bugs identical on both
+projects. Closed in two parallel batches:
+
+- **audit-format cluster (9 fails)** `9433285` + `77c7e26`: format-cells
+  dialog (Save/Cancel/custom row), v-align dropdown (top/middle/round-trip),
+  fill color popover (`.cell-display` background inheritance), merge dropdown
+  1×1 enabled, Print Preview toolbar button removed (Wave 5 pruning).
+- **Wave 7 dialogs (5 fails)** `ee34233` + `65114f1` + `ead1d6c`: name-box
+  scroll on cell jump (paste-special navigation), remove-duplicates EN-locale
+  message assertions, text-to-columns preview cap counts the `…` marker.
+- **Misc UI (6 fails)** `39757a0` + `09560ad` + `b4341da` + `7b69dac` +
+  `c9f41df`: toolbar mousedown preventDefault preserves grid focus for
+  Ctrl+Z/Y; Alt+PageDown/Up uses host viewport delta; context menu collapses
+  1×1 range to cell target-kind; copy-as HTML emits rowspan/colspan on merge
+  anchor; Go To Special row-differences uses selection top-left as anchor.
+
+**Final state: both backends at 478 / 0 / 37 across 515 spec runs.**
 
 ## 5. Hard rules (project memory)
 
@@ -132,27 +153,13 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 ## 6. Open work (prioritized)
 
 The 2026-06-05 follow-up arc closed the previous P1 (e2e re-audit) and the
-three P2 compat tails (Fermat / Hume / Harvey). Remaining work below.
+three P2 compat tails (Fermat / Hume / Harvey). The Wave 5/6/7 UI cluster
+that was P1 has also been fully closed (see §3). Remaining work below.
 
-### P1 — Wave 5/6 UI bug cluster (21 e2e fails, identical on both projects)
+### P1 — No open P1
 
-These are NOT parity issues — TS and WASM agree on them. They're pre-existing
-UI / interaction bugs in `solid/excel/src-vnext/`. Cluster:
-
-- **`audit-format.spec.ts` (9)** — largest cluster:
-  - toolbar Find / Print Preview rendering
-  - fill color popover swatch apply
-  - Format Cells dialog: custom format row, Save/Cancel, v-align dropdown (top/middle/round-trip), merge dropdown 1×1 disabled
-- **`paste-special.spec.ts` (2)** — values-only paste arithmetic add, Escape closes dialog without commit.
-- **`remove-duplicates.spec.ts` (2)** — noDuplicates empty-state message, deselect-all noKeyColumns message.
-- **`text-to-columns.spec.ts` (1)** — 600-token row clamp at 500 with `…` marker.
-- **`toolbar-buttons.spec.ts` (2)** — Ctrl+Z / Ctrl+Y after format change.
-- **`copy-as.spec.ts` (1)** — rowspan/colspan on merged A1:B2 anchor.
-- **`go-to.spec.ts` (1)** — row differences scoped to selection rect (B4 #11).
-- **`vnext-smoke.spec.ts` (2)** — alt page horizontal nav; toolbar/context-menu vNext atoms.
-- **`vnext-wave5.spec.ts` (1)** — 1×1 selection disables merge variants in dropdown.
-
-ROADMAP.md sequences Wave 5 (shell + canvas overlay) → Wave 6 (cell-format complete) → Wave 7 (data-ops + nav) → Wave 8 (formula extension + export). The audit-format cluster overlaps Wave 5 + Wave 6.
+Both backends are at 478/0/37 with Δ=0. The previous P1 cluster (21 UI
+fails) is fully closed. Next priorities are P2 / P3 — perf and quality.
 
 ### P2 — Engine compat edges still open
 
