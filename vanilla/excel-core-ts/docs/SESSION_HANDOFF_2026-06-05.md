@@ -96,18 +96,26 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 - DATE 0..1899 year offset rule; TIME bounds; GCD/LCM negatives; STANDARDIZE zero stddev; POISSON.DIST non-integer truncation.
 - TRANSLATE / PHONETIC implementations (were stubs).
 
-## 4. Verification numbers (post-arc)
+## 4. Verification numbers (after 2026-06-05 follow-up arc)
 
 | Surface | Suites | Tests | Status |
 |---|---:|---:|---|
-| `vanilla/excel-core-ts` | 28 | **1675** | ✅ |
+| `vanilla/excel-core-ts` | 28 | **1702** | ✅ |
 | `vanilla/spreadsheet-ui-core` | 52 | **769** | ✅ |
 | `solid/excel` | 56 | **840** | ✅ |
-| Total monorepo jest | 186 | **3557** | ✅ |
+| Total monorepo jest | 186 | **3584** | ✅ |
 | `cargo test --lib` (rust/excel-core) | — | **1396** + 3 ignored | ✅ |
 | `cargo test --lib` (rust/wasm) | — | 29+ | ✅ |
 | `tsc -b` | — | — | ✅ clean |
-| e2e BACKEND_PARITY | 59 specs × 2 | last full audit 2026-05-28 | ⚠️ pending re-audit |
+| e2e WASM | 515 | **465 / 21 / 29** | ✅ |
+| e2e TS | 515 | **465 / 21 / 29** | ✅ Δ=0 vs WASM |
+
+### Follow-up arc (2026-06-05) — landed since the v2 doc was written
+
+- **Fermat (refs)** `bfaee8c`: `SUM/COUNTIF/SUMIF/COUNTA/COUNT((A:A,C:C))` multi-area sparse aggregation. CHOOSE array-index broadcasting and INDEX(...):INDEX(...) parser were already in HEAD — regression tests added.
+- **Harvey (financial)** `86ff484`: RATE/IRR/XIRR residual tolerance floored at 1; NASD 30/360 February EOM adjustment; 25 bond/depreciation functions reject invalid `basis` with `#NUM!` (was `#VALUE!`).
+- **Hume (dynamic arrays)** `b14a817` (mixed with parity doc): MAP/FILTER/TOCOL whole-column sparse iteration; REDUCE/BYROW/BYCOL input cap; MAKEARRAY/SEQUENCE/RANDARRAY/EXPAND 16384-column guard; TAKE/DROP/EXPAND/WRAPROWS/WRAPCOLS reject array-typed pad_with.
+- **Worker runtime parity** `173120f` + `77731bf`: TS worker `debugFormulaCacheState` reports 'dirty' for never-read formula cells; `snapshotRangeSparseChunks` respects the chunk-size cap; bulk-import collapses per-chunk writes into one `bulkApply` per sheet. Closes the 3 TS-only `vnext-worker-backend.spec.ts` failures (lines 100/165/217). **TS = WASM at 465/21/29.**
 
 ## 5. Hard rules (project memory)
 
@@ -123,46 +131,54 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 
 ## 6. Open work (prioritized)
 
-### P1 — Re-audit e2e parity
-The last full 59-spec × 2-project audit was 2026-05-28. Since then: TS port grew 192→500 functions, evaluator-aware paths added, Rust ported parallel. The targeted size-fix landed (2 tests now green on both backends), but the wide audit hasn't been re-run. Likely a few specs moved from red to green; some may have moved the other way.
+The 2026-06-05 follow-up arc closed the previous P1 (e2e re-audit) and the
+three P2 compat tails (Fermat / Hume / Harvey). Remaining work below.
 
-```bash
-cd solid/excel
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
-  && NO_PROXY=localhost,127.0.0.1 \
-  npx playwright test --project=wasm
-npx playwright test --project=ts
-```
+### P1 — Wave 5/6 UI bug cluster (21 e2e fails, identical on both projects)
 
-Update `solid/excel/e2e/BACKEND_PARITY.md` matrix.
+These are NOT parity issues — TS and WASM agree on them. They're pre-existing
+UI / interaction bugs in `solid/excel/src-vnext/`. Cluster:
 
-### P2 — Compat tail (open from §41 of the historical doc)
+- **`audit-format.spec.ts` (9)** — largest cluster:
+  - toolbar Find / Print Preview rendering
+  - fill color popover swatch apply
+  - Format Cells dialog: custom format row, Save/Cancel, v-align dropdown (top/middle/round-trip), merge dropdown 1×1 disabled
+- **`paste-special.spec.ts` (2)** — values-only paste arithmetic add, Escape closes dialog without commit.
+- **`remove-duplicates.spec.ts` (2)** — noDuplicates empty-state message, deselect-all noKeyColumns message.
+- **`text-to-columns.spec.ts` (1)** — 600-token row clamp at 500 with `…` marker.
+- **`toolbar-buttons.spec.ts` (2)** — Ctrl+Z / Ctrl+Y after format change.
+- **`copy-as.spec.ts` (1)** — rowspan/colspan on merged A1:B2 anchor.
+- **`go-to.spec.ts` (1)** — row differences scoped to selection rect (B4 #11).
+- **`vnext-smoke.spec.ts` (2)** — alt page horizontal nav; toolbar/context-menu vNext atoms.
+- **`vnext-wave5.spec.ts` (1)** — 1×1 selection disables merge variants in dropdown.
 
-**Fermat (reference semantics):**
-- `CHOOSE({1,2}, A1:A2, C1:C2)` should block-concatenate refs (currently picks scalar).
-- `SUM((A:A,C:C))` whole-column multi-area still bypasses sparse aggregation.
-- `INDEX(...):INDEX(...)` dynamic ranges need parser support.
+ROADMAP.md sequences Wave 5 (shell + canvas overlay) → Wave 6 (cell-format complete) → Wave 7 (data-ops + nav) → Wave 8 (formula extension + export). The audit-format cluster overlaps Wave 5 + Wave 6.
 
-**Hume (dynamic arrays / higher-order):**
-- Whole-column/lazy-grid behavior for `MAP`/`FILTER`/`TOCOL` (currently materializes).
-- Input-vs-output cap semantics for `REDUCE`/`BYROW`/`BYCOL` — needs planned pass.
-- Shape guards should respect Excel 16,384-column limit.
-- Ordinary array literals and `pad` arguments can still leak nested arrays in edge cases.
+### P2 — Engine compat edges still open
 
-**Harvey (financial / date):**
-- RATE/IRR/XIRR tiny-cashflow residual scaling (premature convergence on flat tangent).
-- US NASD 30/360 February month-end handling — basic adjustment works but Feb-EOM edge differs.
-- Invalid basis values should return `#NUM!` consistently (currently mixed).
+**Refs (still TODO from Fermat scope):**
+- Verify the new multi-area sparse path covers every aggregate the user
+  might hit (current pass: SUM/COUNTIF/SUMIF/COUNTA/COUNT).
+
+**Higher-order arrays (still TODO from Hume scope):**
+- Empty-input semantics for FILTER (`if_empty`) and MAP/REDUCE; current
+  pass handles input cap and shape guards, but the empty-array branch
+  needs Excel-exact `#CALC!` vs `if_empty` evaluation.
+
+**Bulk-import caveat (introduced by 2026-06-05 worker-runtime fix):**
+- The `bulkApply` fast path in `worker-runtime-ts.ts` can mis-classify
+  text values that look numeric / boolean / error / formula
+  (e.g. `text="00123"` → number 123). Single-cell `setCell` RPC still
+  preserves type via `setCellValue`. Documented inline in the runtime.
 
 ### P3 — Perf reference numbers (still on the table)
 - `bulk_import_cells` 750k cap is engineering tourniquet — streaming-deserialize / wasm64 / panic=unwind.
 - Chain10k→Chain100k step still 9.3× (target 10×).
 - Range-dep coalescing path gated off (`use_coalesced = false`); pinned equivalence test prevents bit-rot.
 
-### P3 — Wave 5/6/7/8 (UI features)
-24 e2e fails identical on both backends — pre-existing UI bugs, not parity issues. Cluster in `audit-format.spec.ts` (9), `paste-special.spec.ts` (2), `remove-duplicates.spec.ts` (2), `text-to-columns.spec.ts` (1), `vnext-smoke.spec.ts` (2).
-
-ROADMAP.md sequences Wave 5 (shell + canvas overlay) → Wave 6 (cell-format complete) → Wave 7 (data-ops + nav) → Wave 8 (formula extension + export).
+### P3 — Wave 7.4 / Wave 8 features
+- Wave 7.4 (Copy as HTML/Markdown) shipped earlier.
+- Wave 8 PNG export + remote formulas + array enhancements pending the UI shell.
 
 ## 7. Critical gotcha — wasm-bindgen "attempted to take ownership while borrowed"
 
