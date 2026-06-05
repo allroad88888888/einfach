@@ -17,14 +17,17 @@
  *  - String comparisons are case-insensitive (Excel uses caseless collation
  *    for lookup, even though it's case-sensitive for display).
  *
- * NOT implemented yet (TODOs flagged inline):
- *  - XLOOKUP binary search modes (`search_mode = 2 | -2`) fall back to linear
- *    scan in the appropriate direction; results are correct on sorted input
- *    but slower than Excel. The acceptance tests don't exercise large inputs.
- *  - VLOOKUP/HLOOKUP/MATCH approximate-match assumes ascending-sorted data;
- *    on unsorted data Excel returns "undefined" results — we match the
- *    documented behaviour (largest value <= lookup) which is what Excel
- *    actually does in practice.
+ * Approximate-match performance:
+ *  - VLOOKUP / HLOOKUP / MATCH approximate mode uses binary search on the
+ *    assumed sorted column / row (`O(log n)`). On mixed-type or unsortable
+ *    input the binary helper signals "abort" and the caller falls back to
+ *    the legacy linear scan — Excel's spec is undefined on unsorted data,
+ *    but the linear path preserves the previously documented behaviour
+ *    (largest hay <= needle, skipping incompatible cells).
+ *  - XLOOKUP `search_mode = 2 / -2` use the same binary helper (asc / desc)
+ *    and fall back to the linear scan when the input is unsortable or when
+ *    wildcards are requested (Excel rejects wildcards with binary search,
+ *    but to keep us forgiving we fall back instead of erroring).
  */
 
 import type { FunctionImpl, Value } from '../../types'
@@ -171,6 +174,109 @@ function wildcardHaystackText(value: Value): string | undefined {
   }
 }
 
+// ----------------------------------------------------------------------------
+// Binary search helpers (shared by VLOOKUP / HLOOKUP / MATCH / XLOOKUP)
+// ----------------------------------------------------------------------------
+
+/**
+ * Sentinel returned by `binarySearchSorted` when the array isn't reliably
+ * sortable in the assumed direction (mixed types, errors, blanks-vs-string).
+ * Callers fall back to a linear scan to preserve Excel's "undefined on
+ * unsorted data" leniency.
+ */
+const BSEARCH_UNSORTABLE = -2
+
+/**
+ * Binary search over `arr` (assumed sorted in `direction`). All comparisons
+ * are PHYSICAL — i.e., `cmp` here means `compareForLookup(arr[mid], target)`
+ * with values ascending naturally (numbers numerically, strings lexically).
+ * The `direction` parameter only tells the helper how to navigate the
+ * partitions (which half is "before" vs "after" target), not how to flip
+ * the semantics of the result.
+ *
+ * Modes:
+ *  - `'exact'`  → any index where arr[i] == target, or -1 if none.
+ *  - `'lte'`    → the index whose value is the LARGEST physical value that
+ *                 is ≤ target. In an asc array that's the rightmost cell
+ *                 ≤ target; in a desc array that's the leftmost cell
+ *                 ≤ target. Used for XLOOKUP matchMode=-1 ("exact or next
+ *                 smaller") and MATCH match_type=1.
+ *  - `'gte'`    → the index whose value is the SMALLEST physical value that
+ *                 is ≥ target. In an asc array that's the leftmost cell
+ *                 ≥ target; in a desc array that's the rightmost cell
+ *                 ≥ target. Used for XLOOKUP matchMode=1 ("exact or next
+ *                 larger") and MATCH match_type=-1.
+ *
+ * Returns `BSEARCH_UNSORTABLE` when any compared cell is non-orderable vs
+ * the target (compareForLookup → null), so the caller can fall back to the
+ * linear scan that the rest of the file already implements.
+ */
+function binarySearchSorted(
+  arr: ReadonlyArray<Value>,
+  target: Value,
+  mode: 'exact' | 'lte' | 'gte',
+  direction: 'asc' | 'desc',
+): number {
+  const n = arr.length
+  if (n === 0) return -1
+  let lo = 0
+  let hi = n - 1
+  let best = -1
+  while (lo <= hi) {
+    const mid = (lo + hi) >>> 1
+    const rawCmp = compareForLookup(arr[mid], target)
+    if (rawCmp === null) return BSEARCH_UNSORTABLE
+    if (rawCmp === 0) {
+      if (mode === 'exact') return mid
+      best = mid
+      // For lte we want the rightmost (asc) / leftmost (desc) equal element.
+      // For gte we want the leftmost (asc) / rightmost (desc) equal element.
+      // We're traversing in physical order, so:
+      //  - asc + lte → continue right
+      //  - asc + gte → continue left
+      //  - desc + lte → continue left
+      //  - desc + gte → continue right
+      const continueRight =
+        (direction === 'asc' && mode === 'lte') ||
+        (direction === 'desc' && mode === 'gte')
+      if (continueRight) lo = mid + 1
+      else hi = mid - 1
+      continue
+    }
+    // rawCmp != 0: arr[mid] is physically below (rawCmp<0) or above (rawCmp>0) target.
+    if (rawCmp < 0) {
+      // arr[mid] < target physically. For lte this is a candidate. For gte
+      // we need to look at the side where larger values live.
+      if (mode === 'lte') best = mid
+      if (direction === 'asc') {
+        lo = mid + 1 // larger values are to the right
+      } else {
+        hi = mid - 1 // in desc, larger values are to the left
+      }
+    } else {
+      // arr[mid] > target physically. For gte this is a candidate.
+      if (mode === 'gte') best = mid
+      if (direction === 'asc') {
+        hi = mid - 1 // smaller values are to the left
+      } else {
+        lo = mid + 1 // in desc, smaller values are to the right
+      }
+    }
+  }
+  return best
+}
+
+/**
+ * Approximate match for VLOOKUP / HLOOKUP / MATCH(type=1) on ascending data.
+ * Returns largest index where arr[i] <= needle, or -1 if none / unsortable.
+ *
+ * Signals unsortable via BSEARCH_UNSORTABLE so the caller can fall back to
+ * the legacy linear walk.
+ */
+function binaryApproxAsc(arr: ReadonlyArray<Value>, needle: Value): number {
+  return binarySearchSorted(arr, needle, 'lte', 'asc')
+}
+
 /**
  * Pull a number from a `Value`, defaulting to `fallback` for blank. Returns
  * `null` if coercion fails (so callers can surface `#VALUE!`).
@@ -249,9 +355,14 @@ function findRowVLookup(needle: Value, table: Value[][], approx: boolean): numbe
     }
     return -1
   }
-  // Approximate: linear scan, track best row where first-col <= needle.
-  // Excel's spec assumes ascending sort; we just return the last row whose
-  // first-col is <= needle.
+  // Approximate: binary search the first column (assumed ascending sort
+  // per Excel spec) for the largest row where col0 <= needle. On mixed-type
+  // or otherwise unsortable input the binary helper bails and we fall back
+  // to the legacy linear walk.
+  const firstCol: Value[] = []
+  for (let r = 0; r < table.length; r += 1) firstCol.push(table[r][0])
+  const bin = binaryApproxAsc(firstCol, needle)
+  if (bin !== BSEARCH_UNSORTABLE) return bin
   let best = -1
   for (let r = 0; r < table.length; r += 1) {
     const cmp = compareForLookup(table[r][0], needle)
@@ -302,6 +413,9 @@ function findColHLookup(needle: Value, table: Value[][], approx: boolean): numbe
     }
     return -1
   }
+  // Approximate: same binary-search-with-linear-fallback approach as VLOOKUP.
+  const bin = binaryApproxAsc(firstRow, needle)
+  if (bin !== BSEARCH_UNSORTABLE) return bin
   let best = -1
   for (let c = 0; c < firstRow.length; c += 1) {
     const cmp = compareForLookup(firstRow[c], needle)
@@ -434,7 +548,13 @@ export const MATCH: FunctionImpl = (args, _ctx) => {
   }
 
   if (matchType === 1) {
-    // Largest <= needle; assumes ascending.
+    // Largest <= needle; assumes ascending. Binary search first; on
+    // unsortable input fall back to the linear walk.
+    const bin = binarySearchSorted(flat, needle, 'lte', 'asc')
+    if (bin !== BSEARCH_UNSORTABLE) {
+      if (bin === -1) return ERR_NA
+      return { kind: 'number', value: bin + 1 }
+    }
     let best = -1
     for (let i = 0; i < flat.length; i += 1) {
       const cmp = compareForLookup(flat[i], needle)
@@ -446,7 +566,14 @@ export const MATCH: FunctionImpl = (args, _ctx) => {
     return { kind: 'number', value: best + 1 }
   }
 
-  // matchType === -1 : smallest >= needle; assumes descending.
+  // matchType === -1 : smallest >= needle; assumes descending. Binary search
+  // returns the smallest physical value still >= needle (rightmost cell ≥
+  // needle in a descending array).
+  const bin = binarySearchSorted(flat, needle, 'gte', 'desc')
+  if (bin !== BSEARCH_UNSORTABLE) {
+    if (bin === -1) return ERR_NA
+    return { kind: 'number', value: bin + 1 }
+  }
   let best = -1
   for (let i = 0; i < flat.length; i += 1) {
     const cmp = compareForLookup(flat[i], needle)
@@ -572,26 +699,55 @@ function findXLookupIndex(
   const useWildcards = matchMode === 2
   const len = arr.length
 
-  // search_mode === 2 / -2 → binary search.
-  // TODO(C3): proper binary search; fall back to linear scan in the
-  // appropriate direction for correctness. Acceptance tests cover ≤ 20
-  // elements so perf is fine.
-  if (searchMode === 2) {
-    // Sorted asc — scan forward
+  // search_mode === 2 / -2 → binary search on sorted data.
+  // Excel rejects wildcards with binary search (matchMode=2 + searchMode=±2
+  // is filtered out one level up), but for safety we fall back to linear if
+  // anyone reaches here with wildcards or with non-orderable cells.
+  if (searchMode === 2 || searchMode === -2) {
+    const direction = searchMode === 2 ? 'asc' : 'desc'
+    const bin = binaryXLookup(needle, arr, matchMode, direction)
+    if (bin !== BSEARCH_UNSORTABLE) return bin
+    // Fall through to linear scan — preserves "soft" semantics on unsortable
+    // input rather than emitting a spurious #N/A.
     return scanXLookup(needle, arr, matchMode, useWildcards, 0, len, 1)
-  }
-  if (searchMode === -2) {
-    // Sorted desc — scan from end? Actually binary search on desc data.
-    // For correctness on sorted-desc data, scan from start and use a
-    // different "next nearest" strategy. Simpler: scan and pick first
-    // match (or, for nearest modes, the appropriate side).
-    return scanXLookupDesc(needle, arr, matchMode, useWildcards)
   }
   if (searchMode === -1) {
     return scanXLookup(needle, arr, matchMode, useWildcards, len - 1, -1, -1)
   }
   // searchMode === 1 (default)
   return scanXLookup(needle, arr, matchMode, useWildcards, 0, len, 1)
+}
+
+/**
+ * Binary-search variant for XLOOKUP `search_mode = ±2`.
+ *
+ *  - matchMode 0 → exact match (no nearest fallback). Returns -1 when not
+ *    found.
+ *  - matchMode -1 → "exact or next smaller" — largest hay <= needle in
+ *    ascending mode; in descending mode the first hay that's <= needle
+ *    (mapped via `binarySearchSorted` with mode='lte', direction='desc').
+ *  - matchMode 1 → "exact or next larger" — smallest hay >= needle.
+ *
+ * Returns BSEARCH_UNSORTABLE when the binary helper hits an unsortable
+ * comparison, so the caller can fall back to the linear scan path.
+ */
+function binaryXLookup(
+  needle: Value,
+  arr: Value[],
+  matchMode: number,
+  direction: 'asc' | 'desc',
+): number {
+  if (matchMode === 0) {
+    return binarySearchSorted(arr, needle, 'exact', direction)
+  }
+  if (matchMode === -1) {
+    return binarySearchSorted(arr, needle, 'lte', direction)
+  }
+  if (matchMode === 1) {
+    return binarySearchSorted(arr, needle, 'gte', direction)
+  }
+  // matchMode === 2 (wildcards) — Excel disallows with binary modes; bail.
+  return BSEARCH_UNSORTABLE
 }
 
 /**
@@ -669,22 +825,6 @@ function scanXLookup(
   if (matchMode === -1) return bestSmaller
   if (matchMode === 1) return bestLarger
   return -1
-}
-
-/**
- * Specialised scan for `search_mode = -2` (binary on desc-sorted data).
- *
- * TODO(C3): true O(log n) binary search. We linear-scan but use Excel's
- * desc-sorted semantics: first exact wins; for "next smaller" / "next larger"
- * nearest-modes, we still find the closest neighbour.
- */
-function scanXLookupDesc(
-  needle: Value,
-  arr: Value[],
-  matchMode: number,
-  useWildcards: boolean,
-): number {
-  return scanXLookup(needle, arr, matchMode, useWildcards, 0, arr.length, 1)
 }
 
 /** Extract a numeric rank if possible — used for "nearest" distance metric. */

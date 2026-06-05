@@ -519,6 +519,154 @@ describe('XMATCH', () => {
 })
 
 // ============================================================================
+// Binary search on sorted data (VLOOKUP / HLOOKUP / MATCH approximate +
+// XLOOKUP search_mode = ±2). Regression for FUNCTION_QUALITY_2026-06-05.md
+// "XLOOKUP search_mode = ±2" / "VLOOKUP/HLOOKUP/MATCH approximate" entries.
+//
+// We don't time these — Jest doesn't reliably distinguish O(log n) from
+// O(n) at 1k elements. Instead we assert correctness on inputs the linear
+// path used to handle, plus structural invariants: results on the boundary
+// between two sorted runs, and fallback behaviour on mixed-type input
+// (where binary search must NOT error).
+// ============================================================================
+
+describe('binary search on sorted data', () => {
+  // 1000 ascending unique integers: 0, 2, 4, ..., 1998.
+  const ascRow: Value[] = []
+  const ascCol: Value[][] = []
+  for (let i = 0; i < 1000; i += 1) {
+    ascRow.push(n(i * 2))
+    ascCol.push([n(i * 2)])
+  }
+  const ascRowArr: Value = arr([ascRow])
+  // VLOOKUP table: col 0 is the sorted key, col 1 the label.
+  const vlookTable: Value[][] = ascCol.map((cell, i) => [cell[0], s(`row-${i}`)])
+  const vlookArr: Value = arr(vlookTable)
+
+  test('VLOOKUP approximate hits the right row on 1000-entry sorted column', () => {
+    // exact element
+    expect(VLOOKUP([n(500), vlookArr, n(2)], ctx)).toEqual(s('row-250'))
+    // between elements (498 and 500) → largest <= 499 is 498 → row-249
+    expect(VLOOKUP([n(499), vlookArr, n(2)], ctx)).toEqual(s('row-249'))
+    // first element
+    expect(VLOOKUP([n(0), vlookArr, n(2)], ctx)).toEqual(s('row-0'))
+    // last element
+    expect(VLOOKUP([n(1998), vlookArr, n(2)], ctx)).toEqual(s('row-999'))
+    // overshoot — last row matches (largest <= needle)
+    expect(VLOOKUP([n(99999), vlookArr, n(2)], ctx)).toEqual(s('row-999'))
+    // undershoot → #N/A
+    expect(VLOOKUP([n(-1), vlookArr, n(2)], ctx)).toEqual(errNA)
+  })
+
+  test('HLOOKUP approximate hits the right column on 1000-entry sorted row', () => {
+    const table = arr([ascRow, ascRow.map((_, i) => s(`col-${i}`))])
+    expect(HLOOKUP([n(500), table, n(2)], ctx)).toEqual(s('col-250'))
+    expect(HLOOKUP([n(499), table, n(2)], ctx)).toEqual(s('col-249'))
+    expect(HLOOKUP([n(-1), table, n(2)], ctx)).toEqual(errNA)
+  })
+
+  test('MATCH approximate (type=1) on 1000-entry sorted asc row', () => {
+    // 1-based index. Largest <= 1000 is element 500 (value 1000) → position 501.
+    expect(MATCH([n(1000), ascRowArr, n(1)], ctx)).toEqual(n(501))
+    // Largest <= 999 is element 499 (value 998) → position 500.
+    expect(MATCH([n(999), ascRowArr, n(1)], ctx)).toEqual(n(500))
+    // Below all → #N/A.
+    expect(MATCH([n(-1), ascRowArr, n(1)], ctx)).toEqual(errNA)
+  })
+
+  test('MATCH approximate (type=-1) on 1000-entry sorted desc row', () => {
+    const desc: Value[] = []
+    for (let i = 999; i >= 0; i -= 1) desc.push(n(i * 2))
+    const descArr = arr([desc])
+    // Smallest >= 999 in [1998..0] desc — that's 1000 at position 500
+    // (0-based index 499 in physical order).
+    expect(MATCH([n(999), descArr, n(-1)], ctx)).toEqual(n(500))
+    expect(MATCH([n(1998), descArr, n(-1)], ctx)).toEqual(n(1))
+    expect(MATCH([n(0), descArr, n(-1)], ctx)).toEqual(n(1000))
+    expect(MATCH([n(9999), descArr, n(-1)], ctx)).toEqual(errNA)
+  })
+
+  test('XLOOKUP search_mode = 2 (binary asc) exact and nearest', () => {
+    const lookCol: Value[][] = []
+    const retCol: Value[][] = []
+    for (let i = 0; i < 1000; i += 1) {
+      lookCol.push([n(i * 2)])
+      retCol.push([s(`v-${i}`)])
+    }
+    const look = arr(lookCol)
+    const ret = arr(retCol)
+    // exact (matchMode 0, searchMode 2)
+    expect(XLOOKUP([n(500), look, ret, blank, n(0), n(2)], ctx)).toEqual(s('v-250'))
+    // not found → #N/A
+    expect(XLOOKUP([n(501), look, ret, blank, n(0), n(2)], ctx)).toEqual(errNA)
+    // matchMode -1: exact or next smaller
+    expect(XLOOKUP([n(501), look, ret, blank, n(-1), n(2)], ctx)).toEqual(s('v-250'))
+    expect(XLOOKUP([n(-1), look, ret, blank, n(-1), n(2)], ctx)).toEqual(errNA)
+    // matchMode 1: exact or next larger
+    expect(XLOOKUP([n(501), look, ret, blank, n(1), n(2)], ctx)).toEqual(s('v-251'))
+    expect(XLOOKUP([n(99999), look, ret, blank, n(1), n(2)], ctx)).toEqual(errNA)
+  })
+
+  test('XLOOKUP search_mode = -2 (binary desc) exact and nearest', () => {
+    const lookCol: Value[][] = []
+    const retCol: Value[][] = []
+    for (let i = 999; i >= 0; i -= 1) {
+      lookCol.push([n(i * 2)])
+      retCol.push([s(`v-${i}`)])
+    }
+    const look = arr(lookCol)
+    const ret = arr(retCol)
+    expect(XLOOKUP([n(500), look, ret, blank, n(0), n(-2)], ctx)).toEqual(s('v-250'))
+    expect(XLOOKUP([n(501), look, ret, blank, n(0), n(-2)], ctx)).toEqual(errNA)
+    // matchMode -1: exact or next smaller (smaller value, not smaller index)
+    expect(XLOOKUP([n(501), look, ret, blank, n(-1), n(-2)], ctx)).toEqual(s('v-250'))
+    // matchMode 1: exact or next larger
+    expect(XLOOKUP([n(501), look, ret, blank, n(1), n(-2)], ctx)).toEqual(s('v-251'))
+  })
+
+  test('binary search falls back to linear on mixed-type lookup column', () => {
+    // First column mixes strings and numbers — not monotonically orderable
+    // by compareForLookup. The binary path returns BSEARCH_UNSORTABLE and
+    // the function falls back to the linear walk (which skips incompatible
+    // cells and returns the largest comparable hay <= needle, per the
+    // function's documented fallback).
+    const mixed = arr([
+      [s('foo'), s('label-a')],
+      [n(1), s('label-1')],
+      [n(2), s('label-2')],
+      [s('bar'), s('label-b')],
+      [n(5), s('label-5')],
+    ])
+    // Linear scan picks the largest numeric row <= 3 → row index 2 (n(2)).
+    expect(VLOOKUP([n(3), mixed, n(2)], ctx)).toEqual(s('label-2'))
+    // For XLOOKUP we explicitly request binary asc but the input is
+    // unsortable — must fall back, not error.
+    const look = arr([[s('foo')], [n(1)], [n(2)], [s('bar')], [n(5)]])
+    const ret = arr([[s('a')], [s('b')], [s('c')], [s('d')], [s('e')]])
+    // Exact match (matchMode 0) — should find n(2).
+    expect(XLOOKUP([n(2), look, ret, blank, n(0), n(2)], ctx)).toEqual(s('c'))
+  })
+
+  test('XLOOKUP wildcards (matchMode 2) with binary search reject as before', () => {
+    // matchMode=2 + searchMode=±2 was already rejected with #VALUE!; binary
+    // implementation keeps that contract.
+    const fruit = arr([[s('apple')], [s('banana')], [s('cherry')]])
+    const prices = arr([[n(1)], [n(2)], [n(3)]])
+    expect(XLOOKUP([s('ban*'), fruit, prices, blank, n(2), n(2)], ctx)).toEqual(errVAL)
+    expect(XLOOKUP([s('ban*'), fruit, prices, blank, n(2), n(-2)], ctx)).toEqual(errVAL)
+  })
+
+  test('empty lookup array returns #N/A (binary helper short-circuits at n=0)', () => {
+    const empty = arr([[]])
+    // VLOOKUP with empty table is caught earlier as #VALUE!; that path stays.
+    // For MATCH the empty path also surfaces as VALUE per existing wrapping,
+    // so this assertion just guards no infinite loop / no throw.
+    const result = MATCH([n(1), empty, n(1)], ctx)
+    expect(result.kind === 'error').toBe(true)
+  })
+})
+
+// ============================================================================
 // Registry sanity
 // ============================================================================
 
