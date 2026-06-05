@@ -100,16 +100,38 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 
 | Surface | Suites | Tests | Status |
 |---|---:|---:|---|
-| `vanilla/excel-core-ts` | 28 | **1702** | ✅ |
+| `vanilla/excel-core-ts` | 29 | **1767** | ✅ |
 | `vanilla/spreadsheet-ui-core` | 52 | **769** | ✅ |
 | `solid/excel` | 56 | **840** | ✅ |
-| Total monorepo jest | 186 | **3584** | ✅ |
+| Total monorepo jest | — | **3649** | ✅ |
 | `cargo test --lib` (rust/excel-core) | — | **1396** + 3 ignored | ✅ |
 | `cargo test --tests` (integration suites) | — | all green (15+ suites) | ✅ |
 | `cargo test --lib` (rust/wasm) | — | 29+ | ✅ |
 | `tsc -b` | — | — | ✅ clean |
 | e2e WASM | 515 | **478 / 0 / 37** | ✅ all green |
 | e2e TS | 515 | **478 / 0 / 37** | ✅ Δ=0 vs WASM, all green |
+
+### Function quality hardening (after `a1abdec`)
+
+Catalogued via `FUNCTION_QUALITY_2026-06-05.md`. Initial pass landed
+`10924eb` + `f42cb88` (5 S-fixes + 18 cataloged). Three follow-up agents
+attacked the M-difficulty layer:
+
+- **ERF/ERFC** `d7830d9`: Abramowitz polynomial (~1.5e-7) → Cody Chebyshev
+  rational (~1 ULP). ERF.PRECISE / ERFC.PRECISE alias intact.
+- **lookup binary search** `f5bc362`: VLOOKUP / HLOOKUP / MATCH approximate
+  match + XLOOKUP `search_mode = ±2` use shared `binarySearchSorted` with
+  exact / lte / gte modes; fall back to linear on unsortable input.
+- **Text** `4efc3f1`: ROMAN(0) → "" (was `#VALUE!`); DOLLAR / FIXED
+  regression coverage. Locale-aware separators remain L-difficulty.
+- **Stats** `dfafe73`: BETA.INV / GAMMA.INV Newton-Raphson seeded at mean
+  with bisection fallback. T.INV df=1 closed form (Cauchy); T.INV df>1 and
+  F.INV use Wilson-Hilferty seeds. STDEV/VAR family (12 variants) routed
+  through Welford's online algorithm for cancellation-resistant variance.
+- **Math** `f677e6d`: SUMPRODUCT uses Kahan-Babuška-Neumaier compensated
+  summation (recovers 1e20 + 1 − 1e20 → 1); SERIESSUM uses plain Kahan.
+
+**Net test growth from quality arc: 1702 → 1767 (+65 new tests).**
 
 ### Follow-up arc (2026-06-05) — landed since the v2 doc was written
 
