@@ -81,37 +81,69 @@ EINFACH_PERF=1 NODE_OPTIONS='--expose-gc --max-old-space-size=8192' \
 ```
 
 <!-- BENCH:RESULTS:START -->
-*Last bench run: 2026-05-27T09:57:33.424Z*
+*Last bench run: 2026-06-05T09:48:55.903Z*
 
 | Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Mega | setup | 221 | 1087 | 0.20× | acceptable |
-| Mega | bulkWrite | 919 | 479312 | 0.00× | acceptable |
-| Mega | readBack | 29985 | 60211 | 0.50× | acceptable |
-| Mega | recalc | 31634 | 62851 | 0.50× | acceptable |
+| Tiny | setup | 0.12 | 1.1 | 0.11× | acceptable |
+| Tiny | bulkWrite | 0.23 | 0.52 | 0.45× | acceptable |
+| Tiny | readBack | 1.1 | 0.52 | 2.21× | acceptable |
+| Tiny | recalc | 1.0 | 0.52 | 2.02× | acceptable |
+| Medium | setup | 3.1 | 17.2 | 0.18× | acceptable |
+| Medium | bulkWrite | 6.4 | 214 | 0.03× | acceptable |
+| Medium | readBack | 521 | 466 | 1.12× | acceptable |
+| Medium | recalc | 534 | 461 | 1.16× | acceptable |
+| Large | setup | 31.7 | 164 | 0.19× | acceptable |
+| Large | bulkWrite | 75.5 | 4608 | 0.02× | acceptable |
+| Large | readBack | 5276 | 5728 | 0.92× | acceptable |
+| Large | recalc | 5515 | 5628 | 0.98× | acceptable |
+| XLarge | setup | 96.9 | 444 | 0.22× | acceptable |
+| XLarge | bulkWrite | 383 | 35607 | 0.01× | acceptable |
+| XLarge | readBack | 37220 | 31221 | 1.19× | acceptable |
+| XLarge | recalc | 30479 | 30384 | 1.00× | acceptable |
+| Mega | setup | 241 | 942 | 0.26× | acceptable |
+| Mega | bulkWrite | 908 | 427585 | 0.00× | acceptable |
+| Mega | readBack | 60367 | 74961 | 0.81× | acceptable |
+| Mega | recalc | 66347 | 61193 | 1.08× | acceptable |
 
 ### Peak RSS by phase (MB)
 
 | Workload | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Mega | setup | 643 MB | 2012 MB |
-| Mega | bulkWrite | 1179 MB | 2663 MB |
-| Mega | readBack | 1689 MB | 2809 MB |
-| Mega | recalc | 2086 MB | 3349 MB |
+| Tiny | setup | 599 MB | 602 MB |
+| Tiny | bulkWrite | 599 MB | 602 MB |
+| Tiny | readBack | 599 MB | 604 MB |
+| Tiny | recalc | 599 MB | 604 MB |
+| Medium | setup | 657 MB | 708 MB |
+| Medium | bulkWrite | 657 MB | 708 MB |
+| Medium | readBack | 658 MB | 708 MB |
+| Medium | recalc | 660 MB | 708 MB |
+| Large | setup | 735 MB | 973 MB |
+| Large | bulkWrite | 769 MB | 1269 MB |
+| Large | readBack | 868 MB | 1268 MB |
+| Large | recalc | 968 MB | 1268 MB |
+| XLarge | setup | 1288 MB | 1674 MB |
+| XLarge | bulkWrite | 1311 MB | 1750 MB |
+| XLarge | readBack | 1529 MB | 2406 MB |
+| XLarge | recalc | 1582 MB | 2406 MB |
+| Mega | setup | 2619 MB | 3245 MB |
+| Mega | bulkWrite | 2852 MB | 2212 MB |
+| Mega | readBack | 3692 MB | 3409 MB |
+| Mega | recalc | 3182 MB | 3483 MB |
 
 ### Crossover analysis (TS-vs-WASM by tier)
 
 Ratio > 1.0× means TS is SLOWER than WASM. We track the first
 tier where each phase crosses (WASM regains advantage).
 
-- **setup**: Mega=0.20×
+- **setup**: Tiny=0.11×, Medium=0.18×, Large=0.19×, XLarge=0.22×, Mega=0.26×
   - crossover: TS still faster at largest measured tier
-- **bulkWrite**: Mega=0.00×
+- **bulkWrite**: Tiny=0.45×, Medium=0.03×, Large=0.02×, XLarge=0.01×, Mega=0.00×
   - crossover: TS still faster at largest measured tier
-- **readBack**: Mega=0.50×
-  - crossover: TS still faster at largest measured tier
-- **recalc**: Mega=0.50×
-  - crossover: TS still faster at largest measured tier
+- **readBack**: Tiny=2.21×, Medium=1.12×, Large=0.92×, XLarge=1.19×, Mega=0.81×
+  - crossover: Tiny (ratio 2.21×)
+- **recalc**: Tiny=2.02×, Medium=1.16×, Large=0.98×, XLarge=1.00×, Mega=1.08×
+  - crossover: Tiny (ratio 2.02×)
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
