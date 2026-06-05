@@ -177,19 +177,25 @@
   background: var(--hover, #e8e8e8);
 }
 
-/* Hide native radio circle visually while keeping it as the testid hook +
- * accessible focus target. */
+/* Hide native radio circle visually while keeping the input as the testid
+ * hook + accessible focus target. The input stretches over the whole row so
+ * direct clicks on its testid (e.g. from Playwright) hit the input itself —
+ * the label-forwarded click path also works for keyboard / mouse users. */
+.format-cells-dialog .format-cells-category-row {
+  position: relative;
+}
+
 .format-cells-dialog .format-cells-category-row input[type='radio'] {
   position: absolute;
-  width: 1px;
-  height: 1px;
+  inset: 0;
+  width: 100%;
+  height: 100%;
   margin: 0;
   padding: 0;
   border: 0;
-  clip: rect(0 0 0 0);
-  overflow: hidden;
   opacity: 0;
-  pointer-events: auto;
+  appearance: none;
+  cursor: pointer;
 }
 
 /* Selected-row highlight replaces the native radio dot. */

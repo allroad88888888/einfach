@@ -72,7 +72,8 @@ test.describe('toolbar — sanity', () => {
       'toolbar-btn-redo',
       'toolbar-btn-format-painter',
       'toolbar-btn-clear-format',
-      'toolbar-btn-print-preview',
+      // Wave 5 dropped the print-preview toolbar button; the print surface
+      // is still reachable via the menus.
       'toolbar-btn-comment',
       'toolbar-btn-font-family',
       'toolbar-btn-font-size',
@@ -109,7 +110,11 @@ test.describe('toolbar — sanity', () => {
   })
 })
 
-test.describe('toolbar — print preview', () => {
+// Wave 5 removed the print-preview toolbar button. The print surface stays
+// available via the menu bar; the dedicated print-preview spec covers the
+// overlay contract. The block below stays as a `describe.skip` so the
+// intent is preserved if a future wave re-introduces the button.
+test.describe.skip('toolbar — print preview (button removed in Wave 5)', () => {
   test.beforeEach(async ({ page }) => {
     guardConsoleErrors(page)
   })

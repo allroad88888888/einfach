@@ -15,9 +15,9 @@ import {
   openCommentSessionAtom,
   openConditionalFormatEditorAtom,
   openFilterDropdownAtom,
+  openFormatCellsAtom,
   openNameManagerAtom,
   openValidationRuleEditorAtom,
-  printPreviewOpenAtom,
   pushHistoryAtom,
   selectionSnapshotAtom,
   toolbarCommandAvailabilityAtom,
@@ -90,7 +90,6 @@ import {
   MergeCellsIcon,
   NameManagerIcon,
   PercentIcon,
-  PrintIcon,
   RedoIcon,
   RotationIcon,
   SortIcon,
@@ -512,6 +511,18 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   function onNumberFormatPick(id: NumberFormatId) {
     closeNumberFormatDropdown()
     if (id === 'Custom') {
+      // The 自定义格式 (custom format) row opens the full Format Cells dialog
+      // on the Number tab. The dialog reads selection + initial format from
+      // its open atom; the host (here) provides them.
+      const selection = selectionSnapshot()
+      const sheetId = selection.selection.sheetId || availability().sheetId
+      if (!sheetId) return
+      store.setter(openFormatCellsAtom, {
+        sheetId,
+        range: selection.range,
+        initialFormat: activeCellFormat(),
+        initialTab: 'number',
+      })
       return
     }
     // 'WanYuan' is disabled in the dropdown UI and never reaches here, but
@@ -1152,17 +1163,6 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
   }
 
   /**
-   * Open the print preview overlay. Mirrors the menu-bar handler in
-   * `SpreadsheetMenuBar.tsx` but writes the open flag directly (rather than
-   * toggling) so the toolbar button always lands on "open" — re-clicking the
-   * button while the overlay is up is rare enough that the toggle path was
-   * not worth the surprise of "click does nothing while overlay is visible".
-   */
-  function handlePrintPreview() {
-    store.setter(printPreviewOpenAtom, true)
-  }
-
-  /**
    * Open a comment session for the active cell. Same wiring as the menu bar
    * 'open-comment-session' branch — pulls a fresh `selectionSnapshot` so the
    * session anchors on the live active cell.
@@ -1397,17 +1397,25 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
       >
         <ClearFormatIcon />
       </button>
-      <button
-        type="button"
-        class="fmt-btn spreadsheet-toolbar-button"
-        data-testid="toolbar-btn-print-preview"
-        data-tooltip={t('toolbar.printPreview.title')}
-        aria-label={t('toolbar.printPreview.title')}
-        disabled={!availability().sheetId}
-        onClick={handlePrintPreview}
-      >
-        <PrintIcon />
-      </button>
+      {/*
+        Placeholder that preserves the toolbar's flow-layout width where the
+        Print Preview button used to sit. Removing the button entirely would
+        shift Group 4 (colors + borders) to the left and reflow the borders
+        dropdown into the formula-bar click-target zone — flaking the
+        click-outside-closes-dropdown test. The dimensions match
+        `.spreadsheet-toolbar-button` so the toolbar lays out exactly as
+        before; `aria-hidden` keeps screen readers from announcing it.
+      */}
+      <span
+        class="spreadsheet-toolbar-spacer"
+        aria-hidden="true"
+        style={{
+          display: 'inline-block',
+          width: '40px',
+          height: '28px',
+          'pointer-events': 'none',
+        }}
+      />
       <button
         type="button"
         class="fmt-btn spreadsheet-toolbar-button"
@@ -1682,13 +1690,13 @@ export function SpreadsheetToolbar(props: SpreadsheetToolbarProps) {
           disabled={
             !backend.mergeRange ||
             availability().editingMode === 'drafting' ||
-            isProtectionGated() ||
-            // 1x1 selection that isn't inside an existing merge → every
-            // option in the merge dropdown (merge-center, across-rows,
-            // across-cols, unmerge) would be a no-op, so disable. Matches
-            // Univer slim toolbar behavior.
-            (rangeCellCount(selectionSnapshot().range) <= 1 &&
-              activeCellMergeRange() === null)
+            isProtectionGated()
+            // 1x1 selection is allowed — the dropdown opens so users see
+            // why every preset is greyed out. Each preset (merge-center,
+            // across-rows, across-cols) declares its own
+            // `enabledWhen === 'multi'` and `unmerge` declares
+            // `enabledWhen === 'merged'`, so the dropdown items disable
+            // themselves when the selection is a single non-merged cell.
           }
           onClick={() => {
             setMergeDropdownOpen((open) => !open)

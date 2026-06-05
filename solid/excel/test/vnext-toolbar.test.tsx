@@ -11,6 +11,7 @@ import type {
   VisibleProjectionRequest,
 } from '@einfach/spreadsheet-ui-core'
 import {
+  formatCellsEditorAtom,
   formatPainterStateAtom,
   historyStackAtom,
   selectCellAtom,
@@ -26,25 +27,6 @@ import { SpreadsheetToolbar } from '../src-vnext/toolbar'
 
 const RAW_I18N_KEY_RE =
   /\b(?:toolbar|numberFormatDropdown|numberFormatDialog|formatCells)\.[A-Za-z0-9_.-]+/
-
-const MORE_FORMAT_LABELS = {
-  en: {
-    currency: /More currency formats(?:\.\.\.|…)?/,
-    'date-time': /More date (?:&|and) time formats(?:\.\.\.|…)?/,
-    number: /More number formats(?:\.\.\.|…)?/,
-  },
-  zh: {
-    currency: /更多货币格式(?:\.\.\.|…)?/,
-    'date-time': /更多日期(?:与|和)时间格式(?:\.\.\.|…)?/,
-    number: /更多数字格式(?:\.\.\.|…)?/,
-  },
-} as const
-
-const MORE_FORMAT_TEST_IDS = {
-  currency: 'number-format-custom-currency',
-  'date-time': 'number-format-custom-dateTime',
-  number: 'number-format-custom-number',
-} as const
 
 afterEach(() => {
   cleanup()
@@ -159,42 +141,6 @@ function getButtons(container: HTMLElement) {
       '[data-testid="toolbar-btn-format-painter"]',
     ) as HTMLButtonElement,
   }
-}
-
-function getMoreFormatButton(
-  kind: 'currency' | 'date-time' | 'number',
-  locale: 'en' | 'zh',
-): HTMLButtonElement | null {
-  const customTestId = MORE_FORMAT_TEST_IDS[kind]
-  const byCustomTestId = document.body.querySelector(
-    `[data-testid="${customTestId}"]`,
-  ) as HTMLButtonElement | null
-  if (byCustomTestId) return byCustomTestId
-
-  const byTestId = document.body.querySelector(
-    `[data-testid="number-format-more-${kind}"]`,
-  ) as HTMLButtonElement | null
-  if (byTestId) return byTestId
-
-  const label = MORE_FORMAT_LABELS[locale][kind]
-  const match = Array.from(document.body.querySelectorAll('button,[role="menuitem"]')).find((el) =>
-    label.test(el.textContent ?? ''),
-  )
-  return (match as HTMLButtonElement | undefined) ?? null
-}
-
-async function openCustomFormatSubmenu(container: HTMLElement) {
-  fireEvent.click(getButtons(container).numberFormat)
-  const dropdown = document.body.querySelector('[data-testid="number-format-dropdown"]')
-  expect(dropdown).not.toBeNull()
-  expect(dropdown?.textContent ?? '').not.toMatch(RAW_I18N_KEY_RE)
-
-  const custom = document.body.querySelector(
-    '[data-testid="number-format-item-Custom"]',
-  ) as HTMLButtonElement | null
-  expect(custom).not.toBeNull()
-  fireEvent.pointerEnter(custom!)
-  fireEvent.mouseEnter(custom!)
 }
 
 describe('vNext SpreadsheetToolbar', () => {
@@ -399,7 +345,11 @@ describe('vNext SpreadsheetToolbar', () => {
     })
   })
 
-  it('renders localized custom-format submenu entries without raw i18n keys', async () => {
+  it('renders the Custom row in the number-format dropdown without raw i18n keys', async () => {
+    // Wave 5 dropped the per-kind submenu (currency / date-time / number) and
+    // routes the Custom row to the full Format Cells dialog. The remaining
+    // contract here is that the Custom row renders with a localised label and
+    // no raw i18n keys in either supported locale.
     for (const locale of ['en', 'zh'] as const) {
       setLocale(locale)
       const store = createStore()
@@ -414,27 +364,29 @@ describe('vNext SpreadsheetToolbar', () => {
         </SpreadsheetUiProvider>
       ))
 
-      await openCustomFormatSubmenu(container)
+      fireEvent.click(getButtons(container).numberFormat)
+      const dropdown = document.body.querySelector('[data-testid="number-format-dropdown"]')
+      expect(dropdown).not.toBeNull()
+      expect(dropdown?.textContent ?? '').not.toMatch(RAW_I18N_KEY_RE)
 
-      await waitFor(() => {
-        expect(getMoreFormatButton('currency', locale)).not.toBeNull()
-        expect(getMoreFormatButton('date-time', locale)).not.toBeNull()
-        expect(getMoreFormatButton('number', locale)).not.toBeNull()
-      })
-      const text = [
-        getMoreFormatButton('currency', locale)?.textContent,
-        getMoreFormatButton('date-time', locale)?.textContent,
-        getMoreFormatButton('number', locale)?.textContent,
-      ].join(' ')
-      expect(text).toMatch(MORE_FORMAT_LABELS[locale].currency)
-      expect(text).toMatch(MORE_FORMAT_LABELS[locale]['date-time'])
-      expect(text).toMatch(MORE_FORMAT_LABELS[locale].number)
-      expect(text).not.toMatch(RAW_I18N_KEY_RE)
+      const custom = document.body.querySelector(
+        '[data-testid="number-format-item-Custom"]',
+      ) as HTMLButtonElement | null
+      expect(custom).not.toBeNull()
+      expect((custom?.textContent ?? '').trim()).not.toBe('')
+      expect(custom?.textContent ?? '').not.toMatch(RAW_I18N_KEY_RE)
+
+      // The dropdown no longer renders a nested submenu — the Custom row is a
+      // plain item with no aria-haspopup and no submenu siblings.
+      expect(custom?.getAttribute('aria-haspopup')).toBeNull()
+      expect(
+        document.body.querySelector('[data-testid="number-format-custom-submenu"]'),
+      ).toBeNull()
       cleanup()
     }
   })
 
-  it('opens the currency number-format dialog from the custom-format submenu', async () => {
+  it('opens the Format Cells dialog from the Custom number-format row', async () => {
     const store = createStore()
     const backend = createFakeBackend()
 
@@ -447,17 +399,25 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    await openCustomFormatSubmenu(container)
-    await waitFor(() => expect(getMoreFormatButton('currency', 'en')).not.toBeNull())
-    fireEvent.click(getMoreFormatButton('currency', 'en')!)
+    fireEvent.click(getButtons(container).numberFormat)
+    const custom = document.body.querySelector(
+      '[data-testid="number-format-item-Custom"]',
+    ) as HTMLButtonElement | null
+    expect(custom).not.toBeNull()
+    fireEvent.click(custom!)
 
     await waitFor(() => {
-      const state = store.getter(numberFormatDialogAtom)
-      if (state.status !== 'open') throw new Error('number-format dialog did not open')
-      expect(state.kind).toBe('currency')
+      const state = store.getter(formatCellsEditorAtom)
+      if (state.status !== 'open') throw new Error('Format Cells dialog did not open')
+      // The Custom row routes to the Number tab on first open so users land
+      // where the dropdown left them.
+      expect(state.activeTab).toBe('number')
       expect(state.range).toEqual({ rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 })
-      expect(state.digits).toBe(2)
     })
+
+    // The lightweight per-kind dialog must NOT open along the new path.
+    const lightweight = store.getter(numberFormatDialogAtom)
+    expect(lightweight.status).toBe('closed')
   })
 
   it('calls backend merge and unmerge ports for the current selection range', async () => {
@@ -589,7 +549,7 @@ describe('vNext SpreadsheetToolbar', () => {
     expect(buttons.merge.disabled).toBe(true)
   })
 
-  it('renders Print Preview, Comment, and Decimal-adjust toolbar buttons', () => {
+  it('renders Comment and Decimal-adjust toolbar buttons', () => {
     const store = createStore()
     const backend = createFakeBackend()
 
@@ -602,10 +562,12 @@ describe('vNext SpreadsheetToolbar', () => {
       </SpreadsheetUiProvider>
     ))
 
-    // The toolbar surfaces Print Preview + Comment alongside the existing
-    // history group, and a pair of Increase / Decrease Decimal buttons at
-    // the end of the number-format group.
-    expect(container.querySelector('[data-testid="toolbar-btn-print-preview"]')).not.toBeNull()
+    // The toolbar surfaces a Comment button alongside the existing history
+    // group, plus a pair of Increase / Decrease Decimal buttons at the end
+    // of the number-format group. Print Preview was removed for the Wave 5
+    // Univer-parity layout (still reachable via menus); the explicit
+    // negative check pins that contract.
+    expect(container.querySelector('[data-testid="toolbar-btn-print-preview"]')).toBeNull()
     expect(container.querySelector('[data-testid="toolbar-btn-comment"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="toolbar-btn-inc-decimal"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="toolbar-btn-dec-decimal"]')).not.toBeNull()

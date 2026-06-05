@@ -283,7 +283,14 @@ async function saveDialog(dialog: Locator) {
   await expect(dialog).toBeHidden()
 }
 
-test.describe('Wave 5 — more number formats', () => {
+// Wave 5 removed the per-kind "more <category> formats" submenu under the
+// Custom row of the number-format dropdown. The Custom row now routes
+// directly to the full Format Cells dialog (see audit-format.spec.ts).
+// The lightweight per-kind dialogs (`SpreadsheetNumberFormatDialogs`) remain
+// available for hosts that wire them up explicitly, but the toolbar demo no
+// longer surfaces them so these tests stay skipped until/unless the submenu
+// returns.
+test.describe.skip('Wave 5 — more number formats (submenu removed in Wave 5)', () => {
   test('custom-format submenu and dialog title are localized in English and Chinese', async ({
     page,
   }) => {

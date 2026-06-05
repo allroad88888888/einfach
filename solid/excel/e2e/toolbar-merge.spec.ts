@@ -42,7 +42,7 @@ function assertNotRawLabel(label: string | null, keyCandidate: string, context: 
 }
 
 test.describe('Wave 5 toolbar merge', () => {
-  test('toolbar-btn-merge is visible, labels are localized, and single-cell non-merge is disabled', async ({
+  test('toolbar-btn-merge is visible, labels are localized, and stays enabled on single-cell non-merge so the dropdown explains why presets are greyed', async ({
     page,
   }) => {
     await gotoWave5(page)
@@ -57,7 +57,10 @@ test.describe('Wave 5 toolbar merge', () => {
     assertNotRawLabel(ariaLabel, 'toolbar.merge.title', 'toolbar aria-label')
     expect(tooltip).toBe('Merge cells')
     expect(ariaLabel).toBe('Merge cells')
-    await expect(button).toBeDisabled()
+    // Wave 5 keeps the button enabled so the dropdown opens and the user sees
+    // why every preset is greyed out (1x1 + not-in-merge → all four presets
+    // are no-ops). Per-item disable lives in `MergeDropdown`.
+    await expect(button).toBeEnabled()
   })
 
   test('multi-cell selection enables merge and opens the dropdown', async ({ page }) => {
