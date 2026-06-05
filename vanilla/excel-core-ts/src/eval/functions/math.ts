@@ -538,20 +538,6 @@ function unaryNumber(args: ReadonlyArray<Value>, fn: (n: number) => number): Val
   return NUM(out)
 }
 
-/** Generic 2-arg numeric helper. */
-function binaryNumber(args: ReadonlyArray<Value>, fn: (a: number, b: number) => number): Value {
-  const propagated = propagateError(args)
-  if (propagated) return propagated
-  if (args.length !== 2) return ERR('#VALUE!')
-  const a = toNumber(args[0])
-  if (!a.ok) return a.error
-  const b = toNumber(args[1])
-  if (!b.ok) return b.error
-  const out = fn(a.value, b.value)
-  if (!Number.isFinite(out) || Number.isNaN(out)) return ERR('#NUM!')
-  return NUM(out)
-}
-
 // Trig & inverse trig
 export const SIN: FunctionImpl = (args) => unaryNumber(args, Math.sin)
 export const COS: FunctionImpl = (args) => unaryNumber(args, Math.cos)
