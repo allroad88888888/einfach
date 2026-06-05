@@ -1561,7 +1561,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   ): { kind: 'cell'; row: number; col: number } | { kind: 'range'; row: number; col: number; range: CellRange } {
     const range = getSelectionRangeContaining(row, col)
     if (range) {
-      return { kind: 'range', row, col, range }
+      // A single-cell "range" (rowStart===rowEnd && colStart===colEnd) is
+      // semantically a cell target — the menu surface treats `kind: 'cell'`
+      // vs `kind: 'range'` as the "single cell vs multi-cell selection"
+      // distinction, so collapsing 1x1 ranges keeps the context menu's
+      // `data-menu-target-kind="cell"` invariant for the default A1 cursor
+      // (vnext-smoke.spec.ts 'toolbar and context menu use vNext interaction
+      // atoms') without losing the multi-cell range path used by adjacent
+      // tests ('range context menu clear preserves selection...').
+      const isSingleCell =
+        range.rowStart === range.rowEnd && range.colStart === range.colEnd
+      if (!isSingleCell) {
+        return { kind: 'range', row, col, range }
+      }
     }
 
     return { kind: 'cell', row, col }
