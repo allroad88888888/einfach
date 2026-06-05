@@ -246,9 +246,28 @@ export function SpreadsheetGoToDialog(props: SpreadsheetGoToDialogProps) {
       // the used range — they fall back to the used range when no rect-like
       // selection is active.
       const selectionRect = snap.range
+      // For row/column differences, the comparison anchor in Excel is the
+      // active cell of the selection — which Excel keeps at the cell the
+      // user originally clicked (the selection's `anchor`), even after a
+      // Shift+click extends the selection. Our `snap.activeCell` derives
+      // from the selection's focus instead (Shift+click on D5 leaves focus
+      // = D5), so we pass the rect's top-left corner explicitly so the
+      // engine compares against the first column / first row of the
+      // selection rather than the last cell the pointer landed on.
+      // Pinned by `go-to.spec.ts:253` 'row differences scoped to selection
+      // rect, not the used range' (anchor column expected to be B, not D).
+      const isDifferencesLocator =
+        locator().kind === 'row-differences' || locator().kind === 'column-differences'
+      const scanActiveCell = isDifferencesLocator
+        ? {
+            sheetId: activeSheetId,
+            row: selectionRect.rowStart,
+            col: selectionRect.colStart,
+          }
+        : snap.activeCell
       const scan = runGoToSpecialScan(locator(), {
         sheetId: activeSheetId,
-        activeCell: snap.activeCell,
+        activeCell: scanActiveCell,
         cells: candidates,
         searchRect: usedRange,
         selectionRect,
