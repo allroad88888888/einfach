@@ -1,31 +1,36 @@
 # vNext e2e — Backend Parity Matrix
 
-Last full audited: 2026-05-28 (Phase 5 — full 59-spec audit, dual project run)
-Targeted update: 2026-05-29 — TS `snapshotPersistenceV1.sizes` gap fixed and
-the two targeted `vnext-worker-backend.spec.ts` size tests pass on both
-`--project=ts` and `--project=wasm` (4 tests total). The full 59-spec
-dual-project audit was not re-run after this targeted fix.
+Last full audited: 2026-06-05 (post-500-fn-parity arc; full 59-spec audit, dual project run)
+Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
+`snapshotPersistenceV1.sizes` on TS.
 
 ## Summary (full run, both projects)
 
 | Project | Passed | Failed | Skipped (in spec) | Total |
 |---------|-------:|-------:|------------------:|------:|
-| `wasm`  |    462 |     24 |                29 |   515 |
-| `ts`    |    460 |     26 |                29 |   515 |
+| `wasm`  |  **465** | **21** |                29 |   515 |
+| `ts`    |  **461** | **25** |                29 |   515 |
 
-**Pre-fix Δ between projects:** TS introduced **two additional failures**, both
-in `vnext-worker-backend.spec.ts` (snapshotPersistenceV1 `sizes` payload). That
-gap has since been fixed in the TS worker runtime; every other failure from the
-full audit (24) reproduced identically on both projects and is a pre-existing
-UI bug, not a backend-parity issue.
+**Δ since 2026-05-28 baseline** (wasm 462/24/29 ; ts 460/26/29):
+- WASM: +3 pass / −3 fail (3 specs moved red → green).
+- TS: +1 pass / −1 fail (the `snapshotPersistenceV1.sizes` 2 specs moved green
+  via the 2026-05-29 targeted fix; a few worker-backend behaviors shifted in
+  both directions during the 500-fn / evaluator-aware arc).
+
+**Δ between projects after this audit:** TS shows 4 more failures than WASM.
+The TS-only failures cluster in `vnext-worker-backend.spec.ts` (lazy 3-sheet
+chain rendering, sparse range chunked snapshots, paste large TSV through
+worker bulk import) plus `formulas-wasm.spec.ts` (MIN/MAX initial render) and
+`smoke.spec.ts` (formula commit display). These are surface-area gaps where
+the TS worker's RPC sequence or rendering signal differs from the Rust
+worker's, not formula-engine bugs.
 
 Out of 59 spec files:
-- **49** pass cleanly on **both** projects.
-- **9** have pre-existing UI failures that reproduce on both projects (so the
-  spec is partially red, but identically red — not a parity issue).
-- **1** (`vnext-worker-backend.spec.ts`) had 5 fails on TS vs 3 on WASM in the
-  full audit; the 2 extra TS-only size failures are now fixed by the targeted
-  update above.
+- ~49 pass cleanly on **both** projects.
+- ~9 have pre-existing UI failures that reproduce on both projects (partially
+  red, but identically red — not a parity issue; cluster in
+  `audit-format.spec.ts` as the largest at 9 fails).
+- 1 (`vnext-worker-backend.spec.ts`) has the residual TS-only gap.
 
 The audit reads `?backend=ts` and `?backend=wasm` from the Playwright project
 name via `gotoRoot(page)` / `withEnglishLocale()` helpers. Only the
