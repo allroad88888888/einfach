@@ -1950,6 +1950,49 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 
+  it('applies custom number formats from worker format snapshots', async () => {
+    const client = createFakeWorkerWorkbookClient()
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client,
+      sheets: ['Sheet1'],
+      revision: 5,
+    })
+
+    await backend.ready()
+    client.putCell({
+      sheet: 0,
+      addr: 'A1',
+      display: '1234.5',
+      type: 'number',
+      isError: false,
+      formula: '',
+    })
+    await client.setFormatRange(
+      { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+      { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
+    )
+
+    const result = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 13,
+        window: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      }),
+    )
+
+    expect(result.cells).toEqual([
+      {
+        row: 0,
+        col: 0,
+        displayValue: '1,234.50 kg',
+        valueKind: 'number',
+        format: { numberFormat: { kind: 'custom', pattern: '#,##0.00" kg"' } },
+      },
+    ])
+
+    backend.dispose()
+  })
+
   it('applies worker backend toolbar overlays instead of silently no-oping', async () => {
     const client = createFakeWorkerWorkbookClient()
     const backend = createWorkerWorkbookSpreadsheetBackend({

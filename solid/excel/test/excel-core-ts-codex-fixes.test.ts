@@ -139,9 +139,11 @@ describe('codex review fixes', () => {
   })
 
   describe('P2.1 — whole-column range is bounded', () => {
-    test('=SUM(A:A) does not hang; returns #NUM!', async () => {
+    test('=SUM(A:A) does not hang; aggregates sparsely', async () => {
       const { rpc } = makeRpc()
       await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '10' })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A2', formula: '20' })
       const before = Date.now()
       await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'B1', formula: '=SUM(A:A)' })
       const [b1] = (await rpc({
@@ -149,9 +151,9 @@ describe('codex review fixes', () => {
         cells: [{ sheet: 0, addr: 'B1' }],
       })) as Array<{ display: string; isError: boolean }>
       const elapsed = Date.now() - before
-      expect(elapsed).toBeLessThan(1000) // bounded — was hanging the worker before
-      expect(b1.isError).toBe(true)
-      expect(b1.display).toMatch(/#NUM!|#VALUE!/)
+      expect(elapsed).toBeLessThan(1000)
+      expect(b1.isError).toBe(false)
+      expect(b1.display).toBe('30')
     })
   })
 

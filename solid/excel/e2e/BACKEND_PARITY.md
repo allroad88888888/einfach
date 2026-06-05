@@ -1,6 +1,10 @@
 # vNext e2e — Backend Parity Matrix
 
-Last audited: 2026-05-28 (Phase 5 — full 59-spec audit, dual project run)
+Last full audited: 2026-05-28 (Phase 5 — full 59-spec audit, dual project run)
+Targeted update: 2026-05-29 — TS `snapshotPersistenceV1.sizes` gap fixed and
+the two targeted `vnext-worker-backend.spec.ts` size tests pass on both
+`--project=ts` and `--project=wasm` (4 tests total). The full 59-spec
+dual-project audit was not re-run after this targeted fix.
 
 ## Summary (full run, both projects)
 
@@ -9,17 +13,19 @@ Last audited: 2026-05-28 (Phase 5 — full 59-spec audit, dual project run)
 | `wasm`  |    462 |     24 |                29 |   515 |
 | `ts`    |    460 |     26 |                29 |   515 |
 
-**Δ between projects:** TS introduces **two additional failures**, both in
-`vnext-worker-backend.spec.ts` (snapshotPersistenceV1 `sizes` payload — see
-"Known TS-only gap" below). Every other failure (24) reproduces identically on
-both projects and is a pre-existing UI bug, not a backend-parity issue.
+**Pre-fix Δ between projects:** TS introduced **two additional failures**, both
+in `vnext-worker-backend.spec.ts` (snapshotPersistenceV1 `sizes` payload). That
+gap has since been fixed in the TS worker runtime; every other failure from the
+full audit (24) reproduced identically on both projects and is a pre-existing
+UI bug, not a backend-parity issue.
 
 Out of 59 spec files:
 - **49** pass cleanly on **both** projects.
 - **9** have pre-existing UI failures that reproduce on both projects (so the
   spec is partially red, but identically red — not a parity issue).
-- **1** (`vnext-worker-backend.spec.ts`) has 5 fails on TS vs 3 on WASM —
-  2 extra failures are the real TS-only gap.
+- **1** (`vnext-worker-backend.spec.ts`) had 5 fails on TS vs 3 on WASM in the
+  full audit; the 2 extra TS-only size failures are now fixed by the targeted
+  update above.
 
 The audit reads `?backend=ts` and `?backend=wasm` from the Playwright project
 name via `gotoRoot(page)` / `withEnglishLocale()` helpers. Only the
@@ -174,32 +180,32 @@ each project. Both runs pass.
   capability-gating test runs against the static demo and degrades the
   same way on both projects.
 
-### Known TS-only failures (1 spec, 2 tests)
+### Resolved TS-only gap (1 spec, 2 tests)
 
 - `vnext-worker-backend.spec.ts` (7 tests):
   Three tests fail on **both** projects (sibling agent is fixing the DOM
-  count assertions there). Two additional tests fail **only on TS**:
+  count assertions there). Two additional tests failed **only on TS** before
+  the targeted update:
 
   - line 380 — `persists row and column size metadata as Rust sparse facts`
   - line 447 — `autofits visible column size and persists the override`
 
   Both tests poll `window.__einfachWorkbookDebugClient.snapshotPersistenceV1()`
   and assert that the returned `sizes[<sheet>].rowHeights/colWidths` arrays
-  contain entries for the manually resized row/column. The WASM worker
-  implements this via `Workbook::snapshot_persistence_v1` (Rust); the TS
-  worker (`solid/excel/src-vnext/adapter/worker-runtime-ts.ts:1148`)
-  currently returns `{ version, sheets, cells }` without a `sizes`
-  field — viewport sizes are not part of the TS workbook's persistence
-  surface yet.
+  contain entries for the manually resized row/column. The TS worker now keeps
+  row-height / column-width metadata in `worker-runtime-ts.ts` and emits it via
+  both `snapshotViewportSizes` and `snapshotPersistenceV1`.
 
-  Not skipped at the e2e layer because **the spec file is owned by a
-  sibling agent fixing related DOM count assertions in parallel**. Fix
-  belongs in either:
+  Targeted recheck on 2026-05-29:
 
-  1. `worker-runtime-ts.ts` — implement a `sizes` field, mirroring
-     `snapshotViewportSizes` from `worker-runtime.ts`, OR
-  2. the spec itself — guard the size assertions on `project.name === 'ts'`
-     once the sibling's DOM count work lands.
+  ```bash
+  NO_PROXY=localhost,127.0.0.1 \
+    npx playwright test e2e/vnext-worker-backend.spec.ts \
+      --project=ts --project=wasm \
+      -g "persists row and column size metadata|autofits visible column size"
+  ```
+
+  Result: 4 passed.
 
   See "What the debug-probe RPC surfaces" below for context on which TS
   RPCs are already present.
@@ -247,8 +253,8 @@ exact divergence rules. The `observability.spec.ts` lazy-import test only
 asserts on the *never-read* state, which both backends agree on, so it
 runs identically.
 
-The viewport-size RPC (`snapshotPersistenceV1.sizes`) is the only known
-RPC asymmetry — see the "Known TS-only failures" section above.
+The previous viewport-size RPC asymmetry (`snapshotPersistenceV1.sizes`) is now
+fixed — see the "Resolved TS-only gap" section above.
 
 ## Shadow specs intentionally kept
 
@@ -274,16 +280,16 @@ Folding them into the main spec is a follow-up cleanup once both above hold.
    29 skipped, 7m 48s wall clock.
 3. **Diff:** stripped per-test timing and compared failure sets via
    `comm`. Found 24 failures common to both projects (pre-existing UI
-   bugs) and 2 TS-only failures (snapshotPersistenceV1 sizes gap).
+   bugs) and 2 TS-only failures (snapshotPersistenceV1 sizes gap, fixed
+   by the targeted update above).
 4. **No `test.skip(project === 'ts', …)` calls were added**: every TS
    failure either reproduces on WASM (so the breakage is upstream of the
    backend) or lives in a spec file owned by a sibling agent. Adding skips
    would mask the matching WASM failures without reducing the failure
    count, and would conflict with the sibling agent's edits.
 
-Net result: the TS backend is at 99.6% e2e parity with WASM (460/462 of
-the WASM-passing tests also pass on TS), with the only divergence being
-the snapshotPersistenceV1 sizes RPC. Every other observable behavior —
-formula evaluation, custom-formula dispatch, lazy projection, sparse
-range snapshots over chunked import, sheet-tab reordering, ctrl-arrow
-navigation — round-trips identically through both worker backends.
+Pre-fix net result: the TS backend was at 99.6% e2e parity with WASM
+(460/462 of the WASM-passing tests also pass on TS), with the only divergence
+being the snapshotPersistenceV1 sizes RPC. After the targeted fix, that known
+RPC divergence is resolved; a full dual-project re-audit should refresh the
+table above.

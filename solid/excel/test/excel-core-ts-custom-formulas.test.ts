@@ -256,14 +256,47 @@ describe('worker-runtime-ts custom formulas — registration + dispatch', () => 
     const runtime = createWorkerRuntimeTs()
     const { rpc, sheetIdx } = await initSheet(runtime)
 
+    const codes = [
+      '#NULL!',
+      '#DIV/0!',
+      '#N/A',
+      '#REF!',
+      '#VALUE!',
+      '#NAME?',
+      '#NUM!',
+      '#CYCLE!',
+      '#TYPE!',
+      '#ARGS!',
+      '#SPILL!',
+      '#CALC!',
+    ] as const
+    for (const [i, code] of codes.entries()) {
+      const name = `FAIL${i}`
+      const addr = `A${i + 1}`
+      await rpc({
+        cmd: 'registerCustomFormula',
+        name,
+        source: `return ${JSON.stringify(code)}`,
+      })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr, formula: `=${name}()` })
+      const cell = await readCellDisplay(rpc, sheetIdx, addr)
+      expect(cell.isError).toBe(true)
+      expect(cell.display).toBe(code)
+    }
+
     await rpc({
       cmd: 'registerCustomFormula',
-      name: 'FAILNA',
-      source: 'return "#N/A"',
+      name: 'CIRCULARTEXT',
+      source: 'return "#CIRCULAR!"',
     })
-    await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=FAILNA()' })
-    const b1 = await readCellDisplay(rpc, sheetIdx, 'B1')
-    expect(b1.isError).toBe(true)
-    expect(b1.display).toBe('#N/A')
+    await rpc({
+      cmd: 'setFormulaDetailed',
+      sheet: sheetIdx,
+      addr: 'B1',
+      formula: '=CIRCULARTEXT()',
+    })
+    const circularText = await readCellDisplay(rpc, sheetIdx, 'B1')
+    expect(circularText.isError).toBe(false)
+    expect(circularText.display).toBe('#CIRCULAR!')
   })
 })

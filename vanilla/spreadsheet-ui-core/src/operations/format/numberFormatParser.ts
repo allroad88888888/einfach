@@ -16,8 +16,10 @@
  * - `[Red]`, `[Blue]`, `[Green]`, `[Black]`, `[White]`, `[Cyan]`, `[Magenta]`,
  *   `[Yellow]` — color tag for the section
  * - `[>0]`, `[<0]`, `[=0]`, `[>=N]`, `[<=N]`, `[<>N]` — section condition
+ * - `[$-409]`, `[$¥-411]`, `[$$-409]` — locale / currency tags are stripped
  * - `"literal"` — literal passthrough
  * - `\<char>` — escaped literal
+ * - `@` — text placeholder in text sections
  * - `m`, `mm`, `mmm`, `mmmm` — month number / padded / short name / long name
  * - `d`, `dd`, `ddd`, `dddd` — day number / padded / short name / long name
  * - `yy`, `yyyy` — two- / four-digit year
@@ -31,7 +33,7 @@
  *
  * - `*` (repeat next char) is ignored.
  * - `_` (skip width of next char) is treated as a single space.
- * - Locale tags such as `[$-409]` are stripped and ignored.
+ * - Locale / currency tags such as `[$-409]` are stripped and not applied.
  * - `@` text placeholder in numeric sections is not supported.
  * - Fractional-second modifiers (`s.000`) collapse to plain `ss`.
  */
@@ -46,6 +48,10 @@ const COLOR_TAGS = new Map<string, string>([
   ['magenta', '#ff00ff'],
   ['yellow', '#ffff00'],
 ])
+
+function isCurrencyOrLocaleTag(tag: string): boolean {
+  return tag.startsWith('$')
+}
 
 const MONTH_SHORT = [
   'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -97,6 +103,7 @@ export type NumberFormatTokenKind =
   | 'decimal-point'
   | 'thousands'
   | 'percent'
+  | 'text-placeholder'
   | 'month'
   | 'day'
   | 'year'
@@ -235,7 +242,7 @@ export function parseSection(input: string): NumberFormatSection {
       continue
     }
 
-    // Bracket tag: `[Red]`, `[>0]`, `[$-409]`
+    // Bracket tag: `[Red]`, `[>0]`, `[$¥-411]`
     if (ch === '[') {
       const end = input.indexOf(']', i)
       if (end === -1) {
@@ -249,7 +256,7 @@ export function parseSection(input: string): NumberFormatSection {
         color = COLOR_TAGS.get(lower)
       } else if (lower.startsWith('color')) {
         // [Color5] etc.  Skip; not supported.
-      } else if (lower.startsWith('$')) {
+      } else if (isCurrencyOrLocaleTag(tag)) {
         // Locale or currency override.  Strip; not supported.
       } else {
         const parsed = parseConditionTag(tag)
@@ -299,6 +306,11 @@ export function parseSection(input: string): NumberFormatSection {
     }
     if (ch === '%') {
       tokens.push({ kind: 'percent', text: ch })
+      i += 1
+      continue
+    }
+    if (ch === '@') {
+      tokens.push({ kind: 'text-placeholder', text: ch })
       i += 1
       continue
     }
@@ -512,7 +524,7 @@ function evaluateTextSection(
       out += token.text
       continue
     }
-    if (token.kind === 'digit-required' && token.text === '@') {
+    if (token.kind === 'text-placeholder') {
       out += text
       hadPlaceholder = true
       continue

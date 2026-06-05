@@ -109,6 +109,21 @@ describe('parseSection token parsing', () => {
     expect(section.color).toBe('#ff0000')
   })
 
+  test('strips currency and locale bracket tags without literal tokens', () => {
+    const section = parseSection('[$¥-411]#,##0.00')
+    expect(section.tokens.map((t) => t.kind)).toEqual([
+      'digit-optional',
+      'thousands',
+      'digit-optional',
+      'digit-optional',
+      'digit-required',
+      'decimal-point',
+      'digit-required',
+      'digit-required',
+    ])
+    expect(section.tokens.some((t) => t.kind === 'literal')).toBe(false)
+  })
+
   test('parses condition tags', () => {
     const section = parseSection('[>0]0.00')
     expect(section.condition).toEqual({ op: '>', value: 0 })
@@ -121,6 +136,11 @@ describe('parseSection token parsing', () => {
     const literalText = section.tokens.filter((t) => t.kind === 'literal').map((t) => t.text)
     expect(literalText).toContain('USD ')
     expect(literalText).toContain('!')
+  })
+
+  test('parses text placeholder tokens', () => {
+    const section = parseSection('"SKU-"@')
+    expect(section.tokens.map((t) => t.kind)).toEqual(['literal', 'text-placeholder'])
   })
 
   test('detects date and time tokens', () => {
@@ -312,6 +332,27 @@ describe('formatNumberValue — kinds', () => {
 
   test('custom pattern with literal currency string and grouping', () => {
     expect(formatCustomNumber('"€"#,##0.00', 1234.5).text).toBe('€1,234.50')
+  })
+
+  test('custom pattern strips bracket currency tags while keeping number format', () => {
+    expect(formatCustomNumber('[$¥-411]#,##0.00', 1234.5).text).toBe('1,234.50')
+    expect(formatCustomNumber('[$$-409]#,##0.00', 1234.5).text).toBe('1,234.50')
+
+    const colored = formatCustomNumber('[Red][$¥-411]#,##0.00', 1234.5)
+    expect(colored.text).toBe('1,234.50')
+    expect(colored.color).toBe('#ff0000')
+  })
+
+  test('custom pattern with text section placeholder', () => {
+    expect(formatCustomNumber('0;[Red](0);"-";"SKU-"@', 'A12').text).toBe('SKU-A12')
+  })
+
+  test('custom pattern with quoted literal suffix', () => {
+    expect(formatCustomNumber('0.0" kg"', 12.34).text).toBe('12.3 kg')
+  })
+
+  test('custom pattern with trailing comma scaling', () => {
+    expect(formatCustomNumber('#,##0,', 1234567).text).toBe('1,235')
   })
 
   test('custom menu number patterns render digits, grouping, parens, and colors', () => {
