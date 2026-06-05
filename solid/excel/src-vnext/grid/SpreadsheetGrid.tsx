@@ -1275,11 +1275,19 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       }
     }
 
+    // Anchor at the top-left, focus at the bottom-right: the natural user
+    // mental model for "I clicked this cell and the selection grew to cover
+    // the merged region". A subsequent Shift+click extends from the top-left
+    // anchor (not the bottom-right), so clicking a merge-anchor A1 (which
+    // expands to A1:B2) and then Shift+clicking C3 lands on the rect A1:C3,
+    // letting the copy-as HTML encoder emit `rowspan="2" colspan="2"` for
+    // the merge anchor. Pinned by `copy-as.spec.ts:210` 'emits
+    // rowspan/colspan on the anchor of a merged A1:B2 region'.
     return {
       kind: 'range',
       sheetId: props.sheetId,
-      anchor: { row: range.rowEnd, col: range.colEnd },
-      focus: { row: range.rowStart, col: range.colStart },
+      anchor: { row: range.rowStart, col: range.colStart },
+      focus: { row: range.rowEnd, col: range.colEnd },
     }
   }
 
