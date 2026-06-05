@@ -2839,6 +2839,8 @@ const ROMAN: FunctionImpl = (args) => {
   if (err) return err
   const nR = readInteger(args[0])
   if (!nR.ok) return nR.error
+  // Excel: ROMAN(0) returns an empty string; out-of-range values are #VALUE!.
+  if (nR.value === 0) return { kind: 'string', value: '' }
   if (nR.value < 1 || nR.value > 3999) return ERR_VALUE
   let form = 0
   if (args.length === 2) {

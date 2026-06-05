@@ -287,10 +287,34 @@ describe('NUMBERVALUE / DOLLAR / FIXED', () => {
     expect(call('DOLLAR', [NUM(1234.567), NUM(0)])).toEqual(STR('$1,235'))
   })
 
+  test('DOLLAR default decimals is 2 and arg count is enforced', () => {
+    // Explicit default — DOLLAR(n) === DOLLAR(n, 2).
+    expect(call('DOLLAR', [NUM(99.5)])).toEqual(call('DOLLAR', [NUM(99.5), NUM(2)]))
+    expect(call('DOLLAR', [NUM(0)])).toEqual(STR('$0.00'))
+    // Arg-count guards still fire with #VALUE!.
+    expect(call('DOLLAR', []).kind).toBe('error')
+    expect((call('DOLLAR', []) as { code: string }).code).toBe('#VALUE!')
+    expect(call('DOLLAR', [NUM(1), NUM(2), NUM(3)]).kind).toBe('error')
+  })
+
   test('FIXED formats numbers and honors no_commas', () => {
     expect(call('FIXED', [NUM(1234.567)])).toEqual(STR('1,234.57'))
     expect(call('FIXED', [NUM(-1234.5)])).toEqual(STR('-1,234.50'))
     expect(call('FIXED', [NUM(1234.567), NUM(2), BOOL(true)])).toEqual(STR('1234.57'))
+  })
+
+  test('FIXED default decimals is 2 and no_commas defaults to FALSE', () => {
+    // FIXED(n) === FIXED(n, 2) === FIXED(n, 2, FALSE).
+    expect(call('FIXED', [NUM(1234.567)])).toEqual(call('FIXED', [NUM(1234.567), NUM(2)]))
+    expect(call('FIXED', [NUM(1234.567), NUM(2)])).toEqual(
+      call('FIXED', [NUM(1234.567), NUM(2), BOOL(false)]),
+    )
+    // no_commas FALSE explicit should match implicit.
+    expect(call('FIXED', [NUM(1234567)])).toEqual(STR('1,234,567.00'))
+    expect(call('FIXED', [NUM(1234567), NUM(0), BOOL(true)])).toEqual(STR('1234567'))
+    expect(call('FIXED', []).kind).toBe('error')
+    expect((call('FIXED', []) as { code: string }).code).toBe('#VALUE!')
+    expect(call('FIXED', [NUM(1), NUM(2), BOOL(true), NUM(4)]).kind).toBe('error')
   })
 })
 
@@ -316,6 +340,14 @@ describe('ROMAN / ARABIC', () => {
     expect(call('ROMAN', [NUM(1994), NUM(5)])).toEqual(ERR('#VALUE!'))
     expect(call('ARABIC', [STR('hello')])).toEqual(ERR('#VALUE!'))
     expect(call('ARABIC', [NUM(123)])).toEqual(ERR('#VALUE!'))
+  })
+
+  test('ROMAN(0) returns empty string and negatives return #VALUE!', () => {
+    // Excel: ROMAN(0) yields "" but ROMAN(-1) and ROMAN(4000) are #VALUE!.
+    expect(call('ROMAN', [NUM(0)])).toEqual(STR(''))
+    expect(call('ROMAN', [NUM(0), NUM(3)])).toEqual(STR(''))
+    expect(call('ROMAN', [NUM(-1)])).toEqual(ERR('#VALUE!'))
+    expect(call('ROMAN', [NUM(-1994)])).toEqual(ERR('#VALUE!'))
   })
 
   test('ARABIC supports a leading minus sign', () => {

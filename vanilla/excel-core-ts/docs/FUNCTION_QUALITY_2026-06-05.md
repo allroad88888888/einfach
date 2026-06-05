@@ -14,7 +14,7 @@ Difficulty key:
 - **L** — architectural (depends on engine-aware state we don't expose at
   the function layer, e.g. ISFORMULA / ISREF).
 
-## Fixed in this pass (5)
+## Fixed in this pass (7)
 
 | # | Function | File | Gap | Difficulty |
 |---|----------|------|-----|------------|
@@ -23,6 +23,8 @@ Difficulty key:
 | 3 | AND / OR | logical.ts:119,144 | Did not descend into array/range args — only the top-left cell mattered. Excel iterates every cell. | S |
 | 4 | ARABIC   | text.ts:2865 | Rejected leading minus sign. Excel returns negatives for `=ARABIC("-IV")` etc. | S |
 | 5 | ATAN2    | math.ts:567 | Returned `#NUM!` for `ATAN2(0,0)`. Microsoft docs say `#DIV/0!`. | S |
+| 6 | ERF / ERFC (+ .PRECISE) | engineering.ts:635 | Swapped A&S 7.1.26 (~1.5e-7 max err) for Cody's split-interval rational Chebyshev — full IEEE 754 double-precision accuracy (~1 ULP). | M |
+| 7 | ROMAN(0) | text.ts:2835 | Now returns `""` like Excel; negatives still `#VALUE!`. | S |
 
 ## Catalogued but NOT fixed
 
@@ -30,7 +32,6 @@ Difficulty key:
 
 | Function | File | Gap | Difficulty |
 |----------|------|-----|------------|
-| ERF / ERF.PRECISE / ERFC / ERFC.PRECISE | engineering.ts:635 | Uses Abramowitz & Stegun 7.1.26 polynomial (~1.5e-7 max abs error). Excel matches IEEE 754 double for `ERF.PRECISE`. To match exactly, swap in a Chebyshev-rational or split-interval approximation (Cody / Cephes style). | M |
 | BETA.INV / BETAINV | stats.ts:1812 | 100-iter bisection on `[0,1]`. Each step halves; final error ≈ 1e-30 on the unit interval but converges slowly when the regularized beta is shallow near `p`. Newton with continued-fraction derivative would be 5-10× faster and 1-2 ULP. | M |
 | GAMMA.INV / GAMMAINV | stats.ts:2035 | Bisection via `inversePositiveCdf` with the upper bound doubled until `cdf(hi) >= p`. Same shape as BETA.INV — switch to Newton on `regularizedGammaP'`. | M |
 | LOGNORM.INV / NORM.INV /  T.INV / F.INV | stats.ts:1662 (etc.) | Same bisection. Existing `standardNormalInv` is closed-form (Acklam) — others could route through it. | M |
@@ -65,7 +66,6 @@ Difficulty key:
 |----------|------|-----|------------|
 | DATEDIF "MD" | date.ts:569 | Microsoft documents that DATEDIF "MD" can return negative values (their words: "incorrect results") on certain inputs. We compute the algebraically correct version. Pinning this to match Excel's bug would be a behavior regression for most users — keep as documented divergence. | S, but DO NOT FIX |
 | TIME(h, m, s) max range | date.ts:317 | Excel caps each component at 32767; we match. Excel additionally allows fractional hours and uses them; we truncate. Spreadsheet UIs always pass integers, so low impact. | M |
-| ROMAN(0) | text.ts:2835 | Excel returns `""` (empty string) for ROMAN(0). We return `#VALUE!`. Edge case — most users will pass 1..3999. | S |
 | RATE convergence | financial.ts:321 | TODO(F1) flagged inline: switch to analytical derivative for ~2× perf on Newton-Raphson. Correctness already matches Excel within `RATE_RESIDUAL_REL_TOLERANCE`. | M |
 
 ### Numerical stability (not buggy, just suboptimal)
