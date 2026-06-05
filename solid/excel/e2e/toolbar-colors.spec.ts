@@ -83,7 +83,7 @@ test.describe('Wave 5 toolbar color buttons', () => {
 })
 
 test.describe('Wave 5 toolbar color swatches', () => {
-  test('fill swatch updates td background and keeps the cell-display transparent', async ({
+  test('fill swatch updates td background and propagates the tint to the cell-display', async ({
     page,
   }) => {
     await gotoWave5(page)
@@ -100,7 +100,15 @@ test.describe('Wave 5 toolbar color swatches', () => {
 
     await expect(popover).toBeHidden()
     await expect(cell(page, target)).toHaveCSS('background-color', 'rgb(255, 217, 102)')
-    await expect(cellDisplay(page, target)).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
+    // The .cell-display span used to render transparent so the TD's bgColor
+    // could bleed through the 6px padding strip. Wave 5 forces the span to
+    // inherit the parent TD's `background-color` via CSS so the same tint
+    // covers both the padding strip and the text run — see
+    // `solid/excel/src/styles.css`.
+    await expect(cellDisplay(page, target)).toHaveCSS(
+      'background-color',
+      'rgb(255, 217, 102)',
+    )
     await expect(cellDisplay(page, target)).toHaveCSS('color', before.displayColor)
   })
 

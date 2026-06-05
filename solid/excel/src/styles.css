@@ -326,6 +326,15 @@ thead .row-header {
   padding: 0 6px;
   height: 100%;
   line-height: 20px;
+  /* `background-color` does not normally inherit, so a TD with an inline
+   * `background: #ffd966` would leave the span transparent — surfacing the
+   * cell tint only in the 6px horizontal padding. Forcing inheritance keeps
+   * the visual identical (TD + span paint the same fill) and lets e2e
+   * assertions read the fill via `getComputedStyle(span).backgroundColor`
+   * without relying on parent-bleed quirks. Inline `cell.style.background`
+   * stays on the TD only, so unit tests that assert
+   * `display.style.background === ''` continue to hold. */
+  background-color: inherit;
 }
 
 .cell-number .cell-display {
@@ -638,7 +647,11 @@ thead .row-header {
   height: 100%;
   border: 0;
   padding: 0;
-  background: transparent;
+  /* `inherit` (not `transparent`) so the parent TD's inline fill propagates
+   * down to the .cell-display child via `background-color: inherit`. The
+   * fill renderer paints bgColor onto the TD inline; intermediate elements
+   * must hand the value through or the span ends up transparent. */
+  background-color: inherit;
   color: inherit;
   font: inherit;
   text-align: left;

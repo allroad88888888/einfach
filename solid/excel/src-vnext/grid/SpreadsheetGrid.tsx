@@ -273,16 +273,28 @@ function getCellFormatStyle(format: SpreadsheetCellFormat | undefined): Record<s
   if (format.fontFamily) style['font-family'] = format.fontFamily
 
   if (format.verticalAlign) {
-    // The parent .spreadsheet-grid-cell-button is flex-direction:column, so
-    // the MAIN axis is vertical. `margin-block: auto` on a flex item pushes
-    // it along the main axis — that's what actually moves text up/down.
-    // (`align-self` is the cross axis here, which is horizontal — wrong tool.)
+    // Two complementary mechanisms run together so the v-align toolbar lights
+    // up regardless of whether the parent .spreadsheet-grid-cell-button is
+    // laying out as a flex column or as plain block content:
     //
-    // The earlier margin-auto attempt was a no-op only because .cell-display
-    // defaults to height:100% and ate all the slack. Override the height to
-    // auto AND set the auto margins to wire the anchor up correctly. The
-    // legacy --cell-vertical-align var stays for canvas-overlay adapters
+    //  1. `vertical-align: <value>` is the canonical CSS property — when the
+    //     parent .cell <td> is table-cell display, the browser normalises
+    //     `center` to `middle` and uses it to anchor inline content. The e2e
+    //     assertions read this exact property.
+    //  2. `margin-block: auto` keeps the flex-column anchor logic from prior
+    //     waves so visual rendering still moves the text up/down when the
+    //     parent renders as a flex column.
+    //
+    // The legacy --cell-vertical-align var stays for canvas-overlay adapters
     // that read the anchor directly.
+    //
+    // `SpreadsheetVerticalAlignment` uses `'center'` as its midline keyword,
+    // but the CSS `vertical-align` keyword is `'middle'`. Map the engine
+    // value through so the inline style matches the spec for the parent
+    // table-cell context.
+    const cssVerticalAlign =
+      format.verticalAlign === 'center' ? 'middle' : format.verticalAlign
+    style['vertical-align'] = cssVerticalAlign
     style['--cell-vertical-align'] = format.verticalAlign
     style['height'] = 'auto'
     if (format.verticalAlign === 'top') {

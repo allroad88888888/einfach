@@ -133,7 +133,9 @@ test.describe('vNext Wave 5 — shell + canvas overlay', () => {
     })
 
     expect(paint.cellBackground).toBe('rgb(254, 243, 199)')
-    expect(paint.displayBackground).toBe('rgba(0, 0, 0, 0)')
+    // Wave 5 forces the span to inherit the TD's bgColor so the tint covers
+    // both the cell box AND the text run (matching audit-format.spec.ts).
+    expect(paint.displayBackground).toBe('rgb(254, 243, 199)')
     expect(paint.paddingLeft).toBe('4px')
     expect(paint.paddingRight).toBe('4px')
   })
