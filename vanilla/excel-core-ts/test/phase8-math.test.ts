@@ -526,6 +526,25 @@ describe('SERIESSUM', () => {
       ERR('#N/A'),
     )
   })
+
+  // Kahan compensated summation regression — pin the small-term recovery
+  // path that the naive accumulator used to drop.
+  test('Kahan summation recovers small terms against a 1e20-magnitude term', () => {
+    // SERIESSUM(x=1, n=0, m=1, coeffs) = sum_i coeffs[i] * 1^i = sum_i coeffs[i].
+    // Coefficients [1e20, 1, -1e20] with x=1 collapse to the textbook
+    // catastrophic-cancellation pattern. Naive sum yields 0; Kahan yields 1.
+    expect(
+      call(SERIESSUM, [NUM(1), NUM(0), NUM(1), ARR([[NUM(1e20), NUM(1), NUM(-1e20)]])]),
+    ).toEqual(NUM(1))
+  })
+
+  test('Kahan summation across many polynomial terms stays at 1 ULP', () => {
+    // SERIESSUM(x=1, n=0, m=1, coeffs=[0.1, 0.1, ..., 0.1] × 100) = 10.
+    // Naive sum lands near 9.99999...; Kahan returns exactly 10 in IEEE 754.
+    const coeffs: Value[] = []
+    for (let i = 0; i < 100; i += 1) coeffs.push(NUM(0.1))
+    expect(call(SERIESSUM, [NUM(1), NUM(0), NUM(1), ARR([coeffs])])).toEqual(NUM(10))
+  })
 })
 
 describe('SUBTOTAL / AGGREGATE', () => {

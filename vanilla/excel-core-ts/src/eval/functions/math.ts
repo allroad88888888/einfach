@@ -480,14 +480,23 @@ export const SUMPRODUCT: FunctionImpl = (args) => {
     if (gr !== rows || gc !== cols) return ERR('#VALUE!')
   }
 
+  // Kahan-Babuška-Neumaier compensated summation. Plain Kahan loses
+  // precision when a small accumulated compensation gets absorbed by a
+  // following large summand (classic textbook example: 1e20 + 1 - 1e20
+  // → plain Kahan still returns 0). The Neumaier variant tracks the
+  // larger of (running sum, incoming term) per step and accumulates the
+  // round-off into a compensation that is added once at the end. Long
+  // ranges of similar-magnitude products gain a few ULPs of precision;
+  // catastrophic-cancellation patterns recover the small terms entirely.
   let total = 0
+  let c = 0 // running compensation
   for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
+    for (let cIdx = 0; cIdx < cols; cIdx++) {
       let product = 1
       for (const g of grids) {
         const gr = g.length
         const gc = g[0]?.length ?? 0
-        const cell = gr === 1 && gc === 1 ? g[0][0] : g[r][c]
+        const cell = gr === 1 && gc === 1 ? g[0][0] : g[r][cIdx]
         if (cell.kind === 'error') return cell
         if (cell.kind === 'number') {
           product *= cell.value
@@ -497,9 +506,16 @@ export const SUMPRODUCT: FunctionImpl = (args) => {
           break
         }
       }
-      total += product
+      const t = total + product
+      if (Math.abs(total) >= Math.abs(product)) {
+        c += total - t + product
+      } else {
+        c += product - t + total
+      }
+      total = t
     }
   }
+  total += c
   if (!Number.isFinite(total)) return ERR('#NUM!')
   return NUM(total)
 }
@@ -1325,12 +1341,24 @@ export const SERIESSUM: FunctionImpl = (args) => {
   const coefficientError = collectSeriesCoefficients(args[3], coefficients)
   if (coefficientError) return coefficientError
   if (coefficients.length === 0) return ERR('#VALUE!')
+  // Kahan-Babuška-Neumaier compensated summation — same rationale as
+  // SUMPRODUCT. Recovers the small tail of a Taylor expansion when the
+  // leading term dwarfs it, and also handles the 1e20+1-1e20-style
+  // catastrophic-cancellation pattern that plain Kahan misses.
   let total = 0
+  let c = 0 // running compensation
   for (let i = 0; i < coefficients.length; i += 1) {
     const term = coefficients[i] * Math.pow(x.value, n.value + i * m.value)
     if (!Number.isFinite(term) || Number.isNaN(term)) return ERR('#NUM!')
-    total += term
+    const t = total + term
+    if (Math.abs(total) >= Math.abs(term)) {
+      c += total - t + term
+    } else {
+      c += term - t + total
+    }
+    total = t
   }
+  total += c
   if (!Number.isFinite(total) || Number.isNaN(total)) return ERR('#NUM!')
   return NUM(total)
 }

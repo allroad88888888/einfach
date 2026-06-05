@@ -648,6 +648,54 @@ describe('SUMPRODUCT', () => {
   test('zero args → #VALUE!', () => {
     expect(call(SUMPRODUCT, [])).toEqual(ERR('#VALUE!'))
   })
+
+  // Kahan compensated summation regression — FUNCTION_QUALITY_2026-06-05.md
+  // "Numerical stability" entry. Naive sum loses small terms when paired
+  // with a large term; Kahan keeps them.
+  test('compensated sum recovers small terms in 1e20 + 1 - 1e20 pattern', () => {
+    // Single-array SUMPRODUCT collapses to a straight Kahan sum of the row.
+    const row: Value[] = []
+    for (let i = 0; i < 100; i += 1) {
+      row.push(NUM(1e20))
+      row.push(NUM(1))
+      row.push(NUM(-1e20))
+    }
+    // Naive sum yields 0 (each +1 vanishes against 1e20). Kahan yields 100.
+    expect(call(SUMPRODUCT, [ARR([row])])).toEqual(NUM(100))
+  })
+
+  test('two-array SUMPRODUCT with disparate magnitudes keeps the small terms', () => {
+    // First array: alternating 1e20 / 1 / -1e20. Second: all ones.
+    // Product is identical to first; sum should be 1 per (1e20, 1, -1e20)
+    // triple, totalling 50 across 50 such triples (150 cells).
+    const a: Value[] = []
+    const b: Value[] = []
+    for (let i = 0; i < 50; i += 1) {
+      a.push(NUM(1e20))
+      a.push(NUM(1))
+      a.push(NUM(-1e20))
+      b.push(NUM(1))
+      b.push(NUM(1))
+      b.push(NUM(1))
+    }
+    expect(call(SUMPRODUCT, [ARR([a]), ARR([b])])).toEqual(NUM(50))
+  })
+
+  test('long uniform-magnitude sum stays within 1 ULP of the naive result', () => {
+    // 10k 0.1s — naive sum drifts noticeably from 1000 (≈ 1000.0000000001587);
+    // Kahan stays within a tighter envelope. We assert the magnitude is
+    // correct and the error is at most a handful of ULPs.
+    const row: Value[] = []
+    for (let i = 0; i < 10000; i += 1) row.push(NUM(0.1))
+    const out = call(SUMPRODUCT, [ARR([row])])
+    expect(out.kind).toBe('number')
+    if (out.kind === 'number') {
+      // Kahan summation of 10000 × 0.1 yields exactly 1000 in IEEE 754
+      // double (the compensation cancels all the 2^-52 drift). Naive sum
+      // would yield 1000.0000000001587. We pin the exact Kahan result.
+      expect(out.value).toBe(1000)
+    }
+  })
 })
 
 describe('PRODUCT', () => {
