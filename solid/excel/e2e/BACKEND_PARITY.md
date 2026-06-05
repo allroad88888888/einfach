@@ -1,7 +1,7 @@
 # vNext e2e — Backend Parity Matrix
 
-Last full audited: 2026-06-05 (post-500-fn-parity arc + TS worker-runtime
-fixes + audit-format UI cluster fixes; full 59-spec audit, dual project run)
+Last full audited: 2026-06-05 (after Wave 5/6/7 UI cluster fixes;
+full 59-spec audit, dual project run)
 Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 `snapshotPersistenceV1.sizes` on TS.
 
@@ -9,26 +9,34 @@ Prior full audit: 2026-05-28; targeted 2026-05-29 fix landed
 
 | Project | Passed | Failed | Skipped (in spec) | Total |
 |---------|-------:|-------:|------------------:|------:|
-| `wasm`  |  **467** | **11** |                37 |   515 |
-| `ts`    |  **467** | **11** |                37 |   515 |
+| `wasm`  |  **478** | **0** |                 37 |   515 |
+| `ts`    |  **478** | **0** |                 37 |   515 |
 
-**Δ between projects: 0** — TS and WASM are at numeric parity. The 11
-failures are the same set on both projects (remaining UI surfaces after
-the audit-format cluster fix).
+**🎯 Both backends fully green. Δ = 0.**
 
-**Remaining 11 failures** (UI bugs, both backends identically red):
-- `copy-as.spec.ts:210` rowspan/colspan on merged A1:B2 anchor
-- `go-to.spec.ts:253` row differences scoped to selection rect
-- `paste-special.spec.ts:101 / :204` values-only arithmetic; Escape closes
-- `remove-duplicates.spec.ts:192 / :213` noDuplicates / noKeyColumns
-- `text-to-columns.spec.ts:261` 600-token clamp with `…` marker
-- `toolbar-buttons.spec.ts:211 / :229` Ctrl+Z / Ctrl+Y after format change
-- `vnext-smoke.spec.ts:208 / :225` alt page horizontal; toolbar/context atoms
+**Δ since 2026-05-28 baseline** (wasm 462/24/29 ; ts 460/26/29):
+- WASM: +16 pass / −24 fail / +8 skip (all 24 failures closed; +8 skips
+  came from retiring obsolete contracts in toolbar-more-number-formats and
+  toolbar-buttons print-preview blocks).
+- TS: +18 pass / −26 fail / +8 skip (snapshotPersistenceV1.sizes from
+  2026-05-29 + the same 24 UI failures + the 2 worker-runtime-ts gaps).
 
-The skip count rose from 29 → 37 because the audit-format work also
-retired contracts in `toolbar-more-number-formats.spec.ts` (Custom row
-submenu removed; routed to Format Cells dialog instead) and the
-print-preview blocks in `toolbar-buttons.spec.ts`.
+**Fix progression in this arc** (commit summary):
+- `40c5567` worker-runtime-ts snapshotPersistenceV1.sizes (2026-05-29)
+- `173120f` worker-runtime-ts debugFormulaCacheState dirty + chunking
+- `9433285` + `77c7e26` audit-format cluster (9 UI fails)
+- `ee34233` name-box scroll + paste-special tests
+- `65114f1` remove-duplicates EN locale
+- `ead1d6c` text-to-columns 500-token cap
+- `39757a0` toolbar preserves grid focus for Ctrl+Z/Y
+- `09560ad` Alt+PageDown/Up viewport delta
+- `b4341da` context menu 1×1 target-kind
+- `7b69dac` copy-as HTML rowspan/colspan on merge anchor
+- `c9f41df` Go To Special row differences selection anchor
+
+The skip count of 37 reflects intentional retirements:
+- Print Preview button removed (Wave 5 toolbar pruning)
+- Custom format submenu replaced by Format Cells dialog routing
 
 **Δ since 2026-05-28 baseline** (wasm 462/24/29 ; ts 460/26/29):
 - WASM: +3 pass / −3 fail (3 specs moved red → green).
