@@ -3315,12 +3315,32 @@ impl<'a> BulkLoader<'a> {
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        let expr = match parse_formula(formula_str) {
-            Some(e) => e,
-            None => {
-                self.write_error_no_notify(addr, ValueError::InvalidValue);
-                self.touched.insert(addr);
-                return false;
+        // Phase 1 instrumentation (bulk_import_trace): when the
+        // instrumented import driver is active, record the parse-only
+        // share of this path. The `flush_phase_active()` check is a
+        // cheap thread-local read; cold-path overhead is one branch
+        // when the flag is off (production import).
+        let active = crate::bulk_import_trace::flush_phase_active();
+        let expr = if active {
+            let t = std::time::Instant::now();
+            let parsed = parse_formula(formula_str);
+            crate::bulk_import_trace::add_flush_parse_ns(t.elapsed().as_nanos() as u64);
+            match parsed {
+                Some(e) => e,
+                None => {
+                    self.write_error_no_notify(addr, ValueError::InvalidValue);
+                    self.touched.insert(addr);
+                    return false;
+                }
+            }
+        } else {
+            match parse_formula(formula_str) {
+                Some(e) => e,
+                None => {
+                    self.write_error_no_notify(addr, ValueError::InvalidValue);
+                    self.touched.insert(addr);
+                    return false;
+                }
             }
         };
         self.install_parsed_formula(addr, expr, formula_str.to_string())
@@ -3379,8 +3399,23 @@ impl<'a> BulkLoader<'a> {
         self.sheet.detach_address_sub(addr);
 
         let expr = Rc::new(expr);
-        let deps = Sheet::formula_deps_for(&expr);
-        let range_deps = collect_range_refs(&expr);
+        // Phase 1 instrumentation (bulk_import_trace): split the
+        // formula install path into dep_extract / dep_register /
+        // formula_record sub-phases. Sampling Instant only on the
+        // instrumented path keeps production zero-cost (one
+        // thread-local read + branch).
+        let active = crate::bulk_import_trace::flush_phase_active();
+        let (deps, range_deps) = if active {
+            let t = std::time::Instant::now();
+            let deps = Sheet::formula_deps_for(&expr);
+            let range_deps = collect_range_refs(&expr);
+            crate::bulk_import_trace::add_flush_dep_extract_ns(
+                t.elapsed().as_nanos() as u64,
+            );
+            (deps, range_deps)
+        } else {
+            (Sheet::formula_deps_for(&expr), collect_range_refs(&expr))
+        };
         // Drop any prior formula record (no notify) and any primitive scaffold
         // that no longer has dependents — mirrors `Sheet::set_formula` minus
         // the `with_remap` listener fire.
@@ -3397,16 +3432,40 @@ impl<'a> BulkLoader<'a> {
         // singleton `deps` and an empty `range_deps`, so each clone was
         // a malloc for a single-bucket set — at 100k formulas that's
         // 200k saved mallocs.
-        self.sheet.add_formula_deps(addr, &deps);
-        self.sheet.add_formula_range_deps(addr, &range_deps);
-        let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
-        self.sheet.note_cross_sheet_if_any(&expr);
-        self.sheet.formula_cells.insert(addr, record);
-        self.sheet.formula_exprs.insert(addr, expr);
-        // Consume the owned `formula_text` directly — the caller's
-        // string allocation lands in `formula_texts` without a
-        // `String::clone`.
-        self.sheet.formula_texts.insert(addr, formula_text);
+        if active {
+            let t = std::time::Instant::now();
+            self.sheet.add_formula_deps(addr, &deps);
+            self.sheet.add_formula_range_deps(addr, &range_deps);
+            crate::bulk_import_trace::add_flush_dep_register_ns(
+                t.elapsed().as_nanos() as u64,
+            );
+        } else {
+            self.sheet.add_formula_deps(addr, &deps);
+            self.sheet.add_formula_range_deps(addr, &range_deps);
+        }
+        if active {
+            let t = std::time::Instant::now();
+            let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
+            self.sheet.note_cross_sheet_if_any(&expr);
+            self.sheet.formula_cells.insert(addr, record);
+            self.sheet.formula_exprs.insert(addr, expr);
+            // Consume the owned `formula_text` directly — the caller's
+            // string allocation lands in `formula_texts` without a
+            // `String::clone`.
+            self.sheet.formula_texts.insert(addr, formula_text);
+            crate::bulk_import_trace::add_flush_formula_record_ns(
+                t.elapsed().as_nanos() as u64,
+            );
+        } else {
+            let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
+            self.sheet.note_cross_sheet_if_any(&expr);
+            self.sheet.formula_cells.insert(addr, record);
+            self.sheet.formula_exprs.insert(addr, expr);
+            // Consume the owned `formula_text` directly — the caller's
+            // string allocation lands in `formula_texts` without a
+            // `String::clone`.
+            self.sheet.formula_texts.insert(addr, formula_text);
+        }
 
         // B1 — bump the imported-formula counter for successfully registered
         // bulk-load entries. Parse failure / cycle paths return earlier and

@@ -1686,20 +1686,24 @@ pub struct WasmWorkbook {
     /// Phase timings recorded by the most recent
     /// `bulk_import_cells_instrumented` call. `None` until the host calls
     /// the instrumented variant at least once. Stored as a flat
-    /// `[f64; 8]` rather than a struct so the wasm-bindgen exposure can
+    /// `[f64; 12]` rather than a struct so the wasm-bindgen exposure can
     /// reach it via the simple `Vec<f64>` accessor below — no extra
     /// `serde` wire type needed for a one-shot debug surface.
     ///
     /// Layout (matches `debug_last_bulk_import_phase_ms` doc):
-    ///   [0] cell_count
-    ///   [1] formula_count
-    ///   [2] rpc_deserialize_ms
-    ///   [3] parse_only_ms
-    ///   [4] set_cell_loop_ms
-    ///   [5] set_formula_loop_ms
-    ///   [6] flush_ms
-    ///   [7] engine_total_ms
-    last_bulk_import_phase_ms: Cell<Option<[f64; 8]>>,
+    ///   [0]  cell_count
+    ///   [1]  formula_count
+    ///   [2]  rpc_deserialize_ms
+    ///   [3]  parse_only_ms
+    ///   [4]  set_cell_loop_ms
+    ///   [5]  set_formula_loop_ms
+    ///   [6]  flush_ms
+    ///   [7]  engine_total_ms
+    ///   [8]  flush_parse_ms          (Phase 1 sub-slice of [6])
+    ///   [9]  flush_dep_extract_ms    (Phase 1 sub-slice of [6])
+    ///   [10] flush_dep_register_ms   (Phase 1 sub-slice of [6])
+    ///   [11] flush_formula_record_ms (Phase 1 sub-slice of [6])
+    last_bulk_import_phase_ms: Cell<Option<[f64; 12]>>,
 }
 
 #[wasm_bindgen]
@@ -2584,6 +2588,10 @@ impl WasmWorkbook {
             timings.set_formula_loop_ms,
             timings.flush_ms,
             timings.engine_total_ms,
+            timings.flush_parse_ms,
+            timings.flush_dep_extract_ms,
+            timings.flush_dep_register_ms,
+            timings.flush_formula_record_ms,
         ]));
 
         // ---- Return a thin success object (NOT the full stats wire) ---
@@ -2599,14 +2607,24 @@ impl WasmWorkbook {
     ///
     /// | Index | Field |
     /// |---:|---|
-    /// | 0 | cell_count |
-    /// | 1 | formula_count |
-    /// | 2 | rpc_deserialize_ms |
-    /// | 3 | parse_only_ms |
-    /// | 4 | set_cell_loop_ms |
-    /// | 5 | set_formula_loop_ms |
-    /// | 6 | flush_ms |
-    /// | 7 | engine_total_ms |
+    /// | 0  | cell_count |
+    /// | 1  | formula_count |
+    /// | 2  | rpc_deserialize_ms |
+    /// | 3  | parse_only_ms |
+    /// | 4  | set_cell_loop_ms |
+    /// | 5  | set_formula_loop_ms |
+    /// | 6  | flush_ms |
+    /// | 7  | engine_total_ms |
+    /// | 8  | flush_parse_ms          (Phase 1 sub-slice of flush_ms) |
+    /// | 9  | flush_dep_extract_ms    (Phase 1 sub-slice of flush_ms) |
+    /// | 10 | flush_dep_register_ms   (Phase 1 sub-slice of flush_ms) |
+    /// | 11 | flush_formula_record_ms (Phase 1 sub-slice of flush_ms) |
+    ///
+    /// Indices [8..=11] are Phase 1 of the lazy-formula-indexing arc:
+    /// they decompose the per-formula `install_parsed_formula` work
+    /// inside the implicit flush. The sum of [8]+[9]+[10]+[11] should
+    /// be ≤ flush_ms (the remainder is BFS dirty propagation +
+    /// subscriber dedup + cross-sheet BFS).
     ///
     /// Returns an empty `Vec<f64>` if no instrumented bulk import has
     /// run yet on this workbook.

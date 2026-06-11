@@ -46,6 +46,83 @@
 use crate::workbook::Workbook;
 use crate::{parse_formula, CellAddress};
 use einfach_core::{Value, ValueError};
+use std::cell::Cell;
+
+thread_local! {
+    /// Sub-phase accumulator for the formula install path inside
+    /// `Sheet::install_parsed_formula`. The instrumented bulk-import
+    /// driver enables collection (`set_active(true)`) before
+    /// `Workbook::bulk_load` runs the flush, then reads the totals back
+    /// out via `take_*_ns`. Production paths see `active() == false`
+    /// and pay no per-formula instrumentation cost.
+    ///
+    /// Stored as `u64` nanoseconds for additive precision — converting
+    /// each per-formula `Duration` to f64 ms inline would round to zero
+    /// for sub-microsecond Phase 4 dep_register inserts at 1M scale.
+    /// The driver converts to ms at read-back time.
+    ///
+    /// `Cell<u64>` is sound because the engine is single-threaded; the
+    /// existing `LET_FRAMES` thread-local in `eval.rs` uses the same
+    /// pattern with `RefCell`.
+    static FLUSH_PHASE_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static FLUSH_PARSE_NS: Cell<u64> = const { Cell::new(0) };
+    static FLUSH_DEP_EXTRACT_NS: Cell<u64> = const { Cell::new(0) };
+    static FLUSH_DEP_REGISTER_NS: Cell<u64> = const { Cell::new(0) };
+    static FLUSH_FORMULA_RECORD_NS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Public accessor for `Sheet::install_parsed_formula` and adjacent
+/// helpers. The check is a cheap thread-local read; when inactive the
+/// instrumentation site short-circuits before any `Instant::now()`.
+pub fn flush_phase_active() -> bool {
+    FLUSH_PHASE_ACTIVE.with(|c| c.get())
+}
+
+/// Bump `flush_parse_ms`'s underlying ns counter. Called by the
+/// formula install path with the elapsed nanoseconds of one parse.
+pub fn add_flush_parse_ns(ns: u64) {
+    FLUSH_PARSE_NS.with(|c| c.set(c.get().saturating_add(ns)));
+}
+
+pub fn add_flush_dep_extract_ns(ns: u64) {
+    FLUSH_DEP_EXTRACT_NS.with(|c| c.set(c.get().saturating_add(ns)));
+}
+
+pub fn add_flush_dep_register_ns(ns: u64) {
+    FLUSH_DEP_REGISTER_NS.with(|c| c.set(c.get().saturating_add(ns)));
+}
+
+pub fn add_flush_formula_record_ns(ns: u64) {
+    FLUSH_FORMULA_RECORD_NS.with(|c| c.set(c.get().saturating_add(ns)));
+}
+
+/// Enable / disable per-formula sub-phase accumulation. The driver wraps
+/// `Workbook::bulk_load` in `set_active(true) ... set_active(false)` and
+/// resets the counters on entry.
+fn set_flush_phase_active(active: bool) {
+    FLUSH_PHASE_ACTIVE.with(|c| c.set(active));
+}
+
+fn reset_flush_phase_accumulators() {
+    FLUSH_PARSE_NS.with(|c| c.set(0));
+    FLUSH_DEP_EXTRACT_NS.with(|c| c.set(0));
+    FLUSH_DEP_REGISTER_NS.with(|c| c.set(0));
+    FLUSH_FORMULA_RECORD_NS.with(|c| c.set(0));
+}
+
+fn take_flush_phase_accumulators_ms() -> (f64, f64, f64, f64) {
+    let ns_to_ms = |ns: u64| (ns as f64) / 1_000_000.0;
+    let parse = FLUSH_PARSE_NS.with(|c| c.replace(0));
+    let dep_extract = FLUSH_DEP_EXTRACT_NS.with(|c| c.replace(0));
+    let dep_register = FLUSH_DEP_REGISTER_NS.with(|c| c.replace(0));
+    let formula_record = FLUSH_FORMULA_RECORD_NS.with(|c| c.replace(0));
+    (
+        ns_to_ms(parse),
+        ns_to_ms(dep_extract),
+        ns_to_ms(dep_register),
+        ns_to_ms(formula_record),
+    )
+}
 
 /// Phase timings recorded by [`run_bulk_import_with_phase_timings`]. All
 /// values are wall-clock milliseconds from the host clock; subtractions
@@ -88,6 +165,28 @@ pub struct BulkImportPhaseTimings {
     /// and the same-sheet subscriber notify dedup) plus the workbook-
     /// wide cross-sheet BFS.
     pub flush_ms: f64,
+    /// **Sub-slice of `flush_ms`** — time spent parsing formula source
+    /// inside `install_parsed_formula` (set_formula_pre_parsed receives
+    /// a pre-parsed AST so this stays near zero; the parse-failure path
+    /// re-tokenizes the source which would appear here). Phase 1
+    /// instrumentation only — not consumed by any production path.
+    pub flush_parse_ms: f64,
+    /// **Sub-slice of `flush_ms`** — time spent walking the AST to
+    /// extract point dependencies (`Sheet::formula_deps_for`) and range
+    /// dependencies (`collect_range_refs`) for each installed formula.
+    pub flush_dep_extract_ms: f64,
+    /// **Sub-slice of `flush_ms`** — time spent inserting the extracted
+    /// deps into `cell_dependents` / `range_dependents`
+    /// (`Sheet::add_formula_deps` + `Sheet::add_formula_range_deps`).
+    /// Codex's 2026-06-11 attribution called this the dominant cost at
+    /// Mega tier — Phase 1 measures it directly so the claim is
+    /// quantifiable.
+    pub flush_dep_register_ms: f64,
+    /// **Sub-slice of `flush_ms`** — time spent materialising
+    /// `Rc<FormulaRecord>` and inserting into `formula_cells` /
+    /// `formula_exprs` / `formula_texts`. Captures the "FormulaRecord
+    /// allocation + map insert" share.
+    pub flush_formula_record_ms: f64,
     /// `set_cell_loop_ms + set_formula_loop_ms + flush_ms`. Convenient
     /// for the JS report so the bench doesn't redo the sum.
     pub engine_total_ms: f64,
@@ -178,6 +277,14 @@ where
     let mut set_cell_loop_ms = 0.0_f64;
     let mut set_formula_loop_ms = 0.0_f64;
 
+    // Arm the formula-install sub-phase accumulators. The Sheet-side
+    // `install_parsed_formula` instrumentation gates on
+    // `flush_phase_active()` — when armed it samples `Instant::now()`
+    // around each phase and adds the elapsed ns into the thread-local
+    // counters. We reset to zero on entry so prior runs don't bleed in.
+    reset_flush_phase_accumulators();
+    set_flush_phase_active(true);
+
     // Capture the loop-timer state by reference so the closure passed
     // to `bulk_load` can mutate it. The closure captures `now_ms` by
     // mutable borrow as well; both borrows live for the duration of
@@ -239,6 +346,11 @@ where
         set_formula_loop_ms = p2_end - p2_start;
     });
     let t2_engine_end = now_ms();
+    // Disarm before reading the accumulators back so any later code
+    // (panics, drops, etc.) doesn't sneak more samples in.
+    set_flush_phase_active(false);
+    let (flush_parse_ms, flush_dep_extract_ms, flush_dep_register_ms, flush_formula_record_ms) =
+        take_flush_phase_accumulators_ms();
     // Engine total = body + implicit flush. Flush is what happens
     // BETWEEN p2_end and the closure returning AND between the closure
     // returning and `bulk_load` returning — i.e. everything except the
@@ -257,6 +369,10 @@ where
         set_cell_loop_ms,
         set_formula_loop_ms,
         flush_ms,
+        flush_parse_ms,
+        flush_dep_extract_ms,
+        flush_dep_register_ms,
+        flush_formula_record_ms,
         engine_total_ms,
     }
 }
@@ -306,6 +422,10 @@ mod tests {
         assert!(timings.set_cell_loop_ms >= 0.0);
         assert!(timings.set_formula_loop_ms >= 0.0);
         assert!(timings.flush_ms >= 0.0);
+        assert!(timings.flush_parse_ms >= 0.0);
+        assert!(timings.flush_dep_extract_ms >= 0.0);
+        assert!(timings.flush_dep_register_ms >= 0.0);
+        assert!(timings.flush_formula_record_ms >= 0.0);
         // engine_total ≈ set_cell + set_formula + flush (allowing slack
         // for the inner `now_ms()` calls). We let it slip by 1ms either
         // side to keep CI-stable.
