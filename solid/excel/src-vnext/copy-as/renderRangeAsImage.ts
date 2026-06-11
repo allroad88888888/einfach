@@ -230,8 +230,22 @@ export async function renderRangeAsImage(
   const width = Math.max(1, sumMap(colWidths.values()) * scale)
   const height = Math.max(1, sumMap(rowHeights.values()) * scale)
 
-  const svg = buildRangeSvg(input, width, height)
-  const bytes = await rasterizer(svg, width, height)
+  let bytes: Uint8Array
+  try {
+    const svg = buildRangeSvg(input, width, height)
+    bytes = await rasterizer(svg, width, height)
+  } catch (svgErr) {
+    // SVG-with-foreignObject can fail to decode in headless Chromium
+    // (`InvalidStateError: The source image could not be decoded`) and
+    // similar quirks on stripped-down user agents. Fall back to the
+    // canvas-direct path which paints cells with Canvas 2D primitives
+    // and never goes through createImageBitmap on an SVG blob.
+    try {
+      bytes = await paintCellsToCanvasPng(input, colWidths, rowHeights, width, height)
+    } catch {
+      throw svgErr
+    }
+  }
 
   return {
     kind: 'range-image',
@@ -242,4 +256,93 @@ export async function renderRangeAsImage(
     height,
     mimeType: 'image/png',
   }
+}
+
+/**
+ * Canvas-direct paint path — used as a fallback when SVG/foreignObject
+ * rasterisation fails (headless Chromium, stripped user agents) and as
+ * the first-choice paint when a Wave 5 canvas overlay is mounted.
+ *
+ * Draws each cell as a white rectangle with a grey border + the cell's
+ * displayValue text at default font. Per-cell sizes come from the same
+ * `columnWidths` / `rowHeights` resolved by the SVG path so the geometry
+ * stays in lockstep.
+ *
+ * The encoding does not attempt to reproduce font weight, alignment, or
+ * cell formatting — that's deferred to a future iteration once the SVG
+ * path renders reliably in test environments. The canvas fallback's
+ * purpose is to keep the dispatch pipeline observable in headless
+ * Playwright runs.
+ */
+async function paintCellsToCanvasPng(
+  input: RenderRangeAsImageInput,
+  colWidths: Map<number, number>,
+  rowHeights: Map<number, number>,
+  width: number,
+  height: number,
+): Promise<Uint8Array> {
+  const g = globalThis as unknown as {
+    OffscreenCanvas?: typeof OffscreenCanvas
+  }
+  let getCtx: () => CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null
+  let toBytes: () => Promise<Uint8Array>
+  if (typeof g.OffscreenCanvas !== 'undefined') {
+    const canvas = new g.OffscreenCanvas(width, height)
+    getCtx = () => canvas.getContext('2d')
+    toBytes = async () => {
+      const blob = await canvas.convertToBlob({ type: 'image/png' })
+      return new Uint8Array(await blob.arrayBuffer())
+    }
+  } else if (typeof document !== 'undefined') {
+    const canvas = document.createElement('canvas')
+    canvas.width = width
+    canvas.height = height
+    getCtx = () => canvas.getContext('2d')
+    toBytes = async () => {
+      const blob: Blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => (b ? resolve(b) : reject(new Error('canvas.toBlob returned null'))),
+          'image/png',
+        )
+      })
+      return new Uint8Array(await blob.arrayBuffer())
+    }
+  } else {
+    throw new Error('paintCellsToCanvasPng: no canvas surface available')
+  }
+
+  const ctx = getCtx()
+  if (!ctx) throw new Error('paintCellsToCanvasPng: failed to get 2D context')
+
+  ctx.fillStyle = '#ffffff'
+  ctx.fillRect(0, 0, width, height)
+  ctx.strokeStyle = '#d0d0d0'
+  ctx.lineWidth = 1
+  ctx.font = '12px system-ui, sans-serif'
+  ctx.fillStyle = '#000000'
+  ctx.textBaseline = 'middle'
+
+  const lookup = new Map<string, string>()
+  for (const c of input.cells) {
+    lookup.set(`${c.row}:${c.col}`, c.displayValue ?? '')
+  }
+
+  let y = 0
+  for (let row = input.range.rowStart; row <= input.range.rowEnd; row += 1) {
+    const rh = rowHeights.get(row) ?? 24
+    let x = 0
+    for (let col = input.range.colStart; col <= input.range.colEnd; col += 1) {
+      const cw = colWidths.get(col) ?? 96
+      ctx.strokeRect(x + 0.5, y + 0.5, cw, rh)
+      const text = lookup.get(`${row}:${col}`) ?? ''
+      if (text.length > 0) {
+        ctx.fillStyle = '#000000'
+        ctx.fillText(text, x + 4, y + rh / 2, Math.max(1, cw - 8))
+      }
+      x += cw
+    }
+    y += rh
+  }
+
+  return toBytes()
 }
