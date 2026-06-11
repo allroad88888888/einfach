@@ -42,7 +42,16 @@ type MockFormulaFailure = {
 type MockWasmWorkbookOptions = {
   formulaFailuresByFormula?: Record<string, MockFormulaFailure>
   disablePersistenceV1?: boolean
+  disableBulkInstallWorkbook?: boolean
   bulkImportFailureAfterApply?: string
+}
+
+// STORAGE_PRIMARY Phase 6.3 — mirrors the wasm `bulk_install_workbook`
+// wire: per-sheet `[addr, value]` pairs, addr as zero-based `"R:C"`.
+type MockBulkInstallSheetPayload = {
+  sheet: number
+  primitives: Array<[string, number | string | boolean | { error: string }]>
+  formulas: Array<[string, string]>
 }
 
 type MockWasmWorkbook = {
@@ -64,6 +73,7 @@ type MockWasmWorkbook = {
     formula: string
   }
   bulk_import_cells: (cells: ImportCellWire[]) => WorkbookImportStatsWire
+  bulk_install_workbook?: (payload: MockBulkInstallSheetPayload[]) => unknown
   list_non_empty_cells: () => { sheet: number; addr: string }[]
   set_cell_number: (sheet: number, addr: string, value: number) => void
   set_cell_text: (sheet: number, addr: string, value: string) => void
@@ -129,6 +139,7 @@ type MockWasmWorkbook = {
   __mockCalls?: {
     bulkImportCells: number
     bulkImportPayloads: ImportCellWire[][]
+    bulkInstallWorkbookPayloads: MockBulkInstallSheetPayload[][]
     snapshotSparse: number
     snapshotRangeSparse: SparseRangeWire[]
     restoreSparse: SparseCellWire[][]
@@ -200,6 +211,7 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
   const calls: NonNullable<MockWasmWorkbook['__mockCalls']> = {
     bulkImportCells: 0,
     bulkImportPayloads: [],
+    bulkInstallWorkbookPayloads: [],
     snapshotSparse: 0,
     snapshotRangeSparse: [],
     restoreSparse: [],
@@ -384,6 +396,55 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
         errors: 0,
       }
     },
+    // STORAGE_PRIMARY Phase 6.3 — full-sheet replace per listed sheet,
+    // matching `Workbook::install_sheet_bulk` semantics. Optional like
+    // the real binding (absent on pre-Phase-6.2 wasm-pkg builds).
+    ...(options.disableBulkInstallWorkbook
+      ? {}
+      : {
+          bulk_install_workbook: (payload: MockBulkInstallSheetPayload[]) => {
+            calls.bulkInstallWorkbookPayloads.push(payload)
+            for (const entry of payload) {
+              if (entry.sheet >= sheets.length) {
+                throw new Error(`bulk install rejected: sheet out of range: ${entry.sheet}`)
+              }
+            }
+            for (const entry of payload) {
+              for (const raw of [...cells.keys()]) {
+                if (Number(raw.split(':')[0]) === entry.sheet) cells.delete(raw)
+              }
+              const fromWireAddr = (addr: string) => {
+                const [row, col] = addr.split(':').map(Number)
+                return toAddress(col, row)
+              }
+              for (const [addr, value] of entry.primitives) {
+                if (typeof value === 'object' && value !== null) {
+                  setPrimitive(entry.sheet, fromWireAddr(addr), 'error', value.error)
+                } else if (typeof value === 'number') {
+                  setPrimitive(entry.sheet, fromWireAddr(addr), 'number', value)
+                } else if (typeof value === 'boolean') {
+                  setPrimitive(entry.sheet, fromWireAddr(addr), 'boolean', value)
+                } else {
+                  setPrimitive(entry.sheet, fromWireAddr(addr), 'text', value)
+                }
+              }
+              for (const [addr, source] of entry.formulas) {
+                cells.set(key(entry.sheet, fromWireAddr(addr)), {
+                  type: 'formula',
+                  display: '',
+                  formula: source,
+                  isError: false,
+                })
+              }
+            }
+            return payload.map((entry) => ({
+              sheet: entry.sheet,
+              primitivesInstalled: entry.primitives.length,
+              formulasInstalled: entry.formulas.length,
+              crossSheetParsed: 0,
+            }))
+          },
+        }),
     list_non_empty_cells: () =>
       [...cells.entries()].map(([raw]) => {
         const [sheet, addr] = raw.split(':')
@@ -620,6 +681,14 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       importWorkbooks: () => workbooks.slice(1).length,
       allBulkImportCalls: () =>
         workbooks.reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
+      importBulkImportCalls: () =>
+        workbooks
+          .slice(1)
+          .reduce((sum, workbook) => sum + (workbook.__mockCalls?.bulkImportCells ?? 0), 0),
+      importBulkInstallPayloads: () =>
+        workbooks.slice(1).flatMap((workbook) => workbook.__mockCalls?.bulkInstallWorkbookPayloads ?? []),
+      importBulkImportPayloads: () =>
+        workbooks.slice(1).flatMap((workbook) => workbook.__mockCalls?.bulkImportPayloads ?? []),
       mainRestoreSparsePayloads: () => workbooks[0]?.__mockCalls?.restoreSparse ?? [],
       mainSnapshotSparse: () => workbooks[0]?.__mockCalls?.snapshotSparse ?? 0,
       mainSnapshotRangeSparse: () => workbooks[0]?.__mockCalls?.snapshotRangeSparse ?? [],
@@ -787,6 +856,158 @@ describe('wasm-workbook-worker import session contract', () => {
       expect(harness.calls.importSnapshotSparse()).toBe(0)
       expect(harness.calls.importWorkbooks()).toBeGreaterThanOrEqual(1)
       expect(harness.calls.allBulkImportCalls()).toBeGreaterThan(0)
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('routes atomic staging through one bulk_install_workbook call on the shell at commit', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1', 'Sheet2'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 41,
+      })
+
+      await harness.send<number>({
+        id: 3,
+        cmd: 'importChunk',
+        sessionId: 41,
+        cells: [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+          { sheet: 1, row: 0, col: 0, kind: 'text', value: 'hello' },
+        ],
+      })
+      // No engine work until commit — atomic chunks only stage.
+      expect(harness.calls.importBulkImportCalls()).toBe(0)
+      expect(harness.calls.importBulkInstallPayloads()).toEqual([])
+
+      await harness.send<number>({
+        id: 4,
+        cmd: 'importChunk',
+        sessionId: 41,
+        cells: [
+          { sheet: 0, row: 2, col: 0, kind: 'error', value: '#DIV/0!' },
+          { sheet: 0, row: 3, col: 0, kind: 'null' },
+          // Last write wins for the A1 duplicate.
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 7 },
+          // Out-of-range sheets surface as chunk-time issues and are
+          // skipped at install, mirroring the legacy engine check.
+          { sheet: 5, row: 0, col: 0, kind: 'number', value: 9 },
+        ],
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: 5,
+        cmd: 'commitImport',
+        sessionId: 41,
+      })
+
+      // The shell never sees the legacy per-chunk path...
+      expect(harness.calls.importBulkImportCalls()).toBe(0)
+      // ...just one storage-primary install, grouped per sheet with
+      // zero-based "R:C" addrs, formulas split out, nulls skipped.
+      expect(harness.calls.importBulkInstallPayloads()).toEqual([
+        [
+          {
+            sheet: 0,
+            primitives: [
+              ['0:0', 7],
+              ['2:0', { error: '#DIV/0!' }],
+            ],
+            formulas: [['1:0', '=A1+1']],
+          },
+          {
+            sheet: 1,
+            primitives: [['0:0', 'hello']],
+            formulas: [],
+          },
+        ],
+      ])
+      // The live workbook still receives the additive legacy replay of
+      // final touches (including the clear).
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([
+        [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 7 },
+          { sheet: 0, row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+          { sheet: 1, row: 0, col: 0, kind: 'text', value: 'hello' },
+          { sheet: 0, row: 2, col: 0, kind: 'error', value: '#DIV/0!' },
+          { sheet: 0, row: 3, col: 0, kind: 'null' },
+        ],
+      ])
+      expect(commit).toEqual({
+        accepted: 6,
+        formulas: 1,
+        rejectedFormulas: 0,
+        cleared: 1,
+        errors: 1,
+        issues: [
+          {
+            sheet: 5,
+            row: 0,
+            col: 0,
+            kind: 'number',
+            code: 'SHEET_OUT_OF_RANGE',
+            message: 'cell sheet index is outside the workbook',
+          },
+        ],
+      })
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('falls back to legacy bulk_import_cells staging when bulk_install_workbook is unavailable', async () => {
+    const harness = withMockedWorker({ disableBulkInstallWorkbook: true })
+    try {
+      await harness.send({
+        id: 1,
+        cmd: 'initWorkbook',
+        sheets: ['Sheet1'],
+      })
+      await harness.send<number>({
+        id: 2,
+        cmd: 'beginImport',
+        sessionId: 42,
+      })
+      await harness.send<number>({
+        id: 3,
+        cmd: 'importChunk',
+        sessionId: 42,
+        cells: [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+        ],
+      })
+
+      const commit = await harness.send<WorkbookImportStatsWire>({
+        id: 4,
+        cmd: 'commitImport',
+        sessionId: 42,
+      })
+
+      expect(harness.calls.importBulkInstallPayloads()).toEqual([])
+      expect(harness.calls.importBulkImportPayloads()).toEqual([
+        [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+        ],
+      ])
+      expect(harness.calls.mainBulkImportPayloads()).toEqual([
+        [
+          { sheet: 0, row: 0, col: 0, kind: 'number', value: 1 },
+          { sheet: 0, row: 1, col: 0, kind: 'formula', value: '=A1+1' },
+        ],
+      ])
+      expect(commit.accepted).toBe(2)
+      expect(commit.formulas).toBe(1)
     } finally {
       harness.dispose()
     }

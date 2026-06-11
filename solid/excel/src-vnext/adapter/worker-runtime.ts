@@ -25,6 +25,26 @@ import type {
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope
 
+/**
+ * STORAGE_PRIMARY Phase 6.3 — wire shape consumed by the wasm
+ * `bulk_install_workbook` entry (Phase 6.2). One entry per sheet;
+ * `primitives` / `formulas` are `[addr, value]` pairs and addr strings
+ * use the zero-based `"R:C"` encoding the binding accepts. Error cells
+ * ride as `{ error }` objects (no `kind` discriminator on this wire).
+ *
+ * The engine treats every listed sheet as a FULL-SHEET REPLACE
+ * (`Workbook::install_sheet_bulk` tears down previous content first),
+ * so this payload is only safe against a fresh workbook — the atomic
+ * import shell created at `beginImport`.
+ */
+type BulkInstallPrimitiveWire = number | string | boolean | { error: string }
+
+type SheetBulkInstallWire = {
+  sheet: number
+  primitives: Array<[string, BulkInstallPrimitiveWire]>
+  formulas: Array<[string, string]>
+}
+
 type WasmWorkbookRuntime = {
   sheet_count(): number
   sheet_name(idx: number): string
@@ -51,6 +71,13 @@ type WasmWorkbookRuntime = {
   get_formula(sheetIdx: number, addr: string): string
   snapshotCell(sheetIdx: number, addr: string): CellSnapshotWire
   bulk_import_cells(cells: ImportCellWire[]): WorkbookImportStatsWire
+  /**
+   * STORAGE_PRIMARY Phase 6.2/6.3 — storage-primary bulk install.
+   * Optional because test mocks and pre-Phase-6.2 wasm-pkg builds do
+   * not expose it; the atomic commit path falls back to the legacy
+   * `bulk_import_cells` when missing.
+   */
+  bulk_install_workbook?: (payload: SheetBulkInstallWire[]) => unknown
   list_non_empty_cells?: () => CellRefWire[]
   snapshot_sparse?: () => SparseCellWire[]
   snapshot_range_sparse?: (
@@ -731,19 +758,124 @@ function directImportPartialFailure(err: unknown) {
   )
 }
 
-function importCellsIntoSession(
-  session: ImportSession,
+// TODO(6.4): direct sessions write ADDITIVELY into the live workbook —
+// the storage-primary `bulk_install_workbook` is a full-sheet replace,
+// so this path stays on the legacy `bulk_import_cells` until the engine
+// grows an additive storage-primary entry.
+function importCellsIntoDirectSession(
+  session: DirectImportSession,
   cells: ImportCellWire[],
 ): WorkbookImportStatsWire {
   const bulkImportCells = assertMethod(session.workbook, 'bulk_import_cells')
-  if (session.mode === 'direct') {
-    try {
-      return bulkImportCells.call(session.workbook, cells)
-    } catch (err) {
-      throw directImportPartialFailure(err)
-    }
+  try {
+    return bulkImportCells.call(session.workbook, cells)
+  } catch (err) {
+    throw directImportPartialFailure(err)
   }
-  return bulkImportCells.call(session.workbook, cells)
+}
+
+/**
+ * STORAGE_PRIMARY Phase 6.3 — chunk-time stats for atomic sessions.
+ *
+ * Atomic chunks no longer touch the shell engine per chunk (the staged
+ * cells install in ONE `bulk_install_workbook` call at commit), so the
+ * per-chunk stats the legacy shell `bulk_import_cells` used to return
+ * are synthesized here with the same counting rules:
+ *
+ * - sheet out of range  → `errors` + a `SHEET_OUT_OF_RANGE` issue
+ *   (mirrors the engine's per-cell check; the cells stay recorded in
+ *   `finalTouches` and are skipped again at install/snapshot, exactly
+ *   like the legacy flow).
+ * - `null`              → `accepted` + `cleared`.
+ * - `formula`           → `formulas` + optimistic `accepted`. The
+ *   storage-primary install parks formula text without parsing;
+ *   rejections surface when commit replays the staged cells onto the
+ *   live workbook through the legacy `bulk_import_cells`, and
+ *   `mergeFinalCommitStats` reconciles `accepted` / `rejectedFormulas`
+ *   from that replay — same net stats as the legacy chunk-time
+ *   rejection.
+ * - everything else     → `accepted` (values are already validated by
+ *   `normalizeImportCells`).
+ */
+function stageAtomicChunkStats(
+  session: AtomicImportSession,
+  cells: ImportCellWire[],
+): WorkbookImportStatsWire {
+  const stats = emptyImportStats()
+  const sheetCount = session.workbook.sheet_count()
+  const issues: ImportCellIssueWire[] = []
+  for (const cell of cells) {
+    if (cell.sheet >= sheetCount) {
+      stats.errors += 1
+      issues.push(
+        importCellIssue(cell, 'SHEET_OUT_OF_RANGE', 'cell sheet index is outside the workbook'),
+      )
+      continue
+    }
+    if (cell.kind === 'null') {
+      stats.accepted += 1
+      stats.cleared += 1
+      continue
+    }
+    if (cell.kind === 'formula') stats.formulas += 1
+    stats.accepted += 1
+  }
+  return issues.length > 0 ? { ...stats, issues } : stats
+}
+
+/**
+ * Group staged import cells into the per-sheet `bulk_install_workbook`
+ * payload. Mirrors `snapshotFinalImportTouches` / `finalImportClears`
+ * filtering: out-of-range sheets are skipped (the binding rejects the
+ * whole payload otherwise), and `null` kinds are skipped because the
+ * shell starts empty — there is nothing to clear there; the clears
+ * still replay onto the live workbook via `finalImportClears`.
+ */
+function buildBulkInstallPayload(
+  cells: Iterable<ImportCellWire>,
+  sheetCount: number,
+): SheetBulkInstallWire[] {
+  const bySheet = new Map<number, SheetBulkInstallWire>()
+  for (const cell of cells) {
+    if (cell.sheet >= sheetCount) continue
+    if (cell.kind === 'null') continue
+    let entry = bySheet.get(cell.sheet)
+    if (!entry) {
+      entry = { sheet: cell.sheet, primitives: [], formulas: [] }
+      bySheet.set(cell.sheet, entry)
+    }
+    const addr = `${cell.row}:${cell.col}`
+    if (cell.kind === 'formula') entry.formulas.push([addr, cell.value])
+    else if (cell.kind === 'error') entry.primitives.push([addr, { error: cell.value }])
+    else entry.primitives.push([addr, cell.value])
+  }
+  return [...bySheet.values()]
+}
+
+/**
+ * STORAGE_PRIMARY Phase 6.3 — install the atomic session's staged cells
+ * into its shell workbook in one storage-primary call.
+ *
+ * The shell is a FRESH workbook created at `beginImport`
+ * (`createWorkbookShell`), so the engine's full-sheet-replace semantics
+ * equal a plain fresh install here: one map swap per sheet instead of
+ * per-cell loader calls. `finalTouches` is already deduped
+ * last-write-wins, so the single install lands the same end state the
+ * legacy per-chunk `bulk_import_cells` sequence produced.
+ *
+ * Falls back to the legacy path when the binding is unavailable (test
+ * mocks, pre-Phase-6.2 wasm-pkg builds).
+ */
+function installAtomicStagingIntoShell(session: AtomicImportSession) {
+  if (session.finalTouches.size === 0) return
+  const shell = session.workbook
+  const bulkInstallWorkbook = shell.bulk_install_workbook
+  if (typeof bulkInstallWorkbook === 'function') {
+    const payload = buildBulkInstallPayload(session.finalTouches.values(), shell.sheet_count())
+    if (payload.length > 0) bulkInstallWorkbook.call(shell, payload)
+    return
+  }
+  assertMethod(shell, 'bulk_import_cells').call(shell, [...session.finalTouches.values()])
 }
 
 function normalizeSparseRange(range: unknown): SparseRangeWire {
@@ -1308,7 +1440,14 @@ export function installWorkerRuntime() {
             const chunk = normalizeImportCells(rawCells as ImportCellWire[])
             ensureImportSessionLimits(session, chunk)
             if (chunk.cells.length > 0) {
-              const stats = importCellsIntoSession(session, chunk.cells)
+              // STORAGE_PRIMARY Phase 6.3: atomic chunks only stage —
+              // the shell install happens once at commit through
+              // `bulk_install_workbook`. Direct chunks keep writing
+              // additively into the live workbook via the legacy path.
+              const stats =
+                session.mode === 'atomic'
+                  ? stageAtomicChunkStats(session, chunk.cells)
+                  : importCellsIntoDirectSession(session, chunk.cells)
               session.stats = mergeImportStats(session.stats, stats)
               if (session.mode === 'atomic') recordFinalTouches(session, chunk.cells)
               session.normalizedCount += chunk.cells.length
@@ -1371,11 +1510,20 @@ export function installWorkerRuntime() {
               )
               break
             }
+            // STORAGE_PRIMARY Phase 6.3: the staged cells land in the
+            // fresh shell in ONE storage-primary install, then the
+            // snapshot below reads the final cell states back (lazy
+            // formulas serialize their source without evaluating).
+            installAtomicStagingIntoShell(session)
             const changedCells = snapshotFinalImportTouches(session)
             const finalClears = finalImportClears(session)
             const finalWrites = [...changedCells.map(sparseCellToImportCell), ...finalClears]
             let stats = session.stats
             if (finalWrites.length > 0) {
+              // TODO(6.4): the replay onto the LIVE workbook is additive
+              // (it may hold content outside the imported range), so it
+              // stays on the legacy `bulk_import_cells` — full-sheet
+              // replace would tear down unrelated cells.
               const finalStats = assertMethod(wb, 'bulk_import_cells').call(wb, finalWrites)
               stats = mergeFinalCommitStats(stats, finalStats)
             }
