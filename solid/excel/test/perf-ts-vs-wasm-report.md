@@ -81,73 +81,85 @@ EINFACH_PERF=1 NODE_OPTIONS='--expose-gc --max-old-space-size=8192' \
 ```
 
 <!-- BENCH:RESULTS:START -->
-*Last bench run: 2026-06-05T09:48:55.903Z*
+*Last bench run: 2026-06-11T07:36:37.079Z*
 
 | Workload | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Tiny | setup | 0.12 | 1.1 | 0.11× | acceptable |
-| Tiny | bulkWrite | 0.23 | 0.52 | 0.45× | acceptable |
-| Tiny | readBack | 1.1 | 0.52 | 2.21× | acceptable |
-| Tiny | recalc | 1.0 | 0.52 | 2.02× | acceptable |
-| Medium | setup | 3.1 | 17.2 | 0.18× | acceptable |
-| Medium | bulkWrite | 6.4 | 214 | 0.03× | acceptable |
-| Medium | readBack | 521 | 466 | 1.12× | acceptable |
-| Medium | recalc | 534 | 461 | 1.16× | acceptable |
-| Large | setup | 31.7 | 164 | 0.19× | acceptable |
-| Large | bulkWrite | 75.5 | 4608 | 0.02× | acceptable |
-| Large | readBack | 5276 | 5728 | 0.92× | acceptable |
-| Large | recalc | 5515 | 5628 | 0.98× | acceptable |
-| XLarge | setup | 96.9 | 444 | 0.22× | acceptable |
-| XLarge | bulkWrite | 383 | 35607 | 0.01× | acceptable |
-| XLarge | readBack | 37220 | 31221 | 1.19× | acceptable |
-| XLarge | recalc | 30479 | 30384 | 1.00× | acceptable |
-| Mega | setup | 241 | 942 | 0.26× | acceptable |
-| Mega | bulkWrite | 908 | 427585 | 0.00× | acceptable |
-| Mega | readBack | 60367 | 74961 | 0.81× | acceptable |
-| Mega | recalc | 66347 | 61193 | 1.08× | acceptable |
+| Tiny | setup | 0.12 | 0.63 | 0.20× | acceptable |
+| Tiny | bulkWrite | 0.24 | 0.30 | 0.78× | acceptable |
+| Tiny | readBack | 1.2 | 0.75 | 1.54× | acceptable |
+| Tiny | recalc | 1.1 | 0.42 | 2.52× | acceptable |
+| Medium | setup | 3.0 | 16.3 | 0.18× | acceptable |
+| Medium | bulkWrite | 5.8 | 70.0 | 0.08× | acceptable |
+| Medium | readBack | 500 | 553 | 0.90× | acceptable |
+| Medium | recalc | 513 | 440 | 1.17× | acceptable |
+| Large | setup | 34.6 | 160 | 0.22× | acceptable |
+| Large | bulkWrite | 84.7 | 707 | 0.12× | acceptable |
+| Large | readBack | 5196 | 7621 | 0.68× | acceptable |
+| Large | recalc | 5257 | 5476 | 0.96× | acceptable |
+| XLarge | setup | 115 | 419 | 0.27× | acceptable |
+| XLarge | bulkWrite | 359 | 3565 | 0.10× | acceptable |
+| XLarge | readBack | 30513 | 38882 | 0.78× | acceptable |
+| XLarge | recalc | 30450 | 30089 | 1.01× | acceptable |
+| Mega | setup | 224 | 887 | 0.25× | acceptable |
+| Mega | bulkWrite | 785 | 7197 | 0.11× | acceptable |
+| Mega | readBack | 61350 | 77514 | 0.79× | acceptable |
+| Mega | recalc | 63362 | 61587 | 1.03× | acceptable |
+| Ultra | setup | 562 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | bulkWrite | 1983 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | readBack | 137440 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Ultra | recalc | 153463 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
 
 ### Peak RSS by phase (MB)
 
 | Workload | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Tiny | setup | 599 MB | 602 MB |
-| Tiny | bulkWrite | 599 MB | 602 MB |
-| Tiny | readBack | 599 MB | 604 MB |
-| Tiny | recalc | 599 MB | 604 MB |
-| Medium | setup | 657 MB | 708 MB |
-| Medium | bulkWrite | 657 MB | 708 MB |
-| Medium | readBack | 658 MB | 708 MB |
-| Medium | recalc | 660 MB | 708 MB |
-| Large | setup | 735 MB | 973 MB |
-| Large | bulkWrite | 769 MB | 1269 MB |
-| Large | readBack | 868 MB | 1268 MB |
-| Large | recalc | 968 MB | 1268 MB |
-| XLarge | setup | 1288 MB | 1674 MB |
-| XLarge | bulkWrite | 1311 MB | 1750 MB |
-| XLarge | readBack | 1529 MB | 2406 MB |
-| XLarge | recalc | 1582 MB | 2406 MB |
-| Mega | setup | 2619 MB | 3245 MB |
-| Mega | bulkWrite | 2852 MB | 2212 MB |
-| Mega | readBack | 3692 MB | 3409 MB |
-| Mega | recalc | 3182 MB | 3483 MB |
+| Tiny | setup | 569 MB | 570 MB |
+| Tiny | bulkWrite | 569 MB | 570 MB |
+| Tiny | readBack | 569 MB | 572 MB |
+| Tiny | recalc | 569 MB | 572 MB |
+| Medium | setup | 626 MB | 677 MB |
+| Medium | bulkWrite | 626 MB | 677 MB |
+| Medium | readBack | 627 MB | 677 MB |
+| Medium | recalc | 641 MB | 677 MB |
+| Large | setup | 688 MB | 976 MB |
+| Large | bulkWrite | 694 MB | 978 MB |
+| Large | readBack | 825 MB | 1216 MB |
+| Large | recalc | 1023 MB | 1216 MB |
+| XLarge | setup | 1234 MB | 1662 MB |
+| XLarge | bulkWrite | 1249 MB | 1664 MB |
+| XLarge | readBack | 1498 MB | 2696 MB |
+| XLarge | recalc | 1725 MB | 2987 MB |
+| Mega | setup | 3020 MB | 3373 MB |
+| Mega | bulkWrite | 3073 MB | 3259 MB |
+| Mega | readBack | 2888 MB | 2252 MB |
+| Mega | recalc | 3341 MB | 2680 MB |
+| Ultra | setup | 3701 MB | *failed* |
+| Ultra | bulkWrite | 3171 MB | *failed* |
+| Ultra | readBack | 3712 MB | *failed* |
+| Ultra | recalc | 3853 MB | *failed* |
+
+### Failures / skipped backends
+
+- **Ultra / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
 
 ### Crossover analysis (TS-vs-WASM by tier)
 
 Ratio > 1.0× means TS is SLOWER than WASM. We track the first
 tier where each phase crosses (WASM regains advantage).
 
-- **setup**: Tiny=0.11×, Medium=0.18×, Large=0.19×, XLarge=0.22×, Mega=0.26×
+- **setup**: Tiny=0.20×, Medium=0.18×, Large=0.22×, XLarge=0.27×, Mega=0.25×, Ultra=wasm-failed
   - crossover: TS still faster at largest measured tier
-- **bulkWrite**: Tiny=0.45×, Medium=0.03×, Large=0.02×, XLarge=0.01×, Mega=0.00×
+- **bulkWrite**: Tiny=0.78×, Medium=0.08×, Large=0.12×, XLarge=0.10×, Mega=0.11×, Ultra=wasm-failed
   - crossover: TS still faster at largest measured tier
-- **readBack**: Tiny=2.21×, Medium=1.12×, Large=0.92×, XLarge=1.19×, Mega=0.81×
-  - crossover: Tiny (ratio 2.21×)
-- **recalc**: Tiny=2.02×, Medium=1.16×, Large=0.98×, XLarge=1.00×, Mega=1.08×
-  - crossover: Tiny (ratio 2.02×)
+- **readBack**: Tiny=1.54×, Medium=0.90×, Large=0.68×, XLarge=0.78×, Mega=0.79×, Ultra=wasm-failed
+  - crossover: Tiny (ratio 1.54×)
+- **recalc**: Tiny=2.52×, Medium=1.17×, Large=0.96×, XLarge=1.01×, Mega=1.03×, Ultra=wasm-failed
+  - crossover: Tiny (ratio 2.52×)
 <!-- BENCH:RESULTS:END -->
 
 <!-- BENCH:CHAIN:START -->
-*Last chain bench run: 2026-05-28T04:35:25.133Z*
+*Last chain bench run: 2026-06-11T07:36:37.079Z*
 
 ## Chain dependency workload
 
@@ -166,26 +178,26 @@ per-cell precise dep tracking. Phases:
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| Chain100 | setup | 0.63 | 2.1 | 0.29× | TS wins |
-| Chain100 | bulkWrite | 0.79 | 1.6 | 0.48× | TS wins |
-| Chain100 | firstRecalc | 1.1 | 0.71 | 1.54× | WASM wins |
-| Chain100 | mutateThenRecalc | 0.49 | 0.17 | 2.97× | WASM wins |
-| Chain100 | steadyState | 0.02 | 0.01 | 4.13× | WASM wins |
-| Chain1k | setup | 0.13 | 0.11 | 1.27× | WASM edges |
-| Chain1k | bulkWrite | 1.5 | 5.0 | 0.30× | TS wins |
-| Chain1k | firstRecalc | 3.2 | 0.83 | 3.89× | WASM wins |
-| Chain1k | mutateThenRecalc | 1.8 | 1.00 | 1.76× | WASM wins |
-| Chain1k | steadyState | 0.00 | 0.04 | 0.11× | TS wins |
-| Chain10k | setup | 0.08 | 0.07 | 1.25× | WASM edges |
-| Chain10k | bulkWrite | 7.2 | 29.8 | 0.24× | TS wins |
-| Chain10k | firstRecalc | 27.9 | 6.4 | 4.37× | WASM wins |
-| Chain10k | mutateThenRecalc | 14.4 | 8.8 | 1.65× | WASM wins |
-| Chain10k | steadyState | 0.01 | 0.01 | 0.68× | roughly tied |
-| Chain100k | setup | 0.11 | 0.08 | 1.34× | WASM edges |
-| Chain100k | bulkWrite | 71.1 | 278 | 0.26× | TS wins |
-| Chain100k | firstRecalc | 159 | 66.6 | 2.39× | WASM wins |
-| Chain100k | mutateThenRecalc | 161 | 113 | 1.42× | WASM edges |
-| Chain100k | steadyState | 0.01 | 0.01 | 0.58× | TS wins |
+| Chain100 | setup | 0.77 | 0.31 | 2.48× | WASM wins |
+| Chain100 | bulkWrite | 4.6 | 0.26 | 18.10× | WASM wins |
+| Chain100 | firstRecalc | 0.84 | 0.81 | 1.04× | WASM edges |
+| Chain100 | mutateThenRecalc | 0.55 | 0.10 | 5.52× | WASM wins |
+| Chain100 | steadyState | 0.05 | 0.00 | 12.80× | WASM wins |
+| Chain1k | setup | 0.07 | 0.08 | 0.82× | roughly tied |
+| Chain1k | bulkWrite | 1.1 | 3.4 | 0.33× | TS wins |
+| Chain1k | firstRecalc | 4.8 | 54.3 | 0.09× | TS wins |
+| Chain1k | mutateThenRecalc | 3.7 | 0.85 | 4.38× | WASM wins |
+| Chain1k | steadyState | 0.03 | 0.00 | 10.25× | WASM wins |
+| Chain10k | setup | 0.09 | 0.08 | 1.17× | WASM edges |
+| Chain10k | bulkWrite | 12.5 | 18.8 | 0.66× | roughly tied |
+| Chain10k | firstRecalc | 36.2 | 5724 | 0.01× | TS wins |
+| Chain10k | mutateThenRecalc | 28.8 | 8.9 | 3.23× | WASM wins |
+| Chain10k | steadyState | 0.00 | 0.00 | 0.93× | roughly tied |
+| Chain100k | setup | 0.10 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain100k | bulkWrite | 78.3 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain100k | firstRecalc | 381 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain100k | mutateThenRecalc | 208 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| Chain100k | steadyState | 0.03 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
 
 ### evalCount delta per phase
 
@@ -208,36 +220,36 @@ For a depth-`n` chain, full re-evaluation = `n-1` formula evals. A delta of `0` 
 | Chain10k | firstRecalc | 1 | 9,999 |
 | Chain10k | mutateThenRecalc | 1 | 9,999 |
 | Chain10k | steadyState | 0 | 0 |
-| Chain100k | setup | 0 | 0 |
-| Chain100k | bulkWrite | 0 | 0 |
-| Chain100k | firstRecalc | 1 | 99,999 |
-| Chain100k | mutateThenRecalc | 1 | 99,999 |
-| Chain100k | steadyState | 0 | 0 |
+| Chain100k | setup | 0 | *failed* |
+| Chain100k | bulkWrite | 0 | *failed* |
+| Chain100k | firstRecalc | 1 | *failed* |
+| Chain100k | mutateThenRecalc | 1 | *failed* |
+| Chain100k | steadyState | 0 | *failed* |
 
 ### Peak RSS by phase (MB)
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| Chain100 | setup | 500 MB | 501 MB |
-| Chain100 | bulkWrite | 500 MB | 502 MB |
-| Chain100 | firstRecalc | 500 MB | 502 MB |
-| Chain100 | mutateThenRecalc | 500 MB | 502 MB |
-| Chain100 | steadyState | 500 MB | 502 MB |
-| Chain1k | setup | 507 MB | 508 MB |
-| Chain1k | bulkWrite | 508 MB | 510 MB |
-| Chain1k | firstRecalc | 508 MB | 510 MB |
-| Chain1k | mutateThenRecalc | 508 MB | 511 MB |
-| Chain1k | steadyState | 508 MB | 509 MB |
-| Chain10k | setup | 509 MB | 517 MB |
-| Chain10k | bulkWrite | 510 MB | 524 MB |
-| Chain10k | firstRecalc | 512 MB | 524 MB |
-| Chain10k | mutateThenRecalc | 521 MB | 524 MB |
-| Chain10k | steadyState | 517 MB | 524 MB |
-| Chain100k | setup | 527 MB | 997 MB |
-| Chain100k | bulkWrite | 562 MB | 985 MB |
-| Chain100k | firstRecalc | 677 MB | 985 MB |
-| Chain100k | mutateThenRecalc | 997 MB | 986 MB |
-| Chain100k | steadyState | 997 MB | 986 MB |
+| Chain100 | setup | 2735 MB | 2711 MB |
+| Chain100 | bulkWrite | 2736 MB | 2711 MB |
+| Chain100 | firstRecalc | 2736 MB | 2712 MB |
+| Chain100 | mutateThenRecalc | 2737 MB | 2713 MB |
+| Chain100 | steadyState | 2737 MB | 2713 MB |
+| Chain1k | setup | 2726 MB | 2731 MB |
+| Chain1k | bulkWrite | 2726 MB | 2706 MB |
+| Chain1k | firstRecalc | 2727 MB | 2702 MB |
+| Chain1k | mutateThenRecalc | 2731 MB | 2702 MB |
+| Chain1k | steadyState | 2731 MB | 2702 MB |
+| Chain10k | setup | 2709 MB | 2533 MB |
+| Chain10k | bulkWrite | 2716 MB | 2533 MB |
+| Chain10k | firstRecalc | 2710 MB | 1687 MB |
+| Chain10k | mutateThenRecalc | 2701 MB | 1687 MB |
+| Chain10k | steadyState | 2541 MB | 1681 MB |
+| Chain100k | setup | 1683 MB | *failed* |
+| Chain100k | bulkWrite | 1690 MB | *failed* |
+| Chain100k | firstRecalc | 1680 MB | *failed* |
+| Chain100k | mutateThenRecalc | 1588 MB | *failed* |
+| Chain100k | steadyState | 1477 MB | *failed* |
 
 ### Chain crossover trace (mutateThenRecalc)
 
@@ -245,12 +257,16 @@ Ratio > 1.0× means TS is SLOWER than WASM on the chain mutate cycle.
 This is THE chain-workload diagnostic. If Rust ever beats TS in this
 repo, it should show up here first.
 
-- Chain100=2.97×, Chain1k=1.76×, Chain10k=1.65×, Chain100k=1.42×
-- crossover: Chain100 (ratio 2.97×)
+- Chain100=5.52×, Chain1k=4.38×, Chain10k=3.23×, Chain100k=wasm-failed
+- crossover: Chain100 (ratio 5.52×)
+
+### Chain failures / skipped backends
+
+- **Chain100k / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
 <!-- BENCH:CHAIN:END -->
 
 <!-- BENCH:RANGE:START -->
-*Last range bench run: 2026-05-28T04:40:00.359Z*
+*Last range bench run: 2026-06-11T07:36:37.079Z*
 
 ## Range-heavy workloads
 
@@ -274,42 +290,42 @@ mutateThenRecalc (median of `runs`).
 
 | Tier | Phase | TS (ms) | WASM (ms) | Ratio (ts/wasm) | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| FanOut1k | setup | 0.55 | 2.2 | 0.25× | TS wins |
-| FanOut1k | bulkWrite | 1.9 | 6.1 | 0.32× | TS wins |
-| FanOut1k | firstRecalc | 6.7 | 4.0 | 1.69× | WASM wins |
-| FanOut1k | mutateThenRecalc | 4.3 | 2.6 | 1.64× | WASM wins |
-| FanOut10k | setup | 0.14 | 0.10 | 1.44× | WASM edges |
-| FanOut10k | bulkWrite | 12.1 | 27.0 | 0.45× | TS wins |
-| FanOut10k | firstRecalc | 38.9 | 19.2 | 2.02× | WASM wins |
-| FanOut10k | mutateThenRecalc | 42.6 | 20.9 | 2.04× | WASM wins |
-| FanOut100k | setup | 0.10 | 0.08 | 1.30× | WASM edges |
-| FanOut100k | bulkWrite | 71.0 | 227 | 0.31× | TS wins |
-| FanOut100k | firstRecalc | 405 | 184 | 2.20× | WASM wins |
-| FanOut100k | mutateThenRecalc | 595 | 234 | 2.55× | WASM wins |
-| FanIn1k | setup | 0.60 | 1.9 | 0.32× | TS wins |
-| FanIn1k | bulkWrite | 0.21 | 0.81 | 0.26× | TS wins |
-| FanIn1k | firstRecalc | 1.9 | 3.5 | 0.54× | TS wins |
-| FanIn1k | mutateThenRecalc | 0.78 | 0.94 | 0.82× | roughly tied |
-| FanIn10k | setup | 2.9 | 16.4 | 0.17× | TS wins |
-| FanIn10k | bulkWrite | 0.53 | 4.5 | 0.12× | TS wins |
-| FanIn10k | firstRecalc | 7.2 | 8.9 | 0.81× | roughly tied |
-| FanIn10k | mutateThenRecalc | 6.9 | 8.6 | 0.80× | roughly tied |
-| FanIn100k | setup | 30.1 | 162 | 0.19× | TS wins |
-| FanIn100k | bulkWrite | 5.4 | 50.1 | 0.11× | TS wins |
-| FanIn100k | firstRecalc | 81.8 | 113 | 0.73× | roughly tied |
-| FanIn100k | mutateThenRecalc | 81.9 | 122 | 0.67× | roughly tied |
-| Stripe1k | setup | 0.29 | 1.6 | 0.18× | TS wins |
-| Stripe1k | bulkWrite | 1.3 | 5.5 | 0.25× | TS wins |
-| Stripe1k | firstRecalc | 6.1 | 5.3 | 1.13× | WASM edges |
-| Stripe1k | mutateThenRecalc | 6.5 | 1.2 | 5.58× | WASM wins |
-| Stripe10k | setup | 5.2 | 15.5 | 0.34× | TS wins |
-| Stripe10k | bulkWrite | 9.1 | 51.0 | 0.18× | TS wins |
-| Stripe10k | firstRecalc | 63.6 | 51.2 | 1.24× | WASM edges |
-| Stripe10k | mutateThenRecalc | 70.6 | 11.3 | 6.24× | WASM wins |
-| Stripe100k | setup | 27.5 | 156 | 0.18× | TS wins |
-| Stripe100k | bulkWrite | 109 | 815 | 0.13× | TS wins |
-| Stripe100k | firstRecalc | 699 | 541 | 1.29× | WASM edges |
-| Stripe100k | mutateThenRecalc | 914 | 124 | 7.36× | WASM wins |
+| FanOut1k | setup | 0.11 | 0.11 | 1.02× | WASM edges |
+| FanOut1k | bulkWrite | 1.3 | 2.1 | 0.64× | TS wins |
+| FanOut1k | firstRecalc | 7.5 | 3.0 | 2.52× | WASM wins |
+| FanOut1k | mutateThenRecalc | 8.2 | 2.0 | 4.00× | WASM wins |
+| FanOut10k | setup | 0.06 | 0.09 | 0.75× | roughly tied |
+| FanOut10k | bulkWrite | 8.3 | 18.6 | 0.45× | TS wins |
+| FanOut10k | firstRecalc | 73.5 | 29.7 | 2.48× | WASM wins |
+| FanOut10k | mutateThenRecalc | 70.6 | 22.8 | 3.10× | WASM wins |
+| FanOut100k | setup | 0.09 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| FanOut100k | bulkWrite | 91.6 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| FanOut100k | firstRecalc | 611 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| FanOut100k | mutateThenRecalc | 1034 | *Error: attempted to take ownership of…* | — | WASM failed; TS wins by default |
+| FanIn1k | setup | 0.46 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn1k | bulkWrite | 0.17 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn1k | firstRecalc | 3.9 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn1k | mutateThenRecalc | 1.5 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn10k | setup | 3.3 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn10k | bulkWrite | 0.57 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn10k | firstRecalc | 12.8 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn10k | mutateThenRecalc | 12.3 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn100k | setup | 39.5 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn100k | bulkWrite | 7.7 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn100k | firstRecalc | 197 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| FanIn100k | mutateThenRecalc | 190 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe1k | setup | 0.44 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe1k | bulkWrite | 2.1 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe1k | firstRecalc | 11.9 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe1k | mutateThenRecalc | 13.3 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe10k | setup | 3.6 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe10k | bulkWrite | 13.5 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe10k | firstRecalc | 124 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe10k | mutateThenRecalc | 133 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe100k | setup | 37.4 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe100k | bulkWrite | 154 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe100k | firstRecalc | 1363 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
+| Stripe100k | mutateThenRecalc | 1665 | *skipped (WASM range failed at tier in…* | — | WASM failed; TS wins by default |
 
 ### evalCount delta per phase
 
@@ -323,75 +339,85 @@ mutateThenRecalc (median of `runs`).
 | FanOut10k | bulkWrite | 0 | 0 |
 | FanOut10k | firstRecalc | 10,000 | 10,000 |
 | FanOut10k | mutateThenRecalc | 10,000 | 10,000 |
-| FanOut100k | setup | 0 | 0 |
-| FanOut100k | bulkWrite | 0 | 0 |
-| FanOut100k | firstRecalc | 100,000 | 100,000 |
-| FanOut100k | mutateThenRecalc | 100,000 | 100,000 |
-| FanIn1k | setup | 0 | 0 |
-| FanIn1k | bulkWrite | 0 | 0 |
-| FanIn1k | firstRecalc | 3 | 3 |
-| FanIn1k | mutateThenRecalc | 3 | 3 |
-| FanIn10k | setup | 0 | 0 |
-| FanIn10k | bulkWrite | 0 | 0 |
-| FanIn10k | firstRecalc | 3 | 3 |
-| FanIn10k | mutateThenRecalc | 3 | 3 |
-| FanIn100k | setup | 0 | 0 |
-| FanIn100k | bulkWrite | 0 | 0 |
-| FanIn100k | firstRecalc | 3 | 3 |
-| FanIn100k | mutateThenRecalc | 3 | 3 |
-| Stripe1k | setup | 0 | 0 |
-| Stripe1k | bulkWrite | 0 | 0 |
-| Stripe1k | firstRecalc | 1,000 | 1,000 |
-| Stripe1k | mutateThenRecalc | 1,000 | 10 |
-| Stripe10k | setup | 0 | 0 |
-| Stripe10k | bulkWrite | 0 | 0 |
-| Stripe10k | firstRecalc | 10,000 | 10,000 |
-| Stripe10k | mutateThenRecalc | 10,000 | 10 |
-| Stripe100k | setup | 0 | 0 |
-| Stripe100k | bulkWrite | 0 | 0 |
-| Stripe100k | firstRecalc | 100,000 | 100,000 |
-| Stripe100k | mutateThenRecalc | 100,000 | 10 |
+| FanOut100k | setup | 0 | *failed* |
+| FanOut100k | bulkWrite | 0 | *failed* |
+| FanOut100k | firstRecalc | 100,000 | *failed* |
+| FanOut100k | mutateThenRecalc | 100,000 | *failed* |
+| FanIn1k | setup | 0 | *failed* |
+| FanIn1k | bulkWrite | 0 | *failed* |
+| FanIn1k | firstRecalc | 3 | *failed* |
+| FanIn1k | mutateThenRecalc | 3 | *failed* |
+| FanIn10k | setup | 0 | *failed* |
+| FanIn10k | bulkWrite | 0 | *failed* |
+| FanIn10k | firstRecalc | 3 | *failed* |
+| FanIn10k | mutateThenRecalc | 3 | *failed* |
+| FanIn100k | setup | 0 | *failed* |
+| FanIn100k | bulkWrite | 0 | *failed* |
+| FanIn100k | firstRecalc | 3 | *failed* |
+| FanIn100k | mutateThenRecalc | 3 | *failed* |
+| Stripe1k | setup | 0 | *failed* |
+| Stripe1k | bulkWrite | 0 | *failed* |
+| Stripe1k | firstRecalc | 1,000 | *failed* |
+| Stripe1k | mutateThenRecalc | 1,000 | *failed* |
+| Stripe10k | setup | 0 | *failed* |
+| Stripe10k | bulkWrite | 0 | *failed* |
+| Stripe10k | firstRecalc | 10,000 | *failed* |
+| Stripe10k | mutateThenRecalc | 10,000 | *failed* |
+| Stripe100k | setup | 0 | *failed* |
+| Stripe100k | bulkWrite | 0 | *failed* |
+| Stripe100k | firstRecalc | 100,000 | *failed* |
+| Stripe100k | mutateThenRecalc | 100,000 | *failed* |
 
 ### Peak RSS by phase (MB)
 
 | Tier | Phase | TS RSS | WASM RSS |
 | --- | --- | --- | --- |
-| FanOut1k | setup | 543 MB | 546 MB |
-| FanOut1k | bulkWrite | 544 MB | 548 MB |
-| FanOut1k | firstRecalc | 545 MB | 548 MB |
-| FanOut1k | mutateThenRecalc | 545 MB | 548 MB |
-| FanOut10k | setup | 553 MB | 606 MB |
-| FanOut10k | bulkWrite | 572 MB | 611 MB |
-| FanOut10k | firstRecalc | 582 MB | 611 MB |
-| FanOut10k | mutateThenRecalc | 606 MB | 611 MB |
-| FanOut100k | setup | 620 MB | 790 MB |
-| FanOut100k | bulkWrite | 654 MB | 844 MB |
-| FanOut100k | firstRecalc | 769 MB | 791 MB |
-| FanOut100k | mutateThenRecalc | 790 MB | 791 MB |
-| FanIn1k | setup | 791 MB | 791 MB |
-| FanIn1k | bulkWrite | 791 MB | 791 MB |
-| FanIn1k | firstRecalc | 791 MB | 792 MB |
-| FanIn1k | mutateThenRecalc | 791 MB | 792 MB |
-| FanIn10k | setup | 792 MB | 793 MB |
-| FanIn10k | bulkWrite | 793 MB | 793 MB |
-| FanIn10k | firstRecalc | 793 MB | 793 MB |
-| FanIn10k | mutateThenRecalc | 794 MB | 793 MB |
-| FanIn100k | setup | 803 MB | 808 MB |
-| FanIn100k | bulkWrite | 810 MB | 809 MB |
-| FanIn100k | firstRecalc | 801 MB | 809 MB |
-| FanIn100k | mutateThenRecalc | 805 MB | 809 MB |
-| Stripe1k | setup | 809 MB | 809 MB |
-| Stripe1k | bulkWrite | 809 MB | 809 MB |
-| Stripe1k | firstRecalc | 809 MB | 817 MB |
-| Stripe1k | mutateThenRecalc | 809 MB | 830 MB |
-| Stripe10k | setup | 831 MB | 864 MB |
-| Stripe10k | bulkWrite | 850 MB | 864 MB |
-| Stripe10k | firstRecalc | 856 MB | 864 MB |
-| Stripe10k | mutateThenRecalc | 864 MB | 864 MB |
-| Stripe100k | setup | 876 MB | 898 MB |
-| Stripe100k | bulkWrite | 883 MB | 950 MB |
-| Stripe100k | firstRecalc | 876 MB | 950 MB |
-| Stripe100k | mutateThenRecalc | 898 MB | 950 MB |
+| FanOut1k | setup | 1439 MB | 1438 MB |
+| FanOut1k | bulkWrite | 1439 MB | 1438 MB |
+| FanOut1k | firstRecalc | 1439 MB | 1438 MB |
+| FanOut1k | mutateThenRecalc | 1439 MB | 1438 MB |
+| FanOut10k | setup | 1438 MB | 1405 MB |
+| FanOut10k | bulkWrite | 1439 MB | 1405 MB |
+| FanOut10k | firstRecalc | 1443 MB | 1405 MB |
+| FanOut10k | mutateThenRecalc | 1438 MB | 1333 MB |
+| FanOut100k | setup | 1325 MB | *failed* |
+| FanOut100k | bulkWrite | 1327 MB | *failed* |
+| FanOut100k | firstRecalc | 1173 MB | *failed* |
+| FanOut100k | mutateThenRecalc | 1277 MB | *failed* |
+| FanIn1k | setup | 1206 MB | *failed* |
+| FanIn1k | bulkWrite | 1206 MB | *failed* |
+| FanIn1k | firstRecalc | 1207 MB | *failed* |
+| FanIn1k | mutateThenRecalc | 1207 MB | *failed* |
+| FanIn10k | setup | 1206 MB | *failed* |
+| FanIn10k | bulkWrite | 1206 MB | *failed* |
+| FanIn10k | firstRecalc | 1206 MB | *failed* |
+| FanIn10k | mutateThenRecalc | 1207 MB | *failed* |
+| FanIn100k | setup | 1215 MB | *failed* |
+| FanIn100k | bulkWrite | 1222 MB | *failed* |
+| FanIn100k | firstRecalc | 1215 MB | *failed* |
+| FanIn100k | mutateThenRecalc | 1220 MB | *failed* |
+| Stripe1k | setup | 1206 MB | *failed* |
+| Stripe1k | bulkWrite | 1206 MB | *failed* |
+| Stripe1k | firstRecalc | 1206 MB | *failed* |
+| Stripe1k | mutateThenRecalc | 1206 MB | *failed* |
+| Stripe10k | setup | 1206 MB | *failed* |
+| Stripe10k | bulkWrite | 1209 MB | *failed* |
+| Stripe10k | firstRecalc | 1212 MB | *failed* |
+| Stripe10k | mutateThenRecalc | 1214 MB | *failed* |
+| Stripe100k | setup | 1206 MB | *failed* |
+| Stripe100k | bulkWrite | 1183 MB | *failed* |
+| Stripe100k | firstRecalc | 906 MB | *failed* |
+| Stripe100k | mutateThenRecalc | 945 MB | *failed* |
+
+### Range failures / skipped backends
+
+- **FanOut100k / WASM**: Error: attempted to take ownership of Rust value while it was borrowed
+- **FanIn1k / WASM**: skipped (WASM range failed at tier index 2)
+- **FanIn10k / WASM**: skipped (WASM range failed at tier index 2)
+- **FanIn100k / WASM**: skipped (WASM range failed at tier index 2)
+- **Stripe1k / WASM**: skipped (WASM range failed at tier index 2)
+- **Stripe10k / WASM**: skipped (WASM range failed at tier index 2)
+- **Stripe100k / WASM**: skipped (WASM range failed at tier index 2)
 <!-- BENCH:RANGE:END -->
 
 ## Findings (2026-05-28 — Range workloads + bulk_import flush coalescing)
