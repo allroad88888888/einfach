@@ -1273,7 +1273,32 @@ impl Workbook {
         let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
         queue.push_back((src_sheet, src_addr));
         visited.insert((src_sheet, src_addr));
+        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, None);
+    }
 
+    /// Shared BFS body for [`Self::propagate_cross_sheet_dirty`] and the
+    /// storage-primary install fanout. Pops `(sheet, addr)` nodes, finds
+    /// their cross-sheet dependents through both reverse-index halves,
+    /// marks each unvisited dependent dirty, fires its subscribers, and
+    /// enqueues it for the next layer. The caller pre-seeds `visited` +
+    /// `queue` (and decides whether the seeds themselves were already
+    /// marked/fired).
+    ///
+    /// `skip_sheets`: dependents living on these sheets are neither
+    /// marked nor fired nor traversed. The install fanout passes the
+    /// just-installed sheet set here — those sheets' formulas are
+    /// freshly parked (no cached value to dirty) and their subscription
+    /// buckets were already notified once by `bulk_install_storage`'s
+    /// reattach pass; firing them again would break the
+    /// each-subscriber-fires-once contract. Skipping traversal is safe
+    /// because any formula with an edge INTO an installed sheet is
+    /// already a fanout seed.
+    fn run_cross_sheet_dirty_bfs(
+        &self,
+        visited: &mut HashSet<(usize, CellAddress)>,
+        queue: &mut VecDeque<(usize, CellAddress)>,
+        skip_sheets: Option<&HashSet<usize>>,
+    ) {
         while let Some((sheet_idx, addr)) = queue.pop_front() {
             // Collect dependents of this node from both reverse-index
             // halves. The CrossSheetDeps borrows are read-only, so we
@@ -1299,6 +1324,9 @@ impl Workbook {
             }
 
             for (target_sheet, target_addr) in dependents {
+                if skip_sheets.is_some_and(|skip| skip.contains(&target_sheet)) {
+                    continue;
+                }
                 if !visited.insert((target_sheet, target_addr)) {
                     continue;
                 }
@@ -1310,6 +1338,54 @@ impl Workbook {
                 queue.push_back((target_sheet, target_addr));
             }
         }
+    }
+
+    /// STORAGE_PRIMARY Phase 6.1 fixup (codex P2): after a full-sheet
+    /// replace, every formula on a NON-installed sheet holding an
+    /// incoming cross-sheet edge into any installed sheet is potentially
+    /// stale — `install_sheet_bulk` swaps the whole sheet, so "treat
+    /// every cell of the replaced sheet as touched". Implemented by
+    /// walking the FORWARD `formula_refs` map once (O(cross-sheet
+    /// formulas), NOT O(installed cells)) and seeding the same dirty BFS
+    /// that `set_cell` / `bulk_load` use:
+    ///
+    ///   - each seed is marked dirty (no-op for lazy/unhydrated
+    ///     dependents — they have no cached value and evaluate fresh on
+    ///     read) and its subscribers fire (subscriptions CAN exist
+    ///     pre-hydration; see `install_cross_sheet_formula_notifies`),
+    ///   - the shared `visited` set dedups across seeds AND across
+    ///     multiple installed sheets, so a dependent referencing two
+    ///     replaced sheets notifies once,
+    ///   - formulas living ON an installed sheet are never seeds (their
+    ///     sheet's subscription buckets were already notified once by
+    ///     `bulk_install_storage`) and are skipped during traversal.
+    fn fanout_install_cross_sheet_dependents(&self, installed: &HashSet<usize>) {
+        if self.cross_sheet.formula_refs.is_empty() {
+            return; // common bench shape: zero cross-sheet formulas
+        }
+        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
+        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
+        for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
+            if installed.contains(formula_sheet) {
+                continue;
+            }
+            let depends_on_installed = edges.iter().any(|edge| match edge {
+                CrossSheetRef::Cell(src_sheet, _) => installed.contains(src_sheet),
+                CrossSheetRef::Range(src_sheet, _) => installed.contains(src_sheet),
+            });
+            if !depends_on_installed {
+                continue;
+            }
+            if !visited.insert((*formula_sheet, *formula_addr)) {
+                continue;
+            }
+            if let Some(sheet) = self.sheets.get(*formula_sheet) {
+                sheet.mark_dirty_for_addr(*formula_addr);
+                sheet.fire_subscribers(*formula_addr);
+            }
+            queue.push_back((*formula_sheet, *formula_addr));
+        }
+        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, Some(installed));
     }
 
     /// Recover every formula sheet index for a range-typed reverse edge.
@@ -1562,6 +1638,28 @@ impl Workbook {
         primitives: HashMap<CellAddress, Value>,
         formulas: HashMap<CellAddress, String>,
     ) -> Result<BulkInstallStats, InstallError> {
+        let stats = self.install_sheet_bulk_inner(sheet_idx, primitives, formulas)?;
+        // Cross-sheet dirty fanout (codex P2): formulas on OTHER sheets
+        // referencing the replaced sheet must dirty + notify, exactly
+        // like a `set_cell` to every cell would. Cost is proportional
+        // to the workbook's cross-sheet edge count, not installed cells.
+        let mut installed = HashSet::with_capacity(1);
+        installed.insert(sheet_idx);
+        self.fanout_install_cross_sheet_dependents(&installed);
+        Ok(stats)
+    }
+
+    /// Body of [`Self::install_sheet_bulk`] WITHOUT the cross-sheet
+    /// dependent fanout. Split out so [`Self::install_workbook_bulk`]
+    /// can install every sheet first and then run ONE fanout over the
+    /// whole installed set — a dependent referencing two replaced
+    /// sheets must notify once, not once per sheet.
+    fn install_sheet_bulk_inner(
+        &mut self,
+        sheet_idx: usize,
+        primitives: HashMap<CellAddress, Value>,
+        formulas: HashMap<CellAddress, String>,
+    ) -> Result<BulkInstallStats, InstallError> {
         if self.is_inside_custom_call() {
             return Err(InstallError::MutationDuringCustomCall);
         }
@@ -1650,12 +1748,18 @@ impl Workbook {
                 return Err(InstallError::SheetOutOfRange(*sheet_idx));
             }
         }
-        payload
+        let installed: HashSet<usize> =
+            payload.iter().map(|(sheet_idx, _, _)| *sheet_idx).collect();
+        let stats = payload
             .into_iter()
             .map(|(sheet_idx, primitives, formulas)| {
-                self.install_sheet_bulk(sheet_idx, primitives, formulas)
+                self.install_sheet_bulk_inner(sheet_idx, primitives, formulas)
             })
-            .collect()
+            .collect::<Result<Vec<BulkInstallStats>, InstallError>>()?;
+        // One fanout AFTER all installs so a dependent referencing
+        // several replaced sheets notifies once (shared visited set).
+        self.fanout_install_cross_sheet_dependents(&installed);
+        Ok(stats)
     }
 
     pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut WorkbookLoader<'_>) -> R) -> R {

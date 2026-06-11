@@ -213,6 +213,164 @@ fn install_cross_sheet_formula_notifies() {
 }
 
 #[test]
+fn install_dirties_and_notifies_cross_sheet_dependents() {
+    let mut wb = Workbook::new();
+    let s2 = wb.add_sheet("Sheet2");
+    let s3 = wb.add_sheet("Sheet3");
+    wb.set_cell(s2, "A1", Value::Number(1.0));
+    assert!(wb.set_formula(0, "B1", "=Sheet2!A1+1"));
+    // Chained cross-sheet dependent: Sheet3!C1 → Sheet1!B1 → Sheet2!A1.
+    assert!(wb.set_formula(s3, "C1", "=Sheet1!B1*10"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(2.0)); // hydrated + cached
+    assert_eq!(wb.get_cell("Sheet3", "C1"), Value::Number(20.0));
+
+    let direct = Rc::new(RefCell::new(0usize));
+    let direct_clone = direct.clone();
+    let _sub_direct = wb.sheet_mut(0).unwrap().subscribe_cell("B1", move || {
+        *direct_clone.borrow_mut() += 1;
+    });
+    let chained = Rc::new(RefCell::new(0usize));
+    let chained_clone = chained.clone();
+    let _sub_chained = wb.sheet_mut(s3).unwrap().subscribe_cell("C1", move || {
+        *chained_clone.borrow_mut() += 1;
+    });
+
+    // Replace Sheet2 entirely via the storage-primary path.
+    let mut prims = HashMap::new();
+    prims.insert(addr("A1"), Value::Number(10.0));
+    wb.install_sheet_bulk(s2, prims, HashMap::new())
+        .expect("install must succeed");
+
+    assert_eq!(
+        *direct.borrow(),
+        1,
+        "cross-sheet subscriber must fire exactly once on install"
+    );
+    assert_eq!(
+        *chained.borrow(),
+        1,
+        "chained cross-sheet subscriber must fire exactly once on install"
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "B1"),
+        Value::Number(11.0),
+        "dependent must recompute"
+    );
+    assert_eq!(
+        wb.get_cell("Sheet3", "C1"),
+        Value::Number(110.0),
+        "chained dependent must recompute"
+    );
+}
+
+#[test]
+fn install_removing_referenced_cell_matches_set_cell_null() {
+    // Control: what does writing Null to the source produce?
+    let mut control = Workbook::new();
+    let c2 = control.add_sheet("Sheet2");
+    control.set_cell(c2, "A1", Value::Number(1.0));
+    assert!(control.set_formula(0, "B1", "=Sheet2!A1+1"));
+    assert_eq!(control.get_cell("Sheet1", "B1"), Value::Number(2.0));
+    control.set_cell(c2, "A1", Value::Null);
+    let expected = control.get_cell("Sheet1", "B1");
+
+    // Install path: the replaced sheet simply omits A1.
+    let mut wb = Workbook::new();
+    let s2 = wb.add_sheet("Sheet2");
+    wb.set_cell(s2, "A1", Value::Number(1.0));
+    assert!(wb.set_formula(0, "B1", "=Sheet2!A1+1"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(2.0));
+
+    let counter = Rc::new(RefCell::new(0usize));
+    let counter_clone = counter.clone();
+    let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("B1", move || {
+        *counter_clone.borrow_mut() += 1;
+    });
+
+    wb.install_sheet_bulk(s2, HashMap::new(), HashMap::new())
+        .expect("install must succeed");
+
+    assert_eq!(
+        *counter.borrow(),
+        1,
+        "subscriber must fire when source vanishes"
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "B1"),
+        expected,
+        "removed source must read like a set_cell-to-Null write"
+    );
+}
+
+#[test]
+fn install_notifies_lazy_unhydrated_cross_sheet_dependent() {
+    let mut wb = Workbook::new();
+    let s2 = wb.add_sheet("Sheet2");
+    wb.set_cell(s2, "A1", Value::Number(1.0));
+
+    // The dependent itself arrives via install — lazy, never read, so it
+    // has no cached value to dirty. Its subscriber must still fire.
+    let mut s1_formulas = HashMap::new();
+    s1_formulas.insert(addr("B1"), "=Sheet2!A1+1".to_string());
+    wb.install_sheet_bulk(0, HashMap::new(), s1_formulas)
+        .expect("install must succeed");
+
+    let counter = Rc::new(RefCell::new(0usize));
+    let counter_clone = counter.clone();
+    let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("B1", move || {
+        *counter_clone.borrow_mut() += 1;
+    });
+
+    let mut prims = HashMap::new();
+    prims.insert(addr("A1"), Value::Number(41.0));
+    wb.install_sheet_bulk(s2, prims, HashMap::new())
+        .expect("install must succeed");
+
+    assert_eq!(
+        *counter.borrow(),
+        1,
+        "lazy dependent's subscriber must fire on install"
+    );
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(42.0));
+}
+
+#[test]
+fn workbook_bulk_install_notifies_multi_sheet_dependent_once() {
+    let mut wb = Workbook::new();
+    let s2 = wb.add_sheet("Sheet2");
+    let s3 = wb.add_sheet("Sheet3");
+    wb.set_cell(s2, "A1", Value::Number(1.0));
+    wb.set_cell(s3, "A1", Value::Number(2.0));
+    assert!(wb.set_formula(0, "B1", "=Sheet2!A1+Sheet3!A1"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(3.0));
+
+    let counter = Rc::new(RefCell::new(0usize));
+    let counter_clone = counter.clone();
+    let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("B1", move || {
+        *counter_clone.borrow_mut() += 1;
+    });
+
+    // Replace BOTH referenced sheets in one workbook-level install. The
+    // dependent references both, but its subscriber must fire ONCE.
+    let mut s2_prims = HashMap::new();
+    s2_prims.insert(addr("A1"), Value::Number(10.0));
+    let mut s3_prims = HashMap::new();
+    s3_prims.insert(addr("A1"), Value::Number(20.0));
+    wb.install_workbook_bulk(vec![
+        (s2, s2_prims, HashMap::new()),
+        (s3, s3_prims, HashMap::new()),
+    ])
+    .expect("install must succeed");
+
+    assert_eq!(
+        *counter.borrow(),
+        1,
+        "dependent referencing two replaced sheets must notify once, not twice"
+    );
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(30.0));
+}
+
+#[test]
 fn install_same_sheet_formulas_skip_parse() {
     const N: u32 = 100;
     let mut primitives = HashMap::new();
