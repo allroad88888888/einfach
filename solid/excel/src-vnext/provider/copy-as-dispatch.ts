@@ -1,5 +1,6 @@
 import { atom, type Store } from '@einfach/core'
 import {
+  encodeSelectionAsImage,
   encodeSelectionAsPlainText,
   encodeSelectionForClipboard,
   lastCopyAsAtom,
@@ -7,10 +8,16 @@ import {
   type CellRange,
   type CopyAsResult,
   type CopyAsTextResult,
+  type EncodeSelectionAsImageResult,
+  type RangeImageExportRequest,
+  type RangeImageExportResult,
   type SpreadsheetBackend,
+  type ViewportColumnWidth,
+  type ViewportRowHeight,
 } from '@einfach/spreadsheet-ui-core'
 
 import { advanceSpreadsheetProjectionRequestIdAtom } from './atoms'
+import { renderRangeAsImage } from '../copy-as/renderRangeAsImage'
 
 /**
  * Maximum selection size (rows × cols) the multi-MIME copy-as path will
@@ -34,6 +41,19 @@ export type CopyAsError =
   | { kind: 'too-large'; cells: number; limit: number }
   | { kind: 'fallback-plain-only' }
   | { kind: 'failed' }
+  // --- image variants (Wave 8.4 / .5) -----------------------------------
+  // `image-too-large` mirrors `too-large` but is keyed by estimated pixel
+  // count, not cell count — the pre-flight gate in
+  // `encodeSelectionAsImage` rejects on `width × height` and the host
+  // surfaces a different status string ("selection too large to render")
+  // because the cap semantics differ.
+  | { kind: 'image-too-large'; estimatedPixels: number; limit: number }
+  // Backend omits both `exportRangeAsImage` and a host-side renderer
+  // (the dispatch helper installs the SVG renderer when missing, so this
+  // variant is rare in practice — useful for tests that force a stripped
+  // backend).
+  | { kind: 'image-no-backend' }
+  | { kind: 'image-failed' }
 
 export const copyAsErrorAtom = atom<CopyAsError | null>(null)
 copyAsErrorAtom.debugLabel = 'spreadsheet.copyAs.error'
@@ -268,6 +288,240 @@ export async function dispatchCopyAs(
     store.setter(copyAsErrorAtom, null)
   } else {
     // Tier 2 or 3 — partial success. Surface as a non-fatal status.
+    store.setter(copyAsErrorAtom, { kind: 'fallback-plain-only' })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Copy as PNG (Wave 8.4 / 8.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Pick the median width / height from a `ViewportSizeProjectionResult`.
+ * The encoder uses these for the pre-flight pixel-count estimate and the
+ * SVG renderer uses them for the rasterised geometry. We deliberately
+ * average over a representative slice rather than reading per-cell
+ * sizes — the PoC renderer only takes a single column-width / row-height
+ * pair, so the dispatch's job is to pick the best single value.
+ */
+function pickRepresentativeSize(
+  rows: ReadonlyArray<ViewportRowHeight>,
+  cols: ReadonlyArray<ViewportColumnWidth>,
+): { colWidthPx?: number; rowHeightPx?: number } {
+  function median(values: number[]): number | undefined {
+    if (values.length === 0) return undefined
+    const sorted = [...values].sort((a, b) => a - b)
+    return sorted[Math.floor(sorted.length / 2)]
+  }
+  return {
+    colWidthPx: median(cols.map((c) => c.widthPx).filter((n) => n > 0)),
+    rowHeightPx: median(rows.map((r) => r.heightPx).filter((n) => n > 0)),
+  }
+}
+
+/**
+ * Wrap a backend that lacks `exportRangeAsImage` with a host-side renderer
+ * that reads the projection via `readRangeProjection` and rasterises via
+ * the SVG `<foreignObject>` pipeline in `renderRangeAsImage`. Returns the
+ * original backend unchanged if it already advertises the port (the worker
+ * adapter still has the option to render in-worker via the JS-side, even
+ * if the WASM workbook doesn't expose a native renderer).
+ *
+ * Per-cell sizes flow through via the optional
+ * `readViewportSizeProjection` port — if the host implements it we pick
+ * the representative size to feed the SVG geometry; otherwise the
+ * renderer falls back to its baked-in PoC defaults.
+ */
+function withHostImageRenderer(backend: SpreadsheetBackend): SpreadsheetBackend {
+  if (backend.exportRangeAsImage) return backend
+  return {
+    ...backend,
+    async exportRangeAsImage(
+      request: RangeImageExportRequest,
+    ): Promise<RangeImageExportResult> {
+      const projection = await backend.readRangeProjection({
+        kind: 'range',
+        sheetId: request.sheetId,
+        requestId: request.requestId,
+        revision: request.revision,
+        reason: 'clipboard',
+        range: request.range,
+      })
+      let colWidthPx: number | undefined
+      let rowHeightPx: number | undefined
+      if (backend.readViewportSizeProjection) {
+        try {
+          const size = await backend.readViewportSizeProjection({
+            kind: 'viewport-size',
+            sheetId: request.sheetId,
+            window: request.range,
+            requestId: request.requestId,
+            revision: request.revision,
+          })
+          const pick = pickRepresentativeSize(size.rowHeights, size.colWidths)
+          colWidthPx = pick.colWidthPx
+          rowHeightPx = pick.rowHeightPx
+        } catch {
+          // Sizing is decoration — a viewport-size failure must not poison
+          // the PNG render. Fall back to PoC defaults.
+        }
+      }
+      return renderRangeAsImage({
+        sheetId: request.sheetId,
+        range: request.range,
+        cells: projection.cells,
+        scale: request.scale,
+        colWidthPx,
+        rowHeightPx,
+      })
+    },
+  }
+}
+
+/**
+ * Multi-tier clipboard write for an image Blob. Mirrors
+ * `multiTierWrite` for the text triple: try the rich-MIME path first,
+ * fall back to a degraded mode if the browser rejects.
+ *
+ *   tier 1 — `navigator.clipboard.write([new ClipboardItem({'image/png': blob})])`
+ *   tier 2 — `lastCopyAsAtom` snapshot only (no system clipboard write)
+ *
+ * Tier 2 is intentionally a "soft success" — Playwright headless without
+ * `clipboard-write` permission, jsdom, and Firefox builds that haven't
+ * exposed `ClipboardItem` for images all land here. The host UI still
+ * has a Blob to surface (e.g. a "Download PNG" affordance) so the user
+ * isn't left holding nothing.
+ */
+async function writeImageToClipboard(blob: Blob): Promise<'system-clipboard' | 'atom-only' | null> {
+  const g = globalThis as { ClipboardItem?: typeof ClipboardItem }
+  const hasClipboardItem = typeof g.ClipboardItem !== 'undefined'
+  const hasClipboardWrite =
+    typeof navigator !== 'undefined' && Boolean(navigator.clipboard?.write)
+  if (hasClipboardItem && hasClipboardWrite) {
+    try {
+      const item = new g.ClipboardItem!({ 'image/png': blob })
+      await navigator.clipboard.write([item])
+      return 'system-clipboard'
+    } catch {
+      // Fall through — we'll still mirror to the atom so the host can
+      // surface a "saved snapshot" indicator.
+    }
+  }
+  return 'atom-only'
+}
+
+/**
+ * Shared "Copy as PNG" dispatch — the image-flavour twin of
+ * `dispatchCopyAs`. Called from the Ctrl+Shift+P keyboard binding and
+ * (eventually) the menubar "Edit → Copy as image" entry.
+ *
+ * Flow:
+ *   1. Resolve the selection rectangle.
+ *   2. If the backend lacks `exportRangeAsImage`, install a host-side
+ *      renderer wrapper (`withHostImageRenderer`). The wrapper reads the
+ *      projection and rasterises via the SVG → canvas pipeline.
+ *   3. Call `encodeSelectionAsImage`. Surfaces failure variants
+ *      (`no-backend` / `too-large` / `empty-bytes`) on `copyAsErrorAtom`.
+ *   4. On success, attempt `navigator.clipboard.write([ClipboardItem])`.
+ *      Fall back to setting only `lastCopyAsAtom` if the system
+ *      clipboard rejects (Playwright headless, Firefox, etc.).
+ *
+ * The Blob is mirrored into `lastCopyAsAtom` whenever encoding succeeded,
+ * even if the system clipboard write fell through — diagnostics consumers
+ * can narrow on `kind: 'image'` to find the snapshot.
+ */
+export async function dispatchCopyAsImage(
+  store: Store,
+  backend: SpreadsheetBackend,
+  options: { sheetId?: string; range?: CellRange } = {},
+): Promise<void> {
+  const snap = store.getter(selectionSnapshotAtom)
+  const sheetId = options.sheetId ?? snap.selection.sheetId ?? ''
+  if (!sheetId) return
+  const range = options.range ?? snap.range
+
+  // Install the host-side renderer if the backend doesn't ship one. The
+  // wrapper is per-call so we don't mutate the long-lived backend
+  // instance held by the provider.
+  const renderingBackend = withHostImageRenderer(backend)
+
+  // Pre-flight: read per-cell sizes so the cap estimate uses the actual
+  // rendered geometry rather than the encoder's baked defaults. The
+  // wrapper inside `withHostImageRenderer` reads them again for the SVG
+  // dimensions — duplicated calls are intentional so the cap stays a
+  // pure UI-core concern (no state shared with the renderer).
+  let estimatedColWidthPx: number | undefined
+  let estimatedRowHeightPx: number | undefined
+  if (backend.readViewportSizeProjection) {
+    try {
+      const size = await backend.readViewportSizeProjection({
+        kind: 'viewport-size',
+        sheetId,
+        window: range,
+      })
+      const pick = pickRepresentativeSize(size.rowHeights, size.colWidths)
+      estimatedColWidthPx = pick.colWidthPx
+      estimatedRowHeightPx = pick.rowHeightPx
+    } catch {
+      // Pre-flight sizing failure is non-fatal — fall through to defaults.
+    }
+  }
+
+  let encoded: EncodeSelectionAsImageResult
+  try {
+    encoded = await encodeSelectionAsImage(
+      {
+        sheetId,
+        rect: {
+          startRow: range.rowStart,
+          startCol: range.colStart,
+          endRow: range.rowEnd,
+          endCol: range.colEnd,
+        },
+        estimatedColWidthPx,
+        estimatedRowHeightPx,
+      },
+      renderingBackend,
+    )
+  } catch {
+    store.setter(copyAsErrorAtom, { kind: 'image-failed' })
+    return
+  }
+
+  if (!encoded.ok) {
+    switch (encoded.reason) {
+      case 'no-backend':
+        store.setter(copyAsErrorAtom, { kind: 'image-no-backend' })
+        return
+      case 'too-large':
+        store.setter(copyAsErrorAtom, {
+          kind: 'image-too-large',
+          estimatedPixels: encoded.estimatedPixels ?? 0,
+          limit: encoded.limit ?? 0,
+        })
+        return
+      case 'empty-bytes':
+        store.setter(copyAsErrorAtom, { kind: 'image-failed' })
+        return
+    }
+  }
+
+  // Snapshot the blob into `lastCopyAsAtom` BEFORE attempting the
+  // clipboard write. This way a Playwright headless run (no clipboard
+  // permission) still produces a verifiable mirror — the e2e spec asserts
+  // the atom mirror, not `navigator.clipboard.read()`, when the system
+  // clipboard is unavailable.
+  const snapshot: CopyAsResult = { kind: 'image', mimeType: 'image/png', blob: encoded.blob }
+  store.setter(lastCopyAsAtom, snapshot)
+  setE2EMirror(snapshot)
+
+  const tier = await writeImageToClipboard(encoded.blob)
+  if (tier === 'system-clipboard') {
+    store.setter(copyAsErrorAtom, null)
+  } else {
+    // atom-only — still a soft success, surfaced as the same
+    // "fallback-plain-only" status the text triple uses for tier-2 / tier-3
+    // landings. The host shows "saved snapshot — clipboard not available".
     store.setter(copyAsErrorAtom, { kind: 'fallback-plain-only' })
   }
 }

@@ -94,6 +94,7 @@ import {
   acceptFormulaSuggestion,
   advanceSpreadsheetProjectionRequestIdAtom,
   dispatchCopyAs,
+  dispatchCopyAsImage,
   dispatchEditingCancel,
   dispatchRedo,
   dispatchUndo,
@@ -2190,6 +2191,23 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           return
         }
         await dispatchCopyAs(store, backend, {
+          sheetId: props.sheetId,
+          range: snap.range,
+        })
+        return
+      }
+      case 'clipboard.copyAsImage': {
+        // Ctrl+Shift+P → render the selection as a PNG and write to the
+        // system clipboard. The dispatch installs a host-side SVG renderer
+        // when the backend lacks `exportRangeAsImage`, falls back to
+        // `lastCopyAsAtom` mirroring when `navigator.clipboard.write`
+        // isn't available (Playwright headless without `clipboard-write`).
+        event.preventDefault()
+        const snap = selectionSnapshot()
+        if (snap.selection.sheetId !== props.sheetId) {
+          return
+        }
+        await dispatchCopyAsImage(store, backend, {
           sheetId: props.sheetId,
           range: snap.range,
         })

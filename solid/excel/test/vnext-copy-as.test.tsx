@@ -22,6 +22,7 @@ import { SpreadsheetMenuBar } from '../src-vnext/menu-bar'
 import {
   copyAsErrorAtom,
   dispatchCopyAs,
+  dispatchCopyAsImage,
   MAX_COPY_AS_CELLS,
   SpreadsheetUiProvider,
 } from '../src-vnext/provider'
@@ -468,6 +469,8 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
     expect(clippedCells).toBeLessThanOrEqual(MAX_COPY_AS_CELLS)
   })
 
+  // ---- end of text-triple tests; image-flavour tests follow below. ----
+
   it('leaves lastCopyAsAtom unchanged when both write paths fail', async () => {
     // Pre-populate the atom with a known sentinel so we can verify it's
     // not overwritten by a failed dispatch.
@@ -495,5 +498,129 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
     // Atom unchanged — distinguishes "never copied" from "wrote stale value".
     expect(store.getter(lastCopyAsAtom)).toEqual(sentinel)
     expect(store.getter(copyAsErrorAtom)).toEqual({ kind: 'failed' })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Wave 8.4 / .5 — Copy as PNG (Ctrl+Shift+P)
+// ---------------------------------------------------------------------------
+
+const FAKE_PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+function backendWithImagePort(): SpreadsheetBackend {
+  return {
+    ...createBackend(),
+    async exportRangeAsImage(request) {
+      return {
+        kind: 'range-image',
+        sheetId: request.sheetId,
+        range: request.range,
+        bytes: FAKE_PNG,
+        width: 200,
+        height: 40,
+        mimeType: 'image/png',
+        requestId: request.requestId,
+        revision: request.revision,
+      }
+    },
+  }
+}
+
+describe('Copy as PNG (Ctrl+Shift+P) — dispatchCopyAsImage', () => {
+  let fake: ReturnType<typeof installFakeClipboard>
+
+  beforeEach(() => {
+    fake = installFakeClipboard()
+  })
+
+  afterEach(() => {
+    fake.restore()
+  })
+
+  it('writes image/png to the clipboard and mirrors the blob into lastCopyAsAtom', async () => {
+    const store = createStore()
+    const backend = backendWithImagePort()
+    seedTwoByTwoSelection(store)
+
+    await dispatchCopyAsImage(store, backend, {
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+
+    expect(fake.fakeWrite).toHaveBeenCalledTimes(1)
+    const call = fake.writeCalls[0]!
+    expect(call.types).toEqual(['image/png'])
+    // The Blob inside the ClipboardItem carries the backend bytes verbatim.
+    expect(call.blobs['image/png']!.type).toBe('image/png')
+    expect(call.blobs['image/png']!.size).toBe(FAKE_PNG.byteLength)
+
+    // lastCopyAsAtom now holds the image variant — diagnostics consumers
+    // narrow on `kind: 'image'`.
+    const snap = store.getter(lastCopyAsAtom)
+    expect(snap).not.toBeNull()
+    expect(snap!.kind).toBe('image')
+    if (snap && snap.kind === 'image') {
+      expect(snap.mimeType).toBe('image/png')
+      expect(snap.blob.size).toBe(FAKE_PNG.byteLength)
+    }
+
+    expect(store.getter(copyAsErrorAtom)).toBeNull()
+  })
+
+  it('falls back to atom-only mirror when navigator.clipboard.write rejects', async () => {
+    fake.restore()
+    fake = installFakeClipboard({ writeRejects: true })
+
+    const store = createStore()
+    const backend = backendWithImagePort()
+    seedTwoByTwoSelection(store)
+
+    await dispatchCopyAsImage(store, backend, {
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+
+    // Even on system-clipboard rejection, lastCopyAsAtom holds the blob —
+    // the e2e spec asserts the mirror when running in Playwright without
+    // clipboard-write permission.
+    const snap = store.getter(lastCopyAsAtom)
+    expect(snap?.kind).toBe('image')
+    expect(store.getter(copyAsErrorAtom)).toEqual({ kind: 'fallback-plain-only' })
+  })
+
+  it('surfaces image-too-large without calling the backend renderer when the selection exceeds the cap', async () => {
+    const store = createStore()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-1' })
+    store.setter(setSelectionBoundsAtom, { rowCount: 1_500_000, colCount: 16_384 })
+    const exportSpy = jest.fn()
+    const backend: SpreadsheetBackend = {
+      ...createBackend(),
+      async exportRangeAsImage(request) {
+        exportSpy(request)
+        return {
+          kind: 'range-image',
+          sheetId: request.sheetId,
+          range: request.range,
+          bytes: FAKE_PNG,
+          width: 1,
+          height: 1,
+          mimeType: 'image/png',
+        }
+      },
+    }
+
+    await dispatchCopyAsImage(store, backend, {
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 999_999, colStart: 0, colEnd: 25 },
+    })
+
+    // The pre-flight cap must block the backend call entirely.
+    expect(exportSpy).not.toHaveBeenCalled()
+    expect(fake.fakeWrite).not.toHaveBeenCalled()
+    const err = store.getter(copyAsErrorAtom)
+    expect(err?.kind).toBe('image-too-large')
+    if (err?.kind === 'image-too-large') {
+      expect(err.estimatedPixels).toBeGreaterThan(err.limit)
+    }
   })
 })
