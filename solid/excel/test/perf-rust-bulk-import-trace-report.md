@@ -1,22 +1,22 @@
 # Rust bulk-import phase-decomposition
 
-*Last run: 2026-06-11T04:51:00.950Z*
+*Last run: 2026-06-11T05:44:56.234Z*
 
 ## Per-tier phase breakdown
 
 | Tier | total cells | JS wall (ms) | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100k | 100000 | 801 | 83.0 | 23.0 | 9.0 | 623 | 57.0 | 689 | 28.6 |
-| 250k | 250000 | 2015 | 202 | 59.0 | 23.0 | 1556 | 163 | 1742 | 70.5 |
-| 500k | 500000 | 4111 | 407 | 117 | 46.0 | 3180 | 340 | 3566 | 138 |
+| 100k | 100000 | 803 | 83.0 | 23.0 | 9.0 | 625 | 58.0 | 692 | 27.9 |
+| 250k | 250000 | 2016 | 204 | 59.0 | 23.0 | 1556 | 164 | 1743 | 69.0 |
+| 500k | 500000 | 4119 | 410 | 118 | 47.0 | 3179 | 344 | 3570 | 139 |
 
 ## Phase share (% of JS wall)
 
 | Tier | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100k | 10.4% | 2.9% | 1.1% | 77.8% | 7.1% | 86.1% | 3.6% |
-| 250k | 10.0% | 2.9% | 1.1% | 77.2% | 8.1% | 86.5% | 3.5% |
-| 500k | 9.9% | 2.8% | 1.1% | 77.3% | 8.3% | 86.7% | 3.4% |
+| 100k | 10.3% | 2.9% | 1.1% | 77.8% | 7.2% | 86.2% | 3.5% |
+| 250k | 10.1% | 2.9% | 1.1% | 77.2% | 8.1% | 86.5% | 3.4% |
+| 500k | 10.0% | 2.9% | 1.1% | 77.2% | 8.4% | 86.7% | 3.4% |
 
 ## Super-linearity (ratio of `500k` to `100k` phase ms)
 
@@ -24,21 +24,21 @@ Cell-count ratio = 5.00×. A linear phase grows at the same ratio; >cellRatio = 
 
 | Phase | 100k (ms) | 500k (ms) | Ratio | Verdict |
 | --- | --- | --- | --- | --- |
-| deserialize | 83.0 | 407 | 4.90× | linear-ish |
-| parse-only | 23.0 | 117 | 5.09× | linear-ish |
-| set_cell loop | 9.0 | 46.0 | 5.11× | linear-ish |
-| set_formula loop | 623 | 3180 | 5.10× | linear-ish |
-| flush | 57.0 | 340 | 5.96× | linear-ish |
-| engine total | 689 | 3566 | 5.18× | linear-ish |
-| JS wall | 801 | 4111 | 5.14× | linear-ish |
+| deserialize | 83.0 | 410 | 4.94× | linear-ish |
+| parse-only | 23.0 | 118 | 5.13× | linear-ish |
+| set_cell loop | 9.0 | 47.0 | 5.22× | linear-ish |
+| set_formula loop | 625 | 3179 | 5.09× | linear-ish |
+| flush | 58.0 | 344 | 5.93× | linear-ish |
+| engine total | 692 | 3570 | 5.16× | linear-ish |
+| JS wall | 803 | 4119 | 5.13× | linear-ish |
 
 ## flush_ms sub-phase decomposition (Phase 1A)
 
 | Tier | flush total | parse | dep_extract | dep_register | formula_record | sub-phase sum | residual (BFS + notify) |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 100k | 57.0 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 57.0 |
-| 250k | 163 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 163 |
-| 500k | 340 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 340 |
+| 100k | 58.0 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 58.0 |
+| 250k | 164 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 164 |
+| 500k | 344 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 344 |
 
 ## flush_ms sub-phase share (% of flush_ms)
 
