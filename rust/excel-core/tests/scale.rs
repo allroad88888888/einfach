@@ -297,21 +297,32 @@ fn single_write_with_100k_range_formulas_is_bounded() {
 
     // Mirrors the bench setup in `benches/scale_bench.rs::
     // bench_dirty_lookup_100k_ranges`: 100k overlapping 6-row ranges
-    // anchored in column A. `bulk_load.set_formula` populates
-    // `range_dependents` from the static AST corners, so all 100k
-    // entries are in the index without any formula being evaluated.
+    // anchored in column A.
+    //
+    // LAZY_FORMULA_INDEXING Phase 3: bulk_load no longer populates
+    // `range_dependents` eagerly — formulas live in `formula_source`
+    // until first read. To exercise the original "100k registered
+    // ranges + 1 write" assertion, we hydrate every formula by
+    // reading its cell (forcing parse + dep install) before the
+    // probing write below. The test's purpose is unchanged: validate
+    // that a write touching ~6 of 100k registered ranges costs
+    // O(matches), not O(N).
     sheet.bulk_load(|loader| {
         for r in 1..=N_RANGE_FORMULAS {
             loader.set_formula(&format!("B{}", r), &format!("=SUM(A{}:A{})", r, r + 5));
         }
     });
+    for r in 1..=N_RANGE_FORMULAS {
+        let _ = sheet.get_cell(&format!("B{}", r));
+    }
 
     // Sanity: 100k distinct ranges are in the index (each formula has
     // a unique starting row). If this fails the test setup drifted.
     assert_eq!(
         sheet.debug_range_dep_count(),
         N_RANGE_FORMULAS as usize,
-        "100k distinct ranges must be registered in range_dependents"
+        "100k distinct ranges must be registered in range_dependents \
+         after hydration"
     );
 
     // One single primitive write that lies inside ~6 overlapping

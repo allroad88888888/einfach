@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use einfach_core::{Value, ValueError};
@@ -625,10 +626,20 @@ impl Workbook {
     fn invalidate_formulas_using_name(&self, name: &str) {
         let key = name.to_ascii_uppercase();
         for sheet in &self.sheets {
-            for (addr, expr) in sheet.formula_exprs_iter() {
-                if formula_references_name(expr, &key) {
-                    sheet.mark_dirty_for_addr(*addr);
-                    sheet.fire_subscribers(*addr);
+            // LAZY_FORMULA_INDEXING Phase 3: snapshot the (addr, expr)
+            // pairs out of the live `Ref` before iterating so the
+            // closures we call below (`mark_dirty_for_addr`,
+            // `fire_subscribers`) can take their own `borrow()`s on
+            // `formula_cells` without a conflict.
+            let entries: Vec<(CellAddress, Rc<Expr>)> = sheet
+                .formula_exprs_iter()
+                .iter()
+                .map(|(addr, expr)| (*addr, expr.clone()))
+                .collect();
+            for (addr, expr) in entries {
+                if formula_references_name(&expr, &key) {
+                    sheet.mark_dirty_for_addr(addr);
+                    sheet.fire_subscribers(addr);
                 }
             }
         }
@@ -712,7 +723,14 @@ impl Workbook {
     fn rebuild_cross_sheet_deps(&mut self) {
         let mut cross_sheet = CrossSheetDeps::new();
         for (formula_sheet, sheet) in self.sheets.iter().enumerate() {
-            for (&formula_addr, expr) in sheet.formula_exprs_iter() {
+            // LAZY_FORMULA_INDEXING Phase 3: dereference the `Ref` and
+            // iterate. The `formula_exprs_iter` is now a `Ref<HashMap>`;
+            // explicit `.iter()` calls `HashMap::iter`. Lazy entries
+            // are absent (their AST hasn't been parsed yet); cross-
+            // sheet edges from those formulas will be rebuilt on first
+            // read via the read-path hydrator + cross-sheet propagation.
+            let exprs = sheet.formula_exprs_iter();
+            for (&formula_addr, expr) in exprs.iter() {
                 for edge in collect_cross_sheet_refs(expr.as_ref(), &self.by_name) {
                     cross_sheet.add_edge(formula_sheet, formula_addr, edge);
                 }

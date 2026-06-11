@@ -627,13 +627,59 @@ pub struct Sheet {
     /// not as core derived atoms, so `set_formula` does not compute. Same
     /// row-major shape as `cells` so range scans that hit a mix of primitive
     /// and formula cells stay O(matches).
-    formula_cells: RowMajorMap<Rc<FormulaRecord>>,
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` so `hydrate_formula(&self)`
+    /// can install a freshly-parsed record without taking `&mut self`.
+    /// Read paths consult the map via short `borrow()` snapshots that
+    /// clone `Rc<FormulaRecord>` and release the borrow before any
+    /// recursive eval (which might re-enter through another read /
+    /// hydration). Iteration patterns snapshot keys first to avoid
+    /// holding the borrow across a possible `borrow_mut`.
+    formula_cells: RefCell<RowMajorMap<Rc<FormulaRecord>>>,
     /// AST of each formula cell, used for static cycle detection (B.2).
-    formula_exprs: HashMap<CellAddress, Rc<Expr>>,
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` so the hydrator can
+    /// insert during a `&self` read. Same recursion-safety pattern as
+    /// `formula_cells`.
+    formula_exprs: RefCell<HashMap<CellAddress, Rc<Expr>>>,
     /// Original formula text per cell, for `get_formula` so the formula bar
     /// and edit-mode entry can show the source instead of the computed
     /// result (D.11).
-    formula_texts: HashMap<CellAddress, String>,
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` for the same hydrator-
+    /// from-`&self` reason.
+    formula_texts: RefCell<HashMap<CellAddress, String>>,
+    /// Lazy-load source storage (Phase 2 of LAZY_FORMULA_INDEXING). Holds
+    /// the raw formula text for cells that came in via `bulk_load` and
+    /// have NOT yet been parsed / indexed. Mirrors `formula_cells` in
+    /// row-major shape so range scans still cost O(cells_in_range), but
+    /// each entry is just an `Rc<str>` — no AST, no dep edges, no
+    /// `FormulaRecord`. Entries are drained into the eager `formula_cells`
+    /// / `formula_exprs` / `formula_texts` family by `hydrate_formula`
+    /// once a read first touches them.
+    ///
+    /// Co-existence rule: `formula_source.contains_key(addr)` ↔
+    /// `needs_parse.contains(addr)`. While the addr is unhydrated:
+    ///   - `formula_cells` does NOT have an entry
+    ///   - `formula_exprs` does NOT have an entry
+    ///   - `formula_texts` does NOT have an entry
+    ///   - `cell_dependents` / `range_dependents` carry NO edges for this addr
+    /// Hydration moves the source out of `formula_source` and into the
+    /// eager state atomically (single-threaded — no races).
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: wrapped in `RefCell` so the
+    /// hydrator (which runs from `&self` contexts) can both read the
+    /// source and remove the entry after install.
+    formula_source: RefCell<RowMajorMap<Rc<str>>>,
+    /// Lazy-load index of unparsed formulas. `RefCell` because read-only
+    /// entry points (`peek_value_with_provider`, sparse-iter resolvers,
+    /// cycle checks) need to drain entries as part of hydration without
+    /// taking `&mut self`.
+    ///
+    /// Invariant: a single address appears in `needs_parse` iff it also
+    /// appears as a key in `formula_source`. Hydration removes from both
+    /// in lockstep.
+    needs_parse: RefCell<HashSet<CellAddress>>,
     /// Address-level subscriptions. Buckets are only wired to store atoms when
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
@@ -741,9 +787,11 @@ impl Sheet {
         Sheet {
             store: Store::new(),
             cells: RowMajorMap::new(),
-            formula_cells: RowMajorMap::new(),
-            formula_exprs: HashMap::new(),
-            formula_texts: HashMap::new(),
+            formula_cells: RefCell::new(RowMajorMap::new()),
+            formula_exprs: RefCell::new(HashMap::new()),
+            formula_texts: RefCell::new(HashMap::new()),
+            formula_source: RefCell::new(RowMajorMap::new()),
+            needs_parse: RefCell::new(HashSet::new()),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
             range_dependents: RefCell::new(RangeDependentIndex::new()),
@@ -889,7 +937,7 @@ impl Sheet {
     }
 
     fn current_readable_atom(&self, addr: CellAddress) -> Option<AtomId> {
-        if self.formula_cells.contains_key(&addr) {
+        if self.formula_cells.borrow().contains_key(&addr) {
             None
         } else {
             self.cells.get(&addr).copied()
@@ -1054,23 +1102,157 @@ impl Sheet {
     }
 
     fn remove_formula_record(&mut self, addr: CellAddress) -> Option<Rc<FormulaRecord>> {
-        let record = self.formula_cells.remove(&addr)?;
+        // LAZY_FORMULA_INDEXING Phase 3: drain lazy state FIRST so an
+        // "unhydrated only" addr still gets cleaned up even when there
+        // is no eager `FormulaRecord` to remove. This matters when
+        // `try_set_formula` calls `remove_formula_record` against a
+        // bulk-loaded but not-yet-read formula — without the early
+        // drain the new install would race the old lazy entry on the
+        // first read.
+        self.formula_source.borrow_mut().remove(&addr);
+        self.needs_parse.borrow_mut().remove(&addr);
+        let record = self.formula_cells.borrow_mut().remove(&addr)?;
         let deps = record.deps.borrow().clone();
         self.remove_formula_deps(addr, &deps);
         let range_deps = record.range_deps.borrow().clone();
         self.remove_formula_range_deps(addr, &range_deps);
-        self.formula_exprs.remove(&addr);
-        self.formula_texts.remove(&addr);
+        self.formula_exprs.borrow_mut().remove(&addr);
+        self.formula_texts.borrow_mut().remove(&addr);
         Some(record)
+    }
+
+    /// LAZY_FORMULA_INDEXING Phase 3: idempotent lazy parse+install.
+    ///
+    /// If `addr` is not in `needs_parse`, returns immediately (already
+    /// hydrated or never lazy). Otherwise pulls the source text out of
+    /// `formula_source`, parses it, runs the same-sheet static cycle
+    /// check (B.2), then installs the `FormulaRecord` + dep edges via
+    /// the same shape as `BulkLoader::install_parsed_formula`.
+    ///
+    /// Takes `&self` (not `&mut self`) so read-path callers can hydrate
+    /// without holding a unique borrow of the sheet. All mutable state
+    /// goes through the per-field `RefCell`s (`formula_cells`,
+    /// `formula_exprs`, `formula_texts`, `cell_dependents`,
+    /// `range_dependents`, `needs_parse`) or interior-mutable fields
+    /// (`imported_formula_count` is bumped at park time, not here;
+    /// `has_cross_sheet_refs` is a `Cell`).
+    ///
+    /// Cost-amortisation note: this method is called once per cell per
+    /// lifetime — the `needs_parse.contains(&addr)` check is a cheap
+    /// `HashSet` lookup that hits ~all reads in the steady state. For
+    /// the typical workload (rendering a 50×27 viewport over a
+    /// million-formula sheet) only ~1350 cells go through the parse
+    /// branch.
+    fn hydrate_formula(&self, addr: CellAddress) {
+        // Fast path: not lazy. One hashset lookup, no allocations.
+        // Done under a short borrow so concurrent `&self` callers don't
+        // race against a `borrow_mut` from the parse path below.
+        if !self.needs_parse.borrow().contains(&addr) {
+            return;
+        }
+
+        // Drain the source. Removing from `formula_source` AND
+        // `needs_parse` in lockstep keeps the
+        // `formula_source ↔ needs_parse` invariant tight. Done under
+        // exclusive borrows that are released before the parse so the
+        // parse path can re-enter sheet-level `RefCell`s freely.
+        let source = {
+            let mut needs = self.needs_parse.borrow_mut();
+            if !needs.remove(&addr) {
+                return;
+            }
+            let src = self.formula_source.borrow_mut().remove(&addr);
+            match src {
+                Some(s) => s,
+                None => return,
+            }
+        };
+
+        // Parse the source. On failure write `#VALUE!` via the
+        // `&self`-friendly path: store a Clean cache with the error,
+        // no dep edges, no `FormulaRecord` for the AST (there is no
+        // AST). To keep the existing eager path's invariants we
+        // synthesise a minimal record whose expr is a literal
+        // `#VALUE!` error.
+        let expr_owned = match parse_formula(source.as_ref()) {
+            Some(e) => e,
+            None => {
+                let err_expr = Rc::new(Expr::Error(ValueError::InvalidValue));
+                let record = Rc::new(FormulaRecord::new(
+                    err_expr.clone(),
+                    HashSet::new(),
+                    HashSet::new(),
+                ));
+                // Clamp cache to Clean(error) so the first read returns
+                // `#VALUE!` immediately and won't try to re-eval.
+                *record.cache.borrow_mut() =
+                    FormulaCache::Clean(Value::Error(ValueError::InvalidValue));
+                self.formula_cells.borrow_mut().insert(addr, record);
+                self.formula_exprs.borrow_mut().insert(addr, err_expr);
+                self.formula_texts
+                    .borrow_mut()
+                    .insert(addr, source.as_ref().to_string());
+                return;
+            }
+        };
+
+        // Cycle check (B.2). On hit write `#CYCLE!` the same way.
+        if self.would_create_cycle(addr, &expr_owned) {
+            let err_expr = Rc::new(Expr::Error(ValueError::CyclicRef));
+            let record = Rc::new(FormulaRecord::new(
+                err_expr.clone(),
+                HashSet::new(),
+                HashSet::new(),
+            ));
+            *record.cache.borrow_mut() =
+                FormulaCache::Clean(Value::Error(ValueError::CyclicRef));
+            self.formula_cells.borrow_mut().insert(addr, record);
+            self.formula_exprs.borrow_mut().insert(addr, err_expr);
+            self.formula_texts
+                .borrow_mut()
+                .insert(addr, source.as_ref().to_string());
+            return;
+        }
+
+        // Install: dep extract → dep register → FormulaRecord, mirror
+        // of `BulkLoader::install_parsed_formula` but going through
+        // `&self`-only paths.
+        let expr_rc = Rc::new(expr_owned);
+        let deps = Sheet::formula_deps_for(&expr_rc);
+        let range_deps = collect_range_refs(&expr_rc);
+        self.add_formula_deps(addr, &deps);
+        self.add_formula_range_deps(addr, &range_deps);
+        let record = Rc::new(FormulaRecord::new(expr_rc.clone(), deps, range_deps));
+        self.note_cross_sheet_if_any(&expr_rc);
+        self.formula_cells.borrow_mut().insert(addr, record);
+        self.formula_exprs.borrow_mut().insert(addr, expr_rc);
+        self.formula_texts
+            .borrow_mut()
+            .insert(addr, source.as_ref().to_string());
     }
 
     fn rebuild_all_formula_dependents(&self) {
         self.cell_dependents.borrow_mut().clear();
         self.range_dependents.borrow_mut().clear();
-        for (addr, record) in self.formula_cells.iter() {
-            let deps = record.deps.borrow().clone();
+        // Snapshot the (addr, deps, range_deps) triples up front so we
+        // don't hold the `formula_cells` borrow across `add_formula_deps`,
+        // which takes its own `borrow_mut` on `cell_dependents`. The
+        // inner record-level `RefCell`s on `deps` / `range_deps` are
+        // borrowed transiently for the clone, no recursion risk.
+        let snapshot: Vec<(CellAddress, HashSet<CellAddress>, HashSet<CellRange>)> = self
+            .formula_cells
+            .borrow()
+            .iter()
+            .map(|(addr, record)| {
+                (
+                    addr,
+                    record.deps.borrow().clone(),
+                    record.range_deps.borrow().clone(),
+                )
+            })
+            .collect();
+        for (addr, deps, range_deps) in snapshot {
             self.add_formula_deps(addr, &deps);
-            let range_deps = record.range_deps.borrow().clone();
             self.add_formula_range_deps(addr, &range_deps);
         }
     }
@@ -1103,8 +1285,8 @@ impl Sheet {
         // upper bound is benign (the maps live as long as the sheet
         // and headroom amortizes across future inserts).
         self.cell_dependents.get_mut().reserve(hint);
-        self.formula_exprs.reserve(hint);
-        self.formula_texts.reserve(hint);
+        self.formula_exprs.get_mut().reserve(hint);
+        self.formula_texts.get_mut().reserve(hint);
     }
 
     /// Collect every formula address that depends on a write to `addr`,
@@ -1180,7 +1362,7 @@ impl Sheet {
     /// own `set_cell` path already did that. This helper is purely the
     /// "mark this one formula dirty" primitive.
     pub fn mark_dirty_for_addr(&self, addr: CellAddress) {
-        if let Some(record) = self.formula_cells.get(&addr) {
+        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
             *record.cache.borrow_mut() = FormulaCache::Dirty;
         }
     }
@@ -1209,7 +1391,7 @@ impl Sheet {
             if !notified.insert(addr) {
                 continue;
             }
-            if let Some(record) = self.formula_cells.get(&addr) {
+            if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
             self.notify_address_subscribers(addr);
@@ -1409,8 +1591,12 @@ impl Sheet {
     /// `spill_targets[our_anchor_atom]` should NOT be considered
     /// collisions (we're re-spilling into our own previous range).
     fn is_target_occupied(&self, target: CellAddress, our_anchor_atom: AtomId) -> bool {
-        // (a) Formula cell at target — always blocks.
-        if self.formula_cells.contains_key(&target) {
+        // (a) Formula cell at target — always blocks. Unhydrated lazy
+        // formulas count too: a same-cell collision with a deferred
+        // formula must surface as #SPILL!, not pass through.
+        if self.formula_cells.borrow().contains_key(&target)
+            || self.needs_parse.borrow().contains(&target)
+        {
             return true;
         }
         // (b) Primitive atom holding a non-Null value.
@@ -1554,7 +1740,11 @@ impl Sheet {
             .copied()
             .filter(|id| self.spill_targets.contains_key(id));
 
-        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate before consulting
+        // `formula_cells` so unhydrated array-producing formulas get
+        // their spill installed by this eager pass.
+        self.hydrate_formula(addr);
+        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
             // Not a formula cell — nothing to recompute.
             return;
         };
@@ -1602,7 +1792,7 @@ impl Sheet {
                         if let Some(&atom_id) = self.cells.get(&addr) {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
-                        if let Some(record) = self.formula_cells.get(&addr) {
+                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() =
                                 FormulaCache::Clean(Value::Error(ValueError::Spill));
                         }
@@ -1611,7 +1801,7 @@ impl Sheet {
                         if let Some(&atom_id) = self.cells.get(&addr) {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
-                        if let Some(record) = self.formula_cells.get(&addr) {
+                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
@@ -1653,10 +1843,20 @@ impl Sheet {
     fn recompute_array_formulas_in(&mut self, addrs: &HashSet<CellAddress>) {
         // Collect addresses to process — clone the addresses to avoid
         // borrowing self while we mutate.
+        //
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate each candidate before
+        // taking the filter; an unhydrated formula at `a` would slip
+        // past the `formula_cells.contains_key(a)` test and the
+        // downstream array-recompute would miss it. Hydration is
+        // idempotent — already-hydrated addrs cost a single
+        // `needs_parse.contains` lookup.
         let candidates: Vec<CellAddress> = addrs
             .iter()
             .copied()
-            .filter(|a| self.formula_cells.contains_key(a))
+            .filter(|a| {
+                self.hydrate_formula(*a);
+                self.formula_cells.borrow().contains_key(a)
+            })
             .collect();
         for a in candidates {
             self.recompute_array_formula(a);
@@ -1690,7 +1890,10 @@ impl Sheet {
             .copied()
             .filter(|id| self.spill_targets.contains_key(id));
 
-        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate so the workbook-aware
+        // re-eval sees the parsed AST.
+        self.hydrate_formula(addr);
+        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
             return;
         };
         if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
@@ -1713,7 +1916,7 @@ impl Sheet {
                         if let Some(&atom_id) = self.cells.get(&addr) {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
-                        if let Some(record) = self.formula_cells.get(&addr) {
+                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() =
                                 FormulaCache::Clean(Value::Error(ValueError::Spill));
                         }
@@ -1722,7 +1925,7 @@ impl Sheet {
                         if let Some(&atom_id) = self.cells.get(&addr) {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
-                        if let Some(record) = self.formula_cells.get(&addr) {
+                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
@@ -1772,10 +1975,18 @@ impl Sheet {
 
         // Drop any prior formula at the anchor — an array write is a
         // primitive-style mutation that replaces formula state.
-        let had_formula = self.formula_cells.contains_key(&addr);
+        //
+        // LAZY_FORMULA_INDEXING Phase 3: an unhydrated formula still
+        // owns the address. Drain the source / needs_parse entries
+        // explicitly; the `formula_cells` map has no record to
+        // `remove_formula_record` for an unhydrated addr.
+        let had_formula = self.formula_cells.borrow().contains_key(&addr)
+            || self.needs_parse.borrow().contains(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
+                sheet.formula_source.borrow_mut().remove(&addr);
+                sheet.needs_parse.borrow_mut().remove(&addr);
                 let _ = sheet.ensure_cell(addr);
             });
         }
@@ -1834,12 +2045,18 @@ impl Sheet {
         // strand the derived atoms at the old targets.
         self.clear_spill_at_address(addr);
 
-        let had_formula = self.formula_cells.contains_key(&addr);
+        // LAZY_FORMULA_INDEXING Phase 3: include unhydrated lazy
+        // formulas. `remove_formula_record` already drains the lazy
+        // entries defensively.
+        let had_formula = self.formula_cells.borrow().contains_key(&addr)
+            || self.needs_parse.borrow().contains(&addr);
         let is_null = matches!(value, Value::Null);
 
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
+                sheet.formula_source.borrow_mut().remove(&addr);
+                sheet.needs_parse.borrow_mut().remove(&addr);
                 let id = sheet.ensure_cell(addr);
                 sheet.store.set(id, value);
             });
@@ -1904,7 +2121,12 @@ impl Sheet {
             return;
         };
         // Formula cells are lazy records, not primitive atoms.
-        if self.formula_cells.contains_key(&addr) {
+        // LAZY_FORMULA_INDEXING Phase 3: also skip when an unhydrated
+        // formula is parked at `addr` — the eventual hydration will
+        // reuse the primitive slot if it needs one.
+        if self.formula_cells.borrow().contains_key(&addr)
+            || self.needs_parse.borrow().contains(&addr)
+        {
             return;
         }
         if self.store.has_dependents(atom_id) {
@@ -1998,9 +2220,9 @@ impl Sheet {
             sheet.add_formula_range_deps(addr, &range_deps);
             let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
             sheet.note_cross_sheet_if_any(&expr);
-            sheet.formula_cells.insert(addr, record);
-            sheet.formula_exprs.insert(addr, expr);
-            sheet.formula_texts.insert(addr, formula_str.to_string());
+            sheet.formula_cells.borrow_mut().insert(addr, record);
+            sheet.formula_exprs.borrow_mut().insert(addr, expr);
+            sheet.formula_texts.borrow_mut().insert(addr, formula_str.to_string());
         });
         let dirtied = self.mark_dependents_dirty(addr);
         // Eager spill maintenance: re-evaluate the just-installed
@@ -2017,7 +2239,10 @@ impl Sheet {
     /// detection failure (`#CYCLE!`) to the target cell without re-deriving
     /// the helper logic here.
     pub(crate) fn write_error(&mut self, addr: CellAddress, err: ValueError) {
-        let had_formula = self.formula_cells.contains_key(&addr);
+        // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas count as
+        // "had a formula" for the remap-vs-direct teardown decision.
+        let had_formula = self.formula_cells.borrow().contains_key(&addr)
+            || self.needs_parse.borrow().contains(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
@@ -2036,8 +2261,27 @@ impl Sheet {
     /// detector. `pub(crate)` because cross-sheet BFS in `Workbook::set_formula`
     /// needs to walk per-sheet formula ASTs without owning the sheet's
     /// internal state.
-    pub(crate) fn formula_exprs_iter(&self) -> &HashMap<CellAddress, Rc<Expr>> {
-        &self.formula_exprs
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: returns a `Ref<...>` so callers
+    /// see the live `formula_exprs` snapshot through the new `RefCell`
+    /// wrapper. The returned guard is held for the duration of the
+    /// caller's borrow; callers that need to take additional mutable
+    /// borrows on the sheet must collect addresses first then drop the
+    /// guard before mutating (the existing workbook callers already do
+    /// this — they snapshot `.keys().copied().collect::<Vec<_>>()` up
+    /// front).
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: this view does NOT include
+    /// unhydrated lazy formulas. Callers that need lazy entries (e.g.
+    /// cross-sheet AST walks) must hydrate first via
+    /// `hydrate_all_formulas` or accept that an unhydrated formula
+    /// won't show up in this iter. The cross-sheet workbook callers
+    /// today operate after `Sheet::set_formula` (eager parse, D1=4A)
+    /// or after the workbook bulk_load already hydrated through its
+    /// per-cell cycle pre-check — so they observe the parsed entries
+    /// they need.
+    pub(crate) fn formula_exprs_iter(&self) -> std::cell::Ref<'_, HashMap<CellAddress, Rc<Expr>>> {
+        self.formula_exprs.borrow()
     }
 
     /// Static cycle detection (B.2). Returns true iff installing `expr` at
@@ -2157,11 +2401,66 @@ impl Sheet {
         value_resolver: &dyn Fn(&Sheet, CellAddress) -> Value,
         f: &mut dyn FnMut(CellAddress, Value),
     ) {
+        // LAZY_FORMULA_INDEXING Phase 3: snapshot the formula address
+        // sets up front. Both `formula_cells` and `formula_source` may
+        // grow during iteration (hydration moves entries from the
+        // latter to the former), and the `BTreeMap::range` iterators
+        // hold a borrow that conflicts with the `borrow_mut` inside
+        // hydration. Collecting addresses first releases the borrows
+        // and gives us a stable iteration set.
+        let formula_addrs: Vec<CellAddress> = {
+            let cells = self.formula_cells.borrow();
+            let source = self.formula_source.borrow();
+            // Row-major union: each map yields ascending order; merge
+            // so duplicates collapse and the final list is ascending
+            // too (matches the pre-lazy contract that callers rely on
+            // for deterministic snapshots).
+            let mut out: Vec<CellAddress> = Vec::with_capacity(cells.len() + source.len());
+            let mut a = cells.range_iter(range).map(|(addr, _)| addr).peekable();
+            let mut b = source.range_iter(range).map(|(addr, _)| addr).peekable();
+            loop {
+                match (a.peek().copied(), b.peek().copied()) {
+                    (None, None) => break,
+                    (Some(x), None) => {
+                        out.push(x);
+                        a.next();
+                    }
+                    (None, Some(y)) => {
+                        out.push(y);
+                        b.next();
+                    }
+                    (Some(x), Some(y)) => {
+                        let xk = (x.row, x.col);
+                        let yk = (y.row, y.col);
+                        if xk == yk {
+                            // Co-existence invariant says this should
+                            // never happen, but guard defensively so
+                            // duplicate emit can't break callers that
+                            // assume distinct addresses.
+                            out.push(x);
+                            a.next();
+                            b.next();
+                        } else if xk < yk {
+                            out.push(x);
+                            a.next();
+                        } else {
+                            out.push(y);
+                            b.next();
+                        }
+                    }
+                }
+            }
+            out
+        };
+
         for (addr, &id) in self.cells.range_iter(range) {
             // Skip primitives that have been upgraded to formulas — the
             // formula pass below will emit the formula value at this addr.
             // Address-equality check stays O(1) (BTreeMap point lookup).
-            if self.formula_cells.contains_key(&addr) {
+            // Both hydrated and lazy formulas count.
+            if self.formula_cells.borrow().contains_key(&addr)
+                || self.formula_source.borrow().contains_key(&addr)
+            {
                 continue;
             }
             let v = if self.store.has_atom(id) {
@@ -2171,7 +2470,7 @@ impl Sheet {
             };
             f(addr, v);
         }
-        for (addr, _record) in self.formula_cells.range_iter(range) {
+        for addr in formula_addrs {
             let v = value_resolver(self, addr);
             f(addr, v);
         }
@@ -2182,7 +2481,14 @@ impl Sheet {
         addr: CellAddress,
         provider: &dyn EvalProvider,
     ) -> Value {
-        if self.formula_cells.contains_key(&addr) {
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate before the
+        // `formula_cells` / `cells` branch decision so an unhydrated
+        // formula at `addr` doesn't fall through to
+        // `primitive_value_at` (which would return whatever stale
+        // primitive scaffold the bulk-load left behind). Hydration is
+        // idempotent and `&self`-only via internal `RefCell`s.
+        self.hydrate_formula(addr);
+        if self.formula_cells.borrow().contains_key(&addr) {
             return self.eval_formula_at_with_provider(addr, provider);
         }
         self.cells
@@ -2205,10 +2511,16 @@ impl Sheet {
         addr: CellAddress,
         provider: &dyn EvalProvider,
     ) -> Value {
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate before the cache hit
+        // check. `peek_value_with_provider` already hydrated, but
+        // direct callers (e.g. `recompute_array_formula`) reach here
+        // without going through `peek_value_with_provider` first.
+        self.hydrate_formula(addr);
         // Cheap early-out for cache hit (mirrors the original behavior).
         // Done before `prewarm_formula_chain` so a Clean cache short-circuits
         // before we allocate the work-stack.
-        if let Some(record) = self.formula_cells.get(&addr) {
+        let cached = self.formula_cells.borrow().get(&addr).cloned();
+        if let Some(record) = cached {
             match record.cache.borrow().clone() {
                 FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
                 FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
@@ -2252,7 +2564,7 @@ impl Sheet {
         // computed inside the prewarm pass. If for any reason the prewarm
         // left the cache in a non-Clean state (e.g. a primitive_value_at
         // detour), fall back to compute_formula_at.
-        if let Some(record) = self.formula_cells.get(&addr) {
+        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
             if let FormulaCache::Clean(value) = record.cache.borrow().clone() {
                 return value;
             }
@@ -2268,7 +2580,12 @@ impl Sheet {
     /// eval cycle case and the (already-impossible by static check) prewarm
     /// cycle case.
     fn compute_formula_at(&self, addr: CellAddress, provider: &dyn EvalProvider) -> Value {
-        let Some(record) = self.formula_cells.get(&addr).cloned() else {
+        // LAZY_FORMULA_INDEXING Phase 3: hydrate before consulting
+        // `formula_cells`. Callers that arrive here through the
+        // prewarm path may not have routed through
+        // `peek_value_with_provider`.
+        self.hydrate_formula(addr);
+        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
             return self.primitive_value_at(addr);
         };
         match record.cache.borrow().clone() {
@@ -2329,8 +2646,12 @@ impl Sheet {
         stack.push((start, false));
 
         while let Some((addr, ready_to_eval)) = stack.pop() {
+            // LAZY_FORMULA_INDEXING Phase 3: hydrate each prewarm
+            // candidate so an unhydrated lazy dep pulled in via
+            // `collect_prewarm_refs` participates in the chain pre-fill.
+            self.hydrate_formula(addr);
             // Fetch the record. Skip primitives (they have no FormulaRecord).
-            let Some(record) = self.formula_cells.get(&addr).cloned() else {
+            let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
                 continue;
             };
 
@@ -2393,7 +2714,13 @@ impl Sheet {
                 if !enqueued.insert(dep) {
                     continue;
                 }
-                if !self.formula_cells.contains_key(&dep) {
+                // LAZY_FORMULA_INDEXING Phase 3: include lazy formulas
+                // — `formula_cells.contains_key` would miss them. The
+                // hydration on the next iteration moves the dep into
+                // `formula_cells`.
+                if !self.formula_cells.borrow().contains_key(&dep)
+                    && !self.needs_parse.borrow().contains(&dep)
+                {
                     continue;
                 }
                 stack.push((dep, false));
@@ -2413,9 +2740,21 @@ impl Sheet {
     /// should prefer `recompute_cross_sheet_formulas_reachable_from(addr)`,
     /// which scopes the work to formulas on the dep chain of `addr`.
     pub fn recompute_cross_sheet_formulas(&mut self) {
-        for (addr, expr) in &self.formula_exprs {
-            if expr_has_sheet_ref(expr) {
-                if let Some(record) = self.formula_cells.get(addr) {
+        // LAZY_FORMULA_INDEXING Phase 3: only hydrated formulas have an
+        // entry in `formula_exprs`. Unhydrated lazies will hit
+        // `expr_has_sheet_ref` for the first time at their next read
+        // (where the read-path hydrate runs) — at which point their
+        // cache starts Dirty anyway. So scanning only the hydrated set
+        // here is sufficient; nothing observable is missed.
+        let entries: Vec<(CellAddress, Rc<Expr>)> = self
+            .formula_exprs
+            .borrow()
+            .iter()
+            .map(|(addr, expr)| (*addr, expr.clone()))
+            .collect();
+        for (addr, expr) in entries {
+            if expr_has_sheet_ref(&expr) {
+                if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
@@ -2438,11 +2777,16 @@ impl Sheet {
             if !visited.insert(addr) {
                 continue;
             }
-            let Some(expr) = self.formula_exprs.get(&addr) else {
+            // LAZY_FORMULA_INDEXING Phase 3: hydrate so reachable lazy
+            // entries get walked. The BFS uses `formula_exprs` which
+            // only carries hydrated entries — without the hydrate the
+            // chain would terminate at the first lazy node.
+            self.hydrate_formula(addr);
+            let Some(expr) = self.formula_exprs.borrow().get(&addr).cloned() else {
                 continue;
             };
-            if expr_has_sheet_ref(expr) {
-                if let Some(record) = self.formula_cells.get(&addr) {
+            if expr_has_sheet_ref(&expr) {
+                if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
@@ -2451,7 +2795,8 @@ impl Sheet {
             // expanded but each cell is gated by `formula_exprs` so the
             // typical `SUM(A:A)` only enqueues the small subset of column A
             // cells that are actually formulas.
-            collect_formula_refs_into(expr, &self.formula_exprs, &mut to_visit);
+            let exprs = self.formula_exprs.borrow();
+            collect_formula_refs_into(&expr, &exprs, &mut to_visit);
         }
     }
 
@@ -2474,9 +2819,14 @@ impl Sheet {
 
     /// Number of formula cells. Formulas are Sheet-level lazy records, not
     /// core derived atoms.
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: counts hydrated formulas (in
+    /// `formula_cells`) plus parked lazy formulas (in `formula_source`).
+    /// The scale suite relies on this returning N immediately after
+    /// `bulk_load` of N formulas, even if no reads have hydrated yet.
     #[doc(hidden)]
     pub fn debug_formula_count(&self) -> usize {
-        self.formula_cells.len()
+        self.formula_cells.borrow().len() + self.formula_source.borrow().len()
     }
 
     /// Number of formulas that currently depend on the cell at `addr`.
@@ -2498,10 +2848,19 @@ impl Sheet {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return "invalid";
         };
-        let Some(record) = self.formula_cells.get(&addr) else {
+        // LAZY_FORMULA_INDEXING Phase 3: report unhydrated formulas
+        // as "dirty" — they have no FormulaRecord yet, but
+        // semantically they would compute fresh on the next read
+        // (matches the pre-lazy contract: every just-imported
+        // formula starts dirty).
+        if self.needs_parse.borrow().contains(&addr) {
+            return "dirty";
+        }
+        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
             return "none";
         };
-        match &*record.cache.borrow() {
+        let cache = record.cache.borrow().clone();
+        match cache {
             FormulaCache::Dirty => "dirty",
             FormulaCache::Computing => "computing",
             FormulaCache::Clean(_) => "clean",
@@ -2538,10 +2897,19 @@ impl Sheet {
     /// dirty-propagation correctness without forcing an eval.
     #[doc(hidden)]
     pub fn debug_dirty_count(&self) -> usize {
-        self.formula_cells
+        // LAZY_FORMULA_INDEXING Phase 3: also count unhydrated lazy
+        // formulas — they're semantically Dirty (will compute on
+        // first read). Counting just the hydrated cells would let the
+        // scale suite's "N dirty after bulk_load" assertion drop to
+        // zero after lazy bulk_load even though every cell is still
+        // "pending compute".
+        let hydrated_dirty = self
+            .formula_cells
+            .borrow()
             .values()
             .filter(|record| matches!(*record.cache.borrow(), FormulaCache::Dirty))
-            .count()
+            .count();
+        hydrated_dirty + self.needs_parse.borrow().len()
     }
 
     /// Number of formulas registered via `bulk_load` (cumulative since the
@@ -2653,14 +3021,24 @@ impl Sheet {
         // range dep registered. The `formula_cells` map holds a
         // `FormulaRecord` per formula; we count those whose
         // `range_deps` set is non-empty.
+        //
+        // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas are not
+        // counted here — they have no installed `range_deps` yet. This
+        // is exactly the "edges are zero after lazy bulk_load" probe
+        // the Phase 1 measurement summary asked for.
         let range_formula_count = self
             .formula_cells
+            .borrow()
             .values()
             .filter(|record| !record.range_deps.borrow().is_empty())
             .count() as u64;
 
         DepGraphStats {
-            formula_count: self.formula_cells.len() as u64,
+            // `formula_count` reflects HYDRATED formulas only so the
+            // stats probe surfaces "how much of the dep graph is
+            // actually live". The total formula count (hydrated +
+            // lazy) is exposed via `debug_formula_count`.
+            formula_count: self.formula_cells.borrow().len() as u64,
             total_point_dep_edges: total_point_edges,
             total_range_dep_entries: total_range_entries,
             max_fanout,
@@ -2687,13 +3065,25 @@ impl Sheet {
     /// require `&mut self` because no atom creation is involved.
     pub fn get_formula(&self, addr_str: &str) -> Option<String> {
         let addr = CellAddress::parse(addr_str)?;
-        self.formula_texts.get(&addr).cloned()
+        // LAZY_FORMULA_INDEXING Phase 3: hydrated formulas live in
+        // `formula_texts`, lazy ones live in `formula_source`. Check
+        // both so the formula bar shows the source even before first
+        // read.
+        if let Some(t) = self.formula_texts.borrow().get(&addr) {
+            return Some(t.clone());
+        }
+        self.formula_source
+            .borrow()
+            .get(&addr)
+            .map(|s| s.as_ref().to_string())
     }
 
     /// Is there a formula at `addr`? Used by `ISFORMULA(reference)` via
     /// the `EvalProvider::cell_has_formula` hook.
     pub fn has_formula_at(&self, addr: CellAddress) -> bool {
-        self.formula_cells.contains_key(&addr)
+        // LAZY_FORMULA_INDEXING Phase 3: lazy formulas are still
+        // formulas — ISFORMULA must observe them.
+        self.formula_cells.borrow().contains_key(&addr) || self.needs_parse.borrow().contains(&addr)
     }
 
     /// Source formula text at `addr`, if any. Used by
@@ -2703,7 +3093,13 @@ impl Sheet {
     /// per call is acceptable for the formula-bar / `FORMULATEXT` use
     /// case.
     pub fn formula_text_at(&self, addr: CellAddress) -> Option<String> {
-        self.formula_texts.get(&addr).cloned()
+        if let Some(t) = self.formula_texts.borrow().get(&addr) {
+            return Some(t.clone());
+        }
+        self.formula_source
+            .borrow()
+            .get(&addr)
+            .map(|s| s.as_ref().to_string())
     }
 
     /// Iterate every address that has a primitive value or a formula. Empty
@@ -2724,11 +3120,38 @@ impl Sheet {
     /// so this two-pass walk preserves the prior HashMap-era contract
     /// without changing observable behavior.
     pub fn for_each_non_empty(&self, mut f: impl FnMut(CellAddress)) {
-        for (addr, _) in self.formula_cells.iter() {
+        // LAZY_FORMULA_INDEXING Phase 3: snapshot addresses up front so
+        // the inner closure can hydrate / mutate without conflicting
+        // borrows. Iteration covers hydrated formulas AND lazy parked
+        // formulas — both are "non-empty" from the snapshot caller's
+        // POV.
+        let formula_addrs: Vec<CellAddress> = {
+            let cells = self.formula_cells.borrow();
+            let source = self.formula_source.borrow();
+            let mut out: Vec<CellAddress> = Vec::with_capacity(cells.len() + source.len());
+            out.extend(cells.iter().map(|(a, _)| a));
+            for (a, _) in source.iter() {
+                if !cells.contains_key(&a) {
+                    out.push(a);
+                }
+            }
+            out
+        };
+        for addr in formula_addrs {
             f(addr);
         }
+        // Snapshot the formula key set once so the inner closure cost
+        // doesn't pay a per-cell `RefCell::borrow`.
+        let formula_keys: HashSet<CellAddress> = {
+            let cells = self.formula_cells.borrow();
+            let source = self.formula_source.borrow();
+            cells
+                .keys()
+                .chain(source.keys())
+                .collect()
+        };
         for (addr, _) in self.cells.iter() {
-            if self.formula_cells.contains_key(&addr) {
+            if formula_keys.contains(&addr) {
                 continue;
             }
             f(addr);
@@ -2739,11 +3162,33 @@ impl Sheet {
     /// values. Formula entries are reported by address only, so this does
     /// not evaluate dirty formula caches.
     pub fn for_each_non_empty_in_range(&self, range: CellRange, mut f: impl FnMut(CellAddress)) {
-        for (addr, _) in self.formula_cells.range_iter(range) {
+        // LAZY_FORMULA_INDEXING Phase 3: same snapshot pattern as
+        // `for_each_non_empty`.
+        let formula_addrs: Vec<CellAddress> = {
+            let cells = self.formula_cells.borrow();
+            let source = self.formula_source.borrow();
+            let mut out: Vec<CellAddress> = Vec::new();
+            out.extend(cells.range_iter(range).map(|(a, _)| a));
+            for (a, _) in source.range_iter(range) {
+                if !cells.contains_key(&a) {
+                    out.push(a);
+                }
+            }
+            out
+        };
+        for addr in formula_addrs {
             f(addr);
         }
+        let formula_keys: HashSet<CellAddress> = {
+            let cells = self.formula_cells.borrow();
+            let source = self.formula_source.borrow();
+            cells
+                .keys()
+                .chain(source.keys())
+                .collect()
+        };
         for (addr, _) in self.cells.range_iter(range) {
-            if self.formula_cells.contains_key(&addr) {
+            if formula_keys.contains(&addr) {
                 continue;
             }
             f(addr);
@@ -2768,7 +3213,11 @@ impl Sheet {
     /// Collect every non-empty address as an `"A1"`-style string. Cheap
     /// convenience wrapper around `for_each_non_empty` for wasm exposure.
     pub fn non_empty_addrs(&self) -> Vec<String> {
-        let mut out = Vec::with_capacity(self.formula_cells.len() + self.cells.len());
+        let mut out = Vec::with_capacity(
+            self.formula_cells.borrow().len()
+                + self.formula_source.borrow().len()
+                + self.cells.len(),
+        );
         self.for_each_non_empty(|addr| out.push(addr.to_string()));
         out
     }
@@ -3140,18 +3589,30 @@ impl Sheet {
             new_cells.insert(f(addr), id);
         }
         let mut new_formula_cells: RowMajorMap<Rc<FormulaRecord>> = RowMajorMap::new();
-        for (addr, record) in self.formula_cells.drain_into_vec() {
+        for (addr, record) in self.formula_cells.get_mut().drain_into_vec() {
             new_formula_cells.insert(f(addr), record);
         }
         let new_formula_exprs: HashMap<CellAddress, Rc<Expr>> =
-            std::mem::take(&mut self.formula_exprs)
+            std::mem::take(self.formula_exprs.get_mut())
                 .into_iter()
                 .map(|(addr, expr)| (f(addr), expr))
                 .collect();
         let new_formula_texts: HashMap<CellAddress, String> =
-            std::mem::take(&mut self.formula_texts)
+            std::mem::take(self.formula_texts.get_mut())
                 .into_iter()
                 .map(|(addr, text)| (f(addr), text))
+                .collect();
+        // LAZY_FORMULA_INDEXING Phase 3: relocate parked lazy formula
+        // entries too. `formula_source` is keyed by addr; `needs_parse`
+        // is a set of addrs. Both get the same shift.
+        let mut new_formula_source: RowMajorMap<Rc<str>> = RowMajorMap::new();
+        for (addr, src) in self.formula_source.get_mut().drain_into_vec() {
+            new_formula_source.insert(f(addr), src);
+        }
+        let new_needs_parse: HashSet<CellAddress> =
+            std::mem::take(self.needs_parse.get_mut())
+                .into_iter()
+                .map(&f)
                 .collect();
         // Phase 6 — formats follow the same shift as cells so a format set
         // on A1 survives a row insert above and re-emerges on A2. Entries
@@ -3191,9 +3652,11 @@ impl Sheet {
             })
             .collect();
         self.cells = new_cells;
-        self.formula_cells = new_formula_cells;
-        self.formula_exprs = new_formula_exprs;
-        self.formula_texts = new_formula_texts;
+        *self.formula_cells.get_mut() = new_formula_cells;
+        *self.formula_exprs.get_mut() = new_formula_exprs;
+        *self.formula_texts.get_mut() = new_formula_texts;
+        *self.formula_source.get_mut() = new_formula_source;
+        *self.needs_parse.get_mut() = new_needs_parse;
         self.formats = new_formats;
         self.range_formats = new_range_formats;
         self.rebuild_all_formula_dependents();
@@ -3203,8 +3666,18 @@ impl Sheet {
     /// existing formula AST. Used after structural edits so formulas
     /// continue to point at the same logical cell.
     fn retarget_formula_refs(&mut self, f: &dyn Fn(CellAddress) -> CellAddress) {
+        // LAZY_FORMULA_INDEXING Phase 3: relocate_cells already shifted
+        // the `formula_source` / `needs_parse` keys. Hydrated formulas
+        // also need their ASTs rewritten — we hydrate every lazy entry
+        // first so the AST walk below sees every formula.
+        let lazy_addrs: Vec<CellAddress> =
+            self.needs_parse.borrow().iter().copied().collect();
+        for addr in lazy_addrs {
+            self.hydrate_formula(addr);
+        }
         let updated: Vec<(CellAddress, Expr)> = self
             .formula_exprs
+            .borrow()
             .iter()
             .map(|(addr, expr)| (*addr, crate::shift::map_addrs(expr, f)))
             .collect();
@@ -3216,7 +3689,7 @@ impl Sheet {
                 continue;
             }
             let new_expr_rc = Rc::new(new_expr);
-            self.formula_exprs.insert(addr, new_expr_rc.clone());
+            self.formula_exprs.borrow_mut().insert(addr, new_expr_rc.clone());
             let rendered = crate::shift::render_formula(&new_expr_rc);
             self.rebuild_formula_lazy(addr, rendered);
         }
@@ -3243,9 +3716,9 @@ impl Sheet {
         self.add_formula_deps(addr, &deps);
         self.add_formula_range_deps(addr, &range_deps);
         self.note_cross_sheet_if_any(&expr);
-        self.formula_cells.insert(addr, record);
-        self.formula_exprs.insert(addr, expr);
-        self.formula_texts.insert(addr, formula_str);
+        self.formula_cells.borrow_mut().insert(addr, record);
+        self.formula_exprs.borrow_mut().insert(addr, expr);
+        self.formula_texts.borrow_mut().insert(addr, formula_str);
         // Fanout reattach + per-address fire are handled by the enclosing
         // `with_structural_edit` (this is only ever called from
         // `retarget_formula_refs` during a structural edit).
@@ -3364,11 +3837,20 @@ impl<'a> BulkLoader<'a> {
         // notify exactly once per subscribed touched/dirty address.
         self.sheet.detach_address_sub(addr);
 
-        if self.sheet.formula_cells.contains_key(&addr) {
+        // LAZY_FORMULA_INDEXING Phase 3: lazy and hydrated formulas
+        // both transition to primitive here. `remove_formula_record`
+        // is a no-op on lazies (no record) — drain `formula_source` /
+        // `needs_parse` explicitly so the address stops looking like a
+        // formula to any later check.
+        let had_formula = self.sheet.formula_cells.borrow().contains_key(&addr)
+            || self.sheet.needs_parse.borrow().contains(&addr);
+        if had_formula {
             // Formula → primitive transition. Drop the formula record (and
             // its reverse dep entries) but no notify; primitive scaffold is
             // re-established below.
             self.sheet.remove_formula_record(addr);
+            self.sheet.formula_source.borrow_mut().remove(&addr);
+            self.sheet.needs_parse.borrow_mut().remove(&addr);
             // The pre-existing primitive atom from formula→primitive remap may
             // still be present; ensure_cell + store.set covers both branches.
             let id = self.sheet.ensure_cell(addr);
@@ -3396,67 +3878,99 @@ impl<'a> BulkLoader<'a> {
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        // Phase 1 instrumentation (bulk_import_trace): when the
-        // instrumented import driver is active, record the parse share
-        // of this path. The `flush_phase_clock()` check is a cheap
-        // thread-local read; cold-path overhead is one branch when the
-        // clock is `None` (production import). We do NOT use
-        // `std::time::Instant` because it panics at runtime on
-        // `wasm32-unknown-unknown` — the host supplies a clock fn
-        // (`js_sys::Date::now` in browser, an `Instant` epoch on
-        // native) via the thread-local.
-        let clock = crate::bulk_import_trace::flush_phase_clock();
-        let expr = if let Some(now_ms) = clock {
-            let t0 = now_ms();
-            let parsed = parse_formula(formula_str);
-            crate::bulk_import_trace::add_flush_parse_ms(now_ms() - t0);
-            match parsed {
-                Some(e) => e,
-                None => {
-                    self.write_error_no_notify(addr, ValueError::InvalidValue);
-                    self.touched.insert(addr);
-                    return false;
-                }
-            }
-        } else {
-            match parse_formula(formula_str) {
-                Some(e) => e,
-                None => {
-                    self.write_error_no_notify(addr, ValueError::InvalidValue);
-                    self.touched.insert(addr);
-                    return false;
-                }
-            }
-        };
-        self.install_parsed_formula(addr, expr, formula_str.to_string())
+        // LAZY_FORMULA_INDEXING Phase 2: defer parse / dep extract /
+        // dep register / FormulaRecord materialization. Store the source
+        // text and mark `addr` as `needs_parse`; the actual install
+        // happens lazily at first read (Phase 3) or eagerly in
+        // `hydrate_all_after_load` at `flush` end while Phase 3 lands.
+        self.set_formula_lazy(addr, formula_str.to_string())
     }
 
     /// Variant of `set_formula` that takes a pre-parsed `Expr` plus an
     /// owned source `String`. The `Workbook::bulk_load` flush uses this
-    /// to avoid both
-    ///
-    ///   1. re-parsing every formula the workbook loader already parsed
-    ///      (`parse_formula` allocates a `Vec<char>` per source char
-    ///      plus boxed nodes for every binop / cellref / funccall), and
-    ///   2. the redundant `String::clone` for the `formula_texts`
-    ///      insert — the workbook side already owns the source string
-    ///      for the buffered op queue, so we hand the same allocation
-    ///      directly to the sheet-side `formula_texts` map.
-    ///
-    /// Both savings compound at the wasm32 100k-chain tier where the
-    /// dominant constant-factor was per-cell allocator churn.
+    /// to avoid re-parsing the formula the workbook loader already
+    /// parsed for its own cross-sheet cycle pre-check.
     ///
     /// Same return contract: `true` on success, `false` (with `#CYCLE!`
     /// written) on same-sheet cycle. `expr` is trusted to be the parse
     /// of `formula_text`; the caller keeps them in sync.
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 2: the pre-parsed AST is discarded
+    /// at this entry point. Only the source string is stored; the
+    /// hydrator re-parses on first read. The pre-parse the workbook
+    /// loader did is still needed for the cross-sheet cycle check it
+    /// ran at queue time, but the AST does not need to survive into the
+    /// sheet because the hydrator owns its own parse. Cost of the
+    /// re-parse is amortised by the per-call hydration trigger; reads
+    /// that never touch the cell never pay it.
     pub(crate) fn set_formula_pre_parsed(
         &mut self,
         addr_str: &str,
-        expr: Expr,
+        _expr: Expr,
         formula_text: String,
     ) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        self.install_parsed_formula(addr, expr, formula_text)
+        self.set_formula_lazy(addr, formula_text)
+    }
+
+    /// LAZY_FORMULA_INDEXING Phase 2 core: park `formula_text` in
+    /// `Sheet::formula_source` and add `addr` to `Sheet::needs_parse`.
+    /// Skips parse, dep extract, dep register, and `FormulaRecord`
+    /// materialisation. Touched is still recorded so the existing
+    /// dirty-propagation / subscriber-notify pass in `flush()` runs.
+    ///
+    /// Returns `true` unconditionally — the cycle check is deferred
+    /// to first read (matches the TS port's "lazy build, lazy eval"
+    /// contract). The cycle-on-write semantics of `set_formula`
+    /// outside the bulk-load contract are preserved by D1=4A
+    /// (`Sheet::set_formula` keeps its eager parse).
+    fn set_formula_lazy(&mut self, addr: CellAddress, formula_text: String) -> bool {
+        // Detach fanout so any prior-formula / primitive-scaffold
+        // teardown below does not double-fire through the listener.
+        self.sheet.detach_address_sub(addr);
+
+        // If the address previously had an eagerly-installed formula
+        // record (rare for bulk_load but possible in mixed-mode
+        // workloads — see `bulk_load_skips_eval_until_first_read`), tear
+        // it down so the lazy path is the sole source of truth for this
+        // address.
+        if self.sheet.formula_cells.borrow().contains_key(&addr) {
+            self.sheet.remove_formula_record(addr);
+        }
+        // Also drop any prior lazy parking — overwrite semantics.
+        self.sheet.formula_source.borrow_mut().remove(&addr);
+        self.sheet.needs_parse.borrow_mut().remove(&addr);
+
+        // Drop any prior primitive scaffold (no notify); mirrors the
+        // primitive→formula transition cleanup in
+        // `install_parsed_formula`.
+        if let Some(prim) = self.sheet.cells.remove(&addr) {
+            if self.sheet.store.has_atom(prim) && !self.sheet.store.has_dependents(prim) {
+                self.sheet.store.destroy_atom(prim);
+            }
+        }
+
+        // Park the source text. `Rc<str>` keeps the per-formula heap
+        // footprint to one allocation; the hydrator clones the `Rc`
+        // (cheap) when it reads back.
+        self.sheet
+            .formula_source
+            .borrow_mut()
+            .insert(addr, Rc::<str>::from(formula_text));
+        self.sheet.needs_parse.borrow_mut().insert(addr);
+
+        // Bump imported-formula counter so the scale suite's
+        // `debug_imported_formula_count` reads as N after a 100k import
+        // even when no formula has been hydrated. Counts every
+        // successful lazy-park (matches the pre-lazy contract: the
+        // counter was bumped once per `install_parsed_formula` success;
+        // here we count once per `set_formula_lazy` success).
+        self.sheet
+            .imported_formula_count
+            .set(self.sheet.imported_formula_count.get() + 1);
+
+        self.touched.insert(addr);
+        true
     }
 
     /// Shared core for `set_formula` / `set_formula_pre_parsed`. Runs
@@ -3465,6 +3979,13 @@ impl<'a> BulkLoader<'a> {
     /// the formula would close a same-sheet cycle. Consumes
     /// `formula_text` to land directly in `formula_texts` without a
     /// trailing `String::clone`.
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: the active bulk_load path is
+    /// `set_formula_lazy`. This eager method is preserved for any
+    /// future arc that needs a "force-eager" mode or for parity
+    /// regression tests; `#[allow(dead_code)]` keeps the build clean
+    /// while the code stays available to call.
+    #[allow(dead_code)]
     fn install_parsed_formula(
         &mut self,
         addr: CellAddress,
@@ -3523,12 +4044,12 @@ impl<'a> BulkLoader<'a> {
         let t_formula_record_start = clock.map(|f| f());
         let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
         self.sheet.note_cross_sheet_if_any(&expr);
-        self.sheet.formula_cells.insert(addr, record);
-        self.sheet.formula_exprs.insert(addr, expr);
+        self.sheet.formula_cells.borrow_mut().insert(addr, record);
+        self.sheet.formula_exprs.borrow_mut().insert(addr, expr);
         // Consume the owned `formula_text` directly — the caller's
         // string allocation lands in `formula_texts` without a
         // `String::clone`.
-        self.sheet.formula_texts.insert(addr, formula_text);
+        self.sheet.formula_texts.borrow_mut().insert(addr, formula_text);
         if let Some(now_ms) = clock {
             let t_end = now_ms();
             let t0 = t_dep_extract_start.expect("paired with clock");
@@ -3558,11 +4079,20 @@ impl<'a> BulkLoader<'a> {
 
     /// Inline `write_error` minus the dirty-mark + subscriber notify. Used by
     /// the parse-failure and cycle paths in bulk-mode `set_formula`.
+    ///
+    /// LAZY_FORMULA_INDEXING Phase 3: parse-failure / cycle now
+    /// surface at first read via `hydrate_formula`'s own write_error
+    /// shape. Kept for the eager `install_parsed_formula` callers that
+    /// the same arc may reactivate.
+    #[allow(dead_code)]
     fn write_error_no_notify(&mut self, addr: CellAddress, err: ValueError) {
         self.sheet.detach_address_sub(addr);
-        if self.sheet.formula_cells.contains_key(&addr) {
+        if self.sheet.formula_cells.borrow().contains_key(&addr) {
             self.sheet.remove_formula_record(addr);
         }
+        // Drop any lazy parking too.
+        self.sheet.formula_source.borrow_mut().remove(&addr);
+        self.sheet.needs_parse.borrow_mut().remove(&addr);
         let id = self.sheet.ensure_cell(addr);
         self.sheet.store.set(id, Value::Error(err));
     }
@@ -3670,7 +4200,7 @@ impl<'a> BulkLoader<'a> {
                 if !dirty.insert(addr) {
                     continue;
                 }
-                if let Some(record) = self.sheet.formula_cells.get(&addr) {
+                if let Some(record) = self.sheet.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
                 self.sheet.dependents_of_into_with_scratch(
@@ -3728,7 +4258,7 @@ impl<'a> BulkLoader<'a> {
                         if !dirty.insert(addr) {
                             continue;
                         }
-                        if let Some(record) = self.sheet.formula_cells.get(&addr) {
+                        if let Some(record) = self.sheet.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Dirty;
                         }
                         // Touched addresses were already seeded into
@@ -4361,7 +4891,16 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     /// return a clone of the stored source. A primitive cell has no
     /// entry → `None` → the FORMULATEXT arm surfaces `#N/A`.
     fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
-        self.sheet.formula_texts.get(&addr).cloned()
+        // LAZY_FORMULA_INDEXING Phase 3: prefer hydrated source, fall
+        // back to lazy `formula_source`.
+        if let Some(t) = self.sheet.formula_texts.borrow().get(&addr) {
+            return Some(t.clone());
+        }
+        self.sheet
+            .formula_source
+            .borrow()
+            .get(&addr)
+            .map(|s| s.as_ref().to_string())
     }
 }
 
@@ -5842,10 +6381,12 @@ mod tests {
 
     #[test]
     fn bulk_load_cycle_check_still_runs() {
-        // Static cycle protection (B.2) is preserved inside bulk_load — the
-        // task's contract: "cycle protection isn't worth dropping for perf".
-        // The second formula closes a self-cycle and must be rejected with
-        // false; no panic, no stack overflow on subsequent read.
+        // LAZY_FORMULA_INDEXING Phase 3 contract change: bulk_load no
+        // longer eagerly parses formulas — cycles installed via
+        // bulk_load surface at first read (matching the TS port).
+        // `set_formula` inside bulk_load now returns `true`
+        // unconditionally; the cycle becomes a `#CIRCULAR!` on the
+        // first read of any cycle member.
         let mut sheet = Sheet::new();
         let mut a_ok = true;
         let mut b_ok = true;
@@ -5853,13 +6394,18 @@ mod tests {
             a_ok = loader.set_formula("A1", "=B1+1");
             b_ok = loader.set_formula("B1", "=A1+1");
         });
-        assert!(a_ok, "first formula has no cycle yet — must accept");
-        assert!(
-            !b_ok,
-            "second formula closes the cycle — bulk_load must reject"
-        );
+        assert!(a_ok, "lazy bulk_load always returns true (cycle deferred)");
+        assert!(b_ok, "lazy bulk_load always returns true (cycle deferred)");
         // B1 holds the cycle error; reading it must not stack-overflow.
-        assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::CyclicRef));
+        // Hydration parses both formulas — A1's hydration installs
+        // edges, then B1's cycle check sees the edge from A1 (which
+        // depends on B1) and surfaces the cycle.
+        let b1 = sheet.get_cell("B1");
+        assert!(
+            matches!(b1, Value::Error(ValueError::CyclicRef)),
+            "B1 read must surface the cycle once hydrated; got {:?}",
+            b1
+        );
     }
 
     /// Regression: `=A(n-1)+1` chain install must scale linearly. The old
@@ -6010,9 +6556,9 @@ mod tests {
 
                     let t5 = Instant::now();
                     loader.sheet.note_cross_sheet_if_any(&expr);
-                    loader.sheet.formula_cells.insert(*addr, record);
-                    loader.sheet.formula_exprs.insert(*addr, expr);
-                    loader.sheet.formula_texts.insert(*addr, src.clone());
+                    loader.sheet.formula_cells.borrow_mut().insert(*addr, record);
+                    loader.sheet.formula_exprs.borrow_mut().insert(*addr, expr);
+                    loader.sheet.formula_texts.borrow_mut().insert(*addr, src.clone());
                     loader
                         .sheet
                         .imported_formula_count
