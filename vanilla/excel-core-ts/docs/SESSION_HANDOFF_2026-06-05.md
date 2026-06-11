@@ -118,13 +118,21 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
   contexts. TEXT / DOLLAR / FIXED consume via new `_locale.ts` Intl-based
   helpers (number / currency parts). LCID `[$-XXX]` format tags stripped
   silently. `setLocale` invalidates atoms (respects `withBatch`).
-- **Wave 8 PNG export PoC**: `5e95b93` design doc → `84986d9` UI core
-  port + `encodeSelectionAsImage` → `c6babae` Solid host PoC rasterizing
-  via SVG `<foreignObject>` + canvas. Backend port `exportRangeAsImage`
-  is OPTIONAL; UI core returns null when host omits. TODO documented in
-  the design doc: worker-backend advertising, `Ctrl+Shift+P` keybind,
-  `ClipboardItem({'image/png': blob})` write, MAX_EXPORT_PIXELS cap, per-
-  cell sizing from viewport projection, canvas-first paint, Playwright e2e.
+- **Wave 8 PNG export**: 7-commit closure of the feature from design
+  through e2e.
+  - `5e95b93` design doc
+  - `84986d9` UI core port + `encodeSelectionAsImage`
+  - `c6babae` Solid host PoC (SVG `<foreignObject>` + rasterizer)
+  - `d078e9f` `Ctrl+Shift+P` keybind intent + `MAX_EXPORT_PIXELS` cap +
+    `'image-too-large'` error variant
+  - `d51b5ea` `navigator.clipboard.write` of `ClipboardItem({'image/png': blob})`
+    with mirror-only fallback when system clipboard rejects
+  - `5ef8482` viewport-projected per-cell sizes
+  - `d355961` canvas-direct paint fallback (headless Chromium can't
+    decode SVG/foreignObject blobs; `paintCellsToCanvasPng` draws via
+    Canvas 2D primitives) + Playwright e2e on both backends
+  All 7 design-doc items closed. Backend port `exportRangeAsImage` stays
+  OPTIONAL; host wraps via `withHostImageRenderer` when omitted.
 
 ### Function quality hardening (after `a1abdec`)
 

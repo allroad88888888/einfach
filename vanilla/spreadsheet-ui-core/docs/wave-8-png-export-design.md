@@ -199,15 +199,28 @@ PoC stops at "encoder produces a Blob".
 
 Total PoC: ~150 LOC code + ~80 LOC test, plus design doc.
 
-## What's still TODO post-PoC
+## Closed since the PoC
 
-1. Solid host adapter wiring on `worker-workbook-backend.ts` so the
-   port is actually advertised to UI core.
-2. `Ctrl+Shift+P` keyboard binding in `vanilla/spreadsheet-ui-core/src/keyboard`.
-3. `navigator.clipboard.write` integration in `copy-as-dispatch.ts`
-   alongside the existing text triple.
-4. `MAX_EXPORT_PIXELS` cap + `'too-large'` failure variant on
-   `copyAsErrorAtom`.
-5. Per-cell width / height pulled from `readViewportSizeProjection`.
-6. Canvas-first rendering path when a canvas grid is mounted (Wave 5).
-7. Playwright e2e asserting non-empty PNG bytes for a 2×2 selection.
+All 7 post-PoC items shipped in the 2026-06-11 closure arc:
+
+1. ✅ `withHostImageRenderer` wraps any backend lacking `exportRangeAsImage`
+   with a host-side renderer at dispatch time (smarter than per-backend
+   advertising — the worker backends don't need to know about rendering).
+   `d51b5ea`.
+2. ✅ `Ctrl+Shift+P` keyboard intent in `keyboard/index.ts:281` returns
+   `clipboard.copyAsImage`. `d078e9f`.
+3. ✅ `navigator.clipboard.write` of `ClipboardItem({'image/png': blob})`
+   via `writeImageToClipboard`. Falls back to mirror-only when the system
+   clipboard rejects. `d51b5ea`.
+4. ✅ `MAX_EXPORT_PIXELS` (16,777,216 = 4096²) cap; `'image-too-large'`
+   error variant on `copyAsErrorAtom`. `d078e9f`.
+5. ✅ Per-cell sizes read via `readViewportSizeProjection` and threaded
+   through `projectViewportSizes` → `columnWidths`/`rowHeights` maps +
+   median fallback. `5ef8482`.
+6. ✅ Canvas-direct paint fallback: when SVG/foreignObject rasterisation
+   throws (headless Chromium fails `createImageBitmap` on SVG blobs),
+   `paintCellsToCanvasPng` draws cells via Canvas 2D primitives directly.
+   Same path is the natural fit for a future Wave 5 canvas overlay. `d355961`.
+7. ✅ Playwright e2e `solid/excel/e2e/copy-as-png.spec.ts` asserts
+   `Ctrl+Shift+P` over 2×2 selection mirrors a non-empty `image/png`
+   Blob into `__einfach_lastCopyAs__`. Passes on both backends. `d355961`.
