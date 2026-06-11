@@ -2284,6 +2284,24 @@ impl Sheet {
         self.formula_exprs.borrow()
     }
 
+    /// Codex P2 #1 fix: walk every parked lazy formula in this sheet,
+    /// invoking `f(addr, source)` once per entry. Used by
+    /// `Workbook::rebuild_cross_sheet_deps` to extract cross-sheet
+    /// edges from formulas that haven't been hydrated yet — without it,
+    /// a `move_sheet` after `bulk_load` would drop those edges and
+    /// downstream subscribers stop firing.
+    ///
+    /// Source is exposed as `&str` (the underlying `Rc<str>` is held by
+    /// the per-cell `formula_source` map for the duration of the
+    /// callback). Callers parse the source themselves on demand; the
+    /// hot path (every formula already hydrated) pays zero cost.
+    pub(crate) fn for_each_lazy_formula(&self, mut f: impl FnMut(CellAddress, &str)) {
+        let source = self.formula_source.borrow();
+        for (addr, src) in source.iter() {
+            f(addr, src.as_ref());
+        }
+    }
+
     /// Static cycle detection (B.2). Returns true iff installing `expr` at
     /// `target` would close a same-sheet dep cycle.
     ///
@@ -3477,6 +3495,15 @@ impl Sheet {
             return;
         }
         self.with_structural_edit(|sheet| {
+            // Codex P1 #1 fix: hydrate every lazy formula BEFORE the
+            // relocate. `relocate_cells` shifts the `formula_source`
+            // keys, but the parked source text still references the
+            // OLD addresses; a later hydrate would lock in self-cycles
+            // (e.g. `A1 = "=A2"` parked, insert row 0 → A1 → A2,
+            // hydrate(A2) parses `=A2` → `#CYCLE!`). Hydrating up front
+            // lets `retarget_formula_refs` walk the parsed AST and
+            // rewrite refs through `f`, matching the eager-formula path.
+            sheet.hydrate_all_lazy_formulas();
             sheet.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_row_insert(addr, at, count)
@@ -3492,6 +3519,9 @@ impl Sheet {
             return;
         }
         self.with_structural_edit(|sheet| {
+            // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
+            // `insert_row` for the rationale.
+            sheet.hydrate_all_lazy_formulas();
             sheet.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
             sheet.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
@@ -3506,6 +3536,8 @@ impl Sheet {
             return;
         }
         self.with_structural_edit(|sheet| {
+            // Codex P1 #1 fix: hydrate BEFORE relocate. See `insert_row`.
+            sheet.hydrate_all_lazy_formulas();
             sheet.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_col_insert(addr, at, count)
@@ -3519,6 +3551,9 @@ impl Sheet {
             return;
         }
         self.with_structural_edit(|sheet| {
+            // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
+            // `insert_row` for the rationale.
+            sheet.hydrate_all_lazy_formulas();
             sheet.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
             sheet.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
@@ -3526,6 +3561,24 @@ impl Sheet {
             });
             Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
         });
+    }
+
+    /// Hydrate every lazy (parked) formula in this sheet. Used by
+    /// structural edits (`insert_row` / `delete_row` /
+    /// `insert_col` / `delete_col`) BEFORE relocate so the source-
+    /// text retarget walks parsed ASTs and the
+    /// `formula_source` / `needs_parse` invariant doesn't surface a
+    /// stale text reference at a relocated address.
+    ///
+    /// Also exposed for the cross-sheet rebuild path
+    /// (`Workbook::rebuild_cross_sheet_deps`) so a lazy cross-sheet
+    /// edge picked up at `bulk_load` time survives a `move_sheet`.
+    pub(crate) fn hydrate_all_lazy_formulas(&self) {
+        let lazy_addrs: Vec<CellAddress> =
+            self.needs_parse.borrow().iter().copied().collect();
+        for addr in lazy_addrs {
+            self.hydrate_formula(addr);
+        }
     }
 
     /// Run a structural edit (row/col insert/delete) so that subscribers are
@@ -3555,13 +3608,40 @@ impl Sheet {
     }
 
     fn drop_cells_in(&mut self, pred: impl Fn(CellAddress) -> bool) {
-        let to_drop: Vec<CellAddress> = self.cells.keys().filter(|a| pred(*a)).collect();
+        // Codex P1 #2 fix: collect EVERY address in the deleted band
+        // across the four cell/formula maps — primitive cells, hydrated
+        // formula records, AND lazy parked formulas
+        // (`formula_source` / `needs_parse`). The pre-fix version only
+        // walked `self.cells.keys()`, so lazy-only entries inside the
+        // band survived `drop_cells_in` and were later relocated through
+        // `f(addr)` into `REF_INVALID_*` sentinels, where they panic
+        // `non_empty_addrs()` (cell.rs:58 add overflow on `row + 1`).
+        let mut to_drop: HashSet<CellAddress> = HashSet::new();
+        to_drop.extend(self.cells.keys().filter(|a| pred(*a)));
+        // `HashMap::keys` yields `&CellAddress`; `RowMajorMap::keys` yields
+        // owned `CellAddress`. Normalise both with copied().
+        to_drop.extend(
+            self.formula_cells
+                .borrow()
+                .keys()
+                .filter(|a| pred(*a)),
+        );
+        to_drop.extend(
+            self.formula_source
+                .borrow()
+                .keys()
+                .filter(|a| pred(*a)),
+        );
         for addr in to_drop {
             if let Some(prim) = self.cells.remove(&addr) {
                 if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
                     self.store.destroy_atom(prim);
                 }
             }
+            // `remove_formula_record` already drains `formula_source` +
+            // `needs_parse` first (LAZY_FORMULA_INDEXING Phase 3) so a
+            // lazy-only entry is cleaned up even though no eager record
+            // exists for it.
             self.remove_formula_record(addr);
             // Fanout reattach + per-address fire are handled by the enclosing
             // `with_structural_edit`; nothing to do here.
@@ -3666,15 +3746,11 @@ impl Sheet {
     /// existing formula AST. Used after structural edits so formulas
     /// continue to point at the same logical cell.
     fn retarget_formula_refs(&mut self, f: &dyn Fn(CellAddress) -> CellAddress) {
-        // LAZY_FORMULA_INDEXING Phase 3: relocate_cells already shifted
-        // the `formula_source` / `needs_parse` keys. Hydrated formulas
-        // also need their ASTs rewritten — we hydrate every lazy entry
-        // first so the AST walk below sees every formula.
-        let lazy_addrs: Vec<CellAddress> =
-            self.needs_parse.borrow().iter().copied().collect();
-        for addr in lazy_addrs {
-            self.hydrate_formula(addr);
-        }
+        // Codex P1 #1: hydration runs BEFORE `relocate_cells` (see the
+        // `hydrate_all_lazy_formulas` call at the top of every
+        // structural-edit path). By the time we get here every formula
+        // is parsed into `formula_exprs`, so the AST walk below covers
+        // them all and the formula_source/needs_parse maps are empty.
         let updated: Vec<(CellAddress, Expr)> = self
             .formula_exprs
             .borrow()
@@ -3878,6 +3954,18 @@ impl<'a> BulkLoader<'a> {
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        // Codex P2 #2 fix: validate parseability up front. If the source
+        // does not parse, materialise `#VALUE!` immediately (matching
+        // legacy eager behavior) and return `false` — DO NOT park
+        // unparseable text into `formula_source`, otherwise
+        // `get_formula(addr)` / `ISFORMULA(addr)` would surface the
+        // rejected source as a live formula even though its value is
+        // `#VALUE!`.
+        if crate::formula::parse_formula(formula_str).is_none() {
+            self.write_error_no_notify(addr, ValueError::InvalidValue);
+            self.touched.insert(addr);
+            return false;
+        }
         // LAZY_FORMULA_INDEXING Phase 2: defer parse / dep extract /
         // dep register / FormulaRecord materialization. Store the source
         // text and mark `addr` as `needs_parse`; the actual install

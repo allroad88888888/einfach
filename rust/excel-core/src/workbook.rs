@@ -723,18 +723,31 @@ impl Workbook {
     fn rebuild_cross_sheet_deps(&mut self) {
         let mut cross_sheet = CrossSheetDeps::new();
         for (formula_sheet, sheet) in self.sheets.iter().enumerate() {
-            // LAZY_FORMULA_INDEXING Phase 3: dereference the `Ref` and
-            // iterate. The `formula_exprs_iter` is now a `Ref<HashMap>`;
-            // explicit `.iter()` calls `HashMap::iter`. Lazy entries
-            // are absent (their AST hasn't been parsed yet); cross-
-            // sheet edges from those formulas will be rebuilt on first
-            // read via the read-path hydrator + cross-sheet propagation.
+            // Hydrated formulas: walk the cached AST.
             let exprs = sheet.formula_exprs_iter();
             for (&formula_addr, expr) in exprs.iter() {
                 for edge in collect_cross_sheet_refs(expr.as_ref(), &self.by_name) {
                     cross_sheet.add_edge(formula_sheet, formula_addr, edge);
                 }
             }
+            // Codex P2 #1 fix: lazy (parked) formulas would otherwise
+            // contribute zero edges here, so a `move_sheet` between a
+            // `bulk_load` and the first read of a cross-sheet formula
+            // silently drops every cross-sheet edge that formula owns.
+            // Parse on-the-fly per lazy entry (cheap relative to the
+            // rebuild cost itself, which only runs on sheet moves) so
+            // the edge set survives the move; the hydrator on first
+            // read still owns the FormulaRecord install — we only walk
+            // the AST here, we do not install dep edges or transition
+            // the lazy entry out of `needs_parse`.
+            drop(exprs);
+            sheet.for_each_lazy_formula(|formula_addr, source| {
+                if let Some(expr) = parse_formula(source) {
+                    for edge in collect_cross_sheet_refs(&expr, &self.by_name) {
+                        cross_sheet.add_edge(formula_sheet, formula_addr, edge);
+                    }
+                }
+            });
         }
         self.cross_sheet = cross_sheet;
     }

@@ -355,3 +355,117 @@ fn clear_cell_on_unparsed_formula_clears_lazy_state() {
     );
     assert_eq!(sheet.get_cell("A1"), Value::Null);
 }
+
+// === Codex P1/P2 regressions (2026-06-11) ===
+
+/// Codex P1 #1: inserting a row before a bulk-loaded (lazy) formula
+/// must keep the formula pointing at the original logical cell, not at
+/// its own new address.
+///
+/// Repro: `A1 = "=A2"`, `A2 = 42`. After `insert_row(0, 1)`:
+///   - `A2` holds the formula (previously at A1).
+///   - `A3` holds 42 (previously at A2).
+///   - The formula text MUST retarget to `=A3` before hydration; otherwise
+///     hydration parses `=A2` as a self-reference and locks in `#CYCLE!`.
+#[test]
+fn insert_row_before_lazy_formula_preserves_reference() {
+    let mut sheet = Sheet::new();
+    sheet.bulk_load(|loader| {
+        loader.set_cell("A2", Value::Number(42.0));
+        loader.set_formula("A1", "=A2"); // never read — stays lazy
+    });
+    // Insert one row at the top so A1 shifts to A2 and old A2 shifts to A3.
+    sheet.insert_row(0, 1);
+    // The relocated formula must observe its source cell at its NEW address.
+    assert_eq!(sheet.get_cell("A2"), Value::Number(42.0));
+    // And the relocated primitive is at A3.
+    assert_eq!(sheet.get_cell("A3"), Value::Number(42.0));
+}
+
+/// Codex P1 #2: deleting a row whose only content is a lazy formula
+/// must drop the lazy state cleanly. Otherwise the lazy formula's
+/// address gets shifted through `f` into `REF_INVALID_*` sentinels and
+/// `non_empty_addrs()` panics formatting the invalid address.
+#[test]
+fn delete_row_containing_lazy_formula_removes_it_cleanly() {
+    let mut sheet = Sheet::new();
+    sheet.bulk_load(|l| {
+        l.set_formula("A1", "=42");
+        l.set_cell("A2", Value::Number(5.0));
+        l.set_formula("A3", "=A2"); // depends on the cell being deleted
+    });
+    // Delete row 2 (0-based row index 1) — drops the primitive A2 and the
+    // dependent formula A3 should either shift to A2 or become #REF!.
+    sheet.delete_row(1, 1);
+    // Must not panic. A1 + (relocated formula) should be the only entries.
+    let addrs = sheet.non_empty_addrs();
+    assert!(
+        addrs.len() <= 2,
+        "expected at most A1 + relocated formula, got {:?}",
+        addrs
+    );
+    // The lazy A1 formula stayed intact and still evaluates to 42.
+    assert_eq!(sheet.get_cell("A1"), Value::Number(42.0));
+}
+
+/// Codex P1 #2 (sharper): deleting the band that contains the ONLY
+/// lazy formula must clear the lazy state — no orphan
+/// `formula_source` / `needs_parse` entry survives the relocate.
+#[test]
+fn delete_row_drops_lazy_state_for_addresses_in_deleted_band() {
+    let mut sheet = Sheet::new();
+    sheet.bulk_load(|l| {
+        l.set_formula("B5", "=1+1"); // lazy, lives inside the deleted band
+    });
+    // Sanity: lazy entry exists.
+    assert_eq!(sheet.debug_formula_count(), 1);
+    sheet.delete_row(4, 1); // delete row 5 (0-based 4)
+    // The lazy formula at B5 must be GONE — not parked at the
+    // REF_INVALID sentinel.
+    assert_eq!(sheet.debug_formula_count(), 0);
+    let addrs = sheet.non_empty_addrs();
+    assert!(addrs.is_empty(), "sheet must be empty, got {:?}", addrs);
+}
+
+/// Codex P1 #2 (column variant): same contract for delete_col.
+#[test]
+fn delete_col_drops_lazy_state_for_addresses_in_deleted_band() {
+    let mut sheet = Sheet::new();
+    sheet.bulk_load(|l| {
+        l.set_formula("C1", "=42"); // lazy
+        l.set_cell("D1", Value::Number(7.0));
+    });
+    sheet.delete_col(2, 1); // delete column C
+    // C1's lazy state must be gone; D1 shifts to C1.
+    let addrs = sheet.non_empty_addrs();
+    assert_eq!(addrs.len(), 1);
+    assert_eq!(sheet.get_cell("C1"), Value::Number(7.0));
+}
+
+/// Codex P2 #2: `BulkLoader::set_formula` returns `false` on parse
+/// failure. After flush, the cell must hold `#VALUE!` AND
+/// `get_formula(addr)` must return `None` — a rejected source is NOT a
+/// formula.
+#[test]
+fn bulk_loader_set_formula_parse_failure_is_not_observable_as_formula() {
+    use einfach_core::ValueError;
+    let mut sheet = Sheet::new();
+    let mut ok = true;
+    sheet.bulk_load(|loader| {
+        ok = loader.set_formula("A1", "=SUM(");
+    });
+    assert!(!ok, "loader must report parse failure");
+    assert_eq!(
+        sheet.get_cell("A1"),
+        Value::Error(ValueError::InvalidValue),
+        "cell value must be #VALUE!"
+    );
+    assert!(
+        sheet.get_formula("A1").is_none(),
+        "rejected source must NOT surface as a formula"
+    );
+    assert!(
+        !sheet.has_formula_at(einfach_excel_core::CellAddress::parse("A1").unwrap()),
+        "ISFORMULA(A1) must be false"
+    );
+}
