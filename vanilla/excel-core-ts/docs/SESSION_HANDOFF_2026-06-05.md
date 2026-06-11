@@ -144,6 +144,29 @@ Phase 1 trace + Ultra measurements live at
 `rust/excel-core/docs/CAP_REMOVAL_2026-06-11.md`. Architecture decisions
 live at `rust/excel-core/docs/LAZY_FORMULA_INDEXING_PLAN.md`.
 
+### Storage-primary bulk_import — Phase 6 proper (2026-06-11)
+
+After lazy indexing, the residual 9.2× bulkWrite gap traced to
+`WorkbookLoader::set_formula` ceremony: 500k per-cell calls each doing
+parse + cross-sheet cycle BFS + edge install + a SetFormula op. User
+directive set the contract straight: **storage is primary** — sheet state
+is a map keyed by cell id (per sheet); bulk init hands the engine
+pre-built maps in one call; per-cell set APIs exist only for interactive
+edits; reads (atoms) pull from the map and hydrate lazily. Exactly the
+TS port's `sheetAtom` model.
+
+| Phase | Commit | Outcome |
+|---|---|---|
+| RFC | `08025e8` | `STORAGE_PRIMARY_PLAN.md` |
+| 6.1 engine | `3c0574a` | `install_sheet_bulk` / `install_workbook_bulk`; full-sheet replace; `!`-prefilter (same-sheet formulas skip parse entirely) |
+| 6.2 wire | `5d0ad42` | `bulk_install_workbook` — pair arrays deserialize straight into engine maps |
+| bench | `c814b62` | 1M: legacy 8652ms → **771ms**. **WASM bulkWrite at TS parity** (TS=785ms) |
+| 6.3 routing | `812fdad` | Fresh-import paths (file import, million-demo) use ONE install call at commit; additive paths (paste-TSV, direct chunks) stay legacy |
+| codex P2 fixup | `db6ba64` | install fires cross-sheet dirty fanout (O(edges), subscriber dedup); post-fix bench 578ms |
+
+Legacy `bulk_import_cells` retained as the additive-merge path only — no
+longer hot. Final: cargo 1740, jest 3695, playwright wasm 480/0/37.
+
 ### Wave 8 + locale infrastructure (2026-06-11)
 
 - **Workbook locale** `9cde891`: `Workbook.setLocale(bcp47)` / `getLocale()`,

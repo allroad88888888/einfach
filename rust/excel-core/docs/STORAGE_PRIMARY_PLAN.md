@@ -1,6 +1,30 @@
 # Plan — Storage-primary bulk_import (Phase 6 proper)
 
-Status: 2026-06-11 RFC, not yet implemented.
+Status: **2026-06-11 LANDED** (6.1–6.3 + codex fixup; 6.4 partially —
+see below). Original RFC preserved below for reference.
+
+## Closure summary
+
+| Phase | Commit | Outcome |
+|---|---|---|
+| 6.1 engine entry | `3c0574a` | `install_sheet_bulk` / `install_workbook_bulk` / `content_revision()`; full-sheet-replace semantics; `!`-prefilter keeps cross-sheet edges correct while same-sheet formulas skip parse entirely |
+| 6.2 wire + binding | `5d0ad42` | `bulk_install_workbook(payload)`; per-sheet [addr, value] / [addr, source] pair arrays deserialized straight into engine maps |
+| bench | `c814b62` | 500k: 4835→323ms (15×). 1M: 8652→771ms (11.2×). **WASM bulkWrite at TS parity** (TS=785ms) |
+| 6.3 worker routing | `812fdad` | Atomic import sessions (file import, million-demo) stage into a fresh shell, ONE `bulk_install_workbook` at commit. Direct-mode chunks + live-workbook replay stay on legacy additive `bulk_import_cells` (TODO(6.4) markers) |
+| codex review fixup | `db6ba64` | P2: install now fires cross-sheet dirty fanout — O(cross-sheet formula edges), dependents on other sheets dirty + notify once (multi-sheet install dedups). Post-fix bench 578ms |
+
+**Phase 6.4 status**: legacy `bulk_import_cells` is retained, deliberately —
+it is the additive-merge path (paste-TSV into existing content, direct-mode
+chunks). It is no longer on any hot path; fresh imports route storage-primary.
+Full retirement would require an additive variant of install; not worth it
+until a workload shows the additive path hot again.
+
+**Phase 6.5 status**: superseded — the `!`-prefilter in 6.1 achieves the goal
+(no parse for same-sheet formulas at install) without moving cross-sheet edge
+install to hydrate; `rebuild_cross_sheet_deps` + `for_each_lazy_formula`
+(from 7d0e380) cover move_sheet correctness.
+
+Final numbers: cargo 1740, wasm 30, jest 3695, playwright wasm 480/0/37.
 
 ## The architectural mistake
 
