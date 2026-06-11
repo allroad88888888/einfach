@@ -66,9 +66,25 @@ type ImportCell =
   | { sheet: number; row: number; col: number; kind: 'number'; value: number }
   | { sheet: number; row: number; col: number; kind: 'formula'; value: string }
 
+interface DepGraphStats {
+  totalFormulaCount: number
+  totalPointDepEdges: number
+  totalRangeDepEntries: number
+  maxFanout: number
+  avgFanout: number
+  rangeFormulaCount: number
+}
+
 interface WasmWorkbookLike {
   bulkImportCellsInstrumented(cells: ReadonlyArray<ImportCell>): unknown
+  // Production import path — kept un-instrumented but used by the
+  // Mega tier below to push past the per-call cap (caller chunks the
+  // payload), so we can capture dep-graph stats at 1M scale.
+  bulk_import_cells(cells: ReadonlyArray<ImportCell>): unknown
   debugLastBulkImportPhaseMs(): Float64Array
+  // Phase 1B (lazy-formula-indexing) dep-graph probe. Returns
+  // `undefined` on older wasm-pkg builds that predate the probe.
+  debugDepGraphStats?(): DepGraphStats
   free(): void
 }
 
@@ -172,6 +188,14 @@ const PHASE_INDEX = {
   setFormulaLoopMs: 5,
   flushMs: 6,
   engineTotalMs: 7,
+  // Phase 1 of the lazy-formula-indexing arc — sub-slices of
+  // `flushMs` decomposing the per-formula install path inside
+  // `Sheet::install_parsed_formula`. Appended after `engineTotalMs`
+  // so older host code reading `[0..=7]` still works.
+  flushParseMs: 8,
+  flushDepExtractMs: 9,
+  flushDepRegisterMs: 10,
+  flushFormulaRecordMs: 11,
 } as const
 
 interface PhaseSnapshot {
@@ -183,6 +207,13 @@ interface PhaseSnapshot {
   setFormulaLoopMs: number
   flushMs: number
   engineTotalMs: number
+  // Phase 1 sub-slices of `flushMs` (lazy-formula-indexing arc).
+  // Their sum is ≤ flushMs; the remainder is BFS dirty propagation
+  // + subscriber dedup + cross-sheet BFS.
+  flushParseMs: number
+  flushDepExtractMs: number
+  flushDepRegisterMs: number
+  flushFormulaRecordMs: number
   // Computed:
   jsWallMs: number // wall-clock around the RPC (includes deserialize + engine)
   unaccountedMs: number // jsWall − (deserialize + engineTotal); ≈ wasm-bindgen boundary
@@ -195,6 +226,9 @@ function readPhases(wb: WasmWorkbookLike, jsWallMs: number): PhaseSnapshot {
   }
   const engineTotalMs = a[PHASE_INDEX.engineTotalMs]
   const rpcDeserializeMs = a[PHASE_INDEX.rpcDeserializeMs]
+  // Phase 1 fields were appended after [7]; older host wasm-pkg
+  // builds report length 8, so default missing slots to 0.
+  const safe = (idx: number) => (idx < a.length ? a[idx] : 0)
   return {
     cellCount: a[PHASE_INDEX.cellCount],
     formulaCount: a[PHASE_INDEX.formulaCount],
@@ -204,6 +238,10 @@ function readPhases(wb: WasmWorkbookLike, jsWallMs: number): PhaseSnapshot {
     setFormulaLoopMs: a[PHASE_INDEX.setFormulaLoopMs],
     flushMs: a[PHASE_INDEX.flushMs],
     engineTotalMs,
+    flushParseMs: safe(PHASE_INDEX.flushParseMs),
+    flushDepExtractMs: safe(PHASE_INDEX.flushDepExtractMs),
+    flushDepRegisterMs: safe(PHASE_INDEX.flushDepRegisterMs),
+    flushFormulaRecordMs: safe(PHASE_INDEX.flushFormulaRecordMs),
     jsWallMs,
     unaccountedMs: Math.max(0, jsWallMs - rpcDeserializeMs - engineTotalMs),
   }
@@ -234,6 +272,7 @@ interface TierResult {
   formulas: number
   phases: PhaseSnapshot
   jsWallRuns: number[]
+  depStats?: DepGraphStats
 }
 
 const results: TierResult[] = []
@@ -274,6 +313,10 @@ function medianPhases(snaps: PhaseSnapshot[]): PhaseSnapshot {
     setFormulaLoopMs: median(snaps.map((s) => s.setFormulaLoopMs)),
     flushMs: median(snaps.map((s) => s.flushMs)),
     engineTotalMs: median(snaps.map((s) => s.engineTotalMs)),
+    flushParseMs: median(snaps.map((s) => s.flushParseMs)),
+    flushDepExtractMs: median(snaps.map((s) => s.flushDepExtractMs)),
+    flushDepRegisterMs: median(snaps.map((s) => s.flushDepRegisterMs)),
+    flushFormulaRecordMs: median(snaps.map((s) => s.flushFormulaRecordMs)),
     jsWallMs: median(snaps.map((s) => s.jsWallMs)),
     unaccountedMs: median(snaps.map((s) => s.unaccountedMs)),
   }
@@ -301,6 +344,89 @@ describePerf('Rust bulk-import phase-decomp bench (EINFACH_PERF=1)', () => {
   afterAll(() => {
     writeReport()
   })
+
+  // Phase 1B (lazy-formula-indexing) — Mega tier dep-stats. The
+  // instrumented variant caps at the 750k per-call WASM limit, so for
+  // 1M cells (500k seeds + 500k formulas) we chunk into two production
+  // `bulk_import_cells` calls and query `debugDepGraphStats` afterward.
+  // No phase breakdown for this tier (the production path is
+  // deliberately uninstrumented) — only the dep-graph counts.
+  it(
+    `Mega dep-stats only — 500k seeds + 500k formulas via production path`,
+    async () => {
+      if (!wasmAvailable) {
+        // eslint-disable-next-line no-console
+        console.warn(`[bench] skipping Mega dep-stats: ${wasmSkipReason}`)
+        return
+      }
+      const workload = buildWorkload('Mega', 500_000, 500_000)
+      // eslint-disable-next-line no-console
+      console.log(
+        `[bench] Mega dep-stats: ${workload.cells.length} total cells (500k seeds + 500k formulas, production path)`,
+      )
+      const wb = new WasmModule!.WasmWorkbook()
+      let depStats: DepGraphStats | undefined
+      let importMs = NaN
+      try {
+        // Chunk into ≤ 500k-cell calls so each stays well below the
+        // per-call cap. Order doesn't matter for the dep-graph count
+        // contract: cell_dependents / range_dependents are computed
+        // from the final installed state.
+        const t0 = performance.now()
+        const seedChunk = workload.cells.filter((c) => c.kind === 'number')
+        const formulaChunk = workload.cells.filter((c) => c.kind === 'formula')
+        wb.bulk_import_cells(seedChunk)
+        wb.bulk_import_cells(formulaChunk)
+        importMs = performance.now() - t0
+        if (typeof wb.debugDepGraphStats === 'function') {
+          depStats = wb.debugDepGraphStats()
+        }
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(
+          `[bench] Mega dep-stats import failed:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      }
+      if (depStats !== undefined) {
+        // Synthesize a TierResult so the report's dep-stats table
+        // picks Mega up alongside the smaller tiers. Phases are zero-
+        // filled because the production path isn't instrumented; the
+        // sub-phase decomposition table simply omits Mega.
+        const zeroPhases: PhaseSnapshot = {
+          cellCount: workload.cells.length,
+          formulaCount: workload.formulaCount,
+          rpcDeserializeMs: 0,
+          parseOnlyMs: 0,
+          setCellLoopMs: 0,
+          setFormulaLoopMs: 0,
+          flushMs: 0,
+          engineTotalMs: 0,
+          flushParseMs: 0,
+          flushDepExtractMs: 0,
+          flushDepRegisterMs: 0,
+          flushFormulaRecordMs: 0,
+          jsWallMs: importMs,
+          unaccountedMs: 0,
+        }
+        results.push({
+          name: 'Mega',
+          totalCells: workload.cells.length,
+          formulas: workload.formulaCount,
+          phases: zeroPhases,
+          jsWallRuns: [importMs],
+          depStats,
+        })
+        writeReport()
+      }
+      try {
+        wb.free()
+      } catch {
+        // ignore — see same-shape comment in the per-tier loop above
+      }
+    },
+    1_800_000,
+  )
 
   for (const tier of TIERS) {
     it(
@@ -345,12 +471,28 @@ describePerf('Rust bulk-import phase-decomp bench (EINFACH_PERF=1)', () => {
           // a free()-side failure doesn't lose the engine breakdown we
           // already captured.
           if (importSucceeded && snaps.length > 0) {
+            // Phase 1B probe — query dep-graph stats before freeing
+            // the workbook. Older wasm-pkg builds won't have the
+            // method; treat as optional.
+            let depStats: DepGraphStats | undefined
+            try {
+              if (typeof wb.debugDepGraphStats === 'function') {
+                depStats = wb.debugDepGraphStats()
+              }
+            } catch (err) {
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[bench] ${tier.name} debugDepGraphStats failed (ignored):`,
+                err instanceof Error ? err.message : String(err),
+              )
+            }
             results.push({
               name: tier.name,
               totalCells: workload.cells.length,
               formulas: workload.formulaCount,
               phases: medianPhases(snaps),
               jsWallRuns: [...wallRuns],
+              depStats,
             })
             writeReport()
           }
@@ -391,13 +533,18 @@ function writeReport() {
     return
   }
 
+  // Instrumented tiers only — the Mega dep-stats row sets engine
+  // timings to 0 because it runs the un-instrumented production path
+  // (the instrumented variant caps at the 750k per-call WASM limit).
+  const instrumentedTiers = results.filter((r) => r.phases.engineTotalMs > 0)
+
   lines.push('## Per-tier phase breakdown')
   lines.push('')
   lines.push(
     '| Tier | total cells | JS wall (ms) | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |',
   )
   lines.push('| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |')
-  for (const r of results) {
+  for (const r of instrumentedTiers) {
     const p = r.phases
     lines.push(
       `| ${r.name} | ${r.totalCells} | ${fmtMs(p.jsWallMs)} | ${fmtMs(p.rpcDeserializeMs)} | ${fmtMs(p.parseOnlyMs)} | ${fmtMs(p.setCellLoopMs)} | ${fmtMs(p.setFormulaLoopMs)} | ${fmtMs(p.flushMs)} | ${fmtMs(p.engineTotalMs)} | ${fmtMs(p.unaccountedMs)} |`,
@@ -411,19 +558,21 @@ function writeReport() {
     '| Tier | deserialize | parse-only | set_cell loop | set_formula loop | flush | engine total | unaccounted |',
   )
   lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |')
-  for (const r of results) {
+  for (const r of instrumentedTiers) {
     const p = r.phases
     lines.push(
       `| ${r.name} | ${pct(p.rpcDeserializeMs, p.jsWallMs)} | ${pct(p.parseOnlyMs, p.jsWallMs)} | ${pct(p.setCellLoopMs, p.jsWallMs)} | ${pct(p.setFormulaLoopMs, p.jsWallMs)} | ${pct(p.flushMs, p.jsWallMs)} | ${pct(p.engineTotalMs, p.jsWallMs)} | ${pct(p.unaccountedMs, p.jsWallMs)} |`,
     )
   }
 
-  // Super-linearity analysis — first vs last available tier. With ≥2
-  // tiers we compute the ratio of phase ms; expected linear ratio =
-  // total_cells_ratio. Anything materially above that is super-linear.
-  if (results.length >= 2) {
-    const smaller = results[0]
-    const larger = results[results.length - 1]
+  // Super-linearity analysis — first vs last available instrumented
+  // tier. With ≥2 tiers we compute the ratio of phase ms; expected
+  // linear ratio = total_cells_ratio. Anything materially above that
+  // is super-linear. The Mega dep-stats-only row is excluded because
+  // its engine timings are zero by construction.
+  if (instrumentedTiers.length >= 2) {
+    const smaller = instrumentedTiers[0]
+    const larger = instrumentedTiers[instrumentedTiers.length - 1]
     const cellRatio = larger.totalCells / smaller.totalCells
     lines.push('')
     lines.push(
@@ -463,6 +612,65 @@ function writeReport() {
     }
   }
 
+  // Phase 1A — sub-phase decomposition of `flushMs`. The implicit
+  // `WorkbookLoader::flush` runs `Sheet::install_parsed_formula` for
+  // each formula; this table reports the wall-time share of each of
+  // the 4 install sub-phases instrumented in `BulkLoader`.
+  lines.push('')
+  lines.push('## flush_ms sub-phase decomposition (Phase 1A)')
+  lines.push('')
+  lines.push(
+    '| Tier | flush total | parse | dep_extract | dep_register | formula_record | sub-phase sum | residual (BFS + notify) |',
+  )
+  lines.push('| --- | --- | --- | --- | --- | --- | --- | --- |')
+  for (const r of instrumentedTiers) {
+    const p = r.phases
+    const subSum =
+      p.flushParseMs + p.flushDepExtractMs + p.flushDepRegisterMs + p.flushFormulaRecordMs
+    const residual = Math.max(0, p.flushMs - subSum)
+    lines.push(
+      `| ${r.name} | ${fmtMs(p.flushMs)} | ${fmtMs(p.flushParseMs)} | ${fmtMs(p.flushDepExtractMs)} | ${fmtMs(p.flushDepRegisterMs)} | ${fmtMs(p.flushFormulaRecordMs)} | ${fmtMs(subSum)} | ${fmtMs(residual)} |`,
+    )
+  }
+
+  lines.push('')
+  lines.push('## flush_ms sub-phase share (% of flush_ms)')
+  lines.push('')
+  lines.push(
+    '| Tier | parse | dep_extract | dep_register | formula_record | residual |',
+  )
+  lines.push('| --- | --- | --- | --- | --- | --- |')
+  for (const r of instrumentedTiers) {
+    const p = r.phases
+    const subSum =
+      p.flushParseMs + p.flushDepExtractMs + p.flushDepRegisterMs + p.flushFormulaRecordMs
+    const residual = Math.max(0, p.flushMs - subSum)
+    lines.push(
+      `| ${r.name} | ${pct(p.flushParseMs, p.flushMs)} | ${pct(p.flushDepExtractMs, p.flushMs)} | ${pct(p.flushDepRegisterMs, p.flushMs)} | ${pct(p.flushFormulaRecordMs, p.flushMs)} | ${pct(residual, p.flushMs)} |`,
+    )
+  }
+
+  // Phase 1B — dep-graph stats. Each tier's debugDepGraphStats() call
+  // ran AFTER the bulk import completed; this table reports the
+  // installed edge counts so the MEGA_TRACE doc can quantify how much
+  // state the eager-build phase produced.
+  const tiersWithStats = results.filter((r): r is TierResult & { depStats: DepGraphStats } => !!r.depStats)
+  if (tiersWithStats.length > 0) {
+    lines.push('')
+    lines.push('## Dep-graph stats after import (Phase 1B)')
+    lines.push('')
+    lines.push(
+      '| Tier | formulas | point_dep_edges | range_dep_entries | range_formula_count | max_fanout | avg_fanout |',
+    )
+    lines.push('| --- | --- | --- | --- | --- | --- | --- |')
+    for (const r of tiersWithStats) {
+      const s = r.depStats
+      lines.push(
+        `| ${r.name} | ${s.totalFormulaCount} | ${s.totalPointDepEdges} | ${s.totalRangeDepEntries} | ${s.rangeFormulaCount} | ${s.maxFanout} | ${s.avgFanout.toFixed(2)} |`,
+      )
+    }
+  }
+
   lines.push('')
   lines.push('## Notes')
   lines.push('')
@@ -473,6 +681,14 @@ function writeReport() {
   lines.push('- `flush` = `engineTotal − (set_cell + set_formula)`. This is `WorkbookLoader::flush` + per-sheet `BulkLoader::flush`.')
   lines.push('- `unaccounted` = `jsWall − (deserialize + engineTotal)`. Approximates wasm-bindgen boundary + JS-side V8 work building the input array.')
   lines.push('- Write order in the instrumented variant differs from production (primitives first, then formulas). For the disjoint-column workload here it does not affect engine cost.')
+  lines.push('')
+  lines.push('### Sub-phase split (Phase 1A — lazy-formula-indexing)')
+  lines.push('')
+  lines.push('- `parse` is the formula-source → AST share (≈ 0 for the bulk path — workbook side pre-parses; only the parse-failure arm runs here).')
+  lines.push('- `dep_extract` is `formula_deps_for` + `collect_range_refs` — AST walk only.')
+  lines.push('- `dep_register` is `cell_dependents.insert` + `range_dependents.insert`. Codex flagged this as the dominant Mega-tier cost.')
+  lines.push('- `formula_record` is `Rc<FormulaRecord>::new` + the 3 map inserts (`formula_cells` / `formula_exprs` / `formula_texts`).')
+  lines.push('- `residual` = `flush − (parse + dep_extract + dep_register + formula_record)`. Includes BFS dirty propagation + subscriber notify dedup + cross-sheet BFS.')
 
   writeFileSync(reportPath, lines.join('\n') + '\n')
 }

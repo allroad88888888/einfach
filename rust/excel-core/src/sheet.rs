@@ -3486,22 +3486,21 @@ impl<'a> BulkLoader<'a> {
         let expr = Rc::new(expr);
         // Phase 1 instrumentation (bulk_import_trace): split the
         // formula install path into dep_extract / dep_register /
-        // formula_record sub-phases. Sampling the host clock only on
-        // the instrumented path keeps production zero-cost (one
-        // thread-local read + branch). Native uses an `Instant` epoch
-        // wrapped in a `fn() -> f64`; wasm32 uses `js_sys::Date::now`
-        // — `std::time::Instant` is not available on
-        // `wasm32-unknown-unknown`.
+        // formula_record sub-phases. Sample the host clock at the 4
+        // sub-phase boundaries (4 calls per formula install) only on
+        // the instrumented path; production is zero-cost (one thread-
+        // local read + branch). Native uses an `Instant` epoch wrapped
+        // in a `fn() -> f64`; wasm32 uses `js_sys::Date::now` —
+        // `std::time::Instant` is not available on
+        // `wasm32-unknown-unknown`. We do NOT sample around the cheap
+        // intervening work (`remove_formula_record` / primitive
+        // scaffold teardown); that overhead lives in `flush_ms`
+        // minus the sub-phase sum and is interpretable from the
+        // existing `engine_total - set_cell - set_formula` residual.
         let clock = crate::bulk_import_trace::flush_phase_clock();
-        let (deps, range_deps) = if let Some(now_ms) = clock {
-            let t0 = now_ms();
-            let deps = Sheet::formula_deps_for(&expr);
-            let range_deps = collect_range_refs(&expr);
-            crate::bulk_import_trace::add_flush_dep_extract_ms(now_ms() - t0);
-            (deps, range_deps)
-        } else {
-            (Sheet::formula_deps_for(&expr), collect_range_refs(&expr))
-        };
+        let t_dep_extract_start = clock.map(|f| f());
+        let deps = Sheet::formula_deps_for(&expr);
+        let range_deps = collect_range_refs(&expr);
         // Drop any prior formula record (no notify) and any primitive scaffold
         // that no longer has dependents — mirrors `Sheet::set_formula` minus
         // the `with_remap` listener fire.
@@ -3518,35 +3517,32 @@ impl<'a> BulkLoader<'a> {
         // singleton `deps` and an empty `range_deps`, so each clone was
         // a malloc for a single-bucket set — at 100k formulas that's
         // 200k saved mallocs.
+        let t_dep_register_start = clock.map(|f| f());
+        self.sheet.add_formula_deps(addr, &deps);
+        self.sheet.add_formula_range_deps(addr, &range_deps);
+        let t_formula_record_start = clock.map(|f| f());
+        let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
+        self.sheet.note_cross_sheet_if_any(&expr);
+        self.sheet.formula_cells.insert(addr, record);
+        self.sheet.formula_exprs.insert(addr, expr);
+        // Consume the owned `formula_text` directly — the caller's
+        // string allocation lands in `formula_texts` without a
+        // `String::clone`.
+        self.sheet.formula_texts.insert(addr, formula_text);
         if let Some(now_ms) = clock {
-            let t0 = now_ms();
-            self.sheet.add_formula_deps(addr, &deps);
-            self.sheet.add_formula_range_deps(addr, &range_deps);
-            crate::bulk_import_trace::add_flush_dep_register_ms(now_ms() - t0);
-        } else {
-            self.sheet.add_formula_deps(addr, &deps);
-            self.sheet.add_formula_range_deps(addr, &range_deps);
-        }
-        if let Some(now_ms) = clock {
-            let t0 = now_ms();
-            let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
-            self.sheet.note_cross_sheet_if_any(&expr);
-            self.sheet.formula_cells.insert(addr, record);
-            self.sheet.formula_exprs.insert(addr, expr);
-            // Consume the owned `formula_text` directly — the caller's
-            // string allocation lands in `formula_texts` without a
-            // `String::clone`.
-            self.sheet.formula_texts.insert(addr, formula_text);
-            crate::bulk_import_trace::add_flush_formula_record_ms(now_ms() - t0);
-        } else {
-            let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
-            self.sheet.note_cross_sheet_if_any(&expr);
-            self.sheet.formula_cells.insert(addr, record);
-            self.sheet.formula_exprs.insert(addr, expr);
-            // Consume the owned `formula_text` directly — the caller's
-            // string allocation lands in `formula_texts` without a
-            // `String::clone`.
-            self.sheet.formula_texts.insert(addr, formula_text);
+            let t_end = now_ms();
+            let t0 = t_dep_extract_start.expect("paired with clock");
+            let t1 = t_dep_register_start.expect("paired with clock");
+            let t2 = t_formula_record_start.expect("paired with clock");
+            // Dep_extract here also folds the cheap
+            // `remove_formula_record` + primitive scaffold cleanup into
+            // its slot — those two HashMap removes are O(1) and at Mega
+            // scale stay in single-digit % of total, so attributing
+            // them to dep_extract (rather than carving a separate
+            // sub-phase) keeps the timer count to 4 per formula.
+            crate::bulk_import_trace::add_flush_dep_extract_ms(t1 - t0);
+            crate::bulk_import_trace::add_flush_dep_register_ms(t2 - t1);
+            crate::bulk_import_trace::add_flush_formula_record_ms(t_end - t2);
         }
 
         // B1 — bump the imported-formula counter for successfully registered
