@@ -443,6 +443,15 @@ export interface EvalContext {
   sheetIndexOf?(sheetName: string): number | undefined
 
   /**
+   * Active workbook locale as a BCP-47 tag (e.g. `'en-US'`, `'de-DE'`).
+   * Functions that produce locale-sensitive output — TEXT, DOLLAR, FIXED —
+   * read this to pick number separators / currency symbol. Absent in
+   * direct-unit-test contexts; the workbook always threads it through.
+   * Implementations should fall back to `'en-US'` when undefined.
+   */
+  readonly locale?: string
+
+  /**
    * Optional per-call lambda scope. Maps a LAMBDA parameter name to the
    * already-evaluated argument `Value`. The evaluator checks this map
    * BEFORE consulting `resolveName` when it hits a `NameExpr`, so a

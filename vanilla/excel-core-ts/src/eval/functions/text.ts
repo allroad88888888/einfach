@@ -20,6 +20,11 @@
 
 import { propagateError, toBoolean, toNumber, toString as valueToString } from '../coerce'
 import type { FunctionImpl, Value } from '../../types'
+import {
+  formatCurrency,
+  formatNumber,
+  getNumberFormatParts,
+} from './_locale'
 
 // =============================================================================
 // Helpers
@@ -287,24 +292,17 @@ function readBoolean(v: Value): { ok: true; value: boolean } | { ok: false; erro
   return { ok: true, value: r.value }
 }
 
-function insertCommas(digits: string): string {
-  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+function insertCommas(digits: string, separator = ','): string {
+  if (separator === '') return digits
+  // We replace the implicit comma with the locale separator on the
+  // already-built string so the regex (which expects digit boundaries
+  // only) keeps working regardless of separator width.
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, separator)
 }
 
-function formatThousandsFixed(value: number, decimals: number, useCommas: boolean): string {
-  const abs = Math.abs(value)
-  if (decimals < 0) {
-    const factor = 10 ** -decimals
-    const rounded = Math.round(abs / factor) * factor
-    const whole = String(Math.trunc(rounded))
-    return useCommas ? insertCommas(whole) : whole
-  }
-  const fixedDecimals = Math.min(decimals, 15)
-  const formatted = abs.toFixed(fixedDecimals)
-  const [whole = '0', frac] = formatted.split('.')
-  const wholeOut = useCommas ? insertCommas(whole) : whole
-  return frac !== undefined && frac !== '' ? `${wholeOut}.${frac}` : wholeOut
-}
+// Type alias used by the TEXT format engine to pipe locale separators
+// through without sprawling the helper signatures.
+type NumberSeparators = { readonly thousand: string; readonly decimal: string }
 
 function quoteStrictText(s: string): string {
   return `"${s.replace(/"/g, '""')}"`
@@ -814,7 +812,7 @@ const TRIM: FunctionImpl = (args) => {
  * Out of scope:
  *   - Locale semantics, rendered colors, and full custom formats.
  */
-function formatTextNumber(n: number, format: string): string | undefined {
+function formatTextNumber(n: number, format: string, separators: NumberSeparators): string | undefined {
   if (format.length === 0) return undefined
 
   const sections = splitTextNumberSections(format)
@@ -824,7 +822,7 @@ function formatTextNumber(n: number, format: string): string | undefined {
     const conditioned = parsed.find(
       (section) => section.condition && matchesTextNumberCondition(section.condition, n),
     )
-    if (conditioned) return formatSelectedTextNumberSection(n, conditioned.body)
+    if (conditioned) return formatSelectedTextNumberSection(n, conditioned.body, separators)
 
     const unconditioned = parsed.filter((section) => !section.condition)
     if (unconditioned.length === 0) return undefined
@@ -833,14 +831,18 @@ function formatTextNumber(n: number, format: string): string | undefined {
       : n === 0 && unconditioned[2]
         ? unconditioned[2]
         : unconditioned[0]
-    return formatSelectedTextNumberSection(n < 0 ? Math.abs(n) : n, section.body)
+    return formatSelectedTextNumberSection(n < 0 ? Math.abs(n) : n, section.body, separators)
   }
 
-  return formatTextNumberSection(n, format)
+  return formatTextNumberSection(n, format, separators)
 }
 
-function formatSelectedTextNumberSection(n: number, format: string): string | undefined {
-  return format === '' ? '' : formatTextNumberSection(n, format)
+function formatSelectedTextNumberSection(
+  n: number,
+  format: string,
+  separators: NumberSeparators,
+): string | undefined {
+  return format === '' ? '' : formatTextNumberSection(n, format, separators)
 }
 
 function formatTextTextValue(text: string, format: string): string | undefined {
@@ -1035,15 +1037,19 @@ function matchesTextNumberCondition(condition: TextNumberCondition, value: numbe
   }
 }
 
-function formatTextNumberSection(n: number, format: string): string | undefined {
+function formatTextNumberSection(
+  n: number,
+  format: string,
+  separators: NumberSeparators,
+): string | undefined {
   const stripped = stripTextNumberBracketTags(format)
-  if (stripped !== format) return formatTextNumberSection(n, stripped)
+  if (stripped !== format) return formatTextNumberSection(n, stripped, separators)
 
   const date = formatDateSerial(n, format)
   if (date !== undefined) return date
 
   if (format.startsWith('(') && format.endsWith(')')) {
-    const inner = formatTextNumberSection(n, format.slice(1, -1))
+    const inner = formatTextNumberSection(n, format.slice(1, -1), separators)
     return inner === undefined ? undefined : `(${inner})`
   }
 
@@ -1057,17 +1063,19 @@ function formatTextNumberSection(n: number, format: string): string | undefined 
     case '0':
       return roundHalfAwayFromZero(n).toString()
     case '0.00':
-      return n.toFixed(2)
+      // Compose: integer part + locale decimal + 2-digit fraction. Avoids
+      // relying on Number.prototype.toFixed (which always uses `.`).
+      return formatFixedDecimal(n, 2, separators.decimal)
     case '#,##0':
-      return formatThousands(roundHalfAwayFromZero(n), 0)
+      return formatThousands(roundHalfAwayFromZero(n), 0, separators)
     case '#,##0.00':
-      return formatThousands(n, 2)
+      return formatThousands(n, 2, separators)
     case '0%':
       return `${roundHalfAwayFromZero(n * 100)}%`
     case '0.00%':
-      return `${(n * 100).toFixed(2)}%`
+      return `${formatFixedDecimal(n * 100, 2, separators.decimal)}%`
     case '$#,##0.00':
-      return `$${formatThousands(n, 2)}`
+      return `$${formatThousands(n, 2, separators)}`
     default:
       break
   }
@@ -1080,16 +1088,28 @@ function formatTextNumberSection(n: number, format: string): string | undefined 
 
   const fixed = format.match(/^(0+)\.(0+)$/)
   if (fixed) {
-    return n.toFixed(fixed[2].length)
+    return formatFixedDecimal(n, fixed[2].length, separators.decimal)
   }
 
-  const custom = formatTextCustomNumber(n, format)
+  const custom = formatTextCustomNumber(n, format, separators)
   if (custom !== undefined) return custom
 
   const literal = formatTextLiteralOnly(format)
   if (literal !== undefined) return literal
 
   return undefined
+}
+
+/**
+ * Render `n.toFixed(decimals)` with the locale's decimal separator
+ * instead of `.`. Sign is preserved verbatim from `toFixed`. We never
+ * apply grouping here — the `#,##0` / `#,##0.00` cases above thread
+ * grouping through `formatThousands` instead.
+ */
+function formatFixedDecimal(n: number, decimals: number, decimalSep: string): string {
+  const raw = n.toFixed(decimals)
+  if (decimalSep === '.') return raw
+  return raw.replace('.', decimalSep)
 }
 
 const TEXT_NUMBER_COLOR_TAGS = new Set([
@@ -1167,6 +1187,12 @@ function replacementForTextNumberBracketTag(tag: string): string | undefined {
   const trimmed = tag.trim()
   const lower = trimmed.toLowerCase()
   if (TEXT_NUMBER_COLOR_TAGS.has(lower) || /^color\d+$/.test(lower)) return ''
+  // `[$-409]` — Excel locale-only marker, no currency symbol. The hex
+  // after the `-` is an LCID we DON'T act on yet (workbook-level locale
+  // wins); we just strip the tag silently so the format engine doesn't
+  // see it as garbage. Same goes for `[$-en-US]` BCP-47 form some hosts
+  // emit.
+  if (/^\$-[0-9a-zA-Z-]+$/.test(trimmed)) return ''
   if (!trimmed.startsWith('$')) return undefined
   const currencyAndLocale = trimmed.slice(1)
   const localeStart = currencyAndLocale.indexOf('-')
@@ -1279,7 +1305,11 @@ function tokenizeTextNumberFormat(format: string): TextNumberFormatToken[] | und
   return tokens
 }
 
-function formatTextCustomNumber(n: number, format: string): string | undefined {
+function formatTextCustomNumber(
+  n: number,
+  format: string,
+  separators: NumberSeparators,
+): string | undefined {
   if (!Number.isFinite(n)) return undefined
   const tokens = tokenizeTextNumberFormat(format)
   if (!tokens) return undefined
@@ -1305,13 +1335,17 @@ function formatTextCustomNumber(n: number, format: string): string | undefined {
 
   const prefix = tokens.slice(0, firstPattern).map((token) => token.value).join('')
   const suffix = tokens.slice(lastPattern + 1).map((token) => token.value).join('')
-  const body = formatTextCustomNumberPattern(n, pattern)
+  const body = formatTextCustomNumberPattern(n, pattern, separators)
   if (body !== undefined) return `${prefix}${body}${suffix}`
 
   return formatTextCustomIntegerMask(n, tokens, firstPattern, lastPattern)
 }
 
-function formatTextCustomNumberPattern(n: number, pattern: string): string | undefined {
+function formatTextCustomNumberPattern(
+  n: number,
+  pattern: string,
+  separators: NumberSeparators,
+): string | undefined {
   const percentCount = (pattern.match(/%/g) ?? []).length
   const numericPattern = pattern.replace(/%/g, '')
   if ((numericPattern.match(/\./g) ?? []).length > 1) return undefined
@@ -1347,13 +1381,13 @@ function formatTextCustomNumberPattern(n: number, pattern: string): string | und
   let [whole, frac = ''] = rounded.split('.')
   whole = whole.padStart(minIntDigits, '0')
   if (requiredIntDigits === 0 && Number(whole) === 0) whole = ''
-  if (useCommas) whole = insertCommas(whole)
+  if (useCommas) whole = insertCommas(whole, separators.thousand)
 
   if (maxFracDigits > 0) {
     while (frac.length > requiredFracDigits && frac.endsWith('0')) frac = frac.slice(0, -1)
   }
 
-  const decimal = frac !== '' ? `.${frac}` : ''
+  const decimal = frac !== '' ? `${separators.decimal}${frac}` : ''
   return `${negative ? '-' : ''}${whole}${decimal}${'%'.repeat(percentCount)}`
 }
 
@@ -1832,8 +1866,20 @@ function padTextElapsed(value: number, count: number): string {
   return count >= 2 ? String(value).padStart(2, '0') : String(value)
 }
 
-/** Format a number with thousands separators and a fixed decimal count. */
-function formatThousands(n: number, decimals: number): string {
+/**
+ * Format a number with thousands separators and a fixed decimal count.
+ *
+ * Optional `separators` lets TEXT swap the en-US `, .` defaults for the
+ * active workbook locale. The format string the user supplied (e.g.
+ * `#,##0.00`) is parsed as Excel literals — the comma/dot in the format
+ * are *placeholder markers*, not the output characters — so we always
+ * substitute the locale's actual separators on the way out.
+ */
+function formatThousands(
+  n: number,
+  decimals: number,
+  separators: { readonly thousand: string; readonly decimal: string } = { thousand: ',', decimal: '.' },
+): string {
   const negative = n < 0
   const abs = Math.abs(n)
   // Round to the requested number of decimals first so we don't carry
@@ -1842,9 +1888,10 @@ function formatThousands(n: number, decimals: number): string {
     ? abs.toFixed(decimals)
     : Math.round(abs).toString()
   const [intPart, decPart] = rounded.split('.')
-  // Insert commas every 3 digits from the right.
-  const withCommas = intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',')
-  const body = decPart !== undefined ? `${withCommas}.${decPart}` : withCommas
+  // Insert commas every 3 digits from the right, then map them to the
+  // locale's actual group separator.
+  const withCommas = insertCommas(intPart, separators.thousand)
+  const body = decPart !== undefined ? `${withCommas}${separators.decimal}${decPart}` : withCommas
   return negative ? `-${body}` : body
 }
 
@@ -1852,13 +1899,15 @@ function formatThousands(n: number, decimals: number): string {
  * TEXT(value, format_code) — format a number per Excel format string.
  * Text values pass through unless the format has an explicit `@` text section.
  */
-const TEXT: FunctionImpl = (args) => {
+const TEXT: FunctionImpl = (args, ctx) => {
   if (args.length !== 2) return errValue('#VALUE!', 'TEXT takes exactly 2 arguments')
   const err = propagateError(args)
   if (err) return err
   const fmtR = coerceText(args[1])
   if (!fmtR.ok) return fmtR.error
   const fmt = fmtR.value
+  const parts = getNumberFormatParts(ctx.locale)
+  const separators: NumberSeparators = { thousand: parts.thousand, decimal: parts.decimal }
   const v = args[0]
   if (v.kind === 'string') {
     return { kind: 'string', value: formatTextTextValue(v.value, fmt) ?? v.value }
@@ -1877,13 +1926,13 @@ const TEXT: FunctionImpl = (args) => {
     if (inner.kind === 'blank') return { kind: 'string', value: '' }
     if (inner.kind === 'boolean') return { kind: 'string', value: inner.value ? 'TRUE' : 'FALSE' }
     if (inner.kind === 'number') {
-      const formatted = formatTextNumber(inner.value, fmt)
+      const formatted = formatTextNumber(inner.value, fmt, separators)
       return formatted === undefined ? ERR_VALUE : { kind: 'string', value: formatted }
     }
     return ERR_VALUE
   }
   if (v.kind !== 'number') return ERR_VALUE
-  const formatted = formatTextNumber(v.value, fmt)
+  const formatted = formatTextNumber(v.value, fmt, separators)
   return formatted === undefined ? ERR_VALUE : { kind: 'string', value: formatted }
 }
 
@@ -2758,7 +2807,7 @@ const NUMBERVALUE: FunctionImpl = (args) => {
   return { kind: 'number', value: n / 100 ** percentCount }
 }
 
-const DOLLAR: FunctionImpl = (args) => {
+const DOLLAR: FunctionImpl = (args, ctx) => {
   if (args.length < 1 || args.length > 2)
     return errValue('#VALUE!', 'DOLLAR takes 1 or 2 arguments')
   const err = propagateError(args)
@@ -2772,11 +2821,20 @@ const DOLLAR: FunctionImpl = (args) => {
     if (!r.ok) return r.error
     decimals = r.value
   }
-  const body = formatThousandsFixed(nR.value, decimals, true)
-  return { kind: 'string', value: nR.value < 0 ? `($${body})` : `$${body}` }
+  // Negative decimals → round to the nearest 10^|d| but still render with
+  // zero decimal places. Intl can't take a negative `minimumFractionDigits`,
+  // so we pre-round and then format with 0 decimals.
+  let value = nR.value
+  let renderedDecimals = decimals
+  if (decimals < 0) {
+    const factor = 10 ** -decimals
+    value = Math.round(value / factor) * factor
+    renderedDecimals = 0
+  }
+  return { kind: 'string', value: formatCurrency(value, ctx.locale, renderedDecimals) }
 }
 
-const FIXED: FunctionImpl = (args) => {
+const FIXED: FunctionImpl = (args, ctx) => {
   if (args.length < 1 || args.length > 3)
     return errValue('#VALUE!', 'FIXED takes 1 to 3 arguments')
   const err = propagateError(args)
@@ -2796,8 +2854,20 @@ const FIXED: FunctionImpl = (args) => {
     if (!r.ok) return r.error
     noCommas = r.value
   }
-  const body = formatThousandsFixed(nR.value, decimals, !noCommas)
-  return { kind: 'string', value: nR.value < 0 ? `-${body}` : body }
+  let value = nR.value
+  let renderedDecimals = decimals
+  if (decimals < 0) {
+    const factor = 10 ** -decimals
+    value = Math.round(value / factor) * factor
+    renderedDecimals = 0
+  }
+  return {
+    kind: 'string',
+    value: formatNumber(value, ctx.locale, {
+      decimals: renderedDecimals,
+      useGrouping: !noCommas,
+    }),
+  }
 }
 
 const ROMAN_TABLE = [

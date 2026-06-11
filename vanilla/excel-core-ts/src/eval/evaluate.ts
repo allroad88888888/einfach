@@ -3917,6 +3917,7 @@ function evaluateInForeignSheet(
     currentSheetIndex: sheetIndex,
     sheetCount: parent.sheetCount,
     sheetIndexOf: parent.sheetIndexOf,
+    locale: parent.locale,
   }
   if (inner.kind === 'ref') {
     const key = parseRefToKey(inner.a1)
@@ -4123,6 +4124,7 @@ function resolveCell(
       currentSheetIndex: ctx.currentSheetIndex,
       sheetCount: ctx.sheetCount,
       sheetIndexOf: ctx.sheetIndexOf,
+      locale: ctx.locale,
     }
     return evaluate(cell.ast, sub)
   } finally {
@@ -4324,6 +4326,7 @@ function makeTrampolineCtx(
     lambdaFunctionScope: hostCtx.lambdaFunctionScope,
     lambdaOmittedParams: hostCtx.lambdaOmittedParams,
     lambdaCallDepth: hostCtx.lambdaCallDepth,
+    locale: hostCtx.locale,
   }
   return ctx
 }

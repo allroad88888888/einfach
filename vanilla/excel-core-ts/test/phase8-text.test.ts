@@ -20,10 +20,14 @@ const ERR = (code: '#DIV/0!' | '#N/A' | '#NUM!' | '#VALUE!' | '#REF!'): Value =>
   code,
 })
 
+// TEXT / DOLLAR / FIXED legitimately read `ctx.locale` (workbook-level
+// locale infrastructure — defaults to en-US when absent). Allow that one
+// access through the proxy; every other ctx read is still a regression.
 const ctx: EvalContext = new Proxy(
   {},
   {
     get(_, prop) {
+      if (prop === 'locale') return undefined
       throw new Error(`phase8 text unexpectedly read ctx.${String(prop)}`)
     },
   },

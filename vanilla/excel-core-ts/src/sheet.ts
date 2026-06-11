@@ -101,6 +101,14 @@ export interface SheetResolvers {
   sheetIndexOf?(sheetName: string): number | undefined
   /** Current workbook sheet count. */
   sheetCount?(): number
+  /**
+   * Current workbook locale (BCP-47 tag). Threaded into every
+   * `EvalContext` so locale-sensitive functions (TEXT / DOLLAR / FIXED)
+   * pick the right separators / currency symbol. Optional so unit tests
+   * that construct a sheet without a workbook still work — consumers
+   * default to `'en-US'`.
+   */
+  locale?(): string
 }
 
 /**
@@ -184,6 +192,7 @@ export function createSheet(
         currentSheetIndex: resolvers.sheetIndexOf?.(name),
         sheetCount: resolvers.sheetCount?.(),
         sheetIndexOf: resolvers.sheetIndexOf,
+        locale: resolvers.locale?.(),
       }
       try {
         // The trampoline removes cross-cell recursion that previously

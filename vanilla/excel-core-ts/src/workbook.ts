@@ -99,6 +99,23 @@ export interface Workbook {
   /** Manual F9 — bump every sheetAtom to a fresh Map reference. */
   recalc(): void
   /**
+   * Get the active workbook locale as a BCP-47 tag (e.g. `'en-US'`).
+   * Defaults to `'en-US'` on a freshly created workbook.
+   */
+  getLocale(): string
+  /**
+   * Switch the active workbook locale. Triggers a sheet-wide recalc so
+   * formulas that depend on locale-sensitive output (TEXT, DOLLAR, FIXED)
+   * re-evaluate against the new separators / currency. Respects
+   * `withBatch()` — inside a batch, the recalc defers to the outermost
+   * exit.
+   *
+   * Validation: any non-empty string is accepted. We do not validate
+   * BCP-47 syntax up front; downstream Intl.* calls fall back to en-US
+   * shape on bad input (see `getNumberFormatParts` in `text.ts`).
+   */
+  setLocale(locale: string): void
+  /**
    * Register a named range / value / LAMBDA.
    */
   defineName(name: string, binding: NameBinding): void
@@ -203,6 +220,12 @@ export function createWorkbook(
   // correct, and matches vanilla/core's broad dirty propagation.
   let revisionCounter = 0
 
+  // Active workbook locale. Read by every sheet via `resolvers.locale()`
+  // and threaded into each EvalContext. Mutated only via `setLocale`,
+  // which routes through the same `requestRecalc` deferral as named-range
+  // and custom-formula registration so a host can batch changes.
+  let currentLocale = 'en-US'
+
   // Batch state for `withBatch`. `batchDepth` tracks nested invocations
   // so only the outermost exit triggers the deferred recalc.
   // `pendingRecalc` is sticky across the batch — any participating
@@ -245,6 +268,9 @@ export function createWorkbook(
     },
     sheetCount() {
       return sheetsList.length
+    },
+    locale() {
+      return currentLocale
     },
   }
 
@@ -481,6 +507,20 @@ export function createWorkbook(
     },
     recalc() {
       recalculateAllSheets()
+    },
+    getLocale() {
+      return currentLocale
+    },
+    setLocale(locale) {
+      if (typeof locale !== 'string' || locale.length === 0) {
+        throw new Error(`Workbook.setLocale: locale must be a non-empty string, got ${String(locale)}`)
+      }
+      if (currentLocale === locale) return
+      currentLocale = locale
+      // Locale change is a workbook-level recalc trigger. Route through
+      // the same `requestRecalc` path so `withBatch` coalesces it with
+      // other registration ops.
+      requestRecalc()
     },
     defineName(name, binding) {
       names.set(canonicalName(name), binding)
