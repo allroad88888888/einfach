@@ -230,8 +230,8 @@ describePerf('Rust bulk_import_cells Ultra single-call bench (EINFACH_PERF=1)', 
           // should not throw. We don't assert specific values — the goal
           // here is "the WasmRefCell is not poisoned".
           try {
-            const _seedVal = wb.get_display(0, 'A1')
-            const _formulaVal = wb.get_display(0, 'B1')
+            void wb.get_display(0, 'A1')
+            void wb.get_display(0, 'B1')
             postImportReadOk = true
           } catch (e) {
             error = `post-import read threw: ${e instanceof Error ? e.message : String(e)}`
@@ -296,10 +296,9 @@ describePerf('Rust bulk_import_cells Ultra single-call bench (EINFACH_PERF=1)', 
 
         // Hint the GC between tiers so we don't carry residual RSS
         // from the workload array into the next measurement.
-        // (cells is the only large local; releasing the reference is enough)
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        let _release: unknown = cells
-        _release = null
+        // (cells is the only large local; truncating it releases the
+        // backing storage without leaving an unused binding behind)
+        cells.length = 0
         if (typeof globalThis.gc === 'function') {
           globalThis.gc()
         }
