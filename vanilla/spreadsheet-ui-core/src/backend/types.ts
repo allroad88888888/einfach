@@ -368,6 +368,42 @@ export interface RangeTsvExportRequest extends SheetRef {
   rowsPerChunk?: number
 }
 
+/**
+ * Wave 8.4 — range screenshot. Host renders the rectangle to a raster
+ * image and returns the encoded bytes. PoC only emits PNG; future hosts
+ * may advertise additional `format` values.
+ *
+ * The port is OPTIONAL — UI core treats a missing implementation as
+ * "feature absent" and hides the trigger surfaces (`copyAs.png` menu
+ * entry, `Ctrl+Shift+P` accelerator) accordingly.
+ */
+export interface RangeImageExportRequest extends SheetRef {
+  kind: 'export-range-image'
+  range: CellRange
+  /** Defaults to `'png'`; PoC only emits PNG. */
+  format?: 'png'
+  /** Defaults to `1` (CSS px). Set to `2` for retina output. */
+  scale?: number
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+export interface RangeImageExportResult extends SheetRef {
+  kind: 'range-image'
+  range: CellRange
+  /**
+   * Encoded image bytes. UI core wraps in a `Blob` for clipboard write;
+   * `Uint8Array` keeps the result postMessage-friendly so a future host
+   * can render in a worker without changing the contract.
+   */
+  bytes: Uint8Array
+  width: number
+  height: number
+  mimeType: 'image/png'
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
 export interface RangeTsvExportResult extends SheetRef {
   kind: 'range-tsv'
   range: CellRange
@@ -704,6 +740,12 @@ export interface SpreadsheetBackend {
   readVisibleProjection(request: VisibleProjectionRequest): Promise<VisibleProjectionResult>
   readRangeProjection(request: RangeProjectionRequest): Promise<RangeProjectionResult>
   exportRangeTsv?(request: RangeTsvExportRequest): Promise<RangeTsvExportResult>
+  /**
+   * Wave 8.4 — range screenshot. Optional capability; UI core hides the
+   * Copy-as-PNG surfaces and `encodeSelectionAsImage` returns `null`
+   * when this method is omitted.
+   */
+  exportRangeAsImage?(request: RangeImageExportRequest): Promise<RangeImageExportResult>
   consumeExportRangeTsvChunks?(
     request: RangeTsvExportRequest,
     onChunk: RangeTsvChunkConsumer,

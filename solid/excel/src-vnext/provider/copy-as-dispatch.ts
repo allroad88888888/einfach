@@ -6,6 +6,7 @@ import {
   selectionSnapshotAtom,
   type CellRange,
   type CopyAsResult,
+  type CopyAsTextResult,
   type SpreadsheetBackend,
 } from '@einfach/spreadsheet-ui-core'
 
@@ -105,7 +106,7 @@ function clipRectToCap(range: CellRange): CellRange {
  * Returns the tier that ultimately succeeded, or `null` if all three failed.
  */
 async function multiTierWrite(
-  encoded: CopyAsResult,
+  encoded: CopyAsTextResult,
 ): Promise<'rich-triple' | 'rich-no-markdown' | 'plain-text' | null> {
   const g = globalThis as { ClipboardItem?: typeof ClipboardItem }
   const hasClipboardItem = typeof g.ClipboardItem !== 'undefined'

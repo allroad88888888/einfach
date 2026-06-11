@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, jest } from '@jest/globals
 import { createStore } from '@einfach/core'
 import { cleanup, fireEvent, render, waitFor } from '@solidjs/testing-library'
 import type {
+  CopyAsTextResult,
   DisplayCell,
   RangeProjectionRequest,
   RangeProjectionResult,
@@ -299,7 +300,7 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
     const call = fake.writeCalls[0]!
     expect(new Set(call.types)).toEqual(new Set(['text/html', 'text/plain', 'text/markdown']))
 
-    const snapshot = store.getter(lastCopyAsAtom)!
+    const snapshot = store.getter(lastCopyAsAtom)! as CopyAsTextResult
     expect(snapshot.plainText).toContain('apple')
     expect(snapshot.plainText).toContain('pear')
     // Plain text is TSV — apples then a tab then 1, etc.
@@ -355,7 +356,7 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
     // second `write([…])` call.
     expect(fake.fakeWrite).toHaveBeenCalledTimes(2)
     expect(fake.fakeWriteText).toHaveBeenCalledTimes(1)
-    const snapshot = store.getter(lastCopyAsAtom)!
+    const snapshot = store.getter(lastCopyAsAtom)! as CopyAsTextResult
     expect(fake.writeTextCalls[0]).toBe(snapshot.plainText)
     expect(store.getter(copyAsErrorAtom)).toEqual({ kind: 'fallback-plain-only' })
   })
@@ -411,7 +412,7 @@ describe('Copy as HTML / Markdown (Ctrl+Shift+C)', () => {
     expect(new Set(call.types)).toEqual(new Set(['text/html', 'text/plain']))
     // The full encoded triple is still on `lastCopyAsAtom` — only the
     // clipboard MIME bag was reduced.
-    const snapshot = store.getter(lastCopyAsAtom)!
+    const snapshot = store.getter(lastCopyAsAtom)! as CopyAsTextResult
     expect(snapshot.markdown).toContain('|')
     expect(snapshot.html).toContain('<table')
     expect(store.getter(copyAsErrorAtom)).toEqual({ kind: 'fallback-plain-only' })

@@ -32,12 +32,17 @@ export interface CopyAsInput {
 }
 
 /**
- * Bundle of all three serialised flavours the clipboard write will publish.
- * Hosts that only want one flavour can call the per-format encoder directly;
- * `encodeSelectionForClipboard` is the convenience helper that returns the
- * full triple in a single pass.
+ * Bundle of all three serialised text flavours the clipboard write will
+ * publish. Hosts that only want one flavour can call the per-format
+ * encoder directly; `encodeSelectionForClipboard` is the convenience
+ * helper that returns the full triple in a single pass.
+ *
+ * `kind` defaults to `'text'` on legacy writers; the field is optional so
+ * existing call sites (`store.setter(lastCopyAsAtom, encoded)`) continue
+ * to type-check without modification.
  */
-export interface CopyAsResult {
+export interface CopyAsTextResult {
+  kind?: 'text'
   /** `text/html` payload. */
   html: string
   /** `text/plain` payload. Tab-separated columns, `\n`-separated rows. */
@@ -45,3 +50,16 @@ export interface CopyAsResult {
   /** `text/markdown` payload. GitHub Flavoured Markdown table. */
   markdown: string
 }
+
+/**
+ * Wave 8.4 — image variant for `lastCopyAsAtom`. Host writes this after a
+ * successful PNG clipboard write so diagnostics can mirror the snapshot
+ * without reaching into `navigator.clipboard.read`.
+ */
+export interface CopyAsImageResult {
+  kind: 'image'
+  mimeType: 'image/png'
+  blob: Blob
+}
+
+export type CopyAsResult = CopyAsTextResult | CopyAsImageResult

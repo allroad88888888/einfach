@@ -1,12 +1,14 @@
 import { atom } from '@einfach/core'
 import type { DisplayCell } from '../backend/types'
-import type { CopyAsInput, CopyAsResult } from './types'
+import type { CopyAsInput, CopyAsResult, CopyAsTextResult } from './types'
 import { encodeSelectionAsHtml } from './html-encoder'
 import { encodeSelectionAsMarkdown } from './markdown-encoder'
 
 export * from './types'
 export { encodeSelectionAsHtml } from './html-encoder'
 export { encodeSelectionAsMarkdown } from './markdown-encoder'
+export { encodeSelectionAsImage } from './encodeSelectionAsImage'
+export type { EncodeSelectionAsImageInput } from './encodeSelectionAsImage'
 
 /**
  * Last successful copy-as result. Solid host writes this after a clipboard
@@ -82,7 +84,7 @@ export function encodeSelectionAsPlainText(input: CopyAsInput): string {
  * same input. Solid host uses this to populate the `ClipboardItem` triple
  * + the `lastCopyAsAtom` snapshot.
  */
-export function encodeSelectionForClipboard(input: CopyAsInput): CopyAsResult {
+export function encodeSelectionForClipboard(input: CopyAsInput): CopyAsTextResult {
   return {
     html: encodeSelectionAsHtml(input),
     plainText: encodeSelectionAsPlainText(input),
