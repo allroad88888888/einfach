@@ -826,6 +826,243 @@ impl WorkbookImportStatsJSON {
     }
 }
 
+// === STORAGE_PRIMARY Phase 6.2 wire (`bulk_install_workbook`) ===
+//
+// One entry per sheet; `primitives` / `formulas` are arrays of
+// `[addr, value]` pairs that deserialize DIRECTLY into the
+// `HashMap<CellAddress, _>` maps `Workbook::install_workbook_bulk`
+// consumes — no intermediate `Vec<ImportCellWire>`, no per-cell engine
+// calls. The addr string accepts two encodings:
+//
+//   - `"R:C"` — zero-based row/col pair (e.g. `"0:0"` = A1). Matches
+//     the zero-based row/col fields of the legacy `bulk_import_cells`
+//     wire, so the worker-side migration (Phase 6.3) is a
+//     `` `${row}:${col}` `` template away.
+//   - A1 form (e.g. `"B2"`) — convenience for hand-written payloads
+//     and tests.
+fn parse_wire_addr(s: &str) -> Option<CellAddress> {
+    if let Some((row, col)) = s.split_once(':') {
+        if let (Ok(row), Ok(col)) = (row.parse::<u32>(), col.parse::<u32>()) {
+            return Some(CellAddress::new(row, col));
+        }
+    }
+    CellAddress::parse(s)
+}
+
+/// Primitive value wire for the storage-primary install path. Same
+/// JS-type-driven encoding as `BulkImportValueJSON` (number → Number,
+/// string → Text, boolean → Boolean) minus the side-channel `kind`
+/// string; error cells ride as `{ error: "#DIV/0!" }` objects since
+/// there is no `kind: "error"` discriminator anymore.
+#[derive(Clone, Debug)]
+enum PrimitiveWireJSON {
+    Number(f64),
+    Boolean(bool),
+    Text(String),
+    Error(String),
+    /// `null` / `undefined` — treated as "absent": skipped at install.
+    Null,
+}
+
+impl PrimitiveWireJSON {
+    /// Convert to an engine `Value`. `None` means "skip this entry":
+    /// explicit nulls and non-finite numbers (NaN / ±Infinity cannot be
+    /// represented as a cell number; the legacy wire rejected them too).
+    fn into_value(self) -> Option<Value> {
+        match self {
+            PrimitiveWireJSON::Number(n) if n.is_finite() => Some(Value::Number(n)),
+            PrimitiveWireJSON::Number(_) => None,
+            PrimitiveWireJSON::Boolean(b) => Some(Value::Boolean(b)),
+            PrimitiveWireJSON::Text(s) => Some(Value::Text(s)),
+            PrimitiveWireJSON::Error(s) => Some(Value::Error(value_error_from_display(&s))),
+            PrimitiveWireJSON::Null => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PrimitiveWireJSON {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = PrimitiveWireJSON;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a number, string, boolean, null, or { error } object")
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Number(v))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Number(v as f64))
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Number(v as f64))
+            }
+
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Boolean(v))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Text(v.to_string()))
+            }
+
+            fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Text(v))
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Null)
+            }
+
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(PrimitiveWireJSON::Null)
+            }
+
+            fn visit_some<D2>(self, deserializer: D2) -> Result<Self::Value, D2::Error>
+            where
+                D2: de::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut error: Option<String> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "error" {
+                        error = Some(map.next_value::<String>()?);
+                    } else {
+                        let _ = map.next_value::<de::IgnoredAny>()?;
+                    }
+                }
+                match error {
+                    Some(e) => Ok(PrimitiveWireJSON::Error(e)),
+                    None => Err(de::Error::custom(
+                        "object primitive must carry an `error` key",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// `Array<[addr, PrimitiveWire]>` → `HashMap<CellAddress, Value>` in one
+/// deserialize pass. Skippable entries (null / non-finite numbers) are
+/// dropped here; malformed addresses fail the whole call (the payload
+/// is machine-built by the worker — fail fast beats silent data loss).
+#[derive(Default)]
+struct PrimitivePairsJSON(HashMap<CellAddress, Value>);
+
+impl<'de> Deserialize<'de> for PrimitivePairsJSON {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = PrimitivePairsJSON;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of [addr, primitive] pairs")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut map: HashMap<CellAddress, Value> =
+                    HashMap::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some((addr, wire)) = seq.next_element::<(String, PrimitiveWireJSON)>()? {
+                    let Some(addr) = parse_wire_addr(&addr) else {
+                        return Err(de::Error::custom(format!("invalid cell address: {addr}")));
+                    };
+                    if let Some(value) = wire.into_value() {
+                        map.insert(addr, value);
+                    }
+                }
+                Ok(PrimitivePairsJSON(map))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+/// `Array<[addr, source]>` → `HashMap<CellAddress, String>`. Source text
+/// is NOT parse-validated here — that's the storage-primary contract;
+/// unparseable text surfaces `#VALUE!` at first read via the hydrator.
+#[derive(Default)]
+struct FormulaPairsJSON(HashMap<CellAddress, String>);
+
+impl<'de> Deserialize<'de> for FormulaPairsJSON {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> de::Visitor<'de> for Visitor {
+            type Value = FormulaPairsJSON;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of [addr, formula-source] pairs")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut map: HashMap<CellAddress, String> =
+                    HashMap::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some((addr, source)) = seq.next_element::<(String, String)>()? {
+                    let Some(addr) = parse_wire_addr(&addr) else {
+                        return Err(de::Error::custom(format!("invalid cell address: {addr}")));
+                    };
+                    map.insert(addr, source);
+                }
+                Ok(FormulaPairsJSON(map))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+/// One sheet's storage-primary payload.
+#[derive(Deserialize)]
+struct SheetBulkInstallJSON {
+    sheet: usize,
+    #[serde(default)]
+    primitives: PrimitivePairsJSON,
+    #[serde(default)]
+    formulas: FormulaPairsJSON,
+}
+
+/// Per-sheet stats returned by `bulk_install_workbook`.
+#[derive(Clone, Copy, Debug, Serialize)]
+struct BulkInstallStatsJSON {
+    sheet: usize,
+    #[serde(rename = "primitivesInstalled")]
+    primitives_installed: u32,
+    #[serde(rename = "formulasInstalled")]
+    formulas_installed: u32,
+    #[serde(rename = "crossSheetParsed")]
+    cross_sheet_parsed: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct CellRefJSON {
     sheet: usize,
@@ -2431,6 +2668,60 @@ impl WasmWorkbook {
 
         serde_wasm_bindgen::to_value(&stats)
             .map_err(|err| JsValue::from_str(&format!("serialize import stats: {err}")))
+    }
+
+    /// STORAGE_PRIMARY Phase 6.2: storage-primary bulk install. The
+    /// payload deserializes straight into the per-sheet
+    /// `HashMap<CellAddress, _>` maps and `Workbook::install_workbook_bulk`
+    /// swaps them into each sheet — no per-cell engine API calls, no
+    /// parse, no dep extraction, no ops queue. Formulas hydrate lazily
+    /// on first read.
+    ///
+    /// Wire shape (see `SheetBulkInstallJSON`) — the addr string is
+    /// `"R:C"` (zero-based) or A1 form; formula pair values are raw
+    /// source text:
+    /// ```ts
+    /// type WorkbookBulkPayload = Array<{
+    ///   sheet: number,
+    ///   primitives: Array<[string, number|string|boolean|null|{error:string}]>,
+    ///   formulas:   Array<[string, string]>,
+    /// }>
+    /// ```
+    ///
+    /// Returns `Array<{ sheet, primitivesInstalled, formulasInstalled,
+    /// crossSheetParsed }>`. Each listed sheet is fully REPLACED. The
+    /// legacy `bulk_import_cells` path stays available until Phase 6.4.
+    pub fn bulk_install_workbook(&mut self, payload: JsValue) -> Result<JsValue, JsValue> {
+        let sheets: Vec<SheetBulkInstallJSON> = serde_wasm_bindgen::from_value(payload)
+            .map_err(|err| JsValue::from_str(&format!("invalid bulk install payload: {err}")))?;
+
+        let sheet_indexes: Vec<usize> = sheets.iter().map(|s| s.sheet).collect();
+        let engine_payload: Vec<(
+            usize,
+            HashMap<CellAddress, Value>,
+            HashMap<CellAddress, String>,
+        )> = sheets
+            .into_iter()
+            .map(|s| (s.sheet, s.primitives.0, s.formulas.0))
+            .collect();
+
+        let stats = self
+            .workbook
+            .install_workbook_bulk(engine_payload)
+            .map_err(|err| JsValue::from_str(&format!("bulk install rejected: {err}")))?;
+
+        let stats_json: Vec<BulkInstallStatsJSON> = sheet_indexes
+            .into_iter()
+            .zip(stats)
+            .map(|(sheet, s)| BulkInstallStatsJSON {
+                sheet,
+                primitives_installed: s.primitives_installed as u32,
+                formulas_installed: s.formulas_installed as u32,
+                cross_sheet_parsed: s.cross_sheet_parsed as u32,
+            })
+            .collect();
+        serde_wasm_bindgen::to_value(&stats_json)
+            .map_err(|err| JsValue::from_str(&format!("serialize install stats: {err}")))
     }
 
     /// **Instrumented variant** of [`Self::bulk_import_cells`]: same end

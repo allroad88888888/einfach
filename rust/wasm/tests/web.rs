@@ -383,3 +383,47 @@ fn wasm_workbook_custom_formula_count_probe() {
     assert!(!wb.unregister_custom_formula("UNKNOWN"));
     assert_eq!(wb.custom_formula_count(), 1);
 }
+
+/// STORAGE_PRIMARY Phase 6.2: one round-trip through
+/// `bulk_install_workbook`. Primitives (both addr encodings, plus an
+/// `{error}` object) and a formula land via the storage-primary path;
+/// the formula hydrates lazily on first read; the per-sheet stats
+/// report what was installed.
+#[wasm_bindgen_test]
+fn wasm_workbook_bulk_install_workbook_round_trip() {
+    let mut wb = WasmWorkbook::new();
+    let payload = js_sys::JSON::parse(
+        r##"[{
+            "sheet": 0,
+            "primitives": [
+                ["0:0", 2],
+                ["1:0", 3],
+                ["A3", "label"],
+                ["3:0", {"error": "#DIV/0!"}]
+            ],
+            "formulas": [["0:1", "=A1+A2"]]
+        }]"##,
+    )
+    .expect("payload JSON parses");
+
+    let stats = wb
+        .bulk_install_workbook(payload)
+        .expect("bulk install succeeds");
+    let entry = js_sys::Array::from(&stats).get(0);
+    let field = |name: &str| {
+        js_sys::Reflect::get(&entry, &JsValue::from_str(name))
+            .expect("stats field exists")
+            .as_f64()
+            .expect("stats field is a number")
+    };
+    assert_eq!(field("primitivesInstalled"), 4.0);
+    assert_eq!(field("formulasInstalled"), 1.0);
+    assert_eq!(field("crossSheetParsed"), 0.0, "same-sheet formula skips the parse");
+
+    assert_eq!(wb.get_number(0, "A1"), 2.0);
+    assert_eq!(wb.get_number(0, "A2"), 3.0);
+    assert_eq!(wb.get_display(0, "A3"), "label");
+    assert_eq!(wb.get_display(0, "A4"), "#DIV/0!");
+    // Lazy hydration on first read.
+    assert_eq!(wb.get_number(0, "B1"), 5.0);
+}
