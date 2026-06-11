@@ -48,79 +48,90 @@ use crate::{parse_formula, CellAddress};
 use einfach_core::{Value, ValueError};
 use std::cell::Cell;
 
+/// Function pointer type for a host-supplied wall-clock returning
+/// milliseconds. On native this is `Instant::elapsed().as_secs_f64() *
+/// 1000.0` against a sampled epoch; on wasm32 this is
+/// `js_sys::Date::now()`. We use `fn()` (not `Fn()`) so the
+/// `Cell<Option<fn() -> f64>>` is `Copy` — the existing
+/// `last_bulk_import_phase_ms: Cell<Option<[f64; N]>>` on `WasmWorkbook`
+/// uses the same pattern.
+pub type NowMsFn = fn() -> f64;
+
 thread_local! {
     /// Sub-phase accumulator for the formula install path inside
     /// `Sheet::install_parsed_formula`. The instrumented bulk-import
-    /// driver enables collection (`set_active(true)`) before
+    /// driver enables collection (`set_clock(Some(now_ms))`) before
     /// `Workbook::bulk_load` runs the flush, then reads the totals back
-    /// out via `take_*_ns`. Production paths see `active() == false`
-    /// and pay no per-formula instrumentation cost.
+    /// out via `take_*_ms`. Production paths see `clock() == None` and
+    /// pay nothing past the one thread-local read.
     ///
-    /// Stored as `u64` nanoseconds for additive precision — converting
-    /// each per-formula `Duration` to f64 ms inline would round to zero
-    /// for sub-microsecond Phase 4 dep_register inserts at 1M scale.
-    /// The driver converts to ms at read-back time.
+    /// Stored as f64 milliseconds — the JS-side `Date.now()` already
+    /// gives ms; on native we convert ns→ms once per sample. Per-call
+    /// noise floor is `Date.now()`'s 1ms resolution on browsers, which
+    /// at Mega scale (100k+ samples) integrates to a meaningful total.
     ///
-    /// `Cell<u64>` is sound because the engine is single-threaded; the
+    /// `Cell` is sound because the engine is single-threaded; the
     /// existing `LET_FRAMES` thread-local in `eval.rs` uses the same
     /// pattern with `RefCell`.
-    static FLUSH_PHASE_ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static FLUSH_PARSE_NS: Cell<u64> = const { Cell::new(0) };
-    static FLUSH_DEP_EXTRACT_NS: Cell<u64> = const { Cell::new(0) };
-    static FLUSH_DEP_REGISTER_NS: Cell<u64> = const { Cell::new(0) };
-    static FLUSH_FORMULA_RECORD_NS: Cell<u64> = const { Cell::new(0) };
+    ///
+    /// IMPORTANT: we DO NOT use `std::time::Instant` here — it panics
+    /// at runtime on `wasm32-unknown-unknown`. The host (WASM bridge
+    /// or native test) supplies `now_ms` and the sheet-side timer
+    /// just calls it.
+    static FLUSH_PHASE_CLOCK: Cell<Option<NowMsFn>> = const { Cell::new(None) };
+    static FLUSH_PARSE_MS: Cell<f64> = const { Cell::new(0.0) };
+    static FLUSH_DEP_EXTRACT_MS: Cell<f64> = const { Cell::new(0.0) };
+    static FLUSH_DEP_REGISTER_MS: Cell<f64> = const { Cell::new(0.0) };
+    static FLUSH_FORMULA_RECORD_MS: Cell<f64> = const { Cell::new(0.0) };
 }
 
-/// Public accessor for `Sheet::install_parsed_formula` and adjacent
-/// helpers. The check is a cheap thread-local read; when inactive the
-/// instrumentation site short-circuits before any `Instant::now()`.
-pub fn flush_phase_active() -> bool {
-    FLUSH_PHASE_ACTIVE.with(|c| c.get())
+/// Cheap thread-local probe used by `Sheet::install_parsed_formula` to
+/// decide whether to sample the clock at all. Production paths see
+/// `None` and skip the four `now_ms()` invocations entirely.
+pub fn flush_phase_clock() -> Option<NowMsFn> {
+    FLUSH_PHASE_CLOCK.with(|c| c.get())
 }
 
-/// Bump `flush_parse_ms`'s underlying ns counter. Called by the
-/// formula install path with the elapsed nanoseconds of one parse.
-pub fn add_flush_parse_ns(ns: u64) {
-    FLUSH_PARSE_NS.with(|c| c.set(c.get().saturating_add(ns)));
+/// Add an elapsed-ms sample to `flush_parse_ms`. Callers are expected
+/// to compute the delta as `end_ms - start_ms` using the same clock
+/// they got from [`flush_phase_clock`].
+pub fn add_flush_parse_ms(ms: f64) {
+    FLUSH_PARSE_MS.with(|c| c.set(c.get() + ms.max(0.0)));
 }
 
-pub fn add_flush_dep_extract_ns(ns: u64) {
-    FLUSH_DEP_EXTRACT_NS.with(|c| c.set(c.get().saturating_add(ns)));
+pub fn add_flush_dep_extract_ms(ms: f64) {
+    FLUSH_DEP_EXTRACT_MS.with(|c| c.set(c.get() + ms.max(0.0)));
 }
 
-pub fn add_flush_dep_register_ns(ns: u64) {
-    FLUSH_DEP_REGISTER_NS.with(|c| c.set(c.get().saturating_add(ns)));
+pub fn add_flush_dep_register_ms(ms: f64) {
+    FLUSH_DEP_REGISTER_MS.with(|c| c.set(c.get() + ms.max(0.0)));
 }
 
-pub fn add_flush_formula_record_ns(ns: u64) {
-    FLUSH_FORMULA_RECORD_NS.with(|c| c.set(c.get().saturating_add(ns)));
+pub fn add_flush_formula_record_ms(ms: f64) {
+    FLUSH_FORMULA_RECORD_MS.with(|c| c.set(c.get() + ms.max(0.0)));
 }
 
-/// Enable / disable per-formula sub-phase accumulation. The driver wraps
-/// `Workbook::bulk_load` in `set_active(true) ... set_active(false)` and
-/// resets the counters on entry.
-fn set_flush_phase_active(active: bool) {
-    FLUSH_PHASE_ACTIVE.with(|c| c.set(active));
+/// Install / clear the per-formula clock for the formula-install sub-
+/// phase timer. The driver wraps `Workbook::bulk_load` in
+/// `set_flush_phase_clock(Some(now_ms))` / `set_flush_phase_clock(None)`
+/// and resets the counters on entry.
+fn set_flush_phase_clock(now: Option<NowMsFn>) {
+    FLUSH_PHASE_CLOCK.with(|c| c.set(now));
 }
 
 fn reset_flush_phase_accumulators() {
-    FLUSH_PARSE_NS.with(|c| c.set(0));
-    FLUSH_DEP_EXTRACT_NS.with(|c| c.set(0));
-    FLUSH_DEP_REGISTER_NS.with(|c| c.set(0));
-    FLUSH_FORMULA_RECORD_NS.with(|c| c.set(0));
+    FLUSH_PARSE_MS.with(|c| c.set(0.0));
+    FLUSH_DEP_EXTRACT_MS.with(|c| c.set(0.0));
+    FLUSH_DEP_REGISTER_MS.with(|c| c.set(0.0));
+    FLUSH_FORMULA_RECORD_MS.with(|c| c.set(0.0));
 }
 
 fn take_flush_phase_accumulators_ms() -> (f64, f64, f64, f64) {
-    let ns_to_ms = |ns: u64| (ns as f64) / 1_000_000.0;
-    let parse = FLUSH_PARSE_NS.with(|c| c.replace(0));
-    let dep_extract = FLUSH_DEP_EXTRACT_NS.with(|c| c.replace(0));
-    let dep_register = FLUSH_DEP_REGISTER_NS.with(|c| c.replace(0));
-    let formula_record = FLUSH_FORMULA_RECORD_NS.with(|c| c.replace(0));
     (
-        ns_to_ms(parse),
-        ns_to_ms(dep_extract),
-        ns_to_ms(dep_register),
-        ns_to_ms(formula_record),
+        FLUSH_PARSE_MS.with(|c| c.replace(0.0)),
+        FLUSH_DEP_EXTRACT_MS.with(|c| c.replace(0.0)),
+        FLUSH_DEP_REGISTER_MS.with(|c| c.replace(0.0)),
+        FLUSH_FORMULA_RECORD_MS.with(|c| c.replace(0.0)),
     )
 }
 
@@ -233,14 +244,11 @@ pub enum BulkImportCellKind {
 /// the end. Phase durations are computed by subtracting adjacent
 /// samples — robust to clock skew within one call (which is the only
 /// timescale that matters here).
-pub fn run_bulk_import_with_phase_timings<F>(
+pub fn run_bulk_import_with_phase_timings(
     wb: &mut Workbook,
     cells: &[BulkImportCellInput],
-    mut now_ms: F,
-) -> BulkImportPhaseTimings
-where
-    F: FnMut() -> f64,
-{
+    now_ms: NowMsFn,
+) -> BulkImportPhaseTimings {
     let cell_count = cells.len() as u32;
     let mut formula_count: u32 = 0;
 
@@ -279,11 +287,11 @@ where
 
     // Arm the formula-install sub-phase accumulators. The Sheet-side
     // `install_parsed_formula` instrumentation gates on
-    // `flush_phase_active()` — when armed it samples `Instant::now()`
-    // around each phase and adds the elapsed ns into the thread-local
+    // `flush_phase_clock()` — when set it samples the host clock
+    // around each phase and adds the elapsed ms into the thread-local
     // counters. We reset to zero on entry so prior runs don't bleed in.
     reset_flush_phase_accumulators();
-    set_flush_phase_active(true);
+    set_flush_phase_clock(Some(now_ms));
 
     // Capture the loop-timer state by reference so the closure passed
     // to `bulk_load` can mutate it. The closure captures `now_ms` by
@@ -348,7 +356,7 @@ where
     let t2_engine_end = now_ms();
     // Disarm before reading the accumulators back so any later code
     // (panics, drops, etc.) doesn't sneak more samples in.
-    set_flush_phase_active(false);
+    set_flush_phase_clock(None);
     let (flush_parse_ms, flush_dep_extract_ms, flush_dep_register_ms, flush_formula_record_ms) =
         take_flush_phase_accumulators_ms();
     // Engine total = body + implicit flush. Flush is what happens
@@ -382,9 +390,29 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    fn native_clock() -> impl FnMut() -> f64 {
-        let start = Instant::now();
-        move || start.elapsed().as_secs_f64() * 1000.0
+    // The thread-local epoch lets us hand the driver a plain `fn() -> f64`
+    // (matching `NowMsFn`) instead of a stateful closure — needed because
+    // the per-formula install timer also stores the clock in a thread-
+    // local `Cell<Option<fn() -> f64>>`, which requires Copy.
+    thread_local! {
+        static NATIVE_CLOCK_START: std::cell::Cell<Option<Instant>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    fn native_now_ms() -> f64 {
+        NATIVE_CLOCK_START.with(|c| {
+            let start = c.get().unwrap_or_else(|| {
+                let s = Instant::now();
+                c.set(Some(s));
+                s
+            });
+            start.elapsed().as_secs_f64() * 1000.0
+        })
+    }
+
+    fn install_native_clock() -> fn() -> f64 {
+        NATIVE_CLOCK_START.with(|c| c.set(Some(Instant::now())));
+        native_now_ms
     }
 
     #[test]
@@ -413,7 +441,7 @@ mod tests {
             },
         ];
 
-        let timings = run_bulk_import_with_phase_timings(&mut wb, &inputs, native_clock());
+        let timings = run_bulk_import_with_phase_timings(&mut wb, &inputs, install_native_clock());
 
         assert_eq!(timings.cell_count, 4);
         assert_eq!(timings.formula_count, 1);
@@ -449,7 +477,7 @@ mod tests {
     fn run_bulk_import_phases_handles_empty_input() {
         let mut wb = Workbook::new();
         let inputs: Vec<BulkImportCellInput> = vec![];
-        let timings = run_bulk_import_with_phase_timings(&mut wb, &inputs, native_clock());
+        let timings = run_bulk_import_with_phase_timings(&mut wb, &inputs, install_native_clock());
         assert_eq!(timings.cell_count, 0);
         assert_eq!(timings.formula_count, 0);
     }
