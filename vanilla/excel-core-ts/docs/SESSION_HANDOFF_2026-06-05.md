@@ -96,20 +96,35 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 - DATE 0..1899 year offset rule; TIME bounds; GCD/LCM negatives; STANDARDIZE zero stddev; POISSON.DIST non-integer truncation.
 - TRANSLATE / PHONETIC implementations (were stubs).
 
-## 4. Verification numbers (after 2026-06-05 follow-up arc)
+## 4. Verification numbers (after 2026-06-05/11 follow-up arc)
 
 | Surface | Suites | Tests | Status |
 |---|---:|---:|---|
-| `vanilla/excel-core-ts` | 29 | **1767** | ✅ |
-| `vanilla/spreadsheet-ui-core` | 52 | **769** | ✅ |
-| `solid/excel` | 56 | **840** | ✅ |
-| Total monorepo jest | — | **3649** | ✅ |
+| `vanilla/excel-core-ts` | 30 | **1791** | ✅ |
+| `vanilla/spreadsheet-ui-core` | 53 | **774** | ✅ |
+| `solid/excel` | 58 | **843** | ✅ |
+| Total monorepo jest | — | **3681** | ✅ |
 | `cargo test --lib` (rust/excel-core) | — | **1396** + 3 ignored | ✅ |
 | `cargo test --tests` (integration suites) | — | all green (15+ suites) | ✅ |
 | `cargo test --lib` (rust/wasm) | — | 29+ | ✅ |
 | `tsc -b` | — | — | ✅ clean |
 | e2e WASM | 515 | **478 / 0 / 37** | ✅ all green |
 | e2e TS | 515 | **478 / 0 / 37** | ✅ Δ=0 vs WASM, all green |
+
+### Wave 8 + locale infrastructure (2026-06-11)
+
+- **Workbook locale** `9cde891`: `Workbook.setLocale(bcp47)` / `getLocale()`,
+  defaults to `'en-US'`. `EvalContext.locale` threaded through cross-sheet
+  contexts. TEXT / DOLLAR / FIXED consume via new `_locale.ts` Intl-based
+  helpers (number / currency parts). LCID `[$-XXX]` format tags stripped
+  silently. `setLocale` invalidates atoms (respects `withBatch`).
+- **Wave 8 PNG export PoC**: `5e95b93` design doc → `84986d9` UI core
+  port + `encodeSelectionAsImage` → `c6babae` Solid host PoC rasterizing
+  via SVG `<foreignObject>` + canvas. Backend port `exportRangeAsImage`
+  is OPTIONAL; UI core returns null when host omits. TODO documented in
+  the design doc: worker-backend advertising, `Ctrl+Shift+P` keybind,
+  `ClipboardItem({'image/png': blob})` write, MAX_EXPORT_PIXELS cap, per-
+  cell sizing from viewport projection, canvas-first paint, Playwright e2e.
 
 ### Function quality hardening (after `a1abdec`)
 
