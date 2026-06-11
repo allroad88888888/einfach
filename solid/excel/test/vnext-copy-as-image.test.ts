@@ -99,4 +99,61 @@ describe('vnext copy-as image renderer (Wave 8.4 PoC)', () => {
     expect(result.width).toBe(2 * 96 * 2)
     expect(result.height).toBe(2 * 24 * 2)
   })
+
+  test('renderRangeAsImage sums per-column widths and per-row heights from the size map', async () => {
+    const rasterizer = jest.fn(
+      async (_svg: string, _w: number, _h: number) => FAKE_PNG,
+    )
+    // 2-column selection: col 0 = 50px, col 1 = 150px → 200px total.
+    // 2-row selection: row 0 = 24px, row 1 = 36px → 60px total.
+    const result = await renderRangeAsImage(
+      {
+        sheetId: 'sheet-x',
+        range,
+        cells: cells2x2(),
+        columnWidths: new Map([
+          [0, 50],
+          [1, 150],
+        ]),
+        rowHeights: new Map([
+          [0, 24],
+          [1, 36],
+        ]),
+      },
+      rasterizer,
+    )
+
+    expect(result.width).toBe(200)
+    expect(result.height).toBe(60)
+    // The HTML encoder gets the same map so the rendered <table> hits the
+    // same dimensions as the outer SVG — checked indirectly via the SVG
+    // containing a `<col style="width: 50px">` etc. (encoder behaviour
+    // tested in detail elsewhere; here we only confirm the wiring).
+    const svg = rasterizer.mock.calls[0]![0]
+    expect(svg).toMatch(/width:\s*50px/)
+    expect(svg).toMatch(/width:\s*150px/)
+  })
+
+  test('missing per-cell sizes fall back to the single-value override, then the PoC default', async () => {
+    const rasterizer = jest.fn(
+      async (_svg: string, _w: number, _h: number) => FAKE_PNG,
+    )
+    // Only col 1 has a measurement (200px); col 0 falls back to the
+    // single-value override (10px). Rows have no measurements at all —
+    // both fall back to the explicit `rowHeightPx` override of 12px.
+    const result = await renderRangeAsImage(
+      {
+        sheetId: 'sheet-x',
+        range,
+        cells: cells2x2(),
+        columnWidths: new Map([[1, 200]]),
+        colWidthPx: 10,
+        rowHeightPx: 12,
+      },
+      rasterizer,
+    )
+    // 10 + 200 = 210; 12 + 12 = 24.
+    expect(result.width).toBe(210)
+    expect(result.height).toBe(24)
+  })
 })

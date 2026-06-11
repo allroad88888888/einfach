@@ -38,6 +38,18 @@ export interface RenderRangeAsImageInput extends SheetRef {
   colWidthPx?: number
   /** Override the PoC default row height (`24px`). */
   rowHeightPx?: number
+  /**
+   * Optional per-column widths in CSS px. Typically derived from
+   * `readViewportSizeProjection`. Indexed by absolute column number (the
+   * same coordinate space as `range.colStart` / `range.colEnd`). Missing
+   * columns fall back to `colWidthPx` (or the PoC default).
+   */
+  columnWidths?: ReadonlyMap<number, number>
+  /**
+   * Optional per-row heights in CSS px. Same indexing semantics as
+   * `columnWidths` — keyed by absolute row number.
+   */
+  rowHeights?: ReadonlyMap<number, number>
 }
 
 /**
@@ -106,13 +118,61 @@ export async function rasterizeSvgToPng(
 }
 
 /**
+ * Compute the per-column widths the SVG geometry will use. Returns a
+ * map keyed by absolute column index inside `[colStart, colEnd]`. Order
+ * of preference per column:
+ *   1. `columnWidths.get(col)` if the host supplied a measurement
+ *      (typically from `readViewportSizeProjection`).
+ *   2. `colWidthPx` (a single override, e.g. the projection's median).
+ *   3. `DEFAULT_COL_WIDTH_PX` (the PoC bake-in).
+ *
+ * The shared "resolve" pass keeps the geometry sum and the
+ * `encodeSelectionAsHtml({columnWidths})` argument in lockstep — the SVG
+ * `width=` attribute and the inner `<col>` widths describe the same
+ * layout, otherwise `<foreignObject>` would clip or pillarbox.
+ */
+function resolveColumnWidths(input: RenderRangeAsImageInput): Map<number, number> {
+  const fallback = input.colWidthPx ?? DEFAULT_COL_WIDTH_PX
+  const out = new Map<number, number>()
+  for (let col = input.range.colStart; col <= input.range.colEnd; col += 1) {
+    const measured = input.columnWidths?.get(col)
+    out.set(col, Math.max(1, measured ?? fallback))
+  }
+  return out
+}
+
+function resolveRowHeights(input: RenderRangeAsImageInput): Map<number, number> {
+  const fallback = input.rowHeightPx ?? DEFAULT_ROW_HEIGHT_PX
+  const out = new Map<number, number>()
+  for (let row = input.range.rowStart; row <= input.range.rowEnd; row += 1) {
+    const measured = input.rowHeights?.get(row)
+    out.set(row, Math.max(1, measured ?? fallback))
+  }
+  return out
+}
+
+function sumMap(values: Iterable<number>): number {
+  let sum = 0
+  for (const v of values) sum += v
+  return sum
+}
+
+/**
  * Build the SVG document the rasteriser consumes. Wrapping the HTML
  * table in `<foreignObject>` is what lets us reuse `encodeSelectionAsHtml`
  * verbatim — the renderer paints the same markup as `text/html`
  * clipboard already produces, so the PNG output stays consistent with
  * the HTML preview.
+ *
+ * Per-cell sizes (when supplied via `columnWidths` / `rowHeights`) flow
+ * through the HTML encoder's `<colgroup>` and row `height` attributes,
+ * so each `<td>` ends up at the same dimensions the live grid would
+ * render. The fallback path (no size map) is the PoC default grid of
+ * uniform 96×24 cells.
  */
 export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, height: number): string {
+  const colWidths = resolveColumnWidths(input)
+  const rowHeights = resolveRowHeights(input)
   const tableHtml = encodeSelectionAsHtml({
     cells: input.cells,
     rect: {
@@ -121,6 +181,8 @@ export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, hei
       endRow: input.range.rowEnd,
       endCol: input.range.colEnd,
     },
+    columnWidths: colWidths,
+    rowHeights: rowHeights,
   })
 
   return [
@@ -143,18 +205,30 @@ export function buildRangeSvg(input: RenderRangeAsImageInput, width: number, hei
  * `rasterizer` is injectable for tests — under jsdom we hand it a fake
  * that emits a fixed PNG byte sequence so we can assert the result
  * shape without booting a real canvas.
+ *
+ * Geometry: total width = sum of resolved column widths × scale, total
+ * height = sum of resolved row heights × scale. Per-cell measurements
+ * from `columnWidths` / `rowHeights` override the single-value PoC
+ * `colWidthPx` / `rowHeightPx` knobs; both fall back to the baked
+ * 96×24 defaults when the host supplies nothing.
+ *
+ * TODO(canvas): when Wave 5 lands a real `<canvas>` overlay grid, this
+ * function should detect the mounted canvas and paint via
+ * `canvas.getContext('2d').drawImage(...)` instead of the SVG path. See
+ * `vanilla/spreadsheet-ui-core/docs/wave-8-png-export-design.md`
+ * §"What's still TODO post-PoC" item 6. Today no canvas grid exists on
+ * the Wave 5 demo (it's an SVG overlay), so the SVG path is the only
+ * path.
  */
 export async function renderRangeAsImage(
   input: RenderRangeAsImageInput,
   rasterizer: typeof rasterizeSvgToPng = rasterizeSvgToPng,
 ): Promise<RangeImageExportResult> {
   const scale = input.scale ?? 1
-  const colWidth = input.colWidthPx ?? DEFAULT_COL_WIDTH_PX
-  const rowHeight = input.rowHeightPx ?? DEFAULT_ROW_HEIGHT_PX
-  const cols = input.range.colEnd - input.range.colStart + 1
-  const rows = input.range.rowEnd - input.range.rowStart + 1
-  const width = Math.max(1, cols * colWidth * scale)
-  const height = Math.max(1, rows * rowHeight * scale)
+  const colWidths = resolveColumnWidths(input)
+  const rowHeights = resolveRowHeights(input)
+  const width = Math.max(1, sumMap(colWidths.values()) * scale)
+  const height = Math.max(1, sumMap(rowHeights.values()) * scale)
 
   const svg = buildRangeSvg(input, width, height)
   const bytes = await rasterizer(svg, width, height)

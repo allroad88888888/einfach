@@ -297,25 +297,45 @@ export async function dispatchCopyAs(
 // ---------------------------------------------------------------------------
 
 /**
- * Pick the median width / height from a `ViewportSizeProjectionResult`.
- * The encoder uses these for the pre-flight pixel-count estimate and the
- * SVG renderer uses them for the rasterised geometry. We deliberately
- * average over a representative slice rather than reading per-cell
- * sizes — the PoC renderer only takes a single column-width / row-height
- * pair, so the dispatch's job is to pick the best single value.
+ * Build per-index size maps from a `ViewportSizeProjectionResult`. The
+ * SVG renderer reads these to compute exact per-column / per-row pixel
+ * dimensions; the encoder's pre-flight cap reads the median as a single
+ * representative scalar.
+ *
+ * Returned shape:
+ *   - `columnWidths` / `rowHeights`: full per-index maps, ready to hand
+ *     to `renderRangeAsImage({columnWidths, rowHeights})`.
+ *   - `medianColWidthPx` / `medianRowHeightPx`: median over non-zero
+ *     values — used by `encodeSelectionAsImage`'s `estimatedColWidthPx`
+ *     / `estimatedRowHeightPx` (the cap is a single-number gate).
  */
-function pickRepresentativeSize(
+function projectViewportSizes(
   rows: ReadonlyArray<ViewportRowHeight>,
   cols: ReadonlyArray<ViewportColumnWidth>,
-): { colWidthPx?: number; rowHeightPx?: number } {
+): {
+  columnWidths: Map<number, number>
+  rowHeights: Map<number, number>
+  medianColWidthPx?: number
+  medianRowHeightPx?: number
+} {
   function median(values: number[]): number | undefined {
     if (values.length === 0) return undefined
     const sorted = [...values].sort((a, b) => a - b)
     return sorted[Math.floor(sorted.length / 2)]
   }
+  const columnWidths = new Map<number, number>()
+  for (const c of cols) {
+    if (c.widthPx > 0) columnWidths.set(c.colIndex, c.widthPx)
+  }
+  const rowHeights = new Map<number, number>()
+  for (const r of rows) {
+    if (r.heightPx > 0) rowHeights.set(r.rowIndex, r.heightPx)
+  }
   return {
-    colWidthPx: median(cols.map((c) => c.widthPx).filter((n) => n > 0)),
-    rowHeightPx: median(rows.map((r) => r.heightPx).filter((n) => n > 0)),
+    columnWidths,
+    rowHeights,
+    medianColWidthPx: median(cols.map((c) => c.widthPx).filter((n) => n > 0)),
+    medianRowHeightPx: median(rows.map((r) => r.heightPx).filter((n) => n > 0)),
   }
 }
 
@@ -342,11 +362,13 @@ function withHostImageRenderer(backend: SpreadsheetBackend): SpreadsheetBackend 
       const projection = await backend.readRangeProjection({
         kind: 'range',
         sheetId: request.sheetId,
-        requestId: request.requestId,
+        requestId: request.requestId ?? 0,
         revision: request.revision,
         reason: 'clipboard',
         range: request.range,
       })
+      let columnWidths: ReadonlyMap<number, number> | undefined
+      let rowHeights: ReadonlyMap<number, number> | undefined
       let colWidthPx: number | undefined
       let rowHeightPx: number | undefined
       if (backend.readViewportSizeProjection) {
@@ -358,9 +380,11 @@ function withHostImageRenderer(backend: SpreadsheetBackend): SpreadsheetBackend 
             requestId: request.requestId,
             revision: request.revision,
           })
-          const pick = pickRepresentativeSize(size.rowHeights, size.colWidths)
-          colWidthPx = pick.colWidthPx
-          rowHeightPx = pick.rowHeightPx
+          const pick = projectViewportSizes(size.rowHeights, size.colWidths)
+          columnWidths = pick.columnWidths
+          rowHeights = pick.rowHeights
+          colWidthPx = pick.medianColWidthPx
+          rowHeightPx = pick.medianRowHeightPx
         } catch {
           // Sizing is decoration — a viewport-size failure must not poison
           // the PNG render. Fall back to PoC defaults.
@@ -371,6 +395,8 @@ function withHostImageRenderer(backend: SpreadsheetBackend): SpreadsheetBackend 
         range: request.range,
         cells: projection.cells,
         scale: request.scale,
+        columnWidths,
+        rowHeights,
         colWidthPx,
         rowHeightPx,
       })
@@ -459,9 +485,9 @@ export async function dispatchCopyAsImage(
         sheetId,
         window: range,
       })
-      const pick = pickRepresentativeSize(size.rowHeights, size.colWidths)
-      estimatedColWidthPx = pick.colWidthPx
-      estimatedRowHeightPx = pick.rowHeightPx
+      const pick = projectViewportSizes(size.rowHeights, size.colWidths)
+      estimatedColWidthPx = pick.medianColWidthPx
+      estimatedRowHeightPx = pick.medianRowHeightPx
     } catch {
       // Pre-flight sizing failure is non-fatal — fall through to defaults.
     }
