@@ -3,6 +3,7 @@ import { createStore } from '@einfach/core'
 import {
   encodeSelectionAsImage,
   lastCopyAsAtom,
+  MAX_EXPORT_PIXELS,
   type CopyAsImageResult,
   type CopyAsTextResult,
 } from '../src/copy-as'
@@ -58,16 +59,17 @@ function makeMinimalBackend(
 }
 
 describe('encodeSelectionAsImage', () => {
-  test('returns null when backend.exportRangeAsImage is missing', async () => {
+  test('returns no-backend failure when backend.exportRangeAsImage is missing', async () => {
     const backend = makeMinimalBackend()
-    const blob = await encodeSelectionAsImage(
+    const result = await encodeSelectionAsImage(
       { sheetId: 'sheet-1', rect: { startRow: 0, startCol: 0, endRow: 1, endCol: 1 } },
       backend,
     )
-    expect(blob).toBeNull()
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('no-backend')
   })
 
-  test('returns null when backend returns empty bytes', async () => {
+  test('returns empty-bytes failure when backend returns empty bytes', async () => {
     const backend = makeMinimalBackend({
       exportRangeAsImage: async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
         kind: 'range-image',
@@ -79,11 +81,12 @@ describe('encodeSelectionAsImage', () => {
         mimeType: 'image/png',
       }),
     })
-    const blob = await encodeSelectionAsImage(
+    const result = await encodeSelectionAsImage(
       { sheetId: 'sheet-1', rect: { startRow: 0, startCol: 0, endRow: 1, endCol: 1 } },
       backend,
     )
-    expect(blob).toBeNull()
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.reason).toBe('empty-bytes')
   })
 
   test('returns a Blob typed image/png with the backend bytes', async () => {
@@ -99,16 +102,17 @@ describe('encodeSelectionAsImage', () => {
       }),
     )
     const backend = makeMinimalBackend({ exportRangeAsImage: spy })
-    const blob = await encodeSelectionAsImage(
+    const result = await encodeSelectionAsImage(
       { sheetId: 'sheet-x', rect: { startRow: 0, startCol: 0, endRow: 1, endCol: 1 }, scale: 2 },
       backend,
     )
-    expect(blob).not.toBeNull()
-    expect(blob!.type).toBe('image/png')
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error('expected ok=true')
+    expect(result.blob.type).toBe('image/png')
     // jsdom's Blob lacks `arrayBuffer()`; `size` is the most we can assert
     // about the payload without reading it back. The size === input bytes
     // confirms the encoder didn't drop or re-encode anything.
-    expect(blob!.size).toBe(FAKE_PNG_BYTES.byteLength)
+    expect(result.blob.size).toBe(FAKE_PNG_BYTES.byteLength)
     // And the encoder forwarded the rect → range conversion + scale verbatim.
     expect(spy).toHaveBeenCalledTimes(1)
     const call = spy.mock.calls[0]![0]
@@ -117,6 +121,94 @@ describe('encodeSelectionAsImage', () => {
     expect(call.format).toBe('png')
     expect(call.scale).toBe(2)
     expect(call.range).toEqual({ rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 })
+  })
+
+  test('returns too-large failure without calling the backend when the estimate exceeds the cap', async () => {
+    // 100k rows × 26 cols × default sizes (96 × 24) = 2,496 × 96 × 100,000 × 24
+    // = 5.99e9 pixels — well above the 16.78M cap.
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 1,
+        height: 1,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    const result = await encodeSelectionAsImage(
+      {
+        sheetId: 'big-sheet',
+        rect: { startRow: 0, startCol: 0, endRow: 99_999, endCol: 25 },
+      },
+      backend,
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected ok=false')
+    expect(result.reason).toBe('too-large')
+    expect(result.estimatedPixels).toBeGreaterThan(MAX_EXPORT_PIXELS)
+    expect(result.limit).toBe(MAX_EXPORT_PIXELS)
+    // Critical: backend was NEVER called — the cap is a pre-flight gate.
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  test('per-call maxPixels override raises the cap', async () => {
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 1,
+        height: 1,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    // 4 × 4 cells × 96 × 24 defaults = 36,864 pixels — well below the
+    // default cap. With maxPixels=10, that same rect now exceeds.
+    const result = await encodeSelectionAsImage(
+      {
+        sheetId: 'sheet-x',
+        rect: { startRow: 0, startCol: 0, endRow: 3, endCol: 3 },
+        maxPixels: 10,
+      },
+      backend,
+    )
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error('expected ok=false')
+    expect(result.reason).toBe('too-large')
+    expect(result.limit).toBe(10)
+    expect(spy).not.toHaveBeenCalled()
+  })
+
+  test('host-provided per-cell sizes feed the estimate', async () => {
+    // 10 × 10 cells × 1px × 1px overrides = 100 pixels. Default cap.
+    const spy = jest.fn(
+      async (req: RangeImageExportRequest): Promise<RangeImageExportResult> => ({
+        kind: 'range-image',
+        sheetId: req.sheetId,
+        range: req.range,
+        bytes: FAKE_PNG_BYTES,
+        width: 10,
+        height: 10,
+        mimeType: 'image/png',
+      }),
+    )
+    const backend = makeMinimalBackend({ exportRangeAsImage: spy })
+    const result = await encodeSelectionAsImage(
+      {
+        sheetId: 'sheet-x',
+        rect: { startRow: 0, startCol: 0, endRow: 9, endCol: 9 },
+        estimatedColWidthPx: 1,
+        estimatedRowHeightPx: 1,
+      },
+      backend,
+    )
+    expect(result.ok).toBe(true)
+    expect(spy).toHaveBeenCalledTimes(1)
   })
 })
 

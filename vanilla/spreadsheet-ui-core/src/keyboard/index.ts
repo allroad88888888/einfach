@@ -278,6 +278,21 @@ function getCommandShortcutIntent(
       return {
         type: 'clipboard.paste',
       }
+    case 'p':
+      // Ctrl+Shift+P → Copy As Image (PNG). Sits alongside Ctrl+Shift+C
+      // (Copy As text triple) as the second "rich clipboard" accelerator;
+      // host wires the actual `exportRangeAsImage` → `ClipboardItem` call
+      // at the dispatcher case. The shortcut only fires under Shift —
+      // plain Ctrl+P stays free for the host's Print binding.
+      if (input.shiftKey) {
+        return {
+          type: 'clipboard.copyAsImage',
+        }
+      }
+      return {
+        type: 'none',
+        reason: 'unhandled',
+      }
     case 'z':
       return {
         type: 'history.undo',

@@ -67,3 +67,45 @@ describe('copy-as keyboard intent (Ctrl+Shift+C)', () => {
     expect(intent.type).toBe('editing.start')
   })
 })
+
+describe('copy-as-image keyboard intent (Ctrl+Shift+P)', () => {
+  test('Ctrl+Shift+P dispatches clipboard.copyAsImage', () => {
+    const store = makeStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, {
+      key: 'p',
+      ctrlKey: true,
+      shiftKey: true,
+    })
+    expect(intent).toEqual({ type: 'clipboard.copyAsImage' })
+  })
+
+  test('Cmd+Shift+P (macOS) dispatches clipboard.copyAsImage', () => {
+    const store = makeStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, {
+      key: 'p',
+      metaKey: true,
+      shiftKey: true,
+    })
+    expect(intent).toEqual({ type: 'clipboard.copyAsImage' })
+  })
+
+  test('Ctrl+P without Shift does NOT dispatch copyAsImage (reserved for Print)', () => {
+    const store = makeStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, {
+      key: 'p',
+      ctrlKey: true,
+    })
+    // Plain Ctrl+P stays unhandled at the spreadsheet layer — the host
+    // (browser / shell) gets the keystroke for its own Print binding.
+    expect(intent.type).toBe('none')
+  })
+
+  test('plain Shift+P without modifier does not emit a clipboard intent', () => {
+    const store = makeStore()
+    const intent = store.setter(dispatchKeyboardInputAtom, {
+      key: 'P',
+      shiftKey: true,
+    })
+    expect(intent.type).toBe('editing.start')
+  })
+})

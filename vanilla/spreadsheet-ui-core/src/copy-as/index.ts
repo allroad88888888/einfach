@@ -7,8 +7,14 @@ import { encodeSelectionAsMarkdown } from './markdown-encoder'
 export * from './types'
 export { encodeSelectionAsHtml } from './html-encoder'
 export { encodeSelectionAsMarkdown } from './markdown-encoder'
-export { encodeSelectionAsImage } from './encodeSelectionAsImage'
-export type { EncodeSelectionAsImageInput } from './encodeSelectionAsImage'
+export { encodeSelectionAsImage, MAX_EXPORT_PIXELS } from './encodeSelectionAsImage'
+export type {
+  EncodeSelectionAsImageInput,
+  EncodeSelectionAsImageResult,
+  EncodeSelectionAsImageSuccess,
+  EncodeSelectionAsImageFailure,
+  EncodeSelectionAsImageFailureKind,
+} from './encodeSelectionAsImage'
 
 /**
  * Last successful copy-as result. Solid host writes this after a clipboard

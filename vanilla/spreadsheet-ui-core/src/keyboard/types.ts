@@ -65,6 +65,7 @@ export interface KeyboardClipboardIntent {
     | 'clipboard.paste'
     | 'clipboard.pasteSpecial'
     | 'clipboard.copyAs'
+    | 'clipboard.copyAsImage'
 }
 
 export interface SheetNavigationIntent {
