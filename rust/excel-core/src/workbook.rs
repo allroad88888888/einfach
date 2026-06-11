@@ -132,6 +132,25 @@ impl CrossSheetDeps {
         }
     }
 
+    /// STORAGE_PRIMARY Phase 6.1: drop EVERY outgoing edge owned by
+    /// formulas living on `formula_sheet`. Used by
+    /// `Workbook::install_sheet_bulk` — a full-sheet replace
+    /// invalidates all of the sheet's previous formulas, so their
+    /// cross-sheet edges must go before the new content's edges are
+    /// installed. Incoming edges (other sheets' formulas referencing
+    /// this sheet) are untouched — they remain valid.
+    fn remove_all_outgoing_for_sheet(&mut self, formula_sheet: usize) {
+        let addrs: Vec<CellAddress> = self
+            .formula_refs
+            .keys()
+            .filter(|(sheet, _)| *sheet == formula_sheet)
+            .map(|(_, addr)| *addr)
+            .collect();
+        for addr in addrs {
+            self.remove_outgoing(formula_sheet, addr);
+        }
+    }
+
     fn has_remaining_range_edge(
         &self,
         src_sheet: usize,
@@ -328,7 +347,56 @@ pub struct Workbook {
     /// the `WorkbookEvalProvider::call_custom` adapter can bump/decrement
     /// it via the RAII guard in `CustomCallScope`.
     pub(crate) custom_call_depth: Cell<usize>,
+    /// STORAGE_PRIMARY Phase 6.1 (OD1): monotonically-increasing content
+    /// revision. Bumped once per `install_sheet_bulk` (so once per sheet
+    /// inside `install_workbook_bulk`) — a bulk install replaces a whole
+    /// sheet's content without per-cell notifications, so hosts /
+    /// projection layers compare this counter to know "the world
+    /// changed, re-read everything". Single-cell mutators do NOT bump it
+    /// (they have precise per-cell subscriber fanout already).
+    content_revision: u64,
 }
+
+/// STORAGE_PRIMARY Phase 6.1: result stats from one
+/// [`Workbook::install_sheet_bulk`] call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BulkInstallStats {
+    /// Primitive values installed (excludes `Value::Null` entries and
+    /// addresses shadowed by a formula in the same payload).
+    pub primitives_installed: usize,
+    /// Formula sources parked lazily (`formula_source` + `needs_parse`).
+    pub formulas_installed: usize,
+    /// Formulas that went through the `!`-prefilter cross-sheet parse.
+    /// 0 when every formula is same-sheet (the dominant case).
+    pub cross_sheet_parsed: usize,
+}
+
+/// STORAGE_PRIMARY Phase 6.1: rejection reasons for
+/// [`Workbook::install_sheet_bulk`] / [`Workbook::install_workbook_bulk`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallError {
+    /// The payload referenced a sheet index outside the workbook.
+    SheetOutOfRange(usize),
+    /// Bulk install attempted from inside a custom-formula callback
+    /// (Wave 8 re-entrancy guard — same contract as every other
+    /// workbook mutation entry point).
+    MutationDuringCustomCall,
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallError::SheetOutOfRange(idx) => {
+                write!(f, "sheet index {idx} is outside the workbook")
+            }
+            InstallError::MutationDuringCustomCall => {
+                write!(f, "bulk install is not allowed inside a custom-formula callback")
+            }
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
 
 /// RAII scope guard that increments `Workbook::custom_call_depth` on
 /// construction and decrements on drop. Used by
@@ -373,6 +441,7 @@ impl Workbook {
             named_values: BTreeMap::new(),
             custom_functions: None,
             custom_call_depth: Cell::new(0),
+            content_revision: 0,
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
@@ -1457,6 +1526,138 @@ impl Workbook {
     ///
     /// RAII shape mirrors `Sheet::bulk_load`: the loader is not exposed
     /// outside the closure, so the flush always runs.
+    /// STORAGE_PRIMARY Phase 6.1: read the content revision counter
+    /// (OD1). Bumped once per `install_sheet_bulk`; hosts compare
+    /// successive values to detect whole-sheet replaces that bypass
+    /// per-cell subscriber fanout.
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
+    }
+
+    /// Storage-primary bulk install: swap pre-built maps directly into
+    /// the sheet. No per-cell calls, no parse, no dep extraction, no
+    /// ops queue. Formulas hydrate lazily on first read (Phase 2+3
+    /// machinery). This is a FULL-SHEET REPLACE — previous content
+    /// (primitives, hydrated formulas, lazy parking, dep edges, spills,
+    /// and this sheet's outgoing cross-sheet edges) is torn down first.
+    ///
+    /// Cross-sheet correctness without eager parse: after the swap, the
+    /// formula sources are walked once with a cheap `!`-prefilter — a
+    /// formula whose text contains no `!` cannot hold a cross-sheet ref
+    /// (`Sheet2!A1`) and is skipped without parsing. Only the (rare)
+    /// `!`-containing formulas are parsed to install their
+    /// `CrossSheetDeps` edges so move_sheet / cross-sheet dirty
+    /// propagation keep working before first read. False positives are
+    /// acceptable: a `!` inside a string literal (e.g. `="hi!"`)
+    /// triggers one wasted parse whose AST yields zero cross-sheet
+    /// edges — a small perf cost, never a correctness issue. Phase 6.5
+    /// moves this edge install into `hydrate_formula` entirely.
+    ///
+    /// Cross-sheet cycle detection for installed formulas is deferred
+    /// to first read (hydration) — same semantic shift Phase 2+3 made
+    /// for same-sheet cycles, accepted in the RFC.
+    pub fn install_sheet_bulk(
+        &mut self,
+        sheet_idx: usize,
+        primitives: HashMap<CellAddress, Value>,
+        formulas: HashMap<CellAddress, String>,
+    ) -> Result<BulkInstallStats, InstallError> {
+        if self.is_inside_custom_call() {
+            return Err(InstallError::MutationDuringCustomCall);
+        }
+        if sheet_idx >= self.sheets.len() {
+            return Err(InstallError::SheetOutOfRange(sheet_idx));
+        }
+
+        // Tear down the sheet's previous outgoing cross-sheet edges —
+        // every formula that owned them is about to be replaced.
+        self.cross_sheet.remove_all_outgoing_for_sheet(sheet_idx);
+
+        // The swap itself: three map installs on the sheet, no per-cell
+        // ceremony (see `Sheet::bulk_install_storage` for the exact
+        // cost model — primitives are O(n) plain storage writes because
+        // they live behind atoms, formulas are O(n) text parks).
+        let (primitives_installed, formulas_installed) =
+            self.sheets[sheet_idx].bulk_install_storage(primitives, formulas);
+
+        // `!`-prefilter cross-sheet edge scan (see method docs). Edges
+        // are buffered because `for_each_lazy_formula` holds a shared
+        // borrow of the sheet while `add_edge` needs `&mut
+        // self.cross_sheet`.
+        let mut cross_sheet_parsed: usize = 0;
+        let mut edge_buf: Vec<(CellAddress, Vec<CrossSheetRef>)> = Vec::new();
+        {
+            let sheet = &self.sheets[sheet_idx];
+            let by_name = &self.by_name;
+            sheet.for_each_lazy_formula(|addr, source| {
+                if !source.contains('!') {
+                    // No `!` → cannot be a cross-sheet ref → skip the
+                    // parse entirely. This is the overwhelmingly common
+                    // same-sheet case.
+                    return;
+                }
+                cross_sheet_parsed += 1;
+                if let Some(expr) = parse_formula(source) {
+                    let edges = collect_cross_sheet_refs(&expr, by_name);
+                    if !edges.is_empty() {
+                        edge_buf.push((addr, edges));
+                    }
+                }
+            });
+        }
+        if !edge_buf.is_empty() {
+            // Arm the sheet's one-way cross-sheet latch so the read-time
+            // `force_formula_recompute` safety net covers these formulas
+            // even before their first hydration.
+            self.sheets[sheet_idx].arm_cross_sheet_latch();
+        }
+        for (addr, edges) in edge_buf {
+            for edge in edges {
+                self.cross_sheet.add_edge(sheet_idx, addr, edge);
+            }
+        }
+
+        // OD1: bump the revision so subscribers / projections know the
+        // world changed without per-cell notifications.
+        self.content_revision += 1;
+
+        Ok(BulkInstallStats {
+            primitives_installed,
+            formulas_installed,
+            cross_sheet_parsed,
+        })
+    }
+
+    /// Whole-workbook variant of [`Self::install_sheet_bulk`] (OD2):
+    /// one call installs every sheet's pre-built maps. Sheet indexes
+    /// are validated up front so the call is all-or-nothing — no
+    /// partial install when a later entry is out of range. The
+    /// per-SHEET loop here is fine (sheet counts are small); the
+    /// per-CELL loop is what the storage-primary refactor kills.
+    pub fn install_workbook_bulk(
+        &mut self,
+        payload: Vec<(
+            usize,
+            HashMap<CellAddress, Value>,
+            HashMap<CellAddress, String>,
+        )>,
+    ) -> Result<Vec<BulkInstallStats>, InstallError> {
+        if self.is_inside_custom_call() {
+            return Err(InstallError::MutationDuringCustomCall);
+        }
+        for (sheet_idx, _, _) in &payload {
+            if *sheet_idx >= self.sheets.len() {
+                return Err(InstallError::SheetOutOfRange(*sheet_idx));
+            }
+        }
+        payload
+            .into_iter()
+            .map(|(sheet_idx, primitives, formulas)| {
+                self.install_sheet_bulk(sheet_idx, primitives, formulas)
+            })
+            .collect()
+    }
+
     pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut WorkbookLoader<'_>) -> R) -> R {
         // Re-entrancy guard for Wave 8 custom-formula callbacks. We can't
         // refuse cleanly without breaking the signature, so we still let

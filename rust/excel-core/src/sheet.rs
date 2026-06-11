@@ -815,6 +815,15 @@ impl Sheet {
         self.has_cross_sheet_refs.get()
     }
 
+    /// STORAGE_PRIMARY Phase 6.1: arm the one-way cross-sheet latch
+    /// without an `Expr` in hand. `Workbook::install_sheet_bulk`'s
+    /// `!`-prefilter scan already knows the sheet holds cross-sheet
+    /// formulas (it parsed them for edge install) but the lazy parking
+    /// path never routes through `note_cross_sheet_if_any`.
+    pub(crate) fn arm_cross_sheet_latch(&self) {
+        self.has_cross_sheet_refs.set(true);
+    }
+
     /// Inline helper: set the cross-sheet latch if `expr` contains any
     /// `SheetRef` / `SheetRange`. Called from every formula-installation
     /// path in this module so the raw `wb.sheet_mut(...).set_formula(...)`
@@ -1287,6 +1296,145 @@ impl Sheet {
         self.cell_dependents.get_mut().reserve(hint);
         self.formula_exprs.get_mut().reserve(hint);
         self.formula_texts.get_mut().reserve(hint);
+    }
+
+    /// STORAGE_PRIMARY Phase 6.1: full-sheet replace via direct map
+    /// installs — "the storage IS the API". No per-cell parse, no dep
+    /// extraction, no cycle check, no ops queue. Returns
+    /// `(primitives_installed, formulas_installed)`.
+    ///
+    /// Semantics (per `docs/STORAGE_PRIMARY_PLAN.md` § "The right
+    /// architecture"):
+    ///
+    ///   - Previous sheet content is fully torn down first (this is a
+    ///     REPLACE, not a merge): primitive atoms are destroyed, every
+    ///     hydrated-formula structure (`formula_cells` /
+    ///     `formula_exprs` / `formula_texts` / `cell_dependents` /
+    ///     `range_dependents`) is cleared wholesale, lazy parking
+    ///     (`formula_source` / `needs_parse`) is dropped, and spill
+    ///     bookkeeping is reset. Wholesale clears — not per-record
+    ///     edge removal — because the entire index family is being
+    ///     rebuilt from scratch (lazily, on first read).
+    ///   - Primitives: one `Store::create_atom` + `RowMajorMap::insert`
+    ///     per cell. A true O(1) map swap is impossible here because
+    ///     primitive values live behind atoms in `self.store`
+    ///     (`cells` maps addr → `AtomId`, not addr → `Value`), so this
+    ///     is O(n) iterate-insert — but each insert is a plain storage
+    ///     write (~atom alloc + BTreeMap insert), with zero parse / dep
+    ///     / notify work. `Value::Null` entries are skipped (Null means
+    ///     "absent" — matches `set_cell`'s release contract).
+    ///   - Formulas: parked as raw source text in `formula_source` with
+    ///     every addr in `needs_parse` — exactly the Phase 2+3 lazy
+    ///     state. `hydrate_formula` does parse / cycle-check / dep
+    ///     install on first read, unchanged. NOTE: unlike
+    ///     `BulkLoader::set_formula`, the source is NOT parse-validated
+    ///     here (validation would defeat the storage-primary contract);
+    ///     unparseable text surfaces `#VALUE!` at first read via the
+    ///     hydrator's parse-failure arm, and `get_formula` /
+    ///     `ISFORMULA` will see it as a live formula until then.
+    ///   - An address present in BOTH maps resolves formula-wins
+    ///     (mirrors the loader path, where a formula install drops the
+    ///     primitive scaffold).
+    ///   - Existing subscription buckets survive: their fanouts are
+    ///     detached during the swap, reattached after, and every
+    ///     subscribed address is notified once (the whole world
+    ///     changed).
+    ///
+    /// The `has_cross_sheet_refs` latch is deliberately NOT cleared —
+    /// it is a one-way conservative latch; staying armed costs at most
+    /// a redundant recompute per read and never under-fires. Cross-
+    /// sheet edge install for the new content is owned by the caller
+    /// (`Workbook::install_sheet_bulk`'s `!`-prefilter scan).
+    pub(crate) fn bulk_install_storage(
+        &mut self,
+        primitives: HashMap<CellAddress, Value>,
+        formulas: HashMap<CellAddress, String>,
+    ) -> (usize, usize) {
+        // --- Teardown of previous content ---------------------------------
+        // Detach every subscription fanout first so atom destruction below
+        // cannot fire through a stale store sub. Buckets (and their
+        // listeners) stay; we reattach + notify at the end.
+        let sub_addrs: Vec<CellAddress> = self.cell_subscriptions.keys().copied().collect();
+        for addr in &sub_addrs {
+            self.detach_address_sub(*addr);
+        }
+
+        // Spill-derived atoms read their anchor atom, so destroy the
+        // derived targets first — otherwise the anchor's guarded
+        // `has_dependents` check below would see them and leak the
+        // anchor (same leak-don't-panic posture as `clear_spill`).
+        let spill_target_addrs: Vec<CellAddress> = self
+            .spill_targets
+            .values()
+            .flat_map(|targets| targets.iter().copied())
+            .collect();
+        self.spill_targets.clear();
+        for addr in spill_target_addrs {
+            if let Some(id) = self.cells.remove(&addr) {
+                if self.store.has_atom(id) && !self.store.has_dependents(id) {
+                    self.store.destroy_atom(id);
+                }
+            }
+        }
+        for (_, id) in self.cells.drain_into_vec() {
+            if self.store.has_atom(id) && !self.store.has_dependents(id) {
+                self.store.destroy_atom(id);
+            }
+        }
+
+        // Hydrated formula state — wholesale clears (full replace).
+        *self.formula_cells.get_mut() = RowMajorMap::new();
+        self.formula_exprs.get_mut().clear();
+        self.formula_texts.get_mut().clear();
+        self.cell_dependents.get_mut().clear();
+        self.range_dependents.get_mut().clear();
+        // Lazy parking from any previous bulk load.
+        *self.formula_source.get_mut() = RowMajorMap::new();
+        self.needs_parse.get_mut().clear();
+
+        // --- Primitive install ---------------------------------------------
+        // `cells` is empty after the teardown and the payload HashMap keys
+        // are unique, so we create atoms directly instead of routing
+        // through `ensure_cell`'s exists-check.
+        let mut primitives_installed: usize = 0;
+        for (addr, value) in primitives {
+            if matches!(value, Value::Null) {
+                continue;
+            }
+            // Formula wins when the same addr appears in both maps.
+            if formulas.contains_key(&addr) {
+                continue;
+            }
+            let id = self.store.create_atom(value);
+            self.cells.insert(addr, id);
+            primitives_installed += 1;
+        }
+
+        // --- Formula parking (lazy — Phase 2+3 machinery) ------------------
+        let formulas_installed = formulas.len();
+        let mut needs: HashSet<CellAddress> = HashSet::with_capacity(formulas_installed);
+        let mut source_map: RowMajorMap<Rc<str>> = RowMajorMap::new();
+        for (addr, text) in formulas {
+            needs.insert(addr);
+            source_map.insert(addr, Rc::<str>::from(text));
+        }
+        *self.formula_source.get_mut() = source_map;
+        *self.needs_parse.get_mut() = needs;
+        self.imported_formula_count
+            .set(self.imported_formula_count.get() + formulas_installed);
+
+        // --- Reattach + notify subscribers ---------------------------------
+        // Every subscribed address is notified exactly once: a full-sheet
+        // replace means any watched cell may have changed. Bounded by the
+        // (small) subscription count, not by payload size.
+        for addr in sub_addrs {
+            self.attach_address_sub(addr);
+            if self.has_address_subscribers(addr) {
+                self.notify_address_subscribers(addr);
+            }
+        }
+
+        (primitives_installed, formulas_installed)
     }
 
     /// Collect every formula address that depends on a write to `addr`,

@@ -25,4 +25,4 @@ pub use sheet::{
 };
 pub use shift::{render_formula, shift_refs};
 pub use undo::{CellSnapshot, Edit, UndoStack};
-pub use workbook::{Workbook, WorkbookError};
+pub use workbook::{BulkInstallStats, InstallError, Workbook, WorkbookError};
