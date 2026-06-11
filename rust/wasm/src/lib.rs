@@ -1617,64 +1617,20 @@ fn error_token_to_value_error(s: &str) -> Option<ValueError> {
     }
 }
 
-/// Hard upper bound on the number of cell records accepted by a single
-/// `bulk_import_cells` / `bulk_import_cells_instrumented` /
-/// `restore_sparse` / `restore_persistence_v1` call.
-///
-/// **Why**: at ~1 M formula records in one call the WASM linear-memory
-/// allocator panics on the formula-install path (`Workbook::bulk_load` →
-/// `Sheet::bulk_load` → per-formula `FormulaRecord` / `cell_dependents` /
-/// `range_dependents` allocations). With `panic = "abort"` the WASM
-/// instance aborts mid-call, leaving the wasm-bindgen `WasmRefCell` in a
-/// permanently borrowed state; the NEXT call into the workbook
-/// (typically `wb.free()` during a host's cleanup path) then throws the
-/// cryptic `"attempted to take ownership of Rust value while it was
-/// borrowed"` from the wasm-bindgen-generated `FromWasmAbi::from_abi`
-/// shim — see `solid/excel/test/perf-ts-vs-wasm-report.md` "Bug fix log"
-/// for the full chain.
-///
-/// We surface a clear, returnable error BEFORE the allocator can panic.
-/// Hosts that legitimately need larger imports must chunk their payload
-/// (the engine has no contract issue with `chunk + chunk + chunk`; the
-/// only failure mode is "one giant `Vec` mid-call exhausts linear
-/// memory").
-///
-/// **Threshold**: 750 K is the empirical safe ceiling.
-///   - `Mega` tier (500 K seeds + 500 K formulas, two separate calls of
-///     500 K each) finishes cleanly at ~3 GB WASM peak RSS.
-///   - `Ultra` tier (1 M seeds + 1 M formulas, two calls of 1 M each)
-///     reliably panics on the formula-install pass.
-/// 750 K splits the difference; pure-primitive imports could safely go
-/// higher, but a single call-site limit keeps the contract simple.
-const MAX_BULK_IMPORT_CELLS_PER_CALL: usize = 750_000;
-
-/// Inspect `cells` (the `JsValue` argument to a bulk-import method) for
-/// an oversized payload. Returns `Err(JsValue::from_str(...))` with a
-/// host-actionable message when the JS-side input is an `Array` of more
-/// than [`MAX_BULK_IMPORT_CELLS_PER_CALL`] entries.
-///
-/// We deliberately do NOT use `serde_wasm_bindgen::from_value` to count —
-/// that would have already paid the deserialization allocation cost we
-/// are trying to avoid. `js_sys::Array::length` is a single property
-/// read on the JS side and runs in O(1).
-///
-/// Non-Array inputs (e.g. a custom iterable a host passes in) skip the
-/// pre-flight check — they will still hit the serde path, where the
-/// caller's payload-size choice is their own contract. The cap exists to
-/// prevent the WASM abort + cryptic borrow-error chain, not to enforce
-/// taste.
-fn check_bulk_import_payload_size(cells: &JsValue, method_name: &str) -> Result<(), JsValue> {
-    let Some(arr) = cells.dyn_ref::<js_sys::Array>() else {
-        return Ok(());
-    };
-    let n = arr.length() as usize;
-    if n > MAX_BULK_IMPORT_CELLS_PER_CALL {
-        return Err(JsValue::from_str(&format!(
-            "{method_name} refused: payload of {n} cells exceeds the per-call limit of {MAX_BULK_IMPORT_CELLS_PER_CALL}. Split into smaller chunks (each ≤ {MAX_BULK_IMPORT_CELLS_PER_CALL}). At this scale the WASM linear-memory allocator panics on the formula-install path; the guard fails fast with this clear error instead of letting the WASM instance abort and then surface a cryptic \"attempted to take ownership of Rust value while it was borrowed\" message from the next call."
-        )));
-    }
-    Ok(())
-}
+// Historical note: there used to be a `MAX_BULK_IMPORT_CELLS_PER_CALL`
+// constant (750_000) and a matching `check_bulk_import_payload_size`
+// pre-flight guard at the four bulk-import entry points. Both were
+// installed because the pre-Phase-2 eager `Workbook::bulk_load` path
+// allocated per-formula `FormulaRecord` + `cell_dependents` +
+// `range_dependents` entries during import, which panicked the WASM
+// linear-memory allocator at ~1M formula records. The Phase 2/3
+// lazy-formula-indexing refactor (commits 40bc473 + 7d0e380) moved all
+// of that work to first-read, so `bulk_load` now allocates only the
+// formula source `Rc<str>` plus a `HashSet<CellAddress>` membership in
+// `needs_parse`. Single-call payloads of 5M cells now complete cleanly
+// at ~2.9 GB peak RSS. See `rust/excel-core/docs/CAP_REMOVAL_2026-06-11.md`
+// for the bench numbers and `rust/excel-core/docs/LAZY_FORMULA_INDEXING_PLAN.md`
+// §"Phase 5" for the broader arc.
 
 /// WASM-exposed workbook. Wraps the Rust Workbook so browser demos can
 /// evaluate formulas through workbook context, including cross-sheet refs.
@@ -2339,13 +2295,10 @@ impl WasmWorkbook {
     /// are installed dirty and remain lazy until a read/subscription hydrates
     /// them through the normal workbook eval path.
     pub fn bulk_import_cells(&mut self, cells: JsValue) -> Result<JsValue, JsValue> {
-        // Pre-flight size check (cheap O(1) `Array.length` read on the JS
-        // side). Refuse oversized payloads BEFORE the serde deserialize
-        // or the per-formula install loop can panic the WASM linear-
-        // memory allocator and surface a cryptic "attempted to take
-        // ownership" error from a downstream call. See
-        // `MAX_BULK_IMPORT_CELLS_PER_CALL` doc for rationale.
-        check_bulk_import_payload_size(&cells, "bulk_import_cells")?;
+        // No per-call payload cap. The pre-Phase-2 path needed one to
+        // dodge a WASM allocator panic on the eager formula-install
+        // loop; the Phase 2/3 lazy `bulk_load` makes single-call 5M+
+        // payloads finish cleanly. See `CAP_REMOVAL_2026-06-11.md`.
         let cells: Vec<WorkbookImportCellJSON> = serde_wasm_bindgen::from_value(cells)
             .map_err(|err| JsValue::from_str(&format!("invalid import cells: {err}")))?;
 
@@ -2517,12 +2470,6 @@ impl WasmWorkbook {
         use einfach_excel_core::bulk_import_trace::{
             run_bulk_import_with_phase_timings, BulkImportCellInput, BulkImportCellKind,
         };
-
-        // Same pre-flight guard as the production variant — see
-        // `MAX_BULK_IMPORT_CELLS_PER_CALL` doc. Must run BEFORE the
-        // serde phase below so an oversized payload doesn't burn its
-        // deserialize cost before we refuse it.
-        check_bulk_import_payload_size(&cells, "bulk_import_cells_instrumented")?;
 
         // ---- Phase: rpc_deserialize -----------------------------------
         // Measure the JsValue → Vec<WorkbookImportCellJSON> cost. This
@@ -2762,11 +2709,9 @@ impl WasmWorkbook {
     /// `snapshot_range_sparse`. Uses workbook bulk-load so formulas are
     /// reinstalled dirty and are not evaluated during restore.
     pub fn restore_sparse(&mut self, cells: JsValue) -> Result<u32, JsValue> {
-        // Restore uses the same `Workbook::bulk_load` formula-install
-        // path that panics at `MAX_BULK_IMPORT_CELLS_PER_CALL`+ entries;
-        // refuse oversized payloads here too so a "huge undo" doesn't
-        // abort the WASM instance.
-        check_bulk_import_payload_size(&cells, "restore_sparse")?;
+        // Routes through `Workbook::bulk_load`, which Phase 2/3 made
+        // lazy — see `CAP_REMOVAL_2026-06-11.md`. No per-call payload
+        // cap is needed.
         let cells: Vec<SparseCellJSON> = serde_wasm_bindgen::from_value(cells)
             .map_err(|err| JsValue::from_str(&format!("invalid sparse cells: {err}")))?;
         Ok(self.restore_sparse_cells(cells))
@@ -3048,18 +2993,10 @@ impl WasmWorkbook {
             return Err("persistence payload has no sheets".into());
         }
 
-        // Same cap as the standalone bulk-import paths — refuse before
-        // `restore_sparse_cells` enters the per-formula install loop
-        // that panics the WASM allocator past ~1 M entries.
-        if payload.cells.len() > MAX_BULK_IMPORT_CELLS_PER_CALL {
-            return Err(format!(
-                "restore_persistence_v1 refused: payload of {} cells exceeds the per-call limit of {}. Split into smaller chunks (each ≤ {}). See {} doc for the WASM allocator rationale.",
-                payload.cells.len(),
-                MAX_BULK_IMPORT_CELLS_PER_CALL,
-                MAX_BULK_IMPORT_CELLS_PER_CALL,
-                "MAX_BULK_IMPORT_CELLS_PER_CALL",
-            ));
-        }
+        // No per-call payload cap. `restore_sparse_cells` routes through
+        // the Phase 2/3 lazy `Workbook::bulk_load`, which holds only the
+        // formula source `Rc<str>` instead of pre-installing dep edges.
+        // See `CAP_REMOVAL_2026-06-11.md`.
 
         let mut seen_names = HashSet::new();
         for (idx, sheet) in payload.sheets.iter().enumerate() {
@@ -4250,62 +4187,12 @@ mod tests {
         assert_eq!(wb.debug_formula_eval_count_total(), targets.len() as u32);
     }
 
-    /// Pre-flight payload-size guard contract. We build a sparse JS array
-    /// of `MAX_BULK_IMPORT_CELLS_PER_CALL + 1` length using `Array::new()`
-    /// + `set_length` so we don't actually allocate cell records (the
-    /// guard's whole point is to refuse BEFORE per-cell allocation). The
-    /// `Err` message must mention the limit AND name the method so hosts
-    /// can localize the failure without grepping the wasm crate.
-    ///
-    /// Companion to the perf-bench "Bug fix log" — the chain this guards
-    /// against is: oversized payload → wasm allocator panic → wasm abort →
-    /// next call (`wb.free()`) throws cryptic "attempted to take
-    /// ownership of Rust value while it was borrowed" because the
-    /// previous `RcRefMut` is leaked. The guard short-circuits the entire
-    /// chain at step 0.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test::wasm_bindgen_test]
-    fn wasm_workbook_bulk_import_cells_refuses_oversized_payload() {
-        // sparse array of length > cap; entries are `undefined` slots so
-        // we don't allocate cell records. The cap check runs on
-        // `Array.length` only, before any per-entry access.
-        let arr = js_sys::Array::new();
-        arr.set_length(MAX_BULK_IMPORT_CELLS_PER_CALL as u32 + 1);
-        let cells: JsValue = arr.into();
-
-        let mut wb = WasmWorkbook::new();
-        let err = wb
-            .bulk_import_cells(cells)
-            .expect_err("oversized bulk_import_cells must be refused");
-        let msg = err.as_string().unwrap_or_default();
-        assert!(
-            msg.contains("bulk_import_cells refused"),
-            "error must name the method: {msg}"
-        );
-        assert!(
-            msg.contains(&MAX_BULK_IMPORT_CELLS_PER_CALL.to_string()),
-            "error must surface the limit value: {msg}"
-        );
-    }
-
-    /// Small payloads are not affected by the guard — sanity check that
-    /// the guard isn't accidentally too tight. Mirrors a typical "tens of
-    /// formulas" host call shape.
-    #[cfg(target_arch = "wasm32")]
-    #[wasm_bindgen_test::wasm_bindgen_test]
-    fn wasm_workbook_bulk_import_cells_accepts_under_cap_payload() {
-        let cells = vec![TestBulkImportCell {
-            sheet: 0,
-            row: 0,
-            col: 0,
-            kind: "number",
-            value: TestBulkImportValue::Number(42.0),
-        }];
-        let import_value = serde_wasm_bindgen::to_value(&cells).expect("serialize import cells");
-        let mut wb = WasmWorkbook::new();
-        let _ = wb
-            .bulk_import_cells(import_value)
-            .expect("small payload must pass the pre-flight guard");
-        assert_eq!(wb.get_number(0, "A1"), 42.0);
-    }
+    // Note: pre-flight payload-size guard tests
+    // (`wasm_workbook_bulk_import_cells_refuses_oversized_payload` +
+    // `_accepts_under_cap_payload`) were removed alongside the
+    // `MAX_BULK_IMPORT_CELLS_PER_CALL` cap they covered — see
+    // `rust/excel-core/docs/CAP_REMOVAL_2026-06-11.md`. With the cap gone
+    // there is no oversized-payload error path to assert; the WASM
+    // linear-memory ceiling is the only remaining bound and it manifests
+    // as a runtime allocation failure, not a structured `Result::Err`.
 }
