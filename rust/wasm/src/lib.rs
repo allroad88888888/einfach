@@ -1,7 +1,7 @@
 use einfach_core::{CellListener, Value, ValueError};
 use einfach_excel_core::{
     Align, BorderSpec, BorderStyle, CellAddress, CellBorders, CellFormat, CellRange,
-    CellSubscription, CustomFunctionRegistry, FormatRangeSnapshot, NumberFormat,
+    CellSubscription, CustomFunctionRegistry, DepGraphStats, FormatRangeSnapshot, NumberFormat,
     RangeFormatSnapshotLayer, Rotation, Sheet, SheetError, VerticalAlign, Workbook, WorkbookError,
 };
 use serde::{de, Deserialize, Serialize};
@@ -830,6 +830,26 @@ impl WorkbookImportStatsJSON {
 struct CellRefJSON {
     sheet: usize,
     addr: String,
+}
+
+/// Phase 1 dep-graph statistics wire shape. Mirrors
+/// `einfach_excel_core::DepGraphStats` summed across all sheets plus
+/// the derived `avg_fanout` computed here so the JS bench doesn't have
+/// to divide on its side.
+#[derive(Clone, Debug, Default, Serialize)]
+struct DepGraphStatsJSON {
+    #[serde(rename = "totalFormulaCount")]
+    total_formula_count: u64,
+    #[serde(rename = "totalPointDepEdges")]
+    total_point_dep_edges: u64,
+    #[serde(rename = "totalRangeDepEntries")]
+    total_range_dep_entries: u64,
+    #[serde(rename = "maxFanout")]
+    max_fanout: u32,
+    #[serde(rename = "avgFanout")]
+    avg_fanout: f64,
+    #[serde(rename = "rangeFormulaCount")]
+    range_formula_count: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2634,6 +2654,62 @@ impl WasmWorkbook {
             Some(arr) => arr.to_vec(),
             None => Vec::new(),
         }
+    }
+
+    /// Phase 1 (lazy-formula-indexing) dep-graph probe. Walks every
+    /// sheet's `cell_dependents` + `range_dependents` and returns
+    /// aggregate edge counts. This is a measurement-only debug surface
+    /// — costs O(formula_count + total_point_dep_edges), so cheap on
+    /// small workbooks and bounded by graph size on large ones. Do NOT
+    /// call from the hot path.
+    ///
+    /// Returns a JS object with these fields (camelCase):
+    /// - `totalFormulaCount` — sum of `formula_cells.len()` over sheets
+    /// - `totalPointDepEdges` — sum of `cell_dependents[a].len()`
+    /// - `totalRangeDepEntries` — sum of `range_dependents.len()`
+    /// - `maxFanout` — max single-cell fanout across all sheets
+    /// - `avgFanout` — `totalPointDepEdges / cell_dependents_keys`
+    ///   (number of cells that have at least one dependent). Zero
+    ///   when no formula has installed any deps.
+    /// - `rangeFormulaCount` — formulas whose `range_deps` is non-empty
+    #[wasm_bindgen(js_name = "debugDepGraphStats")]
+    pub fn debug_dep_graph_stats(&self) -> Result<JsValue, JsValue> {
+        // We need the per-sheet "cell_dependents key count" to compute
+        // a meaningful avg_fanout — `Sheet::debug_dep_graph_stats`
+        // already gives us total edges + max; we just need the
+        // denominator. Add a tiny per-sheet probe and sum on this side
+        // so the core stays free of JS-only derived metrics.
+        let mut total = DepGraphStatsJSON::default();
+        let mut cell_dep_key_total: u64 = 0;
+        for sheet_idx in 0..self.workbook.sheet_count() {
+            let Some(sheet) = self.workbook.sheet(sheet_idx) else {
+                continue;
+            };
+            let s: DepGraphStats = sheet.debug_dep_graph_stats();
+            total.total_formula_count =
+                total.total_formula_count.saturating_add(s.formula_count);
+            total.total_point_dep_edges = total
+                .total_point_dep_edges
+                .saturating_add(s.total_point_dep_edges);
+            total.total_range_dep_entries = total
+                .total_range_dep_entries
+                .saturating_add(s.total_range_dep_entries);
+            if s.max_fanout > total.max_fanout {
+                total.max_fanout = s.max_fanout;
+            }
+            total.range_formula_count = total
+                .range_formula_count
+                .saturating_add(s.range_formula_count);
+            cell_dep_key_total = cell_dep_key_total
+                .saturating_add(sheet.debug_cell_dependents_key_count() as u64);
+        }
+        total.avg_fanout = if cell_dep_key_total == 0 {
+            0.0
+        } else {
+            (total.total_point_dep_edges as f64) / (cell_dep_key_total as f64)
+        };
+        serde_wasm_bindgen::to_value(&total)
+            .map_err(|err| JsValue::from_str(&format!("serialize dep graph stats: {err}")))
     }
 
     /// List every address that has a primitive value or formula across

@@ -183,6 +183,36 @@ struct AddressSubscriptionBucket {
     store_sub: Option<SubscriptionId>,
 }
 
+/// Aggregate dep-graph statistics produced by
+/// `Sheet::debug_dep_graph_stats` (Phase 1 of the lazy-formula-indexing
+/// arc). One per sheet; the workbook-level probe in `WasmWorkbook`
+/// sums these across all sheets and computes derived metrics
+/// (avg_fanout) on the JS side.
+///
+/// All counters are `u64` so summing across sheets in the workbook
+/// probe can't overflow even at multi-million formula scale.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DepGraphStats {
+    /// Number of formula records in this sheet (`formula_cells.len()`).
+    pub formula_count: u64,
+    /// Sum of `cell_dependents[addr].len()` over every entry — i.e.
+    /// total point-dep edges installed.
+    pub total_point_dep_edges: u64,
+    /// `range_dependents.len()` — number of distinct `CellRange`
+    /// entries currently registered. NOT the number of "range edges":
+    /// a single `SUM(A:A)` referenced by 5 formulas counts as 1
+    /// entry here but 5 dependents downstream.
+    pub total_range_dep_entries: u64,
+    /// Maximum value of `cell_dependents[addr].len()` across all
+    /// addresses. Captures the worst-case fanout from a single source
+    /// cell change.
+    pub max_fanout: u32,
+    /// Number of formula records whose `range_deps` set is non-empty.
+    /// Discriminates "formulas that touch a range" from cell-cell-only
+    /// formulas.
+    pub range_formula_count: u64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum FormulaCache {
     Dirty,
@@ -2595,6 +2625,57 @@ impl Sheet {
             },
         );
         visits
+    }
+
+    /// Phase 1 (lazy-formula-indexing) dep-graph probe. Walks
+    /// `cell_dependents` + `range_dependents` and returns aggregate
+    /// edge counts so the bench / MEGA_TRACE summary can quantify how
+    /// much state the eager-build phase produced.
+    ///
+    /// Costs O(formula_count + sum-of-fanouts) — fine for a one-shot
+    /// debug probe, not for any hot path.
+    #[doc(hidden)]
+    pub fn debug_dep_graph_stats(&self) -> DepGraphStats {
+        let cell_deps = self.cell_dependents.borrow();
+        let mut total_point_edges: u64 = 0;
+        let mut max_fanout: u32 = 0;
+        for set in cell_deps.values() {
+            let len = set.len() as u32;
+            total_point_edges = total_point_edges.saturating_add(len as u64);
+            if len > max_fanout {
+                max_fanout = len;
+            }
+        }
+
+        let range_deps = self.range_dependents.borrow();
+        let total_range_entries = range_deps.len() as u64;
+        // Count how many distinct formula addresses have at least one
+        // range dep registered. The `formula_cells` map holds a
+        // `FormulaRecord` per formula; we count those whose
+        // `range_deps` set is non-empty.
+        let range_formula_count = self
+            .formula_cells
+            .values()
+            .filter(|record| !record.range_deps.borrow().is_empty())
+            .count() as u64;
+
+        DepGraphStats {
+            formula_count: self.formula_cells.len() as u64,
+            total_point_dep_edges: total_point_edges,
+            total_range_dep_entries: total_range_entries,
+            max_fanout,
+            range_formula_count,
+        }
+    }
+
+    /// Number of addresses that appear as a key in `cell_dependents`,
+    /// i.e. the count of distinct source cells with at least one
+    /// formula depending on them. Phase 1 probe helper used by the
+    /// WASM-side `debug_dep_graph_stats` to compute `avg_fanout`
+    /// (= total_point_dep_edges / this).
+    #[doc(hidden)]
+    pub fn debug_cell_dependents_key_count(&self) -> usize {
+        self.cell_dependents.borrow().len()
     }
 
     /// Return the original formula text for a cell, or `None` if the cell

@@ -19,7 +19,10 @@ pub use format::{
 };
 pub use formula::{parse_formula, BinOperator, Expr};
 pub use range::CellRange;
-pub use sheet::{CellSubscription, FormatRangeSnapshot, RangeFormatSnapshotLayer, Sheet, SheetError};
+pub use sheet::{
+    CellSubscription, DepGraphStats, FormatRangeSnapshot, RangeFormatSnapshotLayer, Sheet,
+    SheetError,
+};
 pub use shift::{render_formula, shift_refs};
 pub use undo::{CellSnapshot, Edit, UndoStack};
 pub use workbook::{Workbook, WorkbookError};
