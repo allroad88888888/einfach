@@ -103,13 +103,46 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 | `vanilla/excel-core-ts` | 30 | **1791** | ✅ |
 | `vanilla/spreadsheet-ui-core` | 53 | **774** | ✅ |
 | `solid/excel` | 58 | **843** | ✅ |
-| Total monorepo jest | — | **3681** | ✅ |
-| `cargo test --lib` (rust/excel-core) | — | **1396** + 3 ignored | ✅ |
-| `cargo test --tests` (integration suites) | — | all green (15+ suites) | ✅ |
-| `cargo test --lib` (rust/wasm) | — | 29+ | ✅ |
+| Total monorepo jest | 190 | **3693** | ✅ |
+| `cargo test --lib + --tests` (rust/excel-core) | — | **1728** + 3 ignored | ✅ |
+| `cargo test --lib` (rust/wasm) | — | 30+ | ✅ |
 | `tsc -b` | — | — | ✅ clean |
 | e2e WASM | 515 | **478 / 0 / 37** | ✅ all green |
 | e2e TS | 515 | **478 / 0 / 37** | ✅ Δ=0 vs WASM, all green |
+| Mega (1M) WASM bulkWrite | — | **11.4 s** (was 428 s, **38× faster**) | ✅ |
+| Ultra (5M cells) single-call | — | **54.6 s** at 2.9 GB peak RSS | ✅ |
+| `MAX_BULK_IMPORT_CELLS_PER_CALL` cap | — | **removed** | ✅ |
+
+### Lazy formula indexing — Rust core philosophy realignment (2026-06-11)
+
+einfach is a lazy atom-based state library, but `Sheet::bulk_load`
+eagerly parsed every formula, extracted point + range deps, and built
+`cell_dependents` / `range_dependents` / `FormulaRecord` at import.
+Codex's 2026-06-11 review attributed the Mega-tier 470× gap
+(TS 908ms vs WASM 428s) to "eager Rust formula/dependency installation"
+— not host chunking, not the 750k cap. The cap was a symptom.
+
+**Result**: 5-phase refactor restoring `bulk_load` to the lazy contract
+the runtime already documents. Single-call Ultra (5M cells) now works.
+
+| Phase | Commits | Outcome |
+|---|---|---|
+| RFC | `d246c53` | Plan doc |
+| 1 — instrument + edge-count | `ffe4feb` `5744175` `54d42cd` `5766333` | 500k formulas = 103M point edges, dep_register 58% of flush |
+| 2+3 — lazy `bulk_load` + read-path hydrate | `40bc473` | 500k flush 13834→340ms (40×); Mega 428→11.7s (36×) |
+| Codex review fixups | `7d0e380` | 2 P1 + 2 P2 + 1 bonus range-dep edge case |
+| 5 — Ultra bench + cap removal | `8a2f7f3` `d0eb0da` `3948b27` | 5M single-call works (2.9 GB peak); 750k cap deleted |
+
+The `MAX_BULK_IMPORT_CELLS_PER_CALL = 750_000` constant, the
+`check_bulk_import_payload_size` function, and all 4 call sites
+(`bulk_import_cells`, `bulk_import_cells_instrumented`, `restore_sparse`,
+`restore_persistence_v1`) are gone. Engine self-consistent now:
+**lazy build matches lazy eval**.
+
+Phase 1 trace + Ultra measurements live at
+`rust/excel-core/docs/MEGA_TRACE_2026-06-11.md` and
+`rust/excel-core/docs/CAP_REMOVAL_2026-06-11.md`. Architecture decisions
+live at `rust/excel-core/docs/LAZY_FORMULA_INDEXING_PLAN.md`.
 
 ### Wave 8 + locale infrastructure (2026-06-11)
 

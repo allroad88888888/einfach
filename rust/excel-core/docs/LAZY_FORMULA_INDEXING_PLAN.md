@@ -1,6 +1,18 @@
 # Plan — Lazy Formula Indexing (Option E)
 
-Status: 2026-06-11 RFC, not yet implemented.
+Status: **2026-06-11 LANDED**. Phases 1, 2+3, 4 (implicit), 5 complete.
+Codex review caught 2 P1 + 2 P2 correctness regressions (`7d0e380`).
+Cap removed entirely. Mega bulkWrite 428s → 11.4s (38×). Ultra (5M
+cells, single call) works at 2.9 GB peak RSS.
+
+Original RFC preserved below for historical reference. Closure summary:
+
+- Phase 1 (instrument): `ffe4feb` + `5744175` + `54d42cd` + `5766333`
+- Phase 2+3 (lazy bulk_load + hydrate): `40bc473`
+- Codex review fixups: `7d0e380`
+- Phase 5 (cap removal): `8a2f7f3` + `d0eb0da` + `3948b27`
+
+Trace + measurements: `MEGA_TRACE_2026-06-11.md`, `CAP_REMOVAL_2026-06-11.md`.
 
 ## Why this exists
 
