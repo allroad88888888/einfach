@@ -1620,9 +1620,8 @@ impl Sheet {
     /// Look up the anchor address for a given anchor atom by reverse-scanning
     /// `cells`. Returns None if the anchor has been removed from `cells`
     /// (which shouldn't happen in normal flow — spill teardown clears
-    /// `spill_targets` first). Currently unused — kept for symmetry with
-    /// `spilled_into_anchor`, which performs the same lookup inline.
-    #[allow(dead_code)]
+    /// `spill_targets` first). Used by `teardown_all_spills` (AUDIT A-5)
+    /// to snapshot anchor addresses before a structural shift.
     fn anchor_address_for(&self, anchor_atom: AtomId) -> Option<CellAddress> {
         for (cell_addr, &cell_atom) in self.cells.iter() {
             if cell_atom == anchor_atom {
@@ -3652,11 +3651,20 @@ impl Sheet {
             // lets `retarget_formula_refs` walk the parsed AST and
             // rewrite refs through `f`, matching the eager-formula path.
             sheet.hydrate_all_lazy_formulas();
+            // AUDIT A-5: tear every spill down BEFORE the shift,
+            // re-derive surviving anchors after the retarget.
+            let spill_anchors = sheet.teardown_all_spills();
             sheet.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_row_insert(addr, at, count)
             });
             Self::shift_dimension_insert(&mut sheet.row_heights, at, count);
+            sheet.rederive_spill_anchors(
+                spill_anchors
+                    .into_iter()
+                    .map(|a| crate::shift::shift_addr_row_insert(a, at, count))
+                    .collect(),
+            );
         });
     }
 
@@ -3670,12 +3678,22 @@ impl Sheet {
             // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
             // `insert_row` for the rationale.
             sheet.hydrate_all_lazy_formulas();
+            // AUDIT A-5: teardown before drop+shift, re-derive after.
+            // Anchors inside the deleted band map to the REF_INVALID
+            // sentinel and are skipped by `rederive_spill_anchors`.
+            let spill_anchors = sheet.teardown_all_spills();
             sheet.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
             sheet.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_row_delete(addr, at, count)
             });
             Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
+            sheet.rederive_spill_anchors(
+                spill_anchors
+                    .into_iter()
+                    .map(|a| crate::shift::shift_addr_row_delete(a, at, count))
+                    .collect(),
+            );
         });
     }
 
@@ -3686,11 +3704,19 @@ impl Sheet {
         self.with_structural_edit(|sheet| {
             // Codex P1 #1 fix: hydrate BEFORE relocate. See `insert_row`.
             sheet.hydrate_all_lazy_formulas();
+            // AUDIT A-5: teardown before the shift, re-derive after.
+            let spill_anchors = sheet.teardown_all_spills();
             sheet.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_col_insert(addr, at, count)
             });
             Self::shift_dimension_insert(&mut sheet.col_widths, at, count);
+            sheet.rederive_spill_anchors(
+                spill_anchors
+                    .into_iter()
+                    .map(|a| crate::shift::shift_addr_col_insert(a, at, count))
+                    .collect(),
+            );
         });
     }
 
@@ -3702,12 +3728,20 @@ impl Sheet {
             // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
             // `insert_row` for the rationale.
             sheet.hydrate_all_lazy_formulas();
+            // AUDIT A-5: teardown before drop+shift, re-derive after.
+            let spill_anchors = sheet.teardown_all_spills();
             sheet.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
             sheet.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
             sheet.retarget_formula_refs(&|addr| {
                 crate::shift::shift_addr_col_delete(addr, at, count)
             });
             Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
+            sheet.rederive_spill_anchors(
+                spill_anchors
+                    .into_iter()
+                    .map(|a| crate::shift::shift_addr_col_delete(a, at, count))
+                    .collect(),
+            );
         });
     }
 
@@ -3726,6 +3760,48 @@ impl Sheet {
             self.needs_parse.borrow().iter().copied().collect();
         for addr in lazy_addrs {
             self.hydrate_formula(addr);
+        }
+    }
+
+    /// AUDIT A-5 — snapshot and tear down every active spill ahead of a
+    /// structural shift. `spill_targets` stores target *addresses* keyed
+    /// by anchor *atom id*; neither survives `relocate_cells` coherently
+    /// (the audit's stale-bookkeeping panic). Instead of remapping keys,
+    /// the chosen design tears everything down pre-shift and re-derives
+    /// surviving anchors post-shift (`rederive_spill_anchors`), so spills
+    /// always re-flow contiguously from the (possibly shifted) anchor —
+    /// Excel's recompute-after-structural-edit contract.
+    ///
+    /// Returns the pre-shift anchor addresses. `clear_spill` removes the
+    /// derived target atoms; each anchor's primitive (holding the
+    /// `Value::Array`) stays in `cells` and is shifted by
+    /// `relocate_cells` like any other primitive.
+    fn teardown_all_spills(&mut self) -> Vec<CellAddress> {
+        let anchor_atoms: Vec<AtomId> = self.spill_targets.keys().copied().collect();
+        let mut anchors = Vec::with_capacity(anchor_atoms.len());
+        for anchor_atom in anchor_atoms {
+            if let Some(addr) = self.anchor_address_for(anchor_atom) {
+                anchors.push(addr);
+            }
+            self.clear_spill(anchor_atom);
+        }
+        anchors
+    }
+
+    /// AUDIT A-5 — re-run the eager array-formula maintenance at each
+    /// (already shifted) anchor address after a structural edit.
+    /// Addresses mapped into the deleted band carry the `REF_INVALID`
+    /// sentinel and are skipped; anchors whose formula record was
+    /// dropped by `drop_cells_in` are no-ops inside
+    /// `recompute_array_formula`.
+    fn rederive_spill_anchors(&mut self, shifted_anchors: Vec<CellAddress>) {
+        for addr in shifted_anchors {
+            if addr.row == crate::shift::REF_INVALID_ROW
+                || addr.col == crate::shift::REF_INVALID_COL
+            {
+                continue;
+            }
+            self.recompute_array_formula(addr);
         }
     }
 
@@ -4056,6 +4132,19 @@ impl<'a> BulkLoader<'a> {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         let is_null = matches!(value, Value::Null);
 
+        // AUDIT A-4 — spill parity with the single-cell mutators
+        // (`Sheet::set_cell` / `try_set_cell`): a write to a non-anchor
+        // spill TARGET is skipped (the array stays intact; Excel treats
+        // Delete over the ghost cells of a dynamic array as a no-op),
+        // and a write to a spill ANCHOR tears the spill down before
+        // proceeding. Without the guard, `ensure_cell` below returns
+        // the read-only derived spill-target atom and `store.set`
+        // panics.
+        if self.sheet.spilled_into_anchor(addr).is_some() {
+            return;
+        }
+        self.sheet.clear_spill_at_address(addr);
+
         // Detach the fanout for this address so the store-level `set` below
         // does not synchronously fire subscribers. `flush` will reattach and
         // notify exactly once per subscribed touched/dirty address.
@@ -4102,6 +4191,16 @@ impl<'a> BulkLoader<'a> {
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        // AUDIT A-4 — spill parity with `Sheet::try_set_formula`
+        // (`:2331/:2336`): reject writes on a non-anchor spill target
+        // (array stays intact), tear down the spill when overwriting
+        // the anchor. Runs BEFORE the parse check so the
+        // `write_error_no_notify` parse-failure path below can never
+        // `store.set` a read-only derived spill-target atom.
+        if self.sheet.spilled_into_anchor(addr).is_some() {
+            return false;
+        }
+        self.sheet.clear_spill_at_address(addr);
         // Codex P2 #2 fix: validate parseability up front. If the source
         // does not parse, materialise `#VALUE!` immediately (matching
         // legacy eager behavior) and return `false` — DO NOT park
@@ -4161,6 +4260,16 @@ impl<'a> BulkLoader<'a> {
     /// outside the bulk-load contract are preserved by D1=4A
     /// (`Sheet::set_formula` keeps its eager parse).
     fn set_formula_lazy(&mut self, addr: CellAddress, formula_text: String) -> bool {
+        // AUDIT A-4 — same spill guard as `set_formula`, repeated here
+        // so the `set_formula_pre_parsed` entry point (used by
+        // `Workbook::bulk_load`) is covered too. `clear_spill_at_address`
+        // is idempotent, so the double call on the `set_formula` route
+        // is harmless.
+        if self.sheet.spilled_into_anchor(addr).is_some() {
+            return false;
+        }
+        self.sheet.clear_spill_at_address(addr);
+
         // Detach fanout so any prior-formula / primitive-scaffold
         // teardown below does not double-fire through the listener.
         self.sheet.detach_address_sub(addr);
@@ -4528,6 +4637,17 @@ impl<'a> BulkLoader<'a> {
                 }
             }
         }
+
+        // AUDIT A-4 — eager spill maintenance over the dirty closure,
+        // mirroring the `recompute_array_formulas_in(&dirtied)` tail of
+        // the single-cell mutators: a bulk dependency write must
+        // re-flow downstream dynamic arrays at flush (grow/shrink the
+        // spill, release vacated targets). `dirty` only ever contains
+        // already-registered formula addresses (lazy-parked formulas
+        // have no dep edges until first read), so the lazy bulk-import
+        // contract — zero parse / zero eval for freshly loaded
+        // formulas — is preserved.
+        self.sheet.recompute_array_formulas_in(&dirty);
 
         // Reattach fanouts on touched addresses so future writes notify
         // normally. Reattach is a no-op when the address has no

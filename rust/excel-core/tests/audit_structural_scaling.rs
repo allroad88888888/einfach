@@ -6,8 +6,9 @@
 //! lands. Each test's doc comment states what the CORRECT behavior
 //! would be; when a fix lands, flip the assertion.
 //!
-//! Status: A-6 / A-7 pins FLIPPED to the fixed behavior (W1.2 fix arc,
-//! see tests/cross_sheet_propagation.rs).
+//! Status: A-4 / A-5 pins FLIPPED to the fixed behavior (W1.1 fix arc,
+//! see tests/spill_structural.rs). A-6 / A-7 pins FLIPPED to the fixed
+//! behavior (W1.2 fix arc, see tests/cross_sheet_propagation.rs).
 //!
 //! Timing benches are `#[ignore]`d — run with:
 //!   cargo test --release --test audit_structural_scaling -- --ignored --nocapture
@@ -145,76 +146,69 @@ fn bench_clear_range_one_cell_scales_with_sheet_size() {
 }
 
 // =====================================================================
-// Finding A4 (P-D, P1): clear_range routes through BulkLoader::set_cell,
-// which has NO spill awareness: no spilled_into_anchor rejection, no
-// clear_spill_at_address teardown. When the cleared range covers a
-// spill region, the loader's `ensure_cell` hands back the READ-ONLY
-// derived spill-target atom and `store.set` on it PANICS
-// (`core/src/store.rs:315 "cannot set a read-only derived atom"`).
-// A Delete-key clear over any spill range aborts the engine.
+// Finding A4 (P-D, P1) — FIXED. clear_range routes through
+// BulkLoader::set_cell, which is now spill-aware: a non-anchor spill
+// TARGET write is skipped (array intact, single-cell parity with
+// try_set_cell's SpillCellWrite rejection) and an ANCHOR write tears
+// the spill down first. Pin flipped from the panic to the fixed
+// behavior; the full semantics matrix lives in
+// tests/spill_structural.rs.
 // =====================================================================
 
 #[test]
-fn audit_clear_range_over_spill_region_panics() {
-    let result = std::panic::catch_unwind(|| {
-        let mut sheet = Sheet::new();
-        assert!(sheet.set_formula("A1", "=SEQUENCE(3)"));
-        assert_eq!(sheet.get_cell("A2"), Value::Number(2.0), "spill landed");
-        // Clear the whole spill region through the range path.
-        sheet.clear_range(range("A1", "A3"))
-    });
-    // CORRECT behavior: Ok(3) and an empty, writable region.
-    // CURRENT behavior (pinned): panic on the first spill-target write.
-    assert!(
-        result.is_err(),
-        "AUDIT PIN (P-D/P1): clear_range over a spill region panics in \
-         Store::set (read-only derived atom). When fixed, this should \
-         return Ok and the region should be writable."
-    );
+fn audit_clear_range_over_spill_region_clears_cleanly() {
+    let mut sheet = Sheet::new();
+    assert!(sheet.set_formula("A1", "=SEQUENCE(3)"));
+    assert_eq!(sheet.get_cell("A2"), Value::Number(2.0), "spill landed");
+    // Clear the whole spill region through the range path. Pre-fix this
+    // panicked in Store::set (read-only derived spill-target atom).
+    let cleared = sheet.clear_range(range("A1", "A3"));
+    assert_eq!(cleared, 3, "anchor + both targets visited");
+    for a in ["A1", "A2", "A3"] {
+        assert_eq!(sheet.get_cell(a), Value::Null, "{a} must be empty");
+    }
+    // Region is writable again.
+    assert!(sheet.try_set_cell("A2", Value::Number(5.0)).is_ok());
 }
 
 // =====================================================================
-// Finding A5 (P-D, P1): structural edits relocate `cells` /
-// formula maps / formats but NOT `spill_targets` (whose values are
-// target ADDRESSES). After insert_row above a spill, the bookkeeping
-// points at the pre-shift addresses:
-//   - a write to the REAL (shifted) bottom target misses the
-//     spilled_into_anchor guard, `ensure_cell` returns the relocated
-//     read-only derived atom, and `store.set` PANICS;
-//   - a write to the (shifted) ANCHOR is wrongly rejected with
-//     SpillCellWrite (the stale target list claims the anchor address
-//     is a target).
+// Finding A5 (P-D, P1) — FIXED. Structural edits now tear every spill
+// down before the address shift and re-derive surviving anchors
+// afterwards, so the spill bookkeeping always matches the post-shift
+// addresses. Pin flipped from the stale-bookkeeping behavior (anchor
+// overwrite wrongly rejected; target write panicked in Store::set) to
+// the fixed behavior; the full insert/delete row/col matrix lives in
+// tests/spill_structural.rs.
 // =====================================================================
 
 #[test]
-fn audit_insert_row_does_not_relocate_spill_targets() {
+fn audit_insert_row_relocates_spill_targets() {
     let mut sheet = Sheet::new();
     assert!(sheet.set_formula("A1", "=SEQUENCE(3)"));
     assert_eq!(sheet.get_cell("A3"), Value::Number(3.0), "spill landed");
 
     sheet.insert_row(0, 1); // spill now occupies A2:A4 (anchor A2)
 
-    // Pinned: overwriting the anchor (legal — replaces the array) is
-    // rejected because the stale target list still names A2 a target.
-    let anchor_write = sheet.try_set_cell("A2", Value::Number(9.0));
+    // Write to the real (shifted) bottom target: clean SpillCellWrite
+    // rejection at the NEW anchor address — pre-fix this panicked on
+    // the read-only derived atom.
+    let target_write = sheet.try_set_cell("A4", Value::Number(7.0));
     assert!(
-        anchor_write.is_err(),
-        "AUDIT PIN (P-D/P1): anchor overwrite wrongly rejected after \
-         insert_row — spill_targets was not relocated. When fixed, \
-         this should be is_ok()."
+        matches!(
+            target_write,
+            Err(einfach_excel_core::SheetError::SpillCellWrite { anchor })
+                if anchor == addr("A2")
+        ),
+        "target write must be rejected against the shifted anchor, got {target_write:?}"
     );
 
-    // Pinned: writing to the real bottom target (A4) bypasses the
-    // spill guard entirely and panics on the read-only derived atom.
-    let target_write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        sheet.try_set_cell("A4", Value::Number(7.0))
-    }));
-    assert!(
-        target_write.is_err(),
-        "AUDIT PIN (P-D/P1): write to a live spill target panics in \
-         Store::set after insert_row. When fixed, this should return \
-         Ok(Err(SpillCellWrite)) without panicking."
-    );
+    // Overwriting the shifted anchor is legal — replaces the array.
+    // Pre-fix this was wrongly rejected (stale target list named A2 a
+    // target).
+    assert!(sheet.try_set_cell("A2", Value::Number(9.0)).is_ok());
+    assert_eq!(sheet.get_cell("A2"), Value::Number(9.0));
+    assert_eq!(sheet.get_cell("A3"), Value::Null);
+    assert_eq!(sheet.get_cell("A4"), Value::Null);
 }
 
 // =====================================================================
