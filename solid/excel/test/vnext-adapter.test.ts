@@ -3703,3 +3703,223 @@ describe('vnext adapter', () => {
     backend.dispose()
   })
 })
+
+describe('static backend undo/redo (reverse-delta history, audit D-2)', () => {
+  async function readCellDisplay(
+    backend: ReturnType<typeof createStaticSpreadsheetBackend>,
+    sheetId: string,
+    row: number,
+    col: number,
+  ): Promise<string | undefined> {
+    const result = await backend.readRangeProjection(
+      createRangeProjectionRequest({
+        sheetId,
+        requestId: 999,
+        reason: 'test',
+        range: { rowStart: row, rowEnd: row, colStart: col, colEnd: col },
+      }),
+    )
+    return result.cells.find((c) => c.row === row && c.col === col)?.displayValue
+  }
+
+  function undoReq(id = 't-1') {
+    return { kind: 'undo-transaction' as const, transactionId: id }
+  }
+  function redoReq(id = 't-1') {
+    return { kind: 'redo-transaction' as const, transactionId: id }
+  }
+
+  it('undo restores the before-value of a single-cell edit; redo reapplies it', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['old']] })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 0,
+      col: 0,
+      input: 'new',
+    })
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('new')
+
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('old')
+
+    await backend.redoTransaction!(redoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('new')
+
+    // Undo again — deltas must survive a full undo→redo→undo cycle.
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('old')
+  })
+
+  it('undo restores a cell created on a previously empty coordinate (delete on undo)', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1 })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 3,
+      col: 3,
+      input: 'created',
+    })
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 3, 3)).toBeUndefined()
+  })
+
+  it('undo restores every cell removed by clearRange', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [
+        ['a', 'b'],
+        ['c', 'd'],
+      ],
+    })
+    await backend.clearRange!({
+      kind: 'clear-range',
+      sheetId: 'sheet-1',
+      range: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 },
+    })
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBeUndefined()
+
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('a')
+    expect(await readCellDisplay(backend, 'sheet-1', 1, 1)).toBe('d')
+  })
+
+  it('undo of a structural insertRows restores the original layout (full-sheet fallback)', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      matrix: [['top'], ['bottom']],
+    })
+    await backend.insertRows!({
+      kind: 'insert-rows',
+      sheetId: 'sheet-1',
+      rowIndex: 1,
+      count: 2,
+    })
+    expect(await readCellDisplay(backend, 'sheet-1', 3, 0)).toBe('bottom')
+
+    await backend.undoTransaction!(undoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 1, 0)).toBe('bottom')
+    expect(await readCellDisplay(backend, 'sheet-1', 3, 0)).toBeUndefined()
+
+    await backend.redoTransaction!(redoReq())
+    expect(await readCellDisplay(backend, 'sheet-1', 3, 0)).toBe('bottom')
+  })
+
+  it('undo removes a format applied by setFormatRange', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['x']] })
+    const range = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
+    await backend.setFormatRange!({
+      kind: 'set-format-range',
+      sheetId: 'sheet-1',
+      range,
+      format: { bold: true },
+    })
+    const formatted = await backend.readRangeProjection(
+      createRangeProjectionRequest({ sheetId: 'sheet-1', requestId: 1, reason: 'test', range }),
+    )
+    expect(formatted.cells[0]?.format?.bold).toBe(true)
+
+    await backend.undoTransaction!(undoReq())
+    const reverted = await backend.readRangeProjection(
+      createRangeProjectionRequest({ sheetId: 'sheet-1', requestId: 2, reason: 'test', range }),
+    )
+    expect(reverted.cells[0]?.format?.bold).toBeUndefined()
+  })
+
+  it('undo restores validation metadata mutated in place by setValidationRule', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['v']] })
+    const range = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
+    await backend.setValidationRule!({
+      kind: 'set-validation-rule',
+      sheetId: 'sheet-1',
+      range,
+      rule: { kind: 'list', values: ['a'], dropdown: true },
+      mode: 'warn',
+    })
+    const withRule = await backend.readRangeProjection(
+      createRangeProjectionRequest({ sheetId: 'sheet-1', requestId: 3, reason: 'test', range }),
+    )
+    expect(withRule.cells[0]?.validation).toBeDefined()
+
+    await backend.undoTransaction!(undoReq())
+    const reverted = await backend.readRangeProjection(
+      createRangeProjectionRequest({ sheetId: 'sheet-1', requestId: 4, reason: 'test', range }),
+    )
+    expect(reverted.cells[0]?.validation).toBeUndefined()
+  })
+
+  it('undo of deleteSheet restores the sheet, its cells, and sheet-scoped named ranges', async () => {
+    const backend = createStaticSpreadsheetBackend({
+      revision: 1,
+      sheets: ['Sheet1', 'Sheet2'],
+    })
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-2',
+      row: 0,
+      col: 0,
+      input: 'keep-me',
+    })
+    await backend.setNamedRange!({
+      kind: 'set-named-range',
+      name: 'OnTwo',
+      scope: { sheetId: 'sheet-2' },
+      refersTo: { kind: 'range', sheetId: 'sheet-2', address: 'A1' },
+    })
+    await backend.deleteSheet!({ kind: 'delete-sheet', sheetId: 'sheet-2' })
+    expect((await backend.listSheets!()).sheets.map((s) => s.id)).toEqual(['sheet-1'])
+
+    await backend.undoTransaction!(undoReq())
+    expect((await backend.listSheets!()).sheets.map((s) => s.id)).toEqual(['sheet-1', 'sheet-2'])
+    expect(await readCellDisplay(backend, 'sheet-2', 0, 0)).toBe('keep-me')
+    const names = await backend.listNamedRanges!({ kind: 'list-named-ranges' })
+    expect(names.names.map((n) => n.name)).toEqual(['OnTwo'])
+  })
+
+  it('a new mutation clears the redo stack', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['a']] })
+    const edit = (input: string) =>
+      backend.setCellInput({ kind: 'set-cell-input', sheetId: 'sheet-1', row: 0, col: 0, input })
+    await edit('b')
+    await backend.undoTransaction!(undoReq())
+    await edit('c')
+    await expect(backend.redoTransaction!(redoReq())).rejects.toThrow('nothing to redo')
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('c')
+  })
+
+  it('undo restores merge ranges removed by unmergeRange', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1, matrix: [['m', ''], ['', '']] })
+    const range = { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 1 }
+    await backend.mergeRange!({ kind: 'merge-range', sheetId: 'sheet-1', range })
+    await backend.unmergeRange!({ kind: 'unmerge-range', sheetId: 'sheet-1', range })
+
+    await backend.undoTransaction!(undoReq())
+    const projected = await backend.readRangeProjection(
+      createRangeProjectionRequest({ sheetId: 'sheet-1', requestId: 5, reason: 'test', range }),
+    )
+    expect(projected.cells.find((c) => c.row === 0 && c.col === 0)?.mergedSpan).toEqual({
+      rows: 2,
+      cols: 2,
+    })
+  })
+
+  it('history stays capped at 200 entries', async () => {
+    const backend = createStaticSpreadsheetBackend({ revision: 1 })
+    for (let i = 0; i <= 205; i += 1) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: 'sheet-1',
+        row: 0,
+        col: 0,
+        input: `v${i}`,
+      })
+    }
+    for (let i = 0; i < 200; i += 1) {
+      await backend.undoTransaction!(undoReq(`t-${i}`))
+    }
+    await expect(backend.undoTransaction!(undoReq('t-final'))).rejects.toThrow('nothing to undo')
+    // The 6 oldest entries fell off the cap: v0..v5 happened-before the
+    // retained window, so the floor value is v5.
+    expect(await readCellDisplay(backend, 'sheet-1', 0, 0)).toBe('v5')
+  })
+})

@@ -38,8 +38,9 @@
  *  - C-8  wire **FIXED** bulk import forwards typed `BulkTypedCellInput`
  *         entries — text that looks numeric/boolean/error survives the
  *         bulk path (no parseLiteral re-classification).
- *  - D-2  P-A  static-backend beginUndoableMutation deep-clones the WHOLE
- *         workbook on every undoable mutation (incl. each setCellInput).
+ *  - D-2  P-A  FIXED — static-backend history records per-mutation
+ *         reverse deltas (before-values of touched entries only); the
+ *         pin below now asserts O(change), not O(workbook).
  */
 
 import { describe, expect, test } from '@jest/globals'
@@ -624,7 +625,7 @@ describe('audit C-8 · wire-type · FIXED — bulk import preserves wire typing 
   })
 })
 
-describe('audit D-2 · P-A · static backend deep-clones the whole workbook per undoable mutation', () => {
+describe('audit D-2 · P-A · FIXED — static backend history is reverse deltas, not workbook clones', () => {
   function seededBackend(cellCount: number) {
     const cells = new Array(cellCount).fill(null).map((_, i) => ({
       row: Math.floor(i / 10),
@@ -650,7 +651,7 @@ describe('audit D-2 · P-A · static backend deep-clones the whole workbook per 
     return now() - t0
   }
 
-  test('single-cell setCellInput cost scales with TOTAL workbook size (snapshot per keystroke)', async () => {
+  test('single-cell setCellInput cost is O(change), not O(workbook) (reverse-delta history)', async () => {
     const edits = 20
     const small = seededBackend(50)
     const large = seededBackend(20_000)
@@ -660,14 +661,16 @@ describe('audit D-2 · P-A · static backend deep-clones the whole workbook per 
 
     // eslint-disable-next-line no-console
     console.log(
-      `[audit D-2] ${edits} x setCellInput: 50-cell book ${smallMs.toFixed(1)} ms ` +
+      `[audit D-2 FIXED] ${edits} x setCellInput: 50-cell book ${smallMs.toFixed(1)} ms ` +
         `vs 20k-cell book ${largeMs.toFixed(1)} ms (ratio ${(largeMs / Math.max(smallMs, 0.01)).toFixed(1)}x) ` +
-        '— beginUndoableMutation clones every cell of every sheet, cap 200 snapshots',
+        '— was 0.5 ms vs 57.3 ms (108x) when beginUndoableMutation deep-cloned the workbook',
     )
 
-    // Deliberately loose: editing one cell in a 20k-cell book must not be
-    // FASTER than in a 50-cell book if each edit deep-clones the state;
-    // the logged ratio is the real finding (≈ O(workbook) per keystroke).
-    expect(largeMs).toBeGreaterThanOrEqual(smallMs)
+    // FLIPPED PIN (was: largeMs >= smallMs, pinning the O(workbook)
+    // clone). History entries are now per-mutation reverse deltas — a
+    // single-cell edit records one before-value regardless of workbook
+    // size, so 20 edits at 20k cells must stay within ~2x of 50 cells
+    // (5 ms absolute floor absorbs sub-ms timer jitter).
+    expect(largeMs).toBeLessThan(Math.max(smallMs * 2, 5))
   })
 })

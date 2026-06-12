@@ -250,86 +250,368 @@ interface StaticBackendState {
   revision: ProjectionRevision
   /** BCP-47 workbook locale used by the projection-layer number-format pipeline. */
   workbookLocale?: string
-  /** LIFO snapshots of state-before-mutation for backend-side undo. */
-  undoStack: StateSnapshot[]
-  /** LIFO snapshots populated when undoing so redo can roll forward. */
-  redoStack: StateSnapshot[]
+  /** LIFO reverse deltas (state-before-mutation) for backend-side undo. */
+  undoStack: StateDelta[]
+  /** LIFO forward deltas populated when undoing so redo can roll forward. */
+  redoStack: StateDelta[]
+  /**
+   * The delta the in-flight mutation records into. Set by
+   * `beginUndoableMutation`; every record* helper writes here. Null
+   * outside mutations (recorders then no-op).
+   */
+  pendingDelta: StateDelta | null
 }
 
-interface StateSnapshot {
-  cellsBySheet: Map<string, Map<string, DisplayCell>>
-  cellFormatsBySheetId: Map<string, Map<string, SpreadsheetCellFormat>>
-  rangeFormatsBySheetId: Map<string, RangeFormatLayer[]>
-  conditionalFormatRulesBySheetId: Map<string, ConditionalFormatRuleEntry[]>
-  namedRanges: NamedRange[]
-  mergeRangesBySheetId: Map<string, CellRange[]>
-  rowHeightsBySheetId: Map<string, Map<number, number>>
-  colWidthsBySheetId: Map<string, Map<number, number>>
-  sheets: SpreadsheetSheetMetadata[]
+/**
+ * Reverse-delta history (audit D-2).
+ *
+ * `beginUndoableMutation` used to deep-clone EVERY cell of EVERY sheet
+ * (plus all format/merge/dimension tables) per undoable mutation —
+ * measured 108× slowdown per keystroke at 20k cells vs 50, and a
+ * steady-state memory of 200 × workbook. History entries are now
+ * before-value deltas scoped to exactly what the mutation touches
+ * (mirroring ui-core history's small-descriptor contract): undo applies
+ * the reverse delta and symmetrically captures a forward delta for redo.
+ *
+ * Cost is O(change) per mutation. Structural ops that genuinely rewrite
+ * a whole sheet (row/column shifts, removeRows, deleteSheet) use the
+ * labeled `fullSheet` fallback — O(one sheet), never O(workbook).
+ *
+ * All captured values are CLONES: some mutations (validation rules)
+ * mutate live cell objects in place, so a recorded before-value must
+ * not alias live state.
+ */
+interface FullSheetCapture {
+  cells: Map<string, DisplayCell>
+  cellFormats: Map<string, SpreadsheetCellFormat>
+  rangeFormats: RangeFormatLayer[]
+  conditionalFormatRules: ConditionalFormatRuleEntry[]
+  mergeRanges: CellRange[]
+  rowHeights: Map<number, number>
+  colWidths: Map<number, number>
+}
+
+interface SheetDelta {
+  /** Before-values per touched cell key; null = key was absent. */
+  cells?: Map<string, DisplayCell | null>
+  cellFormats?: Map<string, SpreadsheetCellFormat | null>
+  /** Whole-table before-clones for small per-sheet tables (bounded by op count, not cell count). */
+  rangeFormats?: RangeFormatLayer[]
+  conditionalFormatRules?: ConditionalFormatRuleEntry[]
+  mergeRanges?: CellRange[]
+  rowHeights?: Map<number, number | null>
+  colWidths?: Map<number, number | null>
+  /** Labeled O(one-sheet) fallback for structural ops. Supersedes the granular fields. */
+  fullSheet?: FullSheetCapture
+}
+
+interface StateDelta {
+  sheetDeltas: Map<string, SheetDelta>
+  namedRanges?: NamedRange[]
+  sheetsMeta?: SpreadsheetSheetMetadata[]
   revision: ProjectionRevision
 }
 
 const STATIC_BACKEND_UNDO_CAP = 200
 
-function takeStateSnapshot(state: StaticBackendState): StateSnapshot {
-  return {
-    cellsBySheet: new Map(
-      Array.from(state.cellsBySheet, ([k, v]) => [
-        k,
-        new Map(Array.from(v, ([cellKey, cell]) => [cellKey, cloneCell(cell)])),
-      ]),
-    ),
-    cellFormatsBySheetId: new Map(
-      Array.from(state.cellFormatsBySheetId, ([k, v]) => [k, new Map(v)]),
-    ),
-    rangeFormatsBySheetId: new Map(
-      Array.from(state.rangeFormatsBySheetId, ([k, v]) => [
-        k,
-        v.map((layer) => ({ range: { ...layer.range }, format: cloneFormat(layer.format) })),
-      ]),
-    ),
-    conditionalFormatRulesBySheetId: new Map(
-      Array.from(state.conditionalFormatRulesBySheetId, ([k, v]) => [
-        k,
-        v.map(cloneConditionalFormatRuleEntry),
-      ]),
-    ),
-    namedRanges: state.namedRanges.map(cloneNamedRange),
-    mergeRangesBySheetId: new Map(
-      Array.from(state.mergeRangesBySheetId, ([k, v]) => [k, v.map((r) => ({ ...r }))]),
-    ),
-    rowHeightsBySheetId: new Map(
-      Array.from(state.rowHeightsBySheetId, ([k, v]) => [k, new Map(v)]),
-    ),
-    colWidthsBySheetId: new Map(
-      Array.from(state.colWidthsBySheetId, ([k, v]) => [k, new Map(v)]),
-    ),
-    sheets: state.sheets.map((s) => ({ ...s })),
-    revision: state.revision,
-  }
-}
-
-function restoreStateSnapshot(state: StaticBackendState, snap: StateSnapshot): void {
-  state.cellsBySheet = snap.cellsBySheet
-  state.cellFormatsBySheetId = snap.cellFormatsBySheetId
-  state.rangeFormatsBySheetId = snap.rangeFormatsBySheetId
-  state.conditionalFormatRulesBySheetId = snap.conditionalFormatRulesBySheetId
-  state.namedRanges = snap.namedRanges
-  state.mergeRangesBySheetId = snap.mergeRangesBySheetId
-  state.rowHeightsBySheetId = snap.rowHeightsBySheetId
-  state.colWidthsBySheetId = snap.colWidthsBySheetId
-  state.sheets = snap.sheets
-  state.revision = snap.revision
+function cloneRangeFormatLayers(layers: readonly RangeFormatLayer[]): RangeFormatLayer[] {
+  return layers.map((layer) => ({ range: { ...layer.range }, format: cloneFormat(layer.format) }))
 }
 
 function beginUndoableMutation(state: StaticBackendState): void {
-  const snap = takeStateSnapshot(state)
-  state.undoStack.push(snap)
+  const delta: StateDelta = { sheetDeltas: new Map(), revision: state.revision }
+  state.pendingDelta = delta
+  state.undoStack.push(delta)
   if (state.undoStack.length > STATIC_BACKEND_UNDO_CAP) {
     state.undoStack.shift()
   }
   // Any forward-history is invalidated by a new mutation.
   state.redoStack = []
+}
+
+function pendingSheetDelta(state: StaticBackendState, sheetId: string): SheetDelta | null {
+  const delta = state.pendingDelta
+  if (!delta) return null
+  let sheet = delta.sheetDeltas.get(sheetId)
+  if (!sheet) {
+    sheet = {}
+    delta.sheetDeltas.set(sheetId, sheet)
+  }
+  // A full-sheet capture already covers every granular field.
+  return sheet.fullSheet ? null : sheet
+}
+
+function recordCellBefore(state: StaticBackendState, sheetId: string, key: string): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const cells = sheet.cells ?? (sheet.cells = new Map())
+  if (cells.has(key)) return // first touch wins
+  const cell = state.cellsBySheet.get(sheetId)?.get(key)
+  cells.set(key, cell ? cloneCell(cell) : null)
+}
+
+function recordCellsBeforeInRange(
+  state: StaticBackendState,
+  sheetId: string,
+  range: CellRange,
+): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const live = state.cellsBySheet.get(sheetId)
+  if (!live) return
+  const cells = sheet.cells ?? (sheet.cells = new Map())
+  for (const [key, cell] of live) {
+    if (!isCellInsideRange(cell, range)) continue
+    if (!cells.has(key)) cells.set(key, cloneCell(cell))
+  }
+}
+
+function recordCellFormatBefore(state: StaticBackendState, sheetId: string, key: string): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const formats = sheet.cellFormats ?? (sheet.cellFormats = new Map())
+  if (formats.has(key)) return
+  const format = state.cellFormatsBySheetId.get(sheetId)?.get(key)
+  formats.set(key, format ? cloneFormat(format) : null)
+}
+
+function recordCellFormatsBeforeInRange(
+  state: StaticBackendState,
+  sheetId: string,
+  range: CellRange,
+): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const live = state.cellFormatsBySheetId.get(sheetId)
+  if (!live) return
+  const formats = sheet.cellFormats ?? (sheet.cellFormats = new Map())
+  for (const [key, format] of live) {
+    const coord = parseKey(key)
+    if (!coord || !isCoordInsideRange(coord.row, coord.col, range)) continue
+    if (!formats.has(key)) formats.set(key, cloneFormat(format))
+  }
+}
+
+function recordRangeFormatsBefore(state: StaticBackendState, sheetId: string): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet || sheet.rangeFormats) return
+  sheet.rangeFormats = cloneRangeFormatLayers(state.rangeFormatsBySheetId.get(sheetId) ?? [])
+}
+
+function recordConditionalRulesBefore(state: StaticBackendState, sheetId: string): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet || sheet.conditionalFormatRules) return
+  sheet.conditionalFormatRules = (
+    state.conditionalFormatRulesBySheetId.get(sheetId) ?? []
+  ).map(cloneConditionalFormatRuleEntry)
+}
+
+function recordMergeRangesBefore(state: StaticBackendState, sheetId: string): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet || sheet.mergeRanges) return
+  sheet.mergeRanges = (state.mergeRangesBySheetId.get(sheetId) ?? []).map((r) => ({ ...r }))
+}
+
+function recordRowHeightBefore(state: StaticBackendState, sheetId: string, rowIndex: number): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const heights = sheet.rowHeights ?? (sheet.rowHeights = new Map())
+  if (heights.has(rowIndex)) return
+  heights.set(rowIndex, state.rowHeightsBySheetId.get(sheetId)?.get(rowIndex) ?? null)
+}
+
+function recordColWidthBefore(state: StaticBackendState, sheetId: string, colIndex: number): void {
+  const sheet = pendingSheetDelta(state, sheetId)
+  if (!sheet) return
+  const widths = sheet.colWidths ?? (sheet.colWidths = new Map())
+  if (widths.has(colIndex)) return
+  widths.set(colIndex, state.colWidthsBySheetId.get(sheetId)?.get(colIndex) ?? null)
+}
+
+function recordNamedRangesBefore(state: StaticBackendState): void {
+  const delta = state.pendingDelta
+  if (!delta || delta.namedRanges) return
+  delta.namedRanges = state.namedRanges.map(cloneNamedRange)
+}
+
+function recordSheetsMetaBefore(state: StaticBackendState): void {
+  const delta = state.pendingDelta
+  if (!delta || delta.sheetsMeta) return
+  delta.sheetsMeta = state.sheets.map((s) => ({ ...s }))
+}
+
+function captureFullSheet(state: StaticBackendState, sheetId: string): FullSheetCapture {
+  return {
+    cells: new Map(
+      Array.from(state.cellsBySheet.get(sheetId) ?? [], ([key, cell]) => [key, cloneCell(cell)]),
+    ),
+    cellFormats: new Map(
+      Array.from(state.cellFormatsBySheetId.get(sheetId) ?? [], ([key, format]) => [
+        key,
+        cloneFormat(format),
+      ]),
+    ),
+    rangeFormats: cloneRangeFormatLayers(state.rangeFormatsBySheetId.get(sheetId) ?? []),
+    conditionalFormatRules: (
+      state.conditionalFormatRulesBySheetId.get(sheetId) ?? []
+    ).map(cloneConditionalFormatRuleEntry),
+    mergeRanges: (state.mergeRangesBySheetId.get(sheetId) ?? []).map((r) => ({ ...r })),
+    rowHeights: new Map(state.rowHeightsBySheetId.get(sheetId) ?? []),
+    colWidths: new Map(state.colWidthsBySheetId.get(sheetId) ?? []),
+  }
+}
+
+function restoreFullSheet(
+  state: StaticBackendState,
+  sheetId: string,
+  capture: FullSheetCapture,
+): void {
+  // Ownership transfer is safe: a delta is applied at most once (popped
+  // from its stack) and the symmetric inverse is captured separately.
+  state.cellsBySheet.set(sheetId, capture.cells)
+  state.cellFormatsBySheetId.set(sheetId, capture.cellFormats)
+  state.rangeFormatsBySheetId.set(sheetId, capture.rangeFormats)
+  state.conditionalFormatRulesBySheetId.set(sheetId, capture.conditionalFormatRules)
+  state.mergeRangesBySheetId.set(sheetId, capture.mergeRanges)
+  state.rowHeightsBySheetId.set(sheetId, capture.rowHeights)
+  state.colWidthsBySheetId.set(sheetId, capture.colWidths)
+}
+
+function recordFullSheetBefore(state: StaticBackendState, sheetId: string): void {
+  const delta = state.pendingDelta
+  if (!delta) return
+  let sheet = delta.sheetDeltas.get(sheetId)
+  if (!sheet) {
+    sheet = {}
+    delta.sheetDeltas.set(sheetId, sheet)
+  }
+  if (sheet.fullSheet) return
+  sheet.fullSheet = captureFullSheet(state, sheetId)
+  // Full capture supersedes any granular records taken earlier.
+  delete sheet.cells
+  delete sheet.cellFormats
+  delete sheet.rangeFormats
+  delete sheet.conditionalFormatRules
+  delete sheet.mergeRanges
+  delete sheet.rowHeights
+  delete sheet.colWidths
+}
+
+function applyEntryDelta<V>(
+  live: Map<string, V>,
+  recorded: Map<string, V | null>,
+  cloneValue: (value: V) => V,
+): Map<string, V | null> {
+  const inverse = new Map<string, V | null>()
+  for (const [key, before] of recorded) {
+    const current = live.get(key)
+    inverse.set(key, current === undefined ? null : cloneValue(current))
+    if (before === null) {
+      live.delete(key)
+    } else {
+      live.set(key, before)
+    }
+  }
+  return inverse
+}
+
+function applyDimensionDelta(
+  live: Map<number, number>,
+  recorded: Map<number, number | null>,
+): Map<number, number | null> {
+  const inverse = new Map<number, number | null>()
+  for (const [index, before] of recorded) {
+    inverse.set(index, live.get(index) ?? null)
+    if (before === null) {
+      live.delete(index)
+    } else {
+      live.set(index, before)
+    }
+  }
+  return inverse
+}
+
+/**
+ * Apply a delta (restore its before-values) and return the symmetric
+ * inverse delta capturing the values being overwritten — undo produces
+ * the redo entry and vice versa.
+ */
+function applyStateDelta(state: StaticBackendState, delta: StateDelta): StateDelta {
+  const inverse: StateDelta = { sheetDeltas: new Map(), revision: state.revision }
+
+  if (delta.sheetsMeta) {
+    inverse.sheetsMeta = state.sheets.map((s) => ({ ...s }))
+    state.sheets = delta.sheetsMeta.map((s) => ({ ...s }))
+  }
+  if (delta.namedRanges) {
+    inverse.namedRanges = state.namedRanges.map(cloneNamedRange)
+    state.namedRanges = delta.namedRanges.map(cloneNamedRange)
+  }
+
+  for (const [sheetId, sheet] of delta.sheetDeltas) {
+    const inverseSheet: SheetDelta = {}
+
+    if (sheet.fullSheet) {
+      inverseSheet.fullSheet = captureFullSheet(state, sheetId)
+      restoreFullSheet(state, sheetId, sheet.fullSheet)
+    } else {
+      if (sheet.cells) {
+        inverseSheet.cells = applyEntryDelta(
+          getOrCreateSheetCells(state, sheetId),
+          sheet.cells,
+          cloneCell,
+        )
+      }
+      if (sheet.cellFormats) {
+        inverseSheet.cellFormats = applyEntryDelta(
+          getOrCreateCellFormats(state, sheetId),
+          sheet.cellFormats,
+          cloneFormat,
+        )
+      }
+      if (sheet.rangeFormats) {
+        inverseSheet.rangeFormats = cloneRangeFormatLayers(
+          state.rangeFormatsBySheetId.get(sheetId) ?? [],
+        )
+        state.rangeFormatsBySheetId.set(sheetId, cloneRangeFormatLayers(sheet.rangeFormats))
+      }
+      if (sheet.conditionalFormatRules) {
+        inverseSheet.conditionalFormatRules = (
+          state.conditionalFormatRulesBySheetId.get(sheetId) ?? []
+        ).map(cloneConditionalFormatRuleEntry)
+        state.conditionalFormatRulesBySheetId.set(
+          sheetId,
+          sheet.conditionalFormatRules.map(cloneConditionalFormatRuleEntry),
+        )
+      }
+      if (sheet.mergeRanges) {
+        inverseSheet.mergeRanges = (state.mergeRangesBySheetId.get(sheetId) ?? []).map((r) => ({
+          ...r,
+        }))
+        state.mergeRangesBySheetId.set(
+          sheetId,
+          sheet.mergeRanges.map((r) => ({ ...r })),
+        )
+      }
+      if (sheet.rowHeights) {
+        inverseSheet.rowHeights = applyDimensionDelta(
+          getDimensionMap(state.rowHeightsBySheetId, sheetId),
+          sheet.rowHeights,
+        )
+      }
+      if (sheet.colWidths) {
+        inverseSheet.colWidths = applyDimensionDelta(
+          getDimensionMap(state.colWidthsBySheetId, sheetId),
+          sheet.colWidths,
+        )
+      }
+    }
+
+    inverse.sheetDeltas.set(sheetId, inverseSheet)
+  }
+
+  state.revision = delta.revision
+  return inverse
 }
 
 function getOrCreateSheetCells(
@@ -443,6 +725,7 @@ function buildState(
     revision,
     undoStack: [],
     redoStack: [],
+    pendingDelta: null,
   }
 }
 
@@ -879,6 +1162,9 @@ function applyValidationRule(state: StaticBackendState, request: SetValidationRu
 
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
     for (let col = range.colStart; col <= range.colEnd; col += 1) {
+      // upsertBlankCell mutates the LIVE cell object in place — record
+      // the before-clone first (audit D-2).
+      recordCellBefore(state, request.sheetId, keyFor(row, col))
       const cell = upsertBlankCell(cells, row, col)
       cell.validation = { ...validation }
       changed += 1
@@ -898,6 +1184,7 @@ function clearValidationRule(
 
   for (const cell of cells.values()) {
     if (!isCellInsideRange(cell, range) || !cell.validation) continue
+    recordCellBefore(state, request.sheetId, keyFor(cell.row, cell.col))
     delete cell.validation
     changed += 1
   }
@@ -1299,10 +1586,13 @@ function applyClearRange(state: StaticBackendState, request: ClearRangeRequest):
   let cleared = 0
 
   if (target === 'values' || target === 'all') {
+    recordCellsBeforeInRange(state, request.sheetId, request.range)
     cleared += clearRangeValues(getOrCreateSheetCells(state, request.sheetId), request.range)
   }
 
   if (target === 'formats' || target === 'all') {
+    recordCellFormatsBeforeInRange(state, request.sheetId, request.range)
+    recordRangeFormatsBefore(state, request.sheetId)
     cleared += clearRangeFormats(
       getOrCreateCellFormats(state, request.sheetId),
       getOrCreateRangeFormats(state, request.sheetId),
@@ -1340,6 +1630,8 @@ function applyFillRange(state: StaticBackendState, request: FillRangeRequest): n
       const sourceKey = keyFor(sourceCoord.row, sourceCoord.col)
       const sourceCell = sourceCells.get(sourceKey)
       const targetKey = keyFor(row, col)
+      recordCellBefore(state, request.sheetId, targetKey)
+      recordCellFormatBefore(state, request.sheetId, targetKey)
 
       if (sourceCell) {
         sheetCells.set(targetKey, {
@@ -1719,6 +2011,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setCellInput(request) {
       beginUndoableMutation(state)
+      recordCellBefore(state, request.sheetId, keyFor(request.row, request.col))
       updateCell(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
@@ -1736,6 +2029,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setCellRichValue(request) {
       beginUndoableMutation(state)
+      recordCellBefore(state, request.sheetId, keyFor(request.row, request.col))
       updateCellRichValue(getOrCreateSheetCells(state, request.sheetId), request)
       state.revision = bumpRevision(state.revision)
 
@@ -1755,6 +2049,7 @@ export function createStaticSpreadsheetBackend(
       beginUndoableMutation(state)
       const cells = getOrCreateSheetCells(state, request.sheetId)
       for (const cell of request.cells) {
+        recordCellBefore(state, request.sheetId, keyFor(cell.row, cell.col))
         updateCell(
           cells,
           {
@@ -1781,6 +2076,7 @@ export function createStaticSpreadsheetBackend(
       const cells = getOrCreateSheetCells(state, request.sheetId)
       for await (const chunk of request.chunks) {
         for (const cell of chunk) {
+          recordCellBefore(state, request.sheetId, keyFor(cell.row, cell.col))
           updateCell(
             cells,
             {
@@ -1822,6 +2118,7 @@ export function createStaticSpreadsheetBackend(
     },
     async insertRows(request) {
       beginUndoableMutation(state)
+      recordFullSheetBefore(state, request.sheetId)
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1841,6 +2138,7 @@ export function createStaticSpreadsheetBackend(
     },
     async deleteRows(request) {
       beginUndoableMutation(state)
+      recordFullSheetBefore(state, request.sheetId)
       shiftRows(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1860,6 +2158,7 @@ export function createStaticSpreadsheetBackend(
     },
     async insertColumns(request) {
       beginUndoableMutation(state)
+      recordFullSheetBefore(state, request.sheetId)
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1879,6 +2178,7 @@ export function createStaticSpreadsheetBackend(
     },
     async deleteColumns(request) {
       beginUndoableMutation(state)
+      recordFullSheetBefore(state, request.sheetId)
       shiftColumns(
         getOrCreateSheetCells(state, request.sheetId),
         getOrCreateCellFormats(state, request.sheetId),
@@ -1898,6 +2198,8 @@ export function createStaticSpreadsheetBackend(
     },
     async setFormatRange(request: SetFormatRangeRequest) {
       beginUndoableMutation(state)
+      recordCellFormatsBeforeInRange(state, request.sheetId, request.range)
+      recordRangeFormatsBefore(state, request.sheetId)
       const cellFormats = getOrCreateCellFormats(state, request.sheetId)
       const rangeFormats = getOrCreateRangeFormats(state, request.sheetId)
       clearCellFormatsInRange(cellFormats, request.range)
@@ -2057,6 +2359,7 @@ export function createStaticSpreadsheetBackend(
             // verbatim. Otherwise reuse the in-place setCellInput
             // helper so revision/value-kind invariants stay consistent.
             if (finalInput !== null) {
+              recordCellBefore(state, request.sheetId, tgtKey)
               updateCell(targetSheetCells, {
                 kind: 'set-cell-input',
                 sheetId: request.sheetId,
@@ -2068,6 +2371,7 @@ export function createStaticSpreadsheetBackend(
           }
 
           if (writeFormats) {
+            recordCellFormatBefore(state, request.sheetId, tgtKey)
             const effectiveFormat = getEffectiveFormat(
               srcRow,
               srcCol,
@@ -2124,6 +2428,7 @@ export function createStaticSpreadsheetBackend(
       const maxRow = unique[0]
 
       beginUndoableMutation(state)
+      recordFullSheetBefore(state, request.sheetId)
 
       const cells = getOrCreateSheetCells(state, request.sheetId)
       const cellFormats = getOrCreateCellFormats(state, request.sheetId)
@@ -2169,6 +2474,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setRowHeight(request: SetRowHeightRequest) {
       beginUndoableMutation(state)
+      recordRowHeightBefore(state, request.sheetId, request.rowIndex)
       getDimensionMap(state.rowHeightsBySheetId, request.sheetId).set(
         request.rowIndex,
         normalizeDimensionSize(request.heightPx),
@@ -2183,6 +2489,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setColumnWidth(request: SetColumnWidthRequest) {
       beginUndoableMutation(state)
+      recordColWidthBefore(state, request.sheetId, request.colIndex)
       getDimensionMap(state.colWidthsBySheetId, request.sheetId).set(
         request.colIndex,
         normalizeDimensionSize(request.widthPx),
@@ -2200,6 +2507,7 @@ export function createStaticSpreadsheetBackend(
     },
     async setNamedRange(request: SetNamedRangeRequest): Promise<NamedRangeMutationResult> {
       beginUndoableMutation(state)
+      recordNamedRangesBefore(state)
       setNamedRangeInState(state, request)
       state.revision = bumpRevision(state.revision)
       return {
@@ -2211,6 +2519,7 @@ export function createStaticSpreadsheetBackend(
       request: DeleteNamedRangeRequest,
     ): Promise<NamedRangeMutationResult> {
       beginUndoableMutation(state)
+      recordNamedRangesBefore(state)
       deleteNamedRangeFromState(state, request)
       state.revision = bumpRevision(state.revision)
       return {
@@ -2248,6 +2557,7 @@ export function createStaticSpreadsheetBackend(
       request: SetConditionalFormatRuleRequest,
     ): Promise<BackendMutationResult> {
       beginUndoableMutation(state)
+      recordConditionalRulesBefore(state, request.sheetId)
       setConditionalFormatRuleInState(state, request)
       state.revision = bumpRevision(state.revision)
       return mutationResult(request, state.revision, request.scope.range)
@@ -2256,6 +2566,7 @@ export function createStaticSpreadsheetBackend(
       request: RemoveConditionalFormatRuleRequest,
     ): Promise<BackendMutationResult> {
       beginUndoableMutation(state)
+      recordConditionalRulesBefore(state, request.sheetId)
       removeConditionalFormatRuleFromState(state, request)
       state.revision = bumpRevision(state.revision)
       return mutationResult(request, state.revision)
@@ -2275,6 +2586,7 @@ export function createStaticSpreadsheetBackend(
     },
     async mergeRange(request) {
       beginUndoableMutation(state)
+      recordMergeRangesBefore(state, request.sheetId)
       const range = normalizeRange(request.range)
       const ranges = getMergeRanges(state, request.sheetId)
       const nextRanges = ranges.filter((candidate) => !rangesIntersect(candidate, range))
@@ -2288,6 +2600,7 @@ export function createStaticSpreadsheetBackend(
     },
     async unmergeRange(request) {
       beginUndoableMutation(state)
+      recordMergeRangesBefore(state, request.sheetId)
       const range = normalizeRange(request.range)
       const ranges = getMergeRanges(state, request.sheetId)
       state.mergeRangesBySheetId.set(
@@ -2376,6 +2689,7 @@ export function createStaticSpreadsheetBackend(
         for (const [key, list] of byKey) {
           const cell = cells.get(key)
           if (!cell) continue
+          recordCellBefore(state, sheetId, key)
           // Decide which string to splice — formula text takes precedence
           // when present (mirroring `searchRange`'s `searchFormulas` path).
           const useFormula = cell.formula !== undefined
@@ -2428,6 +2742,7 @@ export function createStaticSpreadsheetBackend(
     },
     async addSheet(request) {
       beginUndoableMutation(state)
+      recordSheetsMetaBefore(state)
       const name = normalizeSheetMutationName(request.name, createNextSheetName(state.sheets))
       assertUniqueSheetName(state.sheets, name)
 
@@ -2450,6 +2765,7 @@ export function createStaticSpreadsheetBackend(
     },
     async renameSheet(request) {
       beginUndoableMutation(state)
+      recordSheetsMetaBefore(state)
       const name = normalizeSheetMutationName(request.name, '')
       if (name.length === 0) {
         throw new Error('sheet name cannot be empty')
@@ -2473,6 +2789,9 @@ export function createStaticSpreadsheetBackend(
     },
     async deleteSheet(request) {
       beginUndoableMutation(state)
+      recordSheetsMetaBefore(state)
+      recordNamedRangesBefore(state)
+      recordFullSheetBefore(state, request.sheetId)
       if (state.sheets.length <= 1) {
         throw new Error('cannot delete the last sheet')
       }
@@ -2508,6 +2827,7 @@ export function createStaticSpreadsheetBackend(
     },
     async reorderSheet(request: ReorderSheetRequest) {
       beginUndoableMutation(state)
+      recordSheetsMetaBefore(state)
       const sheet = state.sheets.find((item) => item.id === request.sheetId)
       if (!sheet) {
         throw new Error(`unknown sheet: ${request.sheetId}`)
@@ -2525,13 +2845,13 @@ export function createStaticSpreadsheetBackend(
       })
     },
     async undoTransaction(request) {
-      const snap = state.undoStack.pop()
-      if (!snap) {
+      const delta = state.undoStack.pop()
+      if (!delta) {
         throw new Error('nothing to undo')
       }
-      const current = takeStateSnapshot(state)
-      state.redoStack.push(current)
-      restoreStateSnapshot(state, snap)
+      state.pendingDelta = null
+      const forward = applyStateDelta(state, delta)
+      state.redoStack.push(forward)
       state.revision = bumpRevision(state.revision)
       return {
         transactionId: request.transactionId,
@@ -2540,13 +2860,13 @@ export function createStaticSpreadsheetBackend(
       }
     },
     async redoTransaction(request) {
-      const snap = state.redoStack.pop()
-      if (!snap) {
+      const delta = state.redoStack.pop()
+      if (!delta) {
         throw new Error('nothing to redo')
       }
-      const current = takeStateSnapshot(state)
-      state.undoStack.push(current)
-      restoreStateSnapshot(state, snap)
+      state.pendingDelta = null
+      const reverse = applyStateDelta(state, delta)
+      state.undoStack.push(reverse)
       state.revision = bumpRevision(state.revision)
       return {
         transactionId: request.transactionId,
