@@ -36,6 +36,19 @@ export interface FindCursorState {
   error?: SpreadsheetError
 }
 
+/**
+ * Replace-all cap surface (audit D-12). `pageMatches` is bounded at
+ * `MAX_FIND_PAGE` (500), so a replace-all over a larger result set only
+ * rewrites the current page. When that happens the host marks this
+ * 'capped' status so the dialog can tell the user "replaced first
+ * `replacedCount` of `totalCount` — run again for the rest" instead of
+ * silently leaving matches 501..N untouched.
+ */
+export interface ReplaceAllCapInfo {
+  replacedCount: number
+  totalCount: number
+}
+
 export interface FindRangeRequest extends SheetRef {
   kind: 'find-range'
   query: FindReplaceQuery

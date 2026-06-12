@@ -1,6 +1,11 @@
 import { atom } from '@einfach/core'
 import type { SpreadsheetError } from '../shared'
-import type { FindCursorState, FindReplaceQuery, SearchRangeResult } from './types'
+import type {
+  FindCursorState,
+  FindReplaceQuery,
+  ReplaceAllCapInfo,
+  SearchRangeResult,
+} from './types'
 
 export * from './types'
 
@@ -22,6 +27,16 @@ findReplaceCursorAtom.debugLabel = 'spreadsheet.findReplace.cursor'
 export const findReplaceOpenAtom = atom<boolean>(false)
 findReplaceOpenAtom.debugLabel = 'spreadsheet.findReplace.open'
 
+/**
+ * Non-null when the last replace-all hit the `MAX_FIND_PAGE` cap (audit
+ * D-12): only the first `replacedCount` of `totalCount` matches were
+ * rewritten. Cleared by `commitFindReplaceQueryAtom` (a fresh search
+ * supersedes the notice) and `closeFindReplaceAtom`. Hosts set it AFTER
+ * the post-replace re-search so the commit-time clear does not race it.
+ */
+export const replaceAllCappedAtom = atom<ReplaceAllCapInfo | null>(null)
+replaceAllCappedAtom.debugLabel = 'spreadsheet.findReplace.replaceAllCapped'
+
 export const openFindReplaceAtom = atom(
   null,
   (_get, set) => {
@@ -36,6 +51,7 @@ export const closeFindReplaceAtom = atom(
     set(findReplaceOpenAtom, false)
     set(findReplaceQueryAtom, null)
     set(findReplaceCursorAtom, { ...INITIAL_CURSOR })
+    set(replaceAllCappedAtom, null)
   },
 )
 closeFindReplaceAtom.debugLabel = 'spreadsheet.findReplace.close'
@@ -50,9 +66,18 @@ export const commitFindReplaceQueryAtom = atom(
       totalCount: 0,
       pageMatches: [],
     })
+    set(replaceAllCappedAtom, null)
   },
 )
 commitFindReplaceQueryAtom.debugLabel = 'spreadsheet.findReplace.commitQuery'
+
+export const markReplaceAllCappedAtom = atom(
+  null,
+  (_get, set, info: ReplaceAllCapInfo) => {
+    set(replaceAllCappedAtom, info)
+  },
+)
+markReplaceAllCappedAtom.debugLabel = 'spreadsheet.findReplace.markReplaceAllCapped'
 
 export const setFindMatchesAtom = atom(
   null,

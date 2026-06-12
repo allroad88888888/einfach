@@ -453,6 +453,7 @@ export const messages: Record<string, string> = {
   'findReplace.status.noMatches': '无匹配项',
   'findReplace.status.count': '{current} / {total}',
   'findReplace.replaceAll': '全部替换',
+  'findReplace.replaceAll.capped': '已替换前 {replaced} 个（共 {total} 个匹配），再次点击“全部替换”继续',
   'findReplace.replace': '替换',
   'findReplace.close': '关闭',
 

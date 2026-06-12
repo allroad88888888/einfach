@@ -10,6 +10,8 @@ import {
   EXCEL_MAX_ROWS,
   findReplaceCursorAtom,
   findReplaceOpenAtom,
+  markReplaceAllCappedAtom,
+  replaceAllCappedAtom,
   scrollToCellAtom,
   selectionSnapshotAtom,
   setFindMatchesAtom,
@@ -35,6 +37,7 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
   const backend = useSpreadsheetBackend()
   const isOpen = useAtomValue(findReplaceOpenAtom)
   const cursor = useAtomValue(findReplaceCursorAtom)
+  const replaceAllCapped = useAtomValue(replaceAllCappedAtom)
 
   const [activeTab, setActiveTab] = createSignal<FindReplaceTab>('find')
   const [needle, setNeedle] = createSignal('')
@@ -188,6 +191,10 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     const c = cursor()
     if (c.pageMatches.length === 0) return
     const sheetId = c.pageMatches[0].sheetId
+    // pageMatches is capped at MAX_FIND_PAGE (500) — a larger totalCount
+    // means this replace-all only rewrites the current page (audit D-12).
+    const replacedCount = c.pageMatches.length
+    const totalCount = c.totalCount
     try {
       await backend.replaceMatches({
         kind: 'replace-matches',
@@ -208,6 +215,11 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
     }
     await refreshVisibleProjection(store, backend, sheetId)
     await runSearch()
+    // Mark AFTER runSearch: commitFindReplaceQueryAtom clears the notice,
+    // so setting it here lets it survive until the next user-driven search.
+    if (totalCount > replacedCount) {
+      store.setter(markReplaceAllCappedAtom, { replacedCount, totalCount })
+    }
   }
 
   function statusText() {
@@ -390,6 +402,14 @@ export function SpreadsheetFindReplaceDialog(props: SpreadsheetFindReplaceDialog
         <div class="fr-status" data-testid="find-status-text" aria-live="polite">
           {statusText()}
         </div>
+        <Show when={replaceAllCapped()}>
+          <div class="fr-capped" data-testid="replace-all-capped-text" role="status">
+            {t('findReplace.replaceAll.capped', {
+              replaced: replaceAllCapped()?.replacedCount ?? 0,
+              total: replaceAllCapped()?.totalCount ?? 0,
+            })}
+          </div>
+        </Show>
         <Show when={errorText()}>
           <div class="fr-error" data-testid="find-error-text" role="alert">
             {errorText()}

@@ -8,7 +8,9 @@ import {
   findReplaceCursorAtom,
   findReplaceOpenAtom,
   findReplaceQueryAtom,
+  markReplaceAllCappedAtom,
   openFindReplaceAtom,
+  replaceAllCappedAtom,
   setFindMatchesAtom,
   setFindReplaceErrorAtom,
 } from '../src/find-replace'
@@ -132,5 +134,30 @@ describe('find-replace', () => {
     store.setter(commitFindReplaceQueryAtom, makeQuery('foo'))
     store.setter(setFindReplaceErrorAtom, new Error('backend failure'))
     expect(store.getter(findReplaceCursorAtom).status).toBe('error')
+  })
+
+  test('replaceAllCappedAtom starts null and markReplaceAllCappedAtom sets it (audit D-12)', () => {
+    const store = createStore()
+    expect(store.getter(replaceAllCappedAtom)).toBeNull()
+    store.setter(markReplaceAllCappedAtom, { replacedCount: MAX_FIND_PAGE, totalCount: 1234 })
+    expect(store.getter(replaceAllCappedAtom)).toEqual({
+      replacedCount: MAX_FIND_PAGE,
+      totalCount: 1234,
+    })
+  })
+
+  test('commitFindReplaceQueryAtom clears the replace-all capped notice', () => {
+    const store = createStore()
+    store.setter(markReplaceAllCappedAtom, { replacedCount: 500, totalCount: 800 })
+    store.setter(commitFindReplaceQueryAtom, makeQuery('foo'))
+    expect(store.getter(replaceAllCappedAtom)).toBeNull()
+  })
+
+  test('closeFindReplaceAtom clears the replace-all capped notice', () => {
+    const store = createStore()
+    store.setter(openFindReplaceAtom)
+    store.setter(markReplaceAllCappedAtom, { replacedCount: 500, totalCount: 800 })
+    store.setter(closeFindReplaceAtom)
+    expect(store.getter(replaceAllCappedAtom)).toBeNull()
   })
 })

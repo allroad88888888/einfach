@@ -474,6 +474,8 @@ export const messages: Record<string, string> = {
   'findReplace.status.noMatches': 'No matches',
   'findReplace.status.count': '{current} of {total}',
   'findReplace.replaceAll': 'Replace all',
+  'findReplace.replaceAll.capped':
+    'Replaced first {replaced} of {total} matches — run Replace all again for the rest',
   'findReplace.replace': 'Replace',
   'findReplace.close': 'Close',
 
