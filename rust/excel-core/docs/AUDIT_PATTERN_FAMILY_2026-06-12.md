@@ -34,8 +34,8 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 |---|---|---|---|
 | W2.1 | **A-1** (+ satellites A-2, A-3, A-9) insert_row = full hydrate + re-render + re-parse; 500k → 2.09 s and sheet turns eager forever — **FIXED** `0ca3a16` | Rust structural | Lazy retarget landed as sketched (option (a), textual rewrite at edit time): parked SOURCE TEXT shifted via token-level ref rewrite (`shift::rewrite_parked_source`, no parse, no hydration); hydrated entries install the `map_addrs` AST directly (render→re-parse killed) and skip reinstall when unchanged. 500k insert_row 2.09 s → **127 ms**, dep graph stays empty. `rebuild_cross_sheet_deps` gained the `!`-prefilter; `clear_range` dedups per visited address. Details + bench tables in § A-1/A-2/A-3. |
 | W2.2 | **C-1 + C-2** (+ C-6) TS port: whole-Map clone per edit (107 ms @1M) + flush re-evals every cached formula (503 ms @100k) + atom cache never evicts — **FIXED** `d98409c` (RFC `49d6f86`) | TS excel-core-ts (vanilla/core untouched) | Key-granular invalidation landed per `vanilla/excel-core-ts/docs/KEY_GRANULAR_INVALIDATION.md`: per-formula epoch atoms + workbook DepGraph (lazy hydrate-on-read dep install, TS mirror of `cell_dependents`/`range_dependents`), in-place storage + per-sheet `revisionAtom`, eviction on overwrite. setCell @1M: 107 ms → ~0.005 ms; @100k cached formulas: 503 ms/100k re-evals → ~0.005 ms/0 re-evals (re-evals == true dependents, pinned); C-6 drag gone. 1811 engine + 3720 monorepo tests, e2e `--project=ts` 480/0/37 green. |
-| W2.3 | **B-1** restores ride legacy per-cell loader (eager parse, no prefilter, double parse) | Rust wasm lib.rs | Route `restore_sparse` / `restore_persistence_v1` through `install_workbook_bulk` (they are fresh-shell semantics → full replace is correct). Mechanical; mirrors 6.3. |
-| W2.4 | **D-1 + C-4** clearRange dense coordinate loop (column delete ≈ 1M engine calls); no bulkClear primitive | engine + both runtimes | Add engine `clear_range` sparse primitive (iterate EXISTING cells in range, not coordinates); runtimes call it once. |
+| W2.3 | **B-1** restores ride legacy per-cell loader (eager parse, no prefilter, double parse) — **FIXED** `1d71ecf` | Rust wasm lib.rs | `restore_persistence_v1` routed through `install_workbook_bulk` (fresh shell → full replace is exactly right): records group into per-sheet primitive/formula maps (`sparse_cells_to_install_payload`, typed twin of the 6.3 conversion), ONE install call, formulas park lazy. 50k+50k native: 67.5 → 29.4 ms (0.67 → 0.29 µs/cell). `restore_sparse` deliberately STAYS legacy — its contract is an ADDITIVE merge (B-7; legacy sheet-store large-clear undo restores a range snapshot onto live content), now documented on the docstring. Full reroute needs the additive install variant 6.4 deferred. |
+| W2.4 | **D-1 + C-4** clearRange dense coordinate loop (column delete ≈ 1M engine calls); no bulkClear primitive — **FIXED** `e507222` | engine + both runtimes | TS engine gained `Workbook.clearRange(sheetId, range, target?)`: walks the live map's keys (O(existing), never O(area)), one `postWrite` batch, clearCell-parity target semantics, count matches WASM sparse `clear_range`. `worker-runtime-ts` clearRange is now ONE engine call; WASM runtime verified already-immune (single `clear_range` RPC, Rust walks `for_each_non_empty_in_range`). Full-column clear @100 cells: 0.1 ms. Spill pin: target-only clear touches nothing, anchor clear tears down (W1.1 mirror). |
 
 ### Wave 3 — P2 hygiene (batchable, after waves 1-2)
 
@@ -515,19 +515,29 @@ green (31 suites / 1811 tests) with the pins included.
   invalidate only formulas that reference names (needs a lazy
   name→dependents index, same shape as the Rust cross-sheet edge fix).
 
-#### C-4 · P-B · **P2** — per-cell `clearCell` loops in worker bulk paths
+#### C-4 · P-B · **P2** — per-cell `clearCell` loops in worker bulk paths — **FIXED**
 
-- `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` `clearRange`
+- **FIXED** (W2.2 `d98409c` + W2.4 `e507222`), in two halves:
+  - The per-call cost: W2.2's in-place storage removed the Map clone +
+    full flush from each `clearCell`. Re-measured: 100 `clearCell`
+    @100k cells = **0.2 ms total (0.002 ms/cell)**, was 513–525 ms
+    (5.1–5.3 ms/cell).
+  - The loop shape: W2.4 added the range-shaped bulk primitive
+    `Workbook.clearRange(sheetId, range, target?)` (O(existing cells in
+    rect), ONE `postWrite` batch — the fix sketch's `bulkClear`, range
+    form) and routed the `worker-runtime-ts` `clearRange` RPC through
+    it (see D-1).
+  - Residual: the `importCells` clears loop (`'null'` wires) still
+    calls `clearCell` per coordinate — bounded by explicit null wires
+    in the payload and cheap post-W2.2; a scattered-keys bulk variant
+    is not worth it until a workload shows it hot.
+- WAS: `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` `clearRange`
   (~line 693) and the `importCells` clears loop (~line 805) call
   `workbook.clearCell` once per cell; each call is a full Map clone
   (C-1) plus a full flush (C-2).
-- Measured: 100 `clearCell` calls on a 100k-cell sheet = **513–525 ms
-  total (5.1–5.3 ms/cell)**. A 100×100 `clearRange` at this sheet size
-  extrapolates to ~51 s.
-- Fix sketch: add a `bulkClear(sheetId, keys|range)` to the workbook
-  (one clone, N deletes, ONE atom write) and route both worker paths
-  through it — exactly what `bulkApply` already does for writes. Note
-  the `importCells` comment ("no batch primitive exists") names the gap.
+- Measured (pre-fix): 100 `clearCell` calls on a 100k-cell sheet =
+  **513–525 ms total (5.1–5.3 ms/cell)**. A 100×100 `clearRange` at
+  this sheet size extrapolates to ~51 s.
 
 #### C-5 · P-C · **P2** — `withBatch` throw path drops invalidation but keeps the mutation — **FIXED** (`a62927d`)
 
@@ -650,7 +660,7 @@ green (31 suites / 1811 tests) with the pins included.
 | severity | count | findings |
 |---|---|---|
 | P1 | 2 | C-1 (clone/edit) **FIXED**, C-2 (flush fan-out) **FIXED** |
-| P2 | 5 | C-3 (open, deliberate-broad documented), C-4 (open), C-5 **FIXED**, C-6 **FIXED**, C-8 (parked) |
+| P2 | 5 | C-3 (open, deliberate-broad documented), C-4 **FIXED** (importCells null-wire loop residual, cheap), C-5 **FIXED**, C-6 **FIXED**, C-8 (parked) |
 | P3 | 1 | C-7 (open) |
 
 Headline (P1s + C-6 resolved as of W2.2 `d98409c`): a keystroke on a
@@ -661,8 +671,10 @@ count == true dependent count, pinned), and overwritten formulas no
 longer leave drag (C-6). The TS port now matches the Rust engine at
 mutation time too: storage primary, per-cell reverse deps hydrated on
 read, dirty O(dependents). Remaining open items: C-3 (registry breadth,
-documented contract), C-4 (worker bulk-clear primitive — each per-cell
-clear is now cheap, but the loop shape remains), C-7, C-8.
+documented contract), C-7, C-8. C-4 closed by W2.4 (`e507222`): the
+range loop shape is gone too — `Workbook.clearRange` walks existing
+cells in ONE postWrite batch (importCells' bounded null-wire loop is
+the only, cheap, residual).
 
 ## D — UI core + worker adapters
 
@@ -678,8 +690,21 @@ worker runtimes, protocol client).
 
 ### Findings
 
-#### D-1 · P-A · **P1** — TS worker runtime `clearRange` iterates the dense rectangle
+#### D-1 · P-A · **P1** — TS worker runtime `clearRange` iterates the dense rectangle — **FIXED**
 
+- **FIXED** (W2.4, `e507222`): the runtime now makes ONE call to the
+  new engine primitive `Workbook.clearRange` (the fix sketch as
+  written: walk the sheet's sparse cell map filtered by bounds, one
+  batched propagation at the end — see C-4). Full-column clearRange
+  (rowEnd 1_048_575) on a 100-cell sheet: **0.1 ms, cleared=100**,
+  untouched columns survive; empty-sheet 200×50 clear returns 0. The
+  returned count now matches the WASM backend's sparse `clear_range`
+  (existing cells, not area). Spill pin added: clearing only
+  spill-target coords touches nothing (targets are virtual; anchor
+  keeps spilling), clearing the anchor tears the spill down — W1.1
+  parity. Pins flipped in `audit-adapter-scaling.test.ts`; engine
+  behavior tests in `vanilla/excel-core-ts/test/workbook.test.ts`.
+- WAS:
 - `solid/excel/src-vnext/adapter/worker-runtime-ts.ts:692-704` — nested
   `for row / for col` over the FULL request rectangle, one
   `workbook.clearCell` engine call per coordinate, regardless of whether
@@ -883,7 +908,7 @@ adapters' bulk-import spine — the part the Rust arcs already disciplined —
 is clean; the fan-out lives in the overlay/undo/clear edges the engine
 never sees.
 
-Severity count: **P1 ×1** (D-1) · **P2 ×6** (D-2, D-3, D-4, D-5, D-7,
+Severity count: **P1 ×1** (D-1 **FIXED** W2.4) · **P2 ×6** (D-2, D-3, D-4, D-5, D-7,
 D-8) · **P3 ×6** (D-6, D-9, D-10*, D-11, D-12, D-13) — *D-10 is P2 impact
 but already tracked in-code; counted at P3 to avoid double-reporting.
 
@@ -897,8 +922,26 @@ stale-value bug, B-4). Numbers: Apple Silicon, `cargo test --release`.
 
 ### Findings
 
-#### B-1 · P-B · **P1** — restores still ride the legacy per-cell loader
+#### B-1 · P-B · **P1** — restores still ride the legacy per-cell loader — **FIXED** (persistence path)
 
+- **FIXED** (W2.3, `1d71ecf`): `restore_persistence_v1` now groups its
+  records into per-sheet primitive/formula maps
+  (`sparse_cells_to_install_payload` in `rust/wasm/src/lib.rs`) and
+  installs them with ONE `install_workbook_bulk` call on the fresh
+  shell — no loader ceremony, no eager parse, no second parse at
+  hydration. Measured 50k+50k native release: 67.5 ms → 29.4 ms
+  (0.67 → 0.29 µs/cell). Pin:
+  `wasm_workbook_restore_persistence_v1_storage_primary_lazy` (dep
+  graph + eval count stay 0 across a 1k-formula restore); bench:
+  `bench_restore_persistence_v1_50k_plus_50k` (ignored, manual).
+- `restore_sparse` VERDICT: stays legacy, deliberately — caller audit
+  confirmed B-7's additive contract is load-bearing (legacy
+  `sheet-store.ts` `sparseRangeClear` undo restores a range snapshot
+  onto the LIVE workbook; vnext exposes the RPC but has no production
+  caller). Full-replace install would destroy unrelated content.
+  Contract now documented on the docstring; reroute would need the
+  additive install variant Phase 6.4 deferred.
+- Original finding:
 - `restore_sparse` / `restore_persistence_v1` route through
   `Workbook::bulk_load` + per-cell `WorkbookLoader` calls
   (`rust/wasm/src/lib.rs:3450` `restore_sparse_cells`), NOT the Phase 6
@@ -1047,8 +1090,13 @@ and fix sketch; no separate severity counted here.
   and the O(F) sledgehammer is documented in-code with the per-name
   reverse-index upgrade path. Watch-list only.
 
-#### B-7 · P-D · **P3** — `restore_sparse` is additive with no teardown
+#### B-7 · P-D · **P3** — `restore_sparse` is additive with no teardown — **RESOLVED** (contract documented)
 
+- **RESOLVED** (W2.3, `1d71ecf`): decided per the fix sketch's FIRST
+  option — the additive contract is documented on the `restore_sparse`
+  docstring (it is load-bearing for the legacy sheet-store's
+  large-range-clear undo), and B-1's reroute was scoped to
+  `restore_persistence_v1` only so the additive behavior is unchanged.
 - `restore_sparse` (`rust/wasm/src/lib.rs:3002`) applies records onto
   the LIVE workbook: no cell teardown, no subscription reset.
   `snapshot_sparse` walks only non-empty cells (`lib.rs:3391`) and
@@ -1109,5 +1157,7 @@ and fix sketch; no separate severity counted here.
 
 ### Severity tally
 
-**P1 ×2** (B-1, B-4) · **P2 ×1** (B-2) · **P3 ×4** (B-5, B-6, B-7,
-B-8) — B-3 corroborates A-1, not double-counted.
+**P1 ×2** (B-1 **FIXED** W2.3 persistence path, B-4 **FIXED** W1.3) ·
+**P2 ×1** (B-2) · **P3 ×4** (B-5 partially subsumed by B-1's reroute,
+B-6, B-7 **RESOLVED** documented-additive, B-8) — B-3 corroborates A-1,
+not double-counted.
