@@ -14,6 +14,235 @@ lazy-formula-indexing and storage-primary arcs
 
 Sections are appended per territory as audits land.
 
+## A — Structural ops (Rust)
+
+Audit date 2026-06-12. Read-only; repro pins live in
+`rust/excel-core/tests/audit_structural_scaling.rs` (5 always-on tests
+pinning CURRENT behavior — including the bugs — plus 3 `#[ignore]`d
+timing benches). Numbers below: Apple Silicon, `cargo test --release
+--test audit_structural_scaling -- --ignored --nocapture`. WASM hosts
+should expect a multi-x multiplier on top. `cargo test --lib` green
+(1396 tests) with the pins included.
+
+### Findings
+
+#### A-1 · P-A · **P1** — one `insert_row` hydrates + re-parses EVERY formula on the sheet
+
+- `sheet.rs:3654/3672/3688/3704` — all four structural ops
+  (`insert_row` / `delete_row` / `insert_col` / `delete_col`) start
+  with `hydrate_all_lazy_formulas()` (`:3724`), parse + dep-install for
+  every parked formula (the 7d0e380 codex fix for the self-cycle bug).
+  Then `relocate_cells` (`:3809`) rebuilds all six per-cell maps AND
+  calls `rebuild_all_formula_dependents` (`:1243`, full dep-graph clear
+  + re-add). Then `retarget_formula_refs` (`:3896`) walks EVERY
+  `formula_exprs` entry, AST-clones it via `map_addrs`, renders it back
+  to a string, and `rebuild_formula_lazy` (`:3922`) **re-parses the
+  string it just rendered** and re-installs deps — even for formulas
+  the shift left untouched.
+- Measured, one `insert_row(0,1)` on a lazy-bulk-loaded sheet:
+
+  | formulas | first insert | second insert (already hydrated) |
+  |---|---|---|
+  | 1k | 4.7–6.0 ms | 2.4–3.2 ms |
+  | 10k | 32 ms | 16–17 ms |
+  | 100k | 335–375 ms | 222–230 ms |
+  | 500k | **2.09 s** | **1.35 s** |
+
+  Perfectly linear in TOTAL formula count. At Mega tier (500k) the
+  import win the lazy arc bought (428 s → 0.6 s) is repaid on the FIRST
+  row insert — and the sheet is left fully hydrated/eager forever
+  after, so the lazy contract is permanently destroyed by one
+  structural edit. Pinned structurally (no timing) by
+  `audit_insert_row_hydrates_every_lazy_formula`:
+  `cell_dependents` goes 0 → N keys on one insert.
+- Fix sketch: don't hydrate. Relocate the parked `formula_source` text
+  keys (already done) and retarget lazily — either rewrite parked
+  source text only for formulas whose refs cross the edit boundary
+  (cheap textual A1-ref scan, no full parse), or park a per-sheet
+  pending shift transform that `hydrate_formula` applies at first read.
+  For already-hydrated formulas: install the `map_addrs` result
+  directly (kill the render→re-parse round trip, P-B) and skip the
+  rebuild entirely when the mapped AST is unchanged; make
+  `relocate_cells` patch dep-index keys instead of
+  `rebuild_all_formula_dependents`.
+
+#### A-2 · P-A · **P2** — `move_sheet` parses every lazy formula on every sheet
+
+- `workbook.rs:830` `move_sheet` → `rebuild_cross_sheet_deps`
+  (`:792`) → `for_each_lazy_formula` + `parse_formula` per parked
+  entry (`:813-819`), across ALL sheets — with **no `!`-prefilter**,
+  even though `install_sheet_bulk_inner` (`:1690-1696`) already ships
+  exactly that prefilter for the identical job.
+- Measured, one `move_sheet(0,1)` with zero cross-sheet formulas:
+  1k → 0.95 ms, 10k → 4.7 ms, 100k → 25.7 ms (linear; ~130 ms native /
+  est. ≥0.5 s wasm at Mega tier, per sheet-tab drag).
+- Fix sketch: copy the `!`-prefilter into `rebuild_cross_sheet_deps`
+  (one-line scan, skips ~100% of typical sheets). Better: key
+  `CrossSheetDeps` by sheet name or a stable sheet id instead of
+  position index, making `move_sheet` O(1) with no rebuild at all.
+
+#### A-3 · P-A · **P2** — clearing ONE cell is O(total formulas)
+
+- `sheet.rs:3348-3355` — `for_each_non_empty_in_range` builds its
+  `formula_keys` dedup `HashSet` from **all** `formula_cells` +
+  `formula_source` keys, regardless of how small the requested range
+  is. Both `Sheet::clear_range` (`:3367`) and `Workbook::clear_range`
+  (`workbook.rs:1233`) pay it, as does every other caller of the
+  range scan.
+- Measured, `clear_range(B1:B1)` (one cell): 1k → 135 µs, 10k →
+  523 µs, 100k → 3.6 ms, 500k → **22.8 ms** — linear in sheet size for
+  a single-cell clear.
+- Fix sketch: dedup per-visited-address instead of globally — for each
+  `cells.range_iter` hit, check `formula_cells.contains_key` +
+  `formula_source.contains_key` (two map probes per visited cell,
+  range-proportional) rather than materializing the global key set.
+
+#### A-4 · P-D · **P1** — `clear_range` over a spill region PANICS the engine
+
+- `sheet.rs:4055-4096` — `BulkLoader::set_cell` has zero spill
+  awareness: no `spilled_into_anchor` rejection, no
+  `clear_spill_at_address` teardown (both of which the sibling
+  `try_set_cell` path fires, `:2188/:2194`). `clear_range` routes every
+  cleared address through it (`:3371`). On a spill TARGET,
+  `ensure_cell` returns the existing read-only derived atom and
+  `store.set` panics (`core/src/store.rs:315 "cannot set a read-only
+  derived atom"`). `BulkLoader::flush` (`:4346`) also never runs
+  `recompute_array_formulas_in`, so bulk paths do no spill maintenance
+  at all.
+- Pinned by `audit_clear_range_over_spill_region_panics`:
+  `A1 = =SEQUENCE(3)`, then `clear_range(A1:A3)` → panic. User-visible:
+  select-and-Delete over any dynamic array aborts the WASM instance.
+- Fix sketch: in `BulkLoader::set_cell` / `set_formula_lazy`, mirror
+  the eager path's two checks (tear down the spill when the address is
+  an anchor; skip-or-collect-error when it is a non-anchor target), and
+  run `recompute_array_formulas_in(dirty)` at the end of `flush`.
+
+#### A-5 · P-D · **P1** — structural edits do not relocate `spill_targets`
+
+- `sheet.rs:3809-3891` — `relocate_cells` moves `cells`,
+  `formula_cells/exprs/texts`, `formula_source`, `needs_parse`,
+  `formats`, `range_formats`… but NOT `spill_targets`, whose values are
+  target **addresses**. After `insert_row(0,1)` above a `=SEQUENCE(3)`
+  spill (now at A2:A4): (a) writing the real bottom target A4 misses
+  the `spilled_into_anchor` guard and **panics** in `store.set`
+  (read-only derived atom); (b) overwriting the new anchor A2 — a legal
+  array-replace — is wrongly rejected `SpillCellWrite { anchor: A2 }`
+  because the stale list still names A2 a target.
+- Pinned by `audit_insert_row_does_not_relocate_spill_targets`.
+- Fix sketch: shift `spill_targets` values through the same `f(addr)`
+  inside `relocate_cells` (drop entries mapped to the `REF_INVALID`
+  sentinel), or simpler: tear down all spills before the edit and let
+  `recompute_array_formulas_in` re-install them inside
+  `with_structural_edit`.
+
+#### A-6 · P-C · **P1** — `remove_sheet` permanently kills ALL cross-sheet dirty/notify fanout
+
+- `workbook.rs:1521-1538` — `remove_sheet` replaces the whole
+  `CrossSheetDeps` with an empty graph. The comment claims "the next
+  workbook-routed `set_formula` call will repopulate edges from the
+  live formulas", but `set_formula` only adds edges for the formula
+  being set (`:996`) and `rebuild_cross_sheet_deps` is only ever called
+  by `move_sheet` (`:846`). Removing an UNRELATED sheet therefore
+  silently severs every existing cross-sheet formula's dirty + notify
+  fanout; reads stay correct only via the `has_any_cross_sheet_edges`
+  force-recompute latch, so a reactive host shows stale values until
+  some unrelated event repaints.
+- Pinned by `audit_remove_unrelated_sheet_kills_cross_sheet_notify`:
+  subscriber on `Sheet1!B1 = =Data!A1*2` fires before, never after,
+  removing a third `Scratch` sheet, while `get_cell` still reads 4.
+- Fix sketch: call `rebuild_cross_sheet_deps()` at the end of
+  `remove_sheet` (the rebuild already exists and handles index remap) —
+  O(all formulas) is acceptable for sheet removal, though it inherits
+  A-2's missing `!`-prefilter; or rewrite `(idx, addr)` keys in place.
+
+#### A-7 · P-C · **P2** — `rename_sheet` changes dependent values with zero propagation
+
+- `workbook.rs:768-783` — `rename_sheet` updates `names` / `by_name`
+  and stops. Formula ASTs/texts store sheet NAMES (`Expr::SheetRef {
+  sheet, .. }`), so `=Data!A1*2` keeps saying `Data` after the rename:
+  the dependent's value silently changes (10 → unresolved) with no
+  dirty-mark and no subscriber fire; and if a NEW sheet later takes the
+  old name, every stale formula silently rebinds to it. Excel rewrites
+  references on rename.
+- Pinned by `audit_rename_sheet_dependents_not_retargeted_or_notified`.
+- Fix sketch: walk `cross_sheet.formula_refs` (already a forward index,
+  O(cross-sheet formulas) not O(all formulas)) and rewrite
+  `SheetRef`/`SheetRange` names in AST + `formula_texts` (+ parked
+  `formula_source` via a text rewrite), then mark-dirty + fire each
+  rewritten formula. Alternative minimal fix: keep names stale but at
+  least dirty + notify the formulas that referenced the renamed sheet.
+
+#### A-8 · P-A · **P3** — `spilled_into_anchor` linear scans on every single-cell write
+
+- `sheet.rs:1602-1618` — every `try_set_cell` / `try_set_formula`
+  (`:2188/:2331`) scans ALL spill target lists; on a hit it
+  reverse-scans the ENTIRE `cells` map to find the anchor address.
+  Harmless with a handful of small spills (the Phase 1 assumption,
+  documented), but one `=SEQUENCE(100000)` makes every keystroke
+  O(100k) compares, and any write inside it O(total cells). Theoretical
+  until large spills are common; no repro pinned.
+- Fix sketch: maintain the reverse index `target_addr → anchor_addr`
+  alongside `spill_targets` (same insert/remove sites).
+
+#### A-9 · P-B · **P3** — `clear_range` round-trips every address through strings
+
+- `sheet.rs:3369-3373` / `workbook.rs:1238-1244` — the sparse scan
+  yields typed `CellAddress`es, which are `to_string()`-ed only to be
+  re-`parse`d inside `BulkLoader::set_cell` / `loader.clear_cell`. One
+  alloc + parse per cleared cell in a bulk path. Dwarfed by A-3 on the
+  same call; fold the fix together (add a typed-address loader entry
+  point).
+
+### Cleared paths
+
+- **Single-cell mutators** (`Sheet::try_set_cell` `:2186`,
+  `try_set_formula` `:2325`, `write_error`, `clear_cell`): work is
+  change-proportional — `mark_dependents_dirty` BFS over actual
+  dependents, eager array recompute gated by `expr_may_produce_array`
+  + prior-anchor check. No P-A (modulo A-8's scan). Spill teardown on
+  overwrite is present and ordered correctly.
+- **`remove_formula_record`** (`:1113`): post-codex it drains all seven
+  tables (`formula_source`, `needs_parse`, `formula_cells`, point deps,
+  range deps, `formula_exprs`, `formula_texts`). No P-D found.
+- **`drop_cells_in`** (`:3758`): post-codex it unions all three key
+  spaces (primitives, hydrated, lazy) before dropping; formats swept in
+  the same pass. Clean.
+- **`bulk_install_storage`** (`:1348-1438`): teardown covers cells,
+  all five formula tables, both dep indexes, `spill_targets` (targets
+  destroyed before anchors), and detach/reattach+notify of every
+  subscription. The only deliberate survivors are style state
+  (`formats` / `range_formats` / row heights / conditional rules) —
+  a content-vs-style contract choice, not a leak. Clean for P-D.
+- **`BulkLoader::flush`** (`:4346`): O(touched + dirty closure) with
+  scratch-amortized candidate buffers; notify deduped per address.
+  Clean for P-A/P-B (its gap is spill maintenance — see A-4).
+- **`batch_set` / `with_structural_edit` subscriber diffing**
+  (`:3956` / `:3737`): pre/post snapshots are O(subscription count)
+  (bounded by viewport), not sheet size. The per-address `peek_value`
+  can evaluate a formula chain, but only for subscribed addresses.
+- **`shift.rs`** (whole file): pure per-AST transforms; no whole-sheet
+  iteration lives here. The render path allocates per node
+  (`format!`), but the real cost is the caller applying it to every
+  formula (A-1), not the helpers.
+- **Sort / fill / copy-range engine paths**: none exist in
+  `excel-core` (no `fn sort` / `fn fill` / `copy_range`); `shift_refs`
+  is a helper for host-side paste, and `undo.rs` is a passive snapshot
+  stack whose replay goes through the audited mutators. Nothing to
+  audit.
+
+### Severity tally
+
+| severity | count | findings |
+|---|---|---|
+| P1 | 4 | A-1 (insert_row O(all formulas)), A-4 (clear_range panic), A-5 (spill_targets not relocated), A-6 (remove_sheet kills fanout) |
+| P2 | 3 | A-2 (move_sheet full parse), A-3 (1-cell clear O(sheet)), A-7 (rename_sheet silent) |
+| P3 | 2 | A-8, A-9 |
+
+Headline: one `insert_row` on a 500k-formula sheet costs **2.09 s**
+native (and ~1.35 s for every one after); `clear_range` over any
+dynamic-array spill **panics the engine**; removing an unrelated sheet
+**permanently silences** all cross-sheet subscriber notifications.
+
 ## C — TS port (vanilla/excel-core-ts + core store)
 
 Audit date 2026-06-12. Read-only; measurement pins live in
