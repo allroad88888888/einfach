@@ -6,6 +6,9 @@
 //! lands. Each test's doc comment states what the CORRECT behavior
 //! would be; when a fix lands, flip the assertion.
 //!
+//! Status: A-6 / A-7 pins FLIPPED to the fixed behavior (W1.2 fix arc,
+//! see tests/cross_sheet_propagation.rs).
+//!
 //! Timing benches are `#[ignore]`d — run with:
 //!   cargo test --release --test audit_structural_scaling -- --ignored --nocapture
 
@@ -215,12 +218,12 @@ fn audit_insert_row_does_not_relocate_spill_targets() {
 }
 
 // =====================================================================
-// Finding A6 (P-C): remove_sheet clears the ENTIRE cross-sheet dep
-// graph and nothing repopulates edges for existing formulas (only
-// future set_formula calls re-add their own). Removing an UNRELATED
-// sheet silently kills dirty/notify fanout for every cross-sheet
-// formula in the workbook. Values stay correct only because the
-// read path force-recomputes; subscribers stop firing.
+// Finding A6 (P-C) — FIXED (W1.2). remove_sheet now rebuilds the
+// cross-sheet dep graph via `rebuild_cross_sheet_deps` (same path as
+// move_sheet) instead of clearing it, so dirty/notify fanout for
+// UNRELATED cross-sheet formulas survives sheet removal. Pin flipped
+// to the fixed behavior; the wider matrix (index remap, removed-
+// source notify) lives in tests/cross_sheet_propagation.rs.
 // =====================================================================
 
 #[test]
@@ -244,30 +247,30 @@ fn audit_remove_unrelated_sheet_kills_cross_sheet_notify() {
 
     // Remove the UNRELATED Scratch sheet.
     assert!(wb.remove_sheet(scratch).is_some());
-    assert_eq!(
-        wb.debug_cross_sheet_reverse_edge_count(),
-        0,
-        "remove_sheet wiped the whole cross-sheet graph"
+    assert!(
+        wb.debug_cross_sheet_reverse_edge_count() > 0,
+        "A-6 FIXED: the surviving Data!A1 -> Sheet1!B1 edge must still \
+         be registered after the rebuild"
     );
 
-    // Same write again: value is still observable (read-path force
-    // recompute)…
+    // Same write again: value observable AND the subscriber fires.
     wb.set_cell(1, "A1", Value::Number(2.0));
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(4.0));
-    // …but the subscriber never fired (pinned broken behavior).
-    assert_eq!(
-        *fires.borrow(),
-        baseline,
-        "AUDIT PIN (P-C): cross-sheet subscriber no longer fires after \
-         removing an unrelated sheet. When fixed, this should be > baseline."
+    assert!(
+        *fires.borrow() > baseline,
+        "A-6 FIXED: cross-sheet subscriber keeps firing after removing \
+         an unrelated sheet"
     );
 }
 
 // =====================================================================
-// Finding A7 (P-C): rename_sheet does not retarget formula ASTs/texts
-// that reference the old name, does not dirty dependents, and does not
-// notify subscribers — the dependent's VALUE changes (to #REF!/Null)
-// with zero propagation.
+// Finding A7 (P-C) — FIXED (W1.2). rename_sheet still does NOT rewrite
+// formula ASTs/texts (the name-resolution contract is unchanged:
+// `=Data!A1` keeps saying `Data` and stops resolving), but dependents
+// are now dirtied and their subscribers notified, and the cross-sheet
+// edge graph is rebuilt against the new name → index map. Pin flipped
+// to the fixed behavior; the new-name-resolves case lives in
+// tests/cross_sheet_propagation.rs.
 // =====================================================================
 
 #[test]
@@ -289,18 +292,19 @@ fn audit_rename_sheet_dependents_not_retargeted_or_notified() {
 
     let after = wb.get_cell("Sheet1", "B1");
     eprintln!("B1 after renaming Data -> Numbers: {after:?}");
-    // CURRENT behavior: the AST still says `Data!A1`, which no longer
-    // resolves — the observable value changed away from 10.
+    // Name-resolution contract (unchanged): the AST still says
+    // `Data!A1`, which no longer resolves — the observable value
+    // changed away from 10 (#REF!-class).
     assert_ne!(
         after,
         Value::Number(10.0),
-        "dependent value silently changed after rename"
+        "dependent value changed after rename (references break, Excel-\
+         style rewrite is a separate follow-up)"
     );
-    // …and the subscriber was never told (pinned broken behavior).
-    assert_eq!(
-        *fires.borrow(),
-        0,
-        "AUDIT PIN (P-C): rename_sheet changed a dependent's value \
-         without notifying its subscriber"
+    // A-7 FIXED: the subscriber is told about the change.
+    assert!(
+        *fires.borrow() >= 1,
+        "A-7 FIXED: rename_sheet must notify dependents whose value \
+         changed"
     );
 }

@@ -8,10 +8,11 @@ use einfach_core::{Value, ValueError};
 use crate::cell::CellAddress;
 use crate::eval::{
     eval_expr_with_provider, is_builtin_function_name, CustomFunctionRegistry, EvalProvider,
+    ExcelLambda,
 };
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
-use crate::sheet::{RangeDependentIndex, Sheet, SheetError};
+use crate::sheet::{expr_has_sheet_ref, RangeDependentIndex, Sheet, SheetError};
 
 /// One outgoing edge from a formula cell to a cross-sheet source.
 ///
@@ -314,6 +315,18 @@ pub struct Workbook {
     /// list at 500, and the workbook-core layer can enforce a similar
     /// cap once a host needs it.
     named_values: BTreeMap<String, NamedEntry>,
+    /// Audit B-4 latch: true once ANY registered named value carries a
+    /// live cross-sheet reference (a `Value::Lambda` whose body — or
+    /// whose captured bindings — contains a `SheetRef`/`SheetRange`).
+    /// OR'd into `has_any_cross_sheet_edges` so the read-time
+    /// force-recompute safety net covers formulas like `=READDATA()`
+    /// installed through the raw `Sheet::set_formula` path, where the
+    /// per-sheet latch cannot arm (the cell AST has no `SheetRef` node
+    /// and the sheet has no access to the registry to resolve the
+    /// name). One-way, same philosophy as the per-sheet latch: may
+    /// stay armed longer than strictly necessary (e.g. after
+    /// `undefine_name`), never under-fires.
+    named_values_cross_sheet: Cell<bool>,
     /// Host-supplied custom-formula registry (Wave 8). When `Some`, formula
     /// dispatch consults this AFTER built-ins and after defined-name LAMBDAs
     /// (see precedence note on `eval_named_call`). When `None`, unknown
@@ -439,6 +452,7 @@ impl Workbook {
             cross_sheet: CrossSheetDeps::new(),
             cycle_ast_walk_count: Cell::new(0),
             named_values: BTreeMap::new(),
+            named_values_cross_sheet: Cell::new(false),
             custom_functions: None,
             custom_call_depth: Cell::new(0),
             content_revision: 0,
@@ -527,6 +541,12 @@ impl Workbook {
         if is_builtin_function_name(&key) {
             return Err(WorkbookError::ReservedName);
         }
+        // Audit B-4: arm the workbook-level cross-sheet latch when the
+        // bound value carries a live sheet reference (lambda body /
+        // captured bindings). See `named_values_cross_sheet` field docs.
+        if named_value_has_sheet_ref(&value) {
+            self.named_values_cross_sheet.set(true);
+        }
         self.named_values.insert(
             key,
             NamedEntry {
@@ -535,6 +555,15 @@ impl Workbook {
             },
         );
         self.invalidate_formulas_using_name(name);
+        // Audit B-4 follow-through: a (re)definition can change what
+        // existing formulas' names resolve to, so edges keyed off the
+        // OLD binding are stale and formulas installed BEFORE the
+        // definition never got edges at all. Rebuild from the live
+        // ASTs/sources — same O(formulas + lazy parse) trade the TS
+        // port makes (it recalcs all sheets on defineName) and the
+        // same path move_sheet/remove_sheet/rename_sheet use. Defines
+        // are rare, host-driven ops.
+        self.rebuild_cross_sheet_deps();
         Ok(())
     }
 
@@ -551,6 +580,11 @@ impl Workbook {
         let removed = self.named_values.remove(&key).is_some();
         if removed {
             self.invalidate_formulas_using_name(name);
+            // Drop edges the removed binding contributed (see
+            // `define_name_value`). The `named_values_cross_sheet`
+            // latch intentionally stays armed — one-way, may over-fire,
+            // never under-fires.
+            self.rebuild_cross_sheet_deps();
         }
         removed
     }
@@ -765,6 +799,20 @@ impl Workbook {
     }
 
     /// Rename a sheet. Fails (returns false) if the new name is taken.
+    ///
+    /// Audit A-7: formula ASTs store sheet NAMES (`=Data!A1` keeps
+    /// saying `Data` after the rename), so renaming changes what
+    /// dependents resolve to — formulas referencing the OLD name stop
+    /// resolving (they surface a `#REF!`-class value at next read) and
+    /// formulas that already referenced the NEW name suddenly start
+    /// resolving. Both groups' observable values change, so both must
+    /// be dirtied and their subscribers notified, and the cross-sheet
+    /// edge graph (keyed by resolved sheet index) must be rebuilt
+    /// because the name → index mapping shifted.
+    ///
+    /// Cost: `rebuild_cross_sheet_deps` is O(hydrated formulas + parse
+    /// of lazy formula sources) — acceptable for a rare structural op
+    /// (same trade `move_sheet` already makes).
     pub fn rename_sheet(&mut self, idx: usize, new_name: &str) -> bool {
         if self.is_inside_custom_call() {
             return false; // re-entrancy guard
@@ -775,10 +823,20 @@ impl Workbook {
         if idx >= self.names.len() {
             return false;
         }
+        // Formulas whose edges currently resolve INTO `idx` referenced
+        // the old name; after the rename they stop resolving.
+        let mut affected = self.formulas_referencing_sheet(idx);
         let old = std::mem::take(&mut self.names[idx]);
         self.by_name.remove(&old);
         self.names[idx] = new_name.to_string();
         self.by_name.insert(new_name.to_string(), idx);
+        self.rebuild_cross_sheet_deps();
+        // Formulas that resolve into `idx` AFTER the rebuild reference
+        // the NEW name — previously dangling, now live. Their values
+        // change too (e.g. `=Numbers!A1` springs to life when `Data`
+        // is renamed to `Numbers`).
+        affected.extend(self.formulas_referencing_sheet(idx));
+        self.notify_cross_sheet_seeds(affected);
         true
     }
 
@@ -795,7 +853,9 @@ impl Workbook {
             // Hydrated formulas: walk the cached AST.
             let exprs = sheet.formula_exprs_iter();
             for (&formula_addr, expr) in exprs.iter() {
-                for edge in collect_cross_sheet_refs(expr.as_ref(), &self.by_name) {
+                for edge in
+                    collect_cross_sheet_refs(expr.as_ref(), &self.by_name, &self.named_values)
+                {
                     cross_sheet.add_edge(formula_sheet, formula_addr, edge);
                 }
             }
@@ -812,7 +872,7 @@ impl Workbook {
             drop(exprs);
             sheet.for_each_lazy_formula(|formula_addr, source| {
                 if let Some(expr) = parse_formula(source) {
-                    for edge in collect_cross_sheet_refs(&expr, &self.by_name) {
+                    for edge in collect_cross_sheet_refs(&expr, &self.by_name, &self.named_values) {
                         cross_sheet.add_edge(formula_sheet, formula_addr, edge);
                     }
                 }
@@ -981,7 +1041,7 @@ impl Workbook {
         // refs are handled inside `Sheet::set_formula` via its own
         // `cell_dependents` / `range_dependents`; this walk only emits
         // edges that cross a sheet boundary.
-        let new_edges = collect_cross_sheet_refs(&expr, &self.by_name);
+        let new_edges = collect_cross_sheet_refs(&expr, &self.by_name, &self.named_values);
 
         // Remove the previous formula's outgoing edges before installing
         // new ones — if the previous formula referenced `Sheet2!A1` and
@@ -1514,10 +1574,22 @@ impl Workbook {
     /// Remove a sheet by index. Returns the removed sheet so callers can
     /// inspect / dispose of its atoms if needed.
     ///
-    /// Clears the cross-sheet dep graph as a defensive measure — sheet
-    /// removal shifts indices, and rewriting every `(idx, addr)` key on
-    /// the fly is brittle. The next workbook-routed `set_formula` call
-    /// will repopulate edges from the live formulas.
+    /// Audit A-6: sheet removal shifts indices, so the cross-sheet dep
+    /// graph (keyed by `(idx, addr)`) is rebuilt from the live formula
+    /// ASTs / lazy sources via `rebuild_cross_sheet_deps` — the same
+    /// path `move_sheet` uses. (The previous behavior — clearing the
+    /// graph and waiting for "the next set_formula" to repopulate it —
+    /// permanently severed dirty/notify fanout for every UNRELATED
+    /// cross-sheet formula in the workbook.)
+    ///
+    /// Formulas on surviving sheets that referenced the REMOVED sheet
+    /// lose their source: their value changes to a `#REF!`-class error
+    /// at next read, so they are dirtied and their subscribers notified
+    /// (with chained cross-sheet dependents reached through the shared
+    /// dirty BFS).
+    ///
+    /// Cost: O(hydrated formulas + parse of lazy formula sources) —
+    /// acceptable for a rare structural op.
     pub fn remove_sheet(&mut self, idx: usize) -> Option<Sheet> {
         if self.is_inside_custom_call() {
             return None; // re-entrancy guard
@@ -1525,17 +1597,75 @@ impl Workbook {
         if idx >= self.sheets.len() {
             return None;
         }
+        // Capture — BEFORE indices shift — every formula on a SURVIVING
+        // sheet that referenced the removed sheet, remapping its host
+        // sheet index past the removal point.
+        let affected: Vec<(usize, CellAddress)> = self
+            .formulas_referencing_sheet(idx)
+            .into_iter()
+            .filter(|(formula_sheet, _)| *formula_sheet != idx)
+            .map(|(formula_sheet, addr)| {
+                let remapped = if formula_sheet > idx {
+                    formula_sheet - 1
+                } else {
+                    formula_sheet
+                };
+                (remapped, addr)
+            })
+            .collect();
         let sheet = self.sheets.remove(idx);
         let name = self.names.remove(idx);
         self.by_name.remove(&name);
         self.rebuild_name_lookup();
-        // Sheet indices shifted; the cross-sheet dep graph is no longer
-        // coherent. Drop it. (Phase 3 callers don't currently mix
-        // `remove_sheet` with cross-sheet subscriptions; if that changes,
-        // a future iteration can rewrite each `(idx, addr)` in place
-        // instead of clearing.)
-        self.cross_sheet = CrossSheetDeps::new();
+        // Rebuild the graph against the post-removal name → index map.
+        // References to the removed sheet's name no longer resolve and
+        // drop out of the edge set; everything else re-keys correctly.
+        self.rebuild_cross_sheet_deps();
+        self.notify_cross_sheet_seeds(affected);
         Some(sheet)
+    }
+
+    /// Forward-map walk: every formula holding at least one cross-sheet
+    /// edge INTO `sheet_idx`. O(cross-sheet formulas), not O(all
+    /// formulas) — the forward `formula_refs` index already exists.
+    fn formulas_referencing_sheet(&self, sheet_idx: usize) -> Vec<(usize, CellAddress)> {
+        let mut out = Vec::new();
+        for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
+            let hits = edges.iter().any(|edge| match edge {
+                CrossSheetRef::Cell(src_sheet, _) => *src_sheet == sheet_idx,
+                CrossSheetRef::Range(src_sheet, _) => *src_sheet == sheet_idx,
+            });
+            if hits {
+                out.push((*formula_sheet, *formula_addr));
+            }
+        }
+        out
+    }
+
+    /// Mark each seed dirty, fire its subscribers, then run the shared
+    /// cross-sheet dirty BFS so CHAINED dependents (`C = =Sheet1!B`,
+    /// `B = =Removed!A`) propagate too. Mirrors the seeding shape of
+    /// `fanout_install_cross_sheet_dependents`. `mark_dirty_for_addr`
+    /// is a no-op for parked/lazy dependents (no cached value to
+    /// invalidate); `fire_subscribers` works pre-hydration.
+    fn notify_cross_sheet_seeds(&self, seeds: Vec<(usize, CellAddress)>) {
+        if seeds.is_empty() {
+            return;
+        }
+        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
+        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
+        for (sheet_idx, addr) in seeds {
+            if !visited.insert((sheet_idx, addr)) {
+                continue;
+            }
+            let Some(sheet) = self.sheets.get(sheet_idx) else {
+                continue;
+            };
+            sheet.mark_dirty_for_addr(addr);
+            sheet.fire_subscribers(addr);
+            queue.push_back((sheet_idx, addr));
+        }
+        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, None);
     }
 
     /// Debug-only: total cross-sheet reverse-edge count. Backs the Phase
@@ -1563,14 +1693,20 @@ impl Workbook {
     ///      per-sheet `Sheet::set_formula` flow regardless of whether
     ///      the workbook ever saw the install. This captures formulas
     ///      installed via the raw `wb.sheet_mut(idx).set_formula(...)`
-    ///      bypass (which skips edge registration) and survives
-    ///      `Workbook::remove_sheet` clearing `cross_sheet` — both cases
-    ///      codex flagged as "force_recompute should still fire". The
-    ///      latch is one-way (never cleared), so the bypass may stay
+    ///      bypass (which skips edge registration) and is independent of
+    ///      `Workbook::remove_sheet` rebuilding `cross_sheet` — both
+    ///      cases codex flagged as "force_recompute should still fire".
+    ///      The latch is one-way (never cleared), so the bypass may stay
     ///      armed slightly longer than strictly necessary but never
     ///      under-fires.
+    ///   3. The `named_values_cross_sheet` latch (audit B-4) — armed by
+    ///      `define_name_value` when a registered value (LAMBDA body /
+    ///      captured bindings) carries a live sheet ref, covering
+    ///      `=READDATA()`-shaped formulas the per-sheet latch cannot
+    ///      see (their ASTs contain no `SheetRef` node).
     pub(crate) fn has_any_cross_sheet_edges(&self) -> bool {
         !self.cross_sheet.formula_refs.is_empty()
+            || self.named_values_cross_sheet.get()
             || self.sheets.iter().any(|s| s.has_cross_sheet_refs())
     }
 
@@ -1687,8 +1823,17 @@ impl Workbook {
         {
             let sheet = &self.sheets[sheet_idx];
             let by_name = &self.by_name;
+            let named_values = &self.named_values;
+            // Audit B-4: when a registered named value carries a live
+            // cross-sheet ref (e.g. `READDATA = LAMBDA(Data!A1)`), a
+            // parked `=READDATA()` holds a cross-sheet edge with no `!`
+            // in its source — the prefilter must not skip it. The latch
+            // gates the wider parse so the common case (no cross-sheet
+            // named values, which includes every storage-primary bench
+            // shape) keeps the cheap `!`-only scan.
+            let names_may_cross = self.named_values_cross_sheet.get();
             sheet.for_each_lazy_formula(|addr, source| {
-                if !source.contains('!') {
+                if !source.contains('!') && !names_may_cross {
                     // No `!` → cannot be a cross-sheet ref → skip the
                     // parse entirely. This is the overwhelmingly common
                     // same-sheet case.
@@ -1696,7 +1841,7 @@ impl Workbook {
                 }
                 cross_sheet_parsed += 1;
                 if let Some(expr) = parse_formula(source) {
-                    let edges = collect_cross_sheet_refs(&expr, by_name);
+                    let edges = collect_cross_sheet_refs(&expr, by_name, named_values);
                     if !edges.is_empty() {
                         edge_buf.push((addr, edges));
                     }
@@ -1922,7 +2067,7 @@ impl<'a> WorkbookLoader<'a> {
         // subsequent `set_formula` calls in the same `bulk_load` see
         // the up-to-date forward map for their own cycle checks.
         self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
-        let new_edges = collect_cross_sheet_refs(&expr, &self.wb.by_name);
+        let new_edges = collect_cross_sheet_refs(&expr, &self.wb.by_name, &self.wb.named_values);
         for edge in new_edges {
             self.wb.cross_sheet.add_edge(sheet_idx, addr, edge);
         }
@@ -2185,25 +2330,113 @@ fn formula_references_name(expr: &Expr, key: &str) -> bool {
     }
 }
 
-fn collect_cross_sheet_refs(expr: &Expr, by_name: &HashMap<String, usize>) -> Vec<CrossSheetRef> {
+/// Walk `expr` and collect every cross-sheet edge it implies.
+///
+/// Audit B-4: `named_values` is consulted so refs hidden behind a
+/// defined name are visible too — `=READDATA()` where
+/// `READDATA = LAMBDA(Data!A1)` must register an edge into `Data`,
+/// otherwise a later write to `Data!A1` finds no edge, no dirty mark,
+/// and the cell serves its stale cached value forever. Both
+/// `Expr::Name` (bare reference) and `Expr::FuncCall` (named-lambda
+/// call) resolve through the registry; lambda BODIES (and captured
+/// lambda bindings) are walked recursively with a visited-name set so
+/// mutually-recursive named lambdas terminate.
+/// Audit B-4 (latch half): does a registry-bound `Value` carry a LIVE
+/// cross-sheet reference? Only `Value::Lambda` can — its body is an
+/// unevaluated AST; everything else was materialized eagerly by
+/// `define_name`. No name resolution is needed here: each named lambda
+/// is checked against ITS OWN body when IT is registered, so a chain
+/// like `A = LAMBDA(B())` is covered by `B`'s own registration arming
+/// the latch. Captured lambdas are finite snapshot trees, so the
+/// recursion terminates without a visited set.
+fn named_value_has_sheet_ref(value: &Value) -> bool {
+    if let Value::Lambda(arc) = value {
+        if let Some(lambda) = arc.as_any().downcast_ref::<ExcelLambda>() {
+            return expr_has_sheet_ref(&lambda.body)
+                || lambda
+                    .captured
+                    .iter()
+                    .any(|(_, captured)| named_value_has_sheet_ref(captured));
+        }
+    }
+    false
+}
+
+fn collect_cross_sheet_refs(
+    expr: &Expr,
+    by_name: &HashMap<String, usize>,
+    named_values: &BTreeMap<String, NamedEntry>,
+) -> Vec<CrossSheetRef> {
     let mut out: Vec<CrossSheetRef> = Vec::new();
-    collect_cross_sheet_refs_into(expr, by_name, &mut out);
+    let mut visiting: HashSet<String> = HashSet::new();
+    collect_cross_sheet_refs_into(expr, by_name, named_values, &mut out, &mut visiting);
     out
+}
+
+/// Resolve a (possibly defined) `name` through the named-value registry
+/// and collect cross-sheet refs out of the bound value. `visiting`
+/// holds every name already on the resolution stack (uppercased) —
+/// inserting it permanently both guards name cycles
+/// (`A = LAMBDA(B())`, `B = LAMBDA(A())`) and dedups repeated
+/// references; edges are a union, so never re-walking a name is safe.
+fn collect_named_cross_sheet_refs_into(
+    name: &str,
+    by_name: &HashMap<String, usize>,
+    named_values: &BTreeMap<String, NamedEntry>,
+    out: &mut Vec<CrossSheetRef>,
+    visiting: &mut HashSet<String>,
+) {
+    let key = name.to_ascii_uppercase();
+    if !visiting.insert(key.clone()) {
+        return; // name cycle / already walked
+    }
+    if let Some(entry) = named_values.get(&key) {
+        collect_value_cross_sheet_refs_into(&entry.value, by_name, named_values, out, visiting);
+    }
+}
+
+/// Collect cross-sheet refs out of a registry-bound `Value`. Only
+/// `Value::Lambda` can carry LIVE references (its body is an unevaluated
+/// AST); every other variant is an already-materialized snapshot
+/// (`define_name` evaluates eagerly), so `=Data!A1`-style scalar
+/// bindings hold a copy, not a reference, and contribute no edge.
+/// Captured LET bindings are walked too — a lambda returned from
+/// `LET(f, LAMBDA(Data!A1), LAMBDA(f()))` reaches its cross-sheet ref
+/// only through the captured `f`.
+fn collect_value_cross_sheet_refs_into(
+    value: &Value,
+    by_name: &HashMap<String, usize>,
+    named_values: &BTreeMap<String, NamedEntry>,
+    out: &mut Vec<CrossSheetRef>,
+    visiting: &mut HashSet<String>,
+) {
+    if let Value::Lambda(arc) = value {
+        if let Some(lambda) = arc.as_any().downcast_ref::<ExcelLambda>() {
+            collect_cross_sheet_refs_into(&lambda.body, by_name, named_values, out, visiting);
+            for (_, captured) in &lambda.captured {
+                collect_value_cross_sheet_refs_into(captured, by_name, named_values, out, visiting);
+            }
+        }
+    }
 }
 
 fn collect_cross_sheet_refs_into(
     expr: &Expr,
     by_name: &HashMap<String, usize>,
+    named_values: &BTreeMap<String, NamedEntry>,
     out: &mut Vec<CrossSheetRef>,
+    visiting: &mut HashSet<String>,
 ) {
     match expr {
         Expr::CellRef(_) | Expr::Range { .. } => {
             // Same-sheet refs/ranges are owned by `Sheet::set_formula`.
         }
-        Expr::SpillRef(anchor) => collect_cross_sheet_refs_into(anchor, by_name, out),
+        Expr::SpillRef(anchor) => {
+            collect_cross_sheet_refs_into(anchor, by_name, named_values, out, visiting)
+        }
         Expr::DynamicRange { start, end } => {
-            collect_cross_sheet_refs_into(start, by_name, out);
-            collect_cross_sheet_refs_into(end, by_name, out);
+            collect_cross_sheet_refs_into(start, by_name, named_values, out, visiting);
+            collect_cross_sheet_refs_into(end, by_name, named_values, out, visiting);
         }
         Expr::SheetRef { sheet, addr } => {
             if let Some(&idx) = by_name.get(sheet) {
@@ -2223,24 +2456,38 @@ fn collect_cross_sheet_refs_into(
             // Unknown sheet → dropped. Read time will surface #REF!.
         }
         Expr::BinOp { left, right, .. } => {
-            collect_cross_sheet_refs_into(left, by_name, out);
-            collect_cross_sheet_refs_into(right, by_name, out);
+            collect_cross_sheet_refs_into(left, by_name, named_values, out, visiting);
+            collect_cross_sheet_refs_into(right, by_name, named_values, out, visiting);
         }
-        Expr::Negate(inner) => collect_cross_sheet_refs_into(inner, by_name, out),
-        Expr::FuncCall { args, .. } => {
+        Expr::Negate(inner) => {
+            collect_cross_sheet_refs_into(inner, by_name, named_values, out, visiting)
+        }
+        Expr::FuncCall { name, args } => {
+            // Audit B-4: the call target may be a defined-name LAMBDA
+            // whose body reads another sheet (`=READDATA()`). Built-in
+            // names never appear in the registry (`define_name` rejects
+            // the collision), so this lookup is a cheap miss for the
+            // common case.
+            collect_named_cross_sheet_refs_into(name, by_name, named_values, out, visiting);
             for a in args {
-                collect_cross_sheet_refs_into(a, by_name, out);
+                collect_cross_sheet_refs_into(a, by_name, named_values, out, visiting);
             }
         }
         Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
-        // LET-bound names don't reference cross-sheet cells.
-        Expr::Name(_) => {}
+        // Audit B-4: a bare name may resolve to a defined value. LET
+        // bindings shadow the registry at eval time, so a LET-bound
+        // `x` that collides with a defined name produces a false-
+        // positive edge here — harmless over-approximation (a spurious
+        // dirty mark at worst, never a missed one).
+        Expr::Name(name) => {
+            collect_named_cross_sheet_refs_into(name, by_name, named_values, out, visiting);
+        }
         // Immediate-call: descend into callee + args so cross-sheet refs
         // hidden inside a LAMBDA body still register.
         Expr::Call(callee, args) => {
-            collect_cross_sheet_refs_into(callee, by_name, out);
+            collect_cross_sheet_refs_into(callee, by_name, named_values, out, visiting);
             for a in args {
-                collect_cross_sheet_refs_into(a, by_name, out);
+                collect_cross_sheet_refs_into(a, by_name, named_values, out, visiting);
             }
         }
         // Constant-array literal can't carry a cross-sheet ref (parser
@@ -2250,7 +2497,7 @@ fn collect_cross_sheet_refs_into(
         // inside the union register against `by_name`.
         Expr::MultiArea(parts) => {
             for p in parts {
-                collect_cross_sheet_refs_into(p, by_name, out);
+                collect_cross_sheet_refs_into(p, by_name, named_values, out, visiting);
             }
         }
     }

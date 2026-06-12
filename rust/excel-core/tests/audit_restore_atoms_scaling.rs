@@ -187,17 +187,14 @@ fn audit_structural_edit_hydrates_every_parked_formula() {
     );
 }
 
-/// FINDING B-4 (P-C, CONFIRMED): a named LAMBDA whose body reads another
-/// sheet is invisible to cross-sheet dirty tracking. The cell formula
-/// `=FN()` contains no `Expr::SheetRef` (`expr_has_sheet_ref` and
-/// `collect_cross_sheet_refs_into` both have `Expr::Name(_) => {}` /
-/// `false`), so no edge is registered and no latch is armed. After the
-/// first eval caches Clean, a write to the upstream cell on the other
-/// sheet is never propagated and the cached value goes STALE.
-///
-/// This test pins the CURRENT (buggy) behavior — `Number(1.0)` after the
-/// upstream write to 2.0 — so the suite stays green while the audit doc
-/// carries the finding. A fix flips the assertion to `Number(2.0)`.
+/// FINDING B-4 (P-C) — FIXED (W1.3). `collect_cross_sheet_refs` now
+/// resolves `Expr::Name` / `Expr::FuncCall` targets through the
+/// defined-name registry and walks LAMBDA bodies (with a visited-name
+/// set guarding name cycles), so `=READDATA()` registers a real edge
+/// into `Data!A1`; `define_name` additionally arms a workbook-level
+/// latch for raw-sheet-path installs. Pin flipped to the FRESH value;
+/// the wider matrix (notify, nesting, cycles, bulk install) lives in
+/// tests/cross_sheet_propagation.rs.
 #[test]
 fn audit_named_lambda_cross_sheet_freshness() {
     let mut wb = Workbook::new();
@@ -214,15 +211,13 @@ fn audit_named_lambda_cross_sheet_freshness() {
     let after = wb.get_cell("Sheet1", "B1");
     println!(
         "AUDIT B-4: =READDATA() (named lambda reading Data!A1) after upstream \
-         write 1.0 -> 2.0 reads as {after:?} (fresh would be Number(2.0))"
+         write 1.0 -> 2.0 reads as {after:?} (fresh is Number(2.0))"
     );
-    // BUG (pinned): the cached Clean value never invalidates. Fresh
-    // behavior would be Number(2.0).
     assert_eq!(
         after,
-        Value::Number(1.0),
-        "behavior changed (possibly fixed) — re-audit B-4, update the doc, \
-         and flip this assertion to the fresh value"
+        Value::Number(2.0),
+        "B-4 FIXED: the named-lambda cross-sheet read must serve the fresh \
+         upstream value"
     );
 }
 

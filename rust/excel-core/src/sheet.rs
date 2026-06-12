@@ -4933,8 +4933,12 @@ fn collect_formula_refs_into(
 
 /// Walk the AST looking for any `Expr::SheetRef`. Used by `Workbook::get_cell`
 /// to skip force-recompute on formulas that don't actually need a cross-sheet
-/// resolver (the common case).
-fn expr_has_sheet_ref(expr: &Expr) -> bool {
+/// resolver (the common case). `pub(crate)` so the workbook can walk
+/// defined-name LAMBDA bodies at registration time (audit B-4 — the
+/// sheet-side walker cannot resolve `Expr::Name` itself, it has no
+/// access to the workbook's named-value registry; the workbook-level
+/// `named_values_cross_sheet` latch closes that hole).
+pub(crate) fn expr_has_sheet_ref(expr: &Expr) -> bool {
     match expr {
         Expr::SheetRef { .. } | Expr::SheetRange { .. } => true,
         Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
@@ -4946,6 +4950,10 @@ fn expr_has_sheet_ref(expr: &Expr) -> bool {
         | Expr::Text(_)
         | Expr::Bool(_)
         | Expr::Error(_) => false,
+        // A bare name may bind to a defined LAMBDA whose body reads
+        // another sheet, but this walker has no registry to resolve it.
+        // The workbook-level `named_values_cross_sheet` latch (armed at
+        // `define_name` time) covers that case — see audit B-4.
         Expr::Name(_) => false,
         Expr::SpillRef(anchor) => expr_has_sheet_ref(anchor),
         Expr::DynamicRange { start, end } => expr_has_sheet_ref(start) || expr_has_sheet_ref(end),
