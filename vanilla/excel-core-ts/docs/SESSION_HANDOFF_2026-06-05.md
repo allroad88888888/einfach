@@ -136,10 +136,17 @@ bypassed propagation / incomplete teardown) across both engines:
 - **Codex reviews** caught 3 P1 stale-cache bugs post-Wave-2; fixed in
   `7ed4217` (Rust BFS roots) + `f8e6d8c`/`95ef444` (TS eviction
   wiring + cycle reverse-deps).
-- **Wave 3 (P2 hygiene) — OPEN**: D-4/D-5 adapter teardown leaks,
-  B-2 atom-per-primitive (23% of install), D-7/D-8 filter/sort viewport
-  scans, D-2 static-backend clone, C-3/C-8/D-10/D-12 small items.
-  P3s tracked in the audit doc sections.
+- **Wave 3 (P2 hygiene) — CLOSED 2026-06-12**: `f303275` lazy
+  primitive-cell atomization (`CellSlot::Plain|Atom`, promotion at
+  subscribe/spill; 1M install 512→398 ms, −22%); `ebc7c7a`+`4e7522b`
+  adapter hygiene (deleteSheet clears all 5 per-sheet overlay tables;
+  sheet ops reset session/probe state; filter/sort permutation cached
+  by content-generation; viewport reads O(window ∩ existing); banded
+  removeRows RPCs; typed bulkApply wires — '00123' stays text);
+  `e9b92c9` static-backend history via reverse deltas (108× → O(change));
+  `bdf19a0` replace-all surfaces the 500-match cap; `38e731e` C-3
+  batch-guidance docs. Audit arc COMPLETE — all 9 P1 + 15 P2 closed;
+  P3s remain catalogued in the audit doc sections.
 
 ### Lazy formula indexing — Rust core philosophy realignment (2026-06-11)
 
