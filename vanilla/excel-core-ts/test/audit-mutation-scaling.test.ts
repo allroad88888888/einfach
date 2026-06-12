@@ -18,6 +18,9 @@
  *  - P-A  defineName / setLocale outside withBatch → recalculateAllSheets
  *         clones EVERY sheet
  *  - P-B  per-cell clearCell loops (mirrors worker-runtime-ts clearRange)
+ *  - P-C  withBatch throw — FIXED (C-5): registries roll back on abort,
+ *         so the pin below asserts the consistent post-fix behavior
+ *         (behavioral tests live in workbook.test.ts)
  *  - P-D  formulaAtomCache / backDependenciesMap never evict — deleted
  *         formulas keep their derive atoms in the flush walk forever
  *  - wire-type caveat re-verify: bulkApply('00123') loses leading zeros
@@ -213,8 +216,8 @@ describe('AUDIT P-D: deleted formulas leave derive atoms in the flush walk forev
   }, 300_000)
 })
 
-describe('AUDIT P-C: withBatch throw leaves names mutated but never invalidates', () => {
-  test('defineName inside a throwing batch: registry updated, cached formula stays stale', () => {
+describe('AUDIT P-C (FIXED): withBatch throw rolls back registry mutations', () => {
+  test('defineName inside a throwing batch: registry rolled back, formula stays consistently #NAME?', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     const sheet = wb.sheet('s1')!
     wb.setCell('s1', 0, 0, '=MYNAME')
@@ -229,24 +232,23 @@ describe('AUDIT P-C: withBatch throw leaves names mutated but never invalidates'
       }),
     ).toThrow('host abort')
 
-    // The name IS in the registry (defineName mutated the map before the
-    // throw), but the deferred recalc was swallowed — the cached derive
-    // is never invalidated and keeps serving #NAME? until some unrelated
-    // mutation happens to bump the sheetAtom.
+    // FIXED (audit C-5): the throw aborts the batch for real — the
+    // registry write is rolled back, so the cached derive's #NAME? is
+    // CONSISTENT with the registry, not stale.
     const after = wb.store.getter(a)
     // eslint-disable-next-line no-console
     console.log(
-      `[P-C batch-throw] post-throw read of =MYNAME -> ${JSON.stringify(after)} ` +
-        `(registry already holds MYNAME=99)`,
+      `[P-C batch-throw FIXED] post-throw read of =MYNAME -> ${JSON.stringify(after)} ` +
+        `(registry rolled back, MYNAME undefined)`,
     )
-    // Pin the CURRENT (inconsistent) behavior: stale #NAME? despite the
-    // registry mutation having been applied.
     expect(after).toEqual({ kind: 'error', code: '#NAME?' })
 
-    // An unrelated cell write "heals" it — proving the registry mutation
-    // was live the whole time and only the invalidation was skipped.
+    // An unrelated cell write must NOT "heal" the formula to 99 — the
+    // rollback removed MYNAME from the registry, so the re-derive still
+    // resolves to #NAME?. (Pre-fix this flipped to 99: the proof of the
+    // registry/cache disagreement.)
     wb.setCell('s1', 9, 9, '1')
-    expect(wb.store.getter(a)).toEqual({ kind: 'number', value: 99 })
+    expect(wb.store.getter(a)).toEqual({ kind: 'error', code: '#NAME?' })
   })
 })
 

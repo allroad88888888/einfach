@@ -134,17 +134,20 @@ export interface Workbook {
    * sheet-wide invalidation pass.
    *
    * Scope: ONLY the four name / custom-formula registration methods
-   * participate. Cell-level mutations (`setCell`, `setCellValue`,
-   * `clearCell`, `bulkApply`, `setFormat`) write through the existing
-   * `writeSheetState` path and are unaffected by the batch flag.
+   * plus `setLocale` participate. Cell-level mutations (`setCell`,
+   * `setCellValue`, `clearCell`, `bulkApply`, `setFormat`) write through
+   * the existing `writeSheetState` path and are unaffected by the batch
+   * flag.
    *
    * Nesting: nested `withBatch` calls share the same pending flag; only
    * the outermost exit triggers the deferred recalc.
    *
-   * Exceptions: if `fn` throws, the batch depth still unwinds and the
-   * pending-recalc flag is cleared without firing a recalc — the throw
-   * is treated as the host aborting its intent. The exception
-   * propagates to the caller.
+   * Exceptions: if `fn` throws, the batch ABORTS — the name and
+   * custom-formula registries and the locale are rolled back to their
+   * state at outermost batch entry, and the pending-recalc flag is
+   * cleared without firing (nothing changed, so nothing to invalidate).
+   * A throw from a nested batch aborts the whole batch as it unwinds.
+   * The exception propagates to the caller.
    */
   withBatch<T>(fn: () => T): T
   /**
@@ -232,6 +235,18 @@ export function createWorkbook(
   // mutation flips it true; the outermost exit reads + clears it.
   let batchDepth = 0
   let pendingRecalc = false
+
+  // Snapshot of the batch-participating registries, taken when the
+  // OUTERMOST batch opens (depth 0→1) and restored if the batch aborts
+  // via throw (audit C-5). These are small, bounded registries — names,
+  // custom-formula callbacks, and the locale tag — NOT cell maps, so a
+  // shallow Map copy is cheap. Cell mutations do not participate in
+  // `withBatch` and are never rolled back.
+  let batchSnapshot: {
+    names: Map<string, NameBinding>
+    customFormulas: Map<string, (args: Value[]) => Value>
+    locale: string
+  } | null = null
 
   function requestRecalc(): void {
     if (batchDepth > 0) {
@@ -541,6 +556,13 @@ export function createWorkbook(
       return removed
     },
     withBatch(fn) {
+      if (batchDepth === 0) {
+        batchSnapshot = {
+          names: new Map(names),
+          customFormulas: new Map(customFormulas),
+          locale: currentLocale,
+        }
+      }
       batchDepth += 1
       try {
         const result = fn()
@@ -552,15 +574,25 @@ export function createWorkbook(
         }
         return result
       } catch (err) {
-        // Throw aborts the host's intent — clear pending without firing
-        // so we don't leak a half-applied batch's recalc out to the
-        // caller. Re-raise unchanged.
+        // Throw aborts the host's intent — make the abort REAL (audit
+        // C-5): the outermost frame restores the registries to their
+        // pre-batch snapshot so registry state and cached derives never
+        // disagree, then clears pending without firing. A throw from a
+        // nested batch unwinds through every frame, so the rollback
+        // covers the whole batch. Re-raise unchanged.
         if (batchDepth === 1) {
+          const snap = batchSnapshot!
+          names.clear()
+          for (const [key, binding] of snap.names) names.set(key, binding)
+          customFormulas.clear()
+          for (const [key, callback] of snap.customFormulas) customFormulas.set(key, callback)
+          currentLocale = snap.locale
           pendingRecalc = false
         }
         throw err
       } finally {
         batchDepth -= 1
+        if (batchDepth === 0) batchSnapshot = null
       }
     },
     debugFormulaCacheState(sheetIdx, addrStr) {

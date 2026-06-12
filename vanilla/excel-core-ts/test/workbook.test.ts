@@ -489,4 +489,158 @@ describe('createWorkbook — withBatch deferral', () => {
     })
     expect(result).toBe('returned-value')
   })
+
+  // --- audit C-5: throw rolls back batch-participating registries ---
+
+  test('throw rolls back defineName: registry and cached derive stay consistent', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '=MYNAME')
+    const a = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a)).toEqual({ kind: 'error', code: '#NAME?' })
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.defineName('MYNAME', { kind: 'value', value: { kind: 'number', value: 99 } })
+        throw new Error('host abort')
+      }),
+    ).toThrow('host abort')
+
+    // The abort is real: MYNAME is gone from the registry, so the
+    // derive stays #NAME? — and an unrelated write must NOT flip it to
+    // 99 (the pre-fix C-5 symptom: registry/cache disagreement healed
+    // only by accidental invalidation).
+    expect(wb.store.getter(a)).toEqual({ kind: 'error', code: '#NAME?' })
+    wb.setCell('s1', 9, 9, '1')
+    expect(wb.store.getter(a)).toEqual({ kind: 'error', code: '#NAME?' })
+  })
+
+  test('throw rolls back undefineName: pre-batch name survives the abort', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.defineName('KEEP', { kind: 'value', value: { kind: 'number', value: 7 } })
+    wb.setCell('s1', 0, 0, '=KEEP')
+    const a = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a)).toEqual({ kind: 'number', value: 7 })
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.undefineName('KEEP')
+        throw new Error('host abort')
+      }),
+    ).toThrow('host abort')
+
+    // Rollback restored the deleted entry; later mutations keep serving 7.
+    wb.setCell('s1', 9, 9, '1')
+    expect(wb.store.getter(a)).toEqual({ kind: 'number', value: 7 })
+  })
+
+  test('throw rolls back registerCustomFormula', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '=MYFN(1)')
+    const a = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a)).toMatchObject({ kind: 'error', code: '#NAME?' })
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.registerCustomFormula('MYFN', () => ({ kind: 'number', value: 42 }))
+        throw new Error('host abort')
+      }),
+    ).toThrow('host abort')
+
+    // Callback rolled back: still #NAME?, even after an unrelated write.
+    wb.setCell('s1', 9, 9, '1')
+    expect(wb.store.getter(a)).toMatchObject({ kind: 'error', code: '#NAME?' })
+  })
+
+  test('throw rolls back setLocale', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    expect(wb.getLocale()).toBe('en-US')
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.setLocale('de-DE')
+        expect(wb.getLocale()).toBe('de-DE') // live inside the batch
+        throw new Error('host abort')
+      }),
+    ).toThrow('host abort')
+
+    expect(wb.getLocale()).toBe('en-US')
+  })
+
+  test('nested batch: inner throw propagating through the outer frame aborts the whole batch', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '=OUTERN')
+    wb.setCell('s1', 0, 1, '=INNERN')
+    const aOuter = sheet.formulaCellAtom(keyFor(0, 0))
+    const aInner = sheet.formulaCellAtom(keyFor(0, 1))
+
+    let fires = 0
+    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+      fires += 1
+    })
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.defineName('OUTERN', { kind: 'value', value: { kind: 'number', value: 1 } })
+        wb.withBatch(() => {
+          wb.defineName('INNERN', { kind: 'value', value: { kind: 'number', value: 2 } })
+          throw new Error('inner abort')
+        })
+      }),
+    ).toThrow('inner abort')
+
+    unsubscribe()
+    expect(fires).toBe(0)
+
+    // BOTH defines rolled back — the snapshot is taken at outermost
+    // entry, so the outer frame's mutation aborts along with the inner.
+    wb.setCell('s1', 9, 9, '1')
+    expect(wb.store.getter(aOuter)).toEqual({ kind: 'error', code: '#NAME?' })
+    expect(wb.store.getter(aInner)).toEqual({ kind: 'error', code: '#NAME?' })
+  })
+
+  test('success path unchanged: batch mutations persist and resolve after exit', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '=GOODN')
+    wb.setCell('s1', 0, 1, '=GOODFN(2)')
+    const aName = sheet.formulaCellAtom(keyFor(0, 0))
+    const aFn = sheet.formulaCellAtom(keyFor(0, 1))
+
+    wb.withBatch(() => {
+      wb.defineName('GOODN', { kind: 'value', value: { kind: 'number', value: 5 } })
+      wb.registerCustomFormula('GOODFN', (args) => {
+        const n = args[0]?.kind === 'number' ? args[0].value : 0
+        return { kind: 'number', value: n * 10 }
+      })
+      wb.setLocale('fr-FR')
+    })
+
+    expect(wb.store.getter(aName)).toEqual({ kind: 'number', value: 5 })
+    expect(wb.store.getter(aFn)).toEqual({ kind: 'number', value: 20 })
+    expect(wb.getLocale()).toBe('fr-FR')
+  })
+
+  test('rollback restores a throwing batch to a clean slate for subsequent batches', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '=RETRYN')
+    const a = sheet.formulaCellAtom(keyFor(0, 0))
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.defineName('RETRYN', { kind: 'value', value: { kind: 'number', value: 1 } })
+        throw new Error('first try fails')
+      }),
+    ).toThrow('first try fails')
+
+    // A later SUCCESSFUL batch works normally — no stale snapshot leaks.
+    wb.withBatch(() => {
+      wb.defineName('RETRYN', { kind: 'value', value: { kind: 'number', value: 2 } })
+    })
+    expect(wb.store.getter(a)).toEqual({ kind: 'number', value: 2 })
+  })
 })
