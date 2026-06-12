@@ -39,11 +39,11 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 
 ### Wave 3 — P2 hygiene (batchable, after waves 1-2)
 
-- **D-4 + D-5** adapter teardown leaks (deleteSheet overlays; readFormulaCells / snapshotSessions / importSessions on sheet ops) — one agent, worker adapters.
+- **D-4 + D-5** adapter teardown leaks (deleteSheet overlays; readFormulaCells / snapshotSessions / importSessions on sheet ops) — one agent, worker adapters. **FIXED** (dropSheetOverlayState; rebuildPreservingCells resets index-keyed state).
 - **B-2** atom-per-primitive-cell (23% of install) — lazy/coarse atomization, perf project.
-- **D-7 + D-8** filter/sort viewport full-scan + O(sheet) range reads.
-- **D-2** static-backend deep-clone history (demo/test surface only).
-- **C-3 / C-8 / D-10 / D-12** — docs/notes or small fixes.
+- **D-7 + D-8** filter/sort viewport full-scan + O(sheet) range reads. **FIXED** (displayRows permutation cache; collectCellsInBounds window probes).
+- **D-2** static-backend deep-clone history (demo/test surface only) — **FIXED** (reverse-delta history).
+- **C-3 / C-8 / D-10 / D-12** — docs/notes or small fixes. C-3 **CLOSED** (documented contract + JSDoc batch guidance); C-8 **FIXED** (typed bulkApply entries); D-10 **FIXED** (contiguous-band deleteRows RPCs); D-12 **FIXED** (capped notice surfaced).
 
 P3s tracked in section bodies; revisit after Wave 3.
 
@@ -499,7 +499,17 @@ green (31 suites / 1811 tests) with the pins included.
   or sub-key dependency granularity so a cell edit only dirties true
   dependents.
 
-#### C-3 · P-A · **P2** — name/custom-formula/locale registration outside `withBatch` clones every sheet
+#### C-3 · P-A · **P2** — name/custom-formula/locale registration outside `withBatch` clones every sheet — **CLOSED (documented contract)**
+
+- **CLOSED** (W3, docs-only — registry breadth is by design): the five
+  mutators (`defineName` / `undefineName` / `registerCustomFormula` /
+  `unregisterCustomFormula` / `setLocale`) now carry a JSDoc perf
+  warning pointing at `withBatch`, and
+  `vanilla/excel-core-ts/docs/KEY_GRANULAR_INVALIDATION.md` § C-3
+  records the measured numbers and the host contract (wrap multi-step
+  registration in `withBatch`). No behavior change; the lazy
+  name→dependents index stays the future option if single-name
+  registration ever gets hot.
 
 - `vanilla/excel-core-ts/src/workbook.ts:342-349`
   (`recalculateAllSheets`) called by `defineName` (`:525`),
@@ -625,7 +635,21 @@ green (31 suites / 1811 tests) with the pins included.
   shape codex flagged in Rust.
 - Fix sketch: `pendingMap.clear()` inside `clear()`.
 
-#### C-8 · wire-type caveat · **P2 (parked, re-verified unchanged)**
+#### C-8 · wire-type caveat · **P2 — FIXED (W3)**
+
+- **FIXED** (W3): the fix sketch as written — `bulkApply` now accepts
+  `BulkCellInput | BulkTypedCellInput` (`{row, col, value: Value}`,
+  exported from `@einfach/excel-core-ts`); typed entries install the
+  value verbatim through the same canonical-input helper as
+  `setCellValue`. `importCells` forwards number/text/boolean/error
+  wires as typed entries (formula wires still parse), and
+  `rebuildPreservingCells` carries typed literals through sheet ops so
+  an addSheet/removeSheet rebuild cannot re-classify them either. Pins
+  flipped: `vanilla/excel-core-ts/test/audit-mutation-scaling.test.ts`
+  (typed-entry preservation) + the C-8 describe in
+  `solid/excel/test/audit-adapter-scaling.test.ts` (`'00123'`/`'TRUE'`/
+  `'=A1'`/`'#N/A'` survive import and sheet-op round trips as text).
+  Original finding below.
 
 - `solid/excel/src-vnext/adapter/worker-runtime-ts.ts` `importCells`
   (~line 716) routes text wires through `bulkApply` input strings →
@@ -660,7 +684,7 @@ green (31 suites / 1811 tests) with the pins included.
 | severity | count | findings |
 |---|---|---|
 | P1 | 2 | C-1 (clone/edit) **FIXED**, C-2 (flush fan-out) **FIXED** |
-| P2 | 5 | C-3 (open, deliberate-broad documented), C-4 **FIXED** (importCells null-wire loop residual, cheap), C-5 **FIXED**, C-6 **FIXED**, C-8 (parked) |
+| P2 | 5 | C-3 **CLOSED** (deliberate-broad documented contract, W3), C-4 **FIXED** (importCells null-wire loop residual, cheap), C-5 **FIXED**, C-6 **FIXED**, C-8 **FIXED** (W3, typed bulkApply) |
 | P3 | 1 | C-7 (open) |
 
 Headline (P1s + C-6 resolved as of W2.2 `d98409c`): a keystroke on a
@@ -670,8 +694,9 @@ formulas, **~503 ms** of synchronous re-evaluation (C-2), composing to
 count == true dependent count, pinned), and overwritten formulas no
 longer leave drag (C-6). The TS port now matches the Rust engine at
 mutation time too: storage primary, per-cell reverse deps hydrated on
-read, dirty O(dependents). Remaining open items: C-3 (registry breadth,
-documented contract), C-7, C-8. C-4 closed by W2.4 (`e507222`): the
+read, dirty O(dependents). Remaining open items: C-7 (C-3 closed
+as documented contract, C-8 fixed via typed bulkApply — both W3).
+C-4 closed by W2.4 (`e507222`): the
 range loop shape is gone too — `Workbook.clearRange` walks existing
 cells in ONE postWrite batch (importCells' bounded null-wire loop is
 the only, cheap, residual).
@@ -723,7 +748,21 @@ worker runtimes, protocol client).
   read-invalidation at the end. WASM runtime is immune — it delegates to
   the engine's `clear_range`.
 
-#### D-2 · P-A · **P2** — static backend deep-clones the whole workbook per undoable mutation
+#### D-2 · P-A · **P2** — static backend deep-clones the whole workbook per undoable mutation — **FIXED**
+
+- **FIXED** (W3): `beginUndoableMutation` no longer snapshots the
+  workbook — history entries are per-mutation REVERSE deltas
+  (before-values of exactly the cells / format entries / per-sheet
+  tables the mutation touches, mirroring ui-core history's
+  small-descriptor contract). Undo applies the delta and symmetrically
+  captures the forward delta for redo. Structural ops (row/col shifts,
+  `removeRows`, `deleteSheet`) use a labeled `fullSheet` fallback —
+  O(one sheet), never O(workbook). Cap stays 200 entries. Pin flipped
+  (`solid/excel/test/audit-adapter-scaling.test.ts`): 20 single-cell
+  edits = **0.2 ms @50 cells vs ~0.0 ms @20k cells** (was 0.5 ms vs
+  57.3 ms, 108×); behavior pinned by the new undo/redo delta suite in
+  `solid/excel/test/vnext-adapter.test.ts` + the audit-history /
+  toolbar-history / undo-redo e2e specs.
 
 - `solid/excel/src-vnext/adapter/static-backend.ts:274-333` —
   `beginUndoableMutation` → `takeStateSnapshot` clones every cell of
@@ -751,7 +790,18 @@ worker runtimes, protocol client).
   (`worker-workbook-backend.ts:362-410`).
 - Fix sketch: port the layer representation back into the static state.
 
-#### D-4 · P-D · **P2** — worker backend `deleteSheet` leaves per-sheet host overlays; sheet ids are reused
+#### D-4 · P-D · **P2 — FIXED (W3)** — worker backend `deleteSheet` leaves per-sheet host overlays; sheet ids are reused
+
+- **FIXED** (W3): `deleteSheet` routes through a new
+  `dropSheetOverlayState(sheetId)` helper that clears EVERY per-sheet
+  table in the backend: `validationRulesBySheetId`,
+  `conditionalFormatRulesBySheetId`, `filterSortBySheetId`, the D-7
+  `filterSortDisplayRowsCache`, and prunes sheet-scoped `namedRanges`.
+  Pin flipped (audit test D-4): a new sheet reusing the deleted id now
+  projects NO inherited validation/conditional overlay, lists zero
+  conditional rules, and the dead sheet-scoped name is gone. (The
+  static backend's missing `filterSortBySheetId` clear is the sibling
+  static-backend arc's item.) Original finding below.
 
 - `worker-workbook-backend.ts:1463-1488` — `deleteSheet` removes the
   worker sheet + refreshes the lookup but never touches
@@ -768,7 +818,20 @@ worker runtimes, protocol client).
   in both backends; prune sheet-scoped named ranges like the static
   backend does.
 
-#### D-5 · P-D · **P2** — TS runtime sheet lifecycle leaves sheet-INDEX-keyed state behind
+#### D-5 · P-D · **P2 — FIXED (W3)** — TS runtime sheet lifecycle leaves sheet-INDEX-keyed state behind
+
+- **FIXED** (W3): `rebuildPreservingCells` (the shared
+  addSheet/renameSheet/removeSheet/moveSheet path) now resets
+  `readFormulaCells`, `importSessions`, and `snapshotSessions`. Clearing
+  (not reindexing) is the correct scheme for `readFormulaCells`: the
+  rebuild swaps in a fresh workbook, so every cached value is dropped
+  and 'dirty' is the honest probe answer until the host re-reads.
+  Stale sessions now fail loudly (INVALID_IMPORT_SESSION /
+  SNAPSHOT_SESSION_MISSING) instead of landing on the wrong shifted
+  index; session-id counters stay monotonic so ids never collide. Pins
+  flipped + extended (audit test D-5): the never-read formula probes
+  'dirty' after removeSheet, and in-flight import/snapshot sessions
+  reject after a structural op. Original finding below.
 
 - `worker-runtime-ts.ts:1292-1338` — `addSheet` / `renameSheet` /
   `removeSheet` / `moveSheet` rebuild the workbook but never touch:
@@ -799,7 +862,21 @@ worker runtimes, protocol client).
   Same family as D-5; P3 because `subscribeCells` has no production
   consumer yet and sessions are short-lived.
 
-#### D-7 · P-A · **P2** — filter/sort active ⇒ every viewport refresh reads the whole sheet
+#### D-7 · P-A · **P2 — FIXED (W3)** — filter/sort active ⇒ every viewport refresh reads the whole sheet
+
+- **FIXED** (W3): the fix sketch as written — `readRange` caches the
+  `displayRows` permutation per sheet, keyed by (content generation,
+  filter/sort state identity, column band). The wide
+  0..1_048_575 read runs ONCE per mutation/spec change to rebuild the
+  permutation; every subsequent viewport refresh maps its window rows
+  through the cache and reads only the contiguous source-row band that
+  projects in — bounded by existing content. The generation counter
+  bumps in `bumpRevision()` (i.e. on every backend mutation + worker
+  dirty event); entries also drop on `setFilterSort` and `deleteSheet`
+  (D-4). Bounded cache: ≤1 entry per sheet with an active spec. Pin
+  flipped (audit test D-7): cached refresh reads endRow ≤ content max
+  (30 in the pin, was 1_048_575); one wide scan re-runs after an edit,
+  then refreshes are bounded again. Original finding below.
 
 - `worker-workbook-backend.ts:878-887` — when `filterSortHasEffect`,
   `readRange` widens EVERY visible-window read to rows
@@ -815,7 +892,21 @@ worker runtimes, protocol client).
   filterSort state); reads then fetch only the source rows that project
   into the window.
 
-#### D-8 · P-A · **P2** — TS runtime range readers walk the entire sheet map per projection read
+#### D-8 · P-A · **P2 — FIXED (W3)** — TS runtime range readers walk the entire sheet map per projection read
+
+- **FIXED** (W3): `snapshotRangeSparse`, `readSparseRange`, and
+  `collectSpillTargets` route through `collectCellsInBounds`, which
+  enumerates window ∩ existing in O(min(window area, existing cells)):
+  viewport-sized windows probe their coordinates directly (`Map.get`
+  per coord — independent of sheet size); huge ranges (full-column,
+  `snapshotSparse`'s MAX_SAFE_INTEGER sentinel, D-7's wide scan) fall
+  back to the sparse map walk the engine's `clearRange` uses. The spill
+  anchor scan caps its up-left probe at the documented SPILL_LOOKBACK
+  (200) on the probe path — same projectability contract as
+  `getSpillProjectedValue`. Pinned with timing (audit test D-8): 100 ×
+  (readSparseRange + snapshotRangeSparse) on a 21×6 window @100k cells
+  ≈ 52 ms total (~0.5 ms/read pair) vs a full map walk per read; spill
+  projection still surfaces in bounded reads. Original finding below.
 
 - `worker-runtime-ts.ts:600-631` (`snapshotRangeSparse`) and `:633-674`
   (`readSparseRange`) iterate ALL cells of the sheet and filter by
@@ -833,7 +924,19 @@ worker runtimes, protocol client).
   O(host-read formulas) per keystroke. Fix: `Map<sheetIdx, Set>` so the
   per-sheet wipe is one `Map.delete`.
 
-#### D-10 · P-B · **P2** — `removeRows` loops one `deleteRows` RPC per row
+#### D-10 · P-B · **P2 — FIXED (W3, band level)** — `removeRows` loops one `deleteRows` RPC per row
+
+- **FIXED** (W3): the descending row list is grouped into contiguous
+  bands; each band is ONE `deleteRows(start, count)` RPC (the protocol
+  already carried `count`). The remove-duplicates shape (clustered
+  rows) collapses to a handful of round-trips; fully scattered rows
+  still cost one RPC per single-row band — the true single-RPC batch
+  still waits on the engine primitive
+  (TODO einfach-excel-core#batch-delete-rows, kept in-code). Partial-
+  failure semantics preserved (per-band atomicity assumed; Error still
+  carries `removedRows` + partial `affectedRange`). Pinned (audit test
+  D-10): rows [3,4,5,1,9,8,12,4] → exactly 4 RPCs
+  (12,1)(8,2)(3,3)(1,1). Original finding below.
 
 - `worker-workbook-backend.ts:1246-1343` — N duplicate rows ⇒ N
   descending single-row `deleteRows` RPCs, each a full worker round-trip
@@ -850,7 +953,16 @@ worker runtimes, protocol client).
   per read. Fix: hoist the sort (and range pre-filter) out of the cell
   loop.
 
-#### D-12 · correctness note · **P3** — replace-all only mutates the current 500-match page
+#### D-12 · correctness note · **P3** — replace-all only mutates the current 500-match page — **FIXED (surfaced)**
+
+- **FIXED** (W3): the page-at-a-time cap stays (bounded find cache,
+  by design) — the SILENT part is gone. ui-core gained
+  `replaceAllCappedAtom` + `markReplaceAllCappedAtom`
+  (`find-replace/index.ts`); the dialog sets it after the post-replace
+  re-search when `totalCount > pageMatches.length` and renders
+  "Replaced first N of M — run Replace all again for the rest"
+  (`replace-all-capped-text`). Cleared on new search commit and dialog
+  close. Unit-pinned in `vanilla/spreadsheet-ui-core/test/find-replace.test.ts`.
 
 - `solid/excel/src-vnext/find-replace/SpreadsheetFindReplaceDialog.tsx:
   186-211` — `handleReplaceAll` sends `cursor.pageMatches` (capped at
@@ -908,8 +1020,10 @@ adapters' bulk-import spine — the part the Rust arcs already disciplined —
 is clean; the fan-out lives in the overlay/undo/clear edges the engine
 never sees.
 
-Severity count: **P1 ×1** (D-1 **FIXED** W2.4) · **P2 ×6** (D-2, D-3, D-4, D-5, D-7,
-D-8) · **P3 ×6** (D-6, D-9, D-10*, D-11, D-12, D-13) — *D-10 is P2 impact
+Severity count: **P1 ×1** (D-1 **FIXED** W2.4) · **P2 ×6** (D-2 **FIXED** W3, D-3,
+D-4 **FIXED** W3, D-5 **FIXED** W3, D-7 **FIXED** W3, D-8 **FIXED** W3) ·
+**P3 ×6** (D-6, D-9, D-10* **FIXED** W3 at the band level, D-11,
+D-12 **FIXED** W3, D-13) — *D-10 is P2 impact
 but already tracked in-code; counted at P3 to avoid double-reporting.
 
 ## B — Restore / recalc / atoms (Rust)
