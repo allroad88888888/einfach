@@ -791,6 +791,15 @@ pub struct Sheet {
     /// `Sheet::set_formula` path does NOT bump this. Used by the scale
     /// suite to verify "imported" vs "live-edited" formula provenance.
     imported_formula_count: Cell<usize>,
+    /// Cumulative count of addresses visited by the dirty-propagation
+    /// BFS (`mark_dependents_dirty`) — one bump per NEWLY visited
+    /// dependent address (the dedup `notified` set gates the bump, so
+    /// diamond fan-ins count once per write, not once per path).
+    /// Read-only complexity probe for the scale suite (S2/S11): total
+    /// dirty work across a mutation storm must be bounded by
+    /// Σ |dependents|, never O(edits × sheet size). `Cell` so the BFS
+    /// (which runs on `&self`) can bump it.
+    dirty_visit_count: Cell<u64>,
 
     // === Spill (dynamic-array) infrastructure ===
     //
@@ -870,6 +879,7 @@ impl Sheet {
             col_widths: BTreeMap::new(),
             formula_eval_count: Cell::new(0),
             imported_formula_count: Cell::new(0),
+            dirty_visit_count: Cell::new(0),
             spill_targets: HashMap::new(),
             has_cross_sheet_refs: Cell::new(false),
         }
@@ -1671,6 +1681,7 @@ impl Sheet {
             if !notified.insert(addr) {
                 continue;
             }
+            self.dirty_visit_count.set(self.dirty_visit_count.get() + 1);
             if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
@@ -3221,6 +3232,34 @@ impl Sheet {
     #[doc(hidden)]
     pub fn debug_imported_formula_count(&self) -> usize {
         self.imported_formula_count.get()
+    }
+
+    /// Cumulative dirty-propagation BFS visits since the sheet was
+    /// created (one per newly visited dependent address inside
+    /// `mark_dependents_dirty`). Scale-suite complexity probe: the
+    /// total dirty work of a workload is `delta(this)` and must be
+    /// bounded by Σ |dependents| of the edited cells — independent of
+    /// total sheet size.
+    #[doc(hidden)]
+    pub fn debug_dirty_visit_count(&self) -> u64 {
+        self.dirty_visit_count.get()
+    }
+
+    /// Number of active spill anchors (entries in the `spill_targets`
+    /// bookkeeping map). Scale-suite leak probe: clearing an anchor must
+    /// return this to its pre-spill baseline.
+    #[doc(hidden)]
+    pub fn debug_spill_anchor_count(&self) -> usize {
+        self.spill_targets.len()
+    }
+
+    /// Total number of installed spill TARGET cells across all anchors
+    /// (sum of `spill_targets` value lengths; excludes the anchors
+    /// themselves). Scale-suite leak probe companion to
+    /// `debug_spill_anchor_count`.
+    #[doc(hidden)]
+    pub fn debug_spill_target_count(&self) -> usize {
+        self.spill_targets.values().map(|t| t.len()).sum()
     }
 
     /// Number of distinct `CellAddress`es with at least one live listener
