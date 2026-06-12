@@ -40,7 +40,7 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 ### Wave 3 — P2 hygiene (batchable, after waves 1-2)
 
 - **D-4 + D-5** adapter teardown leaks (deleteSheet overlays; readFormulaCells / snapshotSessions / importSessions on sheet ops) — one agent, worker adapters. **FIXED** (dropSheetOverlayState; rebuildPreservingCells resets index-keyed state).
-- **B-2** atom-per-primitive-cell (23% of install) — lazy/coarse atomization, perf project.
+- **B-2** atom-per-primitive-cell (23% of install) — lazy/coarse atomization, perf project. **FIXED** (lazy atomization via `CellSlot::Plain` + sorted bulk map build; 1M install −22%, see § B-2).
 - **D-7 + D-8** filter/sort viewport full-scan + O(sheet) range reads. **FIXED** (displayRows permutation cache; collectCellsInBounds window probes).
 - **D-2** static-backend deep-clone history (demo/test surface only) — **FIXED** (reverse-delta history).
 - **C-3 / C-8 / D-10 / D-12** — docs/notes or small fixes. C-3 **CLOSED** (documented contract + JSDoc batch guidance); C-8 **FIXED** (typed bulkApply entries); D-10 **FIXED** (contiguous-band deleteRows RPCs); D-12 **FIXED** (capped notice surfaced).
@@ -1093,9 +1093,40 @@ stale-value bug, B-4). Numbers: Apple Silicon, `cargo test --release`.
   either keep the loader or build the additive install variant Phase
   6.4 deferred.
 
-#### B-2 · P-A drift · **P2** — eager atom-per-primitive-cell
+#### B-2 · P-A drift · **P2** — eager atom-per-primitive-cell — **FIXED**
 
-- Every primitive install allocates a core atom: `sheet.rs:1408`
+- **FIXED** (W3, lazy primitive-cell atomization): `Sheet::cells` is now
+  `RowMajorMap<CellSlot>` with `CellSlot::Plain(Value)` |
+  `CellSlot::Atom(AtomId)`. `bulk_install_storage` parks raw values as
+  `Plain` — ZERO `Store::create_atom` calls at install — and bulk-builds
+  the row-major map from sorted pairs (`RowMajorMap::from_unsorted_pairs`,
+  std's packed BTreeMap bulk construction) instead of a random-order tree
+  insert per cell; the `formula_source` parking map gets the same bulk
+  build. `ensure_cell` is the single atomization point (promotes
+  `Plain` → `Atom` preserving the value, so `store.set` equality dedup is
+  unchanged); `attach_address_sub` promotes subscribed addresses so the
+  fanout always has a real atom — bounded by subscription count. Reads
+  serve `Plain` values directly (`slot_value`), killing the double
+  lookup. Spill anchors/targets stay `Atom` (anchors via `ensure_cell`);
+  `relocate_cells` moves slots with their keys, so structural edits shift
+  parked values for free. Legacy `BulkLoader` (`bulk_import_cells` /
+  restore) deliberately untouched — measured unchanged (+1.5%, noise).
+- Measured after fix (interleaved A/B, node + wasm-pkg release, medians
+  of 7): `bulk_install_workbook` mixed 1M (500k prim + 500k formulas)
+  **511.9 → 398.1 ms (−22.2%)**; primitives-only 1M
+  **480.5 → 360.3 ms (−25.0%)**. Native `install_sheet_bulk` @200k
+  primitives 28.5 → ~24 ms. Beats the ≥15% Wave-3 target on the 1M tier.
+- Pins: `install_primitives_allocates_zero_atoms_at_200k` (store atom
+  count 0 after install), `subscribe_after_install_fires_on_write`
+  (fanout + same-value dedup + lazy extreme),
+  `derive_read_after_install_tracks_parked_primitive`,
+  `structural_edit_relocates_parked_primitives`,
+  `spill_collision_with_parked_primitive`
+  (tests/storage_primary_install.rs), plus the flipped
+  `audit_primitive_install_atom_alloc_share` zero-atom assertion. New
+  probe: `Sheet::debug_materialized_cell_atom_count`.
+
+- (pre-fix analysis) Every primitive install allocated a core atom: `sheet.rs:1408`
   `store.create_atom(value)` + `cells.insert(addr, id)`; the value
   lives behind `Store::values: HashMap<AtomId, Value>`
   (`rust/core/src/store.rs:43`, `:194-198`). Reads pay a double lookup
@@ -1272,6 +1303,6 @@ and fix sketch; no separate severity counted here.
 ### Severity tally
 
 **P1 ×2** (B-1 **FIXED** W2.3 persistence path, B-4 **FIXED** W1.3) ·
-**P2 ×1** (B-2) · **P3 ×4** (B-5 partially subsumed by B-1's reroute,
-B-6, B-7 **RESOLVED** documented-additive, B-8) — B-3 corroborates A-1,
-not double-counted.
+**P2 ×1** (B-2 **FIXED** W3 lazy atomization) · **P3 ×4** (B-5 partially
+subsumed by B-1's reroute, B-6, B-7 **RESOLVED** documented-additive,
+B-8) — B-3 corroborates A-1, not double-counted.
