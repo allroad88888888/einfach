@@ -35,6 +35,16 @@ export interface Propagation {
   installDepsFor(owner: WorkbookSheet, key: string, ast: Expr): void
   postWrite(sheet: WorkbookSheet, records: ReadonlyArray<WriteRecord>): void
   recalculateAllSheets(): void
+  /**
+   * DepGraph size probe (TS mirror of Rust `debug_dep_graph_stats`).
+   * Pure observation for the always-on scale suite. @internal
+   */
+  debugDepGraphStats(): {
+    installed: number
+    pointKeys: number
+    rangeEntries: number
+    broad: number
+  }
 }
 
 export function createPropagation(deps: {
@@ -242,5 +252,6 @@ export function createPropagation(deps: {
     installDepsFor,
     postWrite,
     recalculateAllSheets,
+    debugDepGraphStats: () => depGraph.debugStats(),
   }
 }

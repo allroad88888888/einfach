@@ -1985,10 +1985,50 @@ function sparseValuesForRef(
   }
   coords.sort((a, b) => a.row - b.row || a.col - b.col)
 
-  const values = coords.map((coord) => ({
-    coord,
-    value: valueAtRuntimeCoord(ref.sheetName, coord, ctx),
-  }))
+  // Per-cell resolution discipline (scale-suite S3/S4 finding,
+  // 2026-06-12 — pre-fix, whole-column aggregates over N existing cells
+  // were O(N² log N): every uncached cell's refLookup threw NeedsDep
+  // under the trampoline shim, restarting this whole scan-and-sort once
+  // per cell; SUM(A:A) measured 458 ms @ 1k, 1.83 s @ 2k, 7.3 s @ 4k,
+  // ~hours @ 100k):
+  //
+  //  1. LITERAL cells resolve straight from storage (`coords` came from
+  //     this very map) — O(1), semantics-preserving (refLookup returns
+  //     exactly `cell.value` for them; see `valueAtRuntimeCoord`).
+  //  2. FORMULA cells keep the refLookup path (trampoline evaluation,
+  //     cycle detection, lazy dep install) — but their NeedsDep faults
+  //     are ACCUMULATED and rethrown as ONE batch, mirroring the shim's
+  //     `rangeLookup` batching, so a column dense with formula cells
+  //     costs one retry of the calling formula, not one restart per
+  //     cell. Under the recursive (non-shim) path refLookup never
+  //     throws and the try/catch is inert.
+  const missing: Array<{
+    cells: ReadonlyMap<CellKey, Cell>
+    key: CellKey
+    guardKey: CellKey
+  }> = []
+  const values: Array<{ coord: CellCoord; value: Value }> = new Array(coords.length)
+  for (let i = 0; i < coords.length; i += 1) {
+    const coord = coords[i]
+    const cell = cells.get(cellKey(coord))
+    if (cell && !cell.ast) {
+      values[i] = { coord, value: cell.value }
+      continue
+    }
+    try {
+      values[i] = { coord, value: valueAtRuntimeCoord(ref.sheetName, coord, ctx) }
+    } catch (err) {
+      if (err instanceof NeedsDep) {
+        // Placeholder never observed: the merged NeedsDep below aborts
+        // the caller before `values` is returned.
+        missing.push(...err.deps)
+        values[i] = { coord, value: BLANK }
+        continue
+      }
+      throw err
+    }
+  }
+  if (missing.length > 0) throw new NeedsDep(missing)
   return { ok: true, values }
 }
 
@@ -2030,6 +2070,30 @@ function valueAtRuntimeCoord(
   coord: CellCoord,
   ctx: EvalContext,
 ): Value {
+  // Literal / missing cells resolve straight from storage — O(1), no
+  // trampoline fault. Routing them through `refLookup` made every
+  // per-cell read inside the sparse aggregates THROW NeedsDep under the
+  // trampoline shim, restarting the calling formula's whole evaluation
+  // once per cell (scale-suite S3/S4 finding, 2026-06-12: SUM(A:A) over
+  // N literals was O(N² log N); SUMIF(A:A, crit) re-ran once per
+  // MATCHING cell — 1.86 s @ 50k). The direct read is semantics-
+  // preserving: for a literal, `refLookup` returns exactly `cell.value`,
+  // and for a missing cell, BLANK. Formula cells keep the original
+  // paths (trampoline evaluation, cycle detection, lazy dep install)
+  // untouched, as do out-of-bounds coords (#REF! via the parse failure).
+  if (
+    coord.row >= 0 &&
+    coord.row <= EXCEL_MAX_ROW &&
+    coord.col >= 0 &&
+    coord.col <= EXCEL_MAX_COL
+  ) {
+    const storage = sheetName ? ctx.crossSheetCells(sheetName) : ctx.cells
+    if (storage) {
+      const cell = storage.get(cellKey(coord))
+      if (!cell) return BLANK
+      if (!cell.ast) return cell.value
+    }
+  }
   const a1 = formatA1(coord)
   if (!sheetName) return ctx.refLookup(a1)
   const cells = ctx.crossSheetCells(sheetName)

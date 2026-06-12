@@ -130,6 +130,15 @@ export interface WorkbookSheet {
      * no-op when nothing is cached.
      */
     evict(key: CellKey): void
+    /**
+     * Size probe over the per-sheet atom caches (TS analog of Rust's
+     * `debug_materialized_cell_atom_count`). `derives` counts live
+     * cached derive atoms; `epochs` counts epoch atoms — retained
+     * across eviction BY DESIGN (codex P1 #1), so under churn `derives`
+     * returns to baseline while `epochs` plateaus at the high-water
+     * set of distinct addresses ever read. @internal
+     */
+    debugAtomCounts(): { derives: number; epochs: number }
   }
 }
 
@@ -368,6 +377,9 @@ export function createSheet(
         formulaAtomCache.delete(key)
         lastEvalRevision.delete(key)
         computing.delete(key)
+      },
+      debugAtomCounts() {
+        return { derives: formulaAtomCache.size, epochs: epochAtoms.size }
       },
     },
   }

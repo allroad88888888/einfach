@@ -376,6 +376,31 @@ export class DepGraph {
   }
 
   /**
+   * Size probe for the always-on scale suite (TS mirror of Rust's
+   * `debug_dep_graph_stats`). Pure observation — no graph mutation.
+   *
+   *  - `installed`: formulas with live edges (size of `installed`).
+   *  - `pointKeys`: distinct (sheet, key) coordinates with ≥1 point
+   *    dependent (Σ of per-sheet cellDependents map sizes).
+   *  - `rangeEntries`: distinct registered ranges across all sheets.
+   *  - `broad`: formulas in the dirty-on-every-write set.
+   *
+   * @internal
+   */
+  debugStats(): { installed: number; pointKeys: number; rangeEntries: number; broad: number } {
+    let pointKeys = 0
+    for (const bySheet of this.cellDependents.values()) pointKeys += bySheet.size
+    let rangeEntries = 0
+    for (const idx of this.rangeIndexes.values()) rangeEntries += idx.entries.size
+    return {
+      installed: this.installed.size,
+      pointKeys,
+      rangeEntries,
+      broad: this.broadDependents.size,
+    }
+  }
+
+  /**
    * Append every formula depending on (sheetId, key) — point edges plus
    * range entries containing the coordinate (candidates narrowed via the
    * column bucket; `wide` scanned linearly, expected tiny).

@@ -284,6 +284,20 @@ export interface Workbook {
    * @internal
    */
   debugFormulaCount(sheetIdx: number): number
+  /**
+   * Size probe over the workbook DepGraph (TS mirror of Rust's
+   * `debug_dep_graph_stats`). Used by the always-on scale suite to
+   * assert that edges installed for dead formulas are torn down
+   * (audit C-6) — pure observation, never mutates the graph.
+   *
+   * @internal
+   */
+  debugDepGraphStats(): {
+    installed: number
+    pointKeys: number
+    rangeEntries: number
+    broad: number
+  }
 }
 
 export interface SheetSeed {
@@ -682,6 +696,9 @@ export function createWorkbook(
         return 0
       }
       return sheetsList[sheetIdx]._debug.formulaCount()
+    },
+    debugDepGraphStats() {
+      return propagation.debugDepGraphStats()
     },
   }
 }
