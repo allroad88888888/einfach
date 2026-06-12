@@ -26,7 +26,7 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 | W1.1 | **A-4 + A-5** (panic: clear_range over spill; spill_targets not relocated by structural edits) | Rust sheet.rs spill | Make `BulkLoader::set_cell` + relocate spill-aware: clearing a spill target routes through anchor invalidation; structural shifts remap `spill_targets` keys. One agent, shared subsystem. |
 | W1.2 | **A-6 + A-7** (remove_sheet wipes cross-sheet graph permanently; rename_sheet changes values with no notify) | Rust workbook.rs | `remove_sheet` rebuilds via existing `rebuild_cross_sheet_deps` instead of wipe; `rename_sheet` fires the same rebuild + dirty fanout `install_sheet_bulk` now uses. |
 | W1.3 | **B-4** (named refs invisible to cross-sheet edge walkers → confirmed stale value) | Rust eval/workbook walkers | `collect_cross_sheet_refs` + latch walker resolve `Expr::Name` through `by_name` (incl. LAMBDA bodies). |
-| W1.4 | **C-5** (withBatch throw: registry mutated but invalidation dropped) | TS workbook.ts | On outermost-throw either roll back registry or fire the pending recalc; pick rollback (matches abort intent already documented). Small. |
+| W1.4 | **C-5** (withBatch throw: registry mutated but invalidation dropped) — **FIXED** `a62927d` | TS workbook.ts | On outermost-throw either roll back registry or fire the pending recalc; pick rollback (matches abort intent already documented). Small. |
 
 ### Wave 2 — catastrophic scaling (the P-A/P-B P1s)
 
@@ -372,23 +372,30 @@ jest, `npx jest vanilla/excel-core-ts --no-coverage` green (31 suites /
   through it — exactly what `bulkApply` already does for writes. Note
   the `importCells` comment ("no batch primitive exists") names the gap.
 
-#### C-5 · P-C · **P2** — `withBatch` throw path drops invalidation but keeps the mutation
+#### C-5 · P-C · **P2** — `withBatch` throw path drops invalidation but keeps the mutation — **FIXED** (`a62927d`)
 
-- `vanilla/excel-core-ts/src/workbook.ts:554-561`: on throw, the
-  outermost frame clears `pendingRecalc` WITHOUT firing it — but the
-  registry mutations that already ran (`names.set`,
-  `customFormulas.set/delete`, `currentLocale = ...`) are not rolled
-  back. Result: registry and cached derives disagree until any
-  unrelated mutation heals them.
-- Pinned repro (in the audit test file): `=MYNAME` reads `#NAME?`;
+- WAS: `vanilla/excel-core-ts/src/workbook.ts` `withBatch` catch: on
+  throw, the outermost frame cleared `pendingRecalc` WITHOUT firing it —
+  but the registry mutations that already ran (`names.set`,
+  `customFormulas.set/delete`, `currentLocale = ...`) were not rolled
+  back. Result: registry and cached derives disagreed until any
+  unrelated mutation healed them.
+- Pinned repro (was, in the audit test file): `=MYNAME` reads `#NAME?`;
   `withBatch(() => { defineName('MYNAME', 99); throw })`; post-throw
   read still `#NAME?` while the registry holds `MYNAME=99`; an
   unrelated `setCell` then flips the same cached atom to `99`.
-- Fix sketch: pick one consistent semantic — either roll back the
-  registry deltas on abort (true transactionality) or fire the deferred
-  recalc anyway (mutation happened ⇒ invalidate). Current half-measure
-  is the only P-C instance found; all five cell mutators uniformly
-  route `writeSheetState` and are clean.
+- FIX (W1.4, commit `a62927d`): rollback — the outermost `withBatch`
+  entry snapshots `names` / `customFormulas` (shallow `new Map`, small
+  bounded registries) plus `currentLocale`; the outermost throw restores
+  all three before clearing `pendingRecalc` and re-throwing. Nested
+  batches snapshot only at depth 0→1, so an inner throw that unwinds
+  through the outer frame aborts the WHOLE batch. Success path
+  unchanged. Sweep confirmed `setLocale` is the only other
+  `requestRecalc`-deferred mutator, hence locale joins the snapshot set;
+  all five cell mutators uniformly route `writeSheetState` and stay
+  outside batch semantics. Behavioral tests in
+  `vanilla/excel-core-ts/test/workbook.test.ts` (withBatch describe);
+  the audit pin now asserts the consistent post-fix behavior.
 
 #### C-6 · P-D · **P2** — formula derive atoms are never torn down
 
