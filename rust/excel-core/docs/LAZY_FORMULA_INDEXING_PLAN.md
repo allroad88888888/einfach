@@ -5,12 +5,24 @@ Codex review caught 2 P1 + 2 P2 correctness regressions (`7d0e380`).
 Cap removed entirely. Mega bulkWrite 428s → 11.4s (38×). Ultra (5M
 cells, single call) works at 2.9 GB peak RSS.
 
+**2026-06-12 update (audit W2.1, `0ca3a16`)**: the contract now
+survives structural edits. The 7d0e380 fix had made `insert_row` /
+`delete_row` / `insert_col` / `delete_col` hydrate EVERY parked
+formula first (audit finding A-1: 500k formulas → 2.09 s, sheet eager
+forever). Structural edits now retarget parked formulas by
+token-level source-text rewrite (`shift::rewrite_parked_source` — no
+parse, no dep work) and hydrated formulas by direct mapped-AST
+install; 500k insert_row = 127 ms with ZERO hydrations forced. Pins:
+`tests/lazy_structural_retarget.rs` + flipped A-1/B-3 audit pins;
+mechanism details in `AUDIT_PATTERN_FAMILY_2026-06-12.md` § A-1.
+
 Original RFC preserved below for historical reference. Closure summary:
 
 - Phase 1 (instrument): `ffe4feb` + `5744175` + `54d42cd` + `5766333`
 - Phase 2+3 (lazy bulk_load + hydrate): `40bc473`
 - Codex review fixups: `7d0e380`
 - Phase 5 (cap removal): `8a2f7f3` + `d0eb0da` + `3948b27`
+- Structural-edit lazy retarget (audit A-1, W2.1): `0ca3a16`
 
 Trace + measurements: `MEGA_TRACE_2026-06-11.md`, `CAP_REMOVAL_2026-06-11.md`.
 

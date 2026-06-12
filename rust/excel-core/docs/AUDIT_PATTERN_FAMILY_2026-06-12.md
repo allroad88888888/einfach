@@ -32,7 +32,7 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 
 | # | Findings | Area | Fix shape |
 |---|---|---|---|
-| W2.1 | **A-1** (+ satellites A-2, A-3) insert_row = full hydrate + re-render + re-parse; 500k → 2.09 s and sheet turns eager forever | Rust structural | Lazy retarget: shift parked SOURCE TEXT via token-level ref rewrite (no parse) for lazy entries; hydrated entries keep AST retarget. move_sheet gains the `!`-prefilter; clear_range consults dep indexes instead of scanning all formulas. This is the A-1 design item — RFC-grade, codex review after. |
+| W2.1 | **A-1** (+ satellites A-2, A-3, A-9) insert_row = full hydrate + re-render + re-parse; 500k → 2.09 s and sheet turns eager forever — **FIXED** `0ca3a16` | Rust structural | Lazy retarget landed as sketched (option (a), textual rewrite at edit time): parked SOURCE TEXT shifted via token-level ref rewrite (`shift::rewrite_parked_source`, no parse, no hydration); hydrated entries install the `map_addrs` AST directly (render→re-parse killed) and skip reinstall when unchanged. 500k insert_row 2.09 s → **127 ms**, dep graph stays empty. `rebuild_cross_sheet_deps` gained the `!`-prefilter; `clear_range` dedups per visited address. Details + bench tables in § A-1/A-2/A-3. |
 | W2.2 | **C-1 + C-2** (+ C-6) TS port: whole-Map clone per edit (107 ms @1M) + flush re-evals every cached formula (503 ms @100k) + atom cache never evicts | TS vanilla/core + sheet.ts | Mirror of the Rust fix, TS side. Options: per-sheet revision + in-place map with copy-on-read snapshots, or chunked/sharded maps, or dirty-set flush (only re-derive formulas whose deps intersect the write). Needs its own mini-RFC; touches the core store contract — codex review mandatory. |
 | W2.3 | **B-1** restores ride legacy per-cell loader (eager parse, no prefilter, double parse) | Rust wasm lib.rs | Route `restore_sparse` / `restore_persistence_v1` through `install_workbook_bulk` (they are fresh-shell semantics → full replace is correct). Mechanical; mirrors 6.3. |
 | W2.4 | **D-1 + C-4** clearRange dense coordinate loop (column delete ≈ 1M engine calls); no bulkClear primitive | engine + both runtimes | Add engine `clear_range` sparse primitive (iterate EXISTING cells in range, not coordinates); runtimes call it once. |
@@ -68,8 +68,53 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
 
 ### Findings
 
-#### A-1 · P-A · **P1** — one `insert_row` hydrates + re-parses EVERY formula on the sheet
+#### A-1 · P-A · **P1** — one `insert_row` hydrates + re-parses EVERY formula on the sheet — **FIXED**
 
+- **FIXED** (W2.1, `0ca3a16`): the fix sketch's FIRST option (textual
+  rewrite at edit time) landed, plus the full hydrated-path cleanup:
+  - LAZY: `Sheet::retarget_parked_sources` rewrites A1-style tokens in
+    parked source text via `shift::rewrite_parked_source` — a one-pass
+    byte scanner mirroring `parse_formula`'s tokenization (string
+    literals, function names incl. `LOG10(`/`A1(...)`, sheet names,
+    sheet-qualified refs all skipped; whole-row/whole-col pinned-axis
+    rules replicated; allocation only when a token actually shifts).
+    Refs into a deleted band → `write_error(#REF!)`, with a parse
+    check so unparseable parked garbage keeps its `#VALUE!` fate.
+    Pinned by a corpus test asserting
+    `parse(rewrite(src)) == map_addrs(parse(src))` per edit kind
+    (`src/shift.rs` tests) — this is what makes option (a) provable;
+    option (b) (deferred shift transforms) stays a follow-up if the
+    O(lazy) string pass ever dominates a profile.
+  - HYDRATED: `retarget_formula_refs` installs the `map_addrs` result
+    directly (render→re-parse killed; render kept only for
+    `formula_texts` of changed formulas) and skips reinstall when the
+    mapped AST is unchanged — keeping the cached value unless a range
+    dep can see the shifted region (`ShiftEdit::touches_range`,
+    covers unbounded `A:A`) or an eval-tracked dep moved (OFFSET-
+    style), which flip the cache Dirty.
+  - Indexes: `relocate_cells` no longer rebuilds; ONE
+    `rebuild_all_formula_dependents` at the end of the hydrated
+    retarget (O(hydrated) — ~0 under the lazy contract; both key and
+    value sides shift, so an in-place key patch would be the same
+    full remap), then a cache-only dirty BFS from every value-changed
+    cell so AST-unchanged dependents re-evaluate.
+  - The 7d0e380 self-cycle pin holds (text rewritten in the same
+    shift as the key relocate); W1.1 spill teardown/rederive order
+    preserved. New engine-level matrix in
+    `tests/lazy_structural_retarget.rs`; A-1/B-3 pins flipped.
+- Measured post-fix (same bench, Apple Silicon release; sheet stays
+  LAZY so the second insert rides the same textual path):
+
+  | formulas | first insert (was) | first insert (now) | second insert (now) |
+  |---|---|---|---|
+  | 1k | 4.7–6.0 ms | 0.89 ms | 0.58 ms |
+  | 10k | 32 ms | 4.0 ms | 3.6 ms |
+  | 100k | 335–375 ms | 26.8 ms | 22.8 ms |
+  | 500k | **2.09 s** | **127 ms** | 115 ms |
+
+  `debug_cell_dependents_key_count` stays 0 across both edits (bench
+  now asserts it). 16× at Mega tier, and the lazy import win is no
+  longer repaid on the first edit.
 - `sheet.rs:3654/3672/3688/3704` — all four structural ops
   (`insert_row` / `delete_row` / `insert_col` / `delete_col`) start
   with `hydrate_all_lazy_formulas()` (`:3724`), parse + dep-install for
@@ -108,8 +153,17 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   `relocate_cells` patch dep-index keys instead of
   `rebuild_all_formula_dependents`.
 
-#### A-2 · P-A · **P2** — `move_sheet` parses every lazy formula on every sheet
+#### A-2 · P-A · **P2** — `move_sheet` parses every lazy formula on every sheet — **FIXED**
 
+- **FIXED** (W2.1, `0ca3a16`): `rebuild_cross_sheet_deps` gained the
+  exact `!`-prefilter from `install_sheet_bulk_inner` — parked sources
+  without `!` skip the parse. Bypassed when the B-4
+  `named_values_cross_sheet` latch is armed (parked `=READDATA()`
+  carries an edge with no `!`); the W1.2/W1.3 cross-sheet propagation
+  tests stay green. Measured `move_sheet(0,1)` with zero cross-sheet
+  formulas: 1k → 36 µs (was 0.95 ms), 10k → 0.21 ms (was 4.7 ms),
+  100k → **3.3 ms** (was 25.7 ms). The "key CrossSheetDeps by stable
+  sheet id, making move_sheet O(1)" upgrade remains open.
 - `workbook.rs:830` `move_sheet` → `rebuild_cross_sheet_deps`
   (`:792`) → `for_each_lazy_formula` + `parse_formula` per parked
   entry (`:813-819`), across ALL sheets — with **no `!`-prefilter**,
@@ -123,8 +177,18 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   `CrossSheetDeps` by sheet name or a stable sheet id instead of
   position index, making `move_sheet` O(1) with no rebuild at all.
 
-#### A-3 · P-A · **P2** — clearing ONE cell is O(total formulas)
+#### A-3 · P-A · **P2** — clearing ONE cell is O(total formulas) — **FIXED**
 
+- **FIXED** (W2.1, `0ca3a16`): landed as sketched —
+  `for_each_non_empty_in_range` dedups per visited address (two map
+  probes per cell actually inside the range) instead of materializing
+  the global formula-key `HashSet`. A-9 folded in:
+  `BulkLoader::set_cell_at` typed entry, so `Sheet::clear_range` no
+  longer round-trips every address through strings. Measured
+  `clear_range(B1:B1)`: 100k → 8 µs (was 3.6 ms), 500k → **11 µs**
+  (was 22.8 ms) — now range-proportional. `Workbook::clear_range`
+  shares the fixed scan (its loader path still carries the string
+  addresses; dwarfed by the scan fix, tracked under A-9's remainder).
 - `sheet.rs:3348-3355` — `for_each_non_empty_in_range` builds its
   `formula_keys` dedup `HashSet` from **all** `formula_cells` +
   `formula_source` keys, regardless of how small the requested range
@@ -319,14 +383,17 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
 
 | severity | count | findings |
 |---|---|---|
-| P1 | 4 | A-1 (insert_row O(all formulas)), A-4 (clear_range panic), A-5 (spill_targets not relocated), A-6 (remove_sheet kills fanout) |
-| P2 | 3 | A-2 (move_sheet full parse), A-3 (1-cell clear O(sheet)), A-7 (rename_sheet silent) |
-| P3 | 2 | A-8, A-9 |
+| P1 | 4 | A-1 (insert_row O(all formulas)) **FIXED**, A-4 (clear_range panic) **FIXED**, A-5 (spill_targets not relocated) **FIXED**, A-6 (remove_sheet kills fanout) **FIXED** |
+| P2 | 3 | A-2 (move_sheet full parse) **FIXED**, A-3 (1-cell clear O(sheet)) **FIXED**, A-7 (rename_sheet silent) **FIXED** |
+| P3 | 2 | A-8 (open), A-9 (folded into A-3's fix — typed loader entry landed; the workbook loader's string addresses remain) |
 
-Headline: one `insert_row` on a 500k-formula sheet costs **2.09 s**
-native (and ~1.35 s for every one after); `clear_range` over any
-dynamic-array spill **panics the engine**; removing an unrelated sheet
-**permanently silences** all cross-sheet subscriber notifications.
+Headline (all resolved as of W2.1 `0ca3a16`): one `insert_row` on a
+500k-formula sheet WAS **2.09 s** native and left the sheet eager
+forever — now **127 ms** with the dep graph untouched; `clear_range`
+over a spill no longer panics (W1.1); removing an unrelated sheet no
+longer silences cross-sheet notify (W1.2). Section A's only open item
+is A-8 (spilled_into_anchor linear scan, theoretical until large
+spills are common).
 
 ## C — TS port (vanilla/excel-core-ts + core store)
 
