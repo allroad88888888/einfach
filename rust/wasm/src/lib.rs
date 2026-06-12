@@ -2999,6 +2999,22 @@ impl WasmWorkbook {
     /// Restore sparse cell records produced by `snapshot_sparse` or
     /// `snapshot_range_sparse`. Uses workbook bulk-load so formulas are
     /// reinstalled dirty and are not evaluated during restore.
+    ///
+    /// **Contract: ADDITIVE merge onto the live workbook** (audit B-7).
+    /// There is no teardown and no subscription reset — records are
+    /// applied on top of whatever the workbook already holds, and a
+    /// `"null"`-kind record explicitly clears its cell. The legacy
+    /// sheet-store relies on this for large-range-clear undo: it
+    /// snapshots only the range's non-empty cells, clears, and undoes
+    /// by restoring that sparse snapshot onto the live workbook.
+    ///
+    /// W2.3 (audit B-1) verdict: because of this additive contract,
+    /// `restore_sparse` deliberately STAYS on the legacy per-cell
+    /// `WorkbookLoader` path — the storage-primary
+    /// `install_workbook_bulk` is a full-sheet REPLACE and would
+    /// silently destroy unrelated live content. Routing it would need
+    /// the additive install variant Phase 6.4 deferred. The fresh-shell
+    /// restore (`restore_persistence_v1`) IS routed storage-primary.
     pub fn restore_sparse(&mut self, cells: JsValue) -> Result<u32, JsValue> {
         // Routes through `Workbook::bulk_load`, which Phase 2/3 made
         // lazy — see `CAP_REMOVAL_2026-06-11.md`. No per-call payload
@@ -3284,10 +3300,11 @@ impl WasmWorkbook {
             return Err("persistence payload has no sheets".into());
         }
 
-        // No per-call payload cap. `restore_sparse_cells` routes through
-        // the Phase 2/3 lazy `Workbook::bulk_load`, which holds only the
-        // formula source `Rc<str>` instead of pre-installing dep edges.
-        // See `CAP_REMOVAL_2026-06-11.md`.
+        // No per-call payload cap. The cells route through the
+        // storage-primary `install_workbook_bulk` (audit B-1 / W2.3):
+        // per-sheet primitive/formula maps swap straight into the fresh
+        // shell, formulas park as source text and hydrate lazily on
+        // first read. See `STORAGE_PRIMARY_PLAN.md`.
 
         let mut seen_names = HashSet::new();
         for (idx, sheet) in payload.sheets.iter().enumerate() {
@@ -3352,7 +3369,23 @@ impl WasmWorkbook {
         self.next_token = 0;
         self.workbook = workbook;
 
-        let restored_cells = self.restore_sparse_cells(payload.cells);
+        // W2.3 (audit B-1): fresh-shell restore is exactly the
+        // full-sheet-replace shape `install_workbook_bulk` implements —
+        // group the records into per-sheet primitive/formula maps and
+        // install in ONE engine call. No per-cell loader ceremony, no
+        // eager parse (the `!`-prefilter inside the install covers
+        // cross-sheet edges), formulas hydrate lazily on first read.
+        // Measured (bench_restore_persistence_v1_50k_plus_50k, native
+        // release, 50k primitives + 50k formulas): legacy loader
+        // 67.5 ms → 29.4 ms storage-primary (0.67 → 0.29 µs/cell); the
+        // 6.x bench history puts the wasm32 multiplier higher still.
+        let (install_payload, restored_cells) =
+            sparse_cells_to_install_payload(payload.cells, sheet_count);
+        if !install_payload.is_empty() {
+            self.workbook
+                .install_workbook_bulk(install_payload)
+                .map_err(|err| format!("persistence restore install failed: {err}"))?;
+        }
         let mut restored_formats = 0u32;
         for (sheet_idx, snapshot) in format_snapshots {
             let sheet = self
@@ -3504,6 +3537,97 @@ impl WasmWorkbook {
         });
         restored
     }
+}
+
+/// Group sparse cell records into the per-sheet primitive/formula maps
+/// `Workbook::install_workbook_bulk` consumes (audit B-1 / W2.3). The
+/// twin of the JS-side 6.3 conversion in `worker-runtime.ts`
+/// (`buildBulkInstallPayload`) and the `bulk_install_workbook` wire
+/// deserializer, for callers that already hold typed `SparseCellJSON`
+/// records.
+///
+/// Returns `(payload, restored)` where `restored` counts records that
+/// passed validation — matching the legacy loader's per-record count.
+/// Semantics notes (fresh-shell callers only):
+/// - records for out-of-range sheets are skipped, like the legacy path;
+/// - LAST record wins per address (a later record overwrites an earlier
+///   one across both maps, mirroring loader write order);
+/// - `"null"` records clear the address from both maps. On the fresh
+///   shell this is a no-op unless an earlier record wrote the address;
+/// - a malformed formula parks as source text and surfaces `#VALUE!` on
+///   first read (the legacy loader wrote `#VALUE!` eagerly — same
+///   observable value, deferred).
+#[allow(clippy::type_complexity)]
+fn sparse_cells_to_install_payload(
+    cells: Vec<SparseCellJSON>,
+    sheet_count: usize,
+) -> (
+    Vec<(
+        usize,
+        HashMap<CellAddress, Value>,
+        HashMap<CellAddress, String>,
+    )>,
+    u32,
+) {
+    let mut per_sheet: Vec<(HashMap<CellAddress, Value>, HashMap<CellAddress, String>)> =
+        (0..sheet_count).map(|_| Default::default()).collect();
+    let mut touched: Vec<bool> = vec![false; sheet_count];
+    let mut restored = 0u32;
+
+    for cell in cells {
+        if cell.sheet >= sheet_count {
+            continue;
+        }
+        let addr = CellAddress::new(cell.row, cell.col);
+        let (primitives, formulas) = &mut per_sheet[cell.sheet];
+        let value = match cell.kind.as_str() {
+            "number" => match cell.value {
+                Some(ImportValueJSON::Number(n)) if n.is_finite() => Value::Number(n),
+                _ => continue,
+            },
+            "text" => match cell.value {
+                Some(ImportValueJSON::Text(s)) => Value::Text(s),
+                _ => continue,
+            },
+            "boolean" => match cell.value {
+                Some(ImportValueJSON::Boolean(b)) => Value::Boolean(b),
+                _ => continue,
+            },
+            "error" => match cell.value {
+                Some(ImportValueJSON::Text(s)) => Value::Error(value_error_from_display(&s)),
+                _ => continue,
+            },
+            "formula" => match cell.value {
+                Some(ImportValueJSON::Text(s)) => {
+                    primitives.remove(&addr);
+                    formulas.insert(addr, s);
+                    touched[cell.sheet] = true;
+                    restored += 1;
+                    continue;
+                }
+                _ => continue,
+            },
+            "null" => {
+                primitives.remove(&addr);
+                formulas.remove(&addr);
+                restored += 1;
+                continue;
+            }
+            _ => continue,
+        };
+        formulas.remove(&addr);
+        primitives.insert(addr, value);
+        touched[cell.sheet] = true;
+        restored += 1;
+    }
+
+    let payload = per_sheet
+        .into_iter()
+        .enumerate()
+        .filter(|(sheet_idx, _)| touched[*sheet_idx])
+        .map(|(sheet_idx, (primitives, formulas))| (sheet_idx, primitives, formulas))
+        .collect();
+    (payload, restored)
 }
 
 /// Convert a `Result<(), SheetError>` from a workbook try-set into the
@@ -4294,6 +4418,86 @@ mod tests {
         assert_eq!(stats.sheets, 1);
         assert_eq!(wb.next_token, 0);
         assert!(wb.subscriptions.is_empty());
+    }
+
+    /// Build a persistence-v1 envelope with `n` number primitives in
+    /// column A and `n` formulas (`=A{row}+1`) in column B, all on one
+    /// sheet. Shared by the storage-primary restore pin + bench.
+    fn persistence_v1_workload(n: u32) -> WorkbookPersistenceV1JSON {
+        let mut cells = Vec::with_capacity(2 * n as usize);
+        for row in 0..n {
+            cells.push(SparseCellJSON {
+                sheet: 0,
+                addr: CellAddress::new(row, 0).to_string(),
+                row,
+                col: 0,
+                kind: "number".into(),
+                value: Some(ImportValueJSON::Number(row as f64)),
+            });
+            cells.push(SparseCellJSON {
+                sheet: 0,
+                addr: CellAddress::new(row, 1).to_string(),
+                row,
+                col: 1,
+                kind: "formula".into(),
+                value: Some(ImportValueJSON::Text(format!("=A{}+1", row + 1))),
+            });
+        }
+        WorkbookPersistenceV1JSON {
+            version: 1,
+            sheets: vec![WorkbookPersistenceSheetMetaJSON {
+                idx: 0,
+                name: "Data".into(),
+                row_count: Some(n),
+                col_count: Some(2),
+            }],
+            cells,
+            formats: vec![],
+            sizes: vec![],
+        }
+    }
+
+    /// Audit B-1 (W2.3): `restore_persistence_v1` routes through the
+    /// storage-primary `install_workbook_bulk` — a 1k-formula restore
+    /// leaves the dep graph EMPTY (no eager parse, no eager dep
+    /// install) and evaluates nothing until first read.
+    #[test]
+    fn wasm_workbook_restore_persistence_v1_storage_primary_lazy() {
+        let payload = persistence_v1_workload(1_000);
+
+        let mut restored = WasmWorkbook::new();
+        let stats = restored.restore_persistence_v1_json(payload).unwrap();
+        assert_eq!(stats.restored_cells, 2_000);
+        assert_eq!(stats.sheets, 1);
+
+        // Lazy contract: nothing parsed eagerly into the dep graph,
+        // nothing evaluated.
+        let sheet = restored.workbook.sheet(0).unwrap();
+        assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+        assert_eq!(restored.debug_formula_eval_count(0), 0);
+
+        // Values are correct on first read (hydrate-on-read).
+        assert_eq!(restored.get_number(0, "A500"), 499.0);
+        assert_eq!(restored.get_number(0, "B500"), 500.0);
+        assert_eq!(restored.get_number(0, "B1000"), 1000.0);
+        assert_eq!(restored.debug_formula_cache_state(0, "B1"), "dirty");
+    }
+
+    /// Quick timing for the B-1 reroute. Run with:
+    /// `cargo test -p einfach-wasm --release bench_restore_persistence_v1 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench — run manually with --ignored --nocapture"]
+    fn bench_restore_persistence_v1_50k_plus_50k() {
+        let payload = persistence_v1_workload(50_000);
+        let mut restored = WasmWorkbook::new();
+        let start = std::time::Instant::now();
+        let stats = restored.restore_persistence_v1_json(payload).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(stats.restored_cells, 100_000);
+        let per_cell_us = elapsed.as_secs_f64() * 1e6 / 100_000.0;
+        println!(
+            "restore_persistence_v1 50k primitives + 50k formulas: {elapsed:?} ({per_cell_us:.2} us/cell)"
+        );
     }
 
     #[test]
