@@ -33,7 +33,7 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 | # | Findings | Area | Fix shape |
 |---|---|---|---|
 | W2.1 | **A-1** (+ satellites A-2, A-3, A-9) insert_row = full hydrate + re-render + re-parse; 500k → 2.09 s and sheet turns eager forever — **FIXED** `0ca3a16` | Rust structural | Lazy retarget landed as sketched (option (a), textual rewrite at edit time): parked SOURCE TEXT shifted via token-level ref rewrite (`shift::rewrite_parked_source`, no parse, no hydration); hydrated entries install the `map_addrs` AST directly (render→re-parse killed) and skip reinstall when unchanged. 500k insert_row 2.09 s → **127 ms**, dep graph stays empty. `rebuild_cross_sheet_deps` gained the `!`-prefilter; `clear_range` dedups per visited address. Details + bench tables in § A-1/A-2/A-3. |
-| W2.2 | **C-1 + C-2** (+ C-6) TS port: whole-Map clone per edit (107 ms @1M) + flush re-evals every cached formula (503 ms @100k) + atom cache never evicts | TS vanilla/core + sheet.ts | Mirror of the Rust fix, TS side. Options: per-sheet revision + in-place map with copy-on-read snapshots, or chunked/sharded maps, or dirty-set flush (only re-derive formulas whose deps intersect the write). Needs its own mini-RFC; touches the core store contract — codex review mandatory. |
+| W2.2 | **C-1 + C-2** (+ C-6) TS port: whole-Map clone per edit (107 ms @1M) + flush re-evals every cached formula (503 ms @100k) + atom cache never evicts — **FIXED** `d98409c` (RFC `49d6f86`) | TS excel-core-ts (vanilla/core untouched) | Key-granular invalidation landed per `vanilla/excel-core-ts/docs/KEY_GRANULAR_INVALIDATION.md`: per-formula epoch atoms + workbook DepGraph (lazy hydrate-on-read dep install, TS mirror of `cell_dependents`/`range_dependents`), in-place storage + per-sheet `revisionAtom`, eviction on overwrite. setCell @1M: 107 ms → ~0.005 ms; @100k cached formulas: 503 ms/100k re-evals → ~0.005 ms/0 re-evals (re-evals == true dependents, pinned); C-6 drag gone. 1811 engine + 3720 monorepo tests, e2e `--project=ts` 480/0/37 green. |
 | W2.3 | **B-1** restores ride legacy per-cell loader (eager parse, no prefilter, double parse) | Rust wasm lib.rs | Route `restore_sparse` / `restore_persistence_v1` through `install_workbook_bulk` (they are fresh-shell semantics → full replace is correct). Mechanical; mirrors 6.3. |
 | W2.4 | **D-1 + C-4** clearRange dense coordinate loop (column delete ≈ 1M engine calls); no bulkClear primitive | engine + both runtimes | Add engine `clear_range` sparse primitive (iterate EXISTING cells in range, not coordinates); runtimes call it once. |
 
@@ -397,16 +397,30 @@ spills are common).
 
 ## C — TS port (vanilla/excel-core-ts + core store)
 
-Audit date 2026-06-12. Read-only; measurement pins live in
-`vanilla/excel-core-ts/test/audit-mutation-scaling.test.ts` (loose
-assertions, console timings — not perf gates). Apple Silicon, Node via
-jest, `npx jest vanilla/excel-core-ts --no-coverage` green (31 suites /
-1802 tests) with the pins included.
+Audit date 2026-06-12. Read-only at audit time; measurement pins live
+in `vanilla/excel-core-ts/test/audit-mutation-scaling.test.ts`
+(console timings; after the W2.2 fix the C-1/C-2/C-6 pins were flipped
+to assert the fixed behavior with generous 50-1000× margins). Apple
+Silicon, Node via jest, `npx jest vanilla/excel-core-ts --no-coverage`
+green (31 suites / 1811 tests) with the pins included.
 
 ### Findings
 
-#### C-1 · P-A · **P1** — whole-Map clone per single-cell edit
+#### C-1 · P-A · **P1** — whole-Map clone per single-cell edit — **FIXED**
 
+- **FIXED** (W2.2, `d98409c`): storage-primary mutate-in-place — each
+  sheet owns ONE live Map for its lifetime (`sheet.ts` `liveCells`);
+  mutators write into it directly and `postWrite`
+  (`src/propagation.ts`) propagates. The change signal moved off the
+  Map identity onto (a) per-formula epoch atoms (C-2) and (b) a new
+  per-sheet `revisionAtom` bumped once per mutation batch (the
+  subscription point the clone identity used to be). Re-measured with
+  the flipped pin: median `setCell` = **~0.005–0.013 ms at 10k / 100k /
+  1M cells** (was 0.45 / 4.9 / **107.6 ms** — linear); bulk import
+  unchanged (1M `bulkApply` ≈ 570–715 ms, consistent with the 785 ms
+  reference). Every consumer of the old identity signal is accounted
+  for in the RFC's consumer-of-identity table
+  (`vanilla/excel-core-ts/docs/KEY_GRANULAR_INVALIDATION.md`).
 - `vanilla/excel-core-ts/src/sheet.ts:272` — `applyCell` does
   `new Map(prev)` unconditionally; every single-cell mutator routes
   through it (`workbook.ts:387` setCell, `:410` setCellValue, `:453`
@@ -427,8 +441,28 @@ jest, `npx jest vanilla/excel-core-ts --no-coverage` green (31 suites /
   `cells` is shared and `rev` bumps, or adopt a persistent/chunked map
   (row-block pages, clone only the touched page).
 
-#### C-2 · P-A · **P1** — store flush re-derives EVERY cached formula on any write
+#### C-2 · P-A · **P1** — store flush re-derives EVERY cached formula on any write — **FIXED**
 
+- **FIXED** (W2.2, `d98409c`): the fix sketch's second option landed —
+  sub-key dependency granularity, vanilla/core untouched. Formula
+  derives no longer `get(sheetAtom)`; each cached formula's only core
+  dep is a per-key epoch atom. The workbook owns a `DepGraph`
+  (`src/deps.ts`): point index + column-bucketed range index (mirrors
+  Rust `cell_dependents` / `RangeDependentIndex` incl. the wide-range
+  fallback) + a broad set for INDIRECT/OFFSET/dynamic-range/volatile
+  formulas. Deps install lazily as the evaluator visits formulas
+  (`EvalContext.onFormulaEvaluated`, anchors AND transitive trampoline
+  visits — the hydrate-on-read mirror), resolving names through the
+  registry (B-4 twin). `postWrite` BFSes dependents-of-written-keys and
+  bumps exactly those epochs (eager re-derive preserved → probe
+  semantics unchanged). Flipped pins: one unrelated `setCell` @100k
+  cached formulas = **~0.005 ms / 0 re-evals** (was **503 ms /
+  100 000**); a new pin asserts re-eval count == TRUE dependent count
+  (100 of 10 000 cached). Registry-driven invalidation (defineName etc.)
+  stays explicitly broad by contract (C-3). NOTE: the first setter after
+  a host-read burst additionally drains core's pending-read bookkeeping
+  once (~1 ms/1k reads, amortized O(1) per read; pre-existing core
+  behavior, logged separately by the pin).
 - `vanilla/core/src/store.ts:222-239` (`dependenciesChange`) +
   `:241-253` (`flushPending`): a sheetAtom bump walks
   `backDependenciesMap.get(sheetAtom)` — i.e. every formula derive ever
@@ -507,8 +541,24 @@ jest, `npx jest vanilla/excel-core-ts --no-coverage` green (31 suites /
   `vanilla/excel-core-ts/test/workbook.test.ts` (withBatch describe);
   the audit pin now asserts the consistent post-fix behavior.
 
-#### C-6 · P-D · **P2** — formula derive atoms are never torn down
+#### C-6 · P-D · **P2** — formula derive atoms are never torn down — **FIXED**
 
+- **FIXED** (W2.2, `d98409c`): `postWrite` step 1/5 — when a write
+  removes a formula (formula → literal/blank/deleted, detected by AST
+  identity change), the DepGraph edges are uninstalled
+  (`remove_formula_record` twin) and, after one final epoch bump
+  publishes the literal to listeners, the derive + epoch atoms are
+  evicted from the sheet caches (`_internal.evict`). No core
+  `store.evict` needed: the atom's only dep was its own dropped epoch
+  atom, so all store-side state sits in WeakMaps keyed by the dropped
+  objects and is GC-reclaimable. Flipped pin: after 10k formulas are
+  read then overwritten to literals, median `setCell` = **~0.002 ms ≈
+  never-formula baseline** (was 16–17 ms vs 0.4 ms, ~40× permanent
+  drag), and `formulaCellAtom(key)` provably returns a fresh atom.
+  Documented caveat (RFC): a host subscription on a formula atom whose
+  cell is overwritten to a non-formula receives the final literal
+  publish and must re-subscribe; no production code subscribes
+  per-cell today.
 - `vanilla/excel-core-ts/src/sheet.ts:137` `formulaAtomCache` and
   `:153` `lastEvalRevision` grow monotonically and have no eviction;
   `vanilla/core` has no per-atom destroy/evict API (only whole-store
@@ -571,15 +621,20 @@ jest, `npx jest vanilla/excel-core-ts --no-coverage` green (31 suites /
 
 | severity | count | findings |
 |---|---|---|
-| P1 | 2 | C-1 (clone/edit), C-2 (flush fan-out) |
-| P2 | 5 | C-3, C-4, C-5, C-6, C-8 |
-| P3 | 1 | C-7 |
+| P1 | 2 | C-1 (clone/edit) **FIXED**, C-2 (flush fan-out) **FIXED** |
+| P2 | 5 | C-3 (open, deliberate-broad documented), C-4 (open), C-5 **FIXED**, C-6 **FIXED**, C-8 (parked) |
+| P3 | 1 | C-7 (open) |
 
-Headline: on a 1M-cell sheet a single keystroke costs **~108 ms** of Map
-clone (C-1); with 100k read formulas it additionally costs **~503 ms** of
-synchronous re-evaluation (C-2). The two compose: the TS port is the
-architectural reference for *laziness at build time* but has the exact
-inverse problem at *mutation time*.
+Headline (P1s + C-6 resolved as of W2.2 `d98409c`): a keystroke on a
+1M-cell sheet WAS **~108 ms** of Map clone (C-1) plus, with 100k read
+formulas, **~503 ms** of synchronous re-evaluation (C-2), composing to
+~610 ms — now **~0.005 ms with zero spurious re-derives** (re-eval
+count == true dependent count, pinned), and overwritten formulas no
+longer leave drag (C-6). The TS port now matches the Rust engine at
+mutation time too: storage primary, per-cell reverse deps hydrated on
+read, dirty O(dependents). Remaining open items: C-3 (registry breadth,
+documented contract), C-4 (worker bulk-clear primitive — each per-cell
+clear is now cheap, but the loop shape remains), C-7, C-8.
 
 ## D — UI core + worker adapters
 
