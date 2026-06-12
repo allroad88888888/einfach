@@ -322,15 +322,12 @@ function buildFilterSortDisplayRows(
   )
 }
 
-function applyFilterSortOverlay(
+function projectFilterSortWindow(
   cells: DisplayCell[],
   range: CellRange,
-  state: FilterSortState | undefined,
-): { cells: DisplayCell[]; displayRows: number[] | null } {
+  displayRows: readonly number[],
+): DisplayCell[] {
   const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
-  const displayRows = buildFilterSortDisplayRows(bySource, state)
-  if (displayRows === null) return { cells, displayRows: null }
-
   const projected: DisplayCell[] = []
   for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
     const sourceRow = displayRows[row]
@@ -346,7 +343,45 @@ function applyFilterSortOverlay(
       })
     }
   }
-  return { cells: projected, displayRows }
+  return projected
+}
+
+function applyFilterSortOverlay(
+  cells: DisplayCell[],
+  range: CellRange,
+  state: FilterSortState | undefined,
+): { cells: DisplayCell[]; displayRows: number[] | null } {
+  const bySource = new Map(cells.map((cell) => [keyFor(cell.row, cell.col), cell]))
+  const displayRows = buildFilterSortDisplayRows(bySource, state)
+  if (displayRows === null) return { cells, displayRows: null }
+  return { cells: projectFilterSortWindow(cells, range, displayRows), displayRows }
+}
+
+/**
+ * Audit D-7: given a cached display-row permutation, compute the
+ * contiguous SOURCE row band that projects into the requested window —
+ * bounded by existing content, never the 0..EXCEL_MAX_SHEET_ROW
+ * sentinel. Returns `null` when no source row projects into the window
+ * (nothing to read at all).
+ */
+function sourceRowRangeForWindow(
+  displayRows: readonly number[],
+  range: CellRange,
+): CellRange | null {
+  let minRow = Number.POSITIVE_INFINITY
+  let maxRow = -1
+  for (let row = range.rowStart; row <= range.rowEnd; row += 1) {
+    const sourceRow = displayRows[row]
+    if (sourceRow === undefined) continue
+    if (sourceRow < minRow) minRow = sourceRow
+    if (sourceRow > maxRow) maxRow = sourceRow
+  }
+  if (maxRow < 0) return null
+  return { rowStart: minRow, rowEnd: maxRow, colStart: range.colStart, colEnd: range.colEnd }
+}
+
+function emptyFormatRangeSnapshot(range: SparseRangeWire): FormatRangeSnapshot {
+  return { ...range, cellFormats: [], rangeFormats: [] }
 }
 
 function cloneValidationRule(rule: ValidationRule): ValidationRule {
@@ -775,6 +810,26 @@ export function createWorkerWorkbookSpreadsheetBackend(
   const validationRulesBySheetId = new Map<string, WorkerValidationRuleLayer[]>()
   const conditionalFormatRulesBySheetId = new Map<string, ConditionalFormatRuleEntry[]>()
   const filterSortBySheetId = new Map<string, FilterSortState>()
+  // Audit D-7: cached display-row permutation per sheet while filter/sort
+  // is active. Bounded: at most one entry per sheet with an active
+  // filter/sort state; entries drop on setFilterSort and deleteSheet and
+  // self-invalidate via the content generation + state identity checks.
+  // A cache hit lets readRange fetch only the source rows that project
+  // into the window instead of re-reading rows 0..EXCEL_MAX_SHEET_ROW
+  // and rebuilding the permutation on every viewport refresh.
+  type FilterSortDisplayRowsCacheEntry = {
+    generation: number
+    state: FilterSortState
+    colStart: number
+    colEnd: number
+    displayRows: number[]
+  }
+  const filterSortDisplayRowsCache = new Map<string, FilterSortDisplayRowsCacheEntry>()
+  // Monotonic content generation, bumped on EVERY revision bump
+  // (including hosts that seed a non-numeric `revision`, where the
+  // public revision cannot increment). Cache-validity backstop for the
+  // D-7 permutation cache.
+  let contentGeneration = 0
   let namedRanges: NamedRange[] = []
   const readyPromise = client
     .initWorkbook(sheetInputs.map((sheet) => sheet.name))
@@ -789,10 +844,30 @@ export function createWorkerWorkbookSpreadsheetBackend(
   })
 
   function bumpRevision(): ProjectionRevision {
+    contentGeneration += 1
     if (typeof revision === 'number' && Number.isFinite(revision)) {
       revision += 1
     }
     return revision
+  }
+
+  /**
+   * Audit D-4: drop every per-sheet host overlay keyed by `sheetId`.
+   * `syncSheetLookup` re-issues `sheet-${idx+1}` ids, so a deleted
+   * sheet's id IS reused by the next added sheet — stale entries are not
+   * just leaks, they get inherited. Per-sheet-keyed state in this
+   * backend: `validationRulesBySheetId`, `conditionalFormatRulesBySheetId`,
+   * `filterSortBySheetId`, `filterSortDisplayRowsCache` (D-7), and the
+   * sheet-scoped entries of `namedRanges`.
+   */
+  function dropSheetOverlayState(sheetId: string): void {
+    validationRulesBySheetId.delete(sheetId)
+    conditionalFormatRulesBySheetId.delete(sheetId)
+    filterSortBySheetId.delete(sheetId)
+    filterSortDisplayRowsCache.delete(sheetId)
+    namedRanges = namedRanges.filter(
+      (item) => item.scope === 'workbook' || item.scope.sheetId !== sheetId,
+    )
   }
 
   async function refreshSheetLookup(
@@ -868,6 +943,25 @@ export function createWorkerWorkbookSpreadsheetBackend(
     return sheet
   }
 
+  function validCachedDisplayRows(
+    sheetId: string,
+    state: FilterSortState,
+    range: CellRange,
+  ): number[] | null {
+    const entry = filterSortDisplayRowsCache.get(sheetId)
+    if (!entry) return null
+    if (entry.generation !== contentGeneration) return null
+    // `setFilterSort` always installs a fresh clone, so identity is a
+    // sound staleness check for the spec itself.
+    if (entry.state !== state) return null
+    // The permutation was derived from a read bounded to one column
+    // band; reuse only for the same band (matches the pre-cache
+    // behavior where each read derived the permutation from its own
+    // column window).
+    if (entry.colStart !== range.colStart || entry.colEnd !== range.colEnd) return null
+    return entry.displayRows
+  }
+
   async function readRange(
     sheetId: string,
     range: CellRange,
@@ -875,28 +969,76 @@ export function createWorkerWorkbookSpreadsheetBackend(
   ): Promise<{ cells: DisplayCell[]; revision?: ProjectionRevision }> {
     const sheet = await resolveSheet(sheetId)
     const filterSortState = filterSortBySheetId.get(sheetId)
-    // When filter/sort is active, source rows outside the viewport may need to be
-    // repositioned into it. Read a wide row range covering the whole sheet so the
-    // overlay sees every candidate row, then project back to the requested window.
-    const dataRange: CellRange = filterSortHasEffect(filterSortState)
-      ? { rowStart: 0, rowEnd: EXCEL_MAX_SHEET_ROW, colStart: range.colStart, colEnd: range.colEnd }
-      : range
-    const sparseDataRange = toSparseRange(sheet.idx, dataRange)
-    const [snapshots, formatSnapshot] = await Promise.all([
-      client.readSparseRange(sparseDataRange),
-      client.snapshotFormatRange(sparseDataRange),
-    ])
-    const cells = snapshots
-      .map(snapshotToDisplayCell)
-      .filter((cell): cell is DisplayCell => cell !== null)
-      .sort((left, right) => (left.row === right.row ? left.col - right.col : left.row - right.row))
+    const filterSortActive = filterSortHasEffect(filterSortState)
 
-    const filtered = applyFilterSortOverlay(cells, range, filterSortState)
+    // Audit D-7: when filter/sort is active, source rows outside the
+    // viewport may reposition into it, so ONE wide read per (content
+    // generation, filter/sort state, column band) is unavoidable — the
+    // permutation needs every candidate row. But per viewport REFRESH
+    // (scroll tick, post-edit re-read) the cached permutation tells us
+    // exactly which source rows project into the window, so cache hits
+    // read a row band bounded by existing content instead of
+    // 0..EXCEL_MAX_SHEET_ROW.
+    const cachedDisplayRows = filterSortActive
+      ? validCachedDisplayRows(sheetId, filterSortState!, range)
+      : null
+    const dataRange: CellRange | null = !filterSortActive
+      ? range
+      : cachedDisplayRows
+        ? sourceRowRangeForWindow(cachedDisplayRows, range)
+        : {
+            rowStart: 0,
+            rowEnd: EXCEL_MAX_SHEET_ROW,
+            colStart: range.colStart,
+            colEnd: range.colEnd,
+          }
+
+    let cells: DisplayCell[] = []
+    let formatSnapshot: FormatRangeSnapshot = emptyFormatRangeSnapshot(
+      toSparseRange(sheet.idx, range),
+    )
+    if (dataRange) {
+      const sparseDataRange = toSparseRange(sheet.idx, dataRange)
+      const [snapshots, rangeFormatSnapshot] = await Promise.all([
+        client.readSparseRange(sparseDataRange),
+        client.snapshotFormatRange(sparseDataRange),
+      ])
+      formatSnapshot = rangeFormatSnapshot
+      cells = snapshots
+        .map(snapshotToDisplayCell)
+        .filter((cell): cell is DisplayCell => cell !== null)
+        .sort((left, right) =>
+          left.row === right.row ? left.col - right.col : left.row - right.row,
+        )
+    }
+
+    let projectedCells = cells
+    let displayRows: number[] | null = null
+    if (filterSortActive) {
+      if (cachedDisplayRows) {
+        displayRows = cachedDisplayRows
+        projectedCells = projectFilterSortWindow(cells, range, displayRows)
+      } else {
+        const overlay = applyFilterSortOverlay(cells, range, filterSortState)
+        projectedCells = overlay.cells
+        displayRows = overlay.displayRows
+        if (displayRows) {
+          filterSortDisplayRowsCache.set(sheetId, {
+            generation: contentGeneration,
+            state: filterSortState!,
+            colStart: range.colStart,
+            colEnd: range.colEnd,
+            displayRows,
+          })
+        }
+      }
+    }
+
     const formattedCells = mergeFormatsIntoCells(
-      filtered.cells,
+      projectedCells,
       range,
       formatSnapshot,
-      filtered.displayRows,
+      displayRows,
     )
     const numberFormattedCells = applyNumberFormatsToCells(formattedCells)
     const validatedCells = applyValidationOverlay(
@@ -1220,24 +1362,27 @@ export function createWorkerWorkbookSpreadsheetBackend(
     /**
      * Wave 7.5 Remove Duplicates port. The worker protocol does not have
      * a dedicated batched `removeRows` / `deleteRowsBatch` RPC — the Rust
-     * `Workbook` only exposes single-band `delete_row(at, count)`. We
-     * layer multi-row deletion on top of that primitive by issuing one
-     * descending-order `deleteRows` per target row, so each delete keeps
-     * the remaining indices valid.
+     * `Workbook` only exposes contiguous-band `delete_row(at, count)`.
+     * Audit D-10 (FIXED at the band level): we group the descending row
+     * list into contiguous bands and issue ONE `deleteRows(start, count)`
+     * RPC per band — the common remove-duplicates shape (clustered rows)
+     * collapses to a handful of round-trips instead of one per row.
+     * Fully scattered rows still cost one RPC per (single-row) band.
      *
      * TODO(einfach-excel-core#batch-delete-rows): when the Rust side
      * grows a batched primitive (`delete_rows_batch(indices: &[u32])`),
-     * switch to a single RPC so the loop below can become atomic. The
-     * surface contract here will not change.
+     * switch to a single RPC so the band loop below can become atomic.
+     * The surface contract here will not change.
      *
-     * Atomicity caveat (HIGH #5): because each `client.deleteRows` is
-     * its own RPC, a mid-loop failure leaves the workbook with a partial
-     * deletion that we cannot roll back from this side. We surface this
-     * by counting committed deletes and re-throwing an Error that wraps
-     * the underlying rejection AND carries `removedRows` so the caller
-     * can record an accurate (partial) history entry before re-prompting
-     * the user. The revision is still bumped because the workbook IS
-     * dirty.
+     * Atomicity caveat (HIGH #5): because each band is its own RPC, a
+     * mid-loop failure leaves the workbook with a partial deletion that
+     * we cannot roll back from this side. Each band RPC is assumed
+     * atomic engine-side (one `delete_row(at, count)` call). We surface
+     * partial failure by counting committed deletes and re-throwing an
+     * Error that wraps the underlying rejection AND carries
+     * `removedRows` so the caller can record an accurate (partial)
+     * history entry before re-prompting the user. The revision is still
+     * bumped because the workbook IS dirty.
      *
      * Empty input is a no-op: no RPC, no revision bump, no history-side
      * effect, so accidentally confirming with zero duplicates leaves the
@@ -1268,12 +1413,31 @@ export function createWorkerWorkbookSpreadsheetBackend(
       const sheet = await resolveSheet(request.sheetId)
       unique.sort((a, b) => b - a)
 
+      // Audit D-10: collapse the descending row list into contiguous
+      // bands; each band is one `deleteRows(start, count)` RPC. Bands
+      // are processed in descending start order, so earlier deletions
+      // never shift the indices of later bands.
+      const bands: Array<{ startRow: number; count: number }> = []
+      for (const rowIdx of unique) {
+        const last = bands[bands.length - 1]
+        if (last && last.startRow === rowIdx + 1) {
+          last.startRow = rowIdx
+          last.count += 1
+        } else {
+          bands.push({ startRow: rowIdx, count: 1 })
+        }
+      }
+
       const successfullyRemoved: number[] = []
       let failureCause: unknown = null
-      for (const rowIdx of unique) {
+      for (const band of bands) {
         try {
-          await client.deleteRows(sheet.idx, rowIdx, 1)
-          successfullyRemoved.push(rowIdx)
+          await client.deleteRows(sheet.idx, band.startRow, band.count)
+          // Keep `successfullyRemoved` in descending row order so the
+          // partial-failure affectedRange picks min/max from the ends.
+          for (let offset = band.count - 1; offset >= 0; offset -= 1) {
+            successfullyRemoved.push(band.startRow + offset)
+          }
         } catch (err) {
           failureCause = err
           break
@@ -1473,6 +1637,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
         throw createBackendError('SHEET_DELETE_FAILED', `cannot delete sheet: ${request.sheetId}`)
       }
 
+      // Audit D-4 (FIXED): the deleted sheet's id will be reused by the
+      // next added sheet — drop every host-side overlay keyed by it so
+      // the new sheet starts clean instead of inheriting dead state.
+      dropSheetOverlayState(request.sheetId)
       const nextRevision = bumpRevision()
       const remainingSheets = lookup.sheets.filter((item) => item.id !== request.sheetId)
       await refreshSheetLookup(remainingSheets)
@@ -1737,6 +1905,10 @@ export function createWorkerWorkbookSpreadsheetBackend(
       } else {
         filterSortBySheetId.delete(request.sheetId)
       }
+      // Audit D-7: the permutation derives from the spec — drop the
+      // cached one (the state-identity check would also catch this; the
+      // delete keeps the cache from holding a dead sheet band).
+      filterSortDisplayRowsCache.delete(request.sheetId)
       return {
         sheetId: request.sheetId,
         requestId: request.requestId,

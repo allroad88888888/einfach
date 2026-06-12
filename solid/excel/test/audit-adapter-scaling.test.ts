@@ -17,14 +17,27 @@
  *         one postWrite batch. The pins below assert the fixed shape
  *         (cleared counts existing cells only; full-column clear is
  *         bounded by sheet content; spill semantics match W1.1).
- *  - D-5  P-D  worker-runtime-ts removeSheet leaves `readFormulaCells`
- *         keyed by the OLD sheet index → debugFormulaCacheState reports
- *         'clean' for a never-read formula on the sheet that shifted in.
- *  - D-4  P-D  worker-workbook-backend deleteSheet leaves the host-side
- *         per-sheet validation map; sheet ids are reused, so a NEW sheet
- *         inherits the deleted sheet's validation rules.
- *  - D-7  P-A  worker-workbook-backend reads rows 0..EXCEL_MAX while any
- *         filter/sort is active — every viewport refresh is O(sheet).
+ *  - D-5  P-D  **FIXED** worker-runtime-ts sheet ops reset
+ *         `readFormulaCells` / `importSessions` / `snapshotSessions` in
+ *         `rebuildPreservingCells` — the cache-state probe stays honest
+ *         and stale sessions fail loudly instead of hitting the wrong
+ *         (shifted) sheet index.
+ *  - D-4  P-D  **FIXED** worker-workbook-backend deleteSheet drops every
+ *         per-sheet host overlay (`dropSheetOverlayState`) — a reused
+ *         sheet id starts clean.
+ *  - D-7  P-A  **FIXED** worker-workbook-backend caches the filter/sort
+ *         displayRows permutation per (content generation, spec, column
+ *         band); the 0..EXCEL_MAX wide scan runs once per mutation, repeat
+ *         viewport refreshes read a content-bounded source-row band.
+ *  - D-8  P-A  **FIXED** worker-runtime-ts range readers enumerate
+ *         window ∩ existing via `collectCellsInBounds` (coordinate probe
+ *         for viewport windows, sparse map walk for huge ranges).
+ *  - D-10 P-B  **FIXED** worker-workbook-backend removeRows groups the
+ *         descending row list into contiguous bands — one deleteRows RPC
+ *         per band instead of per row.
+ *  - C-8  wire **FIXED** bulk import forwards typed `BulkTypedCellInput`
+ *         entries — text that looks numeric/boolean/error survives the
+ *         bulk path (no parseLiteral re-classification).
  *  - D-2  P-A  static-backend beginUndoableMutation deep-clones the WHOLE
  *         workbook on every undoable mutation (incl. each setCellInput).
  */
@@ -200,8 +213,8 @@ describe('audit D-1 · P-A · FIXED (W2.4) · TS runtime clearRange walks existi
   })
 })
 
-describe('audit D-5 · P-D · TS runtime sheet removal leaves index-keyed read tracking', () => {
-  test('debugFormulaCacheState reports clean for a never-read formula after removeSheet shifts indices', async () => {
+describe('audit D-5 · P-D · FIXED — TS runtime sheet ops drop index-keyed host state', () => {
+  test('debugFormulaCacheState reports dirty for a never-read formula after removeSheet shifts indices', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['S1', 'S2', 'S3', 'S4'] })
 
@@ -214,26 +227,71 @@ describe('audit D-5 · P-D · TS runtime sheet removal leaves index-keyed read t
     await rpc({ cmd: 'setFormulaDetailed', sheet: 3, addr: 'A1', formula: '=2+2' })
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 3, addr: 'A1' })).toBe('dirty')
 
-    // Remove S1 (idx 0): S3 → idx 1, S4 → idx 2. The stale '2:0:0' entry
-    // now matches S4!A1, which the host never read.
+    // Remove S1 (idx 0): S3 → idx 1, S4 → idx 2. Pre-fix, the stale
+    // '2:0:0' entry matched S4!A1 and the probe lied 'clean'.
     await rpc({ cmd: 'removeSheet', sheet: 0 })
     const probed = await rpc({ cmd: 'debugFormulaCacheState', sheet: 2, addr: 'A1' })
 
-    // PIN (bug): should be 'dirty' — the host never observed S4!A1. The
-    // removeSheet/moveSheet paths must drop / reindex `readFormulaCells`
-    // (and `snapshotSessions` / `importSessions`, same index keying).
-    expect(probed).toBe('clean')
+    // FLIPPED PIN (was: 'clean', the inherited stale entry):
+    // `rebuildPreservingCells` now resets `readFormulaCells` on every
+    // sheet op, so the host-read probe is honest again.
+    expect(probed).toBe('dirty')
+
+    // The shifted S3 (now idx 1) lost its 'clean' too — the rebuild
+    // dropped every cached value — and re-reading restores it.
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('dirty')
+    await rpc({ cmd: 'readCells', cells: [{ sheet: 1, addr: 'A1' }] })
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
+  })
+
+  test('in-flight import + snapshot sessions are invalidated by a structural sheet op', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['S1', 'S2'] })
+    await rpc({
+      cmd: 'restoreSparse',
+      cells: [{ sheet: 1, row: 0, col: 0, kind: 'number', value: 7 }],
+    })
+
+    // Open one import session and one chunked snapshot session, both
+    // referencing sheet indices that are about to shift.
+    const importSession = (await rpc({ cmd: 'beginImport', mode: 'direct' })) as number
+    await rpc({
+      cmd: 'importChunk',
+      sessionId: importSession,
+      cells: [{ sheet: 1, row: 1, col: 0, kind: 'number', value: 8 }],
+    })
+    const snapshotSession = (await rpc({
+      cmd: 'beginSnapshotRangeSparse',
+      range: { sheet: 1, startRow: 0, startCol: 0, endRow: 10, endCol: 0 },
+      rowsPerChunk: 4,
+    })) as { sessionId: number }
+
+    // Structural op: removing S1 shifts S2 from idx 1 to idx 0. The
+    // staged wires / chunk cursors carry pre-op indices — committing or
+    // continuing them would target the wrong sheet.
+    await rpc({ cmd: 'removeSheet', sheet: 0 })
+
+    // FIXED (D-5): both sessions were dropped by the sheet op; the next
+    // session RPC fails loudly instead of landing on the wrong sheet.
+    await expect(
+      rpc({ cmd: 'commitImport', sessionId: importSession }),
+    ).rejects.toThrow('INVALID_IMPORT_SESSION')
+    await expect(
+      rpc({ cmd: 'nextSnapshotRangeSparseChunk', sessionId: snapshotSession.sessionId }),
+    ).rejects.toThrow('SNAPSHOT_SESSION_MISSING')
   })
 })
 
-describe('audit D-4 · P-D · worker backend deleteSheet leaves per-sheet host overlays', () => {
-  test('a new sheet reusing the deleted sheet id inherits its validation rules', async () => {
+describe('audit D-4 · P-D · FIXED — worker backend deleteSheet drops per-sheet host overlays', () => {
+  test('a new sheet reusing the deleted sheet id starts clean (no inherited overlays)', async () => {
     const backend = createWorkerWorkbookSpreadsheetBackend({
       workerFactory: () => createInProcessWorker(),
       sheets: ['One', 'Two'],
     })
     await backend.ready()
 
+    // Stamp every per-sheet overlay table the backend keeps for sheet-2:
+    // validation, conditional format, filter/sort, and a sheet-scoped name.
     await backend.setValidationRule?.({
       kind: 'set-validation-rule',
       sheetId: 'sheet-2',
@@ -241,13 +299,31 @@ describe('audit D-4 · P-D · worker backend deleteSheet leaves per-sheet host o
       rule: { kind: 'list', values: ['North', 'South'], dropdown: true },
       mode: 'warn',
     })
+    await backend.setConditionalFormatRule?.({
+      kind: 'set-conditional-format-rule',
+      sheetId: 'sheet-2',
+      scope: { range: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 0 } },
+      rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#ff0000' } },
+    })
+    await backend.setFilterSort?.({
+      kind: 'set-filter-sort',
+      sheetId: 'sheet-2',
+      rules: [],
+      directives: [{ colIndex: 0, direction: 'asc' }],
+    })
+    await backend.setNamedRange?.({
+      kind: 'set-named-range',
+      name: 'DEAD_SHEET_NAME',
+      scope: { sheetId: 'sheet-2' },
+      refersTo: { kind: 'range', sheetId: 'sheet-2', address: 'A1' },
+    })
 
     await backend.deleteSheet?.({ kind: 'delete-sheet', sheetId: 'sheet-2', requestId: 1 })
     const added = await backend.addSheet?.({ kind: 'add-sheet', name: 'Fresh', requestId: 2 })
 
     // Sheet ids ARE reused after deletion (syncSheetLookup assigns
-    // `sheet-${idx+1}`), which is what turns the stale map entry into a
-    // user-visible defect rather than a plain leak.
+    // `sheet-${idx+1}`), which is what turned the stale map entries into
+    // a user-visible defect rather than a plain leak.
     expect(added?.createdSheet?.id).toBe('sheet-2')
 
     const projection = await backend.readVisibleProjection(
@@ -258,18 +334,30 @@ describe('audit D-4 · P-D · worker backend deleteSheet leaves per-sheet host o
       }),
     )
 
-    // PIN (bug): the brand-new empty sheet projects the DELETED sheet's
-    // validation overlay. deleteSheet must clear validationRulesBySheetId,
-    // conditionalFormatRulesBySheetId and filterSortBySheetId (and prune
-    // sheet-scoped named ranges) for the removed sheetId.
-    expect(projection.cells.some((cell) => cell.validation)).toBe(true)
+    // FLIPPED PIN (was: `true` — the new empty sheet projected the dead
+    // sheet's validation overlay). deleteSheet now routes through
+    // `dropSheetOverlayState`, clearing validationRulesBySheetId,
+    // conditionalFormatRulesBySheetId, filterSortBySheetId, the D-7
+    // displayRows cache, and sheet-scoped namedRanges.
+    expect(projection.cells.some((cell) => cell.validation)).toBe(false)
+    expect(projection.cells.some((cell) => cell.conditionalFormat)).toBe(false)
+
+    const conditionalRules = await backend.listConditionalFormatRules?.({
+      kind: 'list-conditional-format-rules',
+      sheetId: 'sheet-2',
+      requestId: 4,
+    })
+    expect(conditionalRules?.rules).toEqual([])
+
+    const names = await backend.listNamedRanges?.({ kind: 'list-named-ranges', requestId: 5 })
+    expect(names?.names.some((entry) => entry.name === 'DEAD_SHEET_NAME')).toBe(false)
 
     backend.dispose()
   })
 })
 
-describe('audit D-7 · P-A · worker backend reads the whole sheet per viewport refresh while filter/sort is active', () => {
-  test('readVisibleProjection requests rows 0..1_048_575 once a sort directive exists', async () => {
+describe('audit D-7 · P-A · FIXED — filter/sort wide scan runs once per mutation, not per viewport refresh', () => {
+  test('repeat reads hit the displayRows cache and request a content-bounded row band', async () => {
     const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
     const readRanges: SparseRangeWire[] = []
     const spyClient: typeof client = {
@@ -285,6 +373,18 @@ describe('audit D-7 · P-A · worker backend reads the whole sheet per viewport 
     })
     await backend.ready()
 
+    // 31 data rows (descending values so the asc sort actually permutes).
+    await backend.importCells?.({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      cells: new Array(31).fill(null).map((_, row) => ({
+        row,
+        col: 0,
+        input: String(100 - row),
+      })),
+      range: { rowStart: 0, rowEnd: 30, colStart: 0, colEnd: 0 },
+    })
+
     const window = { rowStart: 0, rowEnd: 20, colStart: 0, colEnd: 5 }
     await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 1, window }),
@@ -299,26 +399,228 @@ describe('audit D-7 · P-A · worker backend reads the whole sheet per viewport 
       directives: [{ colIndex: 0, direction: 'asc' }],
       requestId: 2,
     })
+
+    // First read after the spec change: the wide scan is legitimate —
+    // the permutation needs every candidate row exactly once.
+    const t0 = now()
     await backend.readVisibleProjection(
       createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 3, window }),
     )
-    const filteredRead = readRanges.at(-1)
+    const buildMs = now() - t0
+    const buildRead = readRanges.at(-1)
+    expect(buildRead?.endRow).toBe(1_048_575)
+
+    // Repeat refresh (scroll tick / re-render): FLIPPED PIN — was
+    // endRow=1_048_575 on EVERY read; now the cached permutation bounds
+    // the read to the source rows that project into the window (within
+    // existing content, ≤ row 30 here).
+    const t1 = now()
+    const refreshed = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 4, window }),
+    )
+    const refreshMs = now() - t1
+    const cachedRead = readRanges.at(-1)
 
     // eslint-disable-next-line no-console
     console.log(
-      `[audit D-7] visible-window read rows: plain endRow=${String(plainRead?.endRow)} ` +
-        `vs filter/sort-active endRow=${String(filteredRead?.endRow)}`,
+      `[audit D-7 FIXED] filter/sort reads: build endRow=${String(buildRead?.endRow)} ` +
+        `(${buildMs.toFixed(1)} ms) vs cached-refresh endRow=${String(cachedRead?.endRow)} ` +
+        `(${refreshMs.toFixed(1)} ms)`,
     )
 
-    // PIN: with filter/sort active EVERY viewport refresh (scroll tick,
-    // single-cell edit refresh, ...) reads + format-snapshots the full
-    // 0..1_048_575 row band and rebuilds the displayRows permutation from
-    // scratch — O(sheet) per refresh. A displayRows cache keyed by
-    // (sheetId, revision, filterSort state) would bound this to one full
-    // scan per mutation instead of per read.
-    expect(filteredRead?.endRow).toBe(1_048_575)
+    expect(cachedRead?.endRow).toBeLessThanOrEqual(30)
+    // The cached projection still shows the sorted ordering (ascending
+    // values 70..90 in window rows 1..20; header row 0 keeps value 100).
+    const row1 = refreshed.cells.find((cell) => cell.row === 1 && cell.col === 0)
+    expect(row1?.displayValue).toBe('70')
+
+    // A mutation invalidates the permutation: exactly ONE more wide scan,
+    // then refreshes are bounded again.
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 40,
+      col: 0,
+      input: '1',
+      requestId: 5,
+    })
+    await backend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 6, window }),
+    )
+    expect(readRanges.at(-1)?.endRow).toBe(1_048_575)
+    await backend.readVisibleProjection(
+      createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 7, window }),
+    )
+    expect(readRanges.at(-1)?.endRow).toBeLessThanOrEqual(40)
 
     backend.dispose()
+  })
+})
+
+describe('audit D-8 · P-A · FIXED — TS runtime range readers are O(window ∩ existing), not O(sheet)', () => {
+  test('viewport-window reads on a 100k-cell sheet probe the window instead of walking the map', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // 100_000 cells: rows 0..9_999 × cols 0..9.
+    const cells = []
+    for (let row = 0; row < 10_000; row += 1) {
+      for (let col = 0; col < 10; col += 1) {
+        cells.push({ sheet: 0, row, col, kind: 'number', value: row * 10 + col })
+      }
+    }
+    await rpc({ cmd: 'restoreSparse', cells })
+
+    // Warm-up + correctness: a 21×6 window returns exactly window ∩ existing.
+    const window = { sheet: 0, startRow: 5_000, startCol: 2, endRow: 5_020, endCol: 7 }
+    const first = (await rpc({ cmd: 'readSparseRange', range: window })) as Array<{
+      addr: string
+    }>
+    expect(first).toHaveLength(21 * 6)
+
+    const reads = 100
+    const t0 = now()
+    for (let i = 0; i < reads; i += 1) {
+      await rpc({ cmd: 'readSparseRange', range: window })
+      await rpc({ cmd: 'snapshotRangeSparse', range: window })
+    }
+    const elapsed = now() - t0
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[audit D-8 FIXED] ${reads} x (readSparseRange + snapshotRangeSparse) 21x6 window ` +
+        `@100k cells: ${elapsed.toFixed(1)} ms total (${(elapsed / reads).toFixed(2)} ms/read pair) ` +
+        '— was a full 100k-entry map walk (plus a second spill pass) per read',
+    )
+
+    // Deliberately loose for slow hardware; the pre-fix full-map walk
+    // (200 passes × 100k entries × key parsing) sits well above this.
+    expect(elapsed).toBeLessThan(1_000)
+
+    // Out-of-content windows cost nothing and return nothing.
+    const empty = (await rpc({
+      cmd: 'readSparseRange',
+      range: { sheet: 0, startRow: 900_000, startCol: 0, endRow: 900_020, endCol: 5 },
+    })) as unknown[]
+    expect(empty).toHaveLength(0)
+  })
+
+  test('spill projection still surfaces through bounded window reads', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=SEQUENCE(3, 2)' })
+    // Cache the anchor (spill targets only project from 'clean' anchors).
+    await rpc({ cmd: 'readCells', cells: [{ sheet: 0, addr: 'A1' }] })
+
+    const snapshots = (await rpc({
+      cmd: 'readSparseRange',
+      range: { sheet: 0, startRow: 1, startCol: 0, endRow: 2, endCol: 1 },
+    })) as Array<{ addr: string; display: string }>
+    expect(snapshots.map((cell) => [cell.addr, cell.display])).toEqual([
+      ['A2', '3'],
+      ['B2', '4'],
+      ['A3', '5'],
+      ['B3', '6'],
+    ])
+  })
+})
+
+describe('audit D-10 · P-B · FIXED — removeRows batches contiguous rows into one deleteRows RPC per band', () => {
+  test('scattered + clustered rows collapse to one RPC per contiguous band, descending', async () => {
+    const client = createWorkerWorkbook({ workerFactory: () => createInProcessWorker() })
+    const deleteCalls: Array<{ rowIndex: number; count: number }> = []
+    const spyClient: typeof client = {
+      ...client,
+      deleteRows(sheet, rowIndex, count) {
+        deleteCalls.push({ rowIndex, count })
+        return client.deleteRows(sheet, rowIndex, count)
+      },
+    }
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      client: spyClient,
+      sheets: ['One'],
+    })
+    await backend.ready()
+
+    const result = await backend.removeRows?.({
+      kind: 'remove-rows',
+      sheetId: 'sheet-1',
+      rows: [3, 4, 5, 1, 9, 8, 12, 4], // duplicates + unsorted + two clusters
+    })
+
+    // FLIPPED PIN (was: one single-row RPC per row — 7 calls here). The
+    // descending row list groups into contiguous bands: [12], [8..9],
+    // [3..5], [1] — four RPCs, each a (start, count) band.
+    expect(deleteCalls).toEqual([
+      { rowIndex: 12, count: 1 },
+      { rowIndex: 8, count: 2 },
+      { rowIndex: 3, count: 3 },
+      { rowIndex: 1, count: 1 },
+    ])
+    expect(result?.removedRows).toBe(7)
+    expect(result?.affectedRange).toEqual({
+      startRow: 1,
+      endRow: 12,
+      startCol: 0,
+      endCol: Number.MAX_SAFE_INTEGER,
+    })
+
+    backend.dispose()
+  })
+})
+
+describe('audit C-8 · wire-type · FIXED — bulk import preserves wire typing end to end', () => {
+  test("text wires that LOOK numeric/boolean/formula/error stay text through the bulk path", async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    const sessionId = (await rpc({ cmd: 'beginImport', mode: 'atomic' })) as number
+    await rpc({
+      cmd: 'importChunk',
+      sessionId,
+      cells: [
+        { sheet: 0, row: 0, col: 0, kind: 'text', value: '00123' },
+        { sheet: 0, row: 0, col: 1, kind: 'text', value: 'TRUE' },
+        { sheet: 0, row: 0, col: 2, kind: 'text', value: '=A1' },
+        { sheet: 0, row: 0, col: 3, kind: 'text', value: '#N/A' },
+        { sheet: 0, row: 0, col: 4, kind: 'number', value: 42 },
+      ],
+    })
+    await rpc({ cmd: 'commitImport', sessionId })
+
+    const readRow = async () =>
+      (await rpc({
+        cmd: 'readCells',
+        cells: ['A1', 'B1', 'C1', 'D1', 'E1'].map((addr) => ({ sheet: 0, addr })),
+      })) as Array<{ display: string; type: string; formula: string; isError: boolean }>
+
+    // FLIPPED PIN (was: importCells routed every wire through input
+    // strings, so parseLiteral re-classified text '00123' → number 123,
+    // 'TRUE' → boolean, '#N/A' → error). The bulk path now forwards
+    // typed entries (`BulkTypedCellInput`) — identical typing to the
+    // single-cell `setCell` wire path.
+    const cells = await readRow()
+    expect(cells.map((cell) => [cell.display, cell.type])).toEqual([
+      ['00123', 'text'],
+      ['TRUE', 'text'],
+      ['=A1', 'text'],
+      ['#N/A', 'text'],
+      ['42', 'number'],
+    ])
+    expect(cells[2].formula).toBe('')
+    expect(cells[3].isError).toBe(false)
+
+    // Sheet ops rebuild the workbook from the live cell maps — the
+    // rebuild must also carry TYPED literals (not input strings), or a
+    // simple addSheet would re-introduce the C-8 corruption.
+    await rpc({ cmd: 'addSheet', name: 'Sheet2' })
+    expect((await readRow()).map((cell) => [cell.display, cell.type])).toEqual([
+      ['00123', 'text'],
+      ['TRUE', 'text'],
+      ['=A1', 'text'],
+      ['#N/A', 'text'],
+      ['42', 'number'],
+    ])
   })
 })
 

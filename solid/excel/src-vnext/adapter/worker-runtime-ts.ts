@@ -59,6 +59,9 @@ import {
   formatA1,
   parseA1,
   parseFormula,
+  type BulkCellInput,
+  type BulkTypedCellInput,
+  type Cell,
   type CellCoord,
   type CellRange,
   type ErrorCode,
@@ -531,6 +534,46 @@ function clampRangeToSheet(range: SparseRangeWire): CellRange {
 }
 
 /**
+ * Audit D-8: enumerate existing cells intersecting `bounds` in
+ * O(min(window area, existing cells)) instead of always walking the
+ * whole live map. Viewport-sized windows probe their coordinates
+ * directly (one `Map.get` per coord — cost independent of sheet size);
+ * huge windows (full-column reads with rowEnd 1_048_575,
+ * `snapshotSparse`'s MAX_SAFE_INTEGER sentinel) fall back to the sparse
+ * map walk, which is O(existing cells) — the same shape the engine's
+ * `clearRange` primitive uses (W2.4 / audit D-1).
+ */
+function collectCellsInBounds(
+  cells: ReadonlyMap<string, Cell>,
+  bounds: CellRange,
+): Array<{ key: string; row: number; col: number; cell: Cell }> {
+  const out: Array<{ key: string; row: number; col: number; cell: Cell }> = []
+  const rowCount = bounds.rowEnd - bounds.rowStart + 1
+  const colCount = bounds.colEnd - bounds.colStart + 1
+  if (rowCount <= 0 || colCount <= 0) return out
+  if (rowCount * colCount <= cells.size) {
+    for (let row = bounds.rowStart; row <= bounds.rowEnd; row += 1) {
+      for (let col = bounds.colStart; col <= bounds.colEnd; col += 1) {
+        const key = `${row}:${col}`
+        const cell = cells.get(key)
+        if (cell) out.push({ key, row, col, cell })
+      }
+    }
+    return out
+  }
+  for (const [key, cell] of cells) {
+    const sep = key.indexOf(':')
+    const row = Number(key.slice(0, sep))
+    const col = Number(key.slice(sep + 1))
+    if (row < bounds.rowStart || row > bounds.rowEnd || col < bounds.colStart || col > bounds.colEnd) {
+      continue
+    }
+    out.push({ key, row, col, cell })
+  }
+  return out
+}
+
+/**
  * Enumerate the (row, col) coords of *spill targets* — cells with no own
  * formula/literal that fall inside the array-region of an anchor in this
  * sheet. Used by the range projectors so a spilled SEQUENCE/TRANSPOSE/SORT
@@ -560,15 +603,23 @@ function collectSpillTargets(
   // tick). We only consult formulas the engine has already cached
   // ('clean'); a formula that is still 'dirty' cannot have produced a
   // spill the host needs to surface yet, so skipping it is safe.
-  for (const [key, cell] of cells) {
+  //
+  // Audit D-8: the anchor scan is bounded too. Arrays spill DOWN and
+  // RIGHT, so only anchors at or before the bounds end can project in;
+  // when `collectCellsInBounds` takes its probe path (huge sheets,
+  // small windows) the up-left search is additionally capped at
+  // SPILL_LOOKBACK — the same documented projectability cap the
+  // single-cell boundary read (`getSpillProjectedValue`) applies. On
+  // sheets smaller than the expanded probe area the sparse map walk
+  // runs instead and finds every anchor (today's behavior).
+  const anchorBounds: CellRange = {
+    rowStart: Math.max(0, bounds.rowStart - SPILL_LOOKBACK),
+    rowEnd: bounds.rowEnd,
+    colStart: Math.max(0, bounds.colStart - SPILL_LOOKBACK),
+    colEnd: bounds.colEnd,
+  }
+  for (const { key, row: ar, col: ac, cell } of collectCellsInBounds(cells, anchorBounds)) {
     if (!cell.input.startsWith('=')) continue
-    const [rowStr, colStr] = key.split(':')
-    const ar = Number(rowStr)
-    const ac = Number(colStr)
-    // Arrays spill DOWN and RIGHT from their anchor. An anchor strictly
-    // past the bounds end cannot project into the requested window —
-    // skip it without evaluating the formula.
-    if (ar > bounds.rowEnd || ac > bounds.colEnd) continue
     // Skip non-clean formulas to avoid forcing a fresh derive run. A
     // formula that was never read by the host yet will be 'dirty' here;
     // its spill (if any) will surface once the host actually requests
@@ -604,13 +655,8 @@ function snapshotRangeSparse(state: RuntimeState, range: SparseRangeWire): Spars
   if (!target) return []
   const cells = state.workbook.store.getter(target.sheetAtom)
   const out: SparseCellWire[] = []
-  for (const [key] of cells) {
-    const [rowStr, colStr] = key.split(':')
-    const row = Number(rowStr)
-    const col = Number(colStr)
-    if (row < bounds.rowStart || row > bounds.rowEnd || col < bounds.colStart || col > bounds.colEnd) {
-      continue
-    }
+  // Audit D-8: O(window ∩ existing) enumeration, not a full map walk.
+  for (const { row, col } of collectCellsInBounds(cells, bounds)) {
     const sparse = readSparseCell(state, sheet, row, col)
     if (sparse) out.push(sparse)
   }
@@ -637,13 +683,8 @@ function readSparseRange(state: RuntimeState, range: SparseRangeWire): CellSnaps
   if (!target) return []
   const cells = state.workbook.store.getter(target.sheetAtom)
   const out: CellSnapshotWire[] = []
-  for (const [key, cell] of cells) {
-    const [rowStr, colStr] = key.split(':')
-    const row = Number(rowStr)
-    const col = Number(colStr)
-    if (row < bounds.rowStart || row > bounds.rowEnd || col < bounds.colStart || col > bounds.colEnd) {
-      continue
-    }
+  // Audit D-8: O(window ∩ existing) enumeration, not a full map walk.
+  for (const { row, col, cell } of collectCellsInBounds(cells, bounds)) {
     // Skip blank-format-only cells in the snapshot (matches the WASM
     // backend's "non-empty" semantics; the projection-builder fills
     // these in via fillBlankFormatOnlyCells using the format snapshot).
@@ -721,20 +762,16 @@ function importCells(state: RuntimeState, cells: ImportCellWire[]): WorkbookImpo
   // once. Cycle detection for formula cells is deferred to first read
   // (it surfaces as `#CIRCULAR!` then) — same lazy contract WASM has.
   //
-  // The wire-type → input-string round-trip preserves classification
-  // because `parseLiteral` (called by `buildCell`) infers using the
-  // same vocabulary the wire encoder produced from: a number wire
-  // serializes to its `String(value)` form (numeric), a boolean wire
-  // serializes to `'TRUE'`/`'FALSE'`, an error wire serializes to its
-  // error code, a formula wire keeps the leading `=`. Edge-case text
-  // values that *look* numeric/boolean/error (e.g. text='00123' or
-  // text='TRUE') would be MIS-classified by this round-trip — that
-  // case is intentionally not supported on the bulk-import fast path.
-  // Callers that need per-cell type preservation must use `setCell`
-  // RPC instead.
+  // Wire typing (audit C-8, FIXED): non-formula wires are forwarded as
+  // TYPED bulk entries (`BulkTypedCellInput`), so the producer's
+  // classification survives the bulk fast path exactly like the
+  // single-cell `setCell` RPC (which routes through `setCellValue`).
+  // Text `'00123'` keeps its leading zeros, text `'TRUE'` stays a
+  // string, text `'=A1'` stays literal. Only `kind:'formula'` wires go
+  // through the parser via input strings.
   type Batch = {
     sheet: SheetEntry
-    inputs: { row: number; col: number; input: string }[]
+    inputs: (BulkCellInput | BulkTypedCellInput)[]
     clears: { row: number; col: number }[]
   }
   const batches = new Map<number, Batch>()
@@ -758,19 +795,35 @@ function importCells(state: RuntimeState, cells: ImportCellWire[]): WorkbookImpo
     try {
       switch (cell.kind) {
         case 'number':
-          batch.inputs.push({ row: cell.row, col: cell.col, input: String(cell.value) })
+          batch.inputs.push({
+            row: cell.row,
+            col: cell.col,
+            value: { kind: 'number', value: cell.value },
+          })
           stats.accepted += 1
           break
         case 'text':
-          batch.inputs.push({ row: cell.row, col: cell.col, input: cell.value })
+          batch.inputs.push({
+            row: cell.row,
+            col: cell.col,
+            value: { kind: 'string', value: cell.value },
+          })
           stats.accepted += 1
           break
         case 'boolean':
-          batch.inputs.push({ row: cell.row, col: cell.col, input: cell.value ? 'TRUE' : 'FALSE' })
+          batch.inputs.push({
+            row: cell.row,
+            col: cell.col,
+            value: { kind: 'boolean', value: cell.value },
+          })
           stats.accepted += 1
           break
         case 'error':
-          batch.inputs.push({ row: cell.row, col: cell.col, input: cell.value })
+          batch.inputs.push({
+            row: cell.row,
+            col: cell.col,
+            value: { kind: 'error', code: cell.value as ErrorCode },
+          })
           stats.accepted += 1
           break
         case 'formula': {
@@ -1675,7 +1728,7 @@ function rebuildPreservingCells(
   // Snapshot the cell maps from the surviving sheets.
   const previousSheets = state.sheets
   const previousWorkbook = state.workbook
-  const cellsBySheetName = new Map<string, ReadonlyMap<string, import('@einfach/excel-core-ts').Cell>>()
+  const cellsBySheetName = new Map<string, ReadonlyMap<string, Cell>>()
   for (const sheet of previousSheets) {
     if (removedIdx !== undefined && sheet.idx === removedIdx) continue
     const handle = previousWorkbook.sheet(sheet.id)
@@ -1694,13 +1747,40 @@ function rebuildPreservingCells(
   for (const newSheet of sheets) {
     const oldCells = cellsBySheetName.get(newSheet.name)
     if (!oldCells || oldCells.size === 0) continue
-    const inputs: { row: number; col: number; input: string }[] = []
+    const inputs: (BulkCellInput | BulkTypedCellInput)[] = []
     for (const [key, cell] of oldCells) {
       const [rowStr, colStr] = key.split(':')
-      inputs.push({ row: Number(rowStr), col: Number(colStr), input: cell.input })
+      const row = Number(rowStr)
+      const col = Number(colStr)
+      // Formulas re-parse from source; literals carry their TYPED value
+      // (audit C-8) so a sheet op cannot re-classify e.g. a text cell
+      // '00123' into number 123 through parseLiteral.
+      if (cell.ast) {
+        inputs.push({ row, col, input: cell.input })
+      } else {
+        inputs.push({ row, col, value: cell.value })
+      }
     }
     state.workbook.bulkApply(newSheet.id, inputs)
   }
+
+  // Audit D-5: the rebuild swapped in a FRESH workbook — every cached
+  // formula value was dropped and sheet indices may have shifted. Sheet-
+  // index-keyed host state must not survive the op:
+  //  - `readFormulaCells`: stale `${oldIdx}:r:c` keys would make
+  //    `debugFormulaCacheState` report 'clean' for a never-observed
+  //    formula on whichever sheet shifted into the old slot.
+  //  - `importSessions`: staged `ImportCellWire.sheet` indices would
+  //    land buffered cells on the wrong sheet at commit.
+  //  - `snapshotSessions`: in-flight chunk cursors would read the wrong
+  //    sheet's rows in later chunks.
+  // Dropping the sessions makes the next session RPC fail loudly with
+  // INVALID_IMPORT_SESSION / SNAPSHOT_SESSION_MISSING so the host
+  // restarts against the new sheet layout. The session-id counters keep
+  // counting up, so a stale id can never collide with a new session.
+  state.readFormulaCells = new Set()
+  state.importSessions = new Map()
+  state.snapshotSessions = new Map()
 
   // Restore custom formulas on the new workbook (they live on the
   // workbook handle, not the sheets).
