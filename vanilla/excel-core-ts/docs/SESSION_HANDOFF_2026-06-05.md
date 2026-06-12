@@ -96,22 +96,50 @@ Ported the same wave. `eval.rs` grew +3487 lines; new `format.rs` (+348). Integr
 - DATE 0..1899 year offset rule; TIME bounds; GCD/LCM negatives; STANDARDIZE zero stddev; POISSON.DIST non-integer truncation.
 - TRANSLATE / PHONETIC implementations (were stubs).
 
-## 4. Verification numbers (after 2026-06-05/11 follow-up arc)
+## 4. Verification numbers (after the 2026-06-12 audit + fix waves)
 
 | Surface | Suites | Tests | Status |
 |---|---:|---:|---|
-| `vanilla/excel-core-ts` | 30 | **1791** | ✅ |
-| `vanilla/spreadsheet-ui-core` | 53 | **774** | ✅ |
-| `solid/excel` | 58 | **843** | ✅ |
-| Total monorepo jest | 190 | **3693** | ✅ |
-| `cargo test --lib + --tests` (rust/excel-core) | — | **1728** + 3 ignored | ✅ |
-| `cargo test --lib` (rust/wasm) | — | 30+ | ✅ |
+| Total monorepo jest | 193 | **3734** | ✅ |
+| `cargo test --lib + --tests` (rust/excel-core) | — | **1801** + ignored benches | ✅ |
+| `cargo test --lib` (rust/wasm) | — | 31 | ✅ |
 | `tsc -b` | — | — | ✅ clean |
-| e2e WASM | 515 | **478 / 0 / 37** | ✅ all green |
-| e2e TS | 515 | **478 / 0 / 37** | ✅ Δ=0 vs WASM, all green |
-| Mega (1M) WASM bulkWrite | — | **11.4 s** (was 428 s, **38× faster**) | ✅ |
-| Ultra (5M cells) single-call | — | **54.6 s** at 2.9 GB peak RSS | ✅ |
-| `MAX_BULK_IMPORT_CELLS_PER_CALL` cap | — | **removed** | ✅ |
+| e2e (last full dual run) | 515 | **480 / 0 / 37** each | ✅ Δ=0 |
+| Mega (1M) bulkWrite | — | WASM **578 ms** / TS ~714 ms | ✅ parity |
+| insert_row @500k lazy formulas | — | **130 ms** (was 2.09 s), sheet stays lazy | ✅ |
+| setCell @1M cells (TS) | — | **0.004 ms** (was 107.6 ms) | ✅ |
+| setCell w/ 100k cached formulas (TS) | — | re-evals == true dependents (was: all) | ✅ |
+| full-column clearRange | — | **0.1 ms** (was ≥1.2 s) | ✅ |
+| restore_persistence_v1 @100k cells | — | **29.4 ms** (was 67.5, zero eager parse) | ✅ |
+
+### Pattern-family audit + fix waves (2026-06-12)
+
+`rust/excel-core/docs/AUDIT_PATTERN_FAMILY_2026-06-12.md` — 4 parallel
+audits hunted the four anti-patterns (eager fan-out / per-item ceremony /
+bypassed propagation / incomplete teardown) across both engines:
+**9 P1 / 15 P2 / 13 P3** found, with measured repros.
+
+- **Wave 1 (correctness)** — `1414f1b` spill-aware bulk writes + spill
+  relocation (Delete over a dynamic array no longer aborts WASM);
+  `08c1d86` remove/rename_sheet rebuild + named-ref cross-sheet edge
+  resolution (LAMBDA-via-name stale values fixed; define_name now
+  rebuilds edges); `a62927d` withBatch throw rolls back registries.
+- **Wave 2 (scaling)** — `0ca3a16` lazy retarget: structural edits
+  rewrite parked source text token-level instead of hydrating
+  (insert_row @500k: 2.09 s → 130 ms, ZERO forced hydrations);
+  `d98409c` TS key-granular invalidation: per-formula epoch atoms +
+  lazily-built DepGraph (TS mirror of Rust cell_dependents), in-place
+  sheet maps + revisionAtom, formula-atom eviction (setCell @1M:
+  107.6 ms → 0.004 ms; vanilla/core ZERO diff); `1d71ecf` restores via
+  storage-primary install (restore_sparse stays additive-legacy by
+  contract evidence); `e507222` sparse clearRange primitive.
+- **Codex reviews** caught 3 P1 stale-cache bugs post-Wave-2; fixed in
+  `7ed4217` (Rust BFS roots) + `f8e6d8c`/`95ef444` (TS eviction
+  wiring + cycle reverse-deps).
+- **Wave 3 (P2 hygiene) — OPEN**: D-4/D-5 adapter teardown leaks,
+  B-2 atom-per-primitive (23% of install), D-7/D-8 filter/sort viewport
+  scans, D-2 static-backend clone, C-3/C-8/D-10/D-12 small items.
+  P3s tracked in the audit doc sections.
 
 ### Lazy formula indexing — Rust core philosophy realignment (2026-06-11)
 
