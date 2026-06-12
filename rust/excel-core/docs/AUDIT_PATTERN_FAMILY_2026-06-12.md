@@ -421,3 +421,226 @@ clone (C-1); with 100k read formulas it additionally costs **~503 ms** of
 synchronous re-evaluation (C-2). The two compose: the TS port is the
 architectural reference for *laziness at build time* but has the exact
 inverse problem at *mutation time*.
+
+## D — UI core + worker adapters
+
+Audit date 2026-06-12. Read-only; measurement/repro pins live in
+`solid/excel/test/audit-adapter-scaling.test.ts` (loose assertions,
+console timings — not perf gates; bug pins assert CURRENT buggy behavior
+and say so inline). `npx jest vanilla/spreadsheet-ui-core solid/excel
+--no-coverage` green with the pins included (111 suites / 1636 tests).
+
+Territory: `vanilla/spreadsheet-ui-core/src` (atoms, ports) and
+`solid/excel/src-vnext/adapter` (static backend, worker backends, TS/WASM
+worker runtimes, protocol client).
+
+### Findings
+
+#### D-1 · P-A · **P1** — TS worker runtime `clearRange` iterates the dense rectangle
+
+- `solid/excel/src-vnext/adapter/worker-runtime-ts.ts:692-704` — nested
+  `for row / for col` over the FULL request rectangle, one
+  `workbook.clearCell` engine call per coordinate, regardless of whether
+  a cell exists. Returns `cleared === area` on an empty sheet.
+- Reachable at catastrophic scale: a column-header selection produces
+  `rowEnd = EXCEL_MAX_ROWS - 1 = 1_048_575`
+  (`vanilla/spreadsheet-ui-core/src/selection/index.ts:140-146`), and
+  `worker-workbook-backend.ts:1179-1206 clearRange` forwards the range
+  verbatim. Delete on a selected column under the TS backend ⇒ ~1M engine
+  calls; each `clearCell` also pays the C-1 whole-Map clone, so cost is
+  O(area × existing cells).
+- Measured: 200×50 empty-sheet clear = 10 000 engine calls, **11.4 ms**
+  ⇒ ≳1.2 s minimum for one column on an EMPTY sheet, far worse populated.
+- Fix sketch: walk the sheet's sparse cell map filtered by bounds (the
+  exact pattern `snapshotRangeSparse` uses three functions up), one
+  read-invalidation at the end. WASM runtime is immune — it delegates to
+  the engine's `clear_range`.
+
+#### D-2 · P-A · **P2** — static backend deep-clones the whole workbook per undoable mutation
+
+- `solid/excel/src-vnext/adapter/static-backend.ts:274-333` —
+  `beginUndoableMutation` → `takeStateSnapshot` clones every cell of
+  EVERY sheet (plus all format/merge/dimension tables). Callers include
+  per-keystroke `setCellInput` (:1720) and per-drag-step
+  `setRowHeight`/`setColumnWidth` (:2171, :2185).
+- Measured: 20 single-cell edits — **0.5 ms** on a 50-cell book vs
+  **57.3 ms** on a 20k-cell book (**108×**, ≈2.9 ms/keystroke at 20k
+  cells; extrapolates to ~145 ms/keystroke at 1M cells).
+- `STATIC_BACKEND_UNDO_CAP = 200` (:272) ⇒ steady-state memory is
+  200 × workbook. Side note: UI-core history cap is 100
+  (`history/index.ts:6`) — the backend retains 100 snapshots the UI can
+  never undo into.
+- Fix sketch: inverse deltas per mutation kind (the history entry kinds
+  already enumerate them) or copy-on-write per-sheet maps.
+
+#### D-3 · P-A · **P2** — static backend `applyValidationRule` materializes blank cells across the whole rule range
+
+- `static-backend.ts:870-889` — dense `for row / for col` with
+  `upsertBlankCell` per coordinate. A full-column rule (1_048_576 rows
+  via the same selection bounds as D-1) creates ~1M cell entries; every
+  later snapshot/undo-clone (D-2) then pays for them forever.
+- The worker backend already has the correct shape: store rule layers,
+  overlay lazily inside the requested window only
+  (`worker-workbook-backend.ts:362-410`).
+- Fix sketch: port the layer representation back into the static state.
+
+#### D-4 · P-D · **P2** — worker backend `deleteSheet` leaves per-sheet host overlays; sheet ids are reused
+
+- `worker-workbook-backend.ts:1463-1488` — `deleteSheet` removes the
+  worker sheet + refreshes the lookup but never touches
+  `validationRulesBySheetId`, `conditionalFormatRulesBySheetId`,
+  `filterSortBySheetId` (:775-777) or sheet-scoped `namedRanges`.
+- Not just a leak: `syncSheetLookup` (:203-232) re-issues
+  `sheet-${idx+1}` ids, so the next added sheet REUSES the deleted id and
+  inherits its validation/conditional-format/filter state. Pinned:
+  delete `sheet-2` → add sheet → new `sheet-2` projects the dead sheet's
+  validation overlay (audit test D-4).
+- Static backend counterpart is almost complete (`static-backend.ts:
+  2474-2507` clears seven tables) but misses `filterSortBySheetId`.
+- Fix sketch: a `dropSheetState(sheetId)` helper called from deleteSheet
+  in both backends; prune sheet-scoped named ranges like the static
+  backend does.
+
+#### D-5 · P-D · **P2** — TS runtime sheet lifecycle leaves sheet-INDEX-keyed state behind
+
+- `worker-runtime-ts.ts:1292-1338` — `addSheet` / `renameSheet` /
+  `removeSheet` / `moveSheet` rebuild the workbook but never touch:
+  - `readFormulaCells` (:147, keys `${sheetIdx}:r:c`) — after
+    removeSheet/moveSheet shifts indices, `debugFormulaCacheState`
+    reports **'clean' for a never-read formula** on the sheet that
+    shifted into the stale slot (pinned, audit test D-5); entries for
+    removed sheets also accumulate forever.
+  - `snapshotSessions` (:132) — in-flight chunked snapshots keep reading
+    the shifted index ⇒ wrong sheet's rows in later chunks.
+  - `importSessions` (:130) — staged `ImportCellWire.sheet` indices land
+    on the wrong sheet if a sheet op happens between begin and commit.
+- Contrast: `initWorkbook` (:1275-1288) and `restorePersistenceV1`
+  (:1561-1594) reset all of these (restore misses `nextImportSessionId`
+  — cosmetic only).
+- Fix sketch: clear all three tables (or reindex `readFormulaCells`) in
+  `rebuildPreservingCells`; reject commits whose session predates a
+  structural sheet op (sessions already carry ids — add a workbook
+  generation counter).
+
+#### D-6 · P-D · **P3** — WASM runtime sheet ops vs sessions/subscriptions
+
+- `worker-runtime.ts:1164-1180` — addSheet/renameSheet/removeSheet/
+  moveSheet don't invalidate `importSessions`/`exportSessions`/
+  `snapshotSessions` (:211-213, all sheet-idx-keyed) nor
+  `subscriptionTokens` (:210; the dirty callback captures `ref.sheet` at
+  :963, so post-removal dirty events report the OLD index).
+  Same family as D-5; P3 because `subscribeCells` has no production
+  consumer yet and sessions are short-lived.
+
+#### D-7 · P-A · **P2** — filter/sort active ⇒ every viewport refresh reads the whole sheet
+
+- `worker-workbook-backend.ts:878-887` — when `filterSortHasEffect`,
+  `readRange` widens EVERY visible-window read to rows
+  `0..1_048_575` (`EXCEL_MAX_SHEET_ROW`, :141) for BOTH
+  `readSparseRange` and `snapshotFormatRange`, then
+  `buildFilterSortDisplayRows` (:305-323) scans all returned cells and
+  rebuilds the full row permutation — per scroll tick, per edit refresh.
+  Pinned: plain read endRow=20 vs filter-active endRow=**1 048 575**
+  (audit test D-7).
+- Reading wide once per MUTATION is legitimate (rows must reposition into
+  the window); doing it per READ is the P-A part.
+- Fix sketch: cache `displayRows` keyed by (sheetId, revision,
+  filterSort state); reads then fetch only the source rows that project
+  into the window.
+
+#### D-8 · P-A · **P2** — TS runtime range readers walk the entire sheet map per projection read
+
+- `worker-runtime-ts.ts:600-631` (`snapshotRangeSparse`) and `:633-674`
+  (`readSparseRange`) iterate ALL cells of the sheet and filter by
+  bounds; `collectSpillTargets` (:547-598) is a second full pass. Every
+  visible-window read is O(total cells), not O(window) — and D-7 composes
+  on top of it for the TS backend. WASM delegates to engine-side range
+  queries (`worker-runtime.ts:1579-1640`).
+- Fix sketch: row-bucketed index on the TS side, or push range queries
+  into `@einfach/excel-core-ts` (it owns the map already).
+
+#### D-9 · P-A · **P3** — `invalidateReadOnMutation` scans the whole host-read set per write
+
+- `worker-runtime-ts.ts:417-428` — every single-cell write iterates ALL
+  `readFormulaCells` entries (all sheets) doing string `startsWith`.
+  O(host-read formulas) per keystroke. Fix: `Map<sheetIdx, Set>` so the
+  per-sheet wipe is one `Map.delete`.
+
+#### D-10 · P-B · **P2** — `removeRows` loops one `deleteRows` RPC per row
+
+- `worker-workbook-backend.ts:1246-1343` — N duplicate rows ⇒ N
+  descending single-row `deleteRows` RPCs, each a full worker round-trip
+  + engine band-shift; partial-failure is handled but non-atomic.
+  Already documented in-code (TODO einfach-excel-core#batch-delete-rows,
+  :1220-1245) — recorded here so the batch primitive lands with the
+  engine arc.
+
+#### D-11 · P-A · **P3** — conditional-format overlay re-sorts the rule list per cell
+
+- `worker-workbook-backend.ts:429-443` — `getConditionalFormatForCell`
+  does `[...rules].sort(...)` and it's invoked per projected cell from
+  `applyConditionalFormatOverlay` (:445-462). O(window × rules·log rules)
+  per read. Fix: hoist the sort (and range pre-filter) out of the cell
+  loop.
+
+#### D-12 · correctness note · **P3** — replace-all only mutates the current 500-match page
+
+- `solid/excel/src-vnext/find-replace/SpreadsheetFindReplaceDialog.tsx:
+  186-211` — `handleReplaceAll` sends `cursor.pageMatches` (capped at
+  `MAX_FIND_PAGE = 500`) in ONE `replaceMatches` call (good — no P-B),
+  but silently leaves matches 501..totalCount untouched even though
+  `totalCount` is displayed to the user. Needs a loop-until-empty or an
+  explicit "replaced 500 of N" surface. Off-family but adjacent.
+
+#### D-13 · P-A · **P3** — TS runtime rebuilds the whole workbook per sheet op
+
+- `worker-runtime-ts.ts:1670-1714` — `rebuildPreservingCells` re-seeds a
+  fresh workbook and `bulkApply`s every surviving sheet's cells on every
+  addSheet/renameSheet/removeSheet/moveSheet. Documented in-code as a
+  TS-core limitation (no live structural mutations yet); recorded so the
+  engine gap is tracked. Adding an empty sheet to a 1M-cell book costs a
+  full reload.
+
+### Cleared paths (checked, no finding)
+
+- **Bulk import**: chunked + batched end to end — backend streams
+  ≤10k-cell chunks (`worker-workbook-backend.ts:983-1019`); TS runtime
+  buffers chunks and lands ONE `bulkApply` per sheet at commit
+  (`worker-runtime-ts.ts:1394-1422`); WASM atomic sessions stage into one
+  `bulk_install_workbook` (`worker-runtime.ts:869-879`). One dirty event
+  per commit, not per chunk (`isMutatingCommand` includes `commitImport`,
+  excludes `importChunk`).
+- **Paste / fill / clear / format / text-to-columns / remove-duplicates
+  dialogs**: each apply path is a single backend port call
+  (`pasteRange` / `fillRange` / `clearRange` / `setFormatRange` /
+  `importCellChunks` / `removeRows`) — no per-cell RPC loops in UI core
+  or the Solid layer (modulo D-10 inside the backend).
+- **UI-core history**: entries are small descriptors
+  (kind + range + revision, `history/types.ts:20-26`), cap 100, no state
+  copies. The state-copy problem is the static BACKEND's stack (D-2).
+- **Find-replace atoms**: page capped at 500 (`find-replace/index.ts:7`,
+  `:60`); replace-all batches through one `replaceMatches` (D-12 caveat).
+- **Atom hygiene**: no per-cell/per-row atom families anywhere in
+  `spreadsheet-ui-core`; the only Map-valued source atom is the
+  custom-formula registry (host-bounded).
+- **Worker resets**: WASM `initWorkbook` (`worker-runtime.ts:325-340`)
+  and `restorePersistenceV1` (:1598-1612) clear subscriptions + all three
+  session tables (+ customFormulas where the engine instance is
+  replaced); TS `initWorkbook`/`restorePersistenceV1` reset every
+  RuntimeState field except the cosmetic `nextImportSessionId` in
+  restore. The teardown gaps are the sheet-LIFECYCLE paths (D-5/D-6),
+  not the reset paths.
+- **Protocol client**: `dispose` rejects pending, clears subscriber +
+  listener tables, terminates (`worker-protocol.ts:686-696`); dirty
+  fan-in is O(listeners + subscribers), all bounded.
+
+Headline: one P1 (a column-clear on the TS backend dense-loops ~1M engine
+calls), and the same teardown bug shipped twice (D-4/D-5: per-sheet state
+keyed by reused ids / shifting indices outliving the sheet). The
+adapters' bulk-import spine — the part the Rust arcs already disciplined —
+is clean; the fan-out lives in the overlay/undo/clear edges the engine
+never sees.
+
+Severity count: **P1 ×1** (D-1) · **P2 ×6** (D-2, D-3, D-4, D-5, D-7,
+D-8) · **P3 ×6** (D-6, D-9, D-10*, D-11, D-12, D-13) — *D-10 is P2 impact
+but already tracked in-code; counted at P3 to avoid double-reporting.
