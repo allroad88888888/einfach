@@ -23,7 +23,7 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 
 | # | Findings | Area | Fix shape |
 |---|---|---|---|
-| W1.1 | **A-4 + A-5** (panic: clear_range over spill; spill_targets not relocated by structural edits) | Rust sheet.rs spill | Make `BulkLoader::set_cell` + relocate spill-aware: clearing a spill target routes through anchor invalidation; structural shifts remap `spill_targets` keys. One agent, shared subsystem. |
+| W1.1 | **A-4 + A-5** (panic: clear_range over spill; spill_targets not relocated by structural edits) — **FIXED** `1414f1b` | Rust sheet.rs spill | `BulkLoader::set_cell` / `set_formula` / `set_formula_lazy` now carry the single-cell spill guards (target write skipped/rejected, anchor write tears down) and `flush` runs `recompute_array_formulas_in(dirty)`; structural ops tear every spill down pre-shift and re-derive surviving anchors post-retarget (teardown+re-derive, not key remapping). Matrix in `tests/spill_structural.rs`. |
 | W1.2 | **A-6 + A-7** (remove_sheet wipes cross-sheet graph permanently; rename_sheet changes values with no notify) — **FIXED** `08c1d86` | Rust workbook.rs | `remove_sheet` rebuilds via existing `rebuild_cross_sheet_deps` instead of wipe; `rename_sheet` fires the same rebuild + dirty fanout `install_sheet_bulk` now uses. |
 | W1.3 | **B-4** (named refs invisible to cross-sheet edge walkers → confirmed stale value) — **FIXED** `08c1d86` | Rust eval/workbook walkers | `collect_cross_sheet_refs` + latch walker resolve `Expr::Name` through `by_name` (incl. LAMBDA bodies). |
 | W1.4 | **C-5** (withBatch throw: registry mutated but invalidation dropped) — **FIXED** `a62927d` | TS workbook.ts | On outermost-throw either roll back registry or fire the pending recalc; pick rollback (matches abort intent already documented). Small. |
@@ -139,8 +139,21 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   `formula_source.contains_key` (two map probes per visited cell,
   range-proportional) rather than materializing the global key set.
 
-#### A-4 · P-D · **P1** — `clear_range` over a spill region PANICS the engine
+#### A-4 · P-D · **P1** — `clear_range` over a spill region PANICS the engine — **FIXED**
 
+- **FIXED** (W1.1, `1414f1b`): the fix sketch landed as written —
+  `BulkLoader::set_cell` skips non-anchor spill-target writes (array
+  stays intact, single-cell `set_cell` parity) and tears the spill down
+  on anchor writes; `BulkLoader::set_formula` / `set_formula_lazy`
+  reject target writes with `false` and tear down on anchor writes
+  (covers the `set_formula_pre_parsed` workbook route and the
+  parse-failure `write_error_no_notify` path); `flush` now ends with
+  `recompute_array_formulas_in(&dirty)` so bulk dependency writes
+  re-flow downstream dynamic arrays (`dirty` only holds registered
+  formula addrs, so the lazy bulk-import zero-parse contract is
+  untouched). Pin flipped to
+  `audit_clear_range_over_spill_region_clears_cleanly`; full semantics
+  matrix in `tests/spill_structural.rs`.
 - `sheet.rs:4055-4096` — `BulkLoader::set_cell` has zero spill
   awareness: no `spilled_into_anchor` rejection, no
   `clear_spill_at_address` teardown (both of which the sibling
@@ -159,8 +172,21 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   an anchor; skip-or-collect-error when it is a non-anchor target), and
   run `recompute_array_formulas_in(dirty)` at the end of `flush`.
 
-#### A-5 · P-D · **P1** — structural edits do not relocate `spill_targets`
+#### A-5 · P-D · **P1** — structural edits do not relocate `spill_targets` — **FIXED**
 
+- **FIXED** (W1.1, `1414f1b`): the fix sketch's SECOND option landed —
+  all four structural ops (`insert_row` / `delete_row` / `insert_col` /
+  `delete_col`) call `teardown_all_spills()` right after
+  `hydrate_all_lazy_formulas` (snapshots anchor addresses, clears every
+  derived target atom) and `rederive_spill_anchors()` after
+  `retarget_formula_refs` (runs `recompute_array_formula` at each
+  shifted anchor; anchors in the deleted band map to the `REF_INVALID`
+  sentinel and are skipped). Spills always re-flow contiguously from
+  the shifted anchor — Excel's recompute-after-structural-edit
+  contract. O(active spills) extra per edit, negligible next to the
+  A-1 hydrate+retarget cost (benches unchanged). Pin flipped to
+  `audit_insert_row_relocates_spill_targets`; insert/delete row/col
+  matrix in `tests/spill_structural.rs`.
 - `sheet.rs:3809-3891` — `relocate_cells` moves `cells`,
   `formula_cells/exprs/texts`, `formula_source`, `needs_parse`,
   `formats`, `range_formats`… but NOT `spill_targets`, whose values are
