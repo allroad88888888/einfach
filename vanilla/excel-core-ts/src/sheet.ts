@@ -110,14 +110,24 @@ export interface WorkbookSheet {
   readonly _internal: {
     /** The live cell storage `sheetAtom` wraps. Mutate in place. */
     readonly cells: Map<CellKey, Cell>
-    /** Epoch atom for `key`, or undefined when no derive is cached. */
+    /**
+     * Epoch atom for `key`, or undefined when the key never had a
+     * cached derive. Epoch atoms SURVIVE eviction so previously
+     * handed-out derives keep receiving bumps for later writes.
+     */
     epochAtomIfCached(key: CellKey): AtomEntity<number> | undefined
-    /** Keys with cached derives (for registry-driven full invalidation). */
+    /**
+     * Keys with a live epoch atom — cached derives PLUS evicted keys
+     * whose previously handed-out atoms may still be held (used by
+     * registry-driven full invalidation, which must reach both).
+     */
     cachedFormulaKeys(): IterableIterator<CellKey>
     /**
-     * Drop the cached derive + epoch atom + eval stamp for `key`
-     * (audit C-6 eviction — called after a formula cell is overwritten
-     * by a non-formula). Safe no-op when nothing is cached.
+     * Drop the cached derive + eval stamp for `key` (audit C-6 eviction
+     * — called after a formula cell is overwritten by a non-formula).
+     * The epoch atom is deliberately retained (codex P1 #1): callers may
+     * still hold the old derive, whose only dep is that epoch. Safe
+     * no-op when nothing is cached.
      */
     evict(key: CellKey): void
   }
@@ -192,8 +202,12 @@ export function createSheet(
   revisionAtom.debugLabel = `excel-core.sheet.${id}.revision`
 
   // Per-key derived atom cache + the paired epoch atoms. Maps (not
-  // WeakMaps) — keys are short strings; entries are evicted when the
-  // workbook overwrites a formula with a non-formula (audit C-6).
+  // WeakMaps) — keys are short strings; derive entries are evicted when
+  // the workbook overwrites a formula with a non-formula (audit C-6).
+  // Epoch atoms are NOT evicted: a host may still hold an old derive
+  // (its only dep is the epoch), so the epoch stays registered and
+  // later writes to the key keep bumping it (codex P1 #1). A fresh
+  // derive built after eviction reuses the surviving epoch.
   const formulaAtomCache = new Map<CellKey, AtomEntity<Value>>()
   const epochAtoms = new Map<CellKey, AtomEntity<number>>()
 
@@ -225,9 +239,17 @@ export function createSheet(
     // The epoch atom is the derive's ONLY reactive dep. The workbook
     // bumps it to invalidate this one formula; nothing else in the
     // store graph points at the derive.
-    const epochAtom: AtomEntity<number> = atom(0)
-    epochAtom.debugLabel = `excel-core.sheet.${id}.formulaCell.${key}.epoch`
-    epochAtoms.set(key, epochAtom)
+    //
+    // REUSE a surviving epoch atom when one exists: eviction (C-6)
+    // drops the derive but keeps the epoch registered, so atoms handed
+    // out before the eviction and the fresh derive built here share the
+    // same bump target — a write to this key updates both.
+    const existingEpoch = epochAtoms.get(key)
+    const epochAtom: AtomEntity<number> = existingEpoch ?? atom(0)
+    if (!existingEpoch) {
+      epochAtom.debugLabel = `excel-core.sheet.${id}.formulaCell.${key}.epoch`
+      epochAtoms.set(key, epochAtom)
+    }
     const a = atom((get) => {
       // ←── the ONLY reactive dep registered by the derive.
       get(epochAtom)
@@ -330,11 +352,20 @@ export function createSheet(
         return epochAtoms.get(key)
       },
       cachedFormulaKeys() {
-        return formulaAtomCache.keys()
+        // epochAtoms ⊇ formulaAtomCache keys: includes evicted keys
+        // whose old derives may still be held by the host — registry
+        // recalc must bump those too (their cell may have been
+        // re-formularized without a fresh `formulaCellAtom` request).
+        return epochAtoms.keys()
       },
       evict(key) {
+        // Drop the heavy derive + probe stamps, but KEEP the epoch atom
+        // registered: a host may still hold a derive previously returned
+        // by `formulaCellAtom(key)`, and later writes to this address
+        // must keep bumping it (codex P1 #1). The epoch is a tiny
+        // primitive atom — retaining it does not reintroduce the C-6
+        // per-edit drag (writes to OTHER keys never touch it).
         formulaAtomCache.delete(key)
-        epochAtoms.delete(key)
         lastEvalRevision.delete(key)
         computing.delete(key)
       },
