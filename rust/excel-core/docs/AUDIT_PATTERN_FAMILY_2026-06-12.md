@@ -24,8 +24,8 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 | # | Findings | Area | Fix shape |
 |---|---|---|---|
 | W1.1 | **A-4 + A-5** (panic: clear_range over spill; spill_targets not relocated by structural edits) | Rust sheet.rs spill | Make `BulkLoader::set_cell` + relocate spill-aware: clearing a spill target routes through anchor invalidation; structural shifts remap `spill_targets` keys. One agent, shared subsystem. |
-| W1.2 | **A-6 + A-7** (remove_sheet wipes cross-sheet graph permanently; rename_sheet changes values with no notify) | Rust workbook.rs | `remove_sheet` rebuilds via existing `rebuild_cross_sheet_deps` instead of wipe; `rename_sheet` fires the same rebuild + dirty fanout `install_sheet_bulk` now uses. |
-| W1.3 | **B-4** (named refs invisible to cross-sheet edge walkers → confirmed stale value) | Rust eval/workbook walkers | `collect_cross_sheet_refs` + latch walker resolve `Expr::Name` through `by_name` (incl. LAMBDA bodies). |
+| W1.2 | **A-6 + A-7** (remove_sheet wipes cross-sheet graph permanently; rename_sheet changes values with no notify) — **FIXED** `08c1d86` | Rust workbook.rs | `remove_sheet` rebuilds via existing `rebuild_cross_sheet_deps` instead of wipe; `rename_sheet` fires the same rebuild + dirty fanout `install_sheet_bulk` now uses. |
+| W1.3 | **B-4** (named refs invisible to cross-sheet edge walkers → confirmed stale value) — **FIXED** `08c1d86` | Rust eval/workbook walkers | `collect_cross_sheet_refs` + latch walker resolve `Expr::Name` through `by_name` (incl. LAMBDA bodies). |
 | W1.4 | **C-5** (withBatch throw: registry mutated but invalidation dropped) — **FIXED** `a62927d` | TS workbook.ts | On outermost-throw either roll back registry or fire the pending recalc; pick rollback (matches abort intent already documented). Small. |
 
 ### Wave 2 — catastrophic scaling (the P-A/P-B P1s)
@@ -177,8 +177,17 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   `recompute_array_formulas_in` re-install them inside
   `with_structural_edit`.
 
-#### A-6 · P-C · **P1** — `remove_sheet` permanently kills ALL cross-sheet dirty/notify fanout
+#### A-6 · P-C · **P1** — `remove_sheet` permanently kills ALL cross-sheet dirty/notify fanout — **FIXED**
 
+- **FIXED** (W1.2, `08c1d86`): `remove_sheet`
+  now calls `rebuild_cross_sheet_deps()` after the removal + name-lookup
+  rebuild (the fix sketch's first option), and additionally dirties +
+  notifies every surviving formula that REFERENCED the removed sheet
+  (their value becomes `#REF!`-class), with chained dependents reached
+  through the shared `run_cross_sheet_dirty_bfs`. Pin flipped; matrix
+  in `tests/cross_sheet_propagation.rs`. O(formulas + lazy parse) per
+  removal accepted for a rare structural op (inherits A-2's missing
+  `!`-prefilter, tracked there).
 - `workbook.rs:1521-1538` — `remove_sheet` replaces the whole
   `CrossSheetDeps` with an empty graph. The comment claims "the next
   workbook-routed `set_formula` call will repopulate edges from the
@@ -197,8 +206,16 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   O(all formulas) is acceptable for sheet removal, though it inherits
   A-2's missing `!`-prefilter; or rewrite `(idx, addr)` keys in place.
 
-#### A-7 · P-C · **P2** — `rename_sheet` changes dependent values with zero propagation
+#### A-7 · P-C · **P2** — `rename_sheet` changes dependent values with zero propagation — **FIXED**
 
+- **FIXED** (W1.2, `08c1d86`): the "alternative minimal fix"
+  landed — names stay stale in ASTs/texts (Excel-style reference
+  rewrite remains a follow-up), but `rename_sheet` now rebuilds the
+  cross-sheet graph against the new name → index map and dirties +
+  notifies BOTH groups whose resolution changed: formulas referencing
+  the old name (now broken) and formulas referencing the new name
+  (previously dangling, now live). Pin flipped; matrix in
+  `tests/cross_sheet_propagation.rs`.
 - `workbook.rs:768-783` — `rename_sheet` updates `names` / `by_name`
   and stops. Formula ASTs/texts store sheet NAMES (`Expr::SheetRef {
   sheet, .. }`), so `=Data!A1*2` keeps saying `Data` after the rename:
@@ -777,8 +794,29 @@ at a different N. `audit_structural_edit_hydrates_every_parked_formula`:
 consistent with A-1's 100k/500k curve. See A-1 for the full analysis
 and fix sketch; no separate severity counted here.
 
-#### B-4 · P-C · **P1** — named-LAMBDA cross-sheet refs bypass propagation (CONFIRMED stale value)
+#### B-4 · P-C · **P1** — named-LAMBDA cross-sheet refs bypass propagation (CONFIRMED stale value) — **FIXED**
 
+- **FIXED** (W1.3, `08c1d86`), in BOTH halves:
+  - Precise edges (beyond the cheapest sketch):
+    `collect_cross_sheet_refs` now resolves `Expr::Name` and
+    `Expr::FuncCall` targets through `named_values` and walks
+    `Value::Lambda` bodies + captured bindings recursively, guarded by
+    a visited-name set so mutually-recursive named lambdas terminate.
+    `=READDATA()` registers a real `CrossSheetDeps` edge → dirty +
+    notify fanout works.
+  - Latch (the sketch itself): `define_name_value` walks the stored
+    value with `expr_has_sheet_ref` (lambda body + captures) and arms
+    a workbook-level one-way `named_values_cross_sheet` latch OR'd
+    into `has_any_cross_sheet_edges`, covering raw-`Sheet::set_formula`
+    installs the per-sheet latch cannot see.
+  - Follow-through: `define_name_value` / `undefine_name` also run
+    `rebuild_cross_sheet_deps` (TS-port parity — defineName recalcs
+    all sheets), so formulas installed BEFORE the name was defined, or
+    against a since-replaced binding, get correct edges too; and
+    `install_sheet_bulk`'s `!`-prefilter is bypassed when the latch is
+    armed so parked `=READDATA()` sources still contribute edges.
+  - Pin `audit_named_lambda_cross_sheet_freshness` flipped to the
+    fresh value; matrix in `tests/cross_sheet_propagation.rs`.
 - A cell calling a named LAMBDA whose body reads another sheet is
   invisible to every cross-sheet tracking mechanism:
   `expr_has_sheet_ref` → `Expr::Name(_) => false` (`sheet.rs:4949`,
