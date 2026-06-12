@@ -45,12 +45,12 @@ fn lazy_sheet(n: u32) -> Sheet {
 // Finding A1 (P-A): one insert_row hydrates EVERY lazy formula.
 // =====================================================================
 
-/// Structural proof (no timing): after `bulk_load` of N formulas the
-/// dep graph is empty (lazy contract); ONE `insert_row` at the top
-/// hydrates all N — `cell_dependents` jumps from 0 keys to N keys.
-/// The work eliminated from import (LAZY_FORMULA_INDEXING) is paid
-/// back in full by the first structural edit, and the sheet stays
-/// eager forever after.
+/// A-1 — FIXED (W2.1). Structural proof (no timing): after `bulk_load`
+/// of N formulas the dep graph is empty (lazy contract); ONE
+/// `insert_row` at the top now retargets parked SOURCE TEXT
+/// (`shift::rewrite_parked_source`) instead of hydrating, so the dep
+/// graph stays empty and the lazy contract survives the edit. Reads
+/// after the edit still see correctly retargeted formulas.
 #[test]
 fn audit_insert_row_hydrates_every_lazy_formula() {
     const N: u32 = 5_000;
@@ -63,20 +63,34 @@ fn audit_insert_row_hydrates_every_lazy_formula() {
 
     sheet.insert_row(0, 1);
 
-    // CURRENT (audited) behavior: full hydration. Each formula has a
-    // distinct single dep, so key count == N proves O(total formulas)
-    // work for a 1-row insert.
+    // A-1 FIXED: the edit forces ZERO hydrations — parked formulas are
+    // retargeted textually, hydrated formulas via direct AST install.
     assert_eq!(
         sheet.debug_cell_dependents_key_count(),
-        N as usize,
-        "insert_row(0,1) hydrated every lazy formula (pattern P-A)"
+        0,
+        "A-1 FIXED: insert_row(0,1) must not hydrate any lazy formula"
+    );
+    assert_eq!(
+        sheet.debug_dep_graph_stats().formula_count,
+        0,
+        "A-1 FIXED: no FormulaRecord may materialize from the edit"
+    );
+
+    // Correctness spot-check: B1's formula shifted to B2 and its ref
+    // shifted with it (=A1+1 -> =A2+1, both empty -> 1).
+    assert_eq!(sheet.get_cell("B2"), Value::Number(1.0));
+    assert_eq!(
+        sheet.get_formula("B2").as_deref(),
+        Some("=A2+1"),
+        "parked source text must be retargeted"
     );
 }
 
 /// Timing bench for the same path. Measures one `insert_row(0,1)` on
-/// 1k / 10k / 100k lazy-formula sheets, plus a SECOND insert on the
-/// (now fully hydrated) sheet to split hydration cost from the
-/// relocate + retarget + rebuild_all_formula_dependents cost.
+/// 1k / 10k / 100k / 500k lazy-formula sheets, plus a SECOND insert to
+/// confirm the sheet STAYED lazy (post-W2.1 both edits ride the
+/// textual parked-source rewrite; pre-fix the first edit hydrated
+/// everything and the second measured the hydrated retarget).
 #[test]
 #[ignore]
 fn bench_insert_row_scales_with_total_formula_count() {
@@ -85,11 +99,16 @@ fn bench_insert_row_scales_with_total_formula_count() {
         let t0 = Instant::now();
         sheet.insert_row(0, 1);
         let first = t0.elapsed();
+        assert_eq!(
+            sheet.debug_cell_dependents_key_count(),
+            0,
+            "A-1 FIXED: the edit must leave the sheet lazy"
+        );
         let t1 = Instant::now();
         sheet.insert_row(0, 1);
         let second = t1.elapsed();
         eprintln!(
-            "insert_row(0,1) on {n} lazy formulas: first {:?} (hydrate+relocate+retarget), second {:?} (already hydrated)",
+            "insert_row(0,1) on {n} lazy formulas: first {:?} (relocate+textual retarget), second {:?} (sheet stayed lazy)",
             first, second
         );
     }

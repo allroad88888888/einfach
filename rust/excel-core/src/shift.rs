@@ -111,6 +111,405 @@ pub fn shift_addr_col_delete(addr: CellAddress, at: u32, count: u32) -> CellAddr
     }
 }
 
+/// Structural-edit descriptor shared by the hydrated AST retarget
+/// (`Sheet::retarget_formula_refs`) and the lazy parked-source rewrite
+/// (`rewrite_parked_source`). Carrying the edit (instead of a bare
+/// `Fn(CellAddress) -> CellAddress`) lets both paths answer
+/// "does this edit even touch coordinate X?" without re-deriving the
+/// axis from closure behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShiftEdit {
+    RowInsert { at: u32, count: u32 },
+    RowDelete { at: u32, count: u32 },
+    ColInsert { at: u32, count: u32 },
+    ColDelete { at: u32, count: u32 },
+}
+
+impl ShiftEdit {
+    /// Apply the edit's address mapping — exactly the `shift_addr_*`
+    /// function the structural ops used to pass as a closure.
+    pub fn apply(&self, addr: CellAddress) -> CellAddress {
+        match *self {
+            ShiftEdit::RowInsert { at, count } => shift_addr_row_insert(addr, at, count),
+            ShiftEdit::RowDelete { at, count } => shift_addr_row_delete(addr, at, count),
+            ShiftEdit::ColInsert { at, count } => shift_addr_col_insert(addr, at, count),
+            ShiftEdit::ColDelete { at, count } => shift_addr_col_delete(addr, at, count),
+        }
+    }
+
+    /// True for row insert/delete, false for column insert/delete.
+    pub fn is_row_edit(&self) -> bool {
+        matches!(
+            self,
+            ShiftEdit::RowInsert { .. } | ShiftEdit::RowDelete { .. }
+        )
+    }
+
+    /// First coordinate on the edit axis touched by the edit. Every
+    /// cell with `row >= boundary` (row edits) / `col >= boundary`
+    /// (col edits) shifts (insert) or shifts-or-dies (delete); cells
+    /// strictly below the boundary are untouched.
+    pub fn boundary(&self) -> u32 {
+        match *self {
+            ShiftEdit::RowInsert { at, .. }
+            | ShiftEdit::RowDelete { at, .. }
+            | ShiftEdit::ColInsert { at, .. }
+            | ShiftEdit::ColDelete { at, .. } => at,
+        }
+    }
+
+    /// Can the edit change any value INSIDE `range` (canonical form —
+    /// unbounded axes carry the `0 / u32::MAX` sentinels)? Used by the
+    /// hydrated retarget to decide whether an AST-unchanged formula's
+    /// cached value can be kept: a range whose end coordinate reaches
+    /// the edit boundary may observe cells that moved.
+    pub fn touches_range(&self, range: &crate::range::CellRange) -> bool {
+        if self.is_row_edit() {
+            range.end.row >= self.boundary()
+        } else {
+            range.end.col >= self.boundary()
+        }
+    }
+}
+
+/// Outcome of `rewrite_parked_source` for one parked formula source.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SourceRewrite {
+    /// No reference crosses the edit boundary — source text reusable as-is.
+    Unchanged,
+    /// At least one reference shifted; the rewritten source is returned.
+    Rewritten(String),
+    /// A reference fell inside the deleted band. Mirrors the hydrated
+    /// path: the whole formula becomes a `#REF!` error cell.
+    DeadRef,
+}
+
+/// AUDIT A-1 — token-level A1-reference rewrite for LAZY (parked)
+/// formula sources. Structural edits must retarget parked formulas
+/// WITHOUT hydrating them (no parse, no dep install); this scanner
+/// rewrites only the reference tokens the edit actually moves, in one
+/// pass over the source bytes, allocating only when something changes.
+///
+/// The scanner mirrors `parse_formula`'s tokenization rules exactly so
+/// that `hydrate(rewrite(src))` ≡ `retarget(hydrate(src))`:
+///
+///   - String literals (`"..."`, no escape support — same as
+///     `Parser::parse_string`) are skipped verbatim, so `="A1"` is
+///     never rewritten.
+///   - Identifier tokens follow `Parser::parse_identifier`:
+///     `[A-Za-z][A-Za-z0-9_]*` with `.` absorbed only when the next
+///     char is another identifier char (so `RANK.EQ` is one token and
+///     never mistaken for a ref).
+///   - A token followed (whitespace allowed) by `(` is a function call
+///     — `LOG10(`, `ATAN2(`, and even `A1(...)` (which the parser
+///     treats as a FuncCall named `A1`, not a ref) are never shifted.
+///   - A token followed (whitespace allowed) by `!` is a sheet name;
+///     the address token immediately after the `!` — plus an optional
+///     `:end` range tail that parses as an address — belongs to a
+///     `SheetRef` / `SheetRange`, which within-sheet structural edits
+///     do NOT shift (mirrors `map_addrs`). Cross-sheet retarget scope
+///     is unchanged from the hydrated path: edits on this sheet never
+///     rewrite other sheets' formulas either.
+///   - A token that parses as a cell address is shifted through
+///     `ShiftEdit::apply`. Bounded range corners (`A1:B5`) are two
+///     independent tokens, exactly like `shift_range_corners` with
+///     `RangeBounds::None`.
+///   - Whole-column (`A:C`) / whole-row (`1:3`) ranges replicate
+///     `shift_range_corners`' synthetic-corner trick: the bounded axis
+///     shifts, the unbounded axis is pinned — and a corner mapped into
+///     the deleted band (e.g. `delete_col(0)` under `=SUM(1:3)`) kills
+///     the formula, matching the hydrated `contains_invalid_ref` path.
+///   - Absolute refs (`$A$1`) and quoted sheet names (`'My Sheet'!A1`)
+///     do not exist in this grammar (`CellAddress::parse` /
+///     `parse_identifier` reject them), so the scanner doesn't model
+///     them.
+///
+/// Sources that don't parse (possible via `bulk_install_storage`,
+/// which parks without validating) still surface `#VALUE!` at
+/// hydration after a rewrite — token rewrites inside garbage can't
+/// make garbage parse. The caller is expected to parse-check before
+/// honoring `DeadRef` so unparseable sources keep the hydrated path's
+/// `#VALUE!` outcome instead of gaining a `#REF!`.
+pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
+    let b = src.as_bytes();
+    let n = b.len();
+    // Output buffer, allocated lazily on the first actual rewrite.
+    // `emitted` is the source index up to which output (or implicit
+    // unchanged prefix) is already accounted for.
+    let mut out: Option<String> = None;
+    let mut emitted = 0usize;
+    let mut i = 0usize;
+    // Raw previous byte (0 at start). `prev == b'!'` marks the token
+    // that immediately follows a sheet-name bang — the parser reads
+    // that address with NO whitespace skip, so raw adjacency is right.
+    let mut prev: u8 = 0;
+
+    while i < n {
+        let c = b[i];
+        if c == b'"' {
+            // String literal: skip to the closing quote (parser has no
+            // escape sequence — first `"` closes).
+            i += 1;
+            while i < n && b[i] != b'"' {
+                i += 1;
+            }
+            if i < n {
+                i += 1;
+            }
+            prev = b'"';
+            continue;
+        }
+        if c.is_ascii_alphabetic() {
+            let start = i;
+            i = scan_ident_end(b, i);
+            let token = &src[start..i];
+            if prev == b'!' {
+                // Cross-sheet address after `Sheet!`. Skip it, plus an
+                // optional `: <addr>` SheetRange tail (the parser
+                // allows whitespace around the `:`; if the tail isn't
+                // an address it re-parses as a DynamicRange end, whose
+                // inner refs DO shift — leave those to the main loop).
+                let mut j = skip_ascii_ws(b, i);
+                if j < n && b[j] == b':' {
+                    j = skip_ascii_ws(b, j + 1);
+                    let k = scan_alnum_end(b, j);
+                    if k > j && parse_addr_token(&src[j..k]).is_some() {
+                        i = k;
+                    }
+                }
+                prev = b[i - 1];
+                continue;
+            }
+            match next_non_ws(b, i) {
+                Some(b'(') | Some(b'!') => {
+                    // Function name or sheet name — never a same-sheet ref.
+                    prev = b[i - 1];
+                    continue;
+                }
+                _ => {}
+            }
+            if let Some(addr) = parse_addr_token(token) {
+                let mapped = edit.apply(addr);
+                if mapped.row == REF_INVALID_ROW || mapped.col == REF_INVALID_COL {
+                    return SourceRewrite::DeadRef;
+                }
+                if mapped != addr {
+                    let buf = out
+                        .get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                    buf.push_str(&src[emitted..start]);
+                    buf.push_str(&mapped.to_string_repr());
+                    emitted = i;
+                }
+                prev = b[i - 1];
+                continue;
+            }
+            // Whole-column range `A:C` — all-alphabetic token, `:` next
+            // (whitespace allowed), all-alphabetic end token NOT
+            // followed by a digit (otherwise it's the `A1:B2` family or
+            // garbage — mirror of the parser's rollback).
+            if token.bytes().all(|x| x.is_ascii_alphabetic()) {
+                let mut j = skip_ascii_ws(b, i);
+                if j < n && b[j] == b':' {
+                    j = skip_ascii_ws(b, j + 1);
+                    let k = scan_alpha_end(b, j);
+                    let followed_by_digit = k < n && b[k].is_ascii_digit();
+                    if k > j && !followed_by_digit {
+                        let start_col = parse_col_letters(token);
+                        let end_col = parse_col_letters(&src[j..k]);
+                        if let (Some(sc), Some(ec)) = (start_col, end_col) {
+                            // Synthetic corners (row 0 = pinned
+                            // unbounded axis), mirroring
+                            // `shift_range_corners`: a row edit leaves
+                            // the corners alone UNLESS the mapping
+                            // kills them (delete at the pinned
+                            // coordinate maps row 0 into the band).
+                            let m1 = edit.apply(CellAddress::new(0, sc));
+                            let m2 = edit.apply(CellAddress::new(0, ec));
+                            if m1.col == REF_INVALID_COL
+                                || m2.col == REF_INVALID_COL
+                                || (!edit.is_row_edit()
+                                    && (m1.row == REF_INVALID_ROW
+                                        || m2.row == REF_INVALID_ROW))
+                            {
+                                return SourceRewrite::DeadRef;
+                            }
+                            if !edit.is_row_edit() && (m1.col != sc || m2.col != ec) {
+                                let buf = out.get_or_insert_with(|| {
+                                    String::with_capacity(src.len() + 8)
+                                });
+                                buf.push_str(&src[emitted..start]);
+                                buf.push_str(&col_only(m1.col));
+                                buf.push(':');
+                                buf.push_str(&col_only(m2.col));
+                                emitted = k;
+                            }
+                            i = k;
+                            prev = b[i - 1];
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Plain Name / TRUE / FALSE / error-literal letters — copy.
+            prev = b[i - 1];
+            continue;
+        }
+        if c.is_ascii_digit() && prev != b'.' {
+            // Candidate whole-row range `1:3`: digit run, IMMEDIATE
+            // `:`, immediate digit run, not followed by a letter —
+            // exactly `try_parse_whole_row_range`'s acceptance rule.
+            let start = i;
+            while i < n && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < n && b[i] == b':' {
+                let d2 = i + 1;
+                let mut j = d2;
+                while j < n && b[j].is_ascii_digit() {
+                    j += 1;
+                }
+                let followed_by_alpha = j < n && b[j].is_ascii_alphabetic();
+                if j > d2 && !followed_by_alpha {
+                    let r1: Option<u32> = src[start..i].parse().ok();
+                    let r2: Option<u32> = src[d2..j].parse().ok();
+                    match (r1, r2) {
+                        (Some(r1), Some(r2)) if r1 > 0 && r2 > 0 => {
+                            // Synthetic corners (col 0 pinned), mirror
+                            // of `shift_range_corners` for
+                            // `RangeBounds::Cols`.
+                            let m1 = edit.apply(CellAddress::new(r1 - 1, 0));
+                            let m2 = edit.apply(CellAddress::new(r2 - 1, 0));
+                            if m1.row == REF_INVALID_ROW
+                                || m2.row == REF_INVALID_ROW
+                                || (edit.is_row_edit()
+                                    && (m1.col == REF_INVALID_COL
+                                        || m2.col == REF_INVALID_COL))
+                            {
+                                return SourceRewrite::DeadRef;
+                            }
+                            if edit.is_row_edit()
+                                && (m1.row != r1 - 1 || m2.row != r2 - 1)
+                            {
+                                let buf = out.get_or_insert_with(|| {
+                                    String::with_capacity(src.len() + 8)
+                                });
+                                buf.push_str(&src[emitted..start]);
+                                buf.push_str(&format!("{}:{}", m1.row + 1, m2.row + 1));
+                                emitted = j;
+                            }
+                            i = j;
+                            prev = b[i - 1];
+                            continue;
+                        }
+                        _ => {
+                            // Unparseable / zero row numbers: the real
+                            // parser rolls back into a parse error —
+                            // leave the text alone.
+                        }
+                    }
+                }
+            }
+            prev = b[i - 1];
+            continue;
+        }
+        // Punctuation / whitespace / multibyte UTF-8 — copy through.
+        prev = c;
+        i += 1;
+    }
+
+    match out {
+        None => SourceRewrite::Unchanged,
+        Some(mut buf) => {
+            buf.push_str(&src[emitted..]);
+            SourceRewrite::Rewritten(buf)
+        }
+    }
+}
+
+/// Identifier scan mirroring `Parser::parse_identifier`: alphanumerics
+/// and `_`, with `.` absorbed only when followed by another identifier
+/// char. `i` must point at the (alphabetic) first char.
+fn scan_ident_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i += 1;
+        } else if c == b'.'
+            && i + 1 < b.len()
+            && (b[i + 1].is_ascii_alphanumeric() || b[i + 1] == b'_')
+        {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+fn scan_alnum_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_alphanumeric() {
+        i += 1;
+    }
+    i
+}
+
+fn scan_alpha_end(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    i
+}
+
+fn skip_ascii_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' || b[i] == b'\n') {
+        i += 1;
+    }
+    i
+}
+
+fn next_non_ws(b: &[u8], i: usize) -> Option<u8> {
+    let j = skip_ascii_ws(b, i);
+    b.get(j).copied()
+}
+
+/// Overflow-safe column-letter parse (`CellAddress::parse`'s
+/// `col_letters_to_index` does unchecked arithmetic, which would panic
+/// in debug builds on absurd letter runs in garbage sources — the
+/// scanner runs over EVERY parked source on EVERY structural edit, so
+/// it must never panic on hostile text).
+fn parse_col_letters(s: &str) -> Option<u32> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut result: u32 = 0;
+    for c in s.bytes() {
+        if !c.is_ascii_alphabetic() {
+            return None;
+        }
+        let d = (c.to_ascii_uppercase() - b'A') as u32;
+        result = result.checked_mul(26)?.checked_add(d + 1)?;
+    }
+    result.checked_sub(1)
+}
+
+/// Overflow-safe equivalent of `CellAddress::parse` for a bare token
+/// (letters then 1-based row digits, nothing else).
+fn parse_addr_token(s: &str) -> Option<CellAddress> {
+    let split = s.bytes().position(|c| !c.is_ascii_alphabetic())?;
+    if split == 0 {
+        return None;
+    }
+    let (letters, digits) = s.split_at(split);
+    if digits.is_empty() || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let row: u32 = digits.parse().ok()?;
+    if row == 0 {
+        return None;
+    }
+    Some(CellAddress::new(row - 1, parse_col_letters(letters)?))
+}
+
 /// Walk an AST applying `f` to every CellRef / Range corner address.
 /// Returns a new AST. Used by row/col insert/delete to retarget formulas.
 ///
@@ -706,5 +1105,209 @@ mod tests {
     fn shift_multi_area_shifts_each_part() {
         // Multi-area shifts every inner reference by the same delta.
         assert_eq!(shifted("=AREAS((A1:B2,D5))", 1, 1), "=AREAS((B2:C3,E6))");
+    }
+
+    // === AUDIT A-1 — parked-source token rewrite ===
+    //
+    // Contract under test: for every parseable source,
+    // `hydrate(rewrite(src))` must equal `retarget(hydrate(src))` —
+    // i.e. parsing the rewritten text yields the same AST as
+    // `map_addrs` over the parse of the original text.
+
+    fn assert_rewrite_matches_ast(src: &str, edit: ShiftEdit) {
+        let rewritten = match rewrite_parked_source(src, edit) {
+            SourceRewrite::Unchanged => src.to_string(),
+            SourceRewrite::Rewritten(s) => s,
+            SourceRewrite::DeadRef => {
+                // The AST path must agree the formula dies.
+                let expr = parse_formula(src).expect("parseable");
+                let mapped = map_addrs(&expr, &|a| edit.apply(a));
+                assert!(
+                    contains_invalid_ref(&mapped),
+                    "scanner said DeadRef but AST retarget survives: {src}"
+                );
+                return;
+            }
+        };
+        let expr = parse_formula(src).expect("original must parse");
+        let mapped = map_addrs(&expr, &|a| edit.apply(a));
+        assert!(
+            !contains_invalid_ref(&mapped),
+            "AST retarget died but scanner rewrote: {src}"
+        );
+        let reparsed = parse_formula(&rewritten)
+            .unwrap_or_else(|| panic!("rewritten must parse: {src} -> {rewritten}"));
+        assert_eq!(
+            mapped, reparsed,
+            "rewrite mismatch for {src} -> {rewritten} under {edit:?}"
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_matches_ast_retarget_corpus() {
+        let edits = [
+            ShiftEdit::RowInsert { at: 0, count: 1 },
+            ShiftEdit::RowInsert { at: 2, count: 3 },
+            ShiftEdit::RowDelete { at: 0, count: 1 },
+            ShiftEdit::RowDelete { at: 1, count: 2 },
+            ShiftEdit::ColInsert { at: 0, count: 1 },
+            ShiftEdit::ColInsert { at: 1, count: 2 },
+            ShiftEdit::ColDelete { at: 0, count: 1 },
+            ShiftEdit::ColDelete { at: 2, count: 1 },
+        ];
+        let corpus = [
+            "=A1",
+            "=A5+B7*2",
+            "=SUM(A1:B5)",
+            "=SUM(A1:A10)+IF(B1>0,B1*2,0)",
+            "=SUM(A:C)",
+            "=SUM(1:3)",
+            "=A1:B2 + SUM( C3 : D4 )",
+            "=IF(A2>0,\"A2\",\"B9\")&C3",
+            "=LOG10(A2)+ATAN2(B3,C4)",
+            "=Data!A1+B2",
+            "=Data!A1:B3+C4",
+            "=SEQUENCE(3)",
+            "=B1#",
+            "=INDEX(A:A,3)",
+            "=A1:INDEX(B:B,5)",
+            "=LET(x, A5, x*2)",
+            "=TRUE+FALSE",
+            "=RANK.EQ(A2,B1:B9)",
+            "={1,2;3,4}",
+            "=AREAS((A1:B2,D5:E6))",
+            "=#REF!+A2",
+            "=\"literal A1:B2 stays\"&A3",
+            "=a5+b7", // lowercase refs are valid and shift
+        ];
+        for edit in edits {
+            for src in corpus {
+                assert_rewrite_matches_ast(src, edit);
+            }
+        }
+    }
+
+    #[test]
+    fn parked_rewrite_unchanged_when_refs_below_boundary() {
+        // No allocation contract: refs strictly above the insert point
+        // report Unchanged.
+        assert_eq!(
+            rewrite_parked_source("=A1+B2", ShiftEdit::RowInsert { at: 5, count: 1 }),
+            SourceRewrite::Unchanged
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM(A1:B3)", ShiftEdit::ColInsert { at: 9, count: 2 }),
+            SourceRewrite::Unchanged
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_quoted_strings_and_function_names_survive() {
+        let got = rewrite_parked_source(
+            "=IF(A2>0,\"A2 ok\",\"skip B9\")&LOG10(C3)",
+            ShiftEdit::RowInsert { at: 0, count: 1 },
+        );
+        assert_eq!(
+            got,
+            SourceRewrite::Rewritten("=IF(A3>0,\"A2 ok\",\"skip B9\")&LOG10(C4)".into())
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_cross_sheet_refs_untouched() {
+        // Within-sheet edits never shift sheet-qualified refs (mirrors
+        // `map_addrs`), including a sheet NAME that looks like a ref.
+        assert_eq!(
+            rewrite_parked_source("=Data!A1+Data!B2:C3", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Unchanged
+        );
+        assert_eq!(
+            rewrite_parked_source("=B2!A1", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Unchanged
+        );
+        // Same-sheet refs around a cross-sheet ref still shift.
+        assert_eq!(
+            rewrite_parked_source("=Data!A1+B2", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=Data!A1+B3".into())
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_deleted_band_is_dead() {
+        assert_eq!(
+            rewrite_parked_source("=B5*2", ShiftEdit::RowDelete { at: 4, count: 1 }),
+            SourceRewrite::DeadRef
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM(A1:B5)", ShiftEdit::ColDelete { at: 0, count: 1 }),
+            SourceRewrite::DeadRef
+        );
+        // Range corner survives a delete inside the band interior.
+        assert_eq!(
+            rewrite_parked_source("=SUM(1:3)", ShiftEdit::RowDelete { at: 1, count: 1 }),
+            SourceRewrite::Rewritten("=SUM(1:2)".into())
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_whole_row_whole_col_axis_rules() {
+        // Row edits move whole-row ranges, leave whole-col ranges.
+        assert_eq!(
+            rewrite_parked_source("=SUM(2:3)", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=SUM(3:4)".into())
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM(B:C)", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Unchanged
+        );
+        // Col edits: the mirror image.
+        assert_eq!(
+            rewrite_parked_source("=SUM(B:C)", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=SUM(C:D)".into())
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM(2:3)", ShiftEdit::ColInsert { at: 0, count: 1 }),
+            SourceRewrite::Unchanged
+        );
+        // Deleting the pinned corner column kills a whole-row range —
+        // quirky but exactly what `shift_range_corners` +
+        // `contains_invalid_ref` produce on the hydrated path.
+        assert_eq!(
+            rewrite_parked_source("=SUM(1:3)", ShiftEdit::ColDelete { at: 0, count: 1 }),
+            SourceRewrite::DeadRef
+        );
+        assert_eq!(
+            rewrite_parked_source("=SUM(B:C)", ShiftEdit::RowDelete { at: 0, count: 1 }),
+            SourceRewrite::DeadRef
+        );
+    }
+
+    #[test]
+    fn parked_rewrite_hostile_text_never_panics() {
+        // Garbage sources (reachable via bulk_install_storage, which
+        // parks without validating) must scan without panicking —
+        // including letter runs that would overflow the naive
+        // column-letter arithmetic.
+        for src in [
+            "=ABCDEFGHIJKLMNOP123",
+            "=ZZZZZZZZZZ:ZZZZZZZZZZ",
+            "=99999999999999999999:3",
+            "=1.5:3",
+            "=A1++",
+            "=\"unterminated",
+            "=日本語+A2",
+            "=0:0",
+        ] {
+            let _ = rewrite_parked_source(src, ShiftEdit::RowInsert { at: 0, count: 1 });
+            let _ = rewrite_parked_source(src, ShiftEdit::ColDelete { at: 0, count: 1 });
+        }
+    }
+
+    #[test]
+    fn parked_rewrite_spill_ref_shifts_anchor() {
+        assert_eq!(
+            rewrite_parked_source("=B1#", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            SourceRewrite::Rewritten("=B2#".into())
+        );
     }
 }

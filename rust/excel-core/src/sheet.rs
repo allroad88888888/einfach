@@ -3344,16 +3344,16 @@ impl Sheet {
         for addr in formula_addrs {
             f(addr);
         }
-        let formula_keys: HashSet<CellAddress> = {
-            let cells = self.formula_cells.borrow();
-            let source = self.formula_source.borrow();
-            cells
-                .keys()
-                .chain(source.keys())
-                .collect()
-        };
+        // AUDIT A-3: dedup per visited address (two map probes per cell
+        // actually inside the range) instead of materializing a HashSet
+        // over the ENTIRE sheet's formula key space — the global
+        // snapshot made a one-cell `clear_range` O(total formulas).
+        // Borrows are taken per iteration so `f` stays free to re-enter
+        // sheet state, matching the old snapshot pattern's guarantees.
         for (addr, _) in self.cells.range_iter(range) {
-            if formula_keys.contains(&addr) {
+            if self.formula_cells.borrow().contains_key(&addr)
+                || self.formula_source.borrow().contains_key(&addr)
+            {
                 continue;
             }
             f(addr);
@@ -3369,7 +3369,9 @@ impl Sheet {
         let cleared = addrs.len();
         self.bulk_load(|loader| {
             for addr in addrs {
-                loader.set_cell(&addr.to_string(), Value::Null);
+                // AUDIT A-9 (folded into A-3): typed-address entry —
+                // no to_string→re-parse round trip per cleared cell.
+                loader.set_cell_at(addr, Value::Null);
             }
         });
         cleared
@@ -3641,31 +3643,7 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        self.with_structural_edit(|sheet| {
-            // Codex P1 #1 fix: hydrate every lazy formula BEFORE the
-            // relocate. `relocate_cells` shifts the `formula_source`
-            // keys, but the parked source text still references the
-            // OLD addresses; a later hydrate would lock in self-cycles
-            // (e.g. `A1 = "=A2"` parked, insert row 0 → A1 → A2,
-            // hydrate(A2) parses `=A2` → `#CYCLE!`). Hydrating up front
-            // lets `retarget_formula_refs` walk the parsed AST and
-            // rewrite refs through `f`, matching the eager-formula path.
-            sheet.hydrate_all_lazy_formulas();
-            // AUDIT A-5: tear every spill down BEFORE the shift,
-            // re-derive surviving anchors after the retarget.
-            let spill_anchors = sheet.teardown_all_spills();
-            sheet.relocate_cells(|addr| crate::shift::shift_addr_row_insert(addr, at, count));
-            sheet.retarget_formula_refs(&|addr| {
-                crate::shift::shift_addr_row_insert(addr, at, count)
-            });
-            Self::shift_dimension_insert(&mut sheet.row_heights, at, count);
-            sheet.rederive_spill_anchors(
-                spill_anchors
-                    .into_iter()
-                    .map(|a| crate::shift::shift_addr_row_insert(a, at, count))
-                    .collect(),
-            );
-        });
+        self.apply_structural_shift(crate::shift::ShiftEdit::RowInsert { at, count });
     }
 
     /// Delete `count` rows starting at `at`. References inside the deleted
@@ -3674,93 +3652,82 @@ impl Sheet {
         if count == 0 {
             return;
         }
-        self.with_structural_edit(|sheet| {
-            // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
-            // `insert_row` for the rationale.
-            sheet.hydrate_all_lazy_formulas();
-            // AUDIT A-5: teardown before drop+shift, re-derive after.
-            // Anchors inside the deleted band map to the REF_INVALID
-            // sentinel and are skipped by `rederive_spill_anchors`.
-            let spill_anchors = sheet.teardown_all_spills();
-            sheet.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
-            sheet.relocate_cells(|addr| crate::shift::shift_addr_row_delete(addr, at, count));
-            sheet.retarget_formula_refs(&|addr| {
-                crate::shift::shift_addr_row_delete(addr, at, count)
-            });
-            Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
-            sheet.rederive_spill_anchors(
-                spill_anchors
-                    .into_iter()
-                    .map(|a| crate::shift::shift_addr_row_delete(a, at, count))
-                    .collect(),
-            );
-        });
+        self.apply_structural_shift(crate::shift::ShiftEdit::RowDelete { at, count });
     }
 
     pub fn insert_col(&mut self, at: u32, count: u32) {
         if count == 0 {
             return;
         }
-        self.with_structural_edit(|sheet| {
-            // Codex P1 #1 fix: hydrate BEFORE relocate. See `insert_row`.
-            sheet.hydrate_all_lazy_formulas();
-            // AUDIT A-5: teardown before the shift, re-derive after.
-            let spill_anchors = sheet.teardown_all_spills();
-            sheet.relocate_cells(|addr| crate::shift::shift_addr_col_insert(addr, at, count));
-            sheet.retarget_formula_refs(&|addr| {
-                crate::shift::shift_addr_col_insert(addr, at, count)
-            });
-            Self::shift_dimension_insert(&mut sheet.col_widths, at, count);
-            sheet.rederive_spill_anchors(
-                spill_anchors
-                    .into_iter()
-                    .map(|a| crate::shift::shift_addr_col_insert(a, at, count))
-                    .collect(),
-            );
-        });
+        self.apply_structural_shift(crate::shift::ShiftEdit::ColInsert { at, count });
     }
 
     pub fn delete_col(&mut self, at: u32, count: u32) {
         if count == 0 {
             return;
         }
-        self.with_structural_edit(|sheet| {
-            // Codex P1 #1 fix: hydrate BEFORE drop+relocate. See
-            // `insert_row` for the rationale.
-            sheet.hydrate_all_lazy_formulas();
-            // AUDIT A-5: teardown before drop+shift, re-derive after.
-            let spill_anchors = sheet.teardown_all_spills();
-            sheet.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
-            sheet.relocate_cells(|addr| crate::shift::shift_addr_col_delete(addr, at, count));
-            sheet.retarget_formula_refs(&|addr| {
-                crate::shift::shift_addr_col_delete(addr, at, count)
-            });
-            Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
-            sheet.rederive_spill_anchors(
-                spill_anchors
-                    .into_iter()
-                    .map(|a| crate::shift::shift_addr_col_delete(a, at, count))
-                    .collect(),
-            );
-        });
+        self.apply_structural_shift(crate::shift::ShiftEdit::ColDelete { at, count });
     }
 
-    /// Hydrate every lazy (parked) formula in this sheet. Used by
-    /// structural edits (`insert_row` / `delete_row` /
-    /// `insert_col` / `delete_col`) BEFORE relocate so the source-
-    /// text retarget walks parsed ASTs and the
-    /// `formula_source` / `needs_parse` invariant doesn't surface a
-    /// stale text reference at a relocated address.
+    /// Shared body of the four structural ops.
     ///
-    /// Also exposed for the cross-sheet rebuild path
-    /// (`Workbook::rebuild_cross_sheet_deps`) so a lazy cross-sheet
-    /// edge picked up at `bulk_load` time survives a `move_sheet`.
-    pub(crate) fn hydrate_all_lazy_formulas(&self) {
-        let lazy_addrs: Vec<CellAddress> =
-            self.needs_parse.borrow().iter().copied().collect();
-        for addr in lazy_addrs {
-            self.hydrate_formula(addr);
-        }
+    /// AUDIT A-1: structural edits no longer hydrate the sheet. The old
+    /// shape (`hydrate_all_lazy_formulas` first, so the AST retarget
+    /// covers parked formulas — the 7d0e380 self-cycle fix) made one
+    /// `insert_row` O(total formulas × parse) and left a lazy sheet
+    /// permanently eager. Now:
+    ///
+    ///   - HYDRATED formulas: `retarget_formula_refs` maps the AST and
+    ///     installs the mapped result DIRECTLY (no render→re-parse) —
+    ///     and skips reinstall entirely when the shift didn't touch the
+    ///     formula's refs.
+    ///   - LAZY (parked) formulas: `retarget_parked_sources` rewrites
+    ///     reference tokens in the parked SOURCE TEXT
+    ///     (`shift::rewrite_parked_source`, pure string work — no
+    ///     parse, no dep install), preserving the 7d0e380 invariant
+    ///     that the text always references post-shift addresses before
+    ///     hydration can run (`A1="=A2"` + insert_row(0,1) ⇒ text
+    ///     `=A3` at the relocated A2 — no self-cycle).
+    ///
+    /// W1.1 (A-5) is preserved: spills are torn down before the shift
+    /// and surviving anchors re-derived after both retargets.
+    fn apply_structural_shift(&mut self, edit: crate::shift::ShiftEdit) {
+        self.with_structural_edit(|sheet| {
+            // AUDIT A-5: tear every spill down BEFORE the shift,
+            // re-derive surviving anchors after the retarget. Anchors
+            // inside a deleted band map to the REF_INVALID sentinel and
+            // are skipped by `rederive_spill_anchors`.
+            let spill_anchors = sheet.teardown_all_spills();
+            match edit {
+                crate::shift::ShiftEdit::RowDelete { at, count } => {
+                    sheet.drop_cells_in(|addr| addr.row >= at && addr.row < at + count);
+                }
+                crate::shift::ShiftEdit::ColDelete { at, count } => {
+                    sheet.drop_cells_in(|addr| addr.col >= at && addr.col < at + count);
+                }
+                _ => {}
+            }
+            sheet.relocate_cells(|addr| edit.apply(addr));
+            sheet.retarget_formula_refs(edit);
+            sheet.retarget_parked_sources(edit);
+            match edit {
+                crate::shift::ShiftEdit::RowInsert { at, count } => {
+                    Self::shift_dimension_insert(&mut sheet.row_heights, at, count);
+                }
+                crate::shift::ShiftEdit::RowDelete { at, count } => {
+                    Self::shift_dimension_delete(&mut sheet.row_heights, at, count);
+                }
+                crate::shift::ShiftEdit::ColInsert { at, count } => {
+                    Self::shift_dimension_insert(&mut sheet.col_widths, at, count);
+                }
+                crate::shift::ShiftEdit::ColDelete { at, count } => {
+                    Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
+                }
+            }
+            sheet.rederive_spill_anchors(
+                spill_anchors.into_iter().map(|a| edit.apply(a)).collect(),
+            );
+        });
     }
 
     /// AUDIT A-5 — snapshot and tear down every active spill ahead of a
@@ -3963,65 +3930,199 @@ impl Sheet {
         *self.needs_parse.get_mut() = new_needs_parse;
         self.formats = new_formats;
         self.range_formats = new_range_formats;
-        self.rebuild_all_formula_dependents();
+        // AUDIT A-1: the dep indexes are NOT rebuilt here. Between the
+        // relocate and the end of `retarget_formula_refs` they are
+        // stale (old keys/values); the retarget finishes with ONE
+        // `rebuild_all_formula_dependents` pass over the (by then
+        // fully remapped) records, then re-fires dirty propagation for
+        // every value-changing cell from the consistent index. Nothing
+        // in between reads the indexes for correctness-critical
+        // decisions — `write_error`'s in-flight `mark_dependents_dirty`
+        // calls are made redundant by that final pass.
     }
 
-    /// Apply an address-mapping function to every CellRef inside every
-    /// existing formula AST. Used after structural edits so formulas
-    /// continue to point at the same logical cell.
-    fn retarget_formula_refs(&mut self, f: &dyn Fn(CellAddress) -> CellAddress) {
-        // Codex P1 #1: hydration runs BEFORE `relocate_cells` (see the
-        // `hydrate_all_lazy_formulas` call at the top of every
-        // structural-edit path). By the time we get here every formula
-        // is parsed into `formula_exprs`, so the AST walk below covers
-        // them all and the formula_source/needs_parse maps are empty.
-        let updated: Vec<(CellAddress, Expr)> = self
+    /// Apply a structural edit to every HYDRATED formula AST. Used after
+    /// structural edits so formulas continue to point at the same
+    /// logical cell.
+    ///
+    /// AUDIT A-1 (hydrated half): the mapped AST is installed DIRECTLY —
+    /// the old render→re-parse round trip (P-B) is gone — and formulas
+    /// the shift left untouched skip reinstall entirely, keeping their
+    /// cached values when that is provably safe:
+    ///
+    ///   - mapped AST == old AST means every STATIC ref points at a
+    ///     cell strictly below the edit boundary, i.e. a cell that did
+    ///     not move — the cache stays valid…
+    ///   - …unless a range dep can see the shifted region
+    ///     (`ShiftEdit::touches_range`: unbounded `A:A` under a row
+    ///     edit, etc.) or an eval-TRACKED point dep (OFFSET-style
+    ///     computed reads) moved/died — then the cache flips Dirty and
+    ///     tracked deps are remapped so the rebuilt index stays
+    ///     coherent until the next read re-tracks them.
+    ///
+    /// Ends with one `rebuild_all_formula_dependents` (O(hydrated
+    /// formulas) — small by the lazy contract; both key AND value sides
+    /// of the indexes shift under a structural edit, so an in-place
+    /// key patch would be the same full remap) plus a cache-only dirty
+    /// BFS from every cell whose VALUE may have changed (#REF! writes
+    /// and reinstalled formulas), so AST-unchanged dependents of
+    /// changed formulas don't serve stale caches.
+    fn retarget_formula_refs(&mut self, edit: crate::shift::ShiftEdit) {
+        let f = |addr: CellAddress| edit.apply(addr);
+        let snapshot: Vec<(CellAddress, Rc<Expr>)> = self
             .formula_exprs
             .borrow()
             .iter()
-            .map(|(addr, expr)| (*addr, crate::shift::map_addrs(expr, f)))
+            .map(|(addr, expr)| (*addr, expr.clone()))
             .collect();
-        for (addr, new_expr) in updated {
+        // Cells whose value may differ after the edit — roots for the
+        // post-rebuild dirty BFS.
+        let mut value_changed: Vec<CellAddress> = Vec::new();
+        for (addr, old_expr) in snapshot {
+            let new_expr = crate::shift::map_addrs(&old_expr, &f);
             if crate::shift::contains_invalid_ref(&new_expr) {
                 // Formula references a cell deleted by this structural edit.
                 // Excel produces #REF!.
                 self.write_error(addr, ValueError::InvalidRef);
+                value_changed.push(addr);
                 continue;
             }
+            if new_expr == *old_expr {
+                // Shift didn't touch any static ref. Keep the record —
+                // but invalidate the cache when the edit can still
+                // change observed values (see doc comment).
+                let record = self.formula_cells.borrow().get(&addr).cloned();
+                if let Some(record) = record {
+                    let tracked_moved = record
+                        .deps
+                        .borrow()
+                        .iter()
+                        .any(|d| f(*d) != *d);
+                    let range_touched = record
+                        .range_deps
+                        .borrow()
+                        .iter()
+                        .any(|r| edit.touches_range(r));
+                    if tracked_moved {
+                        // Remap eval-tracked deps (deps that died map to
+                        // the sentinel and are dropped — the formula is
+                        // dirty and re-tracks on next read).
+                        let remapped: HashSet<CellAddress> = record
+                            .deps
+                            .borrow()
+                            .iter()
+                            .map(|d| f(*d))
+                            .filter(|d| {
+                                d.row != crate::shift::REF_INVALID_ROW
+                                    && d.col != crate::shift::REF_INVALID_COL
+                            })
+                            .collect();
+                        *record.deps.borrow_mut() = remapped;
+                    }
+                    if tracked_moved || range_touched {
+                        *record.cache.borrow_mut() = FormulaCache::Dirty;
+                    }
+                }
+                continue;
+            }
+            // Refs crossed the boundary: install the mapped AST
+            // directly. Fresh record ⇒ cache Dirty. Render (no
+            // re-parse!) only to keep `formula_texts` / `get_formula`
+            // truthful.
             let new_expr_rc = Rc::new(new_expr);
-            self.formula_exprs.borrow_mut().insert(addr, new_expr_rc.clone());
-            let rendered = crate::shift::render_formula(&new_expr_rc);
-            self.rebuild_formula_lazy(addr, rendered);
+            let deps = Sheet::formula_deps_for(&new_expr_rc);
+            let range_deps = collect_range_refs(&new_expr_rc);
+            let record = Rc::new(FormulaRecord::new(new_expr_rc.clone(), deps, range_deps));
+            self.note_cross_sheet_if_any(&new_expr_rc);
+            self.formula_cells.borrow_mut().insert(addr, record);
+            self.formula_exprs
+                .borrow_mut()
+                .insert(addr, new_expr_rc.clone());
+            self.formula_texts
+                .borrow_mut()
+                .insert(addr, crate::shift::render_formula(&new_expr_rc));
+            value_changed.push(addr);
+        }
+        self.rebuild_all_formula_dependents();
+        self.mark_dependents_dirty_silent_batch(&value_changed);
+    }
+
+    /// AUDIT A-1 (lazy half): retarget every PARKED formula by rewriting
+    /// reference tokens in its source text — no parse, no hydration, no
+    /// dep work. Runs AFTER `retarget_formula_refs` so the `write_error`
+    /// calls for dead refs propagate dirtiness through the already-
+    /// rebuilt (consistent) dep indexes.
+    ///
+    /// Cross-sheet scope mirrors the hydrated path exactly: sheet-
+    /// qualified refs in this sheet's sources are not shifted, and
+    /// other sheets' parked formulas referencing this sheet are not
+    /// rewritten (`map_addrs` has never retargeted either).
+    fn retarget_parked_sources(&mut self, edit: crate::shift::ShiftEdit) {
+        let mut rewrites: Vec<(CellAddress, String)> = Vec::new();
+        let mut dead: Vec<CellAddress> = Vec::new();
+        {
+            let source = self.formula_source.borrow();
+            for (addr, src) in source.iter() {
+                match crate::shift::rewrite_parked_source(src.as_ref(), edit) {
+                    crate::shift::SourceRewrite::Unchanged => {}
+                    crate::shift::SourceRewrite::Rewritten(s) => rewrites.push((addr, s)),
+                    crate::shift::SourceRewrite::DeadRef => dead.push(addr),
+                }
+            }
+        }
+        {
+            let mut source = self.formula_source.borrow_mut();
+            for (addr, s) in rewrites {
+                source.insert(addr, Rc::from(s.as_str()));
+            }
+        }
+        for addr in dead {
+            // Parity guard for unparseable parked sources (possible via
+            // `bulk_install_storage`): the hydrated path would surface
+            // `#VALUE!` at first read and never see a ref to kill — so
+            // a "dead ref" inside garbage stays parked untouched.
+            let parses = {
+                let source = self.formula_source.borrow();
+                source
+                    .get(&addr)
+                    .map(|src| crate::formula::parse_formula(src.as_ref()).is_some())
+                    .unwrap_or(false)
+            };
+            if !parses {
+                continue;
+            }
+            // Mirror the hydrated retarget: the whole formula becomes a
+            // #REF! error cell. `write_error` drains the parked state
+            // (`remove_formula_record` clears `formula_source` /
+            // `needs_parse` first) and dirties dependents through the
+            // consistent post-rebuild indexes.
+            self.write_error(addr, ValueError::InvalidRef);
         }
     }
 
-    fn rebuild_formula_lazy(&mut self, addr: CellAddress, formula_str: String) {
-        let expr = match crate::formula::parse_formula(&formula_str) {
-            Some(e) => Rc::new(e),
-            None => {
-                // Render produced something unparsable — shouldn't happen,
-                // but be safe.
-                self.write_error(addr, ValueError::InvalidValue);
-                return;
+    /// Cache-only transitive dirty BFS from every root: flips dependent
+    /// `FormulaRecord` caches to `Dirty` WITHOUT firing address
+    /// subscribers — the enclosing `with_structural_edit` owns
+    /// notification via its pre/post value diff (at-most-once-per-
+    /// address contract).
+    fn mark_dependents_dirty_silent_batch(&self, roots: &[CellAddress]) {
+        if roots.is_empty() {
+            return;
+        }
+        let mut visited: HashSet<CellAddress> = HashSet::new();
+        let mut stack: Vec<CellAddress> = Vec::new();
+        for root in roots {
+            self.dependents_of_into(*root, &mut stack);
+        }
+        while let Some(addr) = stack.pop() {
+            if !visited.insert(addr) {
+                continue;
             }
-        };
-        let deps = Sheet::formula_deps_for(&expr);
-        let range_deps = collect_range_refs(&expr);
-        self.remove_formula_record(addr);
-        let record = Rc::new(FormulaRecord::new(
-            expr.clone(),
-            deps.clone(),
-            range_deps.clone(),
-        ));
-        self.add_formula_deps(addr, &deps);
-        self.add_formula_range_deps(addr, &range_deps);
-        self.note_cross_sheet_if_any(&expr);
-        self.formula_cells.borrow_mut().insert(addr, record);
-        self.formula_exprs.borrow_mut().insert(addr, expr);
-        self.formula_texts.borrow_mut().insert(addr, formula_str);
-        // Fanout reattach + per-address fire are handled by the enclosing
-        // `with_structural_edit` (this is only ever called from
-        // `retarget_formula_refs` during a structural edit).
+            if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                *record.cache.borrow_mut() = FormulaCache::Dirty;
+            }
+            self.dependents_of_into(addr, &mut stack);
+        }
     }
 
     /// Set multiple cells at once, with a single propagation pass.
@@ -4130,6 +4231,13 @@ impl<'a> BulkLoader<'a> {
     /// recorded in `touched` for the post-flush sweep.
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        self.set_cell_at(addr, value);
+    }
+
+    /// Typed-address variant of [`Self::set_cell`] (AUDIT A-9): bulk
+    /// callers that already hold a `CellAddress` (e.g. `clear_range`'s
+    /// sparse scan) skip the string render + re-parse per cell.
+    pub fn set_cell_at(&mut self, addr: CellAddress, value: Value) {
         let is_null = matches!(value, Value::Null);
 
         // AUDIT A-4 — spill parity with the single-cell mutators

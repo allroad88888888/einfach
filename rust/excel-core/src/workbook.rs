@@ -870,7 +870,18 @@ impl Workbook {
             // the AST here, we do not install dep edges or transition
             // the lazy entry out of `needs_parse`.
             drop(exprs);
+            // AUDIT A-2: same `!`-prefilter as `install_sheet_bulk_inner`
+            // — a parked source without `!` cannot carry a cross-sheet
+            // ref, so skip the parse entirely (the overwhelmingly common
+            // same-sheet case; pre-fix a `move_sheet` parsed EVERY lazy
+            // formula on every sheet). Bypassed when the B-4 named-value
+            // latch is armed: a parked `=READDATA()` can hold a cross-
+            // sheet edge with no `!` in its source.
+            let names_may_cross = self.named_values_cross_sheet.get();
             sheet.for_each_lazy_formula(|formula_addr, source| {
+                if !source.contains('!') && !names_may_cross {
+                    return;
+                }
                 if let Some(expr) = parse_formula(source) {
                     for edge in collect_cross_sheet_refs(&expr, &self.by_name, &self.named_values) {
                         cross_sheet.add_edge(formula_sheet, formula_addr, edge);

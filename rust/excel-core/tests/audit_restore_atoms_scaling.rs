@@ -144,13 +144,11 @@ fn audit_primitive_install_atom_alloc_share() {
     );
 }
 
-/// FINDING B-3 (P-A, corroborates A-1): ONE structural edit hydrates EVERY
-/// parked formula.
-/// `Sheet::insert_row` / `delete_row` / `insert_col` / `delete_col` call
-/// `hydrate_all_lazy_formulas()` up front (sheet.rs, codex P1 #1 fix), so
-/// the first row insert on a freshly-imported sheet pays the full eager
-/// parse + dep-extract + dep-register build that the lazy arcs removed
-/// from import — O(total formulas), not O(change).
+/// FINDING B-3 (P-A, corroborates A-1) — FIXED (W2.1). Structural edits
+/// no longer call `hydrate_all_lazy_formulas()`: parked formulas are
+/// retargeted by token-level source-text rewrite
+/// (`shift::rewrite_parked_source`), hydrated ones by direct AST
+/// install. The dep graph stays empty across the edit.
 #[test]
 fn audit_structural_edit_hydrates_every_parked_formula() {
     const N: u32 = 50_000;
@@ -171,18 +169,17 @@ fn audit_structural_edit_hydrates_every_parked_formula() {
     wb.sheet_mut(0).unwrap().insert_row(0, 1);
     let edit_elapsed = t0.elapsed();
 
-    // After ONE row insert every formula has been hydrated: the dep graph
-    // now carries ~N keys (one per referenced A-column cell).
+    // B-3 / A-1 — FIXED (W2.1): the edit leaves the dep graph EMPTY.
     let dep_keys = wb.sheet(0).unwrap().debug_cell_dependents_key_count();
-    assert!(
-        dep_keys >= (N as usize) * 9 / 10,
-        "expected ~N dep keys after structural edit (got {dep_keys}); if this \
-         fails, structural edits may have gone lazy — update the audit doc"
+    assert_eq!(
+        dep_keys, 0,
+        "A-1 FIXED: insert_row must leave every parked formula lazy \
+         (got {dep_keys} dep keys)"
     );
 
     println!(
-        "AUDIT B-3: insert_row(0,1) on {N}-formula parked sheet hydrated all \
-         formulas: {edit_elapsed:?} ({:.2} us/formula), dep keys now {dep_keys}",
+        "AUDIT B-3 (FIXED): insert_row(0,1) on {N}-formula parked sheet stayed \
+         lazy: {edit_elapsed:?} ({:.2} us/formula), dep keys still {dep_keys}",
         edit_elapsed.as_secs_f64() * 1e6 / N as f64
     );
 }
