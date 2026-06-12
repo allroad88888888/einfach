@@ -148,6 +148,36 @@ bypassed propagation / incomplete teardown) across both engines:
   batch-guidance docs. Audit arc COMPLETE — all 9 P1 + 15 P2 closed;
   P3s remain catalogued in the audit doc sections.
 
+### Scale test suites — the regression fence (2026-06-13)
+
+`rust/excel-core/docs/SCALE_TEST_SUITE_PLAN.md` (status LANDED, see its
+Outcome table). Three commits, each through the full pre-commit sweep:
+
+- `1860701` — `rust/excel-core/tests/scale_suite.rs`: S1–S11, 12
+  always-on + 2 `#[ignore]` heavy twins, 2.9 s debug (≤5 s budget);
+  read-only `#[doc(hidden)]` counter probes in sheet.rs. cargo
+  --lib --tests with suite: **1818/0**.
+- `a338b58` — `vanilla/excel-core-ts/test/scale-suite.test.ts`: S1–S12,
+  18 tests, 4.25 s; probe accessors in deps/propagation/sheet/workbook.
+  **Plus a real P1 the suite caught before it was committed**: sparse
+  whole-column aggregates were O(N² log N) — every uncached cell's
+  refLookup threw NeedsDep under the trampoline shim, restarting the
+  whole scan (`SUM(A:A)` 1.83 s @2k, ~hours @100k). Fixed in
+  `src/eval/evaluate.ts`: literal cells resolve directly from storage;
+  formula-cell NeedsDep faults accumulate and rethrow as ONE batch. S3
+  pins single-edit→1-re-eval so the bypass can't break invalidation.
+- `ced77ca` — `solid/excel/test/scale-parity.test.ts`: P1–P5, one
+  seeded ~75k workload through BOTH worker runtimes. **Gated behind
+  `EINFACH_SCALE=1`** (deviation from always-on: measured ~4.5 min;
+  under coverage it pegged a pre-commit worker 80+ min). Skips in
+  0.48 s otherwise. Run before engine-equivalence-sensitive merges.
+
+Codex adversarial review of all three (base `0b65b5b`): **clean** —
+first zero-issue round after four rounds that each found real bugs.
+
+A scale-suite failure is a P1 by definition: it means an O(N)
+regression or stale-cache bug re-entered.
+
 ### Lazy formula indexing — Rust core philosophy realignment (2026-06-11)
 
 einfach is a lazy atom-based state library, but `Sheet::bulk_load`
