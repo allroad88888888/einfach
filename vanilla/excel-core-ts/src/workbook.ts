@@ -75,6 +75,20 @@ export interface BulkCellInput {
   readonly input: string
 }
 
+/**
+ * Typed bulk entry (audit C-8). Carries an already-classified `Value`
+ * through the bulk fast path so the wire type survives — text `'00123'`
+ * stays a string instead of being re-inferred to number 123 by
+ * `parseLiteral`, exactly like the single-cell `setCellValue` path.
+ * Mixed arrays (`BulkCellInput | BulkTypedCellInput`) are accepted by
+ * `bulkApply`; entries with `value` skip the parser entirely.
+ */
+export interface BulkTypedCellInput {
+  readonly row: number
+  readonly col: number
+  readonly value: Value
+}
+
 const ERROR_CODE_SET = new Set<string>(ERROR_CODES)
 
 export interface Workbook {
@@ -127,8 +141,17 @@ export interface Workbook {
     range: CellRange,
     target?: 'value' | 'format' | 'all',
   ): number
-  /** Apply many cells in one atom write (paste / fill / import). */
-  bulkApply(sheetId: string, cells: ReadonlyArray<BulkCellInput>): void
+  /**
+   * Apply many cells in one atom write (paste / fill / import).
+   *
+   * Entries come in two shapes (audit C-8):
+   *  - `BulkCellInput` (`input: string`) — runs the formula parser +
+   *    `parseLiteral` inference, exactly like `setCell`.
+   *  - `BulkTypedCellInput` (`value: Value`) — installs the typed value
+   *    verbatim, exactly like `setCellValue` (no re-inference; text
+   *    `'00123'` keeps its leading zeros, text `'=A1'` stays literal).
+   */
+  bulkApply(sheetId: string, cells: ReadonlyArray<BulkCellInput | BulkTypedCellInput>): void
   /** Apply a format patch to a rectangular range. */
   setFormat(sheetId: string, range: CellRange, format: Partial<CellFormat>): void
   /** Manual F9 — bump every sheetAtom to a fresh Map reference. */
@@ -145,6 +168,11 @@ export interface Workbook {
    * `withBatch()` — inside a batch, the recalc defers to the outermost
    * exit.
    *
+   * ⚠️ Perf (audit C-3): like the four registry mutators below, each
+   * call OUTSIDE `withBatch` fires a FULL registry-breadth recalc —
+   * wrap multi-step registration sequences in `withBatch`. Measured
+   * numbers on `defineName`'s doc.
+   *
    * Validation: any non-empty string is accepted. We do not validate
    * BCP-47 syntax up front; downstream Intl.* calls fall back to en-US
    * shape on bad input (see `getNumberFormatParts` in `text.ts`).
@@ -152,12 +180,39 @@ export interface Workbook {
   setLocale(locale: string): void
   /**
    * Register a named range / value / LAMBDA.
+   *
+   * ⚠️ Perf (audit C-3, deliberate-broad contract): registry changes
+   * invalidate EVERY cached formula on every sheet — names can be
+   * referenced from anywhere, so registry-driven invalidation is
+   * intentionally registry-breadth, not key-granular (see
+   * `docs/KEY_GRANULAR_INVALIDATION.md` § C-3). Each call outside
+   * `withBatch` therefore pays a full recalc pass: measured on
+   * 3 sheets × 100k cells, one `defineName` = 15–21 ms; 50 names
+   * INSIDE one `withBatch` = 15–21 ms total (coalesced); 50 names
+   * OUTSIDE = ~800 ms (~50×). Always wrap multi-registration
+   * sequences (imports, template setup, host boot) in `withBatch`.
    */
   defineName(name: string, binding: NameBinding): void
-  /** Remove a previously defined name. */
+  /**
+   * Remove a previously defined name.
+   *
+   * ⚠️ Perf (audit C-3): full registry-breadth recalc per call outside
+   * `withBatch` — batch multi-step registry changes (see `defineName`).
+   */
   undefineName(name: string): boolean
-  /** Register a host custom formula. Synchronous callback only for B2. */
+  /**
+   * Register a host custom formula. Synchronous callback only for B2.
+   *
+   * ⚠️ Perf (audit C-3): full registry-breadth recalc per call outside
+   * `withBatch` — batch multi-step registry changes (see `defineName`).
+   */
   registerCustomFormula(name: string, fn: (args: Value[]) => Value): void
+  /**
+   * Remove a host custom formula.
+   *
+   * ⚠️ Perf (audit C-3): full registry-breadth recalc per call outside
+   * `withBatch` — batch multi-step registry changes (see `defineName`).
+   */
   unregisterCustomFormula(name: string): boolean
   /**
    * Run `fn` inside a batch window. While the batch is open, calls to
@@ -429,27 +484,7 @@ export function createWorkbook(
       // Keep `input` as the canonical string repr so things like the
       // formula bar still surface something readable, but the parsed
       // `value` overrides any inference the parser might otherwise do.
-      let input: string
-      switch (value.kind) {
-        case 'number':
-          input = String(value.value)
-          break
-        case 'string':
-          input = value.value
-          break
-        case 'boolean':
-          input = value.value ? 'TRUE' : 'FALSE'
-          break
-        case 'error':
-          input = value.code
-          break
-        case 'array':
-          // Array-typed literals don't have a single-cell representation;
-          // collapse to top-left for display, keep the array as the value.
-          input = ''
-          break
-      }
-      cells.set(key, { input, value, format: existing?.format })
+      cells.set(key, { input: canonicalInputFor(value), value, format: existing?.format })
       propagation.postWrite(sheet, [{ key, prevAst: existing?.ast, valueChanged: true }])
     },
     clearCell(sheetId, row, col, target = 'value') {
@@ -498,7 +533,24 @@ export function createWorkbook(
         const entry = cells[i]
         const key = keyFor(entry.row, entry.col)
         const prev = live.get(key)
-        live.set(key, buildCell(parser, entry.input, prev))
+        if ('value' in entry) {
+          // Typed entry (audit C-8): mirror `setCellValue` exactly — no
+          // parser, no `parseLiteral` re-inference. Blank values clear
+          // the entry (keeping format when present), same as the
+          // single-cell path.
+          const value = entry.value
+          if (value.kind === 'blank') {
+            if (prev?.format) {
+              live.set(key, { input: '', value: { kind: 'blank' }, format: prev.format })
+            } else {
+              live.delete(key)
+            }
+          } else {
+            live.set(key, { input: canonicalInputFor(value), value, format: prev?.format })
+          }
+        } else {
+          live.set(key, buildCell(parser, entry.input, prev))
+        }
         records[i] = { key, prevAst: prev?.ast, valueChanged: true }
       }
       // ONE storage pass, ONE propagation pass (the dirty BFS bails out
@@ -675,6 +727,29 @@ function clearRangeInPlace(
     records.push({ key, prevAst: existing.ast, valueChanged: true })
   }
   return records
+}
+
+/**
+ * Canonical string repr for an already-typed `Value` (shared by
+ * `setCellValue` and `bulkApply`'s typed entries — audit C-8). The
+ * stored `value` is authoritative; `input` only exists so the formula
+ * bar surfaces something readable.
+ */
+function canonicalInputFor(value: Exclude<Value, { kind: 'blank' }>): string {
+  switch (value.kind) {
+    case 'number':
+      return String(value.value)
+    case 'string':
+      return value.value
+    case 'boolean':
+      return value.value ? 'TRUE' : 'FALSE'
+    case 'error':
+      return value.code
+    case 'array':
+      // Array-typed literals don't have a single-cell representation;
+      // collapse to top-left for display, keep the array as the value.
+      return ''
+  }
 }
 
 /**

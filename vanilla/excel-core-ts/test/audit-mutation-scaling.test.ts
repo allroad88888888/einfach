@@ -322,21 +322,43 @@ describe('AUDIT P-C (FIXED): withBatch throw rolls back registry mutations', () 
   })
 })
 
-describe('AUDIT wire-type caveat: bulkApply re-classifies text through parseLiteral', () => {
-  test("bulkApply '00123' becomes number 123 (leading zeros lost); setCellValue preserves", () => {
+describe('AUDIT wire-type caveat (C-8) — FIXED: typed bulkApply entries skip parseLiteral', () => {
+  test("typed bulk entry preserves text '00123'; raw input strings still infer", () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    // Raw input-string entries keep `setCell` semantics by design: the
+    // string runs through parseLiteral inference. This is the documented
+    // contract for untyped input, NOT the C-8 bug.
     wb.bulkApply('s1', [{ row: 0, col: 0, input: '00123' }])
-    wb.setCellValue('s1', 0, 1, { kind: 'string', value: '00123' })
+    // Typed entries (the C-8 fix) carry the producer's classification
+    // through the bulk fast path — identical to setCellValue.
+    wb.bulkApply('s1', [
+      { row: 0, col: 1, value: { kind: 'string', value: '00123' } },
+      { row: 0, col: 2, value: { kind: 'string', value: '=A1' } },
+      { row: 0, col: 3, value: { kind: 'string', value: 'TRUE' } },
+      { row: 0, col: 4, value: { kind: 'number', value: 1.5 } },
+      { row: 0, col: 5, value: { kind: 'boolean', value: true } },
+    ])
+    wb.setCellValue('s1', 1, 0, { kind: 'string', value: '00123' })
     const cells = wb.store.getter(wb.sheet('s1')!.sheetAtom)
-    const viaBulk = cells.get(keyFor(0, 0))!.value
-    const viaTyped = cells.get(keyFor(0, 1))!.value
+    const viaRawInput = cells.get(keyFor(0, 0))!.value
+    const viaTypedBulk = cells.get(keyFor(0, 1))!.value
     // eslint-disable-next-line no-console
     console.log(
-      `[wire-type] bulkApply('00123') -> ${JSON.stringify(viaBulk)}; ` +
-        `setCellValue text -> ${JSON.stringify(viaTyped)}`,
+      `[wire-type FIXED] bulkApply input:'00123' -> ${JSON.stringify(viaRawInput)}; ` +
+        `bulkApply typed text -> ${JSON.stringify(viaTypedBulk)}`,
     )
-    // Pin the CURRENT (lossy) behavior so a silent change is visible.
-    expect(viaBulk).toEqual({ kind: 'number', value: 123 })
-    expect(viaTyped).toEqual({ kind: 'string', value: '00123' })
+    expect(viaRawInput).toEqual({ kind: 'number', value: 123 })
+    // FIXED (C-8): the typed bulk path preserves the wire type.
+    expect(viaTypedBulk).toEqual({ kind: 'string', value: '00123' })
+    expect(cells.get(keyFor(0, 2))!.value).toEqual({ kind: 'string', value: '=A1' })
+    expect(cells.get(keyFor(0, 2))!.ast).toBeUndefined()
+    expect(cells.get(keyFor(0, 3))!.value).toEqual({ kind: 'string', value: 'TRUE' })
+    expect(cells.get(keyFor(0, 4))!.value).toEqual({ kind: 'number', value: 1.5 })
+    expect(cells.get(keyFor(0, 5))!.value).toEqual({ kind: 'boolean', value: true })
+    expect(cells.get(keyFor(1, 0))!.value).toEqual({ kind: 'string', value: '00123' })
+
+    // Typed blank clears the entry like setCellValue (delete when no format).
+    wb.bulkApply('s1', [{ row: 0, col: 4, value: { kind: 'blank' } }])
+    expect(wb.store.getter(wb.sheet('s1')!.sheetAtom).has(keyFor(0, 4))).toBe(false)
   })
 })

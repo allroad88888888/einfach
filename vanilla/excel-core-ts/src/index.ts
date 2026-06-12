@@ -95,6 +95,7 @@ export type {
   CreateWorkbookOptions,
   SheetSeed,
   BulkCellInput,
+  BulkTypedCellInput,
   FormulaCacheState,
 } from './workbook'
 export { createSheet, keyFor, applyCell } from './sheet'
