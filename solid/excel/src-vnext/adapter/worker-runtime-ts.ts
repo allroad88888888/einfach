@@ -692,13 +692,13 @@ function snapshotSparse(state: RuntimeState): SparseCellWire[] {
 function clearRange(state: RuntimeState, range: SparseRangeWire): number {
   const sheet = assertSheetIdx(state, range.sheet)
   const bounds = clampRangeToSheet(range)
-  let cleared = 0
-  for (let row = bounds.rowStart; row <= bounds.rowEnd; row += 1) {
-    for (let col = bounds.colStart; col <= bounds.colEnd; col += 1) {
-      state.workbook.clearCell(sheet.id, row, col, 'all')
-      cleared += 1
-    }
-  }
+  // W2.4 (audit D-1): ONE engine call that walks the sheet's EXISTING
+  // cells intersecting the rect — never the dense coordinate rectangle.
+  // A full-column selection (rowEnd = 1_048_575) costs O(existing cells),
+  // not ~1M per-coordinate clearCell calls. The returned count is the
+  // number of existing cells touched, matching the WASM engine's sparse
+  // `clear_range` semantics.
+  const cleared = state.workbook.clearRange(sheet.id, bounds, 'all')
   invalidateReadOnMutation(state, sheet.idx)
   return cleared
 }

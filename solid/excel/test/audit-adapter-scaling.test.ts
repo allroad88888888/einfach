@@ -12,9 +12,11 @@
  * fix lands and move the test into the relevant behavior suite.
  *
  * Pins:
- *  - D-1  P-A  worker-runtime-ts clearRange iterates the dense rectangle
- *         (returns `cleared === area` on an EMPTY sheet; a full-column
- *         selection sends rowEnd = 1_048_575 through this loop).
+ *  - D-1  P-A  **FIXED** (W2.4) worker-runtime-ts clearRange routes
+ *         through the engine's sparse `clearRange` — O(existing cells),
+ *         one postWrite batch. The pins below assert the fixed shape
+ *         (cleared counts existing cells only; full-column clear is
+ *         bounded by sheet content; spill semantics match W1.1).
  *  - D-5  P-D  worker-runtime-ts removeSheet leaves `readFormulaCells`
  *         keyed by the OLD sheet index → debugFormulaCacheState reports
  *         'clean' for a never-read formula on the sheet that shifted in.
@@ -94,13 +96,12 @@ function createInProcessWorker(): WorkerLike {
   }
 }
 
-describe('audit D-1 · P-A · TS runtime clearRange iterates the dense rectangle', () => {
-  test('clearRange on an EMPTY sheet still walks (and reports) every coordinate', async () => {
+describe('audit D-1 · P-A · FIXED (W2.4) · TS runtime clearRange walks existing cells only', () => {
+  test('clearRange on an EMPTY sheet touches (and reports) zero cells', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
 
     // 200 rows x 50 cols = 10_000 coordinates, ZERO existing cells.
-    const area = 200 * 50
     const t0 = now()
     const cleared = await rpc({
       cmd: 'clearRange',
@@ -110,17 +111,92 @@ describe('audit D-1 · P-A · TS runtime clearRange iterates the dense rectangle
 
     // eslint-disable-next-line no-console
     console.log(
-      `[audit D-1] clearRange 200x50 on empty sheet: cleared=${String(cleared)} ` +
-        `(expected 0 touched cells) in ${elapsed.toFixed(1)} ms — O(area), not O(existing)`,
+      `[audit D-1 FIXED] clearRange 200x50 on empty sheet: cleared=${String(cleared)} ` +
+        `in ${elapsed.toFixed(1)} ms — O(existing), not O(area)`,
     )
 
-    // PIN (buggy shape): the loop visits — and counts — every coordinate
-    // in the rectangle even though the sheet is empty. A column selection
-    // (rowEnd = 1_048_575, see selection/index.ts EXCEL_MAX_ROWS bounds)
-    // routed through SpreadsheetBackend.clearRange would make this loop
-    // run ~1M engine calls. Flip to `toBe(0)`-style accounting once the
-    // implementation walks the sparse cell map instead.
-    expect(cleared).toBe(area)
+    // FIXED shape: the engine walks the live cell map filtered by
+    // bounds; an empty sheet means zero touches, matching the WASM
+    // backend's sparse `clear_range` count semantics.
+    expect(cleared).toBe(0)
+  })
+
+  test('full-column clearRange (rowEnd 1_048_575) on a 100-cell sheet touches only existing cells', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+
+    // 100 real cells in column 0 + 5 cells in column 1 (must survive).
+    const cells = []
+    for (let row = 0; row < 100; row += 1) {
+      cells.push({ sheet: 0, row, col: 0, kind: 'number', value: row })
+    }
+    for (let row = 0; row < 5; row += 1) {
+      cells.push({ sheet: 0, row, col: 1, kind: 'number', value: row })
+    }
+    await rpc({ cmd: 'restoreSparse', cells })
+
+    // Column-header selection shape: rowEnd = EXCEL_MAX_ROWS - 1
+    // (selection/index.ts) forwarded verbatim by the worker backend.
+    const t0 = now()
+    const cleared = await rpc({
+      cmd: 'clearRange',
+      range: { sheet: 0, startRow: 0, startCol: 0, endRow: 1_048_575, endCol: 0 },
+    })
+    const elapsed = now() - t0
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[audit D-1 FIXED] full-column clearRange @100 cells: cleared=${String(cleared)} ` +
+        `in ${elapsed.toFixed(1)} ms (was ~1M engine calls / ≳1.2 s on an EMPTY sheet)`,
+    )
+
+    expect(cleared).toBe(100)
+    expect(elapsed).toBeLessThan(50)
+
+    // Column 1 cells are untouched.
+    const survivors = (await rpc({
+      cmd: 'readCells',
+      cells: [{ sheet: 0, addr: 'B1' }, { sheet: 0, addr: 'B5' }],
+    })) as Array<{ display: string }>
+    expect(survivors.map((c) => c.display)).toEqual(['0', '4'])
+  })
+
+  test('spill-region clear matches W1.1 semantics — target-only skip, anchor teardown', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=SEQUENCE(3, 2)' })
+
+    const readSpill = async () =>
+      ((await rpc({
+        cmd: 'readCells',
+        cells: [
+          { sheet: 0, addr: 'A1' },
+          { sheet: 0, addr: 'B2' },
+          { sheet: 0, addr: 'A3' },
+          { sheet: 0, addr: 'B3' },
+        ],
+      })) as Array<{ display: string }>).map((c) => c.display)
+    expect(await readSpill()).toEqual(['1', '4', '5', '6'])
+
+    // Clear rows 2-3 only (spill TARGETS, not the anchor). Targets are
+    // virtual projections — no map entry — so the clear touches nothing
+    // and the anchor keeps spilling (W1.1 target-only skip).
+    const clearedTargets = await rpc({
+      cmd: 'clearRange',
+      range: { sheet: 0, startRow: 1, startCol: 0, endRow: 2, endCol: 1 },
+    })
+    expect(clearedTargets).toBe(0)
+    expect(await readSpill()).toEqual(['1', '4', '5', '6'])
+
+    // Clear a range covering the ANCHOR: the formula cell is deleted
+    // (dep teardown + derive eviction) and the whole spill collapses
+    // (W1.1 anchor teardown).
+    const clearedAnchor = await rpc({
+      cmd: 'clearRange',
+      range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 1 },
+    })
+    expect(clearedAnchor).toBe(1)
+    expect(await readSpill()).toEqual(['', '', '', ''])
   })
 })
 

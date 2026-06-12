@@ -25,8 +25,12 @@
  *  - P-A  defineName / setLocale outside withBatch remain DELIBERATELY
  *         broad (registry-driven full invalidation, audit C-3) — but no
  *         longer clone any sheet, so the absolute cost collapsed.
- *  - P-B  per-cell clearCell loops (C-4 adjacent): each clear is now
- *         O(dependents), no longer a full clone + full flush.
+ *  - P-B  per-cell clearCell loops (C-4): each clear is now
+ *         O(dependents), no longer a full clone + full flush (was
+ *         5.1-5.3 ms/cell @ 100k cells; now ~0.002 ms/cell). W2.4 adds
+ *         the range-shaped bulk primitive `Workbook.clearRange`
+ *         (O(existing cells in rect), ONE postWrite batch) and routes
+ *         worker-runtime-ts clearRange through it (audit D-1).
  *  - P-C  withBatch throw — FIXED (C-5): registries roll back on abort.
  *  - wire-type caveat re-verify: bulkApply('00123') loses leading zeros
  *         (unchanged, still pinned).
@@ -216,8 +220,8 @@ describe('AUDIT P-A: defineName / setLocale outside withBatch clone every sheet'
   }, 300_000)
 })
 
-describe('AUDIT P-B: per-cell clearCell loop (worker-runtime-ts clearRange shape)', () => {
-  test('100 clearCell calls on a 100k-cell sheet — each clones the full Map', () => {
+describe('AUDIT P-B (C-4): per-cell clearCell loop (worker-runtime-ts clearRange shape)', () => {
+  test('100 clearCell calls on a 100k-cell sheet — in-place post-W2.2', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.bulkApply('s1', literals(100_000))
     const t0 = now()

@@ -104,6 +104,29 @@ export interface Workbook {
     col: number,
     target?: 'value' | 'format' | 'all',
   ): void
+  /**
+   * Clear every EXISTING cell intersecting `range` in one pass (audit
+   * D-1/C-4 — the sparse bulk-clear primitive). Walks the live cell
+   * map's keys, so cost is O(existing cells in range), never O(area):
+   * a full-column clear (rowEnd 1_048_575) on a 100-cell sheet touches
+   * at most 100 cells. All cleared keys propagate through ONE
+   * `postWrite` batch (one revision bump, one dirty BFS) — same batch
+   * shape as `bulkApply`.
+   *
+   * `target` semantics match `clearCell` per cell. Returns the number
+   * of existing cells touched (0 on an empty intersection, in which
+   * case nothing propagates — clearing blanks is a value no-op).
+   *
+   * Spill semantics (W1.1 mirror): spill targets are virtual in the TS
+   * engine (no map entry), so a range covering only spill-projected
+   * cells touches nothing and the anchor keeps spilling; a range
+   * covering the anchor deletes it, tearing the whole spill down.
+   */
+  clearRange(
+    sheetId: string,
+    range: CellRange,
+    target?: 'value' | 'format' | 'all',
+  ): number
   /** Apply many cells in one atom write (paste / fill / import). */
   bulkApply(sheetId: string, cells: ReadonlyArray<BulkCellInput>): void
   /** Apply a format patch to a rectangular range. */
@@ -457,6 +480,15 @@ export function createWorkbook(
       }
       propagation.postWrite(sheet, [{ key, prevAst: existing.ast, valueChanged: true }])
     },
+    clearRange(sheetId, range, target = 'value') {
+      const sheet = requireSheet(sheetId)
+      const records = clearRangeInPlace(sheet._internal.cells, range, target)
+      if (records.length === 0) return 0
+      // ONE batched propagation: dep teardown + dirty BFS + epoch bumps
+      // + eviction + a single revision bump for the whole range.
+      propagation.postWrite(sheet, records)
+      return records.length
+    },
     bulkApply(sheetId, cells) {
       const sheet = requireSheet(sheetId)
       if (cells.length === 0) return
@@ -600,6 +632,49 @@ export function createWorkbook(
       return sheetsList[sheetIdx]._debug.formulaCount()
     },
   }
+}
+
+/**
+ * Storage pass of `Workbook.clearRange` (audit D-1/C-4): walk the live
+ * map (the source of truth), NOT the coordinate rectangle — cost is
+ * O(existing cells), never O(area). Mutates `live` in place (deleting /
+ * overwriting the entry under iteration is Map-iteration safe) and
+ * returns one `WriteRecord` per touched cell for the caller's single
+ * `postWrite` batch. Per-cell semantics mirror `clearCell`'s `target`
+ * branches exactly.
+ */
+function clearRangeInPlace(
+  live: Map<string, Cell>,
+  range: CellRange,
+  target: 'value' | 'format' | 'all',
+): WriteRecord[] {
+  const records: WriteRecord[] = []
+  for (const [key, existing] of live) {
+    const sep = key.indexOf(':')
+    const row = Number(key.slice(0, sep))
+    const col = Number(key.slice(sep + 1))
+    if (row < range.rowStart || row > range.rowEnd) continue
+    if (col < range.colStart || col > range.colEnd) continue
+    if (target === 'format') {
+      // Drop format only; same AST object → no dep teardown, no
+      // formula dirtying (mirrors clearCell's 'format' branch).
+      if (existing.format) {
+        const { format: _format, ...rest } = existing
+        void _format
+        live.set(key, { ...rest })
+      }
+      records.push({ key, prevAst: existing.ast, valueChanged: false })
+      continue
+    }
+    if (target === 'all' || !existing.format) {
+      live.delete(key)
+    } else {
+      // target === 'value' — clear value+formula, keep format.
+      live.set(key, { input: '', value: { kind: 'blank' }, format: existing.format })
+    }
+    records.push({ key, prevAst: existing.ast, valueChanged: true })
+  }
+  return records
 }
 
 /**

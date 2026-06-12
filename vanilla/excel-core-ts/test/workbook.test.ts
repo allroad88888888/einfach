@@ -85,6 +85,99 @@ describe('createWorkbook — sheet handles + cell mutation', () => {
     expect(cells.get('1:0')?.value).toEqual({ kind: 'number', value: 3 })
   })
 
+  describe('clearRange — sparse bulk clear (audit D-1/C-4)', () => {
+    test('walks existing cells only; huge rect clears just the intersection', () => {
+      const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+      wb.bulkApply('s1', [
+        { row: 0, col: 0, input: '1' },
+        { row: 5, col: 0, input: '2' },
+        { row: 0, col: 3, input: 'keep' },
+      ])
+      // Full-column rect (Excel max rows) — only the two col-0 cells exist.
+      const cleared = wb.clearRange('s1', {
+        rowStart: 0,
+        rowEnd: 1_048_575,
+        colStart: 0,
+        colEnd: 0,
+      })
+      expect(cleared).toBe(2)
+      const cells = wb.store.getter(wb.sheet('s1')!.sheetAtom)
+      expect(cells.has('0:0')).toBe(false)
+      expect(cells.has('5:0')).toBe(false)
+      expect(cells.get('0:3')?.value).toEqual({ kind: 'string', value: 'keep' })
+    })
+
+    test('one revision bump for the whole batch; empty intersection bumps nothing', () => {
+      const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+      wb.bulkApply('s1', [
+        { row: 0, col: 0, input: '1' },
+        { row: 1, col: 0, input: '2' },
+      ])
+      let updates = 0
+      const unsubscribe = wb.store.sub(wb.sheet('s1')!.revisionAtom, () => {
+        updates += 1
+      })
+      expect(wb.clearRange('s1', { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 })).toBe(2)
+      expect(updates).toBe(1)
+      // Nothing left in the rect — a second clear touches no cells and
+      // must not signal (clearing blanks is a value no-op).
+      expect(wb.clearRange('s1', { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 })).toBe(0)
+      expect(updates).toBe(1)
+      unsubscribe()
+    })
+
+    test("target='value' keeps format; 'all' drops cell; deps re-derive", () => {
+      const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+      const sheet = wb.sheet('s1')!
+      wb.setCell('s1', 0, 0, '10')
+      wb.setFormat('s1', { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }, { bold: true })
+      wb.setCell('s1', 1, 0, '=A1+1')
+      const dependent = sheet.formulaCellAtom(keyFor(1, 0))
+      expect(wb.store.getter(dependent)).toEqual({ kind: 'number', value: 11 })
+
+      // 'value' clear: format survives, value blanks, dependent sees blank.
+      expect(
+        wb.clearRange('s1', { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }, 'value'),
+      ).toBe(1)
+      const cells = wb.store.getter(sheet.sheetAtom)
+      expect(cells.get('0:0')?.format).toEqual({ bold: true })
+      expect(cells.get('0:0')?.value).toEqual({ kind: 'blank' })
+      expect(wb.store.getter(dependent)).toEqual({ kind: 'number', value: 1 })
+
+      // 'all' clear over both rows: formula cell torn down (dep edges +
+      // derive evicted via the shared postWrite path), entries removed.
+      expect(
+        wb.clearRange('s1', { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 }, 'all'),
+      ).toBe(2)
+      expect(cells.has('0:0')).toBe(false)
+      expect(cells.has('1:0')).toBe(false)
+      expect(wb.store.getter(dependent)).toEqual(BLANK)
+    })
+
+    test("target='format' drops formats only, never dirties formulas", () => {
+      const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+      const sheet = wb.sheet('s1')!
+      wb.setCell('s1', 0, 0, '5')
+      wb.setFormat('s1', { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }, { bold: true })
+      wb.setCell('s1', 1, 0, '=A1*2')
+      wb.store.getter(sheet.formulaCellAtom(keyFor(1, 0)))
+      const evalsBefore = wb.debugFormulaEvalCount(0)
+
+      expect(
+        wb.clearRange('s1', { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 }, 'format'),
+      ).toBe(2)
+      const cells = wb.store.getter(sheet.sheetAtom)
+      expect(cells.get('0:0')?.format).toBeUndefined()
+      expect(cells.get('0:0')?.value).toEqual({ kind: 'number', value: 5 })
+      // Same AST object + valueChanged:false → no re-derive happened.
+      expect(wb.debugFormulaEvalCount(0)).toBe(evalsBefore)
+      expect(wb.store.getter(sheet.formulaCellAtom(keyFor(1, 0)))).toEqual({
+        kind: 'number',
+        value: 10,
+      })
+    })
+  })
+
   test('setFormat applies a format patch to every cell in the range', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.setCell('s1', 0, 0, '10')
