@@ -102,6 +102,19 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
     shift as the key relocate); W1.1 spill teardown/rederive order
     preserved. New engine-level matrix in
     `tests/lazy_structural_retarget.rs`; A-1/B-3 pins flipped.
+  - **codex P1 follow-up (post-`0ca3a16`)**: AST-unchanged formulas
+    dirtied via `tracked_moved`/`range_touched` were NOT added to the
+    silent-BFS root set, so their AST-unchanged dependents kept stale
+    caches (`B1=SUM(A:A)`, `C1=B1*10`, delete a row inside A's data →
+    B1 recomputes but C1 serves the old product). Fix in
+    `retarget_formula_refs`: such a formula joins `value_changed` iff
+    its cache was `Clean(_)` before the flip — an already-Dirty
+    formula's clean dependents are impossible (evaluating a dependent
+    re-cleans its inputs; whatever dirtied the formula dirtied its
+    dependents), so never-read formulas add no BFS roots and the
+    500k bench stays ~127–131 ms. Pinned by three tests in
+    `tests/lazy_structural_retarget.rs` (delete_row, insert_row, and
+    a transitive B1→C1→D1 chain).
 - Measured post-fix (same bench, Apple Silicon release; sheet stays
   LAZY so the second insert rides the same textual path):
 

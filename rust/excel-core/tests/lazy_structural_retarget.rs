@@ -290,6 +290,77 @@ fn hydrated_dependent_of_changed_formula_redirties() {
     );
 }
 
+/// codex P1: AST-UNCHANGED formula dirtied via its range dep
+/// (`range_touched`) must propagate to AST-unchanged dependents. Here
+/// B1's AST never changes (unbounded `A:A`), so it is NOT reinstalled —
+/// it must still seed the silent BFS, or C1 serves its stale cache.
+#[test]
+fn hydrated_dependent_of_range_touched_formula_redirties_on_delete() {
+    let mut sheet = Sheet::new();
+    sheet.set_cell("A2", Value::Number(1.0));
+    sheet.set_cell("A3", Value::Number(2.0));
+    sheet.set_cell("A4", Value::Number(4.0));
+    assert!(sheet.set_formula("B1", "=SUM(A:A)"));
+    assert!(sheet.set_formula("C1", "=B1*10"));
+    assert_eq!(sheet.get_cell("C1"), Value::Number(70.0)); // B1 and C1 Clean
+
+    // Delete A3's row: B1/C1 (row 0) don't move, B1's AST is unchanged
+    // (A:A survives), C1's AST and tracked dep (B1) are unchanged.
+    sheet.delete_row(2, 1);
+
+    assert_eq!(
+        sheet.get_cell("C1"),
+        Value::Number(50.0),
+        "C1 must observe B1's recomputed SUM, not its pre-edit cache"
+    );
+    assert_eq!(sheet.get_cell("B1"), Value::Number(5.0));
+}
+
+/// insert_row variant: inserting inside the range shifts the datum that
+/// `INDEX(A:A,3)` reads, without changing any AST above the edit.
+#[test]
+fn hydrated_dependent_of_range_touched_formula_redirties_on_insert() {
+    let mut sheet = Sheet::new();
+    sheet.set_cell("A3", Value::Number(5.0));
+    assert!(sheet.set_formula("B1", "=INDEX(A:A,3)"));
+    assert!(sheet.set_formula("C1", "=B1*10"));
+    assert_eq!(sheet.get_cell("C1"), Value::Number(50.0)); // B1 and C1 Clean
+
+    // Insert above A3's row: the 5 moves to A4, INDEX(A:A,3) now reads
+    // the new (empty) A3. B1/C1 sit in row 0 — no AST changes anywhere.
+    sheet.insert_row(1, 1);
+
+    // B1 now reads the empty new A3 (Null), which coerces to 0 in `*10`.
+    assert_eq!(
+        sheet.get_cell("C1"),
+        Value::Number(0.0),
+        "C1 must observe B1's recomputed INDEX, not its pre-edit cache"
+    );
+    assert_eq!(sheet.get_cell("B1"), Value::Null);
+}
+
+/// Transitive chain: the silent BFS must dirty B1's dependents
+/// TRANSITIVELY (C1 and D1), not just the first hop.
+#[test]
+fn transitive_dependents_of_range_touched_formula_redirty() {
+    let mut sheet = Sheet::new();
+    sheet.set_cell("A2", Value::Number(1.0));
+    sheet.set_cell("A3", Value::Number(2.0));
+    sheet.set_cell("A4", Value::Number(4.0));
+    assert!(sheet.set_formula("B1", "=SUM(A:A)"));
+    assert!(sheet.set_formula("C1", "=B1*10"));
+    assert!(sheet.set_formula("D1", "=C1+1"));
+    assert_eq!(sheet.get_cell("D1"), Value::Number(71.0)); // whole chain Clean
+
+    sheet.delete_row(2, 1); // drop the 2 — SUM becomes 5
+
+    assert_eq!(
+        sheet.get_cell("D1"),
+        Value::Number(51.0),
+        "D1 must observe the recomputed chain B1=5 -> C1=50 -> D1=51"
+    );
+}
+
 /// Mixed sheet: one hydrated (read) formula + parked rest. The edit
 /// retargets both worlds; hydrated count stays at exactly the formulas
 /// the host actually read.

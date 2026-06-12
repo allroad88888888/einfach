@@ -3964,9 +3964,11 @@ impl Sheet {
     /// formulas) — small by the lazy contract; both key AND value sides
     /// of the indexes shift under a structural edit, so an in-place
     /// key patch would be the same full remap) plus a cache-only dirty
-    /// BFS from every cell whose VALUE may have changed (#REF! writes
-    /// and reinstalled formulas), so AST-unchanged dependents of
-    /// changed formulas don't serve stale caches.
+    /// BFS from every cell whose VALUE may have changed (#REF! writes,
+    /// reinstalled formulas, and previously-Clean AST-unchanged
+    /// formulas dirtied via `tracked_moved`/`range_touched`), so
+    /// AST-unchanged dependents of changed formulas don't serve stale
+    /// caches.
     fn retarget_formula_refs(&mut self, edit: crate::shift::ShiftEdit) {
         let f = |addr: CellAddress| edit.apply(addr);
         let snapshot: Vec<(CellAddress, Rc<Expr>)> = self
@@ -4020,6 +4022,17 @@ impl Sheet {
                         *record.deps.borrow_mut() = remapped;
                     }
                     if tracked_moved || range_touched {
+                        // The value may change even though the AST didn't —
+                        // a CLEAN cache here means dependents may hold
+                        // values derived from the soon-stale result, so
+                        // this cell joins the dirty-BFS roots (codex P1).
+                        // An already-Dirty formula needs no root: a clean
+                        // dependent implies its inputs were clean when it
+                        // evaluated, and whatever dirtied this formula
+                        // already dirtied its dependents.
+                        if matches!(*record.cache.borrow(), FormulaCache::Clean(_)) {
+                            value_changed.push(addr);
+                        }
                         *record.cache.borrow_mut() = FormulaCache::Dirty;
                     }
                 }
