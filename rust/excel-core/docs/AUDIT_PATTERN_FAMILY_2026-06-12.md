@@ -14,6 +14,48 @@ lazy-formula-indexing and storage-primary arcs
 
 Sections are appended per territory as audits land.
 
+## Triage — fix waves (architect, 2026-06-12)
+
+Totals: **9 P1 / 15 P2 / 13 P3** across A (Rust structural), B (Rust
+restore/recalc/atoms), C (TS port), D (UI core + adapters).
+
+### Wave 1 — correctness (wrong values / panics; ship first)
+
+| # | Findings | Area | Fix shape |
+|---|---|---|---|
+| W1.1 | **A-4 + A-5** (panic: clear_range over spill; spill_targets not relocated by structural edits) | Rust sheet.rs spill | Make `BulkLoader::set_cell` + relocate spill-aware: clearing a spill target routes through anchor invalidation; structural shifts remap `spill_targets` keys. One agent, shared subsystem. |
+| W1.2 | **A-6 + A-7** (remove_sheet wipes cross-sheet graph permanently; rename_sheet changes values with no notify) | Rust workbook.rs | `remove_sheet` rebuilds via existing `rebuild_cross_sheet_deps` instead of wipe; `rename_sheet` fires the same rebuild + dirty fanout `install_sheet_bulk` now uses. |
+| W1.3 | **B-4** (named refs invisible to cross-sheet edge walkers → confirmed stale value) | Rust eval/workbook walkers | `collect_cross_sheet_refs` + latch walker resolve `Expr::Name` through `by_name` (incl. LAMBDA bodies). |
+| W1.4 | **C-5** (withBatch throw: registry mutated but invalidation dropped) | TS workbook.ts | On outermost-throw either roll back registry or fire the pending recalc; pick rollback (matches abort intent already documented). Small. |
+
+### Wave 2 — catastrophic scaling (the P-A/P-B P1s)
+
+| # | Findings | Area | Fix shape |
+|---|---|---|---|
+| W2.1 | **A-1** (+ satellites A-2, A-3) insert_row = full hydrate + re-render + re-parse; 500k → 2.09 s and sheet turns eager forever | Rust structural | Lazy retarget: shift parked SOURCE TEXT via token-level ref rewrite (no parse) for lazy entries; hydrated entries keep AST retarget. move_sheet gains the `!`-prefilter; clear_range consults dep indexes instead of scanning all formulas. This is the A-1 design item — RFC-grade, codex review after. |
+| W2.2 | **C-1 + C-2** (+ C-6) TS port: whole-Map clone per edit (107 ms @1M) + flush re-evals every cached formula (503 ms @100k) + atom cache never evicts | TS vanilla/core + sheet.ts | Mirror of the Rust fix, TS side. Options: per-sheet revision + in-place map with copy-on-read snapshots, or chunked/sharded maps, or dirty-set flush (only re-derive formulas whose deps intersect the write). Needs its own mini-RFC; touches the core store contract — codex review mandatory. |
+| W2.3 | **B-1** restores ride legacy per-cell loader (eager parse, no prefilter, double parse) | Rust wasm lib.rs | Route `restore_sparse` / `restore_persistence_v1` through `install_workbook_bulk` (they are fresh-shell semantics → full replace is correct). Mechanical; mirrors 6.3. |
+| W2.4 | **D-1 + C-4** clearRange dense coordinate loop (column delete ≈ 1M engine calls); no bulkClear primitive | engine + both runtimes | Add engine `clear_range` sparse primitive (iterate EXISTING cells in range, not coordinates); runtimes call it once. |
+
+### Wave 3 — P2 hygiene (batchable, after waves 1-2)
+
+- **D-4 + D-5** adapter teardown leaks (deleteSheet overlays; readFormulaCells / snapshotSessions / importSessions on sheet ops) — one agent, worker adapters.
+- **B-2** atom-per-primitive-cell (23% of install) — lazy/coarse atomization, perf project.
+- **D-7 + D-8** filter/sort viewport full-scan + O(sheet) range reads.
+- **D-2** static-backend deep-clone history (demo/test surface only).
+- **C-3 / C-8 / D-10 / D-12** — docs/notes or small fixes.
+
+P3s tracked in section bodies; revisit after Wave 3.
+
+### Ordering rationale
+
+Wave 1 items are silent-wrong-value or abort-class bugs reachable from
+normal UI gestures (delete over a spill, removing/renaming a sheet, a
+LAMBDA touching another sheet). Wave 2 items are the performance promise
+of the whole arc — without W2.1/W2.2 the lazy-import win evaporates on
+the first structural edit (Rust) and large workbooks stay un-editable
+(TS). Wave 3 is debt that doesn't bite until specific features are hot.
+
 ## A — Structural ops (Rust)
 
 Audit date 2026-06-12. Read-only; repro pins live in
