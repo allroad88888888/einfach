@@ -435,3 +435,155 @@ fn install_rejects_out_of_range_sheet() {
     assert_eq!(wb.content_revision(), rev_before, "no partial install");
     assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Null, "no partial install");
 }
+
+// === AUDIT B-2 (lazy primitive-cell atomization) acceptance pins ===
+//
+// `bulk_install_storage` parks primitives as `CellSlot::Plain(Value)` —
+// no core store atom per cell. Atoms materialize on first subscribe /
+// write / spill registration through `ensure_cell`. These pins guard the
+// "atoms allocate on demand, behavior identical" contract.
+
+/// Pin 1: a primitives-only install at the audit's 200k tier allocates
+/// ZERO store atoms — the storage map is the only per-cell cost. Reads
+/// serve parked values directly.
+#[test]
+fn install_primitives_allocates_zero_atoms_at_200k() {
+    const N: u32 = 200_000;
+    let mut primitives = HashMap::new();
+    for r in 1..=N {
+        primitives.insert(addr(&format!("A{r}")), Value::Number(r as f64));
+    }
+
+    let mut wb = Workbook::new();
+    wb.install_sheet_bulk(0, primitives, HashMap::new())
+        .expect("install must succeed");
+
+    let sheet = wb.sheet(0).expect("sheet 0 exists");
+    assert_eq!(
+        sheet.debug_primitive_atom_count(),
+        N as usize,
+        "every primitive must be present as a slot"
+    );
+    assert_eq!(
+        sheet.debug_materialized_cell_atom_count(),
+        0,
+        "B-2 pin: install must not materialize any cell atom"
+    );
+    assert_eq!(
+        sheet.debug_total_atom_count(),
+        0,
+        "B-2 pin: the core store must hold zero atoms after install"
+    );
+
+    // Reads serve the parked values without materializing.
+    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(1.0));
+    assert_eq!(wb.get_cell("Sheet1", "A200000"), Value::Number(200000.0));
+    assert_eq!(wb.sheet(0).unwrap().debug_total_atom_count(), 0);
+}
+
+/// Pin 2a: subscribe-after-install still fires on write — and only for
+/// the watched cell (lazy extreme: unwatched writes fire nothing).
+#[test]
+fn subscribe_after_install_fires_on_write() {
+    let mut primitives = HashMap::new();
+    primitives.insert(addr("A1"), Value::Number(1.0));
+    primitives.insert(addr("A2"), Value::Number(2.0));
+
+    let mut wb = Workbook::new();
+    wb.install_sheet_bulk(0, primitives, HashMap::new())
+        .expect("install must succeed");
+
+    let counter = Rc::new(RefCell::new(0usize));
+    let counter_clone = counter.clone();
+    let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("A1", move || {
+        *counter_clone.borrow_mut() += 1;
+    });
+    // Subscribing promotes the parked slot so the fanout has an atom to
+    // attach to — bounded by subscription count, not sheet size.
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_materialized_cell_atom_count(),
+        1,
+        "exactly the subscribed address materializes"
+    );
+
+    wb.set_cell(0, "A1", Value::Number(10.0));
+    assert_eq!(*counter.borrow(), 1, "watched write must fire once");
+
+    // Same-value write dedups exactly like the eager-atom path did.
+    wb.set_cell(0, "A1", Value::Number(10.0));
+    assert_eq!(*counter.borrow(), 1, "same-value write must not fire");
+
+    // Unwatched cell write fires nothing for A1's listener.
+    wb.set_cell(0, "A2", Value::Number(20.0));
+    assert_eq!(*counter.borrow(), 1, "unwatched write must not fire");
+    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Number(10.0));
+}
+
+/// Pin 2b: a formula installed AFTER a lazy primitive install still
+/// tracks its dependency — writing the parked source cell dirties and
+/// re-evaluates the derived read.
+#[test]
+fn derive_read_after_install_tracks_parked_primitive() {
+    let mut primitives = HashMap::new();
+    primitives.insert(addr("A1"), Value::Number(3.0));
+
+    let mut wb = Workbook::new();
+    wb.install_sheet_bulk(0, primitives, HashMap::new())
+        .expect("install must succeed");
+
+    assert!(wb.set_formula(0, "B1", "=A1*2"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(6.0));
+
+    // Write through the workbook path: the parked A1 promotes, the
+    // dependent formula goes dirty, the next read is fresh.
+    wb.set_cell(0, "A1", Value::Number(5.0));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
+}
+
+/// Pin 3: structural edits relocate parked plain values alongside
+/// materialized atoms (the `relocate_cells` value-map shift).
+#[test]
+fn structural_edit_relocates_parked_primitives() {
+    let mut primitives = HashMap::new();
+    primitives.insert(addr("A1"), Value::Number(1.0));
+    primitives.insert(addr("A5"), Value::Number(5.0));
+
+    let mut wb = Workbook::new();
+    wb.install_sheet_bulk(0, primitives, HashMap::new())
+        .expect("install must succeed");
+    assert_eq!(wb.sheet(0).unwrap().debug_total_atom_count(), 0);
+
+    wb.sheet_mut(0).unwrap().insert_row(0, 1);
+
+    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Null);
+    assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Number(1.0));
+    assert_eq!(wb.get_cell("Sheet1", "A6"), Value::Number(5.0));
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_total_atom_count(),
+        0,
+        "a structural edit must not materialize parked primitives"
+    );
+}
+
+/// Pin 4: a spill landing where a parked primitive lives still collides
+/// (#SPILL!), exactly like the eager-atom behavior.
+#[test]
+fn spill_collision_with_parked_primitive() {
+    let mut primitives = HashMap::new();
+    primitives.insert(addr("A1"), Value::Number(1.0));
+    primitives.insert(addr("A2"), Value::Number(2.0));
+    primitives.insert(addr("B2"), Value::Number(99.0)); // obstruction
+
+    let mut wb = Workbook::new();
+    wb.install_sheet_bulk(0, primitives, HashMap::new())
+        .expect("install must succeed");
+
+    // B1 spills down 2 cells; B2 is occupied by a parked value.
+    assert!(wb.set_formula(0, "B1", "=SEQUENCE(2)"));
+    assert_eq!(
+        wb.get_cell("Sheet1", "B1"),
+        Value::Error(einfach_core::ValueError::Spill),
+        "parked plain value must block the spill"
+    );
+    assert_eq!(wb.get_cell("Sheet1", "B2"), Value::Number(99.0));
+}

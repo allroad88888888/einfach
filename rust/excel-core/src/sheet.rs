@@ -133,6 +133,37 @@ impl<V> RowMajorMap<V> {
         self.by_row.values().flat_map(|cols| cols.values())
     }
 
+    /// Build from unsorted `(addr, V)` pairs in one pass (AUDIT B-2):
+    /// sort row-major, then bulk-build the nested BTreeMaps via
+    /// `FromIterator` — std's sorted bulk construction packs nodes
+    /// linearly instead of paying a random-order tree insert per cell.
+    /// At bulk-install scale (1M cells from a HashMap payload) this
+    /// beats N individual `insert` calls by a wide margin. Duplicate
+    /// addresses resolve last-wins (install payloads are HashMap-backed,
+    /// so duplicates cannot occur in practice).
+    pub(crate) fn from_unsorted_pairs(mut pairs: Vec<(CellAddress, V)>) -> Self {
+        pairs.sort_unstable_by(|(a, _), (b, _)| (a.row, a.col).cmp(&(b.row, b.col)));
+        let mut by_row: BTreeMap<u32, BTreeMap<u32, V>> = BTreeMap::new();
+        let mut len = 0usize;
+        let mut iter = pairs.into_iter().peekable();
+        while let Some((first_addr, first_value)) = iter.next() {
+            let row = first_addr.row;
+            let mut cols: Vec<(u32, V)> = vec![(first_addr.col, first_value)];
+            while let Some((next_addr, _)) = iter.peek() {
+                if next_addr.row != row {
+                    break;
+                }
+                let (next_addr, next_value) = iter.next().expect("peeked entry present");
+                cols.push((next_addr.col, next_value));
+            }
+            // Sorted input → `FromIterator` takes the bulk-build path.
+            let row_map: BTreeMap<u32, V> = cols.into_iter().collect();
+            len += row_map.len();
+            by_row.insert(row, row_map);
+        }
+        RowMajorMap { by_row, len }
+    }
+
     /// Drain into a row-major `(CellAddress, V)` iterator. Used by
     /// the structural-edit `relocate_cells` path that needs to
     /// rebuild the index under new keys.
@@ -613,16 +644,52 @@ impl RangeDependentIndex {
     }
 }
 
+/// Storage slot for a primitive cell (AUDIT B-2 — lazy atomization).
+///
+/// Bulk installs park raw `Value`s (`Plain`); a core store atom is only
+/// allocated when something actually needs atom semantics — a subscription
+/// fanout attach, a spill anchor/target install, or any mutation path that
+/// routes through `ensure_cell`. Mirrors the lazy-formula split one layer
+/// down: the storage map is the source of truth, the atom is a demand-
+/// created projection. Invariants:
+///
+///   - `Plain` slots are never `Value::Null` (Null means "absent"; the
+///     install path skips Nulls and every write path promotes first).
+///   - An address with a live subscription fanout is never `Plain`
+///     (`attach_address_sub` promotes before wiring the store sub).
+///   - Spill anchors and spill targets are always `Atom` (anchors via
+///     `ensure_cell`, targets hold derived atoms).
+#[derive(Debug)]
+pub(crate) enum CellSlot {
+    /// Raw stored value — no core atom allocated yet.
+    Plain(Value),
+    /// Materialized core atom (primitive or spill-target derived).
+    Atom(AtomId),
+}
+
+impl CellSlot {
+    /// The materialized atom id, if any. `Plain` slots have none.
+    fn atom_id(&self) -> Option<AtomId> {
+        match self {
+            CellSlot::Atom(id) => Some(*id),
+            CellSlot::Plain(_) => None,
+        }
+    }
+}
+
 /// A spreadsheet sheet backed by an atom store.
 pub struct Sheet {
     pub(crate) store: Store,
-    /// Primitive cell atoms keyed by `(row, col)`. Backed by a row-major
+    /// Primitive cell slots keyed by `(row, col)`. Backed by a row-major
     /// `RowMajorMap` so range reads (e.g. viewport, `SUM(A1:A100)`) scan
     /// O(cells_in_range) rather than the full non-empty set — the Phase 2
     /// Track F target from `PHASE2_PARALLEL.md`. API surface still mimics
-    /// `HashMap` (`get`/`insert`/`remove`/`contains_key`/`len`/`keys`) so
-    /// call sites elsewhere in this file stay unchanged.
-    pub(crate) cells: RowMajorMap<AtomId>,
+    /// `HashMap` (`get`/`insert`/`remove`/`contains_key`/`len`/`keys`).
+    ///
+    /// AUDIT B-2: slots are either `Plain(Value)` (lazily atomized — the
+    /// bulk-install fast path) or `Atom(AtomId)` (materialized). See
+    /// [`CellSlot`] for the invariants.
+    pub(crate) cells: RowMajorMap<CellSlot>,
     /// Formula cells live at the Sheet layer. Formula results are cached here,
     /// not as core derived atoms, so `set_formula` does not compute. Same
     /// row-major shape as `cells` so range scans that hit a mix of primitive
@@ -930,13 +997,61 @@ impl Sheet {
 
     /// Get or create the primitive atom for a cell address.
     /// New cells start as Null.
+    ///
+    /// AUDIT B-2: this is the single atomization point. A `Plain` slot
+    /// (lazily-installed bulk value) is promoted here — the parked value
+    /// moves into a freshly-created store atom, preserving the value
+    /// exactly so the downstream `store.set` equality dedup behaves as if
+    /// the atom had existed all along.
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
-        if let Some(&id) = self.cells.get(&addr) {
-            return id;
+        match self.cells.get(&addr) {
+            Some(CellSlot::Atom(id)) => return *id,
+            Some(CellSlot::Plain(_)) => {
+                let Some(CellSlot::Plain(value)) = self.cells.remove(&addr) else {
+                    unreachable!("slot vanished between get and remove");
+                };
+                let id = self.store.create_atom(value);
+                self.cells.insert(addr, CellSlot::Atom(id));
+                id
+            }
+            None => {
+                let id = self.store.create_atom(Value::Null);
+                self.cells.insert(addr, CellSlot::Atom(id));
+                id
+            }
         }
-        let id = self.store.create_atom(Value::Null);
-        self.cells.insert(addr, id);
-        id
+    }
+
+    /// Read the value behind a cell slot. `Plain` slots return the parked
+    /// value; `Atom` slots read the store (Null if the atom was destroyed
+    /// out from under the slot — defensive, mirrors the old
+    /// `has_atom`-guarded reads).
+    fn slot_value(&self, slot: &CellSlot) -> Value {
+        match slot {
+            CellSlot::Plain(value) => value.clone(),
+            CellSlot::Atom(id) => {
+                if self.store.has_atom(*id) {
+                    self.store.get(*id)
+                } else {
+                    Value::Null
+                }
+            }
+        }
+    }
+
+    /// Remove the slot at `addr`; if it held a materialized atom with no
+    /// live dependents, destroy the atom. `Plain` slots are simply
+    /// dropped. Returns whether a slot was present.
+    fn drop_cell_slot(&mut self, addr: CellAddress) -> bool {
+        let Some(slot) = self.cells.remove(&addr) else {
+            return false;
+        };
+        if let CellSlot::Atom(id) = slot {
+            if self.store.has_atom(id) && !self.store.has_dependents(id) {
+                self.store.destroy_atom(id);
+            }
+        }
+        true
     }
 
     /// Get or create the primitive atom for a cell. Formula results no longer
@@ -949,7 +1064,10 @@ impl Sheet {
         if self.formula_cells.borrow().contains_key(&addr) {
             None
         } else {
-            self.cells.get(&addr).copied()
+            // AUDIT B-2: `Plain` slots report no readable atom. Callers
+            // that need an attachable atom (`attach_address_sub`) promote
+            // first; pure readers go through `slot_value`.
+            self.cells.get(&addr).and_then(|slot| slot.atom_id())
         }
     }
 
@@ -974,7 +1092,18 @@ impl Sheet {
     /// Attach (or re-attach) this address's fanout to the current readable
     /// atom. No-op when there is no listener bucket or the address has no
     /// readable atom yet.
+    ///
+    /// AUDIT B-2: a subscribed address must hold a real store atom so the
+    /// fanout has something to attach to — promote a `Plain` slot first.
+    /// Bounded by the subscription count, never by sheet size. Empty
+    /// (slot-less) addresses still do not materialize anything.
     fn attach_address_sub(&mut self, addr: CellAddress) {
+        if self.cell_subscriptions.contains_key(&addr)
+            && matches!(self.cells.get(&addr), Some(CellSlot::Plain(_)))
+            && !self.formula_cells.borrow().contains_key(&addr)
+        {
+            self.ensure_cell(addr);
+        }
         let new_atom = self.current_readable_atom(addr);
         let Some(bucket) = self.cell_subscriptions.get_mut(&addr) else {
             return;
@@ -1370,15 +1499,13 @@ impl Sheet {
             .collect();
         self.spill_targets.clear();
         for addr in spill_target_addrs {
-            if let Some(id) = self.cells.remove(&addr) {
+            self.drop_cell_slot(addr);
+        }
+        for (_, slot) in self.cells.drain_into_vec() {
+            if let CellSlot::Atom(id) = slot {
                 if self.store.has_atom(id) && !self.store.has_dependents(id) {
                     self.store.destroy_atom(id);
                 }
-            }
-        }
-        for (_, id) in self.cells.drain_into_vec() {
-            if self.store.has_atom(id) && !self.store.has_dependents(id) {
-                self.store.destroy_atom(id);
             }
         }
 
@@ -1393,10 +1520,15 @@ impl Sheet {
         self.needs_parse.get_mut().clear();
 
         // --- Primitive install ---------------------------------------------
-        // `cells` is empty after the teardown and the payload HashMap keys
-        // are unique, so we create atoms directly instead of routing
-        // through `ensure_cell`'s exists-check.
-        let mut primitives_installed: usize = 0;
+        // AUDIT B-2 (FIXED): park raw values as `CellSlot::Plain` — zero
+        // store-atom allocations. The atom materializes lazily at the
+        // first `ensure_cell` (write / spill anchor) or subscription
+        // attach for that address; pure reads serve the parked value
+        // directly via `slot_value`, skipping the old addr → AtomId →
+        // Value double lookup. The map itself is bulk-built from sorted
+        // pairs (`from_unsorted_pairs`) instead of paying a random-order
+        // BTreeMap insert per cell.
+        let mut prim_pairs: Vec<(CellAddress, CellSlot)> = Vec::with_capacity(primitives.len());
         for (addr, value) in primitives {
             if matches!(value, Value::Null) {
                 continue;
@@ -1405,20 +1537,20 @@ impl Sheet {
             if formulas.contains_key(&addr) {
                 continue;
             }
-            let id = self.store.create_atom(value);
-            self.cells.insert(addr, id);
-            primitives_installed += 1;
+            prim_pairs.push((addr, CellSlot::Plain(value)));
         }
+        let primitives_installed = prim_pairs.len();
+        self.cells = RowMajorMap::from_unsorted_pairs(prim_pairs);
 
         // --- Formula parking (lazy — Phase 2+3 machinery) ------------------
         let formulas_installed = formulas.len();
         let mut needs: HashSet<CellAddress> = HashSet::with_capacity(formulas_installed);
-        let mut source_map: RowMajorMap<Rc<str>> = RowMajorMap::new();
+        let mut formula_pairs: Vec<(CellAddress, Rc<str>)> = Vec::with_capacity(formulas_installed);
         for (addr, text) in formulas {
             needs.insert(addr);
-            source_map.insert(addr, Rc::<str>::from(text));
+            formula_pairs.push((addr, Rc::<str>::from(text)));
         }
-        *self.formula_source.get_mut() = source_map;
+        *self.formula_source.get_mut() = RowMajorMap::from_unsorted_pairs(formula_pairs);
         *self.needs_parse.get_mut() = needs;
         self.imported_formula_count
             .set(self.imported_formula_count.get() + formulas_installed);
@@ -1566,11 +1698,8 @@ impl Sheet {
     /// have no `Array` and so return None here, matching Excel's "the
     /// anchor has no spill" semantics in the collision case.
     pub fn spill_info(&self, addr: CellAddress) -> Option<(u32, u32)> {
-        let &atom_id = self.cells.get(&addr)?;
-        if !self.store.has_atom(atom_id) {
-            return None;
-        }
-        match self.store.get(atom_id) {
+        let slot = self.cells.get(&addr)?;
+        match self.slot_value(slot) {
             Value::Array(arr) => Some(arr.shape()),
             _ => None,
         }
@@ -1607,9 +1736,10 @@ impl Sheet {
             // Locate the anchor address by reverse-scanning `cells`.
             // The map is small (one entry per cell) but for Phase 1 we
             // accept the O(n) scan — anchor address lookups are rare
-            // (only for error messages and `is_spilled`).
-            for (cell_addr, &cell_atom) in self.cells.iter() {
-                if cell_atom == anchor_atom {
+            // (only for error messages and `is_spilled`). `Plain` slots
+            // can never be anchors (anchors go through `ensure_cell`).
+            for (cell_addr, slot) in self.cells.iter() {
+                if slot.atom_id() == Some(anchor_atom) {
                     return Some(cell_addr);
                 }
             }
@@ -1623,8 +1753,8 @@ impl Sheet {
     /// `spill_targets` first). Used by `teardown_all_spills` (AUDIT A-5)
     /// to snapshot anchor addresses before a structural shift.
     fn anchor_address_for(&self, anchor_atom: AtomId) -> Option<CellAddress> {
-        for (cell_addr, &cell_atom) in self.cells.iter() {
-            if cell_atom == anchor_atom {
+        for (cell_addr, slot) in self.cells.iter() {
+            if slot.atom_id() == Some(anchor_atom) {
                 return Some(cell_addr);
             }
         }
@@ -1716,12 +1846,8 @@ impl Sheet {
                 // If there was a stale primitive at this address (e.g.
                 // empty `Value::Null` placeholder created by a previous
                 // subscribe), remove it first so we don't leak an atom.
-                if let Some(prev) = self.cells.remove(&target) {
-                    if self.store.has_atom(prev) && !self.store.has_dependents(prev) {
-                        self.store.destroy_atom(prev);
-                    }
-                }
-                self.cells.insert(target, derived);
+                self.drop_cell_slot(target);
+                self.cells.insert(target, CellSlot::Atom(derived));
                 // Re-attach subscription bucket (if any) so address-level
                 // listeners see updates from the new derived atom.
                 self.attach_address_sub(target);
@@ -1746,36 +1872,36 @@ impl Sheet {
         {
             return true;
         }
-        // (b) Primitive atom holding a non-Null value.
-        if let Some(&atom_id) = self.cells.get(&target) {
-            if self.store.has_atom(atom_id) {
-                let v = self.store.get(atom_id);
-                if !matches!(v, Value::Null) {
-                    // (c) Skip if this is already one of OUR own spill
-                    // targets — we're re-spilling and the previous round
-                    // installed this derived atom. Caller (`set_array`)
-                    // tears the old spill down BEFORE calling
-                    // register_spill, so in practice we never see our
-                    // own targets here; the guard is defensive.
-                    if let Some(targets) = self.spill_targets.get(&our_anchor_atom) {
-                        if targets.iter().any(|t| *t == target) {
-                            return false;
-                        }
+        // (b) Primitive slot holding a non-Null value. `Plain` slots are
+        // covered too (AUDIT B-2): a bulk-installed value blocks the
+        // spill exactly like its materialized-atom equivalent would.
+        if let Some(slot) = self.cells.get(&target) {
+            let v = self.slot_value(slot);
+            if !matches!(v, Value::Null) {
+                // (c) Skip if this is already one of OUR own spill
+                // targets — we're re-spilling and the previous round
+                // installed this derived atom. Caller (`set_array`)
+                // tears the old spill down BEFORE calling
+                // register_spill, so in practice we never see our
+                // own targets here; the guard is defensive.
+                if let Some(targets) = self.spill_targets.get(&our_anchor_atom) {
+                    if targets.iter().any(|t| *t == target) {
+                        return false;
                     }
-                    // Check if it's a spilled cell from ANOTHER anchor.
-                    // Iterate `spill_targets` — if any OTHER anchor lists
-                    // `target`, that's a cross-anchor collision.
-                    for (anchor_atom, targets) in &self.spill_targets {
-                        if *anchor_atom == our_anchor_atom {
-                            continue;
-                        }
-                        if targets.iter().any(|t| *t == target) {
-                            return true;
-                        }
-                    }
-                    // Plain non-Null primitive — collision.
-                    return true;
                 }
+                // Check if it's a spilled cell from ANOTHER anchor.
+                // Iterate `spill_targets` — if any OTHER anchor lists
+                // `target`, that's a cross-anchor collision.
+                for (anchor_atom, targets) in &self.spill_targets {
+                    if *anchor_atom == our_anchor_atom {
+                        continue;
+                    }
+                    if targets.iter().any(|t| *t == target) {
+                        return true;
+                    }
+                }
+                // Plain non-Null primitive — collision.
+                return true;
             }
         }
         false
@@ -1796,23 +1922,15 @@ impl Sheet {
             // Detach the address subscription bucket from the soon-dead
             // atom; reattach after removal so listeners refresh.
             self.detach_address_sub(target);
-            if let Some(derived_id) = self.cells.remove(&target) {
-                if self.store.has_atom(derived_id) {
-                    // Spilled cells are read-only derived atoms with
-                    // (typically) no further atom-level dependents.
-                    // Formula cells that referenced this address read
-                    // via the Sheet-level peek path; the dep graph
-                    // there is in `cell_dependents`, not in the store's
-                    // back_deps. So destroy is safe.
-                    if !self.store.has_dependents(derived_id) {
-                        self.store.destroy_atom(derived_id);
-                    }
-                    // If something did register a downstream derived atom
-                    // (no API for that today), we'd leak the spilled
-                    // derived atom rather than panic — acknowledged as
-                    // a Phase 1 limitation.
-                }
-            }
+            // Spilled cells are read-only derived atoms with (typically)
+            // no further atom-level dependents. Formula cells that
+            // referenced this address read via the Sheet-level peek path;
+            // the dep graph there is in `cell_dependents`, not in the
+            // store's back_deps. So destroy is safe. If something did
+            // register a downstream derived atom (no API for that today),
+            // `drop_cell_slot` leaks the spilled derived atom rather than
+            // panic — acknowledged as a Phase 1 limitation.
+            self.drop_cell_slot(target);
             self.attach_address_sub(target);
             self.mark_dependents_dirty(target);
         }
@@ -1823,7 +1941,8 @@ impl Sheet {
     /// the array, so the old spill must go away. No-op when `addr` is
     /// not a spill anchor.
     fn clear_spill_at_address(&mut self, addr: CellAddress) {
-        let Some(&atom_id) = self.cells.get(&addr) else {
+        // `Plain` slots can never be spill anchors — nothing to clear.
+        let Some(atom_id) = self.cells.get(&addr).and_then(|slot| slot.atom_id()) else {
             return;
         };
         if self.spill_targets.contains_key(&atom_id) {
@@ -1884,7 +2003,7 @@ impl Sheet {
         let prev_anchor_atom: Option<AtomId> = self
             .cells
             .get(&addr)
-            .copied()
+            .and_then(|slot| slot.atom_id())
             .filter(|id| self.spill_targets.contains_key(id));
 
         // LAZY_FORMULA_INDEXING Phase 3: hydrate before consulting
@@ -1936,7 +2055,9 @@ impl Sheet {
                         // error path? No — install_formula_spill leaves
                         // the atom holding Value::Array on collision.
                         // Fix that here:
-                        if let Some(&atom_id) = self.cells.get(&addr) {
+                        if let Some(atom_id) =
+                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
+                        {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
                         if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
@@ -1945,7 +2066,9 @@ impl Sheet {
                         }
                     }
                     Err(other) => {
-                        if let Some(&atom_id) = self.cells.get(&addr) {
+                        if let Some(atom_id) =
+                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
+                        {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
                         if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
@@ -1962,11 +2085,7 @@ impl Sheet {
                 // through the formula cache.
                 if prev_anchor_atom.is_some() {
                     self.clear_spill_at_address(addr);
-                    if let Some(prim) = self.cells.remove(&addr) {
-                        if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
-                            self.store.destroy_atom(prim);
-                        }
-                    }
+                    self.drop_cell_slot(addr);
                     // Re-attach the address subscription bucket to
                     // whatever the cell is now (formula-only).
                     self.attach_address_sub(addr);
@@ -2034,7 +2153,7 @@ impl Sheet {
         let prev_anchor_atom: Option<AtomId> = self
             .cells
             .get(&addr)
-            .copied()
+            .and_then(|slot| slot.atom_id())
             .filter(|id| self.spill_targets.contains_key(id));
 
         // LAZY_FORMULA_INDEXING Phase 3: hydrate so the workbook-aware
@@ -2060,7 +2179,9 @@ impl Sheet {
                 match self.install_formula_spill(addr, arr) {
                     Ok(()) => {}
                     Err(ValueError::Spill) => {
-                        if let Some(&atom_id) = self.cells.get(&addr) {
+                        if let Some(atom_id) =
+                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
+                        {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
                         if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
@@ -2069,7 +2190,9 @@ impl Sheet {
                         }
                     }
                     Err(other) => {
-                        if let Some(&atom_id) = self.cells.get(&addr) {
+                        if let Some(atom_id) =
+                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
+                        {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
                         if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
@@ -2082,11 +2205,7 @@ impl Sheet {
             _ => {
                 if prev_anchor_atom.is_some() {
                     self.clear_spill_at_address(addr);
-                    if let Some(prim) = self.cells.remove(&addr) {
-                        if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
-                            self.store.destroy_atom(prim);
-                        }
-                    }
+                    self.drop_cell_slot(addr);
                     self.attach_address_sub(addr);
                     self.mark_dependents_dirty(addr);
                 }
@@ -2264,7 +2383,7 @@ impl Sheet {
     /// fresh primitive and reattach the fanout via the existing
     /// `attach_address_sub` flow, firing the listener as part of that write.
     fn try_release_primitive(&mut self, addr: CellAddress) {
-        let Some(&atom_id) = self.cells.get(&addr) else {
+        let Some(slot) = self.cells.get(&addr) else {
             return;
         };
         // Formula cells are lazy records, not primitive atoms.
@@ -2276,6 +2395,20 @@ impl Sheet {
         {
             return;
         }
+        let atom_id = match slot {
+            // AUDIT B-2: `Plain` slots hold non-Null values by invariant
+            // (every Null-writing path promotes via `ensure_cell` first);
+            // a Null that slips through is released without ever having
+            // had an atom.
+            CellSlot::Plain(value) => {
+                if matches!(value, Value::Null) {
+                    self.cells.remove(&addr);
+                    self.detach_address_sub(addr);
+                }
+                return;
+            }
+            CellSlot::Atom(id) => *id,
+        };
         if self.store.has_dependents(atom_id) {
             return;
         }
@@ -2354,11 +2487,7 @@ impl Sheet {
             let deps = Sheet::formula_deps_for(&expr);
             let range_deps = collect_range_refs(&expr);
             sheet.remove_formula_record(addr);
-            if let Some(prim) = sheet.cells.remove(&addr) {
-                if sheet.store.has_atom(prim) && !sheet.store.has_dependents(prim) {
-                    sheet.store.destroy_atom(prim);
-                }
-            }
+            sheet.drop_cell_slot(addr);
             // Wire dep indexes off `&deps` / `&range_deps` first, then
             // move the originals into the record so we avoid two
             // per-formula `HashSet::clone` allocations (mirrors the
@@ -2618,7 +2747,7 @@ impl Sheet {
             out
         };
 
-        for (addr, &id) in self.cells.range_iter(range) {
+        for (addr, slot) in self.cells.range_iter(range) {
             // Skip primitives that have been upgraded to formulas — the
             // formula pass below will emit the formula value at this addr.
             // Address-equality check stays O(1) (BTreeMap point lookup).
@@ -2628,12 +2757,7 @@ impl Sheet {
             {
                 continue;
             }
-            let v = if self.store.has_atom(id) {
-                self.store.get(id)
-            } else {
-                Value::Null
-            };
-            f(addr, v);
+            f(addr, self.slot_value(slot));
         }
         for addr in formula_addrs {
             let v = value_resolver(self, addr);
@@ -2658,16 +2782,14 @@ impl Sheet {
         }
         self.cells
             .get(&addr)
-            .filter(|id| self.store.has_atom(**id))
-            .map(|&id| self.store.get(id))
+            .map(|slot| self.slot_value(slot))
             .unwrap_or(Value::Null)
     }
 
     fn primitive_value_at(&self, addr: CellAddress) -> Value {
         self.cells
             .get(&addr)
-            .filter(|id| self.store.has_atom(**id))
-            .map(|&id| self.store.get(id))
+            .map(|slot| self.slot_value(slot))
             .unwrap_or(Value::Null)
     }
 
@@ -2973,13 +3095,28 @@ impl Sheet {
     // All `#[doc(hidden)]` — not part of the public API surface, intended
     // for tests / benches / dev tooling.
 
-    /// Number of materialized primitive cell atoms (one per address that
-    /// has been set or referenced from a formula). Empty addresses don't
-    /// count even if subscribed (verified by
-    /// `subscribe_empty_cell_does_not_materialize_until_write`).
+    /// Number of non-empty primitive cell slots — parked plain values
+    /// (AUDIT B-2 lazy atomization) plus materialized atoms. One per
+    /// address that has been set or referenced from a formula. Empty
+    /// addresses don't count even if subscribed (verified by
+    /// `subscribe_empty_cell_does_not_materialize_until_write`). For the
+    /// materialized-atom subset only, see
+    /// `debug_materialized_cell_atom_count`.
     #[doc(hidden)]
     pub fn debug_primitive_atom_count(&self) -> usize {
         self.cells.len()
+    }
+
+    /// Number of primitive cell slots that hold a real store atom
+    /// (`CellSlot::Atom`). AUDIT B-2 pin: a primitives-only bulk install
+    /// leaves this at 0 — atoms allocate on first subscribe / write /
+    /// spill registration, never eagerly.
+    #[doc(hidden)]
+    pub fn debug_materialized_cell_atom_count(&self) -> usize {
+        self.cells
+            .iter()
+            .filter(|(_, slot)| matches!(slot, CellSlot::Atom(_)))
+            .count()
     }
 
     /// Number of formula cells. Formulas are Sheet-level lazy records, not
@@ -3824,11 +3961,7 @@ impl Sheet {
                 .filter(|a| pred(*a)),
         );
         for addr in to_drop {
-            if let Some(prim) = self.cells.remove(&addr) {
-                if self.store.has_atom(prim) && !self.store.has_dependents(prim) {
-                    self.store.destroy_atom(prim);
-                }
-            }
+            self.drop_cell_slot(addr);
             // `remove_formula_record` already drains `formula_source` +
             // `needs_parse` first (LAZY_FORMULA_INDEXING Phase 3) so a
             // lazy-only entry is cleaned up even though no eager record
@@ -3855,9 +3988,9 @@ impl Sheet {
         // `drain_into_vec` empties `self.cells` / `self.formula_cells` and
         // hands back row-major (addr, value) pairs we reinsert under the
         // shifted addresses.
-        let mut new_cells: RowMajorMap<AtomId> = RowMajorMap::new();
-        for (addr, id) in self.cells.drain_into_vec() {
-            new_cells.insert(f(addr), id);
+        let mut new_cells: RowMajorMap<CellSlot> = RowMajorMap::new();
+        for (addr, slot) in self.cells.drain_into_vec() {
+            new_cells.insert(f(addr), slot);
         }
         let mut new_formula_cells: RowMajorMap<Rc<FormulaRecord>> = RowMajorMap::new();
         for (addr, record) in self.formula_cells.get_mut().drain_into_vec() {
@@ -4410,11 +4543,7 @@ impl<'a> BulkLoader<'a> {
         // Drop any prior primitive scaffold (no notify); mirrors the
         // primitive→formula transition cleanup in
         // `install_parsed_formula`.
-        if let Some(prim) = self.sheet.cells.remove(&addr) {
-            if self.sheet.store.has_atom(prim) && !self.sheet.store.has_dependents(prim) {
-                self.sheet.store.destroy_atom(prim);
-            }
-        }
+        self.sheet.drop_cell_slot(addr);
 
         // Park the source text. `Rc<str>` keeps the per-formula heap
         // footprint to one allocation; the hydrator clones the `Rc`
@@ -4492,11 +4621,7 @@ impl<'a> BulkLoader<'a> {
         // that no longer has dependents — mirrors `Sheet::set_formula` minus
         // the `with_remap` listener fire.
         self.sheet.remove_formula_record(addr);
-        if let Some(prim) = self.sheet.cells.remove(&addr) {
-            if self.sheet.store.has_atom(prim) && !self.sheet.store.has_dependents(prim) {
-                self.sheet.store.destroy_atom(prim);
-            }
-        }
+        self.sheet.drop_cell_slot(addr);
         // Wire dep indexes off `&deps` / `&range_deps` first, then *move*
         // the originals into the `FormulaRecord`. Reordering kills two
         // per-formula `HashSet::clone` allocations that dominated the
@@ -7020,13 +7145,7 @@ mod tests {
 
                     let t3 = Instant::now();
                     loader.sheet.remove_formula_record(*addr);
-                    if let Some(prim) = loader.sheet.cells.remove(addr) {
-                        if loader.sheet.store.has_atom(prim)
-                            && !loader.sheet.store.has_dependents(prim)
-                        {
-                            loader.sheet.store.destroy_atom(prim);
-                        }
-                    }
+                    loader.sheet.drop_cell_slot(*addr);
                     t_other += t3.elapsed();
 
                     let t4 = Instant::now();

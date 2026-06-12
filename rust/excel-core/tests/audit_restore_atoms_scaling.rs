@@ -95,11 +95,13 @@ fn audit_restore_legacy_loader_vs_storage_primary_install() {
     );
 }
 
-/// FINDING B-2 (P-A drift, measurement): primitives live behind one core
-/// atom per cell (`Store::create_atom` = HashMap<AtomId, Value> insert,
-/// plus `RowMajorMap` BTreeMap insert in the sheet). Measures the atom-layer
-/// share of a primitives-only install by comparing against plain map builds
-/// of the same data.
+/// FINDING B-2 (P-A drift) — FIXED (lazy primitive-cell atomization).
+/// `bulk_install_storage` now parks primitives as `CellSlot::Plain(Value)`
+/// in the sheet's row-major map; NO core atom is allocated at install.
+/// Atoms materialize on first subscribe / write / spill registration via
+/// `ensure_cell`. The bench below keeps the original three-way comparison
+/// (the `create_atom` loop is now the cost the install path AVOIDS) and
+/// pins the zero-atom contract.
 #[test]
 fn audit_primitive_install_atom_alloc_share() {
     const N: u32 = 200_000;
@@ -133,9 +135,15 @@ fn audit_primitive_install_atom_alloc_share() {
         wb.sheet(0).unwrap().debug_primitive_atom_count(),
         N as usize
     );
+    // B-2 FIXED pin: zero store atoms after a primitives-only install.
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_total_atom_count(),
+        0,
+        "B-2 FIXED: install must not allocate any core atom"
+    );
 
     println!(
-        "AUDIT B-2: N={N} primitives\n\
+        "AUDIT B-2 (FIXED): N={N} primitives\n\
          plain HashMap clone        : {plain_elapsed:?}\n\
          store.create_atom loop     : {atom_elapsed:?}\n\
          install_sheet_bulk (full)  : {install_elapsed:?}\n\
