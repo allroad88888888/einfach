@@ -644,3 +644,207 @@ never sees.
 Severity count: **P1 ×1** (D-1) · **P2 ×6** (D-2, D-3, D-4, D-5, D-7,
 D-8) · **P3 ×6** (D-6, D-9, D-10*, D-11, D-12, D-13) — *D-10 is P2 impact
 but already tracked in-code; counted at P3 to avoid double-reporting.
+
+## B — Restore / recalc / atoms (Rust)
+
+Audit date 2026-06-12. Read-only; repros + benches live in
+`rust/excel-core/tests/audit_restore_atoms_scaling.rs` (5 always-on
+tests, timings printed with `--nocapture`; one pin holds a CONFIRMED
+stale-value bug, B-4). Numbers: Apple Silicon, `cargo test --release`.
+`cargo test --lib` green (1396) with the pins included.
+
+### Findings
+
+#### B-1 · P-B · **P1** — restores still ride the legacy per-cell loader
+
+- `restore_sparse` / `restore_persistence_v1` route through
+  `Workbook::bulk_load` + per-cell `WorkbookLoader` calls
+  (`rust/wasm/src/lib.rs:3450` `restore_sparse_cells`), NOT the Phase 6
+  `install_workbook_bulk`. Per formula the workbook loader pays the
+  full pre-6.1 ceremony: eager `parse_formula` for EVERY formula — no
+  `!`-prefilter (`workbook.rs:1876`); cross-sheet cycle BFS (`:1901`);
+  per-cell edge teardown + reinstall (`:1924-1928`); a `WorkbookOp`
+  carrying two `String` allocs (`:1931-1938`). The parsed AST is then
+  **discarded** at flush (`sheet.rs:4142` `set_formula_pre_parsed`
+  drops `_expr`, parks text), so hydration parses a SECOND time on
+  first read. Plus a per-cell addr round-trip:
+  `CellAddress → to_string_repr()` (`lib.rs:3458`) immediately
+  re-parsed by the loader (`workbook.rs:1869`).
+- The comments at `lib.rs:3003-3005` / `:3287-3290` claim the path
+  "routes through the Phase 2/3 lazy bulk_load" — true only of the
+  sheet layer; the workbook loader above it is still eager. Same
+  "philosophical drift, one layer up" the storage-primary RFC killed
+  for imports, surviving in the restore entries.
+- Measured (`audit_restore_legacy_loader_vs_storage_primary_install`,
+  50k primitives + 50k formulas, native release):
+
+  | path | total | per cell |
+  |---|---|---|
+  | `install_workbook_bulk` | 25.0 ms | 0.25 µs |
+  | legacy loader (restore shape) | 89.8 ms | 0.90 µs |
+
+  3.6× native; the 6.x bench history puts the wasm32 multiplier far
+  higher (4835 → 323 ms at 500k = 15×). A 1M-cell
+  `restore_persistence_v1` today costs multi-second wasm time that
+  `bulk_install_workbook` does in ~0.6 s.
+- Fix sketch: group `payload.cells` per sheet into primitives/formulas
+  maps and call `install_workbook_bulk`. `restore_persistence_v1`
+  already builds a fresh `Workbook`, so full-sheet-replace semantics
+  fit exactly. For `restore_sparse` (additive contract — see B-7)
+  either keep the loader or build the additive install variant Phase
+  6.4 deferred.
+
+#### B-2 · P-A drift · **P2** — eager atom-per-primitive-cell
+
+- Every primitive install allocates a core atom: `sheet.rs:1408`
+  `store.create_atom(value)` + `cells.insert(addr, id)`; the value
+  lives behind `Store::values: HashMap<AtomId, Value>`
+  (`rust/core/src/store.rs:43`, `:194-198`). Reads pay a double lookup
+  (addr → AtomId → value). The TS port keeps ONE sheetAtom per sheet;
+  per-cell granularity only for lazily-created formula atoms.
+- Actual consumers of per-primitive atoms: subscription fanout
+  (buckets already wire lazily, only for subscribed addresses,
+  `sheet.rs:683-686`) and spill-target derived atoms (need the anchor
+  as an atom). For the overwhelming majority of cells the atom is pure
+  indirection — nothing reads it except through the sheet maps.
+- Measured (`audit_primitive_install_atom_alloc_share`, 200k
+  primitives, native release): plain `HashMap<CellAddress, Value>`
+  build 0.47 ms · `store.create_atom` loop alone 7.8 ms ·
+  `install_sheet_bulk` full 34.5 ms. Atom alloc alone ≈ 23% of
+  install; on that ratio ~130 ms of the 578 ms/1M install bench is
+  atom allocation.
+- Fix sketch: store `Value` directly in the sheet
+  (`RowMajorMap<Value>`); allocate the atom lazily on first
+  subscribe / spill-anchor registration — the same allocate-on-demand
+  contract the subscription buckets already follow. Wide but
+  mechanical (`ensure_cell` / `readable_atom` call sites).
+
+#### B-3 · P-A · corroborates **A-1** — structural edit hydrates all parked formulas
+
+Independently reproduced before section A landed; kept as a second pin
+at a different N. `audit_structural_edit_hydrates_every_parked_formula`:
+`insert_row(0,1)` on a 50k-parked-formula sheet = 180 ms
+(3.6 µs/formula), `cell_dependents` keys 0 → 50k. Numbers are
+consistent with A-1's 100k/500k curve. See A-1 for the full analysis
+and fix sketch; no separate severity counted here.
+
+#### B-4 · P-C · **P1** — named-LAMBDA cross-sheet refs bypass propagation (CONFIRMED stale value)
+
+- A cell calling a named LAMBDA whose body reads another sheet is
+  invisible to every cross-sheet tracking mechanism:
+  `expr_has_sheet_ref` → `Expr::Name(_) => false` (`sheet.rs:4949`,
+  and the `=FN()` call site parses with no `SheetRef` node, so the
+  sheet latch never arms); `collect_cross_sheet_refs_into` →
+  `Expr::Name(_) => {}` (`workbook.rs:2237`, no `CrossSheetDeps`
+  edge); `define_name` (`workbook.rs:529`) stores the `Value::Lambda`
+  without scanning its body.
+- First eval resolves correctly through the provider and caches
+  `Clean`; a later write to the referenced cell finds no edge, no
+  latch, `force_formula_recompute() == false` → the cell serves the
+  **stale** cached value indefinitely.
+- CONFIRMED by `audit_named_lambda_cross_sheet_freshness` (assertion
+  pins the bug): `READDATA = LAMBDA(Data!A1)`, `B1 = =READDATA()`
+  reads 1.0; after `Data!A1 ← 2.0` via workbook-routed `set_cell`,
+  B1 still reads **1.0**.
+- Fix sketch (cheapest): in `define_name_value`, walk a stored
+  `Value::Lambda` body with `expr_has_sheet_ref`; on hit arm a
+  workbook-level one-way "named values hold cross-sheet refs" latch
+  OR'd into `has_any_cross_sheet_edges` — O(1) per define, matches the
+  existing latch philosophy. Precise per-cell edges are the bigger
+  follow-up.
+
+#### B-5 · P-B · **P3** — legacy flush notify is O(touched), not O(touched ∩ subscribed)
+
+- `BulkLoader::flush` (`sheet.rs:4532-4551`): `attach_address_sub` per
+  touched address, then `notify_targets = touched ∪ dirty` hash-set
+  build + `has_address_subscribers` check per entry. A 1M-cell restore
+  with zero subscribers performs ~3M hash ops to conclude nobody is
+  watching. The "no listener fires for unwatched cells" contract holds
+  semantically; the cost shape doesn't. Same shape one layer up: the
+  workbook flush BFS seeds queue+visited with the ENTIRE touched set
+  (`workbook.rs:2039-2044`) even with zero cross-sheet edges.
+- Contrast `bulk_install_storage` (`sheet.rs:1357`, `:1430-1435`):
+  iterates only `cell_subscriptions` keys — O(subscribed). Honors the
+  lazy extreme in cost as well as semantics.
+- Fix sketch: subsumed by B-1 (route restores through install). If the
+  legacy loader stays for additive merges: early-out the BFS seeding
+  when `cross_sheet` is empty and skip the notify-set build when
+  `cell_subscriptions` is empty.
+
+#### B-6 · P-A · **P3** — custom-formula / defined-name registry changes walk all hydrated formulas
+
+- `invalidate_all_formulas_for_custom_function_change`
+  (`workbook.rs:647-655`) and `invalidate_formulas_using_name`
+  (`workbook.rs:676+`) walk every sheet's hydrated formula table,
+  mark-dirty + fire-subscribers per address. The vnext provider diffs
+  the registry and forwards each add/replace/remove separately, so K
+  registrations cost K × O(F_hydrated).
+- Mitigations already in place: parked formulas are correctly skipped
+  (no stale cache to invalidate — fresh import makes this near-free),
+  and the O(F) sledgehammer is documented in-code with the per-name
+  reverse-index upgrade path. Watch-list only.
+
+#### B-7 · P-D · **P3** — `restore_sparse` is additive with no teardown
+
+- `restore_sparse` (`rust/wasm/src/lib.rs:3002`) applies records onto
+  the LIVE workbook: no cell teardown, no subscription reset.
+  `snapshot_sparse` walks only non-empty cells (`lib.rs:3391`) and
+  never emits `"null"` records, so snapshot → restore onto a workbook
+  that gained cells since the snapshot does NOT reproduce snapshot
+  state (cells deleted-since-snapshot survive).
+  `restore_persistence_v1` does it right — fresh `Workbook`,
+  `subscriptions.clear()` + token reset (`lib.rs:3338-3353`).
+- Fix sketch: document the additive contract in the `restore_sparse`
+  docstring, or give it the fresh-shell semantics of
+  `restore_persistence_v1`. Decide before B-1's reroute (full-replace
+  install would silently change current additive behavior).
+
+#### B-8 · P-B · **P3** — `readCells` does one wasm-boundary crossing per cell
+
+- Worker RPC `readCells`
+  (`solid/excel/src-vnext/adapter/worker-runtime.ts:1559-1565`) maps
+  per-cell `snapshotCell` → one wasm-bindgen call + per-cell JS object.
+  `subscribeCells` (`:952`) similarly loops `wb.subscribe_cell` per
+  cell. Range-shaped reads are properly batched (one
+  `serde_wasm_bindgen::to_value` per `read_sparse_range` /
+  `snapshot_range_sparse` call) — but arbitrary-cell-list reads have
+  no batch endpoint. Bounded by viewport/subscription size (~10³) in
+  practice. Fix sketch: a `read_cells(JsValue) -> JsValue` batch
+  export mirroring the sparse-range shape.
+
+### Cleared paths
+
+- **recalc / F9**: no recompute-everything API exists in `excel-core`
+  or `rust/wasm` (only "recalc" hit is the `INFO("recalc")` literal,
+  `eval.rs:15454`). Recompute scope is per-read via
+  `force_formula_recompute` gated on `has_any_cross_sheet_edges`.
+  Nothing eager to audit. CLEAR.
+- **cross-sheet latch vs lazy formulas**: `install_sheet_bulk`'s
+  `!`-prefilter arms the sheet latch when edges exist
+  (`workbook.rs:1706-1711`); hydration arms it via
+  `note_cross_sheet_if_any` (`sheet.rs:1235`); a parked formula has no
+  cache to go stale (first read evaluates fresh). CLEAR — except the
+  `Expr::Name` hole, which is B-4.
+- **snapshot paths don't evaluate or hydrate parked formulas**: pinned
+  by `audit_snapshot_does_not_hydrate_parked_formulas` — walking all
+  parked cells through the `sparse_cell_from_sheet_no_eval` shape
+  (`get_formula` text-only + `peek_value` for primitives) leaves eval
+  count and dep-graph keys at 0. Confirms + CLEARS the 6.3 report.
+- **format/size facts serialization is O(facts)**:
+  `snapshot_format_range` (`sheet.rs:3509`) iterates the sparse
+  `formats` map + `range_formats` layers; sizes iterate sparse
+  `BTreeMap`s. No per-cell expansion. CLEAR.
+- **`bulk_install_workbook` wire + notify**: ONE
+  `serde_wasm_bindgen::from_value` per call (`lib.rs:2694`); notify is
+  O(subscribed) + one cross-sheet fanout O(edges), deduped across
+  multi-sheet installs (`workbook.rs:1735-1763`). CLEAR.
+- **`bulk_install_storage` teardown** (`sheet.rs:1348-1438`): spill
+  targets, primitive atoms, hydrated records, dep indexes, lazy
+  parking, and outgoing cross-sheet edges (`workbook.rs:1672`) all
+  torn down; subscription buckets deliberately survive and notify
+  once. No missing parallel table found. CLEAR (P-D).
+
+### Severity tally
+
+**P1 ×2** (B-1, B-4) · **P2 ×1** (B-2) · **P3 ×4** (B-5, B-6, B-7,
+B-8) — B-3 corroborates A-1, not double-counted.

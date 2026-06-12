@@ -1,0 +1,265 @@
+//! AUDIT 2026-06-12 — pattern-family repros (restore / recalc / atom layer).
+//!
+//! Read-only audit artifacts: these tests pin the CURRENT behavior of the
+//! paths flagged in `docs/AUDIT_PATTERN_FAMILY_2026-06-12.md` § B. They are
+//! repros and micro-benches, NOT acceptance tests for fixes — when a finding
+//! is fixed, update the pinned assertion alongside the fix.
+//!
+//! Timing notes: benches run in whatever profile `cargo test` uses (debug by
+//! default). Absolute numbers are only meaningful relative to each other
+//! within one run; assertions on time use generous ratios to stay
+//! deterministic across machines.
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use einfach_core::{Store, Value};
+use einfach_excel_core::{CellAddress, Workbook};
+
+fn addr(s: &str) -> CellAddress {
+    CellAddress::parse(s).expect("test address must parse")
+}
+
+/// Build the same workload twice: as (primitives, formulas) maps for the
+/// storage-primary install path, and as a flat op list shaped like
+/// `restore_sparse_cells` (rust/wasm/src/lib.rs) feeds the legacy
+/// `WorkbookLoader`.
+fn workload(n: u32) -> (HashMap<CellAddress, Value>, HashMap<CellAddress, String>) {
+    let mut primitives = HashMap::new();
+    let mut formulas = HashMap::new();
+    for r in 1..=n {
+        primitives.insert(addr(&format!("A{r}")), Value::Number(r as f64));
+        formulas.insert(addr(&format!("B{r}")), format!("=A{r}*2"));
+    }
+    (primitives, formulas)
+}
+
+/// FINDING B-1 (P-B): `restore_sparse` / `restore_persistence_v1` route
+/// through `Workbook::bulk_load` + per-cell `WorkbookLoader::set_formula`,
+/// which parses EVERY formula eagerly (workbook.rs `WorkbookLoader::
+/// set_formula` — parse + cross-sheet cycle BFS + edge teardown/install +
+/// per-op String×2 alloc), then DISCARDS the AST at flush
+/// (`set_formula_pre_parsed` parks source text only) so hydration parses a
+/// second time on first read. `install_workbook_bulk` (Phase 6.1) skips all
+/// of it. This bench measures the same payload through both paths.
+#[test]
+fn audit_restore_legacy_loader_vs_storage_primary_install() {
+    const N: u32 = 50_000;
+    let (primitives, formulas) = workload(N);
+
+    // --- Path A: storage-primary install (what bulk imports use) ---
+    let mut wb_install = Workbook::new();
+    let t0 = Instant::now();
+    wb_install
+        .install_workbook_bulk(vec![(0, primitives.clone(), formulas.clone())])
+        .expect("install");
+    let install_elapsed = t0.elapsed();
+
+    // --- Path B: legacy loader, shaped exactly like restore_sparse_cells
+    // (per-cell addr String round-trip included — restore_sparse_cells
+    // calls `CellAddress::new(..).to_string_repr()` and the loader parses
+    // it straight back). ---
+    let mut wb_restore = Workbook::new();
+    let t1 = Instant::now();
+    wb_restore.bulk_load(|loader| {
+        for (a, v) in &primitives {
+            loader.set_cell(0, &a.to_string_repr(), v.clone());
+        }
+        for (a, src) in &formulas {
+            loader.set_formula(0, &a.to_string_repr(), src);
+        }
+    });
+    let restore_elapsed = t1.elapsed();
+
+    // Same readable state either way.
+    assert_eq!(wb_install.get_cell("Sheet1", "B7"), Value::Number(14.0));
+    assert_eq!(wb_restore.get_cell("Sheet1", "B7"), Value::Number(14.0));
+
+    let per_cell_install = install_elapsed.as_secs_f64() * 1e6 / (2.0 * N as f64);
+    let per_cell_restore = restore_elapsed.as_secs_f64() * 1e6 / (2.0 * N as f64);
+    println!(
+        "AUDIT B-1: N={N} primitives + {N} formulas\n\
+         install_workbook_bulk : {install_elapsed:?} ({per_cell_install:.2} us/cell)\n\
+         legacy loader (restore shape): {restore_elapsed:?} ({per_cell_restore:.2} us/cell)\n\
+         ratio: {:.1}x",
+        restore_elapsed.as_secs_f64() / install_elapsed.as_secs_f64()
+    );
+
+    // The legacy path does strictly more per-cell work (parse, BFS, op
+    // allocs); generous bound so the assertion never flakes.
+    assert!(
+        restore_elapsed.as_secs_f64() > install_elapsed.as_secs_f64() * 1.3,
+        "expected legacy restore path to be measurably slower than install \
+         (restore {restore_elapsed:?} vs install {install_elapsed:?}); if this \
+         fails the restore path may have been migrated — update the audit doc"
+    );
+}
+
+/// FINDING B-2 (P-A drift, measurement): primitives live behind one core
+/// atom per cell (`Store::create_atom` = HashMap<AtomId, Value> insert,
+/// plus `RowMajorMap` BTreeMap insert in the sheet). Measures the atom-layer
+/// share of a primitives-only install by comparing against plain map builds
+/// of the same data.
+#[test]
+fn audit_primitive_install_atom_alloc_share() {
+    const N: u32 = 200_000;
+    let (primitives, _) = workload(N);
+
+    // Baseline 1: plain HashMap<CellAddress, Value> build (the "TS port
+    // sheetAtom holds one Map" shape).
+    let t0 = Instant::now();
+    let plain: HashMap<CellAddress, Value> = primitives.clone();
+    let plain_elapsed = t0.elapsed();
+    assert_eq!(plain.len(), N as usize);
+
+    // Baseline 2: the store half alone — N create_atom calls.
+    let mut store = Store::new();
+    let t1 = Instant::now();
+    let mut last = None;
+    for v in primitives.values() {
+        last = Some(store.create_atom(v.clone()));
+    }
+    let atom_elapsed = t1.elapsed();
+    assert!(last.is_some());
+
+    // Full path: install_sheet_bulk with zero formulas (teardown is empty,
+    // so this is the per-primitive atom-alloc + BTreeMap-insert loop).
+    let mut wb = Workbook::new();
+    let t2 = Instant::now();
+    wb.install_workbook_bulk(vec![(0, primitives, HashMap::new())])
+        .expect("install");
+    let install_elapsed = t2.elapsed();
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_primitive_atom_count(),
+        N as usize
+    );
+
+    println!(
+        "AUDIT B-2: N={N} primitives\n\
+         plain HashMap clone        : {plain_elapsed:?}\n\
+         store.create_atom loop     : {atom_elapsed:?}\n\
+         install_sheet_bulk (full)  : {install_elapsed:?}\n\
+         atom-layer share of install: {:.0}%",
+        100.0 * atom_elapsed.as_secs_f64() / install_elapsed.as_secs_f64()
+    );
+}
+
+/// FINDING B-3 (P-A, corroborates A-1): ONE structural edit hydrates EVERY
+/// parked formula.
+/// `Sheet::insert_row` / `delete_row` / `insert_col` / `delete_col` call
+/// `hydrate_all_lazy_formulas()` up front (sheet.rs, codex P1 #1 fix), so
+/// the first row insert on a freshly-imported sheet pays the full eager
+/// parse + dep-extract + dep-register build that the lazy arcs removed
+/// from import — O(total formulas), not O(change).
+#[test]
+fn audit_structural_edit_hydrates_every_parked_formula() {
+    const N: u32 = 50_000;
+    let (primitives, formulas) = workload(N);
+
+    let mut wb = Workbook::new();
+    wb.install_workbook_bulk(vec![(0, primitives, formulas)])
+        .expect("install");
+
+    // Everything is parked: zero dep-graph keys before the edit.
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_cell_dependents_key_count(),
+        0,
+        "install must leave formulas parked (lazy contract)"
+    );
+
+    let t0 = Instant::now();
+    wb.sheet_mut(0).unwrap().insert_row(0, 1);
+    let edit_elapsed = t0.elapsed();
+
+    // After ONE row insert every formula has been hydrated: the dep graph
+    // now carries ~N keys (one per referenced A-column cell).
+    let dep_keys = wb.sheet(0).unwrap().debug_cell_dependents_key_count();
+    assert!(
+        dep_keys >= (N as usize) * 9 / 10,
+        "expected ~N dep keys after structural edit (got {dep_keys}); if this \
+         fails, structural edits may have gone lazy — update the audit doc"
+    );
+
+    println!(
+        "AUDIT B-3: insert_row(0,1) on {N}-formula parked sheet hydrated all \
+         formulas: {edit_elapsed:?} ({:.2} us/formula), dep keys now {dep_keys}",
+        edit_elapsed.as_secs_f64() * 1e6 / N as f64
+    );
+}
+
+/// FINDING B-4 (P-C, CONFIRMED): a named LAMBDA whose body reads another
+/// sheet is invisible to cross-sheet dirty tracking. The cell formula
+/// `=FN()` contains no `Expr::SheetRef` (`expr_has_sheet_ref` and
+/// `collect_cross_sheet_refs_into` both have `Expr::Name(_) => {}` /
+/// `false`), so no edge is registered and no latch is armed. After the
+/// first eval caches Clean, a write to the upstream cell on the other
+/// sheet is never propagated and the cached value goes STALE.
+///
+/// This test pins the CURRENT (buggy) behavior — `Number(1.0)` after the
+/// upstream write to 2.0 — so the suite stays green while the audit doc
+/// carries the finding. A fix flips the assertion to `Number(2.0)`.
+#[test]
+fn audit_named_lambda_cross_sheet_freshness() {
+    let mut wb = Workbook::new();
+    wb.add_sheet("Data");
+    wb.set_cell(1, "A1", Value::Number(1.0));
+    wb.define_name("READDATA", "=LAMBDA(Data!A1)")
+        .expect("define named lambda");
+    assert!(wb.set_formula(0, "B1", "=READDATA()"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(1.0));
+
+    // Mutate the upstream cell through the workbook-routed path (the path
+    // that DOES run cross-sheet dirty fanout for registered edges).
+    wb.set_cell(1, "A1", Value::Number(2.0));
+    let after = wb.get_cell("Sheet1", "B1");
+    println!(
+        "AUDIT B-4: =READDATA() (named lambda reading Data!A1) after upstream \
+         write 1.0 -> 2.0 reads as {after:?} (fresh would be Number(2.0))"
+    );
+    // BUG (pinned): the cached Clean value never invalidates. Fresh
+    // behavior would be Number(2.0).
+    assert_eq!(
+        after,
+        Value::Number(1.0),
+        "behavior changed (possibly fixed) — re-audit B-4, update the doc, \
+         and flip this assertion to the fresh value"
+    );
+}
+
+/// CLEARED-PATH CHECK (suspect 6): snapshot paths never hydrate parked
+/// formulas. `snapshot_sparse` reads `get_formula` (text-only) and
+/// `peek_value` for primitives; a parked sheet stays parked.
+#[test]
+fn audit_snapshot_does_not_hydrate_parked_formulas() {
+    const N: u32 = 5_000;
+    let (primitives, formulas) = workload(N);
+    let mut wb = Workbook::new();
+    wb.install_workbook_bulk(vec![(0, primitives, formulas)])
+        .expect("install");
+
+    let sheet = wb.sheet(0).unwrap();
+    assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+    let evals_before = sheet.debug_formula_eval_count();
+
+    // Mirror what wasm `sparse_cell_from_sheet_no_eval` does per cell.
+    let mut formula_count = 0usize;
+    sheet.for_each_non_empty(|a| {
+        let a_str = a.to_string();
+        if sheet.get_formula(&a_str).is_some() {
+            formula_count += 1;
+        } else {
+            let _ = sheet.peek_value(a);
+        }
+    });
+    assert_eq!(formula_count, N as usize);
+    assert_eq!(
+        sheet.debug_formula_eval_count(),
+        evals_before,
+        "snapshot walk must not evaluate formulas"
+    );
+    assert_eq!(
+        sheet.debug_cell_dependents_key_count(),
+        0,
+        "snapshot walk must not hydrate parked formulas"
+    );
+}
