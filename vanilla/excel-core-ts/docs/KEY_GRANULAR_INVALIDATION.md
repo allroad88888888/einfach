@@ -104,6 +104,32 @@ atom) and bump the names revision so the next eval of every formula
 re-extracts deps against the new registry. `withBatch` coalescing and
 the C-5 rollback contract are untouched.
 
+#### C-3 — registry mutators outside `withBatch` (closed as documented contract, 2026-06-12)
+
+The audit flagged the cost of UNBATCHED registry mutation; the breadth
+itself is by design (a name/custom-formula/locale change can affect any
+formula anywhere — building a name→dependents index lazily, the same
+shape as the Rust cross-sheet edge fix, stays the future option if a
+workload makes single-name registration hot).
+
+Measured (Apple Silicon, jest, 3 sheets × 100k cells — audit doc § C-3):
+
+| operation | cost |
+|---|---|
+| one `defineName` (unbatched) | 15–21 ms |
+| 50 `defineName` INSIDE one `withBatch` | 15–21 ms total (coalesces to one pass) |
+| 50 `defineName` OUTSIDE `withBatch` | 797–813 ms (~50×) |
+| one `setLocale` | 14–18 ms |
+| one `recalc()` | 15–17 ms |
+
+Contract for hosts: wrap any multi-step registration sequence (bulk
+name import, template setup, custom-formula boot registration) in
+`withBatch`. The five mutators carry a JSDoc warning pointing here
+(`src/workbook.ts`), so the guidance surfaces on IDE hover — no runtime
+guard is emitted (the engine is console-free by lint rule, and a
+heuristic "you forgot to batch" warning cannot distinguish a deliberate
+single registration from the first call of an unbatched loop).
+
 ### C-1 — mutate-in-place storage + per-sheet revision atom
 
 With key-granular signals, the whole-Map clone no longer carries any
