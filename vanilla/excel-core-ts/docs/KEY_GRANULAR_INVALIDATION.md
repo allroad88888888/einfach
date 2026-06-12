@@ -149,22 +149,33 @@ formula (formula → literal, formula → blank, cleared):
   `remove_formula_record`),
 - its cached atom (if any) gets one final epoch bump — the derive
   re-runs, returns the literal/blank, publishes to listeners — and is
-  then **evicted**: `formulaAtomCache` / epoch atom / eval-stamp
-  entries are deleted. Since the atom's only core dep was its own
-  (now-dropped) epoch atom, all store-side state lives in WeakMaps
-  keyed by the dropped objects and is GC-reclaimable — no
-  `store.evict()` core API needed.
+  then **evicted**: the `formulaAtomCache` / eval-stamp entries are
+  deleted. The **epoch atom survives** (codex P1 follow-up): it stays
+  registered in the key→epoch map so later writes to the same address
+  keep bumping any derive the host still holds, and a fresh
+  `formulaCellAtom(key)` after the eviction reuses the surviving epoch
+  (old and new derives share the bump target). The epoch is a tiny
+  primitive atom; unrelated writes never touch it, so the C-6 drag does
+  not come back. `cachedFormulaKeys()` (registry-recalc breadth)
+  iterates epoch keys, so a held derive over a re-formularized cell is
+  also reached by names/locale/F9 invalidation.
 - Formula → formula overwrite uninstalls the stale edges; the new
   AST's edges install lazily on the next eval (written keys always
   bump their own cached atom, so a cached formula re-installs
   immediately).
 
-Caveat (documented contract): a host subscription taken on a formula
-atom whose cell is later overwritten to a NON-formula receives the
-final literal publish and is then orphaned; re-subscribe via
-`formulaCellAtom(key)` after such an overwrite. No production code
-subscribes per-cell today (the TS worker runtime's `subscribeCells`
-is an ack-only stub).
+Contract (codex P1 follow-up — replaces the original "re-subscribe
+after overwrite" caveat): an atom obtained from `formulaCellAtom(key)`
+stays wired to the ADDRESS for the workbook's lifetime, across
+formula → literal → formula transitions. Pinned in
+`test/key-granular-regressions.test.ts`.
+
+Cycle-cache dep install (codex P1 follow-up): a cycle member whose
+value is stamped `#CIRCULAR!` by a child's `refLookup`/`rangeLookup`
+is popped by the trampoline's cache-hit branch — that branch now fires
+`onFormulaEvaluated` for AST-bearing cells, so EVERY cycle member
+(mutual, deep, self, range-aggregate) installs its reverse edges and
+re-derives when the cycle is broken from any side.
 
 ## What stays the same
 

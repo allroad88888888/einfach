@@ -85,3 +85,63 @@ describe('codex P1 #1 — held formula atoms stay wired across C-6 eviction', ()
     expect(wb.store.getter(before)).toEqual(num(8))
   })
 })
+
+describe('codex P1 #2 — cycle-cached formulas install reverse dep edges', () => {
+  test('mutual cycle: break at the dep of the READ cell (A1=B1, B1=A1, read A1, set B1)', () => {
+    const { wb, sheet } = makeWb()
+    wb.setCell('s1', 0, 0, '=B1') // A1
+    wb.setCell('s1', 0, 1, '=A1') // B1
+    const a1 = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a1)).toMatchObject(CIRC)
+    // Pre-fix: A1's frame was popped via the cache-hit branch (its value
+    // was stamped #CIRCULAR! during B1's eval), so the B1→A1 reverse
+    // edge was never installed and this write left a1 at #CIRCULAR!.
+    wb.setCell('s1', 0, 1, '5')
+    expect(wb.store.getter(a1)).toEqual(num(5))
+  })
+
+  test('mutual cycle: break at the OTHER member (read B1, overwrite A1)', () => {
+    const { wb, sheet } = makeWb()
+    wb.setCell('s1', 0, 0, '=B1') // A1
+    wb.setCell('s1', 0, 1, '=A1') // B1
+    const b1 = sheet.formulaCellAtom(keyFor(0, 1))
+    expect(wb.store.getter(b1)).toMatchObject(CIRC)
+    wb.setCell('s1', 0, 0, '7') // overwrite A1 with a literal
+    expect(wb.store.getter(b1)).toEqual(num(7))
+  })
+
+  test('3-cell cycle: EVERY member has edges (break at the deepest, then the middle)', () => {
+    const { wb, sheet } = makeWb()
+    wb.setCell('s1', 0, 0, '=B1') // A1
+    wb.setCell('s1', 0, 1, '=C1') // B1
+    wb.setCell('s1', 0, 2, '=A1') // C1
+    const a1 = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a1)).toMatchObject(CIRC)
+    // Break the cycle at C1 — propagation must flow C1 → B1 → A1.
+    wb.setCell('s1', 0, 2, '9')
+    expect(wb.store.getter(a1)).toEqual(num(9))
+    // And the middle member's edge must be live too.
+    wb.setCell('s1', 0, 1, '4')
+    expect(wb.store.getter(a1)).toEqual(num(4))
+  })
+
+  test('self-cycle: A1=A1 reads #CIRCULAR!, overwrite to a literal recovers', () => {
+    const { wb, sheet } = makeWb()
+    wb.setCell('s1', 0, 0, '=A1')
+    const a1 = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a1)).toMatchObject(CIRC)
+    wb.setCell('s1', 0, 0, '9')
+    expect(wb.store.getter(a1)).toEqual(num(9))
+  })
+
+  test('cycle through a range aggregate: SUM over own cell recovers on member change', () => {
+    const { wb, sheet } = makeWb()
+    wb.setCell('s1', 0, 0, '=SUM(B1:B2)') // A1
+    wb.setCell('s1', 0, 1, '=A1') // B1 — cycles back through the SUM
+    wb.setCell('s1', 1, 1, '1') // B2
+    const a1 = sheet.formulaCellAtom(keyFor(0, 0))
+    expect(wb.store.getter(a1)).toMatchObject(CIRC)
+    wb.setCell('s1', 0, 1, '2') // break the cycle at B1
+    expect(wb.store.getter(a1)).toEqual(num(3))
+  })
+})

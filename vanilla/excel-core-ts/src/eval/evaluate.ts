@@ -4417,6 +4417,19 @@ export function evaluateCellTrampolined(
     if (cache.has(top.guardKey)) {
       inProgress.delete(top.guardKey)
       stack.pop()
+      // Lazy dep install for frames whose value was cached OUT FROM
+      // UNDER them by cycle detection: when `refLookup` / `rangeLookup`
+      // hits an in-progress ancestor it stamps that ancestor's cache
+      // entry with #CIRCULAR!, so the ancestor's frame lands here and
+      // never reaches the post-`evaluate` hook below. Without this, a
+      // cycle member's reverse edges are missing and breaking the cycle
+      // never re-derives it (codex P1 #2). Repeat pops of duplicate
+      // frames are O(1): `installDepsFor` skips when the AST identity
+      // and names revision are unchanged.
+      if (hostCtx.onFormulaEvaluated) {
+        const cachedCell = top.cells.get(top.key)
+        if (cachedCell?.ast) hostCtx.onFormulaEvaluated(top.cells, top.key, cachedCell.ast)
+      }
       continue
     }
     const cell = top.cells.get(top.key)

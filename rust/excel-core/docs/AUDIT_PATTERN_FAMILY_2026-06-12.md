@@ -568,10 +568,25 @@ green (31 suites / 1811 tests) with the pins included.
   read then overwritten to literals, median `setCell` = **~0.002 ms ≈
   never-formula baseline** (was 16–17 ms vs 0.4 ms, ~40× permanent
   drag), and `formulaCellAtom(key)` provably returns a fresh atom.
-  Documented caveat (RFC): a host subscription on a formula atom whose
-  cell is overwritten to a non-formula receives the final literal
-  publish and must re-subscribe; no production code subscribes
-  per-cell today.
+- **codex P1 follow-up** (post-`d98409c`, two findings, both fixed):
+  (1) eviction orphaned atoms a host already held — later writes to the
+  same address no longer bumped them (`=1` → `2` → `3` kept reading
+  `2`). Fix: `_internal.evict` retains the EPOCH atom in the key→epoch
+  map (only the heavy derive + probe stamps drop); `formulaCellAtom`
+  reuses a surviving epoch so old and fresh derives share the bump
+  target, and `cachedFormulaKeys()` (registry recalc breadth) iterates
+  epoch keys. The former RFC caveat ("re-subscribe after overwrite") is
+  REMOVED — held atoms stay wired. C-6 pin re-verified ≈ baseline
+  (epochs are bumped per-key; unrelated writes never touch them).
+  (2) formulas whose value was cached by trampoline CYCLE detection
+  (`#CIRCULAR!` stamped from a child's `refLookup`) were popped via the
+  cache-hit branch and never reached `onFormulaEvaluated`, so cycle
+  members had no reverse edges — breaking `A1=B1, B1=A1` never
+  re-derived the held member. Fix: the cache-hit pop fires the hook for
+  AST-bearing cells (O(1) repeats via `isCurrent`). Pins:
+  `vanilla/excel-core-ts/test/key-granular-regressions.test.ts`
+  (held-atom overwrite chain, mutual/3-cell/self/range-aggregate
+  cycles).
 - `vanilla/excel-core-ts/src/sheet.ts:137` `formulaAtomCache` and
   `:153` `lastEvalRevision` grow monotonically and have no eviction;
   `vanilla/core` has no per-atom destroy/evict API (only whole-store
