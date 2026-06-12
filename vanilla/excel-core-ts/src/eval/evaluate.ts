@@ -3918,6 +3918,7 @@ function evaluateInForeignSheet(
     sheetCount: parent.sheetCount,
     sheetIndexOf: parent.sheetIndexOf,
     locale: parent.locale,
+    onFormulaEvaluated: parent.onFormulaEvaluated,
   }
   if (inner.kind === 'ref') {
     const key = parseRefToKey(inner.a1)
@@ -4125,8 +4126,13 @@ function resolveCell(
       sheetCount: ctx.sheetCount,
       sheetIndexOf: ctx.sheetIndexOf,
       locale: ctx.locale,
+      onFormulaEvaluated: ctx.onFormulaEvaluated,
     }
-    return evaluate(cell.ast, sub)
+    const value = evaluate(cell.ast, sub)
+    // Lazy dep install (KEY_GRANULAR_INVALIDATION): this formula was
+    // really evaluated — let the workbook record its reverse edges.
+    ctx.onFormulaEvaluated?.(cells, key, cell.ast)
+    return value
   } finally {
     ctx.currentlyEvaluating.delete(guardKey)
   }
@@ -4327,6 +4333,7 @@ function makeTrampolineCtx(
     lambdaOmittedParams: hostCtx.lambdaOmittedParams,
     lambdaCallDepth: hostCtx.lambdaCallDepth,
     locale: hostCtx.locale,
+    onFormulaEvaluated: hostCtx.onFormulaEvaluated,
   }
   return ctx
 }
@@ -4435,6 +4442,11 @@ export function evaluateCellTrampolined(
       cache.set(top.guardKey, value)
       inProgress.delete(top.guardKey)
       stack.pop()
+      // Lazy dep install (KEY_GRANULAR_INVALIDATION): every formula the
+      // trampoline finishes — the root anchor AND transitively-visited
+      // dependency cells — reports to the workbook so its reverse edges
+      // exist before any of its dependents cache a value derived from it.
+      hostCtx.onFormulaEvaluated?.(top.cells, top.key, cell.ast)
     } catch (err) {
       if (err instanceof NeedsDep) {
         // The cell isn't done — it faulted out partway through AST

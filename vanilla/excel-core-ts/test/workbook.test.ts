@@ -67,7 +67,9 @@ describe('createWorkbook — sheet handles + cell mutation', () => {
   test('bulkApply writes many cells under one atom transition', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     let updates = 0
-    const unsubscribe = wb.store.sub(wb.sheet('s1')!.sheetAtom, () => {
+    // revisionAtom is the per-sheet change signal (KEY_GRANULAR_INVALIDATION):
+    // the sheet's Map identity is stable storage, bumped once per mutation batch.
+    const unsubscribe = wb.store.sub(wb.sheet('s1')!.revisionAtom, () => {
       updates += 1
     })
     wb.bulkApply('s1', [
@@ -163,70 +165,80 @@ describe('formulaCellAtom — derive + vanilla/core sub', () => {
   })
 })
 
-describe('recalc — F9 bumps every sheetAtom', () => {
-  test('recalc clones each sheet Map → derive observes change even with same data', () => {
+describe('recalc — F9 re-derives every cached formula', () => {
+  test('recalc keeps the sheet Map identity stable but forces fresh evaluation', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.setCell('s1', 0, 0, '10')
     wb.setCell('s1', 0, 1, '=A1*2')
-    const formulaAtom = wb.sheet('s1')!.formulaCellAtom('0:1')
+    const sheet = wb.sheet('s1')!
+    const formulaAtom = sheet.formulaCellAtom('0:1')
 
-    let publishes = 0
-    const unsubscribe = wb.store.sub(formulaAtom, () => {
-      publishes += 1
-    })
     expect(wb.store.getter(formulaAtom)).toEqual({ kind: 'number', value: 20 })
+    const evalsBefore = sheet._debug.evalCount()
 
+    // Storage-primary (KEY_GRANULAR_INVALIDATION): the sheet's Map
+    // identity is stable for the sheet's lifetime — recalc invalidates
+    // by bumping every cached formula's epoch atom, not by cloning.
+    const prevMap = wb.store.getter(sheet.sheetAtom)
     wb.recalc()
-    // Recalc bumped the atom; the derive re-ran but produced the same
-    // value, so vanilla/core's downstream Object.is filter MAY suppress
-    // the listener publish. What's important is that the next getter
-    // call returns a fresh evaluation — we assert by mutating A1
-    // *before* `recalc` and seeing that recalc alone propagates.
-    const prevMap = wb.store.getter(wb.sheet('s1')!.sheetAtom)
-    wb.recalc()
-    const nextMap = wb.store.getter(wb.sheet('s1')!.sheetAtom)
-    expect(nextMap).not.toBe(prevMap) // fresh identity
-    expect(nextMap.get('0:0')).toEqual(prevMap.get('0:0')) // same contents
+    const nextMap = wb.store.getter(sheet.sheetAtom)
+    expect(nextMap).toBe(prevMap) // stable identity — storage, not signal
+    // The cached derive really re-ran (fresh evaluation for volatiles).
+    expect(sheet._debug.evalCount()).toBe(evalsBefore + 1)
+    expect(wb.store.getter(formulaAtom)).toEqual({ kind: 'number', value: 20 })
+  })
 
+  test('recalc bumps each sheet revisionAtom (the F9 change signal)', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '10')
+    let fires = 0
+    const unsubscribe = wb.store.sub(wb.sheet('s1')!.revisionAtom, () => {
+      fires += 1
+    })
+    wb.recalc()
     unsubscribe()
-    void publishes // not asserted; vanilla/core's no-change publish-skip
-    // is acceptable. The contract that matters is fresh identity above.
+    expect(fires).toBe(1)
   })
 })
 
-describe('one-dep invariant — formula derive registers only sheetAtom', () => {
-  test('mutating a sibling formula does not directly re-derive a non-dep formula', () => {
-    // We can't directly count deps from outside vanilla/core, but we can
-    // assert the looser property: a getter call uses ONE sheetAtom get
-    // by injecting a parser that yields a known AST and confirming the
-    // derive returns without registering extra atom reads. This is more
-    // of an integration smoke than a strict invariant probe — the
-    // structural guarantee lives in `sheet.ts`'s comment "the ONLY
-    // get(sheetAtom) call inside the derive."
+describe('key-granular invalidation — only true dependents re-derive', () => {
+  test('mutating a sibling formula does not re-derive a non-dependent formula', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
     wb.setCell('s1', 0, 0, '5')
     wb.setCell('s1', 0, 1, '=A1+1')
     wb.setCell('s1', 0, 2, '=A1+2')
 
-    // Both formulas live on the same sheet; both depend on the same
-    // sheetAtom. Mutating B1 should not affect C1's value.
-    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:1'))).toEqual({
+    expect(wb.store.getter(sheet.formulaCellAtom('0:1'))).toEqual({
       kind: 'number',
       value: 6,
     })
-    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:2'))).toEqual({
+    expect(wb.store.getter(sheet.formulaCellAtom('0:2'))).toEqual({
+      kind: 'number',
+      value: 7,
+    })
+    const evalsBefore = sheet._debug.evalCount()
+
+    // Rewrite B1. C1 depends only on A1 — with the per-formula epoch
+    // deps + workbook DepGraph (audit C-2 fix) the write re-derives B1
+    // (its own cell changed) and NOTHING else.
+    wb.setCell('s1', 0, 1, '=A1+99')
+    expect(sheet._debug.evalCount()).toBe(evalsBefore + 1)
+    expect(wb.store.getter(sheet.formulaCellAtom('0:2'))).toEqual({
       kind: 'number',
       value: 7,
     })
 
-    // Mutate B1 (rewrite it) — C1 should still be 7. The shared
-    // sheetAtom dep does mark every formula dirty, but vanilla/core's
-    // dep-equality cache (readAtom's `noChange` short-circuit) will
-    // re-evaluate, and the value match → no listener publish.
-    wb.setCell('s1', 0, 1, '=A1+99')
-    expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('0:2'))).toEqual({
+    // Mutating the shared dep A1 re-derives BOTH dependents, eagerly.
+    wb.setCell('s1', 0, 0, '6')
+    expect(sheet._debug.evalCount()).toBe(evalsBefore + 3)
+    expect(wb.store.getter(sheet.formulaCellAtom('0:1'))).toEqual({
       kind: 'number',
-      value: 7,
+      value: 105,
+    })
+    expect(wb.store.getter(sheet.formulaCellAtom('0:2'))).toEqual({
+      kind: 'number',
+      value: 8,
     })
   })
 })
@@ -389,7 +401,7 @@ describe('createWorkbook — withBatch deferral', () => {
     wb.setCell('s1', 0, 0, '1')
 
     let fires = 0
-    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe = wb.store.sub(sheet.revisionAtom, () => {
       fires += 1
     })
 
@@ -414,7 +426,7 @@ describe('createWorkbook — withBatch deferral', () => {
     wb.setCell('s1', 0, 0, '1')
 
     let fires = 0
-    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe = wb.store.sub(sheet.revisionAtom, () => {
       fires += 1
     })
 
@@ -437,7 +449,7 @@ describe('createWorkbook — withBatch deferral', () => {
     wb.setCell('s1', 0, 0, '1')
 
     let fires = 0
-    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe = wb.store.sub(sheet.revisionAtom, () => {
       fires += 1
     })
 
@@ -455,7 +467,7 @@ describe('createWorkbook — withBatch deferral', () => {
     // direct (non-batched) defineName must still fire its immediate
     // recalc through the normal path.
     let postFires = 0
-    const unsubscribe2 = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe2 = wb.store.sub(sheet.revisionAtom, () => {
       postFires += 1
     })
     wb.defineName('AFTER', { kind: 'value', value: { kind: 'number', value: 7 } })
@@ -469,7 +481,7 @@ describe('createWorkbook — withBatch deferral', () => {
     wb.setCell('s1', 0, 0, '1')
 
     let fires = 0
-    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe = wb.store.sub(sheet.revisionAtom, () => {
       fires += 1
     })
 
@@ -569,6 +581,7 @@ describe('createWorkbook — withBatch deferral', () => {
     expect(wb.getLocale()).toBe('en-US')
   })
 
+  // eslint-disable-next-line max-len
   test('nested batch: inner throw propagating through the outer frame aborts the whole batch', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     const sheet = wb.sheet('s1')!
@@ -578,7 +591,7 @@ describe('createWorkbook — withBatch deferral', () => {
     const aInner = sheet.formulaCellAtom(keyFor(0, 1))
 
     let fires = 0
-    const unsubscribe = wb.store.sub(sheet.sheetAtom, () => {
+    const unsubscribe = wb.store.sub(sheet.revisionAtom, () => {
       fires += 1
     })
 

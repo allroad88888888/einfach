@@ -1,29 +1,35 @@
 /**
  * AUDIT MEASUREMENT PINS — mutation-path pattern-family audit (2026-06-12).
  *
- * Purpose: this file is NOT a behavior suite. It exists to pin timed
- * reproductions of the eager-fan-out / per-item-ceremony / bypassed-
+ * Purpose: this file is NOT a behavior suite. It pins the measured
+ * outcomes of the eager-fan-out / per-item-ceremony / bypassed-
  * propagation / incomplete-teardown pattern family hunted across the
  * Rust engine (see rust/excel-core/docs/AUDIT_PATTERN_FAMILY_2026-06-12.md,
- * section C). Timings go to console.log; assertions stay deliberately
- * loose so the suite remains green on any hardware. Do not tighten the
- * assertions into perf gates — the numbers feed the audit doc, nothing
- * else.
+ * section C). Timings go to console.log; the timed assertions use
+ * generous margins (the fixed paths are 50-1000× under them on Apple
+ * Silicon) so the suite stays green on any reasonable hardware.
  *
- * Patterns measured:
- *  - P-A  whole-Map clone per single-cell edit (workbook.ts applyCell)
- *  - P-A  store-level eager re-derive of every cached formula atom on
- *         any sheetAtom bump (vanilla/core store.ts flushPending →
- *         dependenciesChange)
- *  - P-A  defineName / setLocale outside withBatch → recalculateAllSheets
- *         clones EVERY sheet
- *  - P-B  per-cell clearCell loops (mirrors worker-runtime-ts clearRange)
- *  - P-C  withBatch throw — FIXED (C-5): registries roll back on abort,
- *         so the pin below asserts the consistent post-fix behavior
- *         (behavioral tests live in workbook.test.ts)
- *  - P-D  formulaAtomCache / backDependenciesMap never evict — deleted
- *         formulas keep their derive atoms in the flush walk forever
+ * Status after KEY_GRANULAR_INVALIDATION (Wave 2 / W2.2):
+ *  - C-1 FIXED — storage mutates in place; a single-cell edit is O(1)
+ *         in sheet size (was: whole-Map clone, 107 ms @ 1M cells).
+ *  - C-2 FIXED — mutations dirty O(dependents-of-written-keys) via the
+ *         workbook DepGraph; re-eval count == true dependent count
+ *         (was: every cached derive re-ran, 503 ms @ 100k formulas).
+ *         NOTE: the FIRST setter after a large burst of host reads
+ *         additionally drains vanilla/core's pending-read bookkeeping
+ *         once (amortized O(1) per read; pre-existing core behavior,
+ *         logged separately below).
+ *  - C-6 FIXED — overwriting/clearing a formula uninstalls its dep
+ *         edges and evicts its derive + epoch atoms (was: orphaned
+ *         derives cost ~40× per edit forever).
+ *  - P-A  defineName / setLocale outside withBatch remain DELIBERATELY
+ *         broad (registry-driven full invalidation, audit C-3) — but no
+ *         longer clone any sheet, so the absolute cost collapsed.
+ *  - P-B  per-cell clearCell loops (C-4 adjacent): each clear is now
+ *         O(dependents), no longer a full clone + full flush.
+ *  - P-C  withBatch throw — FIXED (C-5): registries roll back on abort.
  *  - wire-type caveat re-verify: bulkApply('00123') loses leading zeros
+ *         (unchanged, still pinned).
  */
 
 import { describe, expect, test } from '@jest/globals'
@@ -57,7 +63,7 @@ function medianSetCellMs(
   return times[Math.floor(times.length / 2)]
 }
 
-describe('AUDIT P-A: whole-Map clone per single-cell edit (workbook.ts applyCell)', () => {
+describe('AUDIT C-1 (FIXED): single-cell edit cost is O(1) in sheet size', () => {
   test.each([10_000, 100_000, 1_000_000])(
     'setCell cost after bulk-loading %i literal cells',
     (count) => {
@@ -68,18 +74,20 @@ describe('AUDIT P-A: whole-Map clone per single-cell edit (workbook.ts applyCell
       const editMs = medianSetCellMs(wb, 's1')
       // eslint-disable-next-line no-console
       console.log(
-        `[P-A clone] cells=${count} bulkLoad=${loadMs.toFixed(1)}ms ` +
-          `median setCell=${editMs.toFixed(2)}ms/edit`,
+        `[C-1 FIXED in-place] cells=${count} bulkLoad=${loadMs.toFixed(1)}ms ` +
+          `median setCell=${editMs.toFixed(3)}ms/edit`,
       )
-      expect(editMs).toBeGreaterThanOrEqual(0)
+      // WAS 107.6 ms @ 1M cells (whole-Map clone). Now in-place:
+      // ~0.01 ms at every size. Margin is generous (W2.2 acceptance: <2ms).
+      expect(editMs).toBeLessThan(2)
     },
     300_000,
   )
 })
 
-describe('AUDIT P-A: store flushPending re-derives every cached formula on any write', () => {
+describe('AUDIT C-2 (FIXED): mutations dirty O(dependents), not O(cached formulas)', () => {
   test.each([1_000, 10_000, 100_000])(
-    'one setCell with %i previously-read formulas cached',
+    'one unrelated setCell with %i previously-read formulas cached',
     (formulaCount) => {
       const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
       const sheet = wb.sheet('s1')!
@@ -90,30 +98,77 @@ describe('AUDIT P-A: store flushPending re-derives every cached formula on any w
         cells.push({ row: 1 + Math.floor(i / 1000), col: i % 1000, input: `=A1+${i}` })
       }
       wb.bulkApply('s1', cells)
-      // Read every formula once → derive cached + registered as a
-      // back-dependency of sheetAtom in vanilla/core.
+      // Read every formula once → derive cached; deps lazily installed
+      // into the workbook DepGraph (Rust hydrate-on-read mirror).
       const tRead0 = now()
       for (let i = 0; i < formulaCount; i += 1) {
         wb.store.getter(sheet.formulaCellAtom(keyFor(1 + Math.floor(i / 1000), i % 1000)))
       }
       const readMs = now() - tRead0
+      // The first setter after a host-read burst drains vanilla/core's
+      // pending-read bookkeeping (amortized O(1) per read; pre-existing
+      // core behavior unrelated to the mutation path). Time it
+      // separately so the per-edit pin below measures the edit itself.
+      const tDrain0 = now()
+      wb.setCell('s1', 4999, 0, '41')
+      const drainMs = now() - tDrain0
       const evalsBefore = wb.debugFormulaEvalCount(0)
-      // Mutate ONE unrelated literal cell. flushPending walks every
-      // cached derive because they all depend on the (new-identity)
-      // sheet Map.
-      const t0 = now()
-      wb.setCell('s1', 5000, 0, '42')
-      const editMs = now() - t0
+      // Mutate ONE unrelated literal cell. Key-granular invalidation:
+      // no cached formula depends on it → ZERO re-derives.
+      const editMs = medianSetCellMs(wb, 's1')
       const evalsAfter = wb.debugFormulaEvalCount(0)
       // eslint-disable-next-line no-console
       console.log(
-        `[P-A flush] formulasRead=${formulaCount} firstReadAll=${readMs.toFixed(1)}ms ` +
-          `one setCell=${editMs.toFixed(1)}ms re-evals=${evalsAfter - evalsBefore}`,
+        `[C-2 FIXED dirty-set] formulasRead=${formulaCount} firstReadAll=${readMs.toFixed(1)}ms ` +
+          `readBacklogDrain=${drainMs.toFixed(1)}ms median setCell=${editMs.toFixed(3)}ms ` +
+          `re-evals=${evalsAfter - evalsBefore}`,
       )
-      expect(editMs).toBeGreaterThanOrEqual(0)
+      // WAS 503 ms / 100 000 re-evals @ 100k. Now: zero re-evals and
+      // sub-millisecond edits (W2.2 acceptance: <10ms).
+      expect(evalsAfter - evalsBefore).toBe(0)
+      expect(editMs).toBeLessThan(10)
     },
     300_000,
   )
+
+  test('re-eval count equals TRUE dependent count, not cached-formula count', () => {
+    const dependentCount = 100
+    const unrelatedCount = 9_900
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 0, '1') // A1 — the dep of the first 100 formulas
+    wb.setCell('s1', 0, 1, '2') // B1 — the dep of the other 9 900
+    const cells: BulkCellInput[] = []
+    for (let i = 0; i < dependentCount + unrelatedCount; i += 1) {
+      const ref = i < dependentCount ? 'A1' : 'B1'
+      cells.push({ row: 1 + Math.floor(i / 1000), col: i % 1000, input: `=${ref}+${i}` })
+    }
+    wb.bulkApply('s1', cells)
+    for (let i = 0; i < dependentCount + unrelatedCount; i += 1) {
+      wb.store.getter(sheet.formulaCellAtom(keyFor(1 + Math.floor(i / 1000), i % 1000)))
+    }
+    // Drain the read backlog so the eval delta below is the edit's own.
+    wb.setCell('s1', 5000, 0, '0')
+    const evalsBefore = wb.debugFormulaEvalCount(0)
+    wb.setCell('s1', 0, 0, '7') // mutate A1
+    const evalsAfter = wb.debugFormulaEvalCount(0)
+    // eslint-disable-next-line no-console
+    console.log(
+      `[C-2 FIXED dependent-count] cached=${dependentCount + unrelatedCount} ` +
+        `write A1 -> re-evals=${evalsAfter - evalsBefore} (true dependents=${dependentCount})`,
+    )
+    // Exactly the 100 true dependents re-derive — not all 10 000 cached.
+    expect(evalsAfter - evalsBefore).toBe(dependentCount)
+    // And the dependents really picked up the new value.
+    expect(wb.store.getter(sheet.formulaCellAtom(keyFor(1, 0)))).toEqual({
+      kind: 'number',
+      value: 7,
+    })
+    expect(wb.store.getter(sheet.formulaCellAtom(keyFor(1, dependentCount)))).toEqual({
+      kind: 'number',
+      value: 2 + dependentCount,
+    })
+  }, 300_000)
 })
 
 describe('AUDIT P-A: defineName / setLocale outside withBatch clone every sheet', () => {
@@ -179,8 +234,9 @@ describe('AUDIT P-B: per-cell clearCell loop (worker-runtime-ts clearRange shape
   }, 300_000)
 })
 
-describe('AUDIT P-D: deleted formulas leave derive atoms in the flush walk forever', () => {
-  test('setCell cost stays elevated after all 10k formulas are overwritten to literals', () => {
+describe('AUDIT C-6 (FIXED): overwritten formulas evict their derive atoms', () => {
+  // eslint-disable-next-line max-len
+  test('setCell cost returns to baseline after all 10k formulas are overwritten to literals', () => {
     const formulaCount = 10_000
     // Baseline: same map size, never any formulas read.
     const base = createWorkbook([{ id: 's1', name: 'Sheet1' }])
@@ -198,25 +254,35 @@ describe('AUDIT P-D: deleted formulas leave derive atoms in the flush walk forev
     for (let i = 0; i < formulaCount; i += 1) {
       wb.store.getter(sheet.formulaCellAtom(keyFor(1 + Math.floor(i / 1000), i % 1000)))
     }
+    const atomBeforeOverwrite = sheet.formulaCellAtom(keyFor(1, 0))
     // "Delete" every formula (overwrite with plain literals → no ast).
+    // C-6 fix: each overwrite uninstalls the formula's dep edges and
+    // evicts its derive + epoch atoms from the sheet caches.
     const overwrite: BulkCellInput[] = cells.map((c) => ({ ...c, input: '7' }))
     wb.bulkApply('s1', overwrite)
-    // The formula derive atoms are now semantically dead, but
-    // formulaAtomCache + backDependenciesMap(sheetAtom) still hold all
-    // 10k of them — every subsequent write re-walks (and re-derives)
-    // each one.
     const afterDeleteMs = medianSetCellMs(wb, 's1')
     // eslint-disable-next-line no-console
     console.log(
-      `[P-D orphan derives] 10k formulas read-then-overwritten: ` +
-        `setCell=${afterDeleteMs.toFixed(2)}ms vs never-formula baseline=${baselineMs.toFixed(2)}ms ` +
-        `(stale-walk overhead=${(afterDeleteMs - baselineMs).toFixed(2)}ms)`,
+      '[C-6 FIXED eviction] 10k formulas read-then-overwritten: ' +
+        `setCell=${afterDeleteMs.toFixed(3)}ms ` +
+        `vs never-formula baseline=${baselineMs.toFixed(3)}ms ` +
+        `(residual overhead=${(afterDeleteMs - baselineMs).toFixed(3)}ms)`,
     )
-    expect(afterDeleteMs).toBeGreaterThanOrEqual(0)
+    // WAS 16-17 ms vs 0.4 ms baseline (~40× permanent drag). Now the
+    // orphans are gone — both medians sit at ~0.01 ms; assert the
+    // generous absolute bound.
+    expect(afterDeleteMs).toBeLessThan(2)
+    // Eviction is observable: asking for the cell's atom again builds a
+    // FRESH atom (the orphan was dropped from the cache) and it serves
+    // the literal.
+    const atomAfterOverwrite = sheet.formulaCellAtom(keyFor(1, 0))
+    expect(atomAfterOverwrite).not.toBe(atomBeforeOverwrite)
+    expect(wb.store.getter(atomAfterOverwrite)).toEqual({ kind: 'number', value: 7 })
   }, 300_000)
 })
 
 describe('AUDIT P-C (FIXED): withBatch throw rolls back registry mutations', () => {
+  // eslint-disable-next-line max-len
   test('defineName inside a throwing batch: registry rolled back, formula stays consistently #NAME?', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     const sheet = wb.sheet('s1')!
@@ -239,7 +305,7 @@ describe('AUDIT P-C (FIXED): withBatch throw rolls back registry mutations', () 
     // eslint-disable-next-line no-console
     console.log(
       `[P-C batch-throw FIXED] post-throw read of =MYNAME -> ${JSON.stringify(after)} ` +
-        `(registry rolled back, MYNAME undefined)`,
+        '(registry rolled back, MYNAME undefined)',
     )
     expect(after).toEqual({ kind: 'error', code: '#NAME?' })
 

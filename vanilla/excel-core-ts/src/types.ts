@@ -500,6 +500,18 @@ export interface EvalContext {
    * `{ ...ctx, lambdaScope }` share the same counter by reference.
    */
   readonly lambdaCallDepth?: { count: number }
+
+  /**
+   * Optional host hook fired once per FORMULA cell the evaluator visits
+   * (the anchor itself plus every formula resolved transitively through
+   * the trampoline / `resolveCell`, including foreign-sheet cells —
+   * `cells` is the map the formula lives in, which the workbook resolves
+   * back to a sheet by identity). The workbook uses it to lazily install
+   * the cell's reverse-dependency edges (`src/deps.ts`), mirroring the
+   * Rust engine's hydrate-on-read dep install. Pure observation — must
+   * not mutate `cells` or evaluation state.
+   */
+  onFormulaEvaluated?(cells: ReadonlyMap<CellKey, Cell>, key: CellKey, ast: Expr): void
 }
 
 /**

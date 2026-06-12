@@ -169,7 +169,9 @@ describe('setLocale recalc', () => {
     wb.store.getter(sheet.formulaCellAtom('0:0'))
 
     let subUpdates = 0
-    const unsub = wb.store.sub(sheet.sheetAtom, () => {
+    // revisionAtom carries the per-sheet change signal (the Map identity
+    // in sheetAtom is stable storage — KEY_GRANULAR_INVALIDATION).
+    const unsub = wb.store.sub(sheet.revisionAtom, () => {
       subUpdates += 1
     })
     wb.withBatch(() => {

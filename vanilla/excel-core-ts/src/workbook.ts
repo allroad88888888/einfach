@@ -4,28 +4,40 @@
  * `createWorkbook` builds a `Workbook` handle that owns:
  *  - a vanilla/core `Store` (created internally — host code can opt-in to a
  *    pre-existing store via `options.store`).
- *  - one `WorkbookSheet` per `initialSheets` entry. Each sheet owns a
- *    single `sheetAtom`, per PLAN §4.1.
+ *  - one `WorkbookSheet` per `initialSheets` entry. Each sheet owns ONE
+ *    live cell map for its lifetime (storage-primary, see
+ *    `docs/KEY_GRANULAR_INVALIDATION.md`).
+ *  - a workbook-level `DepGraph` (`./deps.ts`) — the reverse dependency
+ *    index built lazily as formulas evaluate. Mutations write storage in
+ *    place, then dirty O(dependents-of-written-keys) via BFS over the
+ *    graph and bump exactly those formulas' epoch atoms (audit C-1/C-2).
  *  - a `parseFormula` injectable (defaults to the real parser at
  *    `./parser`). Tests can inject a mock so they don't depend on B1.
  *
- * Mutations always route through the writable `sheetAtom`. We never expose
- * the raw setter to the outside world — the public API is `setCell`,
- * `clearCell`, `bulkApply`, `setFormat`, name registration, and custom
- * formula registration. Each data mutation parses input when needed and
- * produces a new `Map` reference.
+ * Mutations route through `postWrite` (the centralized choke point). We
+ * never expose raw storage mutation to the outside world — the public API
+ * is `setCell`, `clearCell`, `bulkApply`, `setFormat`, name registration,
+ * and custom formula registration.
  *
- * Recalc / F9 (PLAN §4.4): `recalc()` bumps every sheet's atom to a fresh
- * `Map` clone. Same contents, new identity → vanilla/core marks every
- * formula derive dirty → volatile values come out fresh on next read.
+ * Recalc / F9 (PLAN §4.4): `recalc()` bumps EVERY cached formula's epoch
+ * atom (explicit full invalidation — registry-driven breadth is the
+ * documented contract here, in contrast to the key-granular cell path) →
+ * volatile values come out fresh.
  */
 
 import type { Store } from '@einfach/core'
 import { createStore } from '@einfach/core'
 
 import { parseFormula as defaultParseFormula } from './parser'
+import { createPropagation, type WriteRecord } from './propagation'
 import { parseA1 } from './refs'
-import { applyCell, createSheet, keyFor, type SheetResolvers, type SheetState, type WorkbookSheet } from './sheet'
+import {
+  createSheet,
+  keyFor,
+  type SheetResolvers,
+  type SheetState,
+  type WorkbookSheet,
+} from './sheet'
 import { ERROR_CODES } from './types'
 import type {
   Cell,
@@ -215,13 +227,11 @@ export function createWorkbook(
   const customFormulas = new Map<string, (args: Value[]) => Value>()
   const canonicalName = (name: string): string => name.toUpperCase()
 
-  // Workbook-scope revision counter. Bumped once per mutation in
-  // `writeSheetState` (the centralized choke point). Sheets read it via
-  // the `revisionProvider` callback to stamp `lastEvalRevision` on each
-  // formula derive run. One global counter (not per-sheet) so a Sheet1
-  // mutation also marks Sheet2 formulas dirty — over-conservative but
-  // correct, and matches vanilla/core's broad dirty propagation.
-  let revisionCounter = 0
+  // Live-cell-map identity → owning sheet. Map identities are stable for
+  // the workbook's lifetime, so this resolves the `onFormulaEvaluated`
+  // hook's `cells` argument (which may be a foreign sheet's map) back to
+  // a sheet without threading sheet names through the evaluator.
+  const sheetsByCellsMap = new Map<ReadonlyMap<string, Cell>, WorkbookSheet>()
 
   // Active workbook locale. Read by every sheet via `resolvers.locale()`
   // and threaded into each EvalContext. Mutated only via `setLocale`,
@@ -248,26 +258,46 @@ export function createWorkbook(
     locale: string
   } | null = null
 
-  function requestRecalc(): void {
-    if (batchDepth > 0) {
-      pendingRecalc = true
-    } else {
-      recalculateAllSheets()
-    }
-  }
-
   // Build the sheet handles eagerly. The `sheets` array order matches
   // `initialSheets` for deterministic iteration.
   const sheetsList: WorkbookSheet[] = []
   const sheetsById = new Map<string, WorkbookSheet>()
   const sheetsByName = new Map<string, WorkbookSheet>()
 
+  // Dep graph + dirty propagation (KEY_GRANULAR_INVALIDATION, audit
+  // C-1/C-2/C-6). Owns the reverse dependency index, the per-formula
+  // epoch bumps, and the workbook revision counter.
+  const propagation = createPropagation({
+    store,
+    sheetsList,
+    sheetsById,
+    sheetsByName,
+    resolveName: (lookup) => names.get(canonicalName(lookup)),
+  })
+
+  function requestRecalc(): void {
+    if (batchDepth > 0) {
+      pendingRecalc = true
+    } else {
+      propagation.recalculateAllSheets()
+    }
+  }
+
   const resolvers: SheetResolvers = {
-    crossSheetCells(sheetName, get) {
+    // Plain storage read — cross-sheet invalidation flows through the
+    // workbook DepGraph, not vanilla/core dep registration (the unused
+    // `get` parameter is kept on the TYPE for signature compatibility).
+    crossSheetCells(sheetName) {
       const target = sheetsByName.get(sheetName)
       if (!target) return undefined
-      // Registers a dep on the foreign sheet's atom via the captured getter.
-      return get(target.sheetAtom)
+      return target._internal.cells
+    },
+    onFormulaEvaluated(cells, key, ast) {
+      const owner = sheetsByCellsMap.get(cells)
+      // Unknown map identity (e.g. an evaluator driven against a
+      // detached snapshot in tests) → nothing to index.
+      if (!owner) return
+      propagation.installDepsFor(owner, key, ast)
     },
     callCustom(name, args) {
       const fn = customFormulas.get(name.toUpperCase())
@@ -290,10 +320,8 @@ export function createWorkbook(
   }
 
   // Workbook-scope revision read shared across every sheet's debug
-  // probe. Wrapped in a function so the loop below doesn't capture
-  // `revisionCounter` directly (which would trip
-  // `no-loop-func` for `let`-mutated state).
-  const readRevision = (): number => revisionCounter
+  // probe (owned by the propagation module).
+  const readRevision = (): number => propagation.revision()
 
   for (const seed of initialSheets) {
     // Each sheet's debug helpers need a live revision read and a live
@@ -315,6 +343,7 @@ export function createWorkbook(
     sheetsList.push(sheet)
     sheetsById.set(seed.id, sheet)
     sheetsByName.set(seed.name, sheet)
+    sheetsByCellsMap.set(sheet._internal.cells, sheet)
   }
 
   function requireSheet(sheetId: string): WorkbookSheet {
@@ -325,71 +354,6 @@ export function createWorkbook(
     return sheet
   }
 
-  function writeSheetState(sheet: WorkbookSheet, next: SheetState): void {
-    // Bump the workbook revision BEFORE writing. The order matters
-    // because vanilla/core's `setter` synchronously runs `flushPending`,
-    // which walks every back-dep and re-evaluates any cached formula
-    // derive whose dep value changed (`store.ts` `dependenciesChange`).
-    //
-    // That auto-flush is the central engine difference between TS-core
-    // and Rust-core: Rust is purely lazy — a formula goes dirty on dep
-    // change and stays dirty until the next read — while TS eagerly
-    // re-derives cached formulas at the moment of mutation. For probe
-    // semantics that means:
-    //
-    //   * "Never-read" formulas stay dirty across writes (their derive
-    //     isn't in the cache, so `flushPending` doesn't touch them).
-    //   * "Already-read" formulas auto-recover to clean on every
-    //     mutation. The probe will report `'clean'` post-mutation, not
-    //     `'dirty'`.
-    //
-    // The bulk-load → snapshot → restore → probe use case (the main
-    // consumer of this probe in the WAVE3 plan) only ever observes
-    // never-read formulas, so it lines up with Rust's reported state.
-    // Tests that catch the engine mid-flight (mutate then probe before
-    // re-read) will see TS-core report `'clean'` where Rust reports
-    // `'dirty'` — see `excel-core-ts-debug-probes.test.ts` for the
-    // pinned behavior.
-    revisionCounter += 1
-    store.setter(sheet.sheetAtom, next)
-  }
-
-  function recalculateAllSheets(): void {
-    for (const sheet of sheetsList) {
-      const prev = store.getter(sheet.sheetAtom) as SheetState
-      // Clone to a fresh Map identity — every derive sees a new dep value
-      // and marks dirty.
-      writeSheetState(sheet, new Map(prev))
-    }
-  }
-
-  function buildCell(input: string, existing: Cell | undefined): Cell {
-    if (input.length === 0) {
-      // Treat empty input as "clear value but keep format" path.
-      return {
-        input: '',
-        value: { kind: 'blank' },
-        format: existing?.format,
-      }
-    }
-    if (input[0] === '=') {
-      const ast = parser(input)
-      return {
-        input,
-        ast,
-        // Initial value before first eval is BLANK; the formula derive
-        // computes the real one. We do NOT eagerly evaluate here — the
-        // formula-cell atom will run on first sub/read.
-        value: { kind: 'blank' },
-        format: existing?.format,
-      }
-    }
-    return {
-      input,
-      value: parseLiteral(input),
-      format: existing?.format,
-    }
-  }
 
   function setCellInternal(
     sheet: WorkbookSheet,
@@ -398,9 +362,10 @@ export function createWorkbook(
     input: string,
   ): void {
     const key = keyFor(row, col)
-    const prev = store.getter(sheet.sheetAtom) as SheetState
-    const next = applyCell(prev, key, (existing) => buildCell(input, existing))
-    writeSheetState(sheet, next)
+    const cells = sheet._internal.cells
+    const prev = cells.get(key)
+    cells.set(key, buildCell(parser, input, prev))
+    propagation.postWrite(sheet, [{ key, prevAst: prev?.ast, valueChanged: true }])
   }
 
   return {
@@ -421,114 +386,132 @@ export function createWorkbook(
     setCellValue(sheetId, row, col, value) {
       const sheet = requireSheet(sheetId)
       const key = keyFor(row, col)
-      const prev = store.getter(sheet.sheetAtom) as SheetState
-      const next = applyCell(prev, key, (existing) => {
-        if (value.kind === 'blank') {
-          if (!existing) return undefined
-          if (existing.format) {
-            return { input: '', value: { kind: 'blank' }, format: existing.format }
-          }
-          return undefined
+      const cells = sheet._internal.cells
+      const existing = cells.get(key)
+      if (value.kind === 'blank') {
+        if (!existing) {
+          // Nothing stored and nothing to store — still propagate (a
+          // dependent range may aggregate over the blank coordinate).
+          propagation.postWrite(sheet, [{ key, prevAst: undefined, valueChanged: true }])
+          return
         }
-        // Keep `input` as the canonical string repr so things like the
-        // formula bar still surface something readable, but the parsed
-        // `value` overrides any inference the parser might otherwise do.
-        let input: string
-        switch (value.kind) {
-          case 'number':
-            input = String(value.value)
-            break
-          case 'string':
-            input = value.value
-            break
-          case 'boolean':
-            input = value.value ? 'TRUE' : 'FALSE'
-            break
-          case 'error':
-            input = value.code
-            break
-          case 'array':
-            // Array-typed literals don't have a single-cell representation;
-            // collapse to top-left for display, keep the array as the value.
-            input = ''
-            break
+        if (existing.format) {
+          cells.set(key, { input: '', value: { kind: 'blank' }, format: existing.format })
+        } else {
+          cells.delete(key)
         }
-        return {
-          input,
-          value,
-          format: existing?.format,
-        }
-      })
-      writeSheetState(sheet, next)
+        propagation.postWrite(sheet, [{ key, prevAst: existing.ast, valueChanged: true }])
+        return
+      }
+      // Keep `input` as the canonical string repr so things like the
+      // formula bar still surface something readable, but the parsed
+      // `value` overrides any inference the parser might otherwise do.
+      let input: string
+      switch (value.kind) {
+        case 'number':
+          input = String(value.value)
+          break
+        case 'string':
+          input = value.value
+          break
+        case 'boolean':
+          input = value.value ? 'TRUE' : 'FALSE'
+          break
+        case 'error':
+          input = value.code
+          break
+        case 'array':
+          // Array-typed literals don't have a single-cell representation;
+          // collapse to top-left for display, keep the array as the value.
+          input = ''
+          break
+      }
+      cells.set(key, { input, value, format: existing?.format })
+      propagation.postWrite(sheet, [{ key, prevAst: existing?.ast, valueChanged: true }])
     },
     clearCell(sheetId, row, col, target = 'value') {
       const sheet = requireSheet(sheetId)
       const key = keyFor(row, col)
-      const prev = store.getter(sheet.sheetAtom) as SheetState
-      const next = applyCell(prev, key, (existing) => {
-        if (!existing) return undefined
-        if (target === 'all') return undefined
-        if (target === 'format') {
-          // Drop format only; keep value/formula/ast intact.
-          if (!existing.format) return existing
+      const cells = sheet._internal.cells
+      const existing = cells.get(key)
+      if (!existing) {
+        propagation.postWrite(sheet, [{ key, prevAst: undefined, valueChanged: true }])
+        return
+      }
+      if (target === 'format') {
+        // Drop format only; keep value/formula/ast intact (same AST
+        // object → no dep teardown, no formula dirtying).
+        if (existing.format) {
           const { format: _format, ...rest } = existing
           void _format
-          return { ...rest }
+          cells.set(key, { ...rest })
         }
+        propagation.postWrite(sheet, [{ key, prevAst: existing.ast, valueChanged: false }])
+        return
+      }
+      if (target === 'all' || !existing.format) {
+        cells.delete(key)
+      } else {
         // target === 'value' — clear value+formula, keep format.
-        if (existing.format) {
-          return { input: '', value: { kind: 'blank' }, format: existing.format }
-        }
-        return undefined
-      })
-      writeSheetState(sheet, next)
+        cells.set(key, { input: '', value: { kind: 'blank' }, format: existing.format })
+      }
+      propagation.postWrite(sheet, [{ key, prevAst: existing.ast, valueChanged: true }])
     },
     bulkApply(sheetId, cells) {
       const sheet = requireSheet(sheetId)
       if (cells.length === 0) return
-      const prev = store.getter(sheet.sheetAtom) as SheetState
-      // Build a single new Map so dependents see one atom write.
-      const next = new Map(prev)
-      for (const entry of cells) {
+      const live = sheet._internal.cells
+      const records: WriteRecord[] = new Array(cells.length)
+      for (let i = 0; i < cells.length; i += 1) {
+        const entry = cells[i]
         const key = keyFor(entry.row, entry.col)
-        next.set(key, buildCell(entry.input, prev.get(key)))
+        const prev = live.get(key)
+        live.set(key, buildCell(parser, entry.input, prev))
+        records[i] = { key, prevAst: prev?.ast, valueChanged: true }
       }
-      writeSheetState(sheet, next)
+      // ONE storage pass, ONE propagation pass (the dirty BFS bails out
+      // immediately while the dep graph is empty — fresh bulk imports
+      // stay O(cells)).
+      propagation.postWrite(sheet, records)
     },
     setFormat(sheetId, range, format) {
       const sheet = requireSheet(sheetId)
-      const prev = store.getter(sheet.sheetAtom) as SheetState
-      const next = new Map(prev)
+      const live = sheet._internal.cells
+      const records: WriteRecord[] = []
       for (let r = range.rowStart; r <= range.rowEnd; r += 1) {
         for (let c = range.colStart; c <= range.colEnd; c += 1) {
           const key = keyFor(r, c)
-          const existing = prev.get(key)
+          const existing = live.get(key)
           if (existing) {
-            next.set(key, {
+            // Same AST object — format-only swap, no formula dirtying.
+            live.set(key, {
               ...existing,
               format: { ...existing.format, ...format },
             })
           } else {
             // No cell yet — stamp a blank cell with format only.
-            next.set(key, {
+            live.set(key, {
               input: '',
               value: { kind: 'blank' },
               format: { ...format },
             })
           }
+          records.push({ key, prevAst: existing?.ast, valueChanged: false })
         }
       }
-      writeSheetState(sheet, next)
+      propagation.postWrite(sheet, records)
     },
     recalc() {
-      recalculateAllSheets()
+      propagation.recalculateAllSheets()
     },
     getLocale() {
       return currentLocale
     },
     setLocale(locale) {
       if (typeof locale !== 'string' || locale.length === 0) {
-        throw new Error(`Workbook.setLocale: locale must be a non-empty string, got ${String(locale)}`)
+        throw new Error(
+          `Workbook.setLocale: locale must be a non-empty string, got ${String(locale)}`,
+        )
       }
       if (currentLocale === locale) return
       currentLocale = locale
@@ -570,7 +553,7 @@ export function createWorkbook(
         // flag and fires the deferred recalc. Inner frames just decrement.
         if (batchDepth === 1 && pendingRecalc) {
           pendingRecalc = false
-          recalculateAllSheets()
+          propagation.recalculateAllSheets()
         }
         return result
       } catch (err) {
@@ -616,6 +599,40 @@ export function createWorkbook(
       }
       return sheetsList[sheetIdx]._debug.formulaCount()
     },
+  }
+}
+
+/**
+ * Build a `Cell` record from raw user input: `''` clears the value but
+ * keeps format, a leading `=` parses to an AST (lazily evaluated — the
+ * formula-cell atom runs on first sub/read), anything else classifies
+ * through `parseLiteral`.
+ */
+function buildCell(
+  parser: (input: string) => Expr,
+  input: string,
+  existing: Cell | undefined,
+): Cell {
+  if (input.length === 0) {
+    return {
+      input: '',
+      value: { kind: 'blank' },
+      format: existing?.format,
+    }
+  }
+  if (input[0] === '=') {
+    const ast = parser(input)
+    return {
+      input,
+      ast,
+      value: { kind: 'blank' },
+      format: existing?.format,
+    }
+  }
+  return {
+    input,
+    value: parseLiteral(input),
+    format: existing?.format,
   }
 }
 
