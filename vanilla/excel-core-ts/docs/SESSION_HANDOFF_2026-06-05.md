@@ -178,6 +178,44 @@ first zero-issue round after four rounds that each found real bugs.
 A scale-suite failure is a P1 by definition: it means an O(N)
 regression or stale-cache bug re-entered.
 
+### P3 close-out + solid-js resolution — audit arc 37/37 (2026-06-13)
+
+The audit's last open items, all landed; the pattern-family arc is now
+fully closed (9 P1 + 15 P2 + 13 P3 dispositioned, zero open):
+
+- `712ffbc` / `952da8b` — P3 triage: 6 fixed (A-8 spill reverse index,
+  A-9 typed ClearCell, B-5 bulk-notify early-out + S12, D-6 session
+  invalidation, D-9 read-tracking Map, D-11 sort hoist), 3 wont-fix,
+  3 superseded; table in the audit doc.
+- `89dc033` — codex P2 on D-6: `remove_sheet` now remaps wasm
+  subscription tokens (mirrors `move_sheet`); real-wasm pin
+  `wasm-subscription-remap.test.ts` (verified red pre-fix). NOTE:
+  `JsCallbackListener` queues JS callbacks as MICROTASKS — tests must
+  flush before asserting fires.
+- `4a21dc3` — C-7, owner-approved `vanilla/core` change:
+  `store.clear()` also clears `pendingMap`. Defensive — at the current
+  public API the stale entries are unobservable (sub() pre-flushes,
+  reads cache-first); see the audit doc's honesty note.
+- `1b70eff` — follow-ups: `spill_anchor_addr` index
+  (`anchor_address_for` O(cells) scan → probe; insert_row @100k+500
+  anchors 265–584 ms → ~10 ms) + typed `SetCell`/`SetFormula` ops
+  (parse-once at the string boundary; wins are wasm32-allocator-side).
+- `6ddc071` — solid-js "1.9.12 Provider interaction" was STALE DOCS:
+  root cause = two solid-js copies in one process, already fixed by
+  `2b7d65e` (pnpm.overrides). Invariant: ONE `solid-js@` resolution in
+  the lockfile, guarded by the two provider-remount contract tests.
+  CLAUDE.md rewritten; never work around it in components.
+- `fbdddd7` — D-11 residual: conditional-format rules pre-filtered by
+  window bounds before the per-cell loop. The window unions display
+  rows with the filter/sort source-row band (`originalRow` lives
+  outside the display window under permutation) — display range alone
+  is NOT a correct superset.
+
+Verification at close: cargo 1819/0 + wasm 31/0, solid/excel jest
+59 suites / 882, tsc clean, dual-backend e2e 960/0/74 (Δ=0),
+vanilla/core consumers 202/202. Codex review of the P3 wave found
+exactly one real P2 (the D-6 token remap above) — fixed same-day.
+
 ### Lazy formula indexing — Rust core philosophy realignment (2026-06-11)
 
 einfach is a lazy atom-based state library, but `Sheet::bulk_load`
