@@ -852,6 +852,16 @@ pub struct Sheet {
     /// scan of `cells` — one `=SEQUENCE(100000)` must not make every
     /// keystroke O(100k).
     spill_target_anchor: HashMap<CellAddress, (AtomId, CellAddress)>,
+    /// A-8 follow-up (2026-06-13 P3) — anchor atom → anchor address.
+    /// Maintained at exactly the same lockstep sites as
+    /// `spill_target_anchor` (`register_spill` inserts, `clear_spill`
+    /// removes, `bulk_install_storage` teardown clears) so
+    /// `anchor_address_for` — called once per active spill by
+    /// `teardown_all_spills` on EVERY structural edit — is one map
+    /// probe instead of a reverse scan over all of `cells` per anchor.
+    /// `spill_target_anchor` alone can't serve this lookup: anchors
+    /// with zero targets (1×1 / empty arrays) have no entry there.
+    spill_anchor_addr: HashMap<AtomId, CellAddress>,
     /// One-way latch: set to `true` the first time a formula whose AST
     /// contains a `Expr::SheetRef` / `Expr::SheetRange` is installed on
     /// this sheet, never cleared. Drives
@@ -899,6 +909,7 @@ impl Sheet {
             dirty_visit_count: Cell::new(0),
             spill_targets: HashMap::new(),
             spill_target_anchor: HashMap::new(),
+            spill_anchor_addr: HashMap::new(),
             bulk_notify_probe_count: Cell::new(0),
             has_cross_sheet_refs: Cell::new(false),
         }
@@ -1528,6 +1539,7 @@ impl Sheet {
             .collect();
         self.spill_targets.clear();
         self.spill_target_anchor.clear();
+        self.spill_anchor_addr.clear();
         for addr in spill_target_addrs {
             self.drop_cell_slot(addr);
         }
@@ -1768,18 +1780,13 @@ impl Sheet {
             .map(|&(_, anchor_addr)| anchor_addr)
     }
 
-    /// Look up the anchor address for a given anchor atom by reverse-scanning
-    /// `cells`. Returns None if the anchor has been removed from `cells`
-    /// (which shouldn't happen in normal flow — spill teardown clears
-    /// `spill_targets` first). Used by `teardown_all_spills` (AUDIT A-5)
-    /// to snapshot anchor addresses before a structural shift.
+    /// Look up the anchor address for a given anchor atom. Used by
+    /// `teardown_all_spills` (AUDIT A-5) to snapshot anchor addresses
+    /// before a structural shift. One probe of `spill_anchor_addr`
+    /// (A-8 follow-up) — the previous shape reverse-scanned `cells`,
+    /// O(active spills × cells) per structural op.
     fn anchor_address_for(&self, anchor_atom: AtomId) -> Option<CellAddress> {
-        for (cell_addr, slot) in self.cells.iter() {
-            if slot.atom_id() == Some(anchor_atom) {
-                return Some(cell_addr);
-            }
-        }
-        None
+        self.spill_anchor_addr.get(&anchor_atom).copied()
     }
 
     /// Install spilled derived atoms for every non-(0,0) target inside
@@ -1805,6 +1812,7 @@ impl Sheet {
         if rows == 0 || cols == 0 {
             // Empty array — nothing to spill into. Treat as success.
             self.spill_targets.insert(anchor_atom, Vec::new());
+            self.spill_anchor_addr.insert(anchor_atom, anchor_addr);
             return Ok(());
         }
         let end_row = anchor_addr
@@ -1882,6 +1890,7 @@ impl Sheet {
                 .insert(target, (anchor_atom, anchor_addr));
         }
         self.spill_targets.insert(anchor_atom, targets);
+        self.spill_anchor_addr.insert(anchor_atom, anchor_addr);
         Ok(())
     }
 
@@ -1930,6 +1939,7 @@ impl Sheet {
         let Some(targets) = self.spill_targets.remove(&anchor_atom) else {
             return;
         };
+        self.spill_anchor_addr.remove(&anchor_atom);
         for target in targets {
             // Drop the reverse-index entry (AUDIT A-8) — but only when
             // it still points at THIS anchor: a degenerate re-register
@@ -3283,6 +3293,16 @@ impl Sheet {
         self.spill_target_anchor.len()
     }
 
+    /// Size of the anchor-address index (`anchor atom → anchor addr`,
+    /// A-8 follow-up). Scale-suite invariant probe: must equal
+    /// `debug_spill_anchor_count()` at all times — install, re-spill,
+    /// structural shift, teardown — or `teardown_all_spills` is reading
+    /// stale anchor addresses.
+    #[doc(hidden)]
+    pub fn debug_spill_anchor_index_len(&self) -> usize {
+        self.spill_anchor_addr.len()
+    }
+
     /// Cumulative `has_address_subscribers` probes performed by
     /// `BulkLoader::flush`'s notify tail (AUDIT B-5). Stays flat across
     /// a bulk load when the sheet has zero address subscriptions.
@@ -4513,6 +4533,13 @@ impl<'a> BulkLoader<'a> {
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        self.set_formula_at(addr, formula_str)
+    }
+
+    /// Typed-address variant of [`Self::set_formula`] (A-9 follow-up):
+    /// the `Workbook::bulk_load` replay and any bulk caller that already
+    /// holds a `CellAddress` skip the string render + re-parse per cell.
+    pub fn set_formula_at(&mut self, addr: CellAddress, formula_str: &str) -> bool {
         // AUDIT A-4 — spill parity with `Sheet::try_set_formula`
         // (`:2331/:2336`): reject writes on a non-anchor spill target
         // (array stays intact), tear down the spill when overwriting
@@ -4562,11 +4589,10 @@ impl<'a> BulkLoader<'a> {
     /// that never touch the cell never pay it.
     pub(crate) fn set_formula_pre_parsed(
         &mut self,
-        addr_str: &str,
+        addr: CellAddress,
         _expr: Expr,
         formula_text: String,
     ) -> bool {
-        let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         self.set_formula_lazy(addr, formula_text)
     }
 

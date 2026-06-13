@@ -2578,11 +2578,13 @@ impl WasmWorkbook {
                     );
                     continue;
                 }
-                let addr = CellAddress::new(cell.row, cell.col).to_string_repr();
+                // Typed loader entries (A-9 follow-up): no per-cell
+                // `to_string_repr` → re-parse round trip.
+                let addr = CellAddress::new(cell.row, cell.col);
                 match kind {
                     "number" => match &cell.value {
                         Some(BulkImportValueJSON::Number(n)) if n.is_finite() => {
-                            loader.set_cell(cell.sheet, &addr, Value::Number(*n));
+                            loader.set_cell_at(cell.sheet, addr, Value::Number(*n));
                             stats.accepted += 1;
                         }
                         _ => {
@@ -2597,7 +2599,7 @@ impl WasmWorkbook {
                     },
                     "text" => match &cell.value {
                         Some(BulkImportValueJSON::Text(s)) => {
-                            loader.set_cell(cell.sheet, &addr, Value::Text(s.clone()));
+                            loader.set_cell_at(cell.sheet, addr, Value::Text(s.clone()));
                             stats.accepted += 1;
                         }
                         _ => {
@@ -2612,7 +2614,7 @@ impl WasmWorkbook {
                     },
                     "boolean" => match &cell.value {
                         Some(BulkImportValueJSON::Boolean(b)) => {
-                            loader.set_cell(cell.sheet, &addr, Value::Boolean(*b));
+                            loader.set_cell_at(cell.sheet, addr, Value::Boolean(*b));
                             stats.accepted += 1;
                         }
                         _ => {
@@ -2627,9 +2629,9 @@ impl WasmWorkbook {
                     },
                     "error" => match &cell.value {
                         Some(BulkImportValueJSON::Text(s)) => {
-                            loader.set_cell(
+                            loader.set_cell_at(
                                 cell.sheet,
-                                &addr,
+                                addr,
                                 Value::Error(value_error_from_display(s)),
                             );
                             stats.accepted += 1;
@@ -2647,7 +2649,7 @@ impl WasmWorkbook {
                     "formula" => match &cell.value {
                         Some(BulkImportValueJSON::Text(s)) => {
                             stats.formulas += 1;
-                            if loader.set_formula(cell.sheet, &addr, s) {
+                            if loader.set_formula_at(cell.sheet, addr, s) {
                                 stats.accepted += 1;
                             } else {
                                 stats.rejected_formulas += 1;
@@ -2670,7 +2672,7 @@ impl WasmWorkbook {
                         }
                     },
                     "null" => {
-                        loader.clear_cell(cell.sheet, &addr);
+                        loader.clear_cell_at(cell.sheet, addr);
                         stats.accepted += 1;
                         stats.cleared += 1;
                     }
@@ -3504,33 +3506,36 @@ impl WasmWorkbook {
                 if cell.sheet >= sheet_count {
                     continue;
                 }
-                let addr = CellAddress::new(cell.row, cell.col).to_string_repr();
+                // Typed loader entries (A-9 follow-up): the record already
+                // holds row/col, so no `to_string_repr` → re-parse round
+                // trip per cell.
+                let addr = CellAddress::new(cell.row, cell.col);
                 match cell.kind.as_str() {
                     "number" => {
                         if let Some(ImportValueJSON::Number(n)) = cell.value {
                             if n.is_finite() {
-                                loader.set_cell(cell.sheet, &addr, Value::Number(n));
+                                loader.set_cell_at(cell.sheet, addr, Value::Number(n));
                                 restored += 1;
                             }
                         }
                     }
                     "text" => {
                         if let Some(ImportValueJSON::Text(s)) = cell.value {
-                            loader.set_cell(cell.sheet, &addr, Value::Text(s));
+                            loader.set_cell_at(cell.sheet, addr, Value::Text(s));
                             restored += 1;
                         }
                     }
                     "boolean" => {
                         if let Some(ImportValueJSON::Boolean(b)) = cell.value {
-                            loader.set_cell(cell.sheet, &addr, Value::Boolean(b));
+                            loader.set_cell_at(cell.sheet, addr, Value::Boolean(b));
                             restored += 1;
                         }
                     }
                     "error" => {
                         if let Some(ImportValueJSON::Text(s)) = cell.value {
-                            loader.set_cell(
+                            loader.set_cell_at(
                                 cell.sheet,
-                                &addr,
+                                addr,
                                 Value::Error(value_error_from_display(&s)),
                             );
                             restored += 1;
@@ -3538,13 +3543,13 @@ impl WasmWorkbook {
                     }
                     "formula" => {
                         if let Some(ImportValueJSON::Text(s)) = cell.value {
-                            if loader.set_formula(cell.sheet, &addr, &s) {
+                            if loader.set_formula_at(cell.sheet, addr, &s) {
                                 restored += 1;
                             }
                         }
                     }
                     "null" => {
-                        loader.clear_cell(cell.sheet, &addr);
+                        loader.clear_cell_at(cell.sheet, addr);
                         restored += 1;
                     }
                     _ => {}

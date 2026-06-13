@@ -303,36 +303,23 @@ pub fn run_bulk_import_with_phase_timings(
         let p1_start = now_ms();
         for cell in cells {
             match &cell.kind {
+                // Typed loader entries (A-9 follow-up) — keeps the trace
+                // mirroring the production `bulk_import_cells` path, which
+                // no longer renders / re-parses an address string per cell.
                 BulkImportCellKind::Number(n) => {
-                    loader.set_cell(
-                        cell.sheet_idx,
-                        &cell.addr.to_string_repr(),
-                        Value::Number(*n),
-                    );
+                    loader.set_cell_at(cell.sheet_idx, cell.addr, Value::Number(*n));
                 }
                 BulkImportCellKind::Text(s) => {
-                    loader.set_cell(
-                        cell.sheet_idx,
-                        &cell.addr.to_string_repr(),
-                        Value::Text(s.clone()),
-                    );
+                    loader.set_cell_at(cell.sheet_idx, cell.addr, Value::Text(s.clone()));
                 }
                 BulkImportCellKind::Boolean(b) => {
-                    loader.set_cell(
-                        cell.sheet_idx,
-                        &cell.addr.to_string_repr(),
-                        Value::Boolean(*b),
-                    );
+                    loader.set_cell_at(cell.sheet_idx, cell.addr, Value::Boolean(*b));
                 }
                 BulkImportCellKind::Error(e) => {
-                    loader.set_cell(
-                        cell.sheet_idx,
-                        &cell.addr.to_string_repr(),
-                        Value::Error(e.clone()),
-                    );
+                    loader.set_cell_at(cell.sheet_idx, cell.addr, Value::Error(e.clone()));
                 }
                 BulkImportCellKind::Null => {
-                    loader.clear_cell(cell.sheet_idx, &cell.addr.to_string_repr());
+                    loader.clear_cell_at(cell.sheet_idx, cell.addr);
                 }
                 BulkImportCellKind::Formula(_) => {
                     // skip — handled in pass 2
@@ -346,8 +333,7 @@ pub fn run_bulk_import_with_phase_timings(
         let p2_start = now_ms();
         for cell in cells {
             if let BulkImportCellKind::Formula(text) = &cell.kind {
-                let _accepted =
-                    loader.set_formula(cell.sheet_idx, &cell.addr.to_string_repr(), text);
+                let _accepted = loader.set_formula_at(cell.sheet_idx, cell.addr, text);
             }
         }
         let p2_end = now_ms();

@@ -1957,8 +1957,13 @@ impl Workbook {
 /// inside `Sheet::bulk_load`. The owning sheet is the HashMap key in
 /// `ops_by_sheet`, so individual variants don't repeat `sheet_idx`.
 enum WorkbookOp {
+    /// Typed address (A-9 follow-up, 2026-06-13 P3): producers parse or
+    /// construct the `CellAddress` exactly once at the public boundary;
+    /// replay routes `BulkLoader::set_cell_at`. Carrying a `String`
+    /// here meant one alloc + one re-parse per op in bulk paths whose
+    /// producers already hold a typed address (`restore_sparse`).
     SetCell {
-        addr_str: String,
+        addr: CellAddress,
         value: Value,
     },
     /// `expr` is `Some` when the workbook-side parse succeeded — the
@@ -1969,9 +1974,10 @@ enum WorkbookOp {
     /// win for the wasm32 Chain100k bulkWrite tier — `parse_formula`
     /// allocates a `Vec<char>` per source character plus boxed nodes
     /// for every binop / cellref, and was running twice per formula
-    /// (workbook + sheet) before this variant.
+    /// (workbook + sheet) before this variant. The address is typed
+    /// for the same reason as `SetCell`.
     SetFormula {
-        addr_str: String,
+        addr: CellAddress,
         source: String,
         expr: Option<Expr>,
     },
@@ -2012,25 +2018,31 @@ impl<'a> WorkbookLoader<'a> {
     }
 
     /// Queue a primitive write at `(sheet_idx, addr)`. Visible to the
-    /// post-flush workbook BFS as a touched cell.
+    /// post-flush workbook BFS as a touched cell. Parses the address
+    /// once here; the buffered op carries it typed (A-9 follow-up).
     pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return;
+        };
+        self.set_cell_at(sheet_idx, addr, value);
+    }
+
+    /// Typed-address twin of `set_cell` (A-9 follow-up). Bulk producers
+    /// that already hold a `CellAddress` — the wasm `restore_sparse` /
+    /// `bulk_import_cells` decoders — skip the `to_string_repr` →
+    /// re-parse round trip entirely.
+    pub fn set_cell_at(&mut self, sheet_idx: usize, addr: CellAddress, value: Value) {
         if self.wb.is_inside_custom_call() {
             return; // re-entrancy guard (Wave 8)
         }
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
-        let Some(addr) = CellAddress::parse(addr_str) else {
-            return;
-        };
         self.touched.insert((sheet_idx, addr));
         self.ops_by_sheet
             .entry(sheet_idx)
             .or_default()
-            .push(WorkbookOp::SetCell {
-                addr_str: addr_str.to_string(),
-                value,
-            });
+            .push(WorkbookOp::SetCell { addr, value });
     }
 
     /// Queue a formula write at `(sheet_idx, addr)`. Returns `false` if
@@ -2040,15 +2052,21 @@ impl<'a> WorkbookLoader<'a> {
     /// (e.g. for subsequent cycle checks); same-sheet wiring runs
     /// inside the per-sheet `Sheet::bulk_load` replay at flush time.
     pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, source: &str) -> bool {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return false;
+        };
+        self.set_formula_at(sheet_idx, addr, source)
+    }
+
+    /// Typed-address twin of `set_formula` (A-9 follow-up) — same
+    /// contract, same queue path, no address re-parse.
+    pub fn set_formula_at(&mut self, sheet_idx: usize, addr: CellAddress, source: &str) -> bool {
         if self.wb.is_inside_custom_call() {
             return false; // re-entrancy guard (Wave 8)
         }
         if sheet_idx >= self.wb.sheets.len() {
             return false;
         }
-        let Some(addr) = CellAddress::parse(addr_str) else {
-            return false;
-        };
 
         // Parse first. Parse failure still records a SetFormula op so
         // the sheet flush writes `#VALUE!` for us; cross-sheet edge
@@ -2062,7 +2080,7 @@ impl<'a> WorkbookLoader<'a> {
                 .entry(sheet_idx)
                 .or_default()
                 .push(WorkbookOp::SetFormula {
-                    addr_str: addr_str.to_string(),
+                    addr,
                     source: source.to_string(),
                     expr: None,
                 });
@@ -2091,7 +2109,7 @@ impl<'a> WorkbookLoader<'a> {
                 .entry(sheet_idx)
                 .or_default()
                 .push(WorkbookOp::SetCell {
-                    addr_str: addr_str.to_string(),
+                    addr,
                     value: Value::Error(ValueError::CyclicRef),
                 });
             return false;
@@ -2112,7 +2130,7 @@ impl<'a> WorkbookLoader<'a> {
             .entry(sheet_idx)
             .or_default()
             .push(WorkbookOp::SetFormula {
-                addr_str: addr_str.to_string(),
+                addr,
                 source: source.to_string(),
                 expr: Some(expr),
             });
@@ -2172,14 +2190,10 @@ impl<'a> WorkbookLoader<'a> {
             sheet.bulk_load(|loader| {
                 for op in ops {
                     match op {
-                        WorkbookOp::SetCell { addr_str, value } => {
-                            loader.set_cell(&addr_str, value);
+                        WorkbookOp::SetCell { addr, value } => {
+                            loader.set_cell_at(addr, value);
                         }
-                        WorkbookOp::SetFormula {
-                            addr_str,
-                            source,
-                            expr,
-                        } => {
+                        WorkbookOp::SetFormula { addr, source, expr } => {
                             // Hand the pre-parsed AST through when we
                             // have one — skips the sheet-loader's
                             // re-parse (the same AST was just produced
@@ -2202,10 +2216,10 @@ impl<'a> WorkbookLoader<'a> {
                                     // Move `source` so the sheet loader
                                     // stores the original allocation
                                     // instead of cloning.
-                                    loader.set_formula_pre_parsed(&addr_str, expr, source);
+                                    loader.set_formula_pre_parsed(addr, expr, source);
                                 }
                                 None => {
-                                    loader.set_formula(&addr_str, &source);
+                                    loader.set_formula_at(addr, &source);
                                 }
                             }
                         }

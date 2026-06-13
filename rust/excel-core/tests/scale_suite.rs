@@ -349,6 +349,14 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         sheet.debug_spill_target_count(),
         "reverse spill index in lockstep after install"
     );
+    // A-8 follow-up: the anchor-address index (atom → addr) mirrors the
+    // anchor map at the same checkpoints — it is what makes
+    // `teardown_all_spills` O(anchors) instead of O(anchors × cells).
+    assert_eq!(
+        sheet.debug_spill_anchor_index_len(),
+        sheet.debug_spill_anchor_count(),
+        "anchor-address index in lockstep after install"
+    );
     assert_eq!(
         sheet.spill_anchor_for(addr(&format!("A{}", N / 2))),
         Some(addr("A1"))
@@ -381,6 +389,11 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         "reverse spill index in lockstep after structural shift"
     );
     assert_eq!(
+        sheet.debug_spill_anchor_index_len(),
+        sheet.debug_spill_anchor_count(),
+        "anchor-address index in lockstep after structural shift"
+    );
+    assert_eq!(
         sheet.spill_anchor_for(addr(&format!("A{}", N / 2 + 1))),
         Some(addr("A2")),
         "reverse index re-derived against the shifted anchor"
@@ -394,6 +407,11 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         sheet.debug_spill_reverse_index_len(),
         base_targets,
         "reverse spill index torn down with the spill"
+    );
+    assert_eq!(
+        sheet.debug_spill_anchor_index_len(),
+        base_anchors,
+        "anchor-address index torn down with the spill"
     );
     assert_eq!(sheet.debug_formula_count(), base_formulas);
     assert_eq!(
