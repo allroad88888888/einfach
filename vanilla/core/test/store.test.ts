@@ -152,5 +152,40 @@ describe('store', () => {
       expect(store.getter(countAtom)).toBe(0)
       expect(store.getter(nameAtom)).toBe('John')
     })
+
+    test('clear() 丢弃旧世界的 pending 刷新（审计 C-7，防御性）', async () => {
+      const store = createStore()
+      const baseAtom = atom(0)
+      let derives = 0
+      const derivedAtom = atom((get) => {
+        derives += 1
+        return get(baseAtom) + 1
+      })
+      // 异步 setter：writeAtomState 返回 Promise，flushPending 被推迟到
+      // .finally —— pendingMap 里留下 baseAtom 的待刷新条目跨过 clear()
+      const writerAtom = atom(null, (_get, set) => {
+        set(baseAtom, 1)
+        return Promise.resolve()
+      })
+
+      const pendingWrite = store.setter(writerAtom)
+      store.clear()
+
+      // 新世界：读取 derived，安装 base → derived 反向依赖
+      expect(store.getter(derivedAtom)).toBe(1)
+      const derivesAfterClear = derives
+
+      // 旧世界的延迟 flush 现在触发。说明：当前公共 API 下旧条目恰好
+      // 不可观察 —— subscribeAtom 在挂 listener 前无条件 flushPending，
+      // 读路径又是缓存优先，残留条目只会把初始值播种进新状态表。这条
+      // 用例与 clear() 里的 pendingMap.clear() 一起作为防御围栏：若将来
+      // flush / 订阅路径调整（比如去掉 sub 的预 flush），旧世界条目
+      // 不得泄漏进新世界（幽灵重算或多余 publish 都算泄漏）。
+      await pendingWrite
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      expect(derives).toBe(derivesAfterClear)
+      expect(store.getter(baseAtom)).toBe(0)
+    })
   })
 })

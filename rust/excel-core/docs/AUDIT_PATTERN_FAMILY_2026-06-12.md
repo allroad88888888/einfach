@@ -62,7 +62,7 @@ do-not-touch territory for this arc.
 | B-6 | WONT-FIX | Deliberate, documented O(F_hydrated) sledgehammer with the per-name reverse-index upgrade path already recorded in-code; parked formulas are skipped so fresh imports are near-free. No workload shows it hot — building the reverse index now is risk without measured benefit. Stays watch-list. | — |
 | B-7 | SUPERSEDED | Resolved in W2.3 `1d71ecf`: additive contract documented on the `restore_sparse` docstring (load-bearing for legacy sheet-store undo); B-1's reroute scoped to `restore_persistence_v1` only. | — |
 | B-8 | WONT-FIX | Arbitrary-cell-list reads are bounded by viewport/subscription size (~10³) with no measured cost; a `read_cells` batch export means new WASM pkg surface + rebuild for a marginal win. Revisit if a profile shows the boundary hot. | — |
-| C-7 | BLOCKED | The one-line fix (`pendingMap.clear()` inside `clear()`) lives in `vanilla/core/src/store.ts` — core is zero-diff territory for this arc. Verified still present (clear() swaps the four WeakMaps, `pendingMap` survives). Needs a core-owner pass. | — |
+| C-7 | FIXED (defensive) | Owner approved the core change 2026-06-13: `pendingMap.clear()` inside `clear()`. Fix-pass finding: not observable at the current public API (sub() pre-flushes; reads are cache-first) — landed as a defensive fence with a clear-drops-pending test. See § C-7 for the honesty note. | `vanilla/core/src/store.ts`, `vanilla/core/test/store.test.ts` |
 | D-6 | **FIXED** | `removeSheet` / `moveSheet` shift the sheet indices captured by import/export/snapshot sessions and engine cell subscriptions — later chunks read/write the WRONG sheet, dirty events report stale indices. Both ops now route `invalidateSheetIndexedState` (sessions cleared → next RPC fails loudly with `*_SESSION_MISSING`; engine tokens unsubscribed). `addSheet`/`renameSheet` keep indices stable and deliberately do not invalidate (pinned). | `solid/excel/src-vnext/adapter/worker-runtime.ts`, `solid/excel/test/wasm-workbook-worker.test.ts` |
 | D-9 | **FIXED** | Every single-cell write scanned ALL `readFormulaCells` entries (all sheets) with `startsWith` — O(host-read formulas) per keystroke. Re-keyed as `Map<sheetIdx, Set<'r:c'>>`: invalidation is one `Map.delete`, and the pin asserts a write does NOT over-invalidate other sheets' read state. | `solid/excel/src-vnext/adapter/worker-runtime-ts.ts`, `solid/excel/test/audit-adapter-scaling.test.ts` |
 | D-10 | SUPERSEDED | Fixed in W3 at the band level (contiguous-band `deleteRows` RPCs, pinned: [3,4,5,1,9,8,12,4] → 4 RPCs). The true single-RPC batch stays tracked in-code (`TODO einfach-excel-core#batch-delete-rows`) for the engine arc. | — |
@@ -668,7 +668,7 @@ green (31 suites / 1811 tests) with the pins included.
   and a new `store.evict(atom)` in vanilla/core that runs
   `clearDependencies` + drops `atomStateMap`/`listenersMap` entries.
 
-#### C-7 · P-D · **P3** — `store.clear()` misses `pendingMap`
+#### C-7 · P-D · **P3 — FIXED (defensive, 2026-06-13, owner-approved core change)**
 
 - `vanilla/core/src/store.ts:277-282`: `clear()` replaces the four
   WeakMaps but `pendingMap` (`:23`, a regular `Map`) is untouched. A
@@ -677,7 +677,18 @@ green (31 suites / 1811 tests) with the pins included.
   against the fresh (empty) state. Low severity — requires clear()
   mid-mutation — but it is the same "parallel table missed by teardown"
   shape codex flagged in Rust.
-- Fix sketch: `pendingMap.clear()` inside `clear()`.
+- **FIXED** as the sketch: `pendingMap.clear()` inside `clear()`
+  (owner approved the zero-diff exception). Severity honesty note from
+  the fix pass: at the CURRENT public API the stale entries are not
+  observable — `subscribeAtom` unconditionally runs `flushPending()`
+  before installing the listener (draining stale entries against empty
+  listener/backDep maps), reads are cache-first, and a new-world
+  read/write of the same atom replaces the stale same-key entry. So the
+  pre-fix damage reduces to seeding initial values into the fresh
+  `atomStateMap`. The fix + the `store.test.ts` clear-drops-pending
+  test stand as a defensive fence: they keep the invariant honest if
+  the flush/subscribe paths ever change (e.g. removing sub's pre-flush
+  would otherwise turn this into phantom listener fires).
 
 #### C-8 · wire-type caveat · **P2 — FIXED (W3)**
 
@@ -729,7 +740,7 @@ green (31 suites / 1811 tests) with the pins included.
 |---|---|---|
 | P1 | 2 | C-1 (clone/edit) **FIXED**, C-2 (flush fan-out) **FIXED** |
 | P2 | 5 | C-3 **CLOSED** (deliberate-broad documented contract, W3), C-4 **FIXED** (importCells null-wire loop residual, cheap), C-5 **FIXED**, C-6 **FIXED**, C-8 **FIXED** (W3, typed bulkApply) |
-| P3 | 1 | C-7 (open — BLOCKED in the P3 triage 2026-06-13: the one-line fix lives in `vanilla/core/src/store.ts`, zero-diff territory; needs a core-owner pass) |
+| P3 | 0 | — (C-7 closed 2026-06-13 with owner approval; see triage table) |
 
 Headline (P1s + C-6 resolved as of W2.2 `d98409c`): a keystroke on a
 1M-cell sheet WAS **~108 ms** of Map clone (C-1) plus, with 100k read
@@ -738,8 +749,9 @@ formulas, **~503 ms** of synchronous re-evaluation (C-2), composing to
 count == true dependent count, pinned), and overwritten formulas no
 longer leave drag (C-6). The TS port now matches the Rust engine at
 mutation time too: storage primary, per-cell reverse deps hydrated on
-read, dirty O(dependents). Remaining open items: C-7 (C-3 closed
-as documented contract, C-8 fixed via typed bulkApply — both W3).
+read, dirty O(dependents). Remaining open items: none — C-7 closed
+2026-06-13 with owner approval (C-3 closed as documented contract,
+C-8 fixed via typed bulkApply — both W3).
 C-4 closed by W2.4 (`e507222`): the
 range loop shape is gone too — `Workbook.clearRange` walks existing
 cells in ONE postWrite batch (importCells' bounded null-wire loop is

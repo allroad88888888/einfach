@@ -279,6 +279,10 @@ export function createStore(): Store {
     listenersMap = new WeakMap()
     backDependenciesMap = new WeakMap()
     dependenciesMap = new WeakMap()
+    // 异步 setter 把 flushPending 推迟到 .finally；clear() 不清 pendingMap
+    // 的话，旧世界的待刷新条目会在 clear 之后触发 getAtomState /
+    // dependenciesChange，把已清除的 atom 重新物化进新的状态表。
+    pendingMap.clear()
   }
 
   const store = {
