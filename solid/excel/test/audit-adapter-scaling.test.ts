@@ -32,6 +32,9 @@
  *  - D-8  P-A  **FIXED** worker-runtime-ts range readers enumerate
  *         window ∩ existing via `collectCellsInBounds` (coordinate probe
  *         for viewport windows, sparse map walk for huge ranges).
+ *  - D-9  P-A  **FIXED** worker-runtime-ts keys `readFormulaCells` per
+ *         sheet — write-time invalidation is one Map.delete, not a
+ *         startsWith scan over every host-read formula on every sheet.
  *  - D-10 P-B  **FIXED** worker-workbook-backend removeRows groups the
  *         descending row list into contiguous bands — one deleteRows RPC
  *         per band instead of per row.
@@ -280,6 +283,33 @@ describe('audit D-5 · P-D · FIXED — TS runtime sheet ops drop index-keyed ho
     await expect(
       rpc({ cmd: 'nextSnapshotRangeSparseChunk', sessionId: snapshotSession.sessionId }),
     ).rejects.toThrow('SNAPSHOT_SESSION_MISSING')
+  })
+})
+
+describe('audit D-9 · P-A · FIXED — read-invalidation is one Map.delete per write, keyed per sheet', () => {
+  test('a write invalidates exactly its own sheet: other sheets keep their host-read state', async () => {
+    const { rpc } = makeRpc()
+    await rpc({ cmd: 'initWorkbook', sheets: ['S1', 'S2'] })
+
+    // Host-read formulas on BOTH sheets.
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=1+1' })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 1, addr: 'A1', formula: '=2+2' })
+    await rpc({
+      cmd: 'readCells',
+      cells: [
+        { sheet: 0, addr: 'A1' },
+        { sheet: 1, addr: 'A1' },
+      ],
+    })
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'A1' })).toBe('clean')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
+
+    // One write on S1. The per-sheet keying drops S1's whole read set in
+    // one Map.delete (no scan over other sheets' entries) — and must NOT
+    // over-invalidate S2.
+    await rpc({ cmd: 'setCell', sheet: 0, addr: 'B1', value: { type: 'number', value: 5 } })
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'A1' })).toBe('dirty')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
   })
 })
 

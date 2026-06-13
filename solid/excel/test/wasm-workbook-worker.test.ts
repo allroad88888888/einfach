@@ -2428,3 +2428,99 @@ describe('wasm-workbook-worker import session contract', () => {
     }
   })
 })
+
+describe('audit D-6 · P-D · FIXED — WASM runtime sheet ops drop index-keyed sessions and subscriptions', () => {
+  async function beginAllSessions(harness: ReturnType<typeof withMockedWorker>) {
+    await harness.send({ id: 10, cmd: 'beginImport', sessionId: 41 })
+    const exportSession = await harness.send<{ sessionId: number }>({
+      id: 11,
+      cmd: 'beginExportRangeTsv',
+      range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+    })
+    const snapshotSession = await harness.send<{ sessionId: number }>({
+      id: 12,
+      cmd: 'beginSnapshotRangeSparse',
+      range: { sheet: 0, startRow: 0, startCol: 0, endRow: 0, endCol: 0 },
+    })
+    await harness.send({ id: 13, cmd: 'subscribeCells', subId: 5, cells: [{ sheet: 0, addr: 'A1' }] })
+    return { exportSession, snapshotSession }
+  }
+
+  async function expectSessionsGone(
+    harness: ReturnType<typeof withMockedWorker>,
+    sessions: { exportSession: { sessionId: number }; snapshotSession: { sessionId: number } },
+  ) {
+    await expect(harness.send({ id: 20, cmd: 'commitImport', sessionId: 41 })).rejects.toMatchObject(
+      { code: 'IMPORT_SESSION_MISSING' },
+    )
+    await expect(
+      harness.send({
+        id: 21,
+        cmd: 'nextExportRangeTsvChunk',
+        sessionId: sessions.exportSession.sessionId,
+      }),
+    ).rejects.toMatchObject({ code: 'EXPORT_SESSION_MISSING' })
+    await expect(
+      harness.send({
+        id: 22,
+        cmd: 'nextSnapshotRangeSparseChunk',
+        sessionId: sessions.snapshotSession.sessionId,
+      }),
+    ).rejects.toMatchObject({ code: 'SNAPSHOT_SESSION_MISSING' })
+  }
+
+  it('removeSheet invalidates in-flight sessions and engine subscriptions', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 1, cmd: 'initWorkbook', sheets: ['Sheet1', 'Sheet2', 'Sheet3'] })
+      const sessions = await beginAllSessions(harness)
+      expect(harness.calls.mainSubscribeTokens().length).toBe(1)
+
+      await harness.send({ id: 14, cmd: 'removeSheet', sheet: 1 })
+
+      // Sessions captured sheet INDICES; indices shifted, so later
+      // chunks would have read/written the wrong sheet. They must
+      // fail loudly instead.
+      await expectSessionsGone(harness, sessions)
+      // Engine-side subscriptions are dropped too — their dirty
+      // callbacks captured the pre-removal index.
+      expect(harness.calls.mainUnsubscribeTokens()).toEqual(harness.calls.mainSubscribeTokens())
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('moveSheet invalidates in-flight sessions and engine subscriptions', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 1, cmd: 'initWorkbook', sheets: ['Sheet1', 'Sheet2', 'Sheet3'] })
+      const sessions = await beginAllSessions(harness)
+
+      await harness.send({ id: 14, cmd: 'moveSheet', from: 0, to: 2 })
+
+      await expectSessionsGone(harness, sessions)
+      expect(harness.calls.mainUnsubscribeTokens()).toEqual(harness.calls.mainSubscribeTokens())
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('addSheet and renameSheet keep existing indices stable and do NOT invalidate', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 1, cmd: 'initWorkbook', sheets: ['Sheet1', 'Sheet2'] })
+      await harness.send({ id: 10, cmd: 'beginImport', sessionId: 42 })
+
+      await harness.send({ id: 14, cmd: 'addSheet', name: 'Sheet3' })
+      await harness.send({ id: 15, cmd: 'renameSheet', sheet: 0, name: 'Renamed' })
+
+      // addSheet appends and renameSheet changes names only — the
+      // staged session's indices are still valid, so it survives.
+      await expect(
+        harness.send({ id: 16, cmd: 'commitImport', sessionId: 42 }),
+      ).resolves.toBeDefined()
+    } finally {
+      harness.dispose()
+    }
+  })
+})

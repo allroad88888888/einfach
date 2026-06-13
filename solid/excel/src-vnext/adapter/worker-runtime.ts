@@ -322,6 +322,27 @@ function resetSubscriptions(wb?: WasmWorkbookRuntime) {
   subscriptionTokens.clear()
 }
 
+/**
+ * Audit D-6: import/export/snapshot sessions and live cell
+ * subscriptions all hold SHEET INDICES captured at begin/subscribe
+ * time. `removeSheet` / `moveSheet` shift those indices, so a
+ * surviving session would read or write the WRONG sheet in later
+ * chunks and a surviving subscription would post dirty events with a
+ * stale index. Drop them: the next session RPC fails loudly with
+ * IMPORT_SESSION_MISSING / EXPORT_SESSION_MISSING /
+ * SNAPSHOT_SESSION_MISSING and hosts re-subscribe against the new
+ * layout. The id counters keep counting up so a stale id can never
+ * collide with a new session. `addSheet` (appends) and `renameSheet`
+ * (names only) keep existing indices stable and deliberately do NOT
+ * invalidate.
+ */
+function invalidateSheetIndexedState(wb: WasmWorkbookRuntime) {
+  resetSubscriptions(wb)
+  importSessions.clear()
+  exportSessions.clear()
+  snapshotSessions.clear()
+}
+
 function resetWorkbook(sheets?: string[]): WasmWorkbookRuntime {
   resetSubscriptions(workbook)
   importSessions.clear()
@@ -1168,7 +1189,13 @@ export function installWorkerRuntime() {
           postResponse(msg.id, wb.rename_sheet(Number(msg.sheet), String(msg.name ?? '')))
           break
         case 'removeSheet':
-          postResponse(msg.id, wb.remove_sheet(Number(msg.sheet)))
+          {
+            const removed = wb.remove_sheet(Number(msg.sheet))
+            // Audit D-6: sheet indices shifted — sessions/subscriptions
+            // keyed by index must not survive.
+            if (removed) invalidateSheetIndexedState(wb)
+            postResponse(msg.id, removed)
+          }
           break
         case 'moveSheet':
           {
@@ -1176,7 +1203,10 @@ export function installWorkerRuntime() {
             const to = normalizeStructuralIndex(msg.to, 'target sheet index')
             assertSheet(wb, from)
             assertSheet(wb, to)
-            postResponse(msg.id, assertMethod(wb, 'move_sheet').call(wb, from, to))
+            const moved = assertMethod(wb, 'move_sheet').call(wb, from, to)
+            // Audit D-6: same index-shift invalidation as removeSheet.
+            if (from !== to) invalidateSheetIndexedState(wb)
+            postResponse(msg.id, moved)
           }
           break
         case 'setCell':

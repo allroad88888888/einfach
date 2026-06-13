@@ -47,6 +47,34 @@ restore/recalc/atoms), C (TS port), D (UI core + adapters).
 
 P3s tracked in section bodies; revisit after Wave 3.
 
+### P3 triage (2026-06-13)
+
+All 13 P3s triaged post-Wave-3. Verdicts: FIX = landed in this pass;
+SUPERSEDED = already resolved by an earlier wave (commit noted);
+WONT-FIX = deliberate, with reason; BLOCKED = fix lives in
+do-not-touch territory for this arc.
+
+| ID | verdict | justification | files touched |
+|---|---|---|---|
+| A-8 | **FIXED** | `spilled_into_anchor` / `is_target_occupied` sit on EVERY single-cell write; one `=SEQUENCE(100000)` made each keystroke O(targets) compares + O(cells) anchor reverse-scan. Replaced with a reverse index `spill_target_anchor: target → (anchor_atom, anchor_addr)` maintained in lockstep at the four `spill_targets` mutation sites — both guards are now O(1) probes. Lockstep invariant pinned in S5 via `debug_spill_reverse_index_len`. | `rust/excel-core/src/sheet.rs`, `rust/excel-core/tests/scale_suite.rs` |
+| A-9 | **FIXED** (remainder) | The A-3 fix left the WORKBOOK loader's clear path on strings: `Workbook::clear_range` `to_string()`-ed every typed address only for `WorkbookLoader::clear_cell` to re-parse it, and `WorkbookOp::ClearCell` carried the string into a SECOND parse at sheet replay. `ClearCell` now carries `CellAddress`; new typed `clear_cell_at` entry; replay routes `BulkLoader::set_cell_at`. One alloc + two parses per cleared cell gone. | `rust/excel-core/src/workbook.rs` |
+| B-5 | **FIXED** | Both halves, per the fix sketch: `BulkLoader::flush` early-outs its reattach + touched ∪ dirty notify-set build when `cell_subscriptions` is empty; `WorkbookLoader::flush` skips BFS seeding when the cross-sheet reverse maps hold zero edges. A 1M-cell `restore_sparse` no longer pays ~3M hash ops to conclude nobody is watching. Counter probes (`debug_bulk_notify_probe_count`, `debug_loader_bfs_seed_count`) + new scale test S12 pin zero-when-unwatched and change-proportional-when-armed. | `rust/excel-core/src/sheet.rs`, `rust/excel-core/src/workbook.rs`, `rust/excel-core/tests/scale_suite.rs` |
+| B-6 | WONT-FIX | Deliberate, documented O(F_hydrated) sledgehammer with the per-name reverse-index upgrade path already recorded in-code; parked formulas are skipped so fresh imports are near-free. No workload shows it hot — building the reverse index now is risk without measured benefit. Stays watch-list. | — |
+| B-7 | SUPERSEDED | Resolved in W2.3 `1d71ecf`: additive contract documented on the `restore_sparse` docstring (load-bearing for legacy sheet-store undo); B-1's reroute scoped to `restore_persistence_v1` only. | — |
+| B-8 | WONT-FIX | Arbitrary-cell-list reads are bounded by viewport/subscription size (~10³) with no measured cost; a `read_cells` batch export means new WASM pkg surface + rebuild for a marginal win. Revisit if a profile shows the boundary hot. | — |
+| C-7 | BLOCKED | The one-line fix (`pendingMap.clear()` inside `clear()`) lives in `vanilla/core/src/store.ts` — core is zero-diff territory for this arc. Verified still present (clear() swaps the four WeakMaps, `pendingMap` survives). Needs a core-owner pass. | — |
+| D-6 | **FIXED** | `removeSheet` / `moveSheet` shift the sheet indices captured by import/export/snapshot sessions and engine cell subscriptions — later chunks read/write the WRONG sheet, dirty events report stale indices. Both ops now route `invalidateSheetIndexedState` (sessions cleared → next RPC fails loudly with `*_SESSION_MISSING`; engine tokens unsubscribed). `addSheet`/`renameSheet` keep indices stable and deliberately do not invalidate (pinned). | `solid/excel/src-vnext/adapter/worker-runtime.ts`, `solid/excel/test/wasm-workbook-worker.test.ts` |
+| D-9 | **FIXED** | Every single-cell write scanned ALL `readFormulaCells` entries (all sheets) with `startsWith` — O(host-read formulas) per keystroke. Re-keyed as `Map<sheetIdx, Set<'r:c'>>`: invalidation is one `Map.delete`, and the pin asserts a write does NOT over-invalidate other sheets' read state. | `solid/excel/src-vnext/adapter/worker-runtime-ts.ts`, `solid/excel/test/audit-adapter-scaling.test.ts` |
+| D-10 | SUPERSEDED | Fixed in W3 at the band level (contiguous-band `deleteRows` RPCs, pinned: [3,4,5,1,9,8,12,4] → 4 RPCs). The true single-RPC batch stays tracked in-code (`TODO einfach-excel-core#batch-delete-rows`) for the engine arc. | — |
+| D-11 | **FIXED** | `getConditionalFormatForCell` re-allocated + re-sorted the rule list per projected cell — O(window × rules·log rules) + a window's worth of array allocations per read. Sort hoisted into `applyConditionalFormatOverlay` (once per overlay application); behavior unchanged (stable sort, same priority order), covered by the existing conditional-format suites. | `solid/excel/src-vnext/adapter/worker-workbook-backend.ts` |
+| D-12 | SUPERSEDED | Fixed in W3: `replaceAllCappedAtom` + the "Replaced first N of M" dialog surface; unit-pinned in `vanilla/spreadsheet-ui-core/test/find-replace.test.ts`. | — |
+| D-13 | WONT-FIX | `rebuildPreservingCells` is a documented TS-core limitation — the real fix is live structural sheet ops in `@einfach/excel-core-ts` (engine arc), not adapter work; a partial adapter workaround would duplicate engine semantics for a rare op. D-5's fix already made the rebuild's state hygiene correct. | — |
+
+Verification (2026-06-13): `cargo test --lib` 1404 passed / `--tests`
+283 passed across 30 binaries (incl. new S12 + extended S5);
+`npx jest solid/excel --no-coverage` 58 suites / 876 passed (incl. the
+new D-6 + D-9 pins); `npx tsc -b` clean.
+
 ### Ordering rationale
 
 Wave 1 items are silent-wrong-value or abort-class bugs reachable from
@@ -334,8 +362,17 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
   rewritten formula. Alternative minimal fix: keep names stale but at
   least dirty + notify the formulas that referenced the renamed sheet.
 
-#### A-8 · P-A · **P3** — `spilled_into_anchor` linear scans on every single-cell write
+#### A-8 · P-A · **P3** — `spilled_into_anchor` linear scans on every single-cell write — **FIXED**
 
+- **FIXED** (P3 triage 2026-06-13): the fix sketch landed — reverse
+  index `spill_target_anchor: HashMap<CellAddress, (AtomId,
+  CellAddress)>` maintained at the same insert/remove sites as
+  `spill_targets` (`register_spill` / `clear_spill` /
+  `bulk_install_storage` teardown). `spilled_into_anchor` is one map
+  probe; `is_target_occupied`'s cross-anchor collision check is too.
+  Lockstep invariant pinned in scale-suite S5 via
+  `debug_spill_reverse_index_len() == debug_spill_target_count()`
+  across install / structural shift / teardown.
 - `sheet.rs:1602-1618` — every `try_set_cell` / `try_set_formula`
   (`:2188/:2331`) scans ALL spill target lists; on a hit it
   reverse-scans the ENTIRE `cells` map to find the anchor address.
@@ -346,8 +383,15 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
 - Fix sketch: maintain the reverse index `target_addr → anchor_addr`
   alongside `spill_targets` (same insert/remove sites).
 
-#### A-9 · P-B · **P3** — `clear_range` round-trips every address through strings
+#### A-9 · P-B · **P3** — `clear_range` round-trips every address through strings — **FIXED**
 
+- **FIXED** (sheet half folded into A-3's fix; workbook remainder in
+  the P3 triage 2026-06-13): `WorkbookOp::ClearCell` now carries a
+  typed `CellAddress`, `WorkbookLoader` gained `clear_cell_at`, and
+  `Workbook::clear_range` collects typed addresses — the
+  `to_string()` → parse → parse-again chain is gone from the clear
+  path. (`SetCell`/`SetFormula` ops still carry strings: their
+  producers are the public string APIs, so no round trip exists.)
 - `sheet.rs:3369-3373` / `workbook.rs:1238-1244` — the sparse scan
   yields typed `CellAddress`es, which are `to_string()`-ed only to be
   re-`parse`d inside `BulkLoader::set_cell` / `loader.clear_cell`. One
@@ -398,15 +442,15 @@ should expect a multi-x multiplier on top. `cargo test --lib` green
 |---|---|---|
 | P1 | 4 | A-1 (insert_row O(all formulas)) **FIXED**, A-4 (clear_range panic) **FIXED**, A-5 (spill_targets not relocated) **FIXED**, A-6 (remove_sheet kills fanout) **FIXED** |
 | P2 | 3 | A-2 (move_sheet full parse) **FIXED**, A-3 (1-cell clear O(sheet)) **FIXED**, A-7 (rename_sheet silent) **FIXED** |
-| P3 | 2 | A-8 (open), A-9 (folded into A-3's fix — typed loader entry landed; the workbook loader's string addresses remain) |
+| P3 | 2 | A-8 **FIXED** (P3 triage 2026-06-13, reverse spill index), A-9 **FIXED** (sheet half via A-3; workbook remainder via typed `ClearCell`, P3 triage 2026-06-13) |
 
 Headline (all resolved as of W2.1 `0ca3a16`): one `insert_row` on a
 500k-formula sheet WAS **2.09 s** native and left the sheet eager
 forever — now **127 ms** with the dep graph untouched; `clear_range`
 over a spill no longer panics (W1.1); removing an unrelated sheet no
-longer silences cross-sheet notify (W1.2). Section A's only open item
-is A-8 (spilled_into_anchor linear scan, theoretical until large
-spills are common).
+longer silences cross-sheet notify (W1.2). Section A is fully closed as
+of the P3 triage 2026-06-13 (A-8 reverse spill index, A-9 typed clear
+path).
 
 ## C — TS port (vanilla/excel-core-ts + core store)
 
@@ -685,7 +729,7 @@ green (31 suites / 1811 tests) with the pins included.
 |---|---|---|
 | P1 | 2 | C-1 (clone/edit) **FIXED**, C-2 (flush fan-out) **FIXED** |
 | P2 | 5 | C-3 **CLOSED** (deliberate-broad documented contract, W3), C-4 **FIXED** (importCells null-wire loop residual, cheap), C-5 **FIXED**, C-6 **FIXED**, C-8 **FIXED** (W3, typed bulkApply) |
-| P3 | 1 | C-7 (open) |
+| P3 | 1 | C-7 (open — BLOCKED in the P3 triage 2026-06-13: the one-line fix lives in `vanilla/core/src/store.ts`, zero-diff territory; needs a core-owner pass) |
 
 Headline (P1s + C-6 resolved as of W2.2 `d98409c`): a keystroke on a
 1M-cell sheet WAS **~108 ms** of Map clone (C-1) plus, with 100k read
@@ -852,8 +896,18 @@ worker runtimes, protocol client).
   structural sheet op (sessions already carry ids — add a workbook
   generation counter).
 
-#### D-6 · P-D · **P3** — WASM runtime sheet ops vs sessions/subscriptions
+#### D-6 · P-D · **P3** — WASM runtime sheet ops vs sessions/subscriptions — **FIXED**
 
+- **FIXED** (P3 triage 2026-06-13): `removeSheet` / `moveSheet` — the
+  index-shifting ops — now route `invalidateSheetIndexedState`:
+  the three session tables are cleared (next session RPC fails loudly
+  with `IMPORT/EXPORT/SNAPSHOT_SESSION_MISSING`, D-5 parity) and
+  engine cell subscriptions are unsubscribed (their dirty callbacks
+  captured pre-op indices). `addSheet` (appends) and `renameSheet`
+  (names only) keep indices stable and deliberately do NOT invalidate.
+  Pinned in `solid/excel/test/wasm-workbook-worker.test.ts` (audit D-6
+  describe: remove, move, and the add/rename non-invalidation).
+  Original finding below.
 - `worker-runtime.ts:1164-1180` — addSheet/renameSheet/removeSheet/
   moveSheet don't invalidate `importSessions`/`exportSessions`/
   `snapshotSessions` (:211-213, all sheet-idx-keyed) nor
@@ -917,8 +971,15 @@ worker runtimes, protocol client).
 - Fix sketch: row-bucketed index on the TS side, or push range queries
   into `@einfach/excel-core-ts` (it owns the map already).
 
-#### D-9 · P-A · **P3** — `invalidateReadOnMutation` scans the whole host-read set per write
+#### D-9 · P-A · **P3** — `invalidateReadOnMutation` scans the whole host-read set per write — **FIXED**
 
+- **FIXED** (P3 triage 2026-06-13): the fix sketch as written —
+  `readFormulaCells` is now `Map<sheetIdx, Set<'r:c'>>`
+  (`markFormulaRead` / `hasFormulaRead` helpers); the per-write wipe is
+  one `Map.delete`. Pinned in `audit-adapter-scaling.test.ts` (audit
+  D-9 describe): a write dirties its own sheet's probe and does NOT
+  over-invalidate another sheet's host-read state. Original finding
+  below.
 - `worker-runtime-ts.ts:417-428` — every single-cell write iterates ALL
   `readFormulaCells` entries (all sheets) doing string `startsWith`.
   O(host-read formulas) per keystroke. Fix: `Map<sheetIdx, Set>` so the
@@ -945,8 +1006,13 @@ worker runtimes, protocol client).
   :1220-1245) — recorded here so the batch primitive lands with the
   engine arc.
 
-#### D-11 · P-A · **P3** — conditional-format overlay re-sorts the rule list per cell
+#### D-11 · P-A · **P3** — conditional-format overlay re-sorts the rule list per cell — **FIXED**
 
+- **FIXED** (P3 triage 2026-06-13): sort hoisted into
+  `applyConditionalFormatOverlay` — one `[...rules].sort` per overlay
+  application; `getConditionalFormatForCell` now takes the pre-ordered
+  list. Behavior unchanged (stable sort, same priority order), covered
+  by the existing conditional-format suites. Original finding below.
 - `worker-workbook-backend.ts:429-443` — `getConditionalFormatForCell`
   does `[...rules].sort(...)` and it's invoked per projected cell from
   `applyConditionalFormatOverlay` (:445-462). O(window × rules·log rules)
@@ -1022,9 +1088,11 @@ never sees.
 
 Severity count: **P1 ×1** (D-1 **FIXED** W2.4) · **P2 ×6** (D-2 **FIXED** W3, D-3,
 D-4 **FIXED** W3, D-5 **FIXED** W3, D-7 **FIXED** W3, D-8 **FIXED** W3) ·
-**P3 ×6** (D-6, D-9, D-10* **FIXED** W3 at the band level, D-11,
-D-12 **FIXED** W3, D-13) — *D-10 is P2 impact
-but already tracked in-code; counted at P3 to avoid double-reporting.
+**P3 ×6** (D-6 **FIXED** P3 triage 2026-06-13, D-9 **FIXED** P3 triage
+2026-06-13, D-10* **FIXED** W3 at the band level, D-11 **FIXED** P3
+triage 2026-06-13, D-12 **FIXED** W3, D-13 WONT-FIX engine-arc gap) —
+*D-10 is P2 impact but already tracked in-code; counted at P3 to avoid
+double-reporting.
 
 ## B — Restore / recalc / atoms (Rust)
 
@@ -1204,8 +1272,18 @@ and fix sketch; no separate severity counted here.
   existing latch philosophy. Precise per-cell edges are the bigger
   follow-up.
 
-#### B-5 · P-B · **P3** — legacy flush notify is O(touched), not O(touched ∩ subscribed)
+#### B-5 · P-B · **P3** — legacy flush notify is O(touched), not O(touched ∩ subscribed) — **FIXED**
 
+- **FIXED** (P3 triage 2026-06-13): the "if the legacy loader stays"
+  fix sketch landed in both halves — `BulkLoader::flush` early-outs
+  the reattach loop and the touched ∪ dirty notify-set build when
+  `cell_subscriptions` is empty, and `WorkbookLoader::flush` skips BFS
+  seeding when the cross-sheet reverse maps (`cell_dependents` +
+  `range_index_per_sheet`) hold zero edges. Counter probes
+  (`Sheet::debug_bulk_notify_probe_count`,
+  `Workbook::debug_loader_bfs_seed_count`) + scale-suite S12 pin
+  zero-when-unwatched and change-proportional-when-armed (subscriber
+  fires, seeds == touched of THAT batch).
 - `BulkLoader::flush` (`sheet.rs:4532-4551`): `attach_address_sub` per
   touched address, then `notify_targets = touched ∪ dirty` hash-set
   build + `has_address_subscribers` check per entry. A 1M-cell restore
@@ -1303,6 +1381,7 @@ and fix sketch; no separate severity counted here.
 ### Severity tally
 
 **P1 ×2** (B-1 **FIXED** W2.3 persistence path, B-4 **FIXED** W1.3) ·
-**P2 ×1** (B-2 **FIXED** W3 lazy atomization) · **P3 ×4** (B-5 partially
-subsumed by B-1's reroute, B-6, B-7 **RESOLVED** documented-additive,
-B-8) — B-3 corroborates A-1, not double-counted.
+**P2 ×1** (B-2 **FIXED** W3 lazy atomization) · **P3 ×4** (B-5 **FIXED**
+P3 triage 2026-06-13, B-6 WONT-FIX watch-list, B-7 **RESOLVED**
+documented-additive, B-8 WONT-FIX bounded) — B-3 corroborates A-1, not
+double-counted.

@@ -146,12 +146,26 @@ interface RuntimeState {
    * at the worker boundary we mark a cell 'dirty' whenever the host
    * hasn't observed it since the last mutation. Reads add entries here;
    * writes/clears remove them.
+   *
+   * Keyed sheetIdx → set of `row:col` (audit D-9): every single-cell
+   * write invalidates one whole sheet, so the per-write cost must be
+   * one `Map.delete`, not a `startsWith` scan over every host-read
+   * formula on every sheet.
    */
-  readFormulaCells: Set<string>
+  readFormulaCells: Map<number, Set<string>>
 }
 
-function makeReadKey(sheetIdx: number, row: number, col: number): string {
-  return `${sheetIdx}:${row}:${col}`
+function markFormulaRead(state: RuntimeState, sheetIdx: number, row: number, col: number) {
+  let keys = state.readFormulaCells.get(sheetIdx)
+  if (!keys) {
+    keys = new Set()
+    state.readFormulaCells.set(sheetIdx, keys)
+  }
+  keys.add(`${row}:${col}`)
+}
+
+function hasFormulaRead(state: RuntimeState, sheetIdx: number, row: number, col: number): boolean {
+  return state.readFormulaCells.get(sheetIdx)?.has(`${row}:${col}`) ?? false
 }
 
 type RequestMessage = {
@@ -186,7 +200,7 @@ function createInitialState(): RuntimeState {
     nextImportSessionId: 1,
     snapshotSessions: new Map(),
     nextSnapshotSessionId: 1,
-    readFormulaCells: new Set(),
+    readFormulaCells: new Map(),
   }
 }
 
@@ -424,10 +438,10 @@ function invalidateReadOnMutation(state: RuntimeState, sheetIdx: number) {
   // probe checks the host-read set; reads after the mutation re-mark
   // cells clean. Cross-sheet ripple is matched implicitly because the
   // probe sees 'dirty' for any cell the host hasn't re-read.
-  const prefix = `${sheetIdx}:`
-  for (const key of state.readFormulaCells) {
-    if (key.startsWith(prefix)) state.readFormulaCells.delete(key)
-  }
+  //
+  // One Map.delete per write (audit D-9) — the read set is keyed per
+  // sheet so this never scans entries belonging to other sheets.
+  state.readFormulaCells.delete(sheetIdx)
 }
 
 function setCellFromWire(
@@ -708,7 +722,7 @@ function readSparseRange(state: RuntimeState, range: SparseRangeWire): CellSnaps
   for (const snapshot of out) {
     if (snapshot.formula) {
       const coord = parseA1(snapshot.addr)
-      if (coord) state.readFormulaCells.add(makeReadKey(sheet.idx, coord.row, coord.col))
+      if (coord) markFormulaRead(state, sheet.idx, coord.row, coord.col)
     }
   }
   return out
@@ -1337,7 +1351,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
         state.nextImportSessionId = 1
         state.snapshotSessions = new Map()
         state.nextSnapshotSessionId = 1
-        state.readFormulaCells = new Set()
+        state.readFormulaCells = new Map()
         return listSheetMeta(state)
       }
       case 'sheetList':
@@ -1500,7 +1514,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
           }
           const snapshot = readCellSnapshot(state, sheet, coord.row, coord.col)
           if (snapshot.formula) {
-            state.readFormulaCells.add(makeReadKey(sheet.idx, coord.row, coord.col))
+            markFormulaRead(state, sheet.idx, coord.row, coord.col)
           }
           return snapshot
         })
@@ -1625,7 +1639,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
           state.importSessions = new Map()
           state.snapshotSessions = new Map()
           state.nextSnapshotSessionId = 1
-          state.readFormulaCells = new Set()
+          state.readFormulaCells = new Map()
           const cells = snapshot?.cells ?? []
           const importable: ImportCellWire[] = cells.map((c) => {
             switch (c.kind) {
@@ -1696,8 +1710,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
         // signal: if the host has read the cell since the last mutation
         // on this sheet, the host has observed a value the engine just
         // produced → 'clean'. Otherwise 'dirty'.
-        const key = makeReadKey(sheetIdx, coord.row, coord.col)
-        return state.readFormulaCells.has(key) ? 'clean' : 'dirty'
+        return hasFormulaRead(state, sheetIdx, coord.row, coord.col) ? 'clean' : 'dirty'
       }
       case 'debugFormulaEvalCount':
         return state.workbook.debugFormulaEvalCount(Number(msg.sheet))
@@ -1767,7 +1780,7 @@ function rebuildPreservingCells(
   // Audit D-5: the rebuild swapped in a FRESH workbook — every cached
   // formula value was dropped and sheet indices may have shifted. Sheet-
   // index-keyed host state must not survive the op:
-  //  - `readFormulaCells`: stale `${oldIdx}:r:c` keys would make
+  //  - `readFormulaCells`: stale old-index entries would make
   //    `debugFormulaCacheState` report 'clean' for a never-observed
   //    formula on whichever sheet shifted into the old slot.
   //  - `importSessions`: staged `ImportCellWire.sheet` indices would
@@ -1778,7 +1791,7 @@ function rebuildPreservingCells(
   // INVALID_IMPORT_SESSION / SNAPSHOT_SESSION_MISSING so the host
   // restarts against the new sheet layout. The session-id counters keep
   // counting up, so a stale id can never collide with a new session.
-  state.readFormulaCells = new Set()
+  state.readFormulaCells = new Map()
   state.importSessions = new Map()
   state.snapshotSessions = new Map()
 

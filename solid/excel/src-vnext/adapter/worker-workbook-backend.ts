@@ -461,14 +461,16 @@ function conditionalRuleAppliesToCell(
   }
 }
 
+// Expects `orderedRules` already sorted by priority — the sort is
+// hoisted into `applyConditionalFormatOverlay` so a window read pays it
+// once per overlay, not once per projected cell (audit D-11).
 function getConditionalFormatForCell(
   row: number,
   col: number,
   cell: DisplayCell | undefined,
-  rules: readonly ConditionalFormatRuleEntry[],
+  orderedRules: readonly ConditionalFormatRuleEntry[],
 ): SpreadsheetCellFormat | undefined {
-  const ordered = [...rules].sort((left, right) => left.priority - right.priority)
-  for (const entry of ordered) {
+  for (const entry of orderedRules) {
     if (!isCoordInsideRange(row, col, entry.scope.range)) continue
     if (!conditionalRuleAppliesToCell(entry.rule, cell)) continue
     const format = conditionalRuleFormat(entry.rule)
@@ -482,9 +484,10 @@ function applyConditionalFormatOverlay(
   rules: readonly ConditionalFormatRuleEntry[],
 ): DisplayCell[] {
   if (rules.length === 0) return cells
+  const ordered = [...rules].sort((left, right) => left.priority - right.priority)
   return cells.map((cell) => {
     const sourceRow = cell.originalRow ?? cell.row
-    const conditionalFormat = getConditionalFormatForCell(sourceRow, cell.col, cell, rules)
+    const conditionalFormat = getConditionalFormatForCell(sourceRow, cell.col, cell, ordered)
     if (!conditionalFormat) return cell
     return {
       ...cell,
