@@ -102,9 +102,11 @@ Every modal under `solid/excel/src-vnext/*/Spreadsheet*Dialog.tsx` follows the s
 
 `SpreadsheetFindReplaceDialog.tsx` is the canonical example; the conditional-formatting, data-validation, name-manager, protection-unlock, and comment-thread dialogs all mirror it.
 
-### Known limitation: solid-js 1.9.12 Provider interaction
+### Resolved: solid-js single-instance requirement (was "1.9.12 Provider interaction")
 
-`solid/excel` resolves `solid-js@1.9.12`, while `solid/solid` resolves `1.9.5`. Under 1.9.12, a consumer component body wrapped in `Provider` re-executes on atom mutations instead of running once. The pinned contract test is `solid/solid/test/provider-remount.test.tsx`. Workaround for now: keep per-instance state in atoms (not `let` locals in the component body) so re-execution does not lose state. Version alignment is tracked as a separate investigation arc; do not refactor around it without coordinating.
+Root cause (investigated 2026-06-13): the consumer-body re-execution under `Provider` was never a solid-js version bug — it was **two physical copies of solid-js in one process** (historically `solid/solid` → 1.9.5, `solid/excel` → 1.9.12). Copy A's `createProvider` wraps children in copy A's `children()` memo; the consumer instantiated by copy B can't untrack copy A's module-scoped `Listener`, so the children memo subscribes to consumer signals and re-runs on every atom mutation. Either version alone is fine; the split is the bug.
+
+Fixed by `2b7d65e`: root `pnpm.overrides` pins `solid-js: 1.9.12` — the lockfile must only ever contain ONE `solid-js@` resolution. Contract tests: `solid/solid/test/provider-remount.test.tsx` + `solid/excel/test/provider-remount-1912.test.tsx` (consumer body runs once per mount). If either fails or a second solid-js resolution appears in `pnpm-lock.yaml`, fix the dependency graph — do not work around it in components. Keeping per-instance dialog state in atoms is now a convention, not a requirement.
 
 ## Build Pipeline
 
