@@ -297,6 +297,13 @@ pub struct Workbook {
     /// Per-workbook (not process-global) so the assertion isn't flaky
     /// under cargo's parallel test runner.
     cycle_ast_walk_count: Cell<usize>,
+    /// AUDIT B-5 (workbook half) — counts entries seeded into
+    /// `WorkbookLoader::flush`'s cross-sheet BFS. With zero cross-sheet
+    /// reverse edges the seeding is skipped entirely and this stays
+    /// flat, so a large `bulk_load` / `clear_range` on a single-sheet
+    /// workbook never pays O(touched) queue churn to discover there are
+    /// no edges. Scale-suite probe.
+    loader_bfs_seed_count: Cell<usize>,
     /// Workbook-level defined names. Keyed by the uppercased form of the
     /// name so lookup is case-insensitive (Excel parity — `=Tax_Rate` and
     /// `=TAX_RATE` resolve to the same entry); the entry's
@@ -451,6 +458,7 @@ impl Workbook {
             by_name: HashMap::new(),
             cross_sheet: CrossSheetDeps::new(),
             cycle_ast_walk_count: Cell::new(0),
+            loader_bfs_seed_count: Cell::new(0),
             named_values: BTreeMap::new(),
             named_values_cross_sheet: Cell::new(false),
             custom_functions: None,
@@ -1305,14 +1313,16 @@ impl Workbook {
         let Some(sheet) = self.sheets.get(sheet_idx) else {
             return 0;
         };
-        let mut addrs = Vec::new();
+        let mut addrs: Vec<CellAddress> = Vec::new();
         sheet.for_each_non_empty_in_range(range, |addr| {
-            addrs.push(addr.to_string());
+            addrs.push(addr);
         });
         let count = addrs.len();
         self.bulk_load(|loader| {
             for addr in addrs {
-                loader.clear_cell(sheet_idx, &addr);
+                // Typed entry (AUDIT A-9): no `to_string` → re-parse
+                // round trip per cleared cell.
+                loader.clear_cell_at(sheet_idx, addr);
             }
         });
         count
@@ -1732,6 +1742,14 @@ impl Workbook {
         self.cycle_ast_walk_count.get()
     }
 
+    /// Cumulative seeds pushed into the `WorkbookLoader::flush`
+    /// cross-sheet BFS (AUDIT B-5). Stays flat across bulk loads on a
+    /// workbook with no cross-sheet reverse edges.
+    #[doc(hidden)]
+    pub fn debug_loader_bfs_seed_count(&self) -> usize {
+        self.loader_bfs_seed_count.get()
+    }
+
     /// Workbook-level bulk loader (Phase 3 Track I). Collects every
     /// `set_cell` / `set_formula` / `clear_cell` invocation inside the
     /// closure, suppresses per-write fanout, then at flush time:
@@ -1957,8 +1975,14 @@ enum WorkbookOp {
         source: String,
         expr: Option<Expr>,
     },
+    /// Typed address — no `String` round-trip (AUDIT A-9). The clear
+    /// path's producers (`Workbook::clear_range`'s sparse scan, the
+    /// public `clear_cell` after its own parse) always hold a
+    /// `CellAddress` already, and the sheet-side replay has a typed
+    /// entry (`BulkLoader::set_cell_at`), so carrying a string here
+    /// meant one alloc + two parses per cleared cell in a bulk path.
     ClearCell {
-        addr_str: String,
+        addr: CellAddress,
     },
 }
 
@@ -2098,23 +2122,28 @@ impl<'a> WorkbookLoader<'a> {
 
     /// Queue a clear (=write to Null) at `(sheet_idx, addr)`.
     pub fn clear_cell(&mut self, sheet_idx: usize, addr_str: &str) {
+        let Some(addr) = CellAddress::parse(addr_str) else {
+            return;
+        };
+        self.clear_cell_at(sheet_idx, addr);
+    }
+
+    /// Typed-address twin of `clear_cell` (AUDIT A-9). Bulk callers that
+    /// already hold a `CellAddress` — `Workbook::clear_range`'s sparse
+    /// scan — skip the `to_string` → re-parse round trip entirely.
+    pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: CellAddress) {
         if self.wb.is_inside_custom_call() {
             return; // re-entrancy guard (Wave 8)
         }
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
-        let Some(addr) = CellAddress::parse(addr_str) else {
-            return;
-        };
         self.touched.insert((sheet_idx, addr));
         self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
         self.ops_by_sheet
             .entry(sheet_idx)
             .or_default()
-            .push(WorkbookOp::ClearCell {
-                addr_str: addr_str.to_string(),
-            });
+            .push(WorkbookOp::ClearCell { addr });
     }
 
     /// Replay queued ops sheet-by-sheet inside each sheet's
@@ -2180,8 +2209,8 @@ impl<'a> WorkbookLoader<'a> {
                                 }
                             }
                         }
-                        WorkbookOp::ClearCell { addr_str } => {
-                            loader.set_cell(&addr_str, Value::Null);
+                        WorkbookOp::ClearCell { addr } => {
+                            loader.set_cell_at(addr, Value::Null);
                         }
                     }
                 }
@@ -2192,8 +2221,27 @@ impl<'a> WorkbookLoader<'a> {
         //    set so EVERY source write contributes to the dirty fanout.
         //    Within-sheet dependents already fired in step 1; this pass
         //    is strictly for cross-sheet edges.
+        //
+        // AUDIT B-5 (workbook half) — when the workbook holds no
+        // cross-sheet REVERSE edges at all, every popped seed would find
+        // zero dependents: seeding is O(touched) hash + queue churn for
+        // nothing (a 1M-cell restore = ~3M wasted ops). Skip outright.
+        // The named-values latch is irrelevant here — it gates read-time
+        // force-recompute, not edge-walking; precise `=NAME()` edges land
+        // in these same reverse maps (B-4) and so keep the BFS armed.
+        let has_reverse_edges = !wb.cross_sheet.cell_dependents.is_empty()
+            || wb
+                .cross_sheet
+                .range_index_per_sheet
+                .values()
+                .any(|idx| !idx.is_empty());
+        if !has_reverse_edges {
+            return;
+        }
         let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
         let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
+        wb.loader_bfs_seed_count
+            .set(wb.loader_bfs_seed_count.get() + touched.len());
         for entry in &touched {
             queue.push_back(*entry);
             visited.insert(*entry);

@@ -801,6 +801,14 @@ pub struct Sheet {
     /// (which runs on `&self`) can bump it.
     dirty_visit_count: Cell<u64>,
 
+    /// AUDIT B-5 — counts `has_address_subscribers` probes performed by
+    /// `BulkLoader::flush`'s notify tail (one per entry of
+    /// touched ∪ dirty). With zero address subscriptions the tail
+    /// early-outs and this stays untouched — pinned by the scale suite
+    /// so a 1M-cell restore never pays millions of hash probes to
+    /// conclude nobody is watching.
+    bulk_notify_probe_count: Cell<u64>,
+
     // === Spill (dynamic-array) infrastructure ===
     //
     // Phase 1 wires the *plumbing* for dynamic-array spill. The atom-based
@@ -835,6 +843,15 @@ pub struct Sheet {
     /// does not derive `Ord` — atom-id ordering carries no semantic
     /// meaning and we never iterate this map in order.
     spill_targets: HashMap<AtomId, Vec<CellAddress>>,
+    /// AUDIT A-8 — reverse spill index: target address →
+    /// `(anchor_atom, anchor_address)`. Maintained in lockstep with
+    /// `spill_targets` (`register_spill` inserts, `clear_spill` removes,
+    /// `bulk_install_storage` teardown clears) so the per-write spill
+    /// guards (`spilled_into_anchor`, `is_target_occupied`) are O(1) map
+    /// probes instead of a scan over every target list plus a reverse
+    /// scan of `cells` — one `=SEQUENCE(100000)` must not make every
+    /// keystroke O(100k).
+    spill_target_anchor: HashMap<CellAddress, (AtomId, CellAddress)>,
     /// One-way latch: set to `true` the first time a formula whose AST
     /// contains a `Expr::SheetRef` / `Expr::SheetRange` is installed on
     /// this sheet, never cleared. Drives
@@ -881,6 +898,8 @@ impl Sheet {
             imported_formula_count: Cell::new(0),
             dirty_visit_count: Cell::new(0),
             spill_targets: HashMap::new(),
+            spill_target_anchor: HashMap::new(),
+            bulk_notify_probe_count: Cell::new(0),
             has_cross_sheet_refs: Cell::new(false),
         }
     }
@@ -1508,6 +1527,7 @@ impl Sheet {
             .flat_map(|targets| targets.iter().copied())
             .collect();
         self.spill_targets.clear();
+        self.spill_target_anchor.clear();
         for addr in spill_target_addrs {
             self.drop_cell_slot(addr);
         }
@@ -1736,26 +1756,16 @@ impl Sheet {
     /// elsewhere, return the anchor's address. Returns None when `addr`
     /// is either the anchor itself, a plain cell, or empty.
     ///
-    /// Implementation: scan `spill_targets` values. For Phase 1 we keep
-    /// this O(spills) — the typical workbook has a handful of active
-    /// spill ranges, well below the cost of a reverse address index.
+    /// Implementation (AUDIT A-8): one probe of the reverse index
+    /// `spill_target_anchor`. This sits on EVERY single-cell write path
+    /// (`try_set_cell` / `try_set_formula` / the BulkLoader spill
+    /// guards), so it must not scale with spill size — the previous
+    /// Phase 1 shape scanned all target lists and then reverse-scanned
+    /// `cells` for the anchor.
     fn spilled_into_anchor(&self, addr: CellAddress) -> Option<CellAddress> {
-        for (&anchor_atom, targets) in &self.spill_targets {
-            if !targets.iter().any(|t| *t == addr) {
-                continue;
-            }
-            // Locate the anchor address by reverse-scanning `cells`.
-            // The map is small (one entry per cell) but for Phase 1 we
-            // accept the O(n) scan — anchor address lookups are rare
-            // (only for error messages and `is_spilled`). `Plain` slots
-            // can never be anchors (anchors go through `ensure_cell`).
-            for (cell_addr, slot) in self.cells.iter() {
-                if slot.atom_id() == Some(anchor_atom) {
-                    return Some(cell_addr);
-                }
-            }
-        }
-        None
+        self.spill_target_anchor
+            .get(&addr)
+            .map(|&(_, anchor_addr)| anchor_addr)
     }
 
     /// Look up the anchor address for a given anchor atom by reverse-scanning
@@ -1866,6 +1876,11 @@ impl Sheet {
             }
         }
 
+        // Keep the reverse index in lockstep (AUDIT A-8).
+        for &target in &targets {
+            self.spill_target_anchor
+                .insert(target, (anchor_atom, anchor_addr));
+        }
         self.spill_targets.insert(anchor_atom, targets);
         Ok(())
     }
@@ -1889,27 +1904,13 @@ impl Sheet {
         if let Some(slot) = self.cells.get(&target) {
             let v = self.slot_value(slot);
             if !matches!(v, Value::Null) {
-                // (c) Skip if this is already one of OUR own spill
-                // targets — we're re-spilling and the previous round
-                // installed this derived atom. Caller (`set_array`)
-                // tears the old spill down BEFORE calling
-                // register_spill, so in practice we never see our
-                // own targets here; the guard is defensive.
-                if let Some(targets) = self.spill_targets.get(&our_anchor_atom) {
-                    if targets.iter().any(|t| *t == target) {
-                        return false;
-                    }
-                }
-                // Check if it's a spilled cell from ANOTHER anchor.
-                // Iterate `spill_targets` — if any OTHER anchor lists
-                // `target`, that's a cross-anchor collision.
-                for (anchor_atom, targets) in &self.spill_targets {
-                    if *anchor_atom == our_anchor_atom {
-                        continue;
-                    }
-                    if targets.iter().any(|t| *t == target) {
-                        return true;
-                    }
+                // (c) Spilled cell? One probe of the reverse index
+                // (AUDIT A-8). Our OWN previous target is not a
+                // collision (we're re-spilling — caller tears the old
+                // spill down before register_spill, so this branch is
+                // defensive); any OTHER anchor's target is.
+                if let Some(&(anchor_atom, _)) = self.spill_target_anchor.get(&target) {
+                    return anchor_atom != our_anchor_atom;
                 }
                 // Plain non-Null primitive — collision.
                 return true;
@@ -1930,6 +1931,17 @@ impl Sheet {
             return;
         };
         for target in targets {
+            // Drop the reverse-index entry (AUDIT A-8) — but only when
+            // it still points at THIS anchor: a degenerate re-register
+            // may have flipped the target to another anchor without
+            // this anchor's list being pruned first.
+            if self
+                .spill_target_anchor
+                .get(&target)
+                .is_some_and(|&(a, _)| a == anchor_atom)
+            {
+                self.spill_target_anchor.remove(&target);
+            }
             // Detach the address subscription bucket from the soon-dead
             // atom; reattach after removal so listeners refresh.
             self.detach_address_sub(target);
@@ -3260,6 +3272,23 @@ impl Sheet {
     #[doc(hidden)]
     pub fn debug_spill_target_count(&self) -> usize {
         self.spill_targets.values().map(|t| t.len()).sum()
+    }
+
+    /// Size of the AUDIT A-8 reverse spill index (`target address →
+    /// anchor`). Scale-suite invariant probe: must equal
+    /// `debug_spill_target_count()` at all times — install, re-spill,
+    /// teardown — or the O(1) write guards are consulting a stale map.
+    #[doc(hidden)]
+    pub fn debug_spill_reverse_index_len(&self) -> usize {
+        self.spill_target_anchor.len()
+    }
+
+    /// Cumulative `has_address_subscribers` probes performed by
+    /// `BulkLoader::flush`'s notify tail (AUDIT B-5). Stays flat across
+    /// a bulk load when the sheet has zero address subscriptions.
+    #[doc(hidden)]
+    pub fn debug_bulk_notify_probe_count(&self) -> u64 {
+        self.bulk_notify_probe_count.get()
     }
 
     /// Number of distinct `CellAddress`es with at least one live listener
@@ -4934,6 +4963,17 @@ impl<'a> BulkLoader<'a> {
         // formulas — is preserved.
         self.sheet.recompute_array_formulas_in(&dirty);
 
+        // AUDIT B-5 — with zero address subscriptions the reattach loop
+        // and the touched ∪ dirty notify-set build below are pure
+        // overhead: a 1M-cell restore would pay ~3M hash ops to conclude
+        // nobody is watching. `attach_address_sub` is a no-op without a
+        // bucket and the notify loop cannot fire, so early-out keeps the
+        // legacy loader's notify tail O(0) on the unsubscribed path
+        // (pinned by `debug_bulk_notify_probe_count` in the scale suite).
+        if self.sheet.cell_subscriptions.is_empty() {
+            return;
+        }
+
         // Reattach fanouts on touched addresses so future writes notify
         // normally. Reattach is a no-op when the address has no
         // subscription bucket or no readable atom.
@@ -4949,6 +4989,9 @@ impl<'a> BulkLoader<'a> {
             HashSet::with_capacity(self.touched.len() + dirty.len());
         notify_targets.extend(self.touched.iter().copied());
         notify_targets.extend(dirty.iter().copied());
+        self.sheet.bulk_notify_probe_count.set(
+            self.sheet.bulk_notify_probe_count.get() + notify_targets.len() as u64,
+        );
         for addr in notify_targets {
             if self.sheet.has_address_subscribers(addr) {
                 self.sheet.notify_address_subscribers(addr);

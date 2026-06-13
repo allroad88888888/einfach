@@ -341,6 +341,19 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         base_targets + (N - 1) as usize,
         "exactly N − 1 spill targets installed"
     );
+    // AUDIT A-8: the O(1) reverse index must mirror the target lists at
+    // every checkpoint, and target → anchor resolution must work via the
+    // index (this is the lookup every single-cell write performs).
+    assert_eq!(
+        sheet.debug_spill_reverse_index_len(),
+        sheet.debug_spill_target_count(),
+        "reverse spill index in lockstep after install"
+    );
+    assert_eq!(
+        sheet.spill_anchor_for(addr(&format!("A{}", N / 2))),
+        Some(addr("A1"))
+    );
+    assert_eq!(sheet.spill_anchor_for(addr("A1")), None, "anchor is not a target");
     // Sampled targets: row r holds r.
     assert_eq!(sheet.get_cell("A2"), num(2.0));
     assert_eq!(sheet.get_cell(&format!("A{}", N / 2)), num((N / 2) as f64));
@@ -362,11 +375,26 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         base_targets + (N - 1) as usize,
         "shift must not grow or shrink the spill bookkeeping"
     );
+    assert_eq!(
+        sheet.debug_spill_reverse_index_len(),
+        sheet.debug_spill_target_count(),
+        "reverse spill index in lockstep after structural shift"
+    );
+    assert_eq!(
+        sheet.spill_anchor_for(addr(&format!("A{}", N / 2 + 1))),
+        Some(addr("A2")),
+        "reverse index re-derived against the shifted anchor"
+    );
 
     // Teardown: clearing the anchor returns every map to baseline.
     sheet.clear_cell("A2");
     assert_eq!(sheet.debug_spill_anchor_count(), base_anchors);
     assert_eq!(sheet.debug_spill_target_count(), base_targets);
+    assert_eq!(
+        sheet.debug_spill_reverse_index_len(),
+        base_targets,
+        "reverse spill index torn down with the spill"
+    );
     assert_eq!(sheet.debug_formula_count(), base_formulas);
     assert_eq!(
         sheet.debug_primitive_atom_count(),
@@ -947,6 +975,82 @@ fn s11_mutation_storm_dirty_work_bounded_by_fanout() {
         sheet.debug_formula_eval_count() - evals_before,
         2,
         "two parked hydrations, nothing else"
+    );
+}
+
+// =====================================================================
+// S12 — AUDIT B-5: the legacy bulk-loader's notify tail and the
+// workbook flush's cross-sheet BFS seeding are O(watchers/edges), not
+// O(touched).
+//
+// Identities:
+//   - a 2×N bulk load on a workbook with ZERO subscribers and ZERO
+//     cross-sheet edges performs ZERO notify probes and ZERO BFS seeds
+//     (the early-outs) — previously ~3×N hash ops to conclude nobody
+//     was watching;
+//   - arming ONE subscriber and ONE cross-sheet edge re-enables both
+//     paths: the subscriber fires, the BFS seeds O(touched of that
+//     batch), and the cross-sheet dependent serves the fresh value.
+// =====================================================================
+
+#[test]
+fn s12_bulk_flush_notify_and_bfs_skip_unwatched_workbooks() {
+    const N: u32 = 20_000;
+    let mut wb = Workbook::new();
+    wb.bulk_load(|loader| {
+        for r in 1..=N {
+            loader.set_cell(0, &format!("A{r}"), num(r as f64));
+        }
+        for r in 1..=N {
+            assert!(loader.set_formula(0, &format!("B{r}"), &format!("=A{r}*2")));
+        }
+    });
+    assert_eq!(
+        wb.debug_loader_bfs_seed_count(),
+        0,
+        "no cross-sheet edges → zero BFS seed churn for a 2N-cell load"
+    );
+    assert_eq!(
+        wb.sheet(0).unwrap().debug_bulk_notify_probe_count(),
+        0,
+        "no subscribers → zero notify-set probes for a 2N-cell load"
+    );
+    // Closed form still holds — the early-outs skip bookkeeping only.
+    assert_eq!(wb.get_cell("Sheet1", &format!("B{N}")), num(2.0 * N as f64));
+
+    // Arm one subscriber + one cross-sheet edge; both paths must come
+    // back to life and stay change-proportional.
+    wb.add_sheet("S2");
+    assert!(wb.set_formula(1, "A1", "=Sheet1!B1+1"));
+    assert_eq!(wb.get_cell("S2", "A1"), num(3.0));
+    let fires = Rc::new(RefCell::new(0u32));
+    let ff = fires.clone();
+    let _sub = wb
+        .sheet_mut(0)
+        .unwrap()
+        .subscribe_cell("B1", move || *ff.borrow_mut() += 1);
+
+    wb.bulk_load(|loader| {
+        loader.set_cell(0, "A1", num(100.0));
+    });
+    assert!(
+        *fires.borrow() >= 1,
+        "subscriber on a dirty dependent must fire once the sheet has watchers"
+    );
+    let probes = wb.sheet(0).unwrap().debug_bulk_notify_probe_count();
+    assert!(
+        (1..=4).contains(&probes),
+        "notify probes bounded by touched ∪ dirty of the batch (got {probes})"
+    );
+    let seeds = wb.debug_loader_bfs_seed_count();
+    assert_eq!(
+        seeds, 1,
+        "BFS seeds == touched cells of THIS batch, not sheet size (got {seeds})"
+    );
+    assert_eq!(
+        wb.get_cell("S2", "A1"),
+        num(201.0),
+        "cross-sheet dependent recomputes after the bulk write"
     );
 }
 
