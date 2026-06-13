@@ -44,6 +44,11 @@
  *  - D-2  P-A  FIXED — static-backend history records per-mutation
  *         reverse deltas (before-values of touched entries only); the
  *         pin below now asserts O(change), not O(workbook).
+ *  - D-11 P-A  **FIXED** worker-workbook-backend conditional-format
+ *         overlay sorts rules once per application (first half) AND
+ *         pre-filters the sorted list to rules whose scope intersects
+ *         the window's source-coordinate band (second half) — rules
+ *         scoped entirely outside the viewport cost zero per-cell work.
  */
 
 import { describe, expect, test } from '@jest/globals'
@@ -59,7 +64,13 @@ import {
   createWorkerWorkbookSpreadsheetBackend,
   createWorkerWorkbook,
 } from '../src-vnext/adapter'
+import { applyConditionalFormatOverlay } from '../src-vnext/adapter/worker-workbook-backend'
 import type { SparseRangeWire, WorkerLike } from '../src-vnext/adapter'
+import type {
+  CellRange,
+  ConditionalFormatRuleEntry,
+  DisplayCell,
+} from '@einfach/spreadsheet-ui-core'
 
 const now = (): number => performance.now()
 
@@ -702,5 +713,221 @@ describe('audit D-2 · P-A · FIXED — static backend history is reverse deltas
     // size, so 20 edits at 20k cells must stay within ~2x of 50 cells
     // (5 ms absolute floor absorbs sub-ms timer jitter).
     expect(largeMs).toBeLessThan(Math.max(smallMs * 2, 5))
+  })
+})
+
+describe('audit D-11 · P-A · FIXED — conditional-format rules are pre-filtered by window bounds', () => {
+  async function seededBackend(rules: ReadonlyArray<{
+    priority: number
+    range: CellRange
+    bgColor: string
+    gt: string
+  }>) {
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => createInProcessWorker(),
+      sheets: ['One'],
+    })
+    await backend.ready()
+    await backend.importCells?.({
+      kind: 'import-cells',
+      sheetId: 'sheet-1',
+      cells: new Array(5).fill(null).map((_, row) => ({ row, col: 0, input: String(row + 1) })),
+      range: { rowStart: 0, rowEnd: 4, colStart: 0, colEnd: 0 },
+    })
+    for (const rule of rules) {
+      await backend.setConditionalFormatRule?.({
+        kind: 'set-conditional-format-rule',
+        sheetId: 'sheet-1',
+        scope: { range: rule.range },
+        priority: rule.priority,
+        rule: {
+          kind: 'cell-value',
+          operator: 'gt',
+          value: rule.gt,
+          format: { bgColor: rule.bgColor },
+        },
+      })
+    }
+    return backend
+  }
+
+  test('out-of-window rules leave the overlay output byte-identical (precedence preserved)', async () => {
+    const window = { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 3 }
+    // Two in-window rules with OVERLAPPING scopes — priority 1 (gt '2',
+    // red) must keep beating priority 3 (gt '0', green) for rows 2..4.
+    const inWindowRules = [
+      {
+        priority: 1,
+        range: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 0 },
+        bgColor: '#f00',
+        gt: '2',
+      },
+      {
+        priority: 3,
+        range: { rowStart: 0, rowEnd: 9, colStart: 0, colEnd: 0 },
+        bgColor: '#0f0',
+        gt: '0',
+      },
+    ]
+    // Rules scoped entirely outside the window's row band / column band,
+    // bracketing the in-window rules in priority order.
+    const outOfWindowRules = [
+      {
+        priority: 0,
+        range: { rowStart: 500_000, rowEnd: 500_009, colStart: 0, colEnd: 3 },
+        bgColor: '#00f',
+        gt: '0',
+      },
+      {
+        priority: 2,
+        range: { rowStart: 0, rowEnd: 9, colStart: 100, colEnd: 110 },
+        bgColor: '#ff0',
+        gt: '0',
+      },
+    ]
+
+    const noisy = await seededBackend([...outOfWindowRules, ...inWindowRules])
+    const clean = await seededBackend(inWindowRules)
+
+    const readWindow = async (backend: Awaited<ReturnType<typeof seededBackend>>) =>
+      (
+        await backend.readVisibleProjection(
+          createVisibleProjectionRequest({ sheetId: 'sheet-1', requestId: 1, window }),
+        )
+      ).cells
+
+    const noisyCells = await readWindow(noisy)
+    const cleanCells = await readWindow(clean)
+
+    // The pre-filter is a pure superset test: with the out-of-window
+    // rules present the projection must be IDENTICAL to the run that
+    // never registered them.
+    expect(noisyCells).toEqual(cleanCells)
+
+    // Precedence sanity inside the window: value 3 (row 2) matches both
+    // surviving rules — priority 1 wins; value 1 (row 0) only matches
+    // priority 3.
+    const byRow = new Map(noisyCells.map((cell) => [cell.row, cell]))
+    expect(byRow.get(2)?.conditionalFormat).toMatchObject({ bgColor: '#f00' })
+    expect(byRow.get(0)?.conditionalFormat).toMatchObject({ bgColor: '#0f0' })
+
+    noisy.dispose()
+    clean.dispose()
+  })
+
+  test('whole-column rule survives the pre-filter for any window in its column band', async () => {
+    const backend = createWorkerWorkbookSpreadsheetBackend({
+      workerFactory: () => createInProcessWorker(),
+      sheets: ['One'],
+    })
+    await backend.ready()
+    await backend.setCellInput({
+      kind: 'set-cell-input',
+      sheetId: 'sheet-1',
+      row: 5_000,
+      col: 0,
+      input: '7',
+      requestId: 1,
+    })
+    // Unbounded row scope (whole column A) — must intersect ANY window
+    // in that column band, including one 5k rows down.
+    await backend.setConditionalFormatRule?.({
+      kind: 'set-conditional-format-rule',
+      sheetId: 'sheet-1',
+      scope: { range: { rowStart: 0, rowEnd: 1_048_575, colStart: 0, colEnd: 0 } },
+      priority: 0,
+      rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#f00' } },
+    })
+    // Bounded rule far above the window — must be filtered out without
+    // bleeding into the projected cell.
+    await backend.setConditionalFormatRule?.({
+      kind: 'set-conditional-format-rule',
+      sheetId: 'sheet-1',
+      scope: { range: { rowStart: 0, rowEnd: 10, colStart: 0, colEnd: 0 } },
+      priority: 1,
+      rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#00f' } },
+    })
+
+    const projection = await backend.readVisibleProjection(
+      createVisibleProjectionRequest({
+        sheetId: 'sheet-1',
+        requestId: 2,
+        window: { rowStart: 4_995, rowEnd: 5_005, colStart: 0, colEnd: 2 },
+      }),
+    )
+    const cell = projection.cells.find((entry) => entry.row === 5_000 && entry.col === 0)
+    expect(cell?.displayValue).toBe('7')
+    expect(cell?.conditionalFormat).toMatchObject({ bgColor: '#f00' })
+
+    backend.dispose()
+  })
+
+  test('out-of-window rules never enter the per-cell loop (scope-range read counter)', () => {
+    const countingRange = (range: CellRange): { range: CellRange; counter: { reads: number } } => {
+      const counter = { reads: 0 }
+      const proxied = new Proxy(range, {
+        get(target, prop, receiver) {
+          if (
+            prop === 'rowStart' ||
+            prop === 'rowEnd' ||
+            prop === 'colStart' ||
+            prop === 'colEnd'
+          ) {
+            counter.reads += 1
+          }
+          return Reflect.get(target, prop, receiver)
+        },
+      })
+      return { range: proxied, counter }
+    }
+
+    const cellCount = 50
+    const cells: DisplayCell[] = new Array(cellCount).fill(null).map((_, row) => ({
+      row,
+      col: 0,
+      displayValue: '1',
+      valueKind: 'number' as const,
+    }))
+    const window: CellRange = { rowStart: 0, rowEnd: cellCount - 1, colStart: 0, colEnd: 0 }
+
+    const inWindow = countingRange({ rowStart: 0, rowEnd: cellCount - 1, colStart: 0, colEnd: 0 })
+    const outOfWindow = countingRange({
+      rowStart: 1_000,
+      rowEnd: 1_010,
+      colStart: 0,
+      colEnd: 0,
+    })
+    const entries: ConditionalFormatRuleEntry[] = [
+      {
+        id: 'cf-out',
+        scope: { range: outOfWindow.range },
+        priority: 0,
+        rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#00f' } },
+      },
+      {
+        id: 'cf-in',
+        scope: { range: inWindow.range },
+        priority: 1,
+        rule: { kind: 'cell-value', operator: 'gt', value: '0', format: { bgColor: '#f00' } },
+      },
+    ]
+
+    const overlaid = applyConditionalFormatOverlay(cells, entries, window)
+    expect(overlaid.every((cell) => cell.conditionalFormat?.bgColor === '#f00')).toBe(true)
+
+    // eslint-disable-next-line no-console
+    console.log(
+      `[audit D-11 FIXED] scope-range coordinate reads over ${cellCount} cells: ` +
+        `in-window rule=${inWindow.counter.reads}, out-of-window rule=${outOfWindow.counter.reads} ` +
+        '— was ~4 reads PER CELL for every rule regardless of scope',
+    )
+
+    // FLIPPED PIN (was: the out-of-window rule paid isCoordInsideRange
+    // for every projected cell — ≥ cellCount coordinate reads). The
+    // pre-filter's single rangesIntersect test reads at most the four
+    // coordinates once; the surviving in-window rule still pays the
+    // per-cell membership test.
+    expect(outOfWindow.counter.reads).toBeLessThanOrEqual(4)
+    expect(inWindow.counter.reads).toBeGreaterThanOrEqual(cellCount)
   })
 })

@@ -479,12 +479,26 @@ function getConditionalFormatForCell(
   return undefined
 }
 
-function applyConditionalFormatOverlay(
+// Exported for the audit D-11 pin in test/audit-adapter-scaling.test.ts.
+//
+// `window` is the bounding box of every (sourceRow, col) coordinate the
+// per-cell loop can test — the projected window unioned with the
+// filter/sort source-row band when one is active. Rules scoped entirely
+// outside it can never match, so they are dropped BEFORE the per-cell
+// loop (audit D-11, second half). The pre-filter is a pure superset
+// test: per-cell `isCoordInsideRange` still decides membership for the
+// surviving rules, and unbounded scopes (whole-column / whole-sheet)
+// intersect any window in their band, so they always survive.
+export function applyConditionalFormatOverlay(
   cells: DisplayCell[],
   rules: readonly ConditionalFormatRuleEntry[],
+  window: CellRange,
 ): DisplayCell[] {
   if (rules.length === 0) return cells
-  const ordered = [...rules].sort((left, right) => left.priority - right.priority)
+  const ordered = rules
+    .filter((entry) => rangesIntersect(entry.scope.range, window))
+    .sort((left, right) => left.priority - right.priority)
+  if (ordered.length === 0) return cells
   return cells.map((cell) => {
     const sourceRow = cell.originalRow ?? cell.row
     const conditionalFormat = getConditionalFormatForCell(sourceRow, cell.col, cell, ordered)
@@ -1050,10 +1064,26 @@ export function createWorkerWorkbookSpreadsheetBackend(
       validationRulesBySheetId.get(sheetId) ?? [],
     )
 
+    // Bounding box of every source coordinate the conditional-format
+    // overlay can test: cells projected by filter/sort carry an
+    // `originalRow` inside `dataRange`'s source-row band, while blank
+    // cells injected by the validation overlay sit at display rows
+    // inside `range` — so the window unions both row bands over the
+    // shared column band (audit D-11).
+    const conditionalFormatWindow: CellRange = dataRange
+      ? {
+          rowStart: Math.min(range.rowStart, dataRange.rowStart),
+          rowEnd: Math.max(range.rowEnd, dataRange.rowEnd),
+          colStart: range.colStart,
+          colEnd: range.colEnd,
+        }
+      : range
+
     return {
       cells: applyConditionalFormatOverlay(
         validatedCells,
         conditionalFormatRulesBySheetId.get(sheetId) ?? [],
+        conditionalFormatWindow,
       ).sort((left, right) =>
         left.row === right.row ? left.col - right.col : left.row - right.row,
       ),
