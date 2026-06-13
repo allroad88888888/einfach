@@ -1961,7 +1961,23 @@ impl WasmWorkbook {
     }
 
     pub fn remove_sheet(&mut self, idx: u32) -> bool {
-        self.workbook.remove_sheet(idx as usize).is_some()
+        let idx = idx as usize;
+        if self.workbook.remove_sheet(idx).is_none() {
+            return false;
+        }
+        // Mirror move_sheet: keep token → (sheet_idx, sub) accurate across
+        // the shift, or a later unsubscribe_cell resolves against the WRONG
+        // sheet (off by one) and leaves the engine-side callback alive,
+        // emitting dirty events with a pre-removal index. Tokens on the
+        // removed sheet are dropped — their engine subscription died with
+        // the sheet.
+        self.subscriptions.retain(|_, entry| entry.sheet_idx != idx);
+        for entry in self.subscriptions.values_mut() {
+            if entry.sheet_idx > idx {
+                entry.sheet_idx -= 1;
+            }
+        }
+        true
     }
 
     pub fn move_sheet(&mut self, from: u32, to: u32) -> bool {
