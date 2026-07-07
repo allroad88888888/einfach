@@ -106,6 +106,8 @@ describe('CLEAN', () => {
     expect(call('CLEAN', [STR('hello\x01\x02world')])).toEqual(STR('helloworld')))
   test('preserves printable text', () =>
     expect(call('CLEAN', [STR('hi there')])).toEqual(STR('hi there')))
+  test('preserves DEL 127 because Excel CLEAN only strips ASCII 0-31', () =>
+    expect(call('CLEAN', [STR('\x7fx')])).toEqual(STR('\x7fx')))
   test('error propagates', () => expect(call('CLEAN', [ERR('#REF!')])).toEqual(ERR('#REF!')))
 })
 
@@ -155,6 +157,8 @@ describe('TEXTBEFORE / TEXTAFTER', () => {
 
   test('case-insensitive mode and delimiter arrays', () => {
     expect(call('TEXTBEFORE', [STR('axb'), STR('X'), NUM(1), NUM(1)])).toEqual(STR('a'))
+    expect(call('TEXTBEFORE', [STR('Äx'), STR('ä'), NUM(1), NUM(1)])).toEqual(STR(''))
+    expect(call('TEXTAFTER', [STR('Äx'), STR('ä'), NUM(1), NUM(1)])).toEqual(STR('x'))
     expect(call('TEXTAFTER', [STR('a,b;c'), ARR([[STR(','), STR(';')]])])).toEqual(STR('b;c'))
   })
 
@@ -204,6 +208,9 @@ describe('TEXTSPLIT', () => {
     )
     expect(call('TEXTSPLIT', [STR('axb'), STR('X'), STR(''), BOOL(false), NUM(1)])).toEqual(
       ARR([[STR('a'), STR('b')]]),
+    )
+    expect(call('TEXTSPLIT', [STR('ÄxÄ'), STR('ä'), STR(''), BOOL(false), NUM(1)])).toEqual(
+      ARR([[STR(''), STR('x'), STR('')]]),
     )
   })
 
@@ -301,6 +308,11 @@ describe('NUMBERVALUE / DOLLAR / FIXED', () => {
     expect(call('DOLLAR', [NUM(1), NUM(2), NUM(3)]).kind).toBe('error')
   })
 
+  test('DOLLAR negative decimals round halves away from zero', () => {
+    expect(call('DOLLAR', [NUM(-25), NUM(-1)])).toEqual(STR('($30)'))
+    expect(call('DOLLAR', [NUM(25), NUM(-1)])).toEqual(STR('$30'))
+  })
+
   test('FIXED formats numbers and honors no_commas', () => {
     expect(call('FIXED', [NUM(1234.567)])).toEqual(STR('1,234.57'))
     expect(call('FIXED', [NUM(-1234.5)])).toEqual(STR('-1,234.50'))
@@ -319,6 +331,11 @@ describe('NUMBERVALUE / DOLLAR / FIXED', () => {
     expect(call('FIXED', []).kind).toBe('error')
     expect((call('FIXED', []) as { code: string }).code).toBe('#VALUE!')
     expect(call('FIXED', [NUM(1), NUM(2), BOOL(true), NUM(4)]).kind).toBe('error')
+  })
+
+  test('FIXED negative decimals round halves away from zero', () => {
+    expect(call('FIXED', [NUM(-25), NUM(-1), BOOL(true)])).toEqual(STR('-30'))
+    expect(call('FIXED', [NUM(25), NUM(-1), BOOL(true)])).toEqual(STR('30'))
   })
 })
 

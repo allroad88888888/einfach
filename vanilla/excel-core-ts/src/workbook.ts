@@ -384,12 +384,12 @@ export function createWorkbook(
       if (!target) return undefined
       return target._internal.cells
     },
-    onFormulaEvaluated(cells, key, ast) {
+    onFormulaEvaluated(cells, key, ast, runtimeDeps) {
       const owner = sheetsByCellsMap.get(cells)
       // Unknown map identity (e.g. an evaluator driven against a
       // detached snapshot in tests) → nothing to index.
       if (!owner) return
-      propagation.installDepsFor(owner, key, ast)
+      propagation.installDepsFor(owner, key, ast, runtimeDeps)
     },
     callCustom(name, args) {
       const fn = customFormulas.get(name.toUpperCase())

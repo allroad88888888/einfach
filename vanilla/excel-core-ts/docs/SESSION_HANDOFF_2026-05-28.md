@@ -275,3 +275,254 @@ All addressed.
 - 458 commits ahead of origin, never pushed
 
 Your move.
+
+## 15. 2026-06-22 TS formula review P2 closeout
+
+Context:
+
+- macOS external-volume permission was restored for `/Volumes/work/self/einfach`.
+- Continued the previous multi-agent TS formula parity pass and closed the four
+  review P2s left open after the 2026-05-29 run.
+
+Changes landed:
+
+- `RATE` now checks the zero-rate closed-form residual before Newton iteration.
+  This preserves tiny-cashflow residual scaling while allowing exact zero-rate
+  roots such as `RATE(360, 2.0833333333333335, -1000, 250)` to return `0`
+  instead of `#NUM!`.
+- The `RATE` happy-path test was corrected to a true non-zero inverse-PMT
+  fixture: `PMT(0.05, 10, 1000) = -129.50457496545661`, so `RATE(...)`
+  should return `0.05`.
+- Financial invalid basis coverage now includes `AMORDEGRC(..., basis=5)`;
+  `parseBasis` was already aligned to Excel `#NUM!` semantics.
+- Parser range construction now rejects chained range operators whose endpoint
+  is already a range, so malformed formulas such as `A1:B2:C3`,
+  `A1:INDEX(A:A,2):A3`, and `A1:(B1:C1)` return `#VALUE!` instead of silently
+  widening the range.
+- Direct spill refs now reuse `runtimeRefFromSpillRef`, so `A1048576#` rejects
+  an anchor array that would spill past the sheet bounds with `#REF!`.
+- Added a TS worker UI e2e regression in
+  `solid/excel/e2e/vnext-worker-ts.spec.ts` covering the `RATE` zero-root path,
+  chained range parse failure display, and the current over-wide `MAKEARRAY`
+  cap result through a real Worker.
+
+Verification:
+
+```bash
+npx jest --runTestsByPath vanilla/excel-core-ts/test/financial.test.ts \
+  --no-coverage --runInBand -t "RATE|invalid basis"
+npx jest --runTestsByPath \
+  vanilla/excel-core-ts/test/parser.test.ts \
+  vanilla/excel-core-ts/test/reference-functions.test.ts \
+  --no-coverage --runInBand -t "dynamic references|spill references|dynamic-range endpoints"
+npx tsc -p vanilla/excel-core-ts/tsconfig.json --noEmit
+npx jest vanilla/excel-core-ts --no-coverage --runInBand
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+  && NO_PROXY=localhost,127.0.0.1 \
+  npx playwright test e2e/vnext-worker-ts.spec.ts --project=ts \
+    -g "formula compatibility regressions" # from solid/excel
+git diff --check
+```
+
+Results:
+
+- Financial focused run: **34 selected tests passed**.
+- Parser/reference focused run: **2 suites / 11 selected tests passed**.
+- Latest combined targeted unit run: **3 suites / 45 selected tests passed**.
+- TS worker e2e regression: **1 passed**.
+- Full `excel-core-ts` Jest: **33 suites / 1844 tests passed**.
+- Typecheck passed.
+- `git diff --check` clean.
+
+Rust/WASM note:
+
+- No Rust or WASM files were touched in this continuation.
+
+## 16. 2026-06-22 multi-agent formula parity sweep
+
+Context:
+
+- Spawned four read-only review/repro agents:
+  - Agent A: `evaluate.ts` reference/LAMBDA metadata.
+  - Agent B: `text.ts` Excel text compatibility.
+  - Agent C: dynamic array cap/error-code behavior.
+  - Agent D: engineering/financial isolated compat.
+- Main agent integrated only bounded fixes with direct repros and tests.
+
+Changes landed:
+
+- `RATE` now uses a RATE-specific residual convergence check so tiny cash-flow
+  inputs remain scale-invariant. The zero-rate fast path is skipped when the
+  caller supplies an explicit `guess`, so multi-root cases can still converge
+  to the root selected by the guess.
+- `CONVERT` gained documented Excel aliases for pressure and energy units:
+  `p`, `at`, `e`, `c`, `HPh`, `hh`, `flb`, plus explicit coverage for `wh`.
+- `TEXT` fixed decimal rounding paths to round halves away from zero despite
+  binary float noise (`1.005`, `2.675`, percent, grouped, custom, scientific).
+- `DOLLAR` / `FIXED` negative `decimals` now round negative halves away from
+  zero.
+- `SEARCH("~~", ...)` now treats escaped tilde as a literal tilde even when no
+  `*` or `?` wildcard is present.
+- `CLEAN` now strips ASCII 0-31 only and preserves DEL 127.
+- `TEXTBEFORE` / `TEXTAFTER` / `TEXTSPLIT` case-insensitive match mode now
+  handles non-ASCII casing such as `Ä`/`ä`.
+- `SHEET`, `SHEETS`, `AREAS`, and `ISREF` now validate missing sheets inside
+  reference metadata paths, including multi-area references.
+- Direct `A1#` spill refs now preserve 1x1 array identity instead of collapsing
+  to a scalar, so chained spill refs like `B1#` still work.
+- Added a missing `SCAN` nested-array callback regression test.
+
+Verification:
+
+```bash
+npx jest --runTestsByPath \
+  vanilla/excel-core-ts/test/financial.test.ts \
+  vanilla/excel-core-ts/test/phase8-engineering.test.ts \
+  vanilla/excel-core-ts/test/text.test.ts \
+  vanilla/excel-core-ts/test/phase8-text.test.ts \
+  vanilla/excel-core-ts/test/reference-functions.test.ts \
+  vanilla/excel-core-ts/test/lambda-higher-order.test.ts \
+  --no-coverage --runInBand \
+  -t "RATE|CONVERT|TEXT|SEARCH|CLEAN|TEXTBEFORE|TEXTAFTER|TEXTSPLIT|DOLLAR|FIXED|SHEET|SHEETS|ISREF|AREAS|spill|nested array"
+npx tsc -p vanilla/excel-core-ts/tsconfig.json --noEmit
+npx jest vanilla/excel-core-ts --no-coverage --runInBand
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+  && NO_PROXY=localhost,127.0.0.1 \
+  npx playwright test e2e/vnext-worker-ts.spec.ts --project=ts \
+    -g "formula compatibility regressions" # from solid/excel
+```
+
+Results:
+
+- Focused run: **6 suites / 147 selected tests passed**.
+- Full `excel-core-ts` Jest: **33 suites / 1851 tests passed**.
+- Typecheck passed.
+- TS worker e2e regression: **1 passed**.
+- `codex review --uncommitted` caught three P2s during this sweep:
+  explicit-guess `RATE` multi-root selection, 1x1 direct-spill identity, and
+  large-number text rounding epsilon. All three were fixed and covered by
+  targeted tests.
+- Claude Code adversarial review then caught two more P2s:
+  `RATE(..., 0, 0.1)` was not equivalent to omitted default guess, and
+  `ROUND(0.145, 2)` disagreed with the newly corrected `TEXT(0.145, "0.00")`.
+  Both are fixed. `RATE` now allows the zero-root fast path for the explicit
+  default guess, while explicit non-default guesses can still select a
+  non-zero root. `ROUND` now uses the same bounded half-tie correction style
+  as `TEXT`, with tests for `0.145` and `-0.145`.
+- Post-Claude verification:
+  - `npx jest --runTestsByPath vanilla/excel-core-ts/test/financial.test.ts vanilla/excel-core-ts/test/math.test.ts vanilla/excel-core-ts/test/text.test.ts --no-coverage --runInBand -t "RATE|ROUND|TEXT"`:
+    **3 suites / 93 selected tests passed**.
+  - Full `excel-core-ts` Jest remains **33 suites / 1851 tests passed**.
+  - Typecheck passed.
+  - TS worker e2e regression remains **1 passed**.
+
+Deferred next:
+
+- Agent A also flagged full worksheet spill collision / `#SPILL!` parity
+  (`SEQUENCE` over grid bounds, occupied targets). Current repo policy still
+  pins axis overflow to `#NUM!`; changing that should be a separate parity
+  decision because existing tests and TS-worker e2e assert it.
+
+## 17. 2026-06-23 LET/LAMBDA reference identity closeout
+
+Follow-up to the deferred Agent A finding above. Implemented the deliberate
+carrier design without widening public `Value`:
+
+- Added evaluator-internal `LambdaReferenceBinding` and `EvalContext.lambdaRefScope`.
+  Public cell/function values remain scalar/array/error only.
+- `LET` bindings and LAMBDA call arguments now capture `runtimeRefFromExpr(...)`
+  before falling back to ordinary value evaluation. The three local namespaces
+  are mutually exclusive: scalar value, function-valued LAMBDA, or reference.
+- `runtimeRefFromExpr(name)` now resolves scoped reference names, so
+  `CELL`, `FORMULATEXT`, `INDEX`, `ROW(S)`, `COLUMN(S)`, and dynamic ranges can
+  see reference identity through LET/LAMBDA.
+- Ordinary `NameExpr` evaluation materializes scoped references through
+  `evaluateRuntimeRef(...)`, so `LET(r, Data!C3, r+1)` still behaves like a
+  scalar value expression.
+- LAMBDA closures now capture `closureRefScope`; trampoline contexts pass the
+  reference scope through inside the same formula evaluation.
+
+New workbook-backed regression coverage in `reference-functions.test.ts`:
+
+- `LET(r,Data!C3,CELL("address",r))` -> `Data!$C$3`
+- `LAMBDA(r,CELL("address",r))(Data!C3)` -> `Data!$C$3`
+- `LAMBDA(r,FORMULATEXT(r))(Data!A5)` -> source formula text
+- `LAMBDA(r,SUM(INDEX(r,1):INDEX(r,3)))(Data!A:A)` -> `6`
+- `LET(r,Data!C3,r+1)` -> `8`
+
+Verification:
+
+```bash
+npx jest --runTestsByPath \
+  vanilla/excel-core-ts/test/reference-functions.test.ts \
+  vanilla/excel-core-ts/test/lambda-higher-order.test.ts \
+  vanilla/excel-core-ts/test/lambda.test.ts \
+  --no-coverage --runInBand
+npx jest vanilla/excel-core-ts --no-coverage --runInBand
+npx tsc -p vanilla/excel-core-ts/tsconfig.json --noEmit
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+  && NO_PROXY=localhost,127.0.0.1 \
+  npx playwright test e2e/vnext-worker-ts.spec.ts --project=ts \
+    -g "formula compatibility regressions" # from solid/excel
+```
+
+Results:
+
+- Focused reference/LAMBDA run: **3 suites / 84 tests passed**.
+- Full `excel-core-ts` Jest: **33 suites / 1852 tests passed**.
+- Typecheck passed.
+- TS worker e2e regression: **1 passed**.
+
+## 18. 2026-06-23 spill #SPILL! unit-test-first closeout
+
+Followed the unit-test-first path for the remaining spill parity item:
+
+- Added failing workbook tests first for:
+  - an array formula whose spill target is occupied -> anchor `#SPILL!`;
+  - an array formula whose spill extent exceeds sheet bounds -> anchor `#SPILL!`;
+  - writing into an already-cached spill range revalidates the anchor to
+    `#SPILL!`, and clearing the blocker lets it spill again.
+- Initial red run confirmed the old behavior: anchors returned `array` and
+  blocker writes did not dirty cached anchors.
+
+Changes landed:
+
+- `evaluateCellTrampolined` now validates final array values against the
+  formula anchor's worksheet coordinates. It ignores the anchor itself, treats
+  real formula/literal cells as blockers, and leaves format-only blank cells
+  non-blocking.
+- The evaluator hook can now carry `EvalRuntimeDeps`; array anchors pass their
+  current spill range to the workbook.
+- Propagation merges runtime spill ranges into the existing dep graph as range
+  deps. Writes inside a cached spill range therefore rederive the anchor, and
+  clearing the blocker removes `#SPILL!` on the next synchronous rederive.
+- Reference-function fixtures that accidentally overlapped their own spilled
+  outputs were moved to blank coordinates. `A1048576#` now propagates the
+  anchor's `#SPILL!` for an out-of-bounds anchor.
+
+Verification:
+
+```bash
+npx jest --runTestsByPath vanilla/excel-core-ts/test/workbook.test.ts \
+  --no-coverage --runInBand -t "array formula returns #SPILL|writing into a cached spill range"
+npx jest --runTestsByPath \
+  vanilla/excel-core-ts/test/workbook.test.ts \
+  vanilla/excel-core-ts/test/reference-functions.test.ts \
+  vanilla/excel-core-ts/test/scale-suite.test.ts \
+  vanilla/excel-core-ts/test/audit-mutation-scaling.test.ts \
+  --no-coverage --runInBand
+npx tsc -p vanilla/excel-core-ts/tsconfig.json --noEmit
+npx jest vanilla/excel-core-ts --no-coverage --runInBand
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+  && NO_PROXY=localhost,127.0.0.1 \
+  npx playwright test e2e/vnext-worker-ts.spec.ts --project=ts \
+    -g "formula compatibility regressions|SEQUENCE spill projects" # from solid/excel
+```
+
+Results:
+
+- Focused spill tests passed.
+- Related workbook/reference/scale/audit run: **4 suites / 96 tests passed**.
+- Full `excel-core-ts` Jest: **33 suites / 1855 tests passed**.
+- Typecheck passed.
+- TS worker e2e selected run: **2 passed**.

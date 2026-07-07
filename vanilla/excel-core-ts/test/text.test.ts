@@ -365,6 +365,22 @@ describe('TEXT', () => {
     expect(call('TEXT', [num(3.14159), str('0.00')])).toEqual(str('3.14'))
   })
 
+  test('decimal formats round halves away from zero despite binary float noise', () => {
+    expect(call('TEXT', [num(1.005), str('0.00')])).toEqual(str('1.01'))
+    expect(call('TEXT', [num(-1.005), str('0.00')])).toEqual(str('-1.01'))
+    expect(call('TEXT', [num(0.145), str('0.00')])).toEqual(str('0.15'))
+    expect(call('TEXT', [num(2.675), str('0.00')])).toEqual(str('2.68'))
+    expect(call('TEXT', [num(1.005), str('#,##0.00')])).toEqual(str('1.01'))
+    expect(call('TEXT', [num(0.01005), str('0.00%')])).toEqual(str('1.01%'))
+    expect(call('TEXT', [num(9.995), str('0.00E+00')])).toEqual(str('1.00E+01'))
+  })
+
+  test('decimal rounding epsilon does not move large exact integers', () => {
+    expect(call('TEXT', [num(3000000000000000), str('0.00')])).toEqual(
+      str('3000000000000000.00'),
+    )
+  })
+
   test('custom format appends quoted literal text', () => {
     expect(call('TEXT', [num(12.34), str('0.0" kg"')])).toEqual(str('12.3 kg'))
   })
@@ -636,6 +652,7 @@ describe('SEARCH', () => {
   test('~* escapes wildcard', () => {
     // 'a*' literal at position 5 in 'abc a* def'.
     expect(call('SEARCH', [str('a~*'), str('abc a* def')])).toEqual(num(5))
+    expect(call('SEARCH', [str('~~'), str('a~b')])).toEqual(num(2))
     expect(errCodeOf(call('SEARCH', [str('a~*'), str('abc def')]))).toBe('#VALUE!')
   })
 

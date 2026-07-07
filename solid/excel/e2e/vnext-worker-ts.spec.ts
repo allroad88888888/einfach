@@ -104,6 +104,21 @@ test.describe('Solid Excel vNext — TS-core worker backend (F2 parity probe)', 
     await expect(cellDisplay(page, 'B5')).toHaveText('60')
   })
 
+  test('formula compatibility regressions render through the TS worker UI', async ({ page }) => {
+    await gotoVNextWorkerTsDemo(page)
+
+    await typeFormulaAtCell(page, 'A6', '=RATE(360,2.0833333333333335,-1000,250)')
+    await expect(cellDisplay(page, 'A6')).toHaveText('0')
+
+    await scrollToExposeBottomRows(page)
+
+    await typeFormulaAtCell(page, 'A7', '=SUM(A1:B2:C3)')
+    await expect(cellDisplay(page, 'A7')).toHaveText('#VALUE!')
+
+    await typeFormulaAtCell(page, 'A8', '=MAKEARRAY(1,16385,LAMBDA(r,c,c))')
+    await expect(cellDisplay(page, 'A8')).toHaveText('#NUM!')
+  })
+
   // Wave E1 ships spill projection in `worker-runtime-ts.ts`, but only along
   // the explicit-address path (`readCells` → `readCellSnapshot` → `readCellValue`
   // → `getSpillProjectedValue`). The visible-window path used by the grid

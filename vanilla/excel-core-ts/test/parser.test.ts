@@ -338,6 +338,12 @@ describe('parseFormula — dynamic references', () => {
       right: { kind: 'number', value: 2 },
     })
   })
+
+  test('rejects chained range operators instead of widening the range', () => {
+    expect(parseFormula('A1:B2:C3')).toEqual({ kind: 'error', code: '#VALUE!' })
+    expect(parseFormula('A1:INDEX(A:A,2):A3')).toEqual({ kind: 'error', code: '#VALUE!' })
+    expect(parseFormula('A1:(B1:C1)')).toEqual({ kind: 'error', code: '#VALUE!' })
+  })
 })
 
 // ---------- 7b. Multi-area references ----------

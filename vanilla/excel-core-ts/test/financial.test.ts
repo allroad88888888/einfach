@@ -215,20 +215,17 @@ describe('NPER', () => {
 // ---------------------------------------------------------------------------
 
 describe('RATE', () => {
-  test('happy path: 10 periods, -100 pmt, 1000 pv → ~ 0.0492', () => {
-    // =RATE(10, -100, 1000) → 0.04277...
-    // Actually Excel: 0.04277...; let me verify by inverse — PMT(0.04277, 10, 1000) = -124.something.
-    // No — RATE(10, -100, 1000) finds r where PV identity holds.
+  test('happy path: 10 periods, 5% inverse PMT case', () => {
+    // PMT(0.05, 10, 1000) = -129.50457496545661, so RATE should invert it.
     // pv * (1+r)^10 + pmt * ((1+r)^10 - 1)/r + fv = 0
-    // 1000 * (1+r)^10 + (-100) * ((1+r)^10 - 1)/r = 0
-    // The Excel answer is roughly 0.04277.
-    const result = call(RATE, [NUM(10), NUM(-100), NUM(1000)])
+    const result = call(RATE, [NUM(10), NUM(-129.50457496545661), NUM(1000)])
+    expectClose(result, 0.05, 1e-9)
     expect(result.kind).toBe('number')
     if (result.kind === 'number') {
       // Verify by plugging back into the residual:
       const r = result.value
       const pow = Math.pow(1 + r, 10)
-      const residual = 1000 * pow + -100 * (pow - 1) / r
+      const residual = 1000 * pow + -129.50457496545661 * (pow - 1) / r
       expect(Math.abs(residual)).toBeLessThan(1e-4)
     }
   })
@@ -253,11 +250,29 @@ describe('RATE', () => {
   test('tiny cash-flow residual convergence matches normal scale', () => {
     const base = call(RATE, [NUM(1), NUM(0), NUM(-1), NUM(2)])
     const tiny = call(RATE, [NUM(1), NUM(0), NUM(-1e-6), NUM(2e-6)])
+    const smaller = call(RATE, [NUM(1), NUM(0), NUM(-1e-9), NUM(2e-9)])
     expectClose(base, 1, 1e-9)
     expectClose(tiny, 1, 1e-9)
+    expectClose(smaller, 1, 1e-9)
     if (base.kind === 'number' && tiny.kind === 'number') {
       expect(Math.abs(tiny.value - base.value)).toBeLessThan(1e-9)
     }
+    if (base.kind === 'number' && smaller.kind === 'number') {
+      expect(Math.abs(smaller.value - base.value)).toBeLessThan(1e-9)
+    }
+  })
+
+  test('exact zero-rate root returns 0 instead of failing residual recheck', () => {
+    expectClose(call(RATE, [NUM(360), NUM(2.0833333333333335), NUM(-1000), NUM(250)]), 0, 1e-12)
+    expectClose(
+      call(RATE, [NUM(360), NUM(2.0833333333333335), NUM(-1000), NUM(250), NUM(0), NUM(0.1)]),
+      0,
+      1e-12,
+    )
+  })
+
+  test('explicit guess can select a non-zero root when zero is also a root', () => {
+    expectClose(call(RATE, [NUM(2), NUM(-300), NUM(100), NUM(500), NUM(0), NUM(2)]), 1, 1e-9)
   })
 
   test('wrong arity → #VALUE!', () => {
@@ -1458,6 +1473,20 @@ describe('Harvey tail — invalid basis returns #NUM! (Excel-correct)', () => {
         NUM(1),
         NUM(0.15),
         NUM(-1),
+      ]),
+    ).toEqual(ERR('#NUM!'))
+  })
+
+  test('AMORDEGRC basis=5 → #NUM!', () => {
+    expect(
+      call(AMORDEGRC, [
+        NUM(2400),
+        NUM(dateSerial(2008, 8, 19)),
+        NUM(dateSerial(2008, 12, 31)),
+        NUM(300),
+        NUM(1),
+        NUM(0.15),
+        NUM(5),
       ]),
     ).toEqual(ERR('#NUM!'))
   })

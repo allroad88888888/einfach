@@ -251,6 +251,8 @@ interface InstalledRecord {
   ast: Expr
   /** Names-registry revision at install time — skip-reinstall check. */
   namesRevision: number
+  /** Runtime deps such as the formula's current spill range. */
+  runtimeKey: string
   points: Array<{ sheetId: string; key: CellKey }>
   rangeKeys: Array<{ sheetId: string; rangeKey: string }>
   broad: boolean
@@ -276,17 +278,29 @@ export class DepGraph {
   }
 
   /** True when `fid` is already installed for this exact AST + registry rev. */
-  isCurrent(fid: FormulaId, ast: Expr, namesRevision: number): boolean {
+  isCurrent(fid: FormulaId, ast: Expr, namesRevision: number, runtimeKey = ''): boolean {
     const rec = this.installed.get(fid)
-    return rec !== undefined && rec.ast === ast && rec.namesRevision === namesRevision
+    return (
+      rec !== undefined &&
+      rec.ast === ast &&
+      rec.namesRevision === namesRevision &&
+      rec.runtimeKey === runtimeKey
+    )
   }
 
   /** Replace-install `fid`'s edges. */
-  install(fid: FormulaId, ast: Expr, namesRevision: number, deps: ResolvedDeps): void {
+  install(
+    fid: FormulaId,
+    ast: Expr,
+    namesRevision: number,
+    deps: ResolvedDeps,
+    runtimeKey = '',
+  ): void {
     this.uninstall(fid)
     const rec: InstalledRecord = {
       ast,
       namesRevision,
+      runtimeKey,
       points: deps.points,
       rangeKeys: [],
       broad: deps.broad,

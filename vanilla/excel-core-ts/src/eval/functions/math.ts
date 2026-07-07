@@ -231,11 +231,22 @@ export const MAX: FunctionImpl = (args) => {
  * half toward positive infinity (Math.round(-2.5) = -2). We re-derive
  * the sign-aware version below.
  */
+function roundScaledHalfAwayFromZero(abs: number, factor: number): number {
+  const scaled = abs * factor
+  if (!Number.isFinite(scaled) || Math.abs(scaled) > Number.MAX_SAFE_INTEGER) {
+    return Math.round(scaled)
+  }
+  const lower = Math.floor(scaled)
+  const half = lower + 0.5
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(scaled)) * 4
+  const adjusted = Math.abs(scaled - half) <= tolerance ? half : scaled
+  return Math.round(adjusted)
+}
+
 function roundHalfAwayFromZero(x: number, digits: number): number {
   if (!Number.isFinite(x)) return x
   const factor = Math.pow(10, digits)
-  // Using Math.sign to avoid -0 issues.
-  return (x >= 0 ? Math.floor(x * factor + 0.5) : -Math.floor(-x * factor + 0.5)) / factor
+  return (x >= 0 ? 1 : -1) * roundScaledHalfAwayFromZero(Math.abs(x), factor) / factor
 }
 
 function roundAwayFromZero(x: number, digits: number): number {

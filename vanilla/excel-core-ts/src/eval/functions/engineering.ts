@@ -858,18 +858,30 @@ function convertUnitFactor(unit: string): ConvertUnit | null {
       return { category: 'time', factor: 86400 }
     case 'yr': return { category: 'time', factor: 31557600 }
 
-    case 'Pa': return { category: 'pressure', factor: 1 }
-    case 'atm': return { category: 'pressure', factor: 101325 }
+    case 'Pa':
+    case 'p':
+      return { category: 'pressure', factor: 1 }
+    case 'atm':
+    case 'at':
+      return { category: 'pressure', factor: 101325 }
     case 'mmHg': return { category: 'pressure', factor: 133.322387415 }
     case 'psi': return { category: 'pressure', factor: 6894.757293168 }
 
     case 'J': return { category: 'energy', factor: 1 }
-    case 'cal': return { category: 'energy', factor: 4.184 }
+    case 'e': return { category: 'energy', factor: 1e-7 }
+    case 'c':
+    case 'cal':
+      return { category: 'energy', factor: 4.184 }
+    case 'HPh':
+    case 'hh':
+      return { category: 'energy', factor: 2684519.537696173 }
     case 'kWh':
       return { category: 'energy', factor: 3600000 }
     case 'Wh':
     case 'wh':
       return { category: 'energy', factor: 3600 }
+    case 'flb':
+      return { category: 'energy', factor: 1.3558179483314004 }
     case 'BTU':
     case 'btu':
       return { category: 'energy', factor: 1055.05585262 }

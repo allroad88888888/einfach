@@ -43,6 +43,7 @@ const ERR = (code: '#DIV/0!' | '#NUM!' | '#VALUE!', message?: string): Value =>
 const NR_MAX_ITERS = 50
 const NR_TOLERANCE = 1e-7
 const RATE_RESIDUAL_REL_TOLERANCE = NR_TOLERANCE
+const RATE_ZERO_RESIDUAL_REL_TOLERANCE = Number.EPSILON * 1024
 const CASHFLOW_RESIDUAL_REL_TOLERANCE = 1e-10
 const XIRR_MAX_ITERS = 100
 const BOND_MAX_ITERS = 100
@@ -84,6 +85,14 @@ function residualConverged(
   // floor, the threshold is `max(|scale|, 1) * tolerance` — Excel's behavior.
   const effectiveScale = Math.max(Math.abs(scale), 1)
   return Math.abs(residual) <= effectiveScale * tolerance
+}
+
+function rateResidualConverged(residual: number, scale: number): boolean {
+  if (!Number.isFinite(residual) || !Number.isFinite(scale)) return false
+  const absScale = Math.abs(scale)
+  const relativeTolerance = absScale * RATE_RESIDUAL_REL_TOLERANCE
+  const numericTolerance = Math.max(absScale, 1) * RATE_ZERO_RESIDUAL_REL_TOLERANCE
+  return Math.abs(residual) <= Math.max(relativeTolerance, numericTolerance)
 }
 
 // ---------------------------------------------------------------------------
@@ -347,11 +356,17 @@ export const RATE: FunctionImpl = (args) => {
     guess = r.n
   }
 
+  const zeroResidual = rateResidual(0, nper.n, pmt.n, pv.n, fv, type)
+  const zeroScale = rateResidualScale(0, nper.n, pmt.n, pv.n, fv, type)
+  if ((args.length < 6 || guess === 0.1) && rateResidualConverged(zeroResidual, zeroScale)) {
+    return NUM(0)
+  }
+
   let rate = guess
   for (let i = 0; i < NR_MAX_ITERS; i++) {
     const f = rateResidual(rate, nper.n, pmt.n, pv.n, fv, type)
     const scale = rateResidualScale(rate, nper.n, pmt.n, pv.n, fv, type)
-    if (residualConverged(f, scale, RATE_RESIDUAL_REL_TOLERANCE)) return NUM(rate)
+    if (rateResidualConverged(f, scale)) return NUM(rate)
     const fprime = rateDerivative(rate, nper.n, pmt.n, pv.n, fv, type)
     if (fprime === 0 || !Number.isFinite(fprime)) return ERR('#NUM!')
     const step = f / fprime
@@ -361,7 +376,7 @@ export const RATE: FunctionImpl = (args) => {
     if (Math.abs(step) < NR_TOLERANCE) {
       const nextResidual = rateResidual(next, nper.n, pmt.n, pv.n, fv, type)
       const nextScale = rateResidualScale(next, nper.n, pmt.n, pv.n, fv, type)
-      return residualConverged(nextResidual, nextScale, RATE_RESIDUAL_REL_TOLERANCE)
+      return rateResidualConverged(nextResidual, nextScale)
         ? NUM(next)
         : ERR('#NUM!')
     }
@@ -372,7 +387,7 @@ export const RATE: FunctionImpl = (args) => {
   // surface is shallow near the root. Excel does the same.
   const final = rateResidual(rate, nper.n, pmt.n, pv.n, fv, type)
   const finalScale = rateResidualScale(rate, nper.n, pmt.n, pv.n, fv, type)
-  if (residualConverged(final, finalScale, RATE_RESIDUAL_REL_TOLERANCE)) return NUM(rate)
+  if (rateResidualConverged(final, finalScale)) return NUM(rate)
   return ERR('#NUM!')
 }
 

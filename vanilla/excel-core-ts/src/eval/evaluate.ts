@@ -25,6 +25,7 @@ import type {
   EvalContext,
   Expr,
   LambdaBinding,
+  LambdaReferenceBinding,
   Value,
 } from '../types'
 import { getBuiltinFunction } from './functions'
@@ -67,7 +68,12 @@ interface LambdaArgumentValue {
   readonly lambda: LambdaBinding
 }
 
-type LambdaArgument = Value | LambdaArgumentValue
+interface ReferenceArgumentValue {
+  readonly kind: 'referenceArgument'
+  readonly ref: RuntimeRef
+}
+
+type LambdaArgument = Value | LambdaArgumentValue | ReferenceArgumentValue
 
 type LambdaContextResult =
   | { readonly ok: true; readonly subCtx: EvalContext; readonly depth: { count: number } }
@@ -79,11 +85,7 @@ interface Grid {
   readonly cells: Value[][]
 }
 
-interface RuntimeRef {
-  readonly sheetName?: string
-  readonly range: CellRange
-  readonly materialized?: Value[][]
-}
+type RuntimeRef = LambdaReferenceBinding
 
 type IntegerArgResult =
   | { readonly ok: true; readonly value: number }
@@ -186,11 +188,14 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
       // LAMBDA scope wins over workbook-level names — a parameter name
       // shadowing a defined name is the whole point of LAMBDA parameters.
       // See ARCH §9 / types.ts `EvalContext.lambdaScope`.
+      const name = canonicalName(ast.name)
       if (ctx.lambdaScope) {
-        const scoped = ctx.lambdaScope.get(canonicalName(ast.name))
+        const scoped = ctx.lambdaScope.get(name)
         if (scoped !== undefined) return scoped
       }
-      if (ctx.lambdaFunctionScope?.has(canonicalName(ast.name))) {
+      const scopedRef = ctx.lambdaRefScope?.get(name)
+      if (scopedRef) return evaluateRuntimeRef(scopedRef, ctx)
+      if (ctx.lambdaFunctionScope?.has(name)) {
         return ERR(
           '#CALC!',
           `LAMBDA '${ast.name}' must be invoked or passed to an evaluator-aware function`,
@@ -517,6 +522,8 @@ function evaluateSheet(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   }
   if (arg.kind === 'multiArea') {
     if (arg.areas.length === 0) return ERR('#VALUE!')
+    const error = validateReferenceExpr(arg, ctx)
+    if (error) return error
     return evaluateSheet([arg.areas[0]], ctx)
   }
   return ERR('#VALUE!')
@@ -532,8 +539,12 @@ function evaluateSheets(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   if (args.length > 1) return ERR('#VALUE!', 'SHEETS expects 0 or 1 arguments')
   if (args.length === 0) return { kind: 'number', value: ctx.sheetCount ?? 1 }
   const arg = args[0]
-  if (arg.kind === 'ref' || arg.kind === 'range' || arg.kind === 'crossSheet') {
+  if (arg.kind === 'ref' || arg.kind === 'range') {
     return { kind: 'number', value: 1 }
+  }
+  if (arg.kind === 'crossSheet') {
+    const error = validateReferenceExpr(arg, ctx)
+    return error ?? { kind: 'number', value: 1 }
   }
   return ERR('#VALUE!')
 }
@@ -542,6 +553,8 @@ function evaluateAreas(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   if (args.length !== 1) return ERR('#VALUE!', 'AREAS expects 1 argument')
   const arg = args[0]
   if (arg.kind === 'multiArea') {
+    const error = validateReferenceExpr(arg, ctx)
+    if (error) return error
     return { kind: 'number', value: arg.areas.length }
   }
   const resolved = runtimeRefFromExpr(arg, ctx)
@@ -560,11 +573,26 @@ function evaluateIsFormula(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
 
 function evaluateIsRef(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   if (args.length !== 1) return ERR('#VALUE!')
-  if (args[0].kind === 'multiArea') return { kind: 'boolean', value: true }
+  if (args[0].kind === 'multiArea') {
+    return { kind: 'boolean', value: validateReferenceExpr(args[0], ctx) === undefined }
+  }
   const resolved = runtimeRefFromExpr(args[0], ctx)
   if (!resolved.ok) return { kind: 'boolean', value: false }
   const sheetError = validateRuntimeRefSheet(resolved.ref, ctx)
   return { kind: 'boolean', value: sheetError === undefined }
+}
+
+function validateReferenceExpr(expr: Expr, ctx: EvalContext): Value | undefined {
+  if (expr.kind === 'multiArea') {
+    for (const area of expr.areas) {
+      const error = validateReferenceExpr(area, ctx)
+      if (error) return error
+    }
+    return undefined
+  }
+  const resolved = runtimeRefFromExpr(expr, ctx)
+  if (!resolved.ok) return resolved.error ?? ERR('#VALUE!')
+  return validateRuntimeRefSheet(resolved.ref, ctx)
 }
 
 function evaluateFunctionArg(expr: Expr, ctx: EvalContext): Value {
@@ -578,11 +606,18 @@ function evaluateLambdaArg(expr: Expr, ctx: EvalContext): LambdaArgument {
   const resolved = resolveLambdaExpr(expr, ctx)
   if (resolved.error) return resolved.error
   if (resolved.lambda) return { kind: 'lambdaArgument', lambda: resolved.lambda }
+  const ref = runtimeRefFromExpr(expr, ctx)
+  if (ref.ok) return { kind: 'referenceArgument', ref: ref.ref }
+  if (ref.error) return ref.error
   return evaluateFunctionArg(expr, ctx)
 }
 
 function isLambdaArgument(value: LambdaArgument | undefined): value is LambdaArgumentValue {
   return value?.kind === 'lambdaArgument'
+}
+
+function isReferenceArgument(value: LambdaArgument | undefined): value is ReferenceArgumentValue {
+  return value?.kind === 'referenceArgument'
 }
 
 function evaluateIf(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
@@ -1487,7 +1522,12 @@ function isIndexReferenceSource(expr: Expr | undefined, ctx: EvalContext): boole
   ) {
     return true
   }
-  if (expr.kind === 'name') return ctx.resolveName(expr.name)?.kind === 'range'
+  if (expr.kind === 'name') {
+    const name = canonicalName(expr.name)
+    if (ctx.lambdaScope?.get(name) !== undefined) return false
+    if (ctx.lambdaRefScope?.has(name)) return true
+    return ctx.resolveName(expr.name)?.kind === 'range'
+  }
   if (expr.kind !== 'call') return false
   const upper = expr.name.toUpperCase()
   return upper === 'OFFSET' || upper === 'INDIRECT' || upper === 'CHOOSE'
@@ -2349,6 +2389,10 @@ function runtimeRefFromExpr(
     }
     case 'name': {
       if (!ctx) return { ok: false }
+      const name = canonicalName(expr.name)
+      if (ctx.lambdaScope?.get(name) !== undefined) return { ok: false }
+      const scopedRef = ctx.lambdaRefScope?.get(name)
+      if (scopedRef) return { ok: true, ref: scopedRef }
       const binding = ctx.resolveName(expr.name)
       if (binding?.kind !== 'range') return { ok: false }
       const range = parseRange(binding.start, binding.end)
@@ -2419,9 +2463,10 @@ function evaluateSpillRef(
   expr: Extract<Expr, { readonly kind: 'spillRef' }>,
   ctx: EvalContext,
 ): Value {
-  const value = spillAnchorValue(expr, ctx)
-  if (value.kind === 'error') return value
-  return value.kind === 'array' ? value : ERR('#REF!', 'spill reference anchor is not an array')
+  const resolved = runtimeRefFromSpillRef(expr, ctx)
+  if (!resolved.ok) return resolved.error ?? ERR('#REF!')
+  if (resolved.ref.materialized) return arrayResult(resolved.ref.materialized, 'range result')
+  return evaluateRuntimeRef(resolved.ref, ctx)
 }
 
 function runtimeRefFromSpillRef(
@@ -2641,6 +2686,7 @@ function evaluateLet(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   }
 
   const valueScope = new Map<string, Value>(ctx.lambdaScope ?? [])
+  const refScope = new Map<string, RuntimeRef>(ctx.lambdaRefScope ?? [])
   const functionScope = new Map<string, LambdaBinding>(ctx.lambdaFunctionScope ?? [])
   const omitted = ctx.lambdaOmittedParams
     ? new Set<string>(ctx.lambdaOmittedParams)
@@ -2648,6 +2694,7 @@ function evaluateLet(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
   const subCtx: EvalContext = {
     ...ctx,
     lambdaScope: valueScope,
+    lambdaRefScope: refScope,
     lambdaFunctionScope: functionScope,
     lambdaOmittedParams: omitted,
   }
@@ -2664,12 +2711,27 @@ function evaluateLet(args: ReadonlyArray<Expr>, ctx: EvalContext): Value {
       const recursive = bindLambdaSelf(name, lambda.lambda)
       functionScope.set(name, recursive)
       valueScope.delete(name)
+      refScope.delete(name)
       omitted?.delete(name)
       continue
     }
+
+    const ref = runtimeRefFromExpr(args[i + 1], subCtx)
+    if (ref.ok) {
+      const sheetError = validateRuntimeRefSheet(ref.ref, subCtx)
+      if (sheetError) return sheetError
+      refScope.set(name, ref.ref)
+      valueScope.delete(name)
+      functionScope.delete(name)
+      omitted?.delete(name)
+      continue
+    }
+    if (ref.error) return ref.error
+
     const value = evaluate(args[i + 1], subCtx)
     if (value.kind === 'error') return value
     valueScope.set(name, value)
+    refScope.delete(name)
     functionScope.delete(name)
     omitted?.delete(name)
   }
@@ -3745,6 +3807,7 @@ function resolveLetResultAsLambda(args: ReadonlyArray<Expr>, ctx: EvalContext): 
   }
 
   const valueScope = new Map<string, Value>(ctx.lambdaScope ?? [])
+  const refScope = new Map<string, RuntimeRef>(ctx.lambdaRefScope ?? [])
   const functionScope = new Map<string, LambdaBinding>(ctx.lambdaFunctionScope ?? [])
   const omitted = ctx.lambdaOmittedParams
     ? new Set<string>(ctx.lambdaOmittedParams)
@@ -3752,6 +3815,7 @@ function resolveLetResultAsLambda(args: ReadonlyArray<Expr>, ctx: EvalContext): 
   const subCtx: EvalContext = {
     ...ctx,
     lambdaScope: valueScope,
+    lambdaRefScope: refScope,
     lambdaFunctionScope: functionScope,
     lambdaOmittedParams: omitted,
   }
@@ -3768,12 +3832,27 @@ function resolveLetResultAsLambda(args: ReadonlyArray<Expr>, ctx: EvalContext): 
       const recursive = bindLambdaSelf(name, lambda.lambda)
       functionScope.set(name, recursive)
       valueScope.delete(name)
+      refScope.delete(name)
       omitted?.delete(name)
       continue
     }
+
+    const ref = runtimeRefFromExpr(args[i + 1], subCtx)
+    if (ref.ok) {
+      const sheetError = validateRuntimeRefSheet(ref.ref, subCtx)
+      if (sheetError) return { error: sheetError }
+      refScope.set(name, ref.ref)
+      valueScope.delete(name)
+      functionScope.delete(name)
+      omitted?.delete(name)
+      continue
+    }
+    if (ref.error) return { error: ref.error }
+
     const value = evaluateFunctionArg(args[i + 1], subCtx)
     if (value.kind === 'error') return { error: value }
     valueScope.set(name, value)
+    refScope.delete(name)
     functionScope.delete(name)
     omitted?.delete(name)
   }
@@ -3820,6 +3899,7 @@ function makeLambdaBinding(args: ReadonlyArray<Expr>, ctx: EvalContext): LambdaR
       params,
       body: args[args.length - 1],
       closureScope: new Map(ctx.lambdaScope ?? []),
+      closureRefScope: new Map(ctx.lambdaRefScope ?? []),
       closureFunctionScope: new Map(ctx.lambdaFunctionScope ?? []),
       closureOmittedParams: new Set(ctx.lambdaOmittedParams ?? []),
     },
@@ -3885,6 +3965,7 @@ function prepareLambdaContext(
     }
   }
   const scope = new Map<string, Value>(lambda.closureScope ?? [])
+  const refScope = new Map<string, RuntimeRef>(lambda.closureRefScope ?? [])
   const functionScope = new Map<string, LambdaBinding>(
     lambda.closureFunctionScope ?? [],
   )
@@ -3896,8 +3977,14 @@ function prepareLambdaContext(
     if (isLambdaArgument(arg)) {
       functionScope.set(name, arg.lambda)
       scope.delete(name)
+      refScope.delete(name)
+    } else if (isReferenceArgument(arg)) {
+      refScope.set(name, arg.ref)
+      scope.delete(name)
+      functionScope.delete(name)
     } else {
       scope.set(name, arg ?? BLANK)
+      refScope.delete(name)
       functionScope.delete(name)
     }
     if (hasArg) {
@@ -3909,6 +3996,7 @@ function prepareLambdaContext(
   const subCtx: EvalContext = {
     ...ctx,
     lambdaScope: scope,
+    lambdaRefScope: refScope,
     lambdaFunctionScope: functionScope,
     lambdaOmittedParams: omitted,
     lambdaCallDepth: depth,
@@ -4266,7 +4354,7 @@ interface TrampolineFrame {
 /**
  * Build the trampoline's shim `EvalContext`. The shim is a thin wrapper
  * around the host `ctx` (which still owns `callCustom`, `resolveName`,
- * `lambdaScope`, `lambdaCallDepth`); only the ref / range / crossSheet
+ * `lambdaScope`, `lambdaRefScope`, `lambdaCallDepth`); only the ref / range / crossSheet
  * lookups are intercepted to consult the cache instead of recursing.
  *
  * `currentlyEvaluating` is still passed through for compatibility with
@@ -4393,6 +4481,7 @@ function makeTrampolineCtx(
     sheetCount: hostCtx.sheetCount,
     sheetIndexOf: hostCtx.sheetIndexOf,
     lambdaScope: hostCtx.lambdaScope,
+    lambdaRefScope: hostCtx.lambdaRefScope,
     lambdaFunctionScope: hostCtx.lambdaFunctionScope,
     lambdaOmittedParams: hostCtx.lambdaOmittedParams,
     lambdaCallDepth: hostCtx.lambdaCallDepth,
@@ -4515,15 +4604,17 @@ export function evaluateCellTrampolined(
     inProgress.add(top.guardKey)
     const shimCtx = makeTrampolineCtx(top.cells, top.key, hostCtx, cache, inProgress)
     try {
-      const value = evaluate(cell.ast, shimCtx)
-      cache.set(top.guardKey, value)
+      const result = validateSpillAnchorValue(evaluate(cell.ast, shimCtx), top.cells, top.key)
+      cache.set(top.guardKey, result.value)
       inProgress.delete(top.guardKey)
       stack.pop()
       // Lazy dep install (KEY_GRANULAR_INVALIDATION): every formula the
       // trampoline finishes — the root anchor AND transitively-visited
       // dependency cells — reports to the workbook so its reverse edges
       // exist before any of its dependents cache a value derived from it.
-      hostCtx.onFormulaEvaluated?.(top.cells, top.key, cell.ast)
+      hostCtx.onFormulaEvaluated?.(top.cells, top.key, cell.ast, {
+        ranges: result.spillRange ? [{ range: result.spillRange }] : [],
+      })
     } catch (err) {
       if (err instanceof NeedsDep) {
         // The cell isn't done — it faulted out partway through AST
@@ -4562,6 +4653,42 @@ export function evaluateCellTrampolined(
   } finally {
     hostCtx.currentlyEvaluating.delete(rootGuard)
   }
+}
+
+function validateSpillAnchorValue(
+  value: Value,
+  cells: ReadonlyMap<CellKey, Cell>,
+  key: CellKey,
+): { readonly value: Value; readonly spillRange?: CellRange } {
+  if (value.kind !== 'array') return { value }
+  const anchor = cellCoordFromKey(key)
+  if (!anchor) return { value }
+  const rows = value.value.length
+  const cols = value.value[0]?.length ?? 0
+  const rowEnd = anchor.row + rows - 1
+  const colEnd = anchor.col + cols - 1
+  if (rowEnd > EXCEL_MAX_ROW || colEnd > EXCEL_MAX_COL) {
+    return { value: ERR('#SPILL!', 'spill range exceeds sheet bounds') }
+  }
+
+  const spillRange: CellRange = {
+    rowStart: anchor.row,
+    rowEnd,
+    colStart: anchor.col,
+    colEnd,
+  }
+  for (const [candidateKey, candidate] of cells) {
+    if (candidateKey === key || !cellBlocksSpill(candidate)) continue
+    const coord = cellCoordFromKey(candidateKey)
+    if (coord && rangeContainsCoord(spillRange, coord)) {
+      return { value: ERR('#SPILL!', 'spill range is not blank'), spillRange }
+    }
+  }
+  return { value, spillRange }
+}
+
+function cellBlocksSpill(cell: Cell): boolean {
+  return cell.ast !== undefined || cell.input.length > 0 || cell.value.kind !== 'blank'
 }
 
 /**

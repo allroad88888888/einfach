@@ -30,7 +30,15 @@
 
 import { atom, type AtomEntity } from '@einfach/core'
 
-import type { Cell, CellKey, EvalContext, Expr, NameBinding, Value } from './types'
+import type {
+  Cell,
+  CellKey,
+  EvalContext,
+  EvalRuntimeDeps,
+  Expr,
+  NameBinding,
+  Value,
+} from './types'
 import { BLANK } from './types'
 import {
   evaluateCellTrampolined,
@@ -180,7 +188,12 @@ export interface SheetResolvers {
    * `EvalContext.onFormulaEvaluated`). Optional so direct-sheet unit
    * tests run without a dep graph.
    */
-  onFormulaEvaluated?(cells: ReadonlyMap<CellKey, Cell>, key: CellKey, ast: Expr): void
+  onFormulaEvaluated?(
+    cells: ReadonlyMap<CellKey, Cell>,
+    key: CellKey,
+    ast: Expr,
+    runtimeDeps?: EvalRuntimeDeps,
+  ): void
 }
 
 /**

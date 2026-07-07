@@ -18,7 +18,7 @@ import type { Store } from '@einfach/core'
 
 import { collectStaticDeps, DepGraph, fidLocation, fidOf, type ResolvedDeps } from './deps'
 import type { WorkbookSheet } from './sheet'
-import type { Expr, NameBinding } from './types'
+import type { EvalRuntimeDeps, Expr, NameBinding } from './types'
 
 /** One entry per written key, recorded by every cell mutator. */
 export interface WriteRecord {
@@ -32,7 +32,12 @@ export interface WriteRecord {
 export interface Propagation {
   /** Monotonic workbook revision — bumped once per mutation batch. */
   revision(): number
-  installDepsFor(owner: WorkbookSheet, key: string, ast: Expr): void
+  installDepsFor(
+    owner: WorkbookSheet,
+    key: string,
+    ast: Expr,
+    runtimeDeps?: EvalRuntimeDeps,
+  ): void
   postWrite(sheet: WorkbookSheet, records: ReadonlyArray<WriteRecord>): void
   recalculateAllSheets(): void
   /**
@@ -66,6 +71,13 @@ export function createPropagation(deps: {
   let namesRevision = 0
   let epochCounter = 0
 
+  const runtimeRangeKey = (ranges: ResolvedDeps['ranges']): string =>
+    ranges
+      .map((r) =>
+        `${r.sheetId}:${r.range.rowStart}:${r.range.colStart}:${r.range.rowEnd}:${r.range.colEnd}`,
+      )
+      .join('|')
+
   // Workbook-scope revision counter. Bumped once per mutation batch in
   // `postWrite` (the centralized choke point). Sheets read it via the
   // `revisionProvider` callback to stamp `lastEvalRevision` on each
@@ -80,9 +92,13 @@ export function createPropagation(deps: {
    * twin of Rust's hydrate-on-read dep install. Skips when the AST
    * object and names revision are unchanged (O(1) on repeat visits).
    */
-  function installDepsFor(owner: WorkbookSheet, key: string, ast: Expr): void {
+  function installDepsFor(
+    owner: WorkbookSheet,
+    key: string,
+    ast: Expr,
+    runtimeDeps?: EvalRuntimeDeps,
+  ): void {
     const fid = fidOf(owner.id, key)
-    if (depGraph.isCurrent(fid, ast, namesRevision)) return
     const collected = collectStaticDeps(ast, resolveName)
     const resolved: ResolvedDeps = { points: [], ranges: [], broad: collected.broad }
     for (const p of collected.points) {
@@ -95,7 +111,17 @@ export function createPropagation(deps: {
       if (!target) continue
       resolved.ranges.push({ sheetId: target.id, range: r.range })
     }
-    depGraph.install(fid, ast, namesRevision, resolved)
+    const runtimeRanges: ResolvedDeps['ranges'] = []
+    for (const r of runtimeDeps?.ranges ?? []) {
+      const target = r.sheetName === undefined ? owner : sheetsByName.get(r.sheetName)
+      if (!target) continue
+      const resolvedRange = { sheetId: target.id, range: r.range }
+      runtimeRanges.push(resolvedRange)
+      resolved.ranges.push(resolvedRange)
+    }
+    const runtimeKey = runtimeRangeKey(runtimeRanges)
+    if (depGraph.isCurrent(fid, ast, namesRevision, runtimeKey)) return
+    depGraph.install(fid, ast, namesRevision, resolved, runtimeKey)
   }
 
   /** Bump `key`'s epoch atom (if a derive is cached), re-deriving it. */

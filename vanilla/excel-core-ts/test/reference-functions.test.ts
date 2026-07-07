@@ -28,6 +28,7 @@ describe('reference/workbook-aware functions', () => {
     wb.setCell('notes', 0, 0, '=SHEET()')
     wb.setCell('s1', 3, 0, '=SHEETS()')
     wb.setCell('s1', 4, 0, '=SHEET(Missing!A1)')
+    wb.setCell('s1', 5, 0, '=SHEETS(Missing!A1)')
 
     expect(read(wb, 's1', 0, 0)).toEqual(num(2))
     expect(read(wb, 's1', 1, 0)).toEqual(num(3))
@@ -35,6 +36,7 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 'notes', 0, 0)).toEqual(num(3))
     expect(read(wb, 's1', 3, 0)).toEqual(num(3))
     expect(read(wb, 's1', 4, 0)).toEqual({ kind: 'error', code: '#REF!' })
+    expect(read(wb, 's1', 5, 0)).toEqual({ kind: 'error', code: '#REF!' })
   })
 
   test('FORMULATEXT returns same-sheet and cross-sheet formula source', () => {
@@ -110,6 +112,30 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 3, 5)).toEqual(str("'Data Sheet'!$A$1"))
   })
 
+  test('LET and LAMBDA preserve scoped reference identity for reference-aware functions', () => {
+    const wb = createWorkbook([
+      { id: 's1', name: 'Sheet1' },
+      { id: 'data', name: 'Data' },
+    ])
+    wb.setCell('data', 0, 0, '1')
+    wb.setCell('data', 1, 0, '2')
+    wb.setCell('data', 2, 0, '3')
+    wb.setCell('data', 2, 2, '7')
+    wb.setCell('data', 4, 0, '=SUM(A1:A3)')
+
+    wb.setCell('s1', 0, 0, '=LET(r,Data!C3,CELL("address",r))')
+    wb.setCell('s1', 1, 0, '=LAMBDA(r,CELL("address",r))(Data!C3)')
+    wb.setCell('s1', 2, 0, '=LAMBDA(r,FORMULATEXT(r))(Data!A5)')
+    wb.setCell('s1', 3, 0, '=LAMBDA(r,SUM(INDEX(r,1):INDEX(r,3)))(Data!A:A)')
+    wb.setCell('s1', 4, 0, '=LET(r,Data!C3,r+1)')
+
+    expect(read(wb, 's1', 0, 0)).toEqual(str('Data!$C$3'))
+    expect(read(wb, 's1', 1, 0)).toEqual(str('Data!$C$3'))
+    expect(read(wb, 's1', 2, 0)).toEqual(str('=SUM(A1:A3)'))
+    expect(read(wb, 's1', 3, 0)).toEqual(num(6))
+    expect(read(wb, 's1', 4, 0)).toEqual(num(8))
+  })
+
   test('ROW/COLUMN/ROWS/COLUMNS use current cell and reference metadata', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
 
@@ -119,14 +145,14 @@ describe('reference/workbook-aware functions', () => {
     wb.setCell('s1', 0, 1, '=COLUMN(B2)')
     wb.setCell('s1', 0, 2, '=ROWS(B2:C4)')
     wb.setCell('s1', 0, 3, '=COLUMNS(B2:C4)')
-    wb.setCell('s1', 1, 0, '=ROW(B2:B4)')
-    wb.setCell('s1', 1, 1, '=COLUMN(B2:D2)')
-    wb.setCell('s1', 1, 2, '=ROW(OFFSET(A1,1,0,2,1))')
-    wb.setCell('s1', 1, 3, '=ROWS(OFFSET(A1,1,0,3,2))')
-    wb.setCell('s1', 2, 0, '=COLUMN(INDIRECT("C1"))')
-    wb.setCell('s1', 2, 1, '=COLUMNS(INDIRECT("B2:D2"))')
-    wb.setCell('s1', 3, 0, '=ROW(CHOOSE(2,A1,B2))')
-    wb.setCell('s1', 3, 1, '=CELL("address",CHOOSE(2,A1,B2))')
+    wb.setCell('s1', 10, 0, '=ROW(B2:B4)')
+    wb.setCell('s1', 10, 4, '=COLUMN(B2:D2)')
+    wb.setCell('s1', 14, 0, '=ROW(OFFSET(A1,1,0,2,1))')
+    wb.setCell('s1', 14, 3, '=ROWS(OFFSET(A1,1,0,3,2))')
+    wb.setCell('s1', 17, 0, '=COLUMN(INDIRECT("C1"))')
+    wb.setCell('s1', 17, 1, '=COLUMNS(INDIRECT("B2:D2"))')
+    wb.setCell('s1', 18, 0, '=ROW(CHOOSE(2,A1,B2))')
+    wb.setCell('s1', 18, 1, '=CELL("address",CHOOSE(2,A1,B2))')
 
     expect(read(wb, 's1', 6, 2)).toEqual(num(7))
     expect(read(wb, 's1', 6, 3)).toEqual(num(4))
@@ -134,14 +160,14 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 0, 1)).toEqual(num(2))
     expect(read(wb, 's1', 0, 2)).toEqual(num(3))
     expect(read(wb, 's1', 0, 3)).toEqual(num(2))
-    expect(read(wb, 's1', 1, 0)).toEqual(arr([[num(2)], [num(3)], [num(4)]]))
-    expect(read(wb, 's1', 1, 1)).toEqual(arr([[num(2), num(3), num(4)]]))
-    expect(read(wb, 's1', 1, 2)).toEqual(arr([[num(2)], [num(3)]]))
-    expect(read(wb, 's1', 1, 3)).toEqual(num(3))
-    expect(read(wb, 's1', 2, 0)).toEqual(num(3))
-    expect(read(wb, 's1', 2, 1)).toEqual(num(3))
-    expect(read(wb, 's1', 3, 0)).toEqual(num(2))
-    expect(read(wb, 's1', 3, 1)).toEqual(str('$B$2'))
+    expect(read(wb, 's1', 10, 0)).toEqual(arr([[num(2)], [num(3)], [num(4)]]))
+    expect(read(wb, 's1', 10, 4)).toEqual(arr([[num(2), num(3), num(4)]]))
+    expect(read(wb, 's1', 14, 0)).toEqual(arr([[num(2)], [num(3)]]))
+    expect(read(wb, 's1', 14, 3)).toEqual(num(3))
+    expect(read(wb, 's1', 17, 0)).toEqual(num(3))
+    expect(read(wb, 's1', 17, 1)).toEqual(num(3))
+    expect(read(wb, 's1', 18, 0)).toEqual(num(2))
+    expect(read(wb, 's1', 18, 1)).toEqual(str('$B$2'))
   })
 
   test('INDIRECT resolves same-sheet and cross-sheet A1 text', () => {
@@ -244,12 +270,31 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 2, 4)).toEqual(num(1))
   })
 
+  test('direct spill references preserve 1x1 array identity', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 0, 0, '=SEQUENCE(1,1)')
+    wb.setCell('s1', 0, 1, '=A1#')
+    wb.setCell('s1', 0, 2, '=B1#')
+
+    expect(read(wb, 's1', 0, 1)).toEqual(arr([[num(1)]]))
+    expect(read(wb, 's1', 0, 2)).toEqual(arr([[num(1)]]))
+  })
+
   test('spill references reject scalar anchors', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     wb.setCell('s1', 0, 0, '1')
     wb.setCell('s1', 0, 1, '=A1#')
 
     expect(read(wb, 's1', 0, 1)).toMatchObject({ kind: 'error', code: '#REF!' })
+  })
+
+  test('spill references propagate anchor #SPILL! when the anchor exceeds sheet bounds', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.setCell('s1', 1048575, 0, '=SEQUENCE(2,1)')
+    wb.setCell('s1', 0, 1, '=A1048576#')
+
+    expect(read(wb, 's1', 1048575, 0)).toMatchObject({ kind: 'error', code: '#SPILL!' })
+    expect(read(wb, 's1', 0, 1)).toMatchObject({ kind: 'error', code: '#SPILL!' })
   })
 
   test('dynamic range endpoints can come from reference-returning functions', () => {
@@ -311,6 +356,7 @@ describe('reference/workbook-aware functions', () => {
     wb.setCell('s1', 6, 3, '=ISREF(INDEX(A1:B1,1,2))')
     wb.setCell('s1', 7, 3, '=ISREF(INDIRECT("not-a-ref"))')
     wb.setCell('s1', 8, 3, '=ISREF((A1,B1))')
+    wb.setCell('s1', 9, 3, '=ISREF((A1,Missing!A1))')
 
     expect(read(wb, 's1', 0, 3)).toEqual({ kind: 'boolean', value: true })
     expect(read(wb, 's1', 1, 3)).toEqual({ kind: 'boolean', value: false })
@@ -321,6 +367,7 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 6, 3)).toEqual({ kind: 'boolean', value: true })
     expect(read(wb, 's1', 7, 3)).toEqual({ kind: 'boolean', value: false })
     expect(read(wb, 's1', 8, 3)).toEqual({ kind: 'boolean', value: true })
+    expect(read(wb, 's1', 9, 3)).toEqual({ kind: 'boolean', value: false })
   })
 
   test('AREAS counts supported single-area references', () => {
@@ -336,6 +383,7 @@ describe('reference/workbook-aware functions', () => {
     wb.setCell('s1', 4, 5, '=AREAS(DATA_REF)')
     wb.setCell('s1', 5, 5, '=AREAS(OFFSET(A1,0,0,1,1))')
     wb.setCell('s1', 6, 5, '=AREAS(CHOOSE(2,A1,B1))')
+    wb.setCell('s1', 7, 5, '=AREAS((A1:B2,Missing!A1))')
 
     expect(read(wb, 's1', 0, 5)).toEqual(num(1))
     expect(read(wb, 's1', 1, 5)).toEqual(num(1))
@@ -344,6 +392,7 @@ describe('reference/workbook-aware functions', () => {
     expect(read(wb, 's1', 4, 5)).toEqual(num(1))
     expect(read(wb, 's1', 5, 5)).toEqual(num(1))
     expect(read(wb, 's1', 6, 5)).toEqual(num(1))
+    expect(read(wb, 's1', 7, 5)).toEqual({ kind: 'error', code: '#REF!' })
   })
 
   test('multi-area references can be consumed by aggregate functions', () => {
@@ -373,9 +422,11 @@ describe('reference/workbook-aware functions', () => {
     ])
     wb.setCell('s1', 0, 0, '=SHEET((A1:B2,C1:D2))')
     wb.setCell('s1', 1, 0, '=SHEET((Data!A1:B2,A1:B2))')
+    wb.setCell('s1', 2, 0, '=SHEET((A1:B2,Missing!A1:B2))')
 
     expect(read(wb, 's1', 0, 0)).toEqual(num(1))
     expect(read(wb, 's1', 1, 0)).toEqual(num(2))
+    expect(read(wb, 's1', 2, 0)).toEqual({ kind: 'error', code: '#REF!' })
   })
 
   test('INDIRECT supports whole-column and whole-row text references', () => {

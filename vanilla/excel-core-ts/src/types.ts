@@ -109,6 +109,22 @@ export type Value =
 
 export const BLANK: Value = { kind: 'blank' }
 
+/**
+ * Internal reference payload carried by LET / LAMBDA scopes. It is not
+ * a public `Value`; ordinary scalar evaluation still materializes the
+ * referenced cell or range, while evaluator-aware functions can keep
+ * the source sheet/range identity.
+ */
+export interface LambdaReferenceBinding {
+  readonly sheetName?: string
+  readonly range: CellRange
+  readonly materialized?: Value[][]
+}
+
+export interface EvalRuntimeDeps {
+  readonly ranges?: ReadonlyArray<{ readonly sheetName?: string; readonly range: CellRange }>
+}
+
 // =============================================================================
 // 4. Cell — the unit stored inside a sheet's Map
 // =============================================================================
@@ -467,6 +483,15 @@ export interface EvalContext {
   readonly lambdaScope?: ReadonlyMap<string, Value>
 
   /**
+   * Optional per-call reference-valued lambda scope. This is the
+   * reference twin of `lambdaScope`: a parameter / LET binding like
+   * `r = Data!C3` can evaluate as the cell value in ordinary arithmetic,
+   * while `CELL("address", r)` / `FORMULATEXT(r)` / `INDEX(r, ...)`
+   * still see the original reference identity.
+   */
+  readonly lambdaRefScope?: ReadonlyMap<string, LambdaReferenceBinding>
+
+  /**
    * Optional per-call function-valued lambda scope. `lambdaScope` above
    * stores parameter / LET scalar values; this map stores LET-bound
    * LAMBDA values so evaluator-aware functions can pass them to MAP /
@@ -511,7 +536,12 @@ export interface EvalContext {
    * Rust engine's hydrate-on-read dep install. Pure observation — must
    * not mutate `cells` or evaluation state.
    */
-  onFormulaEvaluated?(cells: ReadonlyMap<CellKey, Cell>, key: CellKey, ast: Expr): void
+  onFormulaEvaluated?(
+    cells: ReadonlyMap<CellKey, Cell>,
+    key: CellKey,
+    ast: Expr,
+    runtimeDeps?: EvalRuntimeDeps,
+  ): void
 }
 
 /**
@@ -534,6 +564,7 @@ export interface LambdaBinding {
   readonly params: ReadonlyArray<string>
   readonly body: Expr
   readonly closureScope?: ReadonlyMap<string, Value>
+  readonly closureRefScope?: ReadonlyMap<string, LambdaReferenceBinding>
   readonly closureFunctionScope?: ReadonlyMap<string, LambdaBinding>
   readonly closureOmittedParams?: ReadonlySet<string>
 }

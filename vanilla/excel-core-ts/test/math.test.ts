@@ -291,6 +291,8 @@ describe('ROUND', () => {
   test('rounds half AWAY from zero (Excel rule, not JS rule)', () => {
     expect(call(ROUND, [NUM(2.5), NUM(0)])).toEqual(NUM(3))
     expect(call(ROUND, [NUM(-2.5), NUM(0)])).toEqual(NUM(-3))
+    expect(call(ROUND, [NUM(0.145), NUM(2)])).toEqual(NUM(0.15))
+    expect(call(ROUND, [NUM(-0.145), NUM(2)])).toEqual(NUM(-0.15))
   })
 
   test('negative digits round to left of decimal', () => {

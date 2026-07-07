@@ -336,9 +336,16 @@ describe('CONVERT', () => {
 
   test('converts pressure, energy, power, and temperature units', () => {
     expectNumberClose(call(CONVERT, [NUM(1), STR('atm'), STR('Pa')]), 101325, 3)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('at'), STR('p')]), 101325, 3)
     expectNumberClose(call(CONVERT, [NUM(1), STR('psi'), STR('Pa')]), 6894.757293168, 3)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('e'), STR('J')]), 1e-7, 12)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('c'), STR('J')]), 4.184, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('cal'), STR('J')]), 4.184, 9)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('flb'), STR('J')]), 1.3558179483314004, 9)
     expectNumberClose(call(CONVERT, [NUM(1), STR('Wh'), STR('J')]), 3600, 9)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('wh'), STR('J')]), 3600, 9)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('HPh'), STR('J')]), 2684519.537696173, 3)
+    expectNumberClose(call(CONVERT, [NUM(1), STR('hh'), STR('J')]), 2684519.537696173, 3)
     expectNumberClose(call(CONVERT, [NUM(1), STR('kWh'), STR('J')]), 3600000, 3)
     expectNumberClose(call(CONVERT, [NUM(1), STR('HP'), STR('W')]), 745.69987158227022, 3)
     expectNumberClose(call(CONVERT, [NUM(212), STR('F'), STR('C')]), 100, 9)

@@ -215,16 +215,17 @@ function collectTextDelimiters(
   return { ok: true, value: out }
 }
 
-function isAscii(s: string): boolean {
-  for (let i = 0; i < s.length; i++) {
-    if (s.charCodeAt(i) > 0x7f) return false
-  }
-  return true
-}
-
 interface TextDelimiterMatch {
   readonly start: number
   readonly end: number
+}
+
+function indexOfCaseInsensitive(text: string, needle: string, start: number): number {
+  const lowerNeedle = needle.toLowerCase()
+  for (let i = start; i <= text.length - needle.length; i += 1) {
+    if (text.slice(i, i + needle.length).toLowerCase() === lowerNeedle) return i
+  }
+  return -1
 }
 
 function findFirstTextDelimiter(
@@ -235,18 +236,16 @@ function findFirstTextDelimiter(
 ): TextDelimiterMatch | null {
   if (delims.length === 0 || start > text.length) return null
   const caseInsensitive = matchMode === 1
-  const hayLower = caseInsensitive && isAscii(text) ? text.toLowerCase() : text
   let best: TextDelimiterMatch | null = null
 
   for (const delim of delims) {
     if (delim === '') continue
-    const asciiInsensitive = caseInsensitive && isAscii(text) && isAscii(delim)
-    const hay = asciiInsensitive ? hayLower : text
-    const needle = asciiInsensitive ? delim.toLowerCase() : delim
-    const pos = hay.indexOf(needle, start)
+    const pos = caseInsensitive
+      ? indexOfCaseInsensitive(text, delim, start)
+      : text.indexOf(delim, start)
     if (pos < 0) continue
     if (best === null || pos < best.start) {
-      best = { start: pos, end: pos + needle.length }
+      best = { start: pos, end: pos + delim.length }
     }
   }
 
@@ -1101,13 +1100,13 @@ function formatTextNumberSection(
 }
 
 /**
- * Render `n.toFixed(decimals)` with the locale's decimal separator
- * instead of `.`. Sign is preserved verbatim from `toFixed`. We never
- * apply grouping here — the `#,##0` / `#,##0.00` cases above thread
+ * Render fixed decimals with Excel-style half-away-from-zero rounding. We
+ * never apply grouping here — the `#,##0` / `#,##0.00` cases above thread
  * grouping through `formatThousands` instead.
  */
 function formatFixedDecimal(n: number, decimals: number, decimalSep: string): string {
-  const raw = n.toFixed(decimals)
+  const sign = n < 0 ? '-' : ''
+  const raw = `${sign}${formatAbsFixedDecimal(Math.abs(n), decimals)}`
   if (decimalSep === '.') return raw
   return raw.replace('.', decimalSep)
 }
@@ -1203,6 +1202,36 @@ function roundHalfAwayFromZero(n: number): number {
   return n < 0 ? -Math.round(Math.abs(n)) : Math.round(n)
 }
 
+function roundScaledHalfAwayFromZero(abs: number, decimals: number): number {
+  const factor = 10 ** decimals
+  const scaled = abs * factor
+  if (!Number.isFinite(scaled) || Math.abs(scaled) > Number.MAX_SAFE_INTEGER) {
+    return Math.round(scaled)
+  }
+  const lower = Math.floor(scaled)
+  const half = lower + 0.5
+  const tolerance = Number.EPSILON * Math.max(1, Math.abs(scaled)) * 4
+  const adjusted = Math.abs(scaled - half) <= tolerance ? half : scaled
+  return Math.round(adjusted)
+}
+
+function formatAbsFixedDecimal(abs: number, decimals: number): string {
+  const rounded = roundScaledHalfAwayFromZero(abs, decimals)
+  const factor = 10 ** decimals
+  if (!Number.isSafeInteger(rounded) || !Number.isSafeInteger(factor)) {
+    return (rounded / factor).toFixed(decimals)
+  }
+  if (decimals === 0) return String(rounded)
+  const whole = Math.floor(rounded / factor)
+  const frac = String(rounded % factor).padStart(decimals, '0')
+  return `${whole}.${frac}`
+}
+
+function roundDecimalHalfAwayFromZero(n: number, decimals: number): number {
+  const sign = n < 0 ? -1 : 1
+  return sign * roundScaledHalfAwayFromZero(Math.abs(n), decimals) / 10 ** decimals
+}
+
 function formatTextScientific(n: number, format: string): string | undefined {
   const match = /^(0)(?:\.(0+))?([Ee])\+(0+)$/.exec(format)
   if (!match) return undefined
@@ -1210,11 +1239,22 @@ function formatTextScientific(n: number, format: string): string | undefined {
   const decimals = match[2]?.length ?? 0
   const exponentChar = match[3]
   const exponentWidth = match[4].length
-  const exponential = n.toExponential(decimals)
-  const parts = /^(-?)(\d+(?:\.\d+)?)e([+-])(\d+)$/.exec(exponential)
-  if (!parts) return undefined
-  const [, sign, mantissa, exponentSign, exponentDigits] = parts
-  const exponent = exponentDigits.padStart(exponentWidth, '0')
+  const sign = n < 0 ? '-' : ''
+  const abs = Math.abs(n)
+  if (abs === 0) {
+    const mantissa = decimals > 0 ? `0.${'0'.repeat(decimals)}` : '0'
+    return `${mantissa}${exponentChar}+${'0'.repeat(exponentWidth)}`
+  }
+  let exponentValue = Math.floor(Math.log10(abs))
+  let mantissaValue = abs / 10 ** exponentValue
+  mantissaValue = roundDecimalHalfAwayFromZero(mantissaValue, decimals)
+  if (mantissaValue >= 10) {
+    mantissaValue /= 10
+    exponentValue += 1
+  }
+  const mantissa = formatAbsFixedDecimal(mantissaValue, decimals)
+  const exponentSign = exponentValue < 0 ? '-' : '+'
+  const exponent = String(Math.abs(exponentValue)).padStart(exponentWidth, '0')
   return `${sign}${mantissa}${exponentChar}${exponentSign}${exponent}`
 }
 
@@ -1377,7 +1417,7 @@ function formatTextCustomNumberPattern(
   const scaled = (n * 100 ** percentCount) / 1000 ** scaleCommas
   const negative = scaled < 0
   const abs = Math.abs(scaled)
-  const rounded = maxFracDigits > 0 ? abs.toFixed(maxFracDigits) : Math.round(abs).toString()
+  const rounded = formatAbsFixedDecimal(abs, maxFracDigits)
   let [whole, frac = ''] = rounded.split('.')
   whole = whole.padStart(minIntDigits, '0')
   if (requiredIntDigits === 0 && Number(whole) === 0) whole = ''
@@ -1410,7 +1450,7 @@ function formatTextCustomIntegerMask(
   }
   if (placeholderCount === 0) return undefined
 
-  let remaining = Math.round(Math.abs(n)).toString()
+  let remaining = roundHalfAwayFromZero(Math.abs(n)).toString()
   const parts = tokens.map((token) => token.value)
   let firstSlot = -1
   for (let i = tokens.length - 1; i >= 0; i -= 1) {
@@ -1882,11 +1922,7 @@ function formatThousands(
 ): string {
   const negative = n < 0
   const abs = Math.abs(n)
-  // Round to the requested number of decimals first so we don't carry
-  // float noise into the integer portion.
-  const rounded = decimals > 0
-    ? abs.toFixed(decimals)
-    : Math.round(abs).toString()
+  const rounded = formatAbsFixedDecimal(abs, decimals)
   const [intPart, decPart] = rounded.split('.')
   // Insert commas every 3 digits from the right, then map them to the
   // locale's actual group separator.
@@ -2073,7 +2109,7 @@ function searchCoreMatchIndex(
 ): number | null {
   if (needle.length === 0) return offset
 
-  if (wildcards && /[*?]/.test(needle)) {
+  if (wildcards && /[*?~]/.test(needle)) {
     // Build a regex from the wildcard pattern. `~` escapes the next
     // metachar (`~*` literal asterisk, `~?` literal question mark, `~~`
     // literal tilde).
@@ -2431,8 +2467,7 @@ const CLEAN: FunctionImpl = (args) => {
   if (err) return err
   const ts = coerceText(args[0])
   if (!ts.ok) return ts.error
-  // Strip ASCII control chars 0-31 (and DEL 127).
-  return { kind: 'string', value: ts.value.replace(/[\x00-\x1F\x7F]/g, '') }
+  return { kind: 'string', value: ts.value.replace(/[\x00-\x1F]/g, '') }
 }
 
 /**
@@ -2828,7 +2863,7 @@ const DOLLAR: FunctionImpl = (args, ctx) => {
   let renderedDecimals = decimals
   if (decimals < 0) {
     const factor = 10 ** -decimals
-    value = Math.round(value / factor) * factor
+    value = roundHalfAwayFromZero(value / factor) * factor
     renderedDecimals = 0
   }
   return { kind: 'string', value: formatCurrency(value, ctx.locale, renderedDecimals) }
@@ -2858,7 +2893,7 @@ const FIXED: FunctionImpl = (args, ctx) => {
   let renderedDecimals = decimals
   if (decimals < 0) {
     const factor = 10 ** -decimals
-    value = Math.round(value / factor) * factor
+    value = roundHalfAwayFromZero(value / factor) * factor
     renderedDecimals = 0
   }
   return {

@@ -374,6 +374,8 @@ describe('higher-order LAMBDA array functions', () => {
       message: 'array result was not expanded',
     }
     expect(evaluate(parseFormula('=MAP({1,2}, LAMBDA(x, {x,x}))'), makeCtx())).toEqual(nestedArray)
+    expect(evaluate(parseFormula('=SCAN(0, {1,2}, LAMBDA(acc, x, {acc,x}))'), makeCtx()))
+      .toEqual(nestedArray)
     expect(evaluate(parseFormula('=BYROW({1;2}, LAMBDA(r, {1,2}))'), makeCtx())).toEqual(
       nestedArray,
     )

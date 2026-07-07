@@ -130,9 +130,9 @@ function parseExpr(cur: TokenCursor, minBp: number): Expr {
     const t = cur.peek()
     if (t.kind === 'colon') {
       if (RANGE_BP < minBp) break
-      cur.next()
+      const colon = cur.next()
       const rhs = parseExpr(cur, RANGE_BP + 1)
-      lhs = makeRange(lhs, rhs)
+      lhs = makeRange(lhs, rhs, colon.pos)
       continue
     }
     if (t.kind === 'op') {
@@ -279,7 +279,18 @@ function makeSpillRef(expr: Expr, pos: number): SpillReferenceExpr {
   throw new ParseError('spill references require a single-cell anchor', pos)
 }
 
-function makeRange(start: Expr, end: Expr): RangeExpr | DynamicRangeExpr {
+function isRangeExpr(expr: Expr): boolean {
+  return (
+    expr.kind === 'range' ||
+    expr.kind === 'dynamicRange' ||
+    (expr.kind === 'crossSheet' && expr.inner.kind === 'range')
+  )
+}
+
+function makeRange(start: Expr, end: Expr, pos = 0): RangeExpr | DynamicRangeExpr {
+  if (isRangeExpr(start) || isRangeExpr(end)) {
+    throw new ParseError('range operator endpoints must be single references', pos)
+  }
   if (start.kind === 'ref' && end.kind === 'ref') {
     return { kind: 'range', start: start.a1, end: end.a1 }
   }
@@ -303,14 +314,14 @@ function parseRefOrRange(cur: TokenCursor): Expr {
   cur.next()
   const start = makeRefExpr(t)
   if (cur.peek().kind === 'colon') {
-    cur.next()
+    const colon = cur.next()
     const endTok = cur.peek()
     if (endTok.kind === 'ref') {
       cur.next()
-      return makeRange(start, makeRefExpr(endTok))
+      return makeRange(start, makeRefExpr(endTok), colon.pos)
     }
     const end = parseExpr(cur, RANGE_BP + 1)
-    return makeRange(start, end)
+    return makeRange(start, end, colon.pos)
   }
   return start
 }

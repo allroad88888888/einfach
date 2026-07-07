@@ -256,6 +256,65 @@ describe('formulaCellAtom — derive + vanilla/core sub', () => {
     const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
     expect(wb.store.getter(wb.sheet('s1')!.formulaCellAtom('5:5'))).toEqual(BLANK)
   })
+
+  test('array formula returns #SPILL! when the spill target is occupied', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 0, 1, 'blocker')
+    wb.setCell('s1', 0, 0, '=SEQUENCE(2,2)')
+
+    expect(wb.store.getter(sheet.formulaCellAtom(keyFor(0, 0)))).toMatchObject({
+      kind: 'error',
+      code: '#SPILL!',
+    })
+    expect(wb.store.getter(sheet.formulaCellAtom(keyFor(0, 1)))).toEqual({
+      kind: 'string',
+      value: 'blocker',
+    })
+  })
+
+  test('array formula returns #SPILL! when the spill extent exceeds sheet bounds', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    wb.setCell('s1', 1_048_575, 0, '=SEQUENCE(2,1)')
+
+    expect(wb.store.getter(sheet.formulaCellAtom(keyFor(1_048_575, 0)))).toMatchObject({
+      kind: 'error',
+      code: '#SPILL!',
+    })
+  })
+
+  test('writing into a cached spill range revalidates the anchor as #SPILL!', () => {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    const sheet = wb.sheet('s1')!
+    const anchor = sheet.formulaCellAtom(keyFor(0, 0))
+    wb.setCell('s1', 0, 0, '=SEQUENCE(2,2)')
+
+    expect(wb.store.getter(anchor)).toMatchObject({ kind: 'array' })
+
+    wb.setCell('s1', 0, 1, 'blocker')
+
+    expect(wb.store.getter(anchor)).toMatchObject({
+      kind: 'error',
+      code: '#SPILL!',
+    })
+
+    wb.clearCell('s1', 0, 1, 'all')
+
+    expect(wb.store.getter(anchor)).toEqual({
+      kind: 'array',
+      value: [
+        [
+          { kind: 'number', value: 1 },
+          { kind: 'number', value: 2 },
+        ],
+        [
+          { kind: 'number', value: 3 },
+          { kind: 'number', value: 4 },
+        ],
+      ],
+    })
+  })
 })
 
 describe('recalc — F9 re-derives every cached formula', () => {
