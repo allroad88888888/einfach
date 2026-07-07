@@ -1,0 +1,109 @@
+impl WasmSheet :: [#[wasm_bindgen(constructor)]] :: pub fn new() -> Self
+impl WasmSheet :: [#[wasm_bindgen(js_name = "__debugPanicNextCallback")]] :: pub fn debug_panic_next_callback(&self)
+impl WasmSheet :: [#[wasm_bindgen(js_name = "spillInfo")]] :: pub fn spill_info(&self, addr: &str) -> JsValue
+impl WasmSheet :: [] :: pub fn batch_set_numbers(&mut self, addrs: Vec<String>, values: Vec<f64>)
+impl WasmSheet :: [] :: pub fn clear_cell(&mut self, addr: &str)
+impl WasmSheet :: [] :: pub fn clear_range( &mut self, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> u32
+impl WasmSheet :: [] :: pub fn debug_dirty_count(&self) -> u32
+impl WasmSheet :: [] :: pub fn debug_formula_eval_count(&self) -> u32
+impl WasmSheet :: [] :: pub fn debug_imported_formula_count(&self) -> u32
+impl WasmSheet :: [] :: pub fn debug_live_subscription_count(&self) -> u32
+impl WasmSheet :: [] :: pub fn debug_range_dep_count(&self) -> u32
+impl WasmSheet :: [] :: pub fn delete_col(&mut self, at: u32, count: u32)
+impl WasmSheet :: [] :: pub fn delete_row(&mut self, at: u32, count: u32)
+impl WasmSheet :: [] :: pub fn formatted_display(&self, addr: &str) -> String
+impl WasmSheet :: [] :: pub fn get_display(&mut self, addr: &str) -> String
+impl WasmSheet :: [] :: pub fn get_effective_format(&self, addr: &str) -> JsValue
+impl WasmSheet :: [] :: pub fn get_format(&self, addr: &str) -> JsValue
+impl WasmSheet :: [] :: pub fn get_formula(&self, addr: &str) -> String
+impl WasmSheet :: [] :: pub fn get_number(&mut self, addr: &str) -> f64
+impl WasmSheet :: [] :: pub fn get_type(&mut self, addr: &str) -> String
+impl WasmSheet :: [] :: pub fn insert_col(&mut self, at: u32, count: u32)
+impl WasmSheet :: [] :: pub fn insert_row(&mut self, at: u32, count: u32)
+impl WasmSheet :: [] :: pub fn is_error(&mut self, addr: &str) -> bool
+impl WasmSheet :: [] :: pub fn non_empty_addrs(&self) -> Vec<String>
+impl WasmSheet :: [] :: pub fn restore_format_snapshot(&mut self, snapshot: JsValue) -> Result<u32, JsValue>
+impl WasmSheet :: [] :: pub fn set_boolean(&mut self, addr: &str, value: bool)
+impl WasmSheet :: [] :: pub fn set_error(&mut self, addr: &str, value: &str)
+impl WasmSheet :: [] :: pub fn set_format(&mut self, addr: &str, fmt: JsValue) -> Result<(), JsValue>
+impl WasmSheet :: [] :: pub fn set_format_range( &mut self, start_row: u32, start_col: u32, end_row: u32, end_col: u32, fmt: JsValue, ) -> Result<u32, JsValue>
+impl WasmSheet :: [] :: pub fn set_formula(&mut self, addr: &str, formula: &str) -> bool
+impl WasmSheet :: [] :: pub fn set_number(&mut self, addr: &str, value: f64)
+impl WasmSheet :: [] :: pub fn set_text(&mut self, addr: &str, value: &str)
+impl WasmSheet :: [] :: pub fn snapshot_format_range( &self, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> Result<JsValue, JsValue>
+impl WasmSheet :: [] :: pub fn subscribe(&mut self, addr: &str, callback: js_sys::Function) -> u32
+impl WasmSheet :: [] :: pub fn unsubscribe(&mut self, token: u32)
+impl WasmWorkbook :: [#[wasm_bindgen(constructor)]] :: pub fn new() -> Self
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "bulkImportCellsInstrumented")]] :: pub fn bulk_import_cells_instrumented(&mut self, cells: JsValue) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "clearCellAt")]] :: pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str)
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaCount")]] :: pub fn custom_formula_count(&self) -> u32
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "customFormulaNames")]] :: pub fn custom_formula_names(&self) -> JsValue
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "debugDepGraphStats")]] :: pub fn debug_dep_graph_stats(&self) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "debugLastBulkImportPhaseMs")]] :: pub fn debug_last_bulk_import_phase_ms(&self) -> Vec<f64>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "defineName")]] :: pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "definedNames")]] :: pub fn defined_names(&self) -> Vec<String>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "getCellDisplay")]] :: pub fn get_cell_display(&mut self, sheet_idx: usize, addr: &str) -> String
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "registerCustomFormula")]] :: pub fn register_custom_formula(&mut self, name: String, callback: js_sys::Function)
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "setFormulaAt")]] :: pub fn set_formula_at(&mut self, sheet_idx: usize, addr: &str, src: &str) -> bool
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "snapshotCell")]] :: pub fn snapshot_cell(&self, sheet_idx: u32, addr: &str) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "spillAnchor")]] :: pub fn spill_anchor(&self, sheet_idx: u32, addr: &str) -> JsValue
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "spillInfo")]] :: pub fn spill_info(&self, sheet_idx: u32, addr: &str) -> JsValue
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "tryClearCellAt")]] :: pub fn try_clear_cell_at(&mut self, sheet_idx: usize, addr: &str) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "trySetCellBoolean")]] :: pub fn try_set_cell_boolean( &mut self, sheet_idx: usize, addr: &str, value: bool, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "trySetCellError")]] :: pub fn try_set_cell_error( &mut self, sheet_idx: usize, addr: &str, value: &str, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "trySetCellNumber")]] :: pub fn try_set_cell_number( &mut self, sheet_idx: usize, addr: &str, value: f64, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "trySetCellText")]] :: pub fn try_set_cell_text( &mut self, sheet_idx: usize, addr: &str, value: &str, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "trySetFormulaAt")]] :: pub fn try_set_formula_at( &mut self, sheet_idx: usize, addr: &str, src: &str, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "undefineName")]] :: pub fn undefine_name(&mut self, name: &str) -> bool
+impl WasmWorkbook :: [#[wasm_bindgen(js_name = "unregisterCustomFormula")]] :: pub fn unregister_custom_formula(&mut self, name: &str) -> bool
+impl WasmWorkbook :: [] :: pub fn add_sheet(&mut self, name: &str) -> u32
+impl WasmWorkbook :: [] :: pub fn bulk_import_cells(&mut self, cells: JsValue) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn bulk_install_workbook(&mut self, payload: JsValue) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn clear_cell(&mut self, sheet_idx: u32, addr: &str)
+impl WasmWorkbook :: [] :: pub fn clear_range( &mut self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_cross_sheet_dependents_count(&self) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_formula_cache_state(&self, sheet_idx: u32, addr: &str) -> String
+impl WasmWorkbook :: [] :: pub fn debug_formula_count(&self) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_formula_eval_count(&self, sheet_idx: u32) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_formula_eval_count_total(&self) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_live_subscription_count(&self) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_sheet_formula_count(&self, sheet_idx: u32) -> u32
+impl WasmWorkbook :: [] :: pub fn debug_sheet_live_subscription_count(&self, sheet_idx: u32) -> u32
+impl WasmWorkbook :: [] :: pub fn delete_col(&mut self, sheet_idx: u32, at: u32, count: u32)
+impl WasmWorkbook :: [] :: pub fn delete_row(&mut self, sheet_idx: u32, at: u32, count: u32)
+impl WasmWorkbook :: [] :: pub fn get_display(&self, sheet_idx: u32, addr: &str) -> String
+impl WasmWorkbook :: [] :: pub fn get_formula(&self, sheet_idx: u32, addr: &str) -> String
+impl WasmWorkbook :: [] :: pub fn get_number(&self, sheet_idx: u32, addr: &str) -> f64
+impl WasmWorkbook :: [] :: pub fn get_type(&self, sheet_idx: u32, addr: &str) -> String
+impl WasmWorkbook :: [] :: pub fn insert_col(&mut self, sheet_idx: u32, at: u32, count: u32)
+impl WasmWorkbook :: [] :: pub fn insert_row(&mut self, sheet_idx: u32, at: u32, count: u32)
+impl WasmWorkbook :: [] :: pub fn is_error(&self, sheet_idx: u32, addr: &str) -> bool
+impl WasmWorkbook :: [] :: pub fn list_non_empty_cells(&self) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn move_sheet(&mut self, from: u32, to: u32) -> bool
+impl WasmWorkbook :: [] :: pub fn read_sparse_range( &self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn remove_sheet(&mut self, idx: u32) -> bool
+impl WasmWorkbook :: [] :: pub fn rename_sheet(&mut self, idx: u32, name: &str) -> bool
+impl WasmWorkbook :: [] :: pub fn restore_format_snapshot(&mut self, snapshot: JsValue) -> Result<u32, JsValue>
+impl WasmWorkbook :: [] :: pub fn restore_persistence_v1(&mut self, value: JsValue) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn restore_sparse(&mut self, cells: JsValue) -> Result<u32, JsValue>
+impl WasmWorkbook :: [] :: pub fn set_boolean(&mut self, sheet_idx: u32, addr: &str, value: bool)
+impl WasmWorkbook :: [] :: pub fn set_cell_boolean(&mut self, sheet_idx: usize, addr: &str, value: bool)
+impl WasmWorkbook :: [] :: pub fn set_cell_error(&mut self, sheet_idx: usize, addr: &str, value: &str)
+impl WasmWorkbook :: [] :: pub fn set_cell_number(&mut self, sheet_idx: usize, addr: &str, value: f64)
+impl WasmWorkbook :: [] :: pub fn set_cell_text(&mut self, sheet_idx: usize, addr: &str, value: &str)
+impl WasmWorkbook :: [] :: pub fn set_col_width(&mut self, sheet_idx: u32, col_index: u32, width_px: u32) -> bool
+impl WasmWorkbook :: [] :: pub fn set_error(&mut self, sheet_idx: u32, addr: &str, value: &str)
+impl WasmWorkbook :: [] :: pub fn set_format_range( &mut self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, fmt: JsValue, ) -> Result<u32, JsValue>
+impl WasmWorkbook :: [] :: pub fn set_formula(&mut self, sheet_idx: u32, addr: &str, formula: &str) -> bool
+impl WasmWorkbook :: [] :: pub fn set_number(&mut self, sheet_idx: u32, addr: &str, value: f64)
+impl WasmWorkbook :: [] :: pub fn set_row_height(&mut self, sheet_idx: u32, row_index: u32, height_px: u32) -> bool
+impl WasmWorkbook :: [] :: pub fn set_text(&mut self, sheet_idx: u32, addr: &str, value: &str)
+impl WasmWorkbook :: [] :: pub fn sheet_count(&self) -> u32
+impl WasmWorkbook :: [] :: pub fn sheet_name(&self, idx: u32) -> String
+impl WasmWorkbook :: [] :: pub fn snapshot_format_range( &self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn snapshot_persistence_v1(&self) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn snapshot_range_sparse( &self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn snapshot_sparse(&self) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn snapshot_viewport_sizes( &self, sheet_idx: u32, start_row: u32, start_col: u32, end_row: u32, end_col: u32, ) -> Result<JsValue, JsValue>
+impl WasmWorkbook :: [] :: pub fn subscribe_cell(&mut self, sheet_name: &str, addr: &str, cb: js_sys::Function) -> u32
+impl WasmWorkbook :: [] :: pub fn unsubscribe_cell(&mut self, token: u32)
