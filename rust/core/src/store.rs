@@ -1037,6 +1037,13 @@ impl Store {
         inner.has(id) && !inner.record(id).back_deps.is_empty()
     }
 
+    /// Returns true if the atom has live subscribers (AtomFamily eviction
+    /// safety check).
+    pub fn has_subscribers(&self, id: AtomId) -> bool {
+        let inner = self.inner.borrow();
+        inner.subscriptions.get(&id).is_some_and(|s| !s.is_empty())
+    }
+
     /// Destroy an atom and free all references to it. Panics if live
     /// downstream derived atoms remain (callers destroy dependents first).
     pub fn destroy_atom(&self, id: AtomId) {
