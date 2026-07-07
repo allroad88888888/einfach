@@ -1,6 +1,6 @@
 # Atom-Delegation Rewrite — WORKPLAN & Constitution
 
-> **Current phase: P0 (freeze & scaffolding).**
+> **Current phase: P1 (store rewrite) — exit gate in progress.**
 > Successor agents: read this file FIRST, then the latest `SESSION_HANDOFF_*.md`,
 > then run the quick-verify block (§8). `rust/excel-core/tests/architecture_invariants.rs`
 > enforces §2 mechanically — if it fails, you are off the main direction. Stop and read §6.
@@ -97,7 +97,14 @@ Counter fate (agreed in the approved plan):
 Per-shape rows (S1–S12, probes, wasm native, workbook inline pins) are added
 here at P4/P5/P6, one table per batch, before the corresponding code lands.
 
-_(no rows yet — P0)_
+P1 note for future closed forms: `debug_flush_visit_count` identities carry a
+second-round revalidation term — flushPending drains the re-derived atoms in
+round 2 and each walk revalidates (then prunes) its dependents. A hydrated
+N-chain head edit is therefore visits == 2N−1 (N re-derives + N−1 pruned
+revalidations), evals == N. Pinned by
+`chain_100k_head_write_flush_is_iterative_and_linear`.
+
+_(no S-shape rows yet — those land at P4)_
 
 ## 5. Divergence ledger (store.ts → store.rs)
 
@@ -105,8 +112,11 @@ _(no rows yet — P0)_
 |---|---|---|---|
 | DV-1 | Promise/continuable-promise machinery (`isPromiseLike` branches of setAtom/setAtomState/dependenciesChange, AbortController options) | structurally-marked no-ops with `// DIVERGENCE` comments | no async `Value` in the engine |
 | DV-2 | `Object.is` reference snapshots | per-atom generation counters (gen equal ⟹ Object.is passes; ABA ⟹ one spurious re-derive absorbed by equality pruning) | Rust has no stable reference identity for cloned Values; generations are the honest translation (D1) |
-| DV-3 | recursive readAtom / dependenciesChange | iterative work stacks + NeedsDep scratch-commit | 1 MB WASM stack; semantics preserved (D2) |
-| DV-4 | O(deps) snapshot validation per pending root | settled-memo (`write_seq`/`settled_at`) skip | pure memoization of a deterministic check; differential fuzz test pins equivalence |
+| DV-3 | recursive readAtom / dependenciesChange | HYBRID (refined at P1): nested reads recurse natively up to `READ_RECURSION_BUDGET = 256` (vanilla-verbatim, correctly-typed getter returns for all hand-written atom graphs), past the budget the tracked getter FAULTS — records the needed dep, returns a `Value::Null` placeholder, the frame loop computes deps bottom-up iteratively and re-runs the read fn; scratch discarded on fault (committed deps intact, avoiding the store.ts:47-51 unconditional-fresh trap). Deep-chain read-fn contract: past-budget read fns must tolerate Null from the tracked getter (their output is discarded); the engine evaluator does naturally. `dependencies_change` is a plain explicit-stack DFS. | 1 MB WASM stack has no unwinding (catch_unwind unavailable), so the TS throw-NeedsDep sentinel cannot port directly; the hybrid keeps twin/UI fidelity AND stack safety (D2) |
+| DV-4 | O(deps) snapshot validation per pending root | settled-memo (`write_seq`/`settled_at`) skip | pure memoization of a deterministic check; twin `settled_memo_bulk_write_into_shared_dependent` pins evals==1 / visits==N |
+| DV-5 | `clear()` — vanilla atoms are external objects that survive clear and re-materialize from init | Rust atom definitions live in the store; clear() kills held AtomIds. C-7 protective intent (no ghost flushes) kept + twinned | no WeakMap/GC in Rust |
+| DV-6 | implicit write-fn batching only | public `batch()` kept (explicit form of the same mechanics, engine uses it); write-side cycle guard panics (vanilla would infinite-loop); store-level cross-atom READ cycle panics (vanilla would stack-overflow; engine detects at evaluator level) | defensive hardening, observability unchanged for legal programs |
+| DV-7 | `setter(atom, prev => next)` function-update sugar; `getDefaultStore`; `storeAtom` self-reference | not ported (JS-surface conveniences; `Value` carries no closures) | twins adapt call sites |
 
 Additions require owner approval (§6).
 
@@ -163,8 +173,8 @@ Baseline counts (P0, recorded 2026-07-07 at commit 208688d):
 
 | ID | Decision | Status |
 |---|---|---|
-| D1 | Snapshot = generation counters; `Value::Array`/`Lambda` equality via `Rc::ptr_eq` fast path + `PartialEq` | argued in plan; codex review at P1 start |
-| D2 | NeedsDep scratch-commit protocol; counters bump on completed runs only | designed in plan; codex review at P1 start |
+| D1 | Snapshot = generation counters; `Value::Array`/`Lambda` equality via `Rc::ptr_eq` fast path + `PartialEq` | **CLOSED** (P1 codex review: no holes) |
+| D2 | NeedsDep scratch-commit + 256-deep recursion-budget hybrid (DV-3); counters bump on completed runs only | **CLOSED** (P1 codex review: no holes; unwind guards added per review) |
 | D3 | Cycle semantics: keep two-tier (install-time reject via `store.reverse_reachable` + runtime `#CYCLE!` value); cycle-component registry with dissolve-on-edit | codex review at P4/P6 |
 | D4 | Range tiers: Tier A per-member (threshold ~64–256, tune at P5), Tier B band atoms (col, row/256) | codex review before P5 code |
 | D5 | Per-shape counter re-derivation tables (§4) | owner sign-off per batch |
@@ -172,6 +182,19 @@ Baseline counts (P0, recorded 2026-07-07 at commit 208688d):
 | D7 | Store ownership: `Rc<RefCell<Store>>` handle; borrow windows never span eval re-entry | codex review at P3 |
 
 _(DECISION_REQUESTs, if any, appended below.)_
+
+### P1 codex review disposition (2026-07-08)
+
+codex review of the store rewrite returned 4 findings (all P2), all fixed in
+the P1 commit: unwind-safety guards restored as RAII (ComputingGuard /
+SettingGuard / BatchGuard / ReadDepthGuard — a panicking read fn, write fn,
+or batch body no longer poisons store state; twinned by
+`batch_panic_does_not_leak_depth`, `read_fn_panic_does_not_poison_computing_state`,
+`write_fn_panic_does_not_poison_setting_guard`); large fan-in dep recording
+made linear (Scratch dep_index HashMap + set-backed commit diff + set-backed
+needed dedup; fenced by `large_fan_in_recompute_is_linear`). D1 (generation
+snapshots) and D2 (hybrid NeedsDep protocol) reviewed with no holes found —
+both CLOSED.
 
 ### P0 codex review disposition (2026-07-08)
 

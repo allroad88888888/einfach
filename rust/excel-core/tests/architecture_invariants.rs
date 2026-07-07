@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Current rewrite phase. Advance ONLY at a phase exit gate (WORKPLAN §3).
-const PHASE: u8 = 0;
+const PHASE: u8 = 1;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
