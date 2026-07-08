@@ -4,7 +4,9 @@ use std::rc::Rc;
 
 use std::sync::Arc;
 
-use einfach_core::{ArrayData, AtomId, CellListener, Store, SubscriptionId, Value, ValueError};
+use einfach_core::{
+    ArrayData, AtomFamily, AtomId, CellListener, Store, SubscriptionId, Value, ValueError,
+};
 
 use crate::cell::CellAddress;
 use crate::eval::{eval_expr_with_provider, EvalProvider};
@@ -770,6 +772,21 @@ pub struct Sheet {
     /// Shared cell/formula storage — see [`SheetInterior`] for the field
     /// docs and the P4a borrow rule.
     pub(crate) interior: Rc<SheetInterior>,
+    /// P4b: per-address slot-epoch primitives. A cell's epoch atom is bumped
+    /// whenever its inner atom identity changes (literal↔formula overwrite,
+    /// clear). The facade derives off this so a swap re-runs the facade read
+    /// without re-keying any subscription. Created lazily on first use.
+    /// NOT YET WIRED — the read/write paths flip in the P4c commit.
+    #[allow(dead_code)]
+    slot_epoch_family: RefCell<AtomFamily<CellAddress>>,
+    /// P4b: per-address facade derived atoms — the stable subscription anchor
+    /// that replaces `AddressSubscriptionBucket` remapping. A facade reads its
+    /// slot-epoch then the current inner atom for the address. Behind
+    /// `Rc<RefCell<_>>` so the P4c `AtomEvalProvider` can capture a clone and
+    /// resolve referenced cells' facades under `&self`. Created lazily.
+    /// NOT YET WIRED — the read/write paths flip in the P4c commit.
+    #[allow(dead_code)]
+    cell_facade_family: Rc<RefCell<AtomFamily<CellAddress>>>,
     /// Address-level subscriptions. Buckets are only wired to store atoms when
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
@@ -931,6 +948,8 @@ impl Sheet {
                 formula_source: RefCell::new(RowMajorMap::new()),
                 needs_parse: RefCell::new(HashSet::new()),
             }),
+            slot_epoch_family: RefCell::new(AtomFamily::new()),
+            cell_facade_family: Rc::new(RefCell::new(AtomFamily::new())),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
             range_dependents: RefCell::new(RangeDependentIndex::new()),
