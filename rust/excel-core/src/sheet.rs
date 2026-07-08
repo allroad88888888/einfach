@@ -1587,6 +1587,61 @@ impl Sheet {
         }
     }
 
+    /// P4c write口 helper — bump this address's slot-epoch primitive so a
+    /// materialized facade re-derives after an inner-atom IDENTITY change
+    /// (formula↔literal, Plain/Absent→Atom, slot removal Atom→None). A
+    /// same-id literal value update needs NO bump: the facade re-runs off its
+    /// native `args.get(inner)` edge when `store.set(inner, ..)` flushes.
+    ///
+    /// NON-CREATING (INV-7): if no epoch atom exists for `addr`, no facade was
+    /// ever materialized here, so there is nothing to notify — early return.
+    /// The value is a MONOTONE counter (never re-set to an equal value) so the
+    /// store's equal-value short-circuit can't swallow the bump and an ABA
+    /// within one batch still forces re-derivation.
+    ///
+    /// Inert in production this phase: the facade families stay empty until the
+    /// read口 flip (Commit B), so `slot_epoch_family` never holds `addr` and
+    /// this is a pure `.get()`-returns-`None` no-op.
+    fn bump_facade_epoch(&self, addr: CellAddress) {
+        let Some(epoch_id) = self.slot_epoch_family.borrow().get(&addr) else {
+            return;
+        };
+        let next = match self.store.get(epoch_id) {
+            Value::Number(n) => Value::Number(n + 1.0),
+            _ => Value::Number(1.0),
+        };
+        self.store.set(epoch_id, next);
+    }
+
+    /// P4c write口 helper — force this address's formula-inner atom to
+    /// re-resolve its AST on the next read. Needed for a formula-CONTENT edit
+    /// whose upstream deps are unchanged (`=B1`→`=C1`): the inner atom's
+    /// recorded deps ({B1}) are still fresh, so without this it returns the
+    /// CACHED old-AST value. Because `Store::invalidate` only marks the atom
+    /// stale WITHOUT propagating, this MUST be paired with `bump_facade_epoch`
+    /// to drive the facade to re-read the now-stale inner.
+    ///
+    /// NON-CREATING: a no-op when no inner atom exists (literal→formula and
+    /// absent→formula create the inner lazily on the facade's re-derive, so
+    /// there is nothing to invalidate here).
+    fn invalidate_formula_inner(&self, addr: CellAddress) {
+        if let Some(inner) = self.formula_inner_family.borrow().get(&addr) {
+            self.store.invalidate(inner);
+        }
+    }
+
+    /// The materialized primitive atom currently parked at `addr`, iff the slot
+    /// holds one (`CellSlot::Atom`). `None` for a `Plain` slot, a formula cell,
+    /// or an absent cell. The write口 samples this before and after a mutation
+    /// to detect the inner-atom identity transitions that require a facade
+    /// epoch bump.
+    fn slot_atom_id(&self, addr: CellAddress) -> Option<AtomId> {
+        match self.interior.cells.borrow().get(&addr) {
+            Some(CellSlot::Atom(id)) => Some(*id),
+            _ => None,
+        }
+    }
+
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
         // P4a borrow rule: take the parked value (or bail on Atom) under a
         // short `cells` borrow, release the guard, THEN call into the
@@ -2913,6 +2968,10 @@ impl Sheet {
             }
         }
         self.mark_dependents_dirty(addr);
+        // P4c: drive any materialized facade at the anchor to re-read the new
+        // array (identity/value change on the anchor's inner atom). Spill
+        // TARGET epoch wiring is deferred to P5. Inert until the read口 flip.
+        self.bump_facade_epoch(addr);
         Ok(())
     }
 
@@ -2952,6 +3011,9 @@ impl Sheet {
         let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
             || self.interior.needs_parse.borrow().contains(&addr);
         let is_null = matches!(value, Value::Null);
+        // P4c: sample the inner-atom identity BEFORE the write so we can bump
+        // the facade epoch only on an identity transition (see below).
+        let pre_atom = self.slot_atom_id(addr);
 
         if had_formula {
             self.with_remap(addr, |sheet| {
@@ -2979,6 +3041,16 @@ impl Sheet {
             if is_null {
                 self.try_release_primitive(addr);
             }
+        }
+        // P4c: a same-id literal value update propagates via the facade's
+        // native `args.get(inner)` edge (the `store.set(id, ..)` above already
+        // flushed it) — no bump. Bump only on an identity transition: a
+        // formula→literal replacement (`had_formula`) or a Plain/Absent→Atom
+        // / Atom→None slot change (`pre_atom != post_atom`, the latter when
+        // `try_release_primitive` tore the slot down).
+        let post_atom = self.slot_atom_id(addr);
+        if had_formula || pre_atom != post_atom {
+            self.bump_facade_epoch(addr);
         }
         let dirtied = self.mark_dependents_dirty(addr);
         // Eager spill maintenance for downstream array formulas.
@@ -3145,6 +3217,16 @@ impl Sheet {
             sheet.interior.formula_exprs.borrow_mut().insert(addr, expr);
             sheet.interior.formula_texts.borrow_mut().insert(addr, formula_str.to_string());
         });
+        // P4c: force the facade to re-derive off the NEW formula. A
+        // formula-content edit (`=B1`→`=C1`) whose upstream deps are unchanged
+        // leaves the inner atom's recorded edges fresh, so it would return the
+        // cached old-AST value — `invalidate_formula_inner` marks it stale and
+        // the epoch bump drives the facade to re-read (and thus re-run) it.
+        // literal→formula / absent→formula create the inner lazily on that
+        // re-derive; `invalidate_formula_inner` is a no-op there. Inert until
+        // the read口 flip.
+        self.invalidate_formula_inner(addr);
+        self.bump_facade_epoch(addr);
         let dirtied = self.mark_dependents_dirty(addr);
         // Eager spill maintenance: re-evaluate the just-installed
         // formula (and any downstream array formulas) and install /
@@ -3164,6 +3246,9 @@ impl Sheet {
         // "had a formula" for the remap-vs-direct teardown decision.
         let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
             || self.interior.needs_parse.borrow().contains(&addr);
+        // P4c: sample inner-atom identity BEFORE the write, mirroring
+        // try_set_cell — bump the facade only on an identity transition.
+        let pre_atom = self.slot_atom_id(addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
@@ -3176,6 +3261,16 @@ impl Sheet {
             self.store.set(id, Value::Error(err));
         }
         self.mark_dependents_dirty(addr);
+        // P4c: after write_error the cell is no longer a formula — the facade
+        // re-derives `is_formula=false` and reads the literal error. Bump on a
+        // formula→error replacement (`had_formula`) or a slot identity change
+        // (`pre_atom != post_atom`). No `invalidate_formula_inner`: any stale
+        // formula inner is orphaned, never read again. Inert until the read口
+        // flip.
+        let post_atom = self.slot_atom_id(addr);
+        if had_formula || pre_atom != post_atom {
+            self.bump_facade_epoch(addr);
+        }
     }
 
     /// Read-only access to `formula_exprs` for the workbook-level cycle
@@ -6481,6 +6576,118 @@ mod tests {
         // Change A1 → C1 auto-updates
         sheet.set_cell("A1", Value::Number(100.0));
         assert_eq!(sheet.get_cell("C1"), Value::Number(120.0));
+    }
+
+    // === P4c: write口 → facade re-derivation (Commit A) ===
+    //
+    // These pin the write口 helpers wired this phase (`bump_facade_epoch`,
+    // `invalidate_formula_inner`) against a MANUALLY materialized facade —
+    // the read entry points don't consult the facade yet (that flip is
+    // Commit B), so in production the facade families stay empty and these
+    // helpers are inert. We materialize a facade by hand via `facade_of`,
+    // subscribe on it, drive a REAL write口, and assert the facade re-derives
+    // to the correct VALUE and the subscriber fired. We assert `>= 1`
+    // notifications, never an exact count: over-bumping is safe by design
+    // (the facade re-derives to the same value and change-pruning suppresses a
+    // spurious notify), so an exact count would be a brittle over-specification.
+
+    #[test]
+    fn facade_redrives_on_formula_content_edit() {
+        // The load-bearing case for `invalidate_formula_inner` + bump: a
+        // formula-content edit (`=B1`→`=C1`) whose upstream deps are unchanged.
+        // Without the invalidate the inner atom's recorded edge ({B1}) is still
+        // fresh and the facade would read the CACHED old-AST value (5), never
+        // re-resolving to `=C1` (9).
+        let mut sheet = Sheet::new();
+        sheet.set_cell("B1", Value::Number(5.0));
+        sheet.set_cell("C1", Value::Number(9.0));
+        sheet.set_formula("A1", "=B1");
+
+        let addr = CellAddress::parse("A1").unwrap();
+        let facade = sheet.facade_of(addr);
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_l = hits.clone();
+        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+
+        assert_eq!(sheet.store.get(facade), Value::Number(5.0));
+
+        sheet.set_formula("A1", "=C1");
+        sheet.store.flush();
+
+        assert_eq!(sheet.store.get(facade), Value::Number(9.0));
+        assert!(hits.get() >= 1, "subscriber fired on content edit");
+    }
+
+    #[test]
+    fn facade_redrives_on_formula_upstream_change() {
+        // The NATIVE-edge path: an upstream write bumps the dep atom's
+        // generation, so the formula inner re-derives off its own recorded
+        // edge and the facade re-derives off `args.get(inner)` — no epoch bump
+        // needed (and none fires, because the inner-atom identity is unchanged).
+        let mut sheet = Sheet::new();
+        sheet.set_cell("B1", Value::Number(5.0));
+        sheet.set_formula("A1", "=B1+1");
+
+        let addr = CellAddress::parse("A1").unwrap();
+        let facade = sheet.facade_of(addr);
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_l = hits.clone();
+        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+
+        assert_eq!(sheet.store.get(facade), Value::Number(6.0));
+
+        sheet.set_cell("B1", Value::Number(10.0));
+        sheet.store.flush();
+
+        assert_eq!(sheet.store.get(facade), Value::Number(11.0));
+        assert!(hits.get() >= 1, "subscriber fired on upstream change");
+    }
+
+    #[test]
+    fn facade_redrives_on_literal_update() {
+        // A same-id literal update propagates via the facade's native
+        // `args.get(inner)` edge — `try_set_cell` reuses the Atom slot's id, so
+        // `store.set(id, ..)` alone re-derives the facade with no epoch bump.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+
+        let addr = CellAddress::parse("A1").unwrap();
+        let facade = sheet.facade_of(addr);
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_l = hits.clone();
+        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+
+        assert_eq!(sheet.store.get(facade), Value::Number(1.0));
+
+        sheet.set_cell("A1", Value::Number(2.0));
+        sheet.store.flush();
+
+        assert_eq!(sheet.store.get(facade), Value::Number(2.0));
+        assert!(hits.get() >= 1, "subscriber fired on literal update");
+    }
+
+    #[test]
+    fn facade_redrives_on_formula_to_literal_replacement() {
+        // Identity transition: replacing a formula with a literal swaps the
+        // facade's inner atom (formula-inner → primitive), so the epoch bump
+        // (via `had_formula`) is what drives the re-derive.
+        let mut sheet = Sheet::new();
+        sheet.set_cell("B1", Value::Number(7.0));
+        sheet.set_formula("A1", "=B1");
+
+        let addr = CellAddress::parse("A1").unwrap();
+        let facade = sheet.facade_of(addr);
+        let hits = Rc::new(Cell::new(0u32));
+        let hits_l = hits.clone();
+        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+
+        assert_eq!(sheet.store.get(facade), Value::Number(7.0));
+
+        sheet.set_cell("A1", Value::Number(42.0));
+        sheet.store.flush();
+
+        assert_eq!(sheet.store.get(facade), Value::Number(42.0));
+        assert!(hits.get() >= 1, "subscriber fired on formula→literal");
     }
 
     #[test]

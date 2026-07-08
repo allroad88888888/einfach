@@ -234,7 +234,12 @@ _(DECISION_REQUESTs, if any, appended below.)_
 
 ### DECISION_REQUEST — P4c point-dep flip (filed 2026-07-08, GATE: D3 codex + owner)
 
-**Status:** OPEN. Blocks the single behavior-changing edit of P4. Fence
+**Status:** CLEARED-TO-PROCEED (2026-07-08). Both gate conditions met: owner
+approved fence batch #1 (§4 table, "批准,照表执行") AND the D3 codex review
+completed with **no P0** — see "P4c codex review disposition" below, which
+concludes "the flip proceeds autonomously with all six fixes folded in" (F1–F6).
+The flip DELETES the point index and moves point propagation onto pure store
+delegation; no INV amendment, no new parallel structure. Fence
 batch #1 (§4 table) already owner-approved 2026-07-08 ("批准,照表执行"); this
 request pins the *mechanism* the fence table measures, and satisfies D3
 ("环两层语义" codex review at P4). No INV amendment and no new parallel
