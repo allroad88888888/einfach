@@ -232,6 +232,91 @@ Baseline counts (P0, recorded 2026-07-07 at commit 208688d):
 
 _(DECISION_REQUESTs, if any, appended below.)_
 
+### DECISION_REQUEST — P4c point-dep flip (filed 2026-07-08, GATE: D3 codex + owner)
+
+**Status:** OPEN. Blocks the single behavior-changing edit of P4. Fence
+batch #1 (§4 table) already owner-approved 2026-07-08 ("批准,照表执行"); this
+request pins the *mechanism* the fence table measures, and satisfies D3
+("环两层语义" codex review at P4). No INV amendment and no new parallel
+structure is proposed — the flip DELETES the point index and moves point
+propagation onto pure store delegation. Filed to honor the escalation rule's
+"real decision point → codex → owner" ladder before writing code, not because
+a wall was hit.
+
+**What flips (one commit):**
+
+1. **Formula cells become inner derived atoms.** `try_set_formula` builds the
+   inner via `owned_create_derived_ctx` (LAZY door); read_fn holds `Rc<Expr>`
+   and evals through an `AtomEvalProvider` whose *point* ref lookups resolve
+   `facade_of(dep_addr)` and call `args.get(facade)` — a tracked store edge.
+   The inner atom id goes into the cell slot (`CellSlot::Atom`), so `facade_of`
+   routes reads to it. `formula_cells`/`formula_source`/`needs_parse` stay
+   (content + parse laziness, not a dependency index — INV-2 whitelist).
+
+2. **Point propagation moves to the store.** A write does `store.set(inner
+   primitive)` then `store.flush()` inside the existing `store.batch`. The
+   primitive's back-deps are the facades that read it; their back-deps are the
+   dependent formula inner atoms — `dependencies_change`/`flush_pending` re-derive
+   them eagerly during `set_cell` (fence S1: eval Δ = N−1 moves read→write, read
+   sweep = 0). No BFS, no dirty marking.
+
+3. **Deletions (satisfy tripwire PHASE≥4):** `cell_dependents` field +
+   `add_formula_deps`/`remove_formula_deps`/`replace_formula_deps` point-index
+   maintenance + the point half of `dependents_of_into_with_scratch`; the entire
+   `mark_dependents_dirty` point-BFS; the `FormulaCache` read path
+   (`compute_formula_at`/`eval_formula_at_with_provider`/`prewarm_formula_chain`) —
+   its role (deep-chain safety) is subsumed by the store's DV-3 hybrid iterative
+   read (256 native budget + NeedsDep faulting); `chain_10000` native/browser
+   must stay green through store read at P4 (formal chain-fence bookkeeping
+   transition + `chain_100000` are P6).
+
+4. **Subscriptions attach to the facade** (`attach_address_sub` →
+   `facade_of(addr)` instead of `current_readable_atom`). The facade never
+   re-keys across literal↔formula swaps, so `with_remap`'s sub detach/reattach
+   dance becomes a no-op (kept as a shell until P6). Facade equality-pruning
+   reproduces "notify at most once, only when the displayed value changed" for
+   free.
+
+5. **would_create_cycle point half → on-demand AST walk over `formula_source`**
+   (REVISED per codex F2 — NOT `store.reverse_reachable`). `reverse_reachable`
+   only sees COMMITTED store edges, so an *unread* formula dep (`B1=A1` never
+   read, then `A1=B1`) has no back-edge yet and the check would allow the cycle.
+   The point-cycle check instead BFS-walks the retained `formula_source` ASTs
+   (INV-2 whitelist: content, not a dependency index), which are present the
+   instant a formula is installed regardless of read state — strictly more
+   faithful than the old installed-dep static checker AND than `reverse_reachable`.
+   Keeps Ok(false)+`#CYCLE!` literal semantics and `chain_bulk_install_is_linear`
+   linear (walk visits each reachable formula's source once). Range half stays on
+   `range_dependents` BFS via bridge until P6.
+
+**Bridges retained (temporary, BRIDGE-tagged, delete-by P6/P5):**
+
+- **Range deps → epoch bridge.** Formula read_fns resolve *ranges*
+  non-reactively (enumerate backing store; storage is authoritative) — no store
+  edge on range members at P4. `range_dependents` index still drives range-
+  dependent re-derive: the write path finds range-dependents and bumps their
+  slot_epoch (facade re-derive). Two-tier member/band replacement is P5.
+- **Cross-sheet → `CrossSheetDeps` bridge** unchanged until P6 (single global
+  store already lands the topology; edge-through-facade cross-sheet is P6).
+
+**Cycle semantics under eager flush (the D3 review target):** with formula
+cells as derived atoms, a runtime cycle (`A1=NOT(B1), B1=A1`) is caught by the
+store's `computing` guard on the cross-atom dep read. The guard must record the
+edge at current generation into scratch (else a broken cycle never re-invalidates
+its observers) and the evaluator maps it to `#CYCLE!`. Open sub-question for
+codex: whether the store `computing`-guard PANIC contract (a dep read of a
+computing atom panics as a hard cross-atom cycle) is compatible with returning a
+sticky `#CYCLE!` value, or whether the evaluator's Computing guard must
+intercept strictly before any `args.get` on an in-progress peer — and whether a
+cycle-component registry (plan §engine/cycles.rs) is required at P4 or can defer
+to P6 with a flush debug-ceiling tripwire as the interim guard.
+
+**Verification at P4 exit (unchanged from §4 owner-approved table):** rust/core
+65; excel-core `--lib` 1404 + integration 1825 + wasm native 31; golden replay 5
+seeds green (only sanctioned deviation: once-read eager); tripwire PHASE=4 bans
+`cell_dependents`/`mark_dependents_dirty`; jest solid/excel; e2e Δ=0; playwright
+MCP UI walkthrough.
+
 ### P3 codex review disposition (2026-07-08)
 
 codex caught a P1: `Store` referenced but not imported in workbook.rs — my
@@ -263,3 +348,66 @@ P0 commit: [P2] WASM signature extractor missed multi-line signatures /
 `js_name` attributes / impl owner → rewritten to full-fidelity
 `owner :: attrs :: signature` capture; [P3] BRIDGE markers were only counted
 at P6 → now format-validated at every phase and phase-expiry-checked.
+
+### P4c codex review disposition (2026-07-08)
+
+codex D3 review of the point-dep flip returned **no P0** ("no smuggled
+point-dependency structure found; the flip deletes the point index and moves
+propagation onto pure store delegation") + four P1 + two P2. Every finding has an
+IN-DELEGATION resolution — no INV amendment, no new parallel address→formula
+index required. Dispositions:
+
+- **F1 [P1] Runtime cycles hit the store panic before a sticky `#CYCLE!`.**
+  `read_dep` PANICS on reading a `computing` (in-progress) atom, so `A1=NOT(B1),
+  B1=A1` would panic before any `#CYCLE!` edge is recorded and the cycle could
+  never dissolve on edit. **Fix:** the evaluator's Computing guard intercepts on
+  the ADDRESS strictly BEFORE any `args.get` of an in-progress peer (the flip's
+  two-layer intent, now made load-bearing): the provider tracks the in-flight
+  address set; a point ref to an address already on the eval stack returns
+  `#CYCLE!` directly and records the edge into scratch at current gen (so a later
+  edit re-invalidates observers). No `args.get` on a computing peer is ever
+  issued → the store panic contract is never reached. Cycle-component registry
+  stays a P6 item behind the flush debug-ceiling tripwire; the guard makes the
+  value sticky and stable without it.
+
+- **F2 [P1] `reverse_reachable` is incomplete for unread formula edges.** An
+  unread `B1=A1` has no committed store back-edge, so an install-time check over
+  store edges would allow `A1=B1`. **Fix (spec item 5 revised above):** the
+  point-cycle check BFS-walks the retained `formula_source` ASTs, present at
+  install regardless of read state — strictly more faithful than both the old
+  static checker and `reverse_reachable`. codex explicitly pre-blessed "a
+  non-propagation cycle registry / static cycle path for unread formulas."
+
+- **F3 [P1] Range/cross-sheet epoch bridge must invalidate the formula INNER,
+  not just the facade.** `B1=SUM(A1:A10)` cached, then `A5=10`: bumping only the
+  B1 facade epoch re-runs the facade but `args.get(B1_inner)` returns the stale
+  cached inner value. **Fix:** the bridge write path calls
+  `store.invalidate(inner)` (drops the inner's memoized state) in addition to
+  bumping the slot epoch, so the inner re-evals on next pull. Applies to both the
+  `range_dependents` and `CrossSheetDeps` bridges.
+
+- **F4 [P1] Empty-cell point refs silently fail unless every inner-slot identity
+  transition bumps the facade epoch.** `A1=B1+1` read while B1 empty, then
+  `B1=41` creates a primitive; without an epoch bump the new primitive has no
+  back-dep to A1's facade. **Fix:** bump slot_epoch on EVERY inner-slot identity
+  transition — empty→primitive (`ensure_cell`), primitive→formula, formula→
+  primitive, formula→empty (`drop_cell_slot` / inner swaps). Enforced at the
+  single write口 so no path can skip it.
+
+- **F5 [P2] Deep-chain stack safety plausible; effective budget ~128 formula
+  links** (facade+inner ≈2 frames/edge vs the 256 native budget). Stack-safe IFF
+  Null placeholders are tolerated and faulted passes have NO observable effects.
+  **Fix:** only a COMPLETE read_fn run increments eval/recompute counters, and
+  host custom-formula callbacks MUST NOT run on a faulted pass (guard the
+  provider so a NeedsDep fault short-circuits before any callback). `chain_10000`
+  stays green through the store read; `chain_100000` + formal chain bookkeeping
+  are P6.
+
+- **F6 [P2] Retained range/cross-sheet indices need explicit BRIDGE markers** so
+  the tripwire distinguishes an approved temporary bridge from permanent parallel
+  state. **Fix:** annotate `BRIDGE(delete-by: P5)` at `range_dependents` sites
+  and `BRIDGE(delete-by: P6)` at `CrossSheetDeps` sites; tripwire counts them.
+
+None of the four P1s is a wall requiring counter re-derivation or an INV
+amendment, and codex found no P0 — so per the escalation ladder the flip proceeds
+autonomously with all six fixes folded in.
