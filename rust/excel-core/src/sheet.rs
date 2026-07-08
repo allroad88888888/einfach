@@ -680,6 +680,12 @@ impl CellSlot {
 /// A spreadsheet sheet backed by an atom store.
 pub struct Sheet {
     pub(crate) store: Store,
+    /// Number of store atoms THIS sheet created and still owns. With the
+    /// P3 workbook-global shared store, `store.debug_total_atom_count()`
+    /// counts every sheet's atoms; per-sheet probes and fences need the
+    /// sheet-local number, maintained by the `owned_*` lifecycle wrappers
+    /// (the only places this sheet creates or destroys atoms).
+    atoms_owned: Cell<usize>,
     /// Primitive cell slots keyed by `(row, col)`. Backed by a row-major
     /// `RowMajorMap` so range reads (e.g. viewport, `SUM(A1:A100)`) scan
     /// O(cells_in_range) rather than the full non-empty set — the Phase 2
@@ -887,8 +893,19 @@ pub struct Sheet {
 
 impl Sheet {
     pub fn new() -> Self {
+        Self::with_store(Store::new())
+    }
+
+    /// Construct a sheet bound to a SHARED store (P3 of the atom-delegation
+    /// rewrite): `Workbook` hands every sheet a clone of its single store so
+    /// cross-sheet dependencies can become ordinary in-store edges (P6).
+    /// `Store` is a cheap Rc handle — cloning shares state, exactly like
+    /// passing the vanilla store object around. Standalone sheets
+    /// (`Sheet::new`) keep a private store.
+    pub fn with_store(store: Store) -> Self {
         Sheet {
-            store: Store::new(),
+            store,
+            atoms_owned: Cell::new(0),
             cells: RowMajorMap::new(),
             formula_cells: RefCell::new(RowMajorMap::new()),
             formula_exprs: RefCell::new(HashMap::new()),
@@ -1043,6 +1060,28 @@ impl Sheet {
     /// moves into a freshly-created store atom, preserving the value
     /// exactly so the downstream `store.set` equality dedup behaves as if
     /// the atom had existed all along.
+    /// The ONLY create/destroy doors to the store for this sheet — they keep
+    /// `atoms_owned` exact so per-sheet probes survive the P3 shared store.
+    pub(crate) fn owned_create_atom(&self, value: Value) -> AtomId {
+        self.atoms_owned.set(self.atoms_owned.get() + 1);
+        self.store.create_atom(value)
+    }
+
+    pub(crate) fn owned_create_derived(
+        &self,
+        read_fn: impl Fn(&dyn Fn(AtomId) -> Value) -> Value + 'static,
+    ) -> AtomId {
+        self.atoms_owned.set(self.atoms_owned.get() + 1);
+        self.store.create_derived(read_fn)
+    }
+
+    pub(crate) fn owned_destroy_atom(&self, id: AtomId) {
+        if self.store.has_atom(id) {
+            self.store.destroy_atom(id);
+            self.atoms_owned.set(self.atoms_owned.get() - 1);
+        }
+    }
+
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
         match self.cells.get(&addr) {
             Some(CellSlot::Atom(id)) => return *id,
@@ -1050,12 +1089,12 @@ impl Sheet {
                 let Some(CellSlot::Plain(value)) = self.cells.remove(&addr) else {
                     unreachable!("slot vanished between get and remove");
                 };
-                let id = self.store.create_atom(value);
+                let id = self.owned_create_atom(value);
                 self.cells.insert(addr, CellSlot::Atom(id));
                 id
             }
             None => {
-                let id = self.store.create_atom(Value::Null);
+                let id = self.owned_create_atom(Value::Null);
                 self.cells.insert(addr, CellSlot::Atom(id));
                 id
             }
@@ -1088,7 +1127,7 @@ impl Sheet {
         };
         if let CellSlot::Atom(id) = slot {
             if self.store.has_atom(id) && !self.store.has_dependents(id) {
-                self.store.destroy_atom(id);
+                self.owned_destroy_atom(id);
             }
         }
         true
@@ -1546,7 +1585,7 @@ impl Sheet {
         for (_, slot) in self.cells.drain_into_vec() {
             if let CellSlot::Atom(id) = slot {
                 if self.store.has_atom(id) && !self.store.has_dependents(id) {
-                    self.store.destroy_atom(id);
+                    self.owned_destroy_atom(id);
                 }
             }
         }
@@ -1860,17 +1899,16 @@ impl Sheet {
                 let row_off = di;
                 let col_off = dj;
                 let derived =
-                    self.store
-                        .create_derived(move |get| match get(anchor_atom_for_read) {
-                            Value::Array(inner) => {
-                                inner.get(row_off, col_off).cloned().unwrap_or(Value::Null)
-                            }
-                            // Anchor switched off Array (e.g. became #SPILL! after
-                            // a later remap that hasn't yet cleared us). Return
-                            // Null defensively — the parent re-spill will
-                            // re-install a fresh derived atom anyway.
-                            _ => Value::Null,
-                        });
+                    self.owned_create_derived(move |get| match get(anchor_atom_for_read) {
+                        Value::Array(inner) => {
+                            inner.get(row_off, col_off).cloned().unwrap_or(Value::Null)
+                        }
+                        // Anchor switched off Array (e.g. became #SPILL! after
+                        // a later remap that hasn't yet cleared us). Return
+                        // Null defensively — the parent re-spill will
+                        // re-install a fresh derived atom anyway.
+                        _ => Value::Null,
+                    });
 
                 // If there was a stale primitive at this address (e.g.
                 // empty `Value::Null` placeholder created by a previous
@@ -2455,7 +2493,7 @@ impl Sheet {
         }
         self.cells.remove(&addr);
         self.detach_address_sub(addr);
-        self.store.destroy_atom(atom_id);
+        self.owned_destroy_atom(atom_id);
     }
 
     /// Set a cell's formula by address string (e.g. "=A1+B1").
@@ -3206,7 +3244,9 @@ impl Sheet {
     /// a gross "did anything materialize?" signal in tests.
     #[doc(hidden)]
     pub fn debug_total_atom_count(&self) -> usize {
-        self.store.debug_total_atom_count()
+        // Sheet-local count (P3): with the workbook-shared store,
+        // store.debug_total_atom_count() would sum every sheet.
+        self.atoms_owned.get()
     }
 
     /// Cumulative core derived recompute count from the underlying store.

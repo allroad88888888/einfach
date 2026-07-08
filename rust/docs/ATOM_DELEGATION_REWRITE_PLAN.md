@@ -183,6 +183,17 @@ Baseline counts (P0, recorded 2026-07-07 at commit 208688d):
 
 _(DECISION_REQUESTs, if any, appended below.)_
 
+### P3 codex review disposition (2026-07-08)
+
+codex caught a P1: `Store` referenced but not imported in workbook.rs — my
+own earlier "all green" runs were **stale incremental-build artifacts**
+(cargo had not recompiled workbook.rs; grep-filtered output hid the truth).
+Fixed the import; verification rule hardened: phase-gate runs use forced
+recompilation (`touch` the edited roots) and assert on cargo's EXIT CODE,
+never on grep counts alone. remove_sheet atom retention under the shared
+store documented as intentional (caller-inspectable contract; cleanup moves
+to family lifecycle at P6).
+
 ### P1 codex review disposition (2026-07-08)
 
 codex review of the store rewrite returned 4 findings (all P2), all fixed in

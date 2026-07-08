@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use einfach_core::{Value, ValueError};
+use einfach_core::{Store, Value, ValueError};
 
 use crate::cell::CellAddress;
 use crate::eval::{
@@ -275,6 +275,10 @@ impl std::error::Error for WorkbookError {}
 /// `EvalProvider`. Formula nodes stay lazy: reads evaluate the reachable
 /// formula chain, writes only mark local dependents dirty.
 pub struct Workbook {
+    /// P3 (atom-delegation rewrite): the ONE store shared by every sheet in
+    /// this workbook. `Store` is a cheap Rc handle; each sheet holds a
+    /// clone. Cross-sheet dependencies become ordinary in-store edges (P6).
+    store: Store,
     sheets: Vec<Sheet>,
     names: Vec<String>,
     /// name → index lookup; rebuilt whenever sheets are added/renamed.
@@ -453,6 +457,7 @@ impl Drop for CustomCallScope<'_> {
 impl Workbook {
     pub fn new() -> Self {
         let mut wb = Workbook {
+            store: Store::new(),
             sheets: Vec::new(),
             names: Vec::new(),
             by_name: HashMap::new(),
@@ -772,7 +777,9 @@ impl Workbook {
             return idx;
         }
         let idx = self.sheets.len();
-        self.sheets.push(Sheet::new());
+        // P3: every sheet shares the workbook's single store, so cross-sheet
+        // dependencies can live as ordinary in-store edges (P6).
+        self.sheets.push(Sheet::with_store(self.store.clone()));
         self.names.push(name.to_string());
         self.by_name.insert(name.to_string(), idx);
         idx
