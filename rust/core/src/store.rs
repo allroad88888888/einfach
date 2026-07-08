@@ -71,6 +71,45 @@ impl ReadArgs<'_> {
     pub fn peek(&self, id: AtomId) -> Value {
         read_dep(self.inner, self.scratch, id, false)
     }
+
+    /// Record a dependency edge on `id` at its current generation WITHOUT
+    /// reading its value, tolerating an in-progress (`computing`) atom.
+    ///
+    /// Both `get` and `peek` PANIC on a `computing` atom (the cross-atom
+    /// cycle guard). A runtime cycle in the excel evaluator is intercepted
+    /// ABOVE the store — the evaluator's Computing guard returns a sticky
+    /// `#CYCLE!` for a point ref to an on-stack address rather than reading
+    /// the in-progress peer — but the reader must still wire the reverse
+    /// edge so that DISSOLVING the cycle later (an edit that bumps the peer's
+    /// generation) re-invalidates it. `depend` is the only primitive that can
+    /// record that edge: it reads the peer's current generation directly and
+    /// pushes `(id, gen)` into the frame scratch, never touching the value and
+    /// never panicking on `computing`. Self-references record no edge, exactly
+    /// like the `id == self_id` short-circuit in `read_dep` (store.ts:97-102).
+    ///
+    /// Recording the pre-commit generation of an on-stack peer is a sound
+    /// over-approximation (DV-2): when that peer commits its cycle value its
+    /// generation bumps, so this reader is left stale-at-rest and re-derives
+    /// to the same `#CYCLE!` on next read (equality-pruned). The only
+    /// observable effect is recompute count, never a missed invalidation.
+    ///
+    /// DIVERGENCE(store.ts): no vanilla counterpart — store.ts lets a cycle
+    /// stack-overflow; the excel engine detects cycles itself and needs a way
+    /// to wire the reverse edge for cycle dissolution.
+    pub fn depend(&self, id: AtomId) {
+        let self_id = self.scratch.borrow().self_id;
+        if id == self_id {
+            return;
+        }
+        let gen = {
+            let inner = self.inner.borrow();
+            if !inner.has(id) {
+                panic!("atom {:?} not found in store", id);
+            }
+            inner.record(id).generation
+        };
+        self.scratch.borrow_mut().record_dep(id, gen);
+    }
 }
 
 /// Read/write access handed to writable-atom write functions

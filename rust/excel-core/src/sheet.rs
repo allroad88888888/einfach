@@ -769,7 +769,10 @@ pub struct Sheet {
     /// counts every sheet's atoms; per-sheet probes and fences need the
     /// sheet-local number, maintained by the `owned_*` lifecycle wrappers
     /// (the only places this sheet creates or destroys atoms).
-    atoms_owned: Cell<usize>,
+    /// Behind `Rc<Cell<_>>` so the P4c facade-creation context (`FacadeCtx`)
+    /// can share the counter into `'static` inner-atom closures that mint
+    /// dependent-cell facades on demand.
+    atoms_owned: Rc<Cell<usize>>,
     /// Shared cell/formula storage — see [`SheetInterior`] for the field
     /// docs and the P4a borrow rule.
     pub(crate) interior: Rc<SheetInterior>,
@@ -778,8 +781,10 @@ pub struct Sheet {
     /// clear). The facade derives off this so a swap re-runs the facade read
     /// without re-keying any subscription. Created lazily on first use.
     /// NOT YET WIRED — the read/write paths flip in the P4c commit.
+    /// Behind `Rc<RefCell<_>>` so `FacadeCtx` can share it into `'static`
+    /// closures (see `cell_facade_family`).
     #[allow(dead_code)]
-    slot_epoch_family: RefCell<AtomFamily<CellAddress>>,
+    slot_epoch_family: Rc<RefCell<AtomFamily<CellAddress>>>,
     /// P4b: per-address facade derived atoms — the stable subscription anchor
     /// that replaces `AddressSubscriptionBucket` remapping. A facade reads its
     /// slot-epoch then the current inner atom for the address. Behind
@@ -788,6 +793,29 @@ pub struct Sheet {
     /// NOT YET WIRED — the read/write paths flip in the P4c commit.
     #[allow(dead_code)]
     cell_facade_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P4c: per-address formula-INNER derived atoms. Keyed by the anchor
+    /// address of a formula cell; each runs the cell's `Expr` through an
+    /// `AtomFormulaProvider`, resolving every referenced cell REACTIVELY via
+    /// that cell's facade (`FacadeCtx::get_or_create_facade`). The facade for a
+    /// formula address delegates to this inner atom, so a subscription anchored
+    /// on the facade re-notifies when any read cell's value changes — no
+    /// `cell_dependents` edge. Created lazily on first read of a formula cell.
+    /// NOT YET WIRED — the read path routes here in the P4c flip commit.
+    /// Behind `Rc<RefCell<_>>` so `FacadeCtx` shares it into `'static` closures.
+    #[allow(dead_code)]
+    formula_inner_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P4c: the shared set of addresses whose formula-inner atom is currently
+    /// mid-evaluation (on the read stack). The runtime cycle guard (codex F1):
+    /// before an `AtomFormulaProvider` calls `args.get` on a referenced cell's
+    /// facade, it checks membership here; a hit means the reference closes a
+    /// cycle, so it returns a sticky `#CYCLE!` and records the reverse edge via
+    /// `ReadArgs::depend` (so a later edit that dissolves the cycle still
+    /// re-invalidates). Each inner read_fn inserts its own address on entry and
+    /// removes it on exit through an `InFlightGuard` RAII marker. Shared behind
+    /// `Rc<RefCell<_>>` so every inner closure and `FacadeCtx` clone see one set.
+    /// NOT YET WIRED — populated once the read path flips.
+    #[allow(dead_code)]
+    in_flight: Rc<RefCell<HashSet<CellAddress>>>,
     /// Address-level subscriptions. Buckets are only wired to store atoms when
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
@@ -926,6 +954,381 @@ pub struct Sheet {
     has_cross_sheet_refs: Cell<bool>,
 }
 
+/// P4c facade-creation context: the minimal set of shared handles a facade
+/// (or, at the next increment, an inner formula atom's read closure) needs to
+/// mint and resolve per-address facade atoms WITHOUT holding `&Sheet`.
+///
+/// Every field is an owned `Store` clone or `Rc` clone, so a `FacadeCtx` is
+/// cheap to `clone()` and satisfies the `'static` bound required to move it
+/// into a store `read_fn` closure. That is the unblock for the formula-inner
+/// path: the inner read closure captures a `FacadeCtx` clone and calls
+/// [`FacadeCtx::get_or_create_facade`] to reactively resolve any OTHER cell a
+/// formula references, under a bare `&self` sheet method.
+///
+/// It maintains `atoms_owned` through the same [`FacadeCtx::owned_create_atom`]
+/// / [`FacadeCtx::owned_create_derived_ctx`] doors the sheet uses, so the
+/// per-sheet atom count stays exact regardless of which path minted the atom.
+#[derive(Clone)]
+pub(crate) struct FacadeCtx {
+    store: Store,
+    atoms_owned: Rc<Cell<usize>>,
+    interior: Rc<SheetInterior>,
+    slot_epoch_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    cell_facade_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P4c: shared per-address formula-inner atom family — see the field of
+    /// the same name on [`Sheet`]. The facade for a formula address delegates
+    /// to `formula_inner_of(addr)`.
+    formula_inner_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P4c: shared mid-evaluation address set for the runtime cycle guard
+    /// (codex F1) — see the field of the same name on [`Sheet`].
+    in_flight: Rc<RefCell<HashSet<CellAddress>>>,
+}
+
+impl FacadeCtx {
+    /// `owned_create_atom` mirror — keeps `atoms_owned` exact from within a
+    /// `'static` closure that has no `&Sheet`.
+    fn owned_create_atom(&self, value: Value) -> AtomId {
+        self.atoms_owned.set(self.atoms_owned.get() + 1);
+        self.store.create_atom(value)
+    }
+
+    /// `owned_create_derived_ctx` mirror (lazy — computes nothing until first
+    /// read, INV-7).
+    fn owned_create_derived_ctx(
+        &self,
+        read_fn: impl Fn(&ReadArgs) -> Value + 'static,
+    ) -> AtomId {
+        self.atoms_owned.set(self.atoms_owned.get() + 1);
+        self.store.create_derived_ctx(read_fn)
+    }
+
+    /// The lazy slot-epoch primitive for an address (one per address). Bumped
+    /// whenever the inner atom identity changes so the facade re-derives off a
+    /// swap. Created on demand.
+    fn epoch_of(&self, addr: CellAddress) -> AtomId {
+        self.slot_epoch_family
+            .borrow_mut()
+            .get_or_create(addr, || self.owned_create_atom(Value::Null))
+    }
+
+    /// Idempotent per-address facade derived atom — see [`Sheet::facade_of`]
+    /// for the contract. Returns the cached facade if one exists, else lazily
+    /// creates the slot-epoch primitive and the facade derived atom.
+    ///
+    /// BORROW RULE (D7): every family guard and the `interior.cells` borrow
+    /// inside the read closure is released (inner id copied / plain value
+    /// cloned) before any `store.*` call. The read closure captures only owned
+    /// values / `Rc` clones — never `&self` — so it satisfies the `'static`
+    /// bound and can resolve the inner atom on demand.
+    fn get_or_create_facade(&self, addr: CellAddress) -> AtomId {
+        enum InnerSlot {
+            Atom(AtomId),
+            Plain(Value),
+            Absent,
+        }
+        // Fast path: already built. Bind so the `borrow()` guard drops here.
+        let existing = self.cell_facade_family.borrow().get(&addr);
+        if let Some(id) = existing {
+            return id;
+        }
+        let epoch_id = self.epoch_of(addr);
+        // Facade derived atom. Capture by value / `Rc` clone so the closure
+        // resolves the current inner atom without borrowing the sheet.
+        let interior = Rc::clone(&self.interior);
+        let store = self.store.clone();
+        let ctx = self.clone();
+        self.cell_facade_family.borrow_mut().get_or_create(addr, || {
+            self.owned_create_derived_ctx(move |args| {
+                // Tracked: an epoch bump (inner-atom identity change) re-runs us.
+                let _ = args.get(epoch_id);
+                // P4c: a formula address (hydrated OR still lazy) delegates to
+                // its formula-inner atom, so the facade tracks the formula's
+                // value and, transitively, every cell the formula reads.
+                // Checked FIRST so a formula that shadows a stale primitive
+                // scaffold routes correctly. Both borrows drop at the `;`
+                // before any `store.*` call (D7 borrow rule). Kept ADDITIVE:
+                // the facade path is not yet wired into the read entry points,
+                // so the eager engine stays authoritative until a later
+                // increment flips the read口.
+                let is_formula = interior.formula_cells.borrow().contains_key(&addr)
+                    || interior.needs_parse.borrow().contains(&addr);
+                if is_formula {
+                    let inner = ctx.formula_inner_of(addr);
+                    return args.get(inner);
+                }
+                // Snapshot the current inner under a short borrow, then release.
+                let inner = {
+                    let cells = interior.cells.borrow();
+                    match cells.get(&addr) {
+                        Some(CellSlot::Atom(id)) => InnerSlot::Atom(*id),
+                        Some(CellSlot::Plain(v)) => InnerSlot::Plain(v.clone()),
+                        None => InnerSlot::Absent,
+                    }
+                };
+                match inner {
+                    // Guard the defensive "atom destroyed under the slot" case
+                    // (mirrors `cell_value_at`): `args.get` panics on a missing
+                    // dep atom, so probe existence first.
+                    InnerSlot::Atom(id) if store.has_atom(id) => args.get(id),
+                    InnerSlot::Atom(_) => Value::Null,
+                    InnerSlot::Plain(v) => v,
+                    InnerSlot::Absent => Value::Null,
+                }
+            })
+        })
+    }
+
+    /// Resolve `addr`'s formula AST without a `&Sheet`. Prefers the hydrated
+    /// `formula_exprs` entry; falls back to parsing `formula_source` on
+    /// demand, because `hydrate_formula` DRAINS `formula_source` into
+    /// `formula_exprs` — so a hydrated formula lives only in the former and an
+    /// unhydrated one only in the latter (codex F2). A parse failure maps to
+    /// the same `Expr::Error(InvalidValue)` sentinel the eager hydrator
+    /// installs, so a malformed formula reads as `#VALUE!` rather than trapping
+    /// the reader.
+    #[allow(dead_code)]
+    fn formula_expr_for(&self, addr: CellAddress) -> Option<Rc<Expr>> {
+        if let Some(expr) = self.interior.formula_exprs.borrow().get(&addr) {
+            return Some(Rc::clone(expr));
+        }
+        let source = self.interior.formula_source.borrow().get(&addr).cloned()?;
+        let expr = parse_formula(source.as_ref()).unwrap_or(Expr::Error(ValueError::InvalidValue));
+        Some(Rc::new(expr))
+    }
+
+    /// The per-address formula-inner derived atom (lazy, one per formula
+    /// address). Its read closure re-evaluates the formula under an on-stack
+    /// [`AtomFormulaProvider`], re-recording its dependency edges on every run
+    /// (vanilla `dependenciesChange` parity). It depends only on the cells the
+    /// formula actually reads — no address→formula index.
+    #[allow(dead_code)]
+    fn formula_inner_of(&self, addr: CellAddress) -> AtomId {
+        let existing = self.formula_inner_family.borrow().get(&addr);
+        if let Some(id) = existing {
+            return id;
+        }
+        let ctx = self.clone();
+        self.formula_inner_family
+            .borrow_mut()
+            .get_or_create(addr, move || {
+                let ctx_read = ctx.clone();
+                ctx.owned_create_derived_ctx(move |args| ctx_read.eval_formula_inner(addr, args))
+            })
+    }
+
+    /// Formula-inner read body: evaluate `addr`'s formula under an on-stack
+    /// [`AtomFormulaProvider`] whose ref/range lookups resolve through the
+    /// facade family, so every cell the formula reads becomes a store
+    /// dependency edge on THIS inner atom. The runtime cycle guard (codex F1)
+    /// is armed by pushing `addr` onto the shared `in_flight` set via
+    /// [`InFlightGuard`] for the duration of the eval.
+    #[allow(dead_code)]
+    fn eval_formula_inner(&self, addr: CellAddress, args: &ReadArgs) -> Value {
+        let expr = match self.formula_expr_for(addr) {
+            Some(expr) => expr,
+            // No AST resolvable (address is no longer a formula) — behave like
+            // an empty cell rather than trapping the reader.
+            None => return Value::Null,
+        };
+        let _guard = InFlightGuard::enter(&self.in_flight, addr);
+        let provider = AtomFormulaProvider {
+            args,
+            ctx: self.clone(),
+            current_cell: Cell::new(Some(addr)),
+        };
+        normalize_formula_cell_result(eval_expr_with_provider(&expr, &provider))
+    }
+
+    /// Row-major snapshot of the addresses inside `range` carrying a primitive
+    /// or formula value — the `&Sheet`-free twin of
+    /// [`Sheet::for_each_sparse_cell_with`]'s address collection. All `interior`
+    /// borrows drop before returning, so the caller can read facades
+    /// reactively without holding a borrow across a `store` read (D7).
+    /// Per-member facade reads = Tier A; the large-range band optimization is
+    /// P5.
+    #[allow(dead_code)]
+    fn range_member_addrs(&self, range: CellRange) -> Vec<CellAddress> {
+        // Primitives first (skipping formula-shadowed addresses), matching
+        // `for_each_sparse_cell_with`'s emission order.
+        let mut out: Vec<CellAddress> = {
+            let cells = self.interior.cells.borrow();
+            cells
+                .range_iter(range)
+                .map(|(addr, _)| addr)
+                .filter(|addr| {
+                    !self.interior.formula_cells.borrow().contains_key(addr)
+                        && !self.interior.formula_source.borrow().contains_key(addr)
+                })
+                .collect()
+        };
+        // Then the row-major union of hydrated formula cells + unhydrated
+        // formula source (a formula is in exactly one of the two).
+        let cells = self.interior.formula_cells.borrow();
+        let source = self.interior.formula_source.borrow();
+        let mut a = cells.range_iter(range).map(|(addr, _)| addr).peekable();
+        let mut b = source.range_iter(range).map(|(addr, _)| addr).peekable();
+        loop {
+            match (a.peek().copied(), b.peek().copied()) {
+                (None, None) => break,
+                (Some(x), None) => {
+                    out.push(x);
+                    a.next();
+                }
+                (None, Some(y)) => {
+                    out.push(y);
+                    b.next();
+                }
+                (Some(x), Some(y)) => {
+                    let (xk, yk) = ((x.row, x.col), (y.row, y.col));
+                    if xk == yk {
+                        out.push(x);
+                        a.next();
+                        b.next();
+                    } else if xk < yk {
+                        out.push(x);
+                        a.next();
+                    } else {
+                        out.push(y);
+                        b.next();
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// RAII marker for the runtime cycle guard (codex F1). While a formula-inner
+/// read_fn is executing, its address sits in the shared `in_flight` set; a
+/// referenced cell that is already in-flight is a runtime cycle and reads back
+/// `#CYCLE!` (see [`AtomFormulaProvider::read_facade`]). The guard removes the
+/// address on drop — but ONLY if it was the one that inserted it, so a
+/// re-entrant read of the same address (which cannot happen under the store's
+/// computing-guard, but is cheap to be correct about) never clears a peer's
+/// membership.
+#[allow(dead_code)]
+struct InFlightGuard {
+    set: Rc<RefCell<HashSet<CellAddress>>>,
+    addr: CellAddress,
+    inserted: bool,
+}
+
+impl InFlightGuard {
+    #[allow(dead_code)]
+    fn enter(set: &Rc<RefCell<HashSet<CellAddress>>>, addr: CellAddress) -> Self {
+        let inserted = set.borrow_mut().insert(addr);
+        InFlightGuard {
+            set: Rc::clone(set),
+            addr,
+            inserted,
+        }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.inserted {
+            self.set.borrow_mut().remove(&self.addr);
+        }
+    }
+}
+
+/// On-stack [`EvalProvider`] for a formula-inner read_fn (P4c). Every cell /
+/// range lookup resolves through the facade family and is issued as a tracked
+/// `ReadArgs::get`, so the enclosing formula-inner atom's dependency edges are
+/// exactly the cells the formula reads — the store's `dependenciesMap` is the
+/// single response graph (INV-2), no address→formula index. Mirrors
+/// [`SheetEvalProvider`]'s method bodies, but reads go through `read_facade`
+/// instead of `Sheet::peek_value_with_provider`.
+///
+/// Lifetimes: `'a` is the borrow of the live [`ReadArgs`] handed to the
+/// read_fn; `'r` is that `ReadArgs`'s own store-inner borrow.
+#[allow(dead_code)]
+struct AtomFormulaProvider<'a, 'r> {
+    args: &'a ReadArgs<'r>,
+    ctx: FacadeCtx,
+    /// Cell currently being evaluated (for no-arg `ROW()` / `COLUMN()`), seeded
+    /// to the formula's own address and moved by `set_current_cell` under the
+    /// eval's save/restore guard.
+    current_cell: Cell<Option<CellAddress>>,
+}
+
+impl<'a, 'r> AtomFormulaProvider<'a, 'r> {
+    /// Read a referenced cell through its facade as a tracked store dependency,
+    /// arming the runtime cycle guard (codex F1): if `addr` is already
+    /// mid-evaluation (present in the shared `in_flight` set), reading its
+    /// facade would trip the store's computing-panic, so instead record the
+    /// re-invalidating edge without reading (`ReadArgs::depend`) and surface a
+    /// sticky `#CYCLE!`. A later edit that breaks the cycle bumps the depended
+    /// atom's generation and re-derives this reader (see the `depend` primitive
+    /// tests).
+    #[allow(dead_code)]
+    fn read_facade(&self, addr: CellAddress) -> Value {
+        let facade = self.ctx.get_or_create_facade(addr);
+        if self.ctx.in_flight.borrow().contains(&addr) {
+            self.args.depend(facade);
+            return Value::Error(ValueError::CyclicRef);
+        }
+        self.args.get(facade)
+    }
+}
+
+impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
+    fn cell(&self, addr: CellAddress) -> Value {
+        collapse_array_for_eval(self.read_facade(addr))
+    }
+
+    fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        // Cross-sheet resolution through the shared store is P6; until then a
+        // formula-inner atom only reaches its own sheet's facades.
+        Value::Error(ValueError::InvalidRef)
+    }
+
+    fn raw_cell(&self, addr: CellAddress) -> Value {
+        self.read_facade(addr)
+    }
+
+    fn raw_sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
+        Value::Error(ValueError::InvalidRef)
+    }
+
+    /// Sparse Tier-A range: iterate only the addresses inside `range` that
+    /// actually carry a primitive or formula value, reading each through its
+    /// facade so every member becomes a dependency edge. The large-range band
+    /// optimization is P5.
+    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
+        for addr in self.ctx.range_member_addrs(range) {
+            let v = collapse_array_for_eval(self.read_facade(addr));
+            f(addr, v);
+        }
+    }
+
+    fn current_cell(&self) -> Option<CellAddress> {
+        self.current_cell.get()
+    }
+
+    fn set_current_cell(&self, addr: Option<CellAddress>) {
+        self.current_cell.set(addr);
+    }
+
+    fn cell_has_formula(&self, addr: CellAddress) -> bool {
+        self.ctx.interior.formula_cells.borrow().contains_key(&addr)
+            || self.ctx.interior.needs_parse.borrow().contains(&addr)
+    }
+
+    fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
+        if let Some(t) = self.ctx.interior.formula_texts.borrow().get(&addr) {
+            return Some(t.clone());
+        }
+        self.ctx
+            .interior
+            .formula_source
+            .borrow()
+            .get(&addr)
+            .map(|s| s.as_ref().to_string())
+    }
+}
+
 impl Sheet {
     pub fn new() -> Self {
         Self::with_store(Store::new())
@@ -940,7 +1343,7 @@ impl Sheet {
     pub fn with_store(store: Store) -> Self {
         Sheet {
             store,
-            atoms_owned: Cell::new(0),
+            atoms_owned: Rc::new(Cell::new(0)),
             interior: Rc::new(SheetInterior {
                 cells: RefCell::new(RowMajorMap::new()),
                 formula_cells: RefCell::new(RowMajorMap::new()),
@@ -949,8 +1352,10 @@ impl Sheet {
                 formula_source: RefCell::new(RowMajorMap::new()),
                 needs_parse: RefCell::new(HashSet::new()),
             }),
-            slot_epoch_family: RefCell::new(AtomFamily::new()),
+            slot_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
             cell_facade_family: Rc::new(RefCell::new(AtomFamily::new())),
+            formula_inner_family: Rc::new(RefCell::new(AtomFamily::new())),
+            in_flight: Rc::new(RefCell::new(HashSet::new())),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
             range_dependents: RefCell::new(RangeDependentIndex::new()),
@@ -1115,11 +1520,15 @@ impl Sheet {
     }
 
     /// P4c lazy door: the vanilla-faithful `create_derived_ctx` variant. Unlike
-    /// [`owned_create_derived`] (which wraps the eager `create_derived` BRIDGE
-    /// and reads once at creation to force the back-dep edge), this creates a
+    /// [`owned_create_derived`] (which wraps the eager `create_derived` bridge
+    /// shim and reads once at creation to force the back-dep edge), this creates a
     /// derived atom that computes NOTHING until first read — the laziness
     /// contract facades and inner formula atoms require (INV-7). The `read_fn`
     /// gets the full [`ReadArgs`] context (tracked `get`, untracked `peek`).
+    ///
+    /// Temporarily unused on `Sheet` while `facade_of` routes through the
+    /// [`FacadeCtx`] mirror; the write/wire path in the P4c flip calls it again.
+    #[allow(dead_code)]
     pub(crate) fn owned_create_derived_ctx(
         &self,
         read_fn: impl Fn(&ReadArgs) -> Value + 'static,
@@ -1152,52 +1561,30 @@ impl Sheet {
     /// cloned) before any `store.*` call. The read closure captures only owned
     /// values / `Rc` clones — never `self` — so it satisfies the `'static`
     /// bound and can resolve the inner atom on demand under `&self`.
+    ///
+    /// This is a thin wrapper over [`FacadeCtx::get_or_create_facade`]: the
+    /// facade logic lives on the `'static`-capturable [`FacadeCtx`] so the
+    /// forthcoming inner formula read closure can resolve referenced cells'
+    /// facades on demand without an `&Sheet`.
     #[allow(dead_code)]
     fn facade_of(&self, addr: CellAddress) -> AtomId {
-        enum InnerSlot {
-            Atom(AtomId),
-            Plain(Value),
-            Absent,
+        self.facade_ctx().get_or_create_facade(addr)
+    }
+
+    /// Build a [`FacadeCtx`] snapshot of this sheet's shared handles. Cheap —
+    /// clones a `Store` handle and four `Rc`s. The returned ctx is `'static`
+    /// and `Clone`, so it can be moved into store `read_fn` closures.
+    #[allow(dead_code)]
+    pub(crate) fn facade_ctx(&self) -> FacadeCtx {
+        FacadeCtx {
+            store: self.store.clone(),
+            atoms_owned: Rc::clone(&self.atoms_owned),
+            interior: Rc::clone(&self.interior),
+            slot_epoch_family: Rc::clone(&self.slot_epoch_family),
+            cell_facade_family: Rc::clone(&self.cell_facade_family),
+            formula_inner_family: Rc::clone(&self.formula_inner_family),
+            in_flight: Rc::clone(&self.in_flight),
         }
-        // Fast path: already built. Bind so the `borrow()` guard drops here.
-        let existing = self.cell_facade_family.borrow().get(&addr);
-        if let Some(id) = existing {
-            return id;
-        }
-        // Slot-epoch primitive (lazy, one per address). Bumped whenever the
-        // inner atom identity changes so the facade re-derives off a swap.
-        let epoch_id = self
-            .slot_epoch_family
-            .borrow_mut()
-            .get_or_create(addr, || self.owned_create_atom(Value::Null));
-        // Facade derived atom. Capture by value / `Rc` clone so the closure
-        // resolves the current inner atom under `&self` without borrowing it.
-        let interior = Rc::clone(&self.interior);
-        let store = self.store.clone();
-        self.cell_facade_family.borrow_mut().get_or_create(addr, || {
-            self.owned_create_derived_ctx(move |args| {
-                // Tracked: an epoch bump (inner-atom identity change) re-runs us.
-                let _ = args.get(epoch_id);
-                // Snapshot the current inner under a short borrow, then release.
-                let inner = {
-                    let cells = interior.cells.borrow();
-                    match cells.get(&addr) {
-                        Some(CellSlot::Atom(id)) => InnerSlot::Atom(*id),
-                        Some(CellSlot::Plain(v)) => InnerSlot::Plain(v.clone()),
-                        None => InnerSlot::Absent,
-                    }
-                };
-                match inner {
-                    // Guard the defensive "atom destroyed under the slot" case
-                    // (mirrors `cell_value_at`): `args.get` panics on a missing
-                    // dep atom, so probe existence first.
-                    InnerSlot::Atom(id) if store.has_atom(id) => args.get(id),
-                    InnerSlot::Atom(_) => Value::Null,
-                    InnerSlot::Plain(v) => v,
-                    InnerSlot::Absent => Value::Null,
-                }
-            })
-        })
     }
 
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
@@ -8379,5 +8766,80 @@ mod tests {
         // entirely (no prewarm needed). Counter must NOT advance.
         assert_eq!(sheet.get_cell("A1000"), Value::Number(1000.0));
         assert_eq!(sheet.debug_formula_eval_count(), count_before);
+    }
+
+    // ── P4c additive facade path (white-box) ────────────────────────────
+    // These exercise the new atom-delegated read path DIRECTLY through the
+    // facade / formula-inner atoms, without routing through the eager
+    // engine's `get_cell`. They pin that a formula's value — and its
+    // re-derivation on an upstream edit — flows purely through Store
+    // derived-atom edges (vanilla/core `readAtom` + `dependenciesChange`
+    // parity), with no address-level dependency graph involved. The path is
+    // still additive: the eager engine stays authoritative for `get_cell`
+    // until a later increment flips the read口.
+
+    /// The facade for a formula cell delegates to its formula-inner atom,
+    /// which evaluates the AST via `AtomFormulaProvider` and reads referenced
+    /// cells' facades. First read of `A2 = A1 + 5` resolves to 15 purely
+    /// through store edges.
+    #[test]
+    fn facade_reads_formula_via_inner_atom() {
+        let mut sheet = Sheet::new();
+        // Materialize A1 as an Atom slot so its facade reads the inner atom
+        // reactively. (A Plain slot's facade tracks only its non-reactive
+        // slot-epoch until F4 wires the write-口 epoch bump, so an eager
+        // `set_cell` mutation would not propagate through the additive path.)
+        let a1_inner = sheet.cell_atom("A1");
+        sheet.store.set(a1_inner, Value::Number(10.0));
+        assert!(sheet.set_formula("A2", "=A1+5"));
+
+        let a2 = CellAddress::parse("A2").unwrap();
+        let facade_a2 = sheet.facade_of(a2);
+        assert_eq!(sheet.store.get(facade_a2), Value::Number(15.0));
+    }
+
+    /// Editing an upstream cell's inner atom re-derives the dependent
+    /// formula's facade purely through store dependency edges (vanilla
+    /// `dependenciesChange` parity) — no parallel graph, no epoch bump. The
+    /// live chain is `a1_inner → facade(A1) → formula_inner(A2) → facade(A2)`.
+    #[test]
+    fn facade_rederives_on_upstream_store_write() {
+        let mut sheet = Sheet::new();
+        let a1_inner = sheet.cell_atom("A1");
+        sheet.store.set(a1_inner, Value::Number(10.0));
+        assert!(sheet.set_formula("A2", "=A1+5"));
+
+        let a2 = CellAddress::parse("A2").unwrap();
+        let facade_a2 = sheet.facade_of(a2);
+        assert_eq!(sheet.store.get(facade_a2), Value::Number(15.0));
+
+        // Bump the upstream atom's generation; the dependent facade re-derives
+        // on the next read with no address-level bookkeeping.
+        sheet.store.set(a1_inner, Value::Number(20.0));
+        assert_eq!(sheet.store.get(facade_a2), Value::Number(25.0));
+    }
+
+    /// F1 runtime cycle guard: a self-referential formula installed PAST the
+    /// load-time static cycle check — here via the lazy `formula_source` /
+    /// `needs_parse` path that the static `would_create_cycle` gate never
+    /// sees — must resolve to a sticky `#CYCLE!` through `InFlightGuard` /
+    /// `in_flight` re-entry detection, not unbounded recursion. The self-read
+    /// records a reverse edge via `ReadArgs::depend` (tolerates the computing
+    /// peer) so dissolving the cycle later re-invalidates the reader.
+    #[test]
+    fn facade_runtime_cycle_returns_sticky_cycle() {
+        let sheet = Sheet::new();
+        let a1 = CellAddress::parse("A1").unwrap();
+        // Install `A1 = A1 + 1` directly as a lazy formula, bypassing the
+        // load-time static cycle rejection that `set_formula` would apply.
+        sheet
+            .interior
+            .formula_source
+            .borrow_mut()
+            .insert(a1, Rc::from("=A1+1"));
+        sheet.interior.needs_parse.borrow_mut().insert(a1);
+
+        let facade_a1 = sheet.facade_of(a1);
+        assert_eq!(sheet.store.get(facade_a1), Value::Error(ValueError::CyclicRef));
     }
 }
