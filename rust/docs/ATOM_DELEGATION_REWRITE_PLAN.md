@@ -1,6 +1,35 @@
 # Atom-Delegation Rewrite — WORKPLAN & Constitution
 
-> **Current phase: P1 (store rewrite) — exit gate in progress.**
+> **Current phase: P4 (point-dep flip) — batch #1 fence table owner-approved 2026-07-08.**
+>
+> P4 executes in three sub-steps, each landing green:
+> - **P4a (plumbing, zero semantics):** extract `SheetInterior` — the state a
+>   formula read_fn must reach from inside the store: `cells` storage,
+>   `formula_exprs`, the facade `cell_family`, BRIDGE `formula_epochs`
+>   family, and the per-sheet eval counter — into an `Rc<SheetInterior>`
+>   with `RefCell` fields. `Sheet { interior: Rc<SheetInterior>, store, … }`.
+>   BORROW RULE (D7 corollary): no `interior` borrow may be held across any
+>   `store.*` call or listener dispatch; borrow, copy out, release, then act.
+>   All tests stay byte-identical.
+> - **P4b (facades):** per-address facade derived atoms from `cell_family`
+>   (read = getter(slot_epoch primitive) → look up inner id in interior →
+>   getter(inner)); subscriptions attach to the stable facade;
+>   AddressSubscriptionBucket remap machinery (`with_remap`,
+>   `attach/detach_address_sub` re-pointing) collapses. Still green under
+>   old expectations (facade publishes on the same observable changes).
+> - **P4c (the flip):** formula cells become inner derived atoms — read_fn
+>   captures `Weak<SheetInterior>` + `Rc<Expr>` + its BRIDGE epoch atom,
+>   runs `eval_expr_with_provider` with an `AtomEvalProvider` whose point
+>   refs resolve `family facade → args.get(...)` (edges + snapshots in the
+>   store); `FormulaCache`/`compute_formula_at` read path dies;
+>   `cell_dependents` + the point half of `mark_dependents_dirty` deleted;
+>   `would_create_cycle` point half switches to `store.reverse_reachable`
+>   (interactive installs are eager, so edges exist). Range deps (until P5):
+>   writes consult the RETAINED `range_dependents` index and bump the
+>   dependent formulas' epoch atoms — `BRIDGE(delete-by: P5-exit)`.
+>   Cross-sheet (until P6): CrossSheetDeps dirty-BFS bumps epochs instead of
+>   `mark_dirty_for_addr` — `BRIDGE(delete-by: P6-exit)`. Fence batch #1
+>   lands in the same commit.
 > Successor agents: read this file FIRST, then the latest `SESSION_HANDOFF_*.md`,
 > then run the quick-verify block (§8). `rust/excel-core/tests/architecture_invariants.rs`
 > enforces §2 mechanically — if it fails, you are off the main direction. Stop and read §6.
@@ -104,7 +133,27 @@ N-chain head edit is therefore visits == 2N−1 (N re-derives + N−1 pruned
 revalidations), evals == N. Pinned by
 `chain_100k_head_write_flush_is_iterative_and_linear`.
 
-_(no S-shape rows yet — those land at P4)_
+### P4 batch #1 — point-dep flip (owner sign-off required BEFORE code)
+
+Semantic basis (owner-approved in the plan): once-read (materialized)
+formulas re-derive EAGERLY during the write's flush; never-read formulas
+have no atom and stay lazy ('dirty'). Work moves write-ward; totals conserve.
+
+| Fence | Old pin | New pin | Why |
+|---|---|---|---|
+| S1 chain (hydration) | evals == N−1 on first read sweep | unchanged | hydration/parse laziness untouched |
+| S1 chain (head edit) | dirty_visit delta == N−1 at set; re-read evals == N−1 | eval delta == N−1 **during set_cell** (flush re-derive); post-edit read sweep == 0 evals; flush_visit delta == 2(N−1)−1 (re-derive + pruned revalidation rounds) | dirty flags → eager re-derive |
+| S1 second sweep | 0 evals | unchanged | cache |
+| S2 fanout (head edit) | dirty visits == N; re-read evals == N | eval delta == N during set; reads after == 0; unrelated write == 0 (flush_visit == 0) | same conservation |
+| S2 `debug_dirty_count` | == N post-edit | REPLACED by `debug_unmaterialized_formula_atom_count` where the pin's intent is laziness; == 0 where intent was "pending work" (none remains after eager flush) | counter dies with dirty flags |
+| S11 storm (materialized region) | total dirty visits == STORM_EDITS; sweep evals == distinct rows | recompute delta == STORM_EDITS at set-time (fanout 1 per edit); verification sweep == 0 evals for materialized rows + 1 per parked row (first materialization) | eager work bounded by Σ materialized dependents |
+| S11 parked edits | 0 dirty visits, 0 atoms | unchanged (0 recomputes, 0 atoms — family laziness) | INV-3/INV-7 |
+| probes `debug_formula_cache_state` (once-read, upstream write) | 'dirty' until re-read | 'clean' immediately after set (eager re-derive) — CONVERGES with TS-core semantics; never-read stays 'dirty' | the approved semantic shift |
+| `debug_formula_eval_count` | bump on read | bump at set-time for materialized dependents; still exactly one per formula per change | counter meaning unchanged (completed evals), timing moves |
+| wasm native once-read fences (~8-12) | 'dirty' after mutate | 'clean' after mutate | same |
+| golden replay | values only | UNTOUCHED (must stay green) | oracle |
+
+_(S3/S4/S12 rows land with P5 batch #2; S6/cross-sheet with P6 batch #3.)_
 
 ## 5. Divergence ledger (store.ts → store.rs)
 

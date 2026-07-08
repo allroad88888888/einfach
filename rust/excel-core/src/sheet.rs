@@ -251,7 +251,7 @@ enum FormulaCache {
     Clean(Value),
 }
 
-struct FormulaRecord {
+pub(crate) struct FormulaRecord {
     expr: Rc<Expr>,
     /// Point-cell dependencies (`Expr::CellRef`, plus bounded range cells
     /// expanded by `collect_refs`). Narrowed by eval-time tracking —
@@ -677,15 +677,18 @@ impl CellSlot {
     }
 }
 
-/// A spreadsheet sheet backed by an atom store.
-pub struct Sheet {
-    pub(crate) store: Store,
-    /// Number of store atoms THIS sheet created and still owns. With the
-    /// P3 workbook-global shared store, `store.debug_total_atom_count()`
-    /// counts every sheet's atoms; per-sheet probes and fences need the
-    /// sheet-local number, maintained by the `owned_*` lifecycle wrappers
-    /// (the only places this sheet creates or destroys atoms).
-    atoms_owned: Cell<usize>,
+/// Shared interior cell/formula storage (P4a of the atom-delegation
+/// rewrite — see `rust/docs/ATOM_DELEGATION_REWRITE_PLAN.md`). Holds the
+/// per-sheet state that formula read-closures will later (P4c) need to
+/// reach from inside the store via a `Weak<SheetInterior>` capture, so
+/// it lives behind an `Rc` on [`Sheet`] instead of as direct fields.
+///
+/// BORROW RULE (D7 corollary): no borrow of any field here may be held
+/// across a `store.*` call, an `owned_*` wrapper, subscriber/listener
+/// dispatch, or any `Sheet` method that might re-borrow the same field.
+/// Pattern: borrow → copy out (clone the `Value` / copy the `AtomId` /
+/// collect into a `Vec`) → release the guard → act.
+pub(crate) struct SheetInterior {
     /// Primitive cell slots keyed by `(row, col)`. Backed by a row-major
     /// `RowMajorMap` so range reads (e.g. viewport, `SUM(A1:A100)`) scan
     /// O(cells_in_range) rather than the full non-empty set — the Phase 2
@@ -695,7 +698,7 @@ pub struct Sheet {
     /// AUDIT B-2: slots are either `Plain(Value)` (lazily atomized — the
     /// bulk-install fast path) or `Atom(AtomId)` (materialized). See
     /// [`CellSlot`] for the invariants.
-    pub(crate) cells: RowMajorMap<CellSlot>,
+    pub(crate) cells: RefCell<RowMajorMap<CellSlot>>,
     /// Formula cells live at the Sheet layer. Formula results are cached here,
     /// not as core derived atoms, so `set_formula` does not compute. Same
     /// row-major shape as `cells` so range scans that hit a mix of primitive
@@ -708,20 +711,20 @@ pub struct Sheet {
     /// recursive eval (which might re-enter through another read /
     /// hydration). Iteration patterns snapshot keys first to avoid
     /// holding the borrow across a possible `borrow_mut`.
-    formula_cells: RefCell<RowMajorMap<Rc<FormulaRecord>>>,
+    pub(crate) formula_cells: RefCell<RowMajorMap<Rc<FormulaRecord>>>,
     /// AST of each formula cell, used for static cycle detection (B.2).
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` so the hydrator can
     /// insert during a `&self` read. Same recursion-safety pattern as
     /// `formula_cells`.
-    formula_exprs: RefCell<HashMap<CellAddress, Rc<Expr>>>,
+    pub(crate) formula_exprs: RefCell<HashMap<CellAddress, Rc<Expr>>>,
     /// Original formula text per cell, for `get_formula` so the formula bar
     /// and edit-mode entry can show the source instead of the computed
     /// result (D.11).
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` for the same hydrator-
     /// from-`&self` reason.
-    formula_texts: RefCell<HashMap<CellAddress, String>>,
+    pub(crate) formula_texts: RefCell<HashMap<CellAddress, String>>,
     /// Lazy-load source storage (Phase 2 of LAZY_FORMULA_INDEXING). Holds
     /// the raw formula text for cells that came in via `bulk_load` and
     /// have NOT yet been parsed / indexed. Mirrors `formula_cells` in
@@ -743,7 +746,7 @@ pub struct Sheet {
     /// LAZY_FORMULA_INDEXING Phase 3: wrapped in `RefCell` so the
     /// hydrator (which runs from `&self` contexts) can both read the
     /// source and remove the entry after install.
-    formula_source: RefCell<RowMajorMap<Rc<str>>>,
+    pub(crate) formula_source: RefCell<RowMajorMap<Rc<str>>>,
     /// Lazy-load index of unparsed formulas. `RefCell` because read-only
     /// entry points (`peek_value_with_provider`, sparse-iter resolvers,
     /// cycle checks) need to drain entries as part of hydration without
@@ -752,7 +755,21 @@ pub struct Sheet {
     /// Invariant: a single address appears in `needs_parse` iff it also
     /// appears as a key in `formula_source`. Hydration removes from both
     /// in lockstep.
-    needs_parse: RefCell<HashSet<CellAddress>>,
+    pub(crate) needs_parse: RefCell<HashSet<CellAddress>>,
+}
+
+/// A spreadsheet sheet backed by an atom store.
+pub struct Sheet {
+    pub(crate) store: Store,
+    /// Number of store atoms THIS sheet created and still owns. With the
+    /// P3 workbook-global shared store, `store.debug_total_atom_count()`
+    /// counts every sheet's atoms; per-sheet probes and fences need the
+    /// sheet-local number, maintained by the `owned_*` lifecycle wrappers
+    /// (the only places this sheet creates or destroys atoms).
+    atoms_owned: Cell<usize>,
+    /// Shared cell/formula storage — see [`SheetInterior`] for the field
+    /// docs and the P4a borrow rule.
+    pub(crate) interior: Rc<SheetInterior>,
     /// Address-level subscriptions. Buckets are only wired to store atoms when
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
@@ -906,12 +923,14 @@ impl Sheet {
         Sheet {
             store,
             atoms_owned: Cell::new(0),
-            cells: RowMajorMap::new(),
-            formula_cells: RefCell::new(RowMajorMap::new()),
-            formula_exprs: RefCell::new(HashMap::new()),
-            formula_texts: RefCell::new(HashMap::new()),
-            formula_source: RefCell::new(RowMajorMap::new()),
-            needs_parse: RefCell::new(HashSet::new()),
+            interior: Rc::new(SheetInterior {
+                cells: RefCell::new(RowMajorMap::new()),
+                formula_cells: RefCell::new(RowMajorMap::new()),
+                formula_exprs: RefCell::new(HashMap::new()),
+                formula_texts: RefCell::new(HashMap::new()),
+                formula_source: RefCell::new(RowMajorMap::new()),
+                needs_parse: RefCell::new(HashSet::new()),
+            }),
             cell_subscriptions: HashMap::new(),
             cell_dependents: RefCell::new(HashMap::new()),
             range_dependents: RefCell::new(RangeDependentIndex::new()),
@@ -1083,46 +1102,64 @@ impl Sheet {
     }
 
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
-        match self.cells.get(&addr) {
-            Some(CellSlot::Atom(id)) => return *id,
-            Some(CellSlot::Plain(_)) => {
-                let Some(CellSlot::Plain(value)) = self.cells.remove(&addr) else {
-                    unreachable!("slot vanished between get and remove");
-                };
-                let id = self.owned_create_atom(value);
-                self.cells.insert(addr, CellSlot::Atom(id));
-                id
+        // P4a borrow rule: take the parked value (or bail on Atom) under a
+        // short `cells` borrow, release the guard, THEN call into the
+        // store — atom creation must never run under a live borrow.
+        let parked: Option<Value> = {
+            let mut cells = self.interior.cells.borrow_mut();
+            match cells.get(&addr) {
+                Some(CellSlot::Atom(id)) => return *id,
+                Some(CellSlot::Plain(_)) => {
+                    let Some(CellSlot::Plain(value)) = cells.remove(&addr) else {
+                        unreachable!("slot vanished between get and remove");
+                    };
+                    Some(value)
+                }
+                None => None,
             }
-            None => {
-                let id = self.owned_create_atom(Value::Null);
-                self.cells.insert(addr, CellSlot::Atom(id));
-                id
-            }
-        }
+        };
+        let id = match parked {
+            Some(value) => self.owned_create_atom(value),
+            None => self.owned_create_atom(Value::Null),
+        };
+        self.interior.cells.borrow_mut().insert(addr, CellSlot::Atom(id));
+        id
     }
 
-    /// Read the value behind a cell slot. `Plain` slots return the parked
-    /// value; `Atom` slots read the store (Null if the atom was destroyed
-    /// out from under the slot — defensive, mirrors the old
-    /// `has_atom`-guarded reads).
-    fn slot_value(&self, slot: &CellSlot) -> Value {
-        match slot {
-            CellSlot::Plain(value) => value.clone(),
-            CellSlot::Atom(id) => {
-                if self.store.has_atom(*id) {
-                    self.store.get(*id)
+    /// Read the value behind the cell slot at `addr`, if a slot exists.
+    /// `Plain` slots return the parked value; `Atom` slots read the store
+    /// (Null if the atom was destroyed out from under the slot —
+    /// defensive, mirrors the old `has_atom`-guarded reads).
+    ///
+    /// P4a borrow rule: the slot is snapshotted under a short `cells`
+    /// borrow (value cloned / atom id copied) and the guard released
+    /// BEFORE the store read.
+    fn cell_value_at(&self, addr: CellAddress) -> Option<Value> {
+        let probe: Result<Value, AtomId> = {
+            let cells = self.interior.cells.borrow();
+            match cells.get(&addr)? {
+                CellSlot::Plain(value) => Ok(value.clone()),
+                CellSlot::Atom(id) => Err(*id),
+            }
+        };
+        Some(match probe {
+            Ok(value) => value,
+            Err(id) => {
+                if self.store.has_atom(id) {
+                    self.store.get(id)
                 } else {
                     Value::Null
                 }
             }
-        }
+        })
     }
 
     /// Remove the slot at `addr`; if it held a materialized atom with no
     /// live dependents, destroy the atom. `Plain` slots are simply
     /// dropped. Returns whether a slot was present.
     fn drop_cell_slot(&mut self, addr: CellAddress) -> bool {
-        let Some(slot) = self.cells.remove(&addr) else {
+        let removed = self.interior.cells.borrow_mut().remove(&addr);
+        let Some(slot) = removed else {
             return false;
         };
         if let CellSlot::Atom(id) = slot {
@@ -1140,13 +1177,13 @@ impl Sheet {
     }
 
     fn current_readable_atom(&self, addr: CellAddress) -> Option<AtomId> {
-        if self.formula_cells.borrow().contains_key(&addr) {
+        if self.interior.formula_cells.borrow().contains_key(&addr) {
             None
         } else {
             // AUDIT B-2: `Plain` slots report no readable atom. Callers
             // that need an attachable atom (`attach_address_sub`) promote
-            // first; pure readers go through `slot_value`.
-            self.cells.get(&addr).and_then(|slot| slot.atom_id())
+            // first; pure readers go through `cell_value_at`.
+            self.interior.cells.borrow().get(&addr).and_then(|slot| slot.atom_id())
         }
     }
 
@@ -1178,8 +1215,11 @@ impl Sheet {
     /// (slot-less) addresses still do not materialize anything.
     fn attach_address_sub(&mut self, addr: CellAddress) {
         if self.cell_subscriptions.contains_key(&addr)
-            && matches!(self.cells.get(&addr), Some(CellSlot::Plain(_)))
-            && !self.formula_cells.borrow().contains_key(&addr)
+            && matches!(
+                self.interior.cells.borrow().get(&addr),
+                Some(CellSlot::Plain(_))
+            )
+            && !self.interior.formula_cells.borrow().contains_key(&addr)
         {
             self.ensure_cell(addr);
         }
@@ -1326,15 +1366,15 @@ impl Sheet {
         // bulk-loaded but not-yet-read formula — without the early
         // drain the new install would race the old lazy entry on the
         // first read.
-        self.formula_source.borrow_mut().remove(&addr);
-        self.needs_parse.borrow_mut().remove(&addr);
-        let record = self.formula_cells.borrow_mut().remove(&addr)?;
+        self.interior.formula_source.borrow_mut().remove(&addr);
+        self.interior.needs_parse.borrow_mut().remove(&addr);
+        let record = self.interior.formula_cells.borrow_mut().remove(&addr)?;
         let deps = record.deps.borrow().clone();
         self.remove_formula_deps(addr, &deps);
         let range_deps = record.range_deps.borrow().clone();
         self.remove_formula_range_deps(addr, &range_deps);
-        self.formula_exprs.borrow_mut().remove(&addr);
-        self.formula_texts.borrow_mut().remove(&addr);
+        self.interior.formula_exprs.borrow_mut().remove(&addr);
+        self.interior.formula_texts.borrow_mut().remove(&addr);
         Some(record)
     }
 
@@ -1364,7 +1404,7 @@ impl Sheet {
         // Fast path: not lazy. One hashset lookup, no allocations.
         // Done under a short borrow so concurrent `&self` callers don't
         // race against a `borrow_mut` from the parse path below.
-        if !self.needs_parse.borrow().contains(&addr) {
+        if !self.interior.needs_parse.borrow().contains(&addr) {
             return;
         }
 
@@ -1374,11 +1414,11 @@ impl Sheet {
         // exclusive borrows that are released before the parse so the
         // parse path can re-enter sheet-level `RefCell`s freely.
         let source = {
-            let mut needs = self.needs_parse.borrow_mut();
+            let mut needs = self.interior.needs_parse.borrow_mut();
             if !needs.remove(&addr) {
                 return;
             }
-            let src = self.formula_source.borrow_mut().remove(&addr);
+            let src = self.interior.formula_source.borrow_mut().remove(&addr);
             match src {
                 Some(s) => s,
                 None => return,
@@ -1404,9 +1444,9 @@ impl Sheet {
                 // `#VALUE!` immediately and won't try to re-eval.
                 *record.cache.borrow_mut() =
                     FormulaCache::Clean(Value::Error(ValueError::InvalidValue));
-                self.formula_cells.borrow_mut().insert(addr, record);
-                self.formula_exprs.borrow_mut().insert(addr, err_expr);
-                self.formula_texts
+                self.interior.formula_cells.borrow_mut().insert(addr, record);
+                self.interior.formula_exprs.borrow_mut().insert(addr, err_expr);
+                self.interior.formula_texts
                     .borrow_mut()
                     .insert(addr, source.as_ref().to_string());
                 return;
@@ -1423,9 +1463,9 @@ impl Sheet {
             ));
             *record.cache.borrow_mut() =
                 FormulaCache::Clean(Value::Error(ValueError::CyclicRef));
-            self.formula_cells.borrow_mut().insert(addr, record);
-            self.formula_exprs.borrow_mut().insert(addr, err_expr);
-            self.formula_texts
+            self.interior.formula_cells.borrow_mut().insert(addr, record);
+            self.interior.formula_exprs.borrow_mut().insert(addr, err_expr);
+            self.interior.formula_texts
                 .borrow_mut()
                 .insert(addr, source.as_ref().to_string());
             return;
@@ -1441,9 +1481,9 @@ impl Sheet {
         self.add_formula_range_deps(addr, &range_deps);
         let record = Rc::new(FormulaRecord::new(expr_rc.clone(), deps, range_deps));
         self.note_cross_sheet_if_any(&expr_rc);
-        self.formula_cells.borrow_mut().insert(addr, record);
-        self.formula_exprs.borrow_mut().insert(addr, expr_rc);
-        self.formula_texts
+        self.interior.formula_cells.borrow_mut().insert(addr, record);
+        self.interior.formula_exprs.borrow_mut().insert(addr, expr_rc);
+        self.interior.formula_texts
             .borrow_mut()
             .insert(addr, source.as_ref().to_string());
     }
@@ -1457,7 +1497,7 @@ impl Sheet {
         // inner record-level `RefCell`s on `deps` / `range_deps` are
         // borrowed transiently for the clone, no recursion risk.
         let snapshot: Vec<(CellAddress, HashSet<CellAddress>, HashSet<CellRange>)> = self
-            .formula_cells
+            .interior.formula_cells
             .borrow()
             .iter()
             .map(|(addr, record)| {
@@ -1502,8 +1542,8 @@ impl Sheet {
         // upper bound is benign (the maps live as long as the sheet
         // and headroom amortizes across future inserts).
         self.cell_dependents.get_mut().reserve(hint);
-        self.formula_exprs.get_mut().reserve(hint);
-        self.formula_texts.get_mut().reserve(hint);
+        self.interior.formula_exprs.borrow_mut().reserve(hint);
+        self.interior.formula_texts.borrow_mut().reserve(hint);
     }
 
     /// STORAGE_PRIMARY Phase 6.1: full-sheet replace via direct map
@@ -1582,7 +1622,10 @@ impl Sheet {
         for addr in spill_target_addrs {
             self.drop_cell_slot(addr);
         }
-        for (_, slot) in self.cells.drain_into_vec() {
+        // P4a borrow rule: drain into an owned Vec first — the loop body
+        // calls into the store, so no `cells` borrow may be live there.
+        let drained = self.interior.cells.borrow_mut().drain_into_vec();
+        for (_, slot) in drained {
             if let CellSlot::Atom(id) = slot {
                 if self.store.has_atom(id) && !self.store.has_dependents(id) {
                     self.owned_destroy_atom(id);
@@ -1591,14 +1634,14 @@ impl Sheet {
         }
 
         // Hydrated formula state — wholesale clears (full replace).
-        *self.formula_cells.get_mut() = RowMajorMap::new();
-        self.formula_exprs.get_mut().clear();
-        self.formula_texts.get_mut().clear();
+        *self.interior.formula_cells.borrow_mut() = RowMajorMap::new();
+        self.interior.formula_exprs.borrow_mut().clear();
+        self.interior.formula_texts.borrow_mut().clear();
         self.cell_dependents.get_mut().clear();
         self.range_dependents.get_mut().clear();
         // Lazy parking from any previous bulk load.
-        *self.formula_source.get_mut() = RowMajorMap::new();
-        self.needs_parse.get_mut().clear();
+        *self.interior.formula_source.borrow_mut() = RowMajorMap::new();
+        self.interior.needs_parse.borrow_mut().clear();
 
         // --- Primitive install ---------------------------------------------
         // AUDIT B-2 (FIXED): park raw values as `CellSlot::Plain` — zero
@@ -1621,7 +1664,7 @@ impl Sheet {
             prim_pairs.push((addr, CellSlot::Plain(value)));
         }
         let primitives_installed = prim_pairs.len();
-        self.cells = RowMajorMap::from_unsorted_pairs(prim_pairs);
+        *self.interior.cells.borrow_mut() = RowMajorMap::from_unsorted_pairs(prim_pairs);
 
         // --- Formula parking (lazy — Phase 2+3 machinery) ------------------
         let formulas_installed = formulas.len();
@@ -1631,8 +1674,8 @@ impl Sheet {
             needs.insert(addr);
             formula_pairs.push((addr, Rc::<str>::from(text)));
         }
-        *self.formula_source.get_mut() = RowMajorMap::from_unsorted_pairs(formula_pairs);
-        *self.needs_parse.get_mut() = needs;
+        *self.interior.formula_source.borrow_mut() = RowMajorMap::from_unsorted_pairs(formula_pairs);
+        *self.interior.needs_parse.borrow_mut() = needs;
         self.imported_formula_count
             .set(self.imported_formula_count.get() + formulas_installed);
 
@@ -1723,7 +1766,7 @@ impl Sheet {
     /// own `set_cell` path already did that. This helper is purely the
     /// "mark this one formula dirty" primitive.
     pub fn mark_dirty_for_addr(&self, addr: CellAddress) {
-        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
             *record.cache.borrow_mut() = FormulaCache::Dirty;
         }
     }
@@ -1753,7 +1796,7 @@ impl Sheet {
                 continue;
             }
             self.dirty_visit_count.set(self.dirty_visit_count.get() + 1);
-            if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+            if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
             self.notify_address_subscribers(addr);
@@ -1780,8 +1823,7 @@ impl Sheet {
     /// have no `Array` and so return None here, matching Excel's "the
     /// anchor has no spill" semantics in the collision case.
     pub fn spill_info(&self, addr: CellAddress) -> Option<(u32, u32)> {
-        let slot = self.cells.get(&addr)?;
-        match self.slot_value(slot) {
+        match self.cell_value_at(addr)? {
             Value::Array(arr) => Some(arr.shape()),
             _ => None,
         }
@@ -1914,7 +1956,10 @@ impl Sheet {
                 // empty `Value::Null` placeholder created by a previous
                 // subscribe), remove it first so we don't leak an atom.
                 self.drop_cell_slot(target);
-                self.cells.insert(target, CellSlot::Atom(derived));
+                self.interior
+                    .cells
+                    .borrow_mut()
+                    .insert(target, CellSlot::Atom(derived));
                 // Re-attach subscription bucket (if any) so address-level
                 // listeners see updates from the new derived atom.
                 self.attach_address_sub(target);
@@ -1940,16 +1985,15 @@ impl Sheet {
         // (a) Formula cell at target — always blocks. Unhydrated lazy
         // formulas count too: a same-cell collision with a deferred
         // formula must surface as #SPILL!, not pass through.
-        if self.formula_cells.borrow().contains_key(&target)
-            || self.needs_parse.borrow().contains(&target)
+        if self.interior.formula_cells.borrow().contains_key(&target)
+            || self.interior.needs_parse.borrow().contains(&target)
         {
             return true;
         }
         // (b) Primitive slot holding a non-Null value. `Plain` slots are
         // covered too (AUDIT B-2): a bulk-installed value blocks the
         // spill exactly like its materialized-atom equivalent would.
-        if let Some(slot) = self.cells.get(&target) {
-            let v = self.slot_value(slot);
+        if let Some(v) = self.cell_value_at(target) {
             if !matches!(v, Value::Null) {
                 // (c) Spilled cell? One probe of the reverse index
                 // (AUDIT A-8). Our OWN previous target is not a
@@ -2013,7 +2057,13 @@ impl Sheet {
     /// not a spill anchor.
     fn clear_spill_at_address(&mut self, addr: CellAddress) {
         // `Plain` slots can never be spill anchors — nothing to clear.
-        let Some(atom_id) = self.cells.get(&addr).and_then(|slot| slot.atom_id()) else {
+        let atom_id = self
+            .interior
+            .cells
+            .borrow()
+            .get(&addr)
+            .and_then(|slot| slot.atom_id());
+        let Some(atom_id) = atom_id else {
             return;
         };
         if self.spill_targets.contains_key(&atom_id) {
@@ -2024,7 +2074,7 @@ impl Sheet {
     /// Install (or refresh) a primitive anchor atom holding `arr` at
     /// `addr` for a formula whose latest result was `Value::Array(arr)`.
     /// The formula record at `addr` is preserved — only the primitive
-    /// atom in `self.cells[addr]` is created / updated to mirror the
+    /// atom in `interior.cells[addr]` is created / updated to mirror the
     /// formula's array result, so spilled derived atoms have a
     /// dependency-tracked source to read.
     ///
@@ -2072,7 +2122,9 @@ impl Sheet {
         // (in cells[addr] → spill_targets). Used to decide whether we
         // need to tear down on a scalar result.
         let prev_anchor_atom: Option<AtomId> = self
+            .interior
             .cells
+            .borrow()
             .get(&addr)
             .and_then(|slot| slot.atom_id())
             .filter(|id| self.spill_targets.contains_key(id));
@@ -2081,7 +2133,7 @@ impl Sheet {
         // `formula_cells` so unhydrated array-producing formulas get
         // their spill installed by this eager pass.
         self.hydrate_formula(addr);
-        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
+        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
             // Not a formula cell — nothing to recompute.
             return;
         };
@@ -2126,23 +2178,35 @@ impl Sheet {
                         // error path? No — install_formula_spill leaves
                         // the atom holding Value::Array on collision.
                         // Fix that here:
-                        if let Some(atom_id) =
-                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
-                        {
+                        // P4a borrow rule: copy the atom id out before the
+                        // `store.set` (which dispatches listeners).
+                        let atom_id = self
+                            .interior
+                            .cells
+                            .borrow()
+                            .get(&addr)
+                            .and_then(|slot| slot.atom_id());
+                        if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
-                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() =
                                 FormulaCache::Clean(Value::Error(ValueError::Spill));
                         }
                     }
                     Err(other) => {
-                        if let Some(atom_id) =
-                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
-                        {
+                        // P4a borrow rule: copy the atom id out before the
+                        // `store.set` (which dispatches listeners).
+                        let atom_id = self
+                            .interior
+                            .cells
+                            .borrow()
+                            .get(&addr)
+                            .and_then(|slot| slot.atom_id());
+                        if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
-                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
@@ -2192,7 +2256,7 @@ impl Sheet {
             .copied()
             .filter(|a| {
                 self.hydrate_formula(*a);
-                self.formula_cells.borrow().contains_key(a)
+                self.interior.formula_cells.borrow().contains_key(a)
             })
             .collect();
         for a in candidates {
@@ -2222,7 +2286,9 @@ impl Sheet {
     /// the sheet-local provider (which would re-surface `#NAME?`).
     pub(crate) fn apply_workbook_recomputed_value(&mut self, addr: CellAddress, value: Value) {
         let prev_anchor_atom: Option<AtomId> = self
+            .interior
             .cells
+            .borrow()
             .get(&addr)
             .and_then(|slot| slot.atom_id())
             .filter(|id| self.spill_targets.contains_key(id));
@@ -2230,7 +2296,7 @@ impl Sheet {
         // LAZY_FORMULA_INDEXING Phase 3: hydrate so the workbook-aware
         // re-eval sees the parsed AST.
         self.hydrate_formula(addr);
-        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
+        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
             return;
         };
         if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
@@ -2250,23 +2316,35 @@ impl Sheet {
                 match self.install_formula_spill(addr, arr) {
                     Ok(()) => {}
                     Err(ValueError::Spill) => {
-                        if let Some(atom_id) =
-                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
-                        {
+                        // P4a borrow rule: copy the atom id out before the
+                        // `store.set` (which dispatches listeners).
+                        let atom_id = self
+                            .interior
+                            .cells
+                            .borrow()
+                            .get(&addr)
+                            .and_then(|slot| slot.atom_id());
+                        if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
-                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() =
                                 FormulaCache::Clean(Value::Error(ValueError::Spill));
                         }
                     }
                     Err(other) => {
-                        if let Some(atom_id) =
-                            self.cells.get(&addr).and_then(|slot| slot.atom_id())
-                        {
+                        // P4a borrow rule: copy the atom id out before the
+                        // `store.set` (which dispatches listeners).
+                        let atom_id = self
+                            .interior
+                            .cells
+                            .borrow()
+                            .get(&addr)
+                            .and_then(|slot| slot.atom_id());
+                        if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
-                        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
                         }
                     }
@@ -2317,13 +2395,13 @@ impl Sheet {
         // owns the address. Drain the source / needs_parse entries
         // explicitly; the `formula_cells` map has no record to
         // `remove_formula_record` for an unhydrated addr.
-        let had_formula = self.formula_cells.borrow().contains_key(&addr)
-            || self.needs_parse.borrow().contains(&addr);
+        let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.needs_parse.borrow().contains(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
-                sheet.formula_source.borrow_mut().remove(&addr);
-                sheet.needs_parse.borrow_mut().remove(&addr);
+                sheet.interior.formula_source.borrow_mut().remove(&addr);
+                sheet.interior.needs_parse.borrow_mut().remove(&addr);
                 let _ = sheet.ensure_cell(addr);
             });
         }
@@ -2385,15 +2463,15 @@ impl Sheet {
         // LAZY_FORMULA_INDEXING Phase 3: include unhydrated lazy
         // formulas. `remove_formula_record` already drains the lazy
         // entries defensively.
-        let had_formula = self.formula_cells.borrow().contains_key(&addr)
-            || self.needs_parse.borrow().contains(&addr);
+        let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.needs_parse.borrow().contains(&addr);
         let is_null = matches!(value, Value::Null);
 
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
-                sheet.formula_source.borrow_mut().remove(&addr);
-                sheet.needs_parse.borrow_mut().remove(&addr);
+                sheet.interior.formula_source.borrow_mut().remove(&addr);
+                sheet.interior.needs_parse.borrow_mut().remove(&addr);
                 let id = sheet.ensure_cell(addr);
                 sheet.store.set(id, value);
             });
@@ -2454,44 +2532,54 @@ impl Sheet {
     /// fresh primitive and reattach the fanout via the existing
     /// `attach_address_sub` flow, firing the listener as part of that write.
     fn try_release_primitive(&mut self, addr: CellAddress) {
-        let Some(slot) = self.cells.get(&addr) else {
-            return;
+        // P4a borrow rule: classify the slot under a short borrow
+        // (`Ok(atom_id)` for materialized slots, `Err(plain_is_null)`
+        // for parked plain values), then act with the guard released —
+        // the release paths below re-borrow `cells` mutably and call
+        // into the store.
+        let probe: Result<AtomId, bool> = {
+            let cells = self.interior.cells.borrow();
+            match cells.get(&addr) {
+                None => return,
+                Some(CellSlot::Plain(value)) => Err(matches!(value, Value::Null)),
+                Some(CellSlot::Atom(id)) => Ok(*id),
+            }
         };
         // Formula cells are lazy records, not primitive atoms.
         // LAZY_FORMULA_INDEXING Phase 3: also skip when an unhydrated
         // formula is parked at `addr` — the eventual hydration will
         // reuse the primitive slot if it needs one.
-        if self.formula_cells.borrow().contains_key(&addr)
-            || self.needs_parse.borrow().contains(&addr)
+        if self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.needs_parse.borrow().contains(&addr)
         {
             return;
         }
-        let atom_id = match slot {
+        let atom_id = match probe {
             // AUDIT B-2: `Plain` slots hold non-Null values by invariant
             // (every Null-writing path promotes via `ensure_cell` first);
             // a Null that slips through is released without ever having
             // had an atom.
-            CellSlot::Plain(value) => {
-                if matches!(value, Value::Null) {
-                    self.cells.remove(&addr);
+            Err(plain_is_null) => {
+                if plain_is_null {
+                    self.interior.cells.borrow_mut().remove(&addr);
                     self.detach_address_sub(addr);
                 }
                 return;
             }
-            CellSlot::Atom(id) => *id,
+            Ok(id) => id,
         };
         if self.store.has_dependents(atom_id) {
             return;
         }
         if !self.store.has_atom(atom_id) {
             // Defensive: nothing to release.
-            self.cells.remove(&addr);
+            self.interior.cells.borrow_mut().remove(&addr);
             return;
         }
         if !matches!(self.store.get(atom_id), Value::Null) {
             return;
         }
-        self.cells.remove(&addr);
+        self.interior.cells.borrow_mut().remove(&addr);
         self.detach_address_sub(addr);
         self.owned_destroy_atom(atom_id);
     }
@@ -2567,9 +2655,9 @@ impl Sheet {
             sheet.add_formula_range_deps(addr, &range_deps);
             let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
             sheet.note_cross_sheet_if_any(&expr);
-            sheet.formula_cells.borrow_mut().insert(addr, record);
-            sheet.formula_exprs.borrow_mut().insert(addr, expr);
-            sheet.formula_texts.borrow_mut().insert(addr, formula_str.to_string());
+            sheet.interior.formula_cells.borrow_mut().insert(addr, record);
+            sheet.interior.formula_exprs.borrow_mut().insert(addr, expr);
+            sheet.interior.formula_texts.borrow_mut().insert(addr, formula_str.to_string());
         });
         let dirtied = self.mark_dependents_dirty(addr);
         // Eager spill maintenance: re-evaluate the just-installed
@@ -2588,8 +2676,8 @@ impl Sheet {
     pub(crate) fn write_error(&mut self, addr: CellAddress, err: ValueError) {
         // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas count as
         // "had a formula" for the remap-vs-direct teardown decision.
-        let had_formula = self.formula_cells.borrow().contains_key(&addr)
-            || self.needs_parse.borrow().contains(&addr);
+        let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.needs_parse.borrow().contains(&addr);
         if had_formula {
             self.with_remap(addr, |sheet| {
                 sheet.remove_formula_record(addr);
@@ -2628,7 +2716,7 @@ impl Sheet {
     /// per-cell cycle pre-check — so they observe the parsed entries
     /// they need.
     pub(crate) fn formula_exprs_iter(&self) -> std::cell::Ref<'_, HashMap<CellAddress, Rc<Expr>>> {
-        self.formula_exprs.borrow()
+        self.interior.formula_exprs.borrow()
     }
 
     /// Codex P2 #1 fix: walk every parked lazy formula in this sheet,
@@ -2643,7 +2731,7 @@ impl Sheet {
     /// callback). Callers parse the source themselves on demand; the
     /// hot path (every formula already hydrated) pays zero cost.
     pub(crate) fn for_each_lazy_formula(&self, mut f: impl FnMut(CellAddress, &str)) {
-        let source = self.formula_source.borrow();
+        let source = self.interior.formula_source.borrow();
         for (addr, src) in source.iter() {
             f(addr, src.as_ref());
         }
@@ -2774,8 +2862,8 @@ impl Sheet {
         // hydration. Collecting addresses first releases the borrows
         // and gives us a stable iteration set.
         let formula_addrs: Vec<CellAddress> = {
-            let cells = self.formula_cells.borrow();
-            let source = self.formula_source.borrow();
+            let cells = self.interior.formula_cells.borrow();
+            let source = self.interior.formula_source.borrow();
             // Row-major union: each map yields ascending order; merge
             // so duplicates collapse and the final list is ascending
             // too (matches the pre-lazy contract that callers rely on
@@ -2818,17 +2906,32 @@ impl Sheet {
             out
         };
 
-        for (addr, slot) in self.cells.range_iter(range) {
+        // P4a borrow rule: snapshot the primitive addresses in range so no
+        // `cells` borrow is held across `cell_value_at` (store read) or the
+        // caller's `f`. Membership can't change during the loop (`&self`),
+        // so the per-iteration formula-map checks below observe the same
+        // set the live iteration did.
+        let prim_addrs: Vec<CellAddress> = self
+            .interior
+            .cells
+            .borrow()
+            .range_iter(range)
+            .map(|(addr, _)| addr)
+            .collect();
+        for addr in prim_addrs {
             // Skip primitives that have been upgraded to formulas — the
             // formula pass below will emit the formula value at this addr.
             // Address-equality check stays O(1) (BTreeMap point lookup).
             // Both hydrated and lazy formulas count.
-            if self.formula_cells.borrow().contains_key(&addr)
-                || self.formula_source.borrow().contains_key(&addr)
+            if self.interior.formula_cells.borrow().contains_key(&addr)
+                || self.interior.formula_source.borrow().contains_key(&addr)
             {
                 continue;
             }
-            f(addr, self.slot_value(slot));
+            let Some(value) = self.cell_value_at(addr) else {
+                continue;
+            };
+            f(addr, value);
         }
         for addr in formula_addrs {
             let v = value_resolver(self, addr);
@@ -2848,20 +2951,14 @@ impl Sheet {
         // primitive scaffold the bulk-load left behind). Hydration is
         // idempotent and `&self`-only via internal `RefCell`s.
         self.hydrate_formula(addr);
-        if self.formula_cells.borrow().contains_key(&addr) {
+        if self.interior.formula_cells.borrow().contains_key(&addr) {
             return self.eval_formula_at_with_provider(addr, provider);
         }
-        self.cells
-            .get(&addr)
-            .map(|slot| self.slot_value(slot))
-            .unwrap_or(Value::Null)
+        self.cell_value_at(addr).unwrap_or(Value::Null)
     }
 
     fn primitive_value_at(&self, addr: CellAddress) -> Value {
-        self.cells
-            .get(&addr)
-            .map(|slot| self.slot_value(slot))
-            .unwrap_or(Value::Null)
+        self.cell_value_at(addr).unwrap_or(Value::Null)
     }
 
     fn eval_formula_at_with_provider(
@@ -2877,7 +2974,7 @@ impl Sheet {
         // Cheap early-out for cache hit (mirrors the original behavior).
         // Done before `prewarm_formula_chain` so a Clean cache short-circuits
         // before we allocate the work-stack.
-        let cached = self.formula_cells.borrow().get(&addr).cloned();
+        let cached = self.interior.formula_cells.borrow().get(&addr).cloned();
         if let Some(record) = cached {
             match record.cache.borrow().clone() {
                 FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
@@ -2922,7 +3019,7 @@ impl Sheet {
         // computed inside the prewarm pass. If for any reason the prewarm
         // left the cache in a non-Clean state (e.g. a primitive_value_at
         // detour), fall back to compute_formula_at.
-        if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
             if let FormulaCache::Clean(value) = record.cache.borrow().clone() {
                 return value;
             }
@@ -2943,7 +3040,7 @@ impl Sheet {
         // prewarm path may not have routed through
         // `peek_value_with_provider`.
         self.hydrate_formula(addr);
-        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
+        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
             return self.primitive_value_at(addr);
         };
         match record.cache.borrow().clone() {
@@ -3009,7 +3106,7 @@ impl Sheet {
             // `collect_prewarm_refs` participates in the chain pre-fill.
             self.hydrate_formula(addr);
             // Fetch the record. Skip primitives (they have no FormulaRecord).
-            let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
+            let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
                 continue;
             };
 
@@ -3076,8 +3173,8 @@ impl Sheet {
                 // — `formula_cells.contains_key` would miss them. The
                 // hydration on the next iteration moves the dep into
                 // `formula_cells`.
-                if !self.formula_cells.borrow().contains_key(&dep)
-                    && !self.needs_parse.borrow().contains(&dep)
+                if !self.interior.formula_cells.borrow().contains_key(&dep)
+                    && !self.interior.needs_parse.borrow().contains(&dep)
                 {
                     continue;
                 }
@@ -3105,14 +3202,14 @@ impl Sheet {
         // cache starts Dirty anyway. So scanning only the hydrated set
         // here is sufficient; nothing observable is missed.
         let entries: Vec<(CellAddress, Rc<Expr>)> = self
-            .formula_exprs
+            .interior.formula_exprs
             .borrow()
             .iter()
             .map(|(addr, expr)| (*addr, expr.clone()))
             .collect();
         for (addr, expr) in entries {
             if expr_has_sheet_ref(&expr) {
-                if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
@@ -3140,11 +3237,11 @@ impl Sheet {
             // only carries hydrated entries — without the hydrate the
             // chain would terminate at the first lazy node.
             self.hydrate_formula(addr);
-            let Some(expr) = self.formula_exprs.borrow().get(&addr).cloned() else {
+            let Some(expr) = self.interior.formula_exprs.borrow().get(&addr).cloned() else {
                 continue;
             };
             if expr_has_sheet_ref(&expr) {
-                if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+                if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
             }
@@ -3153,7 +3250,7 @@ impl Sheet {
             // expanded but each cell is gated by `formula_exprs` so the
             // typical `SUM(A:A)` only enqueues the small subset of column A
             // cells that are actually formulas.
-            let exprs = self.formula_exprs.borrow();
+            let exprs = self.interior.formula_exprs.borrow();
             collect_formula_refs_into(&expr, &exprs, &mut to_visit);
         }
     }
@@ -3175,7 +3272,7 @@ impl Sheet {
     /// `debug_materialized_cell_atom_count`.
     #[doc(hidden)]
     pub fn debug_primitive_atom_count(&self) -> usize {
-        self.cells.len()
+        self.interior.cells.borrow().len()
     }
 
     /// Number of primitive cell slots that hold a real store atom
@@ -3184,7 +3281,9 @@ impl Sheet {
     /// spill registration, never eagerly.
     #[doc(hidden)]
     pub fn debug_materialized_cell_atom_count(&self) -> usize {
-        self.cells
+        self.interior
+            .cells
+            .borrow()
             .iter()
             .filter(|(_, slot)| matches!(slot, CellSlot::Atom(_)))
             .count()
@@ -3199,7 +3298,7 @@ impl Sheet {
     /// `bulk_load` of N formulas, even if no reads have hydrated yet.
     #[doc(hidden)]
     pub fn debug_formula_count(&self) -> usize {
-        self.formula_cells.borrow().len() + self.formula_source.borrow().len()
+        self.interior.formula_cells.borrow().len() + self.interior.formula_source.borrow().len()
     }
 
     /// Number of formulas that currently depend on the cell at `addr`.
@@ -3226,10 +3325,10 @@ impl Sheet {
         // semantically they would compute fresh on the next read
         // (matches the pre-lazy contract: every just-imported
         // formula starts dirty).
-        if self.needs_parse.borrow().contains(&addr) {
+        if self.interior.needs_parse.borrow().contains(&addr) {
             return "dirty";
         }
-        let Some(record) = self.formula_cells.borrow().get(&addr).cloned() else {
+        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
             return "none";
         };
         let cache = record.cache.borrow().clone();
@@ -3279,12 +3378,12 @@ impl Sheet {
         // zero after lazy bulk_load even though every cell is still
         // "pending compute".
         let hydrated_dirty = self
-            .formula_cells
+            .interior.formula_cells
             .borrow()
             .values()
             .filter(|record| matches!(*record.cache.borrow(), FormulaCache::Dirty))
             .count();
-        hydrated_dirty + self.needs_parse.borrow().len()
+        hydrated_dirty + self.interior.needs_parse.borrow().len()
     }
 
     /// Number of formulas registered via `bulk_load` (cumulative since the
@@ -3457,7 +3556,7 @@ impl Sheet {
         // is exactly the "edges are zero after lazy bulk_load" probe
         // the Phase 1 measurement summary asked for.
         let range_formula_count = self
-            .formula_cells
+            .interior.formula_cells
             .borrow()
             .values()
             .filter(|record| !record.range_deps.borrow().is_empty())
@@ -3468,7 +3567,7 @@ impl Sheet {
             // stats probe surfaces "how much of the dep graph is
             // actually live". The total formula count (hydrated +
             // lazy) is exposed via `debug_formula_count`.
-            formula_count: self.formula_cells.borrow().len() as u64,
+            formula_count: self.interior.formula_cells.borrow().len() as u64,
             total_point_dep_edges: total_point_edges,
             total_range_dep_entries: total_range_entries,
             max_fanout,
@@ -3499,10 +3598,10 @@ impl Sheet {
         // `formula_texts`, lazy ones live in `formula_source`. Check
         // both so the formula bar shows the source even before first
         // read.
-        if let Some(t) = self.formula_texts.borrow().get(&addr) {
+        if let Some(t) = self.interior.formula_texts.borrow().get(&addr) {
             return Some(t.clone());
         }
-        self.formula_source
+        self.interior.formula_source
             .borrow()
             .get(&addr)
             .map(|s| s.as_ref().to_string())
@@ -3513,7 +3612,7 @@ impl Sheet {
     pub fn has_formula_at(&self, addr: CellAddress) -> bool {
         // LAZY_FORMULA_INDEXING Phase 3: lazy formulas are still
         // formulas — ISFORMULA must observe them.
-        self.formula_cells.borrow().contains_key(&addr) || self.needs_parse.borrow().contains(&addr)
+        self.interior.formula_cells.borrow().contains_key(&addr) || self.interior.needs_parse.borrow().contains(&addr)
     }
 
     /// Source formula text at `addr`, if any. Used by
@@ -3523,10 +3622,10 @@ impl Sheet {
     /// per call is acceptable for the formula-bar / `FORMULATEXT` use
     /// case.
     pub fn formula_text_at(&self, addr: CellAddress) -> Option<String> {
-        if let Some(t) = self.formula_texts.borrow().get(&addr) {
+        if let Some(t) = self.interior.formula_texts.borrow().get(&addr) {
             return Some(t.clone());
         }
-        self.formula_source
+        self.interior.formula_source
             .borrow()
             .get(&addr)
             .map(|s| s.as_ref().to_string())
@@ -3556,8 +3655,8 @@ impl Sheet {
         // formulas — both are "non-empty" from the snapshot caller's
         // POV.
         let formula_addrs: Vec<CellAddress> = {
-            let cells = self.formula_cells.borrow();
-            let source = self.formula_source.borrow();
+            let cells = self.interior.formula_cells.borrow();
+            let source = self.interior.formula_source.borrow();
             let mut out: Vec<CellAddress> = Vec::with_capacity(cells.len() + source.len());
             out.extend(cells.iter().map(|(a, _)| a));
             for (a, _) in source.iter() {
@@ -3573,14 +3672,17 @@ impl Sheet {
         // Snapshot the formula key set once so the inner closure cost
         // doesn't pay a per-cell `RefCell::borrow`.
         let formula_keys: HashSet<CellAddress> = {
-            let cells = self.formula_cells.borrow();
-            let source = self.formula_source.borrow();
+            let cells = self.interior.formula_cells.borrow();
+            let source = self.interior.formula_source.borrow();
             cells
                 .keys()
                 .chain(source.keys())
                 .collect()
         };
-        for (addr, _) in self.cells.iter() {
+        // P4a borrow rule: snapshot the primitive keys so no `cells`
+        // borrow is held across the caller's `f` (row-major order kept).
+        let prim_addrs: Vec<CellAddress> = self.interior.cells.borrow().keys().collect();
+        for addr in prim_addrs {
             if formula_keys.contains(&addr) {
                 continue;
             }
@@ -3595,8 +3697,8 @@ impl Sheet {
         // LAZY_FORMULA_INDEXING Phase 3: same snapshot pattern as
         // `for_each_non_empty`.
         let formula_addrs: Vec<CellAddress> = {
-            let cells = self.formula_cells.borrow();
-            let source = self.formula_source.borrow();
+            let cells = self.interior.formula_cells.borrow();
+            let source = self.interior.formula_source.borrow();
             let mut out: Vec<CellAddress> = Vec::new();
             out.extend(cells.range_iter(range).map(|(a, _)| a));
             for (a, _) in source.range_iter(range) {
@@ -3615,9 +3717,18 @@ impl Sheet {
         // snapshot made a one-cell `clear_range` O(total formulas).
         // Borrows are taken per iteration so `f` stays free to re-enter
         // sheet state, matching the old snapshot pattern's guarantees.
-        for (addr, _) in self.cells.range_iter(range) {
-            if self.formula_cells.borrow().contains_key(&addr)
-                || self.formula_source.borrow().contains_key(&addr)
+        // P4a borrow rule: the in-range primitive keys are snapshotted
+        // first so no `cells` borrow is held across `f`.
+        let prim_addrs: Vec<CellAddress> = self
+            .interior
+            .cells
+            .borrow()
+            .range_iter(range)
+            .map(|(addr, _)| addr)
+            .collect();
+        for addr in prim_addrs {
+            if self.interior.formula_cells.borrow().contains_key(&addr)
+                || self.interior.formula_source.borrow().contains_key(&addr)
             {
                 continue;
             }
@@ -3646,9 +3757,9 @@ impl Sheet {
     /// convenience wrapper around `for_each_non_empty` for wasm exposure.
     pub fn non_empty_addrs(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(
-            self.formula_cells.borrow().len()
-                + self.formula_source.borrow().len()
-                + self.cells.len(),
+            self.interior.formula_cells.borrow().len()
+                + self.interior.formula_source.borrow().len()
+                + self.interior.cells.borrow().len(),
         );
         self.for_each_non_empty(|addr| out.push(addr.to_string()));
         out
@@ -4068,22 +4179,22 @@ impl Sheet {
         // across the four cell/formula maps — primitive cells, hydrated
         // formula records, AND lazy parked formulas
         // (`formula_source` / `needs_parse`). The pre-fix version only
-        // walked `self.cells.keys()`, so lazy-only entries inside the
+        // walked `interior.cells.keys()`, so lazy-only entries inside the
         // band survived `drop_cells_in` and were later relocated through
         // `f(addr)` into `REF_INVALID_*` sentinels, where they panic
         // `non_empty_addrs()` (cell.rs:58 add overflow on `row + 1`).
         let mut to_drop: HashSet<CellAddress> = HashSet::new();
-        to_drop.extend(self.cells.keys().filter(|a| pred(*a)));
+        to_drop.extend(self.interior.cells.borrow().keys().filter(|a| pred(*a)));
         // `HashMap::keys` yields `&CellAddress`; `RowMajorMap::keys` yields
         // owned `CellAddress`. Normalise both with copied().
         to_drop.extend(
-            self.formula_cells
+            self.interior.formula_cells
                 .borrow()
                 .keys()
                 .filter(|a| pred(*a)),
         );
         to_drop.extend(
-            self.formula_source
+            self.interior.formula_source
                 .borrow()
                 .keys()
                 .filter(|a| pred(*a)),
@@ -4113,24 +4224,28 @@ impl Sheet {
     fn relocate_cells(&mut self, f: impl Fn(CellAddress) -> CellAddress) {
         // Phase A: rebuild each map under new keys. We materialize Vecs first
         // because mutating a BTreeMap while iterating its keys would panic.
-        // `drain_into_vec` empties `self.cells` / `self.formula_cells` and
-        // hands back row-major (addr, value) pairs we reinsert under the
-        // shifted addresses.
+        // `drain_into_vec` empties `interior.cells` / `interior.formula_cells`
+        // and hands back row-major (addr, value) pairs we reinsert under the
+        // shifted addresses. P4a borrow rule: each drain lands in an owned
+        // `Vec` in its own statement, so no `interior` borrow is held
+        // across the rebuild loops.
         let mut new_cells: RowMajorMap<CellSlot> = RowMajorMap::new();
-        for (addr, slot) in self.cells.drain_into_vec() {
+        let drained_cells = self.interior.cells.borrow_mut().drain_into_vec();
+        for (addr, slot) in drained_cells {
             new_cells.insert(f(addr), slot);
         }
         let mut new_formula_cells: RowMajorMap<Rc<FormulaRecord>> = RowMajorMap::new();
-        for (addr, record) in self.formula_cells.get_mut().drain_into_vec() {
+        let drained_formula_cells = self.interior.formula_cells.borrow_mut().drain_into_vec();
+        for (addr, record) in drained_formula_cells {
             new_formula_cells.insert(f(addr), record);
         }
         let new_formula_exprs: HashMap<CellAddress, Rc<Expr>> =
-            std::mem::take(self.formula_exprs.get_mut())
+            std::mem::take(&mut *self.interior.formula_exprs.borrow_mut())
                 .into_iter()
                 .map(|(addr, expr)| (f(addr), expr))
                 .collect();
         let new_formula_texts: HashMap<CellAddress, String> =
-            std::mem::take(self.formula_texts.get_mut())
+            std::mem::take(&mut *self.interior.formula_texts.borrow_mut())
                 .into_iter()
                 .map(|(addr, text)| (f(addr), text))
                 .collect();
@@ -4138,11 +4253,12 @@ impl Sheet {
         // entries too. `formula_source` is keyed by addr; `needs_parse`
         // is a set of addrs. Both get the same shift.
         let mut new_formula_source: RowMajorMap<Rc<str>> = RowMajorMap::new();
-        for (addr, src) in self.formula_source.get_mut().drain_into_vec() {
+        let drained_formula_source = self.interior.formula_source.borrow_mut().drain_into_vec();
+        for (addr, src) in drained_formula_source {
             new_formula_source.insert(f(addr), src);
         }
         let new_needs_parse: HashSet<CellAddress> =
-            std::mem::take(self.needs_parse.get_mut())
+            std::mem::take(&mut *self.interior.needs_parse.borrow_mut())
                 .into_iter()
                 .map(&f)
                 .collect();
@@ -4183,12 +4299,12 @@ impl Sheet {
                 }
             })
             .collect();
-        self.cells = new_cells;
-        *self.formula_cells.get_mut() = new_formula_cells;
-        *self.formula_exprs.get_mut() = new_formula_exprs;
-        *self.formula_texts.get_mut() = new_formula_texts;
-        *self.formula_source.get_mut() = new_formula_source;
-        *self.needs_parse.get_mut() = new_needs_parse;
+        *self.interior.cells.borrow_mut() = new_cells;
+        *self.interior.formula_cells.borrow_mut() = new_formula_cells;
+        *self.interior.formula_exprs.borrow_mut() = new_formula_exprs;
+        *self.interior.formula_texts.borrow_mut() = new_formula_texts;
+        *self.interior.formula_source.borrow_mut() = new_formula_source;
+        *self.interior.needs_parse.borrow_mut() = new_needs_parse;
         self.formats = new_formats;
         self.range_formats = new_range_formats;
         // AUDIT A-1: the dep indexes are NOT rebuilt here. Between the
@@ -4233,7 +4349,7 @@ impl Sheet {
     fn retarget_formula_refs(&mut self, edit: crate::shift::ShiftEdit) {
         let f = |addr: CellAddress| edit.apply(addr);
         let snapshot: Vec<(CellAddress, Rc<Expr>)> = self
-            .formula_exprs
+            .interior.formula_exprs
             .borrow()
             .iter()
             .map(|(addr, expr)| (*addr, expr.clone()))
@@ -4254,7 +4370,7 @@ impl Sheet {
                 // Shift didn't touch any static ref. Keep the record —
                 // but invalidate the cache when the edit can still
                 // change observed values (see doc comment).
-                let record = self.formula_cells.borrow().get(&addr).cloned();
+                let record = self.interior.formula_cells.borrow().get(&addr).cloned();
                 if let Some(record) = record {
                     let tracked_moved = record
                         .deps
@@ -4308,11 +4424,11 @@ impl Sheet {
             let range_deps = collect_range_refs(&new_expr_rc);
             let record = Rc::new(FormulaRecord::new(new_expr_rc.clone(), deps, range_deps));
             self.note_cross_sheet_if_any(&new_expr_rc);
-            self.formula_cells.borrow_mut().insert(addr, record);
-            self.formula_exprs
+            self.interior.formula_cells.borrow_mut().insert(addr, record);
+            self.interior.formula_exprs
                 .borrow_mut()
                 .insert(addr, new_expr_rc.clone());
-            self.formula_texts
+            self.interior.formula_texts
                 .borrow_mut()
                 .insert(addr, crate::shift::render_formula(&new_expr_rc));
             value_changed.push(addr);
@@ -4335,7 +4451,7 @@ impl Sheet {
         let mut rewrites: Vec<(CellAddress, String)> = Vec::new();
         let mut dead: Vec<CellAddress> = Vec::new();
         {
-            let source = self.formula_source.borrow();
+            let source = self.interior.formula_source.borrow();
             for (addr, src) in source.iter() {
                 match crate::shift::rewrite_parked_source(src.as_ref(), edit) {
                     crate::shift::SourceRewrite::Unchanged => {}
@@ -4345,7 +4461,7 @@ impl Sheet {
             }
         }
         {
-            let mut source = self.formula_source.borrow_mut();
+            let mut source = self.interior.formula_source.borrow_mut();
             for (addr, s) in rewrites {
                 source.insert(addr, Rc::from(s.as_str()));
             }
@@ -4356,7 +4472,7 @@ impl Sheet {
             // `#VALUE!` at first read and never see a ref to kill — so
             // a "dead ref" inside garbage stays parked untouched.
             let parses = {
-                let source = self.formula_source.borrow();
+                let source = self.interior.formula_source.borrow();
                 source
                     .get(&addr)
                     .map(|src| crate::formula::parse_formula(src.as_ref()).is_some())
@@ -4392,7 +4508,7 @@ impl Sheet {
             if !visited.insert(addr) {
                 continue;
             }
-            if let Some(record) = self.formula_cells.borrow().get(&addr).cloned() {
+            if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
                 *record.cache.borrow_mut() = FormulaCache::Dirty;
             }
             self.dependents_of_into(addr, &mut stack);
@@ -4537,15 +4653,15 @@ impl<'a> BulkLoader<'a> {
         // is a no-op on lazies (no record) — drain `formula_source` /
         // `needs_parse` explicitly so the address stops looking like a
         // formula to any later check.
-        let had_formula = self.sheet.formula_cells.borrow().contains_key(&addr)
-            || self.sheet.needs_parse.borrow().contains(&addr);
+        let had_formula = self.sheet.interior.formula_cells.borrow().contains_key(&addr)
+            || self.sheet.interior.needs_parse.borrow().contains(&addr);
         if had_formula {
             // Formula → primitive transition. Drop the formula record (and
             // its reverse dep entries) but no notify; primitive scaffold is
             // re-established below.
             self.sheet.remove_formula_record(addr);
-            self.sheet.formula_source.borrow_mut().remove(&addr);
-            self.sheet.needs_parse.borrow_mut().remove(&addr);
+            self.sheet.interior.formula_source.borrow_mut().remove(&addr);
+            self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
             // The pre-existing primitive atom from formula→primitive remap may
             // still be present; ensure_cell + store.set covers both branches.
             let id = self.sheet.ensure_cell(addr);
@@ -4667,12 +4783,12 @@ impl<'a> BulkLoader<'a> {
         // workloads — see `bulk_load_skips_eval_until_first_read`), tear
         // it down so the lazy path is the sole source of truth for this
         // address.
-        if self.sheet.formula_cells.borrow().contains_key(&addr) {
+        if self.sheet.interior.formula_cells.borrow().contains_key(&addr) {
             self.sheet.remove_formula_record(addr);
         }
         // Also drop any prior lazy parking — overwrite semantics.
-        self.sheet.formula_source.borrow_mut().remove(&addr);
-        self.sheet.needs_parse.borrow_mut().remove(&addr);
+        self.sheet.interior.formula_source.borrow_mut().remove(&addr);
+        self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
 
         // Drop any prior primitive scaffold (no notify); mirrors the
         // primitive→formula transition cleanup in
@@ -4683,10 +4799,10 @@ impl<'a> BulkLoader<'a> {
         // footprint to one allocation; the hydrator clones the `Rc`
         // (cheap) when it reads back.
         self.sheet
-            .formula_source
+            .interior.formula_source
             .borrow_mut()
             .insert(addr, Rc::<str>::from(formula_text));
-        self.sheet.needs_parse.borrow_mut().insert(addr);
+        self.sheet.interior.needs_parse.borrow_mut().insert(addr);
 
         // Bump imported-formula counter so the scale suite's
         // `debug_imported_formula_count` reads as N after a 100k import
@@ -4769,12 +4885,12 @@ impl<'a> BulkLoader<'a> {
         let t_formula_record_start = clock.map(|f| f());
         let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
         self.sheet.note_cross_sheet_if_any(&expr);
-        self.sheet.formula_cells.borrow_mut().insert(addr, record);
-        self.sheet.formula_exprs.borrow_mut().insert(addr, expr);
+        self.sheet.interior.formula_cells.borrow_mut().insert(addr, record);
+        self.sheet.interior.formula_exprs.borrow_mut().insert(addr, expr);
         // Consume the owned `formula_text` directly — the caller's
         // string allocation lands in `formula_texts` without a
         // `String::clone`.
-        self.sheet.formula_texts.borrow_mut().insert(addr, formula_text);
+        self.sheet.interior.formula_texts.borrow_mut().insert(addr, formula_text);
         if let Some(now_ms) = clock {
             let t_end = now_ms();
             let t0 = t_dep_extract_start.expect("paired with clock");
@@ -4812,12 +4928,12 @@ impl<'a> BulkLoader<'a> {
     #[allow(dead_code)]
     fn write_error_no_notify(&mut self, addr: CellAddress, err: ValueError) {
         self.sheet.detach_address_sub(addr);
-        if self.sheet.formula_cells.borrow().contains_key(&addr) {
+        if self.sheet.interior.formula_cells.borrow().contains_key(&addr) {
             self.sheet.remove_formula_record(addr);
         }
         // Drop any lazy parking too.
-        self.sheet.formula_source.borrow_mut().remove(&addr);
-        self.sheet.needs_parse.borrow_mut().remove(&addr);
+        self.sheet.interior.formula_source.borrow_mut().remove(&addr);
+        self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
         let id = self.sheet.ensure_cell(addr);
         self.sheet.store.set(id, Value::Error(err));
     }
@@ -4925,7 +5041,7 @@ impl<'a> BulkLoader<'a> {
                 if !dirty.insert(addr) {
                     continue;
                 }
-                if let Some(record) = self.sheet.formula_cells.borrow().get(&addr).cloned() {
+                if let Some(record) = self.sheet.interior.formula_cells.borrow().get(&addr).cloned() {
                     *record.cache.borrow_mut() = FormulaCache::Dirty;
                 }
                 self.sheet.dependents_of_into_with_scratch(
@@ -4983,7 +5099,7 @@ impl<'a> BulkLoader<'a> {
                         if !dirty.insert(addr) {
                             continue;
                         }
-                        if let Some(record) = self.sheet.formula_cells.borrow().get(&addr).cloned() {
+                        if let Some(record) = self.sheet.interior.formula_cells.borrow().get(&addr).cloned() {
                             *record.cache.borrow_mut() = FormulaCache::Dirty;
                         }
                         // Touched addresses were already seeded into
@@ -5145,7 +5261,7 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
 
 /// Walk the AST and append every referenced cell address into `out`.
 /// Used by static cycle detection (B.2). Free function so it can run
-/// without borrowing `&self.formula_exprs`.
+/// without borrowing `&self.interior.formula_exprs`.
 ///
 /// Whole-column / whole-row ranges (`A:A`, `1:1`) are NOT expanded into
 /// individual cells here — that would push the entire coordinate space
@@ -5651,11 +5767,11 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
     fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
         // LAZY_FORMULA_INDEXING Phase 3: prefer hydrated source, fall
         // back to lazy `formula_source`.
-        if let Some(t) = self.sheet.formula_texts.borrow().get(&addr) {
+        if let Some(t) = self.sheet.interior.formula_texts.borrow().get(&addr) {
             return Some(t.clone());
         }
         self.sheet
-            .formula_source
+            .interior.formula_source
             .borrow()
             .get(&addr)
             .map(|s| s.as_ref().to_string())
@@ -5788,9 +5904,9 @@ mod tests {
     #[test]
     fn get_cell_does_not_materialize_empty_cell() {
         let sheet = Sheet::new();
-        assert_eq!(sheet.cells.len(), 0);
+        assert_eq!(sheet.interior.cells.borrow().len(), 0);
         assert_eq!(sheet.get_cell("A1"), Value::Null);
-        assert_eq!(sheet.cells.len(), 0);
+        assert_eq!(sheet.interior.cells.borrow().len(), 0);
     }
 
     #[test]
@@ -6001,10 +6117,14 @@ mod tests {
         let cc = count.clone();
         let sub = sheet.subscribe_cell("A1", move || *cc.borrow_mut() += 1);
 
-        assert_eq!(sheet.cells.len(), 0, "subscription should not allocate A1");
+        assert_eq!(
+            sheet.interior.cells.borrow().len(),
+            0,
+            "subscription should not allocate A1"
+        );
         sheet.set_cell("A1", Value::Number(1.0));
         assert_eq!(sheet.get_cell("A1"), Value::Number(1.0));
-        assert_eq!(sheet.cells.len(), 1);
+        assert_eq!(sheet.interior.cells.borrow().len(), 1);
         assert_eq!(*count.borrow(), 1, "exactly one fire on first write");
 
         sheet.unsubscribe_cell(sub);
@@ -6172,7 +6292,11 @@ mod tests {
         let cc = count.clone();
         let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
         // Pre-condition: B1 has no atom yet.
-        assert!(!sheet.cells.contains_key(&CellAddress::new(0, 1)));
+        assert!(!sheet
+            .interior
+            .cells
+            .borrow()
+            .contains_key(&CellAddress::new(0, 1)));
 
         sheet.set_formula("B1", "=A1*2");
         assert_eq!(sheet.get_cell("B1"), Value::Number(6.0));
@@ -7308,9 +7432,9 @@ mod tests {
 
                     let t5 = Instant::now();
                     loader.sheet.note_cross_sheet_if_any(&expr);
-                    loader.sheet.formula_cells.borrow_mut().insert(*addr, record);
-                    loader.sheet.formula_exprs.borrow_mut().insert(*addr, expr);
-                    loader.sheet.formula_texts.borrow_mut().insert(*addr, src.clone());
+                    loader.sheet.interior.formula_cells.borrow_mut().insert(*addr, record);
+                    loader.sheet.interior.formula_exprs.borrow_mut().insert(*addr, expr);
+                    loader.sheet.interior.formula_texts.borrow_mut().insert(*addr, src.clone());
                     loader
                         .sheet
                         .imported_formula_count
