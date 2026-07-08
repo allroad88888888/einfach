@@ -5,7 +5,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use einfach_core::{
-    ArrayData, AtomFamily, AtomId, CellListener, Store, SubscriptionId, Value, ValueError,
+    ArrayData, AtomFamily, AtomId, CellListener, ReadArgs, Store, SubscriptionId, Value,
+    ValueError,
 };
 
 use crate::cell::CellAddress;
@@ -1113,11 +1114,90 @@ impl Sheet {
         self.store.create_derived(read_fn)
     }
 
+    /// P4c lazy door: the vanilla-faithful `create_derived_ctx` variant. Unlike
+    /// [`owned_create_derived`] (which wraps the eager `create_derived` BRIDGE
+    /// and reads once at creation to force the back-dep edge), this creates a
+    /// derived atom that computes NOTHING until first read — the laziness
+    /// contract facades and inner formula atoms require (INV-7). The `read_fn`
+    /// gets the full [`ReadArgs`] context (tracked `get`, untracked `peek`).
+    pub(crate) fn owned_create_derived_ctx(
+        &self,
+        read_fn: impl Fn(&ReadArgs) -> Value + 'static,
+    ) -> AtomId {
+        self.atoms_owned.set(self.atoms_owned.get() + 1);
+        self.store.create_derived_ctx(read_fn)
+    }
+
     pub(crate) fn owned_destroy_atom(&self, id: AtomId) {
         if self.store.has_atom(id) {
             self.store.destroy_atom(id);
             self.atoms_owned.set(self.atoms_owned.get() - 1);
         }
+    }
+
+    /// P4c (UNWIRED, step 1): the per-address facade derived atom — the stable
+    /// subscription anchor that will replace `AddressSubscriptionBucket`
+    /// remapping once the read/write paths flip in the P4c commit. Idempotent:
+    /// returns the cached facade if one exists, else lazily creates the
+    /// slot-epoch primitive and the facade derived atom.
+    ///
+    /// The facade reads its slot-epoch (tracked — a `literal↔formula` overwrite
+    /// or clear that bumps the epoch re-runs the facade WITHOUT re-keying any
+    /// subscription) then the CURRENT inner atom for the address. Only the
+    /// literal / `Atom` inner path is populated today; the formula inner path
+    /// lands with the P4c flip.
+    ///
+    /// BORROW RULE (D7): every family guard and the `interior.cells` borrow
+    /// inside the read closure is released (inner id copied / plain value
+    /// cloned) before any `store.*` call. The read closure captures only owned
+    /// values / `Rc` clones — never `self` — so it satisfies the `'static`
+    /// bound and can resolve the inner atom on demand under `&self`.
+    #[allow(dead_code)]
+    fn facade_of(&self, addr: CellAddress) -> AtomId {
+        enum InnerSlot {
+            Atom(AtomId),
+            Plain(Value),
+            Absent,
+        }
+        // Fast path: already built. Bind so the `borrow()` guard drops here.
+        let existing = self.cell_facade_family.borrow().get(&addr);
+        if let Some(id) = existing {
+            return id;
+        }
+        // Slot-epoch primitive (lazy, one per address). Bumped whenever the
+        // inner atom identity changes so the facade re-derives off a swap.
+        let epoch_id = self
+            .slot_epoch_family
+            .borrow_mut()
+            .get_or_create(addr, || self.owned_create_atom(Value::Null));
+        // Facade derived atom. Capture by value / `Rc` clone so the closure
+        // resolves the current inner atom under `&self` without borrowing it.
+        let interior = Rc::clone(&self.interior);
+        let store = self.store.clone();
+        self.cell_facade_family.borrow_mut().get_or_create(addr, || {
+            self.owned_create_derived_ctx(move |args| {
+                // Tracked: an epoch bump (inner-atom identity change) re-runs us.
+                let _ = args.get(epoch_id);
+                // Snapshot the current inner under a short borrow, then release.
+                let inner = {
+                    let cells = interior.cells.borrow();
+                    match cells.get(&addr) {
+                        Some(CellSlot::Atom(id)) => InnerSlot::Atom(*id),
+                        Some(CellSlot::Plain(v)) => InnerSlot::Plain(v.clone()),
+                        None => InnerSlot::Absent,
+                    }
+                };
+                match inner {
+                    // Guard the defensive "atom destroyed under the slot" case
+                    // (mirrors `cell_value_at`): `args.get` panics on a missing
+                    // dep atom, so probe existence first.
+                    InnerSlot::Atom(id) if store.has_atom(id) => args.get(id),
+                    InnerSlot::Atom(_) => Value::Null,
+                    InnerSlot::Plain(v) => v,
+                    InnerSlot::Absent => Value::Null,
+                }
+            })
+        })
     }
 
     fn ensure_cell(&mut self, addr: CellAddress) -> AtomId {
