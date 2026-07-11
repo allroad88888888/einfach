@@ -222,7 +222,9 @@ describe('deep chain — review 修复回归钉(2026-07-10 多agent复审)', () 
     let prev: Atom<number> = head
     for (let i = 1; i < 300; i += 1) {
       const p: Atom<number> = prev
-      const special = i === 280
+      // 深部节点(i=20)在帧循环内、环境深度 256 处运行——它 mid-read
+      // 触发的 flush 让 probe 也在超预算环境重算,get(dv) 才会故障。
+      const special = i === 20
       prev = atom((get) => {
         const v = get(p)
         if (special && v !== undefined && !fired.done) {
@@ -247,7 +249,9 @@ describe('deep chain — review 修复回归钉(2026-07-10 多agent复审)', () 
     }
     process.on('unhandledRejection', onRejection)
     try {
-      const flag = atom(true)
+      // flag 必须是派生 atom:原始 atom 播种永不故障,只有未算好的派生
+      // 依赖才让同步前缀故障、产生僵尸轮。
+      const flag = atom(() => true)
       const aSrc = atom('a')
       const bSrc = atom('b')
       const runs = { count: 0 }
@@ -255,8 +259,22 @@ describe('deep chain — review 修复回归钉(2026-07-10 多agent复审)', () 
         runs.count += 1
         const f = get(flag) as boolean | undefined
         await Promise.resolve()
+        if (f === undefined) {
+          // 僵尸轮专属路径:抛错必须被丢弃轮静默吞掉(不成 unhandled)
+          throw new Error('zombie-continuation')
+        }
         return f ? (get(aSrc) as string) : (get(bSrc) as string)
       })
+      // 幽灵边场景:僵尸轮(f===undefined)走 bSrc 分支且不抛错——这条
+      // 迟到的幽灵边不得写入活表。
+      const ghostRuns = { count: 0 }
+      const ghostLeaf: Atom<Promise<string>> = atom(async (get) => {
+        ghostRuns.count += 1
+        const f = get(flag) as boolean | undefined
+        await Promise.resolve()
+        return f ? (get(aSrc) as string) : (get(bSrc) as string)
+      })
+
       let prev: Atom<unknown> = asyncLeaf
       for (let i = 0; i < 300; i += 1) {
         const p: Atom<unknown> = prev
@@ -264,15 +282,29 @@ describe('deep chain — review 修复回归钉(2026-07-10 多agent复审)', () 
       }
       const promise = store.getter(prev) as Promise<string>
       expect(await promise).toBe('a')
-      const runsAfterCold = runs.count
+      expect(runs.count).toBe(2) // 僵尸轮 + 提交轮
 
-      // bSrc 是幽灵分支(僵尸轮 flag=undefined 走 else),真实值只依赖 aSrc
-      store.setter(bSrc, 'b-new')
+      let ghostPrev: Atom<unknown> = ghostLeaf
+      for (let i = 0; i < 300; i += 1) {
+        const p: Atom<unknown> = ghostPrev
+        ghostPrev = atom((get) => get(p))
+      }
+      const store2 = createStore()
+      const ghostPromise = store2.getter(ghostPrev) as Promise<string>
+      expect(await ghostPromise).toBe('a')
       await new Promise((resolve) => {
         setTimeout(resolve, 0)
       })
-      expect(runs.count).toBe(runsAfterCold)
+      const ghostAfterCold = ghostRuns.count
 
+      // bSrc 是幽灵分支专属依赖,真实提交值只依赖 aSrc:写它不得引发重算
+      store2.setter(bSrc, 'b-new')
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+      expect(ghostRuns.count).toBe(ghostAfterCold)
+
+      // asyncLeaf 僵尸轮的 throw 必须被丢弃轮静默吞掉
       await new Promise((resolve) => {
         setTimeout(resolve, 0)
       })
