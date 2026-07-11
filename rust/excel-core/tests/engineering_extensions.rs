@@ -42,8 +42,14 @@ fn base_conversion_round_trip() {
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Text("F".into()));
     assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Text("17".into()));
     assert_eq!(wb.get_cell("Sheet1", "C3"), Value::Text("1111".into()));
-    assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Text("1111111111".into()));
-    assert_eq!(wb.get_cell("Sheet1", "D2"), Value::Text("FFFFFFFFFF".into()));
+    assert_eq!(
+        wb.get_cell("Sheet1", "D1"),
+        Value::Text("1111111111".into())
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "D2"),
+        Value::Text("FFFFFFFFFF".into())
+    );
     assert_eq!(wb.get_cell("Sheet1", "D3"), Value::Number(-1.0));
 }
 

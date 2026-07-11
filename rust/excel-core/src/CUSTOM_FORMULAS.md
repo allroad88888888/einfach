@@ -9,17 +9,19 @@ JS function the host registered under `"MYTAX"`.
 ```
 =MYTAX(B1)
       │
-      ▼  formula parser → Expr::FuncCall { name: "MYTAX", args: [...] }
+      ▼  parsed (eagerly or on first read) to
+      │  Expr::FuncCall { name: "MYTAX", args: [...] }
       │
-      ▼  eval.rs : eval_func match — no built-in arm matches
+      ▼  formula facade → formula-inner derived atom → AtomFormulaProvider
       │
       ▼  eval_named_call:
       │    1. provider.lookup_named("MYTAX")        → None  (not a defined LAMBDA)
       │    2. eagerly evaluate args to Vec<Value>   (errors short-circuit)
       │    3. provider.call_custom("MYTAX", &args)  → Option<Value>
       │
-      ▼  WorkbookEvalProvider::call_custom (workbook.rs)
-      │    → wb.custom_functions.lookup(name, args)
+      ▼  WorkbookAtomContext::call_custom (sheet.rs)
+      │    → depend on custom-registry epoch in the active ReadArgs
+      │    → registry.lookup(name, args)
       │
       ▼  WasmCustomFormulaRegistry::lookup (wasm/lib.rs)
       │    → marshal args: Value → JsValue
@@ -29,6 +31,10 @@ JS function the host registered under `"MYTAX"`.
       ▼  JS callback (host-supplied)
            (args) => args[0] * 0.2
 ```
+
+`WorkbookEvalProvider` still supports top-level, non-cell evaluation such as
+defined-name construction. It is not the dependency or value authority for a
+formula cell.
 
 ## Precedence (engine side)
 
@@ -155,26 +161,19 @@ type CustomFormulaFn = (args: CustomFormulaArg[]) => CustomFormulaReturn
 
 `register_custom_formula` (even when replacing an existing name) and
 `unregister_custom_formula` both call
-`Workbook::invalidate_all_formulas_for_custom_function_change`. This
-dirties every formula in the workbook so cached results re-evaluate
-against the new registry on next read. This is a sledgehammer (O(F)
-total formulas) but works correctly without a reverse-dep index keyed on
-function name. If host workflows show frequent registration churn,
-adding a `HashMap<String, HashSet<(sheet, addr)>>` index keyed on
-upper-cased name is the obvious optimization.
+`Workbook::invalidate_all_formulas_for_custom_function_change`. The method
+publishes the custom-registry version root in the workbook Store. Materialized
+formula-inner atoms that previously called the registry recorded an edge to
+that root and re-derive through normal Store propagation. Never-read formulas
+remain lazy, and formulas that never consult the custom registry have no edge
+to publish through.
 
-**TODO: batch invalidation API.** Registering N customs at startup
-currently costs O(N × F) work because each call invalidates every
-formula. The realistic dev workload (3–10 customs registered once at
-load) doesn't hit this — at F ≈ 10 000 cells × 10 customs = 100 000
-mark-dirty ops, all in-memory, that's still sub-millisecond. If a host
-later needs to install hundreds of customs at startup, the lightweight
-fix is a `registerCustomFormulas(names: string[], callbacks: Function[])`
-batch API at the WASM layer that calls
-`Workbook::invalidate_all_formulas_for_custom_function_change` once at
-the end. Defer until a benchmark shows this matters. Benchmark probe:
-add `bench/custom_register_churn.rs` that times N×F mark-dirty cycles
-and reports per-op cost.
+The version root is deliberately coarse. Registering N customs separately can
+publish N times to already-materialized custom-dependent formulas. If a
+benchmark shows startup churn matters, add a batch WASM API that mutates the
+registry N times and publishes the root once. Do not add a per-name
+address-to-formula map: Store dependency edges remain the only invalidation
+authority.
 
 ## Limitations (initial cut)
 
@@ -189,8 +188,9 @@ and reports per-op cost.
   lazy iteration — large ranges are fully copied into JS.
 - **No lambda args.** A custom callback that wants higher-order behavior
   (`MAP`-style) needs to be re-architected.
-- **Replace requires full invalidation.** As noted above; consider per-
-  name dep tracking if churn matters.
+- **Registry publication is coarse.** A change re-runs every materialized
+  formula that consulted the custom registry, even if it called another name.
+  Batch registry changes before publishing if measured churn warrants it.
 - **No mutation during callback execution.** See § "No mutations during
   callback" below.
 - **String return capped at 1 MB.** A callback returning a larger string
@@ -209,10 +209,11 @@ A host custom-formula JS callback **MUST NOT** mutate the workbook while
 it runs. The engine enforces this via the `Workbook::is_inside_custom_call`
 re-entrancy guard:
 
-1. `WorkbookEvalProvider::call_custom` enters a `CustomCallScope` that
-   bumps a counter on `Workbook::custom_call_depth` for the duration of
-   the JS callback. The scope's `Drop` impl decrements on exit (so a
-   thrown JS exception still cleans up the counter).
+1. `WorkbookAtomContext::call_custom` (formula cells) and
+   `WorkbookEvalProvider::call_custom` (top-level evaluation) enter the same
+   `CustomCallScope`. It bumps `Workbook::custom_call_depth` for the duration
+   of the JS callback. The scope's `Drop` impl decrements on exit, so a thrown
+   JS exception still cleans up the counter.
 2. Every public mutation entry point on `Workbook` (`set_cell`,
    `clear_cell`, `set_formula`, `try_set_*`, `define_name`,
    `undefine_name`, `set_custom_function_registry`, `add_sheet`,
@@ -222,12 +223,11 @@ re-entrancy guard:
    `Err(WorkbookError::MutationDuringCustomCall)` on the fallible
    variants, silent no-op on the infallible ones).
 
-**Why**: a mutation inside the callback dirties the cell whose formula
-triggered the callback. The surrounding `eval_formula_at_with_provider`
-then unconditionally writes `FormulaCache::Clean(value)` on return —
-silently losing the dirty mark. The next read of that cell would return
-a stale value until something else dirtied it. Disallowing mutations
-keeps the cache state machine sound.
+**Why**: a mutation inside the callback can re-enter the same shared Store
+while its formula-inner derived atom is computing. That would violate the
+Store's read/write and dependency-commit invariants and could publish a value
+from an inconsistent workbook snapshot. Disallowing mutations keeps one
+formula evaluation atomic with respect to workbook state.
 
 **Workarounds**: callbacks that need to "write back" should return a
 value and let the host write it after the read completes. The host has

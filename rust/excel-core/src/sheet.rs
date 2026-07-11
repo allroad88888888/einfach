@@ -1,22 +1,98 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::rc::Rc;
+use std::hash::Hash;
+use std::rc::{Rc, Weak};
 
 use std::sync::Arc;
 
 use einfach_core::{
-    ArrayData, AtomFamily, AtomId, CellListener, ReadArgs, Store, SubscriptionId, Value,
-    ValueError,
+    ArrayData, AtomFamily, AtomId, CellListener, ReadArgs, Store, SubscriptionId, Value, ValueError,
 };
 
 use crate::cell::CellAddress;
-use crate::eval::{eval_expr_with_provider, EvalProvider};
+use crate::eval::{eval_expr_with_provider, CustomFunctionRegistry, EvalProvider};
 use crate::format::{apply_rules, CellFormat, ConditionalRule};
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
 
 const EXCEL_MAX_ROWS: u32 = 1_048_576;
 const EXCEL_MAX_COLS: u32 = 16_384;
+const RANGE_TIER_A_CELL_LIMIT: u64 = 256;
+const RANGE_BAND_ROWS: u32 = 256;
+const RANGE_BAND_DEP_LIMIT: u64 = 4_096;
+const RANGE_COLUMN_DEP_LIMIT: u64 = 4_096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RangeBandKey {
+    col: u32,
+    row_band: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RangeColumnKey {
+    col: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangeGeometryBounds {
+    start_row: u32,
+    end_row: u32,
+    start_col: u32,
+    end_col: u32,
+}
+
+fn clamp_range_axis_end(value: u32, max_len: u32) -> u32 {
+    if value == u32::MAX {
+        max_len - 1
+    } else {
+        value.min(max_len - 1)
+    }
+}
+
+fn range_geometry_bounds(range: CellRange) -> RangeGeometryBounds {
+    let n = range.normalize();
+    RangeGeometryBounds {
+        start_row: n.start.row.min(EXCEL_MAX_ROWS - 1),
+        end_row: clamp_range_axis_end(n.end.row, EXCEL_MAX_ROWS),
+        start_col: n.start.col.min(EXCEL_MAX_COLS - 1),
+        end_col: clamp_range_axis_end(n.end.col, EXCEL_MAX_COLS),
+    }
+}
+
+fn inclusive_span_u64(start: u32, end: u32) -> u64 {
+    if end < start {
+        0
+    } else {
+        u64::from(end - start) + 1
+    }
+}
+
+fn range_cell_count_u64(range: CellRange) -> u64 {
+    let bounds = range_geometry_bounds(range);
+    let rows = inclusive_span_u64(bounds.start_row, bounds.end_row);
+    let cols = inclusive_span_u64(bounds.start_col, bounds.end_col);
+    rows.saturating_mul(cols)
+}
+
+fn range_row_band(row: u32) -> u32 {
+    row / RANGE_BAND_ROWS
+}
+
+fn range_band_count_u64(range: CellRange) -> u64 {
+    let bounds = range_geometry_bounds(range);
+    let cols = inclusive_span_u64(bounds.start_col, bounds.end_col);
+    let start_band = range_row_band(bounds.start_row);
+    let end_band = range_row_band(bounds.end_row);
+    let bands = inclusive_span_u64(start_band, end_band);
+    cols.saturating_mul(bands)
+}
+
+fn range_band_key_for_addr(addr: CellAddress) -> RangeBandKey {
+    RangeBandKey {
+        col: addr.col,
+        row_band: range_row_band(addr.row),
+    }
+}
 
 /// Row-major sparse map over `(row, col) → V`. Wraps a
 /// `BTreeMap<row, BTreeMap<col, V>>` so range scans cost
@@ -217,6 +293,13 @@ struct AddressSubscriptionBucket {
     store_sub: Option<SubscriptionId>,
 }
 
+/// Old storage atoms retired by a full-sheet replacement. Cleanup runs only
+/// after the enclosing Store batch flushes, when cross-sheet dependents have
+/// detached from the previous graph.
+pub(crate) struct BulkInstallCleanup {
+    retired_atom_ids: Vec<AtomId>,
+}
+
 /// Aggregate dep-graph statistics produced by
 /// `Sheet::debug_dep_graph_stats` (Phase 1 of the lazy-formula-indexing
 /// arc). One per sheet; the workbook-level probe in `WasmWorkbook`
@@ -229,58 +312,76 @@ struct AddressSubscriptionBucket {
 pub struct DepGraphStats {
     /// Number of formula records in this sheet (`formula_cells.len()`).
     pub formula_count: u64,
-    /// Sum of `cell_dependents[addr].len()` over every entry — i.e.
-    /// total point-dep edges installed.
+    /// Legacy point-dep edge count. Same-sheet point edges are now owned
+    /// by the atom store, so this stays zero after the P4c flip.
     pub total_point_dep_edges: u64,
-    /// `range_dependents.len()` — number of distinct `CellRange`
-    /// entries currently registered. NOT the number of "range edges":
-    /// a single `SUM(A:A)` referenced by 5 formulas counts as 1
-    /// entry here but 5 dependents downstream.
+    /// Number of materialized Tier-B range geometry roots. These are Store
+    /// primitives (band, column, or sheet epochs), never formula fanout edges.
     pub total_range_dep_entries: u64,
-    /// Maximum value of `cell_dependents[addr].len()` across all
-    /// addresses. Captures the worst-case fanout from a single source
-    /// cell change.
+    /// Legacy same-sheet point fanout. Store-owned point edges are not
+    /// counted by this sheet-level probe.
     pub max_fanout: u32,
-    /// Number of formula records whose `range_deps` set is non-empty.
-    /// Discriminates "formulas that touch a range" from cell-cell-only
-    /// formulas.
+    /// Number of hydrated formula records whose static range metadata is
+    /// non-empty. This is parser/structure metadata, not reactive fanout.
     pub range_formula_count: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum FormulaCache {
-    Dirty,
-    Computing,
-    Clean(Value),
 }
 
 pub(crate) struct FormulaRecord {
     expr: Rc<Expr>,
-    /// Point-cell dependencies (`Expr::CellRef`, plus bounded range cells
-    /// expanded by `collect_refs`). Narrowed by eval-time tracking —
-    /// branch-skipped `IF` arms drop out of this set, which is the intended
-    /// behavior. Durable range identity lives in `range_deps` so sparse
-    /// iteration cannot collapse a range to "visited cells only".
+    /// Formula-topology generation in which static analysis proved this
+    /// address is not a member of a same-sheet dependency cycle. This is a
+    /// validation certificate only: Store edges remain the sole reactive
+    /// dependency graph and the stamp never participates in recomputation.
+    cycle_checked_at: Cell<u64>,
+    /// Static point-cell references (`Expr::CellRef`, plus bounded range
+    /// cells expanded by `collect_refs`). Kept on the record for structural
+    /// retargeting and debug probes; reactive same-sheet invalidation is
+    /// owned by the atom store.
     deps: RefCell<HashSet<CellAddress>>,
-    /// Range dependencies (`Expr::Range`), stored as ranges rather than
-    /// expanded cells. Populated at `set_formula` time from
-    /// `collect_range_refs` and preserved across eval — sparse iteration
-    /// during eval must not narrow these to the visited subset, otherwise
-    /// writing a previously-empty cell inside the range fails to dirty
-    /// the formula (the P0 bug from `PHASE1_PARALLEL.md` § Track A).
-    range_deps: RefCell<HashSet<CellRange>>,
-    cache: RefCell<FormulaCache>,
+    /// Static `Expr::Range` metadata used by structural retargeting and cycle
+    /// checks. Same-sheet invalidation is owned exclusively by Store edges.
+    static_ranges: RefCell<HashSet<CellRange>>,
 }
 
 impl FormulaRecord {
-    fn new(expr: Rc<Expr>, deps: HashSet<CellAddress>, range_deps: HashSet<CellRange>) -> Self {
+    fn new(expr: Rc<Expr>, deps: HashSet<CellAddress>, static_ranges: HashSet<CellRange>) -> Self {
         FormulaRecord {
             expr,
+            cycle_checked_at: Cell::new(0),
             deps: RefCell::new(deps),
-            range_deps: RefCell::new(range_deps),
-            cache: RefCell::new(FormulaCache::Dirty),
+            static_ranges: RefCell::new(static_ranges),
         }
     }
+}
+
+/// Raw bulk-loaded formula source plus its static-cycle validation stamp.
+/// Keeping the stamp on the already-retained parked entry avoids introducing
+/// a second address-keyed cache or dependency graph.
+#[derive(Clone)]
+pub(crate) struct ParkedFormula {
+    source: Rc<str>,
+    cycle_checked_at: Cell<u64>,
+}
+
+impl ParkedFormula {
+    fn new(source: impl Into<Rc<str>>) -> Self {
+        Self {
+            source: source.into(),
+            cycle_checked_at: Cell::new(0),
+        }
+    }
+}
+
+struct StaticCycleNode {
+    addr: CellAddress,
+    expr: Rc<Expr>,
+    edges: Vec<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct StaticCycleCheckOutcome {
+    closes_cycle: bool,
+    target_certified: bool,
 }
 
 fn normalize_formula_cell_result(value: Value) -> Value {
@@ -310,9 +411,8 @@ pub struct FormatRangeSnapshot {
 }
 
 /// Token returned by `Sheet::subscribe_cell`. The public subscription is tied
-/// to a cell address, not the current primitive atom. `Sheet` wires the
-/// internal store subscription only while the address has a primitive atom;
-/// formula cells are notified through the lazy dependency graph.
+/// to a cell address; internally it is wired to the stable per-address facade
+/// atom so formula/literal swaps do not require listener remapping.
 #[derive(Clone, Copy, Debug)]
 pub struct CellSubscription {
     addr: CellAddress,
@@ -337,7 +437,7 @@ pub enum SheetError {
     InvalidAddress,
     /// Wave 8 re-entrancy guard: the workbook attempted to mutate while
     /// a host custom-formula JS callback was executing. The mutation is
-    /// rejected so the formula cache state machine stays sound (see
+    /// rejected so the transitional workbook-evaluation state stays sound (see
     /// `Workbook::is_inside_custom_call` and
     /// `CUSTOM_FORMULAS.md` § "No mutations during callback").
     MutationDuringCustomCall,
@@ -361,291 +461,6 @@ impl std::fmt::Display for SheetError {
 }
 
 impl std::error::Error for SheetError {}
-
-/// Ranges spanning more than this many rows or columns skip the
-/// per-row / per-col bucket registration and live in `wide_ranges` instead,
-/// which gets a linear scan on lookup. Phase 2 Track E tuning knob — chosen
-/// so that 100k narrow ranges (under a few thousand rows tall) stay in the
-/// fast index but a small handful of "whole sheet" / "whole column 1M" deps
-/// don't blow up registration time / memory.
-const WIDE_RANGE_BUCKET_THRESHOLD: u32 = 4096;
-
-/// Reverse index from `CellRange` to the formula cells that depend on that
-/// exact range. Phase 1 stored only the `formulas: HashMap<CellRange, ...>`
-/// lookup half, which made `Sheet::dependents_of(addr)` an O(range_count)
-/// linear scan per cell write. Phase 2 Track E adds row + col bucket halves
-/// plus a wide-range fallback so candidate-range lookup by address is
-/// O(matches + wide_count) instead.
-///
-/// Invariant: a range `r` is present in EITHER `wide_ranges` OR in every
-/// row in `start.row..=end.row` of `row_buckets` AND every col in
-/// `start.col..=end.col` of `col_buckets`. The choice is decided once at
-/// insert time by comparing `r.rows()` / `r.cols()` to
-/// `WIDE_RANGE_BUCKET_THRESHOLD`. `formulas` is the source of truth for
-/// "does this range still have a dependent" — buckets are kept in sync
-/// with `formulas.contains_key(r)`.
-#[derive(Default)]
-pub(crate) struct RangeDependentIndex {
-    /// `CellRange` → formula cells that depend on it. Mirror of the old
-    /// `range_dependents` map; queried by `dependents_of` once candidate
-    /// ranges have been narrowed by the buckets, and by
-    /// `debug_range_dep_count` for the unchanged Phase 1 counter contract.
-    formulas: HashMap<CellRange, HashSet<CellAddress>>,
-    /// For each row r, the set of *narrow* ranges where
-    /// `normalized.start.row <= r <= normalized.end.row`. Lookup intersects
-    /// this with `col_buckets[addr.col]` to find candidate ranges.
-    row_buckets: HashMap<u32, HashSet<CellRange>>,
-    /// Same shape as `row_buckets` but keyed by column.
-    col_buckets: HashMap<u32, HashSet<CellRange>>,
-    /// Ranges wider than `WIDE_RANGE_BUCKET_THRESHOLD` in rows OR cols.
-    /// Always linearly scanned on lookup — registering them in every row /
-    /// col bucket they span would dominate insert cost. Expected to stay
-    /// small (handful of "whole sheet" deps).
-    wide_ranges: HashSet<CellRange>,
-}
-
-impl RangeDependentIndex {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether a range should live in the wide-range fallback bucket.
-    /// Computed from the normalized range so a transposed `(B2:A1)` decides
-    /// the same way as `(A1:B2)`. Wide on EITHER axis is enough — a
-    /// 1-row 1M-col range is just as bucket-hostile as a 1M-row 1-col one.
-    fn is_wide(range: &CellRange) -> bool {
-        let n = range.normalize();
-        let rows = n.end.row.saturating_sub(n.start.row).saturating_add(1);
-        let cols = n.end.col.saturating_sub(n.start.col).saturating_add(1);
-        rows > WIDE_RANGE_BUCKET_THRESHOLD || cols > WIDE_RANGE_BUCKET_THRESHOLD
-    }
-
-    /// Register `range` in the bucket index. No-op if `range` is already
-    /// indexed — caller (`add_formula`) gates this on a fresh `formulas`
-    /// entry to avoid redundant per-row work on repeat dependents.
-    fn register_range(&mut self, range: CellRange) {
-        if Self::is_wide(&range) {
-            self.wide_ranges.insert(range);
-            return;
-        }
-        let n = range.normalize();
-        for r in n.start.row..=n.end.row {
-            self.row_buckets.entry(r).or_default().insert(range);
-        }
-        for c in n.start.col..=n.end.col {
-            self.col_buckets.entry(c).or_default().insert(range);
-        }
-    }
-
-    /// Inverse of `register_range`. Called by `remove_formula` once the
-    /// last formula for this range is gone. Drops emptied bucket entries
-    /// so the maps stay bounded under formula churn.
-    fn unregister_range(&mut self, range: CellRange) {
-        if Self::is_wide(&range) {
-            self.wide_ranges.remove(&range);
-            return;
-        }
-        let n = range.normalize();
-        for r in n.start.row..=n.end.row {
-            if let Some(set) = self.row_buckets.get_mut(&r) {
-                set.remove(&range);
-                if set.is_empty() {
-                    self.row_buckets.remove(&r);
-                }
-            }
-        }
-        for c in n.start.col..=n.end.col {
-            if let Some(set) = self.col_buckets.get_mut(&c) {
-                set.remove(&range);
-                if set.is_empty() {
-                    self.col_buckets.remove(&c);
-                }
-            }
-        }
-    }
-
-    /// Insert `formula_addr` as a dependent of `range`. First-time
-    /// registrations of `range` also wire it into the bucket index.
-    pub(crate) fn add_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
-        let entry = self.formulas.entry(range).or_default();
-        let was_empty = entry.is_empty();
-        entry.insert(formula_addr);
-        if was_empty {
-            self.register_range(range);
-        }
-    }
-
-    /// Remove `formula_addr` from `range`'s dependent set. Drops the
-    /// `formulas` entry and unregisters the range from the bucket index
-    /// when this was its last dependent — keeps `len()` and the buckets
-    /// honest under formula churn.
-    pub(crate) fn remove_formula(&mut self, range: CellRange, formula_addr: CellAddress) {
-        let should_unregister = if let Some(set) = self.formulas.get_mut(&range) {
-            set.remove(&formula_addr);
-            set.is_empty()
-        } else {
-            false
-        };
-        if should_unregister {
-            self.formulas.remove(&range);
-            self.unregister_range(range);
-        }
-    }
-
-    /// Forget everything. Used by `Sheet::rebuild_all_formula_dependents`
-    /// before it walks the formula_cells map and re-adds every record.
-    pub(crate) fn clear(&mut self) {
-        self.formulas.clear();
-        self.row_buckets.clear();
-        self.col_buckets.clear();
-        self.wide_ranges.clear();
-    }
-
-    /// Number of distinct `CellRange`s that currently have at least one
-    /// dependent formula. Backs `Sheet::debug_range_dep_count` — the
-    /// Phase 1 counter contract is unchanged.
-    pub(crate) fn len(&self) -> usize {
-        self.formulas.len()
-    }
-
-    /// Whether the index is empty. Convenience helper for cross-sheet
-    /// dirty-fanout paths that want to short-circuit if a source sheet
-    /// has no range dependents registered yet.
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.formulas.is_empty()
-    }
-
-    /// Union of every formula dependent across every registered range that
-    /// contains `addr`. Workbook-side helper that mirrors the sheet-local
-    /// `Sheet::dependents_of` range half, but returns formula addresses
-    /// directly so callers don't have to walk `candidates_for` +
-    /// `formulas_for` themselves.
-    #[allow(dead_code)]
-    pub(crate) fn dependents_of(&self, addr: CellAddress) -> HashSet<CellAddress> {
-        let mut out: HashSet<CellAddress> = HashSet::new();
-        for range in self.candidates_for(addr) {
-            if range.contains(addr) {
-                if let Some(formulas) = self.formulas.get(&range) {
-                    out.extend(formulas.iter().copied());
-                }
-            }
-        }
-        out
-    }
-
-    /// Candidate ranges that *might* contain `addr`, before the per-range
-    /// `contains` filter. Combines:
-    ///   - row_buckets[addr.row] ∩ col_buckets[addr.col] for narrow ranges
-    ///   - the full `wide_ranges` set (always scanned linearly)
-    ///
-    /// Net cost: O(min(row_bucket_size, col_bucket_size) + wide_count).
-    /// Caller filters by `range.contains(addr)` and looks each survivor
-    /// up in `formulas`. Returned ranges are unique.
-    pub(crate) fn candidates_for(&self, addr: CellAddress) -> Vec<CellRange> {
-        let mut out: Vec<CellRange> = Vec::new();
-        self.candidates_for_into(addr, &mut out);
-        out
-    }
-
-    /// Allocation-free variant of [`candidates_for`]: append candidate
-    /// ranges into `out` instead of producing a fresh `Vec`. Lets the
-    /// BFS reuse one scratch `Vec` across the entire walk — the per-
-    /// call `Vec` allocation was a measurable share of the bulk-import
-    /// `flush` cost at the 100k+ touched-cell tier. Net cost identical:
-    /// O(min(row_bucket_size, col_bucket_size) + wide_count).
-    pub(crate) fn candidates_for_into(&self, addr: CellAddress, out: &mut Vec<CellRange>) {
-        let row_set = self.row_buckets.get(&addr.row);
-        let col_set = self.col_buckets.get(&addr.col);
-
-        if let (Some(rs), Some(cs)) = (row_set, col_set) {
-            // Intersect the smaller side against the larger — cuts
-            // worst-case work for asymmetric narrow ranges (e.g. one
-            // 6-row column-A range vs a single full-row range).
-            let (small, large) = if rs.len() <= cs.len() {
-                (rs, cs)
-            } else {
-                (cs, rs)
-            };
-            for r in small.iter() {
-                if large.contains(r) {
-                    out.push(*r);
-                }
-            }
-        }
-        out.extend(self.wide_ranges.iter().copied());
-    }
-
-    /// Lookup the formula set for a candidate range. None when the range
-    /// has no dependents (should not happen for ranges returned by
-    /// `candidates_for`, but the caller treats None as "skip").
-    pub(crate) fn formulas_for(&self, range: &CellRange) -> Option<&HashSet<CellAddress>> {
-        self.formulas.get(range)
-    }
-
-    /// Coalesced dirty-fanout: iterate EVERY tracked range once and append
-    /// the dependent-formula address of every range whose `(row, col)`
-    /// rectangle is hit by at least one entry in `dirty_by_row`.
-    ///
-    /// `dirty_by_row` is a row-bucketed view of the dirty set —
-    /// `row -> sorted-or-not list of cols` — built by the caller from
-    /// `BulkLoader::touched ∪ dirty` so the intersection test does not
-    /// need to consult the full `HashSet<CellAddress>` per range.
-    ///
-    /// Cost model: O(|ranges| + Σ over ranges (rows-of-range ∩ rows-of-dirty)).
-    /// Pays off when the flush walks tens of thousands of touched cells
-    /// against hundreds of ranges — the alternative is the per-address
-    /// `candidates_for` walk in `Sheet::dependents_of_into`, which costs
-    /// O(|touched| × matches_per_cell). At the Stripe100k tier (`bulk_import`
-    /// of 100k ranges + 100k touched cells), this collapses the inner loop
-    /// from ~100k × ~10 to ~100k × 1 cell-test-per-range.
-    ///
-    /// Caller responsibility: dedup downstream via the BFS `dirty` set.
-    /// Duplicates are possible whenever multiple ranges share a dependent.
-    pub(crate) fn coalesced_dirty_into(
-        &self,
-        dirty_by_row: &HashMap<u32, Vec<u32>>,
-        out: &mut Vec<CellAddress>,
-    ) {
-        if dirty_by_row.is_empty() || self.formulas.is_empty() {
-            return;
-        }
-        for (range, formulas) in self.formulas.iter() {
-            let n = range.normalize();
-            // Cheap row-bucket pre-test: only scan rows that actually
-            // have any dirty cell. The outer choice picks the smaller
-            // of (rows-in-range) vs (rows-in-dirty) to walk.
-            let range_row_span = n.end.row.saturating_sub(n.start.row).saturating_add(1);
-            let hit = if (range_row_span as usize) <= dirty_by_row.len() {
-                let mut found = false;
-                for row in n.start.row..=n.end.row {
-                    if let Some(cols) = dirty_by_row.get(&row) {
-                        if cols.iter().any(|&c| c >= n.start.col && c <= n.end.col) {
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                found
-            } else {
-                let mut found = false;
-                for (&row, cols) in dirty_by_row.iter() {
-                    if row >= n.start.row
-                        && row <= n.end.row
-                        && cols.iter().any(|&c| c >= n.start.col && c <= n.end.col)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-            if hit {
-                out.extend(formulas.iter().copied());
-            }
-        }
-    }
-}
 
 /// Storage slot for a primitive cell (AUDIT B-2 — lazy atomization).
 ///
@@ -702,10 +517,10 @@ pub(crate) struct SheetInterior {
     /// bulk-install fast path) or `Atom(AtomId)` (materialized). See
     /// [`CellSlot`] for the invariants.
     pub(crate) cells: RefCell<RowMajorMap<CellSlot>>,
-    /// Formula cells live at the Sheet layer. Formula results are cached here,
-    /// not as core derived atoms, so `set_formula` does not compute. Same
-    /// row-major shape as `cells` so range scans that hit a mix of primitive
-    /// and formula cells stay O(matches).
+    /// Formula structural records live at the Sheet layer. Hydrated same-sheet
+    /// formula results are derived and cached by Store formula-inner atoms.
+    /// Same row-major shape as `cells` keeps range scans over mixed
+    /// primitive/formula cells O(matches).
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: `RefCell` so `hydrate_formula(&self)`
     /// can install a freshly-parsed record without taking `&mut self`.
@@ -732,24 +547,26 @@ pub(crate) struct SheetInterior {
     /// the raw formula text for cells that came in via `bulk_load` and
     /// have NOT yet been parsed / indexed. Mirrors `formula_cells` in
     /// row-major shape so range scans still cost O(cells_in_range), but
-    /// each entry is just an `Rc<str>` — no AST, no dep edges, no
-    /// `FormulaRecord`. Entries are drained into the eager `formula_cells`
-    /// / `formula_exprs` / `formula_texts` family by `hydrate_formula`
-    /// once a read first touches them.
+    /// each entry is raw source plus one static-validation generation stamp:
+    /// no AST, reference set, `FormulaRecord`, or formula-inner derived atom.
+    /// Entries are drained
+    /// into `formula_cells` / `formula_exprs` / `formula_texts` by
+    /// `hydrate_formula` once a read first touches them.
     ///
     /// Co-existence rule: `formula_source.contains_key(addr)` ↔
     /// `needs_parse.contains(addr)`. While the addr is unhydrated:
     ///   - `formula_cells` does NOT have an entry
     ///   - `formula_exprs` does NOT have an entry
     ///   - `formula_texts` does NOT have an entry
-    ///   - `cell_dependents` / `range_dependents` carry NO edges for this addr
+    ///   - same-sheet Store edges are absent until the facade/formula-inner
+    ///     path materializes; Tier-B geometry roots stay unmaterialized
     /// Hydration moves the source out of `formula_source` and into the
     /// eager state atomically (single-threaded — no races).
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: wrapped in `RefCell` so the
     /// hydrator (which runs from `&self` contexts) can both read the
     /// source and remove the entry after install.
-    pub(crate) formula_source: RefCell<RowMajorMap<Rc<str>>>,
+    pub(crate) formula_source: RefCell<RowMajorMap<ParkedFormula>>,
     /// Lazy-load index of unparsed formulas. `RefCell` because read-only
     /// entry points (`peek_value_with_provider`, sparse-iter resolvers,
     /// cycle checks) need to drain entries as part of hydration without
@@ -776,22 +593,20 @@ pub struct Sheet {
     /// Shared cell/formula storage — see [`SheetInterior`] for the field
     /// docs and the P4a borrow rule.
     pub(crate) interior: Rc<SheetInterior>,
-    /// P4b: per-address slot-epoch primitives. A cell's epoch atom is bumped
+    /// P4b/P4c: per-address slot-epoch primitives. A cell's epoch atom is bumped
     /// whenever its inner atom identity changes (literal↔formula overwrite,
     /// clear). The facade derives off this so a swap re-runs the facade read
-    /// without re-keying any subscription. Created lazily on first use.
-    /// NOT YET WIRED — the read/write paths flip in the P4c commit.
+    /// without re-keying any subscription. Created lazily on first use and
+    /// wired by the current read/write paths.
     /// Behind `Rc<RefCell<_>>` so `FacadeCtx` can share it into `'static`
     /// closures (see `cell_facade_family`).
-    #[allow(dead_code)]
     slot_epoch_family: Rc<RefCell<AtomFamily<CellAddress>>>,
     /// P4b: per-address facade derived atoms — the stable subscription anchor
     /// that replaces `AddressSubscriptionBucket` remapping. A facade reads its
     /// slot-epoch then the current inner atom for the address. Behind
     /// `Rc<RefCell<_>>` so the P4c `AtomEvalProvider` can capture a clone and
     /// resolve referenced cells' facades under `&self`. Created lazily.
-    /// NOT YET WIRED — the read/write paths flip in the P4c commit.
-    #[allow(dead_code)]
+    /// Wired by read paths and address subscriptions.
     cell_facade_family: Rc<RefCell<AtomFamily<CellAddress>>>,
     /// P4c: per-address formula-INNER derived atoms. Keyed by the anchor
     /// address of a formula cell; each runs the cell's `Expr` through an
@@ -799,11 +614,14 @@ pub struct Sheet {
     /// that cell's facade (`FacadeCtx::get_or_create_facade`). The facade for a
     /// formula address delegates to this inner atom, so a subscription anchored
     /// on the facade re-notifies when any read cell's value changes — no
-    /// `cell_dependents` edge. Created lazily on first read of a formula cell.
-    /// NOT YET WIRED — the read path routes here in the P4c flip commit.
+    /// address-level point edge. Created lazily on first read of a formula cell.
     /// Behind `Rc<RefCell<_>>` so `FacadeCtx` shares it into `'static` closures.
-    #[allow(dead_code)]
     formula_inner_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P5 Tier-B range geometry versions. Large range formulas depend on these
+    /// Store roots by geometry; the atoms never name dependent formulas.
+    range_band_epoch_family: Rc<RefCell<AtomFamily<RangeBandKey>>>,
+    range_column_epoch_family: Rc<RefCell<AtomFamily<RangeColumnKey>>>,
+    range_sheet_epoch_family: Rc<RefCell<AtomFamily<()>>>,
     /// P4c: the shared set of addresses whose formula-inner atom is currently
     /// mid-evaluation (on the read stack). The runtime cycle guard (codex F1):
     /// before an `AtomFormulaProvider` calls `args.get` on a referenced cell's
@@ -813,27 +631,15 @@ pub struct Sheet {
     /// re-invalidates). Each inner read_fn inserts its own address on entry and
     /// removes it on exit through an `InFlightGuard` RAII marker. Shared behind
     /// `Rc<RefCell<_>>` so every inner closure and `FacadeCtx` clone see one set.
-    /// NOT YET WIRED — populated once the read path flips.
-    #[allow(dead_code)]
     in_flight: Rc<RefCell<HashSet<CellAddress>>>,
+    /// Optional workbook scope. Standalone sheets leave this empty; workbook
+    /// sheets point weakly at the shared topology/name/custom-function roots.
+    workbook_context: Rc<RefCell<Option<Weak<WorkbookAtomContext>>>>,
+    workbook_sheet_index: Rc<Cell<Option<usize>>>,
     /// Address-level subscriptions. Buckets are only wired to store atoms when
     /// the address has a materialized readable atom, so subscribing to an empty
     /// visible cell does not allocate a cell atom by itself.
     cell_subscriptions: HashMap<CellAddress, AddressSubscriptionBucket>,
-    /// cell address → formula cells that depend on it.
-    cell_dependents: RefCell<HashMap<CellAddress, HashSet<CellAddress>>>,
-    /// `CellRange` → formula cells whose AST contains that exact range.
-    /// `B1 = SUM(A1:A100)` registers `(A1:A100) → {B1}` here. Dirty
-    /// propagation on a cell write `W` looks up every range that
-    /// contains `W` and adds its dependents to the dirty set; that's
-    /// what keeps range deps alive across sparse-eval narrowing of the
-    /// point `deps` set (P0 from `PHASE1_PARALLEL.md` § Track A).
-    ///
-    /// Phase 2 Track E: this is now a `RangeDependentIndex` with row /
-    /// col bucket halves plus a wide-range fallback, so the address →
-    /// candidates lookup driving `dependents_of` is O(matches + wide)
-    /// instead of O(range_count).
-    range_dependents: RefCell<RangeDependentIndex>,
     next_cell_sub_id: u64,
     /// Per-cell formatting (Phase 6). Independent of the dep graph; format
     /// changes never trigger formula recompute. Entry absent → default.
@@ -849,26 +655,30 @@ pub struct Sheet {
     row_heights: BTreeMap<u32, u32>,
     /// Sparse column widths in physical pixels. Absent means the UI default.
     col_widths: BTreeMap<u32, u32>,
-    /// Cumulative count of formula evaluations performed (cache-miss path in
-    /// `eval_formula_at_with_provider`). Read-only debug counter used by the
-    /// Phase 1 scale tests to assert laziness — `bulk_load` of N formulas
+    /// Cumulative count of completed formula-inner evaluations. Read-only
+    /// debug counter used by the Phase 1 scale tests to assert laziness —
+    /// `bulk_load` of N formulas
     /// must keep this at 0 until the first `get_cell`. `Cell` so the counter
     /// can be bumped from `&self` (eval runs through the immutable reader).
-    formula_eval_count: Cell<usize>,
+    formula_eval_count: Rc<Cell<usize>>,
     /// Cumulative count of formulas inserted via `BulkLoader::set_formula`.
     /// Bumped once per successful entry inside `bulk_load`; the plain
     /// `Sheet::set_formula` path does NOT bump this. Used by the scale
     /// suite to verify "imported" vs "live-edited" formula provenance.
     imported_formula_count: Cell<usize>,
-    /// Cumulative count of addresses visited by the dirty-propagation
-    /// BFS (`mark_dependents_dirty`) — one bump per NEWLY visited
-    /// dependent address (the dedup `notified` set gates the bump, so
-    /// diamond fan-ins count once per write, not once per path).
-    /// Read-only complexity probe for the scale suite (S2/S11): total
-    /// dirty work across a mutation storm must be bounded by
-    /// Σ |dependents|, never O(edits × sheet size). `Cell` so the BFS
-    /// (which runs on `&self`) can bump it.
-    dirty_visit_count: Cell<u64>,
+    /// Cumulative number of formula-inner addresses discovered through Store
+    /// reverse dependencies while mutation code prepares spill/subscriber
+    /// maintenance. This remains a complexity probe; it is not a dirty graph.
+    reverse_dep_visit_count: Cell<u64>,
+
+    /// Monotonic generation of same-sheet formula AST/source topology. A
+    /// formula-content mutation bumps this value, invalidating every embedded
+    /// static-cycle certificate in O(1). Hydration itself preserves topology
+    /// and therefore transfers the current certificate without a bump.
+    formula_topology_epoch: Cell<u64>,
+    /// Deterministic complexity probe: number of formula ASTs expanded by the
+    /// install-time static cycle analyzer. It excludes Store evaluation.
+    static_cycle_node_visit_count: Cell<u64>,
 
     /// AUDIT B-5 — counts `has_address_subscribers` probes performed by
     /// `BulkLoader::flush`'s notify tail (one per entry of
@@ -931,32 +741,10 @@ pub struct Sheet {
     /// `spill_target_anchor` alone can't serve this lookup: anchors
     /// with zero targets (1×1 / empty arrays) have no entry there.
     spill_anchor_addr: HashMap<AtomId, CellAddress>,
-    /// One-way latch: set to `true` the first time a formula whose AST
-    /// contains a `Expr::SheetRef` / `Expr::SheetRange` is installed on
-    /// this sheet, never cleared. Drives
-    /// `Workbook::has_any_cross_sheet_state` so the read-time
-    /// `WorkbookEvalProvider::force_formula_recompute` safety net still
-    /// fires for cross-sheet formulas installed through the raw
-    /// `wb.sheet_mut(idx).set_formula(...)` path (which bypasses
-    /// `CrossSheetDeps::formula_refs` registration) or after
-    /// `Workbook::remove_sheet` clears the cross-sheet dep graph but
-    /// other sheets still hold formulas that referenced the removed
-    /// sheet.
-    ///
-    /// Why a latch rather than a precise counter / set? Clearing on
-    /// formula replacement / deletion would require re-scanning every
-    /// remaining formula's AST to know whether ANY cross-sheet ref still
-    /// lives on the sheet — too much work for the read-time fast path's
-    /// gating decision. The latch is conservative in the safe direction:
-    /// `force_formula_recompute` stays armed slightly longer than
-    /// strictly necessary, which costs one cache-miss recompute per read
-    /// (the pre-bypass status quo) and never under-fires.
-    has_cross_sheet_refs: Cell<bool>,
 }
 
-/// P4c facade-creation context: the minimal set of shared handles a facade
-/// (or, at the next increment, an inner formula atom's read closure) needs to
-/// mint and resolve per-address facade atoms WITHOUT holding `&Sheet`.
+/// Shared facade/formula-inner context: the minimal handles needed to mint and
+/// resolve per-address Store atoms without holding `&Sheet`.
 ///
 /// Every field is an owned `Store` clone or `Rc` clone, so a `FacadeCtx` is
 /// cheap to `clone()` and satisfies the `'static` bound required to move it
@@ -979,12 +767,167 @@ pub(crate) struct FacadeCtx {
     /// the same name on [`Sheet`]. The facade for a formula address delegates
     /// to `formula_inner_of(addr)`.
     formula_inner_family: Rc<RefCell<AtomFamily<CellAddress>>>,
+    /// P5 Tier-B geometry atom families — see [`Sheet`].
+    range_band_epoch_family: Rc<RefCell<AtomFamily<RangeBandKey>>>,
+    range_column_epoch_family: Rc<RefCell<AtomFamily<RangeColumnKey>>>,
+    range_sheet_epoch_family: Rc<RefCell<AtomFamily<()>>>,
     /// P4c: shared mid-evaluation address set for the runtime cycle guard
     /// (codex F1) — see the field of the same name on [`Sheet`].
     in_flight: Rc<RefCell<HashSet<CellAddress>>>,
+    workbook_context: Rc<RefCell<Option<Weak<WorkbookAtomContext>>>>,
+    workbook_sheet_index: Rc<Cell<Option<usize>>>,
+    formula_eval_count: Rc<Cell<usize>>,
+}
+
+struct WorkbookAtomTopology {
+    sheets: Vec<(String, FacadeCtx)>,
+    by_name: HashMap<String, usize>,
+}
+
+/// Workbook-scoped inputs consumed by formula-inner atoms. The three version
+/// atoms are ordinary Store primitives: formulas depend on them only when they
+/// read topology, names, or custom functions. Cell/range dependencies still
+/// point directly at target facades in the same shared Store.
+pub(crate) struct WorkbookAtomContext {
+    store: Store,
+    topology: RefCell<WorkbookAtomTopology>,
+    topology_epoch: RefCell<Option<AtomId>>,
+    topology_revision: Cell<u64>,
+    names: RefCell<HashMap<String, Value>>,
+    names_epoch: RefCell<Option<AtomId>>,
+    names_revision: Cell<u64>,
+    custom_functions: RefCell<Option<Arc<dyn CustomFunctionRegistry>>>,
+    custom_epoch: RefCell<Option<AtomId>>,
+    custom_revision: Cell<u64>,
+    custom_call_depth: Rc<Cell<usize>>,
+    in_flight: Rc<RefCell<HashSet<(usize, CellAddress)>>>,
+}
+
+impl WorkbookAtomContext {
+    pub(crate) fn new(store: Store, custom_call_depth: Rc<Cell<usize>>) -> Rc<Self> {
+        Rc::new(Self {
+            store,
+            topology: RefCell::new(WorkbookAtomTopology {
+                sheets: Vec::new(),
+                by_name: HashMap::new(),
+            }),
+            topology_epoch: RefCell::new(None),
+            topology_revision: Cell::new(0),
+            names: RefCell::new(HashMap::new()),
+            names_epoch: RefCell::new(None),
+            names_revision: Cell::new(0),
+            custom_functions: RefCell::new(None),
+            custom_epoch: RefCell::new(None),
+            custom_revision: Cell::new(0),
+            custom_call_depth,
+            in_flight: Rc::new(RefCell::new(HashSet::new())),
+        })
+    }
+
+    fn epoch_atom(&self, slot: &RefCell<Option<AtomId>>, revision: u64) -> AtomId {
+        if let Some(id) = *slot.borrow() {
+            return id;
+        }
+        let id = self.store.create_atom(Value::Number(revision as f64));
+        *slot.borrow_mut() = Some(id);
+        id
+    }
+
+    fn depend_topology(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.topology_epoch, self.topology_revision.get());
+        let _ = args.get(id);
+    }
+
+    fn depend_names(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.names_epoch, self.names_revision.get());
+        let _ = args.get(id);
+    }
+
+    fn depend_custom(&self, args: &ReadArgs) {
+        let id = self.epoch_atom(&self.custom_epoch, self.custom_revision.get());
+        let _ = args.get(id);
+    }
+
+    fn bump_epoch(&self, slot: &RefCell<Option<AtomId>>, revision: &Cell<u64>) {
+        let next = revision.get().wrapping_add(1);
+        revision.set(next);
+        let id = *slot.borrow();
+        if let Some(id) = id {
+            self.store.set(id, Value::Number(next as f64));
+        }
+    }
+
+    pub(crate) fn sync_topology(&self, sheets: Vec<(String, FacadeCtx)>) {
+        let by_name = sheets
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, _))| (name.clone(), idx))
+            .collect();
+        *self.topology.borrow_mut() = WorkbookAtomTopology { sheets, by_name };
+        self.bump_epoch(&self.topology_epoch, &self.topology_revision);
+    }
+
+    pub(crate) fn sync_names(&self, names: HashMap<String, Value>) {
+        *self.names.borrow_mut() = names;
+        self.bump_epoch(&self.names_epoch, &self.names_revision);
+    }
+
+    pub(crate) fn set_custom_functions(
+        &self,
+        registry: Option<Arc<dyn CustomFunctionRegistry>>,
+        invalidate: bool,
+    ) {
+        *self.custom_functions.borrow_mut() = registry;
+        if invalidate {
+            self.bump_epoch(&self.custom_epoch, &self.custom_revision);
+        }
+    }
+
+    fn resolve_sheet(&self, name: &str, args: &ReadArgs) -> Option<(usize, FacadeCtx)> {
+        self.depend_topology(args);
+        let topology = self.topology.borrow();
+        let idx = topology.by_name.get(name).copied()?;
+        Some((idx, topology.sheets.get(idx)?.1.clone()))
+    }
+
+    fn sheet_count(&self, args: &ReadArgs) -> usize {
+        self.depend_topology(args);
+        self.topology.borrow().sheets.len()
+    }
+
+    fn lookup_named(&self, name: &str, args: &ReadArgs) -> Option<Value> {
+        self.depend_names(args);
+        self.names.borrow().get(&name.to_ascii_uppercase()).cloned()
+    }
+
+    fn call_custom(&self, name: &str, values: &[Value], args: &ReadArgs) -> Option<Value> {
+        self.depend_custom(args);
+        let registry = self.custom_functions.borrow().clone()?;
+        if args.is_faulted() {
+            return Some(Value::Null);
+        }
+        let _scope = crate::workbook::CustomCallScope::enter(&self.custom_call_depth);
+        registry.lookup(name, values)
+    }
 }
 
 impl FacadeCtx {
+    fn workbook_scope(&self) -> Option<(Rc<WorkbookAtomContext>, usize)> {
+        let context = self
+            .workbook_context
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)?;
+        Some((context, self.workbook_sheet_index.get()?))
+    }
+
+    fn is_in_flight(&self, addr: CellAddress) -> bool {
+        if let Some((context, sheet_idx)) = self.workbook_scope() {
+            return context.in_flight.borrow().contains(&(sheet_idx, addr));
+        }
+        self.in_flight.borrow().contains(&addr)
+    }
+
     /// `owned_create_atom` mirror — keeps `atoms_owned` exact from within a
     /// `'static` closure that has no `&Sheet`.
     fn owned_create_atom(&self, value: Value) -> AtomId {
@@ -994,10 +937,7 @@ impl FacadeCtx {
 
     /// `owned_create_derived_ctx` mirror (lazy — computes nothing until first
     /// read, INV-7).
-    fn owned_create_derived_ctx(
-        &self,
-        read_fn: impl Fn(&ReadArgs) -> Value + 'static,
-    ) -> AtomId {
+    fn owned_create_derived_ctx(&self, read_fn: impl Fn(&ReadArgs) -> Value + 'static) -> AtomId {
         self.atoms_owned.set(self.atoms_owned.get() + 1);
         self.store.create_derived_ctx(read_fn)
     }
@@ -1037,45 +977,56 @@ impl FacadeCtx {
         let interior = Rc::clone(&self.interior);
         let store = self.store.clone();
         let ctx = self.clone();
-        self.cell_facade_family.borrow_mut().get_or_create(addr, || {
-            self.owned_create_derived_ctx(move |args| {
-                // Tracked: an epoch bump (inner-atom identity change) re-runs us.
-                let _ = args.get(epoch_id);
-                // P4c: a formula address (hydrated OR still lazy) delegates to
-                // its formula-inner atom, so the facade tracks the formula's
-                // value and, transitively, every cell the formula reads.
-                // Checked FIRST so a formula that shadows a stale primitive
-                // scaffold routes correctly. Both borrows drop at the `;`
-                // before any `store.*` call (D7 borrow rule). Kept ADDITIVE:
-                // the facade path is not yet wired into the read entry points,
-                // so the eager engine stays authoritative until a later
-                // increment flips the read口.
-                let is_formula = interior.formula_cells.borrow().contains_key(&addr)
-                    || interior.needs_parse.borrow().contains(&addr);
-                if is_formula {
-                    let inner = ctx.formula_inner_of(addr);
-                    return args.get(inner);
-                }
-                // Snapshot the current inner under a short borrow, then release.
-                let inner = {
-                    let cells = interior.cells.borrow();
-                    match cells.get(&addr) {
-                        Some(CellSlot::Atom(id)) => InnerSlot::Atom(*id),
-                        Some(CellSlot::Plain(v)) => InnerSlot::Plain(v.clone()),
-                        None => InnerSlot::Absent,
+        self.cell_facade_family
+            .borrow_mut()
+            .get_or_create(addr, || {
+                self.owned_create_derived_ctx(move |args| {
+                    // Tracked: an epoch bump (inner-atom identity change) re-runs us.
+                    let _ = args.get(epoch_id);
+                    // Every formula delegates to its formula-inner atom. Workbook
+                    // scope, when present, is consumed by that atom's provider;
+                    // there is no eager/cached cross-sheet side path.
+                    if ctx.formula_expr_for(addr).is_some() {
+                        let inner = ctx.formula_inner_of(addr);
+                        let formula_value = args.get(inner);
+
+                        // Array formulas mirror their current spill outcome in
+                        // the anchor atom. Depend on that Store atom as a
+                        // structural projection: it holds either the installed
+                        // Array or #SPILL!, while the formula-inner above
+                        // remains the formula value/dependency authority.
+                        let spill_anchor = {
+                            let cells = interior.cells.borrow();
+                            match cells.get(&addr) {
+                                Some(CellSlot::Atom(id)) => Some(*id),
+                                Some(CellSlot::Plain(_)) | None => None,
+                            }
+                        };
+                        return match spill_anchor {
+                            Some(id) if store.has_atom(id) => args.get(id),
+                            _ => formula_value,
+                        };
                     }
-                };
-                match inner {
-                    // Guard the defensive "atom destroyed under the slot" case
-                    // (mirrors `cell_value_at`): `args.get` panics on a missing
-                    // dep atom, so probe existence first.
-                    InnerSlot::Atom(id) if store.has_atom(id) => args.get(id),
-                    InnerSlot::Atom(_) => Value::Null,
-                    InnerSlot::Plain(v) => v,
-                    InnerSlot::Absent => Value::Null,
-                }
+                    // Snapshot the current inner under a short borrow, then release.
+                    let inner = {
+                        let cells = interior.cells.borrow();
+                        match cells.get(&addr) {
+                            Some(CellSlot::Atom(id)) => InnerSlot::Atom(*id),
+                            Some(CellSlot::Plain(v)) => InnerSlot::Plain(v.clone()),
+                            None => InnerSlot::Absent,
+                        }
+                    };
+                    match inner {
+                        // Guard the defensive "atom destroyed under the slot" case
+                        // (mirrors `cell_value_at`): `args.get` panics on a missing
+                        // dep atom, so probe existence first.
+                        InnerSlot::Atom(id) if store.has_atom(id) => args.get(id),
+                        InnerSlot::Atom(_) => Value::Null,
+                        InnerSlot::Plain(v) => v,
+                        InnerSlot::Absent => Value::Null,
+                    }
+                })
             })
-        })
     }
 
     /// Resolve `addr`'s formula AST without a `&Sheet`. Prefers the hydrated
@@ -1086,13 +1037,13 @@ impl FacadeCtx {
     /// the same `Expr::Error(InvalidValue)` sentinel the eager hydrator
     /// installs, so a malformed formula reads as `#VALUE!` rather than trapping
     /// the reader.
-    #[allow(dead_code)]
     fn formula_expr_for(&self, addr: CellAddress) -> Option<Rc<Expr>> {
         if let Some(expr) = self.interior.formula_exprs.borrow().get(&addr) {
             return Some(Rc::clone(expr));
         }
         let source = self.interior.formula_source.borrow().get(&addr).cloned()?;
-        let expr = parse_formula(source.as_ref()).unwrap_or(Expr::Error(ValueError::InvalidValue));
+        let expr =
+            parse_formula(source.source.as_ref()).unwrap_or(Expr::Error(ValueError::InvalidValue));
         Some(Rc::new(expr))
     }
 
@@ -1101,7 +1052,6 @@ impl FacadeCtx {
     /// [`AtomFormulaProvider`], re-recording its dependency edges on every run
     /// (vanilla `dependenciesChange` parity). It depends only on the cells the
     /// formula actually reads — no address→formula index.
-    #[allow(dead_code)]
     fn formula_inner_of(&self, addr: CellAddress) -> AtomId {
         let existing = self.formula_inner_family.borrow().get(&addr);
         if let Some(id) = existing {
@@ -1116,13 +1066,60 @@ impl FacadeCtx {
             })
     }
 
+    fn range_band_epoch_of(&self, key: RangeBandKey) -> AtomId {
+        self.range_band_epoch_family
+            .borrow_mut()
+            .get_or_create(key, || self.owned_create_atom(Value::Null))
+    }
+
+    fn range_column_epoch_of(&self, key: RangeColumnKey) -> AtomId {
+        self.range_column_epoch_family
+            .borrow_mut()
+            .get_or_create(key, || self.owned_create_atom(Value::Null))
+    }
+
+    fn range_sheet_epoch(&self) -> AtomId {
+        self.range_sheet_epoch_family
+            .borrow_mut()
+            .get_or_create((), || self.owned_create_atom(Value::Null))
+    }
+
+    fn depend_range_geometry_epochs(&self, range: CellRange, args: &ReadArgs) {
+        let range = range.normalize();
+        if range_cell_count_u64(range) <= RANGE_TIER_A_CELL_LIMIT {
+            return;
+        }
+
+        let bounds = range_geometry_bounds(range);
+
+        if range_band_count_u64(range) <= RANGE_BAND_DEP_LIMIT {
+            let start_band = range_row_band(bounds.start_row);
+            let end_band = range_row_band(bounds.end_row);
+            for col in bounds.start_col..=bounds.end_col {
+                for row_band in start_band..=end_band {
+                    args.depend(self.range_band_epoch_of(RangeBandKey { col, row_band }));
+                }
+            }
+            return;
+        }
+
+        let cols = inclusive_span_u64(bounds.start_col, bounds.end_col);
+        if cols <= RANGE_COLUMN_DEP_LIMIT {
+            for col in bounds.start_col..=bounds.end_col {
+                args.depend(self.range_column_epoch_of(RangeColumnKey { col }));
+            }
+            return;
+        }
+
+        args.depend(self.range_sheet_epoch());
+    }
+
     /// Formula-inner read body: evaluate `addr`'s formula under an on-stack
     /// [`AtomFormulaProvider`] whose ref/range lookups resolve through the
     /// facade family, so every cell the formula reads becomes a store
     /// dependency edge on THIS inner atom. The runtime cycle guard (codex F1)
     /// is armed by pushing `addr` onto the shared `in_flight` set via
     /// [`InFlightGuard`] for the duration of the eval.
-    #[allow(dead_code)]
     fn eval_formula_inner(&self, addr: CellAddress, args: &ReadArgs) -> Value {
         let expr = match self.formula_expr_for(addr) {
             Some(expr) => expr,
@@ -1130,13 +1127,16 @@ impl FacadeCtx {
             // an empty cell rather than trapping the reader.
             None => return Value::Null,
         };
-        let _guard = InFlightGuard::enter(&self.in_flight, addr);
+        let _guard = InFlightGuard::enter(self, addr);
         let provider = AtomFormulaProvider {
             args,
             ctx: self.clone(),
             current_cell: Cell::new(Some(addr)),
         };
-        normalize_formula_cell_result(eval_expr_with_provider(&expr, &provider))
+        let value = normalize_formula_cell_result(eval_expr_with_provider(&expr, &provider));
+        self.formula_eval_count
+            .set(self.formula_eval_count.get() + 1);
+        value
     }
 
     /// Row-major snapshot of the addresses inside `range` carrying a primitive
@@ -1144,13 +1144,12 @@ impl FacadeCtx {
     /// [`Sheet::for_each_sparse_cell_with`]'s address collection. All `interior`
     /// borrows drop before returning, so the caller can read facades
     /// reactively without holding a borrow across a `store` read (D7).
-    /// Per-member facade reads = Tier A; the large-range band optimization is
-    /// P5.
-    #[allow(dead_code)]
+    /// Tier-A ranges track every member facade; larger ranges track geometry
+    /// epochs and use this sparse snapshot only for current values.
     fn range_member_addrs(&self, range: CellRange) -> Vec<CellAddress> {
         // Primitives first (skipping formula-shadowed addresses), matching
         // `for_each_sparse_cell_with`'s emission order.
-        let mut out: Vec<CellAddress> = {
+        let primitive_addrs: Vec<CellAddress> = {
             let cells = self.interior.cells.borrow();
             cells
                 .range_iter(range)
@@ -1161,6 +1160,10 @@ impl FacadeCtx {
                 })
                 .collect()
         };
+        let mut out: Vec<CellAddress> = primitive_addrs
+            .into_iter()
+            .filter(|addr| self.primitive_slot_has_visible_value(*addr))
+            .collect();
         // Then the row-major union of hydrated formula cells + unhydrated
         // formula source (a formula is in exactly one of the two).
         let cells = self.interior.formula_cells.borrow();
@@ -1196,6 +1199,25 @@ impl FacadeCtx {
         }
         out
     }
+
+    /// Primitive Null atoms may remain alive as Store dependency anchors after
+    /// a clear. They are internal state, not sparse worksheet members.
+    fn primitive_slot_has_visible_value(&self, addr: CellAddress) -> bool {
+        let probe: Result<Value, AtomId> = {
+            let cells = self.interior.cells.borrow();
+            match cells.get(&addr) {
+                Some(CellSlot::Plain(value)) => Ok(value.clone()),
+                Some(CellSlot::Atom(id)) => Err(*id),
+                None => return false,
+            }
+        };
+        let value = match probe {
+            Ok(value) => value,
+            Err(id) if self.store.has_atom(id) => self.store.get(id),
+            Err(_) => Value::Null,
+        };
+        !matches!(value, Value::Null)
+    }
 }
 
 /// RAII marker for the runtime cycle guard (codex F1). While a formula-inner
@@ -1206,19 +1228,29 @@ impl FacadeCtx {
 /// re-entrant read of the same address (which cannot happen under the store's
 /// computing-guard, but is cheap to be correct about) never clears a peer's
 /// membership.
-#[allow(dead_code)]
+enum InFlightSet {
+    Local(Rc<RefCell<HashSet<CellAddress>>>),
+    Workbook(Rc<WorkbookAtomContext>, usize),
+}
+
 struct InFlightGuard {
-    set: Rc<RefCell<HashSet<CellAddress>>>,
+    set: InFlightSet,
     addr: CellAddress,
     inserted: bool,
 }
 
 impl InFlightGuard {
-    #[allow(dead_code)]
-    fn enter(set: &Rc<RefCell<HashSet<CellAddress>>>, addr: CellAddress) -> Self {
-        let inserted = set.borrow_mut().insert(addr);
+    fn enter(ctx: &FacadeCtx, addr: CellAddress) -> Self {
+        let (set, inserted) = if let Some((context, sheet_idx)) = ctx.workbook_scope() {
+            let inserted = context.in_flight.borrow_mut().insert((sheet_idx, addr));
+            (InFlightSet::Workbook(context, sheet_idx), inserted)
+        } else {
+            let set = Rc::clone(&ctx.in_flight);
+            let inserted = set.borrow_mut().insert(addr);
+            (InFlightSet::Local(set), inserted)
+        };
         InFlightGuard {
-            set: Rc::clone(set),
+            set,
             addr,
             inserted,
         }
@@ -1228,7 +1260,17 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if self.inserted {
-            self.set.borrow_mut().remove(&self.addr);
+            match &self.set {
+                InFlightSet::Local(set) => {
+                    set.borrow_mut().remove(&self.addr);
+                }
+                InFlightSet::Workbook(context, sheet_idx) => {
+                    context
+                        .in_flight
+                        .borrow_mut()
+                        .remove(&(*sheet_idx, self.addr));
+                }
+            }
         }
     }
 }
@@ -1243,7 +1285,6 @@ impl Drop for InFlightGuard {
 ///
 /// Lifetimes: `'a` is the borrow of the live [`ReadArgs`] handed to the
 /// read_fn; `'r` is that `ReadArgs`'s own store-inner borrow.
-#[allow(dead_code)]
 struct AtomFormulaProvider<'a, 'r> {
     args: &'a ReadArgs<'r>,
     ctx: FacadeCtx,
@@ -1262,14 +1303,58 @@ impl<'a, 'r> AtomFormulaProvider<'a, 'r> {
     /// sticky `#CYCLE!`. A later edit that breaks the cycle bumps the depended
     /// atom's generation and re-derives this reader (see the `depend` primitive
     /// tests).
-    #[allow(dead_code)]
-    fn read_facade(&self, addr: CellAddress) -> Value {
-        let facade = self.ctx.get_or_create_facade(addr);
-        if self.ctx.in_flight.borrow().contains(&addr) {
+    fn read_facade_from(&self, ctx: &FacadeCtx, addr: CellAddress) -> Value {
+        let facade = ctx.get_or_create_facade(addr);
+        if ctx.is_in_flight(addr) {
             self.args.depend(facade);
             return Value::Error(ValueError::CyclicRef);
         }
         self.args.get(facade)
+    }
+
+    fn read_facade(&self, addr: CellAddress) -> Value {
+        self.read_facade_from(&self.ctx, addr)
+    }
+
+    fn workbook_context(&self) -> Option<Rc<WorkbookAtomContext>> {
+        self.ctx.workbook_scope().map(|(context, _)| context)
+    }
+
+    fn resolve_sheet(&self, name: &str) -> Option<(usize, FacadeCtx)> {
+        self.workbook_context()?.resolve_sheet(name, self.args)
+    }
+
+    fn for_each_range_in(
+        &self,
+        ctx: &FacadeCtx,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        ctx.depend_range_geometry_epochs(range, self.args);
+        let member_addrs = ctx.range_member_addrs(range);
+        if range_cell_count_u64(range) <= RANGE_TIER_A_CELL_LIMIT {
+            let members: HashSet<CellAddress> = member_addrs.iter().copied().collect();
+            for addr in range.normalize().iter() {
+                if !members.contains(&addr) {
+                    let _ = self.read_facade_from(ctx, addr);
+                }
+            }
+        }
+        for addr in member_addrs {
+            let value = collapse_array_for_eval(self.read_facade_from(ctx, addr));
+            f(addr, value);
+        }
+    }
+
+    fn formula_text_in(ctx: &FacadeCtx, addr: CellAddress) -> Option<String> {
+        if let Some(text) = ctx.interior.formula_texts.borrow().get(&addr) {
+            return Some(text.clone());
+        }
+        ctx.interior
+            .formula_source
+            .borrow()
+            .get(&addr)
+            .map(|source| source.source.as_ref().to_string())
     }
 }
 
@@ -1278,29 +1363,46 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
         collapse_array_for_eval(self.read_facade(addr))
     }
 
-    fn sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
-        // Cross-sheet resolution through the shared store is P6; until then a
-        // formula-inner atom only reaches its own sheet's facades.
-        Value::Error(ValueError::InvalidRef)
+    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        let Some((_, ctx)) = self.resolve_sheet(sheet) else {
+            return Value::Error(ValueError::InvalidRef);
+        };
+        collapse_array_for_eval(self.read_facade_from(&ctx, addr))
     }
 
     fn raw_cell(&self, addr: CellAddress) -> Value {
         self.read_facade(addr)
     }
 
-    fn raw_sheet_cell(&self, _sheet: &str, _addr: CellAddress) -> Value {
-        Value::Error(ValueError::InvalidRef)
+    fn raw_sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
+        let Some((_, ctx)) = self.resolve_sheet(sheet) else {
+            return Value::Error(ValueError::InvalidRef);
+        };
+        self.read_facade_from(&ctx, addr)
     }
 
-    /// Sparse Tier-A range: iterate only the addresses inside `range` that
-    /// actually carry a primitive or formula value, reading each through its
-    /// facade so every member becomes a dependency edge. The large-range band
-    /// optimization is P5.
+    /// Store-shaped range read: Tier A per-member facades for small ranges and
+    /// Tier B geometry epoch atoms for larger ranges. The evaluator callback
+    /// remains sparse: empty cells are only read for dependency edges and are
+    /// not emitted.
     fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
-        for addr in self.ctx.range_member_addrs(range) {
-            let v = collapse_array_for_eval(self.read_facade(addr));
-            f(addr, v);
-        }
+        self.for_each_range_in(&self.ctx, range, f);
+    }
+
+    fn for_each_sheet_range_cell(
+        &self,
+        sheet: &str,
+        range: CellRange,
+        f: &mut dyn FnMut(CellAddress, Value),
+    ) {
+        let Some((_, ctx)) = self.resolve_sheet(sheet) else {
+            f(
+                range.normalize().start,
+                Value::Error(ValueError::InvalidRef),
+            );
+            return;
+        };
+        self.for_each_range_in(&ctx, range, f);
     }
 
     fn current_cell(&self) -> Option<CellAddress> {
@@ -1316,16 +1418,46 @@ impl<'a, 'r> EvalProvider for AtomFormulaProvider<'a, 'r> {
             || self.ctx.interior.needs_parse.borrow().contains(&addr)
     }
 
+    fn sheet_cell_has_formula(&self, sheet: &str, addr: CellAddress) -> bool {
+        let Some((_, ctx)) = self.resolve_sheet(sheet) else {
+            return false;
+        };
+        ctx.interior.formula_cells.borrow().contains_key(&addr)
+            || ctx.interior.needs_parse.borrow().contains(&addr)
+    }
+
+    fn lookup_named(&self, name: &str) -> Option<Value> {
+        self.workbook_context()?.lookup_named(name, self.args)
+    }
+
+    fn current_sheet_index(&self) -> Option<usize> {
+        let (context, sheet_idx) = self.ctx.workbook_scope()?;
+        context.depend_topology(self.args);
+        Some(sheet_idx)
+    }
+
+    fn sheet_index_of(&self, name: &str) -> Option<usize> {
+        self.resolve_sheet(name).map(|(idx, _)| idx)
+    }
+
+    fn sheet_count(&self) -> usize {
+        self.workbook_context()
+            .map(|context| context.sheet_count(self.args))
+            .unwrap_or(1)
+    }
+
     fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
-        if let Some(t) = self.ctx.interior.formula_texts.borrow().get(&addr) {
-            return Some(t.clone());
-        }
-        self.ctx
-            .interior
-            .formula_source
-            .borrow()
-            .get(&addr)
-            .map(|s| s.as_ref().to_string())
+        Self::formula_text_in(&self.ctx, addr)
+    }
+
+    fn sheet_cell_formula_text(&self, sheet: &str, addr: CellAddress) -> Option<String> {
+        let (_, ctx) = self.resolve_sheet(sheet)?;
+        Self::formula_text_in(&ctx, addr)
+    }
+
+    fn call_custom(&self, name: &str, values: &[Value]) -> Option<Value> {
+        self.workbook_context()?
+            .call_custom(name, values, self.args)
     }
 }
 
@@ -1336,7 +1468,7 @@ impl Sheet {
 
     /// Construct a sheet bound to a SHARED store (P3 of the atom-delegation
     /// rewrite): `Workbook` hands every sheet a clone of its single store so
-    /// cross-sheet dependencies can become ordinary in-store edges (P6).
+    /// cross-sheet dependencies are ordinary in-store edges (P6).
     /// `Store` is a cheap Rc handle — cloning shares state, exactly like
     /// passing the vanilla store object around. Standalone sheets
     /// (`Sheet::new`) keep a private store.
@@ -1355,50 +1487,53 @@ impl Sheet {
             slot_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
             cell_facade_family: Rc::new(RefCell::new(AtomFamily::new())),
             formula_inner_family: Rc::new(RefCell::new(AtomFamily::new())),
+            range_band_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
+            range_column_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
+            range_sheet_epoch_family: Rc::new(RefCell::new(AtomFamily::new())),
             in_flight: Rc::new(RefCell::new(HashSet::new())),
+            workbook_context: Rc::new(RefCell::new(None)),
+            workbook_sheet_index: Rc::new(Cell::new(None)),
             cell_subscriptions: HashMap::new(),
-            cell_dependents: RefCell::new(HashMap::new()),
-            range_dependents: RefCell::new(RangeDependentIndex::new()),
             next_cell_sub_id: 0,
             formats: HashMap::new(),
             range_formats: Vec::new(),
             conditional_rules: Vec::new(),
             row_heights: BTreeMap::new(),
             col_widths: BTreeMap::new(),
-            formula_eval_count: Cell::new(0),
+            formula_eval_count: Rc::new(Cell::new(0)),
             imported_formula_count: Cell::new(0),
-            dirty_visit_count: Cell::new(0),
+            reverse_dep_visit_count: Cell::new(0),
+            formula_topology_epoch: Cell::new(1),
+            static_cycle_node_visit_count: Cell::new(0),
             spill_targets: HashMap::new(),
             spill_target_anchor: HashMap::new(),
             spill_anchor_addr: HashMap::new(),
             bulk_notify_probe_count: Cell::new(0),
-            has_cross_sheet_refs: Cell::new(false),
         }
     }
 
-    /// Read the one-way cross-sheet latch. See `has_cross_sheet_refs`
-    /// field docs for the contract. `pub(crate)` so
-    /// `Workbook::has_any_cross_sheet_state` can OR it across sheets.
-    pub(crate) fn has_cross_sheet_refs(&self) -> bool {
-        self.has_cross_sheet_refs.get()
+    pub(crate) fn attach_workbook_context(
+        &self,
+        context: &Rc<WorkbookAtomContext>,
+        sheet_index: usize,
+    ) {
+        *self.workbook_context.borrow_mut() = Some(Rc::downgrade(context));
+        self.workbook_sheet_index.set(Some(sheet_index));
     }
 
-    /// STORAGE_PRIMARY Phase 6.1: arm the one-way cross-sheet latch
-    /// without an `Expr` in hand. `Workbook::install_sheet_bulk`'s
-    /// `!`-prefilter scan already knows the sheet holds cross-sheet
-    /// formulas (it parsed them for edge install) but the lazy parking
-    /// path never routes through `note_cross_sheet_if_any`.
-    pub(crate) fn arm_cross_sheet_latch(&self) {
-        self.has_cross_sheet_refs.set(true);
-    }
-
-    /// Inline helper: set the cross-sheet latch if `expr` contains any
-    /// `SheetRef` / `SheetRange`. Called from every formula-installation
-    /// path in this module so the raw `wb.sheet_mut(...).set_formula(...)`
-    /// flow keeps the read-time bypass armed.
-    fn note_cross_sheet_if_any(&self, expr: &Expr) {
-        if !self.has_cross_sheet_refs.get() && expr_has_sheet_ref(expr) {
-            self.has_cross_sheet_refs.set(true);
+    pub(crate) fn detach_workbook_context(&self) {
+        *self.workbook_context.borrow_mut() = None;
+        self.workbook_sheet_index.set(None);
+        let ids: Vec<AtomId> = self
+            .formula_inner_family
+            .borrow()
+            .iter()
+            .map(|(_, id)| id)
+            .collect();
+        for id in ids {
+            if self.store.has_atom(id) {
+                self.store.invalidate(id);
+            }
         }
     }
 
@@ -1519,24 +1654,6 @@ impl Sheet {
         self.store.create_derived(read_fn)
     }
 
-    /// P4c lazy door: the vanilla-faithful `create_derived_ctx` variant. Unlike
-    /// [`owned_create_derived`] (which wraps the eager `create_derived` bridge
-    /// shim and reads once at creation to force the back-dep edge), this creates a
-    /// derived atom that computes NOTHING until first read — the laziness
-    /// contract facades and inner formula atoms require (INV-7). The `read_fn`
-    /// gets the full [`ReadArgs`] context (tracked `get`, untracked `peek`).
-    ///
-    /// Temporarily unused on `Sheet` while `facade_of` routes through the
-    /// [`FacadeCtx`] mirror; the write/wire path in the P4c flip calls it again.
-    #[allow(dead_code)]
-    pub(crate) fn owned_create_derived_ctx(
-        &self,
-        read_fn: impl Fn(&ReadArgs) -> Value + 'static,
-    ) -> AtomId {
-        self.atoms_owned.set(self.atoms_owned.get() + 1);
-        self.store.create_derived_ctx(read_fn)
-    }
-
     pub(crate) fn owned_destroy_atom(&self, id: AtomId) {
         if self.store.has_atom(id) {
             self.store.destroy_atom(id);
@@ -1544,18 +1661,240 @@ impl Sheet {
         }
     }
 
-    /// P4c (UNWIRED, step 1): the per-address facade derived atom — the stable
-    /// subscription anchor that will replace `AddressSubscriptionBucket`
-    /// remapping once the read/write paths flip in the P4c commit. Idempotent:
-    /// returns the cached facade if one exists, else lazily creates the
-    /// slot-epoch primitive and the facade derived atom.
+    fn evict_owned_family_key<K>(&self, family: &Rc<RefCell<AtomFamily<K>>>, key: &K) -> bool
+    where
+        K: Eq + Hash + Clone,
+    {
+        if !family.borrow_mut().evict(&self.store, key) {
+            return false;
+        }
+        self.atoms_owned.set(
+            self.atoms_owned
+                .get()
+                .checked_sub(1)
+                .expect("sheet family eviction underflow"),
+        );
+        true
+    }
+
+    /// Release Store dependency roots after their last formula-inner reader
+    /// disappears. Evicting a formula facade can unmount its own inner, so
+    /// continue iteratively through that inner's Store-recorded dependencies.
+    /// AtomFamily refuses every node that still has a dependent/subscriber;
+    /// this method never reconstructs or owns a parallel dependency graph.
+    fn try_evict_formula_dependency_atoms(&self, roots: impl IntoIterator<Item = AtomId>) {
+        let mut pending: HashSet<AtomId> = roots.into_iter().collect();
+        while !pending.is_empty() {
+            let before = self.atoms_owned.get();
+            let current: Vec<AtomId> = pending.drain().collect();
+
+            for id in current {
+                let cell_addr = { self.cell_facade_family.borrow().key_of(id).copied() };
+                if let Some(addr) = cell_addr {
+                    if self.evict_owned_family_key(&self.cell_facade_family, &addr) {
+                        self.evict_owned_family_key(&self.slot_epoch_family, &addr);
+
+                        let inner_id = { self.formula_inner_family.borrow().get(&addr) };
+                        if let Some(inner_id) = inner_id {
+                            let dependencies = self.store.direct_dependencies(inner_id);
+                            if self.evict_owned_family_key(&self.formula_inner_family, &addr) {
+                                pending.extend(dependencies);
+                            }
+                        }
+                    } else {
+                        // Another candidate in this pass may still own the
+                        // final Store edge. Retry after that candidate peels.
+                        pending.insert(id);
+                    }
+                    continue;
+                }
+
+                let band_key = { self.range_band_epoch_family.borrow().key_of(id).copied() };
+                if let Some(key) = band_key {
+                    if !self.evict_owned_family_key(&self.range_band_epoch_family, &key) {
+                        pending.insert(id);
+                    }
+                    continue;
+                }
+
+                let column_key = { self.range_column_epoch_family.borrow().key_of(id).copied() };
+                if let Some(key) = column_key {
+                    if !self.evict_owned_family_key(&self.range_column_epoch_family, &key) {
+                        pending.insert(id);
+                    }
+                    continue;
+                }
+
+                if self.range_sheet_epoch_family.borrow().key_of(id).is_some()
+                    && !self.evict_owned_family_key(&self.range_sheet_epoch_family, &())
+                {
+                    pending.insert(id);
+                }
+            }
+
+            // No Store node was released, so every remaining candidate is
+            // still externally live and another pass cannot make progress.
+            if self.atoms_owned.get() == before {
+                return;
+            }
+        }
+    }
+
+    /// Reclaim the atomm nodes that existed solely to evaluate a formula that
+    /// no longer owns `addr`. The direct dependency snapshot comes from Store;
+    /// no sheet-local dependency graph is reconstructed here.
+    fn cleanup_obsolete_formula_atoms_at(&self, addr: CellAddress) {
+        if self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.formula_source.borrow().contains_key(&addr)
+        {
+            return;
+        }
+
+        let inner_id = { self.formula_inner_family.borrow().get(&addr) };
+        let dependencies = inner_id
+            .map(|id| self.store.direct_dependencies(id))
+            .unwrap_or_default();
+
+        // A leaf formula facade can go first, severing its edge to the inner.
+        // A facade still read by another formula/subscriber stays; the write's
+        // epoch bump has already retargeted it away from the obsolete inner.
+        self.evict_owned_family_key(&self.cell_facade_family, &addr);
+        if inner_id.is_some() {
+            self.evict_owned_family_key(&self.formula_inner_family, &addr);
+        }
+
+        if self.formula_inner_family.borrow().get(&addr).is_none() {
+            self.try_evict_formula_dependency_atoms(dependencies);
+        }
+        self.evict_owned_family_key(&self.slot_epoch_family, &addr);
+    }
+
+    /// Structural edits can leave old address keys behind after storage has
+    /// moved. Peel obsolete formula components until no further Store-safe
+    /// family eviction is possible (chains may require more than one pass).
+    fn prune_obsolete_formula_atoms(&self) {
+        loop {
+            let keys: Vec<CellAddress> = self
+                .formula_inner_family
+                .borrow()
+                .iter()
+                .map(|(addr, _)| *addr)
+                .filter(|addr| {
+                    !self.interior.formula_cells.borrow().contains_key(addr)
+                        && !self.interior.formula_source.borrow().contains_key(addr)
+                })
+                .collect();
+            if keys.is_empty() {
+                return;
+            }
+            let before = self.atoms_owned.get();
+            for addr in keys {
+                self.cleanup_obsolete_formula_atoms_at(addr);
+            }
+            if self.atoms_owned.get() == before {
+                return;
+            }
+        }
+    }
+
+    /// Full-sheet replacement temporarily has no live sheet content, so every
+    /// removable family node is old-world state. Fixed-point peeling follows
+    /// Store's actual edges and preserves any facade still read externally.
+    fn prune_all_family_atoms(&self) {
+        loop {
+            let before = self.atoms_owned.get();
+
+            let facade_keys: Vec<CellAddress> = self
+                .cell_facade_family
+                .borrow()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect();
+            for key in facade_keys {
+                self.evict_owned_family_key(&self.cell_facade_family, &key);
+            }
+
+            let inner_keys: Vec<CellAddress> = self
+                .formula_inner_family
+                .borrow()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect();
+            for key in inner_keys {
+                self.evict_owned_family_key(&self.formula_inner_family, &key);
+            }
+
+            let epoch_keys: Vec<CellAddress> = self
+                .slot_epoch_family
+                .borrow()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect();
+            for key in epoch_keys {
+                self.evict_owned_family_key(&self.slot_epoch_family, &key);
+            }
+
+            let band_keys: Vec<RangeBandKey> = self
+                .range_band_epoch_family
+                .borrow()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect();
+            for key in band_keys {
+                self.evict_owned_family_key(&self.range_band_epoch_family, &key);
+            }
+
+            let column_keys: Vec<RangeColumnKey> = self
+                .range_column_epoch_family
+                .borrow()
+                .iter()
+                .map(|(key, _)| *key)
+                .collect();
+            for key in column_keys {
+                self.evict_owned_family_key(&self.range_column_epoch_family, &key);
+            }
+
+            self.evict_owned_family_key(&self.range_sheet_epoch_family, &());
+
+            if self.atoms_owned.get() == before {
+                return;
+            }
+        }
+    }
+
+    fn destroy_retired_atoms(&self, ids: Vec<AtomId>) {
+        let mut pending: HashSet<AtomId> = ids.into_iter().collect();
+        loop {
+            let before = pending.len();
+            pending.retain(|id| {
+                if !self.store.has_atom(*id) {
+                    return false;
+                }
+                if self.store.has_dependents(*id) || self.store.has_subscribers(*id) {
+                    return true;
+                }
+                self.owned_destroy_atom(*id);
+                false
+            });
+            if pending.is_empty() || pending.len() == before {
+                break;
+            }
+        }
+        debug_assert!(
+            pending.is_empty(),
+            "full sheet replacement retained {} old cell atom(s)",
+            pending.len()
+        );
+    }
+
+    /// The per-address facade derived atom: the stable subscription anchor
+    /// for all address listeners. Idempotent: returns the cached facade if one
+    /// exists, else lazily creates the slot-epoch primitive and the facade
+    /// derived atom.
     ///
     /// The facade reads its slot-epoch (tracked — a `literal↔formula` overwrite
     /// or clear that bumps the epoch re-runs the facade WITHOUT re-keying any
     /// subscription) then the CURRENT inner atom for the address. Only the
-    /// literal / `Atom` inner path is populated today; the formula inner path
-    /// lands with the P4c flip.
-    ///
     /// BORROW RULE (D7): every family guard and the `interior.cells` borrow
     /// inside the read closure is released (inner id copied / plain value
     /// cloned) before any `store.*` call. The read closure captures only owned
@@ -1566,7 +1905,6 @@ impl Sheet {
     /// facade logic lives on the `'static`-capturable [`FacadeCtx`] so the
     /// forthcoming inner formula read closure can resolve referenced cells'
     /// facades on demand without an `&Sheet`.
-    #[allow(dead_code)]
     fn facade_of(&self, addr: CellAddress) -> AtomId {
         self.facade_ctx().get_or_create_facade(addr)
     }
@@ -1574,7 +1912,6 @@ impl Sheet {
     /// Build a [`FacadeCtx`] snapshot of this sheet's shared handles. Cheap —
     /// clones a `Store` handle and four `Rc`s. The returned ctx is `'static`
     /// and `Clone`, so it can be moved into store `read_fn` closures.
-    #[allow(dead_code)]
     pub(crate) fn facade_ctx(&self) -> FacadeCtx {
         FacadeCtx {
             store: self.store.clone(),
@@ -1583,7 +1920,13 @@ impl Sheet {
             slot_epoch_family: Rc::clone(&self.slot_epoch_family),
             cell_facade_family: Rc::clone(&self.cell_facade_family),
             formula_inner_family: Rc::clone(&self.formula_inner_family),
+            range_band_epoch_family: Rc::clone(&self.range_band_epoch_family),
+            range_column_epoch_family: Rc::clone(&self.range_column_epoch_family),
+            range_sheet_epoch_family: Rc::clone(&self.range_sheet_epoch_family),
             in_flight: Rc::clone(&self.in_flight),
+            workbook_context: Rc::clone(&self.workbook_context),
+            workbook_sheet_index: Rc::clone(&self.workbook_sheet_index),
+            formula_eval_count: Rc::clone(&self.formula_eval_count),
         }
     }
 
@@ -1599,9 +1942,6 @@ impl Sheet {
     /// store's equal-value short-circuit can't swallow the bump and an ABA
     /// within one batch still forces re-derivation.
     ///
-    /// Inert in production this phase: the facade families stay empty until the
-    /// read口 flip (Commit B), so `slot_epoch_family` never holds `addr` and
-    /// this is a pure `.get()`-returns-`None` no-op.
     fn bump_facade_epoch(&self, addr: CellAddress) {
         let Some(epoch_id) = self.slot_epoch_family.borrow().get(&addr) else {
             return;
@@ -1611,6 +1951,53 @@ impl Sheet {
             _ => Value::Number(1.0),
         };
         self.store.set(epoch_id, next);
+    }
+
+    fn bump_existing_epoch(&self, id: AtomId) {
+        let next = match self.store.get(id) {
+            Value::Number(n) => Value::Number(n + 1.0),
+            _ => Value::Number(1.0),
+        };
+        self.store.set(id, next);
+    }
+
+    fn bump_range_geometry_epochs_touching(&self, addr: CellAddress) {
+        let band_key = range_band_key_for_addr(addr);
+        let band_id = { self.range_band_epoch_family.borrow().get(&band_key) };
+        if let Some(id) = band_id {
+            self.bump_existing_epoch(id);
+        }
+
+        let column_key = RangeColumnKey { col: addr.col };
+        let column_id = { self.range_column_epoch_family.borrow().get(&column_key) };
+        if let Some(id) = column_id {
+            self.bump_existing_epoch(id);
+        }
+
+        let sheet_id = { self.range_sheet_epoch_family.borrow().get(&()) };
+        if let Some(id) = sheet_id {
+            self.bump_existing_epoch(id);
+        }
+    }
+
+    fn bump_range_membership_epochs_touching(&self, addr: CellAddress) {
+        self.bump_range_geometry_epochs_touching(addr);
+    }
+
+    /// Sparse range membership matches `range_member_addrs`: a non-Null
+    /// primitive value or formula/source record exists at the address. A Null
+    /// primitive atom retained by Store dependents remains an internal anchor,
+    /// not a worksheet member.
+    fn range_member_present(&self, addr: CellAddress) -> bool {
+        self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.formula_source.borrow().contains_key(&addr)
+            || self.primitive_slot_has_visible_value(addr)
+    }
+
+    fn bump_range_epochs_if_membership_changed(&self, addr: CellAddress, pre_member: bool) {
+        if pre_member != self.range_member_present(addr) {
+            self.bump_range_membership_epochs_touching(addr)
+        }
     }
 
     /// P4c write口 helper — force this address's formula-inner atom to
@@ -1663,7 +2050,10 @@ impl Sheet {
             Some(value) => self.owned_create_atom(value),
             None => self.owned_create_atom(Value::Null),
         };
-        self.interior.cells.borrow_mut().insert(addr, CellSlot::Atom(id));
+        self.interior
+            .cells
+            .borrow_mut()
+            .insert(addr, CellSlot::Atom(id));
         id
     }
 
@@ -1695,6 +2085,13 @@ impl Sheet {
         })
     }
 
+    fn primitive_slot_has_visible_value(&self, addr: CellAddress) -> bool {
+        matches!(
+            self.cell_value_at(addr),
+            Some(value) if !matches!(value, Value::Null)
+        )
+    }
+
     /// Remove the slot at `addr`; if it held a materialized atom with no
     /// live dependents, destroy the atom. `Plain` slots are simply
     /// dropped. Returns whether a slot was present.
@@ -1717,17 +2114,6 @@ impl Sheet {
         self.ensure_cell(addr)
     }
 
-    fn current_readable_atom(&self, addr: CellAddress) -> Option<AtomId> {
-        if self.interior.formula_cells.borrow().contains_key(&addr) {
-            None
-        } else {
-            // AUDIT B-2: `Plain` slots report no readable atom. Callers
-            // that need an attachable atom (`attach_address_sub`) promote
-            // first; pure readers go through `cell_value_at`.
-            self.interior.cells.borrow().get(&addr).and_then(|slot| slot.atom_id())
-        }
-    }
-
     /// Detach this address's fanout from the store. The bucket and its
     /// listener list are kept; only the underlying `store.sub` goes away.
     /// Returns `true` if a fanout was actually attached. Used as the first
@@ -1746,25 +2132,14 @@ impl Sheet {
         }
     }
 
-    /// Attach (or re-attach) this address's fanout to the current readable
-    /// atom. No-op when there is no listener bucket or the address has no
-    /// readable atom yet.
-    ///
-    /// AUDIT B-2: a subscribed address must hold a real store atom so the
-    /// fanout has something to attach to — promote a `Plain` slot first.
-    /// Bounded by the subscription count, never by sheet size. Empty
-    /// (slot-less) addresses still do not materialize anything.
+    /// Attach (or re-attach) this address's fanout to the stable facade atom.
+    /// The facade itself is lazy, but subscribing to an address is the point at
+    /// which the stable anchor is intentionally materialized.
     fn attach_address_sub(&mut self, addr: CellAddress) {
-        if self.cell_subscriptions.contains_key(&addr)
-            && matches!(
-                self.interior.cells.borrow().get(&addr),
-                Some(CellSlot::Plain(_))
-            )
-            && !self.interior.formula_cells.borrow().contains_key(&addr)
-        {
-            self.ensure_cell(addr);
+        if !self.cell_subscriptions.contains_key(&addr) {
+            return;
         }
-        let new_atom = self.current_readable_atom(addr);
+        let new_atom = Some(self.facade_of(addr));
         let Some(bucket) = self.cell_subscriptions.get_mut(&addr) else {
             return;
         };
@@ -1783,27 +2158,19 @@ impl Sheet {
         }
     }
 
-    /// Run a mutation that may swap the readable atom under `addr`.
-    /// Detaches the fanout for `addr` first, runs `f`, then reattaches the
-    /// fanout to whatever atom `addr` now points at and fires listeners
-    /// exactly once. Use this for any state change that goes formula↔
-    /// primitive (so the inner `store.set` doesn't double-fire through the
-    /// fanout that was wired to the OLD atom).
-    ///
-    /// Fires whenever the bucket has at least one listener — NOT only when
-    /// a store_sub was previously attached. The "previously attached"
-    /// condition would silently drop the first set_formula on an empty cell
-    /// that was subscribed before any value existed (bucket has listeners
-    /// but no store_sub, because attach_address_sub no-ops without a
-    /// readable atom to attach to).
-    fn with_remap<R>(&mut self, addr: CellAddress, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.detach_address_sub(addr);
-        let result = f(self);
-        self.attach_address_sub(addr);
-        if self.has_address_subscribers(addr) {
-            self.notify_address_subscribers(addr);
-        }
-        result
+    /// Stable facades make address remapping unnecessary; callers keep this
+    /// wrapper while older mutation code is being simplified.
+    fn with_remap<R>(&mut self, _addr: CellAddress, f: impl FnOnce(&mut Self) -> R) -> R {
+        f(self)
+    }
+
+    fn store_batch<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let store = self.store.clone();
+        let mut result = None;
+        store.batch(|_| {
+            result = Some(f(self));
+        });
+        result.expect("store batch closure did not run")
     }
 
     fn has_address_subscribers(&self, addr: CellAddress) -> bool {
@@ -1825,78 +2192,191 @@ impl Sheet {
         deps.into_iter().collect()
     }
 
-    fn add_formula_deps(&self, formula_addr: CellAddress, deps: &HashSet<CellAddress>) {
-        let mut dependents = self.cell_dependents.borrow_mut();
-        for dep in deps {
-            dependents.entry(*dep).or_default().insert(formula_addr);
-        }
+    fn materialize_formula_inner(&self, addr: CellAddress) {
+        self.facade_ctx().formula_inner_of(addr);
     }
 
-    fn remove_formula_deps(&self, formula_addr: CellAddress, deps: &HashSet<CellAddress>) {
-        let mut dependents = self.cell_dependents.borrow_mut();
-        for dep in deps {
-            let should_remove = if let Some(set) = dependents.get_mut(dep) {
-                set.remove(&formula_addr);
-                set.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                dependents.remove(dep);
+    fn invalidate_formula_value(&self, addr: CellAddress) {
+        self.invalidate_formula_inner(addr);
+        self.bump_facade_epoch(addr);
+    }
+
+    fn formula_has_spill_anchor(&self, addr: CellAddress) -> bool {
+        self.interior
+            .cells
+            .borrow()
+            .get(&addr)
+            .and_then(|slot| slot.atom_id())
+            .is_some_and(|id| self.spill_targets.contains_key(&id))
+    }
+
+    fn formula_needs_spill_maintenance(&self, addr: CellAddress) -> bool {
+        self.formula_has_spill_anchor(addr)
+            || self
+                .interior
+                .formula_cells
+                .borrow()
+                .get(&addr)
+                .is_some_and(|record| expr_may_produce_array(&record.expr))
+    }
+
+    fn store_root_atoms_for_addr_into(&self, addr: CellAddress, out: &mut Vec<AtomId>) {
+        if let Some(id) = self.slot_atom_id(addr) {
+            if self.store.has_atom(id) {
+                out.push(id);
+            }
+        }
+
+        let epoch_id = { self.slot_epoch_family.borrow().get(&addr) };
+        if let Some(id) = epoch_id {
+            if self.store.has_atom(id) {
+                out.push(id);
+            }
+        }
+
+        let facade_id = { self.cell_facade_family.borrow().get(&addr) };
+        if let Some(id) = facade_id {
+            if self.store.has_atom(id) {
+                out.push(id);
+            }
+        }
+
+        self.store_root_range_geometry_atoms_for_addr_into(addr, out);
+    }
+
+    pub(crate) fn store_root_atoms_for_addr(&self, addr: CellAddress) -> Vec<AtomId> {
+        let mut roots = Vec::new();
+        self.store_root_atoms_for_addr_into(addr, &mut roots);
+        roots
+    }
+
+    pub(crate) fn array_formula_addrs_for_store_atoms(
+        &self,
+        atom_ids: &[AtomId],
+    ) -> HashSet<CellAddress> {
+        let formula_inner_family = self.formula_inner_family.borrow();
+        atom_ids
+            .iter()
+            .filter_map(|id| formula_inner_family.key_of(*id).copied())
+            .filter(|addr| self.formula_needs_spill_maintenance(*addr))
+            .collect()
+    }
+
+    fn store_root_range_geometry_atoms_for_addr_into(
+        &self,
+        addr: CellAddress,
+        out: &mut Vec<AtomId>,
+    ) {
+        let band_key = range_band_key_for_addr(addr);
+        let band_id = { self.range_band_epoch_family.borrow().get(&band_key) };
+        if let Some(id) = band_id {
+            if self.store.has_atom(id) {
+                out.push(id);
+            }
+        }
+
+        let column_key = RangeColumnKey { col: addr.col };
+        let column_id = { self.range_column_epoch_family.borrow().get(&column_key) };
+        if let Some(id) = column_id {
+            if self.store.has_atom(id) {
+                out.push(id);
+            }
+        }
+
+        let sheet_id = { self.range_sheet_epoch_family.borrow().get(&()) };
+        if let Some(id) = sheet_id {
+            if self.store.has_atom(id) {
+                out.push(id);
             }
         }
     }
 
-    /// Insert `formula_addr` as a dependent of every range in `ranges`.
-    /// Companion to `add_formula_deps` for the range-typed dep index.
-    /// Each `RangeDependentIndex::add_formula` call also wires the range
-    /// into the row / col bucket halves (or `wide_ranges` if oversize) on
-    /// its first dependent — see `RangeDependentIndex::register_range`.
-    fn add_formula_range_deps(&self, formula_addr: CellAddress, ranges: &HashSet<CellRange>) {
-        let mut dependents = self.range_dependents.borrow_mut();
-        for r in ranges {
-            dependents.add_formula(*r, formula_addr);
-        }
-    }
-
-    /// Remove `formula_addr` from each range's dependent set. Mirrors
-    /// `remove_formula_deps`. The bucket index entries (row / col / wide)
-    /// are dropped automatically when the last dependent goes away, so the
-    /// maps stay bounded under formula churn.
-    fn remove_formula_range_deps(&self, formula_addr: CellAddress, ranges: &HashSet<CellRange>) {
-        let mut dependents = self.range_dependents.borrow_mut();
-        for r in ranges {
-            dependents.remove_formula(*r, formula_addr);
-        }
-    }
-
-    /// Replace this formula's point-cell `deps` with the eval-tracked set
-    /// produced by `TrackingEvalProvider`. The sparse range iterator
-    /// inside eval intentionally narrows this set to addresses that were
-    /// actually visited — `IF`-branch selection drops the unselected
-    /// arm's references, which is correct behavior.
-    ///
-    /// `range_deps` is deliberately untouched: those entries were
-    /// captured statically from `Expr::Range` at `set_formula` time and
-    /// must survive sparse-eval narrowing. Otherwise a write to a
-    /// previously-empty cell inside the range would miss dirty
-    /// propagation (P0 from `PHASE1_PARALLEL.md` § Track A). The
-    /// Dirty propagation consults `range_dependents` in addition to
-    /// `cell_dependents` on each cell write so the surviving range entries
-    /// are honored.
-    fn replace_formula_deps(
+    fn store_dependent_formula_addrs_from_atoms(
         &self,
-        formula_addr: CellAddress,
-        record: &FormulaRecord,
-        new_deps: HashSet<CellAddress>,
-    ) {
-        let old_deps = record.deps.replace(new_deps.clone());
-        self.remove_formula_deps(formula_addr, &old_deps);
-        self.add_formula_deps(formula_addr, &new_deps);
-        // Note: record.range_deps and self.range_dependents are
-        // intentionally NOT touched here. They reflect the static
-        // structure of the formula and only change when `set_formula`
-        // overwrites the cell or `remove_formula_record` drops it.
+        root_atoms: &[AtomId],
+    ) -> HashSet<CellAddress> {
+        if root_atoms.is_empty() {
+            return HashSet::new();
+        }
+        let dependent_atoms = self.store.reverse_dependents(root_atoms);
+        {
+            let formula_inner_family = self.formula_inner_family.borrow();
+            dependent_atoms
+                .into_iter()
+                .filter_map(|id| formula_inner_family.key_of(id).copied())
+                .collect()
+        }
+    }
+
+    fn store_dependent_formula_addrs_from_addrs<I>(&self, addrs: I) -> HashSet<CellAddress>
+    where
+        I: IntoIterator<Item = CellAddress>,
+    {
+        let mut roots = Vec::new();
+        for addr in addrs {
+            self.store_root_atoms_for_addr_into(addr, &mut roots);
+        }
+        let formulas = self.store_dependent_formula_addrs_from_atoms(&roots);
+        self.reverse_dep_visit_count.set(
+            self.reverse_dep_visit_count
+                .get()
+                .saturating_add(formulas.len() as u64),
+        );
+        formulas
+    }
+
+    fn store_dependent_array_formula_addrs_from_addrs<I>(&self, addrs: I) -> HashSet<CellAddress>
+    where
+        I: IntoIterator<Item = CellAddress>,
+    {
+        self.store_dependent_formula_addrs_from_addrs(addrs)
+            .into_iter()
+            .filter(|addr| self.formula_needs_spill_maintenance(*addr))
+            .collect()
+    }
+
+    fn bump_formula_topology_epoch(&self) {
+        if let Some(next) = self.formula_topology_epoch.get().checked_add(1) {
+            self.formula_topology_epoch.set(next);
+            return;
+        }
+
+        // Practically unreachable, but avoid accepting ancient certificates
+        // after u64 wraparound.
+        {
+            let records = self.interior.formula_cells.borrow();
+            for (_, record) in records.iter() {
+                record.cycle_checked_at.set(0);
+            }
+        }
+        {
+            let sources = self.interior.formula_source.borrow();
+            for (_, source) in sources.iter() {
+                source.cycle_checked_at.set(0);
+            }
+        }
+        self.formula_topology_epoch.set(1);
+    }
+
+    fn formula_cycle_is_checked(&self, addr: CellAddress, epoch: u64) -> bool {
+        if let Some(record) = self.interior.formula_cells.borrow().get(&addr) {
+            return record.cycle_checked_at.get() == epoch;
+        }
+        self.interior
+            .formula_source
+            .borrow()
+            .get(&addr)
+            .is_some_and(|source| source.cycle_checked_at.get() == epoch)
+    }
+
+    fn mark_formula_cycle_checked(&self, addr: CellAddress, epoch: u64) {
+        if let Some(record) = self.interior.formula_cells.borrow().get(&addr) {
+            record.cycle_checked_at.set(epoch);
+            return;
+        }
+        if let Some(source) = self.interior.formula_source.borrow().get(&addr) {
+            source.cycle_checked_at.set(epoch);
+        }
     }
 
     fn remove_formula_record(&mut self, addr: CellAddress) -> Option<Rc<FormulaRecord>> {
@@ -1907,16 +2387,18 @@ impl Sheet {
         // bulk-loaded but not-yet-read formula — without the early
         // drain the new install would race the old lazy entry on the
         // first read.
-        self.interior.formula_source.borrow_mut().remove(&addr);
+        let parked = self.interior.formula_source.borrow_mut().remove(&addr);
         self.interior.needs_parse.borrow_mut().remove(&addr);
-        let record = self.interior.formula_cells.borrow_mut().remove(&addr)?;
-        let deps = record.deps.borrow().clone();
-        self.remove_formula_deps(addr, &deps);
-        let range_deps = record.range_deps.borrow().clone();
-        self.remove_formula_range_deps(addr, &range_deps);
-        self.interior.formula_exprs.borrow_mut().remove(&addr);
-        self.interior.formula_texts.borrow_mut().remove(&addr);
-        Some(record)
+        let record = self.interior.formula_cells.borrow_mut().remove(&addr);
+        if record.is_some() {
+            self.interior.formula_exprs.borrow_mut().remove(&addr);
+            self.interior.formula_texts.borrow_mut().remove(&addr);
+            self.invalidate_formula_inner(addr);
+        }
+        if parked.is_some() || record.is_some() {
+            self.bump_formula_topology_epoch();
+        }
+        record
     }
 
     /// LAZY_FORMULA_INDEXING Phase 3: idempotent lazy parse+install.
@@ -1924,16 +2406,16 @@ impl Sheet {
     /// If `addr` is not in `needs_parse`, returns immediately (already
     /// hydrated or never lazy). Otherwise pulls the source text out of
     /// `formula_source`, parses it, runs the same-sheet static cycle
-    /// check (B.2), then installs the `FormulaRecord` + dep edges via
-    /// the same shape as `BulkLoader::install_parsed_formula`.
+    /// check (B.2), then installs static metadata and materializes the
+    /// Store-backed formula-inner via the same shape as
+    /// `BulkLoader::install_parsed_formula`.
     ///
     /// Takes `&self` (not `&mut self`) so read-path callers can hydrate
     /// without holding a unique borrow of the sheet. All mutable state
     /// goes through the per-field `RefCell`s (`formula_cells`,
-    /// `formula_exprs`, `formula_texts`, `cell_dependents`,
-    /// `range_dependents`, `needs_parse`) or interior-mutable fields
-    /// (`imported_formula_count` is bumped at park time, not here;
-    /// `has_cross_sheet_refs` is a `Cell`).
+    /// `formula_exprs`, `formula_texts`, `needs_parse`)
+    /// or interior-mutable fields
+    /// (`imported_formula_count` is bumped at park time, not here).
     ///
     /// Cost-amortisation note: this method is called once per cell per
     /// lifetime — the `needs_parse.contains(&addr)` check is a cheap
@@ -1954,7 +2436,7 @@ impl Sheet {
         // `formula_source ↔ needs_parse` invariant tight. Done under
         // exclusive borrows that are released before the parse so the
         // parse path can re-enter sheet-level `RefCell`s freely.
-        let source = {
+        let parked = {
             let mut needs = self.interior.needs_parse.borrow_mut();
             if !needs.remove(&addr) {
                 return;
@@ -1967,11 +2449,11 @@ impl Sheet {
         };
 
         // Parse the source. On failure write `#VALUE!` via the
-        // `&self`-friendly path: store a Clean cache with the error,
-        // no dep edges, no `FormulaRecord` for the AST (there is no
-        // AST). To keep the existing eager path's invariants we
-        // synthesise a minimal record whose expr is a literal
-        // `#VALUE!` error.
+        // `&self`-friendly path. There is no parsed reference metadata;
+        // synthesize a minimal literal-error record and formula-inner so
+        // same-sheet reads still flow through Store.
+        let source = parked.source;
+        let checked_at = parked.cycle_checked_at.get();
         let expr_owned = match parse_formula(source.as_ref()) {
             Some(e) => e,
             None => {
@@ -1981,78 +2463,83 @@ impl Sheet {
                     HashSet::new(),
                     HashSet::new(),
                 ));
-                // Clamp cache to Clean(error) so the first read returns
-                // `#VALUE!` immediately and won't try to re-eval.
-                *record.cache.borrow_mut() =
-                    FormulaCache::Clean(Value::Error(ValueError::InvalidValue));
-                self.interior.formula_cells.borrow_mut().insert(addr, record);
-                self.interior.formula_exprs.borrow_mut().insert(addr, err_expr);
-                self.interior.formula_texts
+                record
+                    .cycle_checked_at
+                    .set(self.formula_topology_epoch.get());
+                self.interior
+                    .formula_cells
+                    .borrow_mut()
+                    .insert(addr, record);
+                self.interior
+                    .formula_exprs
+                    .borrow_mut()
+                    .insert(addr, err_expr);
+                self.interior
+                    .formula_texts
                     .borrow_mut()
                     .insert(addr, source.as_ref().to_string());
+                self.materialize_formula_inner(addr);
+                self.invalidate_formula_value(addr);
                 return;
             }
         };
 
-        // Cycle check (B.2). On hit write `#CYCLE!` the same way.
-        if self.would_create_cycle(addr, &expr_owned) {
+        let expr_rc = Rc::new(expr_owned);
+
+        // Cycle check (B.2). Parked formulas may reuse certificates created
+        // by an earlier hydration in the same immutable formula topology.
+        let cycle_check = self.closes_parked_local_cycle(addr, expr_rc.clone(), checked_at);
+        if cycle_check.closes_cycle {
             let err_expr = Rc::new(Expr::Error(ValueError::CyclicRef));
             let record = Rc::new(FormulaRecord::new(
                 err_expr.clone(),
                 HashSet::new(),
                 HashSet::new(),
             ));
-            *record.cache.borrow_mut() =
-                FormulaCache::Clean(Value::Error(ValueError::CyclicRef));
-            self.interior.formula_cells.borrow_mut().insert(addr, record);
-            self.interior.formula_exprs.borrow_mut().insert(addr, err_expr);
-            self.interior.formula_texts
+            record
+                .cycle_checked_at
+                .set(self.formula_topology_epoch.get());
+            self.interior
+                .formula_cells
+                .borrow_mut()
+                .insert(addr, record);
+            self.interior
+                .formula_exprs
+                .borrow_mut()
+                .insert(addr, err_expr);
+            self.interior
+                .formula_texts
                 .borrow_mut()
                 .insert(addr, source.as_ref().to_string());
+            self.materialize_formula_inner(addr);
+            self.invalidate_formula_value(addr);
             return;
         }
 
-        // Install: dep extract → dep register → FormulaRecord, mirror
-        // of `BulkLoader::install_parsed_formula` but going through
-        // `&self`-only paths.
-        let expr_rc = Rc::new(expr_owned);
+        // Install static references and the FormulaRecord, then materialize
+        // the formula-inner. This mirrors `BulkLoader::install_parsed_formula`
+        // through `&self`-only paths.
         let deps = Sheet::formula_deps_for(&expr_rc);
-        let range_deps = collect_range_refs(&expr_rc);
-        self.add_formula_deps(addr, &deps);
-        self.add_formula_range_deps(addr, &range_deps);
-        let record = Rc::new(FormulaRecord::new(expr_rc.clone(), deps, range_deps));
-        self.note_cross_sheet_if_any(&expr_rc);
-        self.interior.formula_cells.borrow_mut().insert(addr, record);
-        self.interior.formula_exprs.borrow_mut().insert(addr, expr_rc);
-        self.interior.formula_texts
+        let static_ranges = collect_range_refs(&expr_rc);
+        let record = Rc::new(FormulaRecord::new(expr_rc.clone(), deps, static_ranges));
+        if cycle_check.target_certified {
+            record
+                .cycle_checked_at
+                .set(self.formula_topology_epoch.get());
+        }
+        self.interior
+            .formula_cells
+            .borrow_mut()
+            .insert(addr, record);
+        self.interior
+            .formula_exprs
+            .borrow_mut()
+            .insert(addr, expr_rc.clone());
+        self.interior
+            .formula_texts
             .borrow_mut()
             .insert(addr, source.as_ref().to_string());
-    }
-
-    fn rebuild_all_formula_dependents(&self) {
-        self.cell_dependents.borrow_mut().clear();
-        self.range_dependents.borrow_mut().clear();
-        // Snapshot the (addr, deps, range_deps) triples up front so we
-        // don't hold the `formula_cells` borrow across `add_formula_deps`,
-        // which takes its own `borrow_mut` on `cell_dependents`. The
-        // inner record-level `RefCell`s on `deps` / `range_deps` are
-        // borrowed transiently for the clone, no recursion risk.
-        let snapshot: Vec<(CellAddress, HashSet<CellAddress>, HashSet<CellRange>)> = self
-            .interior.formula_cells
-            .borrow()
-            .iter()
-            .map(|(addr, record)| {
-                (
-                    addr,
-                    record.deps.borrow().clone(),
-                    record.range_deps.borrow().clone(),
-                )
-            })
-            .collect();
-        for (addr, deps, range_deps) in snapshot {
-            self.add_formula_deps(addr, &deps);
-            self.add_formula_range_deps(addr, &range_deps);
-        }
+        self.materialize_formula_inner(addr);
     }
 
     /// Pre-grow the formula-installation HashMaps to fit a hinted batch
@@ -2077,12 +2564,6 @@ impl Sheet {
         if hint == 0 {
             return;
         }
-        // `cell_dependents` gains one entry per unique referenced cell;
-        // for chain-style workloads that's ~`hint` cells, for fan-in
-        // workloads it can be much smaller. Over-reserving for the
-        // upper bound is benign (the maps live as long as the sheet
-        // and headroom amortizes across future inserts).
-        self.cell_dependents.get_mut().reserve(hint);
         self.interior.formula_exprs.borrow_mut().reserve(hint);
         self.interior.formula_texts.borrow_mut().reserve(hint);
     }
@@ -2098,8 +2579,8 @@ impl Sheet {
     ///   - Previous sheet content is fully torn down first (this is a
     ///     REPLACE, not a merge): primitive atoms are destroyed, every
     ///     hydrated-formula structure (`formula_cells` /
-    ///     `formula_exprs` / `formula_texts` / `cell_dependents` /
-    ///     `range_dependents`) is cleared wholesale, lazy parking
+    ///     `formula_exprs` / `formula_texts`) is
+    ///     cleared wholesale, lazy parking
     ///     (`formula_source` / `needs_parse`) is dropped, and spill
     ///     bookkeeping is reset. Wholesale clears — not per-record
     ///     edge removal — because the entire index family is being
@@ -2129,16 +2610,12 @@ impl Sheet {
     ///     subscribed address is notified once (the whole world
     ///     changed).
     ///
-    /// The `has_cross_sheet_refs` latch is deliberately NOT cleared —
-    /// it is a one-way conservative latch; staying armed costs at most
-    /// a redundant recompute per read and never under-fires. Cross-
-    /// sheet edge install for the new content is owned by the caller
-    /// (`Workbook::install_sheet_bulk`'s `!`-prefilter scan).
     pub(crate) fn bulk_install_storage(
         &mut self,
         primitives: HashMap<CellAddress, Value>,
         formulas: HashMap<CellAddress, String>,
-    ) -> (usize, usize) {
+    ) -> (usize, usize, BulkInstallCleanup) {
+        self.bump_formula_topology_epoch();
         // --- Teardown of previous content ---------------------------------
         // Detach every subscription fanout first so atom destruction below
         // cannot fire through a stale store sub. Buckets (and their
@@ -2148,41 +2625,30 @@ impl Sheet {
             self.detach_address_sub(*addr);
         }
 
-        // Spill-derived atoms read their anchor atom, so destroy the
-        // derived targets first — otherwise the anchor's guarded
-        // `has_dependents` check below would see them and leak the
-        // anchor (same leak-don't-panic posture as `clear_spill`).
-        let spill_target_addrs: Vec<CellAddress> = self
-            .spill_targets
-            .values()
-            .flat_map(|targets| targets.iter().copied())
-            .collect();
+        // Retire every old cell atom as one graph. Spill targets are included
+        // in `cells`; fixed-point destruction below naturally removes those
+        // derived targets before their anchors.
         self.spill_targets.clear();
         self.spill_target_anchor.clear();
         self.spill_anchor_addr.clear();
-        for addr in spill_target_addrs {
-            self.drop_cell_slot(addr);
-        }
-        // P4a borrow rule: drain into an owned Vec first — the loop body
-        // calls into the store, so no `cells` borrow may be live there.
         let drained = self.interior.cells.borrow_mut().drain_into_vec();
-        for (_, slot) in drained {
-            if let CellSlot::Atom(id) = slot {
-                if self.store.has_atom(id) && !self.store.has_dependents(id) {
-                    self.owned_destroy_atom(id);
-                }
-            }
-        }
+        let retired_atom_ids: Vec<AtomId> = drained
+            .into_iter()
+            .filter_map(|(_, slot)| slot.atom_id())
+            .collect();
 
         // Hydrated formula state — wholesale clears (full replace).
         *self.interior.formula_cells.borrow_mut() = RowMajorMap::new();
         self.interior.formula_exprs.borrow_mut().clear();
         self.interior.formula_texts.borrow_mut().clear();
-        self.cell_dependents.get_mut().clear();
-        self.range_dependents.get_mut().clear();
         // Lazy parking from any previous bulk load.
         *self.interior.formula_source.borrow_mut() = RowMajorMap::new();
         self.interior.needs_parse.borrow_mut().clear();
+
+        // With storage empty, peel every old-world AtomFamily component that
+        // Store proves is unobserved. A facade retained by an external Store
+        // reader stays alive and is retargeted to the new storage below.
+        self.prune_all_family_atoms();
 
         // --- Primitive install ---------------------------------------------
         // AUDIT B-2 (FIXED): park raw values as `CellSlot::Plain` — zero
@@ -2210,15 +2676,42 @@ impl Sheet {
         // --- Formula parking (lazy — Phase 2+3 machinery) ------------------
         let formulas_installed = formulas.len();
         let mut needs: HashSet<CellAddress> = HashSet::with_capacity(formulas_installed);
-        let mut formula_pairs: Vec<(CellAddress, Rc<str>)> = Vec::with_capacity(formulas_installed);
+        let mut formula_pairs: Vec<(CellAddress, ParkedFormula)> =
+            Vec::with_capacity(formulas_installed);
         for (addr, text) in formulas {
             needs.insert(addr);
-            formula_pairs.push((addr, Rc::<str>::from(text)));
+            formula_pairs.push((addr, ParkedFormula::new(text)));
         }
-        *self.interior.formula_source.borrow_mut() = RowMajorMap::from_unsorted_pairs(formula_pairs);
+        *self.interior.formula_source.borrow_mut() =
+            RowMajorMap::from_unsorted_pairs(formula_pairs);
         *self.interior.needs_parse.borrow_mut() = needs;
         self.imported_formula_count
             .set(self.imported_formula_count.get() + formulas_installed);
+
+        // Only externally-observed family nodes can have survived the old-world
+        // prune. Retarget those through their existing Store epochs now that
+        // final storage is installed; untouched payload remains fully lazy.
+        let surviving_inner_addrs: Vec<CellAddress> = self
+            .formula_inner_family
+            .borrow()
+            .iter()
+            .map(|(addr, _)| *addr)
+            .collect();
+        let surviving_epoch_addrs: Vec<CellAddress> = self
+            .slot_epoch_family
+            .borrow()
+            .iter()
+            .map(|(addr, _)| *addr)
+            .collect();
+        self.store_batch(|sheet| {
+            for addr in surviving_inner_addrs {
+                sheet.invalidate_formula_inner(addr);
+            }
+            for addr in surviving_epoch_addrs {
+                sheet.bump_facade_epoch(addr);
+            }
+        });
+        self.prune_all_family_atoms();
 
         // --- Reattach + notify subscribers ---------------------------------
         // Every subscribed address is notified exactly once: a full-sheet
@@ -2231,121 +2724,19 @@ impl Sheet {
             }
         }
 
-        (primitives_installed, formulas_installed)
+        (
+            primitives_installed,
+            formulas_installed,
+            BulkInstallCleanup { retired_atom_ids },
+        )
     }
 
-    /// Collect every formula address that depends on a write to `addr`,
-    /// merging point-cell dependents from `cell_dependents` with any
-    /// range dependents whose range contains `addr`. Pulled into a helper
-    /// so both the per-write BFS (`mark_dependents_dirty`) and the
-    /// bulk-load `flush` walk use the same union.
-    ///
-    /// The range half walks only the bucket-narrowed candidate set from
-    /// `RangeDependentIndex::candidates_for` plus the small wide-range
-    /// fallback — O(matches + wide_count) per call, not the Phase 1
-    /// O(range_count) scan.
-    ///
-    /// Append every formula address that depends on `addr` into the
-    /// caller-supplied `Vec` (BFS worklist style). Duplicates are
-    /// possible when point-cell deps and range deps both list the
-    /// same formula, or when multiple matching ranges share
-    /// dependents — callers dedup downstream via the BFS `dirty` /
-    /// `notified` set, which is cheaper than allocating a fresh
-    /// `HashSet` per call.
-    ///
-    /// Used by `BulkLoader::flush` and `Sheet::mark_dependents_dirty`
-    /// to keep the dependents traversal at O(1) `HashSet` allocations
-    /// across the entire walk instead of one per visited cell. At
-    /// 500k touched cells the per-call allocation was 82-91% of
-    /// `bulk_import` wall time before this refactor (see
-    /// `vanilla/excel-core-ts/docs/PERF_BULK_IMPORT.md`).
-    fn dependents_of_into(&self, addr: CellAddress, out: &mut Vec<CellAddress>) {
-        let mut scratch: Vec<CellRange> = Vec::new();
-        self.dependents_of_into_with_scratch(addr, out, &mut scratch);
-    }
-
-    /// Allocation-amortizing variant of [`dependents_of_into`] for hot
-    /// BFS loops. The caller supplies a reusable `scratch` `Vec` for
-    /// the candidate-range list returned by
-    /// `RangeDependentIndex::candidates_for_into`; the same buffer is
-    /// drained and refilled for every visited address. At the 100k+
-    /// touched-cell tier the per-call `Vec::new` was a measurable
-    /// share of bulk-import `flush` cost.
-    fn dependents_of_into_with_scratch(
-        &self,
-        addr: CellAddress,
-        out: &mut Vec<CellAddress>,
-        scratch: &mut Vec<CellRange>,
-    ) {
-        if let Some(set) = self.cell_dependents.borrow().get(&addr) {
-            out.extend(set.iter().copied());
-        }
-        let range_dependents = self.range_dependents.borrow();
-        scratch.clear();
-        range_dependents.candidates_for_into(addr, scratch);
-        for range in scratch.iter() {
-            if range.contains(addr) {
-                if let Some(formulas) = range_dependents.formulas_for(range) {
-                    out.extend(formulas.iter().copied());
-                }
-            }
-        }
-    }
-
-    /// Workbook-facing helper: flip the formula cache for `addr` to
-    /// `Dirty` *without* triggering eval. Same internal operation as the
-    /// dirty step inside `mark_dependents_dirty`, exposed so the
-    /// workbook-level cross-sheet propagation (Phase 3 Track I) can mark
-    /// a specific cross-sheet formula stale after a source-sheet write.
-    ///
-    /// No-op when `addr` is not a formula cell on this sheet (the cross-
-    /// sheet reverse index occasionally races formula removal — a
-    /// dangling `(sheet, addr)` entry pointing at a cleared cell just
-    /// becomes a cheap miss instead of a panic).
-    ///
-    /// Intentionally does NOT walk same-sheet dependents — the Sheet's
-    /// own `set_cell` path already did that. This helper is purely the
-    /// "mark this one formula dirty" primitive.
-    pub fn mark_dirty_for_addr(&self, addr: CellAddress) {
-        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-            *record.cache.borrow_mut() = FormulaCache::Dirty;
-        }
-    }
-
-    /// Workbook-facing helper: synchronously fire every listener in
-    /// `cell_subscriptions[addr]`. Companion to `mark_dirty_for_addr` —
-    /// the workbook BFS calls `mark_dirty_for_addr` followed by
-    /// `fire_subscribers` so cross-sheet formula listeners see the same
-    /// "value may have changed" signal that a same-sheet write would
-    /// produce via `notify_address_subscribers` from `set_cell`.
-    ///
-    /// No-op when the address has no subscription bucket or no listeners
-    /// — the bucket map is sparse (only `subscribe_cell` populates it).
-    pub fn fire_subscribers(&self, addr: CellAddress) {
-        if self.has_address_subscribers(addr) {
-            self.notify_address_subscribers(addr);
-        }
-    }
-
-    fn mark_dependents_dirty(&self, root: CellAddress) -> HashSet<CellAddress> {
-        let mut notified = HashSet::new();
-        let mut stack: Vec<CellAddress> = Vec::new();
-        self.dependents_of_into(root, &mut stack);
-
-        while let Some(addr) = stack.pop() {
-            if !notified.insert(addr) {
-                continue;
-            }
-            self.dirty_visit_count.set(self.dirty_visit_count.get() + 1);
-            if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                *record.cache.borrow_mut() = FormulaCache::Dirty;
-            }
-            self.notify_address_subscribers(addr);
-
-            self.dependents_of_into(addr, &mut stack);
-        }
-
-        notified
+    /// Finish a full-sheet replacement after the enclosing Store transaction
+    /// has published and refreshed every dependent formula.
+    pub(crate) fn finish_bulk_install(&self, cleanup: BulkInstallCleanup) {
+        self.prune_all_family_atoms();
+        self.destroy_retired_atoms(cleanup.retired_atom_ids);
+        self.prune_all_family_atoms();
     }
 
     // === Spill (dynamic-array) infrastructure ===
@@ -2496,15 +2887,15 @@ impl Sheet {
                 // If there was a stale primitive at this address (e.g.
                 // empty `Value::Null` placeholder created by a previous
                 // subscribe), remove it first so we don't leak an atom.
+                let pre_range_member = self.range_member_present(target);
                 self.drop_cell_slot(target);
                 self.interior
                     .cells
                     .borrow_mut()
                     .insert(target, CellSlot::Atom(derived));
-                // Re-attach subscription bucket (if any) so address-level
-                // listeners see updates from the new derived atom.
                 self.attach_address_sub(target);
-                self.mark_dependents_dirty(target);
+                self.bump_facade_epoch(target);
+                self.bump_range_epochs_if_membership_changed(target, pre_range_member);
             }
         }
 
@@ -2580,15 +2971,16 @@ impl Sheet {
             self.detach_address_sub(target);
             // Spilled cells are read-only derived atoms with (typically)
             // no further atom-level dependents. Formula cells that
-            // referenced this address read via the Sheet-level peek path;
-            // the dep graph there is in `cell_dependents`, not in the
-            // store's back_deps. So destroy is safe. If something did
-            // register a downstream derived atom (no API for that today),
+            // referenced this address read through facade atoms, so destroy
+            // is safe. If something did register
+            // a downstream derived atom (no API for that today),
             // `drop_cell_slot` leaks the spilled derived atom rather than
             // panic — acknowledged as a Phase 1 limitation.
+            let pre_range_member = self.range_member_present(target);
             self.drop_cell_slot(target);
             self.attach_address_sub(target);
-            self.mark_dependents_dirty(target);
+            self.bump_facade_epoch(target);
+            self.bump_range_epochs_if_membership_changed(target, pre_range_member);
         }
     }
 
@@ -2619,12 +3011,10 @@ impl Sheet {
     /// formula's array result, so spilled derived atoms have a
     /// dependency-tracked source to read.
     ///
-    /// On spill collision the anchor primitive atom is set to
-    /// `Value::Error(Spill)` (sheet-level read of `addr` still goes
-    /// through the formula cache and surfaces the Array — but the
-    /// returned `Err(Spill)` signals the caller that they should NOT
-    /// trust the Array result; the eager re-eval path overwrites the
-    /// formula cache with `#SPILL!` to keep Sheet-level reads honest).
+    /// On spill collision the caller replaces the anchor projection with
+    /// `Value::Error(Spill)`. The formula facade reads formula-inner first,
+    /// then this anchor atom, so Store propagation surfaces `#SPILL!` without
+    /// making the compatibility cache authoritative for same-sheet formulas.
     ///
     /// Returns `Ok(())` on clean install or `Err(ValueError::Spill)` on
     /// collision. Other variants propagate from `register_spill`.
@@ -2643,13 +3033,12 @@ impl Sheet {
         self.register_spill(addr, anchor_atom, &arr)
     }
 
-    /// Eager re-eval + spill maintenance for a single formula cell.
-    /// Forces a recompute (bypassing the cache), then:
+    /// Store-backed spill projection refresh for a single formula cell.
+    /// Reads the already-invalidated formula-inner value, then:
     ///   - if the new result is `Value::Array` → install / refresh the
     ///     spill anchor and derived targets via `install_formula_spill`.
-    ///     On collision, the formula cache is overwritten with
-    ///     `Value::Error(Spill)` so subsequent reads at `addr` surface
-    ///     `#SPILL!`.
+    ///     On collision, the anchor Store atom becomes
+    ///     `Value::Error(Spill)` so the formula facade surfaces `#SPILL!`.
     ///   - if the new result is not an array → tear down any existing
     ///     spill at `addr` (the formula previously produced an array).
     ///
@@ -2681,27 +3070,18 @@ impl Sheet {
 
         // Gate the eager re-eval: only formulas that *might* produce a
         // `Value::Array` get this treatment. Scalar-only formulas stay
-        // fully lazy (preserves the lazy-eval debug counters and the
-        // existing dirty-count invariants).
+        // fully lazy (preserves the compatibility lazy-eval/debug counters).
         if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
             return;
         }
 
-        // Mark dirty so eval_formula_at_with_provider re-runs (it bails
-        // early on `FormulaCache::Clean`).
-        *record.cache.borrow_mut() = FormulaCache::Dirty;
-
-        // Build a borrowing provider mirroring `peek_value`. We can't
-        // call `peek_value_with_provider` directly because it takes
-        // `&self`; we need `&mut self` after the eval to mutate the
-        // spill state. The pattern: scope the immutable borrow inside
-        // a block, extract the resulting value, then take &mut self.
+        // The mutation that selected this formula already invalidated its
+        // Store dependency chain. Read that one authoritative derived value;
+        // do not create a second invalidation/evaluation path for spill
+        // projection.
         let value = {
-            let provider = SheetEvalProvider {
-                sheet: &*self,
-                current_cell: Cell::new(None),
-            };
-            self.eval_formula_at_with_provider(addr, &provider)
+            let inner = self.facade_ctx().formula_inner_of(addr);
+            self.store.get(inner)
         };
 
         match value {
@@ -2712,13 +3092,9 @@ impl Sheet {
                 match self.install_formula_spill(addr, arr) {
                     Ok(()) => {}
                     Err(ValueError::Spill) => {
-                        // Overwrite the formula cache with #SPILL! so
-                        // Sheet-level reads surface the error. The
-                        // anchor primitive atom is already set to
-                        // Value::Error(Spill) by install_formula_spill's
-                        // error path? No — install_formula_spill leaves
-                        // the atom holding Value::Array on collision.
-                        // Fix that here:
+                        // Replace the anchor projection with #SPILL!. The
+                        // facade already depends on formula-inner and will now
+                        // also observe this Store atom.
                         // P4a borrow rule: copy the atom id out before the
                         // `store.set` (which dispatches listeners).
                         let atom_id = self
@@ -2730,10 +3106,7 @@ impl Sheet {
                         if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(ValueError::Spill));
                         }
-                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                            *record.cache.borrow_mut() =
-                                FormulaCache::Clean(Value::Error(ValueError::Spill));
-                        }
+                        self.bump_facade_epoch(addr);
                     }
                     Err(other) => {
                         // P4a borrow rule: copy the atom id out before the
@@ -2747,42 +3120,31 @@ impl Sheet {
                         if let Some(atom_id) = atom_id {
                             self.store.set(atom_id, Value::Error(other.clone()));
                         }
-                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                            *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
-                        }
+                        self.bump_facade_epoch(addr);
                     }
                 }
-                self.mark_dependents_dirty(addr);
             }
             _ => {
                 // Formula no longer produces an array — tear down any
                 // prior spill. If the cells[addr] primitive atom was the
-                // spill anchor, drop it so future reads go cleanly
-                // through the formula cache.
+                // spill anchor, drop it so future reads resolve directly
+                // through formula-inner again.
                 if prev_anchor_atom.is_some() {
                     self.clear_spill_at_address(addr);
                     self.drop_cell_slot(addr);
-                    // Re-attach the address subscription bucket to
-                    // whatever the cell is now (formula-only).
                     self.attach_address_sub(addr);
-                    self.mark_dependents_dirty(addr);
+                    self.bump_facade_epoch(addr);
                 }
             }
         }
     }
 
-    /// Walk every dirty formula reachable from `root` and re-evaluate
-    /// it; for ones that produce / used to produce a `Value::Array`,
-    /// (re)install or tear down the spill via
-    /// `recompute_array_formula`. Called from the mutation paths after
-    /// `mark_dependents_dirty` so dependency changes propagate into the
-    /// spill state synchronously (the `&self` lazy-read path can't
-    /// install spills).
-    ///
-    /// Scope: addresses in `dependents`, plus `root` itself if it has a
-    /// formula record (the initial-install path also calls this to
-    /// catch the just-installed formula at `root`).
-    fn recompute_array_formulas_in(&mut self, addrs: &HashSet<CellAddress>) {
+    /// Re-project formulas selected through Store reverse dependencies that
+    /// produce, or previously produced, a `Value::Array`. This maintains
+    /// spill geometry synchronously because the `&self` read path cannot
+    /// mutate it. Formula values still come exclusively from formula-inner;
+    /// this method owns no result cache or invalidation graph.
+    pub(crate) fn recompute_array_formulas_in(&mut self, addrs: &HashSet<CellAddress>) {
         // Collect addresses to process — clone the addresses to avoid
         // borrowing self while we mutate.
         //
@@ -2802,104 +3164,6 @@ impl Sheet {
             .collect();
         for a in candidates {
             self.recompute_array_formula(a);
-        }
-    }
-
-    /// Apply a workbook-aware re-eval result to the spill state at
-    /// `addr`. Mirrors the array-vs-scalar arms inside
-    /// `recompute_array_formula` but takes the already-computed
-    /// `Value` rather than running its own eval. Used by
-    /// `Workbook::set_formula` to install spills produced by formulas
-    /// that depend on workbook-scope features (defined names,
-    /// cross-sheet refs) — the legacy sheet-only eager recompute
-    /// inside `Sheet::set_formula` can't resolve those without a
-    /// `&Workbook` handle, so the workbook layer runs the eval through
-    /// its own provider and hands the result here.
-    ///
-    /// No-op when:
-    ///   - `addr` is not a formula cell (defensive),
-    ///   - the formula isn't an array-producing candidate AND wasn't
-    ///     previously a spill anchor (matches `recompute_array_formula`'s
-    ///     gating so we don't waste work on plain scalar formulas).
-    ///
-    /// `value` is also stamped into the formula cache so the next read
-    /// hits the workbook-aware result instead of recomputing through
-    /// the sheet-local provider (which would re-surface `#NAME?`).
-    pub(crate) fn apply_workbook_recomputed_value(&mut self, addr: CellAddress, value: Value) {
-        let prev_anchor_atom: Option<AtomId> = self
-            .interior
-            .cells
-            .borrow()
-            .get(&addr)
-            .and_then(|slot| slot.atom_id())
-            .filter(|id| self.spill_targets.contains_key(id));
-
-        // LAZY_FORMULA_INDEXING Phase 3: hydrate so the workbook-aware
-        // re-eval sees the parsed AST.
-        self.hydrate_formula(addr);
-        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
-            return;
-        };
-        if prev_anchor_atom.is_none() && !expr_may_produce_array(&record.expr) {
-            return;
-        }
-
-        let value = normalize_formula_cell_result(value);
-
-        // Stamp the workbook-aware value into the formula cache so
-        // subsequent reads bypass the sheet-local SheetEvalProvider
-        // path that would re-surface #NAME? for named-value references.
-        *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
-
-        match value {
-            Value::Array(arr) => {
-                self.clear_spill_at_address(addr);
-                match self.install_formula_spill(addr, arr) {
-                    Ok(()) => {}
-                    Err(ValueError::Spill) => {
-                        // P4a borrow rule: copy the atom id out before the
-                        // `store.set` (which dispatches listeners).
-                        let atom_id = self
-                            .interior
-                            .cells
-                            .borrow()
-                            .get(&addr)
-                            .and_then(|slot| slot.atom_id());
-                        if let Some(atom_id) = atom_id {
-                            self.store.set(atom_id, Value::Error(ValueError::Spill));
-                        }
-                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                            *record.cache.borrow_mut() =
-                                FormulaCache::Clean(Value::Error(ValueError::Spill));
-                        }
-                    }
-                    Err(other) => {
-                        // P4a borrow rule: copy the atom id out before the
-                        // `store.set` (which dispatches listeners).
-                        let atom_id = self
-                            .interior
-                            .cells
-                            .borrow()
-                            .get(&addr)
-                            .and_then(|slot| slot.atom_id());
-                        if let Some(atom_id) = atom_id {
-                            self.store.set(atom_id, Value::Error(other.clone()));
-                        }
-                        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                            *record.cache.borrow_mut() = FormulaCache::Clean(Value::Error(other));
-                        }
-                    }
-                }
-                self.mark_dependents_dirty(addr);
-            }
-            _ => {
-                if prev_anchor_atom.is_some() {
-                    self.clear_spill_at_address(addr);
-                    self.drop_cell_slot(addr);
-                    self.attach_address_sub(addr);
-                    self.mark_dependents_dirty(addr);
-                }
-            }
         }
     }
 
@@ -2924,54 +3188,65 @@ impl Sheet {
         if let Some(anchor) = self.spilled_into_anchor(addr) {
             return Err(SheetError::SpillCellWrite { anchor });
         }
-
-        // Tear down any spill the current cell already owns; we're
-        // replacing it.
-        self.clear_spill_at_address(addr);
-
-        // Drop any prior formula at the anchor — an array write is a
-        // primitive-style mutation that replaces formula state.
-        //
-        // LAZY_FORMULA_INDEXING Phase 3: an unhydrated formula still
-        // owns the address. Drain the source / needs_parse entries
-        // explicitly; the `formula_cells` map has no record to
-        // `remove_formula_record` for an unhydrated addr.
+        let pre_range_member = self.range_member_present(addr);
         let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
             || self.interior.needs_parse.borrow().contains(&addr);
+        let array_formulas_to_reproject =
+            self.store_dependent_array_formula_addrs_from_addrs(std::iter::once(addr));
+
+        self.store_batch(|sheet| {
+            // Tear down any spill the current cell already owns; we're
+            // replacing it.
+            sheet.clear_spill_at_address(addr);
+
+            // Drop any prior formula at the anchor — an array write is a
+            // primitive-style mutation that replaces formula state.
+            //
+            // LAZY_FORMULA_INDEXING Phase 3: an unhydrated formula still
+            // owns the address. Drain the source / needs_parse entries
+            // explicitly; the `formula_cells` map has no record to
+            // `remove_formula_record` for an unhydrated addr.
+            if had_formula {
+                sheet.with_remap(addr, |sheet| {
+                    sheet.remove_formula_record(addr);
+                    sheet.interior.formula_source.borrow_mut().remove(&addr);
+                    sheet.interior.needs_parse.borrow_mut().remove(&addr);
+                    let _ = sheet.ensure_cell(addr);
+                });
+            }
+
+            let anchor_atom = sheet.ensure_cell(addr);
+            sheet.attach_address_sub(addr);
+
+            // Write the array to the anchor.
+            sheet.store.set(anchor_atom, Value::Array(arr.clone()));
+
+            // Try to install spill targets. On collision, overwrite the
+            // anchor with `#SPILL!` so the user sees the error at the
+            // anchor cell (Excel parity).
+            match sheet.register_spill(addr, anchor_atom, &arr) {
+                Ok(()) => {}
+                Err(ValueError::Spill) => {
+                    sheet
+                        .store
+                        .set(anchor_atom, Value::Error(ValueError::Spill));
+                }
+                Err(other) => {
+                    // register_spill currently only returns Spill, but
+                    // future variants would surface here defensively.
+                    sheet.store.set(anchor_atom, Value::Error(other));
+                }
+            }
+            sheet.bump_range_epochs_if_membership_changed(addr, pre_range_member);
+            // P4c: drive any materialized facade at the anchor to re-read the new
+            // array (identity/value change on the anchor's inner atom). Spill
+            // TARGET epoch wiring is deferred to P5. Inert until the read口 flip.
+            sheet.bump_facade_epoch(addr);
+        });
         if had_formula {
-            self.with_remap(addr, |sheet| {
-                sheet.remove_formula_record(addr);
-                sheet.interior.formula_source.borrow_mut().remove(&addr);
-                sheet.interior.needs_parse.borrow_mut().remove(&addr);
-                let _ = sheet.ensure_cell(addr);
-            });
+            self.cleanup_obsolete_formula_atoms_at(addr);
         }
-
-        let anchor_atom = self.ensure_cell(addr);
-        self.attach_address_sub(addr);
-
-        // Write the array to the anchor.
-        self.store.set(anchor_atom, Value::Array(arr.clone()));
-
-        // Try to install spill targets. On collision, overwrite the
-        // anchor with `#SPILL!` so the user sees the error at the
-        // anchor cell (Excel parity).
-        match self.register_spill(addr, anchor_atom, &arr) {
-            Ok(()) => {}
-            Err(ValueError::Spill) => {
-                self.store.set(anchor_atom, Value::Error(ValueError::Spill));
-            }
-            Err(other) => {
-                // register_spill currently only returns Spill, but
-                // future variants would surface here defensively.
-                self.store.set(anchor_atom, Value::Error(other));
-            }
-        }
-        self.mark_dependents_dirty(addr);
-        // P4c: drive any materialized facade at the anchor to re-read the new
-        // array (identity/value change on the anchor's inner atom). Spill
-        // TARGET epoch wiring is deferred to P5. Inert until the read口 flip.
-        self.bump_facade_epoch(addr);
+        self.recompute_array_formulas_in(&array_formulas_to_reproject);
         Ok(())
     }
 
@@ -3000,11 +3275,7 @@ impl Sheet {
         if let Some(anchor) = self.spilled_into_anchor(addr) {
             return Err(SheetError::SpillCellWrite { anchor });
         }
-        // If this address was itself a spill anchor, the new write
-        // replaces the array — tear the spill down first so we don't
-        // strand the derived atoms at the old targets.
-        self.clear_spill_at_address(addr);
-
+        let pre_range_member = self.range_member_present(addr);
         // LAZY_FORMULA_INDEXING Phase 3: include unhydrated lazy
         // formulas. `remove_formula_record` already drains the lazy
         // entries defensively.
@@ -3014,47 +3285,79 @@ impl Sheet {
         // P4c: sample the inner-atom identity BEFORE the write so we can bump
         // the facade epoch only on an identity transition (see below).
         let pre_atom = self.slot_atom_id(addr);
-
-        if had_formula {
-            self.with_remap(addr, |sheet| {
-                sheet.remove_formula_record(addr);
-                sheet.interior.formula_source.borrow_mut().remove(&addr);
-                sheet.interior.needs_parse.borrow_mut().remove(&addr);
-                let id = sheet.ensure_cell(addr);
-                sheet.store.set(id, value);
-            });
-            // 3.10 — formula→primitive→Null with no surviving dependents leaks
-            // the freshly ensured primitive scaffold. The with_remap tail has
-            // already reattached the fanout; try_release_primitive will
-            // detach it again so the bucket goes back to "subscribed but no
-            // materialized atom" — symmetrical with subscribing to an empty
-            // cell before any write.
-            if is_null {
-                self.try_release_primitive(addr);
-            }
+        let same_display_value = if had_formula {
+            // Formula replacement only needs the old displayed value for a
+            // direct listener's same-value notification. Avoid hydrating an
+            // otherwise cold formula solely for this comparison.
+            self.has_address_subscribers(addr) && self.peek_value(addr) == value
         } else {
-            let id = self.ensure_cell(addr);
-            self.attach_address_sub(addr);
-            self.store.set(id, value);
-            // 3.10 — drop the primitive when a non-formula cell is cleared
-            // back to Null with no live dependents. Listener bucket stays.
-            if is_null {
-                self.try_release_primitive(addr);
+            self.cell_value_at(addr).unwrap_or(Value::Null) == value
+        };
+        let dependent_formulas =
+            self.store_dependent_formula_addrs_from_addrs(std::iter::once(addr));
+        let array_formulas_to_reproject: HashSet<CellAddress> = dependent_formulas
+            .iter()
+            .copied()
+            .filter(|formula_addr| self.formula_needs_spill_maintenance(*formula_addr))
+            .collect();
+
+        self.store_batch(|sheet| {
+            // If this address was itself a spill anchor, the new write
+            // replaces the array — tear the spill down first so we don't
+            // strand the derived atoms at the old targets.
+            sheet.clear_spill_at_address(addr);
+
+            if had_formula {
+                sheet.with_remap(addr, |sheet| {
+                    sheet.remove_formula_record(addr);
+                    sheet.interior.formula_source.borrow_mut().remove(&addr);
+                    sheet.interior.needs_parse.borrow_mut().remove(&addr);
+                    let id = sheet.ensure_cell(addr);
+                    sheet.store.set(id, value);
+                });
+            } else {
+                let id = sheet.ensure_cell(addr);
+                sheet.attach_address_sub(addr);
+                sheet.store.set(id, value);
+            }
+            // P4c: a same-id literal value update propagates via the facade's
+            // native `args.get(inner)` edge (the `store.set(id, ..)` above is
+            // part of this write batch) — no bump. Bump only on an identity
+            // transition: a formula→literal replacement (`had_formula`) or a
+            // Plain/Absent→Atom / Atom→None slot change (`pre_atom !=
+            // post_atom`, the latter when `try_release_primitive` tore the slot
+            // down).
+            let post_atom = sheet.slot_atom_id(addr);
+            if had_formula || pre_atom != post_atom {
+                sheet.invalidate_formula_inner(addr);
+                sheet.bump_facade_epoch(addr);
+            }
+            sheet.bump_range_epochs_if_membership_changed(addr, pre_range_member);
+        });
+        // Run primitive release after the write batch has settled. A subscribed
+        // address has a stable facade edge to the primitive during the batch;
+        // the release helper retargets that facade to Absent before destroying
+        // the old backing atom.
+        if is_null {
+            self.try_release_primitive(addr);
+        }
+        if had_formula {
+            self.cleanup_obsolete_formula_atoms_at(addr);
+        }
+        // Eager spill maintenance for downstream array formulas.
+        self.recompute_array_formulas_in(&array_formulas_to_reproject);
+
+        if !had_formula && same_display_value {
+            for formula_addr in dependent_formulas {
+                if formula_addr != addr && self.has_address_subscribers(formula_addr) {
+                    self.notify_address_subscribers(formula_addr);
+                }
             }
         }
-        // P4c: a same-id literal value update propagates via the facade's
-        // native `args.get(inner)` edge (the `store.set(id, ..)` above already
-        // flushed it) — no bump. Bump only on an identity transition: a
-        // formula→literal replacement (`had_formula`) or a Plain/Absent→Atom
-        // / Atom→None slot change (`pre_atom != post_atom`, the latter when
-        // `try_release_primitive` tore the slot down).
-        let post_atom = self.slot_atom_id(addr);
-        if had_formula || pre_atom != post_atom {
-            self.bump_facade_epoch(addr);
+
+        if had_formula && same_display_value && self.has_address_subscribers(addr) {
+            self.notify_address_subscribers(addr);
         }
-        let dirtied = self.mark_dependents_dirty(addr);
-        // Eager spill maintenance for downstream array formulas.
-        self.recompute_array_formulas_in(&dirtied);
         Ok(())
     }
 
@@ -3080,15 +3383,13 @@ impl Sheet {
     }
 
     /// 3.10 — release the primitive cell atom for `addr` when it is Null and
-    /// has no live dependents. Used by `clear_cell` / `set_cell(.., Null)` to
-    /// keep `cells.len()` bounded across long-running sheets where many cells
-    /// get set then cleared. Skips formula cells and skips any primitive
-    /// that still has core dependents (would panic `Store::destroy_atom`).
+    /// has no direct dependents other than the address's stable facade. Used
+    /// by `clear_cell` / `set_cell(.., Null)` to keep `cells.len()` bounded
+    /// across long-running sheets where many cells get set then cleared.
     ///
-    /// Address listener buckets stay alive — only the underlying `store.sub`
-    /// is detached. The next `set_cell` on this address will re-create a
-    /// fresh primitive and reattach the fanout via the existing
-    /// `attach_address_sub` flow, firing the listener as part of that write.
+    /// When a facade exists, removing the slot and bumping its epoch first
+    /// makes Store re-derive it as Absent. That atomically severs the old
+    /// primitive edge while preserving facade identity and address listeners.
     fn try_release_primitive(&mut self, addr: CellAddress) {
         // P4a borrow rule: classify the slot under a short borrow
         // (`Ok(atom_id)` for materialized slots, `Err(plain_is_null)`
@@ -3126,9 +3427,6 @@ impl Sheet {
             }
             Ok(id) => id,
         };
-        if self.store.has_dependents(atom_id) {
-            return;
-        }
         if !self.store.has_atom(atom_id) {
             // Defensive: nothing to release.
             self.interior.cells.borrow_mut().remove(&addr);
@@ -3137,8 +3435,33 @@ impl Sheet {
         if !matches!(self.store.get(atom_id), Value::Null) {
             return;
         }
+
+        let facade_id = self.cell_facade_family.borrow().get(&addr);
+        if self
+            .store
+            .direct_dependents(atom_id)
+            .into_iter()
+            .any(|dependent| Some(dependent) != facade_id)
+        {
+            return;
+        }
+
         self.interior.cells.borrow_mut().remove(&addr);
-        self.detach_address_sub(addr);
+        if facade_id.is_some() {
+            self.bump_facade_epoch(addr);
+        }
+
+        // A facade-only edge must be gone after the epoch re-derivation. Keep
+        // the slot intact in the defensive case where a re-entrant listener
+        // installed a new direct dependent while the facade was settling.
+        if self.store.has_dependents(atom_id) {
+            self.interior
+                .cells
+                .borrow_mut()
+                .insert(addr, CellSlot::Atom(atom_id));
+            self.bump_facade_epoch(addr);
+            return;
+        }
         self.owned_destroy_atom(atom_id);
     }
 
@@ -3180,9 +3503,7 @@ impl Sheet {
         if let Some(anchor) = self.spilled_into_anchor(addr) {
             return Err(SheetError::SpillCellWrite { anchor });
         }
-        // Replacing the cell at this address: tear down any spill the
-        // previous content (if it was an anchor) installed.
-        self.clear_spill_at_address(addr);
+        let pre_range_member = self.range_member_present(addr);
 
         let expr = match parse_formula(formula_str) {
             Some(e) => e,
@@ -3192,48 +3513,63 @@ impl Sheet {
             }
         };
 
-        // Static cycle check (B.2). Walk the AST collecting referenced cells,
-        // then BFS through their formula_exprs to see if `addr` is reachable.
-        if self.would_create_cycle(addr, &expr) {
+        // Static cycle check (B.2). Walk referenced formula AST/source content
+        // on demand to see if `addr` is reachable; no reverse graph is kept.
+        if self.closes_local_cycle(addr, &expr) {
             self.write_error(addr, ValueError::CyclicRef);
             return Ok(false);
         }
+        let array_formulas_to_reproject =
+            self.store_dependent_array_formula_addrs_from_addrs(std::iter::once(addr));
 
-        self.with_remap(addr, move |sheet| {
-            let expr = Rc::new(expr);
-            let deps = Sheet::formula_deps_for(&expr);
-            let range_deps = collect_range_refs(&expr);
-            sheet.remove_formula_record(addr);
-            sheet.drop_cell_slot(addr);
-            // Wire dep indexes off `&deps` / `&range_deps` first, then
-            // move the originals into the record so we avoid two
-            // per-formula `HashSet::clone` allocations (mirrors the
-            // same optimization in `BulkLoader::set_formula`).
-            sheet.add_formula_deps(addr, &deps);
-            sheet.add_formula_range_deps(addr, &range_deps);
-            let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
-            sheet.note_cross_sheet_if_any(&expr);
-            sheet.interior.formula_cells.borrow_mut().insert(addr, record);
-            sheet.interior.formula_exprs.borrow_mut().insert(addr, expr);
-            sheet.interior.formula_texts.borrow_mut().insert(addr, formula_str.to_string());
+        self.store_batch(|sheet| {
+            // Replacing the cell at this address: tear down any spill the
+            // previous content (if it was an anchor) installed.
+            sheet.clear_spill_at_address(addr);
+
+            sheet.with_remap(addr, move |sheet| {
+                let expr = Rc::new(expr);
+                let deps = Sheet::formula_deps_for(&expr);
+                let static_ranges = collect_range_refs(&expr);
+                sheet.remove_formula_record(addr);
+                sheet.drop_cell_slot(addr);
+                sheet.bump_formula_topology_epoch();
+                let record = Rc::new(FormulaRecord::new(expr.clone(), deps, static_ranges));
+                sheet
+                    .interior
+                    .formula_cells
+                    .borrow_mut()
+                    .insert(addr, record);
+                sheet
+                    .interior
+                    .formula_exprs
+                    .borrow_mut()
+                    .insert(addr, expr.clone());
+                sheet
+                    .interior
+                    .formula_texts
+                    .borrow_mut()
+                    .insert(addr, formula_str.to_string());
+                sheet.materialize_formula_inner(addr);
+            });
+            // P4c: force the facade to re-derive off the NEW formula. A
+            // formula-content edit (`=B1`→`=C1`) whose upstream deps are unchanged
+            // leaves the inner atom's recorded edges fresh, so it would return the
+            // cached old-AST value — `invalidate_formula_inner` marks it stale and
+            // the epoch bump drives the facade to re-read (and thus re-run) it.
+            // literal→formula / absent→formula create the inner lazily on that
+            // re-derive; `invalidate_formula_inner` is a no-op there. Inert until
+            // the read口 flip.
+            sheet.invalidate_formula_inner(addr);
+            sheet.bump_facade_epoch(addr);
+            sheet.bump_range_epochs_if_membership_changed(addr, pre_range_member);
         });
-        // P4c: force the facade to re-derive off the NEW formula. A
-        // formula-content edit (`=B1`→`=C1`) whose upstream deps are unchanged
-        // leaves the inner atom's recorded edges fresh, so it would return the
-        // cached old-AST value — `invalidate_formula_inner` marks it stale and
-        // the epoch bump drives the facade to re-read (and thus re-run) it.
-        // literal→formula / absent→formula create the inner lazily on that
-        // re-derive; `invalidate_formula_inner` is a no-op there. Inert until
-        // the read口 flip.
-        self.invalidate_formula_inner(addr);
-        self.bump_facade_epoch(addr);
-        let dirtied = self.mark_dependents_dirty(addr);
         // Eager spill maintenance: re-evaluate the just-installed
         // formula (and any downstream array formulas) and install /
         // tear down spill state. The lazy `peek_value` read path can't
         // mutate the sheet, so the spill install has to happen here.
         self.recompute_array_formula(addr);
-        self.recompute_array_formulas_in(&dirtied);
+        self.recompute_array_formulas_in(&array_formulas_to_reproject);
         Ok(true)
     }
 
@@ -3242,6 +3578,7 @@ impl Sheet {
     /// detection failure (`#CYCLE!`) to the target cell without re-deriving
     /// the helper logic here.
     pub(crate) fn write_error(&mut self, addr: CellAddress, err: ValueError) {
+        let pre_range_member = self.range_member_present(addr);
         // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas count as
         // "had a formula" for the remap-vs-direct teardown decision.
         let had_formula = self.interior.formula_cells.borrow().contains_key(&addr)
@@ -3249,151 +3586,385 @@ impl Sheet {
         // P4c: sample inner-atom identity BEFORE the write, mirroring
         // try_set_cell — bump the facade only on an identity transition.
         let pre_atom = self.slot_atom_id(addr);
-        if had_formula {
-            self.with_remap(addr, |sheet| {
-                sheet.remove_formula_record(addr);
+        let array_formulas_to_reproject =
+            self.store_dependent_array_formula_addrs_from_addrs(std::iter::once(addr));
+        self.store_batch(|sheet| {
+            sheet.clear_spill_at_address(addr);
+            if had_formula {
+                sheet.with_remap(addr, |sheet| {
+                    sheet.remove_formula_record(addr);
+                    let id = sheet.ensure_cell(addr);
+                    sheet.store.set(id, Value::Error(err.clone()));
+                });
+            } else {
                 let id = sheet.ensure_cell(addr);
+                sheet.attach_address_sub(addr);
                 sheet.store.set(id, Value::Error(err));
-            });
-        } else {
-            let id = self.ensure_cell(addr);
-            self.attach_address_sub(addr);
-            self.store.set(id, Value::Error(err));
+            }
+            sheet.bump_range_epochs_if_membership_changed(addr, pre_range_member);
+            // P4c: after write_error the cell is no longer a formula — the facade
+            // re-derives `is_formula=false` and reads the literal error. Bump on a
+            // formula→error replacement (`had_formula`) or a slot identity change
+            // (`pre_atom != post_atom`).
+            let post_atom = sheet.slot_atom_id(addr);
+            if had_formula || pre_atom != post_atom {
+                sheet.invalidate_formula_inner(addr);
+                sheet.bump_facade_epoch(addr);
+            }
+        });
+        if had_formula {
+            self.cleanup_obsolete_formula_atoms_at(addr);
         }
-        self.mark_dependents_dirty(addr);
-        // P4c: after write_error the cell is no longer a formula — the facade
-        // re-derives `is_formula=false` and reads the literal error. Bump on a
-        // formula→error replacement (`had_formula`) or a slot identity change
-        // (`pre_atom != post_atom`). No `invalidate_formula_inner`: any stale
-        // formula inner is orphaned, never read again. Inert until the read口
-        // flip.
-        let post_atom = self.slot_atom_id(addr);
-        if had_formula || pre_atom != post_atom {
-            self.bump_facade_epoch(addr);
-        }
+        self.recompute_array_formulas_in(&array_formulas_to_reproject);
     }
 
-    /// Read-only access to `formula_exprs` for the workbook-level cycle
-    /// detector. `pub(crate)` because cross-sheet BFS in `Workbook::set_formula`
-    /// needs to walk per-sheet formula ASTs without owning the sheet's
-    /// internal state.
-    ///
-    /// LAZY_FORMULA_INDEXING Phase 3: returns a `Ref<...>` so callers
-    /// see the live `formula_exprs` snapshot through the new `RefCell`
-    /// wrapper. The returned guard is held for the duration of the
-    /// caller's borrow; callers that need to take additional mutable
-    /// borrows on the sheet must collect addresses first then drop the
-    /// guard before mutating (the existing workbook callers already do
-    /// this — they snapshot `.keys().copied().collect::<Vec<_>>()` up
-    /// front).
-    ///
-    /// LAZY_FORMULA_INDEXING Phase 3: this view does NOT include
-    /// unhydrated lazy formulas. Callers that need lazy entries (e.g.
-    /// cross-sheet AST walks) must hydrate first via
-    /// `hydrate_all_formulas` or accept that an unhydrated formula
-    /// won't show up in this iter. The cross-sheet workbook callers
-    /// today operate after `Sheet::set_formula` (eager parse, D1=4A)
-    /// or after the workbook bulk_load already hydrated through its
-    /// per-cell cycle pre-check — so they observe the parsed entries
-    /// they need.
-    pub(crate) fn formula_exprs_iter(&self) -> std::cell::Ref<'_, HashMap<CellAddress, Rc<Expr>>> {
-        self.interior.formula_exprs.borrow()
+    pub(crate) fn cycle_expr_for(&self, addr: CellAddress) -> Option<Rc<Expr>> {
+        if let Some(expr) = self.interior.formula_exprs.borrow().get(&addr).cloned() {
+            return Some(expr);
+        }
+        let source = self.interior.formula_source.borrow().get(&addr).cloned()?;
+        parse_formula(source.source.as_ref()).map(Rc::new)
     }
 
-    /// Codex P2 #1 fix: walk every parked lazy formula in this sheet,
-    /// invoking `f(addr, source)` once per entry. Used by
-    /// `Workbook::rebuild_cross_sheet_deps` to extract cross-sheet
-    /// edges from formulas that haven't been hydrated yet — without it,
-    /// a `move_sheet` after `bulk_load` would drop those edges and
-    /// downstream subscribers stop firing.
+    pub(crate) fn formula_addrs_in_range(&self, range: CellRange) -> HashSet<CellAddress> {
+        let range = range.normalize();
+        let formula_exprs = self.interior.formula_exprs.borrow();
+        let formula_source = self.interior.formula_source.borrow();
+        formula_exprs
+            .keys()
+            .copied()
+            .chain(formula_source.keys())
+            .filter(|addr| range.contains(*addr))
+            .collect()
+    }
+
+    /// Append formula addresses referenced by `expr` for the install-time
+    /// cycle walk. Ranges enqueue only formula cells, because literals cannot
+    /// continue a dependency path. Large and unbounded ranges scan the sparse
+    /// formula tables instead of expanding the coordinate space.
     ///
-    /// Source is exposed as `&str` (the underlying `Rc<str>` is held by
-    /// the per-cell `formula_source` map for the duration of the
-    /// callback). Callers parse the source themselves on demand; the
-    /// hot path (every formula already hydrated) pays zero cost.
-    pub(crate) fn for_each_lazy_formula(&self, mut f: impl FnMut(CellAddress, &str)) {
-        let source = self.interior.formula_source.borrow();
-        for (addr, src) in source.iter() {
-            f(addr, src.as_ref());
+    /// This is an on-demand AST/source walk, not a retained dependency index.
+    /// Store edges remain the runtime dependency truth; source inspection is
+    /// required here because a never-read formula intentionally has no Store
+    /// edges yet.
+    fn collect_cycle_refs(
+        &self,
+        expr: &Expr,
+        target: CellAddress,
+        out: &mut Vec<CellAddress>,
+        detect_unbounded_target: bool,
+    ) -> bool {
+        match expr {
+            Expr::CellRef(addr) => {
+                if *addr == target {
+                    return true;
+                }
+                out.push(*addr);
+            }
+            Expr::Range { start, end, .. } => {
+                let range = CellRange::new(*start, *end).normalize();
+                let is_unbounded = range.end.row == u32::MAX || range.end.col == u32::MAX;
+                if range.contains(target) && (detect_unbounded_target || !is_unbounded) {
+                    return true;
+                }
+
+                let formula_exprs = self.interior.formula_exprs.borrow();
+                let formula_source = self.interior.formula_source.borrow();
+                let formula_count = formula_exprs.len().saturating_add(formula_source.len());
+                let bounds = range_geometry_bounds(range);
+                let cell_count = range_cell_count_u64(range);
+
+                if cell_count <= formula_count as u64 {
+                    for row in bounds.start_row..=bounds.end_row {
+                        for col in bounds.start_col..=bounds.end_col {
+                            let addr = CellAddress::new(row, col);
+                            if formula_exprs.contains_key(&addr)
+                                || formula_source.contains_key(&addr)
+                            {
+                                out.push(addr);
+                            }
+                        }
+                    }
+                } else {
+                    out.extend(
+                        formula_exprs
+                            .keys()
+                            .copied()
+                            .chain(formula_source.keys())
+                            .filter(|addr| range.contains(*addr)),
+                    );
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                if self.collect_cycle_refs(left, target, out, detect_unbounded_target) {
+                    return true;
+                }
+                if self.collect_cycle_refs(right, target, out, detect_unbounded_target) {
+                    return true;
+                }
+            }
+            Expr::Negate(inner) | Expr::SpillRef(inner) => {
+                if self.collect_cycle_refs(inner, target, out, detect_unbounded_target) {
+                    return true;
+                }
+            }
+            Expr::FuncCall { args, .. } | Expr::MultiArea(args) => {
+                for arg in args {
+                    if self.collect_cycle_refs(arg, target, out, detect_unbounded_target) {
+                        return true;
+                    }
+                }
+            }
+            Expr::DynamicRange { start, end } => {
+                if self.collect_cycle_refs(start, target, out, detect_unbounded_target) {
+                    return true;
+                }
+                if self.collect_cycle_refs(end, target, out, detect_unbounded_target) {
+                    return true;
+                }
+            }
+            Expr::Call(callee, args) => {
+                if self.collect_cycle_refs(callee, target, out, detect_unbounded_target) {
+                    return true;
+                }
+                for arg in args {
+                    if self.collect_cycle_refs(arg, target, out, detect_unbounded_target) {
+                        return true;
+                    }
+                }
+            }
+            Expr::SheetRef { .. }
+            | Expr::SheetRange { .. }
+            | Expr::Number(_)
+            | Expr::Text(_)
+            | Expr::Bool(_)
+            | Expr::Error(_)
+            | Expr::Name(_)
+            | Expr::ArrayLit { .. } => {}
         }
+        false
     }
 
     /// Static cycle detection (B.2). Returns true iff installing `expr` at
     /// `target` would close a same-sheet dep cycle.
-    ///
-    /// Algorithm: a cycle is created exactly when one of `expr`'s referenced
-    /// cells already transitively depends on `target`. Equivalently, when
-    /// some `ref ∈ collect_refs(expr)` is reachable forward through the
-    /// reverse-dep map starting at `target`. We BFS through
-    /// `cell_dependents` (target → cells that depend on target → ...) and
-    /// short-circuit the moment we encounter any of the new formula's refs.
-    ///
-    /// Why this beats the previous forward walk: a chain `A2 = A1+1`,
-    /// `A3 = A2+1`, … installed in increasing order has an empty
-    /// `cell_dependents[An]` at install time (nothing yet depends on the
-    /// brand-new cell), so the check is O(1) per insert. The old forward
-    /// walk through `formula_exprs` from each new ref's expr was O(n)
-    /// per insert because the back-chain grew with each step — total
-    /// O(n²). See `chain_bulk_install_is_linear` for the regression
-    /// pin.
-    ///
-    /// Parity: `cell_dependents` is built off `formula_deps_for` /
-    /// `collect_refs`, which expand bounded ranges into point cells but
-    /// skip unbounded ranges (matches the old forward-walk parity — the
-    /// pre-existing path also did not chase through unbounded ranges and
-    /// relied on the runtime guard to surface cross-sheet / unbounded
-    /// cycles).
-    fn would_create_cycle(&self, target: CellAddress, expr: &Expr) -> bool {
-        let mut refs: Vec<CellAddress> = Vec::new();
-        collect_refs(expr, &mut refs);
-        if refs.is_empty() {
-            return false;
-        }
-        // Self-reference (target == one of its own refs) is the trivial
-        // cycle case; catch it before the BFS so we don't depend on the
-        // (possibly empty) `cell_dependents[target]` to surface it.
-        if refs.iter().any(|r| *r == target) {
+    fn closes_local_cycle(&self, target: CellAddress, expr: &Expr) -> bool {
+        let mut stack: Vec<CellAddress> = Vec::new();
+        // Keep the established direct whole-row/whole-column self-reference
+        // behavior: install the formula and let runtime evaluation surface the
+        // cycle. Once the walk follows another formula, an unbounded range
+        // containing `target` is a real install-time back-edge.
+        if self.collect_cycle_refs(expr, target, &mut stack, false) {
             return true;
         }
-        let refs_set: HashSet<CellAddress> = refs.into_iter().collect();
-
-        let dependents = self.cell_dependents.borrow();
-        let range_dependents = self.range_dependents.borrow();
         let mut seen: HashSet<CellAddress> = HashSet::new();
-        let mut to_visit: Vec<CellAddress> = Vec::new();
-        let mut range_scratch: Vec<CellRange> = Vec::new();
-        // Seed the BFS with both point-cell and range dependents of `target`.
-        // Range-only deps survive `replace_formula_deps` cleanup of empty
-        // points (e.g. =SUM(A1:A100) after read drops empty A_i from
-        // cell_dependents but keeps them in range_dependents), so omitting
-        // them lets `set_formula(empty_range_cell, "=ranged_formula")` slip
-        // through as a non-cycle and install circular eval state. Codex P1
-        // fix.
-        let mut seed = |addr: CellAddress, out: &mut Vec<CellAddress>| {
-            if let Some(set) = dependents.get(&addr) {
-                out.extend(set.iter().copied());
+        while let Some(addr) = stack.pop() {
+            if !seen.insert(addr) {
+                continue;
             }
-            range_scratch.clear();
-            range_dependents.candidates_for_into(addr, &mut range_scratch);
-            for range in range_scratch.iter() {
-                if range.contains(addr) {
-                    if let Some(formulas) = range_dependents.formulas_for(range) {
-                        out.extend(formulas.iter().copied());
+            if let Some(next) = self.cycle_expr_for(addr) {
+                if self.collect_cycle_refs(&next, target, &mut stack, true) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn has_direct_unbounded_target_ref(expr: &Expr, target: CellAddress) -> bool {
+        match expr {
+            Expr::Range { start, end, .. } => {
+                let range = CellRange::new(*start, *end).normalize();
+                (range.end.row == u32::MAX || range.end.col == u32::MAX) && range.contains(target)
+            }
+            Expr::BinOp { left, right, .. } => {
+                Self::has_direct_unbounded_target_ref(left, target)
+                    || Self::has_direct_unbounded_target_ref(right, target)
+            }
+            Expr::Negate(inner) | Expr::SpillRef(inner) => {
+                Self::has_direct_unbounded_target_ref(inner, target)
+            }
+            Expr::FuncCall { args, .. } | Expr::MultiArea(args) => args
+                .iter()
+                .any(|arg| Self::has_direct_unbounded_target_ref(arg, target)),
+            Expr::DynamicRange { start, end } => {
+                Self::has_direct_unbounded_target_ref(start, target)
+                    || Self::has_direct_unbounded_target_ref(end, target)
+            }
+            Expr::Call(callee, args) => {
+                Self::has_direct_unbounded_target_ref(callee, target)
+                    || args
+                        .iter()
+                        .any(|arg| Self::has_direct_unbounded_target_ref(arg, target))
+            }
+            Expr::CellRef(_)
+            | Expr::SheetRef { .. }
+            | Expr::SheetRange { .. }
+            | Expr::Number(_)
+            | Expr::Text(_)
+            | Expr::Bool(_)
+            | Expr::Error(_)
+            | Expr::Name(_)
+            | Expr::ArrayLit { .. } => false,
+        }
+    }
+
+    /// Static cycle check for a formula that was already present in parked
+    /// source topology. The temporary reachable graph lets one cold read
+    /// certify every reachable non-cyclic formula in O(V+E), while embedded
+    /// generation stamps make later reads cut at those formulas. No graph or
+    /// edge list survives this call.
+    fn closes_parked_local_cycle(
+        &self,
+        target: CellAddress,
+        expr: Rc<Expr>,
+        target_checked_at: u64,
+    ) -> StaticCycleCheckOutcome {
+        let epoch = self.formula_topology_epoch.get();
+        if target_checked_at == epoch {
+            return StaticCycleCheckOutcome {
+                closes_cycle: false,
+                target_certified: true,
+            };
+        }
+
+        let suppress_target_certificate =
+            Self::has_direct_unbounded_target_ref(expr.as_ref(), target);
+        let mut nodes = vec![StaticCycleNode {
+            addr: target,
+            expr,
+            edges: Vec::new(),
+        }];
+        let mut node_index: HashMap<CellAddress, usize> = HashMap::new();
+        node_index.insert(target, 0);
+
+        let mut cursor = 0;
+        while cursor < nodes.len() {
+            self.static_cycle_node_visit_count
+                .set(self.static_cycle_node_visit_count.get().saturating_add(1));
+            let node_expr = Rc::clone(&nodes[cursor].expr);
+            let mut refs = Vec::new();
+            if self.collect_cycle_refs(node_expr.as_ref(), target, &mut refs, cursor != 0) {
+                return StaticCycleCheckOutcome {
+                    closes_cycle: true,
+                    target_certified: false,
+                };
+            }
+
+            for addr in refs {
+                // The root's direct whole-row/whole-column self-reference is
+                // intentionally runtime-checked. Its parked entry was drained
+                // before this call, but keep this guard for defensive parity.
+                if addr == target {
+                    if cursor == 0 && suppress_target_certificate {
+                        continue;
+                    }
+                    return StaticCycleCheckOutcome {
+                        closes_cycle: true,
+                        target_certified: false,
+                    };
+                }
+                if self.formula_cycle_is_checked(addr, epoch) {
+                    continue;
+                }
+                let Some(next_expr) = self.cycle_expr_for(addr) else {
+                    continue;
+                };
+                let next_index = if let Some(index) = node_index.get(&addr).copied() {
+                    index
+                } else {
+                    let index = nodes.len();
+                    node_index.insert(addr, index);
+                    nodes.push(StaticCycleNode {
+                        addr,
+                        expr: next_expr,
+                        edges: Vec::new(),
+                    });
+                    index
+                };
+                nodes[cursor].edges.push(next_index);
+            }
+            cursor += 1;
+        }
+
+        // Iterative Kosaraju keeps deep spreadsheet chains off the Rust call
+        // stack. Both adjacency directions are temporary and released before
+        // hydration continues into Store evaluation.
+        let mut reverse = vec![Vec::new(); nodes.len()];
+        for (from, node) in nodes.iter().enumerate() {
+            for &to in &node.edges {
+                reverse[to].push(from);
+            }
+        }
+
+        let mut visited = vec![false; nodes.len()];
+        let mut finish_order = Vec::with_capacity(nodes.len());
+        for start in 0..nodes.len() {
+            if visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            let mut stack = vec![(start, 0usize)];
+            while let Some(&(node, next_edge)) = stack.last() {
+                if next_edge < nodes[node].edges.len() {
+                    let next = nodes[node].edges[next_edge];
+                    let last = stack.len() - 1;
+                    stack[last].1 += 1;
+                    if !visited[next] {
+                        visited[next] = true;
+                        stack.push((next, 0));
+                    }
+                } else {
+                    stack.pop();
+                    finish_order.push(node);
+                }
+            }
+        }
+
+        let mut assigned = vec![false; nodes.len()];
+        let mut cyclic = vec![false; nodes.len()];
+        for &start in finish_order.iter().rev() {
+            if assigned[start] {
+                continue;
+            }
+            assigned[start] = true;
+            let mut members = Vec::new();
+            let mut stack = vec![start];
+            while let Some(node) = stack.pop() {
+                members.push(node);
+                for &next in &reverse[node] {
+                    if !assigned[next] {
+                        assigned[next] = true;
+                        stack.push(next);
                     }
                 }
             }
-        };
-        seed(target, &mut to_visit);
-        while let Some(c) = to_visit.pop() {
-            if !seen.insert(c) {
-                continue;
+            let is_cycle = members.len() > 1
+                || nodes[members[0]]
+                    .edges
+                    .iter()
+                    .any(|&next| next == members[0]);
+            if is_cycle {
+                for member in members {
+                    cyclic[member] = true;
+                }
             }
-            if refs_set.contains(&c) {
-                return true;
-            }
-            seed(c, &mut to_visit);
         }
-        false
+
+        if cyclic[0] {
+            return StaticCycleCheckOutcome {
+                closes_cycle: true,
+                target_certified: false,
+            };
+        }
+        for index in 1..nodes.len() {
+            if !cyclic[index] {
+                self.mark_formula_cycle_checked(nodes[index].addr, epoch);
+            }
+        }
+        StaticCycleCheckOutcome {
+            closes_cycle: false,
+            target_certified: !suppress_target_certificate,
+        }
     }
 
     /// Get a cell's value by address string.
@@ -3401,7 +3972,13 @@ impl Sheet {
     /// Returns Null for cells that haven't been set.
     pub fn get_cell(&self, addr_str: &str) -> Value {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
-        self.peek_value(addr)
+        let value = self.peek_value(addr);
+        // A bare Store read intentionally parks newly-computed derived states
+        // in pending. Public engine reads are transaction boundaries: settle
+        // those states now so an unrelated later write does not inherit work
+        // proportional to every formula read since the previous mutation.
+        self.store.settle_pending_reads();
+        value
     }
 
     /// Read a cell's current value without creating any atoms. Returns
@@ -3512,6 +4089,9 @@ impl Sheet {
             let Some(value) = self.cell_value_at(addr) else {
                 continue;
             };
+            if matches!(value, Value::Null) {
+                continue;
+            }
             f(addr, value);
         }
         for addr in formula_addrs {
@@ -3523,7 +4103,7 @@ impl Sheet {
     pub(crate) fn peek_value_with_provider(
         &self,
         addr: CellAddress,
-        provider: &dyn EvalProvider,
+        _provider: &dyn EvalProvider,
     ) -> Value {
         // LAZY_FORMULA_INDEXING Phase 3: hydrate before the
         // `formula_cells` / `cells` branch decision so an unhydrated
@@ -3532,236 +4112,12 @@ impl Sheet {
         // primitive scaffold the bulk-load left behind). Hydration is
         // idempotent and `&self`-only via internal `RefCell`s.
         self.hydrate_formula(addr);
-        if self.interior.formula_cells.borrow().contains_key(&addr) {
-            return self.eval_formula_at_with_provider(addr, provider);
+        let formula = self.interior.formula_cells.borrow().get(&addr).cloned();
+        if formula.is_some() {
+            let facade = self.facade_of(addr);
+            return self.store.get(facade);
         }
         self.cell_value_at(addr).unwrap_or(Value::Null)
-    }
-
-    fn primitive_value_at(&self, addr: CellAddress) -> Value {
-        self.cell_value_at(addr).unwrap_or(Value::Null)
-    }
-
-    fn eval_formula_at_with_provider(
-        &self,
-        addr: CellAddress,
-        provider: &dyn EvalProvider,
-    ) -> Value {
-        // LAZY_FORMULA_INDEXING Phase 3: hydrate before the cache hit
-        // check. `peek_value_with_provider` already hydrated, but
-        // direct callers (e.g. `recompute_array_formula`) reach here
-        // without going through `peek_value_with_provider` first.
-        self.hydrate_formula(addr);
-        // Cheap early-out for cache hit (mirrors the original behavior).
-        // Done before `prewarm_formula_chain` so a Clean cache short-circuits
-        // before we allocate the work-stack.
-        let cached = self.interior.formula_cells.borrow().get(&addr).cloned();
-        if let Some(record) = cached {
-            match record.cache.borrow().clone() {
-                FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
-                FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
-                FormulaCache::Clean(_) | FormulaCache::Dirty => {}
-            }
-        } else {
-            return self.primitive_value_at(addr);
-        }
-
-        // Iteratively pre-evaluate every Dirty formula cell transitively
-        // reachable via point-cell deps — INCLUDING `addr` itself, which the
-        // post-order pass evaluates last once its dep chain is Clean. This
-        // converts a recursion that scales with chain depth into a heap-
-        // allocated work-stack that scales with chain depth on the heap,
-        // where it doesn't matter. Fixes a stack overflow on long linear
-        // chains (e.g. `A1=1; A2=A1+1; ... A1000=A999+1`) where the natural
-        // recursion depth scales with chain length and overflows the WASM
-        // stack (and even the native debug stack at ~1000 deep).
-        //
-        // Only same-sheet point-cell deps are pre-warmed: those are
-        // sufficient for chain-style workloads and avoid having to traverse
-        // range deps / cross-sheet edges in this same-sheet helper. Anything
-        // not pre-warmed (range cells, cross-sheet refs) falls back to the
-        // existing recursive descent — those paths produce shallow recursion
-        // in normal workloads.
-        //
-        // The pre-warm guarantees that by the time the post-order eval
-        // reaches `addr`, its same-sheet point-cell deps already have a
-        // Clean cache, so the inner `eval_expr_with_provider` returns
-        // without recursing back into `peek_value_with_provider`. Reading
-        // the cache afterwards yields the just-computed value (or, if
-        // `force_formula_recompute` is set and `compute_formula_at` was
-        // skipped by the inner provider, fall back to a single direct
-        // `compute_formula_at` call as the safety net).
-        self.prewarm_formula_chain(addr, provider);
-
-        // After prewarm, the cache should be Clean. Read it directly so we
-        // don't double-evaluate when `force_formula_recompute()` is true —
-        // the provider's recompute hint applies to deciding whether to
-        // recompute *new* dirty cells, not to revisiting a value we just
-        // computed inside the prewarm pass. If for any reason the prewarm
-        // left the cache in a non-Clean state (e.g. a primitive_value_at
-        // detour), fall back to compute_formula_at.
-        if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-            if let FormulaCache::Clean(value) = record.cache.borrow().clone() {
-                return value;
-            }
-        }
-        self.compute_formula_at(addr, provider)
-    }
-
-    /// Inner step that actually evaluates `addr`'s formula expression and
-    /// caches the result. Called by `eval_formula_at_with_provider` once the
-    /// dep chain has been pre-warmed, and by `prewarm_formula_chain` for each
-    /// dirty node visited in post-order. The Computing state is set/cleared
-    /// here so `FormulaCache::Computing` correctly traps both the recursive-
-    /// eval cycle case and the (already-impossible by static check) prewarm
-    /// cycle case.
-    fn compute_formula_at(&self, addr: CellAddress, provider: &dyn EvalProvider) -> Value {
-        // LAZY_FORMULA_INDEXING Phase 3: hydrate before consulting
-        // `formula_cells`. Callers that arrive here through the
-        // prewarm path may not have routed through
-        // `peek_value_with_provider`.
-        self.hydrate_formula(addr);
-        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
-            return self.primitive_value_at(addr);
-        };
-        match record.cache.borrow().clone() {
-            FormulaCache::Clean(value) if !provider.force_formula_recompute() => return value,
-            FormulaCache::Computing => return Value::Error(ValueError::CyclicRef),
-            FormulaCache::Clean(_) | FormulaCache::Dirty => {}
-        }
-
-        *record.cache.borrow_mut() = FormulaCache::Computing;
-        let deps = Rc::new(RefCell::new(HashSet::new()));
-        let tracking = TrackingEvalProvider {
-            inner: provider,
-            deps: deps.clone(),
-        };
-        // B1 — bump the cache-miss eval counter exactly once per real
-        // recompute. Sits before the eval call so a panic during eval still
-        // shows up in the counter (matches the intent: "evaluations
-        // attempted"). TODO: Agent A's refactor may relocate this when the
-        // typed-dep split lands; keep it boring until then.
-        self.formula_eval_count
-            .set(self.formula_eval_count.get() + 1);
-        // Push the formula's own address as the provider's current cell so
-        // `ROW()` / `COLUMN()` no-arg calls inside the formula resolve to
-        // this cell. Restore the previous value on the way out so nested
-        // formula evaluation (cell A's formula references cell B's formula)
-        // sees the right addr in each frame. Providers that don't track a
-        // current cell ignore both calls (default no-op impls).
-        let prev_current = provider.current_cell();
-        provider.set_current_cell(Some(addr));
-        let value = normalize_formula_cell_result(eval_expr_with_provider(&record.expr, &tracking));
-        provider.set_current_cell(prev_current);
-        *record.cache.borrow_mut() = FormulaCache::Clean(value.clone());
-        self.replace_formula_deps(addr, &record, deps.borrow().clone());
-        value
-    }
-
-    /// Iterative post-order DFS over the same-sheet point-cell dep graph
-    /// rooted at `start`. For each visited Dirty formula cell, evaluates it
-    /// once its children are Clean — converting a recursion that scales with
-    /// chain depth into a heap-allocated work-stack that scales with chain
-    /// depth on the heap, where it doesn't matter.
-    ///
-    /// Skips cells in `FormulaCache::Computing` (would be a cycle — let the
-    /// recursive eval surface `#CYCLE!` via the existing
-    /// `FormulaCache::Computing => CyclicRef` arm). Skips Clean cells (their
-    /// deps are already evaluated). Skips primitive cells (no eval needed).
-    /// Range deps are intentionally NOT traversed here — chain workloads use
-    /// point refs only, and walking ranges would require expanding sparse
-    /// cells while holding immutable borrows of `formula_cells`. The eval
-    /// pass that runs after this prewarm will still handle range deps
-    /// through `for_each_range_cell` exactly as before, just with bounded
-    /// recursion.
-    fn prewarm_formula_chain(&self, start: CellAddress, provider: &dyn EvalProvider) {
-        // Sentinel value for the visited-children flag on the work-stack:
-        // `false` = "enter this node, push its deps", `true` = "deps done,
-        // now eval this node". Standard iterative post-order pattern.
-        let mut stack: Vec<(CellAddress, bool)> = Vec::new();
-        stack.push((start, false));
-
-        while let Some((addr, ready_to_eval)) = stack.pop() {
-            // LAZY_FORMULA_INDEXING Phase 3: hydrate each prewarm
-            // candidate so an unhydrated lazy dep pulled in via
-            // `collect_prewarm_refs` participates in the chain pre-fill.
-            self.hydrate_formula(addr);
-            // Fetch the record. Skip primitives (they have no FormulaRecord).
-            let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
-                continue;
-            };
-
-            if ready_to_eval {
-                // Children pushed before us have already been popped and
-                // (if they were Dirty formulas) evaluated to Clean. Now
-                // compute this node.
-                self.compute_formula_at(addr, provider);
-                continue;
-            }
-
-            // First visit: decide whether to enqueue.
-            let cache_state = record.cache.borrow().clone();
-            match cache_state {
-                FormulaCache::Clean(_) if !provider.force_formula_recompute() => continue,
-                FormulaCache::Computing => continue,
-                FormulaCache::Clean(_) | FormulaCache::Dirty => {}
-            }
-
-            // Re-push self with ready_to_eval=true, then push each
-            // point-cell dep that points to a formula cell.
-            //
-            // We derive the dep set from a short-circuit-aware AST walk
-            // (`collect_prewarm_refs`) rather than `record.deps` or an
-            // unfiltered `collect_refs` traversal. Codex P2 finding:
-            // walking the raw AST descends into both `IF` branches, so
-            // `=IF(TRUE, 0, B1)` would pre-warm B1 even though IF never
-            // takes the else branch. That regresses lazy-branch
-            // semantics — volatile functions, custom formulas with
-            // state, and expensive chains the user explicitly guarded
-            // out would all run unnecessarily.
-            //
-            // `record.deps` is no better as a stand-alone source:
-            // pre-first-eval it's seeded from the full AST via
-            // `formula_deps_for` (so the dependent graph subscribes to
-            // every cell mentioned, including branches that might be
-            // taken later); post-eval it's the narrowed actually-touched
-            // set. Using it here would just re-leak the unsafe
-            // install-time set on the very first read — exactly the
-            // path the regression exercises.
-            //
-            // Skipping `record.deps` is safe because prewarm is an
-            // optional cache-fill — if the evaluator later takes a
-            // branch we didn't pre-warm, recursive `compute_formula_at`
-            // resolves it. Worst case adds a few stack frames per AST
-            // level; the unbounded-chain risk that `prewarm` exists to
-            // mitigate lives in *uniform* chains (`A2=A1+1`,
-            // `A3=A2+1`, …) which use no short-circuit ops at all and
-            // therefore get the full prewarm treatment as before. See
-            // `if_true_does_not_prewarm_unused_branch` and siblings for
-            // the pinned regressions, and `chain_10000_native_read_does_not_panic`
-            // for the WASM-stack regression we are not allowed to
-            // regress.
-            stack.push((addr, true));
-
-            let mut ast_refs: Vec<CellAddress> = Vec::new();
-            collect_prewarm_refs(&record.expr, &mut ast_refs);
-            let mut enqueued: HashSet<CellAddress> = HashSet::new();
-            for dep in ast_refs {
-                if !enqueued.insert(dep) {
-                    continue;
-                }
-                // LAZY_FORMULA_INDEXING Phase 3: include lazy formulas
-                // — `formula_cells.contains_key` would miss them. The
-                // hydration on the next iteration moves the dep into
-                // `formula_cells`.
-                if !self.interior.formula_cells.borrow().contains_key(&dep)
-                    && !self.interior.needs_parse.borrow().contains(&dep)
-                {
-                    continue;
-                }
-                stack.push((dep, false));
-            }
-        }
     }
 
     /// Get the AtomId for a cell (creating if needed).
@@ -3770,75 +4126,9 @@ impl Sheet {
         self.readable_atom(addr)
     }
 
-    /// Force-recompute every formula on this sheet whose AST contains a
-    /// cross-sheet reference (`Expr::SheetRef`). Whole-sheet sweep, mostly
-    /// useful for tests / "rebuild everything" scenarios. Hot read paths
-    /// should prefer `recompute_cross_sheet_formulas_reachable_from(addr)`,
-    /// which scopes the work to formulas on the dep chain of `addr`.
-    pub fn recompute_cross_sheet_formulas(&mut self) {
-        // LAZY_FORMULA_INDEXING Phase 3: only hydrated formulas have an
-        // entry in `formula_exprs`. Unhydrated lazies will hit
-        // `expr_has_sheet_ref` for the first time at their next read
-        // (where the read-path hydrate runs) — at which point their
-        // cache starts Dirty anyway. So scanning only the hydrated set
-        // here is sufficient; nothing observable is missed.
-        let entries: Vec<(CellAddress, Rc<Expr>)> = self
-            .interior.formula_exprs
-            .borrow()
-            .iter()
-            .map(|(addr, expr)| (*addr, expr.clone()))
-            .collect();
-        for (addr, expr) in entries {
-            if expr_has_sheet_ref(&expr) {
-                if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                    *record.cache.borrow_mut() = FormulaCache::Dirty;
-                }
-            }
-        }
-    }
-
-    /// Targeted version of `recompute_cross_sheet_formulas`: BFS over
-    /// `formula_exprs` starting at `target` and mark reached cross-sheet
-    /// formulas dirty. The Workbook lazy provider now does live recursive
-    /// evaluation, so this remains mostly as an explicit cache-invalidation
-    /// utility for older callers.
-    ///
-    /// Worst-case cost is the size of the dep closure of `target` in
-    /// `formula_exprs` — orders of magnitude smaller than the whole-sheet
-    /// sweep on workbooks with many cross-sheet formulas.
-    pub fn recompute_cross_sheet_formulas_reachable_from(&mut self, target: CellAddress) {
-        let mut visited: HashSet<CellAddress> = HashSet::new();
-        let mut to_visit: Vec<CellAddress> = vec![target];
-        while let Some(addr) = to_visit.pop() {
-            if !visited.insert(addr) {
-                continue;
-            }
-            // LAZY_FORMULA_INDEXING Phase 3: hydrate so reachable lazy
-            // entries get walked. The BFS uses `formula_exprs` which
-            // only carries hydrated entries — without the hydrate the
-            // chain would terminate at the first lazy node.
-            self.hydrate_formula(addr);
-            let Some(expr) = self.interior.formula_exprs.borrow().get(&addr).cloned() else {
-                continue;
-            };
-            if expr_has_sheet_ref(&expr) {
-                if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                    *record.cache.borrow_mut() = FormulaCache::Dirty;
-                }
-            }
-            // Queue only addresses that themselves have a formula — a leaf
-            // primitive ref doesn't need re-traversal. Range refs are
-            // expanded but each cell is gated by `formula_exprs` so the
-            // typical `SUM(A:A)` only enqueues the small subset of column A
-            // cells that are actually formulas.
-            let exprs = self.interior.formula_exprs.borrow();
-            collect_formula_refs_into(&expr, &exprs, &mut to_visit);
-        }
-    }
-
     // === LAZY_FORMULA_EVAL Step 0 — debug counters ===
     //
-    // These expose the lazy formula graph's materialization behavior for
+    // These expose lazy formula and Store materialization behavior for
     // tests / benches / dev tooling.
     //
     // All `#[doc(hidden)]` — not part of the public API surface, intended
@@ -3870,8 +4160,9 @@ impl Sheet {
             .count()
     }
 
-    /// Number of formula cells. Formulas are Sheet-level lazy records, not
-    /// core derived atoms.
+    /// Number of logical formula cells. Hydrated same-sheet formulas own a
+    /// core formula-inner derived atom; this counter measures formula
+    /// addresses rather than atom count.
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: counts hydrated formulas (in
     /// `formula_cells`) plus parked lazy formulas (in `formula_source`).
@@ -3888,14 +4179,14 @@ impl Sheet {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return 0;
         };
-        self.cell_dependents
-            .borrow()
-            .get(&addr)
-            .map(|deps| deps.len())
-            .unwrap_or(0)
+        let mut roots = Vec::new();
+        self.store_root_atoms_for_addr_into(addr, &mut roots);
+        self.store_dependent_formula_addrs_from_atoms(&roots).len()
     }
 
-    /// Formula cache state without evaluating the formula.
+    /// Formula-inner Store state without evaluating the formula. Parked or
+    /// not-yet-materialized formulas report `dirty`; a settled derived atom
+    /// reports `clean`.
     #[doc(hidden)]
     pub fn debug_formula_cache_state(&self, addr_str: &str) -> &'static str {
         let Some(addr) = CellAddress::parse(addr_str) else {
@@ -3909,19 +4200,22 @@ impl Sheet {
         if self.interior.needs_parse.borrow().contains(&addr) {
             return "dirty";
         }
-        let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() else {
+        if !self.interior.formula_cells.borrow().contains_key(&addr) {
             return "none";
+        }
+        let Some(inner) = self.formula_inner_family.borrow().get(&addr) else {
+            return "dirty";
         };
-        let cache = record.cache.borrow().clone();
-        match cache {
-            FormulaCache::Dirty => "dirty",
-            FormulaCache::Computing => "computing",
-            FormulaCache::Clean(_) => "clean",
+        if self.store.debug_atom_is_fresh(inner) {
+            "clean"
+        } else {
+            "dirty"
         }
     }
 
-    /// Total live core atoms. Formulas are not core atoms anymore. Useful as
-    /// a gross "did anything materialize?" signal in tests.
+    /// Total live sheet-owned core atoms, including primitive slots, facade /
+    /// epoch atoms, range geometry epochs, and formula-inner derived atoms.
+    /// Useful as a gross "did anything materialize?" signal in tests.
     #[doc(hidden)]
     pub fn debug_total_atom_count(&self) -> usize {
         // Sheet-local count (P3): with the workbook-shared store,
@@ -3930,15 +4224,16 @@ impl Sheet {
     }
 
     /// Cumulative core derived recompute count from the underlying store.
-    /// Formula cells should not increase this counter anymore.
+    /// Formula-inner and facade recomputes are part of the atomm path and are
+    /// reflected here, including workbook-scoped reads in the shared Store.
     #[doc(hidden)]
     pub fn debug_recompute_count(&self) -> usize {
         self.store.debug_recompute_count()
     }
 
     /// Total formula evaluations performed since the sheet was created.
-    /// Bumped once per cache-miss eval inside `eval_formula_at_with_provider`;
-    /// cache hits are free. Used by the Phase 1 scale suite to assert
+    /// Bumped once per completed formula-inner evaluation; settled Store reads
+    /// are free. Used by the Phase 1 scale suite to assert
     /// `bulk_load` does no eager eval and viewport reads only evaluate
     /// visible formulas.
     #[doc(hidden)]
@@ -3946,10 +4241,8 @@ impl Sheet {
         self.formula_eval_count.get()
     }
 
-    /// Number of formula records whose cache is currently dirty (would
-    /// re-compute on next read). Walks `formula_cells` and counts entries
-    /// in the `FormulaCache::Dirty` state. Used by Phase 1 tests to assert
-    /// dirty-propagation correctness without forcing an eval.
+    /// Number of formula records without a settled formula-inner Store value,
+    /// plus parked formulas awaiting hydration.
     #[doc(hidden)]
     pub fn debug_dirty_count(&self) -> usize {
         // LAZY_FORMULA_INDEXING Phase 3: also count unhydrated lazy
@@ -3958,11 +4251,16 @@ impl Sheet {
         // scale suite's "N dirty after bulk_load" assertion drop to
         // zero after lazy bulk_load even though every cell is still
         // "pending compute".
-        let hydrated_dirty = self
-            .interior.formula_cells
-            .borrow()
-            .values()
-            .filter(|record| matches!(*record.cache.borrow(), FormulaCache::Dirty))
+        let hydrated_addrs: Vec<CellAddress> =
+            self.interior.formula_cells.borrow().keys().collect();
+        let family = self.formula_inner_family.borrow();
+        let hydrated_dirty = hydrated_addrs
+            .into_iter()
+            .filter(|addr| {
+                family
+                    .get(addr)
+                    .is_none_or(|id| !self.store.debug_atom_is_fresh(id))
+            })
             .count();
         hydrated_dirty + self.interior.needs_parse.borrow().len()
     }
@@ -3976,15 +4274,20 @@ impl Sheet {
         self.imported_formula_count.get()
     }
 
-    /// Cumulative dirty-propagation BFS visits since the sheet was
-    /// created (one per newly visited dependent address inside
-    /// `mark_dependents_dirty`). Scale-suite complexity probe: the
-    /// total dirty work of a workload is `delta(this)` and must be
-    /// bounded by Σ |dependents| of the edited cells — independent of
-    /// total sheet size.
+    /// Cumulative Store reverse-dependency formula visits since the sheet was
+    /// created. Scale-suite complexity probe: the total eager spill work of a
+    /// workload is `delta(this)` and must be bounded by formulas reachable
+    /// from the changed cell/facade/geometry roots.
     #[doc(hidden)]
-    pub fn debug_dirty_visit_count(&self) -> u64 {
-        self.dirty_visit_count.get()
+    pub fn debug_reverse_dep_visit_count(&self) -> u64 {
+        self.reverse_dep_visit_count.get()
+    }
+
+    /// Cumulative number of formula AST nodes expanded by parked-formula
+    /// static cycle validation. A topology certificate hit adds zero.
+    #[doc(hidden)]
+    pub fn debug_static_cycle_node_visit_count(&self) -> u64 {
+        self.static_cycle_node_visit_count.get()
     }
 
     /// Number of active spill anchors (entries in the `spill_targets`
@@ -4043,33 +4346,27 @@ impl Sheet {
             .count()
     }
 
-    /// Number of distinct `CellRange`s tracked in `range_dependents`. Each
-    /// formula referencing a range (e.g. `SUM(A1:A100)`) contributes one
-    /// entry to the index — independent of how many cells the range spans.
-    /// A single range with N dependent formulas still counts as one.
-    ///
-    /// Phase 1 acceptance: registering a wide range formula adds exactly
-    /// one entry here, not N (the range's cell count). The interval-index
-    /// scale work in Phase 2 will keep this counter API but change the
-    /// underlying storage.
+    /// Number of materialized Store geometry roots used by large range
+    /// formulas. Small ranges depend on member facades directly and therefore
+    /// contribute zero here.
     #[doc(hidden)]
     pub fn debug_range_dep_count(&self) -> usize {
-        self.range_dependents.borrow().len()
+        self.range_band_epoch_family.borrow().len()
+            + self.range_column_epoch_family.borrow().len()
+            + self.range_sheet_epoch_family.borrow().len()
     }
 
-    /// Debug-only candidate-range probe for the Phase 2 bucket index.
-    /// Returns the count of *candidate* ranges that
-    /// `RangeDependentIndex::candidates_for(addr)` produces — before the
-    /// final `CellRange::contains` filter. Useful for asserting that the
-    /// row × col bucket intersection actually narrows the search instead
-    /// of returning every registered range. Kept `#[doc(hidden)]` because
-    /// it leaks an internal implementation detail of the index.
+    /// Number of already-materialized Store geometry roots touched by an
+    /// address (row band, column, and/or sheet-wide root). This is a
+    /// non-creating lookup.
     #[doc(hidden)]
     pub fn debug_range_dep_candidates(&self, addr_str: &str) -> usize {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return 0;
         };
-        self.range_dependents.borrow().candidates_for(addr).len()
+        let mut roots = Vec::new();
+        self.store_root_range_geometry_atoms_for_addr_into(addr, &mut roots);
+        roots.len()
     }
 
     /// Count how many cells the sparse range-iterator visits when scanning
@@ -4105,65 +4402,46 @@ impl Sheet {
         visits
     }
 
-    /// Phase 1 (lazy-formula-indexing) dep-graph probe. Walks
-    /// `cell_dependents` + `range_dependents` and returns aggregate
-    /// edge counts so the bench / MEGA_TRACE summary can quantify how
-    /// much state the eager-build phase produced.
+    /// Compatibility stats probe. Reports hydrated formula/static-range
+    /// metadata and Store geometry-root counts so bench/trace tooling can
+    /// quantify materialization. Legacy point-fanout fields stay zero.
     ///
-    /// Costs O(formula_count + sum-of-fanouts) — fine for a one-shot
-    /// debug probe, not for any hot path.
+    /// Costs O(hydrated formula count), suitable only for diagnostics.
     #[doc(hidden)]
     pub fn debug_dep_graph_stats(&self) -> DepGraphStats {
-        let cell_deps = self.cell_dependents.borrow();
-        let mut total_point_edges: u64 = 0;
-        let mut max_fanout: u32 = 0;
-        for set in cell_deps.values() {
-            let len = set.len() as u32;
-            total_point_edges = total_point_edges.saturating_add(len as u64);
-            if len > max_fanout {
-                max_fanout = len;
-            }
-        }
-
-        let range_deps = self.range_dependents.borrow();
-        let total_range_entries = range_deps.len() as u64;
-        // Count how many distinct formula addresses have at least one
-        // range dep registered. The `formula_cells` map holds a
-        // `FormulaRecord` per formula; we count those whose
-        // `range_deps` set is non-empty.
+        let total_range_entries = self.debug_range_dep_count() as u64;
+        // Count hydrated formula records with static range metadata. This is
+        // structural information, not reactive fanout.
         //
-        // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas are not
-        // counted here — they have no installed `range_deps` yet. This
-        // is exactly the "edges are zero after lazy bulk_load" probe
-        // the Phase 1 measurement summary asked for.
+        // LAZY_FORMULA_INDEXING Phase 3: unhydrated formulas are not counted
+        // here because their static metadata has not been installed yet.
         let range_formula_count = self
-            .interior.formula_cells
+            .interior
+            .formula_cells
             .borrow()
             .values()
-            .filter(|record| !record.range_deps.borrow().is_empty())
+            .filter(|record| !record.static_ranges.borrow().is_empty())
             .count() as u64;
 
         DepGraphStats {
             // `formula_count` reflects HYDRATED formulas only so the
-            // stats probe surfaces "how much of the dep graph is
-            // actually live". The total formula count (hydrated +
+            // stats probe surfaces how much formula state is materialized.
+            // The total formula count (hydrated +
             // lazy) is exposed via `debug_formula_count`.
             formula_count: self.interior.formula_cells.borrow().len() as u64,
-            total_point_dep_edges: total_point_edges,
+            total_point_dep_edges: 0,
             total_range_dep_entries: total_range_entries,
-            max_fanout,
+            max_fanout: 0,
             range_formula_count,
         }
     }
 
-    /// Number of addresses that appear as a key in `cell_dependents`,
-    /// i.e. the count of distinct source cells with at least one
-    /// formula depending on them. Phase 1 probe helper used by the
-    /// WASM-side `debug_dep_graph_stats` to compute `avg_fanout`
-    /// (= total_point_dep_edges / this).
+    /// Number of addresses in the deleted point-dependency index. Kept
+    /// as a compatibility probe for older scale tests; always zero now
+    /// that same-sheet point formulas delegate through atom edges.
     #[doc(hidden)]
-    pub fn debug_cell_dependents_key_count(&self) -> usize {
-        self.cell_dependents.borrow().len()
+    pub fn debug_point_dependency_key_count(&self) -> usize {
+        0
     }
 
     /// Return the original formula text for a cell, or `None` if the cell
@@ -4182,10 +4460,11 @@ impl Sheet {
         if let Some(t) = self.interior.formula_texts.borrow().get(&addr) {
             return Some(t.clone());
         }
-        self.interior.formula_source
+        self.interior
+            .formula_source
             .borrow()
             .get(&addr)
-            .map(|s| s.as_ref().to_string())
+            .map(|s| s.source.as_ref().to_string())
     }
 
     /// Is there a formula at `addr`? Used by `ISFORMULA(reference)` via
@@ -4193,7 +4472,8 @@ impl Sheet {
     pub fn has_formula_at(&self, addr: CellAddress) -> bool {
         // LAZY_FORMULA_INDEXING Phase 3: lazy formulas are still
         // formulas — ISFORMULA must observe them.
-        self.interior.formula_cells.borrow().contains_key(&addr) || self.interior.needs_parse.borrow().contains(&addr)
+        self.interior.formula_cells.borrow().contains_key(&addr)
+            || self.interior.needs_parse.borrow().contains(&addr)
     }
 
     /// Source formula text at `addr`, if any. Used by
@@ -4206,10 +4486,11 @@ impl Sheet {
         if let Some(t) = self.interior.formula_texts.borrow().get(&addr) {
             return Some(t.clone());
         }
-        self.interior.formula_source
+        self.interior
+            .formula_source
             .borrow()
             .get(&addr)
-            .map(|s| s.as_ref().to_string())
+            .map(|s| s.source.as_ref().to_string())
     }
 
     /// Iterate every address that has a primitive value or a formula. Empty
@@ -4255,16 +4536,13 @@ impl Sheet {
         let formula_keys: HashSet<CellAddress> = {
             let cells = self.interior.formula_cells.borrow();
             let source = self.interior.formula_source.borrow();
-            cells
-                .keys()
-                .chain(source.keys())
-                .collect()
+            cells.keys().chain(source.keys()).collect()
         };
         // P4a borrow rule: snapshot the primitive keys so no `cells`
         // borrow is held across the caller's `f` (row-major order kept).
         let prim_addrs: Vec<CellAddress> = self.interior.cells.borrow().keys().collect();
         for addr in prim_addrs {
-            if formula_keys.contains(&addr) {
+            if formula_keys.contains(&addr) || !self.primitive_slot_has_visible_value(addr) {
                 continue;
             }
             f(addr);
@@ -4273,7 +4551,7 @@ impl Sheet {
 
     /// Iterate every non-empty address inside `range` without reading cell
     /// values. Formula entries are reported by address only, so this does
-    /// not evaluate dirty formula caches.
+    /// not evaluate or materialize Store-derived formula values.
     pub fn for_each_non_empty_in_range(&self, range: CellRange, mut f: impl FnMut(CellAddress)) {
         // LAZY_FORMULA_INDEXING Phase 3: same snapshot pattern as
         // `for_each_non_empty`.
@@ -4310,6 +4588,7 @@ impl Sheet {
         for addr in prim_addrs {
             if self.interior.formula_cells.borrow().contains_key(&addr)
                 || self.interior.formula_source.borrow().contains_key(&addr)
+                || !self.primitive_slot_has_visible_value(addr)
             {
                 continue;
             }
@@ -4318,8 +4597,8 @@ impl Sheet {
     }
 
     /// Clear every non-empty address inside `range` without materializing
-    /// holes. Uses bulk-load so dependent dirtying and subscriber notify are
-    /// coalesced once after the sparse scan.
+    /// holes. Uses bulk-load so Store publication and subscriber notification
+    /// are coalesced once after the sparse scan.
     pub fn clear_range(&mut self, range: CellRange) -> usize {
         let mut addrs = Vec::new();
         self.for_each_non_empty_in_range(range, |addr| addrs.push(addr));
@@ -4422,8 +4701,8 @@ impl Sheet {
 
     /// Set or clear the format for a cell. Passing the default `CellFormat`
     /// removes the entry, keeping the formats map sparse for empty styles.
-    /// Format changes don't dirty the dep graph but DO fire the address
-    /// listener so views can re-style without recomputing the value.
+    /// Format changes do not publish formula Store roots, but they DO fire the
+    /// address listener so views can re-style without recomputing the value.
     pub fn set_format(&mut self, addr_str: &str, fmt: CellFormat) {
         let addr = CellAddress::parse(addr_str).expect("invalid cell address");
         if fmt == CellFormat::default() {
@@ -4681,9 +4960,9 @@ impl Sheet {
                     Self::shift_dimension_delete(&mut sheet.col_widths, at, count);
                 }
             }
-            sheet.rederive_spill_anchors(
-                spill_anchors.into_iter().map(|a| edit.apply(a)).collect(),
-            );
+            sheet
+                .rederive_spill_anchors(spill_anchors.into_iter().map(|a| edit.apply(a)).collect());
+            sheet.prune_obsolete_formula_atoms();
         });
     }
 
@@ -4742,7 +5021,12 @@ impl Sheet {
             self.detach_address_sub(*addr);
         }
 
-        f(self);
+        // A structural shift rewrites many cell, epoch, and formula atoms.
+        // Keep those writes in one Store transaction so dependents observe
+        // only the final topology and propagation walks the atomm graph once.
+        self.bump_formula_topology_epoch();
+        let store = self.store.clone();
+        store.batch(|_| f(self));
 
         for addr in &addrs {
             self.attach_address_sub(*addr);
@@ -4769,13 +5053,15 @@ impl Sheet {
         // `HashMap::keys` yields `&CellAddress`; `RowMajorMap::keys` yields
         // owned `CellAddress`. Normalise both with copied().
         to_drop.extend(
-            self.interior.formula_cells
+            self.interior
+                .formula_cells
                 .borrow()
                 .keys()
                 .filter(|a| pred(*a)),
         );
         to_drop.extend(
-            self.interior.formula_source
+            self.interior
+                .formula_source
                 .borrow()
                 .keys()
                 .filter(|a| pred(*a)),
@@ -4787,6 +5073,8 @@ impl Sheet {
             // lazy-only entry is cleaned up even though no eager record
             // exists for it.
             self.remove_formula_record(addr);
+            self.invalidate_formula_inner(addr);
+            self.bump_facade_epoch(addr);
             // Fanout reattach + per-address fire are handled by the enclosing
             // `with_structural_edit`; nothing to do here.
         }
@@ -4810,38 +5098,75 @@ impl Sheet {
         // shifted addresses. P4a borrow rule: each drain lands in an owned
         // `Vec` in its own statement, so no `interior` borrow is held
         // across the rebuild loops.
+        let mut changed_addrs: HashSet<CellAddress> = HashSet::new();
         let mut new_cells: RowMajorMap<CellSlot> = RowMajorMap::new();
         let drained_cells = self.interior.cells.borrow_mut().drain_into_vec();
         for (addr, slot) in drained_cells {
-            new_cells.insert(f(addr), slot);
+            let next = f(addr);
+            if next != addr {
+                changed_addrs.insert(addr);
+                changed_addrs.insert(next);
+            }
+            new_cells.insert(next, slot);
         }
         let mut new_formula_cells: RowMajorMap<Rc<FormulaRecord>> = RowMajorMap::new();
         let drained_formula_cells = self.interior.formula_cells.borrow_mut().drain_into_vec();
         for (addr, record) in drained_formula_cells {
-            new_formula_cells.insert(f(addr), record);
+            let next = f(addr);
+            if next != addr {
+                changed_addrs.insert(addr);
+                changed_addrs.insert(next);
+            }
+            new_formula_cells.insert(next, record);
         }
         let new_formula_exprs: HashMap<CellAddress, Rc<Expr>> =
             std::mem::take(&mut *self.interior.formula_exprs.borrow_mut())
                 .into_iter()
-                .map(|(addr, expr)| (f(addr), expr))
+                .map(|(addr, expr)| {
+                    let next = f(addr);
+                    if next != addr {
+                        changed_addrs.insert(addr);
+                        changed_addrs.insert(next);
+                    }
+                    (next, expr)
+                })
                 .collect();
         let new_formula_texts: HashMap<CellAddress, String> =
             std::mem::take(&mut *self.interior.formula_texts.borrow_mut())
                 .into_iter()
-                .map(|(addr, text)| (f(addr), text))
+                .map(|(addr, text)| {
+                    let next = f(addr);
+                    if next != addr {
+                        changed_addrs.insert(addr);
+                        changed_addrs.insert(next);
+                    }
+                    (next, text)
+                })
                 .collect();
         // LAZY_FORMULA_INDEXING Phase 3: relocate parked lazy formula
         // entries too. `formula_source` is keyed by addr; `needs_parse`
         // is a set of addrs. Both get the same shift.
-        let mut new_formula_source: RowMajorMap<Rc<str>> = RowMajorMap::new();
+        let mut new_formula_source: RowMajorMap<ParkedFormula> = RowMajorMap::new();
         let drained_formula_source = self.interior.formula_source.borrow_mut().drain_into_vec();
         for (addr, src) in drained_formula_source {
-            new_formula_source.insert(f(addr), src);
+            let next = f(addr);
+            if next != addr {
+                changed_addrs.insert(addr);
+                changed_addrs.insert(next);
+            }
+            new_formula_source.insert(next, src);
         }
         let new_needs_parse: HashSet<CellAddress> =
             std::mem::take(&mut *self.interior.needs_parse.borrow_mut())
                 .into_iter()
-                .map(&f)
+                .map(|addr| {
+                    let next = f(addr);
+                    if next != addr {
+                        changed_addrs.insert(addr);
+                        changed_addrs.insert(next);
+                    }
+                    next
+                })
                 .collect();
         // Phase 6 — formats follow the same shift as cells so a format set
         // on A1 survives a row insert above and re-emerges on A2. Entries
@@ -4888,85 +5213,65 @@ impl Sheet {
         *self.interior.needs_parse.borrow_mut() = new_needs_parse;
         self.formats = new_formats;
         self.range_formats = new_range_formats;
-        // AUDIT A-1: the dep indexes are NOT rebuilt here. Between the
-        // relocate and the end of `retarget_formula_refs` they are
-        // stale (old keys/values); the retarget finishes with ONE
-        // `rebuild_all_formula_dependents` pass over the (by then
-        // fully remapped) records, then re-fires dirty propagation for
-        // every value-changing cell from the consistent index. Nothing
-        // in between reads the indexes for correctness-critical
-        // decisions — `write_error`'s in-flight `mark_dependents_dirty`
-        // calls are made redundant by that final pass.
+        for addr in changed_addrs {
+            self.invalidate_formula_inner(addr);
+            self.bump_facade_epoch(addr);
+        }
+        // Formula dependency edges need no address-index rebuild. Retargeting
+        // below invalidates affected formula-inner/facade atoms; their next
+        // Store read records the remapped dependencies.
     }
 
     /// Apply a structural edit to every HYDRATED formula AST. Used after
     /// structural edits so formulas continue to point at the same
     /// logical cell.
     ///
-    /// AUDIT A-1 (hydrated half): the mapped AST is installed DIRECTLY —
-    /// the old render→re-parse round trip (P-B) is gone — and formulas
-    /// the shift left untouched skip reinstall entirely, keeping their
-    /// cached values when that is provably safe:
+    /// The mapped AST is installed directly, without a render/re-parse round
+    /// trip. Formulas whose AST is unchanged retain their structural record
+    /// and settled Store-derived value when that is provably safe:
     ///
     ///   - mapped AST == old AST means every STATIC ref points at a
     ///     cell strictly below the edit boundary, i.e. a cell that did
-    ///     not move — the cache stays valid…
-    ///   - …unless a range dep can see the shifted region
+    ///     not move — the derived value remains fresh…
+    ///   - …unless a static range can see the shifted region
     ///     (`ShiftEdit::touches_range`: unbounded `A:A` under a row
-    ///     edit, etc.) or an eval-TRACKED point dep (OFFSET-style
-    ///     computed reads) moved/died — then the cache flips Dirty and
-    ///     tracked deps are remapped so the rebuilt index stays
-    ///     coherent until the next read re-tracks them.
+    ///     edit, etc.) or expanded static point metadata moved/died. In that
+    ///     case formula-inner and facade are invalidated.
     ///
-    /// Ends with one `rebuild_all_formula_dependents` (O(hydrated
-    /// formulas) — small by the lazy contract; both key AND value sides
-    /// of the indexes shift under a structural edit, so an in-place
-    /// key patch would be the same full remap) plus a cache-only dirty
-    /// BFS from every cell whose VALUE may have changed (#REF! writes,
-    /// reinstalled formulas, and previously-Clean AST-unchanged
-    /// formulas dirtied via `tracked_moved`/`range_touched`), so
-    /// AST-unchanged dependents of changed formulas don't serve stale
-    /// caches.
+    /// Reactive edges are never rebuilt here. They are owned by Store and are
+    /// re-recorded when an invalidated formula-inner next derives its value.
     fn retarget_formula_refs(&mut self, edit: crate::shift::ShiftEdit) {
         let f = |addr: CellAddress| edit.apply(addr);
         let snapshot: Vec<(CellAddress, Rc<Expr>)> = self
-            .interior.formula_exprs
+            .interior
+            .formula_exprs
             .borrow()
             .iter()
             .map(|(addr, expr)| (*addr, expr.clone()))
             .collect();
-        // Cells whose value may differ after the edit — roots for the
-        // post-rebuild dirty BFS.
-        let mut value_changed: Vec<CellAddress> = Vec::new();
         for (addr, old_expr) in snapshot {
             let new_expr = crate::shift::map_addrs(&old_expr, &f);
             if crate::shift::contains_invalid_ref(&new_expr) {
                 // Formula references a cell deleted by this structural edit.
                 // Excel produces #REF!.
                 self.write_error(addr, ValueError::InvalidRef);
-                value_changed.push(addr);
                 continue;
             }
             if new_expr == *old_expr {
-                // Shift didn't touch any static ref. Keep the record —
-                // but invalidate the cache when the edit can still
+                // Shift didn't touch any static ref. Keep the record, but
+                // invalidate the Store-derived value when the edit can still
                 // change observed values (see doc comment).
                 let record = self.interior.formula_cells.borrow().get(&addr).cloned();
                 if let Some(record) = record {
-                    let tracked_moved = record
-                        .deps
-                        .borrow()
-                        .iter()
-                        .any(|d| f(*d) != *d);
+                    let static_ref_moved = record.deps.borrow().iter().any(|d| f(*d) != *d);
                     let range_touched = record
-                        .range_deps
+                        .static_ranges
                         .borrow()
                         .iter()
                         .any(|r| edit.touches_range(r));
-                    if tracked_moved {
-                        // Remap eval-tracked deps (deps that died map to
-                        // the sentinel and are dropped — the formula is
-                        // dirty and re-tracks on next read).
+                    if static_ref_moved {
+                        // Keep static structural metadata aligned. Deleted
+                        // addresses map to the sentinel and are dropped.
                         let remapped: HashSet<CellAddress> = record
                             .deps
                             .borrow()
@@ -4979,50 +5284,43 @@ impl Sheet {
                             .collect();
                         *record.deps.borrow_mut() = remapped;
                     }
-                    if tracked_moved || range_touched {
-                        // The value may change even though the AST didn't —
-                        // a CLEAN cache here means dependents may hold
-                        // values derived from the soon-stale result, so
-                        // this cell joins the dirty-BFS roots (codex P1).
-                        // An already-Dirty formula needs no root: a clean
-                        // dependent implies its inputs were clean when it
-                        // evaluated, and whatever dirtied this formula
-                        // already dirtied its dependents.
-                        if matches!(*record.cache.borrow(), FormulaCache::Clean(_)) {
-                            value_changed.push(addr);
-                        }
-                        *record.cache.borrow_mut() = FormulaCache::Dirty;
+                    if static_ref_moved || range_touched {
+                        // The value may change even though the AST did not.
+                        // Store publication from the formula facade wakes its
+                        // recorded dependents; the next read refreshes edges.
+                        self.invalidate_formula_value(addr);
                     }
                 }
                 continue;
             }
-            // Refs crossed the boundary: install the mapped AST
-            // directly. Fresh record ⇒ cache Dirty. Render (no
-            // re-parse!) only to keep `formula_texts` / `get_formula`
-            // truthful.
+            // Refs crossed the boundary: install the mapped AST directly and
+            // invalidate formula-inner. Render (no re-parse!) only to keep
+            // `formula_texts` / `get_formula` truthful.
             let new_expr_rc = Rc::new(new_expr);
             let deps = Sheet::formula_deps_for(&new_expr_rc);
-            let range_deps = collect_range_refs(&new_expr_rc);
-            let record = Rc::new(FormulaRecord::new(new_expr_rc.clone(), deps, range_deps));
-            self.note_cross_sheet_if_any(&new_expr_rc);
-            self.interior.formula_cells.borrow_mut().insert(addr, record);
-            self.interior.formula_exprs
+            let static_ranges = collect_range_refs(&new_expr_rc);
+            let record = Rc::new(FormulaRecord::new(new_expr_rc.clone(), deps, static_ranges));
+            self.interior
+                .formula_cells
+                .borrow_mut()
+                .insert(addr, record);
+            self.interior
+                .formula_exprs
                 .borrow_mut()
                 .insert(addr, new_expr_rc.clone());
-            self.interior.formula_texts
+            self.interior
+                .formula_texts
                 .borrow_mut()
                 .insert(addr, crate::shift::render_formula(&new_expr_rc));
-            value_changed.push(addr);
+            self.materialize_formula_inner(addr);
+            self.invalidate_formula_value(addr);
         }
-        self.rebuild_all_formula_dependents();
-        self.mark_dependents_dirty_silent_batch(&value_changed);
     }
 
     /// AUDIT A-1 (lazy half): retarget every PARKED formula by rewriting
     /// reference tokens in its source text — no parse, no hydration, no
-    /// dep work. Runs AFTER `retarget_formula_refs` so the `write_error`
-    /// calls for dead refs propagate dirtiness through the already-
-    /// rebuilt (consistent) dep indexes.
+    /// dependency work. Runs after `retarget_formula_refs`; `write_error` for
+    /// dead refs invalidates the corresponding Store facade normally.
     ///
     /// Cross-sheet scope mirrors the hydrated path exactly: sheet-
     /// qualified refs in this sheet's sources are not shifted, and
@@ -5034,7 +5332,7 @@ impl Sheet {
         {
             let source = self.interior.formula_source.borrow();
             for (addr, src) in source.iter() {
-                match crate::shift::rewrite_parked_source(src.as_ref(), edit) {
+                match crate::shift::rewrite_parked_source(src.source.as_ref(), edit) {
                     crate::shift::SourceRewrite::Unchanged => {}
                     crate::shift::SourceRewrite::Rewritten(s) => rewrites.push((addr, s)),
                     crate::shift::SourceRewrite::DeadRef => dead.push(addr),
@@ -5044,7 +5342,7 @@ impl Sheet {
         {
             let mut source = self.interior.formula_source.borrow_mut();
             for (addr, s) in rewrites {
-                source.insert(addr, Rc::from(s.as_str()));
+                source.insert(addr, ParkedFormula::new(s));
             }
         }
         for addr in dead {
@@ -5056,7 +5354,7 @@ impl Sheet {
                 let source = self.interior.formula_source.borrow();
                 source
                     .get(&addr)
-                    .map(|src| crate::formula::parse_formula(src.as_ref()).is_some())
+                    .map(|src| crate::formula::parse_formula(src.source.as_ref()).is_some())
                     .unwrap_or(false)
             };
             if !parses {
@@ -5065,43 +5363,32 @@ impl Sheet {
             // Mirror the hydrated retarget: the whole formula becomes a
             // #REF! error cell. `write_error` drains the parked state
             // (`remove_formula_record` clears `formula_source` /
-            // `needs_parse` first) and dirties dependents through the
-            // consistent post-rebuild indexes.
+            // `needs_parse` first) and invalidates Store dependents through
+            // the cell facade.
             self.write_error(addr, ValueError::InvalidRef);
-        }
-    }
-
-    /// Cache-only transitive dirty BFS from every root: flips dependent
-    /// `FormulaRecord` caches to `Dirty` WITHOUT firing address
-    /// subscribers — the enclosing `with_structural_edit` owns
-    /// notification via its pre/post value diff (at-most-once-per-
-    /// address contract).
-    fn mark_dependents_dirty_silent_batch(&self, roots: &[CellAddress]) {
-        if roots.is_empty() {
-            return;
-        }
-        let mut visited: HashSet<CellAddress> = HashSet::new();
-        let mut stack: Vec<CellAddress> = Vec::new();
-        for root in roots {
-            self.dependents_of_into(*root, &mut stack);
-        }
-        while let Some(addr) = stack.pop() {
-            if !visited.insert(addr) {
-                continue;
-            }
-            if let Some(record) = self.interior.formula_cells.borrow().get(&addr).cloned() {
-                *record.cache.borrow_mut() = FormulaCache::Dirty;
-            }
-            self.dependents_of_into(addr, &mut stack);
         }
     }
 
     /// Set multiple cells at once, with a single propagation pass.
     ///
     /// Like `set_cell`, this also clears any existing formula on each target
-    /// cell. Formula dependents are dirtied after the batch without eagerly
-    /// computing them.
+    /// cell. Store publication is coalesced for the batch without eagerly
+    /// computing formula values.
     pub fn batch_set(&mut self, updates: &[(&str, Value)]) {
+        let parsed_updates: Vec<(CellAddress, Value)> = updates
+            .iter()
+            .map(|(addr_str, value)| {
+                (
+                    CellAddress::parse(addr_str).expect("invalid cell address"),
+                    value.clone(),
+                )
+            })
+            .collect();
+        let written_addrs: Vec<CellAddress> =
+            parsed_updates.iter().map(|(addr, _)| *addr).collect();
+        let array_formulas_to_reproject =
+            self.store_dependent_array_formula_addrs_from_addrs(written_addrs.iter().copied());
+
         // Snapshot pre-state for *every* subscribed address so we can fire
         // exactly once per actual value change at the end. The subset of
         // those addresses that are also being written get their fanouts
@@ -5116,36 +5403,54 @@ impl Sheet {
             self.detach_address_sub(*addr);
         }
 
-        let mut atom_values: Vec<(AtomId, Value)> = Vec::with_capacity(updates.len());
-        let mut written_addrs: Vec<CellAddress> = Vec::with_capacity(updates.len());
+        let mut atom_values: Vec<(AtomId, Value)> = Vec::with_capacity(parsed_updates.len());
+        let mut pre_range_members: Vec<(CellAddress, bool)> =
+            Vec::with_capacity(parsed_updates.len());
+        let mut obsolete_formula_addrs = HashSet::new();
+        let mut null_addrs = HashSet::new();
 
-        for (addr_str, value) in updates {
-            let addr = CellAddress::parse(addr_str).expect("invalid cell address");
+        for (addr, value) in parsed_updates {
+            let pre_range_member = self.range_member_present(addr);
+            pre_range_members.push((addr, pre_range_member));
 
+            if self.interior.formula_cells.borrow().contains_key(&addr)
+                || self.interior.needs_parse.borrow().contains(&addr)
+            {
+                obsolete_formula_addrs.insert(addr);
+            }
             self.remove_formula_record(addr);
 
             let id = self.ensure_cell(addr);
-            atom_values.push((id, value.clone()));
-            written_addrs.push(addr);
+            if matches!(value, Value::Null) {
+                null_addrs.insert(addr);
+            }
+            atom_values.push((id, value));
         }
 
-        self.store.batch(|store| {
+        self.store_batch(|sheet| {
             for (id, value) in atom_values {
-                store.set(id, value);
+                sheet.store.set(id, value);
+            }
+            for addr in &written_addrs {
+                sheet.invalidate_formula_inner(*addr);
+                sheet.bump_facade_epoch(*addr);
+            }
+            for (addr, pre_range_member) in pre_range_members {
+                sheet.bump_range_epochs_if_membership_changed(addr, pre_range_member);
             }
         });
-        let mut dirty_notified = HashSet::new();
-        for addr in written_addrs {
-            dirty_notified.extend(self.mark_dependents_dirty(addr));
+        for addr in null_addrs {
+            self.try_release_primitive(addr);
         }
+        for addr in obsolete_formula_addrs {
+            self.cleanup_obsolete_formula_atoms_at(addr);
+        }
+        self.recompute_array_formulas_in(&array_formulas_to_reproject);
 
         for addr in &subscribed {
             self.attach_address_sub(*addr);
         }
         for (addr, pre_val) in pre {
-            if dirty_notified.contains(&addr) {
-                continue;
-            }
             let post_val = self.peek_value(addr);
             if pre_val != post_val {
                 self.notify_address_subscribers(addr);
@@ -5155,37 +5460,48 @@ impl Sheet {
 
     // === LAZY_FORMULA_EVAL Step 3 — bulk import API ===
 
-    /// Run `f` inside a bulk-load session. Writes performed through the
-    /// `BulkLoader` skip per-cell dirty propagation and subscriber notification;
-    /// when the closure returns, the loader's `flush` walks the touched set
-    /// once, dirties transitive formula dependents, and notifies each
-    /// currently-subscribed address at most once.
+    /// Run `f` inside a Store batch. Writes performed through the `BulkLoader`
+    /// update source atoms immediately, while derived propagation is coalesced
+    /// until every write in the closure has landed. The loader then restores
+    /// direct address subscriptions and publishes each changed address once.
     ///
     /// Use for CSV / JSON / xlsx import paths that write thousands of cells:
-    /// the per-cell notify cost would dominate, and we want to defer formula
-    /// evaluation entirely to first read.
+    /// the per-cell notify cost would dominate. Already-materialized formulas
+    /// rederive once at batch flush; formulas never read remain unmaterialized.
     ///
     /// RAII shape: `BulkLoader` is not exposed outside the closure, so the
     /// flush always runs (no begin/end pair to forget).
     pub fn bulk_load<R>(&mut self, f: impl FnOnce(&mut BulkLoader<'_>) -> R) -> R {
+        let store = self.store.clone();
         let mut loader = BulkLoader::new(self);
-        let result = f(&mut loader);
+        let mut result = None;
+        store.batch(|_| {
+            result = Some(f(&mut loader));
+        });
         loader.flush();
-        result
+        result.expect("bulk-load closure did not run")
     }
 }
 
 /// In-progress bulk-load session. Writes go directly into the sheet's
-/// formula/primitive state but skip the normal dirty-mark + subscriber-notify
-/// fan-out; the deferred work runs in `flush`.
+/// formula/primitive state while direct address subscriptions are detached;
+/// the surrounding Store batch coalesces derived propagation and `flush`
+/// restores those subscriptions.
 ///
 /// Only constructable inside `Sheet::bulk_load` (RAII), so the lifetime stays
 /// bound to `&mut Sheet` and `flush` is guaranteed to run on the closure exit.
 pub struct BulkLoader<'a> {
     sheet: &'a mut Sheet,
-    /// Addresses written during this bulk load. At `flush()` we walk these to
-    /// dirty downstream formulas + notify currently-subscribed addresses ONCE.
+    /// Addresses written during this bulk load. At `flush()` we notify each
+    /// directly subscribed address whose projected value changed once.
     touched: HashSet<CellAddress>,
+    /// Addresses whose sparse range membership changed during the bulk load.
+    /// Flush bumps already-materialized range-version atoms for these roots.
+    range_membership_changed: HashSet<CellAddress>,
+    /// Formula addresses replaced by a primitive/error during this session.
+    /// Flush reclaims their now-unreferenced Store-backed family nodes after
+    /// the batched epoch changes have settled.
+    obsolete_formula_addrs: HashSet<CellAddress>,
 }
 
 impl<'a> BulkLoader<'a> {
@@ -5193,11 +5509,13 @@ impl<'a> BulkLoader<'a> {
         BulkLoader {
             sheet,
             touched: HashSet::new(),
+            range_membership_changed: HashSet::new(),
+            obsolete_formula_addrs: HashSet::new(),
         }
     }
 
-    /// Write a primitive value at `addr`. Skips dirty propagation and
-    /// subscriber notification — both deferred to `flush`. Equivalent to
+    /// Write a primitive value at `addr`. Defers Store publication and direct
+    /// subscriber notification to `flush`. Equivalent to
     /// `Sheet::set_cell` outside the bulk-load contract; the address is
     /// recorded in `touched` for the post-flush sweep.
     pub fn set_cell(&mut self, addr_str: &str, value: Value) {
@@ -5222,11 +5540,12 @@ impl<'a> BulkLoader<'a> {
         if self.sheet.spilled_into_anchor(addr).is_some() {
             return;
         }
+        let pre_range_member = self.sheet.range_member_present(addr);
         self.sheet.clear_spill_at_address(addr);
 
         // Detach the fanout for this address so the store-level `set` below
         // does not synchronously fire subscribers. `flush` will reattach and
-        // notify exactly once per subscribed touched/dirty address.
+        // notify exactly once per subscribed touched address.
         self.sheet.detach_address_sub(addr);
 
         // LAZY_FORMULA_INDEXING Phase 3: lazy and hydrated formulas
@@ -5234,14 +5553,24 @@ impl<'a> BulkLoader<'a> {
         // is a no-op on lazies (no record) — drain `formula_source` /
         // `needs_parse` explicitly so the address stops looking like a
         // formula to any later check.
-        let had_formula = self.sheet.interior.formula_cells.borrow().contains_key(&addr)
+        let had_formula = self
+            .sheet
+            .interior
+            .formula_cells
+            .borrow()
+            .contains_key(&addr)
             || self.sheet.interior.needs_parse.borrow().contains(&addr);
         if had_formula {
-            // Formula → primitive transition. Drop the formula record (and
-            // its reverse dep entries) but no notify; primitive scaffold is
+            self.obsolete_formula_addrs.insert(addr);
+            // Formula → primitive transition. Drop the structural formula
+            // record, but do not notify yet; primitive scaffold is
             // re-established below.
             self.sheet.remove_formula_record(addr);
-            self.sheet.interior.formula_source.borrow_mut().remove(&addr);
+            self.sheet
+                .interior
+                .formula_source
+                .borrow_mut()
+                .remove(&addr);
             self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
             // The pre-existing primitive atom from formula→primitive remap may
             // still be present; ensure_cell + store.set covers both branches.
@@ -5261,11 +5590,14 @@ impl<'a> BulkLoader<'a> {
         }
 
         self.touched.insert(addr);
+        if pre_range_member != self.sheet.range_member_present(addr) {
+            self.range_membership_changed.insert(addr);
+        }
     }
 
     /// Write a formula at `addr`. Parses, runs the same-sheet static cycle
-    /// check (B.2), and stores the record with cache state Dirty. Does not
-    /// evaluate the formula, does not notify any subscriber. Returns the same
+    /// check (B.2), and installs structural metadata for lazy Store derivation.
+    /// Does not evaluate the formula or notify any subscriber. Returns the same
     /// `bool` contract as `Sheet::set_formula`: `false` on parse failure or
     /// cycle (the cell is left holding `#VALUE!` / `#CYCLE!`, no notify).
     pub fn set_formula(&mut self, addr_str: &str, formula_str: &str) -> bool {
@@ -5335,9 +5667,9 @@ impl<'a> BulkLoader<'a> {
 
     /// LAZY_FORMULA_INDEXING Phase 2 core: park `formula_text` in
     /// `Sheet::formula_source` and add `addr` to `Sheet::needs_parse`.
-    /// Skips parse, dep extract, dep register, and `FormulaRecord`
+    /// Skips dep extract, dep register, and `FormulaRecord`
     /// materialisation. Touched is still recorded so the existing
-    /// dirty-propagation / subscriber-notify pass in `flush()` runs.
+    /// structural/subscriber maintenance in `flush()` runs.
     ///
     /// Returns `true` unconditionally — the cycle check is deferred
     /// to first read (matches the TS port's "lazy build, lazy eval"
@@ -5353,6 +5685,7 @@ impl<'a> BulkLoader<'a> {
         if self.sheet.spilled_into_anchor(addr).is_some() {
             return false;
         }
+        let pre_range_member = self.sheet.range_member_present(addr);
         self.sheet.clear_spill_at_address(addr);
 
         // Detach fanout so any prior-formula / primitive-scaffold
@@ -5364,26 +5697,30 @@ impl<'a> BulkLoader<'a> {
         // workloads — see `bulk_load_skips_eval_until_first_read`), tear
         // it down so the lazy path is the sole source of truth for this
         // address.
-        if self.sheet.interior.formula_cells.borrow().contains_key(&addr) {
-            self.sheet.remove_formula_record(addr);
-        }
-        // Also drop any prior lazy parking — overwrite semantics.
-        self.sheet.interior.formula_source.borrow_mut().remove(&addr);
-        self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
+        self.sheet.remove_formula_record(addr);
 
         // Drop any prior primitive scaffold (no notify); mirrors the
         // primitive→formula transition cleanup in
         // `install_parsed_formula`.
         self.sheet.drop_cell_slot(addr);
+        self.sheet.bump_formula_topology_epoch();
+
+        let parsed_for_inner = parse_formula(&formula_text);
 
         // Park the source text. `Rc<str>` keeps the per-formula heap
         // footprint to one allocation; the hydrator clones the `Rc`
         // (cheap) when it reads back.
         self.sheet
-            .interior.formula_source
+            .interior
+            .formula_source
             .borrow_mut()
-            .insert(addr, Rc::<str>::from(formula_text));
+            .insert(addr, ParkedFormula::new(formula_text));
         self.sheet.interior.needs_parse.borrow_mut().insert(addr);
+        if parsed_for_inner.is_some() {
+            self.sheet.materialize_formula_inner(addr);
+        }
+        self.sheet.invalidate_formula_inner(addr);
+        self.sheet.bump_facade_epoch(addr);
 
         // Bump imported-formula counter so the scale suite's
         // `debug_imported_formula_count` reads as N after a 100k import
@@ -5396,11 +5733,15 @@ impl<'a> BulkLoader<'a> {
             .set(self.sheet.imported_formula_count.get() + 1);
 
         self.touched.insert(addr);
+        if pre_range_member != self.sheet.range_member_present(addr) {
+            self.range_membership_changed.insert(addr);
+        }
         true
     }
 
     /// Shared core for `set_formula` / `set_formula_pre_parsed`. Runs
-    /// the same-sheet cycle check then installs the record + dep edges.
+    /// the same-sheet cycle check, installs static metadata, and materializes
+    /// the Store-backed formula-inner.
     /// Returns `true` on success; `false` (with `#CYCLE!` written) if
     /// the formula would close a same-sheet cycle. Consumes
     /// `formula_text` to land directly in `formula_texts` without a
@@ -5420,20 +5761,22 @@ impl<'a> BulkLoader<'a> {
     ) -> bool {
         // Static cycle check still runs inside bulk_load — incremental cycle
         // protection isn't worth dropping for perf, and the cost is bounded by
-        // the dep closure of the new formula.
-        if self.sheet.would_create_cycle(addr, &expr) {
+        // the static reference closure of the new formula.
+        if self.sheet.closes_local_cycle(addr, &expr) {
             self.write_error_no_notify(addr, ValueError::CyclicRef);
             self.touched.insert(addr);
             return false;
         }
+        let pre_range_member = self.sheet.range_member_present(addr);
 
         // Detach fanout so any primitive scaffold teardown below does not fire.
         self.sheet.detach_address_sub(addr);
 
         let expr = Rc::new(expr);
-        // Phase 1 instrumentation (bulk_import_trace): split the
-        // formula install path into dep_extract / dep_register /
-        // formula_record sub-phases. Sample the host clock at the 4
+        // Phase 1 instrumentation (bulk_import_trace): retain the public
+        // dep_extract / dep_register / formula_record timing fields. P5 has
+        // no separate dependency registration, so dep_register is expected
+        // to stay near zero. Sample the host clock at the 4
         // sub-phase boundaries (4 calls per formula install) only on
         // the instrumented path; production is zero-cost (one thread-
         // local read + branch). Native uses an `Instant` epoch wrapped
@@ -5447,48 +5790,55 @@ impl<'a> BulkLoader<'a> {
         let clock = crate::bulk_import_trace::flush_phase_clock();
         let t_dep_extract_start = clock.map(|f| f());
         let deps = Sheet::formula_deps_for(&expr);
-        let range_deps = collect_range_refs(&expr);
+        let static_ranges = collect_range_refs(&expr);
         // Drop any prior formula record (no notify) and any primitive scaffold
         // that no longer has dependents — mirrors `Sheet::set_formula` minus
         // the `with_remap` listener fire.
         self.sheet.remove_formula_record(addr);
         self.sheet.drop_cell_slot(addr);
-        // Wire dep indexes off `&deps` / `&range_deps` first, then *move*
-        // the originals into the `FormulaRecord`. Reordering kills two
-        // per-formula `HashSet::clone` allocations that dominated the
-        // wasm32 bulk_load constant-factor: each chain formula has a
-        // singleton `deps` and an empty `range_deps`, so each clone was
-        // a malloc for a single-bucket set — at 100k formulas that's
-        // 200k saved mallocs.
+        self.sheet.bump_formula_topology_epoch();
+        // Move the extracted structural metadata into the `FormulaRecord`.
         let t_dep_register_start = clock.map(|f| f());
-        self.sheet.add_formula_deps(addr, &deps);
-        self.sheet.add_formula_range_deps(addr, &range_deps);
         let t_formula_record_start = clock.map(|f| f());
-        let record = Rc::new(FormulaRecord::new(expr.clone(), deps, range_deps));
-        self.sheet.note_cross_sheet_if_any(&expr);
-        self.sheet.interior.formula_cells.borrow_mut().insert(addr, record);
-        self.sheet.interior.formula_exprs.borrow_mut().insert(addr, expr);
+        let record = Rc::new(FormulaRecord::new(expr.clone(), deps, static_ranges));
+        self.sheet
+            .interior
+            .formula_cells
+            .borrow_mut()
+            .insert(addr, record);
+        self.sheet
+            .interior
+            .formula_exprs
+            .borrow_mut()
+            .insert(addr, expr.clone());
         // Consume the owned `formula_text` directly — the caller's
         // string allocation lands in `formula_texts` without a
         // `String::clone`.
-        self.sheet.interior.formula_texts.borrow_mut().insert(addr, formula_text);
+        self.sheet
+            .interior
+            .formula_texts
+            .borrow_mut()
+            .insert(addr, formula_text);
+        self.sheet.materialize_formula_inner(addr);
+        self.sheet.invalidate_formula_inner(addr);
+        self.sheet.bump_facade_epoch(addr);
         if let Some(now_ms) = clock {
             let t_end = now_ms();
             let t0 = t_dep_extract_start.expect("paired with clock");
             let t1 = t_dep_register_start.expect("paired with clock");
             let t2 = t_formula_record_start.expect("paired with clock");
-            // Dep_extract here also folds the cheap
+            // The compatibility dep_extract bucket also folds the cheap
             // `remove_formula_record` + primitive scaffold cleanup into
             // its slot — those two HashMap removes are O(1) and at Mega
             // scale stay in single-digit % of total, so attributing
-            // them to dep_extract (rather than carving a separate
+            // them into that bucket (rather than carving a separate
             // sub-phase) keeps the timer count to 4 per formula.
             crate::bulk_import_trace::add_flush_dep_extract_ms(t1 - t0);
             crate::bulk_import_trace::add_flush_dep_register_ms(t2 - t1);
             crate::bulk_import_trace::add_flush_formula_record_ms(t_end - t2);
         }
 
-        // B1 — bump the imported-formula counter for successfully registered
+        // B1 — bump the imported-formula counter for successfully installed
         // bulk-load entries. Parse failure / cycle paths return earlier and
         // do not insert a formula record, so they intentionally don't bump.
         self.sheet
@@ -5496,11 +5846,15 @@ impl<'a> BulkLoader<'a> {
             .set(self.sheet.imported_formula_count.get() + 1);
 
         self.touched.insert(addr);
+        if pre_range_member != self.sheet.range_member_present(addr) {
+            self.range_membership_changed.insert(addr);
+        }
         true
     }
 
-    /// Inline `write_error` minus the dirty-mark + subscriber notify. Used by
-    /// the parse-failure and cycle paths in bulk-mode `set_formula`.
+    /// Inline `write_error` minus immediate Store publication and subscriber
+    /// notification. Used by the parse-failure and cycle paths in bulk-mode
+    /// `set_formula`.
     ///
     /// LAZY_FORMULA_INDEXING Phase 3: parse-failure / cycle now
     /// surface at first read via `hydrate_formula`'s own write_error
@@ -5508,226 +5862,72 @@ impl<'a> BulkLoader<'a> {
     /// the same arc may reactivate.
     #[allow(dead_code)]
     fn write_error_no_notify(&mut self, addr: CellAddress, err: ValueError) {
+        let pre_range_member = self.sheet.range_member_present(addr);
+        let had_formula = self
+            .sheet
+            .interior
+            .formula_cells
+            .borrow()
+            .contains_key(&addr)
+            || self.sheet.interior.needs_parse.borrow().contains(&addr);
+        if had_formula {
+            self.obsolete_formula_addrs.insert(addr);
+        }
         self.sheet.detach_address_sub(addr);
-        if self.sheet.interior.formula_cells.borrow().contains_key(&addr) {
+        if had_formula {
             self.sheet.remove_formula_record(addr);
         }
         // Drop any lazy parking too.
-        self.sheet.interior.formula_source.borrow_mut().remove(&addr);
+        self.sheet
+            .interior
+            .formula_source
+            .borrow_mut()
+            .remove(&addr);
         self.sheet.interior.needs_parse.borrow_mut().remove(&addr);
         let id = self.sheet.ensure_cell(addr);
         self.sheet.store.set(id, Value::Error(err));
+        self.sheet.invalidate_formula_inner(addr);
+        self.sheet.bump_facade_epoch(addr);
+        if pre_range_member != self.sheet.range_member_present(addr) {
+            self.range_membership_changed.insert(addr);
+        }
     }
 
-    /// Drain the touched set, dirty all transitively-downstream formulas,
-    /// reattach fanouts on touched primitive addresses, and notify each
-    /// currently-subscribed address at most once.
+    /// Drain the touched set, invalidate touched facades plus Store geometry
+    /// roots, reattach fanouts on touched primitive addresses, and notify each
+    /// directly touched subscribed address at most once.
     ///
-    /// Complexity: O(T + D) where T = touched count, D = size of transitive
-    /// formula closure reachable from `touched` through both
-    /// `cell_dependents` and `range_dependents`. The range half is
-    /// O(matches + wide_count) per address via the Phase 2 Track E
-    /// bucket index, not the Phase 1 O(range_count) scan. Notify dedup
-    /// is O(1) per visited address via the `notified` HashSet.
+    /// Same-sheet formulas are invalidated by Store edges from the touched
+    /// facade/inner/geometry atoms. Store reverse reachability is used only to
+    /// find dynamic arrays that need eager spill maintenance.
     fn flush(&mut self) {
-        // BFS through dependents (point + range) starting at every
-        // touched address. Collect the set of transitively-dirty formula
-        // addresses, and as a side effect flip their FormulaCache to
-        // Dirty.
-        //
-        // Two strategies, picked by `|touched|` vs `|ranges|`:
-        //
-        //  - Small touched (default for individual `set_formula`-style
-        //    bulk loads): use the Phase-1 per-address walk through
-        //    `dependents_of_into`. Cost O(|touched| × matches_per_cell),
-        //    cheaper than scanning the entire range index when |touched|
-        //    is tiny.
-        //
-        //  - Large touched (csv / xlsx / paste import): use the
-        //    coalesced two-pass strategy described below.
-        //
-        // The coalesced path adds one full pass over
-        // `range_dependents.formulas` per BFS round, so it only wins
-        // when |touched| approaches |ranges|. The threshold is
-        // intentionally generous: both `|touched|` and `range_count`
-        // need to be in the hundreds for the coalesced path to be
-        // worth it.
-        let touched_len = self.touched.len();
-        let range_count = self.sheet.range_dependents.borrow().len();
-        // Coalesce when both touched and the range-dependent count are
-        // large enough that the per-address `candidates_for` walk does
-        // real work. The thresholds are intentionally generous — for
-        // small bulk loads (paste of 50 cells with a single SUM, single
-        // formula write) the Phase-1 path stays cheaper because Pass B
-        // would walk an entire range map for nothing.
-        // Pick coalesced only when both halves are nontrivial. The
-        // legacy per-address path now uses a scratch `Vec` to amortize
-        // candidate-range allocations, so the bar for switching to
-        // coalesced is higher than it would be otherwise.
-        // Coalescing strategy. On the bench workloads measured for this
-        // arc (Stripe / FanIn / FanOut at 1k / 10k / 100k tiers), the
-        // legacy per-address walk — augmented with the `candidate_scratch`
-        // amortization above — was consistently 5–8% faster than the
-        // coalesced two-pass strategy at 100k cells. The reason is the
-        // Track-E bucket index already makes `candidates_for(addr)`
-        // hashmap-cheap (no allocation, narrow row/col intersect), so
-        // the extra `dirty_by_row` construction and per-range scan in
-        // the coalesced path overshoots the savings.
-        //
-        // The coalesced path stays in place for future workloads that
-        // DO favor it (e.g. a sheet with many `wide_ranges` where the
-        // bucket index degenerates to a linear scan): just flip the
-        // condition below. For now we keep it dark behind a guard
-        // chosen to never fire under measured workloads. Tests still
-        // exercise the implementation via the coalesced-only
-        // RangeDependentIndex API.
-        // Coalesce dark by default. On the bench workloads measured
-        // for this arc (Stripe / FanIn / FanOut at 100k tiers) the
-        // scratch-amortized legacy path was consistently faster than
-        // the two-pass coalesced strategy. The Track-E bucket index
-        // already makes `candidates_for(addr)` cheap (no allocation
-        // thanks to `candidates_for_into`, narrow row/col intersect),
-        // and the per-pass `dirty_by_row` construction + per-range
-        // scan in the coalesced path overshoots the savings.
-        //
-        // The coalesced implementation stays in place — and is
-        // exercised by `range_dep_coalesced_matches_per_address` and
-        // `bulk_load_stripe_range_coalesce_matches_legacy` — for
-        // future workloads that may benefit (e.g. sheets dominated by
-        // `wide_ranges` where the bucket index degenerates to a
-        // linear scan). Flip the literal to a size comparison to turn
-        // it on.
-        let _ = (range_count, touched_len);
-        let use_coalesced = false;
-
-        let mut dirty: HashSet<CellAddress> = HashSet::new();
-
-        if !use_coalesced {
-            // Phase-1 single-pass BFS. Same logical walk as the pre-
-            // coalescing implementation but threading a reusable
-            // `candidate_scratch` buffer through `dependents_of_into`
-            // so the candidate-range list isn't reallocated per
-            // visited address. At 100k+ touched cells the per-call
-            // `Vec::new()` was a real share of the wall-clock cost.
-            let mut stack: Vec<CellAddress> = Vec::new();
-            let mut candidate_scratch: Vec<CellRange> = Vec::new();
-            for &addr in &self.touched {
-                self.sheet.dependents_of_into_with_scratch(
-                    addr,
-                    &mut stack,
-                    &mut candidate_scratch,
-                );
+        let touched: Vec<CellAddress> = self.touched.iter().copied().collect();
+        let range_membership_changed: Vec<CellAddress> =
+            self.range_membership_changed.iter().copied().collect();
+        let array_formulas_to_reproject = self
+            .sheet
+            .store_dependent_array_formula_addrs_from_addrs(touched.iter().copied());
+        self.sheet.store_batch(|sheet| {
+            for &addr in &touched {
+                sheet.invalidate_formula_inner(addr);
+                sheet.bump_facade_epoch(addr);
             }
-            while let Some(addr) = stack.pop() {
-                if !dirty.insert(addr) {
-                    continue;
-                }
-                if let Some(record) = self.sheet.interior.formula_cells.borrow().get(&addr).cloned() {
-                    *record.cache.borrow_mut() = FormulaCache::Dirty;
-                }
-                self.sheet.dependents_of_into_with_scratch(
-                    addr,
-                    &mut stack,
-                    &mut candidate_scratch,
-                );
+            for addr in range_membership_changed.iter().copied() {
+                sheet.bump_range_membership_epochs_touching(addr);
             }
-        } else {
-            // Coalesced two-pass strategy:
-            //
-            //   Pass A — cell-cell deps only. Drains the worklist using
-            //   `cell_dependents[addr]` lookups (O(1) point fetches).
-            //   No range scan per address. Cost O(D_cell) where D_cell
-            //   is the transitive closure through point-cell deps.
-            //
-            //   Pass B — coalesced range deps. ONE iteration over the
-            //   entire `range_dependents` map. For each registered
-            //   range, intersect with the row-bucketed dirty-or-touched
-            //   set; on hit, append all dependents to the worklist.
-            //   Cost O(|ranges| + Σ rows-in-range). The Phase-1 path
-            //   instead called `candidates_for(addr)` once per address
-            //   — O(|dirty| × matches_per_cell), which dominates
-            //   `bulk_import` flush when `|dirty|` is in the tens of
-            //   thousands.
-            //
-            // The two passes iterate to fixpoint: Pass B's newly-added
-            // dependents may have point-cell deps of their own, so
-            // Pass A runs again, then Pass B again, until B finds
-            // nothing new.
-            //
-            // Correctness invariant: the resulting `dirty` set is the
-            // same closure as the Phase-1 BFS — both expose the union
-            // of cell_dependents and range-contains dependents, just
-            // sliced differently. No address can escape Pass A+B
-            // unless it has neither a point-cell predecessor nor a
-            // containing range, in which case the Phase-1 walk would
-            // skip it too.
-            let mut stack: Vec<CellAddress> = Vec::with_capacity(touched_len);
-            stack.extend(self.touched.iter().copied());
-
-            // Row-bucketed view of (touched ∪ dirty). Pass B consults
-            // this so the range-intersection test is O(rows-in-range)
-            // instead of O(|dirty|) — critical when both are large.
-            let mut dirty_by_row: HashMap<u32, Vec<u32>> = HashMap::with_capacity(touched_len);
-            for &addr in &self.touched {
-                dirty_by_row.entry(addr.row).or_default().push(addr.col);
-            }
-
-            loop {
-                // Pass A — drain the stack via cell-cell deps.
-                {
-                    let cell_dependents = self.sheet.cell_dependents.borrow();
-                    while let Some(addr) = stack.pop() {
-                        if !dirty.insert(addr) {
-                            continue;
-                        }
-                        if let Some(record) = self.sheet.interior.formula_cells.borrow().get(&addr).cloned() {
-                            *record.cache.borrow_mut() = FormulaCache::Dirty;
-                        }
-                        // Touched addresses were already seeded into
-                        // `dirty_by_row` outside the loop; only BFS
-                        // additions need bookkeeping here.
-                        if !self.touched.contains(&addr) {
-                            dirty_by_row.entry(addr.row).or_default().push(addr.col);
-                        }
-                        if let Some(set) = cell_dependents.get(&addr) {
-                            stack.extend(set.iter().copied());
-                        }
-                    }
-                }
-
-                // Pass B — coalesced range scan. Find new dirty
-                // addresses by walking `range_dependents.formulas`
-                // once. Pass A re-checks `dirty.insert` so duplicates
-                // are benign; no extra filter needed here. The
-                // alternative would `stack.retain(|a| !dirty.contains(a))`
-                // to keep the stack from ballooning, but for the workloads
-                // measured the retain itself was as expensive as the
-                // no-op pops Pass A does on duplicates.
-                let before_stack_len = stack.len();
-                {
-                    let range_dependents = self.sheet.range_dependents.borrow();
-                    range_dependents.coalesced_dirty_into(&dirty_by_row, &mut stack);
-                }
-
-                if stack.len() == before_stack_len {
-                    break;
-                }
-            }
+        });
+        for addr in self.obsolete_formula_addrs.drain() {
+            self.sheet.cleanup_obsolete_formula_atoms_at(addr);
         }
 
-        // AUDIT A-4 — eager spill maintenance over the dirty closure,
-        // mirroring the `recompute_array_formulas_in(&dirtied)` tail of
-        // the single-cell mutators: a bulk dependency write must
-        // re-flow downstream dynamic arrays at flush (grow/shrink the
-        // spill, release vacated targets). `dirty` only ever contains
-        // already-registered formula addresses (lazy-parked formulas
-        // have no dep edges until first read), so the lazy bulk-import
-        // contract — zero parse / zero eval for freshly loaded
-        // formulas — is preserved.
-        self.sheet.recompute_array_formulas_in(&dirty);
+        // Eager spill maintenance follows the Store's reverse dependency
+        // graph. Lazy-parked formulas have no live edges until first read, so
+        // fresh bulk imports still do zero formula evaluation here.
+        self.sheet
+            .recompute_array_formulas_in(&array_formulas_to_reproject);
 
         // AUDIT B-5 — with zero address subscriptions the reattach loop
-        // and the touched ∪ dirty notify-set build below are pure
+        // and the touched notify loop below are pure
         // overhead: a 1M-cell restore would pay ~3M hash ops to conclude
         // nobody is watching. `attach_address_sub` is a no-op without a
         // bucket and the notify loop cannot fire, so early-out keeps the
@@ -5740,22 +5940,16 @@ impl<'a> BulkLoader<'a> {
         // Reattach fanouts on touched addresses so future writes notify
         // normally. Reattach is a no-op when the address has no
         // subscription bucket or no readable atom.
-        for &addr in &self.touched {
+        for &addr in &touched {
             self.sheet.attach_address_sub(addr);
         }
 
-        // Notify each currently-subscribed address in (touched ∪ dirty)
-        // exactly once. Subscribers on addresses that weren't touched and
-        // have no dirty formula dependents are skipped — the "lazy"
-        // extreme: no listener fires for cells nobody is watching.
-        let mut notify_targets: HashSet<CellAddress> =
-            HashSet::with_capacity(self.touched.len() + dirty.len());
-        notify_targets.extend(self.touched.iter().copied());
-        notify_targets.extend(dirty.iter().copied());
-        self.sheet.bulk_notify_probe_count.set(
-            self.sheet.bulk_notify_probe_count.get() + notify_targets.len() as u64,
-        );
-        for addr in notify_targets {
+        // Downstream formula subscribers stayed attached and are notified by
+        // Store propagation. Only directly touched fanouts were detached.
+        self.sheet
+            .bulk_notify_probe_count
+            .set(self.sheet.bulk_notify_probe_count.get() + touched.len() as u64);
+        for addr in touched {
             if self.sheet.has_address_subscribers(addr) {
                 self.sheet.notify_address_subscribers(addr);
             }
@@ -5765,10 +5959,9 @@ impl<'a> BulkLoader<'a> {
 
 /// Walk the AST and collect every `Expr::Range` as a typed `CellRange`,
 /// without expanding it to individual cells. Mirror of `collect_refs`
-/// that handles only ranges. Used by `set_formula` / `BulkLoader` to
-/// populate `FormulaRecord::range_deps` at registration time so the
-/// sheet-level `range_dependents` index can be rebuilt without losing
-/// range identity across sparse-eval narrowing of the point dep set.
+/// that handles only ranges. Used by `set_formula` / `BulkLoader` to retain
+/// range identity for static cycle checks and structural retargeting without
+/// expanding large ranges into individual cells.
 fn collect_range_refs(expr: &Expr) -> HashSet<CellRange> {
     let mut out = HashSet::new();
     collect_range_refs_into(expr, &mut out);
@@ -5784,9 +5977,8 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
             // For whole-col / whole-row ranges the start/end already carry
             // the sentinel coords (0 and u32::MAX) on the unbounded axis,
             // so the resulting CellRange spans the entire sheet on that
-            // axis. `RangeDependentIndex::is_wide` flags any range > 4096
-            // rows or cols as wide, which routes whole-col / whole-row
-            // automatically into `wide_ranges` — Track E's contract.
+            // axis. Formula evaluation maps that geometry to lazy Store
+            // band/column/sheet roots without expanding the coordinate space.
             out.insert(CellRange::new(*start, *end).normalize());
         }
         Expr::BinOp { left, right, .. } => {
@@ -5847,9 +6039,9 @@ fn collect_range_refs_into(expr: &Expr, out: &mut HashSet<CellRange>) {
 /// Whole-column / whole-row ranges (`A:A`, `1:1`) are NOT expanded into
 /// individual cells here — that would push the entire coordinate space
 /// (`u32::MAX` rows or cols) into the dep vec. Track G's contract: the
-/// unbounded range is tracked via `range_deps` only; the BFS at the
-/// call site (cycle detection, dirty propagation) consults that via the
-/// range_dependents index instead of the point-cell index.
+/// unbounded range remains typed in `static_ranges`; cycle detection walks
+/// materialized formulas within it, while runtime invalidation is owned by
+/// Store geometry roots.
 fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
     match expr {
         Expr::CellRef(addr) => out.push(*addr),
@@ -5859,8 +6051,7 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
             unbounded,
         } => {
             // Skip expansion for unbounded ranges — the row/col bound would
-            // be u32::MAX. Range deps are still tracked through
-            // `collect_range_refs` → `RangeDependentIndex`.
+            // be u32::MAX. `collect_range_refs` retains the typed range.
             if !matches!(unbounded, RangeBounds::None) {
                 return;
             }
@@ -5914,278 +6105,10 @@ fn collect_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
     }
 }
 
-/// Variant of `collect_refs` that respects evaluator short-circuit
-/// semantics — used by `prewarm_formula_chain` to fill the formula cache
-/// without pre-warming branches the evaluator would skip.
-///
-/// `collect_refs` blindly walks every child of every `FuncCall`. Plumbing
-/// its output through prewarm caused a bug (codex P2): `=IF(TRUE, 0, B1)`
-/// would pre-warm B1 because the static AST mentions it, even though the
-/// `IF` evaluator never touches the else branch. That regressed lazy-eval
-/// for any formula guarding a volatile / custom / large chain behind an
-/// `IF` / `IFS` / `SWITCH` / `IFERROR` / `IFNA`.
-///
-/// The fix: when we encounter one of those short-circuit calls, only
-/// descend into the args that are *guaranteed* to be evaluated. The
-/// branches reached only when a runtime condition holds are left out;
-/// if eval later does take that branch, the recursive `compute_formula_at`
-/// path will still resolve those cells correctly. The prewarm is just an
-/// optional cache-fill, so missing a cell is never a correctness issue —
-/// it only means an extra recursive frame at eval time.
-///
-/// Args we treat as "always evaluated":
-///
-/// - `IF(cond, then, else)` → `cond` only.
-/// - `IFS(c1, v1, c2, v2, ...)` → `c1` only (each subsequent cond is
-///   guarded by the prior ones being false).
-/// - `SWITCH(expr, c1, v1, ...)` → `expr` and `c1` (the leading
-///   discriminant and the first case are always touched by the
-///   evaluator; later cases stop as soon as one matches).
-/// - `IFERROR(primary, fallback)` / `IFNA(primary, fallback)` →
-///   `primary` only.
-///
-/// Everything else (other built-ins, lambda calls, binops, ranges, …)
-/// stays exhaustive — those are not short-circuit functions in this
-/// engine. Notably `AND` / `OR` are *not* listed: this implementation
-/// evaluates all of their args (see `for_each_arg_value`), matching
-/// Excel's "evaluates all arguments" contract, so prewarm should still
-/// see their refs.
-fn collect_prewarm_refs(expr: &Expr, out: &mut Vec<CellAddress>) {
-    match expr {
-        Expr::CellRef(addr) => out.push(*addr),
-        Expr::Range {
-            start,
-            end,
-            unbounded,
-        } => {
-            if !matches!(unbounded, RangeBounds::None) {
-                return;
-            }
-            let min_row = start.row.min(end.row);
-            let max_row = start.row.max(end.row);
-            let min_col = start.col.min(end.col);
-            let max_col = start.col.max(end.col);
-            for row in min_row..=max_row {
-                for col in min_col..=max_col {
-                    out.push(CellAddress::new(row, col));
-                }
-            }
-        }
-        Expr::BinOp { left, right, .. } => {
-            collect_prewarm_refs(left, out);
-            collect_prewarm_refs(right, out);
-        }
-        Expr::Negate(inner) => collect_prewarm_refs(inner, out),
-        Expr::FuncCall { name, args } => {
-            // `FuncCall` names are normalized to upper-case by the parser
-            // (see `is_builtin_function_name` in eval.rs), so an exact
-            // match is sufficient here — no `eq_ignore_ascii_case`.
-            match name.as_str() {
-                // IF(cond, then, else) — only `cond` is always evaluated.
-                "IF" => {
-                    if let Some(cond) = args.first() {
-                        collect_prewarm_refs(cond, out);
-                    }
-                }
-                // IFS(c1, v1, c2, v2, ...) — only `c1` is always
-                // evaluated; every later (cond, val) pair is gated by
-                // the previous conds being false.
-                "IFS" => {
-                    if let Some(first_cond) = args.first() {
-                        collect_prewarm_refs(first_cond, out);
-                    }
-                }
-                // SWITCH(expr, c1, v1, c2, v2, ..., [default]) — the
-                // discriminant `expr` and the first case `c1` are always
-                // evaluated. Later cases stop when one matches; values
-                // and the trailing default are skipped on a hit.
-                "SWITCH" => {
-                    if let Some(disc) = args.first() {
-                        collect_prewarm_refs(disc, out);
-                    }
-                    if let Some(first_case) = args.get(1) {
-                        collect_prewarm_refs(first_case, out);
-                    }
-                }
-                // IFERROR / IFNA — fallback only runs when the primary
-                // arg yields an error. Static prewarm of `fallback` would
-                // be an eager evaluation of the recovery path.
-                "IFERROR" | "IFNA" => {
-                    if let Some(primary) = args.first() {
-                        collect_prewarm_refs(primary, out);
-                    }
-                }
-                _ => {
-                    for a in args {
-                        collect_prewarm_refs(a, out);
-                    }
-                }
-            }
-        }
-        Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
-        Expr::Name(_) => {}
-        Expr::SpillRef(anchor) => collect_prewarm_refs(anchor, out),
-        Expr::DynamicRange { start, end } => {
-            collect_prewarm_refs(start, out);
-            collect_prewarm_refs(end, out);
-        }
-        // Immediate-call form — the callee and every arg are evaluated
-        // before the lambda body runs, so they're all "always" touched.
-        // The lambda body itself is opaque to static analysis (it could
-        // contain short-circuit nodes, but we have no way to see through
-        // a runtime `Value::Lambda` here).
-        Expr::Call(callee, args) => {
-            collect_prewarm_refs(callee, out);
-            for a in args {
-                collect_prewarm_refs(a, out);
-            }
-        }
-        Expr::ArrayLit { .. } => {}
-        Expr::MultiArea(parts) => {
-            for p in parts {
-                collect_prewarm_refs(p, out);
-            }
-        }
-    }
-}
-
-/// Variant of `collect_refs` that only enqueues addresses present in
-/// `formula_exprs`. Used by `recompute_cross_sheet_formulas_reachable_from`
-/// to BFS the formula graph without expanding `SUM(A:A)`-style ranges into
-/// every empty cell — only formula cells inside the range get queued.
-fn collect_formula_refs_into(
-    expr: &Expr,
-    formula_exprs: &HashMap<CellAddress, Rc<Expr>>,
-    out: &mut Vec<CellAddress>,
-) {
-    match expr {
-        Expr::CellRef(addr) => {
-            if formula_exprs.contains_key(addr) {
-                out.push(*addr);
-            }
-        }
-        Expr::Range { start, end, .. } => {
-            let min_row = start.row.min(end.row);
-            let max_row = start.row.max(end.row);
-            let min_col = start.col.min(end.col);
-            let max_col = start.col.max(end.col);
-            // For unbounded ranges (`A:A`, `1:1`) one of the dims is u32::MAX;
-            // `cells_in_range` would overflow if computed as a product. The
-            // existing branch already guards via `>` comparison, so we use a
-            // saturating product and let the "scan formulas" branch take
-            // over when the range is large.
-            let cells_in_range = (max_row.saturating_sub(min_row) as usize)
-                .saturating_add(1)
-                .saturating_mul((max_col.saturating_sub(min_col) as usize).saturating_add(1));
-            // For ranges larger than the formula table, scan formulas and
-            // filter; otherwise iterate cells. Avoids `SUM(A:A)` walking
-            // a million empty addresses.
-            if cells_in_range > formula_exprs.len() {
-                for &addr in formula_exprs.keys() {
-                    if addr.row >= min_row
-                        && addr.row <= max_row
-                        && addr.col >= min_col
-                        && addr.col <= max_col
-                    {
-                        out.push(addr);
-                    }
-                }
-            } else {
-                for row in min_row..=max_row {
-                    for col in min_col..=max_col {
-                        let a = CellAddress::new(row, col);
-                        if formula_exprs.contains_key(&a) {
-                            out.push(a);
-                        }
-                    }
-                }
-            }
-        }
-        Expr::BinOp { left, right, .. } => {
-            collect_formula_refs_into(left, formula_exprs, out);
-            collect_formula_refs_into(right, formula_exprs, out);
-        }
-        Expr::Negate(inner) => collect_formula_refs_into(inner, formula_exprs, out),
-        Expr::FuncCall { args, .. } => {
-            for a in args {
-                collect_formula_refs_into(a, formula_exprs, out);
-            }
-        }
-        // SheetRef points outside this sheet — handled by the resolver, not
-        // by local BFS.
-        Expr::SheetRef { .. } | Expr::SheetRange { .. } => {}
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
-        // LET-bound names don't reference cells in the formula graph.
-        Expr::Name(_) => {}
-        Expr::SpillRef(anchor) => collect_formula_refs_into(anchor, formula_exprs, out),
-        Expr::DynamicRange { start, end } => {
-            collect_formula_refs_into(start, formula_exprs, out);
-            collect_formula_refs_into(end, formula_exprs, out);
-        }
-        // Immediate-call form — descend into callee + args.
-        Expr::Call(callee, args) => {
-            collect_formula_refs_into(callee, formula_exprs, out);
-            for a in args {
-                collect_formula_refs_into(a, formula_exprs, out);
-            }
-        }
-        // Constant-array literal carries no formula-graph references.
-        Expr::ArrayLit { .. } => {}
-        // Multi-area: descend so cells referenced via the union also
-        // count as formula-graph refs.
-        Expr::MultiArea(parts) => {
-            for p in parts {
-                collect_formula_refs_into(p, formula_exprs, out);
-            }
-        }
-    }
-}
-
-/// Walk the AST looking for any `Expr::SheetRef`. Used by `Workbook::get_cell`
-/// to skip force-recompute on formulas that don't actually need a cross-sheet
-/// resolver (the common case). `pub(crate)` so the workbook can walk
-/// defined-name LAMBDA bodies at registration time (audit B-4 — the
-/// sheet-side walker cannot resolve `Expr::Name` itself, it has no
-/// access to the workbook's named-value registry; the workbook-level
-/// `named_values_cross_sheet` latch closes that hole).
-pub(crate) fn expr_has_sheet_ref(expr: &Expr) -> bool {
-    match expr {
-        Expr::SheetRef { .. } | Expr::SheetRange { .. } => true,
-        Expr::BinOp { left, right, .. } => expr_has_sheet_ref(left) || expr_has_sheet_ref(right),
-        Expr::Negate(inner) => expr_has_sheet_ref(inner),
-        Expr::FuncCall { args, .. } => args.iter().any(expr_has_sheet_ref),
-        Expr::CellRef(_)
-        | Expr::Range { .. }
-        | Expr::Number(_)
-        | Expr::Text(_)
-        | Expr::Bool(_)
-        | Expr::Error(_) => false,
-        // A bare name may bind to a defined LAMBDA whose body reads
-        // another sheet, but this walker has no registry to resolve it.
-        // The workbook-level `named_values_cross_sheet` latch (armed at
-        // `define_name` time) covers that case — see audit B-4.
-        Expr::Name(_) => false,
-        Expr::SpillRef(anchor) => expr_has_sheet_ref(anchor),
-        Expr::DynamicRange { start, end } => expr_has_sheet_ref(start) || expr_has_sheet_ref(end),
-        // Immediate-call could resolve to a LAMBDA whose body references
-        // another sheet; descend conservatively.
-        Expr::Call(callee, args) => {
-            expr_has_sheet_ref(callee) || args.iter().any(expr_has_sheet_ref)
-        }
-        // Constant-array literal can't carry a SheetRef (parser rejected
-        // refs of any kind inside `{...}`).
-        Expr::ArrayLit { .. } => false,
-        // Multi-area: a `SheetRef` / `SheetRange` could be one of the
-        // inner parts (`(Sheet2!A1, Sheet3!B2)` is valid).
-        Expr::MultiArea(parts) => parts.iter().any(expr_has_sheet_ref),
-    }
-}
-
 /// Conservative static check: does this AST contain a call to a
 /// function that can produce a `Value::Array`? Used to gate the eager
 /// spill re-eval — formulas that can't produce arrays stay fully lazy
-/// and preserve the dirty-count / eval-count debug counters.
+/// and preserve the compatibility dirty-count / eval-count debug counters.
 ///
 /// Currently any of SEQUENCE / UNIQUE / SORT / FILTER, or any function
 /// that itself receives an array-producing call as an argument
@@ -6276,10 +6199,9 @@ fn expr_may_produce_array(expr: &Expr) -> bool {
 
 struct SheetEvalProvider<'a> {
     sheet: &'a Sheet,
-    /// Cell currently being evaluated. Updated by
-    /// `eval_formula_at_with_provider` via `set_current_cell` (save/restore
-    /// guard pattern) so `ROW()` / `COLUMN()` no-arg calls can read the
-    /// formula's own row/column.
+    /// Cell currently being evaluated. Updated through `set_current_cell`
+    /// (save/restore guard pattern) so no-arg `ROW()` / `COLUMN()` calls can
+    /// read the formula's own row/column.
     current_cell: Cell<Option<CellAddress>>,
 }
 
@@ -6352,116 +6274,11 @@ impl<'a> EvalProvider for SheetEvalProvider<'a> {
             return Some(t.clone());
         }
         self.sheet
-            .interior.formula_source
+            .interior
+            .formula_source
             .borrow()
             .get(&addr)
-            .map(|s| s.as_ref().to_string())
-    }
-}
-
-struct TrackingEvalProvider<'a> {
-    inner: &'a dyn EvalProvider,
-    deps: Rc<RefCell<HashSet<CellAddress>>>,
-}
-
-impl<'a> EvalProvider for TrackingEvalProvider<'a> {
-    fn cell(&self, addr: CellAddress) -> Value {
-        self.deps.borrow_mut().insert(addr);
-        self.inner.cell(addr)
-    }
-
-    fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
-        self.inner.sheet_cell(sheet, addr)
-    }
-
-    fn raw_cell(&self, addr: CellAddress) -> Value {
-        self.deps.borrow_mut().insert(addr);
-        self.inner.raw_cell(addr)
-    }
-
-    fn raw_sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value {
-        self.inner.raw_sheet_cell(sheet, addr)
-    }
-
-    fn force_formula_recompute(&self) -> bool {
-        self.inner.force_formula_recompute()
-    }
-
-    /// Tracking wrapper: record every address the inner provider yields
-    /// as a formula dep. This lets `IF`-style dynamic-branch deps stay
-    /// accurate even when the eval went through `for_each_range_cell`
-    /// instead of explicit per-cell `cell()` calls.
-    fn for_each_range_cell(&self, range: CellRange, f: &mut dyn FnMut(CellAddress, Value)) {
-        let deps = self.deps.clone();
-        self.inner.for_each_range_cell(range, &mut |addr, v| {
-            deps.borrow_mut().insert(addr);
-            f(addr, v);
-        });
-    }
-
-    fn for_each_sheet_range_cell(
-        &self,
-        sheet: &str,
-        range: CellRange,
-        f: &mut dyn FnMut(CellAddress, Value),
-    ) {
-        self.inner.for_each_sheet_range_cell(sheet, range, f);
-    }
-
-    fn current_cell(&self) -> Option<CellAddress> {
-        self.inner.current_cell()
-    }
-
-    fn set_current_cell(&self, addr: Option<CellAddress>) {
-        self.inner.set_current_cell(addr);
-    }
-
-    fn lookup_named(&self, name: &str) -> Option<Value> {
-        // Pass through to the underlying workbook/sheet provider. We do
-        // NOT record a dep edge here: defined-name dependency tracking
-        // is handled by `Workbook::invalidate_formulas_using_name` —
-        // every formula that references the name gets dirtied on
-        // `define_name` / `undefine_name`, so there's no need to mark
-        // anything in the per-cell `deps` set when a named lookup
-        // succeeds.
-        self.inner.lookup_named(name)
-    }
-
-    fn cell_has_formula(&self, addr: CellAddress) -> bool {
-        self.inner.cell_has_formula(addr)
-    }
-
-    fn sheet_cell_has_formula(&self, sheet: &str, addr: CellAddress) -> bool {
-        self.inner.sheet_cell_has_formula(sheet, addr)
-    }
-
-    fn cell_formula_text(&self, addr: CellAddress) -> Option<String> {
-        self.inner.cell_formula_text(addr)
-    }
-
-    fn sheet_cell_formula_text(&self, sheet: &str, addr: CellAddress) -> Option<String> {
-        self.inner.sheet_cell_formula_text(sheet, addr)
-    }
-
-    fn current_sheet_index(&self) -> Option<usize> {
-        self.inner.current_sheet_index()
-    }
-
-    fn sheet_index_of(&self, name: &str) -> Option<usize> {
-        self.inner.sheet_index_of(name)
-    }
-
-    fn sheet_count(&self) -> usize {
-        self.inner.sheet_count()
-    }
-
-    /// Pass-through to the inner provider. No dep edge is recorded — a
-    /// custom function's "dependency" is the registration itself, not a
-    /// cell. When a host changes the custom registry it calls
-    /// `Workbook::invalidate_all_formulas_for_custom_function_change`
-    /// to dirty every formula in one shot.
-    fn call_custom(&self, name: &str, args: &[Value]) -> Option<Value> {
-        self.inner.call_custom(name, args)
+            .map(|s| s.source.as_ref().to_string())
     }
 }
 
@@ -6607,7 +6424,9 @@ mod tests {
         let facade = sheet.facade_of(addr);
         let hits = Rc::new(Cell::new(0u32));
         let hits_l = hits.clone();
-        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+        sheet
+            .store
+            .sub(facade, move || hits_l.set(hits_l.get() + 1));
 
         assert_eq!(sheet.store.get(facade), Value::Number(5.0));
 
@@ -6632,7 +6451,9 @@ mod tests {
         let facade = sheet.facade_of(addr);
         let hits = Rc::new(Cell::new(0u32));
         let hits_l = hits.clone();
-        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+        sheet
+            .store
+            .sub(facade, move || hits_l.set(hits_l.get() + 1));
 
         assert_eq!(sheet.store.get(facade), Value::Number(6.0));
 
@@ -6655,7 +6476,9 @@ mod tests {
         let facade = sheet.facade_of(addr);
         let hits = Rc::new(Cell::new(0u32));
         let hits_l = hits.clone();
-        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+        sheet
+            .store
+            .sub(facade, move || hits_l.set(hits_l.get() + 1));
 
         assert_eq!(sheet.store.get(facade), Value::Number(1.0));
 
@@ -6679,7 +6502,9 @@ mod tests {
         let facade = sheet.facade_of(addr);
         let hits = Rc::new(Cell::new(0u32));
         let hits_l = hits.clone();
-        sheet.store.sub(facade, move || hits_l.set(hits_l.get() + 1));
+        sheet
+            .store
+            .sub(facade, move || hits_l.set(hits_l.get() + 1));
 
         assert_eq!(sheet.store.get(facade), Value::Number(7.0));
 
@@ -6722,6 +6547,26 @@ mod tests {
             sheet.get_cell("C1"),
             Value::Error(ValueError::DivisionByZero)
         );
+    }
+
+    #[test]
+    fn formula_error_recovers_through_store_derivation() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(0.0));
+        sheet.set_formula("B1", "=1/A1");
+
+        assert_eq!(
+            sheet.get_cell("B1"),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        let evals_before = sheet.debug_formula_eval_count();
+
+        sheet.set_cell("A1", Value::Number(2.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(0.5));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
+
+        assert_eq!(sheet.get_cell("B1"), Value::Number(0.5));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
     }
 
     #[test]
@@ -6801,6 +6646,225 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_range_formula_fires_once_on_member_change() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_cell("A2", Value::Number(2.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("A1", Value::Number(5.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(7.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "range formula subscriber fires exactly once"
+        );
+    }
+
+    #[test]
+    fn subscribe_range_formula_fires_once_on_new_member_change() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let count = Rc::new(RefCell::new(0u32));
+        let cc = count.clone();
+        let _sub = sheet.subscribe_cell("B1", move || *cc.borrow_mut() += 1);
+
+        sheet.set_cell("A2", Value::Number(2.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(
+            *count.borrow(),
+            1,
+            "range formula subscriber fires exactly once when membership grows"
+        );
+    }
+
+    #[test]
+    fn small_range_formula_does_not_materialize_geometry_root() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+
+        assert_eq!(
+            sheet.debug_range_dep_count(),
+            0,
+            "small range geometry stays lazy until the formula is read"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+        assert_eq!(
+            sheet.debug_range_dep_count(),
+            0,
+            "Tier-A ranges depend on member facades instead of a geometry root"
+        );
+
+        sheet.set_cell("A2", Value::Number(2.0));
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+    }
+
+    #[test]
+    fn small_range_formula_records_store_edge_on_empty_member_facade() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let a2 = CellAddress::parse("A2").unwrap();
+        let a2_facade = sheet
+            .cell_facade_family
+            .borrow()
+            .get(&a2)
+            .expect("Tier-A range read materializes empty member facade");
+        assert_eq!(
+            sheet.store.debug_dependent_count(a2_facade),
+            1,
+            "formula-inner must depend on the empty member facade through Store"
+        );
+
+        let evals_before = sheet.debug_formula_eval_count();
+        let visits_before = sheet.debug_reverse_dep_visit_count();
+        sheet.set_cell("A2", Value::Number(2.0));
+
+        assert_eq!(
+            sheet.debug_reverse_dep_visit_count() - visits_before,
+            1,
+            "Store reverse reachability should find exactly this formula"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
+    }
+
+    #[test]
+    fn large_range_formula_records_store_edge_on_band_epoch() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A300)");
+
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let band_key = RangeBandKey {
+            col: 0,
+            row_band: 1,
+        };
+        let band_epoch = sheet
+            .range_band_epoch_family
+            .borrow()
+            .get(&band_key)
+            .expect("large range read materializes the touched row-band epoch");
+        assert_eq!(
+            sheet.store.debug_dependent_count(band_epoch),
+            1,
+            "formula-inner must depend on the range band epoch through Store"
+        );
+
+        let a300 = CellAddress::parse("A300").unwrap();
+        assert!(
+            sheet.cell_facade_family.borrow().get(&a300).is_none(),
+            "Tier-B range read should not materialize every empty member facade"
+        );
+
+        let evals_before = sheet.debug_formula_eval_count();
+        let visits_before = sheet.debug_reverse_dep_visit_count();
+        sheet.set_cell("A300", Value::Number(2.0));
+
+        assert_eq!(
+            sheet.debug_reverse_dep_visit_count() - visits_before,
+            1,
+            "the band root should reach exactly this formula through Store"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
+    }
+
+    #[test]
+    fn range_formula_membership_change_uses_store_edges() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let evals_before = sheet.debug_formula_eval_count();
+        let visits_before = sheet.debug_reverse_dep_visit_count();
+
+        sheet.set_cell("A2", Value::Number(2.0));
+
+        assert_eq!(
+            sheet.debug_reverse_dep_visit_count() - visits_before,
+            1,
+            "Store reverse reachability should find the affected formula once"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            evals_before + 1,
+            "Store-tracked range inputs should drive one formula-inner recompute"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(
+            sheet.debug_formula_eval_count(),
+            evals_before + 1,
+            "post-write read should hit the clean Store-derived value"
+        );
+    }
+
+    #[test]
+    fn batch_range_formula_membership_change_uses_store_edges() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let evals_before = sheet.debug_formula_eval_count();
+        let visits_before = sheet.debug_reverse_dep_visit_count();
+
+        sheet.batch_set(&[("A2", Value::Number(2.0))]);
+
+        assert_eq!(
+            sheet.debug_reverse_dep_visit_count() - visits_before,
+            1,
+            "batch membership changes should discover one Store dependent"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
+    }
+
+    #[test]
+    fn bulk_range_formula_membership_change_uses_store_edges() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=SUM(A1:A2)");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
+
+        let evals_before = sheet.debug_formula_eval_count();
+        let visits_before = sheet.debug_reverse_dep_visit_count();
+
+        sheet.bulk_load(|bulk| {
+            bulk.set_cell("A2", Value::Number(2.0));
+        });
+
+        assert_eq!(
+            sheet.debug_reverse_dep_visit_count() - visits_before,
+            1,
+            "bulk membership changes should discover one Store dependent"
+        );
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(sheet.debug_formula_eval_count(), evals_before + 1);
+    }
+
+    #[test]
     fn subscribe_empty_cell_does_not_materialize_until_write() {
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -6839,14 +6903,27 @@ mod tests {
         sheet.set_formula("B1", "=A1+Z99");
         assert_eq!(sheet.debug_primitive_atom_count(), 1);
         assert_eq!(sheet.debug_formula_count(), 1);
-        assert_eq!(sheet.debug_total_atom_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 2);
 
-        assert_eq!(sheet.debug_dependents_count("A1"), 1);
-        assert_eq!(sheet.debug_dependents_count("Z99"), 1);
+        assert_eq!(sheet.debug_dependents_count("A1"), 0);
+        assert_eq!(sheet.debug_dependents_count("Z99"), 0);
 
         assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
         assert_eq!(sheet.debug_primitive_atom_count(), 1);
-        assert_eq!(sheet.debug_total_atom_count(), 1);
+        assert_eq!(sheet.debug_total_atom_count(), 8);
+
+        let b1 = CellAddress::parse("B1").unwrap();
+        for addr_str in ["A1", "Z99"] {
+            let addr = CellAddress::parse(addr_str).unwrap();
+            let mut roots = Vec::new();
+            sheet.store_root_atoms_for_addr_into(addr, &mut roots);
+            assert!(
+                sheet
+                    .store_dependent_formula_addrs_from_atoms(&roots)
+                    .contains(&b1),
+                "{addr_str} should have a Store edge into B1 after formula read"
+            );
+        }
     }
 
     #[test]
@@ -6858,7 +6935,11 @@ mod tests {
             0,
             "subscribing to an empty cell must not materialize an atom"
         );
-        assert_eq!(sheet.debug_total_atom_count(), 0);
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            2,
+            "subscribing anchors the empty cell with a facade plus slot epoch"
+        );
     }
 
     // === B1 — counter additions ===
@@ -6871,11 +6952,11 @@ mod tests {
         // No read yet — counter must be zero.
         assert_eq!(sheet.debug_formula_eval_count(), 0);
 
-        // First read: cache miss → exactly one eval.
+        // First read: cold formula-inner → exactly one eval.
         assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
         assert_eq!(sheet.debug_formula_eval_count(), 1);
 
-        // Second read: cache hit → no additional eval.
+        // Second read: settled Store-derived value → no additional eval.
         assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
         assert_eq!(sheet.debug_formula_eval_count(), 1);
     }
@@ -6893,9 +6974,10 @@ mod tests {
         assert_eq!(sheet.get_cell("B1"), Value::Number(2.0));
         assert_eq!(sheet.debug_dirty_count(), 0);
 
-        // Writing a dep flips it back to dirty.
+        // Writing a dep now propagates through the Store-derived formula inner;
+        // the formula cache is already refreshed by the atomm path.
         sheet.set_cell("A1", Value::Number(5.0));
-        assert_eq!(sheet.debug_dirty_count(), 1);
+        assert_eq!(sheet.debug_dirty_count(), 0);
     }
 
     #[test]
@@ -6940,33 +7022,33 @@ mod tests {
     }
 
     #[test]
-    fn debug_range_dep_count_counts_distinct_ranges() {
-        // Three formulas, two distinct ranges: A1:A10 (twice) and B1:B5
-        // (once). The counter must report 2 ranges, not 3 formulas and
-        // not the 15 cells the ranges nominally span.
+    fn debug_range_dep_count_counts_materialized_geometry_roots() {
         let mut sheet = Sheet::new();
         assert_eq!(sheet.debug_range_dep_count(), 0);
 
-        sheet.set_formula("C1", "=SUM(A1:A10)");
-        assert_eq!(sheet.debug_range_dep_count(), 1);
+        sheet.set_formula("C1", "=SUM(A1:A300)");
+        assert_eq!(sheet.debug_range_dep_count(), 0, "roots are read-lazy");
+        assert_eq!(sheet.get_cell("C1"), Value::Number(0.0));
+        assert_eq!(sheet.debug_range_dep_count(), 2);
 
-        sheet.set_formula("C2", "=AVERAGE(A1:A10)");
-        // Same range, second consumer — index stays at 1 entry.
-        assert_eq!(sheet.debug_range_dep_count(), 1);
+        sheet.set_formula("C2", "=AVERAGE(A1:A300)");
+        assert_eq!(
+            sheet.get_cell("C2"),
+            Value::Error(ValueError::DivisionByZero)
+        );
+        assert_eq!(
+            sheet.debug_range_dep_count(),
+            2,
+            "consumers share the same two band roots"
+        );
 
         sheet.set_formula("C3", "=SUM(B1:B5)");
-        assert_eq!(sheet.debug_range_dep_count(), 2);
-
-        // Replacing C2's formula with a non-range one drops it from the
-        // A1:A10 dependents; C1 still references that range, so the
-        // index entry survives.
-        sheet.set_formula("C2", "=A1+1");
-        assert_eq!(sheet.debug_range_dep_count(), 2);
-
-        // Replace C1 too — A1:A10 has no remaining dependents and the
-        // index entry should be removed by remove_formula_range_deps.
-        sheet.set_formula("C1", "=A1+2");
-        assert_eq!(sheet.debug_range_dep_count(), 1);
+        assert_eq!(sheet.get_cell("C3"), Value::Number(0.0));
+        assert_eq!(
+            sheet.debug_range_dep_count(),
+            2,
+            "Tier-A ranges use facades and add no geometry root"
+        );
     }
 
     #[test]
@@ -7298,6 +7380,35 @@ mod tests {
         sheet.delete_row(4, 1);
         // The formula referencing the deleted row should produce #REF!.
         assert_eq!(sheet.get_cell("B1"), Value::Error(ValueError::InvalidRef));
+    }
+
+    #[test]
+    fn structural_edit_batches_store_propagation() {
+        const ROW_COUNT: u32 = 120;
+
+        let mut sheet = Sheet::new();
+        for row in 1..=ROW_COUNT {
+            sheet.set_cell(&format!("A{row}"), Value::Number(row as f64));
+            assert!(sheet.set_formula(&format!("B{row}"), &format!("=A{row}+1")));
+            assert_eq!(
+                sheet.get_cell(&format!("B{row}")),
+                Value::Number(row as f64 + 1.0)
+            );
+        }
+
+        let before = sheet.store.debug_flush_visit_count();
+        sheet.delete_row(0, 1);
+        let visits = sheet.store.debug_flush_visit_count() - before;
+
+        assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
+        assert_eq!(
+            sheet.get_cell(&format!("B{}", ROW_COUNT - 1)),
+            Value::Number(ROW_COUNT as f64 + 1.0)
+        );
+        assert!(
+            visits <= ROW_COUNT as usize * 20,
+            "one structural transaction must not repeatedly walk the formula graph: {visits} visits"
+        );
     }
 
     #[test]
@@ -7724,15 +7835,10 @@ mod tests {
         assert_eq!(sheet.debug_primitive_atom_count(), 1);
         assert_eq!(sheet.get_cell("B1"), Value::Number(10.0));
 
-        // After eval, A1 is in B1's dep set (cell_dependents[A1] contains B1).
-        // try_release_primitive checks store-level has_dependents (atom-level),
-        // which is false for A1's primitive (no derived atoms exist in lazy).
-        // But we still want to keep A1 because B1's formula record depends on
-        // it — clearing A1 sets the value to Null. The lazy formula will
-        // re-evaluate against the new Null on next read.
+        // After eval, B1's formula-inner atom depends on A1's facade.
+        // Clearing A1 sets the value to Null, and B1 re-evaluates against
+        // that new value on the next read.
         sheet.clear_cell("A1");
-        // Lazy: A1 may be released (no atom-level dependents) since the
-        // dep relationship is at the address level via cell_dependents.
         // B1 re-evaluates against A1 = Null → coerced to 0 → 0 * 2 = 0.
         assert_eq!(sheet.get_cell("B1"), Value::Number(0.0));
         assert_eq!(sheet.get_cell("A1"), Value::Null);
@@ -7756,10 +7862,9 @@ mod tests {
     #[test]
     fn subscribed_cell_release_keeps_listener_alive() {
         // Subscriber contract on release: the bucket's listener list survives
-        // even after the underlying primitive atom is destroyed. The next
-        // set_cell on the address re-creates a fresh primitive and reattaches
-        // the fanout — the listener fires as part of that write, same as
-        // subscribing to an empty cell and setting it for the first time.
+        // while the stable facade retargets from the primitive to Absent.
+        // Clearing publishes Null through that facade, and the next write
+        // reuses the same stable subscription anchor.
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -7778,7 +7883,7 @@ mod tests {
         assert_eq!(
             sheet.debug_primitive_atom_count(),
             0,
-            "primitive released even though A1 has a subscriber"
+            "subscribed facade must not keep a Null primitive slot alive"
         );
         assert_eq!(
             *count.borrow(),
@@ -7799,7 +7904,7 @@ mod tests {
         assert_eq!(
             sheet.debug_primitive_atom_count(),
             1,
-            "next write re-creates a fresh primitive"
+            "next write reuses the subscribed primitive path"
         );
         assert_eq!(*count.borrow(), 3, "fresh primitive notifies the listener");
         assert_eq!(sheet.get_cell("A1"), Value::Number(7.0));
@@ -7844,6 +7949,55 @@ mod tests {
         assert_eq!(sheet.get_cell("B1"), Value::Null);
         assert_eq!(sheet.get_cell("A1"), Value::Number(2.0));
         assert_eq!(sheet.get_formula("B1"), None);
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            1,
+            "only A1's live primitive may remain after the leaf formula clears"
+        );
+    }
+
+    #[test]
+    fn clearing_leaf_formula_unmounts_unobserved_upstream_formula_chain() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert!(sheet.set_formula("B1", "=A1+1"));
+        assert!(sheet.set_formula("C1", "=B1+1"));
+        assert_eq!(sheet.get_cell("C1"), Value::Number(3.0));
+
+        sheet.clear_cell("C1");
+
+        assert_eq!(sheet.debug_formula_count(), 1, "B1 remains a live formula");
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            1,
+            "the cold B1 chain must unmount back to A1's primitive"
+        );
+        assert_eq!(
+            sheet.get_cell("B1"),
+            Value::Number(2.0),
+            "reading B1 must lazily remount the same Store-derived formula"
+        );
+    }
+
+    #[test]
+    fn clearing_formula_diamond_retries_shared_upstream_eviction() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        assert!(sheet.set_formula("A2", "=A1+1"));
+        assert!(sheet.set_formula("B1", "=A2+1"));
+        assert!(sheet.set_formula("C1", "=A2+2"));
+        assert!(sheet.set_formula("D1", "=B1+C1"));
+        assert_eq!(sheet.get_cell("D1"), Value::Number(7.0));
+
+        sheet.clear_cell("D1");
+
+        assert_eq!(sheet.debug_formula_count(), 3);
+        assert_eq!(
+            sheet.debug_total_atom_count(),
+            1,
+            "the shared A2 chain must be retried after both branches unmount"
+        );
+        assert_eq!(sheet.get_cell("A2"), Value::Number(2.0));
     }
 
     // === LAZY_FORMULA_EVAL Step 3 — bulk_load tests ===
@@ -7877,7 +8031,7 @@ mod tests {
             "bulk_load with set_formula only must not trigger any core recompute"
         );
         assert_eq!(sheet.debug_formula_count(), 100);
-        // All formula caches are still Dirty — no read happened.
+        // Compatibility cache probes stay Dirty until a formula is materialized.
         assert_eq!(
             sheet.debug_formula_cache_state("B1"),
             "dirty",
@@ -7935,10 +8089,8 @@ mod tests {
             loader.set_formula("B1", "=A1*2");
         });
 
-        // Pre-read: B1's cache is Dirty (formula was bulk-loaded, never
-        // evaluated). The flush sweep only marks downstream cells of
-        // touched addresses dirty — B1 itself is `touched` and starts Dirty
-        // from `FormulaRecord::new`.
+        // Pre-read: B1 is still parked and the compatibility probe reports
+        // Dirty. No formula-inner exists until the first read.
         assert_eq!(
             sheet.debug_formula_cache_state("B1"),
             "dirty",
@@ -7983,35 +8135,125 @@ mod tests {
         );
     }
 
-    /// Regression: `=A(n-1)+1` chain install must scale linearly. The old
-    /// `would_create_cycle` walked all of `formula_exprs` from the new
-    /// expr's refs, which gave O(n²) total across n inserts (chain n=100k
-    /// took 776s in the WASM bench). The reverse-deps walk drops that
-    /// per-insert work to O(direct dependents of the new cell) — which is
-    /// zero for the chain pattern installed in increasing order — so 10k
-    /// finishes in tens of ms on a dev laptop in --release.
-    ///
-    /// Threshold reasoning: 10k took 2.9s pre-fix (clear O(n²) trend
-    /// extrapolating to 290s+ at 100k). The 500ms ceiling here is still
-    /// 20× slack over the observed 20-25ms baseline but small enough to
-    /// catch a regression long before it scales out to the 100k tier.
-    /// Codex P1 regression: would_create_cycle must consult range_dependents,
-    /// not just cell_dependents. After `=SUM(A1:A100)` evaluates with empty
-    /// A2..A100, sparse-eval narrows `cell_dependents` to just `A1`, but the
-    /// range registration `(A1:A100, B1)` survives in `range_dependents`. A
-    /// subsequent `set_formula("A50", "=B1")` is a real cycle (A50 → B1 →
-    /// SUM(A1..A100) including A50) and must be rejected.
+    #[test]
+    fn parked_cycle_certificate_is_invalidated_by_topology_change() {
+        let mut sheet = Sheet::new();
+        sheet.bulk_load(|loader| {
+            loader.set_formula("A2", "=A3");
+            loader.set_cell("A3", Value::Number(1.0));
+        });
+
+        assert_eq!(sheet.get_cell("A2"), Value::Number(1.0));
+        let a2 = CellAddress::parse("A2").unwrap();
+        let certified_epoch = sheet
+            .interior
+            .formula_cells
+            .borrow()
+            .get(&a2)
+            .unwrap()
+            .cycle_checked_at
+            .get();
+        assert_eq!(certified_epoch, sheet.formula_topology_epoch.get());
+
+        // This is the pruning counterexample: A2 was valid while A3 was a
+        // literal, then A3 changes to point back to A2. The mutation must make
+        // A2's old certificate unusable before A3's first hydration.
+        sheet.bulk_load(|loader| {
+            loader.set_formula("A3", "=A2");
+        });
+        assert_ne!(certified_epoch, sheet.formula_topology_epoch.get());
+        assert_eq!(sheet.get_cell("A3"), Value::Error(ValueError::CyclicRef));
+
+        let a3 = CellAddress::parse("A3").unwrap();
+        let expr = sheet
+            .interior
+            .formula_exprs
+            .borrow()
+            .get(&a3)
+            .cloned()
+            .unwrap();
+        assert!(matches!(expr.as_ref(), Expr::Error(ValueError::CyclicRef)));
+    }
+
+    #[test]
+    fn tail_first_chain_static_cycle_walk_is_linear() {
+        const N: u32 = 512;
+        let mut sheet = Sheet::new();
+        sheet.bulk_load(|loader| {
+            loader.set_cell("A1", Value::Number(1.0));
+            for row in 2..=N {
+                loader.set_formula(&format!("A{row}"), &format!("=A{}+1", row - 1));
+            }
+        });
+
+        let before = sheet.debug_static_cycle_node_visit_count();
+        assert_eq!(sheet.get_cell(&format!("A{N}")), Value::Number(N as f64));
+        assert_eq!(
+            sheet.debug_static_cycle_node_visit_count() - before,
+            (N - 1) as u64,
+            "one temporary reachable-graph pass must certify the whole chain"
+        );
+
+        let after_tail = sheet.debug_static_cycle_node_visit_count();
+        for row in 2..=N {
+            let _ = sheet.get_cell(&format!("A{row}"));
+        }
+        assert_eq!(
+            sheet.debug_static_cycle_node_visit_count(),
+            after_tail,
+            "later hydrations must reuse same-topology certificates"
+        );
+    }
+
+    /// The local cycle check must consult range expressions, not just point
+    /// refs. After `=SUM(A1:A100)` evaluates with empty A2..A100, only A1 is
+    /// read dynamically, but the static range expression still covers A50.
     #[test]
     fn range_cycle_detected_after_sparse_eval() {
         let mut sheet = Sheet::new();
         sheet.set_cell("A1", Value::Number(1.0));
         assert!(sheet.set_formula("B1", "=SUM(A1:A100)"));
-        // Read forces eval, which narrows cell_dependents.
+        // Read forces eval, but static cycle detection still sees the range.
         assert_eq!(sheet.get_cell("B1"), Value::Number(1.0));
         // A50 is inside A1:A100 and is empty — register a back-edge to B1.
         // This forms a cycle through the range dep.
         let ok = sheet.set_formula("A50", "=B1");
         assert!(!ok, "set_formula should reject the range-mediated cycle");
+    }
+
+    #[test]
+    fn direct_unbounded_self_reference_keeps_legacy_ref_behavior() {
+        let mut sheet = Sheet::new();
+
+        assert!(sheet.set_formula("D35", "=SUM(D:D)"));
+        assert_eq!(sheet.get_formula("D35").as_deref(), Some("=SUM(D:D)"));
+        assert_eq!(sheet.get_cell("D35"), Value::Error(ValueError::CyclicRef));
+    }
+
+    #[test]
+    fn unbounded_range_cycle_is_rejected_before_store_edges_exist() {
+        let mut sheet = Sheet::new();
+        assert!(sheet.set_formula("C3", "=SUM(B:B)"));
+
+        // C3 has never been read, so its formula-inner has no committed Store
+        // edges. The install-time source walk must still see that B:B contains
+        // B26 and reject B26 -> C3 -> B:B -> B26.
+        assert!(!sheet.set_formula("B26", "=SUM(A1:C10)"));
+        assert_eq!(sheet.get_formula("B26"), None);
+        assert_eq!(sheet.get_cell("B26"), Value::Error(ValueError::CyclicRef));
+    }
+
+    #[test]
+    fn unbounded_range_cycle_follows_formula_cells_inside_the_range() {
+        let mut sheet = Sheet::new();
+        assert!(sheet.set_formula("B5", "=A1"));
+        assert!(sheet.set_formula("C1", "=SUM(B:B)"));
+
+        // A1 -> C1 -> B:B -> B5 -> A1. Walking only direct refs or checking
+        // whether B:B contains A1 would miss the formula hop through B5.
+        assert!(!sheet.set_formula("A1", "=C1"));
+        assert_eq!(sheet.get_formula("A1"), None);
+        assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::CyclicRef));
     }
 
     #[test]
@@ -8063,8 +8305,8 @@ mod tests {
     }
 
     /// Per-phase decomposition of `Sheet::bulk_load` at chain depths.
-    /// Times: parse, formula_deps_for, would_create_cycle,
-    /// add_formula_deps, formula_cells/exprs/texts inserts, and flush.
+    /// Times: parse, dependency extraction, local cycle check,
+    /// range registration, formula_cells/exprs/texts inserts, and flush.
     #[test]
     #[ignore]
     fn chain_install_scaling_trace_phases() {
@@ -8096,7 +8338,7 @@ mod tests {
                     t_parse += t0.elapsed();
 
                     let t1 = Instant::now();
-                    if loader.sheet.would_create_cycle(*addr, &expr) {
+                    if loader.sheet.closes_local_cycle(*addr, &expr) {
                         panic!("unexpected cycle");
                     }
                     t_cycle += t1.elapsed();
@@ -8105,7 +8347,7 @@ mod tests {
                     loader.sheet.detach_address_sub(*addr);
                     let expr = Rc::new(expr);
                     let deps = Sheet::formula_deps_for(&expr);
-                    let range_deps = collect_range_refs(&expr);
+                    let static_ranges = collect_range_refs(&expr);
                     t_collect += t2.elapsed();
 
                     let t3 = Instant::now();
@@ -8114,20 +8356,31 @@ mod tests {
                     t_other += t3.elapsed();
 
                     let t4 = Instant::now();
-                    let record = Rc::new(FormulaRecord::new(
-                        expr.clone(),
-                        deps.clone(),
-                        range_deps.clone(),
-                    ));
-                    loader.sheet.add_formula_deps(*addr, &deps);
-                    loader.sheet.add_formula_range_deps(*addr, &range_deps);
+                    let record = Rc::new(FormulaRecord::new(expr.clone(), deps, static_ranges));
                     t_add_deps += t4.elapsed();
 
                     let t5 = Instant::now();
-                    loader.sheet.note_cross_sheet_if_any(&expr);
-                    loader.sheet.interior.formula_cells.borrow_mut().insert(*addr, record);
-                    loader.sheet.interior.formula_exprs.borrow_mut().insert(*addr, expr);
-                    loader.sheet.interior.formula_texts.borrow_mut().insert(*addr, src.clone());
+                    loader
+                        .sheet
+                        .interior
+                        .formula_cells
+                        .borrow_mut()
+                        .insert(*addr, record);
+                    loader
+                        .sheet
+                        .interior
+                        .formula_exprs
+                        .borrow_mut()
+                        .insert(*addr, expr.clone());
+                    loader
+                        .sheet
+                        .interior
+                        .formula_texts
+                        .borrow_mut()
+                        .insert(*addr, src.clone());
+                    loader.sheet.materialize_formula_inner(*addr);
+                    loader.sheet.invalidate_formula_inner(*addr);
+                    loader.sheet.bump_facade_epoch(*addr);
                     loader
                         .sheet
                         .imported_formula_count
@@ -8185,9 +8438,8 @@ mod tests {
         // Lazy-extreme contract: only currently-subscribed addresses get
         // notified at flush. We verify by writing to a subscribed A1 and an
         // unsubscribed Z99, then confirming (a) A1's subscriber fires
-        // exactly once and (b) the bulk write itself does not recompute
-        // anything — `debug_recompute_count` doesn't move even for Z99's
-        // (empty) downstream set.
+        // exactly once and (b) the only recompute is the subscribed A1 facade,
+        // not the unsubscribed Z99 write.
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -8210,92 +8462,25 @@ mod tests {
         );
         assert_eq!(
             after - before,
-            0,
-            "writing to unsubscribed Z99 must not trigger any recompute"
+            1,
+            "only the subscribed A1 facade should recompute at flush"
         );
         // And reading the subscribed cell still gets the bulk value.
         assert_eq!(sheet.get_cell("A1"), Value::Number(7.0));
         assert_eq!(sheet.get_cell("Z99"), Value::Number(99.0));
     }
 
-    /// Coalesced range-dependent fan-out helper — direct test of the
-    /// row-bucketed dirty intersection. Verifies that
-    /// `RangeDependentIndex::coalesced_dirty_into` returns the SAME
-    /// formula address set as the per-address `dependents_of_into`
-    /// path, for a workload with both narrow and wide ranges.
-    #[test]
-    fn range_dep_coalesced_matches_per_address() {
-        let mut sheet = Sheet::new();
-        // 10 narrow ranges (3 rows × 1 col each) on column A + 1 wide
-        // range (5000 rows on column B). Each range gets a dedicated
-        // formula dependent on column C / D.
-        for i in 0..10u32 {
-            let formula = format!("=SUM(A{}:A{})", i + 1, i + 3);
-            sheet.set_formula(&format!("C{}", i + 1), &formula);
-        }
-        sheet.set_formula("D1", "=SUM(B1:B5000)");
-
-        // Build a row-bucketed dirty set for {A2, A5, B100, Z99}.
-        let mut dirty_by_row: HashMap<u32, Vec<u32>> = HashMap::new();
-        for addr_str in ["A2", "A5", "B100", "Z99"] {
-            let addr = CellAddress::parse(addr_str).unwrap();
-            dirty_by_row.entry(addr.row).or_default().push(addr.col);
-        }
-
-        let mut coalesced: Vec<CellAddress> = Vec::new();
-        {
-            let idx = sheet.range_dependents.borrow();
-            idx.coalesced_dirty_into(&dirty_by_row, &mut coalesced);
-        }
-        let coalesced_set: HashSet<CellAddress> = coalesced.into_iter().collect();
-
-        // Per-address baseline: union the legacy `dependents_of_into`
-        // output for every dirty cell, taking only the range half.
-        let mut per_addr_set: HashSet<CellAddress> = HashSet::new();
-        let dirty_cells: Vec<CellAddress> = dirty_by_row
-            .iter()
-            .flat_map(|(row, cols)| {
-                cols.iter()
-                    .map(|c| CellAddress::new(*row, *c))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for addr in &dirty_cells {
-            let idx = sheet.range_dependents.borrow();
-            let mut tmp: Vec<CellRange> = Vec::new();
-            idx.candidates_for_into(*addr, &mut tmp);
-            for r in &tmp {
-                if r.contains(*addr) {
-                    if let Some(deps) = idx.formulas_for(r) {
-                        per_addr_set.extend(deps.iter().copied());
-                    }
-                }
-            }
-        }
-
-        assert_eq!(
-            coalesced_set, per_addr_set,
-            "coalesced range scan must produce same dep set as per-address walk"
-        );
-        // Sanity: we expect C2 / C3 / C4 / C5 (narrow ranges that
-        // contain A2 or A5) and D1 (wide range covers B100).
-        assert!(coalesced_set.contains(&CellAddress::parse("D1").unwrap()));
-    }
-
-    /// Stripe pattern (many overlapping narrow ranges + many touched
-    /// cells) — exercises the BFS coalesced range-dependent path so it
-    /// doesn't bit-rot behind its threshold guard. The threshold gating
-    /// this in production is intentionally high, but the contract that
-    /// matters is: coalesced and legacy paths must produce the same
-    /// dirty closure.
+    /// Stripe pattern with many overlapping Tier-A ranges. It verifies that
+    /// bulk-loaded formulas materialize member-facade dependencies and Store
+    /// re-derives exactly the windows affected by a later source write.
     ///
     /// 200 stripes (B_i = SUM(A_i:A_{i+9})) over 200 A-column seeds.
     /// Bulk-load the whole sheet in one shot, then flip one A cell and
     /// re-read the downstream B values. Every B whose window contains
     /// the mutated cell must re-evaluate to the new value, exactly
-    /// matching what the legacy single-pass BFS produces.
+    /// matching the formulas' Store-recorded dependencies.
     #[test]
-    fn bulk_load_stripe_range_coalesce_matches_legacy() {
+    fn bulk_load_stripe_ranges_recompute_through_store() {
         let mut sheet = Sheet::new();
         const N: u32 = 200;
         const WINDOW: u32 = 10;
@@ -8483,6 +8668,25 @@ mod tests {
     }
 
     #[test]
+    fn non_empty_enumeration_hides_cleared_atom_retained_by_formula_dependency() {
+        let mut sheet = Sheet::new();
+        sheet.set_cell("A1", Value::Number(1.0));
+        sheet.set_formula("B1", "=A1+1");
+        assert_eq!(sheet.get_cell("B1"), Value::Number(2.0));
+
+        sheet.clear_cell("A1");
+
+        let mut all = sheet.non_empty_addrs();
+        all.sort();
+        assert_eq!(all, vec!["B1"]);
+
+        let range = CellRange::new(CellAddress::new(0, 0), CellAddress::new(0, 0));
+        let mut in_range = Vec::new();
+        sheet.for_each_non_empty_in_range(range, |addr| in_range.push(addr.to_string()));
+        assert!(in_range.is_empty());
+    }
+
+    #[test]
     fn non_empty_in_range_skips_holes_and_does_not_eval_formulas() {
         let mut sheet = Sheet::new();
         sheet.set_cell("A1", Value::Number(1.0));
@@ -8512,25 +8716,16 @@ mod tests {
 
         assert_eq!(sheet.get_cell("A1"), Value::Null);
         assert_eq!(sheet.get_cell("C3"), Value::Number(3.0));
-        assert_eq!(sheet.debug_formula_cache_state("D1"), "dirty");
+        assert_eq!(sheet.debug_formula_cache_state("D1"), "clean");
         assert_eq!(sheet.get_cell("D1"), Value::Number(1.0));
     }
 
     // === Phase 1 Track A — P0 bug: range dep survives sparse eval ===
     //
-    // `collect_refs` statically expands `Expr::Range` into individual cell
-    // deps at `set_formula` time, so A50 is initially registered as a
-    // dependent of B1. But during the first `get_cell` evaluation the
-    // sparse range iterator only yields non-empty addresses, the tracked
-    // dep set is built from what eval visited, and `replace_formula_deps`
-    // then replaces the formula's dep set with that visited-only set —
-    // discarding A50. Writing A50 later therefore doesn't dirty B1 and
-    // SUM stays stale.
-    //
-    // The fix preserves range deps as ranges across eval (a separate
-    // `range_deps` index that doesn't get rewritten by the tracked eval
-    // set). Until that fix lands, this test must FAIL on the second
-    // assertion (the post-write read still returns 3.0).
+    // The sparse value iterator only visits non-empty addresses. The Store
+    // dependency layer must still represent empty range members: Tier A via
+    // member facades and Tier B via geometry roots. Otherwise writing A50
+    // after the first read would leave B1 stale.
     #[test]
     fn range_dep_survives_sparse_eval() {
         let mut sheet = Sheet::new();
@@ -8545,85 +8740,40 @@ mod tests {
         assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
     }
 
-    /// Phase 2 Track E: ranges wider than `WIDE_RANGE_BUCKET_THRESHOLD`
-    /// (4096 rows / cols) take the `wide_ranges` fallback — they're not
-    /// registered into per-row / per-col buckets (registration would
-    /// dominate at 1M rows). The fallback gets a linear scan on lookup,
-    /// but it stays small in practice (a handful of "whole sheet" deps).
-    /// This test exercises that path: a 5000-row range still dirties its
-    /// dependent on a write inside it AND `dependents_of` finds the
-    /// range via `wide_ranges`, not via row_buckets.
+    /// A 5000-row, one-column range maps to 20 lazy row-band roots. Writes
+    /// touch one root in O(1), and the Store owns the root-to-formula edge.
     #[test]
-    fn range_dep_wide_range_uses_wide_fallback() {
+    fn large_range_uses_band_geometry_roots() {
         let mut sheet = Sheet::new();
-        // 5000 rows — above the 4096 threshold. Phase 1 stored it the
-        // same as any other range; Phase 2 routes it into wide_ranges.
         sheet.set_cell("A1", Value::Number(1.0));
         sheet.set_cell("A5000", Value::Number(2.0));
         sheet.set_formula("B1", "=SUM(A1:A5000)");
         assert_eq!(sheet.get_cell("B1"), Value::Number(3.0));
 
-        // A write deep inside the wide range must still dirty B1. If
-        // wide_ranges weren't consulted by `dependents_of`, the row
-        // bucket for row 2499 would be empty and the candidate set
-        // would be empty too — B1 stays stale at 3.0.
         sheet.set_cell("A2500", Value::Number(10.0));
         assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
 
-        // Candidate set for any address in the range should include
-        // exactly the one wide range — debug_range_dep_count is 1.
-        assert_eq!(sheet.debug_range_dep_count(), 1);
+        assert_eq!(sheet.debug_range_dep_count(), 20);
         assert_eq!(sheet.debug_range_dep_candidates("A2500"), 1);
-        // An address outside the range still surfaces it as a candidate
-        // (wide_ranges is scanned unconditionally) but the
-        // `range.contains` filter in `dependents_of` rejects it.
-        assert_eq!(sheet.debug_range_dep_candidates("Z1"), 1);
+        assert_eq!(sheet.debug_range_dep_candidates("Z1"), 0);
     }
 
-    /// Phase 2 Track E acceptance: the candidate-range lookup driving
-    /// `dependents_of` must be bucketed, not a linear scan over every
-    /// registered range. Registers 1000 disjoint 3-row tall ranges in
-    /// column A (one per formula cell down column C) and asserts that
-    /// for an address (row r, col 0) covered by exactly 3 of them, the
-    /// internal candidate set returned by `RangeDependentIndex::
-    /// candidates_for` contains at most a handful of ranges — NOT all
-    /// 1000. The previous Phase 1 implementation would have returned
-    /// every range here.
+    /// Tier-A ranges install direct member-facade edges. No sheet-local
+    /// address-to-formula range index is involved.
     #[test]
-    fn range_dependents_lookup_is_bucketed() {
+    fn small_range_reverse_edges_are_store_facades() {
         let mut sheet = Sheet::new();
-        // 1000 ranges, each 3 rows tall, with overlapping but mostly
-        // disjoint coverage. Range i covers rows [i, i+2] of column A.
-        // Probe row r=500 — only ranges i ∈ {498, 499, 500} cover it.
         const N: u32 = 1000;
         for i in 0..N {
             let formula = format!("=SUM(A{}:A{})", i + 1, i + 3);
             let target = format!("C{}", i + 1);
             sheet.set_formula(&target, &formula);
+            let _ = sheet.get_cell(&target);
         }
 
-        // All 1000 distinct ranges registered.
-        assert_eq!(sheet.debug_range_dep_count(), N as usize);
-
-        // A501 sits in column A, row 500 (0-indexed). Three ranges
-        // cover it: row 500 ∈ [498, 500], [499, 501], [500, 502].
-        let candidates = sheet.debug_range_dep_candidates("A501");
-
-        // Tight bound: at most a small constant. The previous
-        // O(range_count) scan would walk all N. Using N/10 as a loose
-        // upper bound that still catches regressions if a future
-        // change accidentally registers ranges in every row.
-        assert!(
-            candidates <= (N / 10) as usize,
-            "candidate set should be bucket-narrowed; got {} of {} ranges",
-            candidates,
-            N
-        );
-        assert!(
-            candidates >= 3,
-            "candidate set must contain the 3 covering ranges; got {}",
-            candidates
-        );
+        assert_eq!(sheet.debug_range_dep_count(), 0);
+        assert_eq!(sheet.debug_range_dep_candidates("A501"), 0);
+        assert_eq!(sheet.debug_dependents_count("A501"), 3);
     }
 
     // === Phase 2 Track F — sparse range read visits O(matches) ===
@@ -8814,20 +8964,9 @@ mod tests {
 
     /// Linear formula chain `A1 = 1; A2 = =A1+1; ... A1000 = =A999+1`.
     ///
-    /// On native the 8MB main-thread stack swallows the 1000-deep
-    /// `eval_formula_at_with_provider` ↔ `eval_expr_with_provider`
-    /// recursion fine. On WASM the much smaller stack (default ~1MB,
-    /// often 256KB after wasm-bindgen frames) blows up — and the
-    /// blow-up surfaces at the wasm-bindgen boundary as the cryptic
-    /// "attempted to take ownership of Rust value while it was
-    /// borrowed" error because the panic aborts mid-eval with the
-    /// FormulaCache::Computing guard still held.
-    ///
-    /// Pinned regression for the iterative `prewarm_formula_chain`
-    /// pass added to `eval_formula_at_with_provider`. With the
-    /// recursion converted to a heap work-stack, even debug builds
-    /// resolve a 1000-deep chain without touching the call stack
-    /// beyond a single AST eval level per cell.
+    /// The formula-inner read path must resolve a 1000-deep chain without
+    /// recursive Rust calls proportional to the chain length. Native stacks
+    /// can hide that bug; WASM stacks cannot.
     #[test]
     fn chain_1000_native_read_does_not_panic() {
         let mut sheet = Sheet::new();
@@ -8845,9 +8984,7 @@ mod tests {
     }
 
     /// Same chain shape, but at a depth that would also overflow even a
-    /// release-mode native stack with the recursive code. Confirms the
-    /// prewarm pass scales: dep-graph traversal is heap-bound, eval
-    /// recursion depth stays O(AST depth) per cell.
+    /// release-mode native stack with recursive formula-cell evaluation.
     #[test]
     fn chain_10000_native_read_does_not_panic() {
         let mut sheet = Sheet::new();
@@ -8864,13 +9001,9 @@ mod tests {
         assert_eq!(v, Value::Number(10_000.0));
     }
 
-    /// Regression for the codex P2 prewarm/short-circuit interaction:
-    /// `prewarm_formula_chain` walks the static AST to gather deps for cells
-    /// that have never been evaluated. Before the fix, the static walk
-    /// descended into every IF branch, so `=IF(TRUE,0,B1)` pre-warmed B1
-    /// even though IF never takes the else branch — bumping the eval
-    /// counter from 1 (the IF cell) to 2 (IF + B1). After the fix the
-    /// static walk skips short-circuit branches and only A1 evaluates.
+    /// Regression for chain warmup and short-circuit interaction: static
+    /// dependency discovery must not evaluate the untaken branch of
+    /// `=IF(TRUE,0,B1)`. Only A1 should evaluate.
     #[test]
     fn if_true_does_not_prewarm_unused_branch() {
         let mut sheet = Sheet::new();
@@ -8969,21 +9102,16 @@ mod tests {
         }
         assert_eq!(sheet.get_cell("A1000"), Value::Number(1000.0));
         let count_before = sheet.debug_formula_eval_count();
-        // Second read: cache hit at the top level should short-circuit
-        // entirely (no prewarm needed). Counter must NOT advance.
+        // Second read hits the clean Store-derived tail. Counter must not
+        // advance.
         assert_eq!(sheet.get_cell("A1000"), Value::Number(1000.0));
         assert_eq!(sheet.debug_formula_eval_count(), count_before);
     }
 
-    // ── P4c additive facade path (white-box) ────────────────────────────
-    // These exercise the new atom-delegated read path DIRECTLY through the
-    // facade / formula-inner atoms, without routing through the eager
-    // engine's `get_cell`. They pin that a formula's value — and its
-    // re-derivation on an upstream edit — flows purely through Store
-    // derived-atom edges (vanilla/core `readAtom` + `dependenciesChange`
-    // parity), with no address-level dependency graph involved. The path is
-    // still additive: the eager engine stays authoritative for `get_cell`
-    // until a later increment flips the read口.
+    // P4c facade/formula-inner path (white-box). These pin that same-sheet
+    // formula values and re-derivation flow through Store derived-atom edges
+    // (`readAtom` + `dependenciesChange` parity), with no address-level
+    // dependency graph.
 
     /// The facade for a formula cell delegates to its formula-inner atom,
     /// which evaluates the AST via `AtomFormulaProvider` and reads referenced
@@ -8992,10 +9120,8 @@ mod tests {
     #[test]
     fn facade_reads_formula_via_inner_atom() {
         let mut sheet = Sheet::new();
-        // Materialize A1 as an Atom slot so its facade reads the inner atom
-        // reactively. (A Plain slot's facade tracks only its non-reactive
-        // slot-epoch until F4 wires the write-口 epoch bump, so an eager
-        // `set_cell` mutation would not propagate through the additive path.)
+        // Materialize A1 so this white-box case can mutate its primitive atom
+        // directly through Store.
         let a1_inner = sheet.cell_atom("A1");
         sheet.store.set(a1_inner, Value::Number(10.0));
         assert!(sheet.set_formula("A2", "=A1+5"));
@@ -9028,7 +9154,7 @@ mod tests {
 
     /// F1 runtime cycle guard: a self-referential formula installed PAST the
     /// load-time static cycle check — here via the lazy `formula_source` /
-    /// `needs_parse` path that the static `would_create_cycle` gate never
+    /// `needs_parse` path that the static local cycle gate never
     /// sees — must resolve to a sticky `#CYCLE!` through `InFlightGuard` /
     /// `in_flight` re-entry detection, not unbounded recursion. The self-read
     /// records a reverse edge via `ReadArgs::depend` (tolerates the computing
@@ -9043,10 +9169,13 @@ mod tests {
             .interior
             .formula_source
             .borrow_mut()
-            .insert(a1, Rc::from("=A1+1"));
+            .insert(a1, ParkedFormula::new("=A1+1"));
         sheet.interior.needs_parse.borrow_mut().insert(a1);
 
         let facade_a1 = sheet.facade_of(a1);
-        assert_eq!(sheet.store.get(facade_a1), Value::Error(ValueError::CyclicRef));
+        assert_eq!(
+            sheet.store.get(facade_a1),
+            Value::Error(ValueError::CyclicRef)
+        );
     }
 }

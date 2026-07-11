@@ -28,8 +28,9 @@
  *     fails to instantiate.
  *
  * Output: this bench writes `perf-ts-vs-wasm-report.md` with the
- * numbers, ratios, and a verdict per row. CI never runs it; humans
- * read the report when they want to see how the port is trending.
+ * numbers, ratios, and a verdict per row. Set
+ * `EINFACH_PERF_WRITE_REPORT=0` for an observation-only run that prints
+ * results without modifying the historical report.
  *
  * Invocation:
  *   EINFACH_PERF=1 npx jest --testRegex 'perf-ts-vs-wasm\.bench\.ts$' --no-coverage
@@ -62,7 +63,13 @@ if (!g.TextEncoder) g.TextEncoder = TextEncoder
 // the file compiles cleanly under `tsc -b`.
 // ---------------------------------------------------------------------------
 const PERF_ENABLED = process.env.EINFACH_PERF === '1'
+const PERF_WRITE_REPORT = process.env.EINFACH_PERF_WRITE_REPORT !== '0'
 const describePerf = PERF_ENABLED ? describe : describe.skip
+
+function logPerfOutcome(name: string, backend: 'TS' | 'WASM', outcome: unknown): void {
+  // eslint-disable-next-line no-console -- opt-in benchmark result
+  console.log(`[bench][result] ${name} ${backend} ${JSON.stringify(outcome)}`)
+}
 
 const WASM_PKG_JS = path.join(
   __dirname,
@@ -517,17 +524,14 @@ let tsFailedAtOrAbove: number | undefined
 let wasmFailedAtOrAbove: number | undefined
 
 // `runs` = how many repetitions per workload (median-aggregated).
-// Large+ use 1 run because each TS pass with 100k+ cells can take tens
-// of seconds — broad-invalidation O(n) Map clones × O(n) per-cell writes
-// (PLAN.md §4.1). 3 runs would push the bench wall-clock past any
-// reasonable budget without changing the verdict.
+// Large+ use 1 run because each pass with 100k+ cells can take tens of
+// seconds. Three runs would push the bench wall-clock past a reasonable
+// local observation budget without changing the broad trend.
 //
 // Tier sizing:
 //   - Tiny  / Medium / Large are unchanged (validate baseline).
-//   - XLarge / Mega / Ultra were added to find the Rust-overtakes-TS
-//     crossover predicted by PLAN.md §4.1 ("per-cell dep graph beats
-//     broad invalidation at scale"). Sizes track the millions-of-cells
-//     threshold:
+//   - XLarge / Mega / Ultra retain the historical crossover probes. Sizes
+//     track the millions-of-cells threshold:
 //        XLarge = 0.5 M total cells (250k seeds + 250k formulas)
 //        Mega   = 1.0 M total cells (500k + 500k)
 //        Ultra  = 2.0 M total cells (1 M + 1 M)
@@ -660,6 +664,8 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
         maybeGc()
 
         results.set(spec.name, { ts, wasm })
+        logPerfOutcome(spec.name, 'TS', ts)
+        logPerfOutcome(spec.name, 'WASM', wasm)
 
         // Persist partial results after each tier — if a later tier OOMs
         // hard enough that `afterAll` never runs, the markdown still
@@ -676,9 +682,8 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
 //
 // Orthogonal to the size tiers above. Builds a single pure chain
 // (`A1=1`, `A2=A1+1`, …, `An=A(n-1)+1`) and measures the four phases below.
-// This is the worst case for "broad invalidation" engines (the TS port) and
-// the best case for "per-cell precise dep tracking" (the Rust port) — if
-// Rust ever beats TS, this is where it should happen.
+// This is the deepest propagation shape in the suite. It compares how both
+// backends install, hydrate, and settle the same dependency chain.
 //
 // Phases (mirrors existing bench shape but with chain-specific intent):
 //
@@ -686,10 +691,9 @@ describePerf('TS vs WASM perf bench (EINFACH_PERF=1)', () => {
 //   - bulkWrite: install all `n` formulas in one bulk_apply / bulk_import
 //   - firstRecalc: read `An`. Forces full chain evaluation top→bottom.
 //                  evalCount delta should be ~n on both backends.
-//   - mutateThenRecalc: set `A1=2`, read `An`. This is THE interesting
-//                  number — Rust's precise graph should walk exactly
-//                  `n-1` deps; TS's broad invalidation marks everything
-//                  dirty, but the eval cost on read is what matters.
+//   - mutateThenRecalc: set `A1=2`, read `An`. The Rust path settles mounted
+//                  formula-inner atoms through Store propagation during the
+//                  write; the following read observes the settled tail.
 //                  Repeated 5×, median taken.
 //   - steadyState: read `An` again with no mutation. Expected to be a
 //                  cache hit (evalCount delta ≈ 0) — confirms the engine
@@ -1083,6 +1087,8 @@ describePerf('Chain dependency workload (EINFACH_PERF=1)', () => {
         maybeGc()
 
         chainResults.set(spec.name, { ts, wasm })
+        logPerfOutcome(spec.name, 'TS', ts)
+        logPerfOutcome(spec.name, 'WASM', wasm)
 
         // Persist partial chain results after each tier in case a deeper
         // tier OOMs hard enough to skip `afterAll`.
@@ -1097,23 +1103,18 @@ describePerf('Chain dependency workload (EINFACH_PERF=1)', () => {
 // RANGE-HEAVY WORKLOADS
 //
 // Orthogonal to the size tiers above and to the chain workload. These tiers
-// exist to exercise the `range_dependents` index — the bookkeeping the dep
-// graph uses for formulas referring to ranges (SUM, AVERAGE, COUNTIF, …) —
+// exercise formula-inner dependency derivation for point and range references
 // in three patterns that real spreadsheets see:
 //
 //   - FanOut: one source cell drives many dependents (`B1..Bn = =A1*k`).
-//     Pure point-cell deps, no range deps. Validates the cell_dependents
-//     half of the dirty BFS.
+//     Pure point-cell deps, no range deps. Validates Store reverse propagation.
 //   - FanIn: one wide range feeds a small number of aggregators
 //     (`B1 = =SUM(A1:An)`, B2 = AVERAGE, B3 = COUNTIF). Mutating one A cell
-//     pulls all aggregators dirty. Validates the `candidates_for` lookup
-//     and one-range-contains-cell path.
+//     re-derives all mounted aggregators through range geometry roots.
 //   - Stripe: every row has a SUM over a 10-cell window overlapping the
 //     previous row's window. The result is a sheet with hundreds /
 //     thousands of overlapping ranges; mutating one A cell can touch up
-//     to 10 SUMs, and bulk_import populates the range_dependents bucket
-//     index heavily. This is the workload the BFS coalescing was
-//     designed for.
+//     to 10 SUMs. This stresses overlapping range-derived dependencies.
 //
 // Phases (shared by all three patterns):
 //   - setup: create the workbook + seed the A column with literals.
@@ -1176,8 +1177,8 @@ function buildRangeWorkload(spec: RangeSpec): RangeWorkload {
   const rng = makeRng(0xfa11ce + spec.size)
 
   if (spec.kind === 'fanOut') {
-    // A1 = 1, then B1..BN = =A1*k. Mutating A1 invalidates all N
-    // dependents through the cell_dependents map.
+    // A1 = 1, then B1..BN = =A1*k. Mutating A1 settles all N mounted
+    // formula-inner dependents through Store propagation.
     seeds.push({ row: 0, col: 0, value: 1 })
     for (let i = 0; i < spec.size; i += 1) {
       formulas.push({ row: i, col: 1, formula: `=${a1(0, 0)}*${i + 1}` })
@@ -1221,7 +1222,7 @@ function buildRangeWorkload(spec: RangeSpec): RangeWorkload {
 
   // Stripe: A1..AN seeded, B_i = SUM(A_i:A_{i+window-1}). Each A cell
   // sits in up to `STRIPE_WINDOW` overlapping ranges; mutating any one
-  // A cell pulls up to that many SUMs dirty in a single BFS step.
+  // A cell re-derives up to that many mounted SUM formula-inner atoms.
   for (let row = 0; row < spec.size; row += 1) {
     seeds.push({ row, col: 0, value: Math.floor(rng() * 100) })
   }
@@ -1243,8 +1244,8 @@ function buildRangeWorkload(spec: RangeSpec): RangeWorkload {
     formulas,
     readAddrs,
     // Mutate a mid-column cell: this address sits inside ~STRIPE_WINDOW
-    // ranges, so the dirty BFS will exercise the range-dependent walk
-    // hardest at that row.
+    // ranges, so Store propagation exercises the most overlapping range
+    // dependencies at that row.
     mutateAddr: a1(Math.floor(spec.size / 2), 0),
   }
 }
@@ -1582,6 +1583,8 @@ describePerf('Range-heavy workloads (EINFACH_PERF=1)', () => {
         maybeGc()
 
         rangeResults.set(spec.name, { ts, wasm })
+        logPerfOutcome(spec.name, 'TS', ts)
+        logPerfOutcome(spec.name, 'WASM', wasm)
 
         // Persist partial range results after each tier.
         writeReport()
@@ -1651,18 +1654,15 @@ function rangeSection(): string[] {
   const out: string[] = []
   out.push('## Range-heavy workloads')
   out.push('')
-  out.push('Three patterns exercising the dep graph at different angles:')
+  out.push('Three patterns exercising Store-derived formula dependencies:')
   out.push('')
   out.push('- **FanOut**: `A1` → `B1..BN = A1 * k`. Mutating `A1` invalidates')
-  out.push('  N point-cell dependents through the `cell_dependents` map.')
-  out.push('  Stresses the cell→cell BFS half.')
+  out.push('  N mounted point-cell dependents through Store propagation.')
   out.push('- **FanIn**: `A1..AN` literals → `B1 = SUM(A1:AN)`, `B2 = AVERAGE(…)`,')
   out.push('  `B3 = COUNTIF(…)`. Mutating one A cell pulls all aggregators dirty.')
-  out.push('  Stresses the range-contains-cell path in `dependents_of`.')
+  out.push('  Stresses range geometry roots feeding mounted formula-inner atoms.')
   out.push('- **Stripe**: `B_i = SUM(A_i : A_{i+9})` for i in 1..N — overlapping')
-  out.push('  10-cell windows. Bulk import installs N ranges into the bucket')
-  out.push('  index; mutate one A cell to dirty up to 10 SUMs in one BFS step.')
-  out.push('  This is the workload the BFS range-coalescing change targets.')
+  out.push('  10-cell windows. Mutating one A cell can settle up to 10 mounted SUMs.')
   out.push('')
   out.push('Phases match the chain suite: setup → bulkWrite → firstRecalc →')
   out.push('mutateThenRecalc (median of `runs`).')
@@ -1876,8 +1876,7 @@ function chainSection(): string[] {
   out.push('## Chain dependency workload')
   out.push('')
   out.push('Single-column chain (`A1=1`, `A2=A1+1`, …, `An=A(n-1)+1`) — the')
-  out.push('worst case for broad-invalidation engines and the best case for')
-  out.push('per-cell precise dep tracking. Phases:')
+  out.push('deepest Store propagation shape in the suite. Phases:')
   out.push('')
   out.push('- **setup**: create the workbook + seed `A1=1`.')
   out.push('- **bulkWrite**: install all `n-1` formulas via `bulkApply` / `bulk_import_cells`.')
@@ -2014,7 +2013,7 @@ function replaceBlock(template: string, name: string, body: string): string {
 }
 
 function writeReport() {
-  if (!PERF_ENABLED) return // describe.skip path — nothing to write.
+  if (!PERF_ENABLED || !PERF_WRITE_REPORT) return
 
   const reportPath = path.join(__dirname, 'perf-ts-vs-wasm-report.md')
   let template: string

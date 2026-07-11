@@ -9,10 +9,10 @@
 //!   3. Reads hydrate lazily and exactly per-cell (Phase 2+3 machinery).
 //!   4. Install is a full-sheet REPLACE: previous primitives, hydrated
 //!      formulas, and lazy parking are gone.
-//!   5. Cross-sheet formulas installed via the new path still notify
-//!      subscribers on source mutation (the `!`-prefilter edge scan).
-//!   6. Same-sheet formulas never pay the cross-sheet parse
-//!      (`cross_sheet_parsed == 0`).
+//!   5. Local and cross-sheet formulas do no install-time parsing; formula
+//!      facades materialize Store dependencies when first observed.
+//!   6. Cross-sheet source mutations still notify formula subscribers through
+//!      the shared Store graph (`cross_sheet_parsed == 0`).
 //!   7. The UI edit path (`Workbook::set_formula`) stays eager after an
 //!      install (D1 = 4A unchanged).
 
@@ -94,9 +94,9 @@ fn install_does_zero_dep_work() {
     assert_eq!(stats.total_point_dep_edges, 0, "no point edges installed");
     assert_eq!(stats.total_range_dep_entries, 0, "no range edges installed");
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
-        "cell_dependents must be empty"
+        "point dependency key count must be empty"
     );
     // The formulas ARE there — just lazily parked.
     assert_eq!(sheet.debug_formula_count(), formula_total);
@@ -123,10 +123,13 @@ fn install_then_read_hydrates_lazily() {
     assert_eq!(wb.get_cell("Sheet1", "B100"), Value::Number(101.0));
 
     let stats = wb.sheet(0).expect("sheet 0 exists").debug_dep_graph_stats();
-    assert_eq!(stats.formula_count, 3, "exactly the 3 read formulas hydrate");
     assert_eq!(
-        stats.total_point_dep_edges, 3,
-        "one point edge per hydrated =A{{r}}+1 formula"
+        stats.formula_count, 3,
+        "exactly the 3 read formulas hydrate"
+    );
+    assert_eq!(
+        stats.total_point_dep_edges, 0,
+        "same-sheet point edges live in the atom store, not the debug graph"
     );
 }
 
@@ -157,9 +160,21 @@ fn install_replaces_previous_content() {
     assert_eq!(wb.content_revision(), rev_before + 1);
 
     // Old state fully gone.
-    assert_eq!(wb.get_cell("Sheet1", "X9"), Value::Null, "old primitive gone");
-    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Null, "old hydrated formula gone");
-    assert_eq!(wb.get_cell("Sheet1", "B2"), Value::Null, "old lazy formula gone");
+    assert_eq!(
+        wb.get_cell("Sheet1", "X9"),
+        Value::Null,
+        "old primitive gone"
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "B1"),
+        Value::Null,
+        "old hydrated formula gone"
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "B2"),
+        Value::Null,
+        "old lazy formula gone"
+    );
     assert_eq!(wb.sheet(0).unwrap().get_formula("B1"), None);
 
     // New state reads correctly.
@@ -191,12 +206,12 @@ fn install_cross_sheet_formula_notifies() {
         .expect("install must succeed");
     assert_eq!(stats.len(), 2);
     assert_eq!(
-        stats[0].cross_sheet_parsed, 1,
-        "the `!` prefilter must route =Sheet2!A1+1 through the parse"
+        stats[0].cross_sheet_parsed, 0,
+        "shared Store formulas require no install-time parse"
     );
 
-    // Subscribe BEFORE any read — the formula is still unhydrated; the
-    // notification must come from the prefilter-installed edge.
+    // Subscribe before an explicit read. Observing the stable facade
+    // materializes its formula-inner and the cross-sheet Store edge.
     let counter = Rc::new(RefCell::new(0usize));
     let counter_clone = counter.clone();
     let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("B1", move || {
@@ -213,7 +228,7 @@ fn install_cross_sheet_formula_notifies() {
 }
 
 #[test]
-fn install_dirties_and_notifies_cross_sheet_dependents() {
+fn install_rederives_and_notifies_cross_sheet_dependents() {
     let mut wb = Workbook::new();
     let s2 = wb.add_sheet("Sheet2");
     let s3 = wb.add_sheet("Sheet3");
@@ -308,8 +323,8 @@ fn install_notifies_lazy_unhydrated_cross_sheet_dependent() {
     let s2 = wb.add_sheet("Sheet2");
     wb.set_cell(s2, "A1", Value::Number(1.0));
 
-    // The dependent itself arrives via install — lazy, never read, so it
-    // has no cached value to dirty. Its subscriber must still fire.
+    // The dependent itself arrives via install with no formula-inner. The
+    // subscription materializes it, so its Store publication must still fire.
     let mut s1_formulas = HashMap::new();
     s1_formulas.insert(addr("B1"), "=Sheet2!A1+1".to_string());
     wb.install_sheet_bulk(0, HashMap::new(), s1_formulas)
@@ -371,7 +386,7 @@ fn workbook_bulk_install_notifies_multi_sheet_dependent_once() {
 }
 
 #[test]
-fn install_same_sheet_formulas_skip_parse() {
+fn install_formulas_do_not_parse_eagerly() {
     const N: u32 = 100;
     let mut primitives = HashMap::new();
     let mut formulas = HashMap::new();
@@ -387,7 +402,7 @@ fn install_same_sheet_formulas_skip_parse() {
     assert_eq!(stats.formulas_installed, N as usize);
     assert_eq!(
         stats.cross_sheet_parsed, 0,
-        "same-sheet formulas must never pay the cross-sheet parse"
+        "bulk install must park formula sources without parsing"
     );
 }
 
@@ -429,11 +444,18 @@ fn install_rejects_out_of_range_sheet() {
     a1_prims.insert(addr("A1"), Value::Number(1.0));
     let rev_before = wb.content_revision();
     let err = wb
-        .install_workbook_bulk(vec![(0, a1_prims, HashMap::new()), (9, HashMap::new(), HashMap::new())])
+        .install_workbook_bulk(vec![
+            (0, a1_prims, HashMap::new()),
+            (9, HashMap::new(), HashMap::new()),
+        ])
         .expect_err("sheet 9 does not exist");
     assert_eq!(err, InstallError::SheetOutOfRange(9));
     assert_eq!(wb.content_revision(), rev_before, "no partial install");
-    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Null, "no partial install");
+    assert_eq!(
+        wb.get_cell("Sheet1", "A1"),
+        Value::Null,
+        "no partial install"
+    );
 }
 
 // === AUDIT B-2 (lazy primitive-cell atomization) acceptance pins ===
@@ -498,12 +520,12 @@ fn subscribe_after_install_fires_on_write() {
     let _sub = wb.sheet_mut(0).unwrap().subscribe_cell("A1", move || {
         *counter_clone.borrow_mut() += 1;
     });
-    // Subscribing promotes the parked slot so the fanout has an atom to
-    // attach to — bounded by subscription count, not sheet size.
+    // Subscribing attaches to the stable facade without promoting the parked
+    // primitive slot.
     assert_eq!(
         wb.sheet(0).unwrap().debug_materialized_cell_atom_count(),
-        1,
-        "exactly the subscribed address materializes"
+        0,
+        "facade subscription must not promote the parked primitive"
     );
 
     wb.set_cell(0, "A1", Value::Number(10.0));
@@ -520,8 +542,8 @@ fn subscribe_after_install_fires_on_write() {
 }
 
 /// Pin 2b: a formula installed AFTER a lazy primitive install still
-/// tracks its dependency — writing the parked source cell dirties and
-/// re-evaluates the derived read.
+/// tracks its dependency — writing the parked source cell re-derives the
+/// materialized formula through Store.
 #[test]
 fn derive_read_after_install_tracks_parked_primitive() {
     let mut primitives = HashMap::new();
@@ -534,8 +556,8 @@ fn derive_read_after_install_tracks_parked_primitive() {
     assert!(wb.set_formula(0, "B1", "=A1*2"));
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(6.0));
 
-    // Write through the workbook path: the parked A1 promotes, the
-    // dependent formula goes dirty, the next read is fresh.
+    // Write through the workbook path: parked A1 promotes and Store eagerly
+    // re-derives the materialized dependent before the next read.
     wb.set_cell(0, "A1", Value::Number(5.0));
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
 }

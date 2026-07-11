@@ -32,6 +32,8 @@
  *    `new Function('args', source)` and binds the resulting callable on
  *    the engine. (Same string-source contract as the WASM bridge so the
  *    Solid-side host atom hooks need no changes.)
+ *  - Debug probes delegate directly to the workbook's atomm-derived state;
+ *    the worker does not maintain a dirty/clean simulation.
  *  - Subscriptions / cellsDirty: every successful mutation broadcasts a
  *    coarse `cellsDirty` event covering the touched cell. The TS core
  *    does not yet wire fine-grained per-cell `sub` propagation back to
@@ -41,7 +43,6 @@
  * NOT in scope here (left for Wave E+ tracks):
  *  - Persistence v1 import / export.
  *  - Subscribe cell-list with hydrated payload.
- *  - Debug counters / formula-eval / formula-cache state.
  *  - Streaming snapshot / export sessions (chunked).
  *
  * Hard rules:
@@ -134,38 +135,6 @@ interface RuntimeState {
   nextImportSessionId: number
   snapshotSessions: Map<number, SnapshotSession>
   nextSnapshotSessionId: number
-  /**
-   * Set of formula-cell addresses (`${sheetIdx}:${row}:${col}`) that have
-   * been read via a client-facing RPC since their last write/clear.
-   *
-   * The TS engine evaluates a formula eagerly whenever its atom is read,
-   * including the internal cycle-check read in `setFormulaDetailed` — so
-   * the engine's own `debugFormulaCacheState` cannot distinguish "never
-   * read by the host" from "auto-evaluated during a write". The WASM
-   * engine has a true dirty/clean state machine; to mirror its semantics
-   * at the worker boundary we mark a cell 'dirty' whenever the host
-   * hasn't observed it since the last mutation. Reads add entries here;
-   * writes/clears remove them.
-   *
-   * Keyed sheetIdx → set of `row:col` (audit D-9): every single-cell
-   * write invalidates one whole sheet, so the per-write cost must be
-   * one `Map.delete`, not a `startsWith` scan over every host-read
-   * formula on every sheet.
-   */
-  readFormulaCells: Map<number, Set<string>>
-}
-
-function markFormulaRead(state: RuntimeState, sheetIdx: number, row: number, col: number) {
-  let keys = state.readFormulaCells.get(sheetIdx)
-  if (!keys) {
-    keys = new Set()
-    state.readFormulaCells.set(sheetIdx, keys)
-  }
-  keys.add(`${row}:${col}`)
-}
-
-function hasFormulaRead(state: RuntimeState, sheetIdx: number, row: number, col: number): boolean {
-  return state.readFormulaCells.get(sheetIdx)?.has(`${row}:${col}`) ?? false
 }
 
 type RequestMessage = {
@@ -200,7 +169,6 @@ function createInitialState(): RuntimeState {
     nextImportSessionId: 1,
     snapshotSessions: new Map(),
     nextSnapshotSessionId: 1,
-    readFormulaCells: new Map(),
   }
 }
 
@@ -418,30 +386,10 @@ function listSheetMeta(state: RuntimeState): WorkbookSheetMeta[] {
 
 function applyCellInput(state: RuntimeState, sheet: SheetEntry, row: number, col: number, input: string) {
   state.workbook.setCell(sheet.id, row, col, input)
-  // After any mutation, dependent formulas may have been auto-flushed by
-  // the engine. We invalidate the host-read tracking for every formula
-  // cell on this sheet so the next `debugFormulaCacheState` reports
-  // 'dirty' until the host re-observes the cell — matching WASM, where
-  // dep-changes mark cells dirty until re-read.
-  invalidateReadOnMutation(state, sheet.idx)
 }
 
 function clearCell(state: RuntimeState, sheet: SheetEntry, row: number, col: number) {
   state.workbook.clearCell(sheet.id, row, col, 'all')
-  invalidateReadOnMutation(state, sheet.idx)
-}
-
-function invalidateReadOnMutation(state: RuntimeState, sheetIdx: number) {
-  // Coarse invalidation matching the WASM engine's broad dirty-bump:
-  // any mutation on a sheet marks every formula cell on that sheet as
-  // unread, regardless of dependency edges. The `debugFormulaCacheState`
-  // probe checks the host-read set; reads after the mutation re-mark
-  // cells clean. Cross-sheet ripple is matched implicitly because the
-  // probe sees 'dirty' for any cell the host hasn't re-read.
-  //
-  // One Map.delete per write (audit D-9) — the read set is keyed per
-  // sheet so this never scans entries belonging to other sheets.
-  state.readFormulaCells.delete(sheetIdx)
 }
 
 function setCellFromWire(
@@ -462,20 +410,16 @@ function setCellFromWire(
   switch (value.type) {
     case 'number':
       state.workbook.setCellValue(sheet.id, row, col, { kind: 'number', value: value.value })
-      invalidateReadOnMutation(state, sheet.idx)
       return true
     case 'text':
       state.workbook.setCellValue(sheet.id, row, col, { kind: 'string', value: value.value })
-      invalidateReadOnMutation(state, sheet.idx)
       return true
     case 'boolean':
       state.workbook.setCellValue(sheet.id, row, col, { kind: 'boolean', value: value.value })
-      invalidateReadOnMutation(state, sheet.idx)
       return true
     case 'error': {
       const code = value.value as ErrorCode
       state.workbook.setCellValue(sheet.id, row, col, { kind: 'error', code })
-      invalidateReadOnMutation(state, sheet.idx)
       return true
     }
     case 'null':
@@ -612,9 +556,9 @@ function collectSpillTargets(
   const out: Array<{ row: number; col: number }> = []
   // Lazy contract: spill target collection must NEVER force evaluation
   // of a formula whose atom has not been read yet. Eager evaluation
-  // defeats the WASM-mirror eval-count contract that bulk-paste tests
-  // probe (an import of 10 000 cells must add at most one eval-count
-  // tick). We only consult formulas the engine has already cached
+  // defeats the engine eval-count contract that bulk-paste tests probe
+  // (an import of 10 000 cells must add at most one eval-count tick).
+  // We only consult formulas the engine has already cached
   // ('clean'); a formula that is still 'dirty' cannot have produced a
   // spill the host needs to surface yet, so skipping it is safe.
   //
@@ -681,12 +625,6 @@ function snapshotRangeSparse(state: RuntimeState, range: SparseRangeWire): Spars
   }
   // Stable order: row-major.
   out.sort((a, b) => (a.row === b.row ? a.col - b.col : a.row - b.row))
-  // NOTE: we deliberately do NOT mark these cells as host-read.
-  // snapshotRangeSparse emits formula SOURCE for formula cells (it does
-  // not evaluate the atom), so it doesn't count as "has the host
-  // observed the value yet?" for the cache-state probe. Compare with
-  // `readSparseRange` and `readCells`, which DO compute a display and
-  // therefore mark the formula clean.
   return out
 }
 
@@ -717,14 +655,6 @@ function readSparseRange(state: RuntimeState, range: SparseRangeWire): CellSnaps
     if (la.row !== ra.row) return la.row - ra.row
     return la.col - ra.col
   })
-  // Track host-observed formula cells so debugFormulaCacheState can
-  // report 'clean' for cells the host has read since the last mutation.
-  for (const snapshot of out) {
-    if (snapshot.formula) {
-      const coord = parseA1(snapshot.addr)
-      if (coord) markFormulaRead(state, sheet.idx, coord.row, coord.col)
-    }
-  }
   return out
 }
 
@@ -753,9 +683,7 @@ function clearRange(state: RuntimeState, range: SparseRangeWire): number {
   // not ~1M per-coordinate clearCell calls. The returned count is the
   // number of existing cells touched, matching the WASM engine's sparse
   // `clear_range` semantics.
-  const cleared = state.workbook.clearRange(sheet.id, bounds, 'all')
-  invalidateReadOnMutation(state, sheet.idx)
-  return cleared
+  return state.workbook.clearRange(sheet.id, bounds, 'all')
 }
 
 function importCells(state: RuntimeState, cells: ImportCellWire[]): WorkbookImportStatsWire {
@@ -871,10 +799,6 @@ function importCells(state: RuntimeState, cells: ImportCellWire[]): WorkbookImpo
       for (const c of batch.clears) {
         state.workbook.clearCell(batch.sheet.id, c.row, c.col, 'all')
       }
-      // One coarse read-invalidation per sheet, matching the WASM
-      // behavior where bulk import flips every formula on the sheet
-      // back to 'dirty' until the host re-observes the cell.
-      invalidateReadOnMutation(state, batch.sheet.idx)
     } catch {
       stats.errors += 1
     }
@@ -1351,7 +1275,6 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
         state.nextImportSessionId = 1
         state.snapshotSessions = new Map()
         state.nextSnapshotSessionId = 1
-        state.readFormulaCells = new Map()
         return listSheetMeta(state)
       }
       case 'sheetList':
@@ -1512,11 +1435,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
               formula: '',
             }
           }
-          const snapshot = readCellSnapshot(state, sheet, coord.row, coord.col)
-          if (snapshot.formula) {
-            markFormulaRead(state, sheet.idx, coord.row, coord.col)
-          }
-          return snapshot
+          return readCellSnapshot(state, sheet, coord.row, coord.col)
         })
       }
       case 'listNonEmpty': {
@@ -1639,7 +1558,6 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
           state.importSessions = new Map()
           state.snapshotSessions = new Map()
           state.nextSnapshotSessionId = 1
-          state.readFormulaCells = new Map()
           const cells = snapshot?.cells ?? []
           const importable: ImportCellWire[] = cells.map((c) => {
             switch (c.kind) {
@@ -1674,44 +1592,8 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
         return undefineNameInWorker(state, String(msg.name ?? ''))
       case 'debugCounters':
         return debugCountersFor(state)
-      case 'debugFormulaCacheState': {
-        // The TS engine evaluates formulas eagerly the first time their
-        // atom is read — including the internal cycle-check read in
-        // `setFormulaDetailed`. By the time the host probes the cell, the
-        // engine has already stamped it 'clean'. The WASM engine doesn't:
-        // it has a true dirty/clean state machine driven by writes and
-        // reads.
-        //
-        // To match WASM semantics at the worker boundary we override the
-        // engine's 'clean' to 'dirty' for any formula cell the host hasn't
-        // observed via a client-facing read RPC since the last write. The
-        // override is purely a probe-shape simulation — the engine itself
-        // still operates eagerly. Other workbook states ('none',
-        // 'computing', 'invalid', or 'dirty') pass through unchanged.
-        const sheetIdx = Number(msg.sheet)
-        const addrStr = String(msg.addr ?? '')
-        const engineState = state.workbook.debugFormulaCacheState(sheetIdx, addrStr)
-        // 'none' (literal/empty), 'invalid' (bad addr/sheet), and
-        // 'computing' (mid-evaluation) pass through unchanged — those
-        // shapes don't fit the dirty/clean dichotomy this override
-        // simulates. Only 'clean' / 'dirty' from the engine are
-        // reinterpreted via the host-read set.
-        if (engineState === 'none' || engineState === 'invalid' || engineState === 'computing') {
-          return engineState
-        }
-        const coord = parseA1(addrStr)
-        if (!coord) return engineState
-        // Engine reports a real formula cell ('clean' or 'dirty'). The
-        // engine's stamp doesn't always refresh on read — a cached derive
-        // whose deps didn't change returns the cached value WITHOUT
-        // re-running the derive, so `lastEvalRevision` stays stale and
-        // the engine still says 'dirty' even though the value is valid.
-        // We use the host-read set as the authoritative observation
-        // signal: if the host has read the cell since the last mutation
-        // on this sheet, the host has observed a value the engine just
-        // produced → 'clean'. Otherwise 'dirty'.
-        return hasFormulaRead(state, sheetIdx, coord.row, coord.col) ? 'clean' : 'dirty'
-      }
+      case 'debugFormulaCacheState':
+        return state.workbook.debugFormulaCacheState(Number(msg.sheet), String(msg.addr ?? ''))
       case 'debugFormulaEvalCount':
         return state.workbook.debugFormulaEvalCount(Number(msg.sheet))
       default:
@@ -1780,9 +1662,6 @@ function rebuildPreservingCells(
   // Audit D-5: the rebuild swapped in a FRESH workbook — every cached
   // formula value was dropped and sheet indices may have shifted. Sheet-
   // index-keyed host state must not survive the op:
-  //  - `readFormulaCells`: stale old-index entries would make
-  //    `debugFormulaCacheState` report 'clean' for a never-observed
-  //    formula on whichever sheet shifted into the old slot.
   //  - `importSessions`: staged `ImportCellWire.sheet` indices would
   //    land buffered cells on the wrong sheet at commit.
   //  - `snapshotSessions`: in-flight chunk cursors would read the wrong
@@ -1791,7 +1670,6 @@ function rebuildPreservingCells(
   // INVALID_IMPORT_SESSION / SNAPSHOT_SESSION_MISSING so the host
   // restarts against the new sheet layout. The session-id counters keep
   // counting up, so a stale id can never collide with a new session.
-  state.readFormulaCells = new Map()
   state.importSessions = new Map()
   state.snapshotSessions = new Map()
 

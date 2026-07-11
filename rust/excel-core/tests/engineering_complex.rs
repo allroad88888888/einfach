@@ -143,7 +143,11 @@ fn complex_transcendental_round_trip() {
 fn complex_trig_pythagoras() {
     let mut wb = Workbook::new();
     wb.set_formula(0, "A1", "=COMPLEX(0.7, 0.3)");
-    wb.set_formula(0, "B1", "=IMSUM(IMPOWER(IMSIN(A1),2), IMPOWER(IMCOS(A1),2))");
+    wb.set_formula(
+        0,
+        "B1",
+        "=IMSUM(IMPOWER(IMSIN(A1),2), IMPOWER(IMCOS(A1),2))",
+    );
 
     let (r, i) = parse_text_complex(&wb.get_cell("Sheet1", "B1"));
     assert!((r - 1.0).abs() < 1e-9, "real {r}");

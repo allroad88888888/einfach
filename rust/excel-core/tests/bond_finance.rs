@@ -81,8 +81,16 @@ fn duration_mduration_identity() {
 #[test]
 fn pricedisc_yielddisc_round_trip() {
     let mut wb = Workbook::new();
-    wb.set_formula(0, "A1", "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),0.05,100,0)");
-    wb.set_formula(0, "A2", "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),A1,100,0)");
+    wb.set_formula(
+        0,
+        "A1",
+        "=PRICEDISC(DATE(2020,1,1),DATE(2020,7,1),0.05,100,0)",
+    );
+    wb.set_formula(
+        0,
+        "A2",
+        "=YIELDDISC(DATE(2020,1,1),DATE(2020,7,1),A1,100,0)",
+    );
 
     let p = match wb.get_cell("Sheet1", "A1") {
         Value::Number(n) => n,

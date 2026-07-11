@@ -7,8 +7,9 @@
 //!     twins of two representative shapes are `#[ignore]`d at the
 //!     bottom.
 //!   - COUNTERS, NOT CLOCKS: complexity is asserted via the
-//!     `#[doc(hidden)] debug_*` probes (eval counts, dirty-BFS visits,
-//!     dep-graph stats, map sizes) — zero wall-clock assertions.
+//!     `#[doc(hidden)] debug_*` probes (eval counts, Store reverse-dependency
+//!     visits, facade stats, map sizes) — zero wall-clock assertions. P7 can
+//!     opt into non-gating timing/RSS observations with `EINFACH_P7_PERF=1`.
 //!   - CLOSED FORM: every shape's correctness check is an arithmetic
 //!     identity (stated in each test's doc comment), not
 //!     sampled-and-hoped.
@@ -54,6 +55,31 @@ fn sum_1_to(n: u64) -> f64 {
     (n * (n + 1) / 2) as f64
 }
 
+fn p7_perf_enabled() -> bool {
+    std::env::var("EINFACH_P7_PERF").as_deref() == Ok("1")
+}
+
+fn current_rss_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    let output = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", pid.as_str()])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|rss_kib| rss_kib * 1024)
+}
+
+fn elapsed_ms(started: std::time::Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1_000.0
+}
+
 // =====================================================================
 // S1 — Chain: A1 = 1, A_i = A_{i-1} + 1.
 //
@@ -61,20 +87,21 @@ fn sum_1_to(n: u64) -> f64 {
 //   - tail == N (closed form).
 //   - hydration sweep evals each formula EXACTLY once: eval delta ==
 //     N - 1, never O(N²) (each read must reuse its upstream's cache).
-//   - after editing the head to 1 + Δ, a full re-read sweep re-evals
-//     exactly N - 1 formulas again ("chain length, not 2×") and the
-//     tail reads N + Δ.
-//   - the SECOND read after the edit re-evals NOTHING (clean cache).
+//   - after editing the head to 1 + Δ, Store synchronously re-derives
+//     exactly N - 1 mounted formulas ("chain length, not 2×").
+//   - every read after the edit hits the settled cache; the tail is N + Δ.
 // =====================================================================
 
 fn s1_chain_body(n: u32) {
     let mut sheet = Sheet::new();
+    let bulk_started = std::time::Instant::now();
     sheet.bulk_load(|loader| {
         loader.set_cell("A1", num(1.0));
         for r in 2..=n {
             loader.set_formula(&format!("A{r}"), &format!("=A{}+1", r - 1));
         }
     });
+    let bulk_load_ms = elapsed_ms(bulk_started);
     assert_eq!(
         sheet.debug_formula_eval_count(),
         0,
@@ -83,9 +110,21 @@ fn s1_chain_body(n: u32) {
 
     // Hydration sweep head→tail: every read's upstream is already
     // clean, so each formula evaluates exactly once.
+    let rss_before_hydration = p7_perf_enabled().then(current_rss_bytes).flatten();
+    let static_cycle_visits_before = sheet.debug_static_cycle_node_visit_count();
+    let hydration_started = std::time::Instant::now();
     for r in 2..=n {
         let _ = sheet.get_cell(&format!("A{r}"));
     }
+    let hydration_ms = elapsed_ms(hydration_started);
+    let static_cycle_node_visits =
+        sheet.debug_static_cycle_node_visit_count() - static_cycle_visits_before;
+    let rss_after_hydration = p7_perf_enabled().then(current_rss_bytes).flatten();
+    assert_eq!(
+        static_cycle_node_visits,
+        (n - 1) as u64,
+        "parked chain cycle validation must visit each formula AST exactly once"
+    );
     assert_eq!(
         sheet.debug_formula_eval_count(),
         (n - 1) as usize,
@@ -99,25 +138,33 @@ fn s1_chain_body(n: u32) {
         "clean tail read must not re-eval"
     );
 
-    // Edit the head: Δ = +10. The dirty BFS must visit the whole chain
-    // exactly once (every formula transitively depends on A1).
-    let visits_before = sheet.debug_dirty_visit_count();
+    // Edit the head: delta = +10. Store reverse reachability must find every
+    // materialized formula-inner exactly once and settle it in the write.
+    let visits_before = sheet.debug_reverse_dep_visit_count();
+    let evals_before = sheet.debug_formula_eval_count();
+    let head_write_started = std::time::Instant::now();
     sheet.set_cell("A1", num(11.0));
+    let head_write_ms = elapsed_ms(head_write_started);
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         (n - 1) as u64,
-        "head edit must dirty each chain formula exactly once"
+        "head edit must reach each chain formula exactly once through Store"
+    );
+    assert_eq!(
+        sheet.debug_formula_eval_count() - evals_before,
+        (n - 1) as usize,
+        "head edit must synchronously re-derive each mounted formula once"
     );
 
-    // Re-read sweep: re-eval count == chain length, not 2×.
+    // Re-read sweep: Store already settled the chain during the write.
     let evals_before = sheet.debug_formula_eval_count();
     for r in 2..=n {
         let _ = sheet.get_cell(&format!("A{r}"));
     }
     assert_eq!(
         sheet.debug_formula_eval_count() - evals_before,
-        (n - 1) as usize,
-        "post-edit sweep must re-eval each formula exactly once"
+        0,
+        "post-edit sweep must only read settled Store caches"
     );
     assert_eq!(
         sheet.get_cell(&format!("A{n}")),
@@ -125,7 +172,7 @@ fn s1_chain_body(n: u32) {
         "tail == N + Δ after head edit"
     );
 
-    // SECOND read after the edit: the cache is clean, zero re-evals.
+    // A second sampled read remains cache-only.
     let evals_clean = sheet.debug_formula_eval_count();
     for r in (2..=n).step_by((n as usize / 64).max(1)) {
         let _ = sheet.get_cell(&format!("A{r}"));
@@ -136,6 +183,29 @@ fn s1_chain_body(n: u32) {
         evals_clean,
         "second read after edit must re-eval nothing"
     );
+
+    if p7_perf_enabled() {
+        let materialized_formulas = sheet.debug_dep_graph_stats().formula_count;
+        let rss_delta_bytes = rss_after_hydration
+            .zip(rss_before_hydration)
+            .map(|(after, before)| after.saturating_sub(before));
+        let bytes_per_materialized_formula = rss_delta_bytes
+            .filter(|_| materialized_formulas > 0)
+            .map(|bytes| bytes as f64 / materialized_formulas as f64);
+        eprintln!(
+            "[p7-perf][S1] n={n} bulk_load_ms={bulk_load_ms:.3} hydration_ms={hydration_ms:.3} \
+             head_write_ms={head_write_ms:.3} materialized_formulas={materialized_formulas} \
+             static_cycle_node_visits={static_cycle_node_visits} store_atoms={} \
+             rss_delta_bytes={} bytes_per_materialized_formula={}",
+            sheet.debug_total_atom_count(),
+            rss_delta_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            bytes_per_materialized_formula
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "unavailable".to_string()),
+        );
+    }
 }
 
 #[test]
@@ -148,8 +218,8 @@ fn s1_chain_evals_linear_and_caches_clean() {
 //
 // Identities:
 //   - every B_i == 2 (then == 10 after the head edit: 2 × 5).
-//   - editing A1 dirties exactly N formulas (dirty-BFS visit delta ==
-//     N, dirty-state count == N).
+//   - editing A1 reaches and synchronously re-derives exactly N mounted
+//     formulas (Store reverse-dependency visit delta == N, settled count 0).
 //   - a write to an UNRELATED cell does zero dirty work (visit delta
 //     == 0) and triggers zero re-evals on subsequent reads.
 // =====================================================================
@@ -172,33 +242,45 @@ fn s2_fanout_dirty_work_equals_fanout() {
     assert_eq!(sheet.debug_formula_eval_count(), N as usize);
     assert_eq!(sheet.debug_dirty_count(), 0, "all clean after hydration");
 
-    // Head edit: bump/dirty count == N exactly.
-    let visits_before = sheet.debug_dirty_visit_count();
+    // Head edit: reach and synchronously settle all N mounted formulas.
+    let visits_before = sheet.debug_reverse_dep_visit_count();
+    let evals_before = sheet.debug_formula_eval_count();
+    let head_write_started = std::time::Instant::now();
     sheet.set_cell("A1", num(5.0));
+    let head_write_ms = elapsed_ms(head_write_started);
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         N as u64,
         "head edit must visit each dependent exactly once"
     );
     assert_eq!(
-        sheet.debug_dirty_count(),
+        sheet.debug_formula_eval_count() - evals_before,
         N as usize,
-        "all N formulas dirty after head edit"
+        "all N mounted formulas must re-derive during the write"
     );
+    assert_eq!(sheet.debug_dirty_count(), 0, "write must settle the graph");
 
-    // Re-read: exactly N re-evals, values follow the head.
+    // Re-read: values follow the head without another evaluation.
     let evals_before = sheet.debug_formula_eval_count();
     for r in 1..=N {
         assert_eq!(sheet.get_cell(&format!("B{r}")), num(10.0));
     }
-    assert_eq!(sheet.debug_formula_eval_count() - evals_before, N as usize);
+    assert_eq!(sheet.debug_formula_eval_count() - evals_before, 0);
     assert_eq!(sheet.debug_dirty_count(), 0);
 
+    if p7_perf_enabled() {
+        eprintln!(
+            "[p7-perf][S2] n={N} head_write_ms={head_write_ms:.3} reverse_dep_visits={N} \
+             synchronous_evals={N} store_atoms={}",
+            sheet.debug_total_atom_count(),
+        );
+    }
+
     // Unrelated write: ZERO dirty work, ZERO re-evals.
-    let visits_before = sheet.debug_dirty_visit_count();
+    let visits_before = sheet.debug_reverse_dep_visit_count();
     sheet.set_cell("Z1", num(99.0));
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         0,
         "unrelated write must do zero dirty work"
     );
@@ -222,8 +304,8 @@ fn s2_fanout_dirty_work_equals_fanout() {
 //     formula eval.
 //   - the sparse range iterator touches exactly N cells — O(existing),
 //     never O(1,048,576).
-//   - editing one source cell re-evals exactly 1 formula and dirties
-//     exactly 1 dependent; new sum == old − r + v (closed form).
+//   - editing one source cell synchronously re-derives exactly 1 mounted
+//     formula; the following read is cached and the new sum is old − r + v.
 // =====================================================================
 
 #[test]
@@ -252,12 +334,18 @@ fn s3_fan_in_whole_column_sum_is_sparse_and_single_eval() {
     );
 
     // One source edit: A500 := 500 + 1_000_000.
-    let visits_before = sheet.debug_dirty_visit_count();
+    let visits_before = sheet.debug_reverse_dep_visit_count();
+    let evals_before = sheet.debug_formula_eval_count();
     sheet.set_cell("A500", num(1_000_500.0));
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         1,
-        "single-cell edit must dirty exactly the one range dependent"
+        "single-cell edit must reach exactly one Store-derived range consumer"
+    );
+    assert_eq!(
+        sheet.debug_formula_eval_count() - evals_before,
+        1,
+        "the mounted aggregate must re-derive during the write"
     );
     let evals_before = sheet.debug_formula_eval_count();
     assert_eq!(
@@ -267,8 +355,8 @@ fn s3_fan_in_whole_column_sum_is_sparse_and_single_eval() {
     );
     assert_eq!(
         sheet.debug_formula_eval_count() - evals_before,
-        1,
-        "exactly 1 formula re-evals after a single cell edit"
+        0,
+        "the post-write aggregate read must hit Store's settled cache"
     );
 }
 
@@ -361,7 +449,11 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         sheet.spill_anchor_for(addr(&format!("A{}", N / 2))),
         Some(addr("A1"))
     );
-    assert_eq!(sheet.spill_anchor_for(addr("A1")), None, "anchor is not a target");
+    assert_eq!(
+        sheet.spill_anchor_for(addr("A1")),
+        None,
+        "anchor is not a target"
+    );
     // Sampled targets: row r holds r.
     assert_eq!(sheet.get_cell("A2"), num(2.0));
     assert_eq!(sheet.get_cell(&format!("A{}", N / 2)), num((N / 2) as f64));
@@ -375,7 +467,10 @@ fn s5_spill_shifts_and_tears_down_to_baseline() {
         Some(format!("=SEQUENCE({N})").as_str()),
         "anchor formula relocated"
     );
-    assert_eq!(sheet.get_cell(&format!("A{}", N / 2 + 1)), num((N / 2) as f64));
+    assert_eq!(
+        sheet.get_cell(&format!("A{}", N / 2 + 1)),
+        num((N / 2) as f64)
+    );
     assert_eq!(sheet.get_cell(&format!("A{}", N + 1)), num(N as f64));
     assert_eq!(sheet.debug_spill_anchor_count(), base_anchors + 1);
     assert_eq!(
@@ -466,11 +561,7 @@ fn s6_cross_sheet_chain_closed_form_and_a6_at_scale() {
                 format!("S{}", k - 1)
             };
             for r in 1..=N {
-                assert!(loader.set_formula(
-                    k,
-                    &format!("A{r}"),
-                    &format!("={prev}!A{r}+1")
-                ));
+                assert!(loader.set_formula(k, &format!("A{r}"), &format!("={prev}!A{r}+1")));
             }
         }
         assert!(loader.set_formula(HOPS, "C1", &format!("=SUM(A1:A{N})")));
@@ -545,7 +636,7 @@ fn s7a_insert_row_body(n: u32) {
         "insert_row on parked formulas must hydrate nothing"
     );
     assert_eq!(stats.total_point_dep_edges, 0);
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0);
     assert_eq!(
         sheet.debug_formula_count(),
         n as usize,
@@ -594,7 +685,7 @@ fn s7b_delete_band_keeps_laziness_and_refs_band_correctly() {
         0,
         "delete_row on parked formulas must hydrate nothing"
     );
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0);
     // Band rows (formula + primitive pairs) are gone from the count,
     // and the #REF! probes converted to plain error CELLS (engine
     // contract pinned in tests/lazy_structural_retarget.rs: a parked
@@ -661,7 +752,7 @@ fn probes(sheet: &Sheet) -> SheetProbes {
         store_atoms: sheet.debug_total_atom_count(),
         formulas: sheet.debug_formula_count(),
         dirty: sheet.debug_dirty_count(),
-        dep_keys: sheet.debug_cell_dependents_key_count(),
+        dep_keys: sheet.debug_point_dependency_key_count(),
         a1_dependents: sheet.debug_dependents_count("A1"),
         range_deps: sheet.debug_range_dep_count(),
         spill_anchors: sheet.debug_spill_anchor_count(),
@@ -900,13 +991,12 @@ fn s10_boundary_corner_refs_and_grid_caps() {
 //
 // Identities:
 //   - every edited source row r has EXACTLY one dependent (B_r), and
-//     only hydrated dependents have edges — so total dirty-BFS visits
+//     only hydrated dependents have edges — so total Store reverse visits
 //     across the storm == (number of edits in the hydrated region)
 //     exactly, and edits in the parked region do ZERO dirty work.
 //     Work is bounded by Σ dependents, never O(edits × sheet size).
-//   - final state is closed-form: B_r == (last value written to A_r)
-//     + 1 for every edited row; the verification sweep re-evals
-//     exactly one formula per DISTINCT edited row.
+//   - mounted B_r nodes re-derive synchronously per edit; parked B_r nodes
+//     remain cold. Verification therefore evaluates only distinct parked rows.
 // =====================================================================
 
 #[test]
@@ -928,48 +1018,74 @@ fn s11_mutation_storm_dirty_work_bounded_by_fanout() {
     for r in 1..=HYDRATED {
         assert_eq!(sheet.get_cell(&format!("B{r}")), num((r + 1) as f64));
     }
-    assert_eq!(
-        sheet.debug_dep_graph_stats().formula_count,
-        HYDRATED as u64
-    );
+    assert_eq!(sheet.debug_dep_graph_stats().formula_count, HYDRATED as u64);
 
     // Storm. Rows are LCG-chosen (deterministic); values are unique and
     // strictly increasing so every write is a real change (the store
     // dedups same-value writes).
     let mut lcg = Lcg::new(0x5EED_CAFE);
     let mut finals: HashMap<u32, f64> = HashMap::new();
-    let visits_before = sheet.debug_dirty_visit_count();
+    let visits_before = sheet.debug_reverse_dep_visit_count();
+    let evals_before = sheet.debug_formula_eval_count();
+    let mounted_storm_started = std::time::Instant::now();
     for i in 0..STORM_EDITS {
         let r = 1 + (lcg.next() % HYDRATED as u64) as u32;
         let v = 1_000_000.0 + i as f64;
         sheet.set_cell(&format!("A{r}"), num(v));
         finals.insert(r, v);
     }
+    let mounted_storm_ms = elapsed_ms(mounted_storm_started);
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         STORM_EDITS as u64,
-        "total dirty-BFS visits must equal Σ dependents (1 per edit), \
+        "total Store reverse visits must equal Σ dependents (1 per edit), \
          independent of sheet size"
+    );
+    assert_eq!(
+        sheet.debug_formula_eval_count() - evals_before,
+        STORM_EDITS as usize,
+        "each edit must synchronously re-derive its one mounted dependent"
     );
 
     // Edits into the parked region: those dependents have NO edges yet,
-    // so the storm does zero dirty work there.
+    // so the storm does zero dirty or evaluation work there.
     let mut parked_finals: HashMap<u32, f64> = HashMap::new();
-    let visits_before = sheet.debug_dirty_visit_count();
+    let visits_before = sheet.debug_reverse_dep_visit_count();
+    let evals_before = sheet.debug_formula_eval_count();
+    let parked_storm_started = std::time::Instant::now();
     for i in 0..PARKED_EDITS {
         let r = 50_001 + (lcg.next() % 10_000) as u32;
         let v = 2_000_000.0 + i as f64;
         sheet.set_cell(&format!("A{r}"), num(v));
         parked_finals.insert(r, v);
     }
+    let parked_storm_ms = elapsed_ms(parked_storm_started);
     assert_eq!(
-        sheet.debug_dirty_visit_count() - visits_before,
+        sheet.debug_reverse_dep_visit_count() - visits_before,
         0,
         "edits to sources of parked formulas must do zero dirty work"
     );
+    assert_eq!(
+        sheet.debug_formula_eval_count(),
+        evals_before,
+        "parked dependents must remain unevaluated during source writes"
+    );
 
-    // Final closed-form state; the sweep re-evals exactly one formula
-    // per distinct edited row (hydrated re-eval or first hydration).
+    if p7_perf_enabled() {
+        eprintln!(
+            "[p7-perf][S11] total_cells={} materialized_formulas={HYDRATED} \
+             mounted_edits={STORM_EDITS} mounted_storm_ms={mounted_storm_ms:.3} \
+             mounted_us_per_edit={:.3} parked_edits={PARKED_EDITS} \
+             parked_storm_ms={parked_storm_ms:.3} parked_us_per_edit={:.3} store_atoms={}",
+            N * 2,
+            mounted_storm_ms * 1_000.0 / STORM_EDITS as f64,
+            parked_storm_ms * 1_000.0 / PARKED_EDITS as f64,
+            sheet.debug_total_atom_count(),
+        );
+    }
+
+    // Final closed-form state. Mounted rows are already settled; parked rows
+    // evaluate once on their first verification read.
     let evals_before = sheet.debug_formula_eval_count();
     for (&r, &v) in finals.iter().chain(parked_finals.iter()) {
         assert_eq!(
@@ -980,8 +1096,8 @@ fn s11_mutation_storm_dirty_work_bounded_by_fanout() {
     }
     assert_eq!(
         sheet.debug_formula_eval_count() - evals_before,
-        finals.len() + parked_finals.len(),
-        "verification sweep must eval exactly once per distinct edited row"
+        parked_finals.len(),
+        "verification must evaluate only distinct parked rows"
     );
 
     // Untouched rows still read their original closed form, cache-clean.
@@ -997,22 +1113,18 @@ fn s11_mutation_storm_dirty_work_bounded_by_fanout() {
 }
 
 // =====================================================================
-// S12 — AUDIT B-5: the legacy bulk-loader's notify tail and the
-// workbook flush's cross-sheet BFS seeding are O(watchers/edges), not
-// O(touched).
+// S12 — AUDIT B-5: the bulk-loader's direct-subscriber tail is
+// O(watchers), while cross-sheet propagation remains entirely in Store.
 //
 // Identities:
-//   - a 2×N bulk load on a workbook with ZERO subscribers and ZERO
-//     cross-sheet edges performs ZERO notify probes and ZERO BFS seeds
-//     (the early-outs) — previously ~3×N hash ops to conclude nobody
-//     was watching;
-//   - arming ONE subscriber and ONE cross-sheet edge re-enables both
-//     paths: the subscriber fires, the BFS seeds O(touched of that
-//     batch), and the cross-sheet dependent serves the fresh value.
+//   - a 2×N bulk load with no subscribers performs zero notify probes;
+//   - arming one subscriber keeps direct notification change-proportional;
+//   - materialized cross-sheet dependents update through the shared Store,
+//     and the retired workbook BFS counter remains zero in both cases.
 // =====================================================================
 
 #[test]
-fn s12_bulk_flush_notify_and_bfs_skip_unwatched_workbooks() {
+fn s12_bulk_flush_notify_and_store_propagation_scale_with_watchers() {
     const N: u32 = 20_000;
     let mut wb = Workbook::new();
     wb.bulk_load(|loader| {
@@ -1026,7 +1138,7 @@ fn s12_bulk_flush_notify_and_bfs_skip_unwatched_workbooks() {
     assert_eq!(
         wb.debug_loader_bfs_seed_count(),
         0,
-        "no cross-sheet edges → zero BFS seed churn for a 2N-cell load"
+        "P6 performs no workbook BFS during a 2N-cell load"
     );
     assert_eq!(
         wb.sheet(0).unwrap().debug_bulk_notify_probe_count(),
@@ -1036,8 +1148,7 @@ fn s12_bulk_flush_notify_and_bfs_skip_unwatched_workbooks() {
     // Closed form still holds — the early-outs skip bookkeeping only.
     assert_eq!(wb.get_cell("Sheet1", &format!("B{N}")), num(2.0 * N as f64));
 
-    // Arm one subscriber + one cross-sheet edge; both paths must come
-    // back to life and stay change-proportional.
+    // Arm one subscriber and materialize one cross-sheet Store path.
     wb.add_sheet("S2");
     assert!(wb.set_formula(1, "A1", "=Sheet1!B1+1"));
     assert_eq!(wb.get_cell("S2", "A1"), num(3.0));
@@ -1051,19 +1162,20 @@ fn s12_bulk_flush_notify_and_bfs_skip_unwatched_workbooks() {
     wb.bulk_load(|loader| {
         loader.set_cell(0, "A1", num(100.0));
     });
-    assert!(
-        *fires.borrow() >= 1,
-        "subscriber on a dirty dependent must fire once the sheet has watchers"
+    assert_eq!(
+        *fires.borrow(),
+        1,
+        "subscriber on the derived cell must fire exactly once"
     );
     let probes = wb.sheet(0).unwrap().debug_bulk_notify_probe_count();
     assert!(
         (1..=4).contains(&probes),
         "notify probes bounded by touched ∪ dirty of the batch (got {probes})"
     );
-    let seeds = wb.debug_loader_bfs_seed_count();
     assert_eq!(
-        seeds, 1,
-        "BFS seeds == touched cells of THIS batch, not sheet size (got {seeds})"
+        wb.debug_loader_bfs_seed_count(),
+        0,
+        "cross-sheet Store propagation must not revive workbook BFS"
     );
     assert_eq!(
         wb.get_cell("S2", "A1"),

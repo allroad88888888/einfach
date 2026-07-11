@@ -166,14 +166,14 @@ fn range_sparse_then_write() {
     assert_eq!(sheet.get_cell("B1"), Value::Number(13.0));
 }
 
-/// Phase 1 验收: "formula dirty notify 不触发 eager compute".
+/// Atom delegation acceptance: a subscribed formula is a mounted Store
+/// derivation and therefore settles eagerly on writes.
 ///
-/// SAFETY/contract: `set_formula` must register the formula as Dirty
-/// without computing it, even when a subscriber is attached. The
-/// subscriber fires (so views can mark themselves dirty), but no eval
-/// happens until the next `get_cell`.
+/// SAFETY/contract: formula value, dependency propagation, and subscriber
+/// publication all come from the same atomm derivation. Do not preserve the
+/// legacy lazy-dirty behavior with a second notification graph.
 #[test]
-fn dirty_notify_no_eager_compute() {
+fn mounted_formula_subscription_rederives_through_store() {
     let mut sheet = Sheet::new();
     sheet.set_cell("A1", Value::Number(0.0));
 
@@ -186,34 +186,35 @@ fn dirty_notify_no_eager_compute() {
     sheet.set_formula("B1", "=A1*2");
     assert_eq!(
         sheet.debug_formula_eval_count(),
-        before,
-        "set_formula must not eagerly evaluate to satisfy a subscriber"
+        before + 1,
+        "the mounted facade must derive the installed formula through Store"
     );
     assert_eq!(
         sheet.debug_dirty_count(),
-        1,
-        "the newly-registered formula must be Dirty"
+        0,
+        "the mounted atomm derivation is settled, not parked in legacy Dirty state"
     );
 
-    // Only an explicit read should bump the eval counter.
+    // The explicit read reuses the settled Store value.
     assert_eq!(sheet.get_cell("B1"), Value::Number(0.0));
     assert_eq!(
         sheet.debug_formula_eval_count(),
         before + 1,
-        "exactly one eval on the first read"
+        "reading a settled mounted formula must not evaluate again"
     );
 
-    // Dirtying A1 must dirty B1 (subscriber fires) without recomputing.
+    // A dependency write re-derives the mounted formula and publishes through
+    // the same Store graph.
     let eval_after_first_read = sheet.debug_formula_eval_count();
     sheet.set_cell("A1", Value::Number(3.0));
     assert_eq!(
         sheet.debug_formula_eval_count(),
-        eval_after_first_read,
-        "dependency change must not eagerly recompute the formula"
+        eval_after_first_read + 1,
+        "dependency change must rederive the mounted formula through Store"
     );
     assert!(
-        *fires.borrow() >= 1,
-        "subscriber must have fired at least once across the formula lifetime"
+        *fires.borrow() >= 2,
+        "subscriber must publish the install and dependency-driven value changes"
     );
 }
 
@@ -258,33 +259,26 @@ fn null_write_releases_primitive_atom() {
 // Two tests pinning the Phase 2 scaling bullets from
 // `rust/docs/PHASE2_PARALLEL.md` § "Phase 2 Acceptance Roll-Up":
 //
-//   - 100k range formulas + 1 cell write → bounded by matches, not by N
-//     (Track E lands the interval index that makes this true).
+//   - 100k range formulas + 1 cell write → bounded by Store matches, not by N.
 //   - 1M coord space + small range read → O(range cells) visited
 //     (Track F lands the row-indexed cell storage that makes this true).
 //
 // Backing implementations:
-//   - `single_write_with_100k_range_formulas_is_bounded` is satisfied by
-//     Agent E's `RangeDependentIndex` (row+col bucket + wide-range
-//     fallback) inside `Sheet::dependents_of`.
-//   - `range_read_1m_sparse_visits_only_range` is satisfied by Agent F's
-//     `RowMajorMap`-backed `cells` storage and the
-//     `Sheet::debug_range_visit_count` probe helper.
+//   - small ranges read every member facade, so Store reverse edges identify
+//     the six affected formula-inner atoms without an address fanout index;
+//   - `range_read_1m_sparse_visits_only_range` is backed by `RowMajorMap` and
+//     the `Sheet::debug_range_visit_count` probe helper.
 
 use std::time::{Duration, Instant};
 
-/// Phase 2 验收: "100k range formulas + 1 cell write → bounded by
-/// matches, not by N" (PHASE2_PARALLEL.md § Phase 2 Acceptance Roll-Up,
-/// first bullet; Track E delivers the interval index that backs it).
+/// Atom-delegation acceptance: "100k small-range formulas + 1 cell write ->
+/// bounded by Store dependents, not by N".
 ///
 /// SAFETY/contract: with 100 000 range formulas of the form
 /// `=SUM(A{r}:A{r+5})` registered, a single `set_cell("A50000", _)`
-/// must consult only the ranges that actually contain A50000 (at most
-/// ~6 of the 100k), not linearly scan the full `range_dependents`
-/// index. The 50ms wall-clock bound is loose enough to survive CI noise
-/// (Phase 1's per-write O(N) scan would take orders of magnitude
-/// longer at N=100k) and tight enough to flag a regression to the
-/// linear path.
+/// must reach only the six formula-inner atoms whose member-facade edges
+/// include A50000. The 50ms wall-clock bound catches a regression to a full
+/// formula scan.
 ///
 /// `Instant`-based timing has obvious limitations on shared CI runners,
 /// but the gap between O(N) and O(matches) at N=100k is large enough
@@ -299,14 +293,8 @@ fn single_write_with_100k_range_formulas_is_bounded() {
     // bench_dirty_lookup_100k_ranges`: 100k overlapping 6-row ranges
     // anchored in column A.
     //
-    // LAZY_FORMULA_INDEXING Phase 3: bulk_load no longer populates
-    // `range_dependents` eagerly — formulas live in `formula_source`
-    // until first read. To exercise the original "100k registered
-    // ranges + 1 write" assertion, we hydrate every formula by
-    // reading its cell (forcing parse + dep install) before the
-    // probing write below. The test's purpose is unchanged: validate
-    // that a write touching ~6 of 100k registered ranges costs
-    // O(matches), not O(N).
+    // Formulas remain parked until first read. Hydrate them so each small
+    // range installs direct facade -> formula-inner edges in Store.
     sheet.bulk_load(|loader| {
         for r in 1..=N_RANGE_FORMULAS {
             loader.set_formula(&format!("B{}", r), &format!("=SUM(A{}:A{})", r, r + 5));
@@ -316,14 +304,12 @@ fn single_write_with_100k_range_formulas_is_bounded() {
         let _ = sheet.get_cell(&format!("B{}", r));
     }
 
-    // Sanity: 100k distinct ranges are in the index (each formula has
-    // a unique starting row). If this fails the test setup drifted.
     assert_eq!(
         sheet.debug_range_dep_count(),
-        N_RANGE_FORMULAS as usize,
-        "100k distinct ranges must be registered in range_dependents \
-         after hydration"
+        0,
+        "small ranges must not allocate geometry roots"
     );
+    assert_eq!(sheet.debug_dependents_count("A50000"), 6);
 
     // One single primitive write that lies inside ~6 overlapping
     // ranges (rows 49 995..=50 000 each include A50000 in their
@@ -334,8 +320,8 @@ fn single_write_with_100k_range_formulas_is_bounded() {
 
     assert!(
         elapsed < Duration::from_millis(50),
-        "set_cell with 100k registered range formulas must be bounded by \
-         the number of containing ranges (Phase 2 Track E), not by N. \
+        "set_cell with 100k range formulas must be bounded by the six \
+         Store dependents, not by N. \
          Observed: {:?}",
         elapsed
     );

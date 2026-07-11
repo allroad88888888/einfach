@@ -34,14 +34,14 @@ fn insert_row_preserves_lazy_contract() {
             loader.set_formula(&format!("B{r}"), &format!("=A{r}*2"));
         }
     });
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0);
     assert_eq!(sheet.debug_dep_graph_stats().formula_count, 0);
 
     sheet.insert_row(0, 1);
 
     let stats = sheet.debug_dep_graph_stats();
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
         "insert_row must not hydrate any parked formula"
     );
@@ -53,7 +53,10 @@ fn insert_row_preserves_lazy_contract() {
     // Reads hydrate on demand and see retargeted refs: row r's formula
     // now lives at B{r+1} and reads A{r+1} (the shifted datum).
     assert_eq!(sheet.get_cell("B2"), Value::Number(2.0));
-    assert_eq!(sheet.get_cell(&format!("B{}", N + 1)), Value::Number(2.0 * N as f64));
+    assert_eq!(
+        sheet.get_cell(&format!("B{}", N + 1)),
+        Value::Number(2.0 * N as f64)
+    );
     // Only the two reads hydrated.
     assert_eq!(sheet.debug_dep_graph_stats().formula_count, 2);
 }
@@ -76,7 +79,7 @@ fn all_structural_ops_preserve_lazy_contract() {
             _ => sheet.delete_col(0, 1),
         }
         assert_eq!(
-            sheet.debug_cell_dependents_key_count(),
+            sheet.debug_point_dependency_key_count(),
             0,
             "op {op} must not hydrate parked formulas"
         );
@@ -145,13 +148,14 @@ fn parked_cross_sheet_ref_untouched_same_sheet_ref_shifts() {
     formulas.insert(addr("B1"), "=Data!A1+A2".to_string());
     let mut primitives: HashMap<CellAddress, Value> = HashMap::new();
     primitives.insert(addr("A2"), Value::Number(5.0));
-    wb.install_sheet_bulk(0, primitives, formulas).expect("install");
+    wb.install_sheet_bulk(0, primitives, formulas)
+        .expect("install");
 
     wb.sheet_mut(0).unwrap().insert_row(0, 1);
 
     let sheet = wb.sheet(0).unwrap();
     assert_eq!(sheet.get_formula("B2").as_deref(), Some("=Data!A1+A3"));
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0, "still parked");
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0, "still parked");
     assert_eq!(wb.get_cell("Sheet1", "B2"), Value::Number(15.0));
 }
 
@@ -221,7 +225,7 @@ fn stacked_edits_then_read_is_correct() {
     sheet.insert_row(0, 2); // B1->B3, =A7; datum A5->A7
     sheet.delete_row(0, 1); // B3->B2, =A6; datum A7->A6
     sheet.insert_col(0, 1); // B2->C2, =B6; datum A6->B6
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0, "still parked");
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0, "still parked");
     assert_eq!(sheet.get_formula("C2").as_deref(), Some("=B6+1"));
     assert_eq!(sheet.get_cell("C2"), Value::Number(43.0));
     assert_eq!(sheet.get_cell("B6"), Value::Number(42.0));

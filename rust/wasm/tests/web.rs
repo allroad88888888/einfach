@@ -418,7 +418,11 @@ fn wasm_workbook_bulk_install_workbook_round_trip() {
     };
     assert_eq!(field("primitivesInstalled"), 4.0);
     assert_eq!(field("formulasInstalled"), 1.0);
-    assert_eq!(field("crossSheetParsed"), 0.0, "same-sheet formula skips the parse");
+    assert_eq!(
+        field("crossSheetParsed"),
+        0.0,
+        "bulk install performs no formula parse"
+    );
 
     assert_eq!(wb.get_number(0, "A1"), 2.0);
     assert_eq!(wb.get_number(0, "A2"), 3.0);

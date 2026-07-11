@@ -85,13 +85,13 @@ fn legacy_wrappers_with_signature_drift_through_workbook() {
     // TDIST takes a `tails` switch (1 or 2) instead of cumulative.
     wb.set_formula(0, "A1", "=TDIST(0, 10, 1)"); // right tail at 0 = 0.5
     wb.set_formula(0, "A2", "=TDIST(0, 10, 2)"); // two tail at 0 = 1.0
-    // NORMSDIST is single-arg (always cumulative).
+                                                 // NORMSDIST is single-arg (always cumulative).
     wb.set_formula(0, "A3", "=NORMSDIST(0)"); // 0.5
-    // HYPGEOMDIST is 4-arg (no cumulative, always PMF).
+                                              // HYPGEOMDIST is 4-arg (no cumulative, always PMF).
     wb.set_formula(0, "A4", "=HYPGEOMDIST(2, 5, 6, 20)");
     // NEGBINOMDIST is 3-arg (no cumulative).
     wb.set_formula(0, "A5", "=NEGBINOMDIST(0, 1, 0.5)"); // 0.5
-    // LOGNORMDIST is 3-arg cumulative-only.
+                                                         // LOGNORMDIST is 3-arg cumulative-only.
     wb.set_formula(0, "A6", "=LOGNORMDIST(EXP(1), 1, 0.5)"); // 0.5
 
     assert!(approx_eq(num(&wb, "A1"), 0.5, 1e-9));
@@ -152,7 +152,12 @@ fn hypothesis_tests_through_workbook() {
     // Each output should be a valid probability in (0, 1].
     for cell in ["C1", "C2", "C3", "C4", "C5", "C6"] {
         let p = num(&wb, cell);
-        assert!(p > 0.0 && p <= 1.0, "expected probability at {}, got {}", cell, p);
+        assert!(
+            p > 0.0 && p <= 1.0,
+            "expected probability at {}, got {}",
+            cell,
+            p
+        );
     }
 }
 

@@ -46,19 +46,20 @@ fn lazy_sheet(n: u32) -> Sheet {
 // =====================================================================
 
 /// A-1 — FIXED (W2.1). Structural proof (no timing): after `bulk_load`
-/// of N formulas the dep graph is empty (lazy contract); ONE
+/// of N formulas no formula-inner or static metadata is materialized; ONE
 /// `insert_row` at the top now retargets parked SOURCE TEXT
 /// (`shift::rewrite_parked_source`) instead of hydrating, so the dep
-/// graph stays empty and the lazy contract survives the edit. Reads
+/// Store/formula state stays unmaterialized and the lazy contract survives.
+/// Reads
 /// after the edit still see correctly retargeted formulas.
 #[test]
 fn audit_insert_row_hydrates_every_lazy_formula() {
     const N: u32 = 5_000;
     let mut sheet = lazy_sheet(N);
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
-        "lazy bulk_load must install zero dep edges"
+        "lazy bulk_load must keep the legacy point graph empty"
     );
 
     sheet.insert_row(0, 1);
@@ -66,7 +67,7 @@ fn audit_insert_row_hydrates_every_lazy_formula() {
     // A-1 FIXED: the edit forces ZERO hydrations — parked formulas are
     // retargeted textually, hydrated formulas via direct AST install.
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
         "A-1 FIXED: insert_row(0,1) must not hydrate any lazy formula"
     );
@@ -100,7 +101,7 @@ fn bench_insert_row_scales_with_total_formula_count() {
         sheet.insert_row(0, 1);
         let first = t0.elapsed();
         assert_eq!(
-            sheet.debug_cell_dependents_key_count(),
+            sheet.debug_point_dependency_key_count(),
             0,
             "A-1 FIXED: the edit must leave the sheet lazy"
         );
@@ -231,16 +232,13 @@ fn audit_insert_row_relocates_spill_targets() {
 }
 
 // =====================================================================
-// Finding A6 (P-C) — FIXED (W1.2). remove_sheet now rebuilds the
-// cross-sheet dep graph via `rebuild_cross_sheet_deps` (same path as
-// move_sheet) instead of clearing it, so dirty/notify fanout for
-// UNRELATED cross-sheet formulas survives sheet removal. Pin flipped
-// to the fixed behavior; the wider matrix (index remap, removed-
-// source notify) lives in tests/cross_sheet_propagation.rs.
+// Finding A6 (P-C) — FIXED. Removing an unrelated sheet updates the
+// workbook topology root without rebuilding a parallel cross-sheet graph.
+// The materialized formula remains connected to Data!A1 through Store.
 // =====================================================================
 
 #[test]
-fn audit_remove_unrelated_sheet_kills_cross_sheet_notify() {
+fn audit_remove_unrelated_sheet_preserves_store_dependency() {
     let mut wb = Workbook::new();
     wb.add_sheet("Data");
     let scratch = wb.add_sheet("Scratch");
@@ -260,19 +258,19 @@ fn audit_remove_unrelated_sheet_kills_cross_sheet_notify() {
 
     // Remove the UNRELATED Scratch sheet.
     assert!(wb.remove_sheet(scratch).is_some());
-    assert!(
-        wb.debug_cross_sheet_reverse_edge_count() > 0,
-        "A-6 FIXED: the surviving Data!A1 -> Sheet1!B1 edge must still \
-         be registered after the rebuild"
+    assert_eq!(
+        wb.debug_cross_sheet_reverse_edge_count(),
+        0,
+        "P6 keeps no workbook-owned reverse-edge graph"
     );
 
     // Same write again: value observable AND the subscriber fires.
     wb.set_cell(1, "A1", Value::Number(2.0));
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(4.0));
-    assert!(
-        *fires.borrow() > baseline,
-        "A-6 FIXED: cross-sheet subscriber keeps firing after removing \
-         an unrelated sheet"
+    assert_eq!(
+        *fires.borrow(),
+        baseline + 1,
+        "the shared Store dependency must notify exactly once"
     );
 }
 

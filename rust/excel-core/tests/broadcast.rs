@@ -142,10 +142,7 @@ fn shape_mismatch_returns_value_error() {
     sheet.set_cell("B5", Value::Number(5.0));
 
     assert!(sheet.set_formula("C1", "=A1:A3+B1:B5"));
-    assert_eq!(
-        sheet.get_cell("C1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("C1"), Value::Error(ValueError::InvalidValue));
     // No spill — C2, C3 untouched (still Null).
     assert_eq!(sheet.get_cell("C2"), Value::Null);
     assert_eq!(sheet.get_cell("C3"), Value::Null);

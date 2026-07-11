@@ -87,7 +87,10 @@ impl<K: Eq + Hash + Clone> AtomFamily<K> {
     /// different atom — silent aliasing would corrupt the reverse map.
     pub fn attach(&mut self, key: K, id: AtomId) {
         if let Some(&existing) = self.map.get(&key) {
-            assert!(existing == id, "AtomFamily::attach: key already holds a different atom");
+            assert!(
+                existing == id,
+                "AtomFamily::attach: key already holds a different atom"
+            );
             return;
         }
         self.map.insert(key.clone(), id);

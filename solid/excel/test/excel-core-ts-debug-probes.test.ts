@@ -279,40 +279,29 @@ describe('worker-runtime-ts: debug-probe RPC dispatch', () => {
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'NOT_AN_ADDR' })).toBe('invalid')
   })
 
-  test('setFormulaDetailed via worker reports dirty until the host reads the cell', async () => {
-    // `setFormulaDetailed` internally calls `readCellValue` for cycle
-    // detection, which the TS engine treats as an eager derive run that
-    // marks the cell clean. The worker RPC boundary now hides that quirk
-    // — it tracks "has the host observed this formula since the last
-    // mutation?" via the read-RPC set, mirroring WASM's truly-lazy
-    // dirty/clean state machine. So immediately after
-    // `setFormulaDetailed`, the cell is 'dirty' (host hasn't read it);
-    // `evalCount` is 1 (engine did evaluate during cycle-check).
+  test('debugFormulaCacheState delegates setFormulaDetailed state to the engine', async () => {
+    // `setFormulaDetailed` reads once for cycle detection. That eager
+    // atomm derive run leaves the formula clean before the host reads it.
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
     await rpc({ cmd: 'setCell', sheet: 0, addr: 'A1', value: { type: 'number', value: 10 } })
     await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'B1', formula: '=A1+1' })
-    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('dirty')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('clean')
     expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 0 })).toBe(1)
-    // A host read flips it clean.
     await rpc({ cmd: 'readCells', cells: [{ sheet: 0, addr: 'B1' }] })
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('clean')
+    expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 0 })).toBe(1)
   })
 
-  test('upstream mutation flips the formula back to dirty (WASM-mirror semantics)', async () => {
+  test('upstream mutation keeps an observed formula clean after eager atomm propagation', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['Sheet1'] })
     await rpc({ cmd: 'setCell', sheet: 0, addr: 'A1', value: { type: 'number', value: 10 } })
     await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'B1', formula: '=A1+1' })
-    // Host reads to flip clean.
     await rpc({ cmd: 'readCells', cells: [{ sheet: 0, addr: 'B1' }] })
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('clean')
     await rpc({ cmd: 'setCell', sheet: 0, addr: 'A1', value: { type: 'number', value: 99 } })
-    // Mutation invalidates the host-read tracking → 'dirty' again, even
-    // though the TS engine's eager flush already re-derived B1 and would
-    // report 'clean' on the underlying workbook (Rust-core would say
-    // 'dirty' too; the override aligns the worker boundary with WASM).
-    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('dirty')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'B1' })).toBe('clean')
     expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 0 })).toBe(2)
   })
 

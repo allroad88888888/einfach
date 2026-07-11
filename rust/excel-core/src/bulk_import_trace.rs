@@ -32,11 +32,11 @@
 //! |---                       |---                                         |
 //! | RPC boundary             | NOT measured here — caller measures it.    |
 //! | Parsing                  | `parse_only_ms` (isolated re-parse pass)   |
-//! | Dep graph wiring         | folded into `set_formula_loop_ms`          |
+//! | Formula metadata         | folded into `set_formula_loop_ms`          |
 //! | Storage allocation       | folded into `set_cell_loop_ms` + the above |
-//! | Initial cache invalidate | folded into `flush_ms`                     |
+//! | Store/structural flush   | folded into `flush_ms`                     |
 //!
-//! "Folded into" is a feature, not a bug — separating parse vs wiring vs
+//! "Folded into" is a feature, not a bug — separating parse vs metadata vs
 //! storage inside one `loader.set_formula(...)` would need a re-entrant
 //! mid-call timer hook, which is far more invasive than this whole arc
 //! is supposed to be. The two-bucket loop split (cells vs formulas) plus
@@ -166,15 +166,13 @@ pub struct BulkImportPhaseTimings {
     /// "pure storage write" share.
     pub set_cell_loop_ms: f64,
     /// Time spent calling `loader.set_formula(...)` for every formula
-    /// cell. Includes: re-parse inside the engine, same-sheet cycle
-    /// check, cross-sheet edge install into `CrossSheetDeps`, AST
-    /// storage, and the per-cell `touched`-set insertion.
+    /// cell. Includes re-parse inside the engine, on-demand cycle checking,
+    /// AST/source storage, and per-cell `touched`-set insertion. Formula
+    /// dependency edges remain lazy until a formula-inner atom is read.
     pub set_formula_loop_ms: f64,
     /// Time spent in the implicit `WorkbookLoader::flush` that runs when
-    /// the `bulk_load` closure returns. Includes the per-sheet replay
-    /// inside `Sheet::bulk_load` (which itself runs the dirty-cache BFS
-    /// and the same-sheet subscriber notify dedup) plus the workbook-
-    /// wide cross-sheet BFS.
+    /// the `bulk_load` closure returns. Includes per-sheet storage replay,
+    /// shared-Store flush, structural maintenance, and subscriber dedup.
     pub flush_ms: f64,
     /// **Sub-slice of `flush_ms`** — time spent parsing formula source
     /// inside `install_parsed_formula` (set_formula_pre_parsed receives
@@ -182,16 +180,15 @@ pub struct BulkImportPhaseTimings {
     /// re-tokenizes the source which would appear here). Phase 1
     /// instrumentation only — not consumed by any production path.
     pub flush_parse_ms: f64,
-    /// **Sub-slice of `flush_ms`** — time spent walking the AST to
-    /// extract point dependencies (`Sheet::formula_deps_for`) and range
-    /// dependencies (`collect_range_refs`) for each installed formula.
+    /// **Compatibility sub-slice of `flush_ms`** — time spent walking the AST
+    /// to collect `FormulaRecord` structural metadata via
+    /// `Sheet::formula_deps_for` and `collect_range_refs`. These sets support
+    /// cycle checks and structural retargeting; they are not a propagation
+    /// graph.
     pub flush_dep_extract_ms: f64,
-    /// **Sub-slice of `flush_ms`** — time spent inserting the extracted
-    /// deps into `cell_dependents` / `range_dependents`
-    /// (`Sheet::add_formula_deps` + `Sheet::add_formula_range_deps`).
-    /// Codex's 2026-06-11 attribution called this the dominant cost at
-    /// Mega tier — Phase 1 measures it directly so the claim is
-    /// quantifiable.
+    /// **Compatibility sub-slice of `flush_ms`** retained in the trace schema.
+    /// The P5 sheet range bridge is gone, so current installs perform no
+    /// separate dependency-registration work and this value stays near zero.
     pub flush_dep_register_ms: f64,
     /// **Sub-slice of `flush_ms`** — time spent materialising
     /// `Rc<FormulaRecord>` and inserting into `formula_cells` /
@@ -351,9 +348,8 @@ pub fn run_bulk_import_with_phase_timings(
     // measured body passes.
     let engine_total_ms = t2_engine_end - t2_engine_start;
     // Flush = engine_total − (cell_loop + formula_loop). Includes both
-    // `Sheet::bulk_load`'s flush (called inside `WorkbookLoader::flush`
-    // for each touched sheet) and the workbook-wide cross-sheet BFS at
-    // the tail of `WorkbookLoader::flush`.
+    // each touched sheet's storage replay plus the shared-Store flush and
+    // post-replay structural/subscriber maintenance.
     let flush_ms = (engine_total_ms - set_cell_loop_ms - set_formula_loop_ms).max(0.0);
 
     BulkImportPhaseTimings {
@@ -443,7 +439,8 @@ mod tests {
         // engine_total ≈ set_cell + set_formula + flush (allowing slack
         // for the inner `now_ms()` calls). We let it slip by 1ms either
         // side to keep CI-stable.
-        let computed_sum = timings.set_cell_loop_ms + timings.set_formula_loop_ms + timings.flush_ms;
+        let computed_sum =
+            timings.set_cell_loop_ms + timings.set_formula_loop_ms + timings.flush_ms;
         assert!(
             (timings.engine_total_ms - computed_sum).abs() < 1.0,
             "engine_total {} ≠ sum {} (delta {})",

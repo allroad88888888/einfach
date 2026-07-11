@@ -185,7 +185,11 @@ fn derived_with_multiple_deps() {
     let first = store.create_atom(t("John"));
     let last = store.create_atom(t("Doe"));
     let full = store.create_derived_ctx(move |args| {
-        t(&format!("{} {}", as_t(args.get(first)), as_t(args.get(last))))
+        t(&format!(
+            "{} {}",
+            as_t(args.get(first)),
+            as_t(args.get(last))
+        ))
     });
     assert_eq!(as_t(store.get(full)), "John Doe");
     store.set(first, t("Jane"));
@@ -328,8 +332,7 @@ fn complex_dependency_network() {
     let c = store.create_atom(n(3.0));
 
     let ab_sum = store.create_derived_ctx(move |args| n(as_n(args.get(a)) + as_n(args.get(b))));
-    let bc_product =
-        store.create_derived_ctx(move |args| n(as_n(args.get(b)) * as_n(args.get(c))));
+    let bc_product = store.create_derived_ctx(move |args| n(as_n(args.get(b)) * as_n(args.get(c))));
     let complex = store.create_derived_ctx(move |args| {
         n(as_n(args.get(ab_sum)) * as_n(args.get(bc_product)) - as_n(args.get(a)))
     });
@@ -395,7 +398,13 @@ fn multi_layer_writable_writes() {
     let last = store.create_atom(t("San"));
 
     let full = store.create_writable(
-        move |args| t(&format!("{}-{}", as_t(args.get(first)), as_t(args.get(last)))),
+        move |args| {
+            t(&format!(
+                "{}-{}",
+                as_t(args.get(first)),
+                as_t(args.get(last))
+            ))
+        },
         move |args, value| {
             let s = as_t(value);
             let (f, l) = s.split_once('-').expect("name has one dash");
@@ -817,7 +826,9 @@ fn write_fn_panic_does_not_poison_setting_guard() {
 #[test]
 fn large_fan_in_recompute_is_linear() {
     let store = Store::new();
-    let members: Vec<_> = (0..20_000).map(|i| store.create_atom(n(i as f64))).collect();
+    let members: Vec<_> = (0..20_000)
+        .map(|i| store.create_atom(n(i as f64)))
+        .collect();
     let members_for_sum = members.clone();
     let sum = store.create_derived_ctx(move |args| {
         let s: f64 = members_for_sum.iter().map(|&m| as_n(args.get(m))).sum();
@@ -857,7 +868,36 @@ fn settled_memo_bulk_write_into_shared_dependent() {
     let evals = store.debug_recompute_count() - evals_before;
     let visits = store.debug_flush_visit_count() - visits_before;
 
-    assert_eq!(as_n(store.get(sum)), (0..1000).map(|i| i as f64 + 1.0).sum());
+    assert_eq!(
+        as_n(store.get(sum)),
+        (0..1000).map(|i| i as f64 + 1.0).sum()
+    );
     assert_eq!(evals, 1, "shared dependent re-derives once per flush");
     assert_eq!(visits, 1000, "one settled-memo visit per drained root");
+}
+
+/// Engine top-level reads may compute a deep cold graph in one `get`.
+/// Settling that read must drain its pending entries without replaying the
+/// already-computed chain, and the next unrelated write must not inherit them.
+#[test]
+fn settle_pending_reads_does_not_rewalk_cold_graph() {
+    let store = Store::new();
+    let (_, tail) = build_chain(&store, 20_000);
+
+    assert_eq!(as_n(store.get(tail)), 20_000.0);
+    let visits_before = store.debug_flush_visit_count();
+    store.settle_pending_reads();
+    assert_eq!(
+        store.debug_flush_visit_count(),
+        visits_before,
+        "read settlement must not run dependencies_change"
+    );
+
+    let unrelated = store.create_atom(n(0.0));
+    store.set(unrelated, n(1.0));
+    assert_eq!(
+        store.debug_flush_visit_count(),
+        visits_before,
+        "the next write must not flush pending work from the prior read"
+    );
 }

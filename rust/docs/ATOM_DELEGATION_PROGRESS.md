@@ -1,128 +1,198 @@
-# Atom-Delegation Rewrite — Progress Snapshot
+# Atom-Delegation Rewrite - Progress Snapshot
 
-> Living status doc for the atom-delegation rewrite arc. Constitution/plan lives in
-> [`ATOM_DELEGATION_REWRITE_PLAN.md`](./ATOM_DELEGATION_REWRITE_PLAN.md) (the WORKPLAN).
-> Current main-line read/write logic (as it stands mid-flip) lives in
+> Living status for the atom-delegation rewrite. Binding invariants and phase
+> gates are in
+> [`ATOM_DELEGATION_REWRITE_PLAN.md`](./ATOM_DELEGATION_REWRITE_PLAN.md); the
+> production paths are described in
 > [`ATOM_DELEGATION_MAINLINE.md`](./ATOM_DELEGATION_MAINLINE.md).
 >
-> Snapshot date: 2026-07-09 · Branch: `claude/rust-core-state-plan-Auzcj`
-> HEAD: `4eca1a3` · Tripwire `PHASE = 1` · **Not pushed. CI untouched. No amends.**
+> Snapshot date: 2026-07-10. P7 is complete and its local release gates have
+> passed.
 
-## Where we are
+## Current Position
 
-The arc rebuilds the Rust engine so that "what changed → recompute what" is decided
-**only** by the `rust/core` Store dependency graph (INV-2), deleting excel-core's
-~1600-line parallel address-level dependency graph (`cell_dependents` /
-`RangeDependentIndex` / `CrossSheetDeps`). Formula cells become derived atoms read
-through a per-cell facade `AtomFamily`.
+Formula state is derived through one workbook-scoped `einfach_core::Store`:
+
+```text
+cell facade -> formula-inner derived atom -> AtomFormulaProvider
+            -> ReadArgs::get/depend -> shared Store dependency graph
+```
+
+This path is identical for local and qualified-sheet references. Workbook
+context changes are Store roots too: topology, defined names, and the custom
+function registry each publish through a version atom. There is no workbook
+formula cache or address-level dependency fanout alongside Store.
 
 | Phase | Content | State |
 |---|---|---|
-| P0 | WORKPLAN + tripwire + golden fixtures + baselines + WASM snapshot | ✅ done |
-| P1 | `rust/core` Store faithful rewrite (gen snapshots D1, NeedsDep scratch-commit D2, settled-memo, reentrant publish) + vanilla twin tests | ✅ done |
-| P2 | `AtomFamily` core primitive (`rust/core/src/family.rs`) | ✅ done |
-| P3 | Workbook-global single store (`Rc<RefCell<Store>>` handles, D7) | ✅ done |
-| **P4** | **Point deps → pure atoms; delete `cell_dependents` + point BFS** | 🔶 **in progress** |
-| P5 | Two-tier ranges (Tier A per-member / Tier B band version atoms) | ⬜ pending |
-| P6 | Cross-sheet via shared store + total parallel-mechanism deletion | ⬜ pending |
-| P7 | Probe convergence, release gate, perf measurement, final handoff | ⬜ pending |
+| P0 | Workplan, tripwire, fixtures, baselines, WASM snapshot | done |
+| P1 | Faithful `rust/core` Store rewrite | done |
+| P2 | `AtomFamily` core primitive | done |
+| P3 | Workbook-global shared Store handle | done |
+| P4 | Point formulas delegated to Store | done |
+| P5 | Range formulas and spill candidate discovery delegated to Store | done |
+| P6 | Workbook formulas delegated to Store; all bridges deleted | done |
+| P7 | Probe convergence, release gate, and performance record | done |
 
-## P4 sub-structure (where the flip actually is)
+## P7 Exit State
 
-P4 was split into three sub-steps to keep each commit reviewable:
+### Formula Authority
 
-- **P4a** — plumbing: extract `Rc<SheetInterior>`, zero semantics. ✅ `611b380`
-- **P4b** — scaffolding: `slot_epoch` + facade `AtomFamily` fields. ✅ `2bed148`
-- **P4c** — the flip itself, split into two commits:
-  - **Commit A** (inert write口 half) — ✅ `4eca1a3` (**current HEAD**). Wires the
-    single write口 to `bump_facade_epoch` / `invalidate_formula_inner`. Inert because
-    the facade families are still empty pre-flip (the hooks early-return).
-  - **Commit B** (the coupled read口 flip) — ⬜ **NOT YET DONE**. This is the
-    destructive, atomic commit that must be done **inline**. See "Next step" below.
+- Every formula facade reads `formula_inner_of(addr)` with `ReadArgs::get`.
+- `AtomFormulaProvider` resolves local and cross-sheet cells through the target
+  sheet's facade in the same `ReadArgs` frame.
+- Local and cross-sheet ranges use the same member-facade and geometry-root
+  strategy.
+- `lookup_named` and `call_custom` depend on workbook version roots before
+  reading their current values.
+- `WorkbookEvalProvider` remains for non-cell/top-level evaluator surfaces and
+  compatibility helpers. It is not formula-cell cache or dependency authority.
+- `FormulaRecord` retains expression/structural metadata plus an embedded
+  static-cycle validation stamp. It contains no formula value cache or
+  reactive freshness state.
 
-Commit chain for P4c (newest → oldest):
-`4eca1a3` (Commit A) → `0f18676` (additive facade/inner read path + `depend` primitive)
-→ `76c113e` (codex D3 disposition F1–F6) → `7d36337` (scaffold lazy facade doors)
-→ `2bed148` (P4b scaffolding) → `611b380` (P4a plumbing).
+### Workbook Scope
 
-## Facade machinery status (built, mostly inert)
+`Workbook::new` creates one Store and one `WorkbookAtomContext`. Every sheet is
+attached to that context with its workbook index. Topology synchronization
+publishes `(sheet name, FacadeCtx)` entries through a Store epoch, so add,
+remove, rename, and move operations invalidate formulas that resolved workbook
+structure.
 
-All live in `rust/excel-core/src/sheet.rs` §960–1330. Everything on the formula-INNER
-path is still `#[allow(dead_code)]` — built and compiling, but not reached until the
-flip. The Commit-A write口 hooks ARE reached, but no-op while families are empty.
+Runtime cycle tracking is workbook-global and keyed by `(sheet index,
+CellAddress)`. A recursive facade read records the Store dependency with
+`ReadArgs::depend` and returns `#CYCLE!` before Store's hard computing guard is
+reached.
 
-| Item | Loc | State |
-|---|---|---|
-| `FacadeCtx` (7 shared handles, `Clone`, `'static`) | @972 | live struct |
-| `owned_create_atom` / `owned_create_derived_ctx` (lazy) | @990 / @997 | **live** |
-| `epoch_of` (lazy slot-epoch primitive) | @1008 | **live** |
-| `get_or_create_facade` (routing gate @1053–1058) | @1023 | **live** (reached by Commit-A) |
-| `formula_expr_for` / `formula_inner_of` | @1090 / @1105 | dead_code (inner path) |
-| `eval_formula_inner` (InFlightGuard + AtomFormulaProvider) | @1126 | dead_code |
-| `range_member_addrs` (Tier A member collection) | @1150 | dead_code |
-| `InFlightGuard` (RAII cycle guard) | @1210 | dead_code |
-| `AtomFormulaProvider` + `read_facade` (F1 cycle guard @1266) | @1247 | dead_code |
-| `bump_facade_epoch` (NON-creating; monotone) | @1605 | live, inert (empty family) |
-| `invalidate_formula_inner` | @1627 | live, inert |
-| `slot_atom_id` (F4 pre/post identity sampling) | @1638 | live |
+### Ranges And Spills
 
-## Verification baselines (honest numbers to hold)
+There is no exact-range or address-to-formula reverse index.
 
-Recorded at P0 exit (WORKPLAN §8), reconciled against in-session re-measure:
+- Tier A ranges of at most 256 cells read every member facade.
+- Larger ranges depend on lazy `(column, row-band)`, column, or sheet geometry
+  atoms, bounded by 4096 roots before moving to the next tier.
+- Value enumeration remains sparse; empty Tier A cells are read only to record
+  dependencies.
+- Spill installation remains explicit structural work because derived reads
+  are pure.
+- Spill candidates are found from `Store::reverse_dependents` and mapped back
+  through `formula_inner_family`.
+- The anchor projection atom exposes the installed array or `#SPILL!`; the
+  formula-inner remains the formula/dependency authority.
 
-- rust/core: **65** passed / 0 ignored
-- rust/excel-core `--lib`: WORKPLAN records **1404**; in-session forced-recompile
-  measured **1411**. Treat **1411** as the live floor — never regress below it.
-  (The 1404 in the plan is stale; do not "reconcile down" to it.)
-- rust/excel-core integration: ~**1825** passed / 12 ignored across 65 binaries
-- rust/wasm native: **31** passed / 1 ignored (browser: 13 wasm-pack tests, separate)
-- golden replay: **5 seeds × 2000 ops**, all green (only sanctioned deviation:
-  once-read eager re-derive)
+### Mutation And Bulk Install
 
-Verify Rust by FORCING recompile (`touch rust/excel-core/src/*.rs`) and asserting the
-cargo **exit code** via zsh `${pipestatus[1]}` / `$?` — never grep pass-counts off a
-possibly-incremental build (P3 lesson: stale artifacts reported "all green" while a
-file didn't recompile).
+Normal writes update storage and Store roots inside a Store batch. Materialized
+dependents settle through Store propagation; never-read formulas remain lazy.
+Structural edits use the same batch boundary for retargeting, slot/geometry
+publication, and family cleanup, so one user mutation settles through one Store
+propagation wave.
 
-## Next step — P4c Commit B (the flip)
+Whole-workbook storage-primary install uses one outer shared-Store batch for
+all sheets. Retired atom IDs are collected during map replacement and destroyed
+only after the batch flush, when old cross-sheet dependencies have detached.
+This both deduplicates downstream publication and avoids destroying an atom
+still referenced by another sheet during the transaction.
 
-One atomic commit, done inline, folding in codex fixes F1–F6. The full item list is
-the CLEARED DECISION_REQUEST in WORKPLAN §9 (§251–295). Headline moves:
+### Cycles And Lifecycle
 
-1. Re-route `peek_value_with_provider` @3523 formula branch to
-   `get_or_create_facade(addr)` for **same-sheet** formulas; cross-sheet stays on the
-   surviving eager `eval_formula_at_with_provider` / FormulaCache path (P6 deletes it).
-2. Write sites (`try_set_formula` @3174, `hydrate_formula` @1944, BulkLoader flush)
-   build inner derived atoms, gated to exclude cross-sheet.
-3. Subscriptions fan out on the facade (`attach_address_sub → facade_of(addr)`;
-   `with_remap` → no-op shell).
-4. **Delete** (satisfy tripwire `PHASE ≥ 4`): `cell_dependents` field,
-   `add_formula_deps` / `remove_formula_deps` / `replace_formula_deps`, the point half
-   of `dependents_of_into_with_scratch` @2280, `mark_dependents_dirty` @2330,
-   `mark_dependents_dirty_silent_batch` @5079, and the same-sheet FormulaCache read
-   path (`compute_formula_at` / `eval_formula_at_with_provider` / `prewarm_formula_chain`).
-5. Range propagation → a **differently-named** epoch-bridge fn (keep `range_dependents`;
-   per F3 seed direct range-dependents with `store.invalidate(inner)` + `bump_facade_epoch`).
-6. Rewrite `would_create_cycle` @3346 body to a `formula_source` AST BFS walk — **keep
-   the name** through P4/P5 (F2).
-7. BRIDGE markers in full parser-valid form: `BRIDGE(delete-by: P5-exit)` at
-   `range_dependents`, `BRIDGE(delete-by: P6-exit)` at `CrossSheetDeps` (F6).
-8. Remove `#[allow(dead_code)]` from the facade machinery; F4 bump on every inner-slot
-   identity transition; F5 only complete read_fn increments counters + no host
-   custom-formula callback on a faulted pass; wire fence batch #1 counters.
-9. Set tripwire `PHASE` 1 → 4 in the **same** commit.
+- Install-time cycle checks walk retained formula AST/source content on demand.
+  This covers unread formulas whose Store edges do not exist yet without
+  retaining a reverse dependency graph.
+- Parked hydration amortizes that walk with per-formula `cycle_checked_at`
+  stamps under one formula-topology generation. An uncertified read builds a
+  temporary reachable graph, runs iterative SCC validation, stamps acyclic
+  entries, and drops the graph before evaluation. Formula topology mutations
+  invalidate all stamps in O(1) by advancing the generation.
+- Runtime cycles use the local/workbook in-flight guard described above.
+- Formula/facade/range families evict their keys on clear, replacement, bulk
+  install, and structural operations; sheet-owned atom counts are decremented
+  with destruction.
 
-### P4 exit gates (all must hold)
+## Removed At P6/P7
 
-Tripwire `PHASE = 4` green · cargo test all crates green (rust/core 65, excel-core
-`--lib` ≥ 1411 + integration 1825 + wasm native 31) · golden replay 5 seeds green ·
-e2e dual-project Δ=0 · playwright MCP UI walkthrough · codex peer review of the flip diff.
+The following parallel paths are gone rather than renamed:
 
-## Guardrails (binding, from WORKPLAN §6)
+- `FormulaCache`
+- `CrossSheetDeps` and `WorkbookRangeBridgeIndex`
+- workbook dirty BFS and dependency-driven manual formula fanout
+- `mark_dirty_for_addr`, `has_cross_sheet_refs`, and provider-context latches
+- `force_formula_recompute` and prewarm bypasses
+- retained point/range reverse dependency maps
+- all `BRIDGE(delete-by: ...)` markers
 
-Escalation rule: a perf/scale/counter wall that pure atom delegation can't satisfy →
-the ONLY legal moves are (a) stop + file a DECISION_REQUEST, (b) codex review,
-(c) owner approval of a counter re-derivation or explicit INV amendment. Introducing
-any address→formula index, cache, or shortcut structure without an INV amendment is a
-**P0 defect even if all tests pass**. Never push mid-arc; never touch `.github/workflows`;
-never `git commit --amend`; never `--no-verify`.
+`architecture_invariants` runs at `PHASE = 7`. It bans these identifiers and
+common address-to-dependent collection shapes. Positive guards require the
+shared workbook context, facade/formula-inner path, cross-sheet facade/range
+reads, workbook version roots, scalable range roots, Store reverse-dependency
+discovery, direct worker debug delegation, and the embedded static-cycle
+generation/stamp wiring.
+
+## Debug Semantics
+
+- `debug_formula_cache_state` projects lazy/materialized Store freshness; it
+  does not inspect a separate cache.
+- legacy point-dependency and workbook-BFS counters remain zero for wire/test
+  compatibility.
+- `debug_range_dep_count` counts materialized Store geometry roots.
+- formula evaluation counters increment only after a completed formula-inner
+  evaluation; faulted deep-read passes do not count or invoke host callbacks.
+- `content_revision` remains the coarse host signal for whole-sheet installs,
+  not a formula invalidation mechanism.
+- the TypeScript worker's `debugFormulaCacheState` directly delegates to
+  `state.workbook.debugFormulaCacheState(...)`; it has no local read/dirty
+  shadow state.
+
+## Validation
+
+Completed for the P7 release gate:
+
+- full `rust/core` test suite: green;
+- full five-seed golden replay: green, including seed 11's spill collision;
+- architecture invariants: green at P7 (`10` passed, `1` ignored);
+- scale suites, including the 100,000-link chain and 200,000-cell
+  storage-primary residue checks: green;
+- WASM native suite: green (`31` passed, `1` ignored);
+- real Chrome 149 WASM suite: green (`1` library test plus `13` browser tests)
+  through the wasm-bindgen runner with a matching ChromeDriver; the direct
+  `wasm-pack` command selected a stale cached 150 driver and is covered by the
+  documented `rust/wasm/README.md` cache-mismatch workaround;
+- storage-primary install suite: green (`17` passed), including one-wave
+  multi-sheet replacement and zero install-time formula parsing;
+- Solid Excel Jest suite: green (`59` suites, `882` tests; `1` suite and `6`
+  tests skipped), its standalone TypeScript check is green, and P7's Chain100k
+  plus Tiny/Medium/Large observation runs are green.
+
+Seed 11, operation 244 installs `=SEQUENCE(2,2)` over an occupied spill target.
+The retired workbook bypass returned a raw array while the Sheet facade returned
+`#SPILL!`. The unified Store path returns `#SPILL!` from both surfaces; the
+fixture and focused regression now pin that one-authority result.
+
+## P7 Record
+
+The P7 release baseline recorded a 20,000-link chain hydration at
+`10,037.259 ms`. The cold-hydration follow-up records bulk load at `36.772 ms`,
+hydration at `55.701 ms`, and head write/flush at `50.301 ms`, with exactly
+`19,999` static-cycle node visits instead of the baseline shape's approximate
+`199,990,000`. RSS delta was `81,084,416 B` (`4,054.4 B` per materialized
+formula).
+
+The old cost came from repeating almost the whole upstream walk for each cell.
+Each `HashSet::insert` pays the default keyed hash (a SipHash-family path in the
+measured toolchain), probe/equality work, and occasional capacity-growth
+rehashing. Geometric rehashing is amortized O(1), so these are large constant
+factors on nearly 200 million visits, not the source of the quadratic shape.
+The fix removes repeated walks; it does not substitute a faster hasher or retain
+a side dependency graph.
+
+The other P7 observations remain unchanged: a 20,000-way fanout flushed in
+`51.450 ms`; a 200,000-cell storm took `4.830 us/edit` for mounted and
+`1.160 us/edit` for parked writes. These are non-gating measurements; they
+neither claim a separate cache nor relax the Store-only architecture.
+
+## Guardrail
+
+Do not add a Sheet or Workbook address-to-formula index to recover behavior.
+Formula values, staleness, and transitive propagation must remain derivations of
+atomm/Store state. A failing fence requires a workplan decision request, not a
+shadow state system.

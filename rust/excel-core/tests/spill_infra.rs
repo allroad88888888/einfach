@@ -113,7 +113,9 @@ fn collision_blocks_spill_anchor_gets_spill_error() {
             Value::Number(9.0),
         ],
     );
-    sheet.set_array("A5", arr).expect("set_array should not error on collision; anchor reflects #SPILL!");
+    sheet
+        .set_array("A5", arr)
+        .expect("set_array should not error on collision; anchor reflects #SPILL!");
 
     // Anchor: #SPILL! error.
     assert_eq!(

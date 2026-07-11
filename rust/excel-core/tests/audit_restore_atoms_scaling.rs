@@ -168,7 +168,7 @@ fn audit_structural_edit_hydrates_every_parked_formula() {
 
     // Everything is parked: zero dep-graph keys before the edit.
     assert_eq!(
-        wb.sheet(0).unwrap().debug_cell_dependents_key_count(),
+        wb.sheet(0).unwrap().debug_point_dependency_key_count(),
         0,
         "install must leave formulas parked (lazy contract)"
     );
@@ -178,7 +178,7 @@ fn audit_structural_edit_hydrates_every_parked_formula() {
     let edit_elapsed = t0.elapsed();
 
     // B-3 / A-1 — FIXED (W2.1): the edit leaves the dep graph EMPTY.
-    let dep_keys = wb.sheet(0).unwrap().debug_cell_dependents_key_count();
+    let dep_keys = wb.sheet(0).unwrap().debug_point_dependency_key_count();
     assert_eq!(
         dep_keys, 0,
         "A-1 FIXED: insert_row must leave every parked formula lazy \
@@ -238,7 +238,7 @@ fn audit_snapshot_does_not_hydrate_parked_formulas() {
         .expect("install");
 
     let sheet = wb.sheet(0).unwrap();
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0);
     let evals_before = sheet.debug_formula_eval_count();
 
     // Mirror what wasm `sparse_cell_from_sheet_no_eval` does per cell.
@@ -258,7 +258,7 @@ fn audit_snapshot_does_not_hydrate_parked_formulas() {
         "snapshot walk must not evaluate formulas"
     );
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
         "snapshot walk must not hydrate parked formulas"
     );

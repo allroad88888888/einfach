@@ -7,12 +7,13 @@
 //! exact same op sequences against the current engine and diff the snapshot.
 //!
 //! The snapshot records VALUES ONLY (displays, formula texts, spill anchors)
-//! — no counters, no timing — so it survives every rewrite phase untouched.
-//! The single owner-approved semantic shift of the arc (once-read formulas
-//! re-derive eagerly on upstream writes) does not change final values, so a
-//! replay mismatch always means an unapproved behavior change. Do NOT
-//! regenerate fixtures to make a phase green; that defeats the oracle
-//! (WORKPLAN §6).
+//! — no counters, no timing. P7 approved a line-by-line fixture correction for
+//! colliding `SEQUENCE` anchors and their downstream formulas: the public Sheet
+//! facade returns `#SPILL!`, while the removed force-recompute bypass had
+//! exposed raw arrays. The migration used the opt-in all-diff report and did
+//! not regenerate fixtures. Every future replay mismatch remains an unapproved
+//! behavior change. Do NOT regenerate fixtures to make a phase green; that
+//! defeats the oracle (WORKPLAN §6).
 
 use einfach_core::Value;
 use einfach_excel_core::{CellAddress, CellRange, Workbook};
@@ -71,15 +72,30 @@ const FORMULA_TEMPLATES: [&str; 14] = [
     "={A}",
 ];
 
-fn build_workbook(seed: u64) -> Workbook {
+fn build_workbook(seed: u64, operation_count: usize) -> Workbook {
     let mut rng = Lcg::new(seed);
     let mut wb = Workbook::new(); // creates "Sheet1"
     wb.add_sheet("Beta");
     wb.add_sheet("Gamma");
+    let trace = std::env::var_os("EINFACH_GOLDEN_TRACE").is_some();
+    let trace_from = std::env::var("EINFACH_GOLDEN_TRACE_FROM")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("EINFACH_GOLDEN_TRACE_FROM must be a usize")
+        })
+        .unwrap_or_default();
 
-    for _ in 0..OPS_PER_SEED {
+    for operation_index in 0..operation_count {
         let sheet_idx = rng.below(SHEETS.len() as u64) as usize;
-        match rng.below(100) {
+        let operation_kind = rng.below(100);
+        if trace && operation_index >= trace_from {
+            eprintln!(
+                "golden seed={seed} operation={operation_index} sheet={sheet_idx} kind={operation_kind}"
+            );
+        }
+        match operation_kind {
             // 30% scalar writes
             0..=29 => {
                 let a = addr(&mut rng);
@@ -118,12 +134,35 @@ fn build_workbook(seed: u64) -> Workbook {
             70..=79 => {
                 let at = rng.below(ROWS / 2) as u32;
                 let count = rng.below(2) as u32 + 1;
+                let structural_kind = rng.below(4);
                 let sheet = wb.sheet_mut(sheet_idx).expect("sheet");
-                match rng.below(4) {
-                    0 => sheet.insert_row(at, count),
-                    1 => sheet.delete_row(at, count),
-                    2 => sheet.insert_col(rng.below(COLS / 2) as u32, 1),
-                    _ => sheet.delete_col(rng.below(COLS / 2) as u32, 1),
+                match structural_kind {
+                    0 => {
+                        if trace && operation_index >= trace_from {
+                            eprintln!("  insert_row at={at} count={count}");
+                        }
+                        sheet.insert_row(at, count);
+                    }
+                    1 => {
+                        if trace && operation_index >= trace_from {
+                            eprintln!("  delete_row at={at} count={count}");
+                        }
+                        sheet.delete_row(at, count);
+                    }
+                    2 => {
+                        let col = rng.below(COLS / 2) as u32;
+                        if trace && operation_index >= trace_from {
+                            eprintln!("  insert_col at={col} count=1");
+                        }
+                        sheet.insert_col(col, 1);
+                    }
+                    _ => {
+                        let col = rng.below(COLS / 2) as u32;
+                        if trace && operation_index >= trace_from {
+                            eprintln!("  delete_col at={col} count=1");
+                        }
+                        sheet.delete_col(col, 1);
+                    }
                 }
             }
             // 5% bulk loads (batch of 20)
@@ -211,17 +250,43 @@ fn golden_generate() {
     )
     .expect("mkdir fixtures");
     for seed in SEEDS {
-        let wb = build_workbook(seed);
+        let wb = build_workbook(seed, OPS_PER_SEED);
         let snap = snapshot(&wb);
         std::fs::write(fixture_path(seed), &snap).expect("write fixture");
         // A snapshot that is trivially empty would fence nothing.
-        assert!(snap.lines().count() > 50, "seed {} produced a degenerate snapshot", seed);
+        assert!(
+            snap.lines().count() > 50,
+            "seed {} produced a degenerate snapshot",
+            seed
+        );
     }
 }
 
 #[test]
 fn golden_replay_all_seeds() {
-    for seed in SEEDS {
+    let report_all = std::env::var_os("EINFACH_GOLDEN_REPORT_ALL").is_some();
+    let selected_seed = std::env::var("EINFACH_GOLDEN_SEED").ok().map(|value| {
+        value
+            .parse::<u64>()
+            .expect("EINFACH_GOLDEN_SEED must be a u64")
+    });
+    let operation_count = std::env::var("EINFACH_GOLDEN_OPS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("EINFACH_GOLDEN_OPS must be a usize")
+        })
+        .unwrap_or(OPS_PER_SEED);
+    assert!(
+        operation_count <= OPS_PER_SEED,
+        "EINFACH_GOLDEN_OPS cannot exceed {OPS_PER_SEED}"
+    );
+    let mut mismatches = Vec::new();
+    for seed in SEEDS
+        .into_iter()
+        .filter(|seed| selected_seed.is_none_or(|selected| *seed == selected))
+    {
         let expected = std::fs::read_to_string(fixture_path(seed)).unwrap_or_else(|_| {
             panic!(
                 "missing fixture for seed {} — run the P0 generator first \
@@ -229,24 +294,46 @@ fn golden_replay_all_seeds() {
                 seed
             )
         });
-        let wb = build_workbook(seed);
+        let wb = build_workbook(seed, operation_count);
         let actual = snapshot(&wb);
+        if operation_count != OPS_PER_SEED {
+            eprintln!("golden diagnostic build completed seed={seed} operations={operation_count}");
+            continue;
+        }
         if expected != actual {
-            // Line-level first-diff report; full dumps would drown the log.
+            // Default to the first diff so ordinary CI logs stay compact.
+            // The opt-in report is useful when reviewing an explicitly
+            // approved oracle migration without regenerating the fixtures.
             for (i, (e, a)) in expected.lines().zip(actual.lines()).enumerate() {
                 if e != a {
-                    panic!(
+                    let mismatch = format!(
                         "golden replay mismatch (seed {seed}) at line {}:\n  expected: {e}\n  actual:   {a}\n\
                          An unapproved observable-behavior change — see WORKPLAN §6.",
                         i + 1
                     );
+                    if !report_all {
+                        panic!("{mismatch}");
+                    }
+                    mismatches.push(mismatch);
                 }
             }
-            panic!(
-                "golden replay mismatch (seed {seed}): line count {} -> {}",
-                expected.lines().count(),
-                actual.lines().count()
-            );
+            let expected_len = expected.lines().count();
+            let actual_len = actual.lines().count();
+            if expected_len != actual_len {
+                let mismatch = format!(
+                    "golden replay mismatch (seed {seed}): line count {expected_len} -> {actual_len}"
+                );
+                if !report_all {
+                    panic!("{mismatch}");
+                }
+                mismatches.push(mismatch);
+            }
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "{} golden replay mismatch(es):\n{}",
+        mismatches.len(),
+        mismatches.join("\n")
+    );
 }

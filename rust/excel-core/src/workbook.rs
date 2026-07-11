@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,182 +12,7 @@ use crate::eval::{
 };
 use crate::formula::{parse_formula, Expr, RangeBounds};
 use crate::range::CellRange;
-use crate::sheet::{expr_has_sheet_ref, RangeDependentIndex, Sheet, SheetError};
-
-/// One outgoing edge from a formula cell to a cross-sheet source.
-///
-/// `Cell` and `Range` mirror the sheet-local distinction between
-/// point-cell deps (`cell_dependents`) and range deps (`range_dependents`).
-/// A single formula can have multiple of each — `=Sheet2!A1 + SUM(Sheet3!B1:B10)`
-/// would produce one `Cell` and one `Range` edge.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CrossSheetRef {
-    Cell(usize, CellAddress),
-    /// Cross-sheet range edge, e.g. `SUM(Sheet2!A1:A100)`.
-    Range(usize, CellRange),
-}
-
-/// Workbook-level cross-sheet dependency graph. Tracks the reverse edges
-/// that let a `Workbook::set_cell(src_sheet, src_addr, _)` find every
-/// formula on every OTHER sheet that needs dirtying — the gap that Sheet-
-/// local `cell_dependents` / `range_dependents` cannot close on its own.
-///
-/// Maintained by `Workbook::set_formula` / `Workbook::clear_cell` and
-/// queried by `Workbook::set_cell` and the BFS underneath it.
-#[derive(Default)]
-pub(crate) struct CrossSheetDeps {
-    /// REVERSE edges, point-cell variant.
-    /// `(src_sheet, src_addr) → set of (formula_sheet, formula_addr)`.
-    /// `=Sheet2!A1` on `Sheet1!B1` becomes
-    /// `cell_dependents[(2, A1)] = {(1, B1)}`.
-    pub(crate) cell_dependents: HashMap<(usize, CellAddress), HashSet<(usize, CellAddress)>>,
-
-    /// REVERSE edges, range variant. One `RangeDependentIndex` per source
-    /// sheet so per-write dirty fanout for that sheet runs the same
-    /// row+col bucket lookup as Phase 2's sheet-local index.
-    ///
-    /// `SUM(Sheet2!A1:A100)` on `Sheet1!D` becomes an entry inside
-    /// `range_index_per_sheet[2]`, where the index value points back at
-    /// `(1, D)` as the dependent formula.
-    pub(crate) range_index_per_sheet: HashMap<usize, RangeDependentIndex>,
-
-    /// FORWARD edges. `(formula_sheet, formula_addr) → its outgoing
-    /// cross-sheet refs`. Needed to undo previous edges when the formula
-    /// is replaced or cleared, and (Track J's future use) to drive
-    /// cross-sheet cycle detection off the same map rather than a
-    /// per-call AST walk.
-    pub(crate) formula_refs: HashMap<(usize, CellAddress), Vec<CrossSheetRef>>,
-}
-
-impl CrossSheetDeps {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Insert one outgoing edge under `(formula_sheet, formula_addr)` and
-    /// also register the corresponding reverse edge. Used by `Workbook::
-    /// set_formula` after the AST walk has produced a `Vec<CrossSheetRef>`.
-    fn add_edge(&mut self, formula_sheet: usize, formula_addr: CellAddress, edge: CrossSheetRef) {
-        // Reverse edge.
-        match &edge {
-            CrossSheetRef::Cell(src_sheet, src_addr) => {
-                self.cell_dependents
-                    .entry((*src_sheet, *src_addr))
-                    .or_default()
-                    .insert((formula_sheet, formula_addr));
-            }
-            CrossSheetRef::Range(src_sheet, range) => {
-                self.range_index_per_sheet
-                    .entry(*src_sheet)
-                    .or_default()
-                    .add_formula(*range, formula_addr);
-                // NOTE: the per-source-sheet `RangeDependentIndex` keys
-                // its formula set by `CellAddress` only. The formula's
-                // sheet is implicit in the formula_refs forward edge —
-                // the workbook BFS pairs each addr back to its sheet by
-                // looking up `formula_refs[(formula_sheet, addr)]`.
-                let _ = formula_sheet;
-            }
-        }
-        // Forward edge.
-        self.formula_refs
-            .entry((formula_sheet, formula_addr))
-            .or_default()
-            .push(edge);
-    }
-
-    /// Drop every outgoing edge previously installed under
-    /// `(formula_sheet, formula_addr)` and tear down the matching reverse
-    /// edges. Inverse of repeated `add_edge` calls. Idempotent — safe to
-    /// call when no entry exists.
-    fn remove_outgoing(&mut self, formula_sheet: usize, formula_addr: CellAddress) {
-        let Some(edges) = self.formula_refs.remove(&(formula_sheet, formula_addr)) else {
-            return;
-        };
-        for edge in edges {
-            match edge {
-                CrossSheetRef::Cell(src_sheet, src_addr) => {
-                    let should_remove =
-                        if let Some(set) = self.cell_dependents.get_mut(&(src_sheet, src_addr)) {
-                            set.remove(&(formula_sheet, formula_addr));
-                            set.is_empty()
-                        } else {
-                            false
-                        };
-                    if should_remove {
-                        self.cell_dependents.remove(&(src_sheet, src_addr));
-                    }
-                }
-                CrossSheetRef::Range(src_sheet, range) => {
-                    if self.has_remaining_range_edge(src_sheet, range, formula_addr) {
-                        continue;
-                    }
-                    if let Some(index) = self.range_index_per_sheet.get_mut(&src_sheet) {
-                        index.remove_formula(range, formula_addr);
-                        if index.is_empty() {
-                            self.range_index_per_sheet.remove(&src_sheet);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// STORAGE_PRIMARY Phase 6.1: drop EVERY outgoing edge owned by
-    /// formulas living on `formula_sheet`. Used by
-    /// `Workbook::install_sheet_bulk` — a full-sheet replace
-    /// invalidates all of the sheet's previous formulas, so their
-    /// cross-sheet edges must go before the new content's edges are
-    /// installed. Incoming edges (other sheets' formulas referencing
-    /// this sheet) are untouched — they remain valid.
-    fn remove_all_outgoing_for_sheet(&mut self, formula_sheet: usize) {
-        let addrs: Vec<CellAddress> = self
-            .formula_refs
-            .keys()
-            .filter(|(sheet, _)| *sheet == formula_sheet)
-            .map(|(_, addr)| *addr)
-            .collect();
-        for addr in addrs {
-            self.remove_outgoing(formula_sheet, addr);
-        }
-    }
-
-    fn has_remaining_range_edge(
-        &self,
-        src_sheet: usize,
-        range: CellRange,
-        formula_addr: CellAddress,
-    ) -> bool {
-        self.formula_refs
-            .iter()
-            .filter(|((_sheet, addr), _edges)| *addr == formula_addr)
-            .any(|(_key, edges)| {
-                edges.iter().any(|edge| {
-                    matches!(
-                        edge,
-                        CrossSheetRef::Range(s, r) if *s == src_sheet && *r == range
-                    )
-                })
-            })
-    }
-
-    /// Total reverse-edge count across both cell and range halves. Used
-    /// by the Phase 3 acceptance test to verify the cross-sheet write
-    /// actually exercised the graph. Each point-cell entry contributes
-    /// its dependent set size; each range entry contributes its dependent
-    /// set size; ranges that contain N source cells still count as one
-    /// entry per dependent (not N), preserving the sparse contract.
-    #[doc(hidden)]
-    pub fn debug_reverse_edge_count(&self) -> usize {
-        let cell_edges: usize = self.cell_dependents.values().map(HashSet::len).sum();
-        let range_edges: usize = self
-            .range_index_per_sheet
-            .values()
-            .map(RangeDependentIndex::len)
-            .sum();
-        cell_edges + range_edges
-    }
-}
+use crate::sheet::{BulkInstallCleanup, Sheet, SheetError, WorkbookAtomContext};
 
 /// One entry in `Workbook::named_values`. Stores the user-supplied
 /// canonical-case name alongside the cached `Value` so the registry can
@@ -238,11 +63,11 @@ pub enum WorkbookError {
     /// they typed the formula into a cell.
     EvalFailed(ValueError),
     /// Wave 8 re-entrancy guard: the caller tried to mutate the workbook
-    /// while a host custom-formula JS callback was executing. Mutations
-    /// during a callback would dirty the cell whose formula triggered the
-    /// callback, but the cache state machine writes `Clean(value)` on
-    /// return — silently losing the dirty mark. We surface this as a
-    /// rejection so hosts can debug rather than chasing stale values.
+    /// while a host custom-formula JS callback was executing. A custom call is
+    /// part of a Store-derived formula read, so mutating the same workbook
+    /// before that read settles would violate the evaluator's purity and
+    /// re-enter Store propagation. Reject the mutation and let the host defer
+    /// it until after the callback returns.
     /// See `CUSTOM_FORMULAS.md` § "No mutations during callback".
     MutationDuringCustomCall,
 }
@@ -269,45 +94,21 @@ impl std::fmt::Display for WorkbookError {
 
 impl std::error::Error for WorkbookError {}
 
-/// A workbook is an ordered collection of named sheets. Phase 4 backend.
-///
-/// Cross-sheet references (`=Sheet2!A1`) resolve through a Workbook
-/// `EvalProvider`. Formula nodes stay lazy: reads evaluate the reachable
-/// formula chain, writes only mark local dependents dirty.
+/// A workbook is an ordered collection of named sheets. Every formula derives
+/// through facade/formula-inner atoms in the workbook's shared Store.
 pub struct Workbook {
     /// P3 (atom-delegation rewrite): the ONE store shared by every sheet in
     /// this workbook. `Store` is a cheap Rc handle; each sheet holds a
     /// clone. Cross-sheet dependencies become ordinary in-store edges (P6).
     store: Store,
+    atom_context: Rc<WorkbookAtomContext>,
     sheets: Vec<Sheet>,
     names: Vec<String>,
-    /// name → index lookup; rebuilt whenever sheets are added/renamed.
+    /// name -> index lookup; rebuilt whenever sheets are added/renamed.
     by_name: HashMap<String, usize>,
-    /// Cross-sheet reverse dep graph (Phase 3 Track I). Maintained by the
-    /// workbook-routed mutators (`set_cell`, `set_formula`, `clear_cell`,
-    /// `bulk_load`). Empty for workbooks edited exclusively through the
-    /// `Sheet::set_*` direct path — those writes deliberately bypass the
-    /// graph so single-sheet tests stay stable.
-    cross_sheet: CrossSheetDeps,
-    /// Phase 3 Track J probe counter: cumulative count of
-    /// `collect_workbook_refs` AST walks initiated by this workbook's
-    /// `cross_sheet_cycle`. The Track J rewrite calls
-    /// `collect_workbook_refs` exactly once per `set_formula` (for the
-    /// candidate seed) and pulls visited-node edges from the forward
-    /// index. The pre-Track-J shape called `collect_workbook_refs` once
-    /// per VISITED formula too, so a test can assert the new shape by
-    /// checking the delta is 1 per `set_formula`, not N.
-    ///
-    /// Per-workbook (not process-global) so the assertion isn't flaky
-    /// under cargo's parallel test runner.
+    /// Number of candidate formula ASTs inspected by install-time workbook
+    /// cycle checks. Runtime dependency ownership remains in Store.
     cycle_ast_walk_count: Cell<usize>,
-    /// AUDIT B-5 (workbook half) — counts entries seeded into
-    /// `WorkbookLoader::flush`'s cross-sheet BFS. With zero cross-sheet
-    /// reverse edges the seeding is skipped entirely and this stays
-    /// flat, so a large `bulk_load` / `clear_range` on a single-sheet
-    /// workbook never pays O(touched) queue churn to discover there are
-    /// no edges. Scale-suite probe.
-    loader_bfs_seed_count: Cell<usize>,
     /// Workbook-level defined names. Keyed by the uppercased form of the
     /// name so lookup is case-insensitive (Excel parity — `=Tax_Rate` and
     /// `=TAX_RATE` resolve to the same entry); the entry's
@@ -326,18 +127,6 @@ pub struct Workbook {
     /// list at 500, and the workbook-core layer can enforce a similar
     /// cap once a host needs it.
     named_values: BTreeMap<String, NamedEntry>,
-    /// Audit B-4 latch: true once ANY registered named value carries a
-    /// live cross-sheet reference (a `Value::Lambda` whose body — or
-    /// whose captured bindings — contains a `SheetRef`/`SheetRange`).
-    /// OR'd into `has_any_cross_sheet_edges` so the read-time
-    /// force-recompute safety net covers formulas like `=READDATA()`
-    /// installed through the raw `Sheet::set_formula` path, where the
-    /// per-sheet latch cannot arm (the cell AST has no `SheetRef` node
-    /// and the sheet has no access to the registry to resolve the
-    /// name). One-way, same philosophy as the per-sheet latch: may
-    /// stay armed longer than strictly necessary (e.g. after
-    /// `undefine_name`), never under-fires.
-    named_values_cross_sheet: Cell<bool>,
     /// Host-supplied custom-formula registry (Wave 8). When `Some`, formula
     /// dispatch consults this AFTER built-ins and after defined-name LAMBDAs
     /// (see precedence note on `eval_named_call`). When `None`, unknown
@@ -358,19 +147,15 @@ pub struct Workbook {
     /// `remove_sheet`, `bulk_load`, `try_set_*`) is a guarded no-op /
     /// rejection.
     ///
-    /// **Why**: a JS callback that mutates the workbook would dirty the
-    /// cell currently being evaluated, but the surrounding
-    /// `eval_formula_at_with_provider` writes
-    /// `FormulaCache::Clean(value)` unconditionally on return — silently
-    /// losing the dirty mark. Disallowing mutations during the callback
-    /// keeps the cache state machine sound. The contract is documented
-    /// in `CUSTOM_FORMULAS.md` § "No mutations during callback".
+    /// Mutating during a callback would change dependencies while a Store
+    /// derivation is active. Rejecting the mutation keeps that derivation
+    /// transactional. The contract is documented in `CUSTOM_FORMULAS.md`.
     ///
     /// `Cell<usize>` (not `RefCell<...>`) because mutation is a single
     /// load + store, no aliasing concerns. The guard is `pub(crate)` so
     /// the `WorkbookEvalProvider::call_custom` adapter can bump/decrement
     /// it via the RAII guard in `CustomCallScope`.
-    pub(crate) custom_call_depth: Cell<usize>,
+    pub(crate) custom_call_depth: Rc<Cell<usize>>,
     /// STORAGE_PRIMARY Phase 6.1 (OD1): monotonically-increasing content
     /// revision. Bumped once per `install_sheet_bulk` (so once per sheet
     /// inside `install_workbook_bulk`) — a bulk install replaces a whole
@@ -390,8 +175,8 @@ pub struct BulkInstallStats {
     pub primitives_installed: usize,
     /// Formula sources parked lazily (`formula_source` + `needs_parse`).
     pub formulas_installed: usize,
-    /// Formulas that went through the `!`-prefilter cross-sheet parse.
-    /// 0 when every formula is same-sheet (the dominant case).
+    /// Install-time formula parses. Retained as a compatibility metric and
+    /// always zero: formulas are parked and first evaluated by Store.
     pub cross_sheet_parsed: usize,
 }
 
@@ -414,7 +199,10 @@ impl std::fmt::Display for InstallError {
                 write!(f, "sheet index {idx} is outside the workbook")
             }
             InstallError::MutationDuringCustomCall => {
-                write!(f, "bulk install is not allowed inside a custom-formula callback")
+                write!(
+                    f,
+                    "bulk install is not allowed inside a custom-formula callback"
+                )
             }
         }
     }
@@ -456,24 +244,47 @@ impl Drop for CustomCallScope<'_> {
 
 impl Workbook {
     pub fn new() -> Self {
+        let store = Store::new();
+        let custom_call_depth = Rc::new(Cell::new(0));
+        let atom_context = WorkbookAtomContext::new(store.clone(), Rc::clone(&custom_call_depth));
         let mut wb = Workbook {
-            store: Store::new(),
+            store,
+            atom_context,
             sheets: Vec::new(),
             names: Vec::new(),
             by_name: HashMap::new(),
-            cross_sheet: CrossSheetDeps::new(),
             cycle_ast_walk_count: Cell::new(0),
-            loader_bfs_seed_count: Cell::new(0),
             named_values: BTreeMap::new(),
-            named_values_cross_sheet: Cell::new(false),
             custom_functions: None,
-            custom_call_depth: Cell::new(0),
+            custom_call_depth,
             content_revision: 0,
         };
         // Default sheet so users can `wb.active_mut()` without first calling
         // add_sheet — matches the Excel "blank file already has Sheet1" UX.
         wb.add_sheet("Sheet1");
         wb
+    }
+
+    fn sync_atom_topology(&self) {
+        let sheets = self
+            .sheets
+            .iter()
+            .enumerate()
+            .map(|(idx, sheet)| {
+                sheet.attach_workbook_context(&self.atom_context, idx);
+                (self.names[idx].clone(), sheet.facade_ctx())
+            })
+            .collect();
+        self.atom_context.sync_topology(sheets);
+    }
+
+    fn sync_atom_names(&self) {
+        let names = self
+            .named_values
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.value.clone()))
+            .collect();
+        self.atom_context.sync_names(names);
     }
 
     // === Workbook-level defined-name registry ===
@@ -487,7 +298,8 @@ impl Workbook {
     //     value directly. Used by tests and by hosts that have a Value in
     //     hand (e.g. round-tripping from a serialization layer).
     //
-    // Both go through `register_name` for validation + dep invalidation.
+    // Both validate through the same registry path and publish the
+    // name-version Store root after the mutation lands.
 
     /// Parse and evaluate `formula` (must start with `=`), then register
     /// the result under `name`. The dominant use case is registering a
@@ -540,11 +352,8 @@ impl Workbook {
     ///   - The uppercased name must not collide with a built-in function
     ///     name (`SUM`, `IF`, etc.).
     ///
-    /// On success, walks all sheets and marks every formula whose AST
-    /// references `name` (as either a bare `Expr::Name` or a
-    /// `Expr::FuncCall` whose target is `name`) dirty, so cached
-    /// formula values re-evaluate against the updated registry on next
-    /// read.
+    /// On success, the workbook name-version atom changes. Formulas that read
+    /// the registry are invalidated by their recorded Store dependency.
     pub fn define_name_value(&mut self, name: &str, value: Value) -> Result<(), WorkbookError> {
         if self.is_inside_custom_call() {
             return Err(WorkbookError::MutationDuringCustomCall);
@@ -554,12 +363,6 @@ impl Workbook {
         if is_builtin_function_name(&key) {
             return Err(WorkbookError::ReservedName);
         }
-        // Audit B-4: arm the workbook-level cross-sheet latch when the
-        // bound value carries a live sheet reference (lambda body /
-        // captured bindings). See `named_values_cross_sheet` field docs.
-        if named_value_has_sheet_ref(&value) {
-            self.named_values_cross_sheet.set(true);
-        }
         self.named_values.insert(
             key,
             NamedEntry {
@@ -567,24 +370,15 @@ impl Workbook {
                 value,
             },
         );
-        self.invalidate_formulas_using_name(name);
-        // Audit B-4 follow-through: a (re)definition can change what
-        // existing formulas' names resolve to, so edges keyed off the
-        // OLD binding are stale and formulas installed BEFORE the
-        // definition never got edges at all. Rebuild from the live
-        // ASTs/sources — same O(formulas + lazy parse) trade the TS
-        // port makes (it recalcs all sheets on defineName) and the
-        // same path move_sheet/remove_sheet/rename_sheet use. Defines
-        // are rare, host-driven ops.
-        self.rebuild_cross_sheet_deps();
+        self.sync_atom_names();
         Ok(())
     }
 
     /// Remove a previously-registered name. Idempotent — a no-op when
     /// no entry exists for `name`. Returns `true` if an entry was
-    /// removed, `false` otherwise. Invalidates downstream formulas the
-    /// same way `define_name` does so previously-cached results that
-    /// depended on the name re-evaluate (and now surface `#NAME?`).
+    /// removed, `false` otherwise. Publishes the workbook name-version root
+    /// the same way `define_name` does, so formulas that recorded that Store
+    /// dependency re-evaluate and now surface `#NAME?`.
     pub fn undefine_name(&mut self, name: &str) -> bool {
         if self.is_inside_custom_call() {
             return false; // re-entrancy guard
@@ -592,21 +386,16 @@ impl Workbook {
         let key = name.to_ascii_uppercase();
         let removed = self.named_values.remove(&key).is_some();
         if removed {
-            self.invalidate_formulas_using_name(name);
-            // Drop edges the removed binding contributed (see
-            // `define_name_value`). The `named_values_cross_sheet`
-            // latch intentionally stays armed — one-way, may over-fire,
-            // never under-fires.
-            self.rebuild_cross_sheet_deps();
+            self.sync_atom_names();
         }
         removed
     }
 
     /// Case-insensitive lookup. Returns a clone of the registered
-    /// value, or `None` if no entry exists. Used by the
-    /// `WorkbookEvalProvider::lookup_named` impl that the formula
-    /// evaluator consults for `Expr::Name` / `Expr::FuncCall`
-    /// fallthrough.
+    /// value, or `None` if no entry exists. Top-level evaluator surfaces use
+    /// this directly; formula-inner atoms read the synchronized registry
+    /// through `WorkbookAtomContext` so the name-version Store edge is
+    /// recorded in their active `ReadArgs` frame.
     pub fn get_named(&self, name: &str) -> Option<Value> {
         let key = name.to_ascii_uppercase();
         self.named_values.get(&key).map(|e| e.value.clone())
@@ -628,14 +417,11 @@ impl Workbook {
     /// `None` detaches the previous registry — subsequent unknown
     /// function calls fall straight through to `#NAME?` again.
     ///
-    /// Wave 8 entry point: the wasm bridge wraps a `js_sys::Function`
-    /// hash map in a struct that impls `CustomFunctionRegistry` and
-    /// installs it here. Cells whose formulas reference custom-formula
-    /// names are NOT auto-invalidated by this call — the host is expected
-    /// to invoke `bump_custom_function_revision` (or equivalent) when a
-    /// registration change should re-fire cached cells. (Initial cut:
-    /// registrations are stable per session, so no invalidation hook is
-    /// wired yet.)
+    /// Wave 8 entry point: the wasm bridge wraps a `js_sys::Function` map in a
+    /// `CustomFunctionRegistry` and installs it here. This synchronizes the
+    /// registry handle without publishing the custom-registry version root;
+    /// hosts that mutate or replace a live registry call
+    /// `invalidate_all_formulas_for_custom_function_change` after the change.
     pub fn set_custom_function_registry(
         &mut self,
         registry: Option<Arc<dyn CustomFunctionRegistry>>,
@@ -648,6 +434,8 @@ impl Workbook {
             return;
         }
         self.custom_functions = registry;
+        self.atom_context
+            .set_custom_functions(self.custom_functions.clone(), false);
     }
 
     /// Clone of the currently-installed custom-formula registry handle,
@@ -659,8 +447,8 @@ impl Workbook {
     }
 
     /// True iff a host custom-formula JS callback is currently executing
-    /// (i.e. the engine is inside a `WorkbookEvalProvider::call_custom`
-    /// frame). Public so the WASM bridge can short-circuit re-entrant
+    /// through either formula-inner or top-level evaluation. Public so the
+    /// WASM bridge can short-circuit re-entrant
     /// mutation calls with a meaningful error rather than the opaque
     /// `wasm-bindgen` "recursive use of an object" panic.
     ///
@@ -671,34 +459,20 @@ impl Workbook {
     }
 
     /// Handle to the re-entrancy depth counter. `pub(crate)` because the
-    /// `WorkbookEvalProvider::call_custom` adapter constructs a
-    /// `CustomCallScope` from this; external callers should use
-    /// `is_inside_custom_call` to query.
+    /// evaluator adapters construct a `CustomCallScope` from this; external
+    /// callers should use `is_inside_custom_call` to query.
     pub(crate) fn custom_call_depth_cell(&self) -> &Cell<usize> {
         &self.custom_call_depth
     }
 
-    /// Force every formula in the workbook to re-evaluate the next time
-    /// it is read. Companion to `set_custom_function_registry`: a host
-    /// that adds / removes / replaces a custom function callback can
-    /// call this to invalidate cached results that depended on
-    /// `MYFUNC(...)` (which the cache marks `clean` after a successful
-    /// first compute, identical to any other formula). Implementation:
-    /// walks every sheet's formula table and flips the cache to dirty,
-    /// then fires per-cell subscribers so reactive hosts repaint.
-    ///
-    /// This is intentionally a sledgehammer — the engine has no
-    /// reverse-dep index keyed on custom-function name. A host that
-    /// hot-swaps registrations frequently can build its own per-name
-    /// invalidation index on top.
+    /// Publish a custom-registry change through its Store version root.
+    /// Materialized formulas that called into the registry re-derive through
+    /// their recorded Store edge; unread formulas remain lazy. The root is
+    /// intentionally coarse and does not retain an address-to-formula or
+    /// per-function reverse index.
     pub fn invalidate_all_formulas_for_custom_function_change(&self) {
-        for sheet in &self.sheets {
-            let addrs: Vec<CellAddress> = sheet.formula_exprs_iter().keys().copied().collect();
-            for addr in addrs {
-                sheet.mark_dirty_for_addr(addr);
-                sheet.fire_subscribers(addr);
-            }
-        }
+        self.atom_context
+            .set_custom_functions(self.custom_functions.clone(), true);
     }
 
     fn validate_name(name: &str) -> Result<(), WorkbookError> {
@@ -718,47 +492,6 @@ impl Workbook {
             }
         }
         Ok(())
-    }
-
-    /// Walk every formula in every sheet and mark it dirty if its AST
-    /// references `name` (case-insensitive). The dirty mark flips the
-    /// formula's cache to `Dirty` so the next read recomputes against
-    /// the up-to-date registry. Also fires any per-cell subscribers so
-    /// reactive hosts (the worker backend, the Solid components) see a
-    /// value-change signal without polling.
-    ///
-    /// **Why a global walk instead of a reverse-dep index**: cells
-    /// referencing a named value aren't tracked in the cross-sheet
-    /// graph (which keys on `(sheet, addr)`) or the per-sheet
-    /// `cell_dependents` (which keys on `CellAddress`). Adding a third
-    /// reverse index keyed on `String` would carry per-formula
-    /// bookkeeping that 99% of workbooks never exercise (defined names
-    /// are rare). The whole-workbook walk runs O(F) where F is the
-    /// total formula count — fine for the workbooks this engine
-    /// targets (low thousands of formulas). If a host registers
-    /// hundreds of names and re-defines them frequently, switching to
-    /// a `HashMap<String, HashSet<(sheet_idx, addr)>>` keyed on
-    /// uppercased name is a straightforward future optimization.
-    fn invalidate_formulas_using_name(&self, name: &str) {
-        let key = name.to_ascii_uppercase();
-        for sheet in &self.sheets {
-            // LAZY_FORMULA_INDEXING Phase 3: snapshot the (addr, expr)
-            // pairs out of the live `Ref` before iterating so the
-            // closures we call below (`mark_dirty_for_addr`,
-            // `fire_subscribers`) can take their own `borrow()`s on
-            // `formula_cells` without a conflict.
-            let entries: Vec<(CellAddress, Rc<Expr>)> = sheet
-                .formula_exprs_iter()
-                .iter()
-                .map(|(addr, expr)| (*addr, expr.clone()))
-                .collect();
-            for (addr, expr) in entries {
-                if formula_references_name(&expr, &key) {
-                    sheet.mark_dirty_for_addr(addr);
-                    sheet.fire_subscribers(addr);
-                }
-            }
-        }
     }
 
     /// Append a new empty sheet. If the name is already taken, returns the
@@ -782,6 +515,7 @@ impl Workbook {
         self.sheets.push(Sheet::with_store(self.store.clone()));
         self.names.push(name.to_string());
         self.by_name.insert(name.to_string(), idx);
+        self.sync_atom_topology();
         idx
     }
 
@@ -815,19 +549,8 @@ impl Workbook {
 
     /// Rename a sheet. Fails (returns false) if the new name is taken.
     ///
-    /// Audit A-7: formula ASTs store sheet NAMES (`=Data!A1` keeps
-    /// saying `Data` after the rename), so renaming changes what
-    /// dependents resolve to — formulas referencing the OLD name stop
-    /// resolving (they surface a `#REF!`-class value at next read) and
-    /// formulas that already referenced the NEW name suddenly start
-    /// resolving. Both groups' observable values change, so both must
-    /// be dirtied and their subscribers notified, and the cross-sheet
-    /// edge graph (keyed by resolved sheet index) must be rebuilt
-    /// because the name → index mapping shifted.
-    ///
-    /// Cost: `rebuild_cross_sheet_deps` is O(hydrated formulas + parse
-    /// of lazy formula sources) — acceptable for a rare structural op
-    /// (same trade `move_sheet` already makes).
+    /// Formula ASTs store sheet names, so changing topology invalidates the
+    /// shared topology atom read by qualified references.
     pub fn rename_sheet(&mut self, idx: usize, new_name: &str) -> bool {
         if self.is_inside_custom_call() {
             return false; // re-entrancy guard
@@ -838,20 +561,11 @@ impl Workbook {
         if idx >= self.names.len() {
             return false;
         }
-        // Formulas whose edges currently resolve INTO `idx` referenced
-        // the old name; after the rename they stop resolving.
-        let mut affected = self.formulas_referencing_sheet(idx);
         let old = std::mem::take(&mut self.names[idx]);
         self.by_name.remove(&old);
         self.names[idx] = new_name.to_string();
         self.by_name.insert(new_name.to_string(), idx);
-        self.rebuild_cross_sheet_deps();
-        // Formulas that resolve into `idx` AFTER the rebuild reference
-        // the NEW name — previously dangling, now live. Their values
-        // change too (e.g. `=Numbers!A1` springs to life when `Data`
-        // is renamed to `Numbers`).
-        affected.extend(self.formulas_referencing_sheet(idx));
-        self.notify_cross_sheet_seeds(affected);
+        self.sync_atom_topology();
         true
     }
 
@@ -862,57 +576,10 @@ impl Workbook {
         }
     }
 
-    fn rebuild_cross_sheet_deps(&mut self) {
-        let mut cross_sheet = CrossSheetDeps::new();
-        for (formula_sheet, sheet) in self.sheets.iter().enumerate() {
-            // Hydrated formulas: walk the cached AST.
-            let exprs = sheet.formula_exprs_iter();
-            for (&formula_addr, expr) in exprs.iter() {
-                for edge in
-                    collect_cross_sheet_refs(expr.as_ref(), &self.by_name, &self.named_values)
-                {
-                    cross_sheet.add_edge(formula_sheet, formula_addr, edge);
-                }
-            }
-            // Codex P2 #1 fix: lazy (parked) formulas would otherwise
-            // contribute zero edges here, so a `move_sheet` between a
-            // `bulk_load` and the first read of a cross-sheet formula
-            // silently drops every cross-sheet edge that formula owns.
-            // Parse on-the-fly per lazy entry (cheap relative to the
-            // rebuild cost itself, which only runs on sheet moves) so
-            // the edge set survives the move; the hydrator on first
-            // read still owns the FormulaRecord install — we only walk
-            // the AST here, we do not install dep edges or transition
-            // the lazy entry out of `needs_parse`.
-            drop(exprs);
-            // AUDIT A-2: same `!`-prefilter as `install_sheet_bulk_inner`
-            // — a parked source without `!` cannot carry a cross-sheet
-            // ref, so skip the parse entirely (the overwhelmingly common
-            // same-sheet case; pre-fix a `move_sheet` parsed EVERY lazy
-            // formula on every sheet). Bypassed when the B-4 named-value
-            // latch is armed: a parked `=READDATA()` can hold a cross-
-            // sheet edge with no `!` in its source.
-            let names_may_cross = self.named_values_cross_sheet.get();
-            sheet.for_each_lazy_formula(|formula_addr, source| {
-                if !source.contains('!') && !names_may_cross {
-                    return;
-                }
-                if let Some(expr) = parse_formula(source) {
-                    for edge in collect_cross_sheet_refs(&expr, &self.by_name, &self.named_values) {
-                        cross_sheet.add_edge(formula_sheet, formula_addr, edge);
-                    }
-                }
-            });
-        }
-        self.cross_sheet = cross_sheet;
-    }
-
     /// Move a sheet from `from` to its final index `to`.
     ///
-    /// Formula ASTs store sheet names, while `CrossSheetDeps` stores the
-    /// current sheet indexes for dirty fanout. Reordering therefore moves the
-    /// sheet/name vectors, rebuilds the name lookup, and then rebuilds the
-    /// cross-sheet dependency graph from the live formula ASTs.
+    /// Formula ASTs store sheet names, so reordering updates the shared
+    /// topology atom after the vectors and lookup are rebuilt.
     pub fn move_sheet(&mut self, from: usize, to: usize) -> bool {
         if self.is_inside_custom_call() {
             return false; // re-entrancy guard
@@ -929,16 +596,15 @@ impl Workbook {
         self.sheets.insert(to, sheet);
         self.names.insert(to, name);
         self.rebuild_name_lookup();
-        self.rebuild_cross_sheet_deps();
+        self.sync_atom_topology();
         true
     }
 
     /// Read a cell from a named sheet. Cross-sheet references in formulas
     /// resolve through this path.
     ///
-    /// Workbook reads bypass formula cache so cross-sheet sources are always
-    /// observed live. Plain `Sheet::get_cell` keeps using per-formula dirty
-    /// cache for same-sheet formulas.
+    /// Every formula reads through its Store facade. Workbook-scoped refs are
+    /// resolved by the formula-inner atom against the shared atom context.
     pub fn get_cell(&self, sheet_name: &str, addr_str: &str) -> Value {
         let idx = match self.index_of(sheet_name) {
             Some(i) => i,
@@ -954,15 +620,18 @@ impl Workbook {
             current: Cell::new(idx),
             current_cell: Cell::new(None),
         };
-        self.sheets[idx].peek_value_with_provider(addr, &provider)
+        let value = self.sheets[idx].peek_value_with_provider(addr, &provider);
+        // Match Sheet::get_cell's public read boundary. All workbook sheets
+        // share this Store, so one flush settles same- and cross-sheet reads.
+        self.store.settle_pending_reads();
+        value
     }
 
     /// Sparse read over one sheet range in workbook context.
     ///
     /// Only non-empty primitive/formula cells inside `range` are visited.
-    /// Formula cells are resolved through `WorkbookEvalProvider`, so
-    /// cross-sheet references inside formulas behave the same as
-    /// `Workbook::get_cell`.
+    /// Formula cells resolve through their Store facades, so cross-sheet
+    /// references behave the same as `Workbook::get_cell`.
     pub fn for_each_sparse_range_cell(
         &self,
         sheet_idx: usize,
@@ -1017,12 +686,12 @@ impl Workbook {
     ///
     /// Otherwise returns `true` and the formula is live.
     ///
-    /// **Complexity**: builds the dep graph on demand on each call. Worst
-    /// case walks every formula reachable from `addr`'s tentative dep set,
+    /// **Complexity**: walks formula sources on demand on each call. Worst
+    /// case visits every formula reachable from `addr`'s tentative dep set,
     /// across all sheets — at most O(F + R) where F is the total number of
     /// formula cells visited and R is the size of the reachable refs (each
-    /// `Range` contributes only formula cells inside it via the gated
-    /// `collect_formula_refs_into`-style logic to avoid `SUM(A:A)` blowup).
+    /// `Range` scans only stored formula cells inside it to avoid `SUM(A:A)`
+    /// blowup).
     /// In practice this is bounded by the size of the cross-sheet dep
     /// closure of `addr`, which is small for typical workbooks.
     pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, formula_text: &str) -> bool {
@@ -1037,138 +706,33 @@ impl Workbook {
             None => return false,
         };
 
-        // Try parse first. On parse failure delegate to sheet.set_formula —
-        // it has the canonical "write #VALUE! and clean up" path. Also
-        // drop any previous cross-sheet edges this addr had: a #VALUE!
-        // cell is no longer participating in cross-sheet deps.
+        let array_dependents = self.cross_sheet_array_dependents_for_addr(sheet_idx, addr);
+
+        // Parse first so the workbook-wide static cycle walk can inspect the
+        // candidate. The sheet remains the canonical parse-error write path.
         let expr = match parse_formula(formula_text) {
             Some(e) => e,
             None => {
-                self.cross_sheet.remove_outgoing(sheet_idx, addr);
                 self.sheets[sheet_idx].set_formula(addr_str, formula_text);
-                // Propagate dirty: the address's previous value was
-                // potentially observed by cross-sheet dependents.
-                self.propagate_cross_sheet_dirty(sheet_idx, addr);
+                self.recompute_array_formula_groups(array_dependents);
                 return false;
             }
         };
 
-        // Cross-sheet cycle pre-check: would installing `expr` at
-        // (sheet_idx, addr) make `(sheet_idx, addr)` reachable from itself
-        // through any combination of same-sheet and SheetRef edges?
-        if self.cross_sheet_cycle(sheet_idx, addr, &expr) {
-            self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        if self.closes_workbook_cycle(sheet_idx, addr, &expr) {
             self.sheets[sheet_idx].write_error(addr, ValueError::CyclicRef);
-            self.propagate_cross_sheet_dirty(sheet_idx, addr);
+            self.recompute_array_formula_groups(array_dependents);
             return false;
         }
 
-        // Compute the new outgoing edges from the parsed AST. Same-sheet
-        // refs are handled inside `Sheet::set_formula` via its own
-        // `cell_dependents` / `range_dependents`; this walk only emits
-        // edges that cross a sheet boundary.
-        let new_edges = collect_cross_sheet_refs(&expr, &self.by_name, &self.named_values);
-
-        // Remove the previous formula's outgoing edges before installing
-        // new ones — if the previous formula referenced `Sheet2!A1` and
-        // the new one doesn't, that reverse edge has to disappear.
-        self.cross_sheet.remove_outgoing(sheet_idx, addr);
-
-        // Install the new edges optimistically. If `Sheet::set_formula`
-        // rejects the formula (parse-fail / same-sheet cycle that the
-        // workbook-level pre-check missed), the rollback path below
-        // restores the world to "no edges for this addr".
-        for edge in &new_edges {
-            self.cross_sheet.add_edge(sheet_idx, addr, edge.clone());
-        }
-
-        // Delegate to per-sheet set_formula. It still runs `would_create_cycle`
-        // for same-sheet cycles — that path was already correct and we don't
-        // duplicate the check here.
         let ok = self.sheets[sheet_idx].set_formula(addr_str, formula_text);
-        if !ok {
-            // Sheet-level rejection (parse-fail handled above already, so
-            // this is the same-sheet cycle path). Roll back the edges we
-            // just inserted to keep the graph honest.
-            self.cross_sheet.remove_outgoing(sheet_idx, addr);
-        }
-
-        // Whether the formula was accepted or rejected, downstream
-        // cross-sheet dependents need a dirty bump — the cell's value
-        // is no longer the previous formula's cached result.
-        self.propagate_cross_sheet_dirty(sheet_idx, addr);
-
-        // Workbook-context array recompute: `Sheet::set_formula` runs an
-        // eager array-recompute pass with a sheet-only provider, which
-        // doesn't see the workbook's named-value registry or cross-sheet
-        // refs. If the formula relies on either (e.g.
-        // `=MAP(SEQUENCE(3), inc)` where `inc` is a defined LAMBDA),
-        // the sheet-local eval returns `#NAME?` and the spill isn't
-        // installed. Re-run the recompute here through a workbook-aware
-        // provider so the spill anchors / derived targets land correctly.
-        //
-        // Gated on `formula_needs_workbook_context` so the common case —
-        // a plain `=A1+B1` or inline `=MAP(A1:A3, LAMBDA(...))` — skips
-        // the second eval pass and stays as cheap as before this commit.
-        if ok && formula_needs_workbook_context(&expr) {
-            self.recompute_array_spill_with_workbook_context(sheet_idx, addr);
-        }
-
+        self.recompute_array_formula_groups(array_dependents);
         ok
     }
 
-    /// Re-run the spill recompute for `(sheet_idx, addr)` through a
-    /// `WorkbookEvalProvider`. The build-then-mutate split is what the
-    /// borrow checker requires: the provider needs `&self`, but the
-    /// install needs `&mut self.sheets[sheet_idx]`. We scope the
-    /// provider inside a block, snapshot the Value the provider
-    /// produced, drop the borrow, then hand the Value to a mutating
-    /// install path on the sheet.
-    fn recompute_array_spill_with_workbook_context(&mut self, sheet_idx: usize, addr: CellAddress) {
-        // Evaluate the formula through the workbook provider so named-
-        // value / cross-sheet lookups resolve. The value is returned by
-        // copy so we can drop the immutable borrow before mutating.
-        let value = {
-            let provider = WorkbookEvalProvider {
-                wb: self,
-                current: Cell::new(sheet_idx),
-                current_cell: Cell::new(None),
-            };
-            // Force a re-eval (bypass the cache) so any earlier sheet-
-            // local result that surfaced #NAME? doesn't shadow the
-            // correct workbook-aware Array.
-            if let Some(sheet) = self.sheets.get(sheet_idx) {
-                if let Some(record) = sheet.formula_exprs_iter().get(&addr).cloned() {
-                    sheet.mark_dirty_for_addr(addr);
-                    crate::eval::eval_expr_with_provider(record.as_ref(), &provider)
-                } else {
-                    return;
-                }
-            } else {
-                return;
-            }
-        };
-        // Mutate: install / refresh the spill from the workbook-aware
-        // value. The sheet's `apply_workbook_recomputed_value` handles
-        // the array-vs-scalar branch identically to
-        // `recompute_array_formula`, so the spill state mirrors the
-        // sheet-only path when no workbook-scope refs are involved.
-        if let Some(sheet) = self.sheets.get_mut(sheet_idx) {
-            sheet.apply_workbook_recomputed_value(addr, value);
-        }
-    }
-
-    /// Workbook-routed cell write. Mirrors `Sheet::set_cell` but also
-    /// fans the dirty-mark + subscriber-fire signal out across the
-    /// cross-sheet dep graph maintained in `cross_sheet`. Use this
-    /// (instead of `wb.sheet_mut(idx).set_cell`) when the write should
-    /// be visible to cross-sheet subscribers.
-    ///
-    /// The legacy `wb.sheet_mut(idx).set_cell(addr, value)` path stays
-    /// valid for single-sheet tests but does NOT propagate cross-sheet
-    /// dirty — that's the "raw" path the documented gap test
-    /// `workbook_get_cell_refreshes_cross_sheet_cache_without_notifying`
-    /// exercises and continues to assert.
+    /// Workbook-routed cell write. The target sheet's source atom belongs to
+    /// the workbook-scoped Store, so materialized same- and cross-sheet
+    /// formulas rederive through their normal dynamic dependencies.
     pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
         if self.is_inside_custom_call() {
             // Re-entrancy guard (Wave 8). A custom-formula JS callback
@@ -1185,22 +749,13 @@ impl Workbook {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return;
         };
-        // 1. Sheet-local write — fires Sheet-local subscribers + dirties
-        //    Sheet-local dependents. If the previous content was a
-        //    formula, this also drops its outgoing cross-sheet edges
-        //    (which it owned before being overwritten with a primitive).
-        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        let array_dependents = self.cross_sheet_array_dependents_for_addr(sheet_idx, addr);
         self.sheets[sheet_idx].set_cell(addr_str, value);
-        // 2. Cross-sheet fanout. The BFS layer dirties each target +
-        //    fires its subscribers; if a target's own formula has a
-        //    cross-sheet edge, the next BFS layer picks it up.
-        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        self.recompute_array_formula_groups(array_dependents);
     }
 
     /// Workbook-routed cell clear. Equivalent to `set_cell(idx, addr,
-    /// Value::Null)` — a cleared cell is a write to Null with the same
-    /// cross-sheet dirty fanout. Provided as a separate name so callers
-    /// don't have to construct a `Value::Null` for Delete-key UX.
+    /// Value::Null)` and provided separately for Delete-key UX.
     pub fn clear_cell(&mut self, sheet_idx: usize, addr_str: &str) {
         if self.is_inside_custom_call() {
             return; // re-entrancy guard; see `set_cell` for rationale
@@ -1211,15 +766,15 @@ impl Workbook {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return;
         };
-        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        let array_dependents = self.cross_sheet_array_dependents_for_addr(sheet_idx, addr);
         self.sheets[sheet_idx].clear_cell(addr_str);
-        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        self.recompute_array_formula_groups(array_dependents);
     }
 
-    /// Fallible variant of `set_cell`. Mirrors `Sheet::try_set_cell` —
+    /// Fallible variant of `set_cell`. Mirrors `Sheet::try_set_cell`.
     /// returns `Err(SpillCellWrite { anchor })` when the target address
-    /// is a non-anchor target of an active spill range. On success the
-    /// cross-sheet dirty fanout runs exactly like `set_cell`.
+    /// is a non-anchor target of an active spill range. Successful writes
+    /// propagate through the same workbook Store as `set_cell`.
     ///
     /// Used by the WASM boundary so JS-side hosts can surface a
     /// "cannot edit spill range" toast instead of silently swallowing
@@ -1237,9 +792,9 @@ impl Workbook {
             return Err(SheetError::InvalidAddress);
         }
         let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
-        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        let array_dependents = self.cross_sheet_array_dependents_for_addr(sheet_idx, addr);
         self.sheets[sheet_idx].try_set_cell(addr_str, value)?;
-        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        self.recompute_array_formula_groups(array_dependents);
         Ok(())
     }
 
@@ -1255,15 +810,14 @@ impl Workbook {
             return Err(SheetError::InvalidAddress);
         }
         let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
-        self.cross_sheet.remove_outgoing(sheet_idx, addr);
+        let array_dependents = self.cross_sheet_array_dependents_for_addr(sheet_idx, addr);
         self.sheets[sheet_idx].try_clear_cell(addr_str)?;
-        self.propagate_cross_sheet_dirty(sheet_idx, addr);
+        self.recompute_array_formula_groups(array_dependents);
         Ok(())
     }
 
     /// Fallible variant of `set_formula`. Mirrors `Sheet::try_set_formula`
-    /// but routes through the workbook so cross-sheet dirty fanout still
-    /// happens on success. Returns:
+    /// and routes through workbook-wide cycle validation. Returns:
     ///   - `Ok(true)`  — formula parsed and installed.
     ///   - `Ok(false)` — formula parse failed (`#VALUE!`) or cycle (`#CYCLE!`).
     ///   - `Err(SpillCellWrite { anchor })` — target inside a spill range.
@@ -1281,7 +835,7 @@ impl Workbook {
             return Err(SheetError::InvalidAddress);
         }
         let addr = CellAddress::parse(addr_str).ok_or(SheetError::InvalidAddress)?;
-        // Reject up-front so the cross-sheet graph isn't touched on rejection.
+        // Reject up-front so a spill target cannot be replaced accidentally.
         if self.sheets[sheet_idx].is_spilled(addr) {
             // Re-derive anchor through the sheet-level fallible path so the
             // error carries the same anchor the per-sheet write would have
@@ -1312,10 +866,35 @@ impl Workbook {
         sheet.spill_anchor_for(addr)
     }
 
+    fn cross_sheet_array_dependents_for_addr(
+        &self,
+        source_sheet: usize,
+        addr: CellAddress,
+    ) -> Vec<(usize, HashSet<CellAddress>)> {
+        let roots = self.sheets[source_sheet].store_root_atoms_for_addr(addr);
+        let dependent_atoms = self.store.reverse_dependents(&roots);
+        self.sheets
+            .iter()
+            .enumerate()
+            .filter(|(sheet_idx, _)| *sheet_idx != source_sheet)
+            .filter_map(|(sheet_idx, sheet)| {
+                let addrs = sheet.array_formula_addrs_for_store_atoms(&dependent_atoms);
+                (!addrs.is_empty()).then_some((sheet_idx, addrs))
+            })
+            .collect()
+    }
+
+    fn recompute_array_formula_groups(&mut self, groups: Vec<(usize, HashSet<CellAddress>)>) {
+        for (sheet_idx, addrs) in groups {
+            if let Some(sheet) = self.sheets.get_mut(sheet_idx) {
+                sheet.recompute_array_formulas_in(&addrs);
+            }
+        }
+    }
+
     /// Clear every non-empty cell inside a range without materializing
     /// every address in that range. The metadata scan is sparse and does
-    /// not evaluate formulas; flush still goes through `bulk_load` so
-    /// same-sheet and cross-sheet dirty propagation is consolidated.
+    /// not evaluate formulas; `bulk_load` coalesces all Store propagation.
     pub fn clear_range(&mut self, sheet_idx: usize, range: CellRange) -> usize {
         let Some(sheet) = self.sheets.get(sheet_idx) else {
             return 0;
@@ -1335,230 +914,26 @@ impl Workbook {
         count
     }
 
-    /// Workbook-level BFS dirty propagation across cross-sheet edges.
-    ///
-    /// Seed: `(src_sheet, src_addr)`. For each popped item, look up its
-    /// cross-sheet dependents (cell + range halves) and for each
-    /// dependent `(target_sheet, target_addr)`:
-    ///   - flip its formula cache to Dirty via
-    ///     `Sheet::mark_dirty_for_addr`,
-    ///   - fire its subscribers via `Sheet::fire_subscribers`,
-    ///   - enqueue it for the next BFS layer (chained cross-sheet
-    ///     dependencies — `Sheet1!D = =Sheet2!C`, `Sheet2!C = =Sheet3!A`).
-    ///
-    /// Uses a `VecDeque` for FIFO order and a visited `HashSet` so loops
-    /// in the graph (the workbook-level static cycle check is best-effort
-    /// — runtime corruption / a sneaky test setup may still close one)
-    /// terminate.
-    ///
-    /// Two-pass split note: both `mark_dirty_for_addr` and
-    /// `fire_subscribers` take `&self`, so the BFS can use immutable
-    /// borrows of `self.sheets[idx]` throughout. No `&mut self` reborrow
-    /// is needed mid-iteration — the dirty-flip happens through interior
-    /// mutability inside `FormulaCache::Dirty` / `AddressSubscriptionBucket`.
-    fn propagate_cross_sheet_dirty(&self, src_sheet: usize, src_addr: CellAddress) {
-        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
-        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
-        queue.push_back((src_sheet, src_addr));
-        visited.insert((src_sheet, src_addr));
-        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, None);
-    }
-
-    /// Shared BFS body for [`Self::propagate_cross_sheet_dirty`] and the
-    /// storage-primary install fanout. Pops `(sheet, addr)` nodes, finds
-    /// their cross-sheet dependents through both reverse-index halves,
-    /// marks each unvisited dependent dirty, fires its subscribers, and
-    /// enqueues it for the next layer. The caller pre-seeds `visited` +
-    /// `queue` (and decides whether the seeds themselves were already
-    /// marked/fired).
-    ///
-    /// `skip_sheets`: dependents living on these sheets are neither
-    /// marked nor fired nor traversed. The install fanout passes the
-    /// just-installed sheet set here — those sheets' formulas are
-    /// freshly parked (no cached value to dirty) and their subscription
-    /// buckets were already notified once by `bulk_install_storage`'s
-    /// reattach pass; firing them again would break the
-    /// each-subscriber-fires-once contract. Skipping traversal is safe
-    /// because any formula with an edge INTO an installed sheet is
-    /// already a fanout seed.
-    fn run_cross_sheet_dirty_bfs(
-        &self,
-        visited: &mut HashSet<(usize, CellAddress)>,
-        queue: &mut VecDeque<(usize, CellAddress)>,
-        skip_sheets: Option<&HashSet<usize>>,
-    ) {
-        while let Some((sheet_idx, addr)) = queue.pop_front() {
-            // Collect dependents of this node from both reverse-index
-            // halves. The CrossSheetDeps borrows are read-only, so we
-            // can collect into a Vec then release the borrow before
-            // touching the sheet (avoids any cross-borrow issues).
-            let mut dependents: Vec<(usize, CellAddress)> = Vec::new();
-
-            if let Some(set) = self.cross_sheet.cell_dependents.get(&(sheet_idx, addr)) {
-                dependents.extend(set.iter().copied());
-            }
-            if let Some(range_idx) = self.cross_sheet.range_index_per_sheet.get(&sheet_idx) {
-                // The range index is keyed by source sheet and stores only
-                // formula addresses. Recover every target sheet through the
-                // forward `formula_refs` map so same-address formulas on
-                // different sheets all receive dirty fanout.
-                for target_addr in range_idx.dependents_of(addr) {
-                    for target_sheet in
-                        self.target_sheets_for_range_dep(target_addr, sheet_idx, addr)
-                    {
-                        dependents.push((target_sheet, target_addr));
-                    }
-                }
-            }
-
-            for (target_sheet, target_addr) in dependents {
-                if skip_sheets.is_some_and(|skip| skip.contains(&target_sheet)) {
-                    continue;
-                }
-                if !visited.insert((target_sheet, target_addr)) {
-                    continue;
-                }
-                let Some(sheet) = self.sheets.get(target_sheet) else {
-                    continue;
-                };
-                sheet.mark_dirty_for_addr(target_addr);
-                sheet.fire_subscribers(target_addr);
-                queue.push_back((target_sheet, target_addr));
-            }
-        }
-    }
-
-    /// STORAGE_PRIMARY Phase 6.1 fixup (codex P2): after a full-sheet
-    /// replace, every formula on a NON-installed sheet holding an
-    /// incoming cross-sheet edge into any installed sheet is potentially
-    /// stale — `install_sheet_bulk` swaps the whole sheet, so "treat
-    /// every cell of the replaced sheet as touched". Implemented by
-    /// walking the FORWARD `formula_refs` map once (O(cross-sheet
-    /// formulas), NOT O(installed cells)) and seeding the same dirty BFS
-    /// that `set_cell` / `bulk_load` use:
-    ///
-    ///   - each seed is marked dirty (no-op for lazy/unhydrated
-    ///     dependents — they have no cached value and evaluate fresh on
-    ///     read) and its subscribers fire (subscriptions CAN exist
-    ///     pre-hydration; see `install_cross_sheet_formula_notifies`),
-    ///   - the shared `visited` set dedups across seeds AND across
-    ///     multiple installed sheets, so a dependent referencing two
-    ///     replaced sheets notifies once,
-    ///   - formulas living ON an installed sheet are never seeds (their
-    ///     sheet's subscription buckets were already notified once by
-    ///     `bulk_install_storage`) and are skipped during traversal.
-    fn fanout_install_cross_sheet_dependents(&self, installed: &HashSet<usize>) {
-        if self.cross_sheet.formula_refs.is_empty() {
-            return; // common bench shape: zero cross-sheet formulas
-        }
-        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
-        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
-        for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
-            if installed.contains(formula_sheet) {
-                continue;
-            }
-            let depends_on_installed = edges.iter().any(|edge| match edge {
-                CrossSheetRef::Cell(src_sheet, _) => installed.contains(src_sheet),
-                CrossSheetRef::Range(src_sheet, _) => installed.contains(src_sheet),
-            });
-            if !depends_on_installed {
-                continue;
-            }
-            if !visited.insert((*formula_sheet, *formula_addr)) {
-                continue;
-            }
-            if let Some(sheet) = self.sheets.get(*formula_sheet) {
-                sheet.mark_dirty_for_addr(*formula_addr);
-                sheet.fire_subscribers(*formula_addr);
-            }
-            queue.push_back((*formula_sheet, *formula_addr));
-        }
-        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, Some(installed));
-    }
-
-    /// Recover every formula sheet index for a range-typed reverse edge.
-    /// The per-source-sheet `RangeDependentIndex` stores only
-    /// `CellAddress` in its formula set (matching the sheet-local shape);
-    /// the corresponding sheet is held in `formula_refs` as the key.
-    ///
-    /// Walks the forward map and returns every key whose
-    /// `formula_addr == target_addr` and whose edge list contains a
-    /// `Range(src_sheet, range)` covering `src_addr`. Worst case O(F) where
-    /// F is the total formula_refs entries — acceptable for the dirty path,
-    /// and small in practice (only formula cells live here, not data cells).
-    fn target_sheets_for_range_dep(
-        &self,
-        target_addr: CellAddress,
-        src_sheet: usize,
-        src_addr: CellAddress,
-    ) -> Vec<usize> {
-        let mut out = Vec::new();
-        for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
-            if *formula_addr != target_addr {
-                continue;
-            }
-            for edge in edges {
-                if let CrossSheetRef::Range(s, range) = edge {
-                    if *s == src_sheet && range.contains(src_addr) {
-                        out.push(*formula_sheet);
-                        break;
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// BFS the workbook-wide dep graph starting from the references of `expr`
-    /// (treated as if it were already installed at `(target_idx, target)`).
-    /// Returns true iff `(target_idx, target)` is reachable.
-    ///
-    /// **Phase 3 Track J**: visited-node edges come from
-    /// `CrossSheetDeps::formula_refs` — the same forward index that
-    /// `Workbook::set_formula` maintains. This avoids the per-visited-node
-    /// AST walk through `collect_workbook_refs` that the pre-Track-J
-    /// implementation used; instead the AST walk runs exactly once, for
-    /// the CANDIDATE expression (which isn't in `formula_refs` yet because
-    /// we're DECIDING whether to install it).
-    ///
-    /// The candidate seed still uses `collect_workbook_refs` because:
-    ///   1. Its edges aren't installed yet at this point in `set_formula`.
-    ///   2. We need to follow BOTH same-sheet and cross-sheet edges
-    ///      *out of the candidate*. Same-sheet edges land at `(target_idx,
-    ///      ref_addr)`, which lets the BFS detect cycles like
-    ///      `Sheet1!A = =Sheet1!B` paired with `Sheet1!B = =Sheet1!A`
-    ///      via the `formula_refs[(target_idx, ref_addr)]` lookup ONLY
-    ///      if `ref_addr` itself has cross-sheet outgoing edges.
-    ///
-    /// `formula_refs` stores ONLY cross-sheet edges (same-sheet refs are
-    /// tracked by `Sheet`'s own `cell_dependents`/`range_dependents`).
-    /// Two consequences:
-    ///   - Pure cross-sheet cycles (the existing 5 tests + the typical
-    ///     `Sheet1!A = =Sheet2!A ↔ Sheet2!A = =Sheet1!A` shape) are caught
-    ///     entirely on the index path — O(F) HashMap lookups per visited
-    ///     node instead of O(AST size).
-    ///   - Cycles that thread through a same-sheet hop in a *visited*
-    ///     formula (e.g. `Sheet1!A = =Sheet2!B`, `Sheet2!B = =Sheet2!C`,
-    ///     `Sheet2!C = =Sheet1!A`) won't be caught here because
-    ///     `formula_refs[(Sheet2, B)]` is empty. Those rely on the
-    ///     runtime fallback: `FormulaCache::Computing` short-circuits with
-    ///     `Value::Error(ValueError::CyclicRef)`. See the
-    ///     `cross_sheet_runtime_guard_returns_cycle_when_static_bypassed`
-    ///     test for the contract.
-    fn cross_sheet_cycle(&self, target_idx: usize, target: CellAddress, expr: &Expr) -> bool {
+    /// Install-time cycle check across workbook formulas. Formula sources are
+    /// inspected on demand because an unread lazy formula intentionally has no
+    /// Store dependency edges yet. Runtime ownership and invalidation remain in
+    /// the shared Store; this walk retains no second dependency graph.
+    fn closes_workbook_cycle(&self, target_idx: usize, target: CellAddress, expr: &Expr) -> bool {
         let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
         let mut to_visit: Vec<(usize, CellAddress)> = Vec::new();
-        // Seed with refs of the candidate expression. `collect_workbook_refs`
-        // is retained for this candidate-only AST walk — the candidate's
-        // edges aren't in `formula_refs` yet (we're deciding whether to
-        // install them), so the only honest source is the parsed `expr`.
-        //
-        // Track J probe: bump the per-workbook counter so tests can verify
-        // the AST walk runs ONCE per `cross_sheet_cycle` call (the
-        // candidate), not N times (the pre-Track-J shape).
         self.cycle_ast_walk_count
             .set(self.cycle_ast_walk_count.get() + 1);
-        collect_workbook_refs(expr, target_idx, &self.by_name, &mut to_visit);
+        let mut visiting_names = HashSet::new();
+        if self.collect_workbook_cycle_refs(
+            expr,
+            target_idx,
+            (target_idx, target),
+            &mut to_visit,
+            &mut visiting_names,
+            false,
+        ) {
+            return true;
+        }
 
         while let Some((idx, addr)) = to_visit.pop() {
             if idx == target_idx && addr == target {
@@ -1567,57 +942,312 @@ impl Workbook {
             if !visited.insert((idx, addr)) {
                 continue;
             }
-            // Visited nodes' outgoing edges come from the forward index,
-            // not a per-node AST walk. The index stores only cross-sheet
-            // edges; same-sheet cycles threaded through visited nodes are
-            // caught by `FormulaCache::Computing` at runtime.
-            let Some(edges) = self.cross_sheet.formula_refs.get(&(idx, addr)) else {
+            let Some(next) = self
+                .sheets
+                .get(idx)
+                .and_then(|sheet| sheet.cycle_expr_for(addr))
+            else {
                 continue;
             };
-            for edge in edges {
-                match edge {
-                    CrossSheetRef::Cell(src_sheet, src_addr) => {
-                        to_visit.push((*src_sheet, *src_addr));
-                    }
-                    CrossSheetRef::Range(src_sheet, range) => {
-                        // Expand a range edge to the formula cells that
-                        // actually live inside the rectangle — same gating
-                        // as `collect_formula_refs_into` in sheet.rs so
-                        // `SUM(A:A)` doesn't enqueue u32::MAX entries.
-                        let Some(sheet) = self.sheets.get(*src_sheet) else {
-                            continue;
-                        };
-                        for cand_addr in sheet.formula_exprs_iter().keys() {
-                            if range.contains(*cand_addr) {
-                                to_visit.push((*src_sheet, *cand_addr));
-                            }
-                        }
-                    }
-                }
+            let mut visiting_names = HashSet::new();
+            if self.collect_workbook_cycle_refs(
+                &next,
+                idx,
+                (target_idx, target),
+                &mut to_visit,
+                &mut visiting_names,
+                true,
+            ) {
+                return true;
             }
         }
         false
     }
 
+    fn collect_workbook_cycle_refs(
+        &self,
+        expr: &Expr,
+        current_idx: usize,
+        target: (usize, CellAddress),
+        out: &mut Vec<(usize, CellAddress)>,
+        visiting_names: &mut HashSet<String>,
+        detect_unbounded_target: bool,
+    ) -> bool {
+        match expr {
+            Expr::CellRef(addr) => {
+                if (current_idx, *addr) == target {
+                    return true;
+                }
+                out.push((current_idx, *addr));
+            }
+            Expr::Range {
+                start,
+                end,
+                unbounded,
+            } => {
+                if self.collect_cycle_range_refs(
+                    current_idx,
+                    CellRange::new(*start, *end),
+                    *unbounded,
+                    target,
+                    out,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+            }
+            Expr::SheetRef { sheet, addr } => {
+                if let Some(&sheet_idx) = self.by_name.get(sheet) {
+                    if (sheet_idx, *addr) == target {
+                        return true;
+                    }
+                    out.push((sheet_idx, *addr));
+                }
+            }
+            Expr::SheetRange {
+                sheet,
+                start,
+                end,
+                unbounded,
+            } => {
+                if let Some(&sheet_idx) = self.by_name.get(sheet) {
+                    if self.collect_cycle_range_refs(
+                        sheet_idx,
+                        CellRange::new(*start, *end),
+                        *unbounded,
+                        target,
+                        out,
+                        detect_unbounded_target,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            Expr::BinOp { left, right, .. } => {
+                if self.collect_workbook_cycle_refs(
+                    left,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) || self.collect_workbook_cycle_refs(
+                    right,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+            }
+            Expr::Negate(inner) | Expr::SpillRef(inner) => {
+                if self.collect_workbook_cycle_refs(
+                    inner,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+            }
+            Expr::FuncCall { name, args } => {
+                if self.collect_named_cycle_refs(
+                    name,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+                for arg in args {
+                    if self.collect_workbook_cycle_refs(
+                        arg,
+                        current_idx,
+                        target,
+                        out,
+                        visiting_names,
+                        detect_unbounded_target,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            Expr::DynamicRange { start, end } => {
+                if self.collect_workbook_cycle_refs(
+                    start,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) || self.collect_workbook_cycle_refs(
+                    end,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+            }
+            Expr::Name(name) => {
+                if self.collect_named_cycle_refs(
+                    name,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+            }
+            Expr::Call(callee, args) => {
+                if self.collect_workbook_cycle_refs(
+                    callee,
+                    current_idx,
+                    target,
+                    out,
+                    visiting_names,
+                    detect_unbounded_target,
+                ) {
+                    return true;
+                }
+                for arg in args {
+                    if self.collect_workbook_cycle_refs(
+                        arg,
+                        current_idx,
+                        target,
+                        out,
+                        visiting_names,
+                        detect_unbounded_target,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            Expr::ArrayLit { data, .. } | Expr::MultiArea(data) => {
+                for item in data {
+                    if self.collect_workbook_cycle_refs(
+                        item,
+                        current_idx,
+                        target,
+                        out,
+                        visiting_names,
+                        detect_unbounded_target,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
+        }
+        false
+    }
+
+    fn collect_cycle_range_refs(
+        &self,
+        sheet_idx: usize,
+        range: CellRange,
+        unbounded: RangeBounds,
+        target: (usize, CellAddress),
+        out: &mut Vec<(usize, CellAddress)>,
+        detect_unbounded_target: bool,
+    ) -> bool {
+        let range = range.normalize();
+        if sheet_idx == target.0
+            && range.contains(target.1)
+            && (detect_unbounded_target || unbounded == RangeBounds::None)
+        {
+            return true;
+        }
+        if let Some(sheet) = self.sheets.get(sheet_idx) {
+            out.extend(
+                sheet
+                    .formula_addrs_in_range(range)
+                    .into_iter()
+                    .map(|addr| (sheet_idx, addr)),
+            );
+        }
+        false
+    }
+
+    fn collect_named_cycle_refs(
+        &self,
+        name: &str,
+        current_idx: usize,
+        target: (usize, CellAddress),
+        out: &mut Vec<(usize, CellAddress)>,
+        visiting_names: &mut HashSet<String>,
+        detect_unbounded_target: bool,
+    ) -> bool {
+        let key = name.to_ascii_uppercase();
+        if !visiting_names.insert(key.clone()) {
+            return false;
+        }
+        let result = self.named_values.get(&key).is_some_and(|entry| {
+            self.collect_value_cycle_refs(
+                &entry.value,
+                current_idx,
+                target,
+                out,
+                visiting_names,
+                detect_unbounded_target,
+            )
+        });
+        visiting_names.remove(&key);
+        result
+    }
+
+    fn collect_value_cycle_refs(
+        &self,
+        value: &Value,
+        current_idx: usize,
+        target: (usize, CellAddress),
+        out: &mut Vec<(usize, CellAddress)>,
+        visiting_names: &mut HashSet<String>,
+        detect_unbounded_target: bool,
+    ) -> bool {
+        let Value::Lambda(lambda) = value else {
+            return false;
+        };
+        let Some(lambda) = lambda.as_any().downcast_ref::<ExcelLambda>() else {
+            return false;
+        };
+        if self.collect_workbook_cycle_refs(
+            &lambda.body,
+            current_idx,
+            target,
+            out,
+            visiting_names,
+            detect_unbounded_target,
+        ) {
+            return true;
+        }
+        lambda.captured.iter().any(|(_, captured)| {
+            self.collect_value_cycle_refs(
+                captured,
+                current_idx,
+                target,
+                out,
+                visiting_names,
+                detect_unbounded_target,
+            )
+        })
+    }
+
     /// Remove a sheet by index. Returns the removed sheet so callers can
     /// inspect / dispose of its atoms if needed.
     ///
-    /// Audit A-6: sheet removal shifts indices, so the cross-sheet dep
-    /// graph (keyed by `(idx, addr)`) is rebuilt from the live formula
-    /// ASTs / lazy sources via `rebuild_cross_sheet_deps` — the same
-    /// path `move_sheet` uses. (The previous behavior — clearing the
-    /// graph and waiting for "the next set_formula" to repopulate it —
-    /// permanently severed dirty/notify fanout for every UNRELATED
-    /// cross-sheet formula in the workbook.)
-    ///
-    /// Formulas on surviving sheets that referenced the REMOVED sheet
-    /// lose their source: their value changes to a `#REF!`-class error
-    /// at next read, so they are dirtied and their subscribers notified
-    /// (with chained cross-sheet dependents reached through the shared
-    /// dirty BFS).
-    ///
-    /// Cost: O(hydrated formulas + parse of lazy formula sources) —
-    /// acceptable for a rare structural op.
+    /// Updating the topology root invalidates every derived formula that
+    /// resolved a sheet name through the shared Store.
     pub fn remove_sheet(&mut self, idx: usize) -> Option<Sheet> {
         if self.is_inside_custom_call() {
             return None; // re-entrancy guard
@@ -1625,155 +1255,34 @@ impl Workbook {
         if idx >= self.sheets.len() {
             return None;
         }
-        // Capture — BEFORE indices shift — every formula on a SURVIVING
-        // sheet that referenced the removed sheet, remapping its host
-        // sheet index past the removal point.
-        let affected: Vec<(usize, CellAddress)> = self
-            .formulas_referencing_sheet(idx)
-            .into_iter()
-            .filter(|(formula_sheet, _)| *formula_sheet != idx)
-            .map(|(formula_sheet, addr)| {
-                let remapped = if formula_sheet > idx {
-                    formula_sheet - 1
-                } else {
-                    formula_sheet
-                };
-                (remapped, addr)
-            })
-            .collect();
         let sheet = self.sheets.remove(idx);
+        sheet.detach_workbook_context();
         let name = self.names.remove(idx);
         self.by_name.remove(&name);
         self.rebuild_name_lookup();
-        // Rebuild the graph against the post-removal name → index map.
-        // References to the removed sheet's name no longer resolve and
-        // drop out of the edge set; everything else re-keys correctly.
-        self.rebuild_cross_sheet_deps();
-        self.notify_cross_sheet_seeds(affected);
+        self.sync_atom_topology();
         Some(sheet)
     }
 
-    /// Forward-map walk: every formula holding at least one cross-sheet
-    /// edge INTO `sheet_idx`. O(cross-sheet formulas), not O(all
-    /// formulas) — the forward `formula_refs` index already exists.
-    fn formulas_referencing_sheet(&self, sheet_idx: usize) -> Vec<(usize, CellAddress)> {
-        let mut out = Vec::new();
-        for ((formula_sheet, formula_addr), edges) in &self.cross_sheet.formula_refs {
-            let hits = edges.iter().any(|edge| match edge {
-                CrossSheetRef::Cell(src_sheet, _) => *src_sheet == sheet_idx,
-                CrossSheetRef::Range(src_sheet, _) => *src_sheet == sheet_idx,
-            });
-            if hits {
-                out.push((*formula_sheet, *formula_addr));
-            }
-        }
-        out
-    }
-
-    /// Mark each seed dirty, fire its subscribers, then run the shared
-    /// cross-sheet dirty BFS so CHAINED dependents (`C = =Sheet1!B`,
-    /// `B = =Removed!A`) propagate too. Mirrors the seeding shape of
-    /// `fanout_install_cross_sheet_dependents`. `mark_dirty_for_addr`
-    /// is a no-op for parked/lazy dependents (no cached value to
-    /// invalidate); `fire_subscribers` works pre-hydration.
-    fn notify_cross_sheet_seeds(&self, seeds: Vec<(usize, CellAddress)>) {
-        if seeds.is_empty() {
-            return;
-        }
-        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
-        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
-        for (sheet_idx, addr) in seeds {
-            if !visited.insert((sheet_idx, addr)) {
-                continue;
-            }
-            let Some(sheet) = self.sheets.get(sheet_idx) else {
-                continue;
-            };
-            sheet.mark_dirty_for_addr(addr);
-            sheet.fire_subscribers(addr);
-            queue.push_back((sheet_idx, addr));
-        }
-        self.run_cross_sheet_dirty_bfs(&mut visited, &mut queue, None);
-    }
-
-    /// Debug-only: total cross-sheet reverse-edge count. Backs the Phase
-    /// 3 acceptance assertion that workbook-routed writes actually
-    /// exercise the dep graph (vs. silently no-oping the way the pre-
-    /// Track-I `Sheet::set_cell`-only path did).
+    /// Retained for host compatibility. Cross-sheet dependencies now live in
+    /// Store and no workbook-owned reverse-edge table exists.
     #[doc(hidden)]
     pub fn debug_cross_sheet_reverse_edge_count(&self) -> usize {
-        self.cross_sheet.debug_reverse_edge_count()
+        0
     }
 
-    /// Cheap "does any sheet in this workbook host a formula that
-    /// references another sheet?" check. Used by
-    /// `WorkbookEvalProvider::force_formula_recompute` to scope the
-    /// read-time bypass: when no formula references another sheet, the
-    /// bypass is unnecessary and every `wb.get_cell` read can hit
-    /// `FormulaCache::Clean`. Single-sheet chains (the bench's Chain100
-    /// etc.) take this fast path and only pay for full chain evaluation
-    /// on the first read.
-    ///
-    /// Combines two signals:
-    ///   1. `CrossSheetDeps::formula_refs` — registered by the workbook-
-    ///      routed `Workbook::set_formula` / bulk-load paths.
-    ///   2. Each sheet's `has_cross_sheet_refs` latch — set by the
-    ///      per-sheet `Sheet::set_formula` flow regardless of whether
-    ///      the workbook ever saw the install. This captures formulas
-    ///      installed via the raw `wb.sheet_mut(idx).set_formula(...)`
-    ///      bypass (which skips edge registration) and is independent of
-    ///      `Workbook::remove_sheet` rebuilding `cross_sheet` — both
-    ///      cases codex flagged as "force_recompute should still fire".
-    ///      The latch is one-way (never cleared), so the bypass may stay
-    ///      armed slightly longer than strictly necessary but never
-    ///      under-fires.
-    ///   3. The `named_values_cross_sheet` latch (audit B-4) — armed by
-    ///      `define_name_value` when a registered value (LAMBDA body /
-    ///      captured bindings) carries a live sheet ref, covering
-    ///      `=READDATA()`-shaped formulas the per-sheet latch cannot
-    ///      see (their ASTs contain no `SheetRef` node).
-    pub(crate) fn has_any_cross_sheet_edges(&self) -> bool {
-        !self.cross_sheet.formula_refs.is_empty()
-            || self.named_values_cross_sheet.get()
-            || self.sheets.iter().any(|s| s.has_cross_sheet_refs())
-    }
-
-    /// Debug-only: per-workbook count of `collect_workbook_refs` AST walks
-    /// performed by `cross_sheet_cycle`. Used by the Phase 3 Track J test
-    /// to assert that visited-node edges come from
-    /// `CrossSheetDeps::formula_refs` (one AST walk per `set_formula` —
-    /// the candidate only) rather than the pre-Track-J shape (one AST
-    /// walk per visited formula).
+    /// Debug-only: number of candidate ASTs checked for cycles.
     #[doc(hidden)]
     pub fn debug_cycle_ast_walk_count(&self) -> usize {
         self.cycle_ast_walk_count.get()
     }
 
-    /// Cumulative seeds pushed into the `WorkbookLoader::flush`
-    /// cross-sheet BFS (AUDIT B-5). Stays flat across bulk loads on a
-    /// workbook with no cross-sheet reverse edges.
+    /// Retained for host compatibility. Store propagation has no loader BFS.
     #[doc(hidden)]
     pub fn debug_loader_bfs_seed_count(&self) -> usize {
-        self.loader_bfs_seed_count.get()
+        0
     }
 
-    /// Workbook-level bulk loader (Phase 3 Track I). Collects every
-    /// `set_cell` / `set_formula` / `clear_cell` invocation inside the
-    /// closure, suppresses per-write fanout, then at flush time:
-    ///   1. Replays each sheet's writes inside `Sheet::bulk_load` (so
-    ///      same-sheet dirty + same-sheet subscriber fanout fires AT
-    ///      MOST ONCE per address within that sheet's flush).
-    ///   2. Applies the accumulated `CrossSheetDeps` edge updates.
-    ///   3. Runs one workbook-wide cross-sheet BFS starting at the union
-    ///      of touched `(sheet, addr)` pairs, and notifies each cross-
-    ///      sheet subscriber AT MOST ONCE.
-    ///
-    /// Use this for CSV / xlsx import paths that touch many cells across
-    /// many sheets and where the per-write cross-sheet fanout cost would
-    /// otherwise dominate.
-    ///
-    /// RAII shape mirrors `Sheet::bulk_load`: the loader is not exposed
-    /// outside the closure, so the flush always runs.
     /// STORAGE_PRIMARY Phase 6.1: read the content revision counter
     /// (OD1). Bumped once per `install_sheet_bulk`; hosts compare
     /// successive values to detect whole-sheet replaces that bypass
@@ -1782,56 +1291,32 @@ impl Workbook {
         self.content_revision
     }
 
-    /// Storage-primary bulk install: swap pre-built maps directly into
-    /// the sheet. No per-cell calls, no parse, no dep extraction, no
-    /// ops queue. Formulas hydrate lazily on first read (Phase 2+3
-    /// machinery). This is a FULL-SHEET REPLACE — previous content
-    /// (primitives, hydrated formulas, lazy parking, dep edges, spills,
-    /// and this sheet's outgoing cross-sheet edges) is torn down first.
-    ///
-    /// Cross-sheet correctness without eager parse: after the swap, the
-    /// formula sources are walked once with a cheap `!`-prefilter — a
-    /// formula whose text contains no `!` cannot hold a cross-sheet ref
-    /// (`Sheet2!A1`) and is skipped without parsing. Only the (rare)
-    /// `!`-containing formulas are parsed to install their
-    /// `CrossSheetDeps` edges so move_sheet / cross-sheet dirty
-    /// propagation keep working before first read. False positives are
-    /// acceptable: a `!` inside a string literal (e.g. `="hi!"`)
-    /// triggers one wasted parse whose AST yields zero cross-sheet
-    /// edges — a small perf cost, never a correctness issue. Phase 6.5
-    /// moves this edge install into `hydrate_formula` entirely.
-    ///
-    /// Cross-sheet cycle detection for installed formulas is deferred
-    /// to first read (hydration) — same semantic shift Phase 2+3 made
-    /// for same-sheet cycles, accepted in the RFC.
+    /// Storage-primary bulk install: swap pre-built maps directly into the
+    /// sheet. Formula parsing and dependency discovery stay lazy; when read,
+    /// each formula derives through its formula-inner atom in the shared Store.
     pub fn install_sheet_bulk(
         &mut self,
         sheet_idx: usize,
         primitives: HashMap<CellAddress, Value>,
         formulas: HashMap<CellAddress, String>,
     ) -> Result<BulkInstallStats, InstallError> {
-        let stats = self.install_sheet_bulk_inner(sheet_idx, primitives, formulas)?;
-        // Cross-sheet dirty fanout (codex P2): formulas on OTHER sheets
-        // referencing the replaced sheet must dirty + notify, exactly
-        // like a `set_cell` to every cell would. Cost is proportional
-        // to the workbook's cross-sheet edge count, not installed cells.
-        let mut installed = HashSet::with_capacity(1);
-        installed.insert(sheet_idx);
-        self.fanout_install_cross_sheet_dependents(&installed);
+        let store = self.store.clone();
+        let mut result = None;
+        store.batch(|_| {
+            result = Some(self.install_sheet_bulk_inner(sheet_idx, primitives, formulas));
+        });
+        let (stats, cleanup) = result.expect("sheet install batch closure did not run")?;
+        self.sheets[sheet_idx].finish_bulk_install(cleanup);
         Ok(stats)
     }
 
-    /// Body of [`Self::install_sheet_bulk`] WITHOUT the cross-sheet
-    /// dependent fanout. Split out so [`Self::install_workbook_bulk`]
-    /// can install every sheet first and then run ONE fanout over the
-    /// whole installed set — a dependent referencing two replaced
-    /// sheets must notify once, not once per sheet.
+    /// Body shared by the single-sheet and whole-workbook install APIs.
     fn install_sheet_bulk_inner(
         &mut self,
         sheet_idx: usize,
         primitives: HashMap<CellAddress, Value>,
         formulas: HashMap<CellAddress, String>,
-    ) -> Result<BulkInstallStats, InstallError> {
+    ) -> Result<(BulkInstallStats, BulkInstallCleanup), InstallError> {
         if self.is_inside_custom_call() {
             return Err(InstallError::MutationDuringCustomCall);
         }
@@ -1839,72 +1324,21 @@ impl Workbook {
             return Err(InstallError::SheetOutOfRange(sheet_idx));
         }
 
-        // Tear down the sheet's previous outgoing cross-sheet edges —
-        // every formula that owned them is about to be replaced.
-        self.cross_sheet.remove_all_outgoing_for_sheet(sheet_idx);
-
-        // The swap itself: three map installs on the sheet, no per-cell
-        // ceremony (see `Sheet::bulk_install_storage` for the exact
-        // cost model — primitives are O(n) plain storage writes because
-        // they live behind atoms, formulas are O(n) text parks).
-        let (primitives_installed, formulas_installed) =
+        let (primitives_installed, formulas_installed, cleanup) =
             self.sheets[sheet_idx].bulk_install_storage(primitives, formulas);
-
-        // `!`-prefilter cross-sheet edge scan (see method docs). Edges
-        // are buffered because `for_each_lazy_formula` holds a shared
-        // borrow of the sheet while `add_edge` needs `&mut
-        // self.cross_sheet`.
-        let mut cross_sheet_parsed: usize = 0;
-        let mut edge_buf: Vec<(CellAddress, Vec<CrossSheetRef>)> = Vec::new();
-        {
-            let sheet = &self.sheets[sheet_idx];
-            let by_name = &self.by_name;
-            let named_values = &self.named_values;
-            // Audit B-4: when a registered named value carries a live
-            // cross-sheet ref (e.g. `READDATA = LAMBDA(Data!A1)`), a
-            // parked `=READDATA()` holds a cross-sheet edge with no `!`
-            // in its source — the prefilter must not skip it. The latch
-            // gates the wider parse so the common case (no cross-sheet
-            // named values, which includes every storage-primary bench
-            // shape) keeps the cheap `!`-only scan.
-            let names_may_cross = self.named_values_cross_sheet.get();
-            sheet.for_each_lazy_formula(|addr, source| {
-                if !source.contains('!') && !names_may_cross {
-                    // No `!` → cannot be a cross-sheet ref → skip the
-                    // parse entirely. This is the overwhelmingly common
-                    // same-sheet case.
-                    return;
-                }
-                cross_sheet_parsed += 1;
-                if let Some(expr) = parse_formula(source) {
-                    let edges = collect_cross_sheet_refs(&expr, by_name, named_values);
-                    if !edges.is_empty() {
-                        edge_buf.push((addr, edges));
-                    }
-                }
-            });
-        }
-        if !edge_buf.is_empty() {
-            // Arm the sheet's one-way cross-sheet latch so the read-time
-            // `force_formula_recompute` safety net covers these formulas
-            // even before their first hydration.
-            self.sheets[sheet_idx].arm_cross_sheet_latch();
-        }
-        for (addr, edges) in edge_buf {
-            for edge in edges {
-                self.cross_sheet.add_edge(sheet_idx, addr, edge);
-            }
-        }
 
         // OD1: bump the revision so subscribers / projections know the
         // world changed without per-cell notifications.
         self.content_revision += 1;
 
-        Ok(BulkInstallStats {
-            primitives_installed,
-            formulas_installed,
-            cross_sheet_parsed,
-        })
+        Ok((
+            BulkInstallStats {
+                primitives_installed,
+                formulas_installed,
+                cross_sheet_parsed: 0,
+            },
+            cleanup,
+        ))
     }
 
     /// Whole-workbook variant of [`Self::install_sheet_bulk`] (OD2):
@@ -1929,17 +1363,25 @@ impl Workbook {
                 return Err(InstallError::SheetOutOfRange(*sheet_idx));
             }
         }
-        let installed: HashSet<usize> =
-            payload.iter().map(|(sheet_idx, _, _)| *sheet_idx).collect();
-        let stats = payload
-            .into_iter()
-            .map(|(sheet_idx, primitives, formulas)| {
-                self.install_sheet_bulk_inner(sheet_idx, primitives, formulas)
-            })
-            .collect::<Result<Vec<BulkInstallStats>, InstallError>>()?;
-        // One fanout AFTER all installs so a dependent referencing
-        // several replaced sheets notifies once (shared visited set).
-        self.fanout_install_cross_sheet_dependents(&installed);
+        let store = self.store.clone();
+        let mut result = None;
+        store.batch(|_| {
+            result = Some(
+                payload
+                    .into_iter()
+                    .map(|(sheet_idx, primitives, formulas)| {
+                        self.install_sheet_bulk_inner(sheet_idx, primitives, formulas)
+                            .map(|(stats, cleanup)| (sheet_idx, stats, cleanup))
+                    })
+                    .collect::<Result<Vec<_>, InstallError>>(),
+            );
+        });
+        let installed = result.expect("workbook install batch closure did not run")?;
+        let mut stats = Vec::with_capacity(installed.len());
+        for (sheet_idx, sheet_stats, cleanup) in installed {
+            self.sheets[sheet_idx].finish_bulk_install(cleanup);
+            stats.push(sheet_stats);
+        }
         Ok(stats)
     }
 
@@ -1969,10 +1411,7 @@ enum WorkbookOp {
     /// replay routes `BulkLoader::set_cell_at`. Carrying a `String`
     /// here meant one alloc + one re-parse per op in bulk paths whose
     /// producers already hold a typed address (`restore_sparse`).
-    SetCell {
-        addr: CellAddress,
-        value: Value,
-    },
+    SetCell { addr: CellAddress, value: Value },
     /// `expr` is `Some` when the workbook-side parse succeeded — the
     /// sheet-side flush installs directly without re-parsing. `None`
     /// covers the parse-failure path: the sheet's `set_formula` sees a
@@ -1994,25 +1433,19 @@ enum WorkbookOp {
     /// `CellAddress` already, and the sheet-side replay has a typed
     /// entry (`BulkLoader::set_cell_at`), so carrying a string here
     /// meant one alloc + two parses per cleared cell in a bulk path.
-    ClearCell {
-        addr: CellAddress,
-    },
+    ClearCell { addr: CellAddress },
 }
 
 /// In-progress workbook bulk-load session. Buffers operations until
 /// `flush` runs at the end of `Workbook::bulk_load`. Inside the closure
 /// callers see synchronous returns from `set_formula` (parse / cycle
-/// outcome decided here at queue time) but no subscriber fires and no
-/// dirty fanout — all of that runs in one consolidated `flush`.
+/// outcome decided here at queue time). Store propagation is consolidated by
+/// each sheet's batch replay.
 pub struct WorkbookLoader<'a> {
     wb: &'a mut Workbook,
     /// Per-sheet ordered op queues so the replay inside each sheet's
     /// `Sheet::bulk_load` preserves the caller's order.
     ops_by_sheet: HashMap<usize, Vec<WorkbookOp>>,
-    /// Union of every `(sheet, addr)` that was written during the
-    /// session (across all sheets). The post-flush cross-sheet BFS
-    /// seeds from this set.
-    touched: HashSet<(usize, CellAddress)>,
 }
 
 impl<'a> WorkbookLoader<'a> {
@@ -2020,13 +1453,11 @@ impl<'a> WorkbookLoader<'a> {
         WorkbookLoader {
             wb,
             ops_by_sheet: HashMap::new(),
-            touched: HashSet::new(),
         }
     }
 
-    /// Queue a primitive write at `(sheet_idx, addr)`. Visible to the
-    /// post-flush workbook BFS as a touched cell. Parses the address
-    /// once here; the buffered op carries it typed (A-9 follow-up).
+    /// Queue a primitive write at `(sheet_idx, addr)`. Parses the address once
+    /// here; the buffered op carries it typed.
     pub fn set_cell(&mut self, sheet_idx: usize, addr_str: &str, value: Value) {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return;
@@ -2045,7 +1476,6 @@ impl<'a> WorkbookLoader<'a> {
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
-        self.touched.insert((sheet_idx, addr));
         self.ops_by_sheet
             .entry(sheet_idx)
             .or_default()
@@ -2053,11 +1483,9 @@ impl<'a> WorkbookLoader<'a> {
     }
 
     /// Queue a formula write at `(sheet_idx, addr)`. Returns `false` if
-    /// either the text fails to parse OR the cross-sheet static cycle
-    /// check rejects it. Cross-sheet edges are installed eagerly so
-    /// later ops in the same `bulk_load` see the up-to-date dep graph
-    /// (e.g. for subsequent cycle checks); same-sheet wiring runs
-    /// inside the per-sheet `Sheet::bulk_load` replay at flush time.
+    /// either the text fails to parse or the workbook static cycle check
+    /// rejects it. Pending formulas in the same batch are additionally covered
+    /// by the Store's runtime in-flight cycle guard.
     pub fn set_formula(&mut self, sheet_idx: usize, addr_str: &str, source: &str) -> bool {
         let Some(addr) = CellAddress::parse(addr_str) else {
             return false;
@@ -2075,14 +1503,9 @@ impl<'a> WorkbookLoader<'a> {
             return false;
         }
 
-        // Parse first. Parse failure still records a SetFormula op so
-        // the sheet flush writes `#VALUE!` for us; cross-sheet edge
-        // install is skipped on this branch.
+        // Parse failure still records a SetFormula op so the sheet flush writes
+        // `#VALUE!` through the normal formula API.
         let Some(expr) = parse_formula(source) else {
-            self.touched.insert((sheet_idx, addr));
-            // Tear down any previous cross-sheet edges this addr owned
-            // — a #VALUE! cell has no outgoing deps.
-            self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
             self.ops_by_sheet
                 .entry(sheet_idx)
                 .or_default()
@@ -2094,24 +1517,7 @@ impl<'a> WorkbookLoader<'a> {
             return false;
         };
 
-        // Cross-sheet static cycle check. Use the existing pre-Track-J
-        // path (`collect_workbook_refs` + BFS through `formula_exprs_iter`)
-        // — that map is populated only after the per-sheet flush runs,
-        // so cycles introduced WITHIN the bulk_load against another
-        // bulk-loaded formula slip past this check. That matches the
-        // pre-Track-I `Sheet::bulk_load` behavior (its `would_create_
-        // cycle` only sees already-installed formulas, not pending
-        // ones); the static check still catches cycles against any
-        // formula that existed before the bulk_load started.
-        if self.wb.cross_sheet_cycle(sheet_idx, addr, &expr) {
-            self.touched.insert((sheet_idx, addr));
-            self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
-            // Follow-up `SetCell` writes the `#CYCLE!` error after the
-            // sheet bulk_load lands the formula (which the sheet's own
-            // bulk_load may or may not have flagged as a cycle on its
-            // own — workbook-level cycles can slip past the per-sheet
-            // check). The final SetCell op guarantees the cell holds
-            // `Value::Error(CyclicRef)` once flush completes.
+        if self.wb.closes_workbook_cycle(sheet_idx, addr, &expr) {
             self.ops_by_sheet
                 .entry(sheet_idx)
                 .or_default()
@@ -2121,18 +1527,6 @@ impl<'a> WorkbookLoader<'a> {
                 });
             return false;
         }
-
-        // Install fresh outgoing edges into CrossSheetDeps. Old edges
-        // (if any) are removed first; the new edges go in eagerly so
-        // subsequent `set_formula` calls in the same `bulk_load` see
-        // the up-to-date forward map for their own cycle checks.
-        self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
-        let new_edges = collect_cross_sheet_refs(&expr, &self.wb.by_name, &self.wb.named_values);
-        for edge in new_edges {
-            self.wb.cross_sheet.add_edge(sheet_idx, addr, edge);
-        }
-
-        self.touched.insert((sheet_idx, addr));
         self.ops_by_sheet
             .entry(sheet_idx)
             .or_default()
@@ -2163,27 +1557,16 @@ impl<'a> WorkbookLoader<'a> {
         if sheet_idx >= self.wb.sheets.len() {
             return;
         }
-        self.touched.insert((sheet_idx, addr));
-        self.wb.cross_sheet.remove_outgoing(sheet_idx, addr);
         self.ops_by_sheet
             .entry(sheet_idx)
             .or_default()
             .push(WorkbookOp::ClearCell { addr });
     }
 
-    /// Replay queued ops sheet-by-sheet inside each sheet's
-    /// `Sheet::bulk_load` (so same-sheet subscribers fire at most once
-    /// per address per flush), then run one workbook-wide cross-sheet
-    /// BFS that fires each cross-sheet subscriber at most once.
+    /// Replay queued ops sheet-by-sheet inside each sheet's Store batch.
     fn flush(self) {
-        let WorkbookLoader {
-            wb,
-            ops_by_sheet,
-            touched,
-        } = self;
+        let WorkbookLoader { wb, ops_by_sheet } = self;
 
-        // 1. Per-sheet replay inside the existing `Sheet::bulk_load`
-        //    plumbing. This handles same-sheet dirty/fire dedup.
         for (sheet_idx, ops) in ops_by_sheet {
             let Some(sheet) = wb.sheets.get_mut(sheet_idx) else {
                 continue;
@@ -2237,64 +1620,6 @@ impl<'a> WorkbookLoader<'a> {
                 }
             });
         }
-
-        // 2. Workbook-wide cross-sheet BFS. Seed with the entire touched
-        //    set so EVERY source write contributes to the dirty fanout.
-        //    Within-sheet dependents already fired in step 1; this pass
-        //    is strictly for cross-sheet edges.
-        //
-        // AUDIT B-5 (workbook half) — when the workbook holds no
-        // cross-sheet REVERSE edges at all, every popped seed would find
-        // zero dependents: seeding is O(touched) hash + queue churn for
-        // nothing (a 1M-cell restore = ~3M wasted ops). Skip outright.
-        // The named-values latch is irrelevant here — it gates read-time
-        // force-recompute, not edge-walking; precise `=NAME()` edges land
-        // in these same reverse maps (B-4) and so keep the BFS armed.
-        let has_reverse_edges = !wb.cross_sheet.cell_dependents.is_empty()
-            || wb
-                .cross_sheet
-                .range_index_per_sheet
-                .values()
-                .any(|idx| !idx.is_empty());
-        if !has_reverse_edges {
-            return;
-        }
-        let mut visited: HashSet<(usize, CellAddress)> = HashSet::new();
-        let mut queue: VecDeque<(usize, CellAddress)> = VecDeque::new();
-        wb.loader_bfs_seed_count
-            .set(wb.loader_bfs_seed_count.get() + touched.len());
-        for entry in &touched {
-            queue.push_back(*entry);
-            visited.insert(*entry);
-        }
-        while let Some((sheet_idx, addr)) = queue.pop_front() {
-            // Reverse dependents from the workbook graph (same shape
-            // as `propagate_cross_sheet_dirty`'s inner loop). Visited
-            // dedups so each cross-sheet subscriber fires at most once
-            // across the entire bulk_load.
-            let mut dependents: Vec<(usize, CellAddress)> = Vec::new();
-            if let Some(set) = wb.cross_sheet.cell_dependents.get(&(sheet_idx, addr)) {
-                dependents.extend(set.iter().copied());
-            }
-            if let Some(range_idx) = wb.cross_sheet.range_index_per_sheet.get(&sheet_idx) {
-                for target_addr in range_idx.dependents_of(addr) {
-                    for target_sheet in wb.target_sheets_for_range_dep(target_addr, sheet_idx, addr)
-                    {
-                        dependents.push((target_sheet, target_addr));
-                    }
-                }
-            }
-            for (target_sheet, target_addr) in dependents {
-                if !visited.insert((target_sheet, target_addr)) {
-                    continue;
-                }
-                if let Some(sheet) = wb.sheets.get(target_sheet) {
-                    sheet.mark_dirty_for_addr(target_addr);
-                    sheet.fire_subscribers(target_addr);
-                }
-                queue.push_back((target_sheet, target_addr));
-            }
-        }
     }
 }
 
@@ -2304,406 +1629,12 @@ impl Default for Workbook {
     }
 }
 
-/// Walk an AST and emit every cross-sheet (NOT same-sheet) outgoing
-/// edge as a `CrossSheetRef`. Used by `Workbook::set_formula` to seed
-/// the reverse maps inside `CrossSheetDeps`.
-///
-/// Same-sheet refs (`CellRef`, `Range` with no sheet qualifier) are
-/// deliberately skipped — those are owned by `Sheet::set_formula`'s
-/// own `cell_dependents` / `range_dependents` insert paths and would
-/// double-fire if duplicated here.
-/// Does `expr` contain anything that requires workbook scope to
-/// evaluate correctly? Two surface points qualify:
-///   1. `Expr::Name(_)` — could resolve via the workbook's defined-name
-///      registry (when no LET binding shadows it).
-///   2. `Expr::FuncCall { name, .. }` whose `name` is not a built-in —
-///      could resolve via the registry as a callable lambda.
-///   3. `Expr::SheetRef` / `Expr::SheetRange` — cross-sheet refs.
-///
-/// Used by `Workbook::set_formula` to skip the second-pass workbook-
-/// aware spill recompute when the formula is purely sheet-local +
-/// uses only built-in functions (the dominant case). Without the
-/// gate, every `set_formula` on an array-producing formula would eval
-/// the formula twice; with it, the extra pass only fires for the
-/// minority of formulas that actually depend on workbook scope.
-fn formula_needs_workbook_context(expr: &Expr) -> bool {
-    match expr {
-        Expr::Name(_) | Expr::SheetRef { .. } | Expr::SheetRange { .. } => true,
-        Expr::FuncCall { name, args } => {
-            // A registered (non-builtin) name in function position is
-            // the lambda-call case. Built-ins are recognized via the
-            // eval crate's dispatch list so the gate stays in sync
-            // with the eval loop's resolution order.
-            if !is_builtin_function_name(name) {
-                return true;
-            }
-            args.iter().any(formula_needs_workbook_context)
-        }
-        Expr::BinOp { left, right, .. } => {
-            formula_needs_workbook_context(left) || formula_needs_workbook_context(right)
-        }
-        Expr::Negate(inner) => formula_needs_workbook_context(inner),
-        Expr::Call(callee, args) => {
-            formula_needs_workbook_context(callee)
-                || args.iter().any(formula_needs_workbook_context)
-        }
-        Expr::SpillRef(anchor) => formula_needs_workbook_context(anchor),
-        Expr::DynamicRange { start, end } => {
-            formula_needs_workbook_context(start) || formula_needs_workbook_context(end)
-        }
-        Expr::Number(_)
-        | Expr::Text(_)
-        | Expr::Bool(_)
-        | Expr::Error(_)
-        | Expr::CellRef(_)
-        | Expr::Range { .. } => false,
-        Expr::ArrayLit { data, .. } => data.iter().any(formula_needs_workbook_context),
-        // Multi-area: a cross-sheet ref inside the union still demands
-        // workbook context. Same-sheet-only unions stay sheet-local.
-        Expr::MultiArea(parts) => parts.iter().any(formula_needs_workbook_context),
-    }
-}
-
-/// Recursive AST walk: does `expr` reference the defined name `key`
-/// anywhere? `key` is the uppercased form; comparisons are
-/// case-insensitive (Excel parity — `=Foo` and `=FOO` resolve the same
-/// way). Returns `true` if the name appears as either a bare
-/// `Expr::Name` or as the target of an `Expr::FuncCall` (the two
-/// surface points where the eval loop consults the registry).
-///
-/// Used by `Workbook::invalidate_formulas_using_name` to flip cached
-/// formulas dirty when the named entry is added / replaced / removed.
-fn formula_references_name(expr: &Expr, key: &str) -> bool {
-    match expr {
-        Expr::Name(n) => n.eq_ignore_ascii_case(key),
-        Expr::FuncCall { name, args } => {
-            if name.eq_ignore_ascii_case(key) {
-                return true;
-            }
-            args.iter().any(|a| formula_references_name(a, key))
-        }
-        Expr::BinOp { left, right, .. } => {
-            formula_references_name(left, key) || formula_references_name(right, key)
-        }
-        Expr::Negate(inner) => formula_references_name(inner, key),
-        Expr::Call(callee, args) => {
-            formula_references_name(callee, key)
-                || args.iter().any(|a| formula_references_name(a, key))
-        }
-        Expr::SpillRef(anchor) => formula_references_name(anchor, key),
-        Expr::DynamicRange { start, end } => {
-            formula_references_name(start, key) || formula_references_name(end, key)
-        }
-        Expr::Number(_)
-        | Expr::Text(_)
-        | Expr::Bool(_)
-        | Expr::Error(_)
-        | Expr::CellRef(_)
-        | Expr::Range { .. }
-        | Expr::SheetRef { .. }
-        | Expr::SheetRange { .. } => false,
-        Expr::ArrayLit { data, .. } => data.iter().any(|e| formula_references_name(e, key)),
-        // Multi-area parts are themselves refs (CellRef / Range /
-        // SheetRef / SheetRange), so none of them can reference a
-        // defined name. Kept as an explicit `false` for clarity.
-        Expr::MultiArea(_) => false,
-    }
-}
-
-/// Walk `expr` and collect every cross-sheet edge it implies.
-///
-/// Audit B-4: `named_values` is consulted so refs hidden behind a
-/// defined name are visible too — `=READDATA()` where
-/// `READDATA = LAMBDA(Data!A1)` must register an edge into `Data`,
-/// otherwise a later write to `Data!A1` finds no edge, no dirty mark,
-/// and the cell serves its stale cached value forever. Both
-/// `Expr::Name` (bare reference) and `Expr::FuncCall` (named-lambda
-/// call) resolve through the registry; lambda BODIES (and captured
-/// lambda bindings) are walked recursively with a visited-name set so
-/// mutually-recursive named lambdas terminate.
-/// Audit B-4 (latch half): does a registry-bound `Value` carry a LIVE
-/// cross-sheet reference? Only `Value::Lambda` can — its body is an
-/// unevaluated AST; everything else was materialized eagerly by
-/// `define_name`. No name resolution is needed here: each named lambda
-/// is checked against ITS OWN body when IT is registered, so a chain
-/// like `A = LAMBDA(B())` is covered by `B`'s own registration arming
-/// the latch. Captured lambdas are finite snapshot trees, so the
-/// recursion terminates without a visited set.
-fn named_value_has_sheet_ref(value: &Value) -> bool {
-    if let Value::Lambda(arc) = value {
-        if let Some(lambda) = arc.as_any().downcast_ref::<ExcelLambda>() {
-            return expr_has_sheet_ref(&lambda.body)
-                || lambda
-                    .captured
-                    .iter()
-                    .any(|(_, captured)| named_value_has_sheet_ref(captured));
-        }
-    }
-    false
-}
-
-fn collect_cross_sheet_refs(
-    expr: &Expr,
-    by_name: &HashMap<String, usize>,
-    named_values: &BTreeMap<String, NamedEntry>,
-) -> Vec<CrossSheetRef> {
-    let mut out: Vec<CrossSheetRef> = Vec::new();
-    let mut visiting: HashSet<String> = HashSet::new();
-    collect_cross_sheet_refs_into(expr, by_name, named_values, &mut out, &mut visiting);
-    out
-}
-
-/// Resolve a (possibly defined) `name` through the named-value registry
-/// and collect cross-sheet refs out of the bound value. `visiting`
-/// holds every name already on the resolution stack (uppercased) —
-/// inserting it permanently both guards name cycles
-/// (`A = LAMBDA(B())`, `B = LAMBDA(A())`) and dedups repeated
-/// references; edges are a union, so never re-walking a name is safe.
-fn collect_named_cross_sheet_refs_into(
-    name: &str,
-    by_name: &HashMap<String, usize>,
-    named_values: &BTreeMap<String, NamedEntry>,
-    out: &mut Vec<CrossSheetRef>,
-    visiting: &mut HashSet<String>,
-) {
-    let key = name.to_ascii_uppercase();
-    if !visiting.insert(key.clone()) {
-        return; // name cycle / already walked
-    }
-    if let Some(entry) = named_values.get(&key) {
-        collect_value_cross_sheet_refs_into(&entry.value, by_name, named_values, out, visiting);
-    }
-}
-
-/// Collect cross-sheet refs out of a registry-bound `Value`. Only
-/// `Value::Lambda` can carry LIVE references (its body is an unevaluated
-/// AST); every other variant is an already-materialized snapshot
-/// (`define_name` evaluates eagerly), so `=Data!A1`-style scalar
-/// bindings hold a copy, not a reference, and contribute no edge.
-/// Captured LET bindings are walked too — a lambda returned from
-/// `LET(f, LAMBDA(Data!A1), LAMBDA(f()))` reaches its cross-sheet ref
-/// only through the captured `f`.
-fn collect_value_cross_sheet_refs_into(
-    value: &Value,
-    by_name: &HashMap<String, usize>,
-    named_values: &BTreeMap<String, NamedEntry>,
-    out: &mut Vec<CrossSheetRef>,
-    visiting: &mut HashSet<String>,
-) {
-    if let Value::Lambda(arc) = value {
-        if let Some(lambda) = arc.as_any().downcast_ref::<ExcelLambda>() {
-            collect_cross_sheet_refs_into(&lambda.body, by_name, named_values, out, visiting);
-            for (_, captured) in &lambda.captured {
-                collect_value_cross_sheet_refs_into(captured, by_name, named_values, out, visiting);
-            }
-        }
-    }
-}
-
-fn collect_cross_sheet_refs_into(
-    expr: &Expr,
-    by_name: &HashMap<String, usize>,
-    named_values: &BTreeMap<String, NamedEntry>,
-    out: &mut Vec<CrossSheetRef>,
-    visiting: &mut HashSet<String>,
-) {
-    match expr {
-        Expr::CellRef(_) | Expr::Range { .. } => {
-            // Same-sheet refs/ranges are owned by `Sheet::set_formula`.
-        }
-        Expr::SpillRef(anchor) => {
-            collect_cross_sheet_refs_into(anchor, by_name, named_values, out, visiting)
-        }
-        Expr::DynamicRange { start, end } => {
-            collect_cross_sheet_refs_into(start, by_name, named_values, out, visiting);
-            collect_cross_sheet_refs_into(end, by_name, named_values, out, visiting);
-        }
-        Expr::SheetRef { sheet, addr } => {
-            if let Some(&idx) = by_name.get(sheet) {
-                out.push(CrossSheetRef::Cell(idx, *addr));
-            }
-            // Unknown sheet → dropped. Read time will surface #REF!.
-        }
-        Expr::SheetRange {
-            sheet, start, end, ..
-        } => {
-            if let Some(&idx) = by_name.get(sheet) {
-                out.push(CrossSheetRef::Range(
-                    idx,
-                    CellRange::new(*start, *end).normalize(),
-                ));
-            }
-            // Unknown sheet → dropped. Read time will surface #REF!.
-        }
-        Expr::BinOp { left, right, .. } => {
-            collect_cross_sheet_refs_into(left, by_name, named_values, out, visiting);
-            collect_cross_sheet_refs_into(right, by_name, named_values, out, visiting);
-        }
-        Expr::Negate(inner) => {
-            collect_cross_sheet_refs_into(inner, by_name, named_values, out, visiting)
-        }
-        Expr::FuncCall { name, args } => {
-            // Audit B-4: the call target may be a defined-name LAMBDA
-            // whose body reads another sheet (`=READDATA()`). Built-in
-            // names never appear in the registry (`define_name` rejects
-            // the collision), so this lookup is a cheap miss for the
-            // common case.
-            collect_named_cross_sheet_refs_into(name, by_name, named_values, out, visiting);
-            for a in args {
-                collect_cross_sheet_refs_into(a, by_name, named_values, out, visiting);
-            }
-        }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
-        // Audit B-4: a bare name may resolve to a defined value. LET
-        // bindings shadow the registry at eval time, so a LET-bound
-        // `x` that collides with a defined name produces a false-
-        // positive edge here — harmless over-approximation (a spurious
-        // dirty mark at worst, never a missed one).
-        Expr::Name(name) => {
-            collect_named_cross_sheet_refs_into(name, by_name, named_values, out, visiting);
-        }
-        // Immediate-call: descend into callee + args so cross-sheet refs
-        // hidden inside a LAMBDA body still register.
-        Expr::Call(callee, args) => {
-            collect_cross_sheet_refs_into(callee, by_name, named_values, out, visiting);
-            for a in args {
-                collect_cross_sheet_refs_into(a, by_name, named_values, out, visiting);
-            }
-        }
-        // Constant-array literal can't carry a cross-sheet ref (parser
-        // rejected SheetRef / SheetRange inside `{...}`).
-        Expr::ArrayLit { .. } => {}
-        // Multi-area: descend into every inner ref so cross-sheet refs
-        // inside the union register against `by_name`.
-        Expr::MultiArea(parts) => {
-            for p in parts {
-                collect_cross_sheet_refs_into(p, by_name, named_values, out, visiting);
-            }
-        }
-    }
-}
-
-/// Walk an AST and append every (sheet_idx, addr) it directly references
-/// onto `out`. `current_idx` is the sheet the AST lives on (used for
-/// `CellRef` / `Range`). `SheetRef` arms resolve their sheet name through
-/// `by_name`; unknown sheet names are dropped (eval-time will return
-/// `#REF!`, which doesn't form a cycle).
-///
-/// **Phase 3 Track J**: used exclusively for the CANDIDATE expression
-/// inside `Workbook::cross_sheet_cycle`. Visited (already-installed)
-/// formulas pull their edges from `CrossSheetDeps::formula_refs` instead
-/// — that's the whole point of the forward index, and avoids re-walking
-/// each visited formula's AST. Kept free so it doesn't borrow `self`.
-/// Range expansion is naive (every cell in the rectangle) because the
-/// seed list feeds into a BFS that gates on dep-graph membership, so
-/// large empty ranges only cost `Vec` pushes here, not unbounded
-/// recursion.
-fn collect_workbook_refs(
-    expr: &Expr,
-    current_idx: usize,
-    by_name: &HashMap<String, usize>,
-    out: &mut Vec<(usize, CellAddress)>,
-) {
-    match expr {
-        Expr::CellRef(addr) => out.push((current_idx, *addr)),
-        Expr::Range {
-            start,
-            end,
-            unbounded,
-        } => {
-            // Unbounded ranges aren't expanded — the cross-sheet cycle BFS
-            // gates on `formula_exprs` membership per-sheet, and an
-            // unbounded enumeration here would push the entire coordinate
-            // space (u32::MAX entries). Cross-sheet cycles involving an
-            // unbounded range stay detectable through the in-sheet
-            // range_dependents path, which is consulted at dirty
-            // propagation time.
-            if !matches!(unbounded, RangeBounds::None) {
-                return;
-            }
-            let min_row = start.row.min(end.row);
-            let max_row = start.row.max(end.row);
-            let min_col = start.col.min(end.col);
-            let max_col = start.col.max(end.col);
-            for row in min_row..=max_row {
-                for col in min_col..=max_col {
-                    out.push((current_idx, CellAddress::new(row, col)));
-                }
-            }
-        }
-        Expr::BinOp { left, right, .. } => {
-            collect_workbook_refs(left, current_idx, by_name, out);
-            collect_workbook_refs(right, current_idx, by_name, out);
-        }
-        Expr::Negate(inner) => collect_workbook_refs(inner, current_idx, by_name, out),
-        Expr::FuncCall { args, .. } => {
-            for a in args {
-                collect_workbook_refs(a, current_idx, by_name, out);
-            }
-        }
-        Expr::SheetRef { sheet, addr } => {
-            if let Some(&idx) = by_name.get(sheet) {
-                out.push((idx, *addr));
-            }
-            // Unknown sheet name → dropped. Eval will surface #REF! at read
-            // time; doesn't participate in cycles.
-        }
-        Expr::SheetRange {
-            sheet,
-            start,
-            end,
-            unbounded,
-        } => {
-            let Some(&idx) = by_name.get(sheet) else {
-                return;
-            };
-            if !matches!(unbounded, RangeBounds::None) {
-                return;
-            }
-            let min_row = start.row.min(end.row);
-            let max_row = start.row.max(end.row);
-            let min_col = start.col.min(end.col);
-            let max_col = start.col.max(end.col);
-            for row in min_row..=max_row {
-                for col in min_col..=max_col {
-                    out.push((idx, CellAddress::new(row, col)));
-                }
-            }
-        }
-        Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) => {}
-        // LET-bound names don't reference cells in the cross-sheet graph.
-        Expr::Name(_) => {}
-        Expr::SpillRef(anchor) => collect_workbook_refs(anchor, current_idx, by_name, out),
-        Expr::DynamicRange { start, end } => {
-            collect_workbook_refs(start, current_idx, by_name, out);
-            collect_workbook_refs(end, current_idx, by_name, out);
-        }
-        // Immediate-call: descend into callee + args.
-        Expr::Call(callee, args) => {
-            collect_workbook_refs(callee, current_idx, by_name, out);
-            for a in args {
-                collect_workbook_refs(a, current_idx, by_name, out);
-            }
-        }
-        // Constant-array literal carries no cell or sheet references.
-        Expr::ArrayLit { .. } => {}
-        // Multi-area: descend into every inner ref so workbook-level
-        // BFS sees every cell mentioned in the union.
-        Expr::MultiArea(parts) => {
-            for p in parts {
-                collect_workbook_refs(p, current_idx, by_name, out);
-            }
-        }
-    }
-}
-
 struct WorkbookEvalProvider<'a> {
     wb: &'a Workbook,
     current: Cell<usize>,
-    /// Cell currently being evaluated. Mirrors `SheetEvalProvider`: pushed
-    /// by `Sheet::eval_formula_at_with_provider` via `set_current_cell` so
-    /// `ROW()` / `COLUMN()` no-arg calls can return the formula's own
-    /// row/column even when eval crosses sheets.
+    /// Cell currently being evaluated. Mirrors `SheetEvalProvider`; evaluator
+    /// save/restore calls keep no-arg `ROW()` / `COLUMN()` anchored to the
+    /// current expression when this compatibility provider is used.
     current_cell: Cell<Option<CellAddress>>,
 }
 
@@ -2759,27 +1690,6 @@ impl<'a> EvalProvider for WorkbookEvalProvider<'a> {
         self.with_current(idx, || {
             self.wb.sheets[idx].peek_value_with_provider(addr, self)
         })
-    }
-
-    fn force_formula_recompute(&self) -> bool {
-        // Safety net for the "raw" `wb.sheet_mut(idx).set_cell(...)` path,
-        // which bypasses cross-sheet dirty fanout (see
-        // `raw_sheet_write_does_not_fire_cross_sheet_subscriber`). When the
-        // workbook has zero cross-sheet state, no formula can have a stale
-        // cross-sheet cache, so the bypass is unnecessary and every
-        // `wb.get_cell` read can hit `FormulaCache::Clean`. This is the
-        // common case for single-sheet workbooks (the chain perf bench's
-        // Chain100/1k/10k/100k all live on Sheet1 only) and turns the
-        // steady-state read from O(formulas) re-evals into O(1).
-        //
-        // `has_any_cross_sheet_edges` ORs the registered-edge map with
-        // each sheet's `has_cross_sheet_refs` latch, so the bypass also
-        // stays armed when a formula is installed via the raw
-        // `wb.sheet_mut(idx).set_formula(...)` path (which skips edge
-        // registration) — without that OR, codex's repro
-        // (`raw_path_cross_sheet_recompute_stays_correct`) leaked the
-        // stale cached value.
-        self.wb.has_any_cross_sheet_edges()
     }
 
     /// Sparse override for the workbook context. Routes the formula-cell
@@ -2970,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_range_scans_sparse_and_dirties_cross_sheet_dependents() {
+    fn clear_range_scans_sparse_and_rederives_cross_sheet_dependents() {
         let mut wb = Workbook::new();
         let data_idx = wb.add_sheet("Data");
         wb.set_cell(data_idx, "A1", Value::Number(41.0));
@@ -2979,6 +1889,7 @@ mod tests {
 
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(42.0));
         assert_eq!(wb.debug_formula_cache_state(0, "B1"), "clean");
+        let before = wb.debug_formula_eval_count(0);
 
         let cleared = wb.clear_range(
             data_idx,
@@ -2986,7 +1897,8 @@ mod tests {
         );
 
         assert_eq!(cleared, 1);
-        assert_eq!(wb.debug_formula_cache_state(0, "B1"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(0, "B1"), "clean");
+        assert_eq!(wb.debug_formula_eval_count(0), before + 1);
         assert_eq!(wb.sheet(data_idx).unwrap().non_empty_addrs(), vec!["C3"]);
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(1.0));
     }
@@ -3041,11 +1953,8 @@ mod tests {
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(50.0));
-        // Sheet1!B1 = =Data!A1 * 2 — formula sits on Sheet1 but reads Data.
-        // Install via the workbook API so the cross-sheet edge gets
-        // registered (the raw `sheet_mut().set_formula` path skips that
-        // registration and relies on the read-time `force_formula_recompute`
-        // safety net; canonical hosts always go through the workbook).
+        // Sheet1!B1 = =Data!A1 * 2. Both sheets share one workbook Store,
+        // so the formula-inner atom reads Data!A1 through its target facade.
         assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
 
         // wb.get_cell evaluates through WorkbookEvalProvider.
@@ -3105,13 +2014,12 @@ mod tests {
     }
 
     #[test]
-    fn workbook_get_cell_only_recomputes_formulas_on_target_dep_chain() {
+    fn workbook_get_cell_materializes_only_target_atom_chain() {
         // Build a sheet with two independent cross-sheet formula chains:
         //   B1 = =Data!A1 * 2   (chain A — what we'll read)
         //   D1 = =Data!A1 + 1   (chain B — must NOT be touched by reading B1)
         //   E1 = =Data!A1 + 5   (chain B continued)
-        // Whole-sheet sweep would refresh all three; the targeted walk
-        // should only touch B1.
+        // Reading B1 should materialize only its Store dependency chain.
         let mut wb = Workbook::new();
         wb.add_sheet("Data");
         wb.sheet_by_name_mut("Data")
@@ -3125,38 +2033,35 @@ mod tests {
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(20.0));
         let after = wb.sheet(0).unwrap().debug_recompute_count();
 
-        // Lazy formulas no longer use core derived recompute. Reading B1
-        // should compute through Sheet formula records only.
         assert_eq!(
             after - before,
-            0,
-            "reading B1 must not force core derived recomputes"
+            3,
+            "reading B1 should materialize formula-inner, facade, and source facade atoms"
         );
+        assert_eq!(wb.debug_formula_eval_count(0), 1);
+        assert_eq!(wb.debug_formula_cache_state(0, "B1"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(0, "D1"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(0, "E1"), "dirty");
     }
 
     #[test]
     fn workbook_get_cell_walks_local_dep_chain_to_cross_sheet() {
         // C1 = =B1 + 100  (no SheetRef directly)
         // B1 = =Data!A1 * 2  (cross-sheet)
-        // Reading C1 (no SheetRef on its own AST) must transitively force
-        // B1 (which DOES have SheetRef) so the cross-sheet value reaches
-        // C1 via dependent recomputation.
+        // Reading C1 materializes its local B1 dependency, whose formula-inner
+        // atom then reads Data!A1 from the same workbook Store.
         let mut wb = Workbook::new();
         wb.add_sheet("Data");
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(3.0));
-        // Install via the workbook API so the cross-sheet edge gets
-        // registered — `force_formula_recompute` keys off
-        // `has_any_cross_sheet_edges()`.
         assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
         assert!(wb.set_formula(0, "C1", "=B1+100"));
 
         // Initial read: B1 should resolve to 6, C1 to 106.
         assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(106.0));
 
-        // Mutate cross-sheet source. Re-reading C1 must follow the change
-        // (proves the targeted walk reaches B1, otherwise B1 stays cached).
+        // Mutating Data!A1 synchronously rederives the materialized chain.
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(4.0));
@@ -3164,9 +2069,11 @@ mod tests {
     }
 
     #[test]
-    fn workbook_get_cell_no_cross_sheet_chain_does_no_recompute() {
-        // Reading a primitive (or a same-sheet-only formula) should force
-        // zero recomputes because no SheetRef is on the dep chain.
+    fn workbook_get_cell_no_cross_sheet_chain_uses_store_recompute_path() {
+        // Reading a same-sheet-only formula through the workbook should stay
+        // on the atomm facade/formula-inner path. The first read therefore
+        // records Store recomputes (facade/inner/source facade) without a
+        // workbook-provider override.
         let mut wb = Workbook::new();
         wb.sheet_mut(0).unwrap().set_cell("A1", Value::Number(7.0));
         wb.sheet_mut(0).unwrap().set_formula("B1", "=A1*2");
@@ -3174,26 +2081,24 @@ mod tests {
         let before = wb.sheet(0).unwrap().debug_recompute_count();
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
         let after = wb.sheet(0).unwrap().debug_recompute_count();
-        assert_eq!(after - before, 0, "no cross-sheet on dep chain → no force");
+        assert_eq!(
+            after - before,
+            3,
+            "same-sheet workbook read must stay on the atomm Store path"
+        );
     }
 
     #[test]
     fn same_sheet_formula_unaffected_by_workbook_get() {
-        // Formulas without SheetRef should NOT be force-recomputed (cheap
-        // path). Verify by reading a same-sheet formula through wb.get_cell.
+        // Same-sheet formulas use the same facade/formula-inner Store path.
         let mut wb = Workbook::new();
         wb.sheet_mut(0).unwrap().set_cell("A1", Value::Number(3.0));
         wb.sheet_mut(0).unwrap().set_formula("B1", "=A1*4");
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(12.0));
     }
 
-    /// Steady-state read through `wb.get_cell` must hit the formula cache —
-    /// no upstream mutation, so the chain should not re-evaluate. This guards
-    /// the chain perf bench (Chain100 / Chain1k / ... steadyState evalCount)
-    /// against `WorkbookEvalProvider::force_formula_recompute` regressing to
-    /// "always recompute". With the bypass scoped to cross-sheet expressions
-    /// the second read of A100 on a 100-deep same-sheet chain evaluates ZERO
-    /// formulas.
+    /// Steady-state reads through `wb.get_cell` reuse fresh derived atoms.
+    /// With no upstream mutation, the second read of A100 evaluates no formulas.
     #[test]
     fn chain_read_uses_cache_when_unchanged() {
         let mut wb = Workbook::new();
@@ -3221,43 +2126,25 @@ mod tests {
         );
     }
 
-    /// Regression: codex P1 — `WorkbookEvalProvider::force_formula_recompute`
-    /// must keep firing when a cross-sheet formula is installed via the
-    /// raw `wb.sheet_mut(idx).set_formula(...)` path. That path bypasses
-    /// `CrossSheetDeps::formula_refs` registration, so a `formula_refs`-
-    /// only check leaks the stale cached value after the cross-sheet
-    /// source mutates. The per-sheet `has_cross_sheet_refs` latch fixes
-    /// it: the latch is set inside `Sheet::set_formula` (regardless of
-    /// who called it) and OR'd into `has_any_cross_sheet_edges`.
+    /// Formulas installed through `sheet_mut` still use the workbook Store
+    /// context, so cross-sheet dependencies are captured by normal atom reads.
     #[test]
-    fn raw_path_cross_sheet_recompute_stays_correct() {
+    fn raw_path_cross_sheet_formula_uses_shared_store() {
         let mut wb = Workbook::new();
         wb.add_sheet("Data");
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(5.0));
-        // Raw path — bypasses workbook-level edge registration. Formula
-        // still parses as cross-sheet so the sheet-level latch fires.
         assert!(wb.sheet_mut(0).unwrap().set_formula("B1", "=Data!A1*2"));
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
-        // Mutate the cross-sheet source. Pre-fix: `formula_refs` is
-        // empty, `force_formula_recompute` returns false, B1's cached
-        // value (10) leaks through. Post-fix: the sheet-1 latch flips
-        // the gate true and the cached value is rechecked.
         wb.sheet_by_name_mut("Data")
             .unwrap()
             .set_cell("A1", Value::Number(7.0));
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
     }
 
-    /// Regression: codex P1 — `Workbook::remove_sheet` clears the
-    /// cross-sheet dep graph (indices shift; rewriting every edge in
-    /// place is brittle). Formulas on surviving sheets that referenced
-    /// the removed sheet still exist; they now resolve to `#REF!` (or
-    /// blank), but they remain cross-sheet AST shapes. Re-reading them
-    /// after a source mutation must NOT trust the pre-removal cached
-    /// value: the sheet-level latch on the formula's host sheet is
-    /// still set, so `force_formula_recompute` keeps firing.
+    /// Removing and recreating a referenced sheet updates the workbook
+    /// topology root, forcing dependent formula atoms to resolve the name again.
     #[test]
     fn remove_sheet_then_recompute_stays_correct() {
         let mut wb = Workbook::new();
@@ -3269,16 +2156,10 @@ mod tests {
         assert!(wb.set_formula(0, "B1", "=Data!A1*2"));
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
 
-        // Drop the Data sheet. `cross_sheet` is cleared (see
-        // `Workbook::remove_sheet`); the host sheet's latch survives.
         wb.remove_sheet(1);
 
-        // Now install a NEW Data sheet at the same name. Without the
-        // latch, `has_any_cross_sheet_edges()` would still return false
-        // here (formula_refs is empty, nothing repopulates it until the
-        // next workbook-routed set_formula on B1). The latch keeps the
-        // bypass armed so the cache stays honest as the new Data!A1
-        // surfaces through B1.
+        // A new Data sheet with the same name is resolved through the updated
+        // topology version rather than any retained sheet index.
         wb.add_sheet("Data");
         wb.sheet_by_name_mut("Data")
             .unwrap()
@@ -3322,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn move_sheet_preserves_cross_sheet_chain_and_dirty_fanout() {
+    fn move_sheet_preserves_cross_sheet_chain_store_propagation() {
         let mut wb = Workbook::new();
         wb.add_sheet("Sheet2");
         wb.add_sheet("Sheet3");
@@ -3333,13 +2214,11 @@ mod tests {
         assert!(wb.set_formula(0, "C2", "=Sheet2!C2+1"));
 
         assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(13.0));
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 3);
         assert!(wb.move_sheet(2, 0));
 
         assert_eq!(wb.name(0), Some("Sheet3"));
         assert_eq!(wb.name(1), Some("Sheet1"));
         assert_eq!(wb.name(2), Some("Sheet2"));
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 3);
         assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(13.0));
 
         let sheet1 = wb.index_of("Sheet1").unwrap();
@@ -3352,17 +2231,23 @@ mod tests {
         assert_eq!(wb.debug_formula_cache_state(sheet1, "C2"), "clean");
         assert_eq!(wb.debug_formula_cache_state(sheet2, "C2"), "clean");
         assert_eq!(wb.debug_formula_cache_state(sheet3, "C2"), "clean");
+        let sheet1_evals = wb.debug_formula_eval_count(sheet1);
+        let sheet2_evals = wb.debug_formula_eval_count(sheet2);
+        let sheet3_evals = wb.debug_formula_eval_count(sheet3);
 
         wb.set_cell(sheet1, "B4", Value::Number(20.0));
 
-        assert_eq!(wb.debug_formula_cache_state(sheet3, "C2"), "dirty");
-        assert_eq!(wb.debug_formula_cache_state(sheet2, "C2"), "dirty");
-        assert_eq!(wb.debug_formula_cache_state(sheet1, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(sheet3, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(sheet2, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(sheet1, "C2"), "clean");
+        assert_eq!(wb.debug_formula_eval_count(sheet1), sheet1_evals + 1);
+        assert_eq!(wb.debug_formula_eval_count(sheet2), sheet2_evals + 1);
+        assert_eq!(wb.debug_formula_eval_count(sheet3), sheet3_evals + 1);
         assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(23.0));
     }
 
     #[test]
-    fn move_sheet_rebuilds_cross_sheet_range_dependents() {
+    fn move_sheet_retargets_cross_sheet_range_store_path() {
         let mut wb = Workbook::new();
         wb.add_sheet("Data");
         wb.set_cell(1, "A1", Value::Number(1.0));
@@ -3370,14 +2255,15 @@ mod tests {
         assert!(wb.set_formula(0, "B1", "=SUM(Data!A1:A2)"));
 
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(3.0));
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
         assert!(wb.move_sheet(1, 0));
 
         let data = wb.index_of("Data").unwrap();
         let sheet1 = wb.index_of("Sheet1").unwrap();
+        let before = wb.debug_formula_eval_count(sheet1);
         wb.set_cell(data, "A1", Value::Number(10.0));
 
-        assert_eq!(wb.debug_formula_cache_state(sheet1, "B1"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(sheet1, "B1"), "clean");
+        assert_eq!(wb.debug_formula_eval_count(sheet1), before + 1);
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(12.0));
     }
 
@@ -3506,10 +2392,8 @@ mod tests {
     fn cross_sheet_runtime_guard_returns_cycle_when_static_bypassed() {
         // Build a cycle by going through Sheet::set_formula directly, which
         // does NOT have workbook-level cycle detection. Then read through
-        // Workbook::get_cell — the lazy FormulaCache::Computing state must
-        // short-circuit instead of either looping or returning a stale
-        // value. (Pre-lazy this required a separate TLS visited-set guard;
-        // the Computing state covers it natively now.)
+        // Workbook::get_cell. The workbook-scoped in-flight guard shared by
+        // formula-inner atom reads must terminate recursive re-entry.
         let mut wb = Workbook::new();
         wb.add_sheet("Sheet2");
         wb.sheet_mut(0).unwrap().set_formula("A1", "=Sheet2!A1");
@@ -3540,41 +2424,20 @@ mod tests {
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(21.0));
     }
 
-    // === Phase 3 Track I — cross-sheet dirty propagation acceptance ===
+    // === Workbook-scoped Store propagation acceptance ===
 
-    /// Inverse of `workbook_get_cell_refreshes_cross_sheet_cache_without_notifying`.
-    ///
-    /// That test exercises the RAW path (`wb.sheet_by_name_mut("Data").
-    /// set_cell(...)`) which deliberately bypasses the workbook dep
-    /// graph — single-sheet edits should continue to work without
-    /// participating in cross-sheet fanout.
-    ///
-    /// THIS test exercises the workbook-routed path: `wb.set_cell(
-    /// data_idx, "A1", ...)` MUST fire the subscriber on `Sheet1!B1`
-    /// (where `B1 = =Data!A1*2`) because the cross-sheet dep graph
-    /// records the reverse edge `(data_idx, A1) → (sheet1_idx, B1)`.
+    /// A workbook-routed source write publishes a changed materialized
+    /// cross-sheet formula through the shared Store dependency graph.
     #[test]
     fn cross_sheet_write_fires_dependent_subscriber() {
         let mut wb = Workbook::new();
         let data_idx = wb.add_sheet("Data");
         let s1 = wb.index_of("Sheet1").unwrap();
 
-        // Set the cross-sheet source via the raw path — pre-existing
-        // value, not part of what we're measuring.
         wb.sheet_mut(data_idx)
             .unwrap()
             .set_cell("A1", Value::Number(5.0));
-        // Install the cross-sheet formula via the workbook path so the
-        // CrossSheetDeps reverse edge actually lands.
         assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
-
-        // Sanity: the dep graph holds exactly one reverse edge —
-        // `(data_idx, A1) → (s1, B1)`.
-        assert_eq!(
-            wb.debug_cross_sheet_reverse_edge_count(),
-            1,
-            "set_formula must record one cross-sheet reverse edge"
-        );
 
         // Subscribe AFTER the formula is installed so we measure only
         // fanout from the upcoming write.
@@ -3584,8 +2447,6 @@ mod tests {
             *changes_clone.borrow_mut() += 1;
         });
 
-        // Workbook-routed write on Data!A1 — this is the path that
-        // SHOULD propagate dirty + fire the cross-sheet subscriber.
         wb.set_cell(data_idx, "A1", Value::Number(7.0));
 
         assert!(
@@ -3600,14 +2461,10 @@ mod tests {
         );
     }
 
-    /// Confirms the design split: `wb.sheet_mut(idx).set_cell(...)` is
-    /// the "raw" path and is INTENTIONALLY excluded from cross-sheet
-    /// fanout. This complements `cross_sheet_write_fires_dependent_
-    /// subscriber` — if both fired, single-sheet test ergonomics would
-    /// degrade (every sheet-local edit would have to consider the
-    /// workbook graph).
+    /// `sheet_mut` writes participate in cross-sheet propagation because every
+    /// attached sheet shares the workbook-scoped Store context.
     #[test]
-    fn raw_sheet_write_does_not_fire_cross_sheet_subscriber() {
+    fn raw_sheet_write_uses_shared_store_cross_sheet_subscriber() {
         let mut wb = Workbook::new();
         let data_idx = wb.add_sheet("Data");
         let s1 = wb.index_of("Sheet1").unwrap();
@@ -3623,25 +2480,21 @@ mod tests {
             *changes_clone.borrow_mut() += 1;
         });
 
-        // RAW path — deliberately bypasses the workbook graph.
         wb.sheet_mut(data_idx)
             .unwrap()
             .set_cell("A1", Value::Number(7.0));
 
         assert_eq!(
             *changes.borrow(),
-            0,
-            "raw Sheet::set_cell path must NOT fire cross-sheet subscribers"
+            1,
+            "shared Store propagation should publish the changed formula once"
         );
-        // The cached formula result is stale — but the cross-sheet
-        // read path (`wb.get_cell`) still refreshes it on demand via
-        // `WorkbookEvalProvider::force_formula_recompute`.
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
     }
 
     /// Chained cross-sheet propagation: `Sheet1!D = =Sheet2!C`,
-    /// `Sheet2!C = =Sheet3!A`. A write to `Sheet3!A` must dirty BOTH
-    /// `Sheet2!C` and `Sheet1!D` (BFS through one cross-sheet hop).
+    /// `Sheet2!C = =Sheet3!A`. A write to `Sheet3!A` must rederive both
+    /// materialized downstream formula atoms.
     #[test]
     fn cross_sheet_chain_fires_transitive_subscribers() {
         let mut wb = Workbook::new();
@@ -3652,8 +2505,6 @@ mod tests {
         wb.sheet_mut(s3).unwrap().set_cell("A1", Value::Number(1.0));
         assert!(wb.set_formula(s2, "C1", "=Sheet3!A1"));
         assert!(wb.set_formula(s1, "D1", "=Sheet2!C1"));
-        // Edges: (s3, A1) → (s2, C1) and (s2, C1) → (s1, D1) = 2 reverse edges.
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 2);
 
         let s1_changes = Rc::new(RefCell::new(0u32));
         let s2_changes = Rc::new(RefCell::new(0u32));
@@ -3676,14 +2527,13 @@ mod tests {
         );
         assert!(
             *s1_changes.borrow() >= 1,
-            "transitive subscriber on Sheet1!D1 must fire (BFS through Sheet2!C1)"
+            "transitive subscriber on Sheet1!D1 must fire through Sheet2!C1"
         );
         assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(99.0));
     }
 
-    /// `Workbook::clear_cell` propagates dirty fanout the same way as
-    /// writing `Value::Null` — a cleared cross-sheet source must dirty
-    /// downstream formulas.
+    /// Clearing a cross-sheet source publishes the same Store update as writing
+    /// `Value::Null`, so materialized downstream formulas rederive.
     #[test]
     fn cross_sheet_clear_fires_dependent_subscriber() {
         let mut wb = Workbook::new();
@@ -3704,12 +2554,10 @@ mod tests {
         assert!(*changes.borrow() >= 1);
     }
 
-    /// `Workbook::set_formula` clean-up: replacing a formula with one
-    /// that has different cross-sheet refs must remove the stale
-    /// reverse edges so a later write to the old source doesn't fire
-    /// the (now-irrelevant) subscriber.
+    /// Replacing a formula updates its dynamic Store dependencies, so writes to
+    /// the old source no longer publish the formula while the new source does.
     #[test]
-    fn cross_sheet_formula_replacement_drops_stale_reverse_edge() {
+    fn cross_sheet_formula_replacement_drops_stale_store_dependency() {
         let mut wb = Workbook::new();
         let data_idx = wb.add_sheet("Data");
         let extra_idx = wb.add_sheet("Extra");
@@ -3722,15 +2570,9 @@ mod tests {
             .unwrap()
             .set_cell("A1", Value::Number(100.0));
         assert!(wb.set_formula(s1, "B1", "=Data!A1*2"));
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
 
         // Replace with a formula that references Extra instead.
         assert!(wb.set_formula(s1, "B1", "=Extra!A1*2"));
-        assert_eq!(
-            wb.debug_cross_sheet_reverse_edge_count(),
-            1,
-            "still one reverse edge, but now keyed by Extra!A1"
-        );
 
         let changes = Rc::new(RefCell::new(0u32));
         let cc = changes.clone();
@@ -3742,7 +2584,7 @@ mod tests {
         assert_eq!(
             *changes.borrow(),
             0,
-            "stale reverse edge from previous formula was not cleaned up"
+            "the old source must no longer be a Store dependency"
         );
         // Writing the NEW source must fire it.
         wb.set_cell(extra_idx, "A1", Value::Number(8.0));
@@ -3750,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_sheet_range_formula_replacement_drops_stale_reverse_edge() {
+    fn cross_sheet_range_formula_replacement_drops_stale_store_dependency() {
         let mut wb = Workbook::new();
         let data_idx = wb.add_sheet("Data");
         let s1 = wb.index_of("Sheet1").unwrap();
@@ -3759,14 +2601,22 @@ mod tests {
             .unwrap()
             .set_cell("A1", Value::Number(1.0));
         assert!(wb.set_formula(s1, "D1", "=SUM(Data!A1:A10)"));
-        assert_eq!(wb.debug_cross_sheet_reverse_edge_count(), 1);
+        assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(1.0));
 
         assert!(wb.set_formula(s1, "D1", "=1"));
+        let changes = Rc::new(RefCell::new(0u32));
+        let cc = changes.clone();
+        wb.sheet_mut(s1).unwrap().subscribe_cell("D1", move || {
+            *cc.borrow_mut() += 1;
+        });
+
+        wb.set_cell(data_idx, "A5", Value::Number(10.0));
         assert_eq!(
-            wb.debug_cross_sheet_reverse_edge_count(),
+            *changes.borrow(),
             0,
-            "replacing a cross-sheet range formula must remove its range edge"
+            "the replaced range must no longer be a Store dependency"
         );
+        assert_eq!(wb.get_cell("Sheet1", "D1"), Value::Number(1.0));
     }
 
     #[test]
@@ -3847,8 +2697,8 @@ mod tests {
         );
     }
 
-    /// Workbook-level `bulk_load` collects writes and fires each cross-
-    /// sheet subscriber at most once at flush time.
+    /// Workbook-level `bulk_load` coalesces Store propagation and fires each
+    /// cross-sheet subscriber at most once at flush time.
     #[test]
     fn bulk_load_dedups_cross_sheet_subscriber_fanout() {
         let mut wb = Workbook::new();
@@ -3860,8 +2710,8 @@ mod tests {
         wb.sheet_mut(data_idx)
             .unwrap()
             .set_cell("A2", Value::Number(2.0));
-        // Formula depends on BOTH Data!A1 and Data!A2 — two cross-sheet
-        // cell edges feed the same target subscriber.
+        // Formula depends on both sources, but one Store batch should publish
+        // the derived formula only once.
         assert!(wb.set_formula(s1, "B1", "=Data!A1+Data!A2"));
 
         let changes = Rc::new(RefCell::new(0u32));
@@ -3884,39 +2734,26 @@ mod tests {
         assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(30.0));
     }
 
-    /// Phase 3 Track J: `cross_sheet_cycle` should expand visited-node
-    /// edges through `CrossSheetDeps::formula_refs`, NOT by re-parsing
-    /// each visited formula's AST. The probe is the per-workbook counter
-    /// `debug_cycle_ast_walk_count`: a third `set_formula` call
-    /// (`Sheet1!C = =Sheet2!B`) that visits an already-installed
-    /// cross-sheet pair must bump the counter by exactly ONE (for the
-    /// candidate seed AST walk), not by `N` for each visited node.
+    /// Cycle detection walks current formula sources on demand and retains no
+    /// workbook dependency index. The debug counter records one candidate
+    /// cycle-check invocation per `set_formula` call.
     #[test]
-    fn cross_sheet_cycle_via_forward_index_no_collect_workbook_refs_on_visited() {
+    fn cross_sheet_cycle_walks_sources_on_demand_without_retained_graph() {
         let mut wb = Workbook::new();
         wb.add_sheet("Sheet2");
         let s1 = wb.index_of("Sheet1").unwrap();
         let s2 = wb.index_of("Sheet2").unwrap();
 
-        // Install a non-cycle cross-sheet pair so the forward index has
-        // entries the BFS will traverse:
+        // Install a non-cycle cross-sheet pair that the next check traverses:
         //   `Sheet1!A1 = =Sheet2!B1`
         //   `Sheet2!B1 = =Sheet1!D1`
-        // After this, formula_refs[(s1, A1)] = [(s2, B1)] and
-        // formula_refs[(s2, B1)] = [(s1, D1)].
         assert!(wb.set_formula(s1, "A1", "=Sheet2!B1"));
         assert!(wb.set_formula(s2, "B1", "=Sheet1!D1"));
 
-        // Baseline counter before the probed call (already 2: one bump
-        // per cycle check, one per set_formula above).
         let before = wb.debug_cycle_ast_walk_count();
 
-        // Third formula: `Sheet1!C1 = =Sheet2!B1`. The candidate seed
-        // edges are `[(s2, B1)]`. From there, the BFS consults
-        // `formula_refs[(s2, B1)] = [(s1, D1)]`, then
-        // `formula_refs[(s1, D1)]` (empty → stop). `(s1, C1)` (the
-        // target) is never reached, so this is NOT a cycle.
-        // The candidate AST walk runs exactly once → counter += 1.
+        // The traversal reaches Sheet2!B1 and Sheet1!D1, but never the
+        // candidate Sheet1!C1, so this is not a cycle.
         assert!(
             wb.set_formula(s1, "C1", "=Sheet2!B1"),
             "re-reader of an existing cross-sheet source is not a cycle"
@@ -3926,11 +2763,7 @@ mod tests {
         let delta = after - before;
         assert_eq!(
             delta, 1,
-            "cross_sheet_cycle must call collect_workbook_refs exactly once \
-             per set_formula (for the candidate seed). Visited nodes should \
-             pull their edges from formula_refs, not the AST. Got {} \
-             AST walks across this set_formula call.",
-            delta
+            "each set_formula should record one on-demand cycle check; got {delta}"
         );
 
         // Sanity: the chain still evaluates correctly.
@@ -3940,73 +2773,32 @@ mod tests {
         ));
     }
 
-    /// Phase 3 Track J.2: cycles threaded through SAME-sheet hops via
-    /// unqualified `Expr::CellRef` in visited formulas are NOT caught
-    /// by the static `cross_sheet_cycle`. The forward index stores only
-    /// cross-sheet (`Expr::SheetRef`) edges; unqualified same-sheet
-    /// `CellRef`s are owned by `Sheet`'s own `cell_dependents` and
-    /// don't surface in `formula_refs`. The BFS therefore stops at the
-    /// first visited node whose only outgoing edges are same-sheet.
+    /// Static cycle detection follows both same-sheet and cross-sheet hops by
+    /// walking each reachable formula source on demand.
     ///
-    /// These cases MUST be caught at runtime by `FormulaCache::Computing`
-    /// — recursive eval into a cell already on the stack returns
-    /// `Value::Error(ValueError::CyclicRef)` instead of looping or
-    /// blowing the stack.
-    ///
-    /// Setup (note `=C1` not `=Sheet2!C1` — the unqualified form is what
-    /// makes the cycle invisible to the static workbook check):
+    /// Setup:
     ///   - `Sheet1!A1 = =Sheet2!B1` — cross-sheet edge.
-    ///   - `Sheet2!B1 = =C1` (set via `Sheet::set_formula` to skip the
-    ///     workbook-level seed; sheet-local check passes because C1 is
-    ///     empty at install time).
-    ///   - `Sheet2!C1 = =Sheet1!A1` — cross-sheet edge. The candidate
-    ///     seed is `(s1, A1)`. From `formula_refs[(s1, A1)] = [(s2, B1)]`,
-    ///     then `formula_refs[(s2, B1)]` is EMPTY (same-sheet refs not
-    ///     indexed). Cycle missed by the static check.
-    ///
-    /// Read at any node of the cycle. The lazy FormulaCache::Computing
-    /// state short-circuits the second re-entry; the cell value is an
-    /// Error (cycle) or Null, never a stale numeric.
+    ///   - `Sheet2!B1 = =C1` — same-sheet edge.
+    ///   - `Sheet2!C1 = =Sheet1!A1` — closing cross-sheet edge.
     #[test]
-    fn runtime_cycle_returns_cycle_error_value_through_same_sheet_hop() {
+    fn static_cycle_check_follows_same_sheet_hop() {
         let mut wb = Workbook::new();
         wb.add_sheet("Sheet2");
         let s1 = wb.index_of("Sheet1").unwrap();
         let s2 = wb.index_of("Sheet2").unwrap();
 
-        // Install Sheet1!A1 = =Sheet2!B1 via the workbook path so the
-        // forward index records the cross-sheet edge.
         assert!(wb.set_formula(s1, "A1", "=Sheet2!B1"));
 
-        // Sheet2!B1 = =C1 (unqualified) via the sheet path — skips
-        // workbook-level seeding so `formula_refs[(s2, B1)]` stays empty.
-        // The sheet-local cycle check passes because C1 is empty.
         wb.sheet_mut(s2).unwrap().set_formula("B1", "=C1");
 
-        // Sheet2!C1 = =Sheet1!A1 via the workbook path. The static
-        // workbook check seeds at `(s1, A1)`, walks to `(s2, B1)`, then
-        // stops (`formula_refs[(s2, B1)]` is empty — same-sheet `=C1` is
-        // not indexed). So this install IS accepted.
         assert!(
-            wb.set_formula(s2, "C1", "=Sheet1!A1"),
-            "static check should NOT flag this — same-sheet =C1 hop in B1 \
-             is invisible to formula_refs"
+            !wb.set_formula(s2, "C1", "=Sheet1!A1"),
+            "the on-demand source walk must detect the same-sheet hop"
         );
-
-        // Reading any node of the cycle must terminate and surface an
-        // Error/Null. The runtime FormulaCache::Computing guard returns
-        // `Value::Error(CyclicRef)` on the re-entry attempt.
-        let va = wb.get_cell("Sheet1", "A1");
-        let vb = wb.get_cell("Sheet2", "B1");
-        let vc = wb.get_cell("Sheet2", "C1");
-        for (label, v) in [("A1", &va), ("B1", &vb), ("C1", &vc)] {
-            assert!(
-                matches!(v, Value::Null | Value::Error(_)),
-                "{} must surface cycle as Error/Null, got {:?}",
-                label,
-                v
-            );
-        }
+        assert_eq!(
+            wb.get_cell("Sheet2", "C1"),
+            Value::Error(ValueError::CyclicRef)
+        );
     }
 
     // === Wave 8 codex-review fix #1: re-entrancy guard ===

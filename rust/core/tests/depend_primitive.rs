@@ -7,6 +7,9 @@
 //! These tests pin its three contract properties directly. See the doc
 //! comment on `ReadArgs::depend` in `rust/core/src/store.rs` and the P4c
 //! cycle-semantics design (F1) in `rust/docs/ATOM_DELEGATION_REWRITE_PLAN.md`.
+//! `Store::reverse_dependents` exposes this same committed back-dep graph as a
+//! read-only traversal for callers that need to map atom state back to external
+//! structures without maintaining a second dependency index.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -100,4 +103,30 @@ fn depend_on_self_records_no_edge() {
     assert_eq!(as_n(store.get(selfish)), 42.0);
     // No self-edge: `selfish` is nobody's dependent, including its own.
     assert_eq!(store.debug_dependent_count(selfish), 0);
+}
+
+#[test]
+fn reverse_dependents_enumerates_committed_back_deps_transitively() {
+    let store = Store::new();
+    let src = store.create_atom(n(1.0));
+    let other = store.create_atom(n(10.0));
+
+    let first = store.create_derived_ctx(move |args| n(as_n(args.get(src)) + 1.0));
+    let second = store.create_derived_ctx(move |args| n(as_n(args.get(first)) * 2.0));
+    let sibling =
+        store.create_derived_ctx(move |args| n(as_n(args.get(src)) + as_n(args.get(other))));
+    let isolated = store.create_derived_ctx(move |args| n(as_n(args.get(other))));
+
+    assert_eq!(as_n(store.get(second)), 4.0);
+    assert_eq!(as_n(store.get(sibling)), 11.0);
+    assert_eq!(as_n(store.get(isolated)), 10.0);
+
+    let from_src = store.reverse_dependents(&[src]);
+    assert!(from_src.contains(&first));
+    assert!(from_src.contains(&second));
+    assert!(from_src.contains(&sibling));
+    assert!(!from_src.contains(&src));
+    assert!(!from_src.contains(&isolated));
+
+    assert_eq!(store.reverse_dependents(&[first]), vec![second]);
 }

@@ -96,11 +96,7 @@ fn stats_special_functions_through_workbook() {
     wb.set_formula(0, "A5", "=ERFC(1)"); // 1 - erf(1)
 
     assert!(approx_eq(num(&wb, "A1"), 24.0, 1e-9));
-    assert!(approx_eq(
-        num(&wb, "A2"),
-        std::f64::consts::PI.sqrt(),
-        1e-9
-    ));
+    assert!(approx_eq(num(&wb, "A2"), std::f64::consts::PI.sqrt(), 1e-9));
     assert!(approx_eq(num(&wb, "A3"), 24.0_f64.ln(), 1e-9));
     assert!(approx_eq(num(&wb, "A4"), 0.842_700_792_949_715, 1e-6));
     assert!(approx_eq(num(&wb, "A5"), 1.0 - 0.842_700_792_949_715, 1e-6));

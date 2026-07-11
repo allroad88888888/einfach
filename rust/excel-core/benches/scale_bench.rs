@@ -18,8 +18,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
-use einfach_excel_core::{Sheet, Workbook};
 use einfach_core::Value;
+use einfach_excel_core::{Sheet, Workbook};
 
 // === Sizing knobs ===========================================================
 //
@@ -83,9 +83,7 @@ fn bench_bulk_load_100k_formulas(c: &mut Criterion) {
     let dest_addrs: Vec<String> = (0..N_FORMULAS)
         .map(|i| addr_of((i as u32) + 1, 1)) // column B, rows 2..N+1
         .collect();
-    let formulas: Vec<String> = (0..N_FORMULAS)
-        .map(|i| format!("=A{}*2", i + 1))
-        .collect();
+    let formulas: Vec<String> = (0..N_FORMULAS).map(|i| format!("=A{}*2", i + 1)).collect();
     // Seed values for the A column the formulas reference. Building this
     // list once and replaying it inside the per-iter setup keeps the timed
     // section honest while still giving each iteration a fresh sheet.
@@ -186,29 +184,20 @@ fn bench_sparse_1m_grid_read_window(c: &mut Criterion) {
 
 // === Bench 3: dirty_lookup_100k_ranges ======================================
 
-/// Phase 2 acceptance probe — measure the wall time of a SINGLE
-/// `set_cell` write on a sheet that has 100 000 registered range-formula
-/// dependents.
+/// Atom-delegation scale probe: measure one `set_cell` write after importing
+/// 100 000 range formulas.
 ///
 /// Setup (NOT timed): import 100 000 formulas of the form
 /// `=SUM(A{r}:A{r+5})` for r in 1..=100 000, anchored in column A so
-/// each range is 6 rows tall. The ranges overlap heavily near rows
-/// 10..=99 995. `bulk_load.set_formula` populates `range_dependents`
-/// statically from `Expr::Range` corners at import time, so all 100k
-/// entries are in the index even though every formula's
-/// `FormulaCache` stays `Dirty` (no eval). This is the explicit Phase 1
-/// laziness contract — we do NOT warm the full formula set. We do one
-/// `get_cell` on a single formula to force its first eval (proving the
-/// index survives sparse-narrowing, mirroring `range_sparse_then_write`
-/// in tests/scale.rs).
+/// each range is 6 rows tall. Import leaves formulas parked and installs no
+/// formula-address dependency index. Setup hydrates only the six formulas
+/// whose Tier-A ranges contain A50000; their member-facade reads install the
+/// relevant formula-inner reverse edges in Store.
 ///
 /// Timed section: one `sheet.set_cell("A50000", Value::Number(_))`.
 ///
-/// Without Track E's interval index, `dependents_of(A50000)` does
-/// 100k `CellRange::contains` calls before any dirty-mark work begins,
-/// so the per-write cost is O(N). With Track E, the cost should be
-/// O(matches + log) — A50000 sits inside the ~6 ranges starting at
-/// rows 49 995..=50 000.
+/// The write must be bounded by Store propagation to those six hydrated
+/// consumers, not by the 100 000 parked formulas.
 ///
 /// `iter_batched` rebuilds the sheet for each iteration so the write
 /// always hits a fresh state (no pre-existing primitive scaffold at
@@ -219,17 +208,14 @@ fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
 
     // Pre-build the (dest, formula) payload once so the per-iter setup
     // is just the bulk_load replay, not string formatting.
-    let dest_addrs: Vec<String> = (1..=N_RANGE_FORMULAS)
-        .map(|r| format!("B{}", r))
-        .collect();
+    let dest_addrs: Vec<String> = (1..=N_RANGE_FORMULAS).map(|r| format!("B{}", r)).collect();
     let formulas: Vec<String> = (1..=N_RANGE_FORMULAS)
         .map(|r| format!("=SUM(A{}:A{})", r, r + 5))
         .collect();
 
     let mut group = c.benchmark_group("scale/dirty_lookup_100k_ranges");
-    // Throughput is per registered range-formula, so the bench reports
-    // "writes per second normalized by N". Phase 1 = O(N); Phase 2's
-    // Track E should make this scale far better.
+    // Throughput is normalized by the imported formula count while timed work
+    // remains bounded by the six materialized Store consumers.
     group.throughput(Throughput::Elements(N_RANGE_FORMULAS as u64));
     // 100k formulas in setup → keep sample count modest so the suite
     // doesn't dominate `cargo bench` wall time.
@@ -237,14 +223,8 @@ fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
 
     group.bench_function("single_set_cell_after_100k_ranges", |b| {
         b.iter_batched(
-            // Setup: fresh sheet with 100k range formulas imported. We
-            // explicitly do NOT warm the full formula set — the Phase 1
-            // contract guarantees `bulk_load.set_formula` registers
-            // `range_dependents` from AST corners without computing the
-            // formula. One `get_cell` on a single neighboring formula
-            // exercises the sparse-eval path (the P0 contract from
-            // tests/scale.rs::range_sparse_then_write) so the index
-            // looks like a realistic post-open state.
+            // Setup: import 100k parked formulas, then hydrate only the six
+            // formulas whose small ranges contain the write target.
             || {
                 let mut sheet = Sheet::new();
                 sheet.bulk_load(|loader| {
@@ -252,14 +232,12 @@ fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
                         loader.set_formula(dest, formula);
                     }
                 });
-                // Optional one-formula warm — does not warm the rest;
-                // remaining 99 999 records stay Dirty.
-                let _ = sheet.get_cell("B49997");
+                for row in 49_995..=50_000 {
+                    let _ = sheet.get_cell(&format!("B{row}"));
+                }
                 sheet
             },
-            // Timed: a single primitive write inside a known number of
-            // overlapping ranges. dependents_of must scan
-            // range_dependents — Phase 1 = O(N), Phase 2 = O(matches).
+            // Timed: Store invalidation reaches six formula-inner consumers.
             |mut sheet| {
                 sheet.set_cell("A50000", Value::Number(42.0));
                 black_box(&sheet);
@@ -271,43 +249,25 @@ fn bench_dirty_lookup_100k_ranges(c: &mut Criterion) {
     group.finish();
 }
 
-// === Bench 4: cross_sheet_dirty_propagation_10k =============================
+// === Bench 4: cross_sheet_store_propagation_10k =============================
 
-/// Phase 3 acceptance probe — measure the wall time of a SINGLE
-/// cross-sheet `Workbook::set_cell` write on a workbook with 10 000
-/// cross-sheet formula dependents on `Data`. This is the cross-sheet
-/// twin of `bench_dirty_lookup_100k_ranges`: same shape (one write
-/// against many registered dependents, dirty-mark only, no eager
-/// eval), different topology (cross-sheet pointwise refs through the
-/// workbook-level dep graph that Track I adds).
+/// Measure one cross-sheet `Workbook::set_cell` write with 10 000
+/// materialized cross-sheet formula-inner atoms in the shared Store.
 ///
-/// Setup (NOT timed): two sheets — `Sheet1` + `Data`. 10 000 formulas
-/// in Sheet1 of the form `Sheet1!B{r} = =Data!A{r}` for r in 1..=10 000.
-/// We deliberately DO NOT pre-evaluate any of these formulas: the
-/// purpose of this bench is to time dirty propagation, NOT eval cost.
-/// All 10 000 formulas stay Dirty after setup — the Phase 1 import
-/// laziness contract guarantees `set_formula` registers the formula
-/// record without computing it.
+/// Setup (not timed): two sheets, plus formulas
+/// `Sheet1!B{r} = Data!A{r}` for `r in 1..=10_000`. Every formula is read once
+/// so its target-sheet facade edge is committed to Store. This materialization
+/// is required by INV-7: never-read formulas intentionally have no dependency
+/// edge and must not do work on writes.
 ///
-/// Timed section: one `wb.set_cell(idx_of_Data, "A5000", _)`.
-///
-/// Phase 3 target: only ONE cross-sheet dependent (`Sheet1!B5000`)
-/// references `Data!A5000`, so Track I's `CrossSheetDeps.cell_dependents`
-/// lookup must yield exactly that one (formula_sheet, formula_addr) and
-/// the per-write cost is O(1 + log) — bounded by matches, not by the
-/// 10 000 total registered cross-sheet formulas.
-///
-/// Pre-Track-I behavior: the extension-trait stub in
-/// `tests/cross_sheet.rs` would panic; this bench works around that by
-/// going through the (existing) `Workbook::set_formula` for setup and
-/// then calling `Sheet::set_cell` directly via `sheet_mut`. After
-/// Track I lands, the workbook-level `set_cell` becomes available and
-/// the bench should be retargeted to it — see the closure body.
+/// Timed section: one `wb.set_cell(idx_of_Data, "A5000", _)`. Exactly one
+/// materialized formula depends on that facade, so Store propagation is
+/// bounded by affected dependencies rather than total workbook formulas.
 ///
 /// `iter_batched` rebuilds the workbook for each iteration so the
 /// write always hits a fresh state. `sample_size(15)` keeps the 10k
 /// per-iter setup from dominating wall-clock.
-fn bench_cross_sheet_dirty_propagation_10k(c: &mut Criterion) {
+fn bench_cross_sheet_store_propagation_10k(c: &mut Criterion) {
     const N_CROSS_SHEET_FORMULAS: usize = 10_000;
 
     // Pre-build (dest, formula) pairs once so per-iter setup is just
@@ -320,41 +280,30 @@ fn bench_cross_sheet_dirty_propagation_10k(c: &mut Criterion) {
         .map(|r| format!("=Data!A{}", r))
         .collect();
 
-    let mut group = c.benchmark_group("scale/cross_sheet_dirty_propagation_10k");
-    // Throughput per registered cross-sheet formula — bench reports
-    // "writes/sec normalized by N". Pre-Track-I this measures whatever
-    // the no-op-cross-sheet `Sheet::set_cell` costs; post-Track-I it
-    // measures the workbook-level dirty BFS, which should remain
-    // bounded by `matches` (1 for this setup) regardless of N.
+    let mut group = c.benchmark_group("scale/cross_sheet_store_propagation_10k");
+    // Normalize by the total materialized cross-sheet formula population even
+    // though the timed write reaches only one of them.
     group.throughput(Throughput::Elements(N_CROSS_SHEET_FORMULAS as u64));
     group.sample_size(15);
 
     group.bench_function("single_cross_sheet_set_cell_after_10k_formulas", |b| {
         b.iter_batched(
-            // Setup: fresh workbook with Sheet1 + Data, plus 10k
-            // cross-sheet formulas. NO pre-eval — we want the cold
-            // dirty-propagation path, mirroring the Phase 2
-            // dirty_lookup_100k_ranges bench's contract.
+            // Setup: install and materialize all 10k formula-inner atoms so
+            // their target-sheet facade dependencies are present in Store.
             || {
                 let mut wb = Workbook::new();
                 let _data_idx = wb.add_sheet("Data");
                 let s1 = wb.index_of("Sheet1").unwrap();
                 for (dest, formula) in dest_addrs.iter().zip(formulas.iter()) {
-                    // `Workbook::set_formula` already exists on this
-                    // branch; the static AST corners feed the
-                    // per-sheet `range_dependents` index. Track I will
-                    // also feed the workbook-level
-                    // `CrossSheetDeps.cell_dependents` map here.
                     let ok = wb.set_formula(s1, dest, formula);
                     debug_assert!(ok);
                 }
+                for dest in &dest_addrs {
+                    let _ = wb.get_cell("Sheet1", dest);
+                }
                 wb
             },
-            // Timed: a single cross-sheet primitive write via
-            // `Workbook::set_cell`. Track I's BFS dirties exactly one
-            // cross-sheet dependent (`Sheet1!B5000`) and fires its
-            // subscriber bucket — that's the propagation work this
-            // bench measures.
+            // Timed: Store re-derives the one affected formula-inner/facade.
             |mut wb| {
                 let data_idx = wb.index_of("Data").unwrap();
                 wb.set_cell(data_idx, "A5000", Value::Number(42.0));
@@ -372,6 +321,6 @@ criterion_group!(
     bench_bulk_load_100k_formulas,
     bench_sparse_1m_grid_read_window,
     bench_dirty_lookup_100k_ranges,
-    bench_cross_sheet_dirty_propagation_10k,
+    bench_cross_sheet_store_propagation_10k,
 );
 criterion_main!(benches);

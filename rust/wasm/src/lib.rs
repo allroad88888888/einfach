@@ -1539,25 +1539,19 @@ impl WasmSheet {
         self.sheet.debug_live_subscription_count() as u32
     }
 
-    /// Number of distinct `CellRange`s tracked in the range dependents
-    /// index. One entry per range referenced by at least one formula,
-    /// regardless of the range's cell count.
+    /// Number of materialized Store geometry roots used by large range
+    /// formulas. Small ranges depend on member facades and contribute zero.
     pub fn debug_range_dep_count(&self) -> u32 {
         self.sheet.debug_range_dep_count() as u32
     }
 }
 
-/// Per-cell subscription bookkeeping for `WasmWorkbook`. We carry the
-/// (sheet_idx, addr) tuple alongside the underlying `CellSubscription`
-/// because Track I's cross-sheet dirty BFS will eventually fire JS callbacks
-/// by looking up `(sheet_idx, CellAddress)`. The `CellSubscription` itself
-/// is what the underlying `Sheet` returned from `subscribe_cell_boxed` and
-/// is what we hand back to `Sheet::unsubscribe_cell` on teardown.
+/// Per-cell subscription bookkeeping for `WasmWorkbook`. The sheet index is
+/// retained so topology operations can remap or remove the token. The stable
+/// facade subscription itself owns callback delivery and is handed back to
+/// `Sheet::unsubscribe_cell` on teardown.
 struct WorkbookCellSubscription {
-    #[allow(dead_code)] // read post-merge once Track I owns dirty fanout
     sheet_idx: usize,
-    #[allow(dead_code)]
-    addr: CellAddress,
     sub: CellSubscription,
 }
 
@@ -1874,19 +1868,10 @@ fn error_token_to_value_error(s: &str) -> Option<ValueError> {
 #[wasm_bindgen]
 pub struct WasmWorkbook {
     workbook: Workbook,
-    /// Workbook-level per-cell subscriptions. The map is keyed by an opaque
-    /// `u32` token handed back to JS. We keep the map on the workbook (not
-    /// the underlying sheet) so that Track I's cross-sheet dirty BFS — which
-    /// runs at workbook scope — can find the JS callbacks for any
-    /// `(sheet_idx, addr)` it dirties.
-    ///
-    /// Track K first-cut wiring: each entry is registered on the underlying
-    /// `Sheet` via `Sheet::subscribe_cell_boxed`. Same-sheet writes therefore
-    /// fire correctly today through the existing Sheet propagation path.
-    /// Cross-sheet writes do not fire yet — that becomes correct after
-    /// Track I merges `Workbook::set_cell` and the cross-sheet dependency
-    /// graph; the integrator will route fanout through this map at that
-    /// point.
+    /// Workbook-level ownership for opaque JS subscription tokens. Each entry
+    /// points at an underlying stable-facade subscription; cross-sheet
+    /// reactivity reaches that facade through the shared Store graph. The
+    /// retained sheet index exists only for unsubscribe and topology remap.
     subscriptions: HashMap<u32, WorkbookCellSubscription>,
     next_token: u32,
     /// Wave 8 custom-formula registry handle. The same `Arc` is installed
@@ -2033,9 +2018,9 @@ impl WasmWorkbook {
     ///   - `"eval-failed: #DIV/0!"` (or other error code) when the
     ///     definition's eval surfaces a cell-style error.
     ///
-    /// Side effect: walks every formula in every sheet and marks those
-    /// referencing `name` dirty so cached values re-compute against the
-    /// updated registry on next read.
+    /// On success the workbook name-version root is published. Materialized
+    /// formula-inner atoms that read the registry re-derive through their
+    /// Store dependency; unread formulas stay lazy.
     #[wasm_bindgen(js_name = "defineName")]
     pub fn define_name(&mut self, name: &str, formula: &str) -> Result<(), JsValue> {
         self.workbook
@@ -2044,9 +2029,9 @@ impl WasmWorkbook {
     }
 
     /// Remove a previously-registered name. Returns `true` if an entry
-    /// was removed; `false` if no entry existed. Formulas that
-    /// reference the name are marked dirty so the next read surfaces
-    /// `#NAME?` (or hits any newly-shadowing definition).
+    /// was removed; `false` if no entry existed. Publishing the name-version
+    /// root makes dependent formula-inner atoms re-derive to `#NAME?` (or any
+    /// newly-shadowing definition).
     #[wasm_bindgen(js_name = "undefineName")]
     pub fn undefine_name(&mut self, name: &str) -> bool {
         self.workbook.undefine_name(name)
@@ -2239,9 +2224,9 @@ impl WasmWorkbook {
     // keep the legacy names for existing demos/tests that already compile
     // against the older wasm-pack surface.
 
-    /// Set a cell to a numeric value through the workbook. Routes
-    /// through `Workbook::set_cell` so cross-sheet dependents dirty
-    /// + fire their subscribers via the workbook's BFS.
+    /// Set a cell to a numeric value through the workbook. The shared Store
+    /// propagates local and cross-sheet formula dependencies and publishes
+    /// changed stable facades to subscribers.
     pub fn set_cell_number(&mut self, sheet_idx: usize, addr: &str, value: f64) {
         self.workbook
             .set_cell(sheet_idx, addr, Value::Number(value));
@@ -2265,8 +2250,8 @@ impl WasmWorkbook {
         self.workbook.set_cell(sheet_idx, addr, Value::Error(err));
     }
 
-    /// Clear a cell through the workbook. Cross-sheet aware — a cleared
-    /// upstream cell still propagates dirty to its dependents.
+    /// Clear a cell through the workbook. Local and cross-sheet formulas that
+    /// read the cell re-derive through the shared Store graph.
     #[wasm_bindgen(js_name = "clearCellAt")]
     pub fn clear_cell_at(&mut self, sheet_idx: usize, addr: &str) {
         self.workbook.clear_cell(sheet_idx, addr);
@@ -2277,10 +2262,9 @@ impl WasmWorkbook {
     /// (cell becomes `#VALUE!`) or a cycle was detected (cell becomes
     /// `#CYCLE!`).
     ///
-    /// Note: the legacy `WasmWorkbook::set_formula(sheet_idx: u32, ...)`
-    /// already routes through `Workbook::set_formula`, which is the
-    /// Track I target. This `usize`-typed variant is the new Phase 3
-    /// canonical entry; both can coexist during the migration.
+    /// The legacy `set_formula(sheet_idx: u32, ...)` routes through the same
+    /// workbook method. This `usize`-typed alias is retained for generated
+    /// bindings and worker callers.
     #[wasm_bindgen(js_name = "setFormulaAt")]
     pub fn set_formula_at(&mut self, sheet_idx: usize, addr: &str, src: &str) -> bool {
         self.workbook.set_formula(sheet_idx, addr, src)
@@ -2419,13 +2403,9 @@ impl WasmWorkbook {
     /// Subscribe to a cell at `sheet_name!addr`. Returns an opaque
     /// `u32` token; pass it back to `unsubscribe_cell` to cancel.
     ///
-    /// First-cut wiring: the JS callback is registered on the underlying
-    /// `Sheet` via `Sheet::subscribe_cell_boxed`, so same-sheet writes
-    /// fire correctly today. The token + `(sheet_idx, addr)` is also
-    /// recorded on the workbook so that once Track I lands the
-    /// cross-sheet dirty BFS, that BFS can look up this map and fire
-    /// JS callbacks for cells that were dirtied via a write on a
-    /// different sheet.
+    /// The callback subscribes to the sheet's stable cell facade. Local and
+    /// cross-sheet dependencies both settle through the workbook-scoped Store;
+    /// this map only owns the opaque token and sheet-remap lifecycle.
     pub fn subscribe_cell(&mut self, sheet_name: &str, addr: &str, cb: js_sys::Function) -> u32 {
         let Some(sheet_idx) = self.workbook.index_of(sheet_name) else {
             // Unknown sheet — hand back a token that is never inserted,
@@ -2435,14 +2415,11 @@ impl WasmWorkbook {
             self.next_token = self.next_token.wrapping_add(1);
             return token;
         };
-        let parsed_addr = match CellAddress::parse(addr) {
-            Some(a) => a,
-            None => {
-                let token = self.next_token;
-                self.next_token = self.next_token.wrapping_add(1);
-                return token;
-            }
-        };
+        if CellAddress::parse(addr).is_none() {
+            let token = self.next_token;
+            self.next_token = self.next_token.wrapping_add(1);
+            return token;
+        }
 
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
@@ -2452,14 +2429,8 @@ impl WasmWorkbook {
             return token;
         };
         let sub = sheet.subscribe_cell_boxed(addr, Box::new(listener));
-        self.subscriptions.insert(
-            token,
-            WorkbookCellSubscription {
-                sheet_idx,
-                addr: parsed_addr,
-                sub,
-            },
-        );
+        self.subscriptions
+            .insert(token, WorkbookCellSubscription { sheet_idx, sub });
         token
     }
 
@@ -2487,9 +2458,9 @@ impl WasmWorkbook {
     /// a Date, function, or other non-scalar object, the cell surfaces
     /// `#TYPE!`. NaN / Infinity return values are folded to `#NUM!`.
     ///
-    /// Registering over an existing name silently replaces the callback.
-    /// All formulas in the workbook are dirtied so cached results re-eval
-    /// against the new registration.
+    /// Registering over an existing name silently replaces the callback and
+    /// publishes the custom-registry Store root. Materialized formulas that
+    /// consulted the registry re-derive; unread formulas remain lazy.
     #[wasm_bindgen(js_name = "registerCustomFormula")]
     pub fn register_custom_formula(&mut self, name: String, callback: js_sys::Function) {
         self.custom_formulas.register(&name, callback);
@@ -2498,10 +2469,9 @@ impl WasmWorkbook {
     }
 
     /// Remove a previously-registered custom formula. Returns `true` if
-    /// an entry was removed; `false` if no entry existed. Cells that
-    /// referenced the name re-evaluate to `#NAME?` on next read; all
-    /// formulas are dirtied to force that re-evaluation (matching the
-    /// `define_name` / `undefine_name` invalidation contract).
+    /// an entry was removed; `false` if no entry existed. The registry Store
+    /// root is published only when removal succeeds, so materialized formulas
+    /// that consulted it re-derive and may surface `#NAME?`.
     #[wasm_bindgen(js_name = "unregisterCustomFormula")]
     pub fn unregister_custom_formula(&mut self, name: &str) -> bool {
         let removed = self.custom_formulas.unregister(name);
@@ -2707,8 +2677,10 @@ impl WasmWorkbook {
     /// ```
     ///
     /// Returns `Array<{ sheet, primitivesInstalled, formulasInstalled,
-    /// crossSheetParsed }>`. Each listed sheet is fully REPLACED. The
-    /// legacy `bulk_import_cells` path stays available until Phase 6.4.
+    /// crossSheetParsed }>`. `crossSheetParsed` is a compatibility field and
+    /// is always zero because Store evaluates parked formulas lazily. Each
+    /// listed sheet is fully REPLACED. The legacy `bulk_import_cells` path
+    /// stays available until Phase 6.4.
     pub fn bulk_install_workbook(&mut self, payload: JsValue) -> Result<JsValue, JsValue> {
         let sheets: Vec<SheetBulkInstallJSON> = serde_wasm_bindgen::from_value(payload)
             .map_err(|err| JsValue::from_str(&format!("invalid bulk install payload: {err}")))?;
@@ -2757,10 +2729,10 @@ impl WasmWorkbook {
     /// - `parse_only_ms`: isolated parser-only pass across formula
     ///   strings.
     /// - `set_cell_loop_ms`: time the engine spent storing primitives.
-    /// - `set_formula_loop_ms`: time the engine spent installing
-    ///   formulas (parse + cycle check + dep wiring + storage).
-    /// - `flush_ms`: implicit `WorkbookLoader::flush` (dirty BFS +
-    ///   subscriber notify dedup + cross-sheet BFS).
+    /// - `set_formula_loop_ms`: time the engine spent installing formulas
+    ///   (parse, cycle check, structural metadata, and storage).
+    /// - `flush_ms`: implicit `WorkbookLoader::flush` (storage replay, shared
+    ///   Store propagation, structural maintenance, and subscriber dedup).
     ///
     /// **Behavior preservation**: the per-cell write ORDER differs from
     /// the production `bulk_import_cells` (primitives first, then
@@ -2896,11 +2868,12 @@ impl WasmWorkbook {
     /// | 10 | flush_dep_register_ms   (Phase 1 sub-slice of flush_ms) |
     /// | 11 | flush_formula_record_ms (Phase 1 sub-slice of flush_ms) |
     ///
-    /// Indices [8..=11] are Phase 1 of the lazy-formula-indexing arc:
-    /// they decompose the per-formula `install_parsed_formula` work
-    /// inside the implicit flush. The sum of [8]+[9]+[10]+[11] should
-    /// be ≤ flush_ms (the remainder is BFS dirty propagation +
-    /// subscriber dedup + cross-sheet BFS).
+    /// Indices [8..=11] are retained compatibility buckets that decompose
+    /// per-formula `install_parsed_formula` work inside the implicit flush.
+    /// The dependency-extract bucket now measures structural metadata and the
+    /// registration bucket stays near zero. Their sum should be no greater
+    /// than `flush_ms`; the remainder is Store propagation, structural work,
+    /// and subscriber dedup.
     ///
     /// Returns an empty `Vec<f64>` if no instrumented bulk import has
     /// run yet on this workbook.
@@ -2912,38 +2885,25 @@ impl WasmWorkbook {
         }
     }
 
-    /// Phase 1 (lazy-formula-indexing) dep-graph probe. Walks every
-    /// sheet's `cell_dependents` + `range_dependents` and returns
-    /// aggregate edge counts. This is a measurement-only debug surface
-    /// — costs O(formula_count + total_point_dep_edges), so cheap on
-    /// small workbooks and bounded by graph size on large ones. Do NOT
-    /// call from the hot path.
+    /// Atom-delegation diagnostics aggregated across every sheet. This is a
+    /// measurement-only debug surface; hydrated formula/static-range metadata
+    /// is O(formula_count), while the legacy point-fanout fields stay zero.
     ///
     /// Returns a JS object with these fields (camelCase):
     /// - `totalFormulaCount` — sum of `formula_cells.len()` over sheets
-    /// - `totalPointDepEdges` — sum of `cell_dependents[a].len()`
-    /// - `totalRangeDepEntries` — sum of `range_dependents.len()`
-    /// - `maxFanout` — max single-cell fanout across all sheets
-    /// - `avgFanout` — `totalPointDepEdges / cell_dependents_keys`
-    ///   (number of cells that have at least one dependent). Zero
-    ///   when no formula has installed any deps.
-    /// - `rangeFormulaCount` — formulas whose `range_deps` is non-empty
+    /// - `totalPointDepEdges` — always zero; Store owns point dependencies
+    /// - `totalRangeDepEntries` — materialized Store geometry roots
+    /// - `maxFanout` / `avgFanout` — always zero; no address fanout index
+    /// - `rangeFormulaCount` — hydrated formulas with static range metadata
     #[wasm_bindgen(js_name = "debugDepGraphStats")]
     pub fn debug_dep_graph_stats(&self) -> Result<JsValue, JsValue> {
-        // We need the per-sheet "cell_dependents key count" to compute
-        // a meaningful avg_fanout — `Sheet::debug_dep_graph_stats`
-        // already gives us total edges + max; we just need the
-        // denominator. Add a tiny per-sheet probe and sum on this side
-        // so the core stays free of JS-only derived metrics.
         let mut total = DepGraphStatsJSON::default();
-        let mut cell_dep_key_total: u64 = 0;
         for sheet_idx in 0..self.workbook.sheet_count() {
             let Some(sheet) = self.workbook.sheet(sheet_idx) else {
                 continue;
             };
             let s: DepGraphStats = sheet.debug_dep_graph_stats();
-            total.total_formula_count =
-                total.total_formula_count.saturating_add(s.formula_count);
+            total.total_formula_count = total.total_formula_count.saturating_add(s.formula_count);
             total.total_point_dep_edges = total
                 .total_point_dep_edges
                 .saturating_add(s.total_point_dep_edges);
@@ -2956,14 +2916,8 @@ impl WasmWorkbook {
             total.range_formula_count = total
                 .range_formula_count
                 .saturating_add(s.range_formula_count);
-            cell_dep_key_total = cell_dep_key_total
-                .saturating_add(sheet.debug_cell_dependents_key_count() as u64);
         }
-        total.avg_fanout = if cell_dep_key_total == 0 {
-            0.0
-        } else {
-            (total.total_point_dep_edges as f64) / (cell_dep_key_total as f64)
-        };
+        total.avg_fanout = 0.0;
         serde_wasm_bindgen::to_value(&total)
             .map_err(|err| JsValue::from_str(&format!("serialize dep graph stats: {err}")))
     }
@@ -4007,9 +3961,9 @@ mod tests {
         assert_eq!(wb.get_number(1, "C2"), 13.0);
 
         wb.set_number(1, "B4", 20.0);
-        assert_eq!(wb.debug_formula_cache_state(0, "C2"), "dirty");
-        assert_eq!(wb.debug_formula_cache_state(2, "C2"), "dirty");
-        assert_eq!(wb.debug_formula_cache_state(1, "C2"), "dirty");
+        assert_eq!(wb.debug_formula_cache_state(0, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(2, "C2"), "clean");
+        assert_eq!(wb.debug_formula_cache_state(1, "C2"), "clean");
         assert_eq!(wb.get_number(1, "C2"), 23.0);
     }
 
@@ -4494,7 +4448,7 @@ mod tests {
         // Lazy contract: nothing parsed eagerly into the dep graph,
         // nothing evaluated.
         let sheet = restored.workbook.sheet(0).unwrap();
-        assert_eq!(sheet.debug_cell_dependents_key_count(), 0);
+        assert_eq!(sheet.debug_point_dependency_key_count(), 0);
         assert_eq!(restored.debug_formula_eval_count(0), 0);
 
         // Values are correct on first read (hydrate-on-read).
@@ -4534,7 +4488,6 @@ mod tests {
             101,
             WorkbookCellSubscription {
                 sheet_idx: 0,
-                addr: CellAddress::parse("A1").unwrap(),
                 sub: sub_a,
             },
         );
@@ -4548,7 +4501,6 @@ mod tests {
             202,
             WorkbookCellSubscription {
                 sheet_idx: 1,
-                addr: CellAddress::parse("B2").unwrap(),
                 sub: sub_b,
             },
         );
@@ -4573,14 +4525,8 @@ mod tests {
             .sheet_mut(1)
             .unwrap()
             .subscribe_cell("B2", || {});
-        wb.subscriptions.insert(
-            202,
-            WorkbookCellSubscription {
-                sheet_idx: 1,
-                addr: CellAddress::parse("B2").unwrap(),
-                sub,
-            },
-        );
+        wb.subscriptions
+            .insert(202, WorkbookCellSubscription { sheet_idx: 1, sub });
 
         assert_eq!(wb.debug_sheet_live_subscription_count(1), 1);
         assert!(wb.move_sheet(1, 0));

@@ -71,10 +71,22 @@ fn bessel_error_propagation() {
     // A4 references an error cell; the error must propagate.
     wb.set_formula(0, "A4", "=A1 + 1");
 
-    assert_eq!(wb.get_cell("Sheet1", "A1"), Value::Error(ValueError::Overflow));
-    assert_eq!(wb.get_cell("Sheet1", "A2"), Value::Error(ValueError::Overflow));
-    assert_eq!(wb.get_cell("Sheet1", "A3"), Value::Error(ValueError::Overflow));
-    assert_eq!(wb.get_cell("Sheet1", "A4"), Value::Error(ValueError::Overflow));
+    assert_eq!(
+        wb.get_cell("Sheet1", "A1"),
+        Value::Error(ValueError::Overflow)
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "A2"),
+        Value::Error(ValueError::Overflow)
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "A3"),
+        Value::Error(ValueError::Overflow)
+    );
+    assert_eq!(
+        wb.get_cell("Sheet1", "A4"),
+        Value::Error(ValueError::Overflow)
+    );
 }
 
 /// CONVERT end-to-end: a length chain (yd -> m -> cm), a temperature

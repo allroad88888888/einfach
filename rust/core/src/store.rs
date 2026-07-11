@@ -49,7 +49,7 @@
 //!   the engine already uses it.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::atom::{AtomId, Value};
@@ -70,6 +70,13 @@ impl ReadArgs<'_> {
     /// Untracked read (`noWatchGetter`): computes if needed, records no edge.
     pub fn peek(&self, id: AtomId) -> Value {
         read_dep(self.inner, self.scratch, id, false)
+    }
+
+    /// Whether this speculative derived read has already faulted because a
+    /// dependency still needs to be computed. Callers with observable side
+    /// effects can use this to defer them until the retry that can commit.
+    pub fn is_faulted(&self) -> bool {
+        self.scratch.borrow().faulted
     }
 
     /// Record a dependency edge on `id` at its current generation WITHOUT
@@ -452,8 +459,26 @@ fn publish_atom(inner: &Rc<RefCell<Inner>>, id: AtomId) {
     }
 }
 
+fn pending_value_changed(inner: &Rc<RefCell<Inner>>, id: AtomId, prev: &Option<Value>) -> bool {
+    let inner_ref = inner.borrow();
+    if !inner_ref.has(id) {
+        return false;
+    }
+    let current = &inner_ref.record(id).value;
+    match (current, prev) {
+        (Some(c), Some(p)) => c != p,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// The tracked/untracked dep read shared by `ReadArgs::get` / `peek`.
-fn read_dep(inner: &Rc<RefCell<Inner>>, scratch: &RefCell<Scratch>, id: AtomId, track: bool) -> Value {
+fn read_dep(
+    inner: &Rc<RefCell<Inner>>,
+    scratch: &RefCell<Scratch>,
+    id: AtomId,
+    track: bool,
+) -> Value {
     let self_id = scratch.borrow().self_id;
     {
         let inner_ref = inner.borrow();
@@ -667,7 +692,10 @@ fn read_atom(inner: &Rc<RefCell<Inner>>, root: AtomId) -> Value {
         // A parent's retry re-validates; anything fresh just pops.
         let (fresh, is_primitive) = {
             let inner_ref = inner.borrow();
-            (inner_ref.is_fresh(id), inner_ref.record(id).read_fn.is_none())
+            (
+                inner_ref.is_fresh(id),
+                inner_ref.record(id).read_fn.is_none(),
+            )
         };
         if fresh {
             stack.pop();
@@ -739,8 +767,7 @@ fn read_atom(inner: &Rc<RefCell<Inner>>, root: AtomId) -> Value {
 fn commit_read(inner: &mut Inner, id: AtomId, new_deps: Vec<(AtomId, u64)>, value: Value) {
     let old_deps = inner.record_mut(id).deps.take().unwrap_or_default();
     // Set-backed diff keeps large fan-in commits linear (codex P1 review).
-    let new_dep_set: std::collections::HashSet<AtomId> =
-        new_deps.iter().map(|(d, _)| *d).collect();
+    let new_dep_set: std::collections::HashSet<AtomId> = new_deps.iter().map(|(d, _)| *d).collect();
     for (old_dep, _) in &old_deps {
         if !new_dep_set.contains(old_dep) && inner.has(*old_dep) {
             inner.record_mut(*old_dep).back_deps.remove(id);
@@ -825,24 +852,34 @@ fn flush_pending(inner: &Rc<RefCell<Inner>>) {
         };
         for (id, prev) in drained {
             dependencies_change(inner, id);
-            let changed = {
-                let inner_ref = inner.borrow();
-                if !inner_ref.has(id) {
-                    false
-                } else {
-                    let current = &inner_ref.record(id).value;
-                    match (current, &prev) {
-                        (Some(c), Some(p)) => c != p,
-                        (Some(_), None) => true,
-                        (None, _) => false,
-                    }
-                }
-            };
-            if changed {
+            if pending_value_changed(inner, id, &prev) {
                 publish_atom(inner, id);
             }
         }
     }
+}
+
+/// Settle pending entries produced by a completed top-level read without
+/// re-traversing the graph that the read just computed. Any listener writes
+/// are handed back to the normal flush path so write propagation retains the
+/// vanilla `flushPending` semantics.
+fn settle_pending_reads(inner: &Rc<RefCell<Inner>>) {
+    let drained = {
+        let mut inner_mut = inner.borrow_mut();
+        if inner_mut.pending.is_empty() {
+            return;
+        }
+        inner_mut.pending.drain_ordered()
+    };
+    for (id, prev) in drained {
+        if pending_value_changed(inner, id, &prev) {
+            publish_atom(inner, id);
+        }
+    }
+    // A listener may synchronously write while the read results publish.
+    // Those new entries were not part of the completed read and must perform
+    // ordinary dependency propagation.
+    flush_pending(inner);
 }
 
 /// The central state container — a faithful port of the vanilla store.
@@ -896,8 +933,8 @@ impl Store {
 
     /// Create a read-only derived atom (`atom(read)`).
     ///
-    /// BRIDGE(delete-by: P4-exit): unlike vanilla (lazy until first read),
-    /// this legacy-signature API computes eagerly at creation because the
+    /// Compatibility: unlike vanilla (lazy until first read), this
+    /// legacy-signature API computes eagerly at creation because the
     /// current sheet engine's spill targets rely on the back-dep edge
     /// existing immediately (`has_dependents` guards anchor destruction).
     /// New code should use the vanilla-faithful `create_derived_ctx`.
@@ -996,6 +1033,17 @@ impl Store {
         flush_pending(&self.inner);
     }
 
+    /// Complete an engine-level read transaction. Bare `get` computes a
+    /// coherent dependency graph before returning; this drains and publishes
+    /// those read-originated pending entries without redundantly walking that
+    /// graph once per computed atom.
+    ///
+    /// Callers must use this only at a top-level read boundary. Writes keep
+    /// using `set` / `batch`, which invoke the full propagation flush.
+    pub fn settle_pending_reads(&self) {
+        settle_pending_reads(&self.inner);
+    }
+
     /// Force-mark a derived atom stale so its next read re-runs the read fn
     /// (engine cycle-dissolve). No-op on primitives and missing atoms.
     pub fn invalidate(&self, id: AtomId) {
@@ -1024,6 +1072,31 @@ impl Store {
             }
         }
         false
+    }
+
+    /// Enumerate reverse-reachable atoms over live back-dep edges.
+    ///
+    /// This exposes the same graph used by `dependencies_change` without
+    /// adding a parallel dependency index. Callers that need to do work
+    /// outside a pure atom recompute (for example sheet-level spill target
+    /// maintenance) can map the returned atom ids back to their own families.
+    pub fn reverse_dependents(&self, roots: &[AtomId]) -> Vec<AtomId> {
+        let inner = self.inner.borrow();
+        let mut seen: HashSet<AtomId> = HashSet::new();
+        let mut out: Vec<AtomId> = Vec::new();
+        let mut stack: Vec<AtomId> = roots.to_vec();
+        while let Some(id) = stack.pop() {
+            if !inner.has(id) {
+                continue;
+            }
+            for dep in inner.record(id).back_deps.iter_ordered() {
+                if seen.insert(dep) {
+                    out.push(dep);
+                    stack.push(dep);
+                }
+            }
+        }
+        out
     }
 
     /// store.ts `subscribeAtom` via the public `sub` name (vanilla's store
@@ -1074,6 +1147,33 @@ impl Store {
     pub fn has_dependents(&self, id: AtomId) -> bool {
         let inner = self.inner.borrow();
         inner.has(id) && !inner.record(id).back_deps.is_empty()
+    }
+
+    /// Snapshot the atoms that directly depend on `id`, in dependency
+    /// registration order. Engine adapters use this when an indirection atom
+    /// can be safely retargeted before releasing its old primitive backing.
+    pub fn direct_dependents(&self, id: AtomId) -> Vec<AtomId> {
+        let inner = self.inner.borrow();
+        if !inner.has(id) {
+            return Vec::new();
+        }
+        inner.record(id).back_deps.iter_ordered().collect()
+    }
+
+    /// Snapshot the atoms that `id` directly depends on, in read order.
+    /// Engine adapters use this only for lifecycle cleanup after a derived
+    /// atom has been detached; dependency propagation remains Store-owned.
+    pub fn direct_dependencies(&self, id: AtomId) -> Vec<AtomId> {
+        let inner = self.inner.borrow();
+        if !inner.has(id) {
+            return Vec::new();
+        }
+        inner
+            .record(id)
+            .deps
+            .as_ref()
+            .map(|deps| deps.iter().map(|(dep, _)| *dep).collect())
+            .unwrap_or_default()
     }
 
     /// Returns true if the atom has live subscribers (AtomFamily eviction
@@ -1152,6 +1252,15 @@ impl Store {
         } else {
             0
         }
+    }
+
+    /// Whether `id` currently has a settled value whose dependency
+    /// generations still match. Intended for diagnostics only; normal reads
+    /// must use [`Store::get`], which re-derives stale atoms as needed.
+    #[doc(hidden)]
+    pub fn debug_atom_is_fresh(&self, id: AtomId) -> bool {
+        let inner = self.inner.borrow();
+        inner.has(id) && inner.is_fresh(id)
     }
 
     /// Total committed dependency edges (successor of the engine's

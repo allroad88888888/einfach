@@ -93,10 +93,7 @@ fn mmult_dim_mismatch_returns_value_error() {
     sheet.set_cell("D2", Value::Number(0.0));
     sheet.set_cell("E2", Value::Number(1.0));
     assert!(sheet.set_formula("G1", "=MMULT(A1:C2, D1:E2)"));
-    assert_eq!(
-        sheet.get_cell("G1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("G1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
@@ -181,10 +178,7 @@ fn minverse_non_square_returns_value_error() {
     sheet.set_cell("B2", Value::Number(5.0));
     sheet.set_cell("C2", Value::Number(6.0));
     assert!(sheet.set_formula("E1", "=MINVERSE(A1:C2)"));
-    assert_eq!(
-        sheet.get_cell("E1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("E1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
@@ -234,20 +228,14 @@ fn munit_3_returns_3x3_identity() {
 fn munit_zero_returns_value_error() {
     let mut sheet = Sheet::new();
     assert!(sheet.set_formula("A1", "=MUNIT(0)"));
-    assert_eq!(
-        sheet.get_cell("A1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
 fn munit_negative_returns_value_error() {
     let mut sheet = Sheet::new();
     assert!(sheet.set_formula("A1", "=MUNIT(-2)"));
-    assert_eq!(
-        sheet.get_cell("A1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("A1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
@@ -573,10 +561,7 @@ fn forecast_shape_mismatch_returns_value_error() {
     sheet.set_cell("B2", Value::Number(2.0));
     sheet.set_cell("B3", Value::Number(3.0));
     assert!(sheet.set_formula("D1", "=FORECAST(5, A1:A2, B1:B3)"));
-    assert_eq!(
-        sheet.get_cell("D1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("D1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
@@ -694,10 +679,7 @@ fn rsq_shape_mismatch_returns_value_error() {
     sheet.set_cell("B2", Value::Number(2.0));
     sheet.set_cell("B3", Value::Number(3.0));
     assert!(sheet.set_formula("D1", "=RSQ(A1:A2, B1:B3)"));
-    assert_eq!(
-        sheet.get_cell("D1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("D1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]
@@ -758,10 +740,7 @@ fn pearson_shape_mismatch_returns_value_error() {
     sheet.set_cell("B2", Value::Number(2.0));
     sheet.set_cell("B3", Value::Number(3.0));
     assert!(sheet.set_formula("D1", "=PEARSON(A1:A2, B1:B3)"));
-    assert_eq!(
-        sheet.get_cell("D1"),
-        Value::Error(ValueError::InvalidValue)
-    );
+    assert_eq!(sheet.get_cell("D1"), Value::Error(ValueError::InvalidValue));
 }
 
 #[test]

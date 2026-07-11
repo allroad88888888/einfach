@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Current rewrite phase. Advance ONLY at a phase exit gate (WORKPLAN §3).
-const PHASE: u8 = 1;
+const PHASE: u8 = 7;
 
 fn manifest_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -40,6 +40,10 @@ fn wasm_lib_rs() -> String {
     read(&manifest_dir().join("../wasm/src/lib.rs"))
 }
 
+fn worker_runtime_ts() -> String {
+    read(&manifest_dir().join("../../solid/excel/src-vnext/adapter/worker-runtime-ts.ts"))
+}
+
 /// Identifiers that must be GONE once the given phase is reached.
 /// (identifier, first-phase-where-forbidden, files-to-check)
 const FORBIDDEN: &[(&str, u8, &[&str])] = &[
@@ -52,7 +56,16 @@ const FORBIDDEN: &[(&str, u8, &[&str])] = &[
     ("coalesced_dirty_into", 5, &["sheet"]),
     // P6 exit: everything else
     ("CrossSheetDeps", 6, &["sheet", "workbook"]),
+    ("WorkbookRangeBridgeIndex", 6, &["sheet", "workbook"]),
     ("has_cross_sheet_refs", 6, &["sheet", "workbook"]),
+    ("formula_needs_provider_context", 6, &["sheet", "workbook"]),
+    ("force_formula_recompute", 6, &["sheet", "workbook"]),
+    ("mark_dirty_for_addr", 6, &["sheet", "workbook"]),
+    (
+        "eval_cross_sheet_formula_eager_with_provider",
+        6,
+        &["sheet", "workbook"],
+    ),
     ("prewarm_formula_chain", 6, &["sheet"]),
     ("collect_prewarm_refs", 6, &["sheet"]),
     ("would_create_cycle", 6, &["sheet", "workbook"]),
@@ -73,6 +86,11 @@ const FORBIDDEN: &[(&str, u8, &[&str])] = &[
 /// and they must not use these shapes.
 const FORBIDDEN_SHAPES: &[(&str, u8)] = &[
     ("HashMap<CellAddress,HashSet<CellAddress", 4),
+    ("HashMap<CellAddress,Vec<CellAddress", 4),
+    ("BTreeMap<CellAddress,HashSet<CellAddress", 4),
+    ("BTreeMap<CellAddress,Vec<CellAddress", 4),
+    ("RowMajorMap<HashSet<CellAddress", 4),
+    ("RowMajorMap<Vec<CellAddress", 4),
     ("HashMap<(usize,CellAddress),HashSet", 6),
 ];
 
@@ -84,6 +102,63 @@ const REQUIRED_STORE_FNS: &[(&str, u8)] = &[
     ("fn flush_pending", 1),
     ("fn publish_atom", 1),
     ("fn subscribe_atom", 1),
+];
+
+/// Production wiring that keeps same-sheet formula derivation and range
+/// invalidation inside Store. Whitespace is stripped before matching so
+/// formatting alone cannot trip the guard.
+const REQUIRED_SHEET_WIRING: &[(&str, u8)] = &[
+    (
+        "ctx.owned_create_derived_ctx(move|args|ctx_read.eval_formula_inner(addr,args))",
+        4,
+    ),
+    (
+        "letinner=ctx.formula_inner_of(addr);letformula_value=args.get(inner);",
+        4,
+    ),
+    (
+        "letfacade=self.facade_of(addr);returnself.store.get(facade);",
+        4,
+    ),
+    ("self.store.reverse_dependents(root_atoms)", 5),
+    ("args.depend(self.range_band_epoch_of(", 5),
+    ("args.depend(self.range_column_epoch_of(", 5),
+    ("args.depend(self.range_sheet_epoch())", 5),
+    (
+        "collapse_array_for_eval(self.read_facade_from(&ctx,addr))",
+        6,
+    ),
+    ("self.for_each_range_in(&ctx,range,f);", 6),
+    ("self.workbook_context()?.lookup_named(name,self.args)", 6),
+    (
+        "self.workbook_context()?.call_custom(name,values,self.args)",
+        6,
+    ),
+    ("self.depend_topology(args);", 6),
+    ("self.depend_names(args);", 6),
+    ("self.depend_custom(args);", 6),
+    // P7 cold-hydration follow-up: static cycle certificates live on the
+    // already-owned formula entries and are generation-invalidated. They are
+    // validation metadata only; the forbidden-shape checks above continue to
+    // ban a retained address→dependent response graph.
+    ("cycle_checked_at:Cell<u64>", 7),
+    ("formula_topology_epoch:Cell<u64>", 7),
+    ("fncloses_parked_local_cycle(", 7),
+    (
+        "self.mark_formula_cycle_checked(nodes[index].addr,epoch);",
+        7,
+    ),
+];
+
+/// Workbook construction/topology wiring that makes every sheet resolve
+/// through the same Store and workbook atom context at P6.
+const REQUIRED_WORKBOOK_WIRING: &[(&str, u8)] = &[
+    (
+        "WorkbookAtomContext::new(store.clone(),Rc::clone(&custom_call_depth))",
+        6,
+    ),
+    ("sheet.attach_workbook_context(&self.atom_context,idx);", 6),
+    ("self.atom_context.sync_topology(sheets);", 6),
 ];
 
 fn file_by_key(key: &str) -> String {
@@ -105,7 +180,9 @@ fn forbidden_identifiers_absent_for_current_phase() {
         for key in *files {
             let src = file_by_key(key);
             if src.contains(ident) {
-                violations.push(format!("{key}.rs still contains `{ident}` (forbidden since P{from_phase})"));
+                violations.push(format!(
+                    "{key}.rs still contains `{ident}` (forbidden since P{from_phase})"
+                ));
             }
         }
     }
@@ -119,7 +196,10 @@ fn forbidden_identifiers_absent_for_current_phase() {
 #[test]
 fn forbidden_type_shapes_absent_for_current_phase() {
     let strip = |s: &str| s.replace([' ', '\n', '\t'], "");
-    let sources = [("sheet", strip(&sheet_rs())), ("workbook", strip(&workbook_rs()))];
+    let sources = [
+        ("sheet", strip(&sheet_rs())),
+        ("workbook", strip(&workbook_rs())),
+    ];
     let mut violations = Vec::new();
     for (shape, from_phase) in FORBIDDEN_SHAPES {
         if PHASE < *from_phase {
@@ -127,7 +207,9 @@ fn forbidden_type_shapes_absent_for_current_phase() {
         }
         for (name, src) in &sources {
             if src.contains(shape) {
-                violations.push(format!("{name}.rs contains forbidden dep-graph shape `{shape}`"));
+                violations.push(format!(
+                    "{name}.rs contains forbidden dep-graph shape `{shape}`"
+                ));
             }
         }
     }
@@ -150,6 +232,128 @@ fn required_store_functions_present_for_current_phase() {
     assert!(
         missing.is_empty(),
         "store.rs is missing store.ts-isomorphic functions (INV-1): {missing:?}"
+    );
+}
+
+#[test]
+fn required_sheet_store_wiring_present_for_current_phase() {
+    let source = sheet_rs();
+    let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+    let compact = production.replace([' ', '\n', '\r', '\t'], "");
+    let missing: Vec<&str> = REQUIRED_SHEET_WIRING
+        .iter()
+        .filter(|(_, from)| PHASE >= *from)
+        .filter(|(shape, _)| !compact.contains(shape))
+        .map(|(shape, _)| *shape)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "sheet.rs is missing Store-owned formula/range wiring (INV-1/INV-2): {missing:?}"
+    );
+}
+
+#[test]
+fn required_workbook_store_wiring_present_for_current_phase() {
+    let source = workbook_rs();
+    let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+    let compact = production.replace([' ', '\n', '\r', '\t'], "");
+    let missing: Vec<&str> = REQUIRED_WORKBOOK_WIRING
+        .iter()
+        .filter(|(_, from)| PHASE >= *from)
+        .filter(|(shape, _)| !compact.contains(shape))
+        .map(|(shape, _)| *shape)
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "workbook.rs is missing shared Store/context wiring (INV-1/INV-2): {missing:?}"
+    );
+}
+
+/// Formula cells have exactly one production evaluation entry, and that entry
+/// is the Store-owned formula-inner body pinned by REQUIRED_SHEET_WIRING.
+/// Workbook's one direct evaluator is reserved for top-level defined-name
+/// construction; it must never become a second formula-cell value path.
+#[test]
+fn formula_cell_evaluation_has_one_store_owned_entry() {
+    let sheet = sheet_rs();
+    let sheet_production = sheet.split("#[cfg(test)]").next().unwrap_or(&sheet);
+    assert_eq!(
+        sheet_production.matches("eval_expr_with_provider(").count(),
+        1,
+        "formula-cell evaluation gained a parallel entry outside formula-inner"
+    );
+
+    let workbook = workbook_rs();
+    let workbook_production = workbook.split("#[cfg(test)]").next().unwrap_or(&workbook);
+    assert_eq!(
+        workbook_production
+            .matches("eval_expr_with_provider(")
+            .count(),
+        1,
+        "workbook direct evaluation must stay limited to top-level defined-name construction"
+    );
+}
+
+/// FormulaRecord may retain AST/reference metadata for structural edits and a
+/// topology-generation stamp for static validation, but formula values and
+/// reactive freshness belong exclusively to Store derived atoms.
+#[test]
+fn formula_record_is_structural_metadata_only() {
+    let source = sheet_rs();
+    let (_, after_start) = source
+        .split_once("pub(crate) struct FormulaRecord {")
+        .expect("FormulaRecord declaration");
+    let (body, _) = after_start
+        .split_once("\n}")
+        .expect("FormulaRecord closing brace");
+    let fields: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("///"))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "expr: Rc<Expr>,",
+            "cycle_checked_at: Cell<u64>,",
+            "deps: RefCell<HashSet<CellAddress>>,",
+            "static_ranges: RefCell<HashSet<CellRange>>,",
+        ],
+        "FormulaRecord acquired response state; formula results/reactive freshness must stay in Store"
+    );
+}
+
+/// P7 removes the worker-boundary dirty/clean simulation. Debug state must be
+/// a direct projection of the TS workbook's atomm-derived formula state.
+#[test]
+fn ts_worker_formula_debug_state_has_no_shadow_override() {
+    if PHASE < 7 {
+        return;
+    }
+
+    let source = worker_runtime_ts();
+    let compact = source.replace([' ', '\n', '\r', '\t'], "");
+    assert!(
+        compact.contains(
+            "case'debugFormulaCacheState':returnstate.workbook.debugFormulaCacheState(\
+             Number(msg.sheet),String(msg.addr??''))"
+        ),
+        "P7 requires debugFormulaCacheState to delegate directly to workbook state"
+    );
+
+    let retired_shadow_state = [
+        "readFormulaCells",
+        "markFormulaRead",
+        "hasFormulaRead",
+        "invalidateReadOnMutation",
+    ];
+    let survived: Vec<&str> = retired_shadow_state
+        .into_iter()
+        .filter(|name| source.contains(name))
+        .collect();
+    assert!(
+        survived.is_empty(),
+        "P7 worker debug shadow state reintroduced: {survived:?}"
     );
 }
 
@@ -292,6 +496,10 @@ fn wasm_snapshot_generate() {
     let dir = manifest_dir().join("tests/fixtures");
     fs::create_dir_all(&dir).expect("mkdir fixtures");
     let sigs = extract_wasm_signatures(&wasm_lib_rs());
-    assert!(sigs.len() > 100, "suspiciously few WASM signatures: {}", sigs.len());
+    assert!(
+        sigs.len() > 100,
+        "suspiciously few WASM signatures: {}",
+        sigs.len()
+    );
     fs::write(dir.join("wasm_api_signatures.txt"), sigs.join("\n") + "\n").expect("write snapshot");
 }

@@ -81,10 +81,7 @@ fn vlookup_wildcard_round_trip() {
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(2.0));
     assert_eq!(wb.get_cell("Sheet1", "C2"), Value::Number(1.0));
     assert_eq!(wb.get_cell("Sheet1", "C3"), Value::Number(4.0));
-    assert!(matches!(
-        wb.get_cell("Sheet1", "C4"),
-        Value::Number(_)
-    ));
+    assert!(matches!(wb.get_cell("Sheet1", "C4"), Value::Number(_)));
 }
 
 /// HLOOKUP wildcard round-trip: same rules as VLOOKUP but along a row.
@@ -117,8 +114,5 @@ fn hlookup_wildcard_round_trip() {
     assert_eq!(wb.get_cell("Sheet1", "A5"), Value::Number(3.0));
     assert_eq!(wb.get_cell("Sheet1", "A6"), Value::Number(1.0));
     // "z*" exact: no row matches "z*" → #N/A.
-    assert!(matches!(
-        wb.get_cell("Sheet1", "A7"),
-        Value::Error(_)
-    ));
+    assert!(matches!(wb.get_cell("Sheet1", "A7"), Value::Error(_)));
 }

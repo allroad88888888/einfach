@@ -1,22 +1,13 @@
-//! Phase 3 — Cross-sheet scale acceptance suite.
+//! Cross-sheet Store-delegation acceptance suite.
 //!
-//! Three integration tests pinning the workbook-level laziness contract
-//! from `rust/docs/PHASE3_PARALLEL.md` § "Phase 3 Acceptance Roll-Up":
+//! Integration tests pinning the workbook-scoped atom contract:
 //!
 //!   - Subscriber on cross-sheet formula fires on source write
 //!     (`write_propagates_to_cross_sheet_subscriber`).
-//!   - Cross-sheet chain stays dirty without eager eval
-//!     (`cross_sheet_chain_no_eager_eval`).
+//!   - A materialized cross-sheet chain re-derives synchronously with Store
+//!     change pruning (`cross_sheet_chain_rederives_during_store_flush`).
 //!   - Cross-sheet range dep survives sparse eval
 //!     (`cross_sheet_range_dirty`).
-//!
-//! Track I merged: `Workbook::set_cell`, `set_formula`, `clear_cell`,
-//! and the cross-sheet dirty-propagation BFS that fires subscribers
-//! are in place. Tests #1 and #2 turn green directly.
-//!
-//! Test #3 (`cross_sheet_range_dirty`) pins the Phase 4A parser/eval
-//! follow-up: `Sheet2!A1:A100` must enter the workbook range-dep graph
-//! and stay sparse/lazy at read time.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -24,20 +15,9 @@ use std::rc::Rc;
 use einfach_core::Value;
 use einfach_excel_core::Workbook;
 
-/// Phase 3 验收 (Roll-Up bullet 1): "Subscriber on cross-sheet formula
-/// fires on source write" — the inverse of the current
-/// `workbook_get_cell_refreshes_cross_sheet_cache_without_notifying`
-/// test in `workbook.rs`. The pre-existing test pins the WRONG behavior
-/// (subscriber count stays at 0 across cross-sheet writes); after Track
-/// I, this test pins the right one.
-///
-/// SAFETY/contract: a subscriber attached to `Sheet1!B1` BEFORE the
-/// cross-sheet formula `=Data!A1*2` is installed must fire when the
-/// upstream cell `Data!A1` is mutated via `Workbook::set_cell`. The
-/// workbook is the only mutation surface that holds the cross-sheet
-/// dep graph — direct `Sheet::set_cell` paths still won't notify
-/// across sheet boundaries (that's by design; the workbook tests
-/// migrate first).
+/// A subscriber attached before the cross-sheet formula is installed must be
+/// retargeted to the formula facade and fire when the Store observes a source
+/// write.
 #[test]
 fn write_propagates_to_cross_sheet_subscriber() {
     let mut wb = Workbook::new();
@@ -53,18 +33,13 @@ fn write_propagates_to_cross_sheet_subscriber() {
         .unwrap()
         .subscribe_cell("B1", move || *ff.borrow_mut() += 1);
 
-    // Install the cross-sheet formula. `Workbook::set_formula` already
-    // exists; the per-sheet path here also wires up the static
-    // dep registration that Track I's `CrossSheetDeps` rides on top of.
+    // Install the cross-sheet formula through the workbook-scoped Store.
     wb.set_formula(0, "B1", "=Data!A1*2");
 
-    // Cross-sheet write — Track I's inherent `Workbook::set_cell` method.
+    // Cross-sheet write through the workbook mutation surface.
     wb.set_cell(1, "A1", Value::Number(5.0));
 
-    // Phase 3 contract: the cross-sheet dependent's subscriber must
-    // fire. "≥ 1" rather than "== 1" because Track I has BFS latitude
-    // to coalesce or fan out — the contract is "at least once", not
-    // "exactly once".
+    // The formula facade publishes when its derived value changes.
     assert!(
         *fires.borrow() >= 1,
         "cross-sheet subscriber didn't fire on Workbook::set_cell"
@@ -73,31 +48,75 @@ fn write_propagates_to_cross_sheet_subscriber() {
     assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(10.0));
 }
 
-/// Phase 3 验收 (Roll-Up bullet 2): "Cross-sheet chain stays dirty
-/// without eager eval". Three-sheet chain
-/// `Sheet1!C1 → Sheet2!B1 → Sheet3!A1`. A write at the root must dirty
-/// the entire chain WITHOUT triggering any formula evaluation; the
-/// dirty propagation is structural (BFS through `CrossSheetDeps`), not
-/// observational.
-///
-/// SAFETY/contract:
-///   1. After reading each formula cell once to populate the chain
-///      caches, baseline `debug_formula_eval_count()` on Sheet1 and
-///      Sheet2 is captured.
-///   2. Subscribers on all three formula cells exist.
-///   3. A write at the root (`Sheet3!A1`) must:
-///      - Fire ALL three subscribers (the BFS traverses both
-///        cross-sheet hops). "≥ 1" each because Track I's BFS may
-///        coalesce duplicates.
-///      - Leave eval counters UNCHANGED on both downstream sheets —
-///        dirty-mark only, no eager eval (the same contract as Phase 1's
-///        `dirty_notify_no_eager_compute` but across sheets).
-///   4. A subsequent read at `Sheet1!C1` recomputes EXACTLY the two
-///      cross-sheet formulas on its dep chain (Sheet1!C1 +
-///      Sheet2!B1), so the combined eval counter for those two sheets
-///      bumps by 2 — not by the full workbook formula count.
+/// A formula that needs workbook context also tracks its local point refs.
+/// Both references are facade dependencies in the same shared Store.
 #[test]
-fn cross_sheet_chain_no_eager_eval() {
+fn workbook_context_formula_tracks_local_point_write() {
+    let mut wb = Workbook::new();
+    let data = wb.add_sheet("Data");
+    let sheet1 = wb.index_of("Sheet1").unwrap();
+
+    wb.set_cell(sheet1, "A1", Value::Number(2.0));
+    wb.set_cell(data, "A1", Value::Number(10.0));
+    assert!(wb.set_formula(sheet1, "B1", "=A1+Data!A1"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(12.0));
+
+    let fires = Rc::new(RefCell::new(0u32));
+    let ff = fires.clone();
+    let _sub = wb
+        .sheet_mut(sheet1)
+        .unwrap()
+        .subscribe_cell("B1", move || *ff.borrow_mut() += 1);
+
+    wb.set_cell(sheet1, "A1", Value::Number(7.0));
+
+    assert_eq!(
+        *fires.borrow(),
+        1,
+        "a local point write must notify the mixed-context formula once"
+    );
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(17.0));
+}
+
+/// Same boundary as the point-ref case, but for a previously empty member of
+/// a local range. Static range membership must wake the workbook-context
+/// formula even though the first sparse read never visited A2.
+#[test]
+fn workbook_context_formula_tracks_local_range_write() {
+    let mut wb = Workbook::new();
+    let data = wb.add_sheet("Data");
+    let sheet1 = wb.index_of("Sheet1").unwrap();
+
+    wb.set_cell(sheet1, "A1", Value::Number(1.0));
+    wb.set_cell(sheet1, "A3", Value::Number(3.0));
+    wb.set_cell(data, "A1", Value::Number(10.0));
+    assert!(wb.set_formula(sheet1, "B1", "=SUM(A1:A3)+Data!A1"));
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(14.0));
+
+    let fires = Rc::new(RefCell::new(0u32));
+    let ff = fires.clone();
+    let _sub = wb
+        .sheet_mut(sheet1)
+        .unwrap()
+        .subscribe_cell("B1", move || *ff.borrow_mut() += 1);
+
+    wb.set_cell(sheet1, "A2", Value::Number(2.0));
+
+    assert_eq!(
+        *fires.borrow(),
+        1,
+        "a local range-member write must notify the mixed-context formula once"
+    );
+    assert_eq!(wb.get_cell("Sheet1", "B1"), Value::Number(16.0));
+}
+
+/// Three-sheet chain `Sheet1!C1 -> Sheet2!B1 -> Sheet3!A1`.
+///
+/// Once the formulas are materialized, a root write follows vanilla Store
+/// semantics: both derived formulas re-run during `flush_pending`, all changed
+/// facades publish, and a later read performs no additional evaluation.
+#[test]
+fn cross_sheet_chain_rederives_during_store_flush() {
     let mut wb = Workbook::new();
     let s2 = wb.add_sheet("Sheet2");
     let s3 = wb.add_sheet("Sheet3");
@@ -110,8 +129,7 @@ fn cross_sheet_chain_no_eager_eval() {
     assert!(wb.set_formula(s2, "B1", "=Sheet3!A1"));
     assert!(wb.set_formula(s1, "C1", "=Sheet2!B1"));
 
-    // Initial reads populate the caches up the chain so subsequent
-    // dirty-only assertions have a meaningful baseline.
+    // Initial reads materialize the formula-inner atoms and dependency chain.
     assert_eq!(wb.get_cell("Sheet3", "A1"), Value::Number(1.0));
     assert_eq!(wb.get_cell("Sheet2", "B1"), Value::Number(1.0));
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(1.0));
@@ -122,8 +140,7 @@ fn cross_sheet_chain_no_eager_eval() {
     let eval_s1_before = wb.sheet(s1).unwrap().debug_formula_eval_count();
     let eval_s2_before = wb.sheet(s2).unwrap().debug_formula_eval_count();
 
-    // Subscribers on each formula cell. Each gets its own counter so
-    // we can verify the BFS reached every layer of the chain.
+    // Subscribers on each cell observe Store publication at every layer.
     let fires_s1 = Rc::new(RefCell::new(0u32));
     let fires_s2 = Rc::new(RefCell::new(0u32));
     let fires_s3 = Rc::new(RefCell::new(0u32));
@@ -143,48 +160,43 @@ fn cross_sheet_chain_no_eager_eval() {
         .unwrap()
         .subscribe_cell("A1", move || *f3.borrow_mut() += 1);
 
-    // Root write — must dirty the entire chain via Track I's
-    // cross-sheet BFS without eager eval anywhere.
+    // Root write synchronously flushes the workbook-scoped Store.
     wb.set_cell(s3, "A1", Value::Number(99.0));
 
-    // All three subscribers fired at least once. "≥ 1" because Track
-    // I's BFS may coalesce; "== 1" would over-specify the coalescing
-    // contract.
+    // All three values changed and therefore all three facades publish.
     assert!(
         *fires_s3.borrow() >= 1,
         "Sheet3!A1 subscriber (root) must fire on its own write"
     );
     assert!(
         *fires_s2.borrow() >= 1,
-        "Sheet2!B1 subscriber (mid) must fire via cross-sheet dirty BFS"
+        "Sheet2!B1 subscriber (mid) must fire via Store propagation"
     );
     assert!(
         *fires_s1.borrow() >= 1,
-        "Sheet1!C1 subscriber (tip) must fire via transitive cross-sheet BFS"
+        "Sheet1!C1 subscriber (tip) must fire via transitive Store propagation"
     );
 
-    // Phase 3's key bullet: no eager eval anywhere on the chain.
+    // INV-7: already-materialized formulas re-derive during the write flush.
     assert_eq!(
         wb.sheet(s1).unwrap().debug_formula_eval_count(),
-        eval_s1_before,
-        "Sheet1 formula eval counter must not change on root write — dirty only"
+        eval_s1_before + 1,
+        "Sheet1!C1 must re-derive once during the root write"
     );
     assert_eq!(
         wb.sheet(s2).unwrap().debug_formula_eval_count(),
-        eval_s2_before,
-        "Sheet2 formula eval counter must not change on root write — dirty only"
+        eval_s2_before + 1,
+        "Sheet2!B1 must re-derive once during the root write"
     );
 
-    // Now an explicit read at the tip pulls the chain. Sheet1!C1
-    // recomputes once; Sheet2!B1 (its cross-sheet dependency)
-    // recomputes once. Combined bump = 2.
+    // The write settled the chain; a subsequent read is cache-only.
     assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Number(99.0));
     let eval_s1_after = wb.sheet(s1).unwrap().debug_formula_eval_count();
     let eval_s2_after = wb.sheet(s2).unwrap().debug_formula_eval_count();
     assert_eq!(
         (eval_s1_after - eval_s1_before) + (eval_s2_after - eval_s2_before),
         2,
-        "tip read must recompute exactly Sheet1!C1 + Sheet2!B1 (2 evals total)"
+        "post-write read must not add evaluations beyond the two flush re-derivations"
     );
 }
 
@@ -198,10 +210,7 @@ fn cross_sheet_chain_no_eager_eval() {
 /// stay empty). Writing `Sheet2!A50` — which the sparse iter DID NOT
 /// visit during the first read — MUST still dirty `Sheet1!D1`. The
 /// subscriber on D1 fires, and re-reading produces the correct sum
-/// 1 + 10 + 2 = 13. Pre-Phase 3, the cross-sheet range dep doesn't even
-/// reach the workbook's cross-sheet dependents index — Sheet2's local
-/// range_dependents knows about the formula but has no way to notify
-/// Sheet1.
+/// 1 + 10 + 2 = 13. The workbook-scoped range-family atom owns this wake-up.
 ///
 #[test]
 fn cross_sheet_range_dirty() {
@@ -236,8 +245,7 @@ fn cross_sheet_range_dirty() {
 
     // The killer write: A50 was empty during the sparse first read,
     // so a "tracked addresses only" implementation would never wake D1
-    // up. Phase 3 + Phase 1's range-dep-from-AST contract say D1 must
-    // dirty.
+    // up. The range-family atom must invalidate D1.
     wb.set_cell(s2, "A50", Value::Number(10.0));
 
     assert!(

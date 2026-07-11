@@ -4,10 +4,11 @@
 //! `rust/excel-core/docs/LAZY_FORMULA_INDEXING_PLAN.md`. Each test
 //! exercises one observable behaviour:
 //!
-//!   1. `bulk_load + no reads` → zero dep-graph edges installed.
-//!   2. `bulk_load + read 5 formulas` → partial hydration; only 5
-//!      formulas' worth of edges land.
-//!   3. `bulk_load + read every formula` → edges match the eager-path
+//!   1. `bulk_load + no reads` → zero formula-inner/geometry state installed.
+//!   2. `bulk_load + read 5 formulas` → partial hydration; only 5 formula
+//!      records and their Store edges materialize.
+//!   3. `bulk_load + read every formula` → materialized state matches the eager
+//!      path
 //!      baseline (cross-check against a clone of the sheet that we
 //!      drive eagerly via `set_formula`).
 //!   4. `bulk_load + mutate primitive + read formula` → correct value
@@ -22,9 +23,8 @@
 use einfach_core::Value;
 use einfach_excel_core::Sheet;
 
-/// Phase 2 acceptance: `bulk_load` of N formulas registers ZERO edges
-/// in `cell_dependents` / `range_dependents`. The dep-graph stays
-/// completely empty until a read first hydrates a formula.
+/// Phase 2 acceptance: `bulk_load` of N formulas registers ZERO formula-inner
+/// or range geometry state. Same-sheet dependencies are owned by Store.
 #[test]
 fn bulk_load_installs_zero_edges_before_any_read() {
     const N: u32 = 1_000;
@@ -32,8 +32,8 @@ fn bulk_load_installs_zero_edges_before_any_read() {
     sheet.bulk_load(|loader| {
         for r in 1..=N {
             loader.set_cell(&format!("A{}", r), Value::Number(r as f64));
-            // Mix of point-cell and range deps so the absence of edges
-            // shows in BOTH halves of the dep graph.
+            // Mix point and range formulas; geometry roots only materialize
+            // when a range formula is read.
             loader.set_formula(&format!("B{}", r), &format!("=A{}+1", r));
             loader.set_formula(&format!("C{}", r), &format!("=SUM(A1:A{})", r));
         }
@@ -51,17 +51,16 @@ fn bulk_load_installs_zero_edges_before_any_read() {
         (2 * N) as usize,
         "total formula count includes lazy parks + hydrated cells"
     );
-    // Hydrated formula records: zero. cell_dependents key count: zero.
-    // range_dependents: zero.
+    // Hydrated formula records and Store range geometry roots are both zero.
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
-        "no point-dep edges before any read"
+        "deleted point graph remains empty before any read"
     );
     assert_eq!(
         sheet.debug_range_dep_count(),
         0,
-        "no range-dep entries before any read"
+        "no range geometry roots before any read"
     );
     let stats = sheet.debug_dep_graph_stats();
     assert_eq!(stats.formula_count, 0, "hydrated formula_count is zero");
@@ -70,9 +69,9 @@ fn bulk_load_installs_zero_edges_before_any_read() {
 }
 
 /// Phase 3 acceptance: reading 5 of N bulk-loaded formulas hydrates
-/// exactly those 5 — the other formulas stay deferred. We use a
-/// point-cell-only shape so each hydrated formula contributes exactly
-/// one edge to `cell_dependents` (and we can count precisely).
+/// exactly those 5 — the other formulas stay deferred. Point-cell
+/// dependencies are store-owned, so hydration is measured through the
+/// formula record count.
 #[test]
 fn bulk_load_then_read_n_hydrates_exactly_n() {
     const N: u32 = 1_000;
@@ -84,18 +83,17 @@ fn bulk_load_then_read_n_hydrates_exactly_n() {
             loader.set_formula(&format!("B{}", r), &format!("=A{}+1", r));
         }
     });
-    // Read 5 formula cells. Each hydrates → 1 cell_dependents key
-    // (A{r}) per formula, no range deps.
+    // Read 5 formula cells. Each hydrates one formula record, no range deps.
     for r in 1..=READ_COUNT {
         let v = sheet.get_cell(&format!("B{}", r));
         assert_eq!(v, Value::Number(r as f64 + 1.0));
     }
     assert_eq!(
-        sheet.debug_cell_dependents_key_count() as u32,
-        READ_COUNT,
-        "exactly 5 distinct dep-source addresses after 5 reads"
+        sheet.debug_point_dependency_key_count() as u32,
+        0,
+        "deleted point-dependency index stays empty after reads"
     );
-    // Hydrated formula count from the dep-graph probe.
+    // Hydrated formula count from the compatibility/materialization probe.
     let stats = sheet.debug_dep_graph_stats();
     assert_eq!(stats.formula_count as u32, READ_COUNT);
     // Total formulas still N: 5 hydrated + (N-5) lazy.
@@ -103,7 +101,7 @@ fn bulk_load_then_read_n_hydrates_exactly_n() {
 }
 
 /// Phase 3 parity: hydrating EVERY formula via reads must produce the
-/// same dep-graph shape as the pre-lazy eager path. We build two
+/// same formula/Store materialization shape as the eager path. We build two
 /// sheets — one through `bulk_load + read-all`, one through eager
 /// per-cell `set_formula` — and compare counters.
 #[test]
@@ -115,8 +113,8 @@ fn full_hydration_matches_eager_path_edge_counts() {
         for r in 1..=N {
             loader.set_cell(&format!("A{}", r), Value::Number(r as f64));
             loader.set_formula(&format!("B{}", r), &format!("=A{}*2", r));
-            // Throw in a range dep so range_dependents has work to
-            // measure too.
+            // Include range formulas so static range metadata and Store edge
+            // hydration are compared too.
             if r % 5 == 0 {
                 loader.set_formula(
                     &format!("C{}", r),
@@ -144,10 +142,8 @@ fn full_hydration_matches_eager_path_edge_counts() {
             );
         }
     }
-    // Force eager to also evaluate every formula (so the
-    // replace_formula_deps narrowing has had a chance to run on both
-    // — that step happens at read time on both paths, so for parity
-    // we read the eager sheet too).
+    // Evaluate every formula so formula records and Store-backed counters are
+    // comparable.
     for r in 1..=N {
         let _ = eager.get_cell(&format!("B{}", r));
         if r % 5 == 0 {
@@ -161,20 +157,20 @@ fn full_hydration_matches_eager_path_edge_counts() {
         "formula_count parity after full hydration"
     );
     assert_eq!(
-        lazy.debug_cell_dependents_key_count(),
-        eager.debug_cell_dependents_key_count(),
-        "cell_dependents key count parity"
+        lazy.debug_point_dependency_key_count(),
+        eager.debug_point_dependency_key_count(),
+        "deleted point graph probe parity"
     );
     assert_eq!(
         lazy.debug_range_dep_count(),
         eager.debug_range_dep_count(),
-        "range_dependents count parity"
+        "range geometry root count parity"
     );
     let lazy_stats = lazy.debug_dep_graph_stats();
     let eager_stats = eager.debug_dep_graph_stats();
     assert_eq!(
         lazy_stats.total_point_dep_edges, eager_stats.total_point_dep_edges,
-        "total point-dep edges parity"
+        "legacy point-edge probe parity"
     );
     assert_eq!(
         lazy_stats.total_range_dep_entries, eager_stats.total_range_dep_entries,
@@ -199,17 +195,16 @@ fn bulk_load_then_mutate_primitive_then_read_formula_returns_post_mutation_value
     });
     // No reads → B1 still lazy.
     assert_eq!(
-        sheet.debug_cell_dependents_key_count(),
+        sheet.debug_point_dependency_key_count(),
         0,
         "no edges before any read"
     );
     // Mutate the primitive.
     sheet.set_cell("A1", Value::Number(99.0));
-    // First read. Hydration parses, registers (A1 → B1), evaluates
-    // against the current A1 value.
+    // First read. Hydration parses and evaluates against the current A1
+    // value; the point edge is tracked by the atom store.
     assert_eq!(sheet.get_cell("B1"), Value::Number(100.0));
-    // And the edge is now installed.
-    assert_eq!(sheet.debug_cell_dependents_key_count(), 1);
+    assert_eq!(sheet.debug_point_dependency_key_count(), 0);
 }
 
 /// Edge case from the plan: `set_cell` (or `set_formula`) overwriting
@@ -420,8 +415,8 @@ fn delete_row_drops_lazy_state_for_addresses_in_deleted_band() {
     // Sanity: lazy entry exists.
     assert_eq!(sheet.debug_formula_count(), 1);
     sheet.delete_row(4, 1); // delete row 5 (0-based 4)
-    // The lazy formula at B5 must be GONE — not parked at the
-    // REF_INVALID sentinel.
+                            // The lazy formula at B5 must be GONE — not parked at the
+                            // REF_INVALID sentinel.
     assert_eq!(sheet.debug_formula_count(), 0);
     let addrs = sheet.non_empty_addrs();
     assert!(addrs.is_empty(), "sheet must be empty, got {:?}", addrs);
@@ -436,7 +431,7 @@ fn delete_col_drops_lazy_state_for_addresses_in_deleted_band() {
         l.set_cell("D1", Value::Number(7.0));
     });
     sheet.delete_col(2, 1); // delete column C
-    // C1's lazy state must be gone; D1 shifts to C1.
+                            // C1's lazy state must be gone; D1 shifts to C1.
     let addrs = sheet.non_empty_addrs();
     assert_eq!(addrs.len(), 1);
     assert_eq!(sheet.get_cell("C1"), Value::Number(7.0));

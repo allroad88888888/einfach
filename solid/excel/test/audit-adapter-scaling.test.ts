@@ -17,11 +17,10 @@
  *         one postWrite batch. The pins below assert the fixed shape
  *         (cleared counts existing cells only; full-column clear is
  *         bounded by sheet content; spill semantics match W1.1).
- *  - D-5  P-D  **FIXED** worker-runtime-ts sheet ops reset
- *         `readFormulaCells` / `importSessions` / `snapshotSessions` in
- *         `rebuildPreservingCells` — the cache-state probe stays honest
- *         and stale sessions fail loudly instead of hitting the wrong
- *         (shifted) sheet index.
+ *  - D-5  P-D  **FIXED** worker-runtime-ts sheet ops discard import and
+ *         snapshot sessions whose indices may shift. Formula-cache probes
+ *         delegate to the Workbook's atomm-derived state, so they carry no
+ *         index-keyed worker cache across a structural operation.
  *  - D-4  P-D  **FIXED** worker-workbook-backend deleteSheet drops every
  *         per-sheet host overlay (`dropSheetOverlayState`) — a reused
  *         sheet id starts clean.
@@ -32,9 +31,9 @@
  *  - D-8  P-A  **FIXED** worker-runtime-ts range readers enumerate
  *         window ∩ existing via `collectCellsInBounds` (coordinate probe
  *         for viewport windows, sparse map walk for huge ranges).
- *  - D-9  P-A  **FIXED** worker-runtime-ts keys `readFormulaCells` per
- *         sheet — write-time invalidation is one Map.delete, not a
- *         startsWith scan over every host-read formula on every sheet.
+ *  - D-9  P-A  **FIXED** upstream writes rederive the materialized
+ *         Workbook formula atoms on their owning sheet. The worker keeps no
+ *         host-read invalidation map or cross-sheet dirty-state simulation.
  *  - D-10 P-B  **FIXED** worker-workbook-backend removeRows groups the
  *         descending row list into contiguous bands — one deleteRows RPC
  *         per band instead of per row.
@@ -228,35 +227,40 @@ describe('audit D-1 · P-A · FIXED (W2.4) · TS runtime clearRange walks existi
   })
 })
 
-describe('audit D-5 · P-D · FIXED — TS runtime sheet ops drop index-keyed host state', () => {
-  test('debugFormulaCacheState reports dirty for a never-read formula after removeSheet shifts indices', async () => {
+describe('audit D-5 · P-D · FIXED — structural sheet ops keep probes bound to Workbook state', () => {
+  test('debugFormulaCacheState follows the shifted Workbook sheet after removeSheet', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['S1', 'S2', 'S3', 'S4'] })
 
-    // Formula on S3 (idx 2), host-reads it → readFormulaCells gains '2:0:0'.
+    // Formula writes run the Workbook's cycle check, materializing the
+    // formula atoms. The direct probe therefore reports Store state rather
+    // than a worker-local host-read record.
     await rpc({ cmd: 'setFormulaDetailed', sheet: 2, addr: 'A1', formula: '=1+1' })
-    await rpc({ cmd: 'readCells', cells: [{ sheet: 2, addr: 'A1' }] })
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 2, addr: 'A1' })).toBe('clean')
 
-    // Formula on S4 (idx 3), never host-read → must be 'dirty'.
     await rpc({ cmd: 'setFormulaDetailed', sheet: 3, addr: 'A1', formula: '=2+2' })
-    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 3, addr: 'A1' })).toBe('dirty')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 3, addr: 'A1' })).toBe('clean')
 
-    // Remove S1 (idx 0): S3 → idx 1, S4 → idx 2. Pre-fix, the stale
-    // '2:0:0' entry matched S4!A1 and the probe lied 'clean'.
+    // Remove S1 (idx 0): S3 -> idx 1, S4 -> idx 2. Rebuilding the Workbook
+    // recreates lazy formula atoms, so the direct probe reports their actual
+    // unmaterialized state; no index-keyed worker state is available to leak.
     await rpc({ cmd: 'removeSheet', sheet: 0 })
-    const probed = await rpc({ cmd: 'debugFormulaCacheState', sheet: 2, addr: 'A1' })
-
-    // FLIPPED PIN (was: 'clean', the inherited stale entry):
-    // `rebuildPreservingCells` now resets `readFormulaCells` on every
-    // sheet op, so the host-read probe is honest again.
-    expect(probed).toBe('dirty')
-
-    // The shifted S3 (now idx 1) lost its 'clean' too — the rebuild
-    // dropped every cached value — and re-reading restores it.
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 2, addr: 'A1' })).toBe('dirty')
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('dirty')
-    await rpc({ cmd: 'readCells', cells: [{ sheet: 1, addr: 'A1' }] })
+    expect(
+      await rpc({
+        cmd: 'readCells',
+        cells: [
+          { sheet: 1, addr: 'A1' },
+          { sheet: 2, addr: 'A1' },
+        ],
+      }),
+    ).toEqual([
+      expect.objectContaining({ display: '2' }),
+      expect.objectContaining({ display: '4' }),
+    ])
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 2, addr: 'A1' })).toBe('clean')
   })
 
   test('in-flight import + snapshot sessions are invalidated by a structural sheet op', async () => {
@@ -297,30 +301,39 @@ describe('audit D-5 · P-D · FIXED — TS runtime sheet ops drop index-keyed ho
   })
 })
 
-describe('audit D-9 · P-A · FIXED — read-invalidation is one Map.delete per write, keyed per sheet', () => {
-  test('a write invalidates exactly its own sheet: other sheets keep their host-read state', async () => {
+describe('audit D-9 · P-A · FIXED — atomm derivation stays scoped to the owning sheet', () => {
+  test('an upstream write rederives its sheet without evaluating an unrelated sheet', async () => {
     const { rpc } = makeRpc()
     await rpc({ cmd: 'initWorkbook', sheets: ['S1', 'S2'] })
 
-    // Host-read formulas on BOTH sheets.
-    await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=1+1' })
-    await rpc({ cmd: 'setFormulaDetailed', sheet: 1, addr: 'A1', formula: '=2+2' })
-    await rpc({
-      cmd: 'readCells',
-      cells: [
-        { sheet: 0, addr: 'A1' },
-        { sheet: 1, addr: 'A1' },
-      ],
-    })
+    await rpc({ cmd: 'setCell', sheet: 0, addr: 'B1', value: { type: 'number', value: 1 } })
+    await rpc({ cmd: 'setCell', sheet: 1, addr: 'B1', value: { type: 'number', value: 2 } })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 0, addr: 'A1', formula: '=B1' })
+    await rpc({ cmd: 'setFormulaDetailed', sheet: 1, addr: 'A1', formula: '=B1' })
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'A1' })).toBe('clean')
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
+    expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 0 })).toBe(1)
+    expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 1 })).toBe(1)
 
-    // One write on S1. The per-sheet keying drops S1's whole read set in
-    // one Map.delete (no scan over other sheets' entries) — and must NOT
-    // over-invalidate S2.
+    // One upstream write on S1 synchronously rederives S1!A1. S2's atom is
+    // untouched: no worker-side Map is consulted or invalidated.
     await rpc({ cmd: 'setCell', sheet: 0, addr: 'B1', value: { type: 'number', value: 5 } })
-    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'A1' })).toBe('dirty')
+    expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 0, addr: 'A1' })).toBe('clean')
     expect(await rpc({ cmd: 'debugFormulaCacheState', sheet: 1, addr: 'A1' })).toBe('clean')
+    expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 0 })).toBe(2)
+    expect(await rpc({ cmd: 'debugFormulaEvalCount', sheet: 1 })).toBe(1)
+    expect(
+      await rpc({
+        cmd: 'readCells',
+        cells: [
+          { sheet: 0, addr: 'A1' },
+          { sheet: 1, addr: 'A1' },
+        ],
+      }),
+    ).toEqual([
+      expect.objectContaining({ display: '5' }),
+      expect.objectContaining({ display: '2' }),
+    ])
   })
 })
 

@@ -157,7 +157,11 @@ fn bulk_dependency_write_recomputes_spill_at_flush() {
     });
 
     assert_eq!(sheet.get_cell("A2"), Value::Number(2.0), "2-row spill");
-    assert_eq!(sheet.get_cell("A3"), Value::Null, "shrunk spill released A3");
+    assert_eq!(
+        sheet.get_cell("A3"),
+        Value::Null,
+        "shrunk spill released A3"
+    );
     assert!(sheet.try_set_cell("A3", Value::Number(1.0)).is_ok());
 }
 

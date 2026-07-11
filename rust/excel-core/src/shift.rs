@@ -294,8 +294,7 @@ pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
                     return SourceRewrite::DeadRef;
                 }
                 if mapped != addr {
-                    let buf = out
-                        .get_or_insert_with(|| String::with_capacity(src.len() + 8));
+                    let buf = out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
                     buf.push_str(&src[emitted..start]);
                     buf.push_str(&mapped.to_string_repr());
                     emitted = i;
@@ -328,15 +327,13 @@ pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
                             if m1.col == REF_INVALID_COL
                                 || m2.col == REF_INVALID_COL
                                 || (!edit.is_row_edit()
-                                    && (m1.row == REF_INVALID_ROW
-                                        || m2.row == REF_INVALID_ROW))
+                                    && (m1.row == REF_INVALID_ROW || m2.row == REF_INVALID_ROW))
                             {
                                 return SourceRewrite::DeadRef;
                             }
                             if !edit.is_row_edit() && (m1.col != sc || m2.col != ec) {
-                                let buf = out.get_or_insert_with(|| {
-                                    String::with_capacity(src.len() + 8)
-                                });
+                                let buf =
+                                    out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
                                 buf.push_str(&src[emitted..start]);
                                 buf.push_str(&col_only(m1.col));
                                 buf.push(':');
@@ -382,17 +379,13 @@ pub fn rewrite_parked_source(src: &str, edit: ShiftEdit) -> SourceRewrite {
                             if m1.row == REF_INVALID_ROW
                                 || m2.row == REF_INVALID_ROW
                                 || (edit.is_row_edit()
-                                    && (m1.col == REF_INVALID_COL
-                                        || m2.col == REF_INVALID_COL))
+                                    && (m1.col == REF_INVALID_COL || m2.col == REF_INVALID_COL))
                             {
                                 return SourceRewrite::DeadRef;
                             }
-                            if edit.is_row_edit()
-                                && (m1.row != r1 - 1 || m2.row != r2 - 1)
-                            {
-                                let buf = out.get_or_insert_with(|| {
-                                    String::with_capacity(src.len() + 8)
-                                });
+                            if edit.is_row_edit() && (m1.row != r1 - 1 || m2.row != r2 - 1) {
+                                let buf =
+                                    out.get_or_insert_with(|| String::with_capacity(src.len() + 8));
                                 buf.push_str(&src[emitted..start]);
                                 buf.push_str(&format!("{}:{}", m1.row + 1, m2.row + 1));
                                 emitted = j;
@@ -1218,7 +1211,10 @@ mod tests {
         // Within-sheet edits never shift sheet-qualified refs (mirrors
         // `map_addrs`), including a sheet NAME that looks like a ref.
         assert_eq!(
-            rewrite_parked_source("=Data!A1+Data!B2:C3", ShiftEdit::RowInsert { at: 0, count: 1 }),
+            rewrite_parked_source(
+                "=Data!A1+Data!B2:C3",
+                ShiftEdit::RowInsert { at: 0, count: 1 }
+            ),
             SourceRewrite::Unchanged
         );
         assert_eq!(

@@ -23,10 +23,9 @@ use einfach_core::ValueError;
 /// `shift::map_addrs` and `shift::shift_refs` are invariant on the
 /// unbounded axis (inserting a row inside column A doesn't move the
 /// `A:A` corners); `render_formula` round-trips the original syntax.
-/// Dependency registration goes through `collect_range_refs`, which
-/// emits a canonical `CellRange` covering the entire sheet on the
-/// unbounded axis — Track E's `RangeDependentIndex` then routes it
-/// into `wide_ranges` (any range > 4096 rows or cols is wide).
+/// Dependency registration retains a canonical `CellRange` covering the
+/// entire sheet on the unbounded axis. Formula evaluation maps it to lazy
+/// Store geometry roots without expanding the coordinate space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RangeBounds {
     None,

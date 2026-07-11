@@ -153,10 +153,7 @@ fn value_to_csv_field(v: &Value) -> String {
         // a raw anchor value without going through `Sheet::peek_value`
         // post-collapse — defensive parity with `coerce_to_text` /
         // wasm `value_to_display`.
-        Value::Array(arr) => arr
-            .get(0, 0)
-            .map(value_to_csv_field)
-            .unwrap_or_default(),
+        Value::Array(arr) => arr.get(0, 0).map(value_to_csv_field).unwrap_or_default(),
         // Lambdas have no canonical CSV form. They should never escape the
         // evaluator into a persisted cell value — they're transient
         // higher-order-function plumbing. If one ever reaches here it's a

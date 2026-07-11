@@ -233,10 +233,7 @@ fn prob_through_workbook() {
         Value::Number(n) => assert!(approx_eq(n, 0.8, 1e-9)),
         other => panic!("{:?}", other),
     }
-    assert!(matches!(
-        wb.get_cell("Sheet1", "C3"),
-        Value::Error(_)
-    ));
+    assert!(matches!(wb.get_cell("Sheet1", "C3"), Value::Error(_)));
 }
 
 #[test]

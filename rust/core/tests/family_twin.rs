@@ -122,9 +122,8 @@ fn family_of_derived_atoms() {
     let store_for_read = store.clone();
     let cell_5 = cells.get(&5).unwrap();
     let f = formulas.get_or_create(5, || {
-        store_for_read.create_derived_ctx(move |args| {
-            n(args.get(cell_5).as_number().unwrap_or(0.0) * 10.0)
-        })
+        store_for_read
+            .create_derived_ctx(move |args| n(args.get(cell_5).as_number().unwrap_or(0.0) * 10.0))
     });
 
     assert_eq!(store.get(f).as_number(), Some(50.0));

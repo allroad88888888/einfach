@@ -6,8 +6,8 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
-use einfach_excel_core::Sheet;
 use einfach_core::Value;
+use einfach_excel_core::Sheet;
 
 /// Cell address helper: turn a (row, col) into the canonical "A1" form
 /// that the public `Sheet` API accepts.
@@ -154,18 +154,14 @@ fn bench_lazy_import_no_eval(c: &mut Criterion) {
     group.finish();
 }
 
-/// `bench_range_dep_registration` — cost of registering many range-formula
-/// dependencies. Gates LAZY Step 5 (range dependency interval index).
+/// `bench_range_dep_registration` — cost of materializing many range-formula
+/// Store derivations.
 ///
-/// Today `set_formula` calls `collect_refs`, which expands every `Range` node
-/// into one `CellAddress` per cell inside the rectangle. Each expanded address
-/// then becomes a key in `cell_dependents`. For N formulas × R range size that
-/// is O(N·R) HashMap inserts + O(N·R) hash-set entries; memory grows the same
-/// way. Step 5's interval-tree variant should make this O(N) registration with
-/// per-row interval lookups at dirty time.
+/// `A1:A1000` is a Tier-B range, so each formula records four row-band epoch
+/// reads in Store rather than expanding to 1000 address→formula edges.
 ///
 /// Parameters sweep N ∈ {10, 100, 1000} formulas each over a 1000-wide range.
-/// At N = 1000 today this is 1M dep entries — the elbow we want to flatten.
+/// The benchmark catches accidental reintroduction of per-cell registration.
 fn bench_range_dep_registration(c: &mut Criterion) {
     let mut group = c.benchmark_group("sheet/range_dep_registration");
     // Each registration writes `n` formulas; throughput is reported per formula.
@@ -198,12 +194,9 @@ fn bench_range_dep_registration(c: &mut Criterion) {
 /// `bench_range_dirty_lookup` — single-cell write dirty cascade when many
 /// range formulas already depend on that cell.
 ///
-/// Setup: N formulas each `=SUM(A1:A1000)` so they all transitively depend
-/// on A1. Then measure one `set_cell("A1", …)`. The fan-out lookup must hit
-/// `cell_dependents[A1]` (HashSet of N entries) and BFS mark each formula
-/// dirty. Both the lookup and the BFS are O(N) today; Step 5's interval
-/// tree should keep this bounded by the number of *intervals containing A1*
-/// not the total range-formula count.
+/// Setup: N formulas each `=SUM(A1:A1000)` so they all read A1's row-band
+/// geometry root. A write publishes that Store primitive and invalidates the N
+/// derived formula-inner atoms. Work remains proportional to actual consumers.
 fn bench_range_dirty_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("sheet/range_dirty_lookup");
     group.sample_size(30);
@@ -218,9 +211,9 @@ fn bench_range_dirty_lookup(c: &mut Criterion) {
             for i in 0..n {
                 sheet.set_formula(&addr_of(i, 25), "=SUM(A1:A1000)");
             }
-            // Touch each formula once so caches are Clean — subsequent dirty
-            // marks have to actually transition Clean → Dirty (the realistic
-            // workload after a user has rendered the viewport).
+            // Materialize each formula-inner and its Store edges. Subsequent
+            // writes re-derive the actual consumers, matching a rendered
+            // viewport workload.
             for i in 0..n {
                 let _ = sheet.get_cell(&addr_of(i, 25));
             }

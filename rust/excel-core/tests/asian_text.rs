@@ -32,7 +32,10 @@ fn asc_jis_round_trip_through_workbook() {
         )
     );
     // Round-trip back to plain ASCII.
-    assert_eq!(wb.get_cell("Sheet1", "C1"), Value::Text("Hello World".into()));
+    assert_eq!(
+        wb.get_cell("Sheet1", "C1"),
+        Value::Text("Hello World".into())
+    );
 }
 
 /// Voiced / semi-voiced katakana — full-width → decomposed half-width →
@@ -48,9 +51,7 @@ fn asc_jis_voiced_kana_round_trip() {
     // Decomposed: each full-width voiced kana → base + mark.
     assert_eq!(
         wb.get_cell("Sheet1", "B1"),
-        Value::Text(
-            "\u{FF76}\u{FF9E}\u{FF8A}\u{FF9F}\u{FF73}\u{FF9E}".into()
-        )
+        Value::Text("\u{FF76}\u{FF9E}\u{FF8A}\u{FF9F}\u{FF73}\u{FF9E}".into())
     );
     // Recomposed back to the originals.
     assert_eq!(
@@ -78,8 +79,5 @@ fn dbcs_alias_and_yen_sign_quirk() {
         wb.get_cell("Sheet1", "C1"),
         Value::Text("\u{FF21}\u{FF22}".into())
     );
-    assert_eq!(
-        wb.get_cell("Sheet1", "D1"),
-        wb.get_cell("Sheet1", "C1")
-    );
+    assert_eq!(wb.get_cell("Sheet1", "D1"), wb.get_cell("Sheet1", "C1"));
 }

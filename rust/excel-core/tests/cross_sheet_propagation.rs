@@ -118,8 +118,8 @@ fn remove_referenced_sheet_notifies_dependents() {
     );
 }
 
-/// Chained cross-sheet dependents of a formula that referenced the
-/// removed sheet propagate through the shared dirty BFS.
+/// Chained cross-sheet dependents of a formula that referenced the removed
+/// sheet propagate through shared Store topology and facade dependencies.
 #[test]
 fn remove_referenced_sheet_propagates_to_chained_dependents() {
     let mut wb = Workbook::new();
@@ -135,7 +135,7 @@ fn remove_referenced_sheet_propagates_to_chained_dependents() {
 
     assert!(
         *fires.borrow() >= 1,
-        "chained dependent must be notified through the BFS"
+        "chained dependent must be notified through Store propagation"
     );
 }
 

@@ -735,9 +735,6 @@ pub trait CustomFunctionRegistry: Send + Sync + std::fmt::Debug {
 pub trait EvalProvider {
     fn cell(&self, addr: CellAddress) -> Value;
     fn sheet_cell(&self, sheet: &str, addr: CellAddress) -> Value;
-    fn force_formula_recompute(&self) -> bool {
-        false
-    }
 
     /// Read a cell without implicit-intersection collapse of dynamic-array
     /// anchors. Most evaluators want `cell()`; spill references (`A1#`) need
@@ -1001,10 +998,8 @@ pub fn eval_expr_with_provider(expr: &Expr, provider: &dyn EvalProvider) -> Valu
             if addr.row == REF_INVALID_ROW || addr.col == REF_INVALID_COL {
                 return Value::Error(ValueError::InvalidRef);
             }
-            // Lazy formula's FormulaCache::Computing state already protects
-            // against cross-sheet cycles at runtime — recursing back into a
-            // cell already on the eval stack returns CyclicRef. No TLS
-            // guard needed; provider dispatch is the canonical path.
+            // Formula-inner evaluation owns the workbook-scoped runtime cycle
+            // guard, so recursing into an on-stack cell surfaces CyclicRef.
             provider.sheet_cell(sheet, *addr)
         }
 

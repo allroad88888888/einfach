@@ -69,7 +69,10 @@ fn xlookup_wildcard_round_trip() {
 fn xlookup_binary_search_round_trip() {
     let mut wb = Workbook::new();
     // Ascending lookup row: A1=1 B1=5 C1=10 D1=20 E1=40
-    for (col, v) in ["A1", "B1", "C1", "D1", "E1"].iter().zip([1, 5, 10, 20, 40]) {
+    for (col, v) in ["A1", "B1", "C1", "D1", "E1"]
+        .iter()
+        .zip([1, 5, 10, 20, 40])
+    {
         wb.set_cell(0, col, Value::Number(v as f64));
     }
     // Return labels row 2.
@@ -80,7 +83,10 @@ fn xlookup_binary_search_round_trip() {
         wb.set_cell(0, col, Value::Text(v.into()));
     }
     // Descending lookup row: A4=40 B4=20 C4=10 D4=5 E4=1, returns same a..e.
-    for (col, v) in ["A4", "B4", "C4", "D4", "E4"].iter().zip([40, 20, 10, 5, 1]) {
+    for (col, v) in ["A4", "B4", "C4", "D4", "E4"]
+        .iter()
+        .zip([40, 20, 10, 5, 1])
+    {
         wb.set_cell(0, col, Value::Number(v as f64));
     }
     for (col, v) in ["A5", "B5", "C5", "D5", "E5"]

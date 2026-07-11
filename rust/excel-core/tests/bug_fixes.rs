@@ -62,11 +62,17 @@ fn vlookup_cross_sheet_range_resolves_correctly() {
     //   A2=2 B2=200
     //   A3=3 B3=300
     wb.sheet_mut(s2).unwrap().set_cell("A1", Value::Number(1.0));
-    wb.sheet_mut(s2).unwrap().set_cell("B1", Value::Number(100.0));
+    wb.sheet_mut(s2)
+        .unwrap()
+        .set_cell("B1", Value::Number(100.0));
     wb.sheet_mut(s2).unwrap().set_cell("A2", Value::Number(2.0));
-    wb.sheet_mut(s2).unwrap().set_cell("B2", Value::Number(200.0));
+    wb.sheet_mut(s2)
+        .unwrap()
+        .set_cell("B2", Value::Number(200.0));
     wb.sheet_mut(s2).unwrap().set_cell("A3", Value::Number(3.0));
-    wb.sheet_mut(s2).unwrap().set_cell("B3", Value::Number(300.0));
+    wb.sheet_mut(s2)
+        .unwrap()
+        .set_cell("B3", Value::Number(300.0));
 
     // VLOOKUP on Sheet1 referencing Sheet2's table.
     wb.set_formula(0, "A1", "=VLOOKUP(2,Sheet2!A1:B3,2,FALSE)");

@@ -1,135 +1,208 @@
-# Atom-Delegation Rewrite — Current Main-Line Logic
+# Atom-Delegation Rewrite - Current Main-Line Logic
 
-> Describes the engine's read/write path **as it stands right now** (HEAD `4eca1a3`,
-> P4c Commit A landed, Commit B not yet done). This is a transitional state: the old
-> eager same-sheet engine is still the LIVE read path; the facade/atom-delegation
-> machinery is built and wired on the write口 but INERT because the facade families
-> are empty pre-flip.
+> Production behavior at P7 completion. Formula cells on every sheet derive
+> through one workbook-scoped atomm/Store graph.
 >
-> For the OLD (pre-arc, eager-push + topological-sort) engine see the legacy
-> [`MAIN_FLOW.md`](./MAIN_FLOW.md) — that describes what the arc is replacing.
-> For where we're headed see [`ATOM_DELEGATION_REWRITE_PLAN.md`](./ATOM_DELEGATION_REWRITE_PLAN.md).
-> For arc status see [`ATOM_DELEGATION_PROGRESS.md`](./ATOM_DELEGATION_PROGRESS.md).
->
-> Snapshot date: 2026-07-09. Line numbers are `rust/excel-core/src/sheet.rs`.
+> Snapshot date: 2026-07-10. Names are authoritative; line numbers drift.
 
-## The two engines, side by side (transitional)
+## Main Shape
 
-Right now the code holds **both** mechanisms. This is deliberate and temporary — the
-flip (Commit B) deletes the same-sheet half of the eager engine and routes reads
-through the facade.
-
-```
-                      LIVE today                    Built, inert (flips in Commit B)
-                      ─────────────                 ───────────────────────────────
-read a cell    peek_value_with_provider @3523  →   get_or_create_facade @1023
-formula eval   eval_formula_at_with_provider   →   formula_inner_of / eval_formula_inner
-               compute_formula_at @3618             (@1105 / @1126)
-propagation    cell_dependents + point BFS      →   store dependency graph (INV-2)
-               mark_dependents_dirty @2330          via ReadArgs::get edges
-invalidation   FormulaCache dirty flags         →   bump_facade_epoch + store.invalidate
-subscription   attach_address_sub (Plain→Atom)  →   attach_address_sub → facade_of(addr)
+```text
+Workbook::get_cell
+  -> Sheet::peek_value_with_provider
+  -> stable address facade
+  -> formula-inner derived atom
+  -> AtomFormulaProvider(ReadArgs)
+  -> local or target-sheet facade / workbook version root
+  -> Store dependency graph
 ```
 
-## Read path (LIVE — eager, still the source of truth)
-
-`peek_value_with_provider(addr, provider)` @3523:
-
-```
-hydrate_formula(addr)                       # lazy parse/install (unchanged, kept)
-if formula_cells.contains_key(&addr):
-    return eval_formula_at_with_provider(addr, provider)   # ← LIVE eager engine
-return cell_value_at(addr).unwrap_or(Value::Null)
-```
-
-- `eval_formula_at_with_provider` @3545 → `compute_formula_at` @3618 (bumps
-  `formula_eval_count` @3644) → `prewarm_formula_chain` @3677 (iterative post-order DFS).
-- This same-sheet eager engine is what Commit B **bypasses for same-sheet formulas**
-  (routing to `get_or_create_facade`) and P6 finally **deletes**. Cross-sheet formulas
-  stay on it until P6.
-
-## Write path (LIVE + Commit-A hooks already wired)
-
-Single write口 discipline: the authoritative store is `RowMajorMap<CellSlot>`; all
-mutation flows through a small set of write helpers.
-
-`try_set_formula` @3174 (formula install):
-
-```
-parse → would_create_cycle @3197 (static BFS over cell_dependents+range_dependents)
-with_remap { build FormulaRecord:
-    add_formula_deps @3212            # point dep index  ← DELETED in Commit B
-    add_formula_range_deps @3213     # range dep index  ← kept, BRIDGE(delete-by: P5-exit)
-    note_cross_sheet_if_any @3215
-    insert formula_cells / formula_exprs / formula_texts }
-invalidate_formula_inner @3228       # ← Commit-A hook (inert: family empty)
-bump_facade_epoch     @3229          # ← Commit-A hook (inert: family empty)
-mark_dependents_dirty @3230          # ← LIVE point-BFS  ← DELETED in Commit B
-recompute_array_formula
+```text
+point dependency       ReadArgs::get(referenced facade)
+range dependency       member facades or band/column/sheet roots
+workbook topology      topology version atom + sheet FacadeCtx lookup
+defined names          names version atom + current name map
+custom functions       registry version atom + guarded host call
+subscriptions          stable address facade
+spill candidates       Store::reverse_dependents -> formula_inner_family
 ```
 
-`write_error` @3244 (and the value-write path) already does F4-style pre/post identity
-sampling:
+The Store graph is the only reactive dependency graph. Formula AST/source,
+static range metadata, and cycle-validation generation stamps are content used
+for parsing, retargeting, cycle checks, and diagnostics; they do not drive
+invalidation fanout.
 
+## Formula Read Path
+
+`Sheet::peek_value_with_provider` hydrates a parked formula, obtains the stable
+address facade, and reads it from Store. The passed provider does not override a
+formula cell's value.
+
+The facade closure:
+
+```text
+depend on slot_epoch(addr)
+if formula:
+    value = args.get(formula_inner_of(addr))
+    if an active spill projection atom exists:
+        return args.get(spill_anchor_atom)
+    return value
+if primitive atom: return args.get(atom)
+if plain primitive: return cloned value
+return Null
 ```
-pre  = slot_atom_id(addr) @3251
-had_formula ? with_remap(write) : direct write
-mark_dependents_dirty @3263          # ← LIVE  ← DELETED in Commit B
-post = slot_atom_id(addr) @3270
-if had_formula || pre != post: bump_facade_epoch @3271   # ← F4 partial (inert today)
-```
 
-### Why the Commit-A hooks are inert
+`formula_inner_of(addr)` is a lazy derived atom. On a completed read it:
 
-`bump_facade_epoch` @1605 is **non-creating**: `slot_epoch_family.get(&addr)` returns
-`None` (nothing has read the cell through a facade yet), so it early-returns.
-`invalidate_formula_inner` @1627 likewise only acts `if let Some(inner) =
-formula_inner_family.get(&addr)`. Pre-flip both families are empty ⇒ both are no-ops.
-They exist now so that when Commit B starts populating the families, invalidation is
-already correct — the write口 was decoupled from the read口 in a separate, safe commit.
+1. resolves the hydrated AST or parses parked source;
+2. enters the local or workbook-global in-flight guard;
+3. evaluates with `AtomFormulaProvider` and the current `ReadArgs`;
+4. replaces its Store dependency set with the cells/roots actually read;
+5. increments the completed formula-evaluation counter.
 
-## Facade machinery (built, `#[allow(dead_code)]` on the inner path)
+No `FormulaCache` is consulted before or after this path.
 
-The target read path, all in `sheet.rs` §960–1330:
+## Workbook Scope
 
-- **`FacadeCtx`** @972 — cheap-to-clone `'static` bundle of the 7 shared handles
-  (`store`, `atoms_owned`, `interior`, `slot_epoch_family`, `cell_facade_family`,
-  `formula_inner_family`, `in_flight`).
-- **`get_or_create_facade`** @1023 — per-address facade derived atom. Fast-path returns
-  cache; else `epoch_of(addr)` then a derived atom whose read closure (routing gate
-  @1053–1058) reads the slot epoch, then: if the address is a formula →
-  `formula_inner_of(addr)` and return its value; else snapshot the `CellSlot` under a
-  short borrow and return `Atom`/`Plain`/`Null`.
-  **⚠ The gate @1053–1058 currently routes ALL formulas (incl. cross-sheet) to an inner
-  atom.** A cross-sheet formula routed this way would eval to `#REF!`. Commit B must
-  gate this branch on per-formula cross-sheet detection so cross-sheet stays on the
-  surviving FormulaCache path. This gate must be applied at BOTH `get_or_create_facade`
-  @1023 and `peek_value_with_provider` @3523.
-- **`formula_inner_of`** @1105 → **`eval_formula_inner`** @1126 — the inner derived
-  atom: `formula_expr_for(addr)` (prefers `formula_exprs`, else parse `formula_source`),
-  `InFlightGuard::enter`, then `eval_expr_with_provider` through an `AtomFormulaProvider`.
-- **`AtomFormulaProvider`** @1247 — the evaluator's ref-resolution seam. `read_facade`
-  @1266 is where dependency edges are recorded through the store:
-  ```
-  facade = ctx.get_or_create_facade(addr)
-  if in_flight.contains(&addr):            # F1 runtime cycle guard (inline, live)
-      args.depend(facade); return Value::Error(CyclicRef)   # #CYCLE!, records edge
-  return args.get(facade)                  # normal: read + record dep edge
-  ```
-  `cell` collapses arrays; `sheet_cell`/`raw_sheet_cell` return `InvalidRef` (cross-sheet
-  handled elsewhere pre-P6); `for_each_range_cell` iterates `range_member_addrs`.
+`Workbook::new` creates one Store and a `WorkbookAtomContext`. Every sheet uses
+that Store and is attached to the context with its current workbook index.
 
-Everything except `owned_create_*` / `epoch_of` / `get_or_create_facade` is
-`#[allow(dead_code)]` — the inner-atom path compiles but is not reached until Commit B
-removes the attributes and routes `peek_value_with_provider` into it.
+For a qualified point reference, `AtomFormulaProvider::sheet_cell` resolves the
+target sheet from the topology root and calls `ReadArgs::get` on the target
+facade. A local and cross-sheet edge are therefore the same Store mechanism.
 
-## Invariant being enforced (INV-2)
+Topology, names, and custom functions are mutable non-cell inputs. Each owns a
+lazy version atom:
 
-The single response graph is the `rust/core` Store's `dependenciesMap` /
-`backDependenciesMap`. Once the flip lands, "what changed → recompute what" is decided
-ONLY by store edges recorded via `ReadArgs::get` (and re-invalidation-only edges via
-`ReadArgs::depend`). excel-core is forbidden a map keyed by address whose value is a
-formula-cell address. Whitelisted structures: band/range family geometry, spill
-`claims`, `cell_subscriptions`, `formula_source` / `needs_parse`. The executable
-tripwire `tests/architecture_invariants.rs` (`PHASE`, currently 1 → flips to 4 with
-Commit B) fails `cargo test` if a banned identifier reappears in the gated files.
+- add/remove/rename/move sheet publishes the topology root;
+- define/undefine name publishes the names root;
+- replacing the custom registry publishes the custom root.
+
+Formula reads depend on the relevant root before consulting current data.
+`WorkbookEvalProvider` remains for top-level evaluator APIs and compatibility
+helpers, but it is not formula-cell state or invalidation authority.
+
+## Range Read Path
+
+Range evaluation is sparse for values and complete for dependencies.
+
+For a normalized range of at most 256 cells, the provider reads every member
+facade. Empty members establish edges but are not emitted to evaluator
+callbacks.
+
+Larger ranges depend on lazy geometry roots:
+
+1. `(column, row / 256)` roots when at most 4096 bands are covered;
+2. per-column roots when band mode is too wide but at most 4096 columns are
+   covered;
+3. one sheet root otherwise.
+
+The provider then emits currently materialized non-Null members. Local and
+cross-sheet ranges call the same `for_each_range_in` implementation with the
+appropriate `FacadeCtx`. No exact-range or dependent-formula index exists.
+
+Membership-changing writes bump already-materialized geometry roots touching
+the address. Pure value changes propagate through the member facade. A Store
+batch deduplicates formulas reached from more than one root.
+
+## Write Path
+
+Mutation paths update worksheet storage and publish Store state:
+
+- primitive value changes publish their atom/facade;
+- formula content changes invalidate formula-inner and bump slot/facade state;
+- inner-slot identity changes bump `slot_epoch(addr)`;
+- range membership changes bump existing geometry roots;
+- topology/name/custom changes publish their workbook roots;
+- structural moves update source/AST metadata and invalidate affected atoms in
+  the same Store batch as slot and geometry publication.
+
+Materialized dependents re-derive in Store's flush. Never-read formulas have no
+formula-inner atom and remain lazy. There is no Sheet or Workbook dirty BFS.
+
+## Bulk Replacement
+
+`install_sheet_bulk` and `install_workbook_bulk` replace pre-built sparse maps
+without parsing or evaluating every formula. Formula hydration and dependency
+discovery remain lazy.
+
+Whole-workbook install has two phases:
+
+1. replace every requested sheet inside one outer shared-Store batch, collecting
+   retired atom IDs;
+2. after Store flush detaches old cross-sheet edges, prune family keys and
+   destroy the retired atoms.
+
+This produces one settled propagation wave across sheets and avoids destroying
+an atom while another sheet still has a committed Store dependency on it.
+`content_revision` is bumped as a host-facing whole-content signal; it is not a
+formula cache epoch. `BulkInstallStats::cross_sheet_parsed` remains in the wire
+shape for compatibility but is always zero: local and cross-sheet formula
+sources are parked without install-time parsing and materialize through Store.
+
+## Dynamic Arrays
+
+Derived reads cannot mutate worksheet storage, so spill installation/teardown
+is explicit structural maintenance. Candidate discovery still starts in Store:
+
+1. collect touched cell/facade and existing geometry-root atoms;
+2. call `Store::reverse_dependents`;
+3. map derived IDs through `formula_inner_family` to formula addresses;
+4. retain array-capable formulas and existing anchors;
+5. install or clear spill projections.
+
+The anchor projection atom contains the installed `Value::Array` or
+`Value::Error(Spill)`. The facade depends on formula-inner first and projection
+second, so `#SPILL!` is the public result while formula-inner remains dependency
+authority. Workbook reads cannot bypass that projection.
+
+## Subscriptions
+
+Address subscriptions attach to stable facades. Primitive/formula swaps keep
+the same listener identity, and Store equality pruning publishes at most once
+when the displayed value changes. Full-sheet replacement may issue its explicit
+coarse host notification, but cross-sheet formula propagation has no manual
+dependency fanout.
+
+## Cycles
+
+Formula installation and hydration reject static cycles from AST/source content.
+This is required for unread formulas, whose Store edges are intentionally
+absent. Normal single-formula installation keeps the direct content walk.
+
+Parked formulas amortize cold hydration with an embedded `cycle_checked_at`
+stamp and a sheet formula-topology generation. The first uncertified parked
+read builds a temporary forward graph for the reachable formula content, runs
+an iterative SCC pass, and stamps the acyclic entries it proved. Formula
+topology mutation increments the generation, invalidating every old proof in
+O(1); parked-to-hydrated conversion preserves the stamp because it does not
+change formula content.
+
+The temporary address table and edges are dropped when validation returns.
+They are never consulted by Store evaluation, writes, invalidation, or
+propagation, and are not retained as an address-to-dependent graph.
+
+At runtime, `AtomFormulaProvider` checks an in-flight set before reading a
+facade. Workbook entries are keyed by `(sheet index, address)`. On recursion it
+records the facade with `ReadArgs::depend` and returns `#CYCLE!`, preserving the
+edge needed to recover after an edit without triggering Store's hard
+computing-atom panic.
+
+## Lifecycle And Debug
+
+Formula, facade, primitive, spill, and range-root families are pruned on clear,
+replacement, bulk install, sheet removal, and structural edits. Debug atom
+counts are sheet-owned lenses over the shared Store.
+
+`debug_formula_cache_state` reports parked/freshness state projected from Store;
+legacy dependency/BFS counters remain zero for compatibility. The TypeScript
+worker's `debugFormulaCacheState` directly calls
+`state.workbook.debugFormulaCacheState(...)`; it does not keep read/dirty debug
+state of its own. Architecture tests at `PHASE = 7` ban all retired bridge/cache
+identifiers and the worker shadow names, while requiring shared Store wiring for
+formula, range, topology, names, custom-function reads, debug delegation, and
+the embedded static-cycle validation wiring described above.
+
+The architectural rule is stronger than behavioral equivalence: formula truth,
+staleness, and transitive propagation must derive from atomm/Store state. A
+passing test suite does not permit a shadow dependency engine.

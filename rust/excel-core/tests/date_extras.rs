@@ -39,7 +39,7 @@ fn networkdays_with_holidays_round_trip() {
 fn workday_intl_skips_holiday_on_landing_day() {
     let mut wb = Workbook::new();
     wb.set_formula(0, "A1", "=DATE(2024,1,1)"); // Mon
-    // Default weekend: Mon + 5 → next Mon.
+                                                // Default weekend: Mon + 5 → next Mon.
     wb.set_formula(0, "B1", "=WORKDAY(A1,5)");
     wb.set_formula(0, "B2", "=DATE(2024,1,8)");
     assert_eq!(wb.get_cell("Sheet1", "B1"), wb.get_cell("Sheet1", "B2"));

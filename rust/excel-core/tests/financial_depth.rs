@@ -27,7 +27,11 @@ fn sln_syd_full_depreciation_totals() {
     wb.set_formula(0, "A1", "=SLN(10000,1000,5)");
     // Sum of SYD over 1..=5 should also reclaim 9000.
     for per in 1..=5u32 {
-        wb.set_formula(0, &format!("B{}", per), &format!("=SYD(10000,1000,5,{})", per));
+        wb.set_formula(
+            0,
+            &format!("B{}", per),
+            &format!("=SYD(10000,1000,5,{})", per),
+        );
     }
     wb.set_formula(0, "B6", "=SUM(B1:B5)");
 

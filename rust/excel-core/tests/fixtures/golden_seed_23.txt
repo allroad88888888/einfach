@@ -1,11 +1,11 @@
 == sheet 0 (Sheet1) ==
-A1 = A:3x1[N:0.0;N:1.0;N:2.0;] | f: =SEQUENCE(3,1,F13)
+A1 = E:#SPILL! | f: =SEQUENCE(3,1,F13)
 A12 = E:#REF! | f: 
 A15 = N:20.0 | f: 
 A16 = E:#CYCLE! | f: 
 A2 = N:191.0 | f: 
 A20 = N:0.0 | f: =Beta!G18*2
-A25 = A:3x1[N:298.0;N:299.0;N:300.0;] | f: =SEQUENCE(3,1,J6)
+A25 = E:#SPILL! | f: =SEQUENCE(3,1,J6)
 A26 = N:265.0 | f: 
 A27 = N:89.0 | f: 
 A29 = N:146.0 | f: 
@@ -18,7 +18,7 @@ A4 = N:3.0 | f: =Gamma!F24+Sheet1!G19
 A6 = N:296.0 | f: 
 A8 = N:109.5 | f: 
 B10 = N:159.25 | f: 
-B11 = N:119.9 | f: =AVERAGE(A1:A11)
+B11 = E:#SPILL! | f: =AVERAGE(A1:A11)
 B12 = T:t7 | f: 
 B14 = N:96.0 | f: 
 B16 = N:52.5 | f: 
@@ -29,7 +29,7 @@ B21 = N:107.0 | f:
 B23 = N:393.0 | f: 
 B29 = T:t41 | f: 
 B31 = B:true | f: 
-B35 = N:25.0 | f: =COUNT(A1:F19)
+B35 = N:23.0 | f: =COUNT(A1:F19)
 B37 = T:t40 | f: 
 B38 = N:86.0 | f: 
 C1 = N:246.0 | f: 
@@ -52,7 +52,7 @@ C31 = N:122.0 | f:
 C32 = T:t40 | f: 
 C33 = N:424.0 | f: 
 C34 = N:435.0 | f: 
-C35 = N:509.0 | f: =(MAX(A1:B5)+MIN(C1:C11))
+C35 = E:#SPILL! | f: =(MAX(A1:B5)+MIN(C1:C11))
 C38 = B:true | f: 
 C39 = N:14.0 | f: 
 C41 = N:26.5 | f: 
@@ -66,7 +66,7 @@ F16 = B:false | f:
 F24 = ∅ | f: =IF((G21>10),M15,0)
 F25 = T:t39 | f: 
 F26 = N:67.0 | f: 
-F30 = N:1472.65 | f: =SUM(B:B)
+F30 = E:#SPILL! | f: =SUM(B:B)
 F36 = T:t29 | f: 
 F38 = N:30.0 | f: 
 F41 = T:t38 | f: 
@@ -91,7 +91,7 @@ G31 = N:93.0 | f:
 G32 = N:245.0 | f: 
 G35 = N:178.25 | f: 
 G36 = N:156.0 | f: 
-G37 = N:27.0 | f: =COUNT(A1:F20)
+G37 = N:25.0 | f: =COUNT(A1:F20)
 G38 = N:295.0 | f: 
 G4 = N:279.0 | f: 
 G40 = N:14.5 | f: 
@@ -100,7 +100,7 @@ G5 = B:false | f:
 G6 = N:190.0 | f: 
 G8 = N:255.0 | f: 
 H1 = N:4.0 | f: =LEN(CONCAT(C34,"x"))
-H10 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+H10 = E:#SPILL! | f: =SEQUENCE(2,2)
 H12 = E:#REF! | f: 
 H14 = N:431.0 | f: 
 H16 = N:286.0 | f: 
@@ -128,7 +128,7 @@ H38 = N:0.0 | f: =Beta!C37*2
 H39 = B:true | f: 
 H6 = E:#REF! | f: 
 I1 = B:true | f: 
-I11 = N:27.0 | f: =COUNT(A1:F20)
+I11 = N:25.0 | f: =COUNT(A1:F20)
 I16 = T:t4 | f: 
 I17 = N:82.0 | f: 
 I19 = B:true | f: 
@@ -136,7 +136,7 @@ I2 = N:0.0 | f: =Gamma!E11+Sheet1!I28
 I20 = N:357.0 | f: 
 I21 = N:2.0 | f: 
 I22 = N:4.0 | f: 
-I23 = N:1472.65 | f: =L24
+I23 = E:#SPILL! | f: =L24
 I26 = N:159.0 | f: 
 I27 = N:41.0 | f: 
 I32 = N:296.0 | f: 
@@ -151,23 +151,23 @@ I7 = N:439.0 | f: =Gamma!K33+Sheet1!C20
 J1 = T:t37 | f: 
 J10 = N:248.0 | f: 
 J14 = N:63.0 | f: 
-J16 = N:1472.65 | f: =SUM(B:B)
+J16 = E:#SPILL! | f: =SUM(B:B)
 J17 = T:t10 | f: 
 J18 = E:#REF! | f: 
 J19 = N:486.0 | f: 
 J2 = N:285.0 | f: 
 J20 = N:398.0 | f: 
 J21 = T:t12 | f: 
-J22 = N:25.0 | f: =COUNT(A1:D20)
+J22 = N:23.0 | f: =COUNT(A1:D20)
 J26 = N:329.0 | f: 
 J29 = B:false | f: 
 J3 = N:438.0 | f: 
 J30 = N:94.25 | f: 
 J31 = N:303.0 | f: 
-J35 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+J35 = E:#SPILL! | f: =SEQUENCE(2,2)
 J37 = N:2.0 | f: 
 J39 = T:t11 | f: 
-J4 = N:22.0 | f: =COUNT(A1:F16)
+J4 = N:20.0 | f: =COUNT(A1:F16)
 J40 = N:20.0 | f: =IF(C11>10,A15,0)
 J41 = N:380.0 | f: 
 J6 = N:298.0 | f: 
@@ -180,35 +180,35 @@ K17 = N:438.0 | f:
 K19 = E:#REF! | f: 
 K2 = B:false | f: 
 K20 = N:107.0 | f: 
-K21 = N:26.0 | f: =COUNT(A1:D21)
+K21 = N:24.0 | f: =COUNT(A1:D21)
 K22 = N:178.0 | f: 
 K23 = N:165.0 | f: 
 K24 = N:43.0 | f: 
 K25 = N:65.75 | f: 
 K26 = N:275.0 | f: 
-K27 = A:3x1[N:1.0;N:2.0;N:3.0;] | f: =SEQUENCE(3,1,I37)
+K27 = E:#SPILL! | f: =SEQUENCE(3,1,I37)
 K28 = N:28.75 | f: 
 K29 = E:#REF! | f: 
 K30 = N:45.0 | f: 
-K32 = A:3x1[N:439.0;N:440.0;N:441.0;] | f: =SEQUENCE(3,1,C20)
+K32 = E:#SPILL! | f: =SEQUENCE(3,1,C20)
 K33 = E:#REF! | f: 
 K34 = N:4.0 | f: =IF((C31>10),I22,0)
 K35 = E:#REF! | f: 
 K36 = T:t44 | f: 
 K37 = N:281.0 | f: 
-K38 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+K38 = E:#SPILL! | f: =SEQUENCE(2,2)
 K39 = N:70.0 | f: 
 K40 = N:258.0 | f: 
 K41 = N:1.0 | f: 
 L11 = N:185.0 | f: 
 L12 = N:1.0 | f: 
-L14 = N:26.0 | f: =COUNT(A1:D21)
+L14 = N:24.0 | f: =COUNT(A1:D21)
 L17 = T:t8 | f: 
 L2 = N:276.0 | f: 
 L20 = N:265.0 | f: 
-L22 = N:27.0 | f: =COUNT(A1:F20)
+L22 = N:25.0 | f: =COUNT(A1:F20)
 L23 = E:#REF! | f: 
-L24 = N:1472.65 | f: =SUM(B:B)
+L24 = E:#SPILL! | f: =SUM(B:B)
 L27 = N:202.0 | f: 
 L28 = N:134.0 | f: 
 L29 = T:t16 | f: 
@@ -222,10 +222,10 @@ L38 = N:101.0 | f:
 L4 = N:96.0 | f: 
 L5 = T:t44 | f: 
 M1 = N:308.0 | f: 
-M12 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+M12 = E:#SPILL! | f: =SEQUENCE(2,2)
 M13 = N:49.0 | f: 
 M16 = E:#REF! | f: 
-M17 = N:119.9 | f: =AVERAGE(A1:A10)
+M17 = E:#SPILL! | f: =AVERAGE(A1:A10)
 M18 = N:156.0 | f: 
 M19 = N:238.0 | f: 
 M20 = N:98.0 | f: 
@@ -266,7 +266,7 @@ A16 = N:491.0 | f:
 A18 = N:45.0 | f: 
 A19 = N:26.0 | f: 
 A20 = N:3.0 | f: 
-A22 = N:2.0 | f: =((I23*2)+P22)
+A22 = E:#SPILL! | f: =((I23*2)+P22)
 A25 = B:true | f: 
 A27 = N:0.0 | f: =Gamma!D2+Sheet1!B32
 A29 = N:358.0 | f: 
@@ -342,7 +342,7 @@ I2 = N:319.0 | f: =MAX(A1:B5)+MIN(C1:C10)
 I20 = N:189.0 | f: 
 I21 = E:#REF! | f: 
 I22 = N:483.0 | f: 
-I23 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+I23 = E:#SPILL! | f: =SEQUENCE(2,2)
 I24 = N:437.0 | f: 
 I25 = N:337.0 | f: 
 I26 = N:35.0 | f: 
@@ -464,7 +464,7 @@ N15 = N:338.0 | f:
 N18 = N:0.0 | f: =Beta!G15*2
 N19 = N:218.25 | f: 
 N20 = N:322.0 | f: 
-N21 = A:3x1[N:231.0;N:232.0;N:233.0;] | f: =SEQUENCE(3,1,L29)
+N21 = E:#SPILL! | f: =SEQUENCE(3,1,L29)
 N22 = N:413.0 | f: 
 N23 = N:240.0 | f: 
 N25 = B:true | f: 
@@ -477,10 +477,10 @@ N30 = N:218.0 | f:
 N31 = T:t11 | f: 
 N32 = N:364.0 | f: 
 N34 = B:false | f: 
-N4 = A:2x2[N:1.0;N:2.0;N:3.0;N:4.0;] | f: =SEQUENCE(2,2)
+N4 = E:#SPILL! | f: =SEQUENCE(2,2)
 N41 = T:t46 | f: 
 N7 = N:82.5 | f: 
-N8 = A:3x1[N:140.0;N:141.0;N:142.0;] | f: =SEQUENCE(3,1,J16)
+N8 = E:#SPILL! | f: =SEQUENCE(3,1,J16)
 N9 = N:230.25 | f: 
 O11 = T:t37 | f: 
 O16 = T:t48 | f: 
@@ -550,7 +550,7 @@ E2 = N:201.0 | f:
 E21 = N:285.0 | f: 
 E22 = N:34.0 | f: 
 E23 = B:true | f: 
-E24 = A:3x1[N:0.0;N:1.0;N:2.0;] | f: =SEQUENCE(3,1,F3)
+E24 = E:#SPILL! | f: =SEQUENCE(3,1,F3)
 E25 = E:#REF! | f: 
 E27 = N:352.0 | f: 
 E28 = T:t10 | f: 
