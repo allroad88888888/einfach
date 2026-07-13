@@ -1,6 +1,7 @@
 /// <reference lib="WebWorker" />
 
 import init, { WasmWorkbook } from '../../wasm-pkg/einfach_wasm.js'
+import { createAsyncCustomPump, type AsyncCustomRequest } from './async-custom-pump'
 import { sparseRangeToTSV } from './range-tsv'
 import type {
   CellFormatJSON,
@@ -156,6 +157,19 @@ type WasmWorkbookRuntime = {
     fn: (args: Array<number | string | boolean | null>) => unknown,
   ) => void
   unregisterCustomFormula?: (name: string) => boolean
+  /**
+   * Wave 8.2 — async custom formulas. Registration is name-only (the
+   * callback stays in this worker's map and never crosses into wasm);
+   * the engine memoizes per (name, args), holds cells at #BUSY!, and
+   * queues requests that the pump drains after every command. Optional:
+   * pre-8.2 wasm-pkg builds and test mocks may not expose them — async
+   * registration then degrades to a sync registration of a callback
+   * that returns #VALUE! never (we simply refuse, see
+   * registerCustomFormulaInWorker).
+   */
+  registerCustomFormulaAsync?: (name: string) => void
+  drainAsyncCustomRequests?: () => AsyncCustomRequest[]
+  resolveAsyncCustomCall?: (callId: number, value: unknown) => boolean
 }
 
 type RequestMessage = {
@@ -223,7 +237,27 @@ const snapshotSessions = new Map<number, SnapshotSession>()
 type CustomFormulaCallable = (
   args: Array<number | string | boolean | null>,
 ) => unknown
-const customFormulas = new Map<string, CustomFormulaCallable>()
+const customFormulas = new Map<string, { fn: CustomFormulaCallable; isAsync: boolean }>()
+
+/**
+ * Wave 8.2 — async custom-formula pump over the WASM engine. Drains the
+ * engine's pending-call queue after every command, invokes the local
+ * compiled callback, awaits it, and settles via resolveAsyncCustomCall.
+ * Settle writes propagate through the Store, so subscribed cells emit
+ * dirty events through the normal subscribe_cell → postDirty path — no
+ * extra wire event. Engine identity (`currentEngine`) drops in-flight
+ * settles across initWorkbook/reset.
+ */
+const asyncCustomPump = createAsyncCustomPump<WasmWorkbookRuntime>({
+  currentEngine: () => workbook,
+  drain: (engine) => engine.drainAsyncCustomRequests?.() ?? [],
+  resolve: (engine, callId, value) =>
+    engine.resolveAsyncCustomCall?.(callId, value) ?? false,
+  lookup: (name) => {
+    const entry = customFormulas.get(name)
+    return entry?.isAsync ? entry.fn : undefined
+  },
+})
 let nextExportId = 1
 let nextSnapshotId = 1
 
@@ -1015,7 +1049,15 @@ function assertCustomFormulaName(name: unknown): string {
   return name
 }
 
-function compileCustomFormula(name: string, source: unknown): CustomFormulaCallable {
+const AsyncFunctionCtor = Object.getPrototypeOf(async function () {
+  /* async constructor probe */
+}).constructor as new (arg: string, body: string) => CustomFormulaCallable
+
+function compileCustomFormula(
+  name: string,
+  source: unknown,
+  isAsync: boolean,
+): CustomFormulaCallable {
   if (typeof source !== 'string') {
     throw Object.assign(new Error(`custom formula ${name}: source must be a string`), {
       code: 'INVALID_CUSTOM_FORMULA_SOURCE',
@@ -1033,8 +1075,11 @@ function compileCustomFormula(name: string, source: unknown): CustomFormulaCalla
     // backend). Untrusted user-input source MUST go through a separate
     // iframe-sandbox + structured-clone IPC boundary instead. See
     // `rust/excel-core/src/CUSTOM_FORMULAS.md` § "Security model" for
-    // the full trust contract.
-    const fn = new Function('args', source) as CustomFormulaCallable
+    // the full trust contract. Async bodies compile through the
+    // AsyncFunction constructor (same trust model) so they can `await`.
+    const fn = isAsync
+      ? new AsyncFunctionCtor('args', source)
+      : (new Function('args', source) as CustomFormulaCallable)
     return fn
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)
@@ -1049,10 +1094,24 @@ function registerCustomFormulaInWorker(
   wb: WasmWorkbookRuntime,
   name: string,
   source: unknown,
+  isAsync: boolean,
 ): boolean {
   const validatedName = assertCustomFormulaName(name)
-  const fn = compileCustomFormula(validatedName, source)
-  customFormulas.set(validatedName, fn)
+  const fn = compileCustomFormula(validatedName, source, isAsync)
+  if (isAsync && !wb.registerCustomFormulaAsync) {
+    // Engine bridge predates async support. Refuse loudly instead of
+    // silently registering a sync callback that returns a Promise
+    // (which the engine would marshal to #TYPE! per cell).
+    throw Object.assign(
+      new Error(`custom formula ${validatedName}: async registration requires a newer wasm build`),
+      { code: 'ASYNC_CUSTOM_FORMULA_UNSUPPORTED' },
+    )
+  }
+  customFormulas.set(validatedName, { fn, isAsync })
+  if (isAsync) {
+    wb.registerCustomFormulaAsync!(validatedName)
+    return true
+  }
   if (wb.registerCustomFormula) {
     wb.registerCustomFormula(validatedName, fn)
     return true
@@ -1698,7 +1757,10 @@ export function installWorkerRuntime() {
           postResponse(msg.id, true)
           break
         case 'registerCustomFormula':
-          postResponse(msg.id, registerCustomFormulaInWorker(wb, msg.name as string, msg.source))
+          postResponse(
+            msg.id,
+            registerCustomFormulaInWorker(wb, msg.name as string, msg.source, msg.isAsync === true),
+          )
           break
         case 'unregisterCustomFormula':
           postResponse(msg.id, unregisterCustomFormulaInWorker(wb, msg.name))
@@ -1725,6 +1787,12 @@ export function installWorkerRuntime() {
       }
     } catch (err) {
       postError(msg.id, toRpcError(err))
+    } finally {
+      // Wave 8.2: any command can surface new async custom-formula
+      // requests (reads evaluate formulas lazily; settles cascade).
+      // Fire-and-forget — an empty drain is near-free, and settles
+      // notify the host through the normal subscription dirty path.
+      asyncCustomPump.pump()
     }
   })
 }

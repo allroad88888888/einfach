@@ -44,6 +44,7 @@ type MockWasmWorkbookOptions = {
   disablePersistenceV1?: boolean
   disableBulkInstallWorkbook?: boolean
   bulkImportFailureAfterApply?: string
+  disableAsyncCustomFormulas?: boolean
 }
 
 // STORAGE_PRIMARY Phase 6.3 — mirrors the wasm `bulk_install_workbook`
@@ -158,7 +159,14 @@ type MockWasmWorkbook = {
     moveSheets: Array<{ from: number; to: number }>
     subscribeTokens: number[]
     unsubscribeTokens: number[]
+    asyncRegistered: string[]
+    asyncResolves: Array<{ callId: number; value: unknown }>
   }
+  registerCustomFormulaAsync?: (name: string) => void
+  drainAsyncCustomRequests?: () => Array<{ callId: number; name: string; args: unknown[] }>
+  resolveAsyncCustomCall?: (callId: number, value: unknown) => boolean
+  /** Test hook: enqueue a pending async request the next drain returns. */
+  __enqueueAsyncRequest?: (req: { callId: number; name: string; args: unknown[] }) => void
 }
 
 type MockWorkerResponse =
@@ -230,7 +238,10 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
     moveSheets: [],
     subscribeTokens: [],
     unsubscribeTokens: [],
+    asyncRegistered: [],
+    asyncResolves: [],
   }
+  const asyncQueue: Array<{ callId: number; name: string; args: unknown[] }> = []
   const sheets = ['Sheet1']
   const cells = new Map<string, MockCellState>()
   let nextToken = 1
@@ -614,6 +625,23 @@ function createMockWasmWorkbook(options: MockWasmWorkbookOptions = {}) {
       activeSubscriptions.delete(token)
       calls.unsubscribeTokens.push(token)
     },
+    registerCustomFormulaAsync: options.disableAsyncCustomFormulas
+      ? undefined
+      : (name: string) => {
+          calls.asyncRegistered.push(name)
+        },
+    drainAsyncCustomRequests: options.disableAsyncCustomFormulas
+      ? undefined
+      : () => asyncQueue.splice(0, asyncQueue.length),
+    resolveAsyncCustomCall: options.disableAsyncCustomFormulas
+      ? undefined
+      : (callId: number, value: unknown) => {
+          calls.asyncResolves.push({ callId, value })
+          return true
+        },
+    __enqueueAsyncRequest: (req) => {
+      asyncQueue.push(req)
+    },
     __mockCalls: calls,
   }
 
@@ -715,7 +743,12 @@ function withMockedWorker(options: MockWasmWorkbookOptions = {}) {
       mainRestorePersistenceV1: () => workbooks[0]?.__mockCalls?.restorePersistenceV1 ?? [],
       mainSubscribeTokens: () => workbooks[0]?.__mockCalls?.subscribeTokens ?? [],
       mainUnsubscribeTokens: () => workbooks[0]?.__mockCalls?.unsubscribeTokens ?? [],
+      mainAsyncRegistered: () => workbooks[0]?.__mockCalls?.asyncRegistered ?? [],
+      mainAsyncResolves: () => workbooks[0]?.__mockCalls?.asyncResolves ?? [],
     },
+    enqueueAsyncRequest: (req: { callId: number; name: string; args: unknown[] }) =>
+      workbooks[0]?.__enqueueAsyncRequest?.(req),
+    workbooks: () => workbooks,
     send: <T>(message: Record<string, unknown>) => requestWorkerResponse<T>(responses, message),
     dispose: () => {
       postMessageSpy.mockRestore()
@@ -2519,6 +2552,118 @@ describe('audit D-6 · P-D · FIXED — WASM runtime sheet ops drop index-keyed 
       await expect(
         harness.send({ id: 16, cmd: 'commitImport', sessionId: 42 }),
       ).resolves.toBeDefined()
+    } finally {
+      harness.dispose()
+    }
+  })
+})
+
+describe('wave 8.2 · async custom formulas — worker pump wiring', () => {
+  async function waitFor(cond: () => boolean) {
+    const deadline = Date.now() + 3000
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for async pump')
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+  }
+
+  it('registers async names via registerCustomFormulaAsync and settles drained requests', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 9101, cmd: 'initWorkbook' })
+      const registered = await harness.send<boolean>({
+        id: 9102,
+        cmd: 'registerCustomFormula',
+        name: 'SLOWTAX',
+        source: 'return await Promise.resolve(args[0] * 2)',
+        isAsync: true,
+      })
+      expect(registered).toBe(true)
+      expect(harness.calls.mainAsyncRegistered()).toEqual(['SLOWTAX'])
+
+      // Engine-side: a formula read enqueued a pending call. Any
+      // subsequent command triggers the post-command pump.
+      harness.enqueueAsyncRequest({ callId: 7, name: 'SLOWTAX', args: [21] })
+      await harness.send({ id: 9103, cmd: 'sheetList' })
+      await waitFor(() => harness.calls.mainAsyncResolves().length > 0)
+      expect(harness.calls.mainAsyncResolves()).toEqual([{ callId: 7, value: 42 }])
+    } finally {
+      harness.dispose()
+    }
+  })
+
+  it('maps callback throw to {error:#VALUE!} and missing local fn to {error:#NAME?}', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 9201, cmd: 'initWorkbook' })
+      await harness.send({
+        id: 9202,
+        cmd: 'registerCustomFormula',
+        name: 'BOOM',
+        source: 'throw new Error("boom")',
+        isAsync: true,
+      })
+      harness.enqueueAsyncRequest({ callId: 1, name: 'BOOM', args: [] })
+      harness.enqueueAsyncRequest({ callId: 2, name: 'GHOST', args: [] })
+      await harness.send({ id: 9203, cmd: 'sheetList' })
+      await waitFor(() => harness.calls.mainAsyncResolves().length >= 2)
+      const byId = new Map(
+        harness.calls.mainAsyncResolves().map((entry) => [entry.callId, entry.value]),
+      )
+      expect(byId.get(1)).toEqual({ error: '#VALUE!' })
+      expect(byId.get(2)).toEqual({ error: '#NAME?' })
+    } finally {
+      harness.dispose()
+      warnSpy.mockRestore()
+    }
+  })
+
+  it('drops in-flight settles when the workbook is replaced mid-promise', async () => {
+    const harness = withMockedWorker()
+    try {
+      await harness.send({ id: 9301, cmd: 'initWorkbook' })
+      let release: (value: number) => void = () => undefined
+      const gate = new Promise<number>((resolve) => {
+        release = resolve
+      })
+      ;(globalThis as Record<string, unknown>).__asyncPumpTestGate = gate
+      await harness.send({
+        id: 9302,
+        cmd: 'registerCustomFormula',
+        name: 'GATED',
+        source: 'return await globalThis.__asyncPumpTestGate',
+        isAsync: true,
+      })
+      harness.enqueueAsyncRequest({ callId: 3, name: 'GATED', args: [] })
+      await harness.send({ id: 9303, cmd: 'sheetList' })
+      // The pump is now awaiting the gate. Replace the workbook, then
+      // release — the settle must be dropped on BOTH workbooks.
+      await harness.send({ id: 9304, cmd: 'initWorkbook' })
+      release(99)
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(harness.calls.mainAsyncResolves()).toEqual([])
+      const replacement = harness.workbooks()[1]
+      expect(replacement?.__mockCalls?.asyncResolves ?? []).toEqual([])
+    } finally {
+      delete (globalThis as Record<string, unknown>).__asyncPumpTestGate
+      harness.dispose()
+    }
+  })
+
+  it('refuses async registration when the wasm bridge lacks the async port', async () => {
+    const harness = withMockedWorker({ disableAsyncCustomFormulas: true })
+    try {
+      await harness.send({ id: 9401, cmd: 'initWorkbook' })
+      await expect(
+        harness.send({
+          id: 9402,
+          cmd: 'registerCustomFormula',
+          name: 'SLOW',
+          source: 'return 1',
+          isAsync: true,
+        }),
+      ).rejects.toMatchObject({ code: 'ASYNC_CUSTOM_FORMULA_UNSUPPORTED' })
     } finally {
       harness.dispose()
     }
