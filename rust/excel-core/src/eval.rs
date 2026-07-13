@@ -721,6 +721,17 @@ fn apply_lambda_for_array_cell(
 /// satisfy this bound.
 pub trait CustomFunctionRegistry: Send + Sync + std::fmt::Debug {
     fn lookup(&self, name: &str, args: &[Value]) -> Option<Value>;
+
+    /// True when `name` is registered as an ASYNC custom formula. Async
+    /// functions are never dispatched through `lookup` during evaluation —
+    /// the engine memoizes per (name, args) call: a cache miss enqueues a
+    /// `PendingAsyncCustomCall` and the cell holds `#BUSY!` until the host
+    /// drains the queue, runs the callback on its own event loop, and
+    /// writes the result back via `Workbook::resolve_async_custom_call`.
+    /// Names default to sync so existing registries are source-compatible.
+    fn is_async(&self, _name: &str) -> bool {
+        false
+    }
 }
 
 /// Address-based evaluation source. Both production (Workbook) and the

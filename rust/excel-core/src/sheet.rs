@@ -784,6 +784,90 @@ struct WorkbookAtomTopology {
     by_name: HashMap<String, usize>,
 }
 
+/// One drained async custom-formula request. The host runs the JS callback
+/// for `name(args)` on its own event loop and reports the outcome through
+/// `Workbook::resolve_async_custom_call(call_id, value)`.
+#[derive(Debug, Clone)]
+pub struct PendingAsyncCustomCall {
+    pub call_id: u64,
+    pub name: String,
+    pub args: Vec<Value>,
+}
+
+/// Per (name, args) memo entry for an async custom-formula call. The result
+/// atom is created on first read with `#BUSY!` and its identity never changes
+/// afterwards — registry invalidation resets the VALUE back to `#BUSY!` and
+/// re-arms the call under a new `call_id`, so formulas that depend on the
+/// atom re-derive without any subscription rekeying.
+struct AsyncCustomEntry {
+    atom: AtomId,
+    call_id: u64,
+    generation: u64,
+}
+
+/// Async custom-formula state: content-addressed result cache + pending-call
+/// queue. `generation` bumps on every registry change; a settle whose entry
+/// generation (or call_id) is stale is dropped, so in-flight Promises from
+/// before an unregister/replace can never write into the new registry's view.
+struct AsyncCustomState {
+    entries: HashMap<String, AsyncCustomEntry>,
+    by_call_id: HashMap<u64, String>,
+    pending: Vec<PendingAsyncCustomCall>,
+    next_call_id: u64,
+    generation: u64,
+}
+
+/// Bounded cache: cap on memoized async custom-formula results. Enforced
+/// best-effort at drain/resolve time (never inside a read frame) by evicting
+/// entries whose result atom has no dependents and no subscribers; entries
+/// still observed by a formula are never evicted, so the cache can exceed
+/// the cap while more than 512 distinct calls are simultaneously live.
+pub(crate) const ASYNC_CUSTOM_RESULT_CACHE_CAP: usize = 512;
+
+/// Content-addressed key for an async custom-formula call. Must agree with
+/// `Value`'s `PartialEq` (NaN normalized to one bit pattern, `+0.0`/`-0.0`
+/// distinct via `to_bits`, arrays element-wise). Text is length-prefixed so
+/// concatenation cannot alias across arg boundaries. Lambdas cannot reach
+/// custom args (`eval_arg_for_custom` materializes scalars/arrays only) but
+/// are keyed by Arc identity defensively.
+fn canonical_custom_call_key(name: &str, args: &[Value]) -> String {
+    use std::fmt::Write;
+    fn write_value(out: &mut String, v: &Value) {
+        match v {
+            Value::Number(n) => {
+                let bits = if n.is_nan() { f64::NAN.to_bits() } else { n.to_bits() };
+                let _ = write!(out, "N:{bits:016x}");
+            }
+            Value::Text(s) => {
+                let _ = write!(out, "T:{}:", s.len());
+                out.push_str(s);
+            }
+            Value::Boolean(b) => out.push_str(if *b { "B:1" } else { "B:0" }),
+            Value::Null => out.push('Z'),
+            Value::Error(e) => {
+                let _ = write!(out, "E:{e}");
+            }
+            Value::Array(arr) => {
+                let _ = write!(out, "A:{}x{}", arr.rows, arr.cols);
+                for cell in &arr.data {
+                    out.push(',');
+                    write_value(out, cell);
+                }
+            }
+            Value::Lambda(l) => {
+                let _ = write!(out, "L:{:p}", Arc::as_ptr(l));
+            }
+        }
+    }
+    let mut key = String::with_capacity(24 + args.len() * 20);
+    key.push_str(&name.to_ascii_uppercase());
+    for v in args {
+        key.push('|');
+        write_value(&mut key, v);
+    }
+    key
+}
+
 /// Workbook-scoped inputs consumed by formula-inner atoms. The three version
 /// atoms are ordinary Store primitives: formulas depend on them only when they
 /// read topology, names, or custom functions. Cell/range dependencies still
@@ -801,6 +885,7 @@ pub(crate) struct WorkbookAtomContext {
     custom_revision: Cell<u64>,
     custom_call_depth: Rc<Cell<usize>>,
     in_flight: Rc<RefCell<HashSet<(usize, CellAddress)>>>,
+    async_custom: RefCell<AsyncCustomState>,
 }
 
 impl WorkbookAtomContext {
@@ -821,6 +906,13 @@ impl WorkbookAtomContext {
             custom_revision: Cell::new(0),
             custom_call_depth,
             in_flight: Rc::new(RefCell::new(HashSet::new())),
+            async_custom: RefCell::new(AsyncCustomState {
+                entries: HashMap::new(),
+                by_call_id: HashMap::new(),
+                pending: Vec::new(),
+                next_call_id: 1,
+                generation: 0,
+            }),
         })
     }
 
@@ -879,7 +971,84 @@ impl WorkbookAtomContext {
     ) {
         *self.custom_functions.borrow_mut() = registry;
         if invalidate {
+            // Registry changed: every memoized async result is stale. Reset
+            // each result atom back to #BUSY! in place (atom identity is
+            // stable; dependents re-derive without rekeying), drop the queue
+            // and call_id index, and bump the generation so in-flight settles
+            // from the old registry are discarded. One batch with the epoch
+            // bump so consumers see a single consistent flush.
+            let atoms: Vec<AtomId> = {
+                let mut state = self.async_custom.borrow_mut();
+                state.generation = state.generation.wrapping_add(1);
+                state.pending.clear();
+                state.by_call_id.clear();
+                state.entries.values().map(|e| e.atom).collect()
+            };
+            self.store.batch(|store| {
+                for atom in atoms {
+                    store.set(atom, Value::Error(ValueError::Busy));
+                }
+            });
             self.bump_epoch(&self.custom_epoch, &self.custom_revision);
+        }
+    }
+
+    /// Drain the async custom-formula request queue. Called by the host
+    /// after every mutation entry point returns (never during evaluation).
+    /// Also the opportunistic moment to enforce the result-cache cap.
+    pub(crate) fn take_pending_async_custom_calls(&self) -> Vec<PendingAsyncCustomCall> {
+        self.sweep_async_custom_entries();
+        std::mem::take(&mut self.async_custom.borrow_mut().pending)
+    }
+
+    /// Write an async call's settled value into its result atom. Returns
+    /// false (and writes nothing) when the call_id is unknown or stale —
+    /// i.e. the registry changed while the Promise was in flight.
+    pub(crate) fn resolve_async_custom_call(&self, call_id: u64, value: Value) -> bool {
+        let atom = {
+            let mut state = self.async_custom.borrow_mut();
+            let Some(key) = state.by_call_id.remove(&call_id) else {
+                return false;
+            };
+            let generation = state.generation;
+            let Some(entry) = state.entries.get(&key) else {
+                return false;
+            };
+            if entry.call_id != call_id || entry.generation != generation {
+                return false;
+            }
+            entry.atom
+        };
+        self.store.set(atom, value);
+        true
+    }
+
+    /// Diagnostics: number of memoized async custom-formula entries.
+    pub(crate) fn async_custom_entry_count(&self) -> usize {
+        self.async_custom.borrow().entries.len()
+    }
+
+    /// Best-effort cap enforcement: evict entries whose result atom nobody
+    /// observes (no dependents, no subscribers — same judgement as
+    /// `AtomFamily::evict`). Runs only outside read frames, so dependency
+    /// edges are committed and destroying an unobserved atom is invisible.
+    fn sweep_async_custom_entries(&self) {
+        let mut state = self.async_custom.borrow_mut();
+        if state.entries.len() <= ASYNC_CUSTOM_RESULT_CACHE_CAP {
+            return;
+        }
+        let evict: Vec<(String, u64, AtomId)> = state
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                !self.store.has_dependents(e.atom) && !self.store.has_subscribers(e.atom)
+            })
+            .map(|(k, e)| (k.clone(), e.call_id, e.atom))
+            .collect();
+        for (key, call_id, atom) in evict {
+            state.entries.remove(&key);
+            state.by_call_id.remove(&call_id);
+            self.store.destroy_atom(atom);
         }
     }
 
@@ -904,10 +1073,69 @@ impl WorkbookAtomContext {
         self.depend_custom(args);
         let registry = self.custom_functions.borrow().clone()?;
         if args.is_faulted() {
+            // Speculative (faulted) run: no side effects — neither the sync
+            // JS callback nor async memo-entry creation/enqueue. The retry
+            // run that can commit does the real work.
             return Some(Value::Null);
+        }
+        if registry.is_async(name) {
+            return Some(self.async_custom_result(name, values, args));
         }
         let _scope = crate::workbook::CustomCallScope::enter(&self.custom_call_depth);
         registry.lookup(name, values)
+    }
+
+    /// Async dispatch: memoized per (name, args). Returns the per-call
+    /// result atom's current value (settled result or `#BUSY!`) and makes
+    /// the calling formula depend on that atom, so the settle write — or a
+    /// registry-invalidation reset — re-derives exactly the observers.
+    fn async_custom_result(&self, name: &str, values: &[Value], args: &ReadArgs) -> Value {
+        let key = canonical_custom_call_key(name, values);
+        let atom = {
+            let mut state = self.async_custom.borrow_mut();
+            let generation = state.generation;
+            let next_call_id = state.next_call_id;
+            match state.entries.get_mut(&key) {
+                Some(entry) if entry.generation == generation => entry.atom,
+                Some(entry) => {
+                    // Survived a registry invalidation: value is already
+                    // back to #BUSY!; re-arm under a fresh call_id.
+                    entry.call_id = next_call_id;
+                    entry.generation = generation;
+                    let atom = entry.atom;
+                    state.next_call_id += 1;
+                    state.by_call_id.insert(next_call_id, key.clone());
+                    state.pending.push(PendingAsyncCustomCall {
+                        call_id: next_call_id,
+                        name: name.to_string(),
+                        args: values.to_vec(),
+                    });
+                    atom
+                }
+                None => {
+                    // Creating an atom inside a read frame is fine — the
+                    // facade machinery does the same.
+                    let atom = self.store.create_atom(Value::Error(ValueError::Busy));
+                    state.next_call_id += 1;
+                    state.entries.insert(
+                        key.clone(),
+                        AsyncCustomEntry {
+                            atom,
+                            call_id: next_call_id,
+                            generation,
+                        },
+                    );
+                    state.by_call_id.insert(next_call_id, key.clone());
+                    state.pending.push(PendingAsyncCustomCall {
+                        call_id: next_call_id,
+                        name: name.to_string(),
+                        args: values.to_vec(),
+                    });
+                    atom
+                }
+            }
+        };
+        args.get(atom)
     }
 }
 
