@@ -504,7 +504,10 @@ export function evaluate(ast: Expr, ctx: EvalContext): Value {
       }
 
       const argValues: Value[] = ast.args.map((a) => evaluateFunctionArg(a, ctx))
-      const custom = ctx.callCustom(ast.name, argValues)
+      const custom = ctx.callCustom(ast.name, argValues, {
+        sheetName: ctx.currentSheetName,
+        cell: ctx.currentCell,
+      })
       if (custom !== undefined) return custom
       return ERR('#NAME?', `function '${ast.name}' is not registered`)
     }

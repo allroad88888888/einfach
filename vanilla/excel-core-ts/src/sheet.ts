@@ -33,6 +33,7 @@ import { atom, type AtomEntity } from '@einfach/core'
 import type {
   Cell,
   CellKey,
+  CustomCallOrigin,
   EvalContext,
   EvalRuntimeDeps,
   Expr,
@@ -167,8 +168,8 @@ export interface SheetResolvers {
     sheetName: string,
     get: <T>(atom: AtomEntity<T>) => T,
   ): ReadonlyMap<CellKey, Cell> | undefined
-  /** Resolve a custom-formula host call. */
-  callCustom(name: string, args: Value[]): Value | undefined
+  /** Resolve a custom-formula host call (origin: evaluating cell, for async settles). */
+  callCustom(name: string, args: Value[], origin?: CustomCallOrigin): Value | undefined
   /** Resolve a named range / defined name. */
   resolveName(name: string): NameBinding | undefined
   /** Resolve a sheet name to its 0-based workbook index. */

@@ -44,6 +44,17 @@ export interface CellCoord {
 }
 
 /**
+ * Identity of the formula cell currently evaluating a custom-formula
+ * call. Threaded from the evaluator's frame context into
+ * `callCustom` so async pending entries know which cells to re-derive
+ * on settle.
+ */
+export interface CustomCallOrigin {
+  readonly sheetName?: string
+  readonly cell?: CellCoord
+}
+
+/**
  * Inclusive on both ends. Empty range is invalid — callers must
  * normalize before constructing.
  */
@@ -80,6 +91,7 @@ export const ERROR_CODES = [
   '#SPILL!',
   '#CIRCULAR!',
   '#ERROR!',
+  '#BUSY!',
 ] as const
 
 export type ErrorCode = (typeof ERROR_CODES)[number]
@@ -429,9 +441,14 @@ export interface EvalContext {
   /**
    * Invoke a host-registered custom formula. Returns `undefined` if no
    * formula by that name; caller should fall through to `#NAME?`.
-   * Synchronous; async custom formulas are wrapped on the host side.
+   * Synchronous dispatch; names registered `isAsync` return the
+   * memoized settled value or `#BUSY!` while the call is in flight.
+   * `origin` identifies the evaluating formula cell so a pending async
+   * call can re-derive exactly its observers when it settles; callers
+   * without cell identity (direct evaluator tests) may omit it and the
+   * settle falls back to a full recalc.
    */
-  callCustom(name: string, args: Value[]): Value | undefined
+  callCustom(name: string, args: Value[], origin?: CustomCallOrigin): Value | undefined
 
   /**
    * Cycle-detection set. Mutated by `refLookup` / `crossSheetCells`

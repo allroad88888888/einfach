@@ -809,3 +809,106 @@ describe('createWorkbook — withBatch deferral', () => {
     expect(wb.store.getter(a)).toEqual({ kind: 'number', value: 2 })
   })
 })
+
+describe('wave 8.2 — async custom formulas (engine-level)', () => {
+  const num = (value: number): { kind: 'number'; value: number } => ({ kind: 'number', value })
+  const neverCalled = (): never => {
+    throw new Error('async custom formula fn must not be invoked by the engine')
+  }
+
+  function makeAsyncWb() {
+    const wb = createWorkbook([{ id: 's1', name: 'Sheet1' }])
+    wb.registerCustomFormula('SLOW', neverCalled, { isAsync: true })
+    const read = (key: string) => wb.store.getter(wb.sheet('s1')!.formulaCellAtom(key))
+    return { wb, read }
+  }
+
+  test('pending cell and its dependent show #BUSY!; settle re-derives both', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(1)')
+    wb.setCell('s1', 1, 0, '=A1+1')
+    expect(read('0:0')).toMatchObject({ kind: 'error', code: '#BUSY!' })
+    expect(read('1:0')).toMatchObject({ kind: 'error', code: '#BUSY!' })
+
+    const calls = wb.drainPendingAsyncCustomCalls()
+    expect(calls).toHaveLength(1)
+    expect(calls[0].name).toBe('SLOW')
+    expect(calls[0].args).toEqual([num(1)])
+
+    const outcome = wb.resolveAsyncCustomCall(calls[0].callId, num(10))
+    expect(outcome.resolved).toBe(true)
+    expect(outcome.touched).toEqual([{ sheetId: 's1', key: '0:0' }])
+    expect(read('0:0')).toEqual(num(10))
+    expect(read('1:0')).toEqual(num(11))
+    // Memoized: nothing re-enqueues on re-read.
+    expect(wb.drainPendingAsyncCustomCalls()).toEqual([])
+  })
+
+  test('same (name, args) across cells dedupes to one pending call, settle updates all', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(2)')
+    wb.setCell('s1', 0, 1, '=SLOW(2)')
+    expect(read('0:0')).toMatchObject({ code: '#BUSY!' })
+    expect(read('0:1')).toMatchObject({ code: '#BUSY!' })
+
+    const calls = wb.drainPendingAsyncCustomCalls()
+    expect(calls).toHaveLength(1)
+    expect(wb.resolveAsyncCustomCall(calls[0].callId, num(5)).resolved).toBe(true)
+    expect(read('0:0')).toEqual(num(5))
+    expect(read('0:1')).toEqual(num(5))
+  })
+
+  test('registry change strands the in-flight settle and re-arms on re-read', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(3)')
+    expect(read('0:0')).toMatchObject({ code: '#BUSY!' })
+    const stale = wb.drainPendingAsyncCustomCalls()
+    expect(stale).toHaveLength(1)
+
+    // Any registry change invalidates the memo wholesale.
+    wb.registerCustomFormula('OTHER', () => num(0))
+
+    expect(wb.resolveAsyncCustomCall(stale[0].callId, num(99)).resolved).toBe(false)
+    expect(read('0:0')).toMatchObject({ code: '#BUSY!' })
+
+    const fresh = wb.drainPendingAsyncCustomCalls()
+    expect(fresh).toHaveLength(1)
+    expect(fresh[0].callId).not.toBe(stale[0].callId)
+    expect(wb.resolveAsyncCustomCall(fresh[0].callId, num(6)).resolved).toBe(true)
+    expect(read('0:0')).toEqual(num(6))
+  })
+
+  test('error args short-circuit without enqueueing', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(1/0)')
+    expect(read('0:0')).toMatchObject({ kind: 'error', code: '#DIV/0!' })
+    expect(wb.drainPendingAsyncCustomCalls()).toEqual([])
+  })
+
+  test('unregistering the async name surfaces #NAME? and drops the stale settle', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(4)')
+    expect(read('0:0')).toMatchObject({ code: '#BUSY!' })
+    const calls = wb.drainPendingAsyncCustomCalls()
+
+    expect(wb.unregisterCustomFormula('SLOW')).toBe(true)
+    expect(read('0:0')).toMatchObject({ kind: 'error', code: '#NAME?' })
+    expect(wb.resolveAsyncCustomCall(calls[0].callId, num(1)).resolved).toBe(false)
+  })
+
+  test('withBatch rollback invalidates the async memo like a registry change', () => {
+    const { wb, read } = makeAsyncWb()
+    wb.setCell('s1', 0, 0, '=SLOW(7)')
+    expect(read('0:0')).toMatchObject({ code: '#BUSY!' })
+    const calls = wb.drainPendingAsyncCustomCalls()
+
+    expect(() =>
+      wb.withBatch(() => {
+        wb.registerCustomFormula('DOOMED', () => num(0))
+        throw new Error('abort')
+      }),
+    ).toThrow('abort')
+
+    expect(wb.resolveAsyncCustomCall(calls[0].callId, num(1)).resolved).toBe(false)
+  })
+})

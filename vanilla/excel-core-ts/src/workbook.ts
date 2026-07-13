@@ -31,6 +31,7 @@ import { createStore } from '@einfach/core'
 import { parseFormula as defaultParseFormula } from './parser'
 import { createPropagation, type WriteRecord } from './propagation'
 import { parseA1 } from './refs'
+import { cellKey } from './refs/ranges'
 import {
   createSheet,
   keyFor,
@@ -43,6 +44,7 @@ import type {
   Cell,
   CellFormat,
   CellRange,
+  CustomCallOrigin,
   ErrorCode,
   Expr,
   NameBinding,
@@ -53,6 +55,13 @@ import type {
  * the Rust side's `Sheet::debug_formula_cache_state` return values so the
  * e2e probe suite reads identically against either backend. */
 export type FormulaCacheState = 'dirty' | 'computing' | 'clean' | 'none' | 'invalid'
+
+/** One drained async custom-formula request (see `registerCustomFormula`). */
+export interface PendingAsyncCustomCall {
+  readonly callId: number
+  readonly name: string
+  readonly args: Value[]
+}
 
 export interface CreateWorkbookOptions {
   /**
@@ -201,12 +210,28 @@ export interface Workbook {
    */
   undefineName(name: string): boolean
   /**
-   * Register a host custom formula. Synchronous callback only for B2.
+   * Register a host custom formula.
+   *
+   * Sync (default): `fn` is invoked inline during evaluation.
+   *
+   * `options.isAsync`: `fn` is NEVER invoked by the engine. Evaluation
+   * memoizes per (name, args): a miss enqueues a pending call and the
+   * cell holds `#BUSY!`; the host drains via
+   * `drainPendingAsyncCustomCalls`, runs its own (possibly Promise-
+   * returning) callback, and settles with `resolveAsyncCustomCall` —
+   * which re-derives exactly the formulas that observed the pending
+   * value. Memoized results live until the NEXT registry change
+   * (register/unregister of ANY custom formula), matching the Rust
+   * engine's contract.
    *
    * ⚠️ Perf (audit C-3): full registry-breadth recalc per call outside
    * `withBatch` — batch multi-step registry changes (see `defineName`).
    */
-  registerCustomFormula(name: string, fn: (args: Value[]) => Value): void
+  registerCustomFormula(
+    name: string,
+    fn: (args: Value[]) => Value,
+    options?: { isAsync?: boolean },
+  ): void
   /**
    * Remove a host custom formula.
    *
@@ -240,6 +265,21 @@ export interface Workbook {
    * The exception propagates to the caller.
    */
   withBatch<T>(fn: () => T): T
+  /**
+   * Drain async custom-formula calls queued by evaluation since the
+   * last drain. The host settles each via `resolveAsyncCustomCall`.
+   */
+  drainPendingAsyncCustomCalls(): PendingAsyncCustomCall[]
+  /**
+   * Settle an async custom-formula call. `resolved: false` means the
+   * call was unknown or stale (a registry change invalidated it) and
+   * the value was dropped. `touched` lists the formula cells that were
+   * re-derived so a worker runtime can forward dirty notifications.
+   */
+  resolveAsyncCustomCall(
+    callId: number,
+    value: Value,
+  ): { resolved: boolean; touched: Array<{ sheetId: string; key: string }> }
   /**
    * Probe the cache state of a formula cell WITHOUT triggering an
    * evaluation. Returns one of `'dirty' | 'computing' | 'clean' | 'none'
@@ -316,8 +356,68 @@ export function createWorkbook(
   // looked up from every sheet's resolver hook. Registration changes
   // invalidate formulas through the existing broad sheetAtom recalc path.
   const names = new Map<string, NameBinding>()
-  const customFormulas = new Map<string, (args: Value[]) => Value>()
+  const customFormulas = new Map<string, { fn: (args: Value[]) => Value; isAsync: boolean }>()
   const canonicalName = (name: string): string => name.toUpperCase()
+
+  // Async custom-formula memo (Wave 8.2, Rust parity — see
+  // `rust/excel-core/src/CUSTOM_FORMULAS.md` § Async). Entries are
+  // content-addressed by (name, canonicalized args); `observers` are the
+  // formula cells that read the entry while pending, re-derived via
+  // `propagation.postWrite` on settle. Any registry change clears the
+  // whole state and bumps `generation` so in-flight settles are dropped.
+  type AsyncCustomEntry = {
+    state: 'pending' | 'settled'
+    value?: Value
+    callId: number
+    generation: number
+    observers: Set<string> // `${sheetId}::${cellKey}`
+    coarse: boolean // an observer without cell identity → settle falls back to full recalc
+  }
+  const asyncCustom = {
+    entries: new Map<string, AsyncCustomEntry>(),
+    byCallId: new Map<number, string>(),
+    pending: [] as PendingAsyncCustomCall[],
+    nextCallId: 1,
+    generation: 0,
+  }
+  /** Bounded cache: settled, unobserved-at-sweep entries beyond the cap
+   * are dropped oldest-insertion-first at drain time. */
+  const ASYNC_CUSTOM_RESULT_CACHE_CAP = 512
+
+  function resetAsyncCustomState(): void {
+    asyncCustom.entries.clear()
+    asyncCustom.byCallId.clear()
+    asyncCustom.pending.length = 0
+    asyncCustom.generation += 1
+  }
+
+  /** Content-addressed key. Must agree with structural Value equality:
+   * numbers via String() (NaN normalized; note ±0 both print '0'),
+   * text length-prefixed so concatenation cannot alias across args. */
+  function canonicalCustomCallKey(name: string, args: Value[]): string {
+    const parts: string[] = [name]
+    const writeValue = (v: Value): string => {
+      switch (v.kind) {
+        case 'number':
+          return `N:${String(v.value)}`
+        case 'string':
+          return `T:${v.value.length}:${v.value}`
+        case 'boolean':
+          return v.value ? 'B:1' : 'B:0'
+        case 'blank':
+          return 'Z'
+        case 'error':
+          return `E:${v.code}`
+        case 'array':
+          return `A:${v.value.length}x${v.value[0]?.length ?? 0}:${v.value
+            .flat()
+            .map(writeValue)
+            .join(',')}`
+      }
+    }
+    for (const v of args) parts.push(writeValue(v))
+    return parts.join('|')
+  }
 
   // Live-cell-map identity → owning sheet. Map identities are stable for
   // the workbook's lifetime, so this resolves the `onFormulaEvaluated`
@@ -346,7 +446,7 @@ export function createWorkbook(
   // `withBatch` and are never rolled back.
   let batchSnapshot: {
     names: Map<string, NameBinding>
-    customFormulas: Map<string, (args: Value[]) => Value>
+    customFormulas: Map<string, { fn: (args: Value[]) => Value; isAsync: boolean }>
     locale: string
   } | null = null
 
@@ -391,10 +491,17 @@ export function createWorkbook(
       if (!owner) return
       propagation.installDepsFor(owner, key, ast, runtimeDeps)
     },
-    callCustom(name, args) {
-      const fn = customFormulas.get(name.toUpperCase())
-      if (!fn) return undefined
-      return fn(args)
+    callCustom(name, args, origin) {
+      const entry = customFormulas.get(name.toUpperCase())
+      if (!entry) return undefined
+      if (!entry.isAsync) return entry.fn(args)
+      // Async dispatch never invokes the callback here. Error args
+      // short-circuit without touching the memo (Rust parity: the
+      // registry never sees Value errors and junk keys never cache).
+      for (const arg of args) {
+        if (arg.kind === 'error') return arg
+      }
+      return asyncCustomResult(name.toUpperCase(), args, origin)
     },
     resolveName(name) {
       return names.get(canonicalName(name))
@@ -414,6 +521,52 @@ export function createWorkbook(
   // Workbook-scope revision read shared across every sheet's debug
   // probe (owned by the propagation module).
   const readRevision = (): number => propagation.revision()
+
+  function asyncCustomResult(name: string, args: Value[], origin?: CustomCallOrigin): Value {
+    const memoKey = canonicalCustomCallKey(name, args)
+    let entry = asyncCustom.entries.get(memoKey)
+    if (entry && entry.generation !== asyncCustom.generation) {
+      // Defensive: reset clears the map, so stale generations should not
+      // survive — but never serve a value across a registry change.
+      asyncCustom.entries.delete(memoKey)
+      entry = undefined
+    }
+    if (!entry) {
+      entry = {
+        state: 'pending',
+        callId: asyncCustom.nextCallId++,
+        generation: asyncCustom.generation,
+        observers: new Set(),
+        coarse: false,
+      }
+      asyncCustom.entries.set(memoKey, entry)
+      asyncCustom.byCallId.set(entry.callId, memoKey)
+      asyncCustom.pending.push({ callId: entry.callId, name, args: args.slice() })
+    }
+    if (entry.state === 'settled') return entry.value!
+    // Record who observed the pending value — exactly these cells (plus
+    // their dependents via postWrite's BFS) re-derive on settle.
+    const ownerSheet = origin?.sheetName ? sheetsByName.get(origin.sheetName) : undefined
+    if (ownerSheet && origin?.cell) {
+      entry.observers.add(`${ownerSheet.id}::${cellKey(origin.cell)}`)
+    } else {
+      entry.coarse = true
+    }
+    return { kind: 'error', code: '#BUSY!', message: `async custom formula ${name} is pending` }
+  }
+
+  /** Bounded-cache sweep at drain time: drop oldest settled entries with
+   * no pending observers once the memo exceeds the cap. A dropped entry
+   * simply re-enqueues (and re-executes) on its next read. */
+  function sweepAsyncCustomEntries(): void {
+    if (asyncCustom.entries.size <= ASYNC_CUSTOM_RESULT_CACHE_CAP) return
+    for (const [memoKey, entry] of asyncCustom.entries) {
+      if (asyncCustom.entries.size <= ASYNC_CUSTOM_RESULT_CACHE_CAP) break
+      if (entry.state !== 'settled') continue
+      asyncCustom.entries.delete(memoKey)
+      asyncCustom.byCallId.delete(entry.callId)
+    }
+  }
 
   for (const seed of initialSheets) {
     // Each sheet's debug helpers need a live revision read and a live
@@ -627,14 +780,71 @@ export function createWorkbook(
       if (removed) requestRecalc()
       return removed
     },
-    registerCustomFormula(name, fn) {
-      customFormulas.set(name.toUpperCase(), fn)
+    registerCustomFormula(name, fn, options) {
+      customFormulas.set(name.toUpperCase(), { fn, isAsync: options?.isAsync === true })
+      // Any registry change invalidates the async memo wholesale and
+      // strands in-flight settles (generation bump) — Rust parity.
+      resetAsyncCustomState()
       requestRecalc()
     },
     unregisterCustomFormula(name) {
       const removed = customFormulas.delete(name.toUpperCase())
-      if (removed) requestRecalc()
+      if (removed) {
+        resetAsyncCustomState()
+        requestRecalc()
+      }
       return removed
+    },
+    drainPendingAsyncCustomCalls() {
+      sweepAsyncCustomEntries()
+      return asyncCustom.pending.splice(0, asyncCustom.pending.length)
+    },
+    resolveAsyncCustomCall(callId, value) {
+      const memoKey = asyncCustom.byCallId.get(callId)
+      if (memoKey === undefined) return { resolved: false, touched: [] }
+      asyncCustom.byCallId.delete(callId)
+      const entry = asyncCustom.entries.get(memoKey)
+      if (!entry || entry.callId !== callId || entry.generation !== asyncCustom.generation) {
+        return { resolved: false, touched: [] }
+      }
+      entry.state = 'settled'
+      entry.value = value
+      const coarse = entry.coarse
+      const observers = [...entry.observers]
+      entry.observers.clear()
+      entry.coarse = false
+
+      const touched: Array<{ sheetId: string; key: string }> = []
+      const bySheet = new Map<string, string[]>()
+      for (const observer of observers) {
+        const sep = observer.indexOf('::')
+        const sheetId = observer.slice(0, sep)
+        const obsKey = observer.slice(sep + 2)
+        let keys = bySheet.get(sheetId)
+        if (!keys) {
+          keys = []
+          bySheet.set(sheetId, keys)
+        }
+        keys.push(obsKey)
+        touched.push({ sheetId, key: obsKey })
+      }
+      if (coarse) {
+        // At least one observer had no cell identity — we cannot target
+        // the bump, so fall back to the registry-breadth recalc.
+        propagation.recalculateAllSheets()
+      } else {
+        for (const [sheetId, keys] of bySheet) {
+          const owner = sheetsById.get(sheetId)
+          if (!owner) continue
+          const records: WriteRecord[] = keys.map((obsKey) => ({
+            key: obsKey,
+            prevAst: undefined,
+            valueChanged: true,
+          }))
+          propagation.postWrite(owner, records)
+        }
+      }
+      return { resolved: true, touched }
     },
     withBatch(fn) {
       if (batchDepth === 0) {
@@ -669,6 +879,9 @@ export function createWorkbook(
           for (const [key, callback] of snap.customFormulas) customFormulas.set(key, callback)
           currentLocale = snap.locale
           pendingRecalc = false
+          // The registry just changed shape (rollback) — same async
+          // memo invalidation as a forward registry change.
+          resetAsyncCustomState()
         }
         throw err
       } finally {

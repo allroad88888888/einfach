@@ -52,6 +52,7 @@ export type {
 
   // 7. EvalContext + names
   EvalContext,
+  CustomCallOrigin,
   NameBinding,
 
   // 8. FunctionImpl
@@ -97,6 +98,7 @@ export type {
   BulkCellInput,
   BulkTypedCellInput,
   FormulaCacheState,
+  PendingAsyncCustomCall,
 } from './workbook'
 export { createSheet, keyFor, applyCell } from './sheet'
 export type { SheetState, SheetResolvers, SheetDebugProviders } from './sheet'
