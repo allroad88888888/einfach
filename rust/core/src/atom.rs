@@ -42,6 +42,11 @@ pub enum ValueError {
     /// in the current scalar/array context, such as a nested dynamic array
     /// returned from a higher-order array callback.
     Calc, // #CALC!
+    /// An async custom-formula call is in flight: the cell holds this error
+    /// until the host resolves the pending Promise, at which point the
+    /// per-call result atom is written and dependents recompute. Propagates
+    /// through the normal error short-circuit so dependents show pending too.
+    Busy, // #BUSY!
 }
 
 impl std::fmt::Display for ValueError {
@@ -59,6 +64,7 @@ impl std::fmt::Display for ValueError {
             ValueError::WrongArgCount => write!(f, "#ARGS!"),
             ValueError::Spill => write!(f, "#SPILL!"),
             ValueError::Calc => write!(f, "#CALC!"),
+            ValueError::Busy => write!(f, "#BUSY!"),
         }
     }
 }
@@ -275,6 +281,12 @@ mod tests {
     fn atom_id_equality() {
         assert_eq!(AtomId(1), AtomId(1));
         assert_ne!(AtomId(1), AtomId(2));
+    }
+
+    #[test]
+    fn busy_error_display() {
+        assert_eq!(ValueError::Busy.to_string(), "#BUSY!");
+        assert_eq!(Value::Error(ValueError::Busy), Value::Error(ValueError::Busy));
     }
 
     // Step 7: New type tests

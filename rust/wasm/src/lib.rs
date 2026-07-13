@@ -1760,6 +1760,8 @@ fn value_to_js(value: &Value) -> JsValue {
 ///     `"#NUM!"`, `"#CYCLE!"`, `"#TYPE!"`, `"#ARGS!"`, `"#SPILL!"`,
 ///     `"#CALC!"` round-trip as the matching `ValueError` so a JS-side
 ///     custom function can deliberately propagate an Excel-style error.
+///     `"#BUSY!"` is reserved for the async pending state and demotes to
+///     `#VALUE!` (see `demote_busy_for_custom_return`).
 ///   - `boolean` → `Value::Boolean`.
 ///   - `null` / `undefined` → `Value::Null`.
 ///   - `{ error: string }` → `Value::Error(_)` parsed from the string
@@ -1780,7 +1782,7 @@ fn js_to_value(js: &JsValue) -> Value {
     }
     if let Some(s) = js.as_string() {
         if let Some(err) = error_token_to_value_error(&s) {
-            return Value::Error(err);
+            return Value::Error(demote_busy_for_custom_return(err));
         }
         // Hard cap on string size returned from a custom-formula
         // callback. A 1 GB string would be silently stored in the
@@ -1813,9 +1815,9 @@ fn js_to_value(js: &JsValue) -> Value {
     if js.is_object() {
         if let Ok(error_val) = js_sys::Reflect::get(js, &JsValue::from_str("error")) {
             if let Some(s) = error_val.as_string() {
-                return Value::Error(
+                return Value::Error(demote_busy_for_custom_return(
                     error_token_to_value_error(&s).unwrap_or(ValueError::InvalidValue),
-                );
+                ));
             }
         }
         // Plain object with no `error` key, or any other non-scalar JS
@@ -1844,8 +1846,28 @@ fn error_token_to_value_error(s: &str) -> Option<ValueError> {
         "#ARGS!" => Some(ValueError::WrongArgCount),
         "#SPILL!" => Some(ValueError::Spill),
         "#CALC!" => Some(ValueError::Calc),
+        "#BUSY!" => Some(ValueError::Busy),
         _ => None,
     }
+}
+
+/// `#BUSY!` is reserved for the engine's async-custom-formula pending state.
+/// A callback that returns it (as `"#BUSY!"` or `{ error: "#BUSY!" }`) would
+/// leave the cell permanently pending — the host would wait for a settle that
+/// never comes — so the custom-return path demotes it to `#VALUE!` with a
+/// console warning. Import / set_error paths keep accepting the token so
+/// exported workbooks containing pending cells round-trip.
+fn demote_busy_for_custom_return(err: ValueError) -> ValueError {
+    if err == ValueError::Busy {
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "[einfach custom formula] callbacks must not return #BUSY! (reserved for the async pending state); surfacing #VALUE!",
+            ));
+        }
+        return ValueError::InvalidValue;
+    }
+    err
 }
 
 // Historical note: there used to be a `MAX_BULK_IMPORT_CELLS_PER_CALL`
@@ -3789,6 +3811,23 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[test]
+    fn busy_token_roundtrip_and_custom_return_demotion() {
+        // Import / set_error paths accept the token so pending cells round-trip…
+        assert_eq!(error_token_to_value_error("#BUSY!"), Some(ValueError::Busy));
+        assert_eq!(value_error_from_display("#BUSY!"), ValueError::Busy);
+        // …but a custom-formula callback returning it demotes to #VALUE!
+        // (returning #BUSY! would leave the cell permanently pending).
+        assert_eq!(
+            demote_busy_for_custom_return(ValueError::Busy),
+            ValueError::InvalidValue
+        );
+        assert_eq!(
+            demote_busy_for_custom_return(ValueError::Spill),
+            ValueError::Spill
+        );
+    }
 
     #[test]
     fn wasm_sheet_basic() {

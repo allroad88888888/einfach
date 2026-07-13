@@ -571,6 +571,7 @@ impl Parser {
             ("#CYCLE!", ValueError::CyclicRef),
             ("#TYPE!", ValueError::WrongType),
             ("#ARGS!", ValueError::WrongArgCount),
+            ("#BUSY!", ValueError::Busy),
             ("#REF!", ValueError::InvalidRef),
             ("#NUM!", ValueError::Overflow),
             ("#N/A", ValueError::NotAvailable),
@@ -1274,6 +1275,10 @@ mod tests {
         assert_eq!(
             parse_formula("=#value!"),
             Some(Expr::Error(ValueError::InvalidValue))
+        );
+        assert_eq!(
+            parse_formula("=#BUSY!"),
+            Some(Expr::Error(ValueError::Busy))
         );
     }
 
