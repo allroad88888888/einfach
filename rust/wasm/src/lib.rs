@@ -1596,7 +1596,18 @@ fn remap_sheet_index_after_move(idx: usize, from: usize, to: usize) -> usize {
 /// insensitive: `wb.registerCustomFormula("myfunc", fn)` and `=MYFUNC()`
 /// resolve to the same entry. Matches Excel + the defined-name registry.
 struct WasmCustomFormulaRegistry {
-    inner: Mutex<HashMap<String, js_sys::Function>>,
+    inner: Mutex<HashMap<String, CustomEntry>>,
+}
+
+/// One registry slot. Sync entries hold the JS callback and dispatch
+/// through `lookup` during evaluation. Async entries are a name-only
+/// marker: the engine memoizes the call and enqueues a pending request,
+/// and the WORKER invokes the JS callback from its own local map on its
+/// own event loop — the callback never crosses into wasm, so evaluation
+/// stays synchronous.
+enum CustomEntry {
+    Sync(js_sys::Function),
+    Async,
 }
 
 impl std::fmt::Debug for WasmCustomFormulaRegistry {
@@ -1634,7 +1645,13 @@ impl WasmCustomFormulaRegistry {
 
     fn register(&self, name: &str, callback: js_sys::Function) {
         if let Ok(mut map) = self.inner.lock() {
-            map.insert(name.to_ascii_uppercase(), callback);
+            map.insert(name.to_ascii_uppercase(), CustomEntry::Sync(callback));
+        }
+    }
+
+    fn register_async(&self, name: &str) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.insert(name.to_ascii_uppercase(), CustomEntry::Async);
         }
     }
 
@@ -1662,9 +1679,29 @@ impl CustomFunctionRegistry for WasmCustomFormulaRegistry {
         let key = name.to_ascii_uppercase();
         let callback = {
             let map = self.inner.lock().ok()?;
-            map.get(&key).cloned()?
+            match map.get(&key)? {
+                CustomEntry::Sync(callback) => callback.clone(),
+                // Async names never dispatch through lookup — the engine
+                // routes them to the memoized pending path before this
+                // point. Reaching here means the engine-side is_async
+                // gate was bypassed; fail loudly as #NAME? rather than
+                // invoking nothing.
+                CustomEntry::Async => return Some(Value::Error(ValueError::InvalidName)),
+            }
         };
         Some(invoke_js_custom_formula(&callback, args))
+    }
+
+    fn is_async(&self, name: &str) -> bool {
+        self.inner
+            .lock()
+            .map(|map| {
+                matches!(
+                    map.get(&name.to_ascii_uppercase()),
+                    Some(CustomEntry::Async)
+                )
+            })
+            .unwrap_or(false)
     }
 }
 
@@ -2488,6 +2525,68 @@ impl WasmWorkbook {
         self.custom_formulas.register(&name, callback);
         self.workbook
             .invalidate_all_formulas_for_custom_function_change();
+    }
+
+    /// Register `name` as an ASYNC custom formula. Name-only: the JS
+    /// callback stays in the worker's local map and never crosses into
+    /// wasm. During evaluation the engine memoizes per (name, args),
+    /// holds the cell at `#BUSY!`, and enqueues a pending request; the
+    /// host drains with `drainAsyncCustomRequests`, awaits the callback,
+    /// and settles with `resolveAsyncCustomCall`. Registering over an
+    /// existing name (sync or async) replaces it and publishes the
+    /// registry root like `registerCustomFormula`.
+    #[wasm_bindgen(js_name = "registerCustomFormulaAsync")]
+    pub fn register_custom_formula_async(&mut self, name: String) {
+        self.custom_formulas.register_async(&name);
+        self.workbook
+            .invalidate_all_formulas_for_custom_function_change();
+    }
+
+    /// Drain the async custom-formula request queue accumulated since the
+    /// last drain. Returns `Array<{ callId: number, name: string,
+    /// args: Array<number|string|boolean|null|any[][]> }>` — args marshal
+    /// with the same rules as sync callback invocation (ranges arrive as
+    /// 2-D row-major arrays). call_id is a u64 exposed as f64: safe below
+    /// 2^53 calls. Call after any mutation entry point; empty queue
+    /// returns an empty array at negligible cost.
+    #[wasm_bindgen(js_name = "drainAsyncCustomRequests")]
+    pub fn drain_async_custom_requests(&mut self) -> JsValue {
+        let arr = js_sys::Array::new();
+        for call in self.workbook.take_pending_async_custom_calls() {
+            let obj = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("callId"),
+                &JsValue::from_f64(call.call_id as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("name"),
+                &JsValue::from_str(&call.name),
+            );
+            let args = js_sys::Array::new();
+            for v in &call.args {
+                args.push(&value_to_js(v));
+            }
+            let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("args"), &args);
+            arr.push(&obj);
+        }
+        arr.into()
+    }
+
+    /// Settle an async custom-formula call. `value` marshals with the
+    /// same rules as a sync callback's return (`js_to_value`): scalars,
+    /// error tokens / `{ error }` objects; `#BUSY!` demotes to `#VALUE!`.
+    /// The worker maps callback throw/reject to `{ error: "#VALUE!" }`
+    /// and calls this same entry — there is no separate reject API.
+    /// Returns `false` when the call is unknown or stale (registry
+    /// changed while the Promise was in flight); the value is dropped.
+    #[wasm_bindgen(js_name = "resolveAsyncCustomCall")]
+    pub fn resolve_async_custom_call(&mut self, call_id: f64, value: JsValue) -> bool {
+        let settled = js_to_value(&value);
+        self.workbook
+            .resolve_async_custom_call(call_id as u64, settled)
+            .unwrap_or(false)
     }
 
     /// Remove a previously-registered custom formula. Returns `true` if
@@ -3811,6 +3910,26 @@ mod tests {
 
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    #[test]
+    fn async_registry_entry_is_flagged_and_never_sync_dispatched() {
+        let registry = WasmCustomFormulaRegistry::new();
+        registry.register_async("slow");
+        // Case-insensitive flag, name-only entry.
+        assert!(registry.is_async("SLOW"));
+        assert!(registry.is_async("slow"));
+        assert!(!registry.is_async("OTHER"));
+        assert_eq!(registry.count(), 1);
+        // Defensive: a bypassed sync dispatch of an async name fails
+        // loudly as #NAME? instead of silently invoking nothing.
+        assert_eq!(
+            registry.lookup("SLOW", &[]),
+            Some(Value::Error(ValueError::InvalidName))
+        );
+        // Unregister clears the flag.
+        assert!(registry.unregister("SLOW"));
+        assert!(!registry.is_async("SLOW"));
+    }
 
     #[test]
     fn busy_token_roundtrip_and_custom_return_demotion() {
