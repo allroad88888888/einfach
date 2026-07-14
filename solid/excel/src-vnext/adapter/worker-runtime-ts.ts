@@ -70,6 +70,12 @@ import {
   type Value,
   type Workbook,
 } from '@einfach/excel-core-ts'
+import {
+  createAsyncCustomPump,
+  type AsyncCustomArg,
+  type AsyncCustomCallable,
+  type AsyncCustomPump,
+} from './async-custom-pump'
 import { sparseRangeToTSV } from './range-tsv'
 import type {
   CellRefWire,
@@ -127,8 +133,10 @@ interface RuntimeState {
   workbook: Workbook
   /** Stable display order of sheets in the TS workbook. */
   sheets: SheetEntry[]
-  /** Custom formula source registry — compiled callables live on the workbook. */
-  customFormulas: Map<string, string>
+  /** Custom formula registry. Sync callables live on the workbook;
+   * async callables stay HERE (the engine never invokes them — the
+   * pump does, on the worker event loop). */
+  customFormulas: Map<string, { source: string; isAsync: boolean; callable?: AsyncCustomCallable }>
   rowHeightsBySheetName: Map<string, Map<number, number>>
   colWidthsBySheetName: Map<string, Map<number, number>>
   importSessions: Map<number, { mode: 'atomic' | 'direct'; cells: ImportCellWire[] }>
@@ -827,19 +835,42 @@ function exportRangeTsv(state: RuntimeState, range: SparseRangeWire): string {
   )
 }
 
-function registerCustomFormulaInWorker(state: RuntimeState, name: string, source: string): boolean {
+const AsyncFunctionCtor = Object.getPrototypeOf(async function () {
+  /* async constructor probe */
+}).constructor as new (arg: string, body: string) => AsyncCustomCallable
+
+function registerCustomFormulaInWorker(
+  state: RuntimeState,
+  name: string,
+  source: string,
+  isAsync: boolean,
+): boolean {
   if (typeof name !== 'string' || name.length === 0) {
     throw rpcError('INVALID_CUSTOM_FORMULA_NAME', 'custom formula name must be a non-empty string')
   }
   if (typeof source !== 'string') {
     throw rpcError('INVALID_CUSTOM_FORMULA_SOURCE', 'custom formula source must be a string')
   }
+  if (isAsync) {
+    // Async: the engine only learns the NAME (memo + #BUSY! + queue);
+    // the compiled callable stays worker-local and the pump invokes it.
+    const callable = new AsyncFunctionCtor('args', source)
+    state.customFormulas.set(name.toUpperCase(), { source, isAsync: true, callable })
+    state.workbook.registerCustomFormula(
+      name,
+      () => {
+        throw new Error(`async custom formula ${name} must not be invoked by the engine`)
+      },
+      { isAsync: true },
+    )
+    return true
+  }
   // `new Function('args', source)` compiles a host callback. The body
   // sees `args` (a runtime-shaped array — scalars are unwrapped to JS
   // primitives; range args arrive as 2-D JS arrays).
   // eslint-disable-next-line no-new-func
   const compiled = new Function('args', source) as (args: unknown[]) => unknown
-  state.customFormulas.set(name.toUpperCase(), source)
+  state.customFormulas.set(name.toUpperCase(), { source, isAsync: false })
   state.workbook.registerCustomFormula(name, (args: Value[]) => {
     const unwrapped = args.map(unwrapForCustom)
     let result: unknown
@@ -987,7 +1018,11 @@ function wrapCustomResult(result: unknown): Value {
   if (typeof result === 'string') {
     // Treat strings that match the known error literal set as errors,
     // matching the WASM convention (custom formulas can return
-    // '#VALUE!' to surface a deliberate error).
+    // '#VALUE!' to surface a deliberate error). '#BUSY!' is reserved
+    // for the engine's async pending state — returning it would leave
+    // the cell permanently pending, so it demotes to #VALUE! (wasm
+    // parity).
+    if (result === '#BUSY!') return { kind: 'error', code: '#VALUE!' }
     const match = CUSTOM_FORMULA_ERROR_CODES.find((code) => code === result)
     if (match !== undefined) return { kind: 'error', code: match }
     return { kind: 'string', value: result }
@@ -996,6 +1031,15 @@ function wrapCustomResult(result: unknown): Value {
     // 2-D array marshalling.
     const rows: Value[][] = result.map((row) => (Array.isArray(row) ? row.map(wrapCustomResult) : [wrapCustomResult(row)]))
     return { kind: 'array', value: rows }
+  }
+  if (typeof result === 'object' && 'error' in (result as Record<string, unknown>)) {
+    // Tagged-error escape hatch `{ error: '#DIV/0!' }` — wasm parity.
+    const token = (result as { error: unknown }).error
+    if (typeof token === 'string' && token !== '#BUSY!') {
+      const match = CUSTOM_FORMULA_ERROR_CODES.find((code) => code === token)
+      if (match !== undefined) return { kind: 'error', code: match }
+    }
+    return { kind: 'error', code: '#VALUE!' }
   }
   return { kind: 'string', value: String(result) }
 }
@@ -1235,14 +1279,57 @@ export interface ExcelCoreTsWorkerRuntime {
   reset(): void
   /** Current state, for tests that need to introspect. */
   state(): RuntimeState
+  /** Resolves when the async custom-formula pump is idle (tests). */
+  asyncPumpIdle(): Promise<void>
 }
 
-export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
+export type WorkerRuntimeTsEvents = {
+  /** Settle-driven dirty notifications (async custom formulas). */
+  postDirty?(cells: CellRefWire[]): void
+}
+
+export function createWorkerRuntimeTs(events?: WorkerRuntimeTsEvents): ExcelCoreTsWorkerRuntime {
   let state: RuntimeState = createInitialState()
 
   function reset() {
     state = createInitialState()
   }
+
+  // Wave 8.2 — async custom-formula pump over the TS engine. Shares the
+  // drain/invoke/settle loop with the wasm runtime; the engine returns
+  // Value-shaped args/results, so the hooks unwrap/wrap at the boundary.
+  // Engine identity: initWorkbook / restore / structural rebuild all
+  // swap `state.workbook`, stranding in-flight settles automatically.
+  const asyncCustomPump: AsyncCustomPump = createAsyncCustomPump<Workbook>({
+    currentEngine: () => state.workbook,
+    drain: (engine) =>
+      engine.drainPendingAsyncCustomCalls().map((call) => ({
+        callId: call.callId,
+        name: call.name,
+        args: call.args.map(unwrapForCustom) as AsyncCustomArg[],
+      })),
+    resolve: (engine, callId, value) => {
+      const outcome = engine.resolveAsyncCustomCall(callId, wrapCustomResult(value))
+      if (outcome.resolved && outcome.touched.length > 0 && events?.postDirty) {
+        const cells: CellRefWire[] = []
+        for (const { sheetId, key } of outcome.touched) {
+          const sheet = state.sheets.find((entry) => entry.id === sheetId)
+          if (!sheet) continue
+          const [rowStr, colStr] = key.split(':')
+          cells.push({
+            sheet: sheet.idx,
+            addr: formatA1({ row: Number(rowStr), col: Number(colStr) }),
+          })
+        }
+        if (cells.length > 0) events.postDirty(cells)
+      }
+      return outcome.resolved
+    },
+    lookup: (name) => {
+      const entry = state.customFormulas.get(name.toUpperCase())
+      return entry?.isAsync ? entry.callable : undefined
+    },
+  })
 
   async function handle(msg: RequestMessage) {
     if (typeof msg.id !== 'number') {
@@ -1258,6 +1345,10 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
           ? { code: String((err as Error & { code?: string }).code ?? 'WORKER_ERROR'), message: err.message }
           : { code: 'WORKER_ERROR', message: String(err) }
       return { id, ok: false as const, error: rpcErr }
+    } finally {
+      // Any command can surface new async custom-formula requests
+      // (reads evaluate lazily; settles cascade). Fire-and-forget.
+      asyncCustomPump.pump()
     }
   }
 
@@ -1583,7 +1674,12 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
       case 'unsubscribeCells':
         return true
       case 'registerCustomFormula':
-        return registerCustomFormulaInWorker(state, String(msg.name ?? ''), String(msg.source ?? ''))
+        return registerCustomFormulaInWorker(
+          state,
+          String(msg.name ?? ''),
+          String(msg.source ?? ''),
+          msg.isAsync === true,
+        )
       case 'unregisterCustomFormula':
         return unregisterCustomFormulaInWorker(state, msg.name)
       case 'defineName':
@@ -1605,6 +1701,7 @@ export function createWorkerRuntimeTs(): ExcelCoreTsWorkerRuntime {
     handle,
     reset,
     state: () => state,
+    asyncPumpIdle: () => asyncCustomPump.idle(),
   }
 }
 
@@ -1675,9 +1772,9 @@ function rebuildPreservingCells(
 
   // Restore custom formulas on the new workbook (they live on the
   // workbook handle, not the sheets).
-  for (const [name, source] of state.customFormulas) {
+  for (const [name, entry] of state.customFormulas) {
     try {
-      registerCustomFormulaInWorker(state, name, source)
+      registerCustomFormulaInWorker(state, name, entry.source, entry.isAsync)
     } catch {
       // Ignore — keep previous registration semantics best-effort.
     }
@@ -1690,8 +1787,14 @@ function rebuildPreservingCells(
  * `postMessage` using the standard `RpcResponseWire` envelope.
  */
 export function installWorkerRuntimeTs(target?: WorkerContext): ExcelCoreTsWorkerRuntime {
-  const runtime = createWorkerRuntimeTs()
   const ctx: WorkerContext = target ?? (self as unknown as WorkerContext)
+  const runtime = createWorkerRuntimeTs({
+    // Async custom-formula settles re-derive their observers AFTER the
+    // triggering command already responded — forward them as cellsDirty
+    // so the host refreshes the projection (same event the coarse
+    // per-command broadcast below uses).
+    postDirty: (cells) => ctx.postMessage({ event: 'cellsDirty', cells }),
+  })
   ctx.addEventListener('message', async (e: MessageEvent) => {
     const msg = e.data as RequestMessage
     if (typeof msg.id !== 'number') return

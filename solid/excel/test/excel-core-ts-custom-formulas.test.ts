@@ -24,7 +24,7 @@
  *     custom → `#NAME?`).
  */
 
-import { describe, expect, test } from '@jest/globals'
+import { describe, expect, jest, test } from '@jest/globals'
 
 import { createWorkerRuntimeTs } from '../src-vnext/adapter/worker-runtime-ts'
 
@@ -298,5 +298,128 @@ describe('worker-runtime-ts custom formulas — registration + dispatch', () => 
     const circularText = await readCellDisplay(rpc, sheetIdx, 'B1')
     expect(circularText.isError).toBe(false)
     expect(circularText.display).toBe('#CIRCULAR!')
+  })
+})
+
+describe('worker-runtime-ts custom formulas — wave 8.2 async', () => {
+  test('isAsync register → #BUSY! while gated → settle updates cell + dependent + dirty', async () => {
+    const dirtyEvents: Array<Array<{ sheet: number; addr: string }>> = []
+    const runtime = createWorkerRuntimeTs({ postDirty: (cells) => dirtyEvents.push(cells) })
+    const { rpc, sheetIdx } = await initSheet(runtime)
+    // Gate the callback so the pending state is deterministically
+    // observable — the pump runs right after every command, and an
+    // ungated Promise.resolve settles before the next RPC lands.
+    let release: (v: number) => void = () => undefined
+    ;(globalThis as Record<string, unknown>).__tsAsyncSlowGate = new Promise<number>((resolve) => {
+      release = resolve
+    })
+    try {
+      await rpc({
+        cmd: 'registerCustomFormula',
+        name: 'SLOWTAX',
+        source: 'return (await globalThis.__tsAsyncSlowGate) * Number(args[0])',
+        isAsync: true,
+      })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=SLOWTAX(100)' })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'C1', formula: '=B1+1' })
+
+      const pending = await readCellDisplay(rpc, sheetIdx, 'B1')
+      expect(pending.display).toBe('#BUSY!')
+      expect(pending.isError).toBe(true)
+      const pendingDep = await readCellDisplay(rpc, sheetIdx, 'C1')
+      expect(pendingDep.display).toBe('#BUSY!')
+
+      release(0.2)
+      await runtime.asyncPumpIdle()
+
+      const settled = await readCellDisplay(rpc, sheetIdx, 'B1')
+      expect(settled.display).toBe('20')
+      expect(settled.isError).toBe(false)
+      const settledDep = await readCellDisplay(rpc, sheetIdx, 'C1')
+      expect(settledDep.display).toBe('21')
+
+      // Settle-driven dirty notification fired for the observer cell.
+      expect(dirtyEvents.flat()).toEqual(
+        expect.arrayContaining([expect.objectContaining({ sheet: sheetIdx, addr: 'B1' })]),
+      )
+    } finally {
+      delete (globalThis as Record<string, unknown>).__tsAsyncSlowGate
+    }
+  })
+
+  test('async callback throw settles as #VALUE!', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => undefined)
+    try {
+      const runtime = createWorkerRuntimeTs()
+      const { rpc, sheetIdx } = await initSheet(runtime)
+      await rpc({
+        cmd: 'registerCustomFormula',
+        name: 'BOOM',
+        source: 'throw new Error("boom")',
+        isAsync: true,
+      })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=BOOM()' })
+      await runtime.asyncPumpIdle()
+      const settled = await readCellDisplay(rpc, sheetIdx, 'B1')
+      expect(settled.display).toBe('#VALUE!')
+      expect(settled.isError).toBe(true)
+    } finally {
+      warnSpy.mockRestore()
+    }
+  })
+
+  test('unregister while the promise is in flight strands the settle', async () => {
+    const runtime = createWorkerRuntimeTs()
+    const { rpc, sheetIdx } = await initSheet(runtime)
+    let release: (v: number) => void = () => undefined
+    ;(globalThis as Record<string, unknown>).__tsAsyncGate = new Promise<number>((resolve) => {
+      release = resolve
+    })
+    try {
+      await rpc({
+        cmd: 'registerCustomFormula',
+        name: 'GATED',
+        source: 'return await globalThis.__tsAsyncGate',
+        isAsync: true,
+      })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=GATED()' })
+      expect((await readCellDisplay(rpc, sheetIdx, 'B1')).display).toBe('#BUSY!')
+
+      // Registry change while the promise is pending — the settle must
+      // be dropped by the engine's generation guard.
+      await rpc({ cmd: 'unregisterCustomFormula', name: 'GATED' })
+      release(42)
+      await runtime.asyncPumpIdle()
+
+      // Re-apply to force a re-eval: the name is gone → #NAME?.
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=GATED()' })
+      expect((await readCellDisplay(rpc, sheetIdx, 'B1')).display).toBe('#NAME?')
+    } finally {
+      delete (globalThis as Record<string, unknown>).__tsAsyncGate
+    }
+  })
+
+  test('same-args calls memoize: callback executes once for two cells', async () => {
+    ;(globalThis as Record<string, unknown>).__tsAsyncCallCount = 0
+    try {
+      const runtime = createWorkerRuntimeTs()
+      const { rpc, sheetIdx } = await initSheet(runtime)
+      await rpc({
+        cmd: 'registerCustomFormula',
+        name: 'COUNTED',
+        source: 'globalThis.__tsAsyncCallCount += 1; return Number(args[0]) + 1',
+        isAsync: true,
+      })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B1', formula: '=COUNTED(5)' })
+      await rpc({ cmd: 'setFormulaDetailed', sheet: sheetIdx, addr: 'B2', formula: '=COUNTED(5)' })
+      await readCellDisplay(rpc, sheetIdx, 'B1')
+      await readCellDisplay(rpc, sheetIdx, 'B2')
+      await runtime.asyncPumpIdle()
+      expect((await readCellDisplay(rpc, sheetIdx, 'B1')).display).toBe('6')
+      expect((await readCellDisplay(rpc, sheetIdx, 'B2')).display).toBe('6')
+      expect((globalThis as Record<string, unknown>).__tsAsyncCallCount).toBe(1)
+    } finally {
+      delete (globalThis as Record<string, unknown>).__tsAsyncCallCount
+    }
   })
 })
