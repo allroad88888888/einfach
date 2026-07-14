@@ -251,8 +251,16 @@ const customFormulas = new Map<string, { fn: CustomFormulaCallable; isAsync: boo
 const asyncCustomPump = createAsyncCustomPump<WasmWorkbookRuntime>({
   currentEngine: () => workbook,
   drain: (engine) => engine.drainAsyncCustomRequests?.() ?? [],
-  resolve: (engine, callId, value) =>
-    engine.resolveAsyncCustomCall?.(callId, value) ?? false,
+  resolve: (engine, callId, value) => {
+    const settled = engine.resolveAsyncCustomCall?.(callId, value) ?? false
+    // A settle lands OUTSIDE any command frame, so the host has no
+    // response to piggyback a refresh on. Cell subscriptions cover
+    // precisely-subscribed cells; this coarse ping (no addresses — the
+    // wasm drain does not expose observer cells) tells the backend to
+    // refetch the visible projection.
+    if (settled) postDirty([])
+    return settled
+  },
   lookup: (name) => {
     const entry = customFormulas.get(name)
     return entry?.isAsync ? entry.fn : undefined

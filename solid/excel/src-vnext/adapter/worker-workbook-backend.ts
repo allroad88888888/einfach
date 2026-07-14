@@ -856,8 +856,14 @@ export function createWorkerWorkbookSpreadsheetBackend(
       return lookup.sheets
     })
 
+  // Wave 8.2 — content-change push for worker-initiated recomputes
+  // (async custom-formula settles). The worker posts a cellsDirty event
+  // after every settle; forwarding it lets the grid refetch the visible
+  // projection without a user interaction.
+  const contentChangeHandlers = new Set<() => void>()
   const offDirty = client.onCellsDirty(() => {
     bumpRevision()
+    for (const handler of contentChangeHandlers) handler()
   })
 
   function bumpRevision(): ProjectionRevision {
@@ -1930,6 +1936,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
     async unregisterCustomFormula(name: string): Promise<void> {
       await readyPromise
       await client.unregisterCustomFormula(name)
+    },
+
+    subscribeContentChanges(handler: () => void): () => void {
+      contentChangeHandlers.add(handler)
+      return () => {
+        contentChangeHandlers.delete(handler)
+      }
     },
 
     async setFilterSort(request: SetFilterSortRequest): Promise<BackendMutationResult> {

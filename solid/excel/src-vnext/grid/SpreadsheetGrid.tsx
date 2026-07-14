@@ -550,6 +550,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   let activeResizeCleanup: (() => void) | null = null
   let activeFillCleanup: (() => void) | null = null
   let unsubscribeProjection: (() => void) | null = null
+  let unsubscribeContentChanges: (() => void) | null = null
   let unsubscribeViewport: (() => void) | null = null
   let unsubscribeSizes: (() => void) | null = null
   let unsubscribeHidden: (() => void) | null = null
@@ -1013,6 +1014,13 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     unsubscribeShowHeadings = store.sub(viewportShowHeadingsAtom, bumpRender)
     unsubscribeSelection = store.sub(selectionAtom, bumpRender)
     unsubscribeEditing = store.sub(editingSessionAtom, bumpRender)
+    // Wave 8.2 — engine-initiated content changes (async custom-formula
+    // settles, collaborative edits) have no UI command to piggyback on;
+    // the backend pushes a coarse ping and we refetch the window.
+    unsubscribeContentChanges =
+      backend.subscribeContentChanges?.(() => {
+        void loadProjection(requestProjection())
+      }) ?? null
 
     lastActiveSheetId = store.getter(workspaceSessionAtom).activeSheetId
     unsubscribeWorkspace = store.sub(workspaceSessionAtom, () => {
@@ -1041,6 +1049,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
   onCleanup(() => {
     resizeObserver?.disconnect()
     unsubscribeProjection?.()
+    unsubscribeContentChanges?.()
     unsubscribeViewport?.()
     unsubscribeSizes?.()
     unsubscribeHidden?.()

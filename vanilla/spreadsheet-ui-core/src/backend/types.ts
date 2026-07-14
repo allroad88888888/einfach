@@ -836,6 +836,14 @@ export interface SpreadsheetBackend {
     options?: { isAsync?: boolean },
   ): Promise<void>
   unregisterCustomFormula?(name: string): Promise<void>
+  // content-change push — Wave 8.2. Optional capability: backends whose
+  // engine can change cell content OUTSIDE a UI-initiated mutation
+  // (async custom-formula settles, collaborative edits) invoke the
+  // handler after such a change so the host refetches the visible
+  // projection. Coarse signal, no payload — hosts must tolerate
+  // spurious invocations. Backends whose content only ever changes in
+  // response to their own mutation methods may omit it.
+  subscribeContentChanges?(handler: () => void): () => void
 }
 
 export interface ViewportFreezeConfig {
