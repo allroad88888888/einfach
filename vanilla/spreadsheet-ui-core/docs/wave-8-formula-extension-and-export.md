@@ -26,6 +26,15 @@ lazy.
 | 8.4 Range screenshot | none | none | optional `export-range-png` | `exportRangeAsImage` | `rangeImageExportAtom` |
 | 8.5 Copy as HTML / PNG / MD | none | none | HTML / Markdown encoders | extends copy intent | `clipboardWritableFormatsAtom` |
 
+**Status (2026-07-14)**: 8.2 Custom formulas **SHIPPED** (sync + async) —
+see the as-built note at the top of § 8.2; the implementation deliberately
+diverges from the pending-reactor design written below. 8.3 Array / spill
+shipped earlier with the engine's spill infrastructure
+(`rust/excel-core/src/sheet.rs` § Spill). 8.1 Remote formulas and
+8.4 / 8.5 remain unstarted — note that 8.1's premise ("single pending
+return path shared with custom formulas") no longer holds and its design
+needs revisiting against the shipped `#BUSY!` + drain/resolve machinery.
+
 ---
 
 ## 8.1 Remote formulas
@@ -133,6 +142,37 @@ UI core.
 ---
 
 ## 8.2 Custom formulas
+
+> **SHIPPED 2026-07-14 (sync + async). This section is the ORIGINAL spec;
+> the as-built implementation deliberately diverges.** Authoritative
+> contract: `rust/excel-core/src/CUSTOM_FORMULAS.md` (engine + § "Async
+> custom formulas (Wave 8.2)") and
+> `vanilla/spreadsheet-ui-core/src/custom-formulas/README.md` (host API).
+> Key divergences from the text below:
+>
+> - **No `Value::Pending` / shared pending reactor.** Async pending state
+>   is `Value::Error(Busy)` (`#BUSY!`) on a per-call memoized result atom;
+>   settles are plain Store writes (`resolve_async_custom_call`) that
+>   re-derive exactly the observers. `#LOADING!` does not exist.
+> - **Handlers cross as SOURCE STRINGS**, compiled in the worker
+>   (`new Function` / AsyncFunction) — not main-thread handlers behind an
+>   `evaluate-custom-formula` RPC. Sync handlers dispatch inline through
+>   `CustomFunctionRegistry::lookup`; async handlers are invoked by the
+>   worker pump (`solid/excel/src-vnext/adapter/async-custom-pump.ts`,
+>   shared by the wasm and TS runtimes) via drain/resolve ports.
+> - **Async results memoize per (name, args) until the next registry
+>   change** — no TTL / refresh in v1; the load-bearing API rule.
+> - Registry atom is `ReadonlyMap<string, CustomFormulaRegistration>`
+>   (`{ name, source, isAsync?, description?, paramLabels? }`), not the
+>   metadata-only descriptor record sketched below.
+> - Errors: throw/reject → `#VALUE!`; returning `#BUSY!` demotes to
+>   `#VALUE!`; unregistered → `#NAME?`; built-ins still always win.
+> - New backend port `subscribeContentChanges` lets engine-initiated
+>   settles refetch the visible projection without a user interaction.
+>
+> Implementation-side naming caveat: engine/code comments label the sync
+> MVP "Wave 8.1" and async "Wave 8.2", while THIS doc numbers remote=8.1 /
+> custom=8.2. Reconcile when 8.1 (remote) is designed.
 
 ### Engine: function-name lookup with host fallback
 

@@ -105,7 +105,7 @@ PivotTable stay excluded per project scope.
 | 5 | [wave-5-shell-and-canvas-overlay](./wave-5-shell-and-canvas-overlay.md) | Top menubar (Luckysheet style, not Excel ribbon) + Name Box + Status Bar aggregates + Format Painter + canvas overlay for selection/decorations (DOM stays for cell text) |
 | 6 | [wave-6-cell-format-complete](./wave-6-cell-format-complete.md) | Format Cells 5-tab dialog + text rotation / overflow / wrap + complete Number Format (12 categories + custom strings) |
 | 7 | [wave-7-data-ops-and-navigation](./wave-7-data-ops-and-navigation.md) | Text to Columns + Remove Duplicates + Paste Special + Go To (Ctrl+G) + complete Data Validation + Copy as HTML/Markdown (7.4, pulled from Wave 8) |
-| 8 | [wave-8-formula-extension-and-export](./wave-8-formula-extension-and-export.md) | Remote formulas + custom formulas + array/matrix enhancements + range screenshot + copy as PNG (HTML/MD shipped early in Wave 7.4) |
+| 8 | [wave-8-formula-extension-and-export](./wave-8-formula-extension-and-export.md) | Remote formulas + custom formulas (**shipped 2026-07-14, sync + async — see doc § 8.2 status note; as-built diverges from the original pending-reactor spec**) + array/matrix enhancements + range screenshot + copy as PNG (HTML/MD shipped early in Wave 7.4) |
 
 **Cross-cutting decisions** (locked before implementation):
 

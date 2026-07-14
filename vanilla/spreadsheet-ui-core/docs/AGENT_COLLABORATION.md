@@ -24,6 +24,7 @@
 | 2026-05-15 | Codex | collaboration protocol | done | `docs/AGENT_COLLABORATION.md` | 按本文档做后续 review / handoff |
 | 2026-05-15 | CC | rich-types core | done | `src/rich-types/*`, `src/backend/types.ts`, `test/rich-types.test.ts` | Codex 已接 Solid vNext 投影渲染和静态 backend 端口 |
 | 2026-05-15 | Codex | rich-types UI integration | done | `solid/excel/src-vnext/*`, `solid/excel/test/vnext-*`, `solid/excel/e2e/vnext-smoke.spec.ts` | 下一步可接 toolbar/context-menu 的 rich edit 入口 |
+| 2026-07-14 | CC | Wave 8.2 custom formulas — async（sync MVP 此前已落地） | done | `rust/core`+`rust/excel-core`+`rust/wasm`（`#BUSY!`、per-call memo atom、drain/resolve）、`solid/excel/src-vnext/adapter/*`（共享 pump、两套 worker runtime）、`src/custom-formulas/*`（isAsync）、`src/backend/types.ts`（`registerCustomFormula` options + `subscribeContentChanges`）| 契约见 `rust/excel-core/src/CUSTOM_FORMULAS.md` § Async；future work：TTL/手动刷新（RTD 语义）、`valueKind:'pending'` 样式、call-key 哈希化。Wave 8 余项 8.1 remote / 8.4 截图 / 8.5 copy-as-PNG 未开工，8.1 设计需对齐已落地的 drain/resolve 机制 |
 
 状态值：
 
