@@ -175,11 +175,75 @@ registry N times and publishes the root once. Do not add a per-name
 address-to-formula map: Store dependency edges remain the only invalidation
 authority.
 
+## Async custom formulas (Wave 8.2)
+
+A name registered ASYNC (`registerCustomFormulaAsync` on the wasm bridge;
+`registerCustomFormula(name, source, { isAsync: true })` on the worker
+RPC / backend port / `CustomFormulaRegistration.isAsync` on the UI
+registry atom) is **never dispatched through `lookup` during
+evaluation**. Evaluation stays synchronous; the waiting happens on the
+worker event loop:
+
+1. **Eval**: `WorkbookAtomContext::call_custom` routes async names to a
+   memo keyed by the canonical `(name, args)` serialization. A hit
+   returns the per-call result atom's value; a miss creates the atom
+   holding `Value::Error(Busy)` (`#BUSY!`), enqueues a
+   `PendingAsyncCustomCall`, and returns `#BUSY!`. The calling formula
+   depends on the result atom either way, and `#BUSY!` propagates to
+   dependents through the normal error short-circuit. Note `IFERROR`
+   treats `#BUSY!` like any other error and will swallow the pending
+   state.
+2. **Drain**: after every mutation/read entry point returns, the host
+   calls `Workbook::take_pending_async_custom_calls()`
+   (`drainAsyncCustomRequests` across wasm). The worker invokes its
+   locally-compiled callback (AsyncFunction; the callback never crosses
+   into wasm), awaits it, and…
+3. **Settle**: …reports through `Workbook::resolve_async_custom_call
+   (call_id, value)` (`resolveAsyncCustomCall`). That is a plain
+   `Store::set` on the result atom — outside any custom-call frame, so
+   the re-entrancy guard does not fire — and Store propagation
+   recomputes exactly the observers. Settle values marshal with the
+   sync return rules (`js_to_value`): error tokens / `{ error }` round-
+   trip, nested Promises are already awaited flat by the worker, and a
+   returned `#BUSY!` demotes to `#VALUE!` (returning the reserved
+   pending token would hang the cell forever). Worker-side
+   throw/reject maps to `{ error: "#VALUE!" }` — there is no separate
+   reject API.
+
+**Memoization contract (the load-bearing API rule)**: one `(name, args)`
+pair executes the callback ONCE, and the settled value is reused until
+the NEXT registry change (any register/unregister/replace). There is no
+TTL and no manual refresh in v1 — async customs suit deterministic-
+per-args computations (pricing models, hashing, worker-side fetch of
+immutable resources), NOT live data feeds. To force re-execution,
+re-register the name.
+
+**Staleness**: every registry change bumps an internal generation,
+clears the pending queue, and resets memoized atoms to `#BUSY!` in
+place (atom identity is stable — no subscription rekeying). A settle
+whose `call_id` no longer matches is dropped (`Ok(false)`); the
+re-armed call gets a fresh `call_id` on the next read. Worker runtimes
+add an engine-identity guard on top: replacing the whole workbook
+(init/restore) strands in-flight Promises.
+
+**Bounded cache**: `ASYNC_CUSTOM_RESULT_CACHE_CAP = 512` entries,
+enforced best-effort at drain time by evicting entries whose result
+atom has no dependents and no subscribers (never inside a read frame).
+
+**Volatile-args warning**: `=SLOW(NOW())` mints a new call key on every
+recalc — cache churn plus one callback execution per key. The cap
+bounds memory, not callback volume. Avoid volatile arguments to async
+customs.
+
+**Not supported**: async names inside `define_name` formulas — the
+eager defined-name evaluation path has no reactive read context, so it
+surfaces `#BUSY!` (`EvalFailed(Busy)`) permanently.
+
 ## Limitations (initial cut)
 
-- **Synchronous only.** JS callbacks must return a value, not a
-  `Promise`. Async (callback returns Promise → cell shows pending state
-  → resolves to a Value when promise settles) is future work.
+- **Async settles are memoized until registry change.** See § "Async
+  custom formulas" — no TTL, no per-name refresh, callbacks must be
+  effectively deterministic per args for correct semantics.
 - **Range args materialise eagerly.** `=MYTAX(A1:A100)` evaluates the
   range to a 2-D `Value::Array` (row-major) BEFORE crossing the JS
   boundary, and the callback receives a `number[][]` / `(number | string

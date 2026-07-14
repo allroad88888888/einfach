@@ -194,6 +194,15 @@ function VNextWorkerWorkbook() {
           'const xs = Array.isArray(args[0]) ? args[0].flat() : [args[0]]; return xs.reduce((s,v)=>s+Number(v)*Number(v),0)',
         paramLabels: ['range'],
       },
+      // Wave 8.2 — async demo: the cell shows #BUSY! for ~800ms, then
+      // settles. Same-args re-entry is memoized (no second delay) until
+      // the registry changes.
+      {
+        name: 'SLOWTAX',
+        source: 'await new Promise((r) => setTimeout(r, 800)); return Number(args[0]) * 0.2',
+        isAsync: true,
+        paramLabels: ['amount'],
+      },
     ]
     for (const reg of customFormulas) store.setter(registerCustomFormulaAtom, reg)
     onCleanup(() => {

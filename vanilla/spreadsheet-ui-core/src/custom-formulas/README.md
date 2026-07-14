@@ -101,12 +101,46 @@ return xs.reduce((s, v) => s + Number(v) * Number(v), 0)
 
 The `source` field is the body of a function whose single parameter is
 bound to `args` (Array). The worker constructs the live function via
-`new Function('args', source)`. The body MUST be synchronous — async /
-Promise returns are not supported in MVP and will surface a
-`#ERROR!` cell with the worker-side exception.
+`new Function('args', source)` — or the AsyncFunction constructor when
+the registration sets `isAsync: true`, in which case the body may
+`await`.
 
 Throwing inside the body produces `#ERROR!` with the thrown message.
 Returning `undefined` is treated the same as returning `null`.
+
+## Async custom formulas (`isAsync`, Wave 8.2)
+
+```ts
+store.setter(registerCustomFormulaAtom, {
+  name: 'SLOWTAX',
+  source: 'const rate = await self.myRateTable.get(args[1]); return args[0] * rate',
+  isAsync: true,
+})
+```
+
+While the returned Promise is in flight the cell shows `#BUSY!`, which
+propagates to dependents like any error (`IFERROR` will swallow it).
+When it settles, the worker writes the value back into the engine and
+exactly the observing formulas re-derive; the UI refreshes through the
+normal dirty/projection path.
+
+Semantics to know before reaching for it:
+
+- **Memoized per (name, args) until the next registry change.** The
+  callback runs once per distinct argument tuple; re-registering (any
+  custom formula) clears the memo and re-executes on next read. No TTL
+  and no manual refresh in v1 — suits deterministic-per-args work, not
+  live data feeds. Avoid volatile args (`=SLOWTAX(A1, NOW())`).
+- **Error mapping**: throw / Promise rejection → `#VALUE!` (message in
+  the worker console); returning an error token or `{ error }` works
+  like the sync path; returning the reserved `#BUSY!` token demotes to
+  `#VALUE!`.
+- **Degradation**: a backend/wasm build without the async ports rejects
+  the registration with `ASYNC_CUSTOM_FORMULA_UNSUPPORTED` instead of
+  silently registering a Promise-returning sync callback.
+
+Engine contract details: `rust/excel-core/src/CUSTOM_FORMULAS.md`
+§ "Async custom formulas (Wave 8.2)".
 
 Plain-value contract (see `CustomFormulaArg` / `CustomFormulaReturn`):
 

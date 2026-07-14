@@ -24,6 +24,12 @@ export default defineConfig({
       // stale published esm/cjs outputs and ?backend=ts would crash when the
       // worker calls debug RPCs added in Phase 1.
       '@einfach/excel-core-ts': path.resolve(repoRoot, 'vanilla/excel-core-ts/src'),
+      // Same source-alias treatment for the remaining workspace deps so the
+      // dev server never depends on built esm/cjs artifacts (a failed
+      // `npm run build` deletes them via clearTypes and would 500 every
+      // module until the next successful build).
+      '@einfach/core': path.resolve(repoRoot, 'vanilla/core/src'),
+      '@einfach/solid': path.resolve(repoRoot, 'solid/solid/src'),
     },
   },
   build: {
