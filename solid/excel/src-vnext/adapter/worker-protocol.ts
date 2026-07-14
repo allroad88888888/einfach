@@ -302,9 +302,16 @@ export interface WorkerWorkbookClient {
    * to the worker, which `new Function('args', source)`s it and binds
    * the resulting callable to the WASM Workbook. Closure-capture hazards
    * are avoided by handing the worker a string body rather than a live
-   * function (JS callbacks cannot cross `postMessage`).
+   * function (JS callbacks cannot cross `postMessage`). Wave 8.2:
+   * `options.isAsync` compiles the body through the AsyncFunction
+   * constructor; the worker pump settles Promise results back into the
+   * engine and cells show `#BUSY!` while in flight.
    */
-  registerCustomFormula(name: string, source: string): Promise<boolean>
+  registerCustomFormula(
+    name: string,
+    source: string,
+    options?: { isAsync?: boolean },
+  ): Promise<boolean>
   unregisterCustomFormula(name: string): Promise<boolean>
   /**
    * Wave F follow-up — register a workbook-level name binding inside the
@@ -671,8 +678,12 @@ export function createWorkerWorkbook(opts: WorkerWorkbookOptions): WorkerWorkboo
       hydratedListeners.add(callback)
       return () => hydratedListeners.delete(callback)
     },
-    registerCustomFormula(name, source) {
-      return request<boolean>('registerCustomFormula', { name, source })
+    registerCustomFormula(name, source, options) {
+      return request<boolean>('registerCustomFormula', {
+        name,
+        source,
+        isAsync: options?.isAsync === true,
+      })
     },
     unregisterCustomFormula(name) {
       return request<boolean>('unregisterCustomFormula', { name })

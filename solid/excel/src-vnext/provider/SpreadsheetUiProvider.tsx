@@ -40,6 +40,9 @@ function diffCustomFormulas(
     }
     const changed =
       before.source !== entry.source ||
+      // Sync ↔ async flips recompile through a different constructor
+      // and change the engine-side registration kind — always replace.
+      (before.isAsync === true) !== (entry.isAsync === true) ||
       before.description !== entry.description ||
       // Cheap shallow compare; registrations replacing solely the label
       // list still reinstall (intentional — labels feed IntelliSense
@@ -63,7 +66,7 @@ function diffCustomFormulas(
  */
 async function applyCustomFormulaOps(
   backend: {
-    registerCustomFormula?: (n: string, s: string) => Promise<void>
+    registerCustomFormula?: (n: string, s: string, o?: { isAsync?: boolean }) => Promise<void>
     unregisterCustomFormula?: (n: string) => Promise<void>
   },
   ops: readonly CustomFormulaOp[],
@@ -83,7 +86,7 @@ async function applyCustomFormulaOps(
         }
         installed.delete(op.name)
       } else if (op.kind === 'register') {
-        await register(op.name, op.entry.source)
+        await register(op.name, op.entry.source, { isAsync: op.entry.isAsync === true })
         installed.set(op.name, nextSnapshot.get(op.name) ?? op.entry)
       } else {
         // replace = unregister-then-register so the worker recompiles
@@ -95,7 +98,7 @@ async function applyCustomFormulaOps(
           installed.delete(op.name)
           if (signal.aborted) return
         }
-        await register(op.name, op.entry.source)
+        await register(op.name, op.entry.source, { isAsync: op.entry.isAsync === true })
         installed.set(op.name, nextSnapshot.get(op.name) ?? op.entry)
       }
     } catch (err) {

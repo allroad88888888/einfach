@@ -18,7 +18,7 @@ afterEach(cleanup)
 
 function createBackendWithCustomFormulas() {
   const registerSpy =
-    jest.fn<(name: string, source: string) => Promise<void>>(
+    jest.fn<(name: string, source: string, options?: { isAsync?: boolean }) => Promise<void>>(
       async () => undefined,
     )
   const unregisterSpy =
@@ -72,7 +72,71 @@ describe('vnext custom formulas — host wiring', () => {
     await waitFor(() => {
       expect(registerSpy).toHaveBeenCalledTimes(1)
     })
-    expect(registerSpy.mock.calls[0]).toEqual(['MYTAX', 'return args[0] * 0.2'])
+    expect(registerSpy.mock.calls[0]).toEqual([
+      'MYTAX',
+      'return args[0] * 0.2',
+      { isAsync: false },
+    ])
+  })
+
+  it('isAsync registrations pass the flag through to the backend', async () => {
+    const store = createStore()
+    const { backend, registerSpy } = createBackendWithCustomFormulas()
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <div />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(registerCustomFormulaAtom, {
+      name: 'SLOWTAX',
+      source: 'return await fetchRate(args[0])',
+      isAsync: true,
+    })
+
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(1)
+    })
+    expect(registerSpy.mock.calls[0]).toEqual([
+      'SLOWTAX',
+      'return await fetchRate(args[0])',
+      { isAsync: true },
+    ])
+  })
+
+  it('flipping isAsync on an unchanged source triggers a replace (unregister + register)', async () => {
+    const store = createStore()
+    const { backend, registerSpy, unregisterSpy } = createBackendWithCustomFormulas()
+
+    render(() => (
+      <SpreadsheetUiProvider backend={backend} store={store}>
+        <div />
+      </SpreadsheetUiProvider>
+    ))
+
+    store.setter(registerCustomFormulaAtom, {
+      name: 'MYTAX',
+      source: 'return args[0] * 0.2',
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(1)
+    })
+
+    store.setter(registerCustomFormulaAtom, {
+      name: 'MYTAX',
+      source: 'return args[0] * 0.2',
+      isAsync: true,
+    })
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledTimes(2)
+    })
+    expect(unregisterSpy).toHaveBeenCalledWith('MYTAX')
+    expect(registerSpy.mock.calls[1]).toEqual([
+      'MYTAX',
+      'return args[0] * 0.2',
+      { isAsync: true },
+    ])
   })
 
   it(
@@ -129,7 +193,7 @@ describe('vnext custom formulas — host wiring', () => {
       expect(unregisterSpy).toHaveBeenCalledWith('GREET')
       expect(registerSpy).toHaveBeenCalledTimes(2)
     })
-    expect(registerSpy.mock.calls[1]).toEqual(['GREET', "return 'hello'"])
+    expect(registerSpy.mock.calls[1]).toEqual(['GREET', "return 'hello'", { isAsync: false }])
   })
 
   it(
@@ -224,7 +288,7 @@ describe('vnext custom formulas — host wiring', () => {
     ))
 
     await waitFor(() => {
-      expect(registerSpy).toHaveBeenCalledWith('PREMOUNT', 'return 1')
+      expect(registerSpy).toHaveBeenCalledWith('PREMOUNT', 'return 1', { isAsync: false })
     })
   })
 

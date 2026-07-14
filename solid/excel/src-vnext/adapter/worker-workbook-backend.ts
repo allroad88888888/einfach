@@ -1918,9 +1918,13 @@ export function createWorkerWorkbookSpreadsheetBackend(
      * when registered names appear inside existing formulas. No
      * `affectedRange` exists.
      */
-    async registerCustomFormula(name: string, source: string): Promise<void> {
+    async registerCustomFormula(
+      name: string,
+      source: string,
+      options?: { isAsync?: boolean },
+    ): Promise<void> {
       await readyPromise
-      await client.registerCustomFormula(name, source)
+      await client.registerCustomFormula(name, source, options)
     },
 
     async unregisterCustomFormula(name: string): Promise<void> {

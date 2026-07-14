@@ -124,6 +124,7 @@ export const registerCustomFormulaAtom = atom(
     next.set(key, {
       name: key,
       source: reg.source,
+      ...(reg.isAsync !== undefined ? { isAsync: reg.isAsync } : {}),
       ...(reg.description !== undefined ? { description: reg.description } : {}),
       ...(reg.paramLabels !== undefined ? { paramLabels: [...reg.paramLabels] } : {}),
     })

@@ -823,11 +823,18 @@ export interface SpreadsheetBackend {
   // custom-formulas — Wave 8. Optional capability; host adapters that
   // omit these methods make the `customFormulaRegistryAtom` inert
   // (writes succeed but no worker side-effect runs). `source` is the
-  // body of a synchronous function whose argument is bound to `args`
-  // (Array) — the adapter is expected to `new Function('args', source)`
-  // it inside whichever runtime owns the formula engine. Errors thrown
-  // during evaluation surface as `#ERROR!` cells.
-  registerCustomFormula?(name: string, source: string): Promise<void>
+  // body of a function whose argument is bound to `args` (Array) — the
+  // adapter is expected to `new Function('args', source)` it inside
+  // whichever runtime owns the formula engine. Errors thrown during
+  // evaluation surface as `#ERROR!` cells. Wave 8.2: pass
+  // `options.isAsync` to compile through the AsyncFunction constructor —
+  // the cell holds `#BUSY!` until the returned Promise settles, and the
+  // result is memoized per (name, args) until the next registry change.
+  registerCustomFormula?(
+    name: string,
+    source: string,
+    options?: { isAsync?: boolean },
+  ): Promise<void>
   unregisterCustomFormula?(name: string): Promise<void>
 }
 

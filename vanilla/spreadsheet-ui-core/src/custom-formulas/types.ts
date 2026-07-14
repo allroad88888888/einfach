@@ -65,10 +65,20 @@ export interface CustomFormulaRegistration {
   /**
    * Function body source. Bound parameter name is `args` (Array). The
    * worker constructs the live function via `new Function('args',
-   * source)`. The body MUST be synchronous — async / Promise returns are
-   * not supported in MVP.
+   * source)` — or the AsyncFunction constructor when `isAsync` is set,
+   * in which case the body may `await`.
    */
   source: string
+  /**
+   * Wave 8.2 — async custom formula. The body compiles through the
+   * AsyncFunction constructor and may return a Promise. While the call
+   * is in flight the cell shows `#BUSY!` (propagating to dependents);
+   * the worker settles the result back into the engine when the
+   * Promise resolves. Results are memoized per (name, args) until the
+   * NEXT registry change — there is no TTL or manual refresh in v1, so
+   * this suits deterministic-per-args calls, not live data feeds.
+   */
+  isAsync?: boolean
   /** Optional metadata for IntelliSense (Wave 9 surface). */
   description?: string
   /** Optional parameter labels for the function-help popover. */
