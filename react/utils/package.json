@@ -1,6 +1,6 @@
 {
   "name": "@einfach/react-utils",
-  "version": "0.3.25",
+  "version": "0.3.26",
   "description": "React utility hooks for Einfach state management",
   "type": "module",
   "main": "./cjs/index.cjs",
