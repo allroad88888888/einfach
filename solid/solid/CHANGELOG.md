@@ -1,5 +1,12 @@
 # @einfach/solid
 
+## 0.2.20
+
+### Patch Changes
+
+- Updated dependencies [8e46430]
+  - @einfach/core@0.2.19
+
 ## 0.2.19
 
 ### Patch Changes

@@ -1,6 +1,6 @@
 {
   "name": "@einfach/core",
-  "version": "0.2.18",
+  "version": "0.2.19",
   "description": "Lightweight Jotai-inspired atomic state management core",
   "type": "module",
   "main": "./cjs/index.cjs",
