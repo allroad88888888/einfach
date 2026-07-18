@@ -1,5 +1,9 @@
 # In-flight 三槽日账
 
+## 2026-07-19 canonical 归属口径已翻转（指针）
+
+canonical 归属的唯一规范源自 2026-07-19 起是 [CANONICAL_OWNERSHIP.md](./CANONICAL_OWNERSHIP.md)：纯视口事实（freeze、hidden 行列、行高列宽、filter 可见性、protection 门禁）翻转为 UI-core canonical，数据事实维持引擎 canonical，undo 改为宿主编排（UI-core history + 引擎快照原语），WASM 为唯一真实后端口径、TS worker 降级 fail-closed 开发后备。本账旧口径中与该文件冲突处（如 #03/#05/#29/#40 的"等 Worker parity"闭环路径、#40 的 host-overlay 禁令表述）以该文件为准；严格产品总账 41 = 0/35/5/1 与"严格产品状态需要真实验证"原则不变。三槽流程相应改为"纵向闭环 + 主控合并"。
+
 ## 2026-07-17 当前并发账
 
 唯一工作根：`/Volumes/work/self/einfach`。本节取代下方 2026-07-14 worktree 日账作为当前执行事实；所有 `pending` 必须由对应 owner 提供真实输出，其他 Agent 不得代填为通过。

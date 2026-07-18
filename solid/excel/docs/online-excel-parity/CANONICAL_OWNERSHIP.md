@@ -1,0 +1,125 @@
+# Canonical 归属口径（2026-07-19 翻转裁决）
+
+**本文件自 2026-07-19 起是 canonical 归属的唯一规范源。** [INFLIGHT.md](./INFLIGHT.md) 与其他 parity 文档旧口径中与本文件冲突处，以本文件为准。翻转只改变"事实归谁所有、闭环走哪条路"，**不改变"严格产品状态需要真实验证"的原则**：严格产品总账维持 **41 = 0 `Verified` / 35 `Partial` / 5 `Missing` / 1 `Deferred`**，任何条目仍必须以真实证据升级，不得因归属翻转而改写产品行。
+
+## 1｜裁决摘要与依据
+
+2026-07-19 完成一次战略裁决，采用 11-agent 工作流：**6 路代码审计 + 3 评审 + 2 对抗批评者**；三评审一致采纳 **"混合翻转 C-modified"**。裁决依据是代码真值，不是设计愿望：
+
+1. **视口事实从未真实活在 backend。** hidden 行列、freeze、filter 可见性、protection 在纸面上是 backend canonical，实际只活在 `static-backend` 的内存态；两个引擎（`rust/excel-core`、`vanilla/excel-core-ts`）和 worker RPC 从未建模它们；引擎没有任何公式读取 hidden（SUBTOTAL 101-111 被折算为 1-11）。
+2. **引擎侧 undo 是死代码，快照原语已在线。** Rust `undo.rs` 是零调用方死代码；wasm 快照原语（`snapshot_sparse` / `restore_sparse` ADDITIVE、format snapshot、persistence v1）已在 worker 协议线上，但从未被组装成 `undoTransaction` 端口。
+3. **TS worker 存在 fail-open 假 ACK。** 结构操作 no-op 却返回 `true` 等路径会伪造成功。
+4. **static-backend 存在实锤 bug。** 插入/删除行列不平移 merge。
+
+裁决结论：与其继续"等两个引擎把视口事实和事务日志补齐"，不如按代码真值翻转归属——视口事实归 UI-core，数据事实归引擎，undo 归宿主编排，WASM 收敛为唯一真实后端口径。
+
+## 2｜新口径定义（四类归属）
+
+| 归属类别             | 定义                                                                                                                            | 覆盖事实                                                                                                                     |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| **引擎数据事实**     | 引擎（经 backend 端口）是唯一权威；UI-core 只读投影                                                                             | 值、公式、重算、结构操作、排序执行、removeDuplicates、paste 数据；cell format / named ranges 维持 backend canonical 合同形状 |
+| **UI-core 视图事实** | UI-core 是唯一权威；backend 端口降级为**可选持久化钩子**，缺失时功能不降级                                                      | freeze、hidden 行列、行高列宽、filter 可见性、protection 门禁                                                                |
+| **adapter overlay**  | 合同形状维持 backend canonical，worker 路径以 host-overlay 落地（validation / conditional-formatting 既有模式即先例，就此转正） | merge（worker 路径）、条件格式、数据验证规则存储                                                                             |
+| **混合**             | 同一功能点内不同事实分属不同类别；逐项注明拆分                                                                                  | 见总账表内注明                                                                                                               |
+
+横切规则：
+
+- **undo = 宿主编排**：UI-core history 负责编排，引擎快照原语负责执行；**不建引擎事务日志**，`undo.rs` 死代码不复活。
+- **WASM 是唯一真实后端口径**；TS worker 降级为 **fail-closed 开发后备**——不支持的能力必须显式 `false` / 隐藏入口，禁止假 ACK。"Worker parity"类闭环条件一律收敛为对 WASM 单口径验证。
+- 只读投影 atom 形状不变；翻转对下游消费者透明，但投影消费者必须显式化（见 §6）。
+
+## 3｜41 项 canonical 归属总账
+
+项目清单与严格产品状态取自 [README｜功能点与当前代码状态总表](./README.md#功能点与当前代码状态总表)（41 = 0/35/5/1，本文件不改动该总账）。"闭环路径变化"列只记录与旧口径不同之处；"不变"表示该项闭环条件不受翻转影响。
+
+|   # | 功能点                                   | 严格状态   | canonical 归属                                                                           | 闭环路径变化                                                                                                                                                                  |
+| --: | ---------------------------------------- | ---------- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+|  01 | 工作表创建、切换、重命名、删除、排序     | `Partial`  | 混合：sheet 生命周期/顺序 = 引擎；激活切换与 ABA gate = UI-core                          | 主体不变；undo 侧改走宿主编排，deleteSheet 级恢复需注册态重放协议（§4-3）                                                                                                     |
+|  02 | 行列插入、删除、清空及操作派发           | `Partial`  | 引擎数据事实                                                                             | TS worker no-op 不再计为 parity 缺口：W1 fail-closed 后隐藏入口，闭环只对 WASM 验证；结构位移经 W3 `structuralShift` remap 合同                                               |
+|  03 | 行高、列宽、隐藏/取消隐藏                | `Partial`  | UI-core 视图事实                                                                         | 从"等 Worker hidden capability / parity"改为 **UI-core canonical 翻转**（顺序第 2 步）；backend 端口降为可选持久化钩子                                                        |
+|  04 | 合并与取消合并                           | `Partial`  | adapter overlay（合同形状维持 backend canonical；worker 路径 host-overlay）              | worker 路径不再等引擎建模 merge，按 host-overlay 先例落地；static 插删行列不平移 merge 的 bug 由 W3 remap 修复                                                                |
+|  05 | 冻结窗格                                 | `Partial`  | UI-core 视图事实                                                                         | 从"等 Worker/real transport + 持久化/hydration"改为 **UI-core canonical 翻转**（顺序第 1 步）；持久化转可选钩子                                                               |
+|  06 | 选区、多选区、名称框与定位               | `Partial`  | UI-core 视图事实（原本即是，非本次翻转新增）                                             | 不变；go-to 列入投影消费者显式化清单（§6）                                                                                                                                    |
+|  07 | 分组、大纲、折叠层级                     | `Missing`  | 混合：折叠可见性 = UI-core（复用 hidden canonical）；大纲层级元数据待裁决                | 新建时直接按新口径实现；大纲层级元数据归属见 §7 已知张力                                                                                                                      |
+|  08 | 单元格直接编辑、提交、取消               | `Partial`  | 引擎数据事实（编辑会话为 UI-core 过程态，非 canonical 事实）                             | 不变；worker undo/redo 缺口改由宿主编排 undo 承载                                                                                                                             |
+|  09 | 公式栏输入与引用模式                     | `Partial`  | 引擎数据事实（引用模式/高亮为 UI-core 过程态）                                           | 跨引擎语义验证收敛为 WASM 单口径                                                                                                                                              |
+|  10 | 复制、剪切、粘贴与 Copy As               | `Partial`  | 引擎数据事实（clipboard 编码为宿主侧）                                                   | 不变；worker undo/redo 缺口改由宿主编排 undo 承载                                                                                                                             |
+|  11 | 选择性粘贴                               | `Partial`  | 引擎数据事实（paste 数据）                                                               | Worker `pasteRange` 仍需引擎真实端口；附载 column-widths 随行高列宽翻转为 UI-core 视图写入，跨域原子性见 §7 已知张力                                                          |
+|  12 | 自动填充与序列                           | `Partial`  | 引擎数据事实                                                                             | Worker parity 收敛为 WASM 单口径                                                                                                                                              |
+|  13 | 分列                                     | `Partial`  | 引擎数据事实                                                                             | Worker parity 收敛为 WASM 单口径                                                                                                                                              |
+|  14 | 查找、全部查找、替换、全部替换           | `Partial`  | 引擎数据事实（替换写入；find 匹配缓存为 UI-core 有界过程态）                             | Worker parity 收敛为 WASM 单口径；find-replace 列入投影消费者清单（§6）                                                                                                       |
+|  15 | 撤销、重做与本地历史时间线               | `Partial`  | 混合：编排 = UI-core history；执行 = 引擎快照原语                                        | 从"等 worker 权威 undo/redo"改为**宿主编排**：组装已在线的 wasm 快照原语成 `undoTransaction` 端口，不建引擎事务日志；history 新增 local-replay 分支承载视图事实 undo（§4-4）  |
+|  16 | 富值/特殊单元格类型                      | `Partial`  | 引擎数据事实                                                                             | Worker parity 收敛为 WASM 单口径                                                                                                                                              |
+|  17 | 工具栏常用格式命令                       | `Partial`  | 引擎数据事实（cell format，合同形状维持 backend canonical）                              | TS worker 格式 no-op 经 W1 fail-closed；闭环只对 WASM 验证                                                                                                                    |
+|  18 | "设置单元格格式"会话                     | `Partial`  | 引擎数据事实（会话为 UI-core 过程态）                                                    | 同 #17                                                                                                                                                                        |
+|  19 | 数字格式与数字格式对话框                 | `Partial`  | 引擎数据事实                                                                             | TS number-format 缺口不再是闭环条件（TS 降级开发后备）；locale/Excel 语义对 WASM 验证                                                                                         |
+|  20 | 格式刷                                   | `Partial`  | 引擎数据事实（painter 会话为 UI-core 过程态）                                            | Worker parity 收敛为 WASM 单口径                                                                                                                                              |
+|  21 | 条件格式                                 | `Partial`  | adapter overlay                                                                          | 既有主线程 overlay 就此**转正**为口径内落地形态，不再视为"等引擎/服务权威事实"的临时态；durable 持久化仍是后续可选钩子                                                        |
+|  22 | 数据验证                                 | `Partial`  | adapter overlay（规则存储）                                                              | 规则存储按 overlay 口径转正；运行时 enforcement 仍缺，属后续实现（可复用 W2 网关必经模式）                                                                                    |
+|  23 | 边框、旋转及完整格式投影                 | `Partial`  | 引擎数据事实（format 投影）                                                              | 不变；shared-edge 合同（#23 blocker）继续待裁决；merge 联动列入投影消费者清单（§6）                                                                                           |
+|  24 | 公式解析、函数调用与引用解析             | `Partial`  | 引擎数据事实                                                                             | conformance 对 WASM 单口径验证                                                                                                                                                |
+|  25 | 函数目录与函数 atom                      | `Partial`  | 引擎数据事实（目录以 Rust evaluator 为唯一口径，UI-core 目录 atom 为镜像）               | 从"三引擎目录一致性"收敛为对 WASM/Rust 单口径校验（沿用 built-in shadow list 先例）                                                                                           |
+|  26 | 自定义公式                               | `Partial`  | 混合：注册表 = UI-core/host；求值 = 引擎                                                 | deleteSheet 级恢复需注册态重放协议——persistence v1 不含注册表/named values/订阅（§4-3）；异步 settle revision 与 history 见证分离计数（§4-2）                                 |
+|  27 | 命名区域与名称管理                       | `Partial`  | 引擎数据事实（合同形状维持 backend canonical）                                           | 不变；真实 WASM 支持仍是闭环条件（唯一真实后端口径）                                                                                                                          |
+|  28 | 重算、异步公式、worker/Rust parity       | `Partial`  | 引擎数据事实                                                                             | parity 目标收敛为 WASM 单口径；TS worker 经 W1 降级 fail-closed 开发后备；异步 settle 无条件 bump revision 与 history 严格 revision 见证分离计数（§4-2）                      |
+|  29 | 排序与筛选                               | `Partial`  | 混合：排序执行 = 引擎；筛选可见性 = UI-core                                              | 从"等 Worker `setFilterSort` parity"改为混合翻转：筛选可见性 **UI-core canonical 翻转**（顺序第 3 步）；排序执行走引擎数据口径；W2 display→originalRow 回映射为必经网关       |
+|  30 | 删除重复项                               | `Partial`  | 引擎数据事实                                                                             | TS no-op 已显式 capability `false`（符合 fail-closed 新口径）；WASM exact bridge 为唯一真实路径；remove-duplicates 列入投影消费者清单（§6）                                   |
+|  31 | 状态栏计数、求和等摘要                   | `Partial`  | 混合：数值聚合源 = 引擎投影；可见性过滤 = UI-core                                        | TS number-format 预期失败不再挡闭环（TS 降级）；status-bar 聚合列入投影消费者清单（§6）                                                                                       |
+|  32 | Excel Table、结构化引用、小计            | `Missing`  | 引擎数据事实                                                                             | 新建时按引擎数据口径实现；小计 SUBTOTAL 101-111 的 hidden 语义与"引擎不读 hidden"存在已知张力，见 §7                                                                          |
+|  33 | 外部数据、查询与连接                     | `Deferred` | 引擎数据事实（Deferred，不进入翻转）                                                     | 不变                                                                                                                                                                          |
+|  34 | 批注线程、草稿、提交与刷新               | `Partial`  | 混合：durable 事实 = 外部 Service（待建，Stage 0 边界已冻结）；会话/草稿过程态 = UI-core | 不变；翻转不涉及，闭环仍需真实 Service                                                                                                                                        |
+|  35 | 备注、resolve/reopen、任务化与通知       | `Partial`  | 混合：同 #34                                                                             | 不变；翻转不涉及                                                                                                                                                              |
+|  36 | 本地 undo/redo 历史                      | `Partial`  | 混合：编排 = UI-core history；执行 = 引擎快照原语                                        | "backend 权威 durable revision"不再是本地历史的闭环条件；结构操作 undo 需全表非空公式快照——`#REF!` 哨兵不可逆（§4-1）；history 新增 local-replay 分支（§4-4）                 |
+|  37 | Show Changes / 更改列表                  | `Missing`  | 混合：变更源事实 = 引擎 revision；durable log = 持久服务（待建）                         | 不变；仍需 durable 服务，翻转不改变 Missing 状态                                                                                                                              |
+|  38 | 版本历史、快照与恢复                     | `Missing`  | 混合：快照原语 = 引擎（wasm persistence v1）；版本编排与服务 = 宿主/服务                 | 快照可组装已在线的 persistence v1 原语，但 deleteSheet 级恢复需注册态重放协议（§4-3）；仍需版本服务                                                                           |
+|  39 | Sheet Views / 个人视图                   | `Missing`  | UI-core 视图事实（+ 可选持久化钩子）                                                     | 个人视图正好落在翻转后口径上；新建时直接按 UI-core canonical + 持久化钩子实现                                                                                                 |
+|  40 | 工作表/范围保护与解锁                    | `Partial`  | UI-core 视图事实（protection 门禁）                                                      | 从"等 protocol/engine 生产 `setRangeLock` / `readSheetProtection`"改为 **UI-core canonical 翻转**（顺序第 4 步）；门禁经 W2 统一 mutation 网关必经；旧 blocker 表述按 §5 重述 |
+|  41 | 工作区加载、投影、恢复与 stale-read 防护 | `Partial`  | 混合：数据投影 = 引擎（经端口）；视图窗口与 refresh lifecycle = UI-core                  | 翻转后投影合并两源（引擎数据投影 + UI-core 视图事实）；只读投影 atom 形状不变；stale-read/恢复合同不变                                                                        |
+
+### 归属统计
+
+| canonical 归属类别 |   项数 | 条目                                                                            |
+| ------------------ | -----: | ------------------------------------------------------------------------------- |
+| 引擎数据事实       |     21 | #02 08 09 10 11 12 13 14 16 17 18 19 20 23 24 25 27 28 30 32 33                 |
+| UI-core 视图事实   |      5 | #03 05 06 39 40                                                                 |
+| adapter overlay    |      3 | #04 21 22                                                                       |
+| 混合               |     12 | #01 07 15 26 29 31 34 35 36 37 38 41                                            |
+| **合计**           | **41** | 与严格产品总账同一清单；第 9 组数据分析、第 16 组打印继续完全延后，不在 41 项内 |
+
+## 4｜确认的设计点（对抗批评者坐实）
+
+1. **结构操作 undo 需全表非空公式快照。** 结构操作会把失效引用改写为 `#REF!` 哨兵，该改写不可逆，增量 delta 无法恢复原公式；必须在结构操作前捕获全表非空公式快照（legacy `STRUCTURAL_SNAPSHOT_MAX=2000` 是既有先例）。
+2. **异步公式 settle 与 history 见证需分离计数。** 异步自定义公式 settle 会无条件 bump revision；history 的严格 revision 见证若与其共用同一计数器会被异步 settle 误伤，两者必须分离。
+3. **deleteSheet 级恢复需注册态重放协议。** persistence v1 快照不含自定义公式注册表、named values、订阅；sheet 级恢复必须在 restore 后重放注册态，否则恢复出的表是残缺的。
+4. **history 模块需新增 local-replay 分支。** 视图事实（freeze/hidden/行高列宽/filter 可见性/protection）翻转为 UI-core canonical 后，其 undo 不经引擎快照，由 history 的 local-replay 分支在 UI-core 内闭环。
+
+## 5｜与旧口径的冲突裁决
+
+- INFLIGHT.md 及各分册中所有"等 Worker parity / 等 TS worker 补齐"类闭环条件，凡涉及 §3 表中标注翻转或收敛的条目（典型如 #03 / #05 / #29 / #40），以本文件的"闭环路径变化"列为准。
+- INFLIGHT.md 对 #40 的旧 blocker 表述——"不得用 mock、optional no-op、host overlay 或 UI atom 冒充真实 backend 能力"——按新口径重述为：protection 门禁的 canonical **就在 UI-core**，UI-core 持有它不是"冒充 backend 能力"；仍然禁止的是用 mock/no-op 伪造"引擎数据事实"或伪造 ACK（W1 正是为此收口）。
+- overlay 类条目（#04 worker merge、#21、#22 规则存储）不再被记为"临时态等待引擎权威"；host-overlay 是裁决后的正式落地形态。
+- 以上重述**不升级任何产品行**：严格总账 41 = 0/35/5/1 不变，每一项仍需按其新闭环路径提供真实验证证据。
+
+## 6｜前置切片与翻转顺序
+
+### 前置切片（正在并行实施）
+
+| 切片 | 内容                                                                                          | 作用                                           |
+| ---- | --------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| W1   | TS worker 假 ACK fail-closed                                                                  | 消灭 fail-open 伪成功，TS 正式降级为开发后备   |
+| W2   | 统一 mutation 网关：display→originalRow 回映射 + protection 门禁必经                          | 排序/筛选可见性翻转与 #40 门禁翻转的公共必经点 |
+| W3   | 结构位移 remap 合同：`BackendMutationResult.structuralShift` + static merge/freeze remap 修复 | 修复 static 插删行列不平移 merge 的实锤 bug    |
+
+### 翻转顺序与约束
+
+翻转按模块原子切换，顺序固定：**freeze → hidden 行列/行高列宽 → filter 可见性 → protection 门禁**。约束：
+
+1. 每模块一次性原子切换 canonical 归属，不允许双权威共存期。
+2. 只读投影 atom 形状不变，下游消费者无感知迁移。
+3. 投影消费者显式化清单（翻转时逐一确认其读取 UI-core canonical 可见性/视口事实，而非旧 backend 投影）：**status-bar 聚合、go-to、find-replace、remove-duplicates、merge 联动**。
+
+## 7｜已知张力（本裁决未覆盖，待后续实现前裁决）
+
+1. **SUBTOTAL 101-111 与 hidden。** "引擎不读 hidden"是本次翻转的依据之一；但未来 #32 小计若要 Excel parity 的 101-111 语义（排除隐藏行），需在"宿主把可见性喂给引擎"与"宿主侧求值"之间二选一，本裁决未覆盖，须在 #32 实现前裁决。
+2. **#07 大纲层级元数据归属。** 折叠可见性明确复用 hidden 的 UI-core canonical；大纲层级定义本身（分组结构元数据）归引擎还是 UI-core 未裁决。
+3. **#11 选择性粘贴的 column-widths 附载。** 行高列宽翻转为 UI-core 后，粘贴 column-widths 成为"引擎数据粘贴 + UI-core 视图写入"的跨域操作，其原子性与 undo 编排需在实现切片时定界。
