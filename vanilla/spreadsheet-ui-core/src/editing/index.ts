@@ -3,6 +3,7 @@ import type { Atom } from '@einfach/core'
 import type { ProjectionRevision } from '../backend/types'
 import { nextHistoryTransactionId, pushHistoryAtom } from '../history'
 import { keyboardModeAtom } from '../keyboard'
+import { resolveContentMutationAtom } from './mutation-gateway'
 import type {
   EditingCancelIntent,
   EditingCommitAcknowledgement,
@@ -23,6 +24,7 @@ import type {
 } from './types'
 
 export * from './types'
+export * from './mutation-gateway'
 
 interface EditingCommitTicket {
   readonly sessionId: number
@@ -441,11 +443,34 @@ export const runEditingCommitAtom = atom(
       source: input.commitSource,
     })
     if (intent === null) return 'blocked'
+
+    // Mutation gateway: remap the display-coordinate session cell to its
+    // source row (filter/sort) and enforce the protection gate. A blocked
+    // resolution never reaches the transport (fail-closed).
+    const resolution = set(resolveContentMutationAtom, {
+      kind: 'set-cell-input',
+      sheetId: intent.sheetId,
+      cell: intent.cell,
+    })
+    if (resolution.status === 'blocked') {
+      set(
+        editingCommitLifecycleBackingAtom,
+        lifecycleFor('blocked', {
+          sessionId: get(editingSessionSequenceAtom),
+          sheetId: intent.sheetId,
+          cell: intent.cell,
+          error: resolution.diagnostic.message,
+        }),
+      )
+      return 'blocked'
+    }
+    const targetCell = resolution.cell ?? intent.cell
+
     const request: EditingCommitRequest = Object.freeze({
       kind: 'set-cell-input',
       sheetId: intent.sheetId,
-      row: intent.cell.row,
-      col: intent.cell.col,
+      row: targetCell.row,
+      col: targetCell.col,
       input: intent.input,
       requestId,
     })
@@ -453,7 +478,7 @@ export const runEditingCommitAtom = atom(
       sessionId: get(editingSessionSequenceAtom),
       requestId,
       sessionWitness: stagedSession,
-      intent: Object.freeze({ ...intent, cell: Object.freeze({ ...intent.cell }) }),
+      intent: Object.freeze({ ...intent, cell: Object.freeze({ ...targetCell }) }),
       request,
     })
     set(editingRequestSequenceAtom, requestId)

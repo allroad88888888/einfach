@@ -50,6 +50,13 @@ export function resolveProjectionSourceCell(
  * safely translated. Multi-row ranges are split by visible row when the whole
  * selection is inside the current projection window; huge selections such as
  * whole columns intentionally fall back to the source range shape.
+ *
+ * NOTE: content mutations (set-cell-input / clear-range / fill / paste) no
+ * longer use these lenient helpers — they resolve through UI-core's
+ * fail-closed `resolveContentMutationAtom` gateway (`editing/mutation-gateway`),
+ * which also enforces the protection gate. These helpers remain for
+ * format-path translation (e.g. toolbar format toggles), which is outside
+ * the content-mutation gating scope.
  */
 export function resolveProjectionSourceRanges(
   store: Store,

@@ -78,6 +78,7 @@ import {
   rejectProjectionAtom,
   readViewportFreezeCanonicalAtom,
   resetProjectionAtom,
+  resolveContentMutationAtom,
   resolveProjectionAtom,
   presenceStateAtom,
   type CellCoord,
@@ -1154,15 +1155,34 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     const bounds = getSelectionBounds()
     const ranges = regions.map((r) => getSelectionRange(r, bounds))
 
+    // Mutation gateway: remap display rows to source rows (filter/sort) and
+    // enforce the protection gate. Any blocked region aborts the whole
+    // command before the first transport (fail-closed). Format-only clears
+    // skip the lock gate — format gating is outside the content-mutation scope.
+    const resolvedRanges: CellRange[][] = []
+    for (const range of ranges) {
+      const resolution = store.setter(resolveContentMutationAtom, {
+        kind: 'clear-range',
+        sheetId: props.sheetId,
+        range,
+        protectionGate: target !== 'formats',
+      })
+      if (resolution.status === 'blocked') {
+        return
+      }
+      resolvedRanges.push((resolution.ranges ?? [range]).map((sourceRange) => ({ ...sourceRange })))
+    }
+
     if (regions.length === 1 && target === 'values') {
       const range = ranges[0]
       const isSingleCell = range.rowStart === range.rowEnd && range.colStart === range.colEnd
       if (isSingleCell) {
+        const sourceRange = resolvedRanges[0][0]
         const result = await backend.setCellInput({
           kind: 'set-cell-input',
           sheetId: props.sheetId,
-          row: range.rowStart,
-          col: range.colStart,
+          row: sourceRange.rowStart,
+          col: sourceRange.colStart,
           input: '',
         })
         const rev =
@@ -1174,7 +1194,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
           kind: 'cell.set-input',
           sheetId: props.sheetId,
           projectionRevision: rev,
-          affectedRange: result?.affectedRange ?? range,
+          affectedRange: result?.affectedRange ?? sourceRange,
         })
         await loadProjection(requestProjection())
         return
@@ -1186,7 +1206,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
     }
 
     const clearResults = await Promise.all(
-      ranges.map((range) =>
+      resolvedRanges.flat().map((range) =>
         backend.clearRange!({
           kind: 'clear-range',
           sheetId: props.sheetId,
@@ -1203,7 +1223,7 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       kind: 'range.clear',
       sheetId: props.sheetId,
       projectionRevision: lastRev,
-      affectedRange: ranges[0],
+      affectedRange: resolvedRanges[0][0],
     })
     await loadProjection(requestProjection())
   }
@@ -1787,18 +1807,38 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       sourceCells.set(makeCellKey(cell.row, cell.col), cell)
     }
 
+    // Mutation gateway: pre-resolve every write cell (display→source remap
+    // plus protection gate); one unmappable or locked cell aborts the whole
+    // fill before the first transport (fail-closed).
+    const writes: Array<{ row: number; col: number; input: string }> = []
     for (let row = writeRange.rowStart; row <= writeRange.rowEnd; row += 1) {
       for (let col = writeRange.colStart; col <= writeRange.colEnd; col += 1) {
+        const resolution = store.setter(resolveContentMutationAtom, {
+          kind: 'fill-range',
+          sheetId: intent.sheetId,
+          cell: { row, col },
+        })
+        if (resolution.status === 'blocked' || resolution.cell === undefined) {
+          return
+        }
         const sourceCoord = getFillHandleSourceCoord(intent.sourceRange, { row, col })
         const sourceCell = sourceCells.get(makeCellKey(sourceCoord.row, sourceCoord.col))
-        await backend.setCellInput({
-          kind: 'set-cell-input',
-          sheetId: intent.sheetId,
-          row,
-          col,
+        writes.push({
+          row: resolution.cell.row,
+          col: resolution.cell.col,
           input: getCellInputForFill(sourceCell, sourceCoord, { row, col }),
         })
       }
+    }
+
+    for (const write of writes) {
+      await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: intent.sheetId,
+        row: write.row,
+        col: write.col,
+        input: write.input,
+      })
     }
   }
 
@@ -1938,20 +1978,49 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       return
     }
 
-    const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
+    // Mutation gateway: the write range must clear the protection gate and
+    // resolve to source rows before any transport (fail-closed). The fill
+    // source only needs the remap answer — copying FROM locked cells is
+    // allowed, so the lock gate is skipped for it.
+    const writeResolution = store.setter(resolveContentMutationAtom, {
+      kind: 'fill-range',
+      sheetId: intent.sheetId,
+      range: writeRange,
+    })
+    if (writeResolution.status === 'blocked') {
+      return
+    }
+    const sourceResolution = store.setter(resolveContentMutationAtom, {
+      kind: 'fill-range',
+      sheetId: intent.sheetId,
+      range: intent.sourceRange,
+      protectionGate: false,
+    })
+    if (sourceResolution.status === 'blocked') {
+      return
+    }
 
-    if (filledSeries) {
-      // Numeric series is a single compact backend mutation.
-    } else if (backend.fillRange) {
-      await backend.fillRange({
-        kind: 'fill-range',
-        sheetId: intent.sheetId,
-        sourceRange: intent.sourceRange,
-        targetRange: intent.targetRange,
-        direction: intent.direction,
-      })
-    } else {
+    if (writeResolution.remapped || sourceResolution.remapped) {
+      // Filter/sort permutes the affected rows: the contiguous
+      // fillSeries/fillRange transports cannot express the write, so use
+      // gateway-mapped per-cell writes instead.
       await fallbackFillHandle(intent, writeRange)
+    } else {
+      const filledSeries = await tryNumericFillSeries({ ...intent, direction: intent.direction })
+
+      if (filledSeries) {
+        // Numeric series is a single compact backend mutation.
+      } else if (backend.fillRange) {
+        await backend.fillRange({
+          kind: 'fill-range',
+          sheetId: intent.sheetId,
+          sourceRange: intent.sourceRange,
+          targetRange: intent.targetRange,
+          direction: intent.direction,
+        })
+      } else {
+        await fallbackFillHandle(intent, writeRange)
+      }
     }
 
     await loadProjection(requestProjection())
@@ -2246,6 +2315,21 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       colEnd: plan.sourceOrigin.col + plan.colCount - 1,
     }
 
+    // Mutation gateway: fail-closed remap + protection gate over the whole
+    // paste target before any transport or clipboard-state change.
+    const resolution = store.setter(resolveContentMutationAtom, {
+      kind: 'paste-range',
+      sheetId: props.sheetId,
+      range: pasteRange,
+    })
+    if (resolution.status === 'blocked') {
+      store.setter(setClipboardErrorAtom, {
+        code: resolution.diagnostic.code,
+        message: resolution.diagnostic.message,
+      })
+      return
+    }
+
     store.setter(pasteClipboardAtom, {
       source: { sheetId: props.sheetId, range: sourceRange },
       target: { sheetId: props.sheetId, range: pasteRange },
@@ -2254,30 +2338,70 @@ export function SpreadsheetGrid(props: SpreadsheetGridProps) {
       estimatedBytes: plan.estimatedBytes,
     })
 
-    let lastRevision = 0
+    // Pre-resolve each write cell so a mid-paste block can never leave a
+    // partial write behind; the range resolution above makes this loop
+    // deterministic (every cell is inside the allowed range).
+    const writes: Array<{ row: number; col: number; input: string }> = []
     for (const chunk of plan.chunks()) {
       for (const cell of chunk.cells) {
-        const r = await backend.setCellInput({
-          kind: 'set-cell-input',
+        const cellResolution = store.setter(resolveContentMutationAtom, {
+          kind: 'paste-range',
           sheetId: props.sheetId,
-          row: cell.row,
-          col: cell.col,
+          cell: { row: cell.row, col: cell.col },
+        })
+        if (cellResolution.status === 'blocked' || cellResolution.cell === undefined) {
+          store.setter(setClipboardErrorAtom, {
+            code:
+              cellResolution.status === 'blocked'
+                ? cellResolution.diagnostic.code
+                : 'MUTATION_INVALID_TARGET',
+            message:
+              cellResolution.status === 'blocked'
+                ? cellResolution.diagnostic.message
+                : 'Paste target cell could not be resolved.',
+          })
+          return
+        }
+        writes.push({
+          row: cellResolution.cell.row,
+          col: cellResolution.cell.col,
           input: cell.input,
         })
-        const rev =
-          typeof r?.revision === 'number'
-            ? r.revision
-            : Number(r?.revision ?? 0) || 0
-        if (rev > lastRevision) lastRevision = rev
       }
     }
 
+    let lastRevision = 0
+    for (const write of writes) {
+      const r = await backend.setCellInput({
+        kind: 'set-cell-input',
+        sheetId: props.sheetId,
+        row: write.row,
+        col: write.col,
+        input: write.input,
+      })
+      const rev =
+        typeof r?.revision === 'number'
+          ? r.revision
+          : Number(r?.revision ?? 0) || 0
+      if (rev > lastRevision) lastRevision = rev
+    }
+
+    const affectedRanges = resolution.ranges ?? [pasteRange]
+    const affectedRange = affectedRanges.reduce(
+      (acc, range) => ({
+        rowStart: Math.min(acc.rowStart, range.rowStart),
+        rowEnd: Math.max(acc.rowEnd, range.rowEnd),
+        colStart: Math.min(acc.colStart, range.colStart),
+        colEnd: Math.max(acc.colEnd, range.colEnd),
+      }),
+      { ...affectedRanges[0] },
+    )
     store.setter(pushHistoryAtom, {
       transactionId: nextHistoryTransactionId(),
       kind: 'cells.import',
       sheetId: props.sheetId,
       projectionRevision: lastRevision,
-      affectedRange: pasteRange,
+      affectedRange,
     })
 
     store.setter(markClipboardReadyAtom)
