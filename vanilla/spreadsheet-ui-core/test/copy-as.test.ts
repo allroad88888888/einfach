@@ -2,11 +2,14 @@ import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import type { DisplayCell } from '../src/backend/types'
 import {
+  copyAsErrorAtom,
   encodeSelectionAsHtml,
   encodeSelectionAsMarkdown,
   encodeSelectionAsPlainText,
   encodeSelectionForClipboard,
   lastCopyAsAtom,
+  publishCopyAsResultAtom,
+  reportCopyAsStatusAtom,
 } from '../src/copy-as'
 
 function rect(startRow: number, startCol: number, endRow: number, endCol: number) {
@@ -22,13 +25,37 @@ function cell(
   return { row, col, displayValue, ...extras }
 }
 
+type AtomHasPublicWrite<Entity> = Entity extends { write: unknown } ? true : false
+
+const LAST_RESULT_IS_READ_ONLY: AtomHasPublicWrite<typeof lastCopyAsAtom> = false
+const COPY_AS_STATUS_IS_READ_ONLY: AtomHasPublicWrite<typeof copyAsErrorAtom> = false
+
 describe('copy-as / atoms', () => {
-  test('lastCopyAsAtom starts null and accepts a snapshot', () => {
-    const store = createStore()
-    expect(store.getter(lastCopyAsAtom)).toBeNull()
+  test('public state is read-only and commands keep stores isolated', () => {
+    const firstStore = createStore()
+    const secondStore = createStore()
+    expect(firstStore.getter(lastCopyAsAtom)).toBeNull()
+    expect(firstStore.getter(copyAsErrorAtom)).toBeNull()
+    expect([LAST_RESULT_IS_READ_ONLY, COPY_AS_STATUS_IS_READ_ONLY]).toEqual([false, false])
+    expect('write' in lastCopyAsAtom).toBe(false)
+    expect('write' in copyAsErrorAtom).toBe(false)
+
     const snap = { html: '<table></table>', plainText: 'a', markdown: '| a |' }
-    store.setter(lastCopyAsAtom, snap)
-    expect(store.getter(lastCopyAsAtom)).toEqual(snap)
+    firstStore.setter(publishCopyAsResultAtom, snap)
+    firstStore.setter(reportCopyAsStatusAtom, { kind: 'fallback-plain-only' })
+    expect(firstStore.getter(lastCopyAsAtom)).toEqual(snap)
+    expect(firstStore.getter(copyAsErrorAtom)).toEqual({ kind: 'fallback-plain-only' })
+    expect(secondStore.getter(lastCopyAsAtom)).toBeNull()
+    expect(secondStore.getter(copyAsErrorAtom)).toBeNull()
+
+    const unsafeSet = firstStore.setter as unknown as (target: unknown, value: unknown) => unknown
+    expect(() => unsafeSet(lastCopyAsAtom, null)).toThrow(TypeError)
+    expect(() => unsafeSet(copyAsErrorAtom, null)).toThrow(TypeError)
+    expect(firstStore.getter(lastCopyAsAtom)).toEqual(snap)
+    expect(firstStore.getter(copyAsErrorAtom)).toEqual({ kind: 'fallback-plain-only' })
+
+    firstStore.setter(reportCopyAsStatusAtom, null)
+    expect(firstStore.getter(copyAsErrorAtom)).toBeNull()
   })
 })
 

@@ -2,9 +2,15 @@ import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   BUILTIN_FORMULA_NAMES,
+  DEFAULT_CUSTOM_FORMULA_REGISTRY_MAX_ENTRIES,
   ENGINE_BUILTIN_FORMULA_NAMES,
+  MAX_CUSTOM_FORMULA_REGISTRY_ENTRIES,
+  configureCustomFormulaRegistryAtom,
   customFormulaRegistryAtom,
+  customFormulaRegistryLifecycleAtom,
+  disposeCustomFormulaRegistryAtom,
   registerCustomFormulaAtom,
+  resetCustomFormulaRegistryAtom,
   unregisterCustomFormulaAtom,
   validateCustomFormulaName,
   type CustomFormulaArg,
@@ -12,9 +18,14 @@ import {
 } from '../src/custom-formulas'
 
 describe('custom-formulas: registry', () => {
-  test('initial registry is empty', () => {
+  test('initial registry is empty, active, and bounded by the default cap', () => {
     const store = createStore()
     expect(store.getter(customFormulaRegistryAtom).size).toBe(0)
+    expect(store.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'active',
+      maxEntries: DEFAULT_CUSTOM_FORMULA_REGISTRY_MAX_ENTRIES,
+      size: 0,
+    })
   })
 
   test('register adds the entry keyed by name', () => {
@@ -92,6 +103,230 @@ describe('custom-formulas: registry', () => {
     expect(store.getter(customFormulaRegistryAtom).get('MYTAX')?.paramLabels).toEqual([
       'amount',
     ])
+  })
+})
+
+describe('custom-formulas: capacity and lifecycle', () => {
+  test('rejects a new name at capacity without mutating or evicting entries', () => {
+    const store = createStore()
+    expect(store.setter(configureCustomFormulaRegistryAtom, 2)).toEqual({
+      outcome: 'configured',
+      maxEntries: 2,
+    })
+    expect(
+      store.setter(registerCustomFormulaAtom, {
+        name: 'FN_ALPHA',
+        source: "return 'first'",
+      }),
+    ).toEqual({ outcome: 'registered', name: 'FN_ALPHA', size: 1 })
+    expect(
+      store.setter(registerCustomFormulaAtom, {
+        name: 'FN_BETA',
+        source: "return 'second'",
+      }),
+    ).toEqual({ outcome: 'registered', name: 'FN_BETA', size: 2 })
+
+    const before = store.getter(customFormulaRegistryAtom)
+    expect(
+      store.setter(registerCustomFormulaAtom, {
+        name: 'FN_GAMMA',
+        source: "return 'third'",
+      }),
+    ).toEqual({
+      outcome: 'rejected',
+      reason: 'capacity-reached',
+      name: 'FN_GAMMA',
+      size: 2,
+      maxEntries: 2,
+    })
+
+    const after = store.getter(customFormulaRegistryAtom)
+    expect(after).toBe(before)
+    expect([...after.keys()]).toEqual(['FN_ALPHA', 'FN_BETA'])
+    expect(store.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'active',
+      maxEntries: 2,
+      size: 2,
+    })
+  })
+
+  test('allows replacement at capacity and reports the replacement', () => {
+    const store = createStore()
+    store.setter(configureCustomFormulaRegistryAtom, 1)
+    store.setter(registerCustomFormulaAtom, {
+      name: 'ONLY',
+      source: "return 'before'",
+    })
+
+    expect(
+      store.setter(registerCustomFormulaAtom, {
+        name: 'ONLY',
+        source: "return 'after'",
+      }),
+    ).toEqual({ outcome: 'replaced', name: 'ONLY', size: 1 })
+    expect(store.getter(customFormulaRegistryAtom).get('ONLY')?.source).toBe("return 'after'")
+  })
+
+  test('unregister frees capacity for the next registration', () => {
+    const store = createStore()
+    store.setter(configureCustomFormulaRegistryAtom, 1)
+    store.setter(registerCustomFormulaAtom, { name: 'OLD', source: 'return 1' })
+
+    expect(store.setter(unregisterCustomFormulaAtom, 'old')).toEqual({
+      outcome: 'removed',
+      name: 'OLD',
+      size: 0,
+    })
+    expect(store.setter(registerCustomFormulaAtom, { name: 'NEW', source: 'return 2' })).toEqual({
+      outcome: 'registered',
+      name: 'NEW',
+      size: 1,
+    })
+  })
+
+  test('rejects invalid limits and lowering below size without eviction', () => {
+    const store = createStore()
+    store.setter(configureCustomFormulaRegistryAtom, 2)
+    store.setter(registerCustomFormulaAtom, { name: 'ONE', source: 'return 1' })
+    store.setter(registerCustomFormulaAtom, { name: 'TWO', source: 'return 2' })
+    const before = store.getter(customFormulaRegistryAtom)
+
+    expect(store.setter(configureCustomFormulaRegistryAtom, 1)).toEqual({
+      outcome: 'rejected',
+      reason: 'limit-below-current-size',
+      maxEntries: 1,
+      currentSize: 2,
+    })
+    for (const invalid of [
+      -1,
+      1.5,
+      Number.POSITIVE_INFINITY,
+      MAX_CUSTOM_FORMULA_REGISTRY_ENTRIES + 1,
+    ]) {
+      expect(store.setter(configureCustomFormulaRegistryAtom, invalid)).toEqual({
+        outcome: 'rejected',
+        reason: 'invalid-limit',
+        maxEntries: invalid,
+        currentSize: 2,
+      })
+    }
+
+    expect(store.getter(customFormulaRegistryAtom)).toBe(before)
+    expect(store.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'active',
+      maxEntries: 2,
+      size: 2,
+    })
+  })
+
+  test('supports an explicit zero cap', () => {
+    const store = createStore()
+    expect(store.setter(configureCustomFormulaRegistryAtom, 0)).toEqual({
+      outcome: 'configured',
+      maxEntries: 0,
+    })
+    expect(
+      store.setter(registerCustomFormulaAtom, { name: 'BLOCKED', source: 'return 0' }),
+    ).toEqual({
+      outcome: 'rejected',
+      reason: 'capacity-reached',
+      name: 'BLOCKED',
+      size: 0,
+      maxEntries: 0,
+    })
+  })
+
+  test('keeps registry state and capacity isolated per store', () => {
+    const first = createStore()
+    const second = createStore()
+    first.setter(configureCustomFormulaRegistryAtom, 1)
+    second.setter(configureCustomFormulaRegistryAtom, 3)
+    first.setter(registerCustomFormulaAtom, { name: 'FN_FIRST', source: 'return 1' })
+    second.setter(registerCustomFormulaAtom, { name: 'FN_SECOND', source: 'return 2' })
+    first.setter(disposeCustomFormulaRegistryAtom)
+
+    expect(first.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'disposed',
+      maxEntries: 1,
+      size: 0,
+    })
+    expect(second.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'active',
+      maxEntries: 3,
+      size: 1,
+    })
+    expect(second.getter(customFormulaRegistryAtom).has('FN_SECOND')).toBe(true)
+  })
+
+  test('reset clears entries, preserves capacity, and stays active', () => {
+    const store = createStore()
+    store.setter(configureCustomFormulaRegistryAtom, 2)
+    store.setter(registerCustomFormulaAtom, { name: 'ONE', source: 'return 1' })
+    store.setter(registerCustomFormulaAtom, { name: 'TWO', source: 'return 2' })
+
+    expect(store.setter(resetCustomFormulaRegistryAtom)).toEqual({
+      outcome: 'reset',
+      clearedEntries: 2,
+    })
+    expect(store.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'active',
+      maxEntries: 2,
+      size: 0,
+    })
+    expect(
+      store.setter(registerCustomFormulaAtom, { name: 'AFTER_RESET', source: 'return 3' }),
+    ).toEqual({ outcome: 'registered', name: 'AFTER_RESET', size: 1 })
+    expect(store.setter(configureCustomFormulaRegistryAtom, 4)).toEqual({
+      outcome: 'configured',
+      maxEntries: 4,
+    })
+  })
+
+  test('dispose is terminal and rejects every later mutation command', () => {
+    const store = createStore()
+    store.setter(configureCustomFormulaRegistryAtom, 2)
+    store.setter(registerCustomFormulaAtom, { name: 'BEFORE', source: 'return 1' })
+
+    expect(store.setter(disposeCustomFormulaRegistryAtom)).toEqual({
+      outcome: 'disposed',
+      clearedEntries: 1,
+    })
+    const disposedRegistry = store.getter(customFormulaRegistryAtom)
+    expect(disposedRegistry.size).toBe(0)
+    expect(store.setter(registerCustomFormulaAtom, { name: 'LATE', source: 'return 2' })).toEqual({
+      outcome: 'rejected',
+      reason: 'registry-disposed',
+      name: 'LATE',
+      size: 0,
+      maxEntries: 2,
+    })
+    expect(store.setter(unregisterCustomFormulaAtom, 'BEFORE')).toEqual({
+      outcome: 'rejected',
+      reason: 'registry-disposed',
+      name: 'BEFORE',
+      size: 0,
+    })
+    expect(store.setter(configureCustomFormulaRegistryAtom, 4)).toEqual({
+      outcome: 'rejected',
+      reason: 'registry-disposed',
+      maxEntries: 4,
+      currentSize: 0,
+    })
+    expect(store.setter(resetCustomFormulaRegistryAtom)).toEqual({
+      outcome: 'rejected',
+      reason: 'registry-disposed',
+      clearedEntries: 0,
+    })
+    expect(store.setter(disposeCustomFormulaRegistryAtom)).toEqual({
+      outcome: 'already-disposed',
+      clearedEntries: 0,
+    })
+    expect(store.getter(customFormulaRegistryAtom)).toBe(disposedRegistry)
+    expect(store.getter(customFormulaRegistryLifecycleAtom)).toEqual({
+      status: 'disposed',
+      maxEntries: 2,
+      size: 0,
+    })
   })
 })
 
@@ -181,10 +416,18 @@ describe('custom-formulas: validation', () => {
 describe('custom-formulas: debug labels', () => {
   test('atoms follow the spreadsheet.customFormulas.<name> convention', () => {
     expect(customFormulaRegistryAtom.debugLabel).toBe('spreadsheet.customFormulas.registry')
+    expect(customFormulaRegistryLifecycleAtom.debugLabel).toBe(
+      'spreadsheet.customFormulas.lifecycle',
+    )
+    expect(configureCustomFormulaRegistryAtom.debugLabel).toBe(
+      'spreadsheet.customFormulas.configure',
+    )
     expect(registerCustomFormulaAtom.debugLabel).toBe('spreadsheet.customFormulas.register')
     expect(unregisterCustomFormulaAtom.debugLabel).toBe(
       'spreadsheet.customFormulas.unregister',
     )
+    expect(resetCustomFormulaRegistryAtom.debugLabel).toBe('spreadsheet.customFormulas.reset')
+    expect(disposeCustomFormulaRegistryAtom.debugLabel).toBe('spreadsheet.customFormulas.dispose')
   })
 })
 

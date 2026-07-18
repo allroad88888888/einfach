@@ -1,4 +1,5 @@
 import type { CellRange, SheetRef, SpreadsheetErrorSeverity } from '../shared'
+import type { ProjectionRequestId, ProjectionRevision } from '../backend'
 
 export type ValidationRuleKind = 'list' | 'range' | 'regex' | 'formula'
 
@@ -41,10 +42,73 @@ export interface ValidationOutcome {
 }
 
 export interface ValidationRuleEditorState {
-  status: 'closed' | 'editing'
+  readonly status: 'closed' | 'editing'
+  readonly sessionId: number
+  readonly requestId: ProjectionRequestId | null
+  readonly targetSheetId: string | null
+  readonly range?: Readonly<CellRange>
+  /** Presence metadata only; the rule value is always derived from `form`. */
+  readonly hasRuleDraft: boolean
+  readonly form: Readonly<ValidationRuleFormState>
+  readonly pending: boolean
+  readonly error: string | null
+}
+
+export interface ValidationRuleFormState {
+  kind: ValidationRuleKind
+  mode: ValidationMode
+  listValues: string
+  listDropdown: boolean
+  rangeMin: string
+  rangeMax: string
+  rangeIntegerOnly: boolean
+  regexPattern: string
+  regexFlags: string
+  formulaText: string
+}
+
+export interface OpenValidationRuleEditorInput {
   range?: CellRange
   draft?: ValidationRule
   mode?: ValidationMode
+}
+
+export type DataValidationOperationAction = 'save' | 'clear'
+
+/**
+ * Fulfilled ports are only acknowledged locally. They do not prove a
+ * canonical backend outcome.
+ */
+export type DataValidationOperationAttemptStatus = 'pending' | 'acknowledged' | 'outcome-unknown'
+
+/** Bounded local request evidence; unresolved attempts are never evicted. */
+export interface DataValidationOperationAttempt {
+  readonly operationId: string
+  readonly requestId: ProjectionRequestId
+  readonly sessionId: number
+  readonly action: DataValidationOperationAction
+  readonly sheetId: string
+  readonly range: Readonly<CellRange>
+  readonly baseRevision: ProjectionRevision | null
+  readonly status: DataValidationOperationAttemptStatus
+  readonly resultRevision?: ProjectionRevision
+  readonly error?: string
+}
+
+export interface DataValidationMutationAcknowledgement extends SheetRef {
+  readonly sheetId: string
+  readonly requestId: ProjectionRequestId
+  readonly revision?: ProjectionRevision
+  readonly affectedRange?: Readonly<CellRange>
+}
+
+export interface RunDataValidationMutationInput {
+  action: DataValidationOperationAction
+  sheetId?: string
+  setRule?: (request: SetValidationRuleRequest) => Promise<unknown>
+  clearRule?: (request: ClearValidationRuleRequest) => Promise<unknown>
+  /** Accepts a fulfilled response without claiming it is canonical. */
+  acceptAcknowledgedResult?: (result: DataValidationMutationAcknowledgement) => Promise<void> | void
 }
 
 export interface SetValidationRuleRequest extends SheetRef {
@@ -52,13 +116,13 @@ export interface SetValidationRuleRequest extends SheetRef {
   range: CellRange
   rule: ValidationRule
   mode: ValidationMode
-  requestId?: number
-  revision?: number | string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
 }
 
 export interface ClearValidationRuleRequest extends SheetRef {
   kind: 'clear-validation-rule'
   range: CellRange
-  requestId?: number
-  revision?: number | string
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
 }

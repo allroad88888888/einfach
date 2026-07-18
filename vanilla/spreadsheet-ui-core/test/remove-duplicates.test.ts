@@ -1,24 +1,55 @@
 import { describe, expect, jest, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
-import type { DisplayCell } from '../src/backend/types'
+import type { Store } from '@einfach/core'
+import type {
+  DisplayCell,
+  RangeProjectionRequest,
+  RangeProjectionResult,
+} from '../src/backend/types'
+import { historyStackAtom } from '../src/history'
+import { selectionAtom } from '../src/selection'
+import {
+  setWorkspaceActiveSheetAtom,
+  workspaceActiveSheetAuthorityWitnessAtom,
+} from '../src/workspace'
 import {
   closeRemoveDuplicatesAtom,
-  deselectAllKeyColumnsAtom,
+  dispatchRemoveDuplicatesIntentAtom,
   findDuplicateRows,
-  openRemoveDuplicatesAtom,
+  nextRemoveDuplicatesMutationRequestId,
+  nextRemoveDuplicatesReadRequestId,
+  nextRemoveDuplicatesSessionId,
+  openRemoveDuplicatesFromSelectionAtom,
+  removeDuplicatesCanCloseAtom,
+  removeDuplicatesCanConfirmAtom,
   removeDuplicatesComparisonAtom,
+  removeDuplicatesErrorAtom,
   removeDuplicatesExcludeHeaderAtom,
   removeDuplicatesKeyColumnsAtom,
+  removeDuplicatesLifecycleAtom,
+  removeDuplicatesMutationRequestIdAtom,
+  removeDuplicatesMutationTargetAtom,
   removeDuplicatesOpenAtom,
   removeDuplicatesPreviewAtom,
+  removeDuplicatesReadRequestIdAtom,
   removeDuplicatesRangeAtom,
   removeDuplicatesScanInputCellsAtom,
-  selectAllKeyColumnsAtom,
-  toggleKeyColumnAtom,
+  removeDuplicatesSessionAtom,
+  removeDuplicatesSessionIdAtom,
+  retryRemoveDuplicatesReadAtom,
+  runRemoveDuplicatesConfirmAtom,
+  type RemoveDuplicatesControllerPort,
   type RemoveDuplicatesRange,
+  type RemoveRowsExactRequest,
+  type RemoveRowsExactResult,
 } from '../src/remove-duplicates'
 
-function cell(row: number, col: number, value: string, kind: DisplayCell['valueKind'] = 'string'): DisplayCell {
+function cell(
+  row: number,
+  col: number,
+  value: string,
+  kind: DisplayCell['valueKind'] = 'string',
+): DisplayCell {
   return { row, col, displayValue: value, valueKind: kind }
 }
 
@@ -34,10 +65,14 @@ function range(
 describe('findDuplicateRows', () => {
   test('3 unique rows produce 0 duplicates', () => {
     const cells: DisplayCell[] = [
-      cell(0, 0, 'header-a'), cell(0, 1, 'header-b'),
-      cell(1, 0, 'apple'), cell(1, 1, '1'),
-      cell(2, 0, 'banana'), cell(2, 1, '2'),
-      cell(3, 0, 'cherry'), cell(3, 1, '3'),
+      cell(0, 0, 'header-a'),
+      cell(0, 1, 'header-b'),
+      cell(1, 0, 'apple'),
+      cell(1, 1, '1'),
+      cell(2, 0, 'banana'),
+      cell(2, 1, '2'),
+      cell(3, 0, 'cherry'),
+      cell(3, 1, '3'),
     ]
     const result = findDuplicateRows({
       cells,
@@ -69,8 +104,10 @@ describe('findDuplicateRows', () => {
 
   test('multi-column key: same in col A but different in col B is NOT a duplicate', () => {
     const cells: DisplayCell[] = [
-      cell(1, 0, 'foo'), cell(1, 1, 'one'),
-      cell(2, 0, 'foo'), cell(2, 1, 'two'),
+      cell(1, 0, 'foo'),
+      cell(1, 1, 'one'),
+      cell(2, 0, 'foo'),
+      cell(2, 1, 'two'),
     ]
     const result = findDuplicateRows({
       cells,
@@ -83,8 +120,12 @@ describe('findDuplicateRows', () => {
 
   test('multi-column key: same in selected cols but different in unselected col IS a duplicate', () => {
     const cells: DisplayCell[] = [
-      cell(1, 0, 'foo'), cell(1, 1, 'differs-A'), cell(1, 2, 'shared'),
-      cell(2, 0, 'foo'), cell(2, 1, 'differs-B'), cell(2, 2, 'shared'),
+      cell(1, 0, 'foo'),
+      cell(1, 1, 'differs-A'),
+      cell(1, 2, 'shared'),
+      cell(2, 0, 'foo'),
+      cell(2, 1, 'differs-B'),
+      cell(2, 2, 'shared'),
     ]
     const result = findDuplicateRows({
       cells,
@@ -96,11 +137,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('excludeHeader=true: header row 0 always survives even when it duplicates a data row', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'same'),
-      cell(1, 0, 'same'),
-      cell(2, 0, 'same'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'same'), cell(1, 0, 'same'), cell(2, 0, 'same')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 2, 0),
@@ -112,11 +149,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('excludeHeader=false: header is treated as a data row', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'same'),
-      cell(1, 0, 'same'),
-      cell(2, 0, 'same'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'same'), cell(1, 0, 'same'), cell(2, 0, 'same')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 2, 0),
@@ -129,10 +162,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('comparison=exact: "foo" vs "Foo" are NOT duplicates', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'foo'),
-      cell(1, 0, 'Foo'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'foo'), cell(1, 0, 'Foo')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -144,10 +174,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('comparison=caseInsensitive: "foo" vs "Foo" ARE duplicates', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'foo'),
-      cell(1, 0, 'Foo'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'foo'), cell(1, 0, 'Foo')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -159,10 +186,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('comparison=trim: " x" vs "x " ARE duplicates', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, ' x'),
-      cell(1, 0, 'x '),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, ' x'), cell(1, 0, 'x ')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -174,10 +198,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('comparison=trimAndIgnoreCase: " Foo " vs "foo" ARE duplicates', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, ' Foo '),
-      cell(1, 0, 'foo'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, ' Foo '), cell(1, 0, 'foo')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -191,7 +212,8 @@ describe('findDuplicateRows', () => {
   test('two rows that are blank in every key column ARE duplicates of each other', () => {
     const cells: DisplayCell[] = [
       // header
-      cell(0, 0, 'A'), cell(0, 1, 'B'),
+      cell(0, 0, 'A'),
+      cell(0, 1, 'B'),
       // rows 1 and 2 have nothing in col 0 or 1
       cell(1, 2, 'side-data-1'),
       cell(2, 2, 'side-data-2'),
@@ -209,13 +231,15 @@ describe('findDuplicateRows', () => {
   test('sparse projection: missing cells default to blank for tuple purposes', () => {
     const cells: DisplayCell[] = [
       // header
-      cell(0, 0, 'h0'), cell(0, 1, 'h1'),
+      cell(0, 0, 'h0'),
+      cell(0, 1, 'h1'),
       // row 1: only col 0 present
       cell(1, 0, 'shared'),
       // row 2: only col 0 present, same value
       cell(2, 0, 'shared'),
       // row 3: col 0 same, col 1 differs (now present)
-      cell(3, 0, 'shared'), cell(3, 1, 'diff'),
+      cell(3, 0, 'shared'),
+      cell(3, 1, 'diff'),
     ]
     const result = findDuplicateRows({
       cells,
@@ -227,10 +251,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('key column outside [startCol..endCol] is reported in ignoredColumns', () => {
-    const cells: DisplayCell[] = [
-      cell(1, 0, 'a'),
-      cell(2, 0, 'a'),
-    ]
+    const cells: DisplayCell[] = [cell(1, 0, 'a'), cell(2, 0, 'a')]
     const result = findDuplicateRows({
       cells,
       range: range(1, 0, 2, 0),
@@ -255,10 +276,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('single row (after header exclusion) yields zero duplicates', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'header'),
-      cell(1, 0, 'only-data'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'header'), cell(1, 0, 'only-data')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -294,10 +312,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('tuple key: identical cell containing U+001F across both rows IS a duplicate', () => {
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'a\x1Fb'),
-      cell(1, 0, 'a\x1Fb'),
-    ]
+    const cells: DisplayCell[] = [cell(0, 0, 'a\x1Fb'), cell(1, 0, 'a\x1Fb')]
     const result = findDuplicateRows({
       cells,
       range: range(0, 0, 1, 0),
@@ -411,10 +426,7 @@ describe('findDuplicateRows', () => {
   })
 
   test('blank-kind cell normalises to empty string regardless of displayValue', () => {
-    const cells: DisplayCell[] = [
-      cell(1, 0, '', 'blank'),
-      cell(2, 0, 'leftover-text', 'blank'),
-    ]
+    const cells: DisplayCell[] = [cell(1, 0, '', 'blank'), cell(2, 0, 'leftover-text', 'blank')]
     const result = findDuplicateRows({
       cells,
       range: range(1, 0, 2, 0),
@@ -425,128 +437,684 @@ describe('findDuplicateRows', () => {
   })
 })
 
-describe('remove-duplicates atoms', () => {
-  test('initial state: dialog closed, preview is null', () => {
+const SHEET_ID = 'sheet-1'
+const SELECTION_RANGE = {
+  rowStart: 0,
+  rowEnd: 4,
+  colStart: 0,
+  colEnd: 1,
+} as const
+
+const SESSION_CELLS: DisplayCell[] = [
+  cell(0, 0, 'Region'),
+  cell(0, 1, 'Score'),
+  cell(1, 0, 'North'),
+  cell(1, 1, '100'),
+  cell(2, 0, 'South'),
+  cell(2, 1, '200'),
+  cell(3, 0, 'North'),
+  cell(3, 1, '300'),
+  cell(4, 0, 'East'),
+  cell(4, 1, '400'),
+]
+
+interface Deferred<Value> {
+  readonly promise: Promise<Value>
+  readonly resolve: (value: Value) => void
+  readonly reject: (reason: unknown) => void
+}
+
+function deferred<Value>(): Deferred<Value> {
+  let resolve!: (value: Value) => void
+  let reject!: (reason: unknown) => void
+  const promise = new Promise<Value>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function seedSelection(store: Store, sheetId = SHEET_ID): void {
+  store.setter(setWorkspaceActiveSheetAtom, { sheetId })
+  store.setter(selectionAtom, {
+    kind: 'range',
+    sheetId,
+    anchor: { row: SELECTION_RANGE.rowStart, col: SELECTION_RANGE.colStart },
+    focus: { row: SELECTION_RANGE.rowEnd, col: SELECTION_RANGE.colEnd },
+  })
+}
+
+function rangeAcknowledgement(
+  request: RangeProjectionRequest,
+  cells: readonly DisplayCell[] = SESSION_CELLS,
+  revision: number | string = 1,
+): RangeProjectionResult {
+  return {
+    kind: 'range',
+    requestId: request.requestId,
+    sheetId: request.sheetId,
+    range: request.range,
+    revision,
+    cells: Array.from(cells),
+  }
+}
+
+function mutationAcknowledgement(
+  request: RemoveRowsExactRequest,
+  revision = 2,
+): RemoveRowsExactResult {
+  return {
+    requestId: request.requestId,
+    sheetId: request.sheetId,
+    targetRange: request.targetRange,
+    removedRowIndices: Array.from(request.rows),
+    removedRows: request.rows.length,
+    affectedRange:
+      request.rows.length === 0
+        ? null
+        : {
+            startRow: request.rows[0],
+            endRow: request.targetRange.rowEnd,
+            startCol: request.targetRange.colStart,
+            endCol: request.targetRange.colEnd,
+          },
+    revision,
+  }
+}
+
+async function hydrate(store: Store, source: RemoveDuplicatesControllerPort): Promise<number> {
+  seedSelection(store)
+  await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+    'editing',
+  )
+  const session = store.getter(removeDuplicatesSessionAtom)
+  expect(session).not.toBeNull()
+  return session!.sessionId
+}
+
+function selectRegionColumnOnly(store: Store): void {
+  expect(
+    store.setter(dispatchRemoveDuplicatesIntentAtom, {
+      kind: 'toggle-key-column',
+      column: 1,
+    }),
+  ).toBe(true)
+  expect(store.getter(removeDuplicatesPreviewAtom)?.duplicateRows).toEqual([3])
+}
+
+describe('remove-duplicates Core lifecycle', () => {
+  test('initial state is closed and public projections have no preview', () => {
     const store = createStore()
     expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
     expect(store.getter(removeDuplicatesPreviewAtom)).toBeNull()
+    expect(store.getter(removeDuplicatesCanConfirmAtom)).toBe(false)
   })
 
-  test('openRemoveDuplicatesAtom seeds range, cells, defaults keyColumns to all cols in range', () => {
+  test('source-only open publishes a read ticket before transport and accepts an exact empty projection', async () => {
     const store = createStore()
-    const cells: DisplayCell[] = [
-      cell(1, 2, 'foo'),
-      cell(1, 3, 'bar'),
-    ]
-    store.setter(openRemoveDuplicatesAtom, range(1, 2, 5, 4), cells)
-    expect(store.getter(removeDuplicatesOpenAtom)).toBe(true)
-    expect(store.getter(removeDuplicatesRangeAtom)).toEqual(range(1, 2, 5, 4))
-    expect(store.getter(removeDuplicatesScanInputCellsAtom)).toEqual(cells)
-    expect(Array.from(store.getter(removeDuplicatesKeyColumnsAtom)).sort()).toEqual([2, 3, 4])
+    seedSelection(store)
+    const read = deferred<RangeProjectionResult>()
+    let captured: RangeProjectionRequest | undefined
+    const source: RemoveDuplicatesControllerPort = {
+      readRangeProjection(request) {
+        captured = request
+        return read.promise
+      },
+      async removeRowsExact(request) {
+        return mutationAcknowledgement(request)
+      },
+    }
+
+    const opening = store.setter(openRemoveDuplicatesFromSelectionAtom, { source })
+    expect(store.getter(removeDuplicatesLifecycleAtom)).toMatchObject({
+      status: 'read-pending',
+      sessionId: 1,
+      readRequestId: 1,
+      sheetId: SHEET_ID,
+    })
+    expect(captured).toBeUndefined()
+    await Promise.resolve()
+    expect(captured).toBeDefined()
+    read.resolve(rangeAcknowledgement(captured!, []))
+    await expect(opening).resolves.toBe('editing')
+
+    const session = store.getter(removeDuplicatesSessionAtom)!
+    expect(session.cells).toEqual([])
+    expect(Object.isFrozen(session)).toBe(true)
+    expect(Object.isFrozen(session.range)).toBe(true)
+    expect(Object.isFrozen(session.cells)).toBe(true)
+    const columns = store.getter(removeDuplicatesKeyColumnsAtom)
+    expect(Array.from(columns)).toEqual([0, 1])
+    expect(Object.isFrozen(columns)).toBe(true)
+    expect((columns as unknown as { add?: unknown }).add).toBeUndefined()
   })
 
-  test('toggleKeyColumnAtom adds and removes a column immutably', () => {
+  test('accepts a matching optional legacy sheet witness without using it as authority', async () => {
     const store = createStore()
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 2, 2), [])
-    const before = store.getter(removeDuplicatesKeyColumnsAtom)
-    store.setter(toggleKeyColumnAtom, 1)
-    const afterRemove = store.getter(removeDuplicatesKeyColumnsAtom)
-    expect(afterRemove).not.toBe(before) // fresh Set reference
-    expect(afterRemove.has(1)).toBe(false)
-    expect(afterRemove.has(0)).toBe(true)
-    expect(afterRemove.has(2)).toBe(true)
+    seedSelection(store)
+    let captured: RangeProjectionRequest | undefined
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        captured = request
+        return rangeAcknowledgement(request)
+      },
+    }
 
-    store.setter(toggleKeyColumnAtom, 1)
-    const afterReAdd = store.getter(removeDuplicatesKeyColumnsAtom)
-    expect(afterReAdd.has(1)).toBe(true)
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source,
+        sheetId: SHEET_ID,
+      }),
+    ).resolves.toBe('editing')
+
+    expect(captured?.sheetId).toBe(SHEET_ID)
+    expect(store.getter(removeDuplicatesSessionAtom)?.sheetId).toBe(SHEET_ID)
   })
 
-  test('deselectAllKeyColumnsAtom makes preview report noKeyColumns:true (and uniqueRows=0)', () => {
+  test('accepts an exact sparse projection without requiring rectangular cell coverage', async () => {
     const store = createStore()
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'a'),
-      cell(1, 0, 'a'),
-      cell(2, 0, 'b'),
-    ]
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 2, 0), cells)
-    // Confirm we get a real preview first.
-    const previewBefore = store.getter(removeDuplicatesPreviewAtom)
-    expect(previewBefore?.noKeyColumns).toBe(false)
+    seedSelection(store)
+    const sparseCells = [cell(0, 0, 'Region'), cell(1, 0, 'North'), cell(3, 1, '300')]
 
-    store.setter(deselectAllKeyColumnsAtom)
-    const previewAfter = store.getter(removeDuplicatesPreviewAtom)
-    expect(previewAfter).not.toBeNull()
-    expect(previewAfter?.noKeyColumns).toBe(true)
-    expect(previewAfter?.duplicateRows).toEqual([])
-    expect(previewAfter?.scannedRows).toBe(0)
-    expect(previewAfter?.uniqueRows).toBe(0)
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          async readRangeProjection(request) {
+            return rangeAcknowledgement(request, sparseCells)
+          },
+        },
+      }),
+    ).resolves.toBe('editing')
+
+    expect(store.getter(removeDuplicatesSessionAtom)?.cells).toEqual(sparseCells)
   })
 
-  test('selectAllKeyColumnsAtom restores the full range column set', () => {
+  test.each(['optional-sheet-witness', 'selection-sheet', 'workspace-sheet'] as const)(
+    'rejects mismatched %s authority before launching a read transport',
+    async (mismatch) => {
+      const store = createStore()
+      seedSelection(store)
+      if (mismatch === 'selection-sheet') {
+        store.setter(selectionAtom, {
+          kind: 'range',
+          sheetId: 'sheet-2',
+          anchor: { row: SELECTION_RANGE.rowStart, col: SELECTION_RANGE.colStart },
+          focus: { row: SELECTION_RANGE.rowEnd, col: SELECTION_RANGE.colEnd },
+        })
+      }
+      if (mismatch === 'workspace-sheet') {
+        store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+      }
+      const readRangeProjection = jest.fn(async (request: RangeProjectionRequest) =>
+        rangeAcknowledgement(request),
+      )
+      const source = { readRangeProjection }
+      const input =
+        mismatch === 'optional-sheet-witness' ? { source, sheetId: 'sheet-2' } : { source }
+
+      await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, input)).resolves.toBe(
+        'failed',
+      )
+
+      expect(readRangeProjection).not.toHaveBeenCalled()
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+    },
+  )
+
+  test.each([
+    {
+      name: 'duplicate visual coordinate',
+      cells: [...SESSION_CELLS, cell(1, 0, 'duplicate-coordinate')],
+    },
+    {
+      name: 'conflicting originalRow values for one visual row',
+      cells: [
+        { ...cell(1, 0, 'North'), originalRow: 10 },
+        { ...cell(1, 1, '100'), originalRow: 11 },
+      ],
+    },
+  ])('rejects a malformed projection with $name', async ({ cells }) => {
     const store = createStore()
-    store.setter(openRemoveDuplicatesAtom, range(0, 1, 4, 3), [])
-    store.setter(deselectAllKeyColumnsAtom)
-    expect(store.getter(removeDuplicatesKeyColumnsAtom).size).toBe(0)
-    store.setter(selectAllKeyColumnsAtom)
-    expect(Array.from(store.getter(removeDuplicatesKeyColumnsAtom)).sort()).toEqual([1, 2, 3])
+    seedSelection(store)
+
+    await expect(
+      store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          async readRangeProjection(request) {
+            return rangeAcknowledgement(request, cells)
+          },
+        },
+      }),
+    ).resolves.toBe('failed')
+
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+    expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
   })
 
-  test('closeRemoveDuplicatesAtom clears range, cells, key columns; preview goes null', () => {
+  test('selection drift makes a late exact read stale and close invalidates late responses', async () => {
     const store = createStore()
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 2, 0), [cell(0, 0, 'x')])
-    store.setter(closeRemoveDuplicatesAtom)
-    expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
-    expect(store.getter(removeDuplicatesRangeAtom)).toBeNull()
-    expect(store.getter(removeDuplicatesScanInputCellsAtom)).toEqual([])
-    expect(store.getter(removeDuplicatesKeyColumnsAtom).size).toBe(0)
-    expect(store.getter(removeDuplicatesPreviewAtom)).toBeNull()
+    seedSelection(store)
+    const firstRead = deferred<RangeProjectionResult>()
+    let firstRequest!: RangeProjectionRequest
+    const firstSource: RemoveDuplicatesControllerPort = {
+      readRangeProjection(request) {
+        firstRequest = request
+        return firstRead.promise
+      },
+    }
+    const firstOpen = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+      source: firstSource,
+    })
+    await Promise.resolve()
+    store.setter(selectionAtom, {
+      kind: 'range',
+      sheetId: SHEET_ID,
+      anchor: { row: 1, col: 0 },
+      focus: { row: 4, col: 1 },
+    })
+    firstRead.resolve(rangeAcknowledgement(firstRequest))
+    await expect(firstOpen).resolves.toBe('stale')
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
+
+    seedSelection(store)
+    const lateRead = deferred<RangeProjectionResult>()
+    let lateRequest!: RangeProjectionRequest
+    const lateOpen = store.setter(retryRemoveDuplicatesReadAtom, {
+      source: {
+        readRangeProjection(request) {
+          lateRequest = request
+          return lateRead.promise
+        },
+      },
+    })
+    await Promise.resolve()
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(true)
+    lateRead.resolve(rangeAcknowledgement(lateRequest))
+    await expect(lateOpen).resolves.toBe('stale')
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+    expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
   })
 
-  test('close does not reset comparison or excludeHeader (session-sticky)', () => {
+  test.each(['selection-range', 'workspace-sheet'] as const)(
+    'transport rejection after %s authority drift is stale, not failed',
+    async (drift) => {
+      const store = createStore()
+      seedSelection(store)
+      const read = deferred<RangeProjectionResult>()
+      const opening = store.setter(openRemoveDuplicatesFromSelectionAtom, {
+        source: {
+          readRangeProjection() {
+            return read.promise
+          },
+        },
+      })
+      await Promise.resolve()
+
+      if (drift === 'selection-range') {
+        store.setter(selectionAtom, {
+          kind: 'range',
+          sheetId: SHEET_ID,
+          anchor: { row: 1, col: 0 },
+          focus: { row: 4, col: 1 },
+        })
+      } else {
+        store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+      }
+      read.reject(new Error('transport disconnected'))
+
+      await expect(opening).resolves.toBe('stale')
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
+      expect(store.getter(removeDuplicatesErrorAtom)).toBe(
+        'The selected range changed while Remove Duplicates was loading. Retry from the current selection.',
+      )
+    },
+  )
+
+  test('truncated source-only read fails; source-only retry allocates fresh identities', async () => {
     const store = createStore()
-    store.setter(removeDuplicatesComparisonAtom, 'trimAndIgnoreCase')
-    store.setter(removeDuplicatesExcludeHeaderAtom, false)
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 1, 0), [])
-    store.setter(closeRemoveDuplicatesAtom)
+    seedSelection(store)
+    let attempts = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        attempts += 1
+        return {
+          ...rangeAcknowledgement(request),
+          truncated: attempts === 1,
+        }
+      },
+    }
+    await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+      'failed',
+    )
+    const firstSessionId = store.getter(removeDuplicatesSessionIdAtom)
+    const firstReadId = store.getter(removeDuplicatesReadRequestIdAtom)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+    expect(store.getter(removeDuplicatesErrorAtom)).not.toBe('')
+
+    await expect(store.setter(retryRemoveDuplicatesReadAtom, { source })).resolves.toBe('editing')
+    expect(store.getter(removeDuplicatesSessionIdAtom)).toBe(firstSessionId + 1)
+    expect(store.getter(removeDuplicatesReadRequestIdAtom)).toBe(firstReadId + 1)
+    expect(attempts).toBe(2)
+  })
+
+  test.each([null, 0, 'false', Object.freeze({})])(
+    'non-boolean truncated=%p is malformed and fails the read',
+    async (truncated) => {
+      const store = createStore()
+      seedSelection(store)
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return {
+            ...rangeAcknowledgement(request),
+            truncated,
+          } as unknown as RangeProjectionResult
+        },
+      }
+
+      await expect(store.setter(openRemoveDuplicatesFromSelectionAtom, { source })).resolves.toBe(
+        'failed',
+      )
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-failed')
+      expect(store.getter(removeDuplicatesSessionAtom)).toBeNull()
+    },
+  )
+
+  test('identity helpers cross MAX_SAFE once, descend, and exhaust without reuse', () => {
+    for (const next of [
+      nextRemoveDuplicatesSessionId,
+      nextRemoveDuplicatesReadRequestId,
+      nextRemoveDuplicatesMutationRequestId,
+    ]) {
+      expect(next(Number.MAX_SAFE_INTEGER - 1)).toBe(Number.MAX_SAFE_INTEGER)
+      expect(next(Number.MAX_SAFE_INTEGER)).toBe(-1)
+      expect(next(-1)).toBe(-2)
+      expect(next(Number.MIN_SAFE_INTEGER)).toBeNull()
+      expect(next(Number.NaN)).toBeNull()
+    }
+  })
+
+  test('session and request sequences are isolated per store', async () => {
+    const left = createStore()
+    const right = createStore()
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+    }
+    await hydrate(left, source)
+    await hydrate(right, source)
+    expect(left.getter(removeDuplicatesSessionIdAtom)).toBe(1)
+    expect(right.getter(removeDuplicatesSessionIdAtom)).toBe(1)
+    expect(left.getter(removeDuplicatesReadRequestIdAtom)).toBe(1)
+    expect(right.getter(removeDuplicatesReadRequestIdAtom)).toBe(1)
+  })
+
+  test('typed intents own form changes and runtime projections remain immutable', async () => {
+    const store = createStore()
+    await hydrate(store, {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+    })
+    expect(
+      store.setter(dispatchRemoveDuplicatesIntentAtom, {
+        kind: 'set-comparison',
+        comparison: 'trimAndIgnoreCase',
+      }),
+    ).toBe(true)
+    expect(
+      store.setter(dispatchRemoveDuplicatesIntentAtom, {
+        kind: 'set-exclude-header',
+        excludeHeader: false,
+      }),
+    ).toBe(true)
     expect(store.getter(removeDuplicatesComparisonAtom)).toBe('trimAndIgnoreCase')
     expect(store.getter(removeDuplicatesExcludeHeaderAtom)).toBe(false)
+    const preview = store.getter(removeDuplicatesPreviewAtom)!
+    expect(Object.isFrozen(preview)).toBe(true)
+    expect(Object.isFrozen(preview.duplicateRows)).toBe(true)
   })
 
-  test('preview reflects comparison + excludeHeader atoms', () => {
+  test('workspace A→B→A after hydration revokes the session before confirm transport', async () => {
     const store = createStore()
-    const cells: DisplayCell[] = [
-      cell(0, 0, 'Foo'),
-      cell(1, 0, 'foo'),
-      cell(2, 0, 'FOO'),
-    ]
-    store.setter(removeDuplicatesExcludeHeaderAtom, false)
-    store.setter(removeDuplicatesComparisonAtom, 'caseInsensitive')
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 2, 0), cells)
-    const preview = store.getter(removeDuplicatesPreviewAtom)
-    expect(preview?.duplicateRows).toEqual([1, 2])
-    expect(preview?.headerRow).toBeNull()
+    const removeRowsExact = jest.fn(async (request: RemoveRowsExactRequest) =>
+      mutationAcknowledgement(request),
+    )
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      removeRowsExact,
+    }
+    const sessionId = await hydrate(store, source)
+    const session = store.getter(removeDuplicatesSessionAtom)!
+    expect(session.workspaceActiveSheetWitness).toBe(
+      store.getter(workspaceActiveSheetAuthorityWitnessAtom),
+    )
+    selectRegionColumnOnly(store)
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: SHEET_ID })
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {},
+      }),
+    ).resolves.toBe('stale')
+
+    expect(removeRowsExact).not.toHaveBeenCalled()
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('read-stale')
   })
 
-  test('preview reports ignoredColumns for out-of-range key cols (even when other cols still match)', () => {
+  test('same-tick confirm is single-flight, freezes the full target, records once, refreshes, then closes', async () => {
     const store = createStore()
-    store.setter(openRemoveDuplicatesAtom, range(0, 0, 2, 1), [
-      cell(0, 0, 'h0'), cell(0, 1, 'h1'),
-      cell(1, 0, 'x'), cell(1, 1, 'y'),
-      cell(2, 0, 'x'), cell(2, 1, 'y'),
-    ])
-    // Force a key set containing an out-of-range column.
-    store.setter(removeDuplicatesKeyColumnsAtom, new Set([0, 1, 99]))
-    const preview = store.getter(removeDuplicatesPreviewAtom)
-    expect(preview?.ignoredColumns).toEqual([99])
-    expect(preview?.duplicateRows).toEqual([2])
-  })
+    const mutation = deferred<RemoveRowsExactResult>()
+    const refresh = deferred<void>()
+    let mutationCalls = 0
+    let request: RemoveRowsExactRequest | undefined
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(readRequest) {
+        return rangeAcknowledgement(readRequest)
+      },
+      removeRowsExact(nextRequest) {
+        mutationCalls += 1
+        request = nextRequest
+        return mutation.promise
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
 
-  test('preview is null when dialog is closed but range/cells are still set', () => {
-    const store = createStore()
-    store.setter(removeDuplicatesRangeAtom, range(0, 0, 1, 0))
-    store.setter(removeDuplicatesScanInputCellsAtom, [cell(0, 0, 'a'), cell(1, 0, 'a')])
-    store.setter(removeDuplicatesKeyColumnsAtom, new Set([0]))
+    const first = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: () => refresh.promise,
+    })
+    const second = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: () => refresh.promise,
+    })
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('mutation-pending')
+    expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+    expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+    await expect(second).resolves.toBe('stale')
+    await Promise.resolve()
+    expect(mutationCalls).toBe(1)
+    expect(request).toBeDefined()
+    expect(request!.rows).toEqual([3])
+    expect(request!.targetRange).toEqual(SELECTION_RANGE)
+    expect(request!.revision).toBe(1)
+    const target = store.getter(removeDuplicatesMutationTargetAtom)!
+    expect(Object.isFrozen(target)).toBe(true)
+    expect(Object.isFrozen(target.targetRange)).toBe(true)
+    expect(Object.isFrozen(target.removedRowIndices)).toBe(true)
+    expect(target.targetKey).toBe(JSON.stringify([SHEET_ID, 0, 4, 0, 1, 'number', 1, [3]]))
+
+    mutation.resolve(mutationAcknowledgement(request!))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('refreshing')
+    refresh.resolve()
+    await expect(first).resolves.toBe('completed')
+    expect(mutationCalls).toBe(1)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
     expect(store.getter(removeDuplicatesOpenAtom)).toBe(false)
-    expect(store.getter(removeDuplicatesPreviewAtom)).toBeNull()
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
+  })
+
+  test.each(['mismatch', 'revision-echo', 'reject'] as const)(
+    '%s mutation outcome stays unknown with no history, close, or resend',
+    async (mode) => {
+      const store = createStore()
+      let calls = 0
+      const source: RemoveDuplicatesControllerPort = {
+        async readRangeProjection(request) {
+          return rangeAcknowledgement(request)
+        },
+        async removeRowsExact(request) {
+          calls += 1
+          if (mode === 'reject') throw new Error('transport disconnected')
+          if (mode === 'revision-echo') {
+            return mutationAcknowledgement(request, request.revision as number)
+          }
+          return { ...mutationAcknowledgement(request), requestId: request.requestId + 1 }
+        },
+      }
+      const sessionId = await hydrate(store, source)
+      selectRegionColumnOnly(store)
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => {},
+        }),
+      ).resolves.toBe('outcome-unknown')
+      expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('outcome-unknown')
+      expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+      expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+      expect(store.setter(closeRemoveDuplicatesAtom)).toBe(false)
+
+      await expect(
+        store.setter(runRemoveDuplicatesConfirmAtom, {
+          source,
+          sessionId,
+          refreshProjection: async () => {},
+        }),
+      ).resolves.toBe('outcome-unknown')
+      expect(calls).toBe(1)
+    },
+  )
+
+  test('selection drift after transport launch makes even an exact acknowledgement outcome-unknown', async () => {
+    const store = createStore()
+    const mutation = deferred<RemoveRowsExactResult>()
+    let request!: RemoveRowsExactRequest
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(readRequest) {
+        return rangeAcknowledgement(readRequest)
+      },
+      removeRowsExact(nextRequest) {
+        request = nextRequest
+        return mutation.promise
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const result = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: async () => {},
+    })
+    await Promise.resolve()
+    store.setter(selectionAtom, {
+      kind: 'cell',
+      sheetId: SHEET_ID,
+      anchor: { row: 9, col: 9 },
+      focus: { row: 9, col: 9 },
+    })
+    mutation.resolve(mutationAcknowledgement(request))
+    await expect(result).resolves.toBe('outcome-unknown')
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
+  test('workspace A→B→A after transport launch makes an exact acknowledgement outcome-unknown', async () => {
+    const store = createStore()
+    const mutation = deferred<RemoveRowsExactResult>()
+    let request!: RemoveRowsExactRequest
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(readRequest) {
+        return rangeAcknowledgement(readRequest)
+      },
+      removeRowsExact(nextRequest) {
+        request = nextRequest
+        return mutation.promise
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    const result = store.setter(runRemoveDuplicatesConfirmAtom, {
+      source,
+      sessionId,
+      refreshProjection: async () => {},
+    })
+    await Promise.resolve()
+    expect(request).toBeDefined()
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: 'sheet-2' })
+    store.setter(setWorkspaceActiveSheetAtom, { sheetId: SHEET_ID })
+    mutation.resolve(mutationAcknowledgement(request))
+
+    await expect(result).resolves.toBe('outcome-unknown')
+    expect(store.getter(historyStackAtom).entries).toHaveLength(0)
+  })
+
+  test('refresh failure retries refresh only and never duplicates mutation/history', async () => {
+    const store = createStore()
+    let mutationCalls = 0
+    let refreshCalls = 0
+    const source: RemoveDuplicatesControllerPort = {
+      async readRangeProjection(request) {
+        return rangeAcknowledgement(request)
+      },
+      async removeRowsExact(request) {
+        mutationCalls += 1
+        return mutationAcknowledgement(request)
+      },
+    }
+    const sessionId = await hydrate(store, source)
+    selectRegionColumnOnly(store)
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          refreshCalls += 1
+          throw new Error('refresh offline')
+        },
+      }),
+    ).resolves.toBe('refresh-failed')
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('refresh-failed')
+    expect(store.getter(removeDuplicatesCanConfirmAtom)).toBe(true)
+    expect(store.getter(removeDuplicatesCanCloseAtom)).toBe(false)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+
+    await expect(
+      store.setter(runRemoveDuplicatesConfirmAtom, {
+        source,
+        sessionId,
+        refreshProjection: async () => {
+          refreshCalls += 1
+        },
+      }),
+    ).resolves.toBe('completed')
+    expect(mutationCalls).toBe(1)
+    expect(refreshCalls).toBe(2)
+    expect(store.getter(historyStackAtom).entries).toHaveLength(1)
+    expect(store.getter(removeDuplicatesMutationRequestIdAtom)).toBe(1)
+    expect(store.getter(removeDuplicatesLifecycleAtom).status).toBe('closed')
   })
 })

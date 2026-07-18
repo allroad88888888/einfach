@@ -1,203 +1,240 @@
 # comments-notes
 
-Cell-anchored notes (single plain text) and threaded comments with author and resolved state.
+Cell-anchored notes and threaded comments share projection metadata, but they do not share editor
+authority. Note text and thread bodies remain backend-owned. UI Core owns only the active comment
+editor, its bounded mutation evidence, and request/session identities.
 
-## Goal
+## Current scope
 
-Two distinct annotation primitives on cells:
+Implemented in `src/comments/`:
 
-- **Note** — a single plain-text string anchored to one cell, owned entirely by the backend. No threading, no author, no resolved state. Equivalent to a traditional spreadsheet cell comment.
-- **Comment thread** — a threaded conversation anchored to one cell. Each thread holds an ordered list of comments, each with an author identity, body text, and creation timestamp. A thread can be resolved or reopened by any participant.
+- exported note/comment/thread and request types;
+- `noteIndicator` and `commentThreadId` passthrough on projected `DisplayCell` values;
+- one active comment session and draft;
+- post/resolve mutation dispatch through an optional selected port;
+- immutable request tickets, a 15-second Core deadline, strict local acknowledgement validation,
+  and a bounded 32-attempt ledger;
+- read-only draft, mutation, ledger, and runtime projections.
 
-The UI core owns only the active session state (which cell's thread is open, the draft reply body). All thread content and note text live in the backend.
+Not implemented by this module:
 
-## Scope
+- storage or projection of note text and comment-thread bodies;
+- note/comment delete commands;
+- identity, ACL, notifications, mentions, or presence;
+- canonical confirmation that a locally acknowledged mutation has been projected.
 
-### In scope
+`LocalAcknowledged` means only that the selected transport returned evidence matching the Core
+ticket. It must not be presented as canonical posted/resolved state.
 
-- Note CRUD: set note text on a cell, clear note from a cell, read note text for the active cell.
-- Comment thread CRUD: post a new comment on a cell, delete an individual comment, delete an entire thread.
-- Resolve / reopen a comment thread.
-- Per-cell indicator flags in the visible-window projection: `noteIndicator` and `commentThreadId` on `DisplayCell`.
-- Active session state: which cell's thread panel is open, the draft reply string.
+## State authority and public API
 
-### Out of scope
-
-- Rich-media attachments (images, files inside a comment body).
-- Mentions and notifications (at-mention rendering, email/push delivery).
-- Presence (who is currently viewing or typing in a thread — see presence doc).
-
-## State (UI core)
-
-Atoms live in `src/comments/index.ts`. All bodies and thread data are fetched through backend ports and are not cached in UI atoms.
+The private `commentEditorStateAtom` is the aggregate authority:
 
 ```ts
-// which cell's comment thread panel is open, null when closed
-export const commentSessionAtom = atom<CommentSession | null>(null)
-commentSessionAtom.debugLabel = 'spreadsheet.comments.session'
-
-// draft text for the pending reply or new thread post
-export const commentEditorDraftAtom = atom<string>('')
-commentEditorDraftAtom.debugLabel = 'spreadsheet.comments.editorDraft'
-
-// last dispatched comment intent for host adapter consumption
-export const commentIntentAtom = atom<CommentIntent | null>(null)
-commentIntentAtom.debugLabel = 'spreadsheet.comments.intent'
+interface CommentEditorAuthorityState {
+  readonly sessionId: number
+  readonly session: Readonly<CommentSessionState> | null
+  readonly draft: string
+  readonly intent: CommentIntent | null
+  readonly mutation: CommentMutationState
+}
 ```
 
-`CommentSession` holds the open cell coordinate, the active sheet id, and the known `threadId` (null when opening a cell with no existing thread).
+The public editor API is:
 
-State decision summary:
+| API                                    | Boundary             | Current behavior                                                                                   |
+| -------------------------------------- | -------------------- | -------------------------------------------------------------------------------------------------- |
+| `commentEditorDraftAtom: Atom<string>` | read-only projection | Reads `draft` from the private aggregate; direct store writes throw.                               |
+| `setCommentDraftAtom`                  | command              | Invalidates launch capture first, applies the phase gate, then updates the private aggregate.      |
+| `openCommentSessionAtom`               | command              | Snapshots the target, rotates `sessionId`, and clears draft/intent/mutation.                       |
+| `closeCommentSessionAtom`              | command              | Rotates `sessionId`, clears the session and draft, and returns editor mutation to `Idle`.          |
+| `commentSessionAtom`                   | compatibility facade | Reads the private aggregate and retains its current session-replacement writer.                    |
+| `commentIntentAtom`                    | compatibility facade | Reads/writes intent and invalidates a launch capture before a write.                               |
+| `runCommentMutationAtom`               | async command        | Reserves and publishes one immutable post/resolve ticket, then invokes one captured optional port. |
+| `commentMutationStateAtom`             | read-only projection | Frozen editor-local phase/action/request/error.                                                    |
+| `commentOperationAttemptLedgerAtom`    | read-only projection | Frozen bounded local attempt evidence.                                                             |
+| `commentRuntimeStatusAtom`             | read-only projection | `Closed`, `OpenClean`, `OpenDirty`, or the non-idle mutation phase.                                |
+| `commentMutationPendingAtom`           | derived read-only    | True when the ledger contains a pending attempt.                                                   |
+| `commentMutationBlockedAtom`           | derived read-only    | True when the ledger contains an outcome-unknown attempt.                                          |
+| `commentMutationSubmissionBlockedAtom` | derived read-only    | True during a launch capture/reservation or while pending/unknown evidence exists.                 |
 
-- Source atoms: `commentSessionAtom`, `commentEditorDraftAtom`, `commentIntentAtom`.
-- Derived atoms: none — thread data is not projected into atoms.
-- Commands: `openCommentSessionAtom`, `closeCommentSessionAtom`, `dispatchCommentIntentAtom`.
-- Scale bound: one session, one draft string — never per-cell atom families.
-- Backend reads: host adapter fetches thread body on session open.
-- Per-cell/per-row/per-col atom risk: not applicable.
-- Tests: `test/comments-notes.test.ts`.
-
-## Types
+The draft debug/API names remain:
 
 ```ts
-// note — single plain-text string, no threading
-export interface CellNote {
-  text: string
-}
+commentEditorDraftAtom.debugLabel = 'spreadsheet.comments.draft'
+setCommentDraftAtom.debugLabel = 'spreadsheet.comments.setDraft'
+```
 
-// a single comment inside a thread
-export interface Comment {
-  id: string
-  author: string          // display name or opaque identifier; backend resolves
-  body: string
-  createdAt: string       // ISO 8601
-}
+This boundary change is deliberately narrow: `commentEditorDraftAtom` is no longer a public
+writer. Textarea code must use `setCommentDraftAtom`; session open/close reset the same private
+aggregate through the session replacement command. No UI-local draft mirror is allowed.
 
-// a full thread; contents fetched by host adapter, not stored in UI atoms
-export interface CommentThread {
-  id: string
-  comments: Comment[]
-  resolved: boolean
-}
+## Draft write flow
 
-// active session descriptor held in commentSessionAtom
-export interface CommentSession {
+The invalidation happens before validation and phase gating. That ordering is intentional: a
+re-entrant draft command invalidates a caller-owned launch capture even if the proposed value is
+later rejected.
+
+```mermaid
+flowchart LR
+  Textarea[Comment textarea] --> SetDraft[setCommentDraftAtom]
+  SetDraft --> Invalidate[invalidateCommentCapture]
+  Invalidate --> Gate{string and phase allowed?}
+  Gate -->|yes| Backing[Private aggregate commentEditorStateAtom]
+  Gate -->|PendingPublished| PendingNoop[Keep draft and mutation unchanged]
+  Gate -->|OutcomeUnknownBlocked| UnknownNoop[Keep draft and mutation unchanged]
+  Gate -->|non-string runtime input| InvalidNoop[Keep backing unchanged]
+  Open[openCommentSessionAtom] --> Replace[Private replaceCommentSessionAtom]
+  Close[closeCommentSessionAtom] --> Replace
+  Replace --> Backing
+  Backing --> Draft[Readonly commentEditorDraftAtom Atom string]
+  Backing --> Aggregate[Session, intent, mutation and runtime projections]
+```
+
+Allowed draft edits reset an `ErrorOpen`/`LocalAcknowledged` editor mutation to `Idle`. Draft edits
+cannot change a `PendingPublished` or `OutcomeUnknownBlocked` editor.
+
+## Session and mutation states
+
+```mermaid
+stateDiagram-v2
+  [*] --> Closed
+  Closed --> OpenClean: open session
+  OpenClean --> OpenDirty: set non-empty draft
+  OpenDirty --> OpenClean: set empty draft
+  OpenClean --> ErrorOpen: invalid resolve or unavailable port
+  OpenDirty --> ErrorOpen: invalid post or unavailable port
+  OpenDirty --> PendingPublished: reserve ticket and publish pending
+  OpenClean --> PendingPublished: valid resolve
+  PendingPublished --> LocalAcknowledged: exact ticket-bound acknowledgement
+  PendingPublished --> OutcomeUnknownBlocked: timeout, reject, invalid or mismatched acknowledgement
+  ErrorOpen --> OpenClean: allowed empty draft edit
+  ErrorOpen --> OpenDirty: allowed non-empty draft edit
+  Closed --> Closed: close rotates session identity
+  OpenClean --> Closed: close and clear
+  OpenDirty --> Closed: close and clear
+  ErrorOpen --> Closed: close and clear
+  PendingPublished --> Closed: close rotates authority; old ledger ticket survives
+  OutcomeUnknownBlocked --> Closed: close clears editor; unknown ledger still blocks globally
+  LocalAcknowledged --> Closed: close resets the local evidence phase
+  LocalAcknowledged --> OpenClean: open a new session
+```
+
+`LocalAcknowledged` already has `session = null`, `draft = ''`, and `intent = null`; its distinct
+runtime label preserves the local evidence phase until a later session replacement resets it.
+
+### Close, acknowledgement, and error branches
+
+```mermaid
+flowchart TD
+  Published[Pending ticket published in editor and ledger] --> Result{Transport result}
+  Result -->|deadline or rejection| UnknownLedger[Set ledger attempt outcome-unknown]
+  Result -->|fulfilled| Validate{Acknowledgement snapshots safely and matches ticket?}
+  Validate -->|no| UnknownLedger
+  Validate -->|yes| AckLedger[Set ledger attempt local-acknowledged]
+  AckLedger --> AckOwner{Ticket still owns current editor?}
+  AckOwner -->|yes| AckEditor[Clear session, draft and intent; phase LocalAcknowledged]
+  AckOwner -->|no, session closed or reopened| KeepEditor[Leave current editor untouched]
+  UnknownLedger --> ErrorOwner{Ticket still owns current editor?}
+  ErrorOwner -->|yes| UnknownEditor[Keep session and draft; phase OutcomeUnknownBlocked]
+  ErrorOwner -->|no, session closed or reopened| KeepEditor
+  CloseCommand[closeCommentSessionAtom] --> Rotate[Rotate sessionId and clear editor to Closed/Idle]
+  Rotate --> LateResult[Late result may settle only its old ledger ticket]
+  LateResult --> KeepEditor
+```
+
+Closing/reopening does not erase pending or outcome-unknown ledger evidence. This is why
+`commentRuntimeStatusAtom` can be `Closed` while `commentMutationBlockedAtom` is still true. An old
+ticket may settle its own ledger row, but the `sessionId` and exact target checks prevent it from
+closing or overwriting a newer editor.
+
+## Mutation contract
+
+`runCommentMutationAtom` accepts:
+
+```ts
+interface RunCommentMutationInput {
+  readonly action: 'post' | 'resolve'
+  readonly source?: {
+    readonly postComment?: (request: PostCommentRequest) => unknown | Promise<unknown>
+    readonly resolveCommentThread?: (
+      request: ResolveCommentThreadRequest,
+    ) => unknown | Promise<unknown>
+  }
+}
+```
+
+Core reads `action`, `source`, and the selected function exactly once under a launch capture. A
+re-entrant session/draft/intent change revokes that capture and produces zero transport calls.
+After reservation, Core publishes `PendingPublished`, the pending ticket, and ledger evidence
+before invoking the selected function.
+
+An acknowledgement is accepted as local evidence only when:
+
+- it is an object with the exact `sheetId` and safe-integer `requestId` from the ticket;
+- `revision`, when present, is a finite number or string;
+- `affectedRange`, when present, is the exact one-cell ticket target;
+- acknowledgement snapshot getters do not re-enter and revoke Core authority.
+
+Timeout, synchronous throw, rejected promise, malformed acknowledgement, mismatch, or capture loss
+all become `outcome-unknown`. The attempt is retained and submission remains blocked.
+
+The attempt ledger holds at most `COMMENT_MUTATION_LEDGER_MAX` (32) entries. Capacity pressure may
+evict only old `local-acknowledged` evidence; `pending` and `outcome-unknown` entries are never
+evicted.
+
+## Current types
+
+The active target uses a nested cell coordinate and an optional thread id:
+
+```ts
+interface CommentSessionState {
   sheetId: string
-  row: number
-  col: number
-  threadId: string | null  // null → cell has no thread yet
+  cell: { row: number; col: number }
+  threadId?: string
 }
 
-// backend request shapes (all extend SheetRef implicitly via sheetId)
-export interface SetNoteRequest {
-  kind: 'set-note'
-  sheetId: string
-  row: number
-  col: number
-  text: string
-  requestId?: number
-  revision?: ProjectionRevision
-}
-
-export interface ClearNoteRequest {
-  kind: 'clear-note'
-  sheetId: string
-  row: number
-  col: number
-  requestId?: number
-  revision?: ProjectionRevision
-}
-
-export interface PostCommentRequest {
+interface PostCommentRequest {
   kind: 'post-comment'
   sheetId: string
-  row: number
-  col: number
-  threadId: string | null  // null → create new thread
+  cell: { row: number; col: number }
+  threadId?: string
   body: string
+  author?: string
   requestId?: number
   revision?: ProjectionRevision
 }
 
-export interface ResolveCommentThreadRequest {
+interface ResolveCommentThreadRequest {
   kind: 'resolve-comment-thread'
   sheetId: string
   threadId: string
-  resolved: boolean        // true = resolve, false = reopen
   requestId?: number
   revision?: ProjectionRevision
 }
-
-export interface DeleteCommentRequest {
-  kind: 'delete-comment'
-  sheetId: string
-  threadId: string
-  commentId: string
-  requestId?: number
-  revision?: ProjectionRevision
-}
-
-// intent union for commentIntentAtom
-export type CommentIntent =
-  | { type: 'comment.set-note'; request: SetNoteRequest }
-  | { type: 'comment.clear-note'; request: ClearNoteRequest }
-  | { type: 'comment.post'; request: PostCommentRequest }
-  | { type: 'comment.resolve-thread'; request: ResolveCommentThreadRequest }
-  | { type: 'comment.delete-comment'; request: DeleteCommentRequest }
 ```
 
-## Backend port
+`SetNoteRequest` and `ClearNoteRequest` also use `cell: { row, col }`. They are exported contract
+shapes; this module does not yet expose note mutation commands.
 
-All methods are optional. Host adapters that do not implement comments/notes simply omit them and the UI falls back to hiding the relevant menu items.
+`DisplayCell.noteIndicator?: boolean` and `DisplayCell.commentThreadId?: string` remain sparse
+visible-projection metadata. Thread bodies must not be materialized into the visible window or an
+atom family keyed by cell.
 
-```ts
-// additions to SpreadsheetBackend
-setNote?(request: SetNoteRequest): Promise<BackendMutationResult>
-clearNote?(request: ClearNoteRequest): Promise<BackendMutationResult>
-postComment?(request: PostCommentRequest): Promise<BackendMutationResult & { threadId: string }>
-resolveCommentThread?(request: ResolveCommentThreadRequest): Promise<BackendMutationResult>
-deleteComment?(request: DeleteCommentRequest): Promise<BackendMutationResult>
-```
+## Test evidence
 
-`DisplayCell` gains two optional indicator fields populated by the visible-window projection result:
+`test/comments-notes.test.ts` covers:
 
-```ts
-export interface DisplayCell {
-  // ... existing fields ...
-  noteIndicator?: boolean       // true when the cell has a note
-  commentThreadId?: string      // present when the cell has at least one comment thread
-}
-```
+- command-owned normal draft updates and session reset;
+- runtime rejection of direct `commentEditorDraftAtom` writes;
+- launch-capture invalidation through a re-entrant `setCommentDraftAtom` call;
+- no-op draft commands in `PendingPublished` and `OutcomeUnknownBlocked`;
+- pending-before-transport publication, deadline/rejection/acknowledgement branches, late
+  settlement isolation, per-store identity isolation, and bounded-ledger eviction.
 
-The projection backend fills these from sparse metadata; it must not materialise thread bodies in the projection result.
+`test/package-boundary.test.ts` adds compile-time writability assertions, runtime fail-closed direct
+write evidence, a source scan for `Atom<string>`, and a guard against internal
+`set(commentEditorDraftAtom, ...)` calls.
 
-## Integration points
-
-- **Menu** (`src/menu/`): right-click on a cell surface dispatches `MenuCommandKind` entries `'note.insert'`, `'note.clear'`, `'comment.insert'`. `isCommandAllowedForTarget` allows these for `'cell'` and `'range'` targets. Host adapters gate visibility on whether `setNote` / `postComment` are present on the backend.
-- **Pointer** (`src/pointer/`): clicking a `noteIndicator` cell opens a note tooltip (no session atom needed — tooltip is stateless). Clicking a `commentThreadId` cell dispatches `openCommentSessionAtom` with the cell coordinate and known thread id.
-- **Projection** (`src/backend/types.ts`): `noteIndicator` and `commentThreadId` on `DisplayCell` flow through `VisibleProjectionResult.cells`. No additional projection request kind is added.
-- **Keyboard**: `Shift+F2` opens the note editor for the active cell (matches Excel/Sheets convention). The keyboard module maps this key to a `'note.edit'` keyboard intent consumed by the host UI layer.
-- **Editing**: comment and note editors are independent panels managed by the host UI. They do not share state with `editingDraftAtom` or the formula bar. The cell editor is not used.
-- **Workspace** (`src/workspace/`): `BackendMutationResult.revision` from note/comment mutations updates the workspace revision atom, keeping the visible projection in sync.
-
-## Risks & open questions
-
-- **Deleting cells with comments**: row/column delete operations (`deleteRows`, `deleteColumns`) may orphan comment threads. The backend must define whether threads move with shifted cells, are deleted, or persist at the original coordinate. UI core has no policy here — the host adapter is responsible.
-- **Comment thread pagination**: `CommentThread.comments` is returned in full by the host adapter on session open. For threads with many replies the adapter may need to paginate; the UI core type does not currently model a cursor. A `nextCursor` field on a future `ReadCommentThreadResult` can be added without breaking existing ports.
-- **Bounded UI cache vs paginated backend reads**: the UI core must not cache thread bodies in an atom family keyed by cell coordinate. If the host needs a read-through cache, that belongs in the adapter layer, not here.
-- **Anonymous vs identified authors**: `Comment.author` is an opaque string supplied by the backend. The UI core makes no assumption about identity resolution, avatars, or whether the current user can edit others' comments. Host adapters enforce edit permissions before calling `deleteComment`.
-- **Presence avatars on threads**: showing who is currently viewing or typing in a thread is deferred to the presence doc. `commentSessionAtom` does not carry presence metadata.
-- **Note vs comment coexistence**: a cell can have both a note and a comment thread simultaneously. The projection carries both `noteIndicator` and `commentThreadId` independently; the host UI decides how to render overlapping indicators.
-
-## Test surface
-
-Tests live in `test/comments-notes.test.ts`.
-
-Coverage targets:
-
-- `commentSessionAtom`: open, close, reopen with different cell coordinates.
-- `commentEditorDraftAtom`: set draft, clear on session close.
-- `commentIntentAtom`: each intent variant is dispatched with correct shape.
-- Backend port shapes: verify `SetNoteRequest`, `PostCommentRequest`, `ResolveCommentThreadRequest`, and `DeleteCommentRequest` serialise correctly (no runtime, pure type-level fixtures).
-- `DisplayCell` indicator fields: assert `noteIndicator` and `commentThreadId` pass through a mock `VisibleProjectionResult` without mutation.
-- Guard: no import of DOM, Solid, React, worker, or WASM in `src/comments/`.
+The package-boundary suite also guards `src/` from importing React, Solid, DOM runtime, workers, or
+WASM glue.

@@ -1,34 +1,87 @@
 # paste-special
 
-Owns Paste Special dialog state — the kind of paste (values / formats / etc.),
-optional arithmetic operation between source and target, transpose, and
-skip-blanks toggles. Backed by the optional `SpreadsheetBackend.pasteRange`
-port; capability-gated by the host so the menu entry and dialog disappear
-when the backend omits the port.
+Owns the Paste Special capability, frozen session, form draft, mutation
+lifecycle, history hand-off, and projection-refresh sequencing. The Solid
+dialog is a projection of this Core state; it does not own or discover the
+capability.
+
+Parity item #11 remains **Partial**. The static backend implements
+`pasteRange`; the Worker and WorkerTS backends do not. The Edit menu and
+Ctrl+Alt+V are capability-gated, while a Context Menu entry is still absent.
 
 ## State Decision Template
 
-- Source atoms:
-  - `pasteSpecialOpenAtom`: whether the dialog is visible.
-  - `pasteSpecialOptionsAtom`: per-instance form state (`kind`, `op`,
-    `transpose`, `skipBlanks`). Atom-backed rather than Solid signal so
-    Solid 1.9.12 provider re-mounts don't drop the draft.
-- Derived atoms: none in core. The host defines a derived
-  `pasteSpecialSupportedAtom` reading `backend.pasteRange != null` and
-  pipes it into the menu item's `isAvailable`.
+- Private source atoms:
+  - the capability backing atom is module-private and is written only by
+    `capturePasteSpecialCapabilityAtom`;
+  - the active mutation ticket is module-private and protects request
+    identity, acknowledgement, history, and refresh ordering.
+- Public state atoms:
+  - `pasteSpecialCapabilityAtom`: read-only capability projection;
+  - `pasteSpecialOpenAtom`, `pasteSpecialOptionsAtom`,
+    `pasteSpecialSessionAtom`, `pasteSpecialLifecycleAtom`, and
+    `pasteSpecialErrorAtom`: Core-owned dialog/session state.
+- Derived atoms:
+  - `pasteSpecialCanEditAtom`, `pasteSpecialCanConfirmAtom`, and
+    `pasteSpecialCanCloseAtom` project allowed UI actions;
+  - Solid's deprecated `pasteSpecialSupportedAtom` is an identity alias of
+    `pasteSpecialCapabilityAtom`, not another state source.
 - Commands:
-  - `openPasteSpecialAtom`
-  - `closePasteSpecialAtom`
-  - `patchPasteSpecialOptionsAtom` — shallow-merge form patch.
-  - `confirmPasteSpecialAtom` — closes the dialog + resets options. The
-    host calls `backend.pasteRange` directly before invoking this,
-    mirroring how `SpreadsheetFindReplaceDialog` handles `searchRange`.
+  - `capturePasteSpecialCapabilityAtom` — captures the active backend port;
+  - `openPasteSpecialAtom` — freezes sheet, target, clipboard source, payload,
+    and default options into one session;
+  - `closePasteSpecialAtom` — invalidates the session and resets the draft;
+  - `patchPasteSpecialOptionsAtom` — updates the draft and frozen session;
+  - `confirmPasteSpecialAtom` — reserves one request, invokes `pasteRange`,
+    validates the acknowledgement, appends history, and refreshes projection.
 - Scale bound: a single dialog instance; no per-cell families.
-- Backend reads: optional `pasteRange(PasteRangeRequest)`. Host adapters
-  may implement it by composing existing `setCellInput` / `setFormatRange`
-  calls.
+- Backend port: optional `pasteRange(PasteRangeRequest)`. Absence is
+  unsupported; Core never falls back to a different write transport.
 - Per-cell atom risk: none — the dialog edits a single options object.
 - Tests: `test/paste-special.test.ts` (core), `test/vnext-paste-special.test.tsx` (host).
+
+`SpreadsheetUiProvider` captures method presence when it binds the backend.
+Mounting or unmounting `SpreadsheetPasteSpecialDialog` cannot change the
+capability.
+
+```mermaid
+flowchart LR
+  Backend["backend.pasteRange presence"] --> Provider["SpreadsheetUiProvider binding"]
+  Provider --> Capture["capturePasteSpecialCapabilityAtom"]
+  Capture --> Backing["private capability backing atom"]
+  Backing --> Readonly["pasteSpecialCapabilityAtom<br/>read-only projection"]
+  Readonly --> Alias["pasteSpecialSupportedAtom<br/>deprecated identity alias"]
+  Readonly --> Menu["Edit menu capability gate"]
+  Readonly --> Shortcut["Ctrl+Alt+V capability gate"]
+  Readonly --> Confirm["Core confirm eligibility"]
+```
+
+`Ready` and `Unsupported` below are conceptual capability/entry states. The
+stored lifecycle uses `closed`, `editing`, `blocked`, `pending`,
+`outcome-unknown`, `local-acknowledged`, `refreshing`, and `error`.
+
+```mermaid
+stateDiagram-v2
+  state "OutcomeUnknown\n(outcome-unknown)" as OutcomeUnknown
+  state "LocalAcknowledged\n(local-acknowledged)" as LocalAcknowledged
+
+  [*] --> Closed
+  Closed --> Unsupported: capability = false
+  Closed --> Ready: capability = true
+  Unsupported --> Ready: provider captures supported backend
+  Ready --> Unsupported: provider captures backend without port
+  Ready --> Editing: open with frozen valid context
+  Editing --> Pending: confirm reserves request
+  Pending --> OutcomeUnknown: transport rejection or bad ACK
+  Pending --> LocalAcknowledged: strict ACK and history append
+  LocalAcknowledged --> Refreshing: refresh projection
+  Refreshing --> Closed: refresh succeeds
+  Refreshing --> Error: refresh fails
+  Error --> Refreshing: retry refresh only
+  Editing --> Closed: cancel
+  Unsupported --> Closed: close / remain hidden
+  OutcomeUnknown --> Closed: close
+```
 
 ## Arithmetic semantics
 

@@ -9,6 +9,10 @@ strikethrough, text wrap, and indent level so the toolbar and keyboard layer
 can write these attributes through the existing `setFormatRange` backend port.
 No new backend methods are required.
 
+Implementation status (2026-07-16): the per-cell four-side projection and DOM
+overlay baseline exists, but shared physical edges do not have a frozen
+resolution policy. Feature groups #04 and #23 therefore remain **Partial**.
+
 ## Scope
 
 - **Borders**: per-side (top, right, bottom, left) with style, color, and
@@ -39,6 +43,8 @@ export type ToolbarDropdownKind = 'alignment' | 'number-format' | 'border'
 `ToolbarSurfaceId` inherits the addition automatically via union. No new atoms
 are needed — `toolbarUiStateAtom` (kind `'dropdown'`, id `'border'`) covers the
 open/closed lifecycle through the existing `openToolbarDropdownAtom` write path.
+This statement is limited to the picker lifecycle; it does not claim that a
+shared-edge derived index or resolver already exists.
 
 New `ToolbarFormatCommandKind` values for the dispatch surface:
 
@@ -153,6 +159,13 @@ and leaves top/right/left unchanged.
 fields are automatically available to renderers via the projection result with
 no changes to `readVisibleProjection` or `readRangeProjection` signatures.
 
+That projection remains per cell. The current Solid
+`SpreadsheetCellBorders` renderer receives only the current cell's four sides,
+so `A1.right` and `B1.left` produce two overlays for one physical edge. Which
+line appears on top currently depends on DOM/stacking, and a freeze seam can
+cover the data border with its divider. This is evidence of a missing
+shared-edge contract, not a winner rule.
+
 ### Keyboard
 
 Standard shortcuts dispatched through `dispatchToolbarFormatCommandAtom` (or a
@@ -173,12 +186,53 @@ clipboard doc (sibling) defines whether format metadata travels with TSV export.
 For now, `importCells` and `importCellChunks` carry only cell inputs; format
 paste is a separate feature flag that the clipboard sibling doc should address.
 
+## Shared-edge architecture decision gate
+
+Adapter-local winner policies are not an implementation contract and must not
+be used to ship different results. Conversely, this document does not
+preselect UI core as the resolver location. The architecture owner must freeze
+one cross-adapter policy, its shared pure-resolver boundary, and golden fixtures
+before implementation. Canonical projection and its ready/stale/error lifecycle
+remain Einfach-owned; Solid is a thin renderer and must not store or infer a
+second product-state source.
+
+Minimum decisions required:
+
+| Dimension | Contract the owner must freeze |
+|-----------|--------------------------------|
+| DOM owner | How one logical owner is selected for horizontal and vertical edges |
+| omitted vs `none` | Whether omission proposes nothing and whether explicit `none` vetoes the neighbour |
+| style priority | How styles/weights compare without adapter-specific ordering |
+| color | How color follows or breaks a style tie |
+| tie | Which stable canonical fact resolves a complete tie |
+| write order | Whether order participates and, if so, which durable projection metadata carries it |
+| seam/layering | How data borders relate to freeze dividers, selection and active-cell layers |
+
+None of these rows chooses an answer. In particular, mutation semantics already
+define an omitted side as "do not update" and `style: 'none'` as an explicit
+side erase, but that does not define how two adjacent canonical cell facts are
+arbitrated for display.
+
+After the policy is frozen, the first implementation slice is deliberately
+bounded to adjacent ordinary cells that are both present in the current visible
+derived index. It excludes merged cells, freeze seams, hidden rows/columns, and
+edges whose neighbouring cell is outside the window. Those exclusions require
+canonical adjacency/halo and ownership rules; the renderer must not fill the
+gap from DOM order.
+
+The state flow and decision gate are documented in
+[`04-cell-formatting.md`](../../../solid/excel/docs/online-excel-parity/04-cell-formatting.md#72-边框绘制原则):
+canonical projection enters the Einfach projection lifecycle, only a current
+`ready` result builds the bounded derived index, stale results are ignored, and
+errors retain the last authoritative projection without speculative resolving.
+The index reaches a pure resolver and single DOM owner only after the policy is
+frozen; today it takes the blocked branch.
+
 ## Risks & open questions
 
-- **Adjacent-cell border conflict**: when two cells each specify a shared edge
-  (e.g. cell A's right border and cell B's left border differ), renderers must
-  define a resolution rule (last-write wins, or priority by weight/style).
-  This must be decided per adapter; the UI core ships no merge logic.
+- **Adjacent-cell border conflict**: this is an architecture decision blocker,
+  not a renderer or per-adapter TODO. Until the decision table above is frozen,
+  the existing double-overlay result is provisional and cannot satisfy parity.
 
 - **Indent unit**: indent is specified as a non-negative integer level, not
   pixels. Renderers translate level to pixels (e.g. 8 px per level). If a
@@ -195,8 +249,10 @@ paste is a separate feature flag that the clipboard sibling doc should address.
 - **`style: 'none'` vs omitting borders**: `SpreadsheetBorderSpec` with
   `style: 'none'` is an explicit "erase this side" signal, distinct from
   omitting the key (leave it). Adapters must honour this distinction; the
-  partial-update semantics table above makes it explicit, but adapters need
-  guard tests.
+  partial-update semantics table above makes it explicit, but its effect when
+  the neighbour proposes a visible shared edge remains part of the blocked
+  decision table. Adapters need mutation guard tests without inventing render
+  arbitration.
 
 - **Underline and strikethrough rendering**: these are CSS text-decoration
   properties in DOM renderers, but canvas renderers must draw them manually.
@@ -229,4 +285,6 @@ Scope:
   `selectionKind === 'cell'` and `editingMode !== 'drafting'`.
 
 No backend adapter tests here — those live in `test/backend*.test.ts` and are
-owned by the host adapter implementations.
+owned by the host adapter implementations. These type/toolbar tests do not
+prove shared-edge parity; once the policy is frozen, one golden resolver fixture
+must run across static/worker projections and the Solid single-owner renderer.

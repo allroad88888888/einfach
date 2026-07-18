@@ -30,15 +30,25 @@ token (e.g. `)`, Enter, Escape).
 
 ## State (UI core)
 
-### Source atoms
+### Private backing and public read-only state
 
 ```ts
-// The single active picking session; null when mode is inactive.
-export const formulaReferenceSessionAtom = atom<FormulaReferenceSession | null>(null)
+const formulaReferenceSessionBackingAtom = atom<FormulaReferenceSession | null>(null)
+
+// The single active picking session; null when mode is inactive. Consumers can
+// observe it but cannot use it as a Store.setter target.
+export const formulaReferenceSessionAtom: Atom<FormulaReferenceSession | null> = atom((get) =>
+  get(formulaReferenceSessionBackingAtom),
+)
 formulaReferenceSessionAtom.debugLabel = 'spreadsheet.formulaReference.session'
 
+const formulaReferenceCaretBackingAtom = atom<number>(-1)
+
 // Caret index inside the current draft string; -1 means unknown / not tracked.
-export const formulaReferenceCaretAtom = atom<number>(-1)
+// This is also a public read-only projection.
+export const formulaReferenceCaretAtom: Atom<number> = atom((get) =>
+  get(formulaReferenceCaretBackingAtom),
+)
 formulaReferenceCaretAtom.debugLabel = 'spreadsheet.formulaReference.caret'
 ```
 
@@ -46,9 +56,7 @@ formulaReferenceCaretAtom.debugLabel = 'spreadsheet.formulaReference.caret'
 
 ```ts
 // True only while a session is live.
-export const formulaReferenceActiveAtom = atom(
-  (get) => get(formulaReferenceSessionAtom) !== null,
-)
+export const formulaReferenceActiveAtom = atom((get) => get(formulaReferenceSessionAtom) !== null)
 formulaReferenceActiveAtom.debugLabel = 'spreadsheet.formulaReference.active'
 
 // The pending token character range in the draft (start inclusive, end exclusive).
@@ -62,6 +70,13 @@ formulaReferenceTokenRangeAtom.debugLabel = 'spreadsheet.formulaReference.tokenR
 ### Command atoms
 
 ```ts
+// Sync the host DOM caret through a command; writes the private caret backing.
+export const setFormulaReferenceCaretAtom: WritableAtom<null, [number], void> = atom(
+  null,
+  (_get, set, caret: number) => set(formulaReferenceCaretBackingAtom, caret),
+)
+setFormulaReferenceCaretAtom.debugLabel = 'spreadsheet.formulaReference.setCaret'
+
 // Enter picking mode. Captures the anchor cell and insertion caret.
 export const enterFormulaReferenceAtom = atom(
   null,
@@ -76,7 +91,8 @@ export const pickFormulaReferenceAtom = atom(
 )
 pickFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.pick'
 
-// Commit the token and exit picking mode; resume normal editing.
+// Exit picking mode through the private session backing and restore keyboard
+// mode to editing while a draft is active, otherwise to navigation.
 export const exitFormulaReferenceAtom = atom(
   null,
   (get, set, reason: FormulaReferenceExitReason) => { ... },
@@ -85,6 +101,20 @@ exitFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.exit'
 ```
 
 Scale bound: one session object, one caret index. No per-cell atoms.
+
+```mermaid
+flowchart LR
+  DOM["DOM caret / selectionchange"] --> SetCaret["setFormulaReferenceCaretAtom"]
+  SetCaret --> CaretBacking["private caret backing atom"]
+  CaretBacking --> Caret["formulaReferenceCaretAtom (read-only)"]
+  Caret --> FormulaDerived["formula suggestions / signature"]
+
+  EnterPick["enter / pick commands"] --> SessionBacking["private session backing atom"]
+  SessionBacking --> Session["formulaReferenceSessionAtom (read-only)"]
+  Session --> SessionDerived["active / tokenRange"]
+  Exit["exitFormulaReferenceAtom(reason)"] --> SessionBacking
+  Exit --> Keyboard["keyboardModeAtom = editing | navigation"]
+```
 
 ## Types
 
@@ -174,12 +204,13 @@ with the freshly-serialised A1 token, updating `tokenRange.end` to
 `start + token.length`. The editing session status stays `'drafting'`
 throughout; only the draft string changes.
 
-**Formula-bar** — The formula-bar draft mirrors `editingSessionAtom.draft`
-already. No special formula-reference wiring is needed provided editing's draft
-update flows through the existing `syncFormulaBarAtom` or `formulaBarDraftAtom`
-path. The formula-bar should visually highlight `[tokenRange.start, tokenRange.end)`
-but that is a rendering concern for the host adapter; the token range is
-available from `formulaReferenceTokenRangeAtom`.
+**Formula-bar** — The formula-bar draft mirrors `editingSessionAtom.draft`.
+Its DOM selection events dispatch `setFormulaReferenceCaretAtom`; the host must
+not write `formulaReferenceCaretAtom` directly. Draft updates still flow through
+the existing editing command path. The formula-bar should visually highlight
+`[tokenRange.start, tokenRange.end)`, but that is a rendering concern for the
+host adapter; the token range is available from
+`formulaReferenceTokenRangeAtom`.
 
 **Pointer** — Pointer-down enters drag mode (`dragging: true`). Pointer-move
 updates `pickFocus` while keeping `pickAnchor` fixed, emitting intermediate pick
@@ -198,11 +229,12 @@ Entry from `editing` to `formula-reference` fires when **all** of:
    `/`, `^`, `&`, `(`, `,`, `<`, `>`, `%`
 3. The character at `caret` is either end-of-string or a closing character (`)`)
 
-Condition 2 is the minimal trigger predicate. A host adapter syncs the DOM
-caret index into `formulaReferenceCaretAtom` on every `selectionchange` event;
-UI core re-evaluates the predicate on each caret update and enters/exits the
-mode automatically. UI core owns the caret index as an atom; the host adapter
-is responsible only for pushing the raw DOM caret position.
+Condition 2 is the minimal trigger predicate. A host adapter dispatches the DOM
+caret index to `setFormulaReferenceCaretAtom` on every `selectionchange` event;
+the command writes the private backing atom and the public
+`formulaReferenceCaretAtom` projection updates. The Solid host adapter's
+`syncFormulaReferenceCaret` then evaluates the UI-core pure predicate and
+dispatches `enterFormulaReferenceAtom` when it matches.
 
 ## Risks & open questions
 
@@ -241,7 +273,11 @@ is responsible only for pushing the raw DOM caret position.
 enterFormulaReferenceAtom
   - sets session with correct anchorCell and insertionCaret
   - sets formulaReferenceActiveAtom to true
+  - sets keyboardModeAtom to formula-reference
   - does not alter editingSessionAtom.status
+
+setFormulaReferenceCaretAtom
+  - updates the public read-only caret state through its command
 
 pickFormulaReferenceAtom (single cell)
   - inserts A1 token at insertion caret when no prior tokenRange
@@ -256,6 +292,7 @@ pickFormulaReferenceAtom (range / drag)
 exitFormulaReferenceAtom
   - clears session (null)
   - sets formulaReferenceActiveAtom to false
+  - restores editing keyboard mode while the draft remains active
   - leaves editingSessionAtom.draft unchanged (token already spliced)
 
 trigger predicate helper

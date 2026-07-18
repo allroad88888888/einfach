@@ -1,19 +1,49 @@
-import { describe, expect, test } from '@jest/globals'
+import { describe, expect, jest, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   closeFormatCellsAtom,
   formatCellsActiveTabAtom,
   formatCellsDraftAtom,
   formatCellsEditorAtom,
+  formatCellsSaveBlockedAtom,
+  formatCellsSaveLedgerAtom,
   formatCellsSavePayloadAtom,
   openFormatCellsAtom,
   patchFormatCellsDraftAtom,
+  runFormatCellsSaveAtom,
   saveFormatCellsAtom,
   setFormatCellsActiveTabAtom,
+  type CellRange,
   type FormatCellsDraft,
+  type RunFormatCellsSaveInput,
 } from '../src/format-cells'
 
 const RANGE = { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 }
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
+function successfulPorts(
+  overrides: Partial<RunFormatCellsSaveInput> = {},
+): RunFormatCellsSaveInput {
+  return {
+    resolveSourceRanges: (_sheetId, range) => [range],
+    setFormatRange: (request) => ({
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      affectedRange: request.range,
+    }),
+    refreshProjection: () => undefined,
+    ...overrides,
+  }
+}
 
 describe('format-cells atoms', () => {
   test('initial state is closed and derived atoms expose safe defaults', () => {
@@ -149,14 +179,14 @@ describe('format-cells atoms', () => {
     expect(store.getter(formatCellsDraftAtom)).toBeNull()
   })
 
-  test('saveFormatCellsAtom closes the editor', () => {
+  test('saveFormatCellsAtom delegates to the guarded save lifecycle', async () => {
     const store = createStore()
     store.setter(openFormatCellsAtom, {
       sheetId: 'sheet-1',
       range: RANGE,
     })
 
-    store.setter(saveFormatCellsAtom)
+    await store.setter(saveFormatCellsAtom, successfulPorts())
     expect(store.getter(formatCellsEditorAtom)).toEqual({ status: 'closed' })
   })
 
@@ -194,10 +224,257 @@ describe('format-cells atoms', () => {
     expect(openFormatCellsAtom.debugLabel).toBe('spreadsheet.formatCells.open')
     expect(closeFormatCellsAtom.debugLabel).toBe('spreadsheet.formatCells.close')
     expect(saveFormatCellsAtom.debugLabel).toBe('spreadsheet.formatCells.save')
-    expect(setFormatCellsActiveTabAtom.debugLabel).toBe(
-      'spreadsheet.formatCells.setActiveTab',
-    )
+    expect(setFormatCellsActiveTabAtom.debugLabel).toBe('spreadsheet.formatCells.setActiveTab')
     expect(patchFormatCellsDraftAtom.debugLabel).toBe('spreadsheet.formatCells.patchDraft')
     expect(formatCellsSavePayloadAtom.debugLabel).toBe('spreadsheet.formatCells.savePayload')
+  })
+})
+
+describe('format-cells Core-owned save lifecycle', () => {
+  test('publishes pending before the port, fans out source ranges, refreshes, then records only a local acknowledgement', async () => {
+    const store = createStore()
+    const sourceRanges: readonly CellRange[] = [
+      { rowStart: 8, rowEnd: 8, colStart: 0, colEnd: 0 },
+      { rowStart: 3, rowEnd: 3, colStart: 0, colEnd: 0 },
+    ]
+    const calls: string[] = []
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+      initialFormat: { bold: true },
+    })
+
+    const result = await store.setter(
+      runFormatCellsSaveAtom,
+      successfulPorts({
+        resolveSourceRanges: () => sourceRanges,
+        setFormatRange: (request) => {
+          const state = store.getter(formatCellsEditorAtom)
+          expect(state.status).toBe('open')
+          if (state.status !== 'open') throw new Error('unreachable')
+          expect(state.phase).toBe('pending-published')
+          expect(state.pending).toBe(true)
+          calls.push(`set:${request.range.rowStart}`)
+          return {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            affectedRange: request.range,
+          }
+        },
+        refreshProjection: () => calls.push('refresh'),
+      }),
+    )
+
+    expect(result).toBe('local-acknowledged')
+    expect(calls).toEqual(['set:8', 'set:3', 'refresh'])
+    expect(store.getter(formatCellsEditorAtom)).toEqual({ status: 'closed' })
+    expect(store.getter(formatCellsSaveLedgerAtom)).toMatchObject([
+      { status: 'local-acknowledged', sheetId: 'sheet-1', range: RANGE },
+    ])
+    expect(store.getter(formatCellsSaveLedgerAtom).map((attempt) => attempt.status)).not.toContain(
+      'applied',
+    )
+  })
+
+  test.each([
+    [
+      'throws',
+      () => {
+        throw new Error('projection map unavailable')
+      },
+    ],
+    ['returns an empty list', () => []],
+    ['returns an invalid range', () => [{ rowStart: -1, rowEnd: 0, colStart: 0, colEnd: 0 }]],
+  ])(
+    'keeps a retryable ErrorOpen when source-range resolution %s before the write boundary',
+    async (_label, resolver) => {
+      const store = createStore()
+      const setFormatRange = jest.fn()
+      store.setter(openFormatCellsAtom, {
+        sheetId: 'sheet-1',
+        range: RANGE,
+        initialFormat: { italic: true },
+      })
+
+      await expect(
+        store.setter(
+          runFormatCellsSaveAtom,
+          successfulPorts({ resolveSourceRanges: resolver, setFormatRange }),
+        ),
+      ).resolves.toBe('error-open')
+
+      const state = store.getter(formatCellsEditorAtom)
+      expect(state.status).toBe('open')
+      if (state.status !== 'open') throw new Error('unreachable')
+      expect(state).toMatchObject({
+        phase: 'error-open',
+        pending: false,
+        requestId: null,
+        draft: { italic: true },
+      })
+      expect(setFormatRange).not.toHaveBeenCalled()
+      expect(store.getter(formatCellsSaveLedgerAtom)).toEqual([])
+      expect(store.getter(formatCellsSaveBlockedAtom)).toBe(false)
+
+      await expect(store.setter(runFormatCellsSaveAtom, successfulPorts())).resolves.toBe(
+        'local-acknowledged',
+      )
+    },
+  )
+
+  test('treats synchronous reentry and timeout before the first write as deterministic ErrorOpen', async () => {
+    const store = createStore()
+    const never = deferred<readonly CellRange[]>()
+    store.setter(openFormatCellsAtom, { sheetId: 'sheet-1', range: RANGE })
+
+    let reentrantPorts!: RunFormatCellsSaveInput
+    reentrantPorts = successfulPorts({
+      resolveSourceRanges: () => {
+        void store.setter(runFormatCellsSaveAtom, reentrantPorts)
+        return [RANGE]
+      },
+    })
+    await expect(store.setter(runFormatCellsSaveAtom, reentrantPorts)).resolves.toBe('error-open')
+    expect(store.getter(formatCellsSaveLedgerAtom)).toEqual([])
+    expect(store.getter(formatCellsSaveBlockedAtom)).toBe(false)
+
+    await expect(
+      store.setter(
+        runFormatCellsSaveAtom,
+        successfulPorts({ resolveSourceRanges: () => never.promise, timeoutMs: 1 }),
+      ),
+    ).resolves.toBe('error-open')
+    expect(store.getter(formatCellsSaveLedgerAtom)).toEqual([])
+    expect(store.getter(formatCellsSaveBlockedAtom)).toBe(false)
+  })
+
+  test.each([
+    [
+      'synchronous provider throw',
+      successfulPorts({
+        setFormatRange: () => {
+          throw new Error('provider threw after launch')
+        },
+      }),
+    ],
+    [
+      'provider rejection',
+      successfulPorts({
+        setFormatRange: () => Promise.reject(new Error('provider rejected after launch')),
+      }),
+    ],
+    [
+      'provider timeout',
+      successfulPorts({
+        setFormatRange: () => new Promise<never>(() => undefined),
+        timeoutMs: 1,
+      }),
+    ],
+    [
+      'mismatched acknowledgement',
+      successfulPorts({
+        setFormatRange: (request) => ({
+          sheetId: request.sheetId,
+          requestId: request.requestId + 1,
+          affectedRange: request.range,
+        }),
+      }),
+    ],
+    [
+      'projection refresh failure',
+      successfulPorts({ refreshProjection: () => Promise.reject(new Error('refresh failed')) }),
+    ],
+  ])('blocks with OutcomeUnknown after the write boundary on %s', async (_label, ports) => {
+    const store = createStore()
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-1',
+      range: RANGE,
+      initialFormat: { bold: true },
+    })
+
+    await expect(store.setter(runFormatCellsSaveAtom, ports)).resolves.toBe('outcome-unknown')
+    const state = store.getter(formatCellsEditorAtom)
+    expect(state.status).toBe('open')
+    if (state.status !== 'open') throw new Error('unreachable')
+    expect(state).toMatchObject({
+      phase: 'outcome-unknown-blocked',
+      pending: false,
+      draft: { bold: true },
+    })
+    expect(store.getter(formatCellsSaveLedgerAtom)).toMatchObject([{ status: 'outcome-unknown' }])
+    expect(store.getter(formatCellsSaveBlockedAtom)).toBe(true)
+    await expect(store.setter(runFormatCellsSaveAtom, successfulPorts())).resolves.toBe('blocked')
+  })
+
+  test('blocks an ordinary double save without poisoning the first save', async () => {
+    const store = createStore()
+    const pendingAck = deferred<unknown>()
+    let requestSnapshot: { sheetId: string; requestId: number; affectedRange: CellRange } | null =
+      null
+    store.setter(openFormatCellsAtom, { sheetId: 'sheet-1', range: RANGE })
+    const ports = successfulPorts({
+      setFormatRange: (request) => {
+        requestSnapshot = {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          affectedRange: request.range,
+        }
+        return pendingAck.promise
+      },
+    })
+
+    const first = store.setter(runFormatCellsSaveAtom, ports)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(requestSnapshot).not.toBeNull()
+    await expect(store.setter(runFormatCellsSaveAtom, ports)).resolves.toBe('blocked')
+    pendingAck.resolve(requestSnapshot)
+    await expect(first).resolves.toBe('local-acknowledged')
+    expect(store.getter(formatCellsEditorAtom)).toEqual({ status: 'closed' })
+  })
+
+  test('late settlement cannot close or overwrite a reopened session', async () => {
+    const store = createStore()
+    const pendingAck = deferred<unknown>()
+    let acknowledgement: unknown
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-old',
+      range: RANGE,
+      initialFormat: { bold: true },
+    })
+    const first = store.setter(
+      runFormatCellsSaveAtom,
+      successfulPorts({
+        setFormatRange: (request) => {
+          acknowledgement = {
+            sheetId: request.sheetId,
+            requestId: request.requestId,
+            affectedRange: request.range,
+          }
+          return pendingAck.promise
+        },
+      }),
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    store.setter(closeFormatCellsAtom)
+    store.setter(openFormatCellsAtom, {
+      sheetId: 'sheet-new',
+      range: { rowStart: 4, rowEnd: 4, colStart: 1, colEnd: 1 },
+      initialFormat: { italic: true },
+    })
+    pendingAck.resolve(acknowledgement)
+    await expect(first).resolves.toBe('outcome-unknown')
+
+    const reopened = store.getter(formatCellsEditorAtom)
+    expect(reopened.status).toBe('open')
+    if (reopened.status !== 'open') throw new Error('unreachable')
+    expect(reopened).toMatchObject({
+      sheetId: 'sheet-new',
+      phase: 'editing',
+      pending: false,
+      draft: { italic: true },
+    })
   })
 })

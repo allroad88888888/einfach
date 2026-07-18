@@ -1,4 +1,4 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import type {
   ClipboardIntent,
@@ -162,22 +162,33 @@ function parseA1Coord(addr: string): CellCoord | null {
 
 function mapFormulaRefs(
   formula: string,
-  mapRef: (row: number, col: number) => { row: number; col: number } | null,
+  mapRef: (
+    row: number,
+    col: number,
+    anchors: { rowAbsolute: boolean; colAbsolute: boolean },
+  ) => { row: number; col: number } | null,
 ): string {
   const rewriteSegment = (segment: string): string => {
-    const refPattern = /(?:([A-Za-z_][A-Za-z0-9_]*)!)?([A-Za-z]+)(\d+)/g
-    return segment.replace(refPattern, (full, sheetName, letters, digits) => {
-      // name tokens (no trailing digits) bypass the rewriter
-      if (!digits || digits.length === 0) return full
-      const coord = parseFormulaRefCoord(letters, digits)
-      if (!coord) return full
+    const refPattern = /(?:([A-Za-z_][A-Za-z0-9_]*)!)?(\$?)([A-Za-z]+)(\$?)(\d+)/g
+    return segment.replace(
+      refPattern,
+      (full, sheetName, colAnchor, letters, rowAnchor, digits) => {
+        // name tokens (no trailing digits) bypass the rewriter
+        if (!digits || digits.length === 0) return full
+        const coord = parseFormulaRefCoord(letters, digits)
+        if (!coord) return full
 
-      const moved = mapRef(coord.row, coord.col)
-      if (moved === null || moved.row < 0 || moved.col < 0) return '#REF!'
+        const moved = mapRef(coord.row, coord.col, {
+          rowAbsolute: rowAnchor === '$',
+          colAbsolute: colAnchor === '$',
+        })
+        if (moved === null || moved.row < 0 || moved.col < 0) return '#REF!'
 
-      const nextAddr = `${indexToColumnLabel(moved.col)}${moved.row + 1}`
-      return sheetName ? `${sheetName}!${nextAddr}` : nextAddr
-    })
+        const nextAddr =
+          `${colAnchor}${indexToColumnLabel(moved.col)}${rowAnchor}${moved.row + 1}`
+        return sheetName ? `${sheetName}!${nextAddr}` : nextAddr
+      },
+    )
   }
 
   let output = ''
@@ -209,7 +220,10 @@ function mapFormulaRefs(
 }
 
 export function shiftFormulaRefs(formula: string, drow: number, dcol: number): string {
-  return mapFormulaRefs(formula, (row, col) => ({ row: row + drow, col: col + dcol }))
+  return mapFormulaRefs(formula, (row, col, anchors) => ({
+    row: anchors.rowAbsolute ? row : row + drow,
+    col: anchors.colAbsolute ? col : col + dcol,
+  }))
 }
 
 function normalizeRowsPerChunk(rowsPerChunk: number | undefined): number {
@@ -519,67 +533,80 @@ export function clearClipboardState(): ClipboardState {
   return createClipboardState()
 }
 
-export const clipboardStateAtom = atom<ClipboardState>(createClipboardState())
+const clipboardStateBackingAtom = atom<ClipboardState>(createClipboardState())
+clipboardStateBackingAtom.debugLabel = 'spreadsheet.clipboard.stateBacking'
+
+export const clipboardStateAtom: Atom<ClipboardState> = atom((get) =>
+  get(clipboardStateBackingAtom),
+)
 clipboardStateAtom.debugLabel = 'spreadsheet.clipboard.state'
 
-export const clipboardIntentAtom = atom<ClipboardIntent | null>(null)
+const clipboardIntentBackingAtom = atom<ClipboardIntent | null>(null)
+clipboardIntentBackingAtom.debugLabel = 'spreadsheet.clipboard.intentBacking'
+
+export const clipboardIntentAtom: Atom<ClipboardIntent | null> = atom((get) =>
+  get(clipboardIntentBackingAtom),
+)
 clipboardIntentAtom.debugLabel = 'spreadsheet.clipboard.intent'
 
 export const copyClipboardAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (get, set, input: ClipboardTransferInput) => {
-    const nextState = copyClipboardState(get(clipboardStateAtom), input)
-    set(clipboardStateAtom, nextState)
-    set(clipboardIntentAtom, nextState.intent)
+    const nextState = copyClipboardState(get(clipboardStateBackingAtom), input)
+    set(clipboardStateBackingAtom, nextState)
+    set(clipboardIntentBackingAtom, nextState.intent)
     return nextState.intent
   },
 )
 copyClipboardAtom.debugLabel = 'spreadsheet.clipboard.copy'
 
 export const cutClipboardAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (get, set, input: ClipboardTransferInput) => {
-    const nextState = cutClipboardState(get(clipboardStateAtom), input)
-    set(clipboardStateAtom, nextState)
-    set(clipboardIntentAtom, nextState.intent)
+    const nextState = cutClipboardState(get(clipboardStateBackingAtom), input)
+    set(clipboardStateBackingAtom, nextState)
+    set(clipboardIntentBackingAtom, nextState.intent)
     return nextState.intent
   },
 )
 cutClipboardAtom.debugLabel = 'spreadsheet.clipboard.cut'
 
 export const pasteClipboardAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (get, set, input: ClipboardTransferInput) => {
-    const nextState = pasteClipboardState(get(clipboardStateAtom), input)
-    set(clipboardStateAtom, nextState)
-    set(clipboardIntentAtom, nextState.intent)
+    const nextState = pasteClipboardState(get(clipboardStateBackingAtom), input)
+    set(clipboardStateBackingAtom, nextState)
+    set(clipboardIntentBackingAtom, nextState.intent)
     return nextState.intent
   },
 )
 pasteClipboardAtom.debugLabel = 'spreadsheet.clipboard.paste'
 
 export const clearClipboardAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (_get, set) => {
-    set(clipboardStateAtom, clearClipboardState())
-    set(clipboardIntentAtom, null)
+    set(clipboardStateBackingAtom, clearClipboardState())
+    set(clipboardIntentBackingAtom, null)
   },
 )
 clearClipboardAtom.debugLabel = 'spreadsheet.clipboard.clear'
 
 export const markClipboardReadyAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (get, set) => {
-    set(clipboardStateAtom, markClipboardReadyState(get(clipboardStateAtom)))
+    set(
+      clipboardStateBackingAtom,
+      markClipboardReadyState(get(clipboardStateBackingAtom)),
+    )
   },
 )
 markClipboardReadyAtom.debugLabel = 'spreadsheet.clipboard.ready'
 
 export const setClipboardErrorAtom = atom(
-  (get) => get(clipboardStateAtom),
+  (get) => get(clipboardStateBackingAtom),
   (get, set, error: ClipboardState['error']) => {
-    const nextState = setClipboardErrorState(get(clipboardStateAtom), error)
-    set(clipboardStateAtom, nextState)
+    const nextState = setClipboardErrorState(get(clipboardStateBackingAtom), error)
+    set(clipboardStateBackingAtom, nextState)
     return nextState
   },
 )

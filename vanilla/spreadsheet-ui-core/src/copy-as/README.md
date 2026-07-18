@@ -17,16 +17,16 @@ strings.
 
 ## State Decision Template
 
-- Source atoms:
-  - `lastCopyAsAtom`: `CopyAsResult | null`. Solid host writes the last
-    successful clipboard payload here; tests and the diagnostics overlay
-    read it. `null` until the first copy-as in the session.
-- Derived atoms: none. The encoders are pure functions exported alongside
-  the atom; downstream callers can wire any derivation they need on top.
-- Commands: none in core. The Solid host owns the `Ctrl+Shift+C` intent,
-  the clipboard write, and the `set(lastCopyAsAtom, …)` snapshot.
-- Scale bound: a single atom holding the most recent snapshot; no per-cell
-  or per-range families. The snapshot is overwritten on every copy.
+- Source atoms: private Core backing atoms hold the latest successful result
+  and user-visible status.
+- Derived atoms: `lastCopyAsAtom` and `copyAsErrorAtom` are read-only public
+  projections consumed by tests, diagnostics, and status surfaces.
+- Commands: hosts publish successful payloads through
+  `publishCopyAsResultAtom` and report or clear status through
+  `reportCopyAsStatusAtom`. A total failure updates only status and preserves
+  the previous successful result.
+- Scale bound: one latest-result snapshot plus one small status value; no
+  per-cell or per-range families. The result is replaced on each success.
 - Backend reads: none. Copy-as consumes the `DisplayCell[]` the host has
   already projected for the rectangle (typically via
   `readRangeProjection` with `reason: 'clipboard'`).
@@ -139,10 +139,25 @@ omitted — only the true anchor carries style.
 ## Atom contract
 
 ```ts
-export const lastCopyAsAtom: WritableAtom<CopyAsResult | null, [CopyAsResult | null], void>
+export const lastCopyAsAtom: Atom<CopyAsResult | null>
+export const copyAsErrorAtom: Atom<CopyAsError | null>
+export const publishCopyAsResultAtom: WritableAtom<null, [CopyAsResult], void>
+export const reportCopyAsStatusAtom: WritableAtom<null, [CopyAsError | null], void>
 // debugLabel = 'spreadsheet.copyAs.last'
 ```
 
-Single source atom. Hosts overwrite this after each successful clipboard
-write so e2e suites can assert on the payload triple without reaching
-into the system clipboard.
+Core owns both private backing atoms. Hosts can only write through typed
+commands; public consumers receive read-only projections. PNG publishes its
+snapshot before attempting the system clipboard. Any later clipboard failure
+reports degraded status without clearing that snapshot.
+
+```mermaid
+flowchart LR
+  H[Host result or clipboard outcome] --> C{Core typed command}
+  C -->|publishCopyAsResultAtom| R[private result backing]
+  C -->|reportCopyAsStatusAtom| E[private status backing]
+  R --> RP[readonly lastCopyAsAtom]
+  E --> EP[readonly copyAsErrorAtom]
+  F[Total failure] --> E
+  F -. preserves previous result .-> R
+```

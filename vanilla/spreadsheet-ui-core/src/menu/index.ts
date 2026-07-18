@@ -1,5 +1,21 @@
 import { atom } from '@einfach/core'
-import type { Getter, Setter } from '@einfach/core'
+import type { Atom, Getter, Setter } from '@einfach/core'
+import { selectionRegionsAtom, selectionSnapshotAtom } from '../selection'
+import {
+  runViewportHiddenMutationAtom,
+  runViewportHiddenSelectionMutationAtom,
+  viewportHiddenAtom,
+  viewportHiddenLifecycleAtom,
+  viewportHiddenProjectionAuthorityAtom,
+} from '../viewport'
+import type {
+  ViewportHiddenCommandOutcome,
+  ViewportHiddenControllerPort,
+  ViewportHiddenLifecycleStatus,
+  ViewportHiddenMutationAction,
+  ViewportHiddenProjectionAuthorityState,
+  ViewportHiddenState,
+} from '../viewport'
 import type {
   MenuCloseIntent,
   MenuCloseReason,
@@ -14,6 +30,7 @@ import type {
   MenuRangeTarget,
   MenuTarget,
   MenuTargetKind,
+  ViewportHiddenContextMenuCommandKind,
 } from './types'
 
 export * from './types'
@@ -26,10 +43,16 @@ const DEFAULT_MENU_STATE: MenuState = {
   highlightedCommand: null,
 }
 
-export const menuStateAtom = atom<MenuState>(DEFAULT_MENU_STATE)
+const menuStateBackingAtom = atom<MenuState>(DEFAULT_MENU_STATE)
+menuStateBackingAtom.debugLabel = 'spreadsheet.menu.stateBacking'
+
+export const menuStateAtom: Atom<MenuState> = atom((get) => get(menuStateBackingAtom))
 menuStateAtom.debugLabel = 'spreadsheet.menu.state'
 
-export const menuIntentAtom = atom<MenuIntent | null>(null)
+const menuIntentBackingAtom = atom<MenuIntent | null>(null)
+menuIntentBackingAtom.debugLabel = 'spreadsheet.menu.intentBacking'
+
+export const menuIntentAtom: Atom<MenuIntent | null> = atom((get) => get(menuIntentBackingAtom))
 menuIntentAtom.debugLabel = 'spreadsheet.menu.intent'
 
 export const menuOpenAtom = atom((get) => get(menuStateAtom).status === 'open')
@@ -144,9 +167,9 @@ function commitMenuIntent(
   set: Setter,
   intent: MenuIntent,
 ): MenuState {
-  const nextState = applyMenuIntent(get(menuStateAtom), intent)
-  set(menuStateAtom, nextState)
-  set(menuIntentAtom, intent)
+  const nextState = applyMenuIntent(get(menuStateBackingAtom), intent)
+  set(menuStateBackingAtom, nextState)
+  set(menuIntentBackingAtom, intent)
   return nextState
 }
 
@@ -206,7 +229,7 @@ export const dispatchMenuCommandAtom = atom(
       return null
     }
 
-    set(menuIntentAtom, intent)
+    set(menuIntentBackingAtom, intent)
     return intent
   },
 )
@@ -215,10 +238,306 @@ dispatchMenuCommandAtom.debugLabel = 'spreadsheet.menu.command'
 export const clearMenuIntentAtom = atom(
   (get) => get(menuIntentAtom),
   (_get, set) => {
-    set(menuIntentAtom, null)
+    set(menuIntentBackingAtom, null)
   },
 )
 clearMenuIntentAtom.debugLabel = 'spreadsheet.menu.clearIntent'
+
+export interface RunViewportHiddenContextMenuCommandInput {
+  readonly source: ViewportHiddenControllerPort
+  readonly command: ViewportHiddenContextMenuCommandKind
+}
+
+export type ViewportHiddenContextMenuCommandAvailability = (
+  source: ViewportHiddenControllerPort,
+  command: ViewportHiddenContextMenuCommandKind,
+) => boolean
+
+type ResolvedViewportHiddenContextMenuCommand = Readonly<{
+  action: ViewportHiddenMutationAction
+  sheetId: string
+  targetIndex: number
+  selectionStart: number
+  selectionEnd: number
+}>
+
+const ACTIVE_VIEWPORT_HIDDEN_LIFECYCLE_STATUSES: readonly ViewportHiddenLifecycleStatus[] = [
+  'pending',
+  'local-acknowledged',
+  'canonical-reading',
+]
+
+export function isViewportHiddenContextMenuCommand(
+  command: unknown,
+): command is ViewportHiddenContextMenuCommandKind {
+  return (
+    command === 'row.hide' ||
+    command === 'row.unhide' ||
+    command === 'column.hide' ||
+    command === 'column.unhide'
+  )
+}
+
+function viewportHiddenActionForContextMenuCommand(
+  command: ViewportHiddenContextMenuCommandKind,
+): ViewportHiddenMutationAction {
+  switch (command) {
+    case 'row.hide':
+      return 'hide-rows'
+    case 'row.unhide':
+      return 'unhide-rows'
+    case 'column.hide':
+      return 'hide-columns'
+    case 'column.unhide':
+      return 'unhide-columns'
+  }
+}
+
+function supportsViewportHiddenContextMenuCommand(
+  source: ViewportHiddenControllerPort,
+  action: ViewportHiddenMutationAction,
+): boolean {
+  if (!source || typeof source.readViewportSizeProjection !== 'function') return false
+
+  switch (action) {
+    case 'hide-rows':
+      return typeof source.hideRows === 'function'
+    case 'unhide-rows':
+      return typeof source.unhideRows === 'function'
+    case 'hide-columns':
+      return typeof source.hideColumns === 'function'
+    case 'unhide-columns':
+      return typeof source.unhideColumns === 'function'
+  }
+}
+
+function isViewportHiddenLifecycleBlocked(status: ViewportHiddenLifecycleStatus): boolean {
+  return (
+    status === 'recovery-required' ||
+    ACTIVE_VIEWPORT_HIDDEN_LIFECYCLE_STATUSES.includes(status)
+  )
+}
+
+function resolveViewportHiddenContextMenuCommand(
+  get: Getter,
+  command: ViewportHiddenContextMenuCommandKind,
+): ResolvedViewportHiddenContextMenuCommand | null {
+  const state = get(menuStateAtom)
+  const target = state.target
+  const regions = get(selectionRegionsAtom)
+  const snapshot = get(selectionSnapshotAtom)
+  const selectsRows = command === 'row.hide' || command === 'row.unhide'
+
+  if (
+    state.status !== 'open' ||
+    (state.surface !== 'header' && state.surface !== 'context') ||
+    regions.length !== 1 ||
+    !target ||
+    target.sheetId !== snapshot.selection.sheetId ||
+    regions[0]?.sheetId !== snapshot.selection.sheetId ||
+    snapshot.selection.kind !== (selectsRows ? 'row' : 'column') ||
+    target.kind !== (selectsRows ? 'row' : 'column')
+  ) {
+    return null
+  }
+
+  const targetIndex = target.kind === 'row' ? target.rowIndex : target.colIndex
+  const selectionStart = selectsRows ? snapshot.range.rowStart : snapshot.range.colStart
+  const selectionEnd = selectsRows ? snapshot.range.rowEnd : snapshot.range.colEnd
+  if (targetIndex < selectionStart || targetIndex > selectionEnd) return null
+
+  return Object.freeze({
+    action: viewportHiddenActionForContextMenuCommand(command),
+    sheetId: target.sheetId,
+    targetIndex,
+    selectionStart,
+    selectionEnd,
+  })
+}
+
+function createSelectedAxisIndices(start: number, end: number): readonly number[] {
+  const indices: number[] = []
+  for (let index = start; index <= end; index += 1) {
+    indices.push(index)
+  }
+  return Object.freeze(indices)
+}
+
+function resolvedViewportHiddenContextMenuCommandIsAvailable(
+  resolution: ResolvedViewportHiddenContextMenuCommand | null,
+  source: ViewportHiddenControllerPort,
+  lifecycleStatus: ViewportHiddenLifecycleStatus,
+  authority: ViewportHiddenProjectionAuthorityState,
+  hidden: ViewportHiddenState,
+): boolean {
+  if (
+    resolution === null ||
+    !supportsViewportHiddenContextMenuCommand(source, resolution.action) ||
+    isViewportHiddenLifecycleBlocked(lifecycleStatus)
+  ) {
+    return false
+  }
+
+  if (resolution.action === 'hide-rows' || resolution.action === 'hide-columns') return true
+
+  const authorityWindow = authority.window
+  if (
+    !authority.ready ||
+    authority.source !== source ||
+    authority.sheetId !== resolution.sheetId ||
+    authority.revision === null ||
+    authorityWindow === null
+  ) {
+    return false
+  }
+
+  const authorityStart =
+    resolution.action === 'unhide-rows' ? authorityWindow.rowStart : authorityWindow.colStart
+  const authorityEnd =
+    resolution.action === 'unhide-rows' ? authorityWindow.rowEnd : authorityWindow.colEnd
+  if (authorityStart > resolution.selectionStart || authorityEnd < resolution.selectionEnd) {
+    return false
+  }
+
+  const hiddenIndices =
+    resolution.action === 'unhide-rows'
+      ? (hidden.rowsBySheet[resolution.sheetId] ?? [])
+      : (hidden.colsBySheet[resolution.sheetId] ?? [])
+  return hiddenIndices.some(
+    (index) => index >= resolution.selectionStart && index <= resolution.selectionEnd,
+  )
+}
+
+/** Reactive, fail-closed capability and authority gate for header context-menu commands. */
+export const viewportHiddenContextMenuCommandAvailabilityAtom = atom(
+  (get): ViewportHiddenContextMenuCommandAvailability => {
+    const resolutions: Readonly<
+      Record<ViewportHiddenContextMenuCommandKind, ResolvedViewportHiddenContextMenuCommand | null>
+    > = Object.freeze({
+      'row.hide': resolveViewportHiddenContextMenuCommand(get, 'row.hide'),
+      'row.unhide': resolveViewportHiddenContextMenuCommand(get, 'row.unhide'),
+      'column.hide': resolveViewportHiddenContextMenuCommand(get, 'column.hide'),
+      'column.unhide': resolveViewportHiddenContextMenuCommand(get, 'column.unhide'),
+    })
+    const lifecycleStatus = get(viewportHiddenLifecycleAtom).status
+    const authority = get(viewportHiddenProjectionAuthorityAtom)
+    const hidden = get(viewportHiddenAtom)
+
+    return (source, command) =>
+      resolvedViewportHiddenContextMenuCommandIsAvailable(
+        resolutions[command],
+        source,
+        lifecycleStatus,
+        authority,
+        hidden,
+      )
+  },
+)
+viewportHiddenContextMenuCommandAvailabilityAtom.debugLabel =
+  'spreadsheet.menu.viewportHiddenCommandAvailability'
+
+function menuIntentMatchesViewportHiddenCommand(
+  get: Getter,
+  command: ViewportHiddenContextMenuCommandKind,
+): boolean {
+  const state = get(menuStateAtom)
+  const intent = get(menuCommandIntentAtom)
+  if (
+    state.status !== 'open' ||
+    state.surface === null ||
+    state.target === null ||
+    intent === null ||
+    intent.command !== command ||
+    intent.surface !== state.surface
+  ) {
+    return false
+  }
+
+  const target = state.target
+  const intentTarget = intent.target
+  if (target.kind !== intentTarget.kind || target.sheetId !== intentTarget.sheetId) return false
+  if (target.kind === 'row' && intentTarget.kind === 'row') {
+    return target.rowIndex === intentTarget.rowIndex
+  }
+  if (target.kind === 'column' && intentTarget.kind === 'column') {
+    return target.colIndex === intentTarget.colIndex
+  }
+  return false
+}
+
+/**
+ * Routes a validated menu intent into the existing canonical hidden-state commands.
+ * Adapters provide transport only; Core re-checks intent, selection, capability and authority.
+ */
+export const runViewportHiddenContextMenuCommandAtom = atom(
+  null,
+  async (
+    get,
+    set,
+    input: RunViewportHiddenContextMenuCommandInput,
+  ): Promise<ViewportHiddenCommandOutcome> => {
+    if (
+      !input ||
+      !isViewportHiddenContextMenuCommand(input.command) ||
+      !menuIntentMatchesViewportHiddenCommand(get, input.command)
+    ) {
+      return 'blocked'
+    }
+
+    const resolution = resolveViewportHiddenContextMenuCommand(get, input.command)
+    if (
+      resolution === null ||
+      isViewportHiddenLifecycleBlocked(get(viewportHiddenLifecycleAtom).status)
+    ) {
+      return 'blocked'
+    }
+    if (!supportsViewportHiddenContextMenuCommand(input.source, resolution.action)) {
+      return 'unsupported'
+    }
+
+    if (resolution.action === 'unhide-rows' || resolution.action === 'unhide-columns') {
+      if (
+        !resolvedViewportHiddenContextMenuCommandIsAvailable(
+          resolution,
+          input.source,
+          get(viewportHiddenLifecycleAtom).status,
+          get(viewportHiddenProjectionAuthorityAtom),
+          get(viewportHiddenAtom),
+        )
+      ) {
+        return 'blocked'
+      }
+      return set(runViewportHiddenSelectionMutationAtom, {
+        source: input.source,
+        action: resolution.action,
+      })
+    }
+
+    const window =
+      resolution.action === 'hide-rows'
+        ? {
+            rowStart: resolution.selectionStart,
+            rowEnd: resolution.selectionEnd,
+            colStart: 0,
+            colEnd: 0,
+          }
+        : {
+            rowStart: 0,
+            rowEnd: 0,
+            colStart: resolution.selectionStart,
+            colEnd: resolution.selectionEnd,
+          }
+    return set(runViewportHiddenMutationAtom, {
+      source: input.source,
+      sheetId: resolution.sheetId,
+      action: resolution.action,
+      indices: createSelectedAxisIndices(resolution.selectionStart, resolution.selectionEnd),
+      window,
+    })
+  },
+)
+runViewportHiddenContextMenuCommandAtom.debugLabel =
+  'spreadsheet.menu.runViewportHiddenCommand'
 
 function normalizeMenuPosition(position: MenuPosition): MenuPosition | null {
   const x = normalizeCoordinate(position.x)
@@ -330,9 +649,15 @@ function isCommandAllowedForTarget(command: MenuCommandKind, kind: MenuTargetKin
     case 'row.insert':
     case 'row.delete':
       return kind === 'row' || kind === 'all'
+    case 'row.hide':
+    case 'row.unhide':
+      return kind === 'row'
     case 'column.insert':
     case 'column.delete':
       return kind === 'column' || kind === 'all'
+    case 'column.hide':
+    case 'column.unhide':
+      return kind === 'column'
     case 'formatting.open':
       return kind !== 'sheet-tab'
     case 'clipboard.copy':

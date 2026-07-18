@@ -321,6 +321,66 @@ describe('keyboard core', () => {
       colEnd: 4,
     })
   })
+
+  test('opens the context menu from navigation mode without mutating selection', () => {
+    const store = createStore()
+
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
+    store.setter(setSelectionAtom, {
+      kind: 'range',
+      sheetId: 'Sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 2, col: 3 },
+    })
+    const selectionBefore = store.getter(selectionAtom)
+
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'F10', shiftKey: true })).toEqual({
+      type: 'context-menu.open',
+      source: 'keyboard',
+    })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'ContextMenu' })).toEqual({
+      type: 'context-menu.open',
+      source: 'keyboard',
+    })
+    expect(store.getter(selectionAtom)).toEqual(selectionBefore)
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'F10' })).toEqual({
+      type: 'none',
+      reason: 'unhandled',
+    })
+  })
+
+  test('does not open the context menu while composing or outside navigation mode', () => {
+    const store = createStore()
+
+    store.setter(setSelectionBoundsAtom, { rowCount: 10, colCount: 5 })
+    store.setter(setSelectionAtom, {
+      kind: 'cell',
+      sheetId: 'Sheet1',
+      anchor: { row: 1, col: 1 },
+      focus: { row: 1, col: 1 },
+    })
+
+    expect(
+      store.setter(dispatchKeyboardInputAtom, {
+        key: 'F10',
+        shiftKey: true,
+        isComposing: true,
+      }),
+    ).toEqual({ type: 'none', reason: 'composing' })
+
+    store.setter(keyboardModeAtom, 'editing')
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'ContextMenu' })).toEqual({
+      type: 'none',
+      reason: 'editing-text-navigation',
+    })
+
+    store.setter(keyboardModeAtom, 'formula-reference')
+    expect(store.setter(dispatchKeyboardInputAtom, { key: 'F10', shiftKey: true })).toEqual({
+      type: 'none',
+      reason: 'editing-text-navigation',
+    })
+  })
 })
 
 describe('editing.start from printable keys (Excel parity)', () => {

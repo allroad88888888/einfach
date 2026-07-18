@@ -103,10 +103,26 @@ export type CopyAsResult =
   | { kind: 'image'; mimeType: 'image/png'; blob: Blob }
 ```
 
-`kind` is optional on the text variant for backwards compatibility — the
-existing host `store.setter(lastCopyAsAtom, encoded)` keeps working
-without modification. New callers that want to mirror an image write
-construct `{ kind: 'image', mimeType: 'image/png', blob }`.
+`kind` is optional on the text variant for backwards compatibility with
+persisted diagnostics. Hosts publish either variant through
+`store.setter(publishCopyAsResultAtom, result)`; `lastCopyAsAtom` is a
+read-only projection over Core-owned private state.
+
+The host reports clipboard outcomes through `reportCopyAsStatusAtom`.
+The PNG path publishes the successfully encoded result before its
+system-clipboard attempt; a later clipboard failure updates only the status
+and preserves the previous successful result.
+
+```mermaid
+flowchart LR
+  H[Host PNG result or clipboard outcome] --> C{Core typed command}
+  C -->|publishCopyAsResultAtom| R[private result backing]
+  C -->|reportCopyAsStatusAtom| E[private status backing]
+  R --> RP[readonly lastCopyAsAtom]
+  E --> EP[readonly copyAsErrorAtom]
+  F[Clipboard failure] --> E
+  F -. preserves published result .-> R
+```
 
 Diagnostics consumers must narrow before touching `.html` / `.blob`.
 
@@ -161,13 +177,14 @@ overrides via `readViewportSizeProjection` are a Wave-8 follow-up.
   the SVG pipeline end-to-end. The pipeline is exercised in
   `solid/excel` Playwright e2e in a follow-up arc.
 
-## Wire to `lastCopyAsAtom` (kept for follow-up)
+## Current `lastCopyAsAtom` wiring
 
-The keyboard binding for "Copy as PNG" (e.g. `Ctrl+Shift+P`), the
+The Solid host now implements the `Ctrl+Shift+P` keyboard binding, the
 `navigator.clipboard.write` + `ClipboardItem({ 'image/png': blob })` call,
-and the `copyAsErrorAtom` failure tiering are deferred. They reuse the
-same multi-tier write pattern `dispatchCopyAs` already implements; the
-PoC stops at "encoder produces a Blob".
+and typed result/status commands. Successful encoding publishes the snapshot
+and diagnostics mirror before the system clipboard attempt; rejection updates
+only status and preserves that snapshot. Only advanced rendering fidelity such
+as conditional-format gradients and ligature/font parity remains deferred.
 
 ## Test plan
 

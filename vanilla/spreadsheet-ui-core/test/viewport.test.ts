@@ -10,7 +10,13 @@ import {
   setViewportColumnWidthAtom,
   setViewportMetricsAtom,
   setViewportRowHeightAtom,
+  toggleFormulaBarAtom,
+  toggleGridlinesAtom,
+  toggleHeadingsAtom,
   visibleWindowAtom,
+  viewportShowFormulaBarAtom,
+  viewportShowGridlinesAtom,
+  viewportShowHeadingsAtom,
   viewportSizeOverridesAtom,
   type ViewportMetrics,
 } from '../src'
@@ -30,6 +36,63 @@ function metrics(overrides: Partial<ViewportMetrics> = {}): ViewportMetrics {
     ...overrides,
   }
 }
+
+describe('viewport chrome state', () => {
+  test('public visibility projections reject direct writes without changing state', () => {
+    const store = createStore()
+    const stateAtoms = [
+      viewportShowGridlinesAtom,
+      viewportShowHeadingsAtom,
+      viewportShowFormulaBarAtom,
+    ]
+    expect(stateAtoms.map((stateAtom) => stateAtom.debugLabel)).toEqual([
+      'spreadsheet.viewport.showGridlines',
+      'spreadsheet.viewport.showHeadings',
+      'spreadsheet.viewport.showFormulaBar',
+    ])
+
+    for (const stateAtom of stateAtoms) {
+      const before = store.getter(stateAtom)
+      expect(() => Reflect.apply(store.setter, store, [stateAtom, false])).toThrow()
+      expect(store.getter(stateAtom)).toBe(before)
+    }
+  })
+
+  test.each([
+    [
+      'gridlines',
+      viewportShowGridlinesAtom,
+      toggleGridlinesAtom,
+      'spreadsheet.viewport.toggleGridlines',
+    ],
+    [
+      'headings',
+      viewportShowHeadingsAtom,
+      toggleHeadingsAtom,
+      'spreadsheet.viewport.toggleHeadings',
+    ],
+    [
+      'formula bar',
+      viewportShowFormulaBarAtom,
+      toggleFormulaBarAtom,
+      'spreadsheet.viewport.toggleFormulaBar',
+    ],
+  ] as const)(
+    '%s toggle is the writable state transition',
+    (_label, stateAtom, toggleAtom, debugLabel) => {
+      const store = createStore()
+
+      expect(toggleAtom.debugLabel).toBe(debugLabel)
+      expect(store.getter(stateAtom)).toBe(true)
+      expect(store.getter(toggleAtom)).toBe(true)
+      store.setter(toggleAtom)
+      expect(store.getter(stateAtom)).toBe(false)
+      expect(store.getter(toggleAtom)).toBe(false)
+      store.setter(toggleAtom)
+      expect(store.getter(stateAtom)).toBe(true)
+    },
+  )
+})
 
 describe('getVisibleWindow', () => {
   test('derives an overscanned visible window from scroll metrics', () => {

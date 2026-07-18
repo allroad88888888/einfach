@@ -5,12 +5,28 @@ import type {
   CustomFormulaNameValidation,
   CustomFormulaNameValidationReason,
   CustomFormulaRegistration,
+  CustomFormulaRegistryLifecycle,
+  CustomFormulaRegistryStatus,
+  ConfigureCustomFormulaRegistryOutcome,
+  DisposeCustomFormulaRegistryOutcome,
+  RegisterCustomFormulaOutcome,
+  ResetCustomFormulaRegistryOutcome,
+  UnregisterCustomFormulaOutcome,
 } from './types'
 
 export * from './types'
 export { ENGINE_BUILTIN_FORMULA_NAMES } from './engine-builtin-names'
 
 const NAME_REGEX = /^[A-Z][A-Z0-9_.]*$/
+
+/** Default workbook-level registry cap. Hosts may lower or raise it explicitly. */
+export const DEFAULT_CUSTOM_FORMULA_REGISTRY_MAX_ENTRIES = 256
+
+/**
+ * Hard safety ceiling for the configurable cap. This keeps the long-lived
+ * registry genuinely bounded even when host configuration comes from user data.
+ */
+export const MAX_CUSTOM_FORMULA_REGISTRY_ENTRIES = 10_000
 
 /**
  * Set of built-in formula names that user code cannot redefine.
@@ -72,21 +88,85 @@ export function validateCustomFormulaName(name: string): CustomFormulaNameValida
   return { ok: true }
 }
 
-/**
- * Source atom: map of registered custom formulas keyed by uppercase
- * name. ReadonlyMap value type prevents accidental in-place mutation by
- * consumers; the registry is rebuilt fresh on every write. Bounded by
- * the host (no per-cell families) — practical caps are in the hundreds
- * for typical workbooks.
- *
- * Solid hosts subscribe to this atom (or its derivations) and diff it
- * against the previously-installed set to drive
- * `backend.registerCustomFormula` / `unregisterCustomFormula` calls.
- */
-export const customFormulaRegistryAtom = atom<ReadonlyMap<string, CustomFormulaRegistration>>(
-  new Map(),
+interface CustomFormulaRegistryState {
+  readonly status: CustomFormulaRegistryStatus
+  readonly maxEntries: number
+  readonly entries: ReadonlyMap<string, CustomFormulaRegistration>
+}
+
+const INITIAL_CUSTOM_FORMULA_REGISTRY_STATE: CustomFormulaRegistryState = Object.freeze({
+  status: 'active',
+  maxEntries: DEFAULT_CUSTOM_FORMULA_REGISTRY_MAX_ENTRIES,
+  entries: new Map<string, CustomFormulaRegistration>(),
+})
+
+/** Private aggregate prevents callers from bypassing capacity or lifecycle commands. */
+const customFormulaRegistryStateAtom = atom<CustomFormulaRegistryState>(
+  INITIAL_CUSTOM_FORMULA_REGISTRY_STATE,
 )
+customFormulaRegistryStateAtom.debugLabel = 'spreadsheet.customFormulas.internal.registryState'
+
+/**
+ * Read-only projection of registered custom formulas keyed by uppercase name.
+ * Each write publishes a fresh map, so subscribers can diff snapshots safely.
+ */
+export const customFormulaRegistryAtom = atom((get) => get(customFormulaRegistryStateAtom).entries)
 customFormulaRegistryAtom.debugLabel = 'spreadsheet.customFormulas.registry'
+
+/** Public lifecycle/capacity projection for host UI and diagnostics. */
+export const customFormulaRegistryLifecycleAtom = atom((get): CustomFormulaRegistryLifecycle => {
+  const state = get(customFormulaRegistryStateAtom)
+  return Object.freeze({
+    status: state.status,
+    maxEntries: state.maxEntries,
+    size: state.entries.size,
+  })
+})
+customFormulaRegistryLifecycleAtom.debugLabel = 'spreadsheet.customFormulas.lifecycle'
+
+/**
+ * Configure the per-workbook cap before teardown. Invalid limits and limits
+ * below the current size reject explicitly; existing entries are never evicted.
+ */
+export const configureCustomFormulaRegistryAtom = atom(
+  null,
+  (get, set, maxEntries: number): ConfigureCustomFormulaRegistryOutcome => {
+    const current = get(customFormulaRegistryStateAtom)
+    if (current.status !== 'active') {
+      return {
+        outcome: 'rejected',
+        reason: 'registry-disposed',
+        maxEntries,
+        currentSize: current.entries.size,
+      }
+    }
+    if (
+      !Number.isSafeInteger(maxEntries) ||
+      maxEntries < 0 ||
+      maxEntries > MAX_CUSTOM_FORMULA_REGISTRY_ENTRIES
+    ) {
+      return {
+        outcome: 'rejected',
+        reason: 'invalid-limit',
+        maxEntries,
+        currentSize: current.entries.size,
+      }
+    }
+    if (maxEntries < current.entries.size) {
+      return {
+        outcome: 'rejected',
+        reason: 'limit-below-current-size',
+        maxEntries,
+        currentSize: current.entries.size,
+      }
+    }
+    if (maxEntries !== current.maxEntries) {
+      set(customFormulaRegistryStateAtom, { ...current, maxEntries })
+    }
+    return { outcome: 'configured', maxEntries }
+  },
+)
+configureCustomFormulaRegistryAtom.debugLabel = 'spreadsheet.customFormulas.configure'
 
 function describeNameError(reason: CustomFormulaNameValidationReason, name: string): string {
   switch (reason) {
@@ -109,7 +189,18 @@ function describeNameError(reason: CustomFormulaNameValidationReason, name: stri
  */
 export const registerCustomFormulaAtom = atom(
   null,
-  (get, set, reg: CustomFormulaRegistration) => {
+  (get, set, reg: CustomFormulaRegistration): RegisterCustomFormulaOutcome => {
+    const current = get(customFormulaRegistryStateAtom)
+    const requestedName = typeof reg.name === 'string' ? normalizeCustomFormulaName(reg.name) : ''
+    if (current.status !== 'active') {
+      return {
+        outcome: 'rejected',
+        reason: 'registry-disposed',
+        name: requestedName,
+        size: current.entries.size,
+        maxEntries: current.maxEntries,
+      }
+    }
     const validation = validateCustomFormulaName(reg.name)
     if (!validation.ok) {
       throw new Error(describeNameError(validation.reason, reg.name))
@@ -118,9 +209,18 @@ export const registerCustomFormulaAtom = atom(
     // hit the same key the WASM engine uses (case-insensitive,
     // canonical upper-case). Without this a lower-case unregister
     // would silently leak the upper-case entry on the worker.
-    const key = normalizeCustomFormulaName(reg.name)
-    const current = get(customFormulaRegistryAtom)
-    const next = new Map(current)
+    const key = requestedName
+    const replacing = current.entries.has(key)
+    if (!replacing && current.entries.size >= current.maxEntries) {
+      return {
+        outcome: 'rejected',
+        reason: 'capacity-reached',
+        name: key,
+        size: current.entries.size,
+        maxEntries: current.maxEntries,
+      }
+    }
+    const next = new Map(current.entries)
     next.set(key, {
       name: key,
       source: reg.source,
@@ -128,7 +228,12 @@ export const registerCustomFormulaAtom = atom(
       ...(reg.description !== undefined ? { description: reg.description } : {}),
       ...(reg.paramLabels !== undefined ? { paramLabels: [...reg.paramLabels] } : {}),
     })
-    set(customFormulaRegistryAtom, next)
+    set(customFormulaRegistryStateAtom, { ...current, entries: next })
+    return {
+      outcome: replacing ? 'replaced' : 'registered',
+      name: key,
+      size: next.size,
+    }
   },
 )
 registerCustomFormulaAtom.debugLabel = 'spreadsheet.customFormulas.register'
@@ -140,19 +245,74 @@ registerCustomFormulaAtom.debugLabel = 'spreadsheet.customFormulas.register'
  */
 export const unregisterCustomFormulaAtom = atom(
   null,
-  (get, set, name: string) => {
+  (get, set, name: string): UnregisterCustomFormulaOutcome => {
     // Mirror the register-side normalization. Hosts that bind to a
     // user-typed input may pass `'mytax'` here even though the engine
     // (and the registry map) keys on `'MYTAX'`; without normalization
     // the unregister would silently no-op and leak the entry on the
     // worker.
-    if (name === null || name === undefined) return
+    const current = get(customFormulaRegistryStateAtom)
+    const requestedName =
+      name === null || name === undefined ? '' : normalizeCustomFormulaName(name)
+    if (current.status !== 'active') {
+      return {
+        outcome: 'rejected',
+        reason: 'registry-disposed',
+        name: requestedName,
+        size: current.entries.size,
+      }
+    }
+    if (name === null || name === undefined) {
+      return { outcome: 'not-found', name: requestedName, size: current.entries.size }
+    }
     const key = normalizeCustomFormulaName(name)
-    const current = get(customFormulaRegistryAtom)
-    if (!current.has(key)) return
-    const next = new Map(current)
+    if (!current.entries.has(key)) {
+      return { outcome: 'not-found', name: key, size: current.entries.size }
+    }
+    const next = new Map(current.entries)
     next.delete(key)
-    set(customFormulaRegistryAtom, next)
+    set(customFormulaRegistryStateAtom, { ...current, entries: next })
+    return { outcome: 'removed', name: key, size: next.size }
   },
 )
 unregisterCustomFormulaAtom.debugLabel = 'spreadsheet.customFormulas.unregister'
+
+/**
+ * Clear the active workbook registry while preserving its configured cap.
+ * Reset stays active so the same workbook store can accept a fresh registry.
+ */
+export const resetCustomFormulaRegistryAtom = atom(
+  null,
+  (get, set): ResetCustomFormulaRegistryOutcome => {
+    const current = get(customFormulaRegistryStateAtom)
+    if (current.status === 'disposed') {
+      return { outcome: 'rejected', reason: 'registry-disposed', clearedEntries: 0 }
+    }
+    const clearedEntries = current.entries.size
+    set(customFormulaRegistryStateAtom, {
+      ...current,
+      entries: new Map<string, CustomFormulaRegistration>(),
+    })
+    return { outcome: 'reset', clearedEntries }
+  },
+)
+resetCustomFormulaRegistryAtom.debugLabel = 'spreadsheet.customFormulas.reset'
+
+/** Terminal teardown: clears entries and rejects all later mutation commands. */
+export const disposeCustomFormulaRegistryAtom = atom(
+  null,
+  (get, set): DisposeCustomFormulaRegistryOutcome => {
+    const current = get(customFormulaRegistryStateAtom)
+    if (current.status === 'disposed') {
+      return { outcome: 'already-disposed', clearedEntries: 0 }
+    }
+    const clearedEntries = current.entries.size
+    set(customFormulaRegistryStateAtom, {
+      ...current,
+      status: 'disposed',
+      entries: new Map<string, CustomFormulaRegistration>(),
+    })
+    return { outcome: 'disposed', clearedEntries }
+  },
+)
+disposeCustomFormulaRegistryAtom.debugLabel = 'spreadsheet.customFormulas.dispose'

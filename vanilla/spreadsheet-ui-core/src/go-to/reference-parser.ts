@@ -1,12 +1,8 @@
 import { parseA1Cell, parseA1Range, findNamedRange } from '../name-box'
 import type { NamedRange } from '../named-ranges'
+import { EXCEL_MAX_COLS, EXCEL_MAX_ROWS } from '../selection'
 import type { CellCoord, CellRange } from '../shared'
-import type {
-  GoToParseContext,
-  GoToParseReason,
-  GoToParseResult,
-  GoToTarget,
-} from './types'
+import type { GoToParseContext, GoToParseReason, GoToParseResult, GoToTarget } from './types'
 
 // Single-cell R1C1 token: `R3C5`, `RC`, `R[-2]C[1]`, `R3C[2]`, etc.
 // Capture groups:
@@ -39,13 +35,10 @@ const R1C1_CELL_PATTERN = new RegExp(`^R${R1C1_AXIS}C${R1C1_AXIS}$`, 'i')
  * `context.activeSheetId`; bare references inherit the active sheet.
  *
  * Relative R1C1 (`R[n]C[n]` / `RC` / `R[n]C`) is resolved against
- * `context.activeCell` (defaults to A1). Out-of-bounds offsets (negative
- * resolved coords) fail with `invalid-address`.
+ * `context.activeCell` (defaults to A1). Coordinates outside Excel's row or
+ * column limits fail with `invalid-address`.
  */
-export function parseGoToReference(
-  input: string,
-  context: GoToParseContext,
-): GoToParseResult {
+export function parseGoToReference(input: string, context: GoToParseContext): GoToParseResult {
   const raw = input.trim()
   if (raw.length === 0) {
     return { ok: false, reason: 'empty' }
@@ -59,9 +52,7 @@ export function parseGoToReference(
   // Resolve sheet — bare = active sheet, prefix = lookup by name.
   let sheetId = context.activeSheetId
   if (sheetPrefix !== null) {
-    const found = context.sheets.find(
-      (s) => s.name.toLowerCase() === sheetPrefix.toLowerCase(),
-    )
+    const found = context.sheets.find((s) => s.name.toLowerCase() === sheetPrefix.toLowerCase())
     if (!found) {
       return { ok: false, reason: 'invalid-address' }
     }
@@ -85,7 +76,11 @@ export function parseGoToReference(
   // Named-range lookup (only when no sheet prefix was supplied — Excel
   // ignores `Sheet1!MyRange` because names carry their own scope).
   if (sheetPrefix === null) {
-    const named = findNamedRange(context.registry as readonly NamedRange[], raw)
+    const named = findNamedRange(
+      context.registry as readonly NamedRange[],
+      raw,
+      context.activeSheetId,
+    )
     if (named && named.refersTo.kind === 'range') {
       const resolvedRange = parseA1Range(named.refersTo.address)
       if (resolvedRange) {
@@ -95,6 +90,12 @@ export function parseGoToReference(
       if (resolvedCell) {
         return ok({ sheetId: named.refersTo.sheetId, coord: resolvedCell })
       }
+      return { ok: false, reason: 'invalid-address' }
+    }
+    // A syntactically valid R1C1 token that failed resolution is out of bounds,
+    // not an unknown name. Keep registered names ahead of this classification
+    // for backward compatibility with existing registries.
+    if (R1C1_CELL_PATTERN.test(body.trim())) {
       return { ok: false, reason: 'invalid-address' }
     }
     // Looks like a bare identifier that is not a registered name.
@@ -171,15 +172,15 @@ function parseR1C1(
 }
 
 // Resolve a single-cell R1C1 match into a 0-based CellCoord. Returns null on
-// out-of-bounds (negative resolved coords).
+// out-of-bounds Excel coordinates.
 function resolveR1C1Cell(
   match: RegExpExecArray,
   activeCell?: CellCoord,
 ): { coord: CellCoord } | null {
   // Group indexes: [1]=row [, [2]=row digits, [3]=col [, [4]=col digits.
   const anchor = activeCell ?? { row: 0, col: 0 }
-  const row = resolveR1C1Axis(match[1], match[2], anchor.row)
-  const col = resolveR1C1Axis(match[3], match[4], anchor.col)
+  const row = resolveR1C1Axis(match[1], match[2], anchor.row, EXCEL_MAX_ROWS)
+  const col = resolveR1C1Axis(match[3], match[4], anchor.col, EXCEL_MAX_COLS)
   if (row === null || col === null) return null
   return { coord: { row, col } }
 }
@@ -191,21 +192,26 @@ function resolveR1C1Axis(
   bracket: string | undefined,
   abs: string | undefined,
   anchorIdx: number,
+  maxCount: number,
 ): number | null {
   if (abs !== undefined) {
     const n = Number(abs)
-    if (!Number.isInteger(n) || n < 1) return null
+    if (!Number.isSafeInteger(n) || n < 1 || n > maxCount) return null
     return n - 1
   }
   if (bracket !== undefined) {
     const n = Number(bracket)
-    if (!Number.isInteger(n)) return null
+    if (!Number.isSafeInteger(n)) return null
     const resolved = anchorIdx + n
-    if (resolved < 0) return null
+    if (!isR1C1IndexInBounds(resolved, maxCount)) return null
     return resolved
   }
   // Bare `R` or `C` — relative with zero offset (Excel: same row/col).
-  return anchorIdx
+  return isR1C1IndexInBounds(anchorIdx, maxCount) ? anchorIdx : null
+}
+
+function isR1C1IndexInBounds(index: number, maxCount: number): boolean {
+  return Number.isSafeInteger(index) && index >= 0 && index < maxCount
 }
 
 export type { GoToParseReason }

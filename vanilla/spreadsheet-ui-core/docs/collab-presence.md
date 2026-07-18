@@ -6,9 +6,9 @@ Collaboration presence: remote cursors and edit awareness in `@einfach/spreadshe
 
 ## Goal
 
-Show each remote participant's active cell and selection as they move, surface
-remote edits as they arrive (attributed to a participant), and expose the
-originating user on diagnostics so errors can be traced to a specific peer.
+Provide bounded UI-core state for remote participants and cursors, plus the
+latest remote-edit attribution event. Rendering, transport wiring, and any
+diagnostics presentation remain host responsibilities.
 
 ---
 
@@ -17,8 +17,8 @@ originating user on diagnostics so errors can be traced to a specific peer.
 - Bounded participant list (cap N, recommended 32).
 - Per-participant remote cursor: sheet, selection subset, last-seen timestamp.
 - Edit attribution: link incoming `BackendMutationResult` revisions to a participant.
-- Local cursor publication: push local `SelectionState` changes to the backend port.
-- Conflict hint: warn when the local cell being edited is concurrently targeted by a remote participant.
+- Optional host publication of local `SelectionState` through the backend port.
+- Optional host conflict hint when a local draft cell is also targeted by a remote participant.
 
 **Out of scope**
 
@@ -32,39 +32,87 @@ originating user on diagnostics so errors can be traced to a specific peer.
 
 ## State (UI core)
 
+The mutable source atoms are module-private backing atoms. Public state is
+exposed as `Atom<T>` read projections, so consumers can subscribe/read but
+cannot call `store.setter` on either public state atom. Only the three command
+atoms below may mutate the private backing state.
+
 ```ts
-// bounded list; capped at MAX_PRESENCE_PARTICIPANTS entries (trim oldest lastSeenAt on overflow)
-export const presenceStateAtom = atom<PresenceState>(DEFAULT_PRESENCE_STATE)
-presenceStateAtom.debugLabel = 'spreadsheet.presence.state'
+const presenceStateBackingAtom = atom<PresenceState>(DEFAULT_PRESENCE_STATE)
+const lastRemoteEditEventBackingAtom = atom<RemoteEditEvent | null>(null)
 
-// derived: one RemoteCursor per participant that has an active selection
-export const remoteCursorsAtom = atom<RemoteCursor[]>(
-  (get) => deriveRemoteCursors(get(presenceStateAtom)),
+export const presenceStateAtom: Atom<PresenceState> = atom((get) =>
+  get(presenceStateBackingAtom),
 )
-remoteCursorsAtom.debugLabel = 'spreadsheet.presence.remoteCursors'
 
-// write-only command atom: host adapter calls this when a PresenceUpdate arrives
+export const lastRemoteEditEventAtom: Atom<RemoteEditEvent | null> = atom((get) =>
+  get(lastRemoteEditEventBackingAtom),
+)
+
+export const remoteCursorsAtom = atom<RemoteCursor[]>((get) =>
+  deriveRemoteCursors(get(presenceStateBackingAtom)),
+)
+
 export const applyPresenceUpdateAtom = atom(
   null,
   (get, set, update: PresenceUpdate): void => {
-    set(presenceStateAtom, applyPresenceUpdate(get(presenceStateAtom), update))
+    set(
+      presenceStateBackingAtom,
+      applyPresenceUpdate(get(presenceStateBackingAtom), update),
+    )
   },
 )
-applyPresenceUpdateAtom.debugLabel = 'spreadsheet.presence.applyUpdate'
 
-// write-only command atom: host adapter calls this when a RemoteEditEvent arrives
-export const applyRemoteEditAtom = atom(
+export const applyRemoteEditEventAtom = atom(
   null,
-  (get, set, event: RemoteEditEvent): void => {
-    set(presenceStateAtom, applyRemoteEdit(get(presenceStateAtom), event))
+  (_get, set, event: RemoteEditEvent): void => {
+    set(lastRemoteEditEventBackingAtom, event)
   },
 )
-applyRemoteEditAtom.debugLabel = 'spreadsheet.presence.applyRemoteEdit'
+
+export const clearPresenceAtom = atom(null, (_get, set): void => {
+  set(presenceStateBackingAtom, DEFAULT_PRESENCE_STATE)
+  set(lastRemoteEditEventBackingAtom, null)
+})
+```
+
+Consumer writes therefore go through commands only:
+
+```ts
+store.setter(applyPresenceUpdateAtom, update)
+store.setter(applyRemoteEditEventAtom, event)
+store.setter(clearPresenceAtom)
 ```
 
 `PresenceState` stores only display-needed slices: the participant roster and
-the latest cursor per participant. It does NOT store workbook facts, formula
-cache, or any unbounded per-cell data.
+the latest cursor per participant. `lastRemoteEditEventAtom` is a separate,
+bounded latest-event slot. Neither state stores workbook facts, formula cache,
+or unbounded per-cell data.
+
+## State flow
+
+The nodes below are observable test checkpoints, not additional product status
+values. All transitions are dispatched through command atoms.
+
+```mermaid
+stateDiagram-v2
+  state "PresenceState" as Presence {
+    [*] --> empty
+    empty --> joined: applyPresenceUpdateAtom(join)
+    joined --> cursor: applyPresenceUpdateAtom(cursor)
+    cursor --> heartbeat: applyPresenceUpdateAtom(heartbeat)
+    heartbeat --> empty: applyPresenceUpdateAtom(leave)
+  }
+
+  state "RemoteEditEvent | null" as RemoteEdit {
+    [*] --> remote_null
+    remote_null --> event: applyRemoteEditEventAtom(event)
+    event --> remote_null: clearPresenceAtom
+  }
+```
+
+`clearPresenceAtom` performs both resets in one command invocation: presence
+returns to `empty` and the latest remote-edit event returns to `null`.
 
 ---
 
@@ -76,56 +124,36 @@ export interface Participant {
   id: string
   displayName: string
   /** CSS-compatible color token; host UI assigns, UI core stores verbatim. */
-  colorHint: string
-  lastSeenAt: number // ms since epoch (Date.now())
+  colorHint?: string
+  lastSeenAt: number // timestamp supplied by join/heartbeat; cursor updates may use Date.now()
 }
 
-/** The subset of SelectionState relevant for remote rendering. */
-export type RemoteCursorSelection =
-  | { kind: 'cell'; anchor: CellCoord; focus: CellCoord }
-  | { kind: 'range'; anchor: CellCoord; focus: CellCoord }
-  | { kind: 'row'; rowAnchor: number; rowFocus: number }
-  | { kind: 'column'; colAnchor: number; colFocus: number }
-  | { kind: 'all' }
-
-/** One remote cursor, derived from presence state. */
 export interface RemoteCursor {
   participantId: string
   sheetId: string
-  selection: RemoteCursorSelection
+  selection: SelectionState
 }
 
-/** Push payload from the backend transport; host adapter maps to this shape. */
-export interface PresenceUpdate {
-  participant: Participant
-  sheetId: string | null
-  selection: RemoteCursorSelection | null
-}
+export type PresenceUpdate =
+  | { kind: 'join'; participant: Participant }
+  | { kind: 'leave'; participantId: string }
+  | { kind: 'cursor'; participantId: string; sheetId: string; selection: SelectionState }
+  | { kind: 'heartbeat'; participantId: string; at: number }
 
 /** Attribution record carried alongside a remote revision. */
 export interface RemoteEditEvent {
   participantId: string
-  /** Matches ProjectionRevision from backend/types.ts. */
   revision: number | string
-  sheetId: string
   affectedRange?: CellRange
+  transactionId?: string
 }
 
 export interface PresenceState {
   participants: Participant[]
-  /** Map from participantId to their current cursor; absent if no active sheet. */
   cursors: Record<string, RemoteCursor>
-  /** Most recent RemoteEditEvent received, for diagnostics attribution. */
-  lastRemoteEdit: RemoteEditEvent | null
 }
 
-export const MAX_PRESENCE_PARTICIPANTS = 32
-
-export const DEFAULT_PRESENCE_STATE: PresenceState = {
-  participants: [],
-  cursors: {},
-  lastRemoteEdit: null,
-}
+export const MAX_PARTICIPANTS = 32
 ```
 
 ---
@@ -148,10 +176,9 @@ export interface SpreadsheetBackend {
 
   /**
    * Publish the local user's current cursor to the backend transport.
-   * Called by the host adapter after it reads selectionAtom changes.
-   * Fire-and-forget; no return value.
+   * Whether and when to call this optional port is a host concern.
    */
-  publishLocalPresence?(payload: PresenceUpdate): void
+  publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
 }
 ```
 
@@ -167,17 +194,17 @@ or any transport primitive. All transport is owned by the host adapter.
 
 ## Integration points
 
-**Selection** — when `selectionAtom` changes, the host adapter (not the UI
-core) reads the new `SelectionState`, maps it to `PresenceUpdate`, and calls
-`publishLocalPresence`. Remote cursors are stored in `remoteCursorsAtom` and
-rendered in a separate overlay channel. They MUST NOT mutate `selectionAtom`;
-the two channels are read-only to each other.
+**Selection** — a host that publishes local presence reads `selectionAtom`,
+maps it to `PublishLocalPresenceRequest`, and calls the optional
+`publishLocalPresence` port. Remote cursors are read from
+`remoteCursorsAtom` and may be rendered in a separate overlay channel. Reading
+remote cursors does not mutate `selectionAtom`.
 
-**Workspace** — when a `RemoteEditEvent` arrives via `applyRemoteEditAtom`, the
-host adapter should also advance `viewportRevision` (via
+**Workspace** — when a `RemoteEditEvent` arrives via
+`applyRemoteEditEventAtom`, a host may also advance `viewportRevision` (via
 `advanceWorkspaceViewportAtom`) so the projection pipeline re-requests visible
-cells incorporating the new revision. Attribution info from
-`presenceStateAtom.lastRemoteEdit` is available for UI labeling.
+cells incorporating the new revision. Attribution is read separately from
+`lastRemoteEditEventAtom`.
 
 **Viewport** — scroll-to-remote-cursor is an optional host-level command. The
 UI core exposes no built-in scroll-to-participant atom; the host reads
@@ -209,12 +236,11 @@ read of `remoteCursorsAtom`; the warning presentation is host-side.
   before writing to the atom.
 - **Ordering of presence vs revision events**: a `RemoteEditEvent` may arrive
   before the corresponding `PresenceUpdate` registers the participant. The atom
-  update must not throw on unknown `participantId`; store the event and
-  reconcile when the participant record arrives.
-- **Transport disconnect fallback**: if `subscribePresence` drops, the host
-  adapter should clear stale cursors by dispatching `PresenceUpdate` with
-  `selection: null` for each known participant, or reset `presenceStateAtom` to
-  `DEFAULT_PRESENCE_STATE`.
+  stores the latest event without requiring a known `participantId`; any later
+  correlation is a host concern.
+- **Transport disconnect fallback**: if `subscribePresence` drops, a host can
+  dispatch a `leave` update per known participant or invoke
+  `clearPresenceAtom`; it must not write `presenceStateAtom` directly.
 - **Privacy of cursor publication**: `publishLocalPresence` sends the local
   user's selection to the server. Host adapters must obtain user consent before
   enabling this; the backend port is optional so hosts can omit it entirely.
@@ -225,27 +251,30 @@ read of `remoteCursorsAtom`; the warning presentation is host-side.
 
 `test/presence.test.ts`
 
-- `applyPresenceUpdate` pure helper: add participant, update cursor, trim on
-  overflow beyond `MAX_PRESENCE_PARTICIPANTS`.
-- `applyRemoteEdit` pure helper: stores `lastRemoteEdit`, unknown participant
-  does not throw.
-- `deriveRemoteCursors` pure helper: maps participant roster + cursor map to
-  `RemoteCursor[]`, excludes participants with `null` sheet or selection.
-- `presenceStateAtom` atom: write via `applyPresenceUpdateAtom`, read back
-  updated roster.
+- Public state atoms are readonly at type level and reject reflected runtime
+  writes without changing the previously observed references.
+- `applyPresenceUpdateAtom`: join, cursor, heartbeat, leave, and overflow
+  eviction beyond `MAX_PARTICIPANTS`.
+- `applyRemoteEditEventAtom`: stores the latest event without requiring a known
+  participant.
+- `clearPresenceAtom`: resets presence and the latest remote-edit event in one
+  command invocation.
+- `presenceStateAtom`: read back the roster and cursor map after command writes.
 - `remoteCursorsAtom` atom: derived value re-evaluates after presence update.
 - Overflow eviction: inserting 33 participants drops the one with oldest
   `lastSeenAt`.
-- Unknown-participant edit event: `applyRemoteEditAtom` stores event without
-  crashing.
+- State flows: `empty → join → cursor → heartbeat → leave` and
+  `remote null → event → clear`.
 
 ## State Decision Template
 
-- Source atoms: `presenceStateAtom`.
+- Private source atoms: presence state and latest remote-edit backing atoms.
+- Public readonly atoms: `presenceStateAtom`, `lastRemoteEditEventAtom`.
 - Derived atoms: `remoteCursorsAtom`.
-- Commands: `applyPresenceUpdateAtom`, `applyRemoteEditAtom`.
-- Scale bound: capped at `MAX_PRESENCE_PARTICIPANTS`; no per-cell atoms.
+- Commands: `applyPresenceUpdateAtom`, `applyRemoteEditEventAtom`,
+  `clearPresenceAtom`.
+- Scale bound: capped at `MAX_PARTICIPANTS`; no per-cell atoms.
 - Backend reads: `subscribePresence` / `publishLocalPresence` (both optional).
-- Per-cell/per-row/per-col atom risk: none; cursor stored as selection subset,
+- Per-cell/per-row/per-col atom risk: none; cursor stored as a `SelectionState`,
   not expanded to cell grid.
 - Tests: `test/presence.test.ts`.

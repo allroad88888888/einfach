@@ -95,6 +95,18 @@ export function getKeyboardCommandIntent(
     return getFormulaReferenceModeIntent(input)
   }
 
+  if (
+    !input.ctrlKey &&
+    !input.metaKey &&
+    !input.altKey &&
+    (input.key === 'ContextMenu' || (input.key === 'F10' && input.shiftKey))
+  ) {
+    return {
+      type: 'context-menu.open',
+      source: 'keyboard',
+    }
+  }
+
   const commandIntent = getCommandShortcutIntent(input, state)
   if (commandIntent.type !== 'none') {
     return commandIntent

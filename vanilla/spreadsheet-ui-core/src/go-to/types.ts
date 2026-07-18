@@ -1,5 +1,6 @@
 import type { CellCoord, CellRange, SheetRef } from '../shared'
 import type { SelectionState } from '../selection'
+import type { RangeProjectionRequest, RangeProjectionResult } from '../backend'
 
 /**
  * The "simple" vs "special" panes of the Go To dialog.
@@ -51,9 +52,9 @@ export const GO_TO_HISTORY_MAX = 10
 /**
  * Bound for Go To Special used-range scans. A 1M-row workbook would freeze
  * the worker if we scanned the entire used range, so we cap the scan-rect
- * cell budget at 100,000 cells and surface a truncation flag. The host is
- * responsible for clipping the search rect to this budget before invoking
- * the locator engine (the engine asserts the inbound rect respects it).
+ * cell budget at 100,000 cells and surface an incomplete warning. The Core
+ * async orchestrator clips the requested search rect to this budget before
+ * invoking the locator engine.
  */
 export const GO_TO_SCAN_MAX_CELLS = 100_000
 
@@ -148,7 +149,8 @@ export interface GoToCandidateCell {
 
 /**
  * Output of the locator scan: a list of selection regions plus an indication
- * of whether the scan was truncated by `GO_TO_SCAN_MAX_CELLS`.
+ * of whether the packed result was truncated by `GO_TO_REGION_CAP`. Search
+ * rectangle completeness is tracked separately by the async orchestrator.
  */
 export interface GoToScanResult {
   regions: readonly SelectionState[]
@@ -168,11 +170,14 @@ export interface GoToScanResult {
  * - `searchRect`         — rect to walk for blanks / visible-cells-only.
  *                          Required for those locators; ignored for others
  *                          that walk `cells` directly. For row/column
- *                          differences this should be the *current selection*
- *                          rect, not the used range. The host MUST clip this
- *                          rect to `GO_TO_SCAN_MAX_CELLS`.
+ *                          differences this is the actual projected slice of
+ *                          the normalized current selection, not the used
+ *                          range, and MUST stay within
+ *                          `GO_TO_SCAN_MAX_CELLS`.
  * - `selectionRect`      — current selection rect, used as the scope for
- *                          row/column differences. Falls back to
+ *                          row/column differences. The async orchestrator
+ *                          passes the same actual projection rect here and in
+ *                          `searchRect`; direct pure callers fall back to
  *                          `searchRect` when absent.
  * - `hiddenRows`/`Cols`  — sheet-level hidden indices (from the backend's
  *                          hidden-state port, or projection echo). Drives
@@ -188,3 +193,69 @@ export interface GoToScanContext {
   hiddenRows?: readonly number[]
   hiddenCols?: readonly number[]
 }
+
+/** Runtime availability of the range-projection port used by Special scans. */
+export type GoToSpecialCapability = 'unknown' | 'available' | 'unavailable'
+
+/** Inline error payload owned by Core and projected by framework adapters. */
+export interface GoToErrorDetails {
+  code: string | null
+  params: Readonly<Record<string, unknown>> | null
+  message: string | null
+}
+
+/** A bounded/incomplete scan keeps the dialog open with this warning. */
+export interface GoToSpecialWarning {
+  reason: 'regions' | 'cells'
+  limit: number
+}
+
+/**
+ * Framework-neutral read port for the async Go To Special command.
+ *
+ * The method is optional so Core can expose an explicit unavailable state when
+ * an older or partial host adapter has not implemented range projection yet.
+ */
+export interface GoToSpecialScanPort {
+  readRangeProjection?: (request: RangeProjectionRequest) => Promise<RangeProjectionResult>
+}
+
+export interface RunGoToSpecialScanInput {
+  port: GoToSpecialScanPort | null | undefined
+}
+
+/** Public state-machine projection used by adapters and transition tests. */
+export type GoToSpecialLifecycle =
+  | {
+      phase: 'closed'
+      sessionId: number
+      capability: GoToSpecialCapability
+    }
+  | {
+      phase: 'open'
+      sessionId: number
+      capability: GoToSpecialCapability
+      mode: GoToMode
+    }
+  | {
+      phase: 'scanning'
+      sessionId: number
+      requestId: number
+      sheetId: string
+      locator: GoToLocator
+      capability: GoToSpecialCapability
+    }
+  | {
+      phase: 'open-error'
+      sessionId: number
+      capability: GoToSpecialCapability
+      mode: GoToMode
+      error: GoToErrorDetails
+    }
+  | {
+      phase: 'open-warning'
+      sessionId: number
+      capability: GoToSpecialCapability
+      mode: 'special'
+      warning: GoToSpecialWarning
+    }

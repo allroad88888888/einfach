@@ -1,9 +1,6 @@
 import type { CellRange, SheetRef } from '../shared'
 import type { ProjectionRevision, ProjectionRequestId } from '../backend/types'
-import type {
-  ClipboardPayloadDescriptor,
-  ClipboardRangeDescriptor,
-} from '../clipboard/types'
+import type { ClipboardPayloadDescriptor, ClipboardRangeDescriptor } from '../clipboard/types'
 
 /**
  * What aspect of the clipboard payload to apply to the target range.
@@ -46,11 +43,42 @@ export interface PasteSpecialOptions {
   skipBlanks: boolean
 }
 
-export const DEFAULT_PASTE_SPECIAL_OPTIONS: PasteSpecialOptions = {
+export const DEFAULT_PASTE_SPECIAL_OPTIONS: PasteSpecialOptions = Object.freeze({
   kind: 'values-and-formats',
   op: 'none',
   transpose: false,
   skipBlanks: false,
+})
+
+export type PasteSpecialLifecycleStatus =
+  | 'closed'
+  | 'editing'
+  | 'blocked'
+  | 'pending'
+  | 'outcome-unknown'
+  | 'local-acknowledged'
+  | 'refreshing'
+  | 'error'
+
+/** Core-owned lifecycle metadata for one frozen Paste Special session. */
+export interface PasteSpecialLifecycleState {
+  readonly status: PasteSpecialLifecycleStatus
+  readonly sessionId: number
+  readonly requestId: ProjectionRequestId | null
+  readonly sheetId: string | null
+}
+
+/**
+ * Immutable snapshot captured by `openPasteSpecialAtom`. Selection and
+ * clipboard changes after open cannot redirect an in-flight paste.
+ */
+export interface PasteSpecialSessionSnapshot {
+  readonly sessionId: number
+  readonly sheetId: string | null
+  readonly target: CellRange | null
+  readonly source: ClipboardRangeDescriptor | null
+  readonly payload: ClipboardPayloadDescriptor | null
+  readonly options: PasteSpecialOptions
 }
 
 /**
@@ -79,6 +107,25 @@ export interface PasteRangeResult extends SheetRef {
   revision?: ProjectionRevision
   affectedRange?: CellRange
 }
+
+/** Minimum backend capability consumed by the framework-neutral Core command. */
+export interface PasteSpecialControllerPort {
+  pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
+}
+
+/** Adapter input for one confirm/retry dispatch. */
+export interface ConfirmPasteSpecialInput {
+  readonly source: PasteSpecialControllerPort
+  readonly sessionId: number
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+}
+
+export type PasteSpecialMutationOutcome =
+  | 'completed'
+  | 'blocked'
+  | 'error'
+  | 'outcome-unknown'
+  | 'stale'
 
 /**
  * Mirror of the input the host adapter receives when wiring a Paste Special

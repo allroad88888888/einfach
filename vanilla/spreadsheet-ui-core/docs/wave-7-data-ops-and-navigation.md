@@ -163,95 +163,162 @@ toggling flips column presence in `keyColumns`; commit is a no-op when
 
 ## 7.3 Paste Special
 
-Triggered by Ctrl+Alt+V or right-click → Paste Special. Reads the same
-clipboard source as a normal paste but applies it through a configured
-combination of value/format channels with optional arithmetic, blank-skipping,
-and transposition.
+Current parity status: **Partial**. The static backend supports the optional
+`pasteRange` port. Worker and WorkerTS omit it, and the Context Menu entry is
+still absent. The supported entrypoints are the capability-gated Edit menu and
+Ctrl+Alt+V shortcut. This status does not change the overall parity counts.
 
-### Clipboard contract changes
+### Implemented contract
 
-`ClipboardTransferRequest` already carries `source` and `target`. Add an
-`options: PasteSpecialOptions` field on the **paste** request only; copy and
-cut are unchanged.
+`openPasteSpecialAtom` freezes the current target selection, clipboard source,
+payload, and default options. Later selection or clipboard changes cannot
+redirect a request already represented by that session.
 
 ```ts
-export type PasteChannel =
-  | 'all' | 'formulas' | 'values' | 'formats' | 'comments' | 'validation'
-  | 'all-except-borders' | 'column-widths'
-  | 'formulas-and-number-formats' | 'values-and-number-formats'
-
-export type PasteOperation = 'none' | 'add' | 'subtract' | 'multiply' | 'divide'
+export type PasteSpecialKind =
+  | 'values'
+  | 'formats'
+  | 'values-and-formats'
+  | 'all'
+  | 'transpose'
+  | 'column-widths'
+  | 'comments'
 
 export interface PasteSpecialOptions {
-  channel: PasteChannel
-  operation: PasteOperation
-  skipBlanks: boolean
+  kind: PasteSpecialKind
+  op: 'none' | 'add' | 'subtract' | 'multiply' | 'divide'
   transpose: boolean
+  skipBlanks: boolean
 }
-```
 
-### Backend port additions
-
-New optional port. `importCells` writes raw inputs only; Paste Special needs
-format / comment / validation channels and per-cell arithmetic against the
-existing target.
-
-```ts
-export interface PasteRangeRequest extends SheetRef {
+export interface PasteRangeRequest {
   kind: 'paste-range'
-  source: ClipboardRangeDescriptor
+  sheetId: string
   target: CellRange
-  options: PasteSpecialOptions
+  source: {
+    sheetId: string
+    range: CellRange
+    payload?: ClipboardPayloadDescriptor | null
+  }
+  pasteKind: PasteSpecialKind
+  op: PasteSpecialOptions['op']
+  transpose: boolean
+  skipBlanks: boolean
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
 
-pasteRange?(request: PasteRangeRequest): Promise<BackendMutationResult>
+pasteRange?(request: PasteRangeRequest): Promise<PasteRangeResult>
 ```
 
-When `pasteRange` is absent, the dialog degrades: only `values` and `all`
-channels are offered (routed through `importCellChunks`), and
-`operation !== 'none'` is hidden.
+There is deliberately no missing-port fallback. When `pasteRange` is absent,
+the capability is false, entrypoints stay unavailable, a forced open is
+blocked with an explanation, and no mutation transport is sent.
 
-### UI
+### Capability ownership and entrypoints
 
-New module: `src/paste-special/`. Modal dialog: radio group for `channel` (10
-entries), radio group for `operation` (5 entries), Skip blanks checkbox,
-Transpose checkbox, OK / Cancel. Source is read from `clipboardStateAtom.payload`;
-when `payload` is `null` the dialog opens disabled with a "Nothing to paste"
-message.
+`SpreadsheetUiProvider` captures `backend.pasteRange` presence at provider
+creation. `capturePasteSpecialCapabilityAtom` is the only writer of a private
+backing atom; public consumers read the canonical, read-only
+`pasteSpecialCapabilityAtom`. Solid's deprecated `pasteSpecialSupportedAtom`
+is the same atom object and exists only for compatibility.
 
-### Atoms
+```mermaid
+flowchart LR
+  Backend["backend.pasteRange presence"] --> Provider["SpreadsheetUiProvider"]
+  Provider --> Capture["capturePasteSpecialCapabilityAtom"]
+  Capture --> Backing["private capability backing atom"]
+  Backing --> Capability["pasteSpecialCapabilityAtom<br/>read-only"]
+  Capability --> Menu["Edit menu"]
+  Capability --> Shortcut["Ctrl+Alt+V"]
+  Capability --> Confirm["confirm eligibility"]
+```
+
+The dialog is mounted in Smoke, Worker, and WorkerTS demos. Mounting the
+dialog is inert while closed and never captures capability itself. On Worker
+and WorkerTS, the missing port therefore produces zero dialog-open dispatch
+and zero Paste Special transport through the supported entrypoints.
+
+| Surface / backend        | Static                     | Worker      | WorkerTS    |
+| ------------------------ | -------------------------- | ----------- | ----------- |
+| Edit menu                | available                  | hidden      | hidden      |
+| Ctrl+Alt+V               | opens with valid clipboard | inert       | inert       |
+| Dialog component mounted | yes                        | yes         | yes         |
+| `pasteRange` transport   | supported                  | port absent | port absent |
+| Context Menu entry       | absent                     | absent      | absent      |
+
+### Core state and commands
 
 ```ts
-pasteSpecialDialogAtom          // atom<PasteSpecialDialogState>
-openPasteSpecialAtom            // command
-closePasteSpecialAtom           // command
-setPasteSpecialOptionAtom       // command, patch: Partial<PasteSpecialOptions>
-commitPasteSpecialAtom          // command
+pasteSpecialCapabilityAtom // read-only capability projection
+pasteSpecialOpenAtom // Core-owned visibility
+pasteSpecialOptionsAtom // Core-owned form draft
+pasteSpecialSessionAtom // frozen session snapshot
+pasteSpecialLifecycleAtom // mutation lifecycle
+pasteSpecialErrorAtom // user-visible diagnostic
+pasteSpecialCanEditAtom // derived UI permission
+pasteSpecialCanConfirmAtom // derived UI permission
+pasteSpecialCanCloseAtom // derived UI permission
+
+capturePasteSpecialCapabilityAtom // only capability writer
+openPasteSpecialAtom // freeze and open
+patchPasteSpecialOptionsAtom // patch draft + session
+confirmPasteSpecialAtom // reserve/send/ACK/history/refresh
+closePasteSpecialAtom // invalidate and reset
 ```
 
-### Test plan
+`Ready` and `Unsupported` are conceptual capability/entry states. The stored
+Core lifecycle labels are shown in parentheses where names differ.
 
-`test/paste-special.test.ts`: defaults `channel='all'`, `operation='none'`,
-`skipBlanks=false`, `transpose=false`; option setter updates only its own
-field; commit no-op when clipboard `payload` is `null`; with
-`operation !== 'none'` and missing `pasteRange` falls back to values-only and
-surfaces a diagnostic; transpose flips source row/col axes before forwarding;
-`skipBlanks: true` leaves target cells under blank sources untouched.
+```mermaid
+stateDiagram-v2
+  state "OutcomeUnknown\n(outcome-unknown)" as OutcomeUnknown
+  state "LocalAcknowledged\n(local-acknowledged)" as LocalAcknowledged
 
-### Risks (operation math on existing values)
+  [*] --> Closed
+  Closed --> Unsupported: capability = false
+  Closed --> Ready: capability = true
+  Unsupported --> Ready: provider captures supported backend
+  Ready --> Unsupported: provider captures backend without port
+  Ready --> Editing: open + frozen valid context
+  Editing --> Pending: confirm reserves request
+  Pending --> OutcomeUnknown: rejection or invalid ACK
+  Pending --> LocalAcknowledged: strict ACK + history
+  LocalAcknowledged --> Refreshing: refresh projection
+  Refreshing --> Closed: refresh succeeds
+  Refreshing --> Error: refresh fails
+  Error --> Refreshing: retry refresh only
+  Editing --> Closed: cancel
+  Unsupported --> Closed: close / stay hidden
+  OutcomeUnknown --> Closed: close
+```
 
+Pending work cannot be closed or replaced. A transport rejection or invalid
+acknowledgement becomes `outcome-unknown`; Core does not resend because the
+remote mutation may already have applied. After a strict acknowledgement,
+history is appended once. If refresh fails, retry performs only the refresh
+and never duplicates the paste.
+
+### Tests
+
+`test/paste-special.test.ts` covers read-only capability capture, frozen
+context, unsupported kinds, request identity, strict acknowledgement,
+outcome-unknown behavior, refresh-only retry, close blocking, and history.
+`solid/excel/test/vnext-paste-special.test.tsx` covers alias identity,
+provider-time supported/unsupported capture without dialog ownership,
+worker-shaped missing-port inert behavior, and the thin dialog projection.
+
+### Remaining gaps and risks
+
+- **Context Menu parity.** There is no Paste Special item yet; #11 remains
+  Partial until that entrypoint and its tests exist.
+- **Worker parity.** Worker and WorkerTS expose no `pasteRange` port. They are
+  correctly unsupported, not silently routed through another mutation API.
 - **Arithmetic with non-numeric targets.** `add` / `subtract` / `multiply` /
-  `divide` against a non-numeric target is backend-defined (error vs.
-  preserve). Surface whatever `BackendMutationResult` reports.
-- **Divide by zero.** New `'paste-special.divide-by-zero'` error code in the
-  existing error-codes taxonomy.
-- **Transpose with merged cells.** Backend decides; UI core surfaces the
-  reported error path only.
-- **Composite channels.** `formulas-and-number-formats` and
-  `values-and-number-formats` must apply atomically in one transaction so
-  undo collapses cleanly.
+  `divide` uses the documented static-backend behavior; any future worker
+  implementation must match it.
+- **Unsupported kinds.** `column-widths` and `comments` remain visible but
+  disabled with an explanation and cannot reach transport.
 
 ---
 

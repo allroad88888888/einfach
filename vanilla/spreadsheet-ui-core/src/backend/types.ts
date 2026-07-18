@@ -31,9 +31,16 @@ import type {
   SearchRangeRequest,
   SearchRangeResult,
   ReplaceMatchesRequest,
+  ReplaceMatchesResponse,
   ReplaceMatchesResult,
 } from '../find-replace/types'
-import type { SetSheetProtectionRequest, SetRangeLockRequest } from '../protection/types'
+import type {
+  ReadSheetProtectionRequest,
+  ReadSheetProtectionResult,
+  SetRangeLockRequest,
+  SetRangeLockResult,
+  SetSheetProtectionRequest,
+} from '../protection/types'
 import type { PasteRangeRequest, PasteRangeResult } from '../paste-special/types'
 
 export type {
@@ -67,7 +74,13 @@ export type {
 export type { ReadPrintConfigRequest, ReadPrintConfigResult, SetPrintConfigRequest }
 
 // --- protection ---
-export type { SetSheetProtectionRequest, SetRangeLockRequest }
+export type {
+  ReadSheetProtectionRequest,
+  ReadSheetProtectionResult,
+  SetRangeLockRequest,
+  SetRangeLockResult,
+  SetSheetProtectionRequest,
+}
 
 // --- paste-special ---
 export type { PasteRangeRequest, PasteRangeResult }
@@ -133,6 +146,8 @@ export interface DisplayCell {
   col: number
   displayValue: string
   valueKind?: 'blank' | 'number' | 'string' | 'boolean' | 'error'
+  /** Read-only projection fact: the canonical finite number before display formatting. */
+  numericValue?: number
   formula?: string
   error?: SpreadsheetError
   formatKey?: string
@@ -802,8 +817,17 @@ export interface SpreadsheetBackend {
   readPrintConfig?(request: ReadPrintConfigRequest): Promise<ReadPrintConfigResult>
   setPrintConfig?(request: SetPrintConfigRequest): Promise<BackendMutationResult>
   // find-replace
+  /**
+   * Match offsets are UTF-16 code-unit indexes into the selected target and use half-open
+   * `[matchStart, matchEnd)` intervals. Every emitted span satisfies
+   * `0 <= matchStart < matchEnd`; zero-width regex results are omitted.
+   */
   searchRange?(request: SearchRangeRequest): Promise<SearchRangeResult>
-  replaceMatches?(request: ReplaceMatchesRequest): Promise<ReplaceMatchesResult>
+  /**
+   * Replacement spans use the same UTF-16 code-unit, half-open, non-empty contract as search
+   * results. Zero-width and reversed spans are rejected before any mutation.
+   */
+  replaceMatches?(request: ReplaceMatchesRequest): Promise<ReplaceMatchesResponse>
   // presence
   subscribePresence?(handler: (update: PresenceUpdate) => void): SubscribePresenceUnsubscribe
   publishLocalPresence?(request: PublishLocalPresenceRequest): Promise<void>
@@ -812,6 +836,7 @@ export interface SpreadsheetBackend {
   // protection
   setSheetProtection?(request: SetSheetProtectionRequest): Promise<BackendMutationResult>
   setRangeLock?(request: SetRangeLockRequest): Promise<BackendMutationResult>
+  readSheetProtection?(request: ReadSheetProtectionRequest): Promise<ReadSheetProtectionResult>
   // paste-special — Wave 7.3. Optional capability: host adapters that
   // omit this method cause the menu entry + dialog to hide via
   // `pasteSpecialSupportedAtom` so the surface degrades cleanly.

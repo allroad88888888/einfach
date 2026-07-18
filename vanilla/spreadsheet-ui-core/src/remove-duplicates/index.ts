@@ -1,186 +1,1214 @@
 import { atom } from '@einfach/core'
-import type { DisplayCell } from '../backend/types'
+import type { Atom, Getter, Setter } from '@einfach/core'
+import type {
+  DisplayCell,
+  ProjectionRequestId,
+  ProjectionRevision,
+  RangeProjectionResult,
+} from '../backend/types'
+import { pushHistoryAtom } from '../history'
+import {
+  primarySelectionRegionAtom,
+  selectionAuthorityWitnessAtom,
+  selectionRangeAtom,
+  type SelectionAuthorityWitness,
+} from '../selection'
+import type { CellRange } from '../shared'
+import {
+  workspaceActiveSheetAuthorityWitnessAtom,
+  workspaceSessionAtom,
+  type WorkspaceActiveSheetAuthorityWitness,
+} from '../workspace'
 import { findDuplicateRows } from './algorithm'
 import type {
+  OpenRemoveDuplicatesInput,
+  RemoveDuplicatesCapabilityState,
   RemoveDuplicatesComparison,
+  RemoveDuplicatesControllerPort,
+  RemoveDuplicatesIntent,
+  RemoveDuplicatesLifecycleState,
+  RemoveDuplicatesMutationOutcome,
+  RemoveDuplicatesMutationTarget,
   RemoveDuplicatesRange,
+  RemoveDuplicatesReadOutcome,
   RemoveDuplicatesScanResult,
+  RemoveDuplicatesSessionSnapshot,
+  RunRemoveDuplicatesConfirmInput,
+  RemoveRowsExactRequest,
+  RemoveRowsExactResult,
 } from './types'
 
 export * from './types'
 export { findDuplicateRows } from './algorithm'
 
-// ---------------------------------------------------------------------------
-// source atoms
-// ---------------------------------------------------------------------------
+export const REMOVE_DUPLICATES_READ_CAPABILITY_ERROR =
+  'Remove Duplicates cannot read the selected range with this workbook backend.'
+export const REMOVE_DUPLICATES_REMOVE_CAPABILITY_ERROR =
+  'Remove Duplicates is unavailable because this workbook does not provide removeRowsExact.'
+export const REMOVE_DUPLICATES_READ_FAILED_ERROR =
+  'Remove Duplicates could not load a complete projection for the selected range.'
+export const REMOVE_DUPLICATES_READ_STALE_ERROR =
+  'The selected range changed while Remove Duplicates was loading. Retry from the current selection.'
+export const REMOVE_DUPLICATES_OUTCOME_UNKNOWN_ERROR =
+  'Rows may have been removed, but the backend did not return a matching acknowledgement. Refresh or reload the workbook before trying again.'
+export const REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX =
+  'Rows were removed, but the workbook projection could not be refreshed: '
 
-/** Dialog visibility. */
-export const removeDuplicatesOpenAtom = atom<boolean>(false)
-removeDuplicatesOpenAtom.debugLabel = 'spreadsheet.removeDuplicates.open'
+interface RemoveDuplicatesReadTicket {
+  readonly sessionId: number
+  readonly requestId: ProjectionRequestId
+  readonly sheetId: string
+  readonly range: Readonly<CellRange>
+  readonly selectionWitness: SelectionAuthorityWitness
+  readonly workspaceActiveSheetWitness: WorkspaceActiveSheetAuthorityWitness
+}
 
-/** The rectangular selection the user invoked Remove Duplicates against.
- *  Null when the dialog is closed. */
-export const removeDuplicatesRangeAtom = atom<RemoveDuplicatesRange | null>(null)
-removeDuplicatesRangeAtom.debugLabel = 'spreadsheet.removeDuplicates.range'
+interface RemoveDuplicatesMutationTicket {
+  readonly sessionId: number
+  readonly selectionWitness: SelectionAuthorityWitness
+  readonly workspaceActiveSheetWitness: WorkspaceActiveSheetAuthorityWitness
+  readonly target: RemoveDuplicatesMutationTarget
+  readonly request: RemoveRowsExactRequest
+  readonly acknowledgement: RemoveRowsExactResult | null
+}
 
-/** Sheet-absolute column indices the user has checked. Empty set means
- *  "no columns selected" (preview returns null with `noKeyColumns:true`);
- *  the open command seeds this with every column in the range. */
-export const removeDuplicatesKeyColumnsAtom = atom<ReadonlySet<number>>(
-  new Set<number>(),
-)
-removeDuplicatesKeyColumnsAtom.debugLabel = 'spreadsheet.removeDuplicates.keyColumns'
+/** `Object.freeze(new Set())` is still writable; expose a mutation-free facade. */
+class ImmutableReadonlySet<Value> {
+  private readonly items: readonly Value[]
 
-/** Per-cell string comparison policy applied before tuple hashing. */
-export const removeDuplicatesComparisonAtom = atom<RemoveDuplicatesComparison>(
-  'exact',
-)
-removeDuplicatesComparisonAtom.debugLabel = 'spreadsheet.removeDuplicates.comparison'
+  constructor(values: Iterable<Value>) {
+    this.items = Object.freeze(Array.from(new Set(values)))
+    Object.freeze(this)
+  }
 
-/** Whether to treat the first row as a header (excluded from the scan). */
-export const removeDuplicatesExcludeHeaderAtom = atom<boolean>(true)
-removeDuplicatesExcludeHeaderAtom.debugLabel =
-  'spreadsheet.removeDuplicates.excludeHeader'
+  get size(): number {
+    return this.items.length
+  }
 
-/** Cells projection pushed in by the Solid layer when the dialog opens.
- *  Stored in an atom (rather than dialog-local state) so the Solid
- *  1.9.12 Provider remount hazard does not strand it. */
-export const removeDuplicatesScanInputCellsAtom = atom<ReadonlyArray<DisplayCell>>([])
-removeDuplicatesScanInputCellsAtom.debugLabel =
-  'spreadsheet.removeDuplicates.scanInputCells'
+  has(value: Value): boolean {
+    return this.items.includes(value)
+  }
 
-// ---------------------------------------------------------------------------
-// derived atoms
-// ---------------------------------------------------------------------------
-
-/**
- * Live preview of the scan result. `null` whenever:
- * - the dialog is closed, or
- * - no range is set.
- *
- * When the user deselects every column the derived atom returns a
- * synthetic result with `noKeyColumns:true`, `duplicateRows:[]`,
- * `scannedRows:0` and `uniqueRows:0` — the dialog uses that flag to
- * disable the OK button and show a "select at least one column" hint.
- */
-export const removeDuplicatesPreviewAtom = atom(
-  (get): RemoveDuplicatesScanResult | null => {
-    const open = get(removeDuplicatesOpenAtom)
-    if (!open) return null
-    const range = get(removeDuplicatesRangeAtom)
-    if (!range) return null
-    const cells = get(removeDuplicatesScanInputCellsAtom)
-    const keyColumns = get(removeDuplicatesKeyColumnsAtom)
-    const comparison = get(removeDuplicatesComparisonAtom)
-    const excludeHeader = get(removeDuplicatesExcludeHeaderAtom)
-
-    // Partition by in-range so we can detect "no usable key columns"
-    // without calling into findDuplicateRows (which throws by spec).
-    let inRangeCount = 0
-    const ignoredColumns: number[] = []
-    for (const col of keyColumns) {
-      if (col >= range.startCol && col <= range.endCol) {
-        inRangeCount += 1
-      } else {
-        ignoredColumns.push(col)
-      }
+  forEach(
+    callback: (value: Value, valueAgain: Value, set: ReadonlySet<Value>) => void,
+    thisArg?: unknown,
+  ): void {
+    for (const value of this.items) {
+      callback.call(thisArg, value, value, this as unknown as ReadonlySet<Value>)
     }
-    ignoredColumns.sort((a, b) => a - b)
+  }
 
+  entries(): IterableIterator<[Value, Value]> {
+    return this.items.map((value): [Value, Value] => [value, value]).values()
+  }
+
+  keys(): IterableIterator<Value> {
+    return this.items.values()
+  }
+
+  values(): IterableIterator<Value> {
+    return this.items.values()
+  }
+
+  [Symbol.iterator](): IterableIterator<Value> {
+    return this.items.values()
+  }
+}
+
+Object.freeze(ImmutableReadonlySet.prototype)
+
+function immutableReadonlySet<Value>(values: Iterable<Value>): ReadonlySet<Value> {
+  return new ImmutableReadonlySet(values) as unknown as ReadonlySet<Value>
+}
+
+const EMPTY_CELLS: readonly DisplayCell[] = Object.freeze([])
+const EMPTY_KEY_COLUMNS: ReadonlySet<number> = immutableReadonlySet([])
+const INITIAL_CAPABILITY: RemoveDuplicatesCapabilityState = Object.freeze({
+  canRead: false,
+  canRemove: false,
+})
+const INITIAL_LIFECYCLE: RemoveDuplicatesLifecycleState = Object.freeze({
+  status: 'closed',
+  sessionId: 0,
+  readRequestId: null,
+  mutationRequestId: null,
+  sheetId: null,
+})
+
+function snapshotRuntimeValue<Value>(value: Value, seen = new WeakMap<object, unknown>()): Value {
+  if (value === null || typeof value !== 'object') return value
+  const object = value as unknown as object
+  const cached = seen.get(object)
+  if (cached !== undefined) return cached as Value
+  if (Array.isArray(value)) {
+    const clone: unknown[] = []
+    seen.set(object, clone)
+    for (const item of value) clone.push(snapshotRuntimeValue(item, seen))
+    return Object.freeze(clone) as Value
+  }
+  const clone: Record<string, unknown> = {}
+  seen.set(object, clone)
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    clone[key] = snapshotRuntimeValue(item, seen)
+  }
+  return Object.freeze(clone) as Value
+}
+
+function snapshotCells(cells: readonly DisplayCell[]): readonly DisplayCell[] {
+  return snapshotRuntimeValue(Array.from(cells))
+}
+
+function snapshotRange(range: CellRange): Readonly<CellRange> {
+  return Object.freeze({
+    rowStart: range.rowStart,
+    rowEnd: range.rowEnd,
+    colStart: range.colStart,
+    colEnd: range.colEnd,
+  })
+}
+
+function snapshotRemoveDuplicatesRange(range: RemoveDuplicatesRange): RemoveDuplicatesRange {
+  return Object.freeze({
+    startRow: range.startRow,
+    endRow: range.endRow,
+    startCol: range.startCol,
+    endCol: range.endCol,
+  })
+}
+
+function toRemoveDuplicatesRange(range: CellRange): RemoveDuplicatesRange {
+  return snapshotRemoveDuplicatesRange({
+    startRow: range.rowStart,
+    endRow: range.rowEnd,
+    startCol: range.colStart,
+    endCol: range.colEnd,
+  })
+}
+
+function sameRange(left: CellRange, right: CellRange): boolean {
+  return (
+    left.rowStart === right.rowStart &&
+    left.rowEnd === right.rowEnd &&
+    left.colStart === right.colStart &&
+    left.colEnd === right.colEnd
+  )
+}
+
+function validRange(range: CellRange): boolean {
+  return (
+    Number.isSafeInteger(range.rowStart) &&
+    Number.isSafeInteger(range.rowEnd) &&
+    Number.isSafeInteger(range.colStart) &&
+    Number.isSafeInteger(range.colEnd) &&
+    range.rowStart >= 0 &&
+    range.colStart >= 0 &&
+    range.rowStart <= range.rowEnd &&
+    range.colStart <= range.colEnd
+  )
+}
+
+function validRevision(revision: unknown): revision is ProjectionRevision {
+  return (
+    (typeof revision === 'number' && Number.isFinite(revision)) ||
+    (typeof revision === 'string' && revision.length > 0)
+  )
+}
+
+function numericHistoryRevision(revision: unknown): revision is number {
+  return typeof revision === 'number' && Number.isFinite(revision)
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) return error.message
+  try {
+    return String(error)
+  } catch {
+    return 'Unknown transport failure.'
+  }
+}
+
+function lifecycleFor(
+  status: RemoveDuplicatesLifecycleState['status'],
+  sessionId: number,
+  sheetId: string | null,
+  readRequestId: ProjectionRequestId | null = null,
+  mutationRequestId: ProjectionRequestId | null = null,
+): RemoveDuplicatesLifecycleState {
+  return Object.freeze({
+    status,
+    sessionId,
+    readRequestId,
+    mutationRequestId,
+    sheetId,
+  })
+}
+
+function snapshotScanResult(result: RemoveDuplicatesScanResult): RemoveDuplicatesScanResult {
+  return Object.freeze({
+    ...result,
+    duplicateRows: Object.freeze(Array.from(result.duplicateRows)),
+    ignoredColumns: Object.freeze(Array.from(result.ignoredColumns)),
+  })
+}
+
+function allColumnsInRange(range: RemoveDuplicatesRange): ReadonlySet<number> {
+  const columns: number[] = []
+  if (range.startCol <= range.endCol) {
+    for (let col = range.startCol; col <= range.endCol; col += 1) columns.push(col)
+  }
+  return immutableReadonlySet(columns)
+}
+
+/** Crosses the positive safe-integer boundary once, then descends without reuse. */
+function nextSafeMonotonicIdentity(sequence: number): number | null {
+  if (!Number.isSafeInteger(sequence)) return null
+  if (sequence >= 0) {
+    return sequence < Number.MAX_SAFE_INTEGER ? sequence + 1 : -1
+  }
+  return sequence > Number.MIN_SAFE_INTEGER ? sequence - 1 : null
+}
+
+export function nextRemoveDuplicatesSessionId(sequence: number): number | null {
+  return nextSafeMonotonicIdentity(sequence)
+}
+
+export function nextRemoveDuplicatesReadRequestId(sequence: number): number | null {
+  return nextSafeMonotonicIdentity(sequence)
+}
+
+export function nextRemoveDuplicatesMutationRequestId(sequence: number): number | null {
+  return nextSafeMonotonicIdentity(sequence)
+}
+
+// Private writable product state. Public names below are read-only projections.
+const removeDuplicatesOpenStateAtom = atom(false)
+const removeDuplicatesRangeStateAtom = atom<RemoveDuplicatesRange | null>(null)
+const removeDuplicatesCellsStateAtom = atom<readonly DisplayCell[]>(EMPTY_CELLS)
+const removeDuplicatesKeyColumnsStateAtom = atom<ReadonlySet<number>>(EMPTY_KEY_COLUMNS)
+const removeDuplicatesComparisonStateAtom = atom<RemoveDuplicatesComparison>('exact')
+const removeDuplicatesExcludeHeaderStateAtom = atom(true)
+const removeDuplicatesSessionSequenceStateAtom = atom(0)
+const removeDuplicatesReadSequenceStateAtom = atom(0)
+const removeDuplicatesMutationSequenceStateAtom = atom(0)
+const removeDuplicatesSessionStateAtom = atom<RemoveDuplicatesSessionSnapshot | null>(null)
+const removeDuplicatesLifecycleStateAtom = atom<RemoveDuplicatesLifecycleState>(INITIAL_LIFECYCLE)
+const removeDuplicatesCapabilityStateAtom =
+  atom<RemoveDuplicatesCapabilityState>(INITIAL_CAPABILITY)
+const removeDuplicatesErrorStateAtom = atom('')
+const activeRemoveDuplicatesReadAtom = atom<RemoveDuplicatesReadTicket | null>(null)
+const activeRemoveDuplicatesMutationAtom = atom<RemoveDuplicatesMutationTicket | null>(null)
+
+removeDuplicatesOpenStateAtom.debugLabel = 'spreadsheet.removeDuplicates.open.state'
+removeDuplicatesRangeStateAtom.debugLabel = 'spreadsheet.removeDuplicates.range.state'
+removeDuplicatesCellsStateAtom.debugLabel = 'spreadsheet.removeDuplicates.cells.state'
+removeDuplicatesKeyColumnsStateAtom.debugLabel = 'spreadsheet.removeDuplicates.keyColumns.state'
+removeDuplicatesComparisonStateAtom.debugLabel = 'spreadsheet.removeDuplicates.comparison.state'
+removeDuplicatesExcludeHeaderStateAtom.debugLabel =
+  'spreadsheet.removeDuplicates.excludeHeader.state'
+removeDuplicatesSessionStateAtom.debugLabel = 'spreadsheet.removeDuplicates.session.state'
+removeDuplicatesLifecycleStateAtom.debugLabel = 'spreadsheet.removeDuplicates.lifecycle.state'
+activeRemoveDuplicatesReadAtom.debugLabel = 'spreadsheet.removeDuplicates.activeRead'
+activeRemoveDuplicatesMutationAtom.debugLabel = 'spreadsheet.removeDuplicates.activeMutation'
+
+export const removeDuplicatesOpenAtom: Atom<boolean> = atom((get) =>
+  get(removeDuplicatesOpenStateAtom),
+)
+export const removeDuplicatesRangeAtom: Atom<RemoveDuplicatesRange | null> = atom((get) =>
+  get(removeDuplicatesRangeStateAtom),
+)
+export const removeDuplicatesScanInputCellsAtom: Atom<readonly DisplayCell[]> = atom((get) =>
+  get(removeDuplicatesCellsStateAtom),
+)
+export const removeDuplicatesKeyColumnsAtom: Atom<ReadonlySet<number>> = atom((get) =>
+  get(removeDuplicatesKeyColumnsStateAtom),
+)
+export const removeDuplicatesComparisonAtom: Atom<RemoveDuplicatesComparison> = atom((get) =>
+  get(removeDuplicatesComparisonStateAtom),
+)
+export const removeDuplicatesExcludeHeaderAtom: Atom<boolean> = atom((get) =>
+  get(removeDuplicatesExcludeHeaderStateAtom),
+)
+export const removeDuplicatesSessionAtom: Atom<RemoveDuplicatesSessionSnapshot | null> = atom(
+  (get) => get(removeDuplicatesSessionStateAtom),
+)
+export const removeDuplicatesLifecycleAtom: Atom<RemoveDuplicatesLifecycleState> = atom((get) =>
+  get(removeDuplicatesLifecycleStateAtom),
+)
+export const removeDuplicatesCapabilityAtom: Atom<RemoveDuplicatesCapabilityState> = atom((get) =>
+  get(removeDuplicatesCapabilityStateAtom),
+)
+export const removeDuplicatesErrorAtom: Atom<string> = atom((get) =>
+  get(removeDuplicatesErrorStateAtom),
+)
+export const removeDuplicatesSessionIdAtom: Atom<number> = atom((get) =>
+  get(removeDuplicatesSessionSequenceStateAtom),
+)
+export const removeDuplicatesReadRequestIdAtom: Atom<number> = atom((get) =>
+  get(removeDuplicatesReadSequenceStateAtom),
+)
+export const removeDuplicatesMutationRequestIdAtom: Atom<number> = atom((get) =>
+  get(removeDuplicatesMutationSequenceStateAtom),
+)
+export const removeDuplicatesMutationTargetAtom: Atom<RemoveDuplicatesMutationTarget | null> = atom(
+  (get) => get(activeRemoveDuplicatesMutationAtom)?.target ?? null,
+)
+
+removeDuplicatesOpenAtom.debugLabel = 'spreadsheet.removeDuplicates.open'
+removeDuplicatesRangeAtom.debugLabel = 'spreadsheet.removeDuplicates.range'
+removeDuplicatesScanInputCellsAtom.debugLabel = 'spreadsheet.removeDuplicates.scanInputCells'
+removeDuplicatesKeyColumnsAtom.debugLabel = 'spreadsheet.removeDuplicates.keyColumns'
+removeDuplicatesComparisonAtom.debugLabel = 'spreadsheet.removeDuplicates.comparison'
+removeDuplicatesExcludeHeaderAtom.debugLabel = 'spreadsheet.removeDuplicates.excludeHeader'
+removeDuplicatesSessionAtom.debugLabel = 'spreadsheet.removeDuplicates.session'
+removeDuplicatesLifecycleAtom.debugLabel = 'spreadsheet.removeDuplicates.lifecycle'
+removeDuplicatesCapabilityAtom.debugLabel = 'spreadsheet.removeDuplicates.capability'
+removeDuplicatesErrorAtom.debugLabel = 'spreadsheet.removeDuplicates.error'
+
+export const removeDuplicatesPreviewAtom: Atom<RemoveDuplicatesScanResult | null> = atom(
+  (get): RemoveDuplicatesScanResult | null => {
+    if (!get(removeDuplicatesOpenAtom)) return null
+    const range = get(removeDuplicatesRangeAtom)
+    if (range === null) return null
+    const keyColumns = get(removeDuplicatesKeyColumnsAtom)
+    const excludeHeader = get(removeDuplicatesExcludeHeaderAtom)
+    const ignoredColumns: number[] = []
+    let inRangeCount = 0
+    for (const col of keyColumns) {
+      if (col >= range.startCol && col <= range.endCol) inRangeCount += 1
+      else ignoredColumns.push(col)
+    }
+    ignoredColumns.sort((left, right) => left - right)
     if (inRangeCount === 0) {
-      return {
+      return snapshotScanResult({
         duplicateRows: [],
         scannedRows: 0,
         uniqueRows: 0,
         ignoredColumns,
-        headerRow:
-          excludeHeader && range.startRow <= range.endRow ? range.startRow : null,
+        headerRow: excludeHeader && range.startRow <= range.endRow ? range.startRow : null,
         noKeyColumns: true,
-      }
+      })
     }
-
-    return findDuplicateRows({
-      cells,
-      range,
-      keyColumns,
-      comparison,
-      excludeHeader,
-    })
+    return snapshotScanResult(
+      findDuplicateRows({
+        cells: get(removeDuplicatesScanInputCellsAtom),
+        range,
+        keyColumns,
+        comparison: get(removeDuplicatesComparisonAtom),
+        excludeHeader,
+      }),
+    )
   },
 )
 removeDuplicatesPreviewAtom.debugLabel = 'spreadsheet.removeDuplicates.preview'
 
-// ---------------------------------------------------------------------------
-// commands
-// ---------------------------------------------------------------------------
-
-function allColumnsInRange(range: RemoveDuplicatesRange): Set<number> {
-  const out = new Set<number>()
-  if (range.startCol > range.endCol) return out
-  for (let col = range.startCol; col <= range.endCol; col += 1) {
-    out.add(col)
-  }
-  return out
+function blocksClose(status: RemoveDuplicatesLifecycleState['status']): boolean {
+  return (
+    status === 'mutation-pending' ||
+    status === 'local-acknowledged' ||
+    status === 'refreshing' ||
+    status === 'refresh-failed' ||
+    status === 'outcome-unknown'
+  )
 }
 
+export const removeDuplicatesCanEditAtom = atom((get) => {
+  return (
+    get(removeDuplicatesOpenAtom) &&
+    get(removeDuplicatesLifecycleAtom).status === 'editing' &&
+    get(activeRemoveDuplicatesMutationAtom) === null
+  )
+})
+
+export const removeDuplicatesCanCloseAtom = atom((get) => {
+  return (
+    get(removeDuplicatesOpenAtom) &&
+    get(activeRemoveDuplicatesMutationAtom) === null &&
+    !blocksClose(get(removeDuplicatesLifecycleAtom).status)
+  )
+})
+
+export const removeDuplicatesCanRetryReadAtom = atom((get) => {
+  const status = get(removeDuplicatesLifecycleAtom).status
+  return status === 'read-stale' || status === 'read-failed'
+})
+
+export const removeDuplicatesBusyAtom = atom((get) => {
+  const status = get(removeDuplicatesLifecycleAtom).status
+  return (
+    status === 'read-pending' ||
+    status === 'mutation-pending' ||
+    status === 'local-acknowledged' ||
+    status === 'refreshing'
+  )
+})
+
+export const removeDuplicatesCanConfirmAtom = atom((get) => {
+  const lifecycle = get(removeDuplicatesLifecycleAtom)
+  const active = get(activeRemoveDuplicatesMutationAtom)
+  if (
+    lifecycle.status === 'refresh-failed' &&
+    active !== null &&
+    active.acknowledgement !== null &&
+    active.sessionId === lifecycle.sessionId
+  ) {
+    return true
+  }
+  if (
+    lifecycle.status !== 'editing' ||
+    active !== null ||
+    get(removeDuplicatesSessionAtom) === null ||
+    !get(removeDuplicatesCapabilityAtom).canRemove
+  ) {
+    return false
+  }
+  const preview = get(removeDuplicatesPreviewAtom)
+  return preview !== null && !preview.noKeyColumns && preview.duplicateRows.length > 0
+})
+
+function closeSession(get: Getter, set: Setter): void {
+  const nextSessionId = nextRemoveDuplicatesSessionId(get(removeDuplicatesSessionSequenceStateAtom))
+  if (nextSessionId !== null) set(removeDuplicatesSessionSequenceStateAtom, nextSessionId)
+  const sessionId = nextSessionId ?? get(removeDuplicatesSessionSequenceStateAtom)
+  set(activeRemoveDuplicatesReadAtom, null)
+  set(activeRemoveDuplicatesMutationAtom, null)
+  set(removeDuplicatesOpenStateAtom, false)
+  set(removeDuplicatesRangeStateAtom, null)
+  set(removeDuplicatesCellsStateAtom, EMPTY_CELLS)
+  set(removeDuplicatesKeyColumnsStateAtom, EMPTY_KEY_COLUMNS)
+  set(removeDuplicatesSessionStateAtom, null)
+  set(removeDuplicatesErrorStateAtom, '')
+  set(removeDuplicatesLifecycleStateAtom, lifecycleFor('closed', sessionId, null))
+}
+
+export const closeRemoveDuplicatesAtom = atom(null, (get, set): boolean => {
+  if (!get(removeDuplicatesCanCloseAtom)) return false
+  closeSession(get, set)
+  return true
+})
+closeRemoveDuplicatesAtom.debugLabel = 'spreadsheet.removeDuplicates.close.command'
+
+export const captureRemoveDuplicatesCapabilityAtom = atom(
+  null,
+  (_get, set, source: RemoveDuplicatesControllerPort): RemoveDuplicatesCapabilityState => {
+    let canRead = false
+    let canRemove = false
+    try {
+      canRead = typeof source?.readRangeProjection === 'function'
+      canRemove = typeof source?.removeRowsExact === 'function'
+    } catch {
+      canRead = false
+      canRemove = false
+    }
+    const capability = Object.freeze({ canRead, canRemove })
+    set(removeDuplicatesCapabilityStateAtom, capability)
+    return capability
+  },
+)
+captureRemoveDuplicatesCapabilityAtom.debugLabel = 'spreadsheet.removeDuplicates.captureCapability'
+
+export const dispatchRemoveDuplicatesIntentAtom = atom(
+  null,
+  (get, set, intent: RemoveDuplicatesIntent): boolean => {
+    if (!get(removeDuplicatesCanEditAtom)) return false
+    const range = get(removeDuplicatesRangeAtom)
+    if (range === null) return false
+    switch (intent.kind) {
+      case 'toggle-key-column': {
+        if (
+          !Number.isSafeInteger(intent.column) ||
+          intent.column < range.startCol ||
+          intent.column > range.endCol
+        ) {
+          return false
+        }
+        const next = new Set(get(removeDuplicatesKeyColumnsAtom))
+        if (next.has(intent.column)) next.delete(intent.column)
+        else next.add(intent.column)
+        set(removeDuplicatesKeyColumnsStateAtom, immutableReadonlySet(next))
+        return true
+      }
+      case 'select-all-key-columns':
+        set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(range))
+        return true
+      case 'deselect-all-key-columns':
+        set(removeDuplicatesKeyColumnsStateAtom, EMPTY_KEY_COLUMNS)
+        return true
+      case 'set-comparison':
+        set(removeDuplicatesComparisonStateAtom, intent.comparison)
+        return true
+      case 'set-exclude-header':
+        set(removeDuplicatesExcludeHeaderStateAtom, intent.excludeHeader)
+        return true
+    }
+  },
+)
+dispatchRemoveDuplicatesIntentAtom.debugLabel = 'spreadsheet.removeDuplicates.dispatchIntent'
+
+// Compatibility commands remain typed write funnels; public product atoms are read-only.
+export const toggleKeyColumnAtom = atom(null, (_get, set, column: number): boolean =>
+  set(dispatchRemoveDuplicatesIntentAtom, { kind: 'toggle-key-column', column }),
+)
+export const selectAllKeyColumnsAtom = atom(null, (_get, set): boolean =>
+  set(dispatchRemoveDuplicatesIntentAtom, { kind: 'select-all-key-columns' }),
+)
+export const deselectAllKeyColumnsAtom = atom(null, (_get, set): boolean =>
+  set(dispatchRemoveDuplicatesIntentAtom, { kind: 'deselect-all-key-columns' }),
+)
+
 /**
- * Open command. Seeds the range + cells, defaults `keyColumns` to every
- * column in the range, and flips the dialog open. Does not reset the
- * `comparison` / `excludeHeader` atoms — those carry their last-used
- * value within a session by design, matching Excel's "remember dialog
- * settings" behaviour.
+ * Temporary RD-C1 compatibility entry. It can render a preview but has no
+ * sheet/revision/selection witness and therefore can never commit rows.
  */
 export const openRemoveDuplicatesAtom = atom(
   null,
-  (
-    _get,
-    set,
-    range: RemoveDuplicatesRange,
-    cells: ReadonlyArray<DisplayCell>,
-  ): void => {
-    set(removeDuplicatesRangeAtom, range)
-    set(removeDuplicatesScanInputCellsAtom, cells)
-    set(removeDuplicatesKeyColumnsAtom, allColumnsInRange(range))
-    set(removeDuplicatesOpenAtom, true)
+  (get, set, range: RemoveDuplicatesRange, cells: readonly DisplayCell[]): number | null => {
+    const lifecycle = get(removeDuplicatesLifecycleAtom)
+    if (
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      lifecycle.status === 'read-pending' ||
+      blocksClose(lifecycle.status)
+    ) {
+      return null
+    }
+    const sessionId = nextRemoveDuplicatesSessionId(get(removeDuplicatesSessionSequenceStateAtom))
+    if (sessionId === null) return null
+    const rangeSnapshot = snapshotRemoveDuplicatesRange(range)
+    set(removeDuplicatesSessionSequenceStateAtom, sessionId)
+    set(activeRemoveDuplicatesReadAtom, null)
+    set(activeRemoveDuplicatesMutationAtom, null)
+    set(removeDuplicatesSessionStateAtom, null)
+    set(removeDuplicatesRangeStateAtom, rangeSnapshot)
+    set(removeDuplicatesCellsStateAtom, snapshotCells(cells))
+    set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(rangeSnapshot))
+    set(removeDuplicatesErrorStateAtom, '')
+    set(removeDuplicatesLifecycleStateAtom, lifecycleFor('editing', sessionId, null))
+    set(removeDuplicatesOpenStateAtom, true)
+    return sessionId
   },
 )
-openRemoveDuplicatesAtom.debugLabel = 'spreadsheet.removeDuplicates.openCommand'
+openRemoveDuplicatesAtom.debugLabel = 'spreadsheet.removeDuplicates.open.compatibility'
 
-/** Close + clear all per-instance state. */
-export const closeRemoveDuplicatesAtom = atom(null, (_get, set): void => {
-  set(removeDuplicatesOpenAtom, false)
-  set(removeDuplicatesRangeAtom, null)
-  set(removeDuplicatesScanInputCellsAtom, [])
-  set(removeDuplicatesKeyColumnsAtom, new Set<number>())
-})
-closeRemoveDuplicatesAtom.debugLabel = 'spreadsheet.removeDuplicates.closeCommand'
+function readTicketContextIsCurrent(get: Getter, ticket: RemoveDuplicatesReadTicket): boolean {
+  const active = get(activeRemoveDuplicatesReadAtom)
+  const lifecycle = get(removeDuplicatesLifecycleAtom)
+  return (
+    active === ticket &&
+    get(removeDuplicatesOpenAtom) &&
+    lifecycle.status === 'read-pending' &&
+    lifecycle.sessionId === ticket.sessionId &&
+    lifecycle.readRequestId === ticket.requestId &&
+    lifecycle.sheetId === ticket.sheetId
+  )
+}
 
-/** Flip a single column's membership in the key set. Immutable rewrite
- *  so subscribers see a fresh reference. */
-export const toggleKeyColumnAtom = atom(null, (get, set, col: number): void => {
-  const current = get(removeDuplicatesKeyColumnsAtom)
-  const next = new Set(current)
-  if (next.has(col)) {
-    next.delete(col)
-  } else {
-    next.add(col)
+function readTicketAuthorityIsCurrent(get: Getter, ticket: RemoveDuplicatesReadTicket): boolean {
+  return (
+    get(selectionAuthorityWitnessAtom) === ticket.selectionWitness &&
+    get(workspaceActiveSheetAuthorityWitnessAtom) === ticket.workspaceActiveSheetWitness &&
+    get(primarySelectionRegionAtom).sheetId === ticket.sheetId &&
+    get(workspaceSessionAtom).activeSheetId === ticket.sheetId &&
+    sameRange(get(selectionRangeAtom), ticket.range)
+  )
+}
+
+function markReadStale(
+  set: Setter,
+  ticket: RemoveDuplicatesReadTicket,
+): RemoveDuplicatesReadOutcome {
+  set(activeRemoveDuplicatesReadAtom, null)
+  set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_STALE_ERROR)
+  set(
+    removeDuplicatesLifecycleStateAtom,
+    lifecycleFor('read-stale', ticket.sessionId, ticket.sheetId, ticket.requestId),
+  )
+  return 'stale'
+}
+
+function classifyReadAcknowledgement(
+  acknowledgement: unknown,
+  ticket: RemoveDuplicatesReadTicket,
+): 'exact' | 'stale' | 'failed' {
+  try {
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) return 'failed'
+    const result = acknowledgement as RangeProjectionResult
+    if (result.kind !== 'range') return 'failed'
+    if (
+      result.requestId !== ticket.requestId ||
+      result.sheetId !== ticket.sheetId ||
+      !sameRange(result.range, ticket.range)
+    ) {
+      return 'stale'
+    }
+    if (
+      (result.truncated !== undefined && typeof result.truncated !== 'boolean') ||
+      result.truncated === true ||
+      !validRevision(result.revision)
+    ) {
+      return 'failed'
+    }
+    if (!Array.isArray(result.cells)) return 'failed'
+    const seenCoordinates = new Set<string>()
+    const originalRowByVisualRow = new Map<number, number>()
+    for (const cell of result.cells) {
+      if (
+        typeof cell !== 'object' ||
+        cell === null ||
+        !Number.isSafeInteger(cell.row) ||
+        !Number.isSafeInteger(cell.col) ||
+        cell.row < ticket.range.rowStart ||
+        cell.row > ticket.range.rowEnd ||
+        cell.col < ticket.range.colStart ||
+        cell.col > ticket.range.colEnd ||
+        typeof cell.displayValue !== 'string' ||
+        (cell.originalRow !== undefined &&
+          (!Number.isSafeInteger(cell.originalRow) || cell.originalRow < 0))
+      ) {
+        return 'failed'
+      }
+      const coordinateKey = `${cell.row}:${cell.col}`
+      if (seenCoordinates.has(coordinateKey)) return 'failed'
+      seenCoordinates.add(coordinateKey)
+
+      const originalRow = cell.originalRow ?? cell.row
+      const existingOriginalRow = originalRowByVisualRow.get(cell.row)
+      if (existingOriginalRow !== undefined && existingOriginalRow !== originalRow) return 'failed'
+      originalRowByVisualRow.set(cell.row, originalRow)
+    }
+    return 'exact'
+  } catch {
+    return 'failed'
   }
-  set(removeDuplicatesKeyColumnsAtom, next)
-})
-toggleKeyColumnAtom.debugLabel = 'spreadsheet.removeDuplicates.toggleKeyColumn'
+}
 
-/** Check every column in the active range. No-op when no range is set. */
-export const selectAllKeyColumnsAtom = atom(null, (get, set): void => {
-  const range = get(removeDuplicatesRangeAtom)
-  if (!range) return
-  set(removeDuplicatesKeyColumnsAtom, allColumnsInRange(range))
-})
-selectAllKeyColumnsAtom.debugLabel = 'spreadsheet.removeDuplicates.selectAllKeyColumns'
+export const openRemoveDuplicatesFromSelectionAtom = atom(
+  null,
+  async (get, set, input: OpenRemoveDuplicatesInput): Promise<RemoveDuplicatesReadOutcome> => {
+    const lifecycle = get(removeDuplicatesLifecycleAtom)
+    if (
+      lifecycle.status === 'read-pending' ||
+      get(activeRemoveDuplicatesMutationAtom) !== null ||
+      blocksClose(lifecycle.status)
+    ) {
+      return 'blocked'
+    }
 
-/** Uncheck every column. Preview will emit `noKeyColumns:true` until the
- *  user toggles at least one column back on. */
-export const deselectAllKeyColumnsAtom = atom(null, (_get, set): void => {
-  set(removeDuplicatesKeyColumnsAtom, new Set<number>())
-})
-deselectAllKeyColumnsAtom.debugLabel =
-  'spreadsheet.removeDuplicates.deselectAllKeyColumns'
+    const sessionId = nextRemoveDuplicatesSessionId(get(removeDuplicatesSessionSequenceStateAtom))
+    const requestId = nextRemoveDuplicatesReadRequestId(get(removeDuplicatesReadSequenceStateAtom))
+    const range = snapshotRange(get(selectionRangeAtom))
+    const selectionWitness = get(selectionAuthorityWitnessAtom)
+    const selectionSheetId = get(primarySelectionRegionAtom).sheetId
+    const workspaceActiveSheetWitness = get(workspaceActiveSheetAuthorityWitnessAtom)
+    const workspaceActiveSheetId = get(workspaceSessionAtom).activeSheetId
+    const compatibilitySheetMatches =
+      input.sheetId === undefined ||
+      (typeof input.sheetId === 'string' && input.sheetId === selectionSheetId)
+    if (
+      sessionId === null ||
+      requestId === null ||
+      selectionSheetId.length === 0 ||
+      selectionSheetId !== workspaceActiveSheetId ||
+      !compatibilitySheetMatches ||
+      !validRange(range)
+    ) {
+      set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_FAILED_ERROR)
+      set(
+        removeDuplicatesLifecycleStateAtom,
+        lifecycleFor('read-failed', lifecycle.sessionId, null),
+      )
+      return 'failed'
+    }
+
+    let execute: RemoveDuplicatesControllerPort['readRangeProjection']
+    let canRemove = false
+    try {
+      execute = input.source?.readRangeProjection
+      canRemove = typeof input.source?.removeRowsExact === 'function'
+    } catch {
+      execute = undefined
+    }
+    const canRead = typeof execute === 'function'
+    set(removeDuplicatesCapabilityStateAtom, Object.freeze({ canRead, canRemove }))
+    set(removeDuplicatesSessionSequenceStateAtom, sessionId)
+    set(removeDuplicatesReadSequenceStateAtom, requestId)
+    set(activeRemoveDuplicatesMutationAtom, null)
+    set(removeDuplicatesSessionStateAtom, null)
+    set(removeDuplicatesRangeStateAtom, toRemoveDuplicatesRange(range))
+    set(removeDuplicatesCellsStateAtom, EMPTY_CELLS)
+    set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(toRemoveDuplicatesRange(range)))
+    set(removeDuplicatesOpenStateAtom, true)
+    set(removeDuplicatesErrorStateAtom, '')
+
+    if (!canRead || execute === undefined) {
+      set(activeRemoveDuplicatesReadAtom, null)
+      set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_CAPABILITY_ERROR)
+      set(
+        removeDuplicatesLifecycleStateAtom,
+        lifecycleFor('read-failed', sessionId, selectionSheetId, requestId),
+      )
+      return 'failed'
+    }
+
+    const ticket: RemoveDuplicatesReadTicket = Object.freeze({
+      sessionId,
+      requestId,
+      sheetId: selectionSheetId,
+      range,
+      selectionWitness,
+      workspaceActiveSheetWitness,
+    })
+    set(activeRemoveDuplicatesReadAtom, ticket)
+    set(
+      removeDuplicatesLifecycleStateAtom,
+      lifecycleFor('read-pending', sessionId, ticket.sheetId, requestId),
+    )
+
+    await Promise.resolve()
+    if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
+    if (!readTicketAuthorityIsCurrent(get, ticket)) return markReadStale(set, ticket)
+    set(removeDuplicatesLifecycleStateAtom, get(removeDuplicatesLifecycleAtom))
+
+    let acknowledgement: unknown
+    try {
+      acknowledgement = await execute.call(input.source, {
+        kind: 'range',
+        sheetId: ticket.sheetId,
+        range: ticket.range,
+        requestId: ticket.requestId,
+        reason: 'selection',
+      })
+    } catch (error) {
+      if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
+      if (!readTicketAuthorityIsCurrent(get, ticket)) {
+        return markReadStale(set, ticket)
+      }
+      set(activeRemoveDuplicatesReadAtom, null)
+      set(
+        removeDuplicatesErrorStateAtom,
+        `${REMOVE_DUPLICATES_READ_FAILED_ERROR} ${errorMessage(error)}`,
+      )
+      set(
+        removeDuplicatesLifecycleStateAtom,
+        lifecycleFor('read-failed', sessionId, ticket.sheetId, requestId),
+      )
+      return 'failed'
+    }
+
+    if (!readTicketContextIsCurrent(get, ticket)) return 'stale'
+    if (!readTicketAuthorityIsCurrent(get, ticket)) return markReadStale(set, ticket)
+    const classification = classifyReadAcknowledgement(acknowledgement, ticket)
+    if (classification !== 'exact') {
+      set(activeRemoveDuplicatesReadAtom, null)
+      set(
+        removeDuplicatesErrorStateAtom,
+        classification === 'stale'
+          ? REMOVE_DUPLICATES_READ_STALE_ERROR
+          : REMOVE_DUPLICATES_READ_FAILED_ERROR,
+      )
+      set(
+        removeDuplicatesLifecycleStateAtom,
+        lifecycleFor(
+          classification === 'stale' ? 'read-stale' : 'read-failed',
+          sessionId,
+          ticket.sheetId,
+          requestId,
+        ),
+      )
+      return classification
+    }
+
+    const result = acknowledgement as RangeProjectionResult
+    const cells = snapshotCells(result.cells)
+    const rangeSnapshot = toRemoveDuplicatesRange(ticket.range)
+    const session: RemoveDuplicatesSessionSnapshot = Object.freeze({
+      sessionId,
+      sheetId: ticket.sheetId,
+      range: rangeSnapshot,
+      selectionWitness: ticket.selectionWitness,
+      workspaceActiveSheetWitness: ticket.workspaceActiveSheetWitness,
+      projectionRevision: result.revision as ProjectionRevision,
+      cells,
+    })
+    set(activeRemoveDuplicatesReadAtom, null)
+    set(removeDuplicatesSessionStateAtom, session)
+    set(removeDuplicatesRangeStateAtom, session.range)
+    set(removeDuplicatesCellsStateAtom, session.cells)
+    set(removeDuplicatesKeyColumnsStateAtom, allColumnsInRange(session.range))
+    set(removeDuplicatesErrorStateAtom, '')
+    set(
+      removeDuplicatesLifecycleStateAtom,
+      lifecycleFor('editing', sessionId, ticket.sheetId, requestId),
+    )
+    return 'editing'
+  },
+)
+openRemoveDuplicatesFromSelectionAtom.debugLabel = 'spreadsheet.removeDuplicates.openFromSelection'
+
+/** Retry captures a new selection witness and allocates a fresh session/read id. */
+export const retryRemoveDuplicatesReadAtom = openRemoveDuplicatesFromSelectionAtom
+
+function canonicalRows(rows: readonly number[]): readonly number[] | null {
+  if (rows.some((row) => !Number.isSafeInteger(row) || row < 0)) return null
+  return Object.freeze(Array.from(new Set(rows)).sort((left, right) => left - right))
+}
+
+function targetRangeFor(
+  range: RemoveDuplicatesRange,
+  rows: readonly number[],
+): Readonly<CellRange> | null {
+  if (rows.length === 0) return null
+  return snapshotRange({
+    rowStart: Math.min(range.startRow, rows[0]),
+    rowEnd: Math.max(range.endRow, rows[rows.length - 1]),
+    colStart: range.startCol,
+    colEnd: range.endCol,
+  })
+}
+
+function targetKeyFor(
+  sheetId: string,
+  targetRange: CellRange,
+  revision: ProjectionRevision,
+  rows: readonly number[],
+): string {
+  return JSON.stringify([
+    sheetId,
+    targetRange.rowStart,
+    targetRange.rowEnd,
+    targetRange.colStart,
+    targetRange.colEnd,
+    typeof revision,
+    revision,
+    rows,
+  ])
+}
+
+function mutationTicketIsCurrent(get: Getter, ticket: RemoveDuplicatesMutationTicket): boolean {
+  const lifecycle = get(removeDuplicatesLifecycleAtom)
+  const active = get(activeRemoveDuplicatesMutationAtom)
+  return (
+    active !== null &&
+    active.sessionId === ticket.sessionId &&
+    active.target.requestId === ticket.target.requestId &&
+    get(removeDuplicatesOpenAtom) &&
+    get(removeDuplicatesSessionAtom)?.sessionId === ticket.sessionId &&
+    lifecycle.sessionId === ticket.sessionId &&
+    lifecycle.mutationRequestId === ticket.target.requestId
+  )
+}
+
+function sessionAuthorityIsCurrent(get: Getter, session: RemoveDuplicatesSessionSnapshot): boolean {
+  const selectionRange = get(selectionRangeAtom)
+  return (
+    get(selectionAuthorityWitnessAtom) === session.selectionWitness &&
+    get(workspaceActiveSheetAuthorityWitnessAtom) === session.workspaceActiveSheetWitness &&
+    get(primarySelectionRegionAtom).sheetId === session.sheetId &&
+    get(workspaceSessionAtom).activeSheetId === session.sheetId &&
+    selectionRange.rowStart === session.range.startRow &&
+    selectionRange.rowEnd === session.range.endRow &&
+    selectionRange.colStart === session.range.startCol &&
+    selectionRange.colEnd === session.range.endCol
+  )
+}
+
+function mutationTicketAuthorityIsCurrent(
+  get: Getter,
+  ticket: RemoveDuplicatesMutationTicket,
+): boolean {
+  return (
+    get(selectionAuthorityWitnessAtom) === ticket.selectionWitness &&
+    get(workspaceActiveSheetAuthorityWitnessAtom) === ticket.workspaceActiveSheetWitness &&
+    get(primarySelectionRegionAtom).sheetId === ticket.target.sheetId &&
+    get(workspaceSessionAtom).activeSheetId === ticket.target.sheetId
+  )
+}
+
+function markMutationStaleBeforeTransport(
+  set: Setter,
+  ticket: RemoveDuplicatesMutationTicket,
+  readRequestId: ProjectionRequestId | null,
+): RemoveDuplicatesMutationOutcome {
+  set(activeRemoveDuplicatesMutationAtom, null)
+  set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_STALE_ERROR)
+  set(
+    removeDuplicatesLifecycleStateAtom,
+    lifecycleFor('read-stale', ticket.sessionId, ticket.target.sheetId, readRequestId),
+  )
+  return 'stale'
+}
+
+function sameNumberList(left: readonly number[], right: readonly number[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function acknowledgementMatches(
+  acknowledgement: unknown,
+  ticket: RemoveDuplicatesMutationTicket,
+): acknowledgement is RemoveRowsExactResult {
+  try {
+    if (typeof acknowledgement !== 'object' || acknowledgement === null) return false
+    const result = acknowledgement as RemoveRowsExactResult
+    const rows = canonicalRows(result.removedRowIndices)
+    if (
+      result.requestId !== ticket.target.requestId ||
+      result.sheetId !== ticket.target.sheetId ||
+      !sameRange(result.targetRange, ticket.target.targetRange) ||
+      rows === null ||
+      !sameNumberList(rows, result.removedRowIndices) ||
+      !sameNumberList(rows, ticket.target.removedRowIndices) ||
+      result.removedRows !== rows.length ||
+      !numericHistoryRevision(result.revision) ||
+      result.revision === ticket.target.projectionRevision
+    ) {
+      return false
+    }
+    if (rows.length === 0) return result.affectedRange === null
+    const affected = result.affectedRange
+    return (
+      affected !== null &&
+      affected.startRow === rows[0] &&
+      affected.endRow === ticket.target.targetRange.rowEnd &&
+      affected.startCol === ticket.target.targetRange.colStart &&
+      affected.endCol === ticket.target.targetRange.colEnd
+    )
+  } catch {
+    return false
+  }
+}
+
+function markOutcomeUnknown(
+  set: Setter,
+  ticket: RemoveDuplicatesMutationTicket,
+  detail = '',
+): RemoveDuplicatesMutationOutcome {
+  set(
+    removeDuplicatesErrorStateAtom,
+    `${REMOVE_DUPLICATES_OUTCOME_UNKNOWN_ERROR}${detail.length > 0 ? ` ${detail}` : ''}`,
+  )
+  set(
+    removeDuplicatesLifecycleStateAtom,
+    lifecycleFor(
+      'outcome-unknown',
+      ticket.sessionId,
+      ticket.target.sheetId,
+      null,
+      ticket.target.requestId,
+    ),
+  )
+  return 'outcome-unknown'
+}
+
+async function refreshAcknowledgedMutation(
+  get: Getter,
+  set: Setter,
+  ticket: RemoveDuplicatesMutationTicket,
+  refreshProjection: (sheetId: string) => Promise<void>,
+): Promise<RemoveDuplicatesMutationOutcome> {
+  set(removeDuplicatesErrorStateAtom, '')
+  set(
+    removeDuplicatesLifecycleStateAtom,
+    lifecycleFor(
+      'refreshing',
+      ticket.sessionId,
+      ticket.target.sheetId,
+      null,
+      ticket.target.requestId,
+    ),
+  )
+  await Promise.resolve()
+  if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  set(removeDuplicatesLifecycleStateAtom, get(removeDuplicatesLifecycleAtom))
+  try {
+    await refreshProjection(ticket.target.sheetId)
+  } catch (error) {
+    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    set(
+      removeDuplicatesErrorStateAtom,
+      `${REMOVE_DUPLICATES_REFRESH_ERROR_PREFIX}${errorMessage(error)}`,
+    )
+    set(
+      removeDuplicatesLifecycleStateAtom,
+      lifecycleFor(
+        'refresh-failed',
+        ticket.sessionId,
+        ticket.target.sheetId,
+        null,
+        ticket.target.requestId,
+      ),
+    )
+    return 'refresh-failed'
+  }
+  if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+  closeSession(get, set)
+  return 'completed'
+}
+
+export const runRemoveDuplicatesConfirmAtom = atom(
+  null,
+  async (
+    get,
+    set,
+    input: RunRemoveDuplicatesConfirmInput,
+  ): Promise<RemoveDuplicatesMutationOutcome> => {
+    const active = get(activeRemoveDuplicatesMutationAtom)
+    const lifecycle = get(removeDuplicatesLifecycleAtom)
+    if (active !== null) {
+      if (
+        active.acknowledgement !== null &&
+        lifecycle.status === 'refresh-failed' &&
+        input.sessionId === active.sessionId &&
+        typeof input.refreshProjection === 'function'
+      ) {
+        return refreshAcknowledgedMutation(get, set, active, input.refreshProjection)
+      }
+      return lifecycle.status === 'outcome-unknown' ? 'outcome-unknown' : 'stale'
+    }
+
+    const session = get(removeDuplicatesSessionAtom)
+    if (
+      session === null ||
+      !get(removeDuplicatesOpenAtom) ||
+      lifecycle.status !== 'editing' ||
+      input.sessionId !== session.sessionId ||
+      lifecycle.sessionId !== session.sessionId
+    ) {
+      return 'stale'
+    }
+    if (!sessionAuthorityIsCurrent(get, session)) {
+      set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_READ_STALE_ERROR)
+      set(
+        removeDuplicatesLifecycleStateAtom,
+        lifecycleFor('read-stale', session.sessionId, session.sheetId, lifecycle.readRequestId),
+      )
+      return 'stale'
+    }
+
+    let execute: RemoveDuplicatesControllerPort['removeRowsExact']
+    try {
+      execute = input.source?.removeRowsExact
+    } catch {
+      execute = undefined
+    }
+    if (typeof execute !== 'function') {
+      set(
+        removeDuplicatesCapabilityStateAtom,
+        Object.freeze({ ...get(removeDuplicatesCapabilityAtom), canRemove: false }),
+      )
+      set(removeDuplicatesErrorStateAtom, REMOVE_DUPLICATES_REMOVE_CAPABILITY_ERROR)
+      return 'blocked'
+    }
+    set(
+      removeDuplicatesCapabilityStateAtom,
+      Object.freeze({ ...get(removeDuplicatesCapabilityAtom), canRemove: true }),
+    )
+    if (typeof input.refreshProjection !== 'function') return 'blocked'
+
+    const preview = get(removeDuplicatesPreviewAtom)
+    const rows = preview === null ? null : canonicalRows(preview.duplicateRows)
+    const targetRange = rows === null ? null : targetRangeFor(session.range, rows)
+    if (
+      preview === null ||
+      preview.noKeyColumns ||
+      rows === null ||
+      rows.length === 0 ||
+      targetRange === null ||
+      !validRevision(session.projectionRevision)
+    ) {
+      return 'blocked'
+    }
+
+    const requestId = nextRemoveDuplicatesMutationRequestId(
+      get(removeDuplicatesMutationSequenceStateAtom),
+    )
+    if (requestId === null) {
+      set(removeDuplicatesErrorStateAtom, 'Remove Duplicates request identity space is exhausted.')
+      return 'blocked'
+    }
+    const target: RemoveDuplicatesMutationTarget = Object.freeze({
+      requestId,
+      sheetId: session.sheetId,
+      targetRange,
+      removedRowIndices: rows,
+      projectionRevision: session.projectionRevision,
+      targetKey: targetKeyFor(session.sheetId, targetRange, session.projectionRevision, rows),
+    })
+    const request: RemoveRowsExactRequest = Object.freeze({
+      kind: 'remove-rows',
+      requestId,
+      sheetId: target.sheetId,
+      targetRange: target.targetRange,
+      rows: target.removedRowIndices,
+      revision: target.projectionRevision,
+    })
+    const ticket: RemoveDuplicatesMutationTicket = Object.freeze({
+      sessionId: session.sessionId,
+      selectionWitness: session.selectionWitness,
+      workspaceActiveSheetWitness: session.workspaceActiveSheetWitness,
+      target,
+      request,
+      acknowledgement: null,
+    })
+    set(removeDuplicatesMutationSequenceStateAtom, requestId)
+    set(activeRemoveDuplicatesMutationAtom, ticket)
+    set(removeDuplicatesErrorStateAtom, '')
+    set(
+      removeDuplicatesLifecycleStateAtom,
+      lifecycleFor('mutation-pending', session.sessionId, session.sheetId, null, requestId),
+    )
+
+    // Publish the immutable ticket before transport launch; same-tick re-entry is inert.
+    await Promise.resolve()
+    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    if (!mutationTicketAuthorityIsCurrent(get, ticket)) {
+      return markMutationStaleBeforeTransport(set, ticket, lifecycle.readRequestId)
+    }
+    set(removeDuplicatesLifecycleStateAtom, get(removeDuplicatesLifecycleAtom))
+
+    let acknowledgement: unknown
+    try {
+      acknowledgement = await execute.call(input.source, ticket.request)
+    } catch (error) {
+      if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+      return markOutcomeUnknown(set, ticket, `Backend detail: ${errorMessage(error)}`)
+    }
+    if (!mutationTicketIsCurrent(get, ticket)) return 'stale'
+    if (
+      !mutationTicketAuthorityIsCurrent(get, ticket) ||
+      !acknowledgementMatches(acknowledgement, ticket)
+    ) {
+      return markOutcomeUnknown(set, ticket)
+    }
+
+    const exactAcknowledgement = acknowledgement as RemoveRowsExactResult
+    const acknowledgedTicket: RemoveDuplicatesMutationTicket = Object.freeze({
+      ...ticket,
+      acknowledgement: exactAcknowledgement,
+    })
+    set(activeRemoveDuplicatesMutationAtom, acknowledgedTicket)
+    set(pushHistoryAtom, {
+      transactionId: `remove-duplicates-${ticket.sessionId}-${ticket.target.requestId}`,
+      kind: 'row.delete',
+      sheetId: ticket.target.sheetId,
+      projectionRevision: exactAcknowledgement.revision as number,
+      affectedRange: {
+        rowStart: exactAcknowledgement.affectedRange!.startRow,
+        rowEnd: exactAcknowledgement.affectedRange!.endRow,
+        colStart: exactAcknowledgement.affectedRange!.startCol,
+        colEnd: exactAcknowledgement.affectedRange!.endCol,
+      },
+    })
+    set(
+      removeDuplicatesLifecycleStateAtom,
+      lifecycleFor(
+        'local-acknowledged',
+        ticket.sessionId,
+        ticket.target.sheetId,
+        null,
+        ticket.target.requestId,
+      ),
+    )
+    await Promise.resolve()
+    if (!mutationTicketIsCurrent(get, acknowledgedTicket)) return 'stale'
+    return refreshAcknowledgedMutation(get, set, acknowledgedTicket, input.refreshProjection)
+  },
+)
+runRemoveDuplicatesConfirmAtom.debugLabel = 'spreadsheet.removeDuplicates.confirm'

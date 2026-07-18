@@ -1,14 +1,16 @@
 import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
+  clipboardIntentAtom,
   clipboardStateAtom,
+  clearClipboardAtom,
   copyClipboardAtom,
-  cutClipboardAtom,
   createClipboardPayloadDescriptor,
   createClipboardTsvPastePlan,
   createClipboardTransferRequest,
+  cutClipboardAtom,
+  markClipboardReadyAtom,
   pasteClipboardAtom,
-  clearClipboardAtom,
   parseClipboardTsv,
   serializeClipboardTsv,
   setClipboardErrorAtom,
@@ -16,7 +18,138 @@ import {
   type ClipboardState,
 } from '../src/clipboard'
 
+type AtomHasPublicWrite<Entity> = Entity extends { write: unknown } ? true : false
+
+const CLIPBOARD_PUBLIC_STATE_IS_READ_ONLY: readonly [
+  AtomHasPublicWrite<typeof clipboardStateAtom>,
+  AtomHasPublicWrite<typeof clipboardIntentAtom>,
+] = [false, false]
+
+const CLIPBOARD_COMMANDS_ARE_WRITABLE: readonly [
+  AtomHasPublicWrite<typeof copyClipboardAtom>,
+  AtomHasPublicWrite<typeof cutClipboardAtom>,
+  AtomHasPublicWrite<typeof pasteClipboardAtom>,
+  AtomHasPublicWrite<typeof clearClipboardAtom>,
+  AtomHasPublicWrite<typeof markClipboardReadyAtom>,
+  AtomHasPublicWrite<typeof setClipboardErrorAtom>,
+] = [true, true, true, true, true, true]
+
 describe('clipboard core', () => {
+  test('rejects reflected writes to public state without changing references', () => {
+    expect(
+      [clipboardStateAtom, clipboardIntentAtom].map((stateAtom) => 'write' in stateAtom),
+    ).toEqual(CLIPBOARD_PUBLIC_STATE_IS_READ_ONLY)
+    expect(
+      [
+        copyClipboardAtom,
+        cutClipboardAtom,
+        pasteClipboardAtom,
+        clearClipboardAtom,
+        markClipboardReadyAtom,
+        setClipboardErrorAtom,
+      ].map((commandAtom) => 'write' in commandAtom),
+    ).toEqual(CLIPBOARD_COMMANDS_ARE_WRITABLE)
+
+    const store = createStore()
+    store.setter(copyClipboardAtom, {
+      source: {
+        sheetId: 'sheet-1',
+        range: { rowStart: 0, rowEnd: 0, colStart: 0, colEnd: 0 },
+      },
+    })
+    const stateBefore = store.getter(clipboardStateAtom)
+    const intentBefore = store.getter(clipboardIntentAtom)
+    if (intentBefore === null) throw new Error('expected copy intent')
+
+    expect(store.getter(clipboardStateAtom)).toBe(stateBefore)
+    expect(store.getter(clipboardIntentAtom)).toBe(intentBefore)
+    expect(stateBefore.intent).toBe(intentBefore)
+
+    expect(() =>
+      Reflect.apply(store.setter, store, [
+        clipboardStateAtom,
+        { ...stateBefore, status: 'cutting' },
+      ]),
+    ).toThrow()
+    expect(() =>
+      Reflect.apply(store.setter, store, [
+        clipboardIntentAtom,
+        { ...intentBefore, type: 'clipboard.cut' },
+      ]),
+    ).toThrow()
+
+    expect(store.getter(clipboardStateAtom)).toBe(stateBefore)
+    expect(store.getter(clipboardIntentAtom)).toBe(intentBefore)
+    expect(store.getter(clipboardStateAtom).intent).toBe(intentBefore)
+    expect(clipboardStateAtom.debugLabel).toBe('spreadsheet.clipboard.state')
+    expect(clipboardIntentAtom.debugLabel).toBe('spreadsheet.clipboard.intent')
+  })
+
+  test('routes copy, cut, and paste through ready, error, and clear', () => {
+    const store = createStore()
+    const input = {
+      source: {
+        sheetId: 'sheet-1',
+        range: { rowStart: 1, rowEnd: 2, colStart: 3, colEnd: 4 },
+      },
+      target: {
+        sheetId: 'sheet-2',
+        range: { rowStart: 5, rowEnd: 6, colStart: 7, colEnd: 8 },
+      },
+      revision: 'rev-1',
+    }
+    const idleState: ClipboardState = {
+      status: 'idle',
+      intent: null,
+      source: null,
+      target: null,
+      payload: null,
+      error: null,
+    }
+    const runFlow = (
+      start: () => void,
+      activeStatus: 'copying' | 'cutting' | 'pasting',
+      intentType: 'clipboard.copy' | 'clipboard.cut' | 'clipboard.paste',
+    ) => {
+      expect(store.getter(clipboardStateAtom)).toEqual(idleState)
+      expect(store.getter(clipboardIntentAtom)).toBeNull()
+
+      start()
+      const activeState = store.getter(clipboardStateAtom)
+      const activeIntent = store.getter(clipboardIntentAtom)
+      expect(activeState.status).toBe(activeStatus)
+      expect(activeIntent?.type).toBe(intentType)
+      expect(activeState.intent).toBe(activeIntent)
+
+      store.setter(markClipboardReadyAtom)
+      const readyState = store.getter(clipboardStateAtom)
+      expect(readyState.status).toBe('ready')
+      expect(readyState.intent).toBe(activeIntent)
+      expect(store.getter(clipboardIntentAtom)).toBe(activeIntent)
+
+      store.setter(setClipboardErrorAtom, {
+        code: 'BACKEND_ERROR',
+        message: `${intentType} failed`,
+      })
+      const errorState = store.getter(clipboardStateAtom)
+      expect(errorState.status).toBe('error')
+      expect(errorState.error).toEqual({
+        code: 'BACKEND_ERROR',
+        message: `${intentType} failed`,
+      })
+      expect(errorState.intent).toBe(activeIntent)
+      expect(store.getter(clipboardIntentAtom)).toBe(activeIntent)
+
+      store.setter(clearClipboardAtom)
+      expect(store.getter(clipboardStateAtom)).toEqual(idleState)
+      expect(store.getter(clipboardIntentAtom)).toBeNull()
+    }
+
+    runFlow(() => store.setter(copyClipboardAtom, input), 'copying', 'clipboard.copy')
+    runFlow(() => store.setter(cutClipboardAtom, input), 'cutting', 'clipboard.cut')
+    runFlow(() => store.setter(pasteClipboardAtom, input), 'pasting', 'clipboard.paste')
+  })
+
   test('describes a bounded range payload and clones caller ranges', () => {
     const source = {
       sheetId: 'sheet-1',
@@ -171,6 +304,16 @@ describe('clipboard core', () => {
       '=Data!B2+SUM(C3:D4)',
     )
     expect(shiftFormulaRefs('="A1"&A1&"B2"', 1, 1)).toBe('="A1"&B2&"B2"')
+  })
+
+  test('shifts only relative A1 axes while preserving row and column anchors', () => {
+    expect(shiftFormulaRefs('=A1+$B2+C$3+$D$4', 2, 1)).toBe(
+      '=B3+$B4+D$3+$D$4',
+    )
+    expect(shiftFormulaRefs('=Data!$A1+Data!B$2+"$C3"', 3, 2)).toBe(
+      '=Data!$A4+Data!D$2+"$C3"',
+    )
+    expect(shiftFormulaRefs('=$A$1+A2', -2, -1)).toBe('=$A$1+#REF!')
   })
 
   test('leaves bare name tokens unchanged when shifting formula refs', () => {

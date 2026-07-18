@@ -4,9 +4,9 @@ import {
   editingDraftAtom,
   formulaFunctionSignatureAtom,
   formulaFunctionSuggestionsAtom,
-  formulaReferenceCaretAtom,
   renderActiveSignatureSlots,
   renderFormulaFunctionSignature,
+  setFormulaReferenceCaretAtom,
   startEditingAtom,
 } from '../src'
 
@@ -19,7 +19,7 @@ function setup(draft: string, caret: number) {
     source: 'cell',
   })
   store.setter(editingDraftAtom, { draft })
-  store.setter(formulaReferenceCaretAtom, caret)
+  store.setter(setFormulaReferenceCaretAtom, caret)
   return store
 }
 

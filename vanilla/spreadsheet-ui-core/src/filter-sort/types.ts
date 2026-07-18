@@ -34,3 +34,136 @@ export interface SetFilterSortRequest extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
 }
+
+export interface FilterSortMutationResult extends SheetRef {
+  requestId?: ProjectionRequestId
+  revision?: ProjectionRevision
+}
+
+/** Framework-neutral command port. The source is passed to commands and is never retained. */
+export interface FilterSortControllerPort {
+  setFilterSort?: (request: SetFilterSortRequest) => Promise<FilterSortMutationResult>
+}
+
+export type FilterSortEntrypoint = 'toolbar' | 'menu-bar'
+
+export interface FilterSortEntrypointTarget {
+  readonly sheetId: string
+  readonly colIndex: number
+}
+
+export type FilterSortEntrypointStatus =
+  | 'idle'
+  | 'blocked'
+  | 'pending'
+  | 'local-acknowledged'
+  | 'refreshing'
+  | 'refresh-failed'
+  | 'outcome-unknown'
+  | 'error'
+  | 'stale'
+
+export interface FilterSortEntrypointState {
+  readonly status: FilterSortEntrypointStatus
+  readonly operationId: number | null
+  readonly requestId: ProjectionRequestId | null
+  readonly entrypoint: FilterSortEntrypoint | null
+  readonly target: FilterSortEntrypointTarget | null
+  readonly direction: SortDirection | null
+  readonly attempt: number
+  readonly error: string
+}
+
+export interface FilterSortEntrypointProjection extends FilterSortEntrypointState {
+  readonly capabilityAvailable: boolean
+  readonly disabled: boolean
+  readonly disabledReason: string | null
+  readonly pending: boolean
+}
+
+export interface RunFilterSortEntrypointInput {
+  readonly source: FilterSortControllerPort
+  readonly entrypoint: FilterSortEntrypoint
+  readonly direction: SortDirection
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+}
+
+export interface RetryFilterSortRefreshInput {
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+}
+
+export type FilterConditionKind = 'none' | 'equals' | 'contains' | 'range'
+
+export interface FilterSortDraftState {
+  readonly sessionId: number
+  readonly sheetId: string | null
+  readonly colIndex: number | null
+  readonly searchInput: string
+  readonly selectedValues: readonly string[]
+  readonly selectionMode: 'all' | 'explicit'
+  readonly conditionKind: FilterConditionKind
+  readonly equalsInput: string
+  readonly containsInput: string
+  readonly rangeMinInput: string
+  readonly rangeMaxInput: string
+  readonly availableValues: readonly string[]
+}
+
+export type FilterSortDraftPatch = Partial<
+  Pick<
+    FilterSortDraftState,
+    | 'searchInput'
+    | 'selectedValues'
+    | 'selectionMode'
+    | 'conditionKind'
+    | 'equalsInput'
+    | 'containsInput'
+    | 'rangeMinInput'
+    | 'rangeMaxInput'
+  >
+>
+
+export type FilterSortLifecycleStatus =
+  | 'closed'
+  | 'editing'
+  | 'blocked'
+  | 'pending'
+  | 'local-acknowledged'
+  | 'refreshing'
+  | 'refresh-failed'
+  | 'outcome-unknown'
+  | 'error'
+
+export interface FilterSortLifecycleState {
+  readonly status: FilterSortLifecycleStatus
+  readonly sessionId: number
+  readonly requestId: ProjectionRequestId | null
+  readonly sheetId: string | null
+  readonly colIndex: number | null
+}
+
+export type FilterSortMutationIntent =
+  | { readonly kind: 'sort'; readonly direction: SortDirection }
+  | { readonly kind: 'clear-sort' }
+  | { readonly kind: 'clear-filter' }
+  | { readonly kind: 'clear-column' }
+  | { readonly kind: 'apply-draft' }
+
+export interface RunFilterSortMutationInput {
+  readonly source: FilterSortControllerPort
+  readonly sessionId: number
+  readonly intent: FilterSortMutationIntent
+  readonly refreshProjection: (sheetId: string) => Promise<void>
+}
+
+export interface UpdateFilterSortDraftInput {
+  readonly sessionId: number
+  readonly patch: FilterSortDraftPatch
+}
+
+export interface UpdateFilterSortAvailableValuesInput {
+  readonly sessionId: number
+  readonly sheetId: string
+  readonly colIndex: number
+  readonly values: readonly string[]
+}

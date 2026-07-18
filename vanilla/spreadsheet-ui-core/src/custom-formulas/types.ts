@@ -98,3 +98,68 @@ export type CustomFormulaNameValidationReason =
 export type CustomFormulaNameValidation =
   | { ok: true }
   | { ok: false; reason: CustomFormulaNameValidationReason }
+
+/**
+ * One store owns one workbook registry lifecycle. Reset clears the
+ * active workbook registry; disposal is terminal for that store.
+ */
+export type CustomFormulaRegistryStatus = 'active' | 'disposed'
+
+export interface CustomFormulaRegistryLifecycle {
+  readonly status: CustomFormulaRegistryStatus
+  readonly maxEntries: number
+  readonly size: number
+}
+
+export type CustomFormulaRegistryRejectionReason = 'capacity-reached' | 'registry-disposed'
+
+export type RegisterCustomFormulaOutcome =
+  | {
+      readonly outcome: 'registered' | 'replaced'
+      readonly name: string
+      readonly size: number
+    }
+  | {
+      readonly outcome: 'rejected'
+      readonly reason: CustomFormulaRegistryRejectionReason
+      readonly name: string
+      readonly size: number
+      readonly maxEntries: number
+    }
+
+export type UnregisterCustomFormulaOutcome =
+  | {
+      readonly outcome: 'removed' | 'not-found'
+      readonly name: string
+      readonly size: number
+    }
+  | {
+      readonly outcome: 'rejected'
+      readonly reason: 'registry-disposed'
+      readonly name: string
+      readonly size: number
+    }
+
+export type ConfigureCustomFormulaRegistryOutcome =
+  | {
+      readonly outcome: 'configured'
+      readonly maxEntries: number
+    }
+  | {
+      readonly outcome: 'rejected'
+      readonly reason: 'invalid-limit' | 'limit-below-current-size' | 'registry-disposed'
+      readonly maxEntries: number
+      readonly currentSize: number
+    }
+
+export type ResetCustomFormulaRegistryOutcome =
+  | { readonly outcome: 'reset'; readonly clearedEntries: number }
+  | {
+      readonly outcome: 'rejected'
+      readonly reason: 'registry-disposed'
+      readonly clearedEntries: 0
+    }
+
+export type DisposeCustomFormulaRegistryOutcome =
+  | { readonly outcome: 'disposed'; readonly clearedEntries: number }
+  | { readonly outcome: 'already-disposed'; readonly clearedEntries: 0 }

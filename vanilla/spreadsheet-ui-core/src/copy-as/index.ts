@@ -1,6 +1,6 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom, type WritableAtom } from '@einfach/core'
 import type { DisplayCell } from '../backend/types'
-import type { CopyAsInput, CopyAsResult, CopyAsTextResult } from './types'
+import type { CopyAsError, CopyAsInput, CopyAsResult, CopyAsTextResult } from './types'
 import { encodeSelectionAsHtml } from './html-encoder'
 import { encodeSelectionAsMarkdown } from './markdown-encoder'
 
@@ -16,14 +16,37 @@ export type {
   EncodeSelectionAsImageFailureKind,
 } from './encodeSelectionAsImage'
 
-/**
- * Last successful copy-as result. Solid host writes this after a clipboard
- * write succeeds; tests and the diagnostics overlay read it. `null` until
- * the first copy-as in a session. Source atom — no derived consumers in
- * core today.
- */
-export const lastCopyAsAtom = atom<CopyAsResult | null>(null)
+const lastCopyAsBackingAtom = atom<CopyAsResult | null>(null)
+lastCopyAsBackingAtom.debugLabel = 'spreadsheet.copyAs.lastBacking'
+
+/** Last successful copy-as result. Publish through `publishCopyAsResultAtom`. */
+export const lastCopyAsAtom: Atom<CopyAsResult | null> = atom((get) => get(lastCopyAsBackingAtom))
 lastCopyAsAtom.debugLabel = 'spreadsheet.copyAs.last'
+
+const copyAsErrorBackingAtom = atom<CopyAsError | null>(null)
+copyAsErrorBackingAtom.debugLabel = 'spreadsheet.copyAs.errorBacking'
+
+/** Latest user-visible copy-as failure or degraded-success status. Read-only. */
+export const copyAsErrorAtom: Atom<CopyAsError | null> = atom((get) => get(copyAsErrorBackingAtom))
+copyAsErrorAtom.debugLabel = 'spreadsheet.copyAs.error'
+
+/** Publish a successfully encoded copy-as snapshot. */
+export const publishCopyAsResultAtom: WritableAtom<null, [CopyAsResult], void> = atom(
+  null,
+  (_get, set, result: CopyAsResult) => {
+    set(lastCopyAsBackingAtom, result)
+  },
+)
+publishCopyAsResultAtom.debugLabel = 'spreadsheet.copyAs.publishResult'
+
+/** Report or clear the latest copy-as user-visible status. */
+export const reportCopyAsStatusAtom: WritableAtom<null, [CopyAsError | null], void> = atom(
+  null,
+  (_get, set, status: CopyAsError | null) => {
+    set(copyAsErrorBackingAtom, status)
+  },
+)
+reportCopyAsStatusAtom.debugLabel = 'spreadsheet.copyAs.reportStatus'
 
 function makeKey(row: number, col: number): string {
   return `${row},${col}`

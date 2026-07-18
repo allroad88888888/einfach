@@ -1,9 +1,6 @@
 import { createStore } from '@einfach/core'
 import { describe, expect, test } from '@jest/globals'
-import type {
-  SpreadsheetCellFormat,
-  SpreadsheetNumberFormat,
-} from '../src/backend/types'
+import type { SpreadsheetCellFormat, SpreadsheetNumberFormat } from '../src/backend/types'
 import {
   DEFAULT_LOCALE,
   excelSerialToDate,
@@ -19,6 +16,41 @@ import {
   setWorkbookLocaleAtom,
   workbookLocaleAtom,
 } from '../src/workspace'
+import {
+  closeNumberFormatDialogAtom,
+  numberFormatDialogAtom,
+  numberFormatDialogSaveBlockedAtom,
+  numberFormatDialogSaveLedgerAtom,
+  openNumberFormatDialogAtom,
+  patchNumberFormatDialogAtom,
+  runNumberFormatDialogSaveAtom,
+  type RunFormatCellsSaveInput,
+} from '../src/format-cells'
+
+const DIALOG_RANGE = { rowStart: 1, rowEnd: 1, colStart: 2, colEnd: 2 }
+
+function numberDialogPorts(
+  overrides: Partial<RunFormatCellsSaveInput> = {},
+): RunFormatCellsSaveInput {
+  return {
+    resolveSourceRanges: (_sheetId, range) => [range],
+    setFormatRange: (request) => ({
+      sheetId: request.sheetId,
+      requestId: request.requestId,
+      affectedRange: request.range,
+    }),
+    refreshProjection: () => undefined,
+    ...overrides,
+  }
+}
+
+function numberDialogDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
 
 describe('SpreadsheetNumberFormat type widening', () => {
   test('accepts all 12 Excel categories', () => {
@@ -179,49 +211,38 @@ describe('formatNumberValue — kinds', () => {
   })
 
   test('decimal kind alias formats identical to number kind', () => {
-    expect(
-      formatNumberValue({ kind: 'decimal', digits: 1, thousands: true }, 1000).text,
-    ).toBe('1,000.0')
+    expect(formatNumberValue({ kind: 'decimal', digits: 1, thousands: true }, 1000).text).toBe(
+      '1,000.0',
+    )
   })
 
   test('number negative=red captures red color', () => {
-    const result = formatNumberValue(
-      { kind: 'number', digits: 2, negative: 'red' },
-      -42.5,
-    )
+    const result = formatNumberValue({ kind: 'number', digits: 2, negative: 'red' }, -42.5)
     expect(result.color).toBe('#ff0000')
   })
 
   test('number negative=parens wraps absolute value in parentheses', () => {
-    const result = formatNumberValue(
-      { kind: 'number', digits: 0, negative: 'parens' },
-      -100,
-    )
+    const result = formatNumberValue({ kind: 'number', digits: 0, negative: 'parens' }, -100)
     expect(result.text).toBe('(100)')
   })
 
   test('number negative=red-parens combines both', () => {
-    const result = formatNumberValue(
-      { kind: 'number', digits: 0, negative: 'red-parens' },
-      -100,
-    )
+    const result = formatNumberValue({ kind: 'number', digits: 0, negative: 'red-parens' }, -100)
     expect(result.text).toBe('(100)')
     expect(result.color).toBe('#ff0000')
   })
 
   test('currency renders with symbol and thousands', () => {
-    expect(
-      formatNumberValue({ kind: 'currency', symbol: '$', digits: 2 }, 1234.5).text,
-    ).toBe('$1,234.50')
+    expect(formatNumberValue({ kind: 'currency', symbol: '$', digits: 2 }, 1234.5).text).toBe(
+      '$1,234.50',
+    )
   })
 
   test('currency honours custom symbol and decimal digits', () => {
-    expect(
-      formatNumberValue({ kind: 'currency', symbol: '¥', digits: 0 }, 1234.56).text,
-    ).toBe('¥1,235')
-    expect(
-      formatNumberValue({ kind: 'currency', symbol: '€', digits: 3 }, 12).text,
-    ).toBe('€12.000')
+    expect(formatNumberValue({ kind: 'currency', symbol: '¥', digits: 0 }, 1234.56).text).toBe(
+      '¥1,235',
+    )
+    expect(formatNumberValue({ kind: 'currency', symbol: '€', digits: 3 }, 12).text).toBe('€12.000')
   })
 
   test('accounting uses parens for negatives and dash for zero', () => {
@@ -249,7 +270,9 @@ describe('formatNumberValue — kinds', () => {
 
   test('fraction one-digit produces small denominator output', () => {
     expect(formatNumberValue({ kind: 'fraction', denominator: 'one-digit' }, 0.5).text).toBe('1/2')
-    expect(formatNumberValue({ kind: 'fraction', denominator: 'one-digit' }, 2.25).text).toBe('2 1/4')
+    expect(formatNumberValue({ kind: 'fraction', denominator: 'one-digit' }, 2.25).text).toBe(
+      '2 1/4',
+    )
   })
 
   test('fraction with fixed denominator forces it', () => {
@@ -303,9 +326,9 @@ describe('formatNumberValue — kinds', () => {
   })
 
   test('special preset phone-us', () => {
-    expect(
-      formatNumberValue({ kind: 'special', preset: 'phone-us' }, 4155551234).text,
-    ).toBe('(415) 555-1234')
+    expect(formatNumberValue({ kind: 'special', preset: 'phone-us' }, 4155551234).text).toBe(
+      '(415) 555-1234',
+    )
   })
 
   test('custom pattern with section split for negatives', () => {
@@ -359,14 +382,9 @@ describe('formatNumberValue — kinds', () => {
     expect(formatNumberValue({ kind: 'custom', pattern: '0' }, 12.6).text).toBe('13')
     expect(formatNumberValue({ kind: 'custom', pattern: '0.00' }, 12).text).toBe('12.00')
     expect(formatNumberValue({ kind: 'custom', pattern: '#,##0' }, 1234.4).text).toBe('1,234')
-    expect(formatNumberValue({ kind: 'custom', pattern: '#,##0.00' }, 1234.5).text).toBe(
-      '1,234.50',
-    )
+    expect(formatNumberValue({ kind: 'custom', pattern: '#,##0.00' }, 1234.5).text).toBe('1,234.50')
 
-    const negative = formatNumberValue(
-      { kind: 'custom', pattern: '#,##0_);(#,##0)' },
-      -1234,
-    )
+    const negative = formatNumberValue({ kind: 'custom', pattern: '#,##0_);(#,##0)' }, -1234)
     expect(negative.text).toBe('(1,234)')
 
     const red = formatNumberValue({ kind: 'custom', pattern: '[Red]#,##0' }, 1234)
@@ -378,31 +396,25 @@ describe('formatNumberValue — kinds', () => {
 describe('formatNumberValue — locale handling', () => {
   test('default locale en-US uses comma thousands and dot decimal', () => {
     expect(
-      formatNumberValue(
-        { kind: 'number', digits: 2, thousands: true },
-        1234.56,
-        { locale: 'en-US' },
-      ).text,
+      formatNumberValue({ kind: 'number', digits: 2, thousands: true }, 1234.56, {
+        locale: 'en-US',
+      }).text,
     ).toBe('1,234.56')
   })
 
   test('de-DE swaps thousands and decimal separators', () => {
     expect(
-      formatNumberValue(
-        { kind: 'number', digits: 2, thousands: true },
-        1234.56,
-        { locale: 'de-DE' },
-      ).text,
+      formatNumberValue({ kind: 'number', digits: 2, thousands: true }, 1234.56, {
+        locale: 'de-DE',
+      }).text,
     ).toBe('1.234,56')
   })
 
   test('fr-FR uses space thousands separator', () => {
     expect(
-      formatNumberValue(
-        { kind: 'number', digits: 2, thousands: true },
-        1234.56,
-        { locale: 'fr-FR' },
-      ).text,
+      formatNumberValue({ kind: 'number', digits: 2, thousands: true }, 1234.56, {
+        locale: 'fr-FR',
+      }).text,
     ).toBe('1 234,56')
   })
 
@@ -420,5 +432,199 @@ describe('parser internals', () => {
     expect(excelSerialToDate(44197).getUTCFullYear()).toBe(2021)
     expect(excelSerialToDate(44197).getUTCMonth()).toBe(0)
     expect(excelSerialToDate(44197).getUTCDate()).toBe(1)
+  })
+})
+
+describe('lightweight number-format dialog Core save lifecycle', () => {
+  test('publishes pending before the write, preserves the selected draft, refreshes, and closes on a strict local acknowledgement', async () => {
+    const store = createStore()
+    const calls: string[] = []
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'currency',
+      sheetId: 'sheet-1',
+      range: DIALOG_RANGE,
+    })
+    store.setter(patchNumberFormatDialogAtom, { selectedId: 'usd', digits: 3 })
+
+    await expect(
+      store.setter(
+        runNumberFormatDialogSaveAtom,
+        numberDialogPorts({
+          setFormatRange: (request) => {
+            const state = store.getter(numberFormatDialogAtom)
+            expect(state.status).toBe('open')
+            if (state.status !== 'open') throw new Error('unreachable')
+            expect(state).toMatchObject({ phase: 'pending-published', pending: true })
+            expect(request.format).toMatchObject({
+              numberFormat: { kind: 'currency', symbol: '$', digits: 3 },
+            })
+            calls.push('set')
+            return {
+              sheetId: request.sheetId,
+              requestId: request.requestId,
+              affectedRange: request.range,
+            }
+          },
+          refreshProjection: () => calls.push('refresh'),
+        }),
+      ),
+    ).resolves.toBe('local-acknowledged')
+
+    expect(calls).toEqual(['set', 'refresh'])
+    expect(store.getter(numberFormatDialogAtom)).toEqual({ status: 'closed' })
+    expect(store.getter(numberFormatDialogSaveLedgerAtom)).toMatchObject([
+      { dialog: 'number-format', status: 'local-acknowledged' },
+    ])
+  })
+
+  test.each([
+    ['missing ports', undefined],
+    [
+      'resolver throw',
+      numberDialogPorts({
+        resolveSourceRanges: () => {
+          throw new Error('source mapping unavailable')
+        },
+      }),
+    ],
+    ['empty source ranges', numberDialogPorts({ resolveSourceRanges: () => [] })],
+    [
+      'invalid source ranges',
+      numberDialogPorts({
+        resolveSourceRanges: () => [{ rowStart: 2, rowEnd: 1, colStart: 0, colEnd: 0 }],
+      }),
+    ],
+    [
+      'resolver timeout',
+      numberDialogPorts({
+        resolveSourceRanges: () => new Promise<never>(() => undefined),
+        timeoutMs: 1,
+      }),
+    ],
+  ])(
+    'keeps %s before the write boundary retryable with no outcome-unknown evidence',
+    async (_label, ports) => {
+      const store = createStore()
+      store.setter(openNumberFormatDialogAtom, {
+        kind: 'number',
+        sheetId: 'sheet-1',
+        range: DIALOG_RANGE,
+      })
+
+      await expect(store.setter(runNumberFormatDialogSaveAtom, ports)).resolves.toBe('error-open')
+      const state = store.getter(numberFormatDialogAtom)
+      expect(state.status).toBe('open')
+      if (state.status !== 'open') throw new Error('unreachable')
+      expect(state).toMatchObject({ phase: 'error-open', pending: false, requestId: null })
+      expect(store.getter(numberFormatDialogSaveLedgerAtom)).toEqual([])
+      expect(store.getter(numberFormatDialogSaveBlockedAtom)).toBe(false)
+
+      await expect(store.setter(runNumberFormatDialogSaveAtom, numberDialogPorts())).resolves.toBe(
+        'local-acknowledged',
+      )
+    },
+  )
+
+  test.each([
+    [
+      'provider throw',
+      numberDialogPorts({
+        setFormatRange: () => {
+          throw new Error('write may have happened')
+        },
+      }),
+    ],
+    [
+      'provider rejection',
+      numberDialogPorts({
+        setFormatRange: () => Promise.reject(new Error('write rejected')),
+      }),
+    ],
+    [
+      'provider timeout',
+      numberDialogPorts({
+        setFormatRange: () => new Promise<never>(() => undefined),
+        timeoutMs: 1,
+      }),
+    ],
+    [
+      'ack mismatch',
+      numberDialogPorts({
+        setFormatRange: (request) => ({
+          sheetId: `${request.sheetId}-wrong`,
+          requestId: request.requestId,
+          affectedRange: request.range,
+        }),
+      }),
+    ],
+    [
+      'refresh failure',
+      numberDialogPorts({
+        refreshProjection: () => Promise.reject(new Error('projection refresh failed')),
+      }),
+    ],
+  ])('keeps the dialog and blocks retry after the write boundary on %s', async (_label, ports) => {
+    const store = createStore()
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'dateTime',
+      sheetId: 'sheet-1',
+      range: DIALOG_RANGE,
+    })
+
+    await expect(store.setter(runNumberFormatDialogSaveAtom, ports)).resolves.toBe(
+      'outcome-unknown',
+    )
+    const state = store.getter(numberFormatDialogAtom)
+    expect(state.status).toBe('open')
+    if (state.status !== 'open') throw new Error('unreachable')
+    expect(state).toMatchObject({ phase: 'outcome-unknown-blocked', pending: false })
+    expect(store.getter(numberFormatDialogSaveLedgerAtom)).toMatchObject([
+      { status: 'outcome-unknown' },
+    ])
+    expect(store.getter(numberFormatDialogSaveBlockedAtom)).toBe(true)
+  })
+
+  test('double save is blocked and a late old-session settlement cannot close a reopen', async () => {
+    const store = createStore()
+    const pending = numberDialogDeferred<unknown>()
+    let acknowledgement: unknown
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'number',
+      sheetId: 'sheet-old',
+      range: DIALOG_RANGE,
+    })
+    const ports = numberDialogPorts({
+      setFormatRange: (request) => {
+        acknowledgement = {
+          sheetId: request.sheetId,
+          requestId: request.requestId,
+          affectedRange: request.range,
+        }
+        return pending.promise
+      },
+    })
+    const first = store.setter(runNumberFormatDialogSaveAtom, ports)
+    await Promise.resolve()
+    await Promise.resolve()
+    await expect(store.setter(runNumberFormatDialogSaveAtom, ports)).resolves.toBe('blocked')
+
+    store.setter(closeNumberFormatDialogAtom)
+    store.setter(openNumberFormatDialogAtom, {
+      kind: 'currency',
+      sheetId: 'sheet-new',
+      range: { rowStart: 9, rowEnd: 9, colStart: 9, colEnd: 9 },
+    })
+    pending.resolve(acknowledgement)
+    await expect(first).resolves.toBe('outcome-unknown')
+
+    const reopened = store.getter(numberFormatDialogAtom)
+    expect(reopened.status).toBe('open')
+    if (reopened.status !== 'open') throw new Error('unreachable')
+    expect(reopened).toMatchObject({
+      kind: 'currency',
+      sheetId: 'sheet-new',
+      phase: 'editing',
+      pending: false,
+    })
   })
 })

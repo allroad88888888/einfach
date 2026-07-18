@@ -1,4 +1,4 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom } from '@einfach/core'
 import type { PresenceState, PresenceUpdate, RemoteCursor, RemoteEditEvent } from './types'
 
 export * from './types'
@@ -84,35 +84,48 @@ function deriveRemoteCursors(state: PresenceState): RemoteCursor[] {
   })
 }
 
-export const presenceStateAtom = atom<PresenceState>(DEFAULT_PRESENCE_STATE)
+const presenceStateBackingAtom = atom<PresenceState>(DEFAULT_PRESENCE_STATE)
+presenceStateBackingAtom.debugLabel = 'spreadsheet.presence.stateBacking'
+
+export const presenceStateAtom: Atom<PresenceState> = atom((get) =>
+  get(presenceStateBackingAtom),
+)
 presenceStateAtom.debugLabel = 'spreadsheet.presence.state'
 
+const lastRemoteEditEventBackingAtom = atom<RemoteEditEvent | null>(null)
+lastRemoteEditEventBackingAtom.debugLabel = 'spreadsheet.presence.lastRemoteEditBacking'
+
+export const lastRemoteEditEventAtom: Atom<RemoteEditEvent | null> = atom((get) =>
+  get(lastRemoteEditEventBackingAtom),
+)
+lastRemoteEditEventAtom.debugLabel = 'spreadsheet.presence.lastRemoteEdit'
+
 export const remoteCursorsAtom = atom<RemoteCursor[]>((get) =>
-  deriveRemoteCursors(get(presenceStateAtom)),
+  deriveRemoteCursors(get(presenceStateBackingAtom)),
 )
 remoteCursorsAtom.debugLabel = 'spreadsheet.presence.remoteCursors'
 
 export const applyPresenceUpdateAtom = atom(
   null,
   (get, set, update: PresenceUpdate): void => {
-    set(presenceStateAtom, applyPresenceUpdate(get(presenceStateAtom), update))
+    set(
+      presenceStateBackingAtom,
+      applyPresenceUpdate(get(presenceStateBackingAtom), update),
+    )
   },
 )
 applyPresenceUpdateAtom.debugLabel = 'spreadsheet.presence.applyUpdate'
 
 export const clearPresenceAtom = atom(null, (_get, set): void => {
-  set(presenceStateAtom, DEFAULT_PRESENCE_STATE)
-  set(lastRemoteEditEventAtom, null)
+  set(presenceStateBackingAtom, DEFAULT_PRESENCE_STATE)
+  set(lastRemoteEditEventBackingAtom, null)
 })
 clearPresenceAtom.debugLabel = 'spreadsheet.presence.clear'
-
-export const lastRemoteEditEventAtom = atom<RemoteEditEvent | null>(null)
-lastRemoteEditEventAtom.debugLabel = 'spreadsheet.presence.lastRemoteEdit'
 
 export const applyRemoteEditEventAtom = atom(
   null,
   (_get, set, event: RemoteEditEvent): void => {
-    set(lastRemoteEditEventAtom, event)
+    set(lastRemoteEditEventBackingAtom, event)
   },
 )
 applyRemoteEditEventAtom.debugLabel = 'spreadsheet.presence.applyRemoteEdit'

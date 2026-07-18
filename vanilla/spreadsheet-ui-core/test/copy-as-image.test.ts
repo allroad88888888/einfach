@@ -3,6 +3,7 @@ import { createStore } from '@einfach/core'
 import {
   encodeSelectionAsImage,
   lastCopyAsAtom,
+  publishCopyAsResultAtom,
   MAX_EXPORT_PIXELS,
   type CopyAsImageResult,
   type CopyAsTextResult,
@@ -217,7 +218,7 @@ describe('lastCopyAsAtom — image variant', () => {
     const store = createStore()
     const blob = new Blob([FAKE_PNG_BYTES], { type: 'image/png' })
     const snap: CopyAsImageResult = { kind: 'image', mimeType: 'image/png', blob }
-    store.setter(lastCopyAsAtom, snap)
+    store.setter(publishCopyAsResultAtom, snap)
     const got = store.getter(lastCopyAsAtom)
     expect(got).not.toBeNull()
     expect(got!.kind).toBe('image')
@@ -231,7 +232,7 @@ describe('lastCopyAsAtom — image variant', () => {
   test('continues to accept the legacy text triple (kind omitted)', () => {
     const store = createStore()
     const snap: CopyAsTextResult = { html: '<table></table>', plainText: 'a', markdown: '| a |' }
-    store.setter(lastCopyAsAtom, snap)
+    store.setter(publishCopyAsResultAtom, snap)
     const got = store.getter(lastCopyAsAtom)
     expect(got).not.toBeNull()
     // No kind on the text variant → undefined, NOT 'image'.

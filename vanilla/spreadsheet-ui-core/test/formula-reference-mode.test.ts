@@ -8,13 +8,16 @@ import {
   enterFormulaReferenceAtom,
   exitFormulaReferenceAtom,
   formulaReferenceActiveAtom,
+  formulaReferenceCaretAtom,
   formulaReferenceSessionAtom,
   pickFormulaReferenceAtom,
+  setFormulaReferenceCaretAtom,
   serializeCellRef,
   serializeRangeRef,
   shouldEnterFormulaReferenceMode,
   spliceDraft,
 } from '../src/formula-reference'
+import { keyboardModeAtom } from '../src/keyboard'
 
 function makeStore() {
   const store = createStore()
@@ -56,6 +59,17 @@ describe('enterFormulaReferenceAtom', () => {
     expect(store.getter(formulaReferenceActiveAtom)).toBe(true)
   })
 
+  test('sets keyboard mode to formula-reference', () => {
+    const store = makeStore()
+    store.setter(enterFormulaReferenceAtom, {
+      anchorCell: { row: 0, col: 0 },
+      sheetId: 'sheet-1',
+      insertionCaret: 1,
+      draft: '=',
+    })
+    expect(store.getter(keyboardModeAtom)).toBe('formula-reference')
+  })
+
   test('does not alter editingSessionAtom.status', () => {
     const store = makeStore()
     store.setter(enterFormulaReferenceAtom, {
@@ -65,6 +79,19 @@ describe('enterFormulaReferenceAtom', () => {
       draft: '=',
     })
     expect(store.getter(editingSessionAtom).status).toBe('drafting')
+  })
+})
+
+describe('setFormulaReferenceCaretAtom', () => {
+  test('updates the public read-only caret state through its command', () => {
+    const store = makeStore()
+    expect(store.getter(formulaReferenceCaretAtom)).toBe(-1)
+    expect(store.getter(setFormulaReferenceCaretAtom)).toBeNull()
+
+    store.setter(setFormulaReferenceCaretAtom, 7)
+
+    expect(store.getter(formulaReferenceCaretAtom)).toBe(7)
+    expect(store.getter(setFormulaReferenceCaretAtom)).toBeNull()
   })
 })
 
@@ -212,6 +239,20 @@ describe('exitFormulaReferenceAtom', () => {
     })
     store.setter(exitFormulaReferenceAtom, 'cancel')
     expect(store.getter(formulaReferenceActiveAtom)).toBe(false)
+  })
+
+  test('restores editing keyboard mode while the draft remains active', () => {
+    const store = makeStore()
+    store.setter(enterFormulaReferenceAtom, {
+      anchorCell: { row: 0, col: 0 },
+      sheetId: 'sheet-1',
+      insertionCaret: 1,
+      draft: '=',
+    })
+
+    store.setter(exitFormulaReferenceAtom, 'operator-typed')
+
+    expect(store.getter(keyboardModeAtom)).toBe('editing')
   })
 
   test('leaves editingSessionAtom.draft unchanged (token already spliced)', () => {

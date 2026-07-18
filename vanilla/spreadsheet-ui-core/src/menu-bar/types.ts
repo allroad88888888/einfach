@@ -1,8 +1,6 @@
 export type TopMenuId = 'file' | 'edit' | 'insert' | 'format' | 'data' | 'view' | 'help'
 
-export type TopMenuOpenState =
-  | { kind: 'idle' }
-  | { kind: 'open'; menu: TopMenuId }
+export type TopMenuOpenState = { kind: 'idle' } | { kind: 'open'; menu: TopMenuId }
 
 /**
  * A menu item declaration. The Solid host reads this registry to render
@@ -84,7 +82,9 @@ export type MenuItemDispatch =
   | { kind: 'set-fill-color' }
   | { kind: 'set-text-color' }
   | { kind: 'hide-rows' }
+  | { kind: 'unhide-rows' }
   | { kind: 'hide-cols' }
+  | { kind: 'unhide-cols' }
   | { kind: 'freeze-panes' }
   | { kind: 'unfreeze-panes' }
   | { kind: 'sort-asc' }

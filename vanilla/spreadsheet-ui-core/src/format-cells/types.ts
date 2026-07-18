@@ -1,9 +1,13 @@
 import type { CellRange } from '../shared'
 import type {
+  BackendMutationResult,
+  SetFormatRangeRequest,
   SpreadsheetBorderSpec,
   SpreadsheetBorderStyle,
   SpreadsheetCellFormat,
   SpreadsheetNumberFormat,
+  VisibleProjectionRequest,
+  VisibleProjectionResult,
 } from '../backend'
 
 /**
@@ -76,6 +80,12 @@ export interface FormatCellsEditorOpenState {
   status: 'open'
   sheetId: string
   range: CellRange
+  /** Per-store dialog generation. Late settlements may only close their own generation. */
+  sessionId: number
+  phase: FormatCellsSavePhase
+  requestId: number | null
+  pending: boolean
+  error: string | null
   activeTab: FormatCellsTabId
   draft: FormatCellsDraft
   dirty: boolean
@@ -85,9 +95,96 @@ export interface FormatCellsEditorClosedState {
   status: 'closed'
 }
 
-export type FormatCellsEditorState =
-  | FormatCellsEditorOpenState
-  | FormatCellsEditorClosedState
+export type FormatCellsEditorState = FormatCellsEditorOpenState | FormatCellsEditorClosedState
+
+export type FormatCellsDialogId = 'format-cells' | 'number-format'
+
+/** Subscriber-visible save lifecycle owned by the framework-free core. */
+export type FormatCellsSavePhase =
+  | 'editing'
+  | 'validating'
+  | 'pending-published'
+  | 'error-open'
+  | 'outcome-unknown-blocked'
+
+export interface FormatCellsSaveRequest {
+  readonly kind: 'save-format-range'
+  readonly dialog: FormatCellsDialogId
+  readonly sheetId: string
+  /** Logical selection range. A host may fan this out to source projection ranges. */
+  readonly range: CellRange
+  readonly format: SpreadsheetCellFormat
+  readonly sessionId: number
+  readonly requestId: number
+}
+
+/**
+ * A host-local acknowledgement. It means every local port/projection step
+ * fulfilled; it deliberately does not claim canonical or durable apply.
+ */
+export interface FormatCellsLocalAcknowledgement {
+  readonly kind: 'local-acknowledged'
+  readonly dialog: FormatCellsDialogId
+  readonly sheetId: string
+  readonly range: CellRange
+  readonly sessionId: number
+  readonly requestId: number
+}
+
+export type FormatCellsResolveSourceRangesPort = (
+  sheetId: string,
+  range: CellRange,
+) => Promise<unknown> | unknown
+
+export type FormatCellsSetFormatRangePort = (
+  request: SetFormatRangeRequest,
+) => Promise<BackendMutationResult | unknown> | BackendMutationResult | unknown
+
+export type FormatCellsRefreshProjectionPort = (sheetId: string) => Promise<unknown> | unknown
+
+export type FormatCellsReadVisibleProjectionPort = (
+  request: VisibleProjectionRequest,
+) => Promise<VisibleProjectionResult> | VisibleProjectionResult
+
+/** Provider surface read once at Solid component initialization by a Core command. */
+export interface FormatCellsBackendCapabilitySource {
+  readonly setFormatRange?: FormatCellsSetFormatRangePort
+  readonly readVisibleProjection?: FormatCellsReadVisibleProjectionPort
+}
+
+export interface FormatCellsBackendCapabilities {
+  readonly setFormatRange?: FormatCellsSetFormatRangePort
+  readonly readVisibleProjection?: FormatCellsReadVisibleProjectionPort
+}
+
+export interface RunFormatCellsSaveInput {
+  /** Ports are captured once. Core owns fan-out, response interpretation and settlement. */
+  readonly resolveSourceRanges?: FormatCellsResolveSourceRangesPort
+  readonly setFormatRange?: FormatCellsSetFormatRangePort
+  readonly refreshProjection?: FormatCellsRefreshProjectionPort
+  /** Bounded by Core; tests/hosts may lower it without moving timeout authority into Solid. */
+  readonly timeoutMs?: number
+}
+
+export type FormatCellsSaveResult =
+  | 'blocked'
+  | 'error-open'
+  | 'local-acknowledged'
+  | 'outcome-unknown'
+  | 'stale'
+
+export type FormatCellsSaveAttemptStatus = 'pending' | 'local-acknowledged' | 'outcome-unknown'
+
+export interface FormatCellsSaveAttempt {
+  readonly operationId: string
+  readonly dialog: FormatCellsDialogId
+  readonly sheetId: string
+  readonly range: CellRange
+  readonly sessionId: number
+  readonly requestId: number
+  readonly status: FormatCellsSaveAttemptStatus
+  readonly error?: string
+}
 
 /** Re-exports for callers that import draft helpers. */
 export type {

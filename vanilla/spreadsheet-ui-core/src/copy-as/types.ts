@@ -37,9 +37,8 @@ export interface CopyAsInput {
  * encoder directly; `encodeSelectionForClipboard` is the convenience
  * helper that returns the full triple in a single pass.
  *
- * `kind` defaults to `'text'` on legacy writers; the field is optional so
- * existing call sites (`store.setter(lastCopyAsAtom, encoded)`) continue
- * to type-check without modification.
+ * `kind` defaults to `'text'` on legacy snapshots; the field remains optional
+ * so existing persisted diagnostics can be read without migration.
  */
 export interface CopyAsTextResult {
   kind?: 'text'
@@ -52,9 +51,10 @@ export interface CopyAsTextResult {
 }
 
 /**
- * Wave 8.4 — image variant for `lastCopyAsAtom`. Host writes this after a
- * successful PNG clipboard write so diagnostics can mirror the snapshot
- * without reaching into `navigator.clipboard.read`.
+ * Wave 8.4 — image variant for `lastCopyAsAtom`. After PNG encoding succeeds,
+ * the host publishes this through `publishCopyAsResultAtom` and the diagnostics
+ * mirror before attempting the system clipboard write. Clipboard failure only
+ * updates status and preserves the published snapshot.
  */
 export interface CopyAsImageResult {
   kind: 'image'
@@ -63,3 +63,18 @@ export interface CopyAsImageResult {
 }
 
 export type CopyAsResult = CopyAsTextResult | CopyAsImageResult
+
+/**
+ * User-visible outcome of the latest copy-as attempt.
+ *
+ * This belongs to the framework-agnostic UI session rather than a host
+ * component because status surfaces and command dispatchers must observe the
+ * same result across framework adapters.
+ */
+export type CopyAsError =
+  | { kind: 'too-large'; cells: number; limit: number }
+  | { kind: 'fallback-plain-only' }
+  | { kind: 'failed' }
+  | { kind: 'image-too-large'; estimatedPixels: number; limit: number }
+  | { kind: 'image-no-backend' }
+  | { kind: 'image-failed' }

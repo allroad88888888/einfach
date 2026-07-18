@@ -1,4 +1,4 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom } from '@einfach/core'
 import type { FormulaBarDiagnostic, FormulaBarState, FormulaBarSyncInput } from './types'
 
 export * from './types'
@@ -83,48 +83,68 @@ export function setFormulaBarErrorState(
   }
 }
 
-export const formulaBarStateAtom = atom<FormulaBarState>(createFormulaBarState())
+const formulaBarStateBackingAtom = atom<FormulaBarState>(createFormulaBarState())
+formulaBarStateBackingAtom.debugLabel = 'spreadsheet.formulaBar.stateBacking'
+
+export const formulaBarStateAtom: Atom<FormulaBarState> = atom((get) =>
+  get(formulaBarStateBackingAtom),
+)
 formulaBarStateAtom.debugLabel = 'spreadsheet.formulaBar.state'
 
-export const formulaBarFocusedAtom = atom((get) => get(formulaBarStateAtom).focused)
+export const formulaBarFocusedAtom = atom((get) => get(formulaBarStateBackingAtom).focused)
 formulaBarFocusedAtom.debugLabel = 'spreadsheet.formulaBar.focused'
 
 export const formulaBarDraftAtom = atom(
-  (get) => get(formulaBarStateAtom).draft,
+  (get) => get(formulaBarStateBackingAtom).draft,
   (get, set, draft: string) => {
-    set(formulaBarStateAtom, updateFormulaBarDraftState(get(formulaBarStateAtom), draft))
+    set(
+      formulaBarStateBackingAtom,
+      updateFormulaBarDraftState(get(formulaBarStateBackingAtom), draft),
+    )
   },
 )
 formulaBarDraftAtom.debugLabel = 'spreadsheet.formulaBar.draft'
 
 export const focusFormulaBarAtom = atom(
-  (get) => get(formulaBarStateAtom),
+  (get) => get(formulaBarStateBackingAtom),
   (get, set, focused: boolean = true) => {
-    set(formulaBarStateAtom, focusFormulaBarState(get(formulaBarStateAtom), focused))
+    set(
+      formulaBarStateBackingAtom,
+      focusFormulaBarState(get(formulaBarStateBackingAtom), focused),
+    )
   },
 )
 focusFormulaBarAtom.debugLabel = 'spreadsheet.formulaBar.focus'
 
 export const syncFormulaBarAtom = atom(
-  (get) => get(formulaBarStateAtom),
+  (get) => get(formulaBarStateBackingAtom),
   (get, set, input: FormulaBarSyncInput) => {
-    set(formulaBarStateAtom, syncFormulaBarState(get(formulaBarStateAtom), input))
+    set(
+      formulaBarStateBackingAtom,
+      syncFormulaBarState(get(formulaBarStateBackingAtom), input),
+    )
   },
 )
 syncFormulaBarAtom.debugLabel = 'spreadsheet.formulaBar.sync'
 
 export const setFormulaBarDiagnosticAtom = atom(
-  (get) => get(formulaBarStateAtom),
+  (get) => get(formulaBarStateBackingAtom),
   (get, set, diagnostic: FormulaBarDiagnostic | null) => {
-    set(formulaBarStateAtom, setFormulaBarDiagnosticState(get(formulaBarStateAtom), diagnostic))
+    set(
+      formulaBarStateBackingAtom,
+      setFormulaBarDiagnosticState(get(formulaBarStateBackingAtom), diagnostic),
+    )
   },
 )
 setFormulaBarDiagnosticAtom.debugLabel = 'spreadsheet.formulaBar.diagnostic'
 
 export const setFormulaBarErrorAtom = atom(
-  (get) => get(formulaBarStateAtom),
+  (get) => get(formulaBarStateBackingAtom),
   (get, set, error: FormulaBarState['error']) => {
-    set(formulaBarStateAtom, setFormulaBarErrorState(get(formulaBarStateAtom), error))
+    set(
+      formulaBarStateBackingAtom,
+      setFormulaBarErrorState(get(formulaBarStateBackingAtom), error),
+    )
   },
 )
 setFormulaBarErrorAtom.debugLabel = 'spreadsheet.formulaBar.error'

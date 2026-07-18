@@ -1,4 +1,4 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom } from '@einfach/core'
 import type { CellCoord, CellRange } from '../shared'
 import type {
   PointerAutoscrollInput,
@@ -279,6 +279,7 @@ function buildFillHandleSession(
     focus: input.focus ? copyCellCoord(input.focus) : null,
     previewRange: input.previewRange ? copyCellRange(input.previewRange) : null,
     direction: input.direction ?? null,
+    ...(input.copyOnly === undefined ? {} : { copyOnly: input.copyOnly }),
   }
 }
 
@@ -350,6 +351,7 @@ function patchInteraction(
           ? null
           : copyCellRange(input.previewRange),
       direction: input.direction ?? state.direction,
+      copyOnly: input.copyOnly === undefined ? state.copyOnly : input.copyOnly,
     }
   }
 
@@ -439,6 +441,7 @@ export function createPointerCommitIntent(
         targetRange: copyCellRange(state.interaction.previewRange),
         focus: state.interaction.focus ? copyCellCoord(state.interaction.focus) : null,
         direction: state.interaction.direction,
+        ...(state.interaction.copyOnly === true ? { copyOnly: true } : {}),
       }
     case 'row-resize':
       if (state.interaction.previewSizePx === null) {
@@ -491,10 +494,20 @@ export function cancelPointerSessionState(
   return clearPointerSessionState()
 }
 
-export const pointerSessionAtom = atom<PointerSessionState>(createPointerSessionState())
+const pointerSessionBackingAtom = atom<PointerSessionState>(createPointerSessionState())
+pointerSessionBackingAtom.debugLabel = 'spreadsheet.pointer.sessionBacking'
+
+export const pointerSessionAtom: Atom<PointerSessionState> = atom((get) =>
+  get(pointerSessionBackingAtom),
+)
 pointerSessionAtom.debugLabel = 'spreadsheet.pointer.session'
 
-export const pointerIntentAtom = atom<PointerIntent | null>(null)
+const pointerIntentBackingAtom = atom<PointerIntent | null>(null)
+pointerIntentBackingAtom.debugLabel = 'spreadsheet.pointer.intentBacking'
+
+export const pointerIntentAtom: Atom<PointerIntent | null> = atom((get) =>
+  get(pointerIntentBackingAtom),
+)
 pointerIntentAtom.debugLabel = 'spreadsheet.pointer.intent'
 
 export const pointerIsActiveAtom = atom((get) => get(pointerSessionAtom).status === 'active')
@@ -503,8 +516,8 @@ pointerIsActiveAtom.debugLabel = 'spreadsheet.pointer.isActive'
 export const startPointerAtom = atom(
   (get) => get(pointerSessionAtom),
   (get, set, input: PointerStartInput) => {
-    set(pointerSessionAtom, startPointerSessionState(get(pointerSessionAtom), input))
-    set(pointerIntentAtom, null)
+    set(pointerSessionBackingAtom, startPointerSessionState(get(pointerSessionBackingAtom), input))
+    set(pointerIntentBackingAtom, null)
   },
 )
 startPointerAtom.debugLabel = 'spreadsheet.pointer.start'
@@ -512,7 +525,7 @@ startPointerAtom.debugLabel = 'spreadsheet.pointer.start'
 export const updatePointerAtom = atom(
   (get) => get(pointerSessionAtom),
   (get, set, input: PointerUpdateInput) => {
-    set(pointerSessionAtom, updatePointerSessionState(get(pointerSessionAtom), input))
+    set(pointerSessionBackingAtom, updatePointerSessionState(get(pointerSessionBackingAtom), input))
   },
 )
 updatePointerAtom.debugLabel = 'spreadsheet.pointer.update'
@@ -520,14 +533,14 @@ updatePointerAtom.debugLabel = 'spreadsheet.pointer.update'
 export const commitPointerAtom = atom(
   (get) => get(pointerSessionAtom),
   (get, set) => {
-    const state = get(pointerSessionAtom)
+    const state = get(pointerSessionBackingAtom)
     const intent = createPointerCommitIntent(state)
     if (intent === null) {
       return null
     }
 
-    set(pointerIntentAtom, intent)
-    set(pointerSessionAtom, commitPointerSessionState(state))
+    set(pointerIntentBackingAtom, intent)
+    set(pointerSessionBackingAtom, commitPointerSessionState(state))
     return intent
   },
 )
@@ -536,13 +549,13 @@ commitPointerAtom.debugLabel = 'spreadsheet.pointer.commit'
 export const cancelPointerAtom = atom(
   (get) => get(pointerSessionAtom),
   (get, set) => {
-    const state = get(pointerSessionAtom)
+    const state = get(pointerSessionBackingAtom)
     if (state.status === 'idle' && state.interaction === null) {
       return null
     }
 
-    set(pointerSessionAtom, cancelPointerSessionState(state))
-    set(pointerIntentAtom, null)
+    set(pointerSessionBackingAtom, cancelPointerSessionState(state))
+    set(pointerIntentBackingAtom, null)
     return null
   },
 )

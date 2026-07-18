@@ -15,13 +15,23 @@ export type MenuCommandKind =
   | 'cell.clear'
   | 'row.insert'
   | 'row.delete'
+  | 'row.hide'
+  | 'row.unhide'
   | 'column.insert'
   | 'column.delete'
+  | 'column.hide'
+  | 'column.unhide'
   | 'formatting.open'
   | 'view.freezeRowsHere'
   | 'view.freezeColsHere'
   | 'view.freezePanes'
   | 'view.unfreeze'
+
+export type ViewportHiddenContextMenuCommandKind =
+  | 'row.hide'
+  | 'row.unhide'
+  | 'column.hide'
+  | 'column.unhide'
 
 export interface MenuPosition {
   x: number

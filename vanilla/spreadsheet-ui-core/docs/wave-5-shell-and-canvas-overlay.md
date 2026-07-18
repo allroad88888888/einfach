@@ -27,7 +27,7 @@ migration of cell text is explicitly deferred.
 
 | Sub | Feature | Surface | New atoms |
 |---|---|---|---:|
-| 5.1 | Top menu bar (Luckysheet-style) | Above toolbar | 2 |
+| 5.1 | Top menu bar (Luckysheet-style) | Above toolbar | 3 public projections |
 | 5.2 | Name box | Left of formula bar | 2 source + 1 derived |
 | 5.3 | Status bar enhanced | Below grid | 4 |
 | 5.4 | Format painter | Toolbar button + cursor mode | 2 |
@@ -45,42 +45,40 @@ port — this wave is host-side and atom-only.
 New module: `src/menu-bar/`, distinct from `src/menu/` which owns the cell
 context menu (see `vanilla/spreadsheet-ui-core/src/menu/types.ts`).
 
-- `menuBarOpenCategoryAtom` — `atom<MenuBarCategory | null>`. The open
-  category or `null`. `debugLabel`: `spreadsheet.menuBar.openCategory`.
-- `menuBarHighlightAtom` — `atom<MenuBarItemId | null>`. Keyboard-highlighted
-  item. `debugLabel`: `spreadsheet.menuBar.highlight`.
+- `topMenuOpenAtom` — read-only `Atom<TopMenuOpenState>`. The state is
+  `{ kind: 'idle' }` or `{ kind: 'open'; menu: TopMenuId }`.
+- `topMenuHighlightAtom` — read-only `Atom<string | null>`. It is currently
+  always `null`; directional item highlighting has not been implemented.
+- `helpOverlayAtom` — read-only `Atom<'closed' | 'shortcuts' | 'about'>`.
 
 ```ts
-export type MenuBarCategory =
+export type TopMenuId =
   | 'file' | 'edit' | 'insert' | 'format' | 'data' | 'view' | 'help'
 ```
 
-A static `MENU_BAR_ITEMS` map in `src/menu-bar/items.ts` declares per
-category the items, labels, dispatch target, and optional `isAvailable`
-predicate. Each item resolves to one of: (1) an existing command atom
-(`undoHistoryAtom`, `redoHistoryAtom`, `copyClipboardAtom`,
-`cutClipboardAtom`, `pasteClipboardAtom`, `selectAllAtom`,
-`togglePrintPreviewAtom`, `dispatchToolbarFormatCommandAtom`,
-`setViewportHiddenAtom`, `setViewportFreezeAtom`); (2) an existing
-UI-open atom (`openFindReplaceAtom`, `openNameManagerAtom`,
-`openConditionalFormatEditorAtom`, `openValidationRuleEditorAtom`,
-`openFilterDropdownAtom`, `openCommentSessionAtom`); (3) a Wave-5 view
-atom (`zoomLevelAtom`, `viewModeAtom`).
+Module-private backing atoms own those values. `openTopMenuAtom`,
+`closeTopMenuAtom`, `openHelpOverlayAtom`, and `closeHelpOverlayAtom` are the
+public write boundary. The first two also clear the private highlight state.
+
+The static `MENU_BAR_ITEMS` registry in `src/menu-bar/index.ts` declares each
+category's labels, dispatch descriptor, availability mode, and optional
+capability key. The Solid host maps those descriptors to existing command
+atoms; placeholder and capability-gated entries remain explicit in the
+registry.
 
 Item map:
 
 - **File** — New / Open (placeholder) / Save (placeholder) / Print Preview
   / Close
-- **Edit** — Undo / Redo / Cut / Copy / Paste / Paste Special (placeholder)
-  / Find / Replace / Go To (Wave 7 placeholder) / Delete cells (via
-  `ClearCellsIntent`) / Select All
+- **Edit** — Undo / Redo / Cut / Copy / Copy As / Paste / Paste Special /
+  Find / Replace / Go To / Delete cells / Select All
 - **Insert** — Insert rows / cols (context-menu commands) / Insert sheet /
   Hyperlink (placeholder) / Comment / Name Manager
 - **Format** — Format Cells (Wave 6 placeholder) / Cell color / Text color
   / Bold / Italic / Underline / Conditional Formatting / Data Validation /
   Hide row / Hide col / Freeze panes
-- **Data** — Sort / Filter / Text to Columns (Wave 7 placeholder) / Remove
-  Duplicates (placeholder) / Data Validation
+- **Data** — Sort / Filter / Text to Columns and Remove Duplicates
+  (capability-gated) / Data Validation
 - **View** — Zoom / Show formula bar / Show gridlines / Show headings /
   Freeze panes / Full screen
 - **Help** — About / Keyboard shortcuts
@@ -92,24 +90,26 @@ None. All targets resolve through existing atoms.
 ### UI components
 
 - `solid/excel/src-vnext/menu-bar/SpreadsheetMenuBar.tsx`
-- `solid/excel/src-vnext/menu-bar/MenuBarDropdown.tsx`
-- Mounted in `solid/excel/src-vnext/demos/` above `SpreadsheetToolbar`.
+- Mounted by the vNext worker demos above `SpreadsheetToolbar`.
 
 ### Interaction states
 
-`idle` (hover highlights only) → `open` (dropdown visible; click swaps
-between categories without intermediate close; `Esc` closes; arrow keys
-navigate) → `dispatching` (transient, target invoked, menu closes; never
-blocks).
+`idle` → `open(menu)`. Clicking another category or hovering it while a menu
+is open switches directly to `open(other menu)`. `Esc`, an outside click, or
+dispatching an enabled item returns to `idle`. There is no `dispatching`
+state, and arrow-key item navigation is not implemented. Help overlays follow
+their own `closed` / `shortcuts` / `about` state flow.
 
 ### Test plan
 
 `test/menu-bar.test.ts`:
 
-- `menuBarOpenCategoryAtom` is `null` on init; click toggles a category.
-- Every entry in `MENU_BAR_ITEMS` resolves to a known atom export or is
-  explicitly marked `placeholder` (lint-style assertion).
-- Keyboard navigation cycles items; disabled items do not dispatch.
+- Public menu and Help state atoms are compile-time and runtime read-only.
+- Command atoms retain their write signatures and current readable values.
+- Open / switch / close and Help overlay transitions remain store-isolated.
+- A source scan keeps backing atoms private and forbids direct public-state
+  writes. Host registry routing and disabled entries remain covered by the
+  Solid `vnext-menu-bar` regression suite.
 
 ### Risks
 
@@ -499,13 +499,15 @@ Cell text on canvas; headers on canvas; WebGL / WebGPU.
 
 ## State Decision Template
 
-- Source atoms: `menuBarOpenCategoryAtom`, `menuBarHighlightAtom`,
-  `nameBoxInputAtom`, `nameBoxModeAtom`, `statusBarAggregateConfigAtom`,
-  `zoomLevelAtom`, `viewModeAtom`, `formatPainterStateAtom`,
-  `formatPainterClipboardAtom`.
+- Public read-only projections: `topMenuOpenAtom`, `topMenuHighlightAtom`,
+  `helpOverlayAtom`.
+- Source atoms: `nameBoxInputAtom`, `nameBoxModeAtom`,
+  `statusBarAggregateConfigAtom`, `zoomLevelAtom`, `viewModeAtom`,
+  `formatPainterStateAtom`, `formatPainterClipboardAtom`.
 - Derived atoms: `nameBoxDisplayAtom`, `selectionAggregatesAtom`,
   `inputModeAtom`.
-- Commands: `commitNameBoxAtom`, `armFormatPainterAtom`,
+- Commands: `openTopMenuAtom`, `closeTopMenuAtom`, `openHelpOverlayAtom`,
+  `closeHelpOverlayAtom`, `commitNameBoxAtom`, `armFormatPainterAtom`,
   `applyFormatPainterAtom`, `cancelFormatPainterAtom`.
 - Scale bound: aggregates capped by the visible window; no per-cell atoms.
 - Backend reads: none added in this wave.

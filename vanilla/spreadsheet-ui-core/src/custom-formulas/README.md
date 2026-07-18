@@ -22,40 +22,86 @@ the value boundary.
 ## State Decision Template
 
 - Source atom:
-  - `customFormulaRegistryAtom`: `ReadonlyMap<name, CustomFormulaRegistration>`.
-    Bounded by the host; practical caps are in the hundreds for typical
-    workbooks. ReadonlyMap value type prevents accidental in-place
-    mutation by consumers.
-- Derived atoms: none in core. The host defines a derived
-  `customFormulasSupportedAtom` reading `backend.registerCustomFormula
-  != null` and uses it to gate optional UI (none in MVP — registration
-  is programmatic, not menu-driven).
+  - Private `customFormulaRegistryStateAtom`: one aggregate per
+    `@einfach/core` store owning `{ status, maxEntries, entries }`. The
+    default cap is `256`; hosts may configure any safe integer from `0`
+    through the hard ceiling `10_000`.
+- Derived atoms:
+  - `customFormulaRegistryAtom`:
+    `ReadonlyMap<name, CustomFormulaRegistration>`. Mutations can only go
+    through the command atoms, so callers cannot bypass capacity or
+    lifecycle rules through the public atom API.
+  - `customFormulaRegistryLifecycleAtom`: exposes
+    `{ status: 'active' | 'disposed', maxEntries, size }` for host UI and
+    diagnostics.
+  - The host defines a derived `customFormulasSupportedAtom` reading
+    `backend.registerCustomFormula != null` and uses it to gate optional
+    UI (none in MVP — registration is programmatic, not menu-driven).
 - Commands:
-  - `registerCustomFormulaAtom` — add or replace by name. Validates the
-    name via `validateCustomFormulaName`; throws if invalid so hosts
-    surface bad inputs at the call site rather than letting them leak
-    into the worker.
-  - `unregisterCustomFormulaAtom` — no-op if not registered.
+  - `configureCustomFormulaRegistryAtom(maxEntries)` — changes the cap
+    without eviction. Invalid caps and caps below the current size return
+    an explicit rejected outcome and leave state untouched.
+  - `registerCustomFormulaAtom(registration)` — add or replace by name.
+    Invalid names still throw for backwards compatibility. Capacity and
+    disposed-state failures return explicit rejected outcomes; replacing
+    an existing name remains valid at capacity.
+  - `unregisterCustomFormulaAtom(name)` — reports `removed` or `not-found`.
+  - `resetCustomFormulaRegistryAtom` — clears entries, preserves the cap,
+    and remains active so the store can register/configure again.
+  - `disposeCustomFormulaRegistryAtom` — clears entries and terminally
+    disposes this store. Later register, unregister, configure, and reset
+    commands reject explicitly without mutation.
 - Helper:
   - `validateCustomFormulaName(name)` — returns
     `{ ok: true } | { ok: false; reason }` where `reason` is one of
     `'name-empty' | 'name-format' | 'name-shadows-builtin'`. Hosts that
     want a UI affordance can call this directly without round-tripping
     through the register atom.
-- Scale bound: a single map; no per-name families.
+- Scale bound: one bounded map per store; no per-name families. Capacity
+  rejection never evicts an older formula and never publishes a new map.
 - Backend reads: optional `registerCustomFormula(name, source)` /
   `unregisterCustomFormula(name)`. Host adapters that omit these
-  methods make the registry atom inert (writes succeed but the host
-  effect skips the worker call); this is the same degraded-feature
-  shape every other Wave 7/8 optional port uses.
+  methods make accepted registry changes core-only (the host effect
+  skips the worker call); this is the same degraded-feature shape every
+  other Wave 7/8 optional port uses.
 - Per-cell atom risk: none.
 - Tests: `test/custom-formulas.test.ts` (core),
   `solid/excel/test/vnext-custom-formulas.test.tsx` (host).
 
+### Compatibility boundary
+
+Existing repository consumers that read or subscribe to
+`customFormulaRegistryAtom`, and existing calls to the register/unregister
+command atoms, keep their call shape. The public registry atom itself is now
+read-only: its former direct-setter capability is intentionally removed because
+it could bypass capacity and lifecycle invariants. This is a type-level breaking
+boundary for external consumers that wrote a replacement map directly; migrate
+those writes to the configure/register/unregister/reset/dispose commands.
+
+## Registry lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Active
+  Active --> Active: configure accepted
+  Active --> Active: register / replace / unregister
+  Active --> Active: reset / clear entries
+  Active --> Active: capacity or config rejected / no mutation
+  Active --> Disposed: dispose / clear entries
+  Disposed --> Disposed: register / unregister / configure / reset rejected
+  Disposed --> Disposed: repeated dispose / already-disposed
+```
+
+The registry transition only governs UI-core state. It does **not** prove
+that an asynchronous backend registration which acknowledges after reset or
+dispose has been removed remotely. Closing that late-ACK race belongs in the
+Solid Provider integration, where the in-flight request and backend handle
+are owned; it is a separate follow-up rather than an implied core guarantee.
+
 ## Name rules
 
-- Regex: `/^[A-Z][A-Z0-9_.]*$/`. The register / unregister atoms
-  normalize the name to upper-case before mutating the map, so
+- Regex: `/^[A-Z][A-Z0-9_.]*$/`. Register requires the as-written name to
+  satisfy the upper-case format. Unregister normalizes incoming names, so
   `'mytax'` and `'MYTAX'` resolve to the same registry slot.
 - Must not shadow a name in `BUILTIN_FORMULA_NAMES`. That set unions
   two sources:

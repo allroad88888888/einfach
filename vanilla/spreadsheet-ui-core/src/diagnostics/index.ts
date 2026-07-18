@@ -1,4 +1,4 @@
-import { atom } from '@einfach/core'
+import { atom, type Atom } from '@einfach/core'
 import type { ProjectionValidationError } from '../projection'
 import type { CellCoord, CellRange, SpreadsheetError } from '../shared'
 
@@ -158,14 +158,17 @@ export function clearDiagnostics(): DiagnosticsState {
   }
 }
 
-export const diagnosticsAtom = atom<DiagnosticsState>(DEFAULT_DIAGNOSTICS_STATE)
+const diagnosticsBackingAtom = atom<DiagnosticsState>(DEFAULT_DIAGNOSTICS_STATE)
+diagnosticsBackingAtom.debugLabel = 'spreadsheet.diagnostics.stateBacking'
+
+export const diagnosticsAtom: Atom<DiagnosticsState> = atom((get) => get(diagnosticsBackingAtom))
 diagnosticsAtom.debugLabel = 'spreadsheet.diagnostics.state'
 
 export const appendDiagnosticsAtom = atom(
   (get) => get(diagnosticsAtom),
   (get, set, ...items: SpreadsheetDiagnostic[]): DiagnosticsState => {
-    const nextState = appendDiagnostics(get(diagnosticsAtom), ...items)
-    set(diagnosticsAtom, nextState)
+    const nextState = appendDiagnostics(get(diagnosticsBackingAtom), ...items)
+    set(diagnosticsBackingAtom, nextState)
     return nextState
   },
 )
@@ -175,7 +178,7 @@ export const replaceDiagnosticsAtom = atom(
   (get) => get(diagnosticsAtom),
   (_get, set, ...items: SpreadsheetDiagnostic[]): DiagnosticsState => {
     const nextState = replaceDiagnostics(DEFAULT_DIAGNOSTICS_STATE, ...items)
-    set(diagnosticsAtom, nextState)
+    set(diagnosticsBackingAtom, nextState)
     return nextState
   },
 )
@@ -184,7 +187,7 @@ replaceDiagnosticsAtom.debugLabel = 'spreadsheet.diagnostics.replace'
 export const clearDiagnosticsAtom = atom(
   (get) => get(diagnosticsAtom),
   (_get, set): DiagnosticsState => {
-    set(diagnosticsAtom, DEFAULT_DIAGNOSTICS_STATE)
+    set(diagnosticsBackingAtom, DEFAULT_DIAGNOSTICS_STATE)
     return DEFAULT_DIAGNOSTICS_STATE
   },
 )

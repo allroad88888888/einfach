@@ -64,14 +64,73 @@ export interface ConditionalFormatRuleEntry {
 }
 
 export interface ConditionalFormatRulesState {
-  sheetId: string | null
-  rules: readonly ConditionalFormatRuleEntry[]
+  readonly sheetId: string | null
+  readonly rules: readonly ConditionalFormatRuleEntry[]
+  /** Revision attached to the latest guarded rules-list response. */
+  readonly revision?: ProjectionRevision
 }
 
 export interface ConditionalFormatEditorState {
-  open: boolean
-  ruleId: ConditionalFormatRuleId | null
-  draft: ConditionalFormatRuleEntry | null
+  readonly open: boolean
+  readonly sessionId: number
+  readonly requestId: ProjectionRequestId | null
+  readonly ruleId: ConditionalFormatRuleId | null
+  readonly draft: ConditionalFormatRuleEntry | null
+  readonly selectedKind: ConditionalFormatRuleKind
+  readonly pending: boolean
+  readonly error: string | null
+}
+
+export type ConditionalFormatOperationAction = 'save' | 'remove'
+
+/**
+ * `acknowledged` only records that the current backend port fulfilled. It is
+ * not canonical evidence that the mutation was durably applied.
+ */
+export type ConditionalFormatOperationAttemptStatus = 'pending' | 'acknowledged' | 'outcome-unknown'
+
+/**
+ * Bounded local attempt evidence. Pending and outcome-unknown entries remain
+ * unresolved and cannot be evicted to make room for a new dispatch.
+ */
+export interface ConditionalFormatOperationAttempt {
+  readonly operationId: string
+  readonly requestId: ProjectionRequestId
+  readonly sessionId: number
+  readonly action: ConditionalFormatOperationAction
+  readonly sheetId: string
+  readonly ruleId: ConditionalFormatRuleId | null
+  readonly scope: ConditionalFormatScope | null
+  readonly baseRevision: ProjectionRevision | null
+  readonly status: ConditionalFormatOperationAttemptStatus
+  readonly resultRevision?: ProjectionRevision
+  readonly error?: string
+}
+
+export interface ConditionalFormatMutationAcknowledgement extends SheetRef {
+  readonly requestId?: ProjectionRequestId
+  readonly revision?: ProjectionRevision
+}
+
+export interface RunConditionalFormatMutationInput {
+  action: ConditionalFormatOperationAction
+  /** Explicit targets bypass workspace / selection fallback reads. */
+  sheetId?: string
+  scope?: ConditionalFormatScope
+  setRule?: (
+    request: SetConditionalFormatRuleRequest,
+  ) => Promise<ConditionalFormatMutationAcknowledgement>
+  removeRule?: (
+    request: RemoveConditionalFormatRuleRequest,
+  ) => Promise<ConditionalFormatMutationAcknowledgement>
+  listRules?: (request: ListConditionalFormatRulesRequest) => Promise<ConditionalFormatRulesResult>
+  /**
+   * Accepts a fulfilled backend response without upgrading it to canonical
+   * applied/reconciled evidence.
+   */
+  acceptAcknowledgedResult?: (
+    result: ConditionalFormatMutationAcknowledgement,
+  ) => Promise<void> | void
 }
 
 export interface SetConditionalFormatRuleRequest extends SheetRef {
@@ -98,7 +157,7 @@ export interface ListConditionalFormatRulesRequest extends SheetRef {
 }
 
 export interface ConditionalFormatRulesResult extends SheetRef {
-  rules: ConditionalFormatRuleEntry[]
-  requestId?: ProjectionRequestId
-  revision?: ProjectionRevision
+  readonly rules: readonly ConditionalFormatRuleEntry[]
+  readonly requestId?: ProjectionRequestId
+  readonly revision?: ProjectionRevision
 }

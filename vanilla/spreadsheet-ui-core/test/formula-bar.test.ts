@@ -2,6 +2,8 @@ import { describe, expect, test } from '@jest/globals'
 import { createStore } from '@einfach/core'
 import {
   focusFormulaBarAtom,
+  formulaBarDraftAtom,
+  formulaBarFocusedAtom,
   formulaBarStateAtom,
   setFormulaBarDiagnosticAtom,
   setFormulaBarErrorAtom,
@@ -11,6 +13,74 @@ import {
 } from '../src/formula-bar'
 
 describe('formula bar core', () => {
+  test('rejects direct writes to the public state without changing state', () => {
+    const store = createStore()
+    const before = store.getter(formulaBarStateAtom)
+
+    expect(() =>
+      Reflect.apply(store.setter, store, [
+        formulaBarStateAtom,
+        {
+          ...before,
+          status: 'editing',
+          focused: true,
+          draft: '=DIRECT',
+        },
+      ]),
+    ).toThrow()
+    expect(store.getter(formulaBarStateAtom)).toBe(before)
+    expect(formulaBarStateAtom.debugLabel).toBe('spreadsheet.formulaBar.state')
+  })
+
+  test('routes the complete state flow through writable views and commands', () => {
+    const store = createStore()
+
+    store.setter(focusFormulaBarAtom)
+    expect(store.getter(formulaBarFocusedAtom)).toBe(true)
+    expect(store.getter(focusFormulaBarAtom).status).toBe('focused')
+
+    store.setter(formulaBarDraftAtom, '=A1+2')
+    expect(store.getter(formulaBarDraftAtom)).toBe('=A1+2')
+    expect(store.getter(formulaBarStateAtom).status).toBe('editing')
+
+    store.setter(setFormulaBarDiagnosticAtom, {
+      code: 'invalid-formula',
+      message: 'bad formula',
+      level: 'error',
+    })
+    expect(store.getter(setFormulaBarDiagnosticAtom).status).toBe('error')
+
+    store.setter(setFormulaBarErrorAtom, {
+      code: 'INVALID_FORMULA',
+      message: 'parse error',
+    })
+    expect(store.getter(setFormulaBarErrorAtom).error?.code).toBe('INVALID_FORMULA')
+
+    store.setter(syncFormulaBarAtom, {
+      sheetId: 'sheet-1',
+      cell: { row: 1, col: 2 },
+      draft: '=C2',
+      source: 'backend',
+      revision: 'rev-2',
+    })
+    expect(store.getter(syncFormulaBarAtom)).toEqual({
+      status: 'focused',
+      focused: true,
+      sheetId: 'sheet-1',
+      cell: { row: 1, col: 2 },
+      draft: '=C2',
+      syncedDraft: '=C2',
+      syncSource: 'backend',
+      revision: 'rev-2',
+      diagnostic: null,
+      error: null,
+    })
+
+    store.setter(focusFormulaBarAtom, false)
+    expect(store.getter(formulaBarFocusedAtom)).toBe(false)
+    expect(store.getter(formulaBarStateAtom).status).toBe('idle')
+  })
+
   test('focuses and syncs the current draft without storing workbook facts', () => {
     const store = createStore()
 

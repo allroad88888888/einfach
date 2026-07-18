@@ -13,7 +13,182 @@ import {
   updatePointerAtom,
 } from '../src/pointer'
 
+type AtomHasPublicWrite<Entity> = Entity extends { write: unknown } ? true : false
+
+const POINTER_PUBLIC_STATE_IS_READ_ONLY: readonly [
+  AtomHasPublicWrite<typeof pointerSessionAtom>,
+  AtomHasPublicWrite<typeof pointerIntentAtom>,
+] = [false, false]
+
+const POINTER_COMMANDS_ARE_WRITABLE: readonly [
+  AtomHasPublicWrite<typeof startPointerAtom>,
+  AtomHasPublicWrite<typeof updatePointerAtom>,
+  AtomHasPublicWrite<typeof commitPointerAtom>,
+  AtomHasPublicWrite<typeof cancelPointerAtom>,
+] = [true, true, true, true]
+
 describe('pointer core', () => {
+  test('keeps public state read-only and rejects reflected writes without changing references', () => {
+    const store = createStore()
+
+    store.setter(startPointerAtom, {
+      kind: 'drag-selection',
+      sheetId: 'sheet-1',
+      anchor: { row: 1, col: 2 },
+      focus: { row: 3, col: 4 },
+      source: 'mouse',
+    })
+
+    const activeBefore = store.getter(pointerSessionAtom)
+    const emptyIntentBefore = store.getter(pointerIntentAtom)
+
+    expect(POINTER_PUBLIC_STATE_IS_READ_ONLY).toEqual([false, false])
+    expect(['write' in pointerSessionAtom, 'write' in pointerIntentAtom]).toEqual(
+      POINTER_PUBLIC_STATE_IS_READ_ONLY,
+    )
+    expect(() =>
+      Reflect.apply(store.setter, store, [
+        pointerSessionAtom,
+        {
+          status: 'idle',
+          source: null,
+          interaction: null,
+          autoscroll: null,
+        },
+      ]),
+    ).toThrow(TypeError)
+    expect(store.getter(pointerSessionAtom)).toBe(activeBefore)
+    expect(store.getter(pointerIntentAtom)).toBe(emptyIntentBefore)
+
+    const committed = store.setter(commitPointerAtom)
+    const idleBefore = store.getter(pointerSessionAtom)
+    const committedIntentBefore = store.getter(pointerIntentAtom)
+
+    expect(committedIntentBefore).toBe(committed)
+    expect(() => Reflect.apply(store.setter, store, [pointerIntentAtom, null])).toThrow(TypeError)
+    expect(store.getter(pointerSessionAtom)).toBe(idleBefore)
+    expect(store.getter(pointerIntentAtom)).toBe(committedIntentBefore)
+  })
+
+  test('flows idle through start and update to commit or cancel through command atoms', () => {
+    const store = createStore()
+    const commandAtoms = [startPointerAtom, updatePointerAtom, commitPointerAtom, cancelPointerAtom]
+
+    expect(commandAtoms.map((commandAtom) => 'write' in commandAtom)).toEqual(
+      POINTER_COMMANDS_ARE_WRITABLE,
+    )
+    expect(commandAtoms.map((commandAtom) => commandAtom.debugLabel)).toEqual([
+      'spreadsheet.pointer.start',
+      'spreadsheet.pointer.update',
+      'spreadsheet.pointer.commit',
+      'spreadsheet.pointer.cancel',
+    ])
+    expect([pointerSessionAtom.debugLabel, pointerIntentAtom.debugLabel]).toEqual([
+      'spreadsheet.pointer.session',
+      'spreadsheet.pointer.intent',
+    ])
+    expect(store.getter(pointerSessionAtom)).toEqual({
+      status: 'idle',
+      source: null,
+      interaction: null,
+      autoscroll: null,
+    })
+
+    store.setter(startPointerAtom, {
+      kind: 'drag-selection',
+      sheetId: 'sheet-1',
+      anchor: { row: 2, col: 3 },
+      source: 'mouse',
+    })
+    const started = store.getter(pointerSessionAtom)
+    expect(started).toMatchObject({
+      status: 'active',
+      source: 'mouse',
+      interaction: {
+        kind: 'drag-selection',
+        anchor: { row: 2, col: 3 },
+        focus: { row: 2, col: 3 },
+      },
+    })
+    expect(store.getter(pointerIntentAtom)).toBeNull()
+
+    store.setter(updatePointerAtom, {
+      kind: 'drag-selection',
+      focus: { row: 7, col: 8 },
+      source: 'touch',
+    })
+    const updated = store.getter(pointerSessionAtom)
+    expect(updated).not.toBe(started)
+    expect(updated).toMatchObject({
+      status: 'active',
+      source: 'touch',
+      interaction: {
+        kind: 'drag-selection',
+        anchor: { row: 2, col: 3 },
+        focus: { row: 7, col: 8 },
+        range: { rowStart: 2, rowEnd: 7, colStart: 3, colEnd: 8 },
+      },
+    })
+
+    const orderedWrites: unknown[] = []
+    const orderedIntent = Reflect.apply(commitPointerAtom.write, undefined, [
+      () => updated,
+      (_target: unknown, nextValue: unknown) => orderedWrites.push(nextValue),
+    ])
+    expect(orderedWrites[0]).toBe(orderedIntent)
+    expect(orderedWrites[1]).toEqual({
+      status: 'idle',
+      source: null,
+      interaction: null,
+      autoscroll: null,
+    })
+
+    const committed = store.setter(commitPointerAtom)
+    expect(committed).toEqual({
+      type: 'pointer.drag-selection.commit',
+      sheetId: 'sheet-1',
+      source: 'touch',
+      anchor: { row: 2, col: 3 },
+      focus: { row: 7, col: 8 },
+      range: { rowStart: 2, rowEnd: 7, colStart: 3, colEnd: 8 },
+    })
+    expect(store.getter(pointerIntentAtom)).toBe(committed)
+    expect(store.getter(pointerSessionAtom)).toEqual({
+      status: 'idle',
+      source: null,
+      interaction: null,
+      autoscroll: null,
+    })
+
+    store.setter(startPointerAtom, {
+      kind: 'column-resize',
+      sheetId: 'sheet-1',
+      colIndex: 5,
+      previewSizePx: 120,
+    })
+    store.setter(updatePointerAtom, {
+      kind: 'column-resize',
+      previewSizePx: 144,
+    })
+    expect(store.getter(pointerSessionAtom)).toMatchObject({
+      status: 'active',
+      interaction: {
+        kind: 'column-resize',
+        colIndex: 5,
+        previewSizePx: 144,
+      },
+    })
+
+    store.setter(cancelPointerAtom)
+    expect(store.getter(pointerSessionAtom)).toEqual({
+      status: 'idle',
+      source: null,
+      interaction: null,
+      autoscroll: null,
+    })
+    expect(store.getter(pointerIntentAtom)).toBeNull()
+  })
+
   test('tracks drag selection boundaries and autoscroll without expanding ranges', () => {
     const store = createStore()
     const input = {
@@ -168,6 +343,28 @@ describe('pointer core', () => {
       source: null,
       interaction: null,
       autoscroll: null,
+    })
+  })
+
+  test('carries copy-only modifier changes into the fill commit intent', () => {
+    const store = createStore()
+
+    store.setter(startPointerAtom, {
+      kind: 'fill-handle',
+      sheetId: 'sheet-1',
+      sourceRange: { rowStart: 0, rowEnd: 1, colStart: 0, colEnd: 0 },
+      previewRange: { rowStart: 0, rowEnd: 3, colStart: 0, colEnd: 0 },
+      direction: 'down',
+      copyOnly: false,
+    })
+    store.setter(updatePointerAtom, {
+      kind: 'fill-handle',
+      copyOnly: true,
+    })
+
+    expect(store.setter(commitPointerAtom)).toMatchObject({
+      type: 'pointer.fill-handle.commit',
+      copyOnly: true,
     })
   })
 

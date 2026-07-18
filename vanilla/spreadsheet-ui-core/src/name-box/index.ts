@@ -1,18 +1,30 @@
 import { atom } from '@einfach/core'
 import type { CellCoord, CellRange } from '../shared'
-import { nameRegistryCacheAtom, type NamedRange } from '../named-ranges'
 import {
+  nameRegistryCacheAtom,
+  normalizeNamedRangeName,
+  runNamedRangeMutationAtom,
+  type NamedRange,
+} from '../named-ranges'
+import {
+  EXCEL_MAX_COLS,
+  EXCEL_MAX_ROWS,
   primarySelectionRegionAtom,
   selectionSnapshotAtom,
   setSelectionAtom,
   selectCellAtom,
 } from '../selection'
-import type { NameBoxCommitInput, NameBoxCommitTarget, NameBoxMode } from './types'
+import type {
+  NameBoxCommitInput,
+  NameBoxCommitTarget,
+  NameBoxMode,
+  NameBoxSessionInput,
+  UpdateNameBoxInput,
+} from './types'
 
 export * from './types'
 
 const COLUMN_LABEL_PATTERN = /^([A-Za-z]+)(\d+)$/
-const NAME_IDENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export const nameBoxInputAtom = atom<string>('')
 nameBoxInputAtom.debugLabel = 'spreadsheet.nameBox.input'
@@ -22,6 +34,15 @@ nameBoxModeAtom.debugLabel = 'spreadsheet.nameBox.mode'
 
 export const nameBoxErrorAtom = atom<boolean>(false)
 nameBoxErrorAtom.debugLabel = 'spreadsheet.nameBox.error'
+
+export const nameBoxFocusedAtom = atom<boolean>(false)
+nameBoxFocusedAtom.debugLabel = 'spreadsheet.nameBox.focused'
+
+export const nameBoxLastCommittedAtom = atom<string>('')
+nameBoxLastCommittedAtom.debugLabel = 'spreadsheet.nameBox.lastCommitted'
+
+export const nameBoxSessionIdAtom = atom<number>(0)
+nameBoxSessionIdAtom.debugLabel = 'spreadsheet.nameBox.sessionId'
 
 function columnLabelToIndex(letters: string): number {
   if (letters.length === 0) return -1
@@ -62,8 +83,10 @@ export function parseA1Cell(input: string): CellCoord | null {
   if (!match) return null
   const col = columnLabelToIndex(match[1])
   const rowOneBased = Number(match[2])
-  if (col < 0) return null
-  if (!Number.isInteger(rowOneBased) || rowOneBased < 1) return null
+  if (col < 0 || col >= EXCEL_MAX_COLS) return null
+  if (!Number.isInteger(rowOneBased) || rowOneBased < 1 || rowOneBased > EXCEL_MAX_ROWS) {
+    return null
+  }
   return { row: rowOneBased - 1, col }
 }
 
@@ -83,11 +106,10 @@ export function parseA1Range(input: string): CellRange | null {
 }
 
 export function isValidName(input: string): boolean {
-  const trimmed = input.trim()
-  if (trimmed.length === 0) return false
-  if (!NAME_IDENT_PATTERN.test(trimmed)) return false
+  const normalized = normalizeNamedRangeName(input)
+  if (normalized === null) return false
   // Reserve A1-style addresses — they would parse as cell refs instead.
-  if (COLUMN_LABEL_PATTERN.test(trimmed)) return false
+  if (COLUMN_LABEL_PATTERN.test(normalized)) return false
   return true
 }
 
@@ -111,11 +133,21 @@ function refersToCoord(refersTo: NamedRange['refersTo']): {
 export function findNamedRange(
   registry: readonly NamedRange[],
   name: string,
+  currentSheetId?: string,
 ): NamedRange | undefined {
   const lookup = name.trim()
   if (lookup.length === 0) return undefined
   const lower = lookup.toLowerCase()
-  return registry.find((entry) => entry.name.toLowerCase() === lower)
+  const matches = registry.filter((entry) => entry.name.toLowerCase() === lower)
+  if (currentSheetId !== undefined) {
+    const currentSheetMatch = matches.find(
+      (entry) => entry.scope !== 'workbook' && entry.scope.sheetId === currentSheetId,
+    )
+    if (currentSheetMatch) return currentSheetMatch
+    return matches.find((entry) => entry.scope === 'workbook')
+  }
+  // Legacy callers without sheet context retain their prior first-match behavior.
+  return matches[0]
 }
 
 /**
@@ -130,11 +162,17 @@ export const nameBoxDisplayAtom = atom((get): string => {
   const rangeAddress = rangeToA1(snapshot.range)
 
   if (rangeAddress.length > 0 && registry.length > 0) {
-    const match = registry.find((entry) => {
+    const matches = registry.filter((entry) => {
       if (entry.refersTo.kind !== 'range') return false
       if (entry.refersTo.sheetId !== sheetId) return false
+      if (entry.scope !== 'workbook' && entry.scope.sheetId !== sheetId) {
+        return false
+      }
       return entry.refersTo.address.toUpperCase() === rangeAddress.toUpperCase()
     })
+    const match =
+      matches.find((entry) => entry.scope !== 'workbook' && entry.scope.sheetId === sheetId) ??
+      matches.find((entry) => entry.scope === 'workbook')
     if (match) return match.name
   }
 
@@ -171,7 +209,7 @@ export function classifyNameBoxInput(
     return { kind: 'range', sheetId: context.sheetId, range }
   }
 
-  const named = findNamedRange(registry, value)
+  const named = findNamedRange(registry, value, context.sheetId)
   if (named) {
     const target = refersToCoord(named.refersTo)
     if (target) {
@@ -200,14 +238,16 @@ export function classifyNameBoxInput(
 
 /**
  * Command atom. Classifies the input via {@link classifyNameBoxInput} and
- * dispatches the matching selection mutation. Defining a new name does NOT
- * dispatch a backend call — the host UI owns that side effect because backend
- * access lives in the framework layer. The returned target tells the host what
- * to do for `define-name` and `invalid` outcomes.
+ * dispatches the matching selection mutation. A new name enters the shared
+ * named-range mutation command; the framework layer never calls the port.
  */
 export const commitNameBoxAtom = atom(
   null,
   (get, set, input: NameBoxCommitInput): NameBoxCommitTarget => {
+    const currentSessionId = get(nameBoxSessionIdAtom)
+    if (input.sessionId !== undefined && input.sessionId !== currentSessionId) {
+      return { kind: 'invalid', reason: 'stale-session' }
+    }
     set(nameBoxModeAtom, 'committing')
     const snapshot = get(selectionSnapshotAtom)
     const registry = get(nameRegistryCacheAtom)
@@ -251,8 +291,24 @@ export const commitNameBoxAtom = atom(
         return target
       }
       case 'define-name': {
-        // Host handles backend.setNamedRange; selection is left untouched.
-        set(nameBoxErrorAtom, false)
+        if (input.source) {
+          void set(runNamedRangeMutationAtom, {
+            source: input.source,
+            origin: 'name-box',
+            sessionId: currentSessionId,
+            mutation: {
+              action: 'set',
+              name: target.name,
+              scope: 'workbook',
+              refersTo: {
+                kind: 'range',
+                sheetId: target.sheetId,
+                address: rangeToA1(target.range),
+              },
+            },
+          })
+        }
+        set(nameBoxErrorAtom, input.source === undefined)
         set(nameBoxModeAtom, 'idle')
         return target
       }
@@ -268,15 +324,56 @@ export const commitNameBoxAtom = atom(
 )
 commitNameBoxAtom.debugLabel = 'spreadsheet.nameBox.commit'
 
+/** Starts a new edit session and snapshots the canonical display. */
+export const focusNameBoxAtom = atom(null, (get, set): number => {
+  const current = get(nameBoxSessionIdAtom)
+  const next = current >= Number.MAX_SAFE_INTEGER ? 1 : current + 1
+  const display = get(nameBoxDisplayAtom)
+  set(nameBoxSessionIdAtom, next)
+  set(nameBoxFocusedAtom, true)
+  set(nameBoxLastCommittedAtom, display)
+  set(nameBoxInputAtom, display)
+  set(nameBoxErrorAtom, false)
+  set(nameBoxModeAtom, 'typing')
+  return next
+})
+focusNameBoxAtom.debugLabel = 'spreadsheet.nameBox.focus'
+
+/** Updates input only when the originating edit session is still active. */
+export const updateNameBoxInputAtom = atom(null, (get, set, input: UpdateNameBoxInput): boolean => {
+  if (input.sessionId !== undefined && input.sessionId !== get(nameBoxSessionIdAtom)) {
+    return false
+  }
+  set(nameBoxInputAtom, input.input)
+  set(nameBoxErrorAtom, false)
+  set(nameBoxModeAtom, 'typing')
+  return true
+})
+updateNameBoxInputAtom.debugLabel = 'spreadsheet.nameBox.updateInput'
+
+/** Records the DOM blur without committing or replaying an older session. */
+export const blurNameBoxAtom = atom(null, (get, set, input?: NameBoxSessionInput): boolean => {
+  if (input?.sessionId !== undefined && input.sessionId !== get(nameBoxSessionIdAtom)) {
+    return false
+  }
+  set(nameBoxFocusedAtom, false)
+  set(nameBoxModeAtom, 'idle')
+  return true
+})
+blurNameBoxAtom.debugLabel = 'spreadsheet.nameBox.blur'
+
 /** Resets the input to the current display and clears any error flash. */
-export const revertNameBoxAtom = atom(
-  null,
-  (get, set) => {
-    set(nameBoxInputAtom, get(nameBoxDisplayAtom))
-    set(nameBoxErrorAtom, false)
-    set(nameBoxModeAtom, 'idle')
-  },
-)
+export const revertNameBoxAtom = atom(null, (get, set, input?: NameBoxSessionInput): boolean => {
+  if (input?.sessionId !== undefined && input.sessionId !== get(nameBoxSessionIdAtom)) {
+    return false
+  }
+  const display = get(nameBoxDisplayAtom)
+  set(nameBoxInputAtom, display)
+  set(nameBoxLastCommittedAtom, display)
+  set(nameBoxErrorAtom, false)
+  set(nameBoxModeAtom, 'idle')
+  return true
+})
 revertNameBoxAtom.debugLabel = 'spreadsheet.nameBox.revert'
 
 /** Convenience getter exposed for tests / debug surfaces. */
@@ -285,6 +382,9 @@ export const nameBoxStateAtom = atom((get) => ({
   mode: get(nameBoxModeAtom),
   display: get(nameBoxDisplayAtom),
   error: get(nameBoxErrorAtom),
+  focused: get(nameBoxFocusedAtom),
+  lastCommitted: get(nameBoxLastCommittedAtom),
+  sessionId: get(nameBoxSessionIdAtom),
   primaryRegion: get(primarySelectionRegionAtom),
 }))
 nameBoxStateAtom.debugLabel = 'spreadsheet.nameBox.state'

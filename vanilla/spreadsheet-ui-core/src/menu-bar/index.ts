@@ -1,21 +1,30 @@
 import { atom } from '@einfach/core'
+import type { Atom } from '@einfach/core'
 import type { MenuBarEntry, TopMenuDescriptor, TopMenuId, TopMenuOpenState } from './types'
 
 export * from './types'
 
 const IDLE_STATE: TopMenuOpenState = { kind: 'idle' }
 
-export const topMenuOpenAtom = atom<TopMenuOpenState>(IDLE_STATE)
+const topMenuOpenBackingAtom = atom<TopMenuOpenState>(IDLE_STATE)
+topMenuOpenBackingAtom.debugLabel = 'spreadsheet.menuBar.openCategoryBacking'
+
+export const topMenuOpenAtom: Atom<TopMenuOpenState> = atom((get) => get(topMenuOpenBackingAtom))
 topMenuOpenAtom.debugLabel = 'spreadsheet.menuBar.openCategory'
 
-export const topMenuHighlightAtom = atom<string | null>(null)
+const topMenuHighlightBackingAtom = atom<string | null>(null)
+topMenuHighlightBackingAtom.debugLabel = 'spreadsheet.menuBar.highlightBacking'
+
+export const topMenuHighlightAtom: Atom<string | null> = atom((get) =>
+  get(topMenuHighlightBackingAtom),
+)
 topMenuHighlightAtom.debugLabel = 'spreadsheet.menuBar.highlight'
 
 export const openTopMenuAtom = atom(
   (get) => get(topMenuOpenAtom),
   (_get, set, menu: TopMenuId) => {
-    set(topMenuOpenAtom, { kind: 'open', menu })
-    set(topMenuHighlightAtom, null)
+    set(topMenuOpenBackingAtom, { kind: 'open', menu })
+    set(topMenuHighlightBackingAtom, null)
   },
 )
 openTopMenuAtom.debugLabel = 'spreadsheet.menuBar.open'
@@ -23,8 +32,8 @@ openTopMenuAtom.debugLabel = 'spreadsheet.menuBar.open'
 export const closeTopMenuAtom = atom(
   (get) => get(topMenuOpenAtom),
   (_get, set) => {
-    set(topMenuOpenAtom, IDLE_STATE)
-    set(topMenuHighlightAtom, null)
+    set(topMenuOpenBackingAtom, IDLE_STATE)
+    set(topMenuHighlightBackingAtom, null)
   },
 )
 closeTopMenuAtom.debugLabel = 'spreadsheet.menuBar.close'
@@ -35,13 +44,16 @@ closeTopMenuAtom.debugLabel = 'spreadsheet.menuBar.close'
 
 export type HelpOverlayKind = 'closed' | 'shortcuts' | 'about'
 
-export const helpOverlayAtom = atom<HelpOverlayKind>('closed')
+const helpOverlayBackingAtom = atom<HelpOverlayKind>('closed')
+helpOverlayBackingAtom.debugLabel = 'spreadsheet.menuBar.helpOverlayBacking'
+
+export const helpOverlayAtom: Atom<HelpOverlayKind> = atom((get) => get(helpOverlayBackingAtom))
 helpOverlayAtom.debugLabel = 'spreadsheet.menuBar.helpOverlay'
 
 export const openHelpOverlayAtom = atom(
   (get) => get(helpOverlayAtom),
   (_get, set, kind: Exclude<HelpOverlayKind, 'closed'>) => {
-    set(helpOverlayAtom, kind)
+    set(helpOverlayBackingAtom, kind)
   },
 )
 openHelpOverlayAtom.debugLabel = 'spreadsheet.menuBar.openHelpOverlay'
@@ -49,7 +61,7 @@ openHelpOverlayAtom.debugLabel = 'spreadsheet.menuBar.openHelpOverlay'
 export const closeHelpOverlayAtom = atom(
   (get) => get(helpOverlayAtom),
   (_get, set) => {
-    set(helpOverlayAtom, 'closed')
+    set(helpOverlayBackingAtom, 'closed')
   },
 )
 closeHelpOverlayAtom.debugLabel = 'spreadsheet.menuBar.closeHelpOverlay'
@@ -327,9 +339,21 @@ const FORMAT_ITEMS: readonly MenuBarEntry[] = [
     isAvailable: 'always',
   },
   {
+    id: 'format.unhideRow',
+    label: 'menuBar.format.unhideRow',
+    dispatch: { kind: 'unhide-rows' },
+    isAvailable: 'always',
+  },
+  {
     id: 'format.hideCol',
     label: 'menuBar.format.hideCol',
     dispatch: { kind: 'hide-cols' },
+    isAvailable: 'always',
+  },
+  {
+    id: 'format.unhideCol',
+    label: 'menuBar.format.unhideCol',
+    dispatch: { kind: 'unhide-cols' },
     isAvailable: 'always',
   },
   {

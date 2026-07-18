@@ -1,290 +1,150 @@
-# frozen-panes
+# Frozen panes: canonical authority contract
 
-Frozen rows and columns (frozen panes) feature plan for `@einfach/spreadsheet-ui-core`.
+This document records the implemented freeze-panes state contract. The workbook backend is the
+canonical authority; `@einfach/spreadsheet-ui-core` owns the framework-neutral controller and a
+read-only projection, while `solid/excel` renders and dispatches commands through that controller.
 
----
+## Authority and state ownership
 
-## Goal
+- `viewportFreezeBackingAtom` is private. It is updated only after an exact canonical backend read.
+- `viewportFreezeAtom` is the public read-only projection. There is no public setter atom and product
+  code must not seed or optimistically mutate it.
+- `viewportFreezeProjectionAuthorityAtom` is a read-only identity/readiness gate containing the
+  backend object, sheet id, request id, revision, and `ready` flag for the projection.
+- `isViewportFreezeProjectionReady(authority, backend, sheetId)` is the required consumer gate. A
+  projection is usable only when both ports exist and the backend identity and sheet id match.
+- `viewportFreezeLifecycleAtom` exposes controller progress for diagnostics and UI feedback.
+- `readViewportFreezeCanonicalAtom` hydrates from the current backend and sheet.
+- `runViewportFreezeMutationAtom` performs validated mutation, acknowledgement matching, and
+  canonical readback. It is the only product mutation path.
 
-Pin N top rows and/or M left columns so they remain visible while the rest of the
-sheet scrolls. The frozen header region renders on top of (or adjacent to) the
-scrolling body without moving when `scrollTop` / `scrollLeft` changes.
+The backing value may retain the last confirmed value during a source or sheet transition. This is a
+cache detail, not authority: renderers and menus must ignore it until the readiness gate matches the
+current backend object and sheet id. Therefore backend A cannot leak its freeze projection into
+backend B, even when both use the same sheet id and Einfach store.
 
----
+## Capability contract
 
-## Scope
-
-- Freeze top N rows per sheet (N ≥ 0).
-- Freeze left M columns per sheet (M ≥ 0).
-- Freeze-at-cell: freeze the rows above and columns to the left of a given cell
-  (combined row + column freeze set from a single input).
-- Per-sheet state stored in a single atom following the same
-  `Record<sheetId, number>` map shape as `viewportSizeOverridesAtom`.
-
-**Out of scope**
-
-- Split panes (two independent scrollbars in a quadrant — Excel "window split").
-- Frozen rows on the bottom edge or frozen columns on the right edge.
-- Per-view (non-sheet) freeze overrides.
-- Freeze animations or transitions.
-
----
-
-## State (UI core)
-
-Add a dedicated source atom rather than extending `ViewportMetrics`. Freeze
-counts are sheet-level persistent state, not derived from scroll geometry, so
-embedding them inside `ViewportMetrics` would conflate two orthogonal concerns
-and make normalization more complex.
-
-### Source atom
-
-**`viewportFreezeAtom`** — `atom<ViewportFreezeState>`
+Freeze panes are supported only when the backend provides both methods:
 
 ```ts
-viewportFreezeAtom.debugLabel = 'spreadsheet.viewport.freeze'
-```
-
-Default value:
-
-```ts
-export const DEFAULT_VIEWPORT_FREEZE: ViewportFreezeState = {
-  rowsBySheet: {},
-  colsBySheet: {},
+interface ViewportFreezeControllerPort {
+  readFreezeConfig?: (request: ReadFreezeConfigRequest) => Promise<ReadFreezeConfigResult>
+  setFreezeConfig?: (request: SetFreezeConfigRequest) => Promise<BackendMutationResult>
 }
 ```
 
-### Derived atom
+Providing only one method is unsupported. There is no UI-only fallback:
 
-**`frozenWindowsAtom`** — `atom<FrozenWindows>` derived from
-`viewportFreezeAtom`, `viewportMetricsAtom`, and the active sheet id.
+- the menu bar disables freeze commands;
+- the context menu hides freeze commands;
+- grid, SVG, and Canvas divider rendering remains gated off;
+- command dispatch performs no backend call and cannot change the projection.
 
-Returns all four quadrant `VisibleWindow` values for the current sheet.
-Consumers (renderer, projection layer) read this single derived value; they do
-not re-derive quadrants independently.
+This prevents an editable-looking local state from diverging from workbook state.
 
-```ts
-frozenWindowsAtom.debugLabel = 'spreadsheet.viewport.frozenWindows'
+## Lifecycle
+
+The public lifecycle statuses are `idle`, `validating`, `mutating`, `canonical-reading`, `committed`,
+`error`, `recovery-required`, and `unsupported`.
+
+```mermaid
+stateDiagram-v2
+  state "canonical-reading" as canonicalReading
+  state "recovery-required" as recoveryRequired
+
+  [*] --> idle
+  idle --> validating: hydrate or command
+  committed --> validating: hydrate or next command
+  error --> validating: retry or authority switch
+  recoveryRequired --> validating: canonical recovery read
+  unsupported --> validating: authority switch or retry
+
+  validating --> unsupported: either port is missing
+  validating --> error: invalid sheet or counts
+  validating --> canonicalReading: hydration
+  validating --> canonicalReading: partial command preflight
+  validating --> mutating: full rows + cols command
+
+  canonicalReading --> mutating: exact preflight + CAS revision
+  mutating --> canonicalReading: exact ACK
+  canonicalReading --> committed: exact canonical response
+
+  canonicalReading --> error: hydration or preflight failure
+  mutating --> recoveryRequired: transport, CAS, or ACK failure
+  canonicalReading --> recoveryRequired: post-mutation readback mismatch
 ```
 
-### Command atoms
+Every operation has a controller-issued request id and captures the exact backend object and sheet
+id. A response is accepted only when its request id and sheet id match the active ticket and its
+revision is valid. A newer authoritative hydration cancels an older ticket; the older operation then
+returns `stale` and cannot commit to the shared projection.
 
-**`setFreezeAtom`** — `atom(null, (get, set, input: SetFreezeInput) => void)`
+### Full mutation
 
-```ts
-setFreezeAtom.debugLabel = 'spreadsheet.viewport.setFreeze'
+A command that supplies both `rows` and `cols` follows:
+
+```text
+validating -> mutating -> canonical-reading -> committed
 ```
 
-**`clearFreezeAtom`** — `atom(null, (get, set, sheetId: string) => void)`
+The controller sends the full pair, requires an exact mutation acknowledgement, then reads the same
+revision back. The projection changes only after that readback is exact.
 
-```ts
-clearFreezeAtom.debugLabel = 'spreadsheet.viewport.clearFreeze'
+### Partial mutation and compare-and-set
+
+A command that supplies only one axis must preserve the sibling axis from canonical workbook state:
+
+```text
+validating -> canonical-reading (preflight) -> mutating (CAS)
+           -> canonical-reading (readback) -> committed
 ```
 
-### Scale bound
+The preflight returns `{ freeze, revision }`. The controller combines the requested axis with the
+canonical sibling and sends the preflight revision as the mutation precondition. If another writer
+changes the workbook between preflight and mutation, the backend rejects the stale revision. The
+controller enters `recovery-required`; it never overwrites the newer state and never publishes the
+unconfirmed request.
 
-Two sparse `Record<string, number>` maps — one entry per sheet that has a
-non-zero freeze. Cost is negligible regardless of sheet count.
+The same rule applies after ACK: if state advances before readback, a read result whose revision no
+longer equals the acknowledged revision cannot be committed and the lifecycle becomes
+`recovery-required`.
 
----
+## Static backend semantics
 
-## Types
+The static backend keeps freeze configuration per sheet. `readFreezeConfig` always returns the
+backend's current revision; it does not echo a caller-provided revision. `setFreezeConfig` validates
+non-negative safe integers and, when a revision precondition is present, performs compare-and-set
+against the current backend revision. A rejected CAS neither writes freeze state nor bumps revision.
 
-```ts
-export interface ViewportFreezeState {
-  rowsBySheet: Record<string, number>
-  colsBySheet: Record<string, number>
-}
+## Solid consumer rules
 
-export interface SetFreezeInput {
-  sheetId: string
-  /** Number of rows to freeze from the top. 0 = unfreeze rows. */
-  frozenRows: number
-  /** Number of columns to freeze from the left. 0 = unfreeze cols. */
-  frozenCols: number
-}
+- `SpreadsheetGrid` hydrates canonical freeze state for the mounted backend and sheet and gates both
+  frozen geometry and boundary attributes by authority readiness.
+- `SpreadsheetGridOverlay` and `SpreadsheetGridOverlaySvg` subscribe to both the projection and the
+  authority gate. Canvas rendering also checks the current provider backend callback before drawing.
+- `SpreadsheetMenuBar` and `SpreadsheetContextMenu` dispatch only through
+  `runViewportFreezeMutationAtom`.
+- Context-menu `Unfreeze` visibility is derived only from a ready projection for the exact backend
+  and target sheet, never from a stale cached value.
 
-export interface FreezeAtCellInput {
-  sheetId: string
-  /** Freeze all rows above this row index and all cols left of this col index. */
-  row: number
-  col: number
-}
+## Verification map
 
-/**
- * Four-quadrant visible window produced when freeze counts are non-zero.
- *
- * Quadrant layout (R = frozen rows, C = frozen cols):
- *
- *   topLeft    topRight
- *   bottomLeft bottomRight
- *
- * topLeft    — rows [0, R), cols [0, C)       — frozen in both axes
- * topRight   — rows [0, R), cols [C, colEnd]  — frozen rows, scrolling cols
- * bottomLeft — rows [R, rowEnd], cols [0, C)  — scrolling rows, frozen cols
- * bottomRight— rows [R, rowEnd], cols [C, colEnd] — fully scrolling body
- *
- * Any quadrant with rowStart > rowEnd or colStart > colEnd is empty and must
- * be skipped by projection callers.
- */
-export interface FrozenWindows {
-  frozenRows: number
-  frozenCols: number
-  topLeft: VisibleWindow
-  topRight: VisibleWindow
-  bottomLeft: VisibleWindow
-  bottomRight: VisibleWindow
-}
+- [Controller implementation](../src/viewport/window.ts)
+- [Controller lifecycle and race tests](../test/frozen-panes.test.ts)
+- [Static backend implementation](../../../solid/excel/src-vnext/adapter/static-backend.ts)
+- [Static authority race tests](../../../solid/excel/test/vnext-freeze-authority.test.ts)
+- [Grid authority tests](../../../solid/excel/test/vnext-grid.test.tsx)
+- [Canvas gate tests](../../../solid/excel/test/vnext-grid-overlay.test.tsx)
+- [SVG gate tests](../../../solid/excel/test/vnext-grid-overlay-svg.test.tsx)
+- [Menu bar capability tests](../../../solid/excel/test/vnext-menu-bar.test.tsx)
+- [Context menu capability tests](../../../solid/excel/test/vnext-context-menu.test.tsx)
+
+Focused verification commands:
+
+```sh
+npx jest vanilla/spreadsheet-ui-core/test/frozen-panes.test.ts --runInBand --coverage=false
+npx jest solid/excel/test/vnext-freeze-authority.test.ts solid/excel/test/vnext-grid.test.tsx solid/excel/test/vnext-grid-overlay.test.tsx solid/excel/test/vnext-grid-overlay-svg.test.tsx solid/excel/test/vnext-menu-bar.test.tsx solid/excel/test/vnext-context-menu.test.tsx --runInBand --coverage=false
+npm run build -w @einfach/spreadsheet-ui-core
+npm exec -w @einfach/solid-excel -- vite build
 ```
-
-`VisibleWindow` remains `CellRange` (unchanged). The four-quadrant split is
-expressed as four `VisibleWindow` values, not a new range type.
-
-`getFrozenWindows(metrics: ViewportMetrics, frozenRows: number, frozenCols: number): FrozenWindows`
-is a pure function that lives in `viewport/window.ts` alongside `getVisibleWindow`.
-Existing callers of `getVisibleWindow` are unaffected; they receive the full
-union range as before when freeze counts are zero (bottom-right quadrant equals
-the current visible window).
-
----
-
-## Backend port
-
-Workbook files (XLSX, ODS) encode freeze configuration in sheet view XML. The
-backend must be able to surface that on load and persist changes.
-
-Two optional methods added to `SpreadsheetBackend`:
-
-```ts
-readFreezeConfig?(sheetId: string): Promise<ReadFreezeConfigResult>
-setFreezeConfig?(request: SetFreezeConfigRequest): Promise<BackendMutationResult>
-```
-
-New types:
-
-```ts
-export interface ReadFreezeConfigResult {
-  sheetId: string
-  frozenRows: number
-  frozenCols: number
-  requestId?: ProjectionRequestId
-  revision?: ProjectionRevision
-}
-
-export interface SetFreezeConfigRequest extends SheetRef {
-  kind: 'set-freeze-config'
-  frozenRows: number
-  frozenCols: number
-  requestId?: ProjectionRequestId
-  revision?: ProjectionRevision
-}
-```
-
-Both ports are **optional**. A backend that omits them treats freeze as UI-only
-state (persisted in `viewportFreezeAtom` only, not written back to the file).
-The host adapter calls `readFreezeConfig` after a sheet load and seeds
-`viewportFreezeAtom` via `setFreezeAtom`. `setFreezeConfig` is called
-optimistically after `setFreezeAtom` writes local state.
-
----
-
-## Integration points
-
-**Viewport** — `frozenWindowsAtom` replaces direct reads of `visibleWindowAtom`
-in the renderer. When `frozenRows === 0 && frozenCols === 0` the bottom-right
-quadrant equals the current `visibleWindowAtom` result; no branch is needed in
-the happy path.
-
-**Projection** — Each non-empty quadrant produces one `VisibleProjectionRequest`
-with `kind: 'visible-window'` and the quadrant's `CellRange` as `window`. Four
-parallel requests are issued at most; in practice two (when only rows or only
-cols are frozen) or one (no freeze). Rationale for separate requests over a
-union: the backend can return results independently as each quadrant resolves,
-avoiding a single large blocking request when the frozen header is small but the
-scrolling body is large. The `reason` field is `'viewport'` on all four.
-
-**Keyboard** — Page-up / page-down skip frozen rows: the scrollable body height
-is `viewportHeight - frozenRowPx` and the page step uses this reduced height.
-Ctrl+Home scrolls to the first non-frozen cell `(frozenRows, frozenCols)` unless
-the intent is to reach the true origin. Both behaviors are pure adjustments
-inside the keyboard intent handler; no new atoms required.
-
-**Pointer** — Resize handles on frozen rows/columns use the same
-`setViewportRowHeightAtom` / `setViewportColumnWidthAtom` path. The renderer
-must translate hit-test coordinates to the correct row/col index accounting for
-frozen offsets; that translation lives in the host adapter, not UI core.
-
-**Clipboard** — Selections that span the freeze boundary (e.g., selecting from a
-frozen row into the scrolling body) produce a single `CellRange` and use the
-existing `range` projection path. No special clipboard handling is needed in UI
-core; the range covers frozen and non-frozen cells uniformly.
-
-**Scroll clamping** — `normalizeViewportMetrics` must clamp `scrollTop` to
-`max(0, rowCount * rowHeight - frozenRowPx - viewportBodyHeight)` and similarly
-for `scrollLeft` once freeze is applied, so the frozen header does not scroll
-off-screen. This requires passing freeze counts into `normalizeViewportMetrics`
-or computing scroll limits separately in the host adapter.
-
----
-
-## Risks & open questions
-
-- **Scroll restoration.** On sheet switch the scroll position is reset; frozen
-  counts must be loaded before the first viewport projection fires, otherwise a
-  frame renders without the correct quadrant split. Load order: `readFreezeConfig`
-  → `setFreezeAtom` → `setViewportMetricsAtom` → projection. Define whether the
-  host adapter enforces this sequence or whether `frozenWindowsAtom` lazily waits
-  for freeze state.
-
-- **Overscan in frozen quadrants.** The top-left and top-right quadrants are
-  small and fully visible; applying the standard overscan to them wastes
-  projection bandwidth. Consider setting `overscanRows = 0` and `overscanCols = 0`
-  for frozen quadrants and applying overscan only to the bottom-right.
-
-- **Freeze + hidden rows/columns.** A hidden row inside the frozen region has
-  zero pixel height but still occupies a row index slot. The pixel-to-index math
-  in `getCellViewportRect` must account for variable row heights (via
-  `ViewportSizeOverrideState`) when computing frozen band pixel size. Confirm
-  that `getViewportRowHeight` is called per row in the frozen band, not using
-  the default uniform `rowHeight`.
-
-- **Performance of 4 parallel projection requests.** Each scroll event could
-  trigger up to 4 `readVisibleProjection` calls. Where the backend is a WASM
-  worker, 4 concurrent messages per frame may saturate the message channel.
-  Mitigate by coalescing bottom-right + top-right (same column range) and
-  bottom-left + top-left (same column range) into two range-union requests, or
-  by skipping re-requests for frozen quadrants when scroll position changes only
-  on one axis.
-
-- **Freeze count validation.** `frozenRows` must be `< rowCount` and
-  `frozenCols` must be `< colCount`; freezing the entire grid is a no-op.
-  `setFreezeAtom` should clamp to `[0, max(0, count - 1)]` and discard invalid
-  inputs (non-integer, negative, NaN).
-
-- **Sheet deletion.** When a sheet is deleted, its entry in `rowsBySheet` and
-  `colsBySheet` must be pruned to avoid unbounded map growth. Wire into the
-  `deleteSheet` result path in the host adapter.
-
----
-
-## Test surface
-
-All tests live in `test/frozen-panes.test.ts`.
-
-- `getFrozenWindows` with `frozenRows=0, frozenCols=0` returns a single
-  non-empty bottom-right quadrant equal to `getVisibleWindow(metrics)`.
-- `getFrozenWindows` with `frozenRows=2, frozenCols=0` returns empty top-left
-  and bottom-left, and top-right rows `[0, 1]`.
-- `getFrozenWindows` with `frozenRows=0, frozenCols=3` returns empty top-left
-  and top-right, and bottom-left cols `[0, 2]`.
-- `getFrozenWindows` with `frozenRows=2, frozenCols=3` returns all four
-  non-empty quadrants; verify row/col boundaries on each.
-- Frozen row count equal to `rowCount` is clamped so bottom quadrants remain
-  valid (rowStart ≤ rowEnd or quadrant is empty).
-- `setFreezeAtom` persists per-sheet and does not overwrite sibling sheets.
-- `clearFreezeAtom` removes a sheet entry from both maps without touching others.
-- `setFreezeAtom` with `frozenRows=0, frozenCols=0` is equivalent to
-  `clearFreezeAtom` for that sheet.
-- Freeze-at-cell input `{ row: 2, col: 3 }` produces `frozenRows=2, frozenCols=3`.
-- `frozenWindowsAtom` reacts when `viewportFreezeAtom` changes (derived
-  invalidation test).

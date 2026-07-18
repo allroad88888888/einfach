@@ -50,6 +50,7 @@ export interface PointerFillHandleStartInput {
   focus?: CellCoord
   previewRange?: CellRange | null
   direction?: PointerFillDirection | null
+  copyOnly?: boolean
   source?: PointerSource
 }
 
@@ -58,6 +59,7 @@ export interface PointerFillHandleUpdateInput {
   focus?: CellCoord
   previewRange?: CellRange | null
   direction?: PointerFillDirection | null
+  copyOnly?: boolean
   source?: PointerSource
   autoscroll?: PointerAutoscrollInput | null
 }

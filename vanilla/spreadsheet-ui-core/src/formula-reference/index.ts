@@ -1,4 +1,5 @@
 import { atom } from '@einfach/core'
+import type { Atom, WritableAtom } from '@einfach/core'
 import type { CellCoord } from '../shared'
 import { editingDraftAtom, editingSessionAtom } from '../editing'
 import { keyboardModeAtom } from '../keyboard'
@@ -84,13 +85,23 @@ export function shouldEnterFormulaReferenceMode(draft: string, caret: number): b
 }
 
 // ---------------------------------------------------------------------------
-// Source atoms
+// State boundary
 // ---------------------------------------------------------------------------
 
-export const formulaReferenceSessionAtom = atom<FormulaReferenceSession | null>(null)
+const formulaReferenceSessionBackingAtom = atom<FormulaReferenceSession | null>(null)
+formulaReferenceSessionBackingAtom.debugLabel = 'spreadsheet.formulaReference.sessionBacking'
+
+export const formulaReferenceSessionAtom: Atom<FormulaReferenceSession | null> = atom((get) =>
+  get(formulaReferenceSessionBackingAtom),
+)
 formulaReferenceSessionAtom.debugLabel = 'spreadsheet.formulaReference.session'
 
-export const formulaReferenceCaretAtom = atom<number>(-1)
+const formulaReferenceCaretBackingAtom = atom<number>(-1)
+formulaReferenceCaretBackingAtom.debugLabel = 'spreadsheet.formulaReference.caretBacking'
+
+export const formulaReferenceCaretAtom: Atom<number> = atom((get) =>
+  get(formulaReferenceCaretBackingAtom),
+)
 formulaReferenceCaretAtom.debugLabel = 'spreadsheet.formulaReference.caret'
 
 // ---------------------------------------------------------------------------
@@ -125,10 +136,18 @@ formulaReferenceTokensAtom.debugLabel = 'spreadsheet.formulaReference.tokens'
 // Command atoms
 // ---------------------------------------------------------------------------
 
+export const setFormulaReferenceCaretAtom: WritableAtom<null, [number], void> = atom(
+  null,
+  (_get, set, caret: number) => {
+    set(formulaReferenceCaretBackingAtom, caret)
+  },
+)
+setFormulaReferenceCaretAtom.debugLabel = 'spreadsheet.formulaReference.setCaret'
+
 export const enterFormulaReferenceAtom = atom(
   null,
   (_get, set, input: EnterFormulaReferenceInput) => {
-    set(formulaReferenceSessionAtom, {
+    set(formulaReferenceSessionBackingAtom, {
       anchorCell: { row: input.anchorCell.row, col: input.anchorCell.col },
       sheetId: input.sheetId,
       insertionCaret: input.insertionCaret,
@@ -143,7 +162,7 @@ enterFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.enter'
 export const pickFormulaReferenceAtom = atom(
   null,
   (get, set, input: FormulaReferencePickInput) => {
-    const session = get(formulaReferenceSessionAtom)
+    const session = get(formulaReferenceSessionBackingAtom)
     if (session === null) return
 
     const token = serializeRangeRef(input.pickAnchor, input.pickFocus)
@@ -152,7 +171,7 @@ export const pickFormulaReferenceAtom = atom(
 
     set(editingDraftAtom, { draft: spliced.draft })
 
-    set(formulaReferenceSessionAtom, {
+    set(formulaReferenceSessionBackingAtom, {
       ...session,
       tokenRange: { start: session.tokenRange?.start ?? session.insertionCaret, end: spliced.end },
       dragging: input.dragging,
@@ -164,7 +183,7 @@ pickFormulaReferenceAtom.debugLabel = 'spreadsheet.formulaReference.pick'
 export const exitFormulaReferenceAtom = atom(
   null,
   (get, set, _reason: FormulaReferenceExitReason) => {
-    set(formulaReferenceSessionAtom, null)
+    set(formulaReferenceSessionBackingAtom, null)
     // Restore the keyboard mode to whichever phase logically follows: if an
     // editing session is still active, fall back to 'editing'; otherwise
     // 'navigation'. Callers committing/cancelling editing flip the mode

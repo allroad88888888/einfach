@@ -95,6 +95,11 @@ export interface GoToOpenIntent {
   type: 'go-to.open'
 }
 
+export interface KeyboardContextMenuOpenIntent {
+  type: 'context-menu.open'
+  source: 'keyboard'
+}
+
 export interface NoneKeyboardIntent {
   type: 'none'
   reason: 'unhandled' | 'composing' | 'editing-text-navigation'
@@ -125,6 +130,7 @@ export type KeyboardCommandIntent =
   | FormatToggleIntent
   | ClearCellsIntent
   | GoToOpenIntent
+  | KeyboardContextMenuOpenIntent
   | FormulaReferenceArrowPickIntent
   | FormulaReferenceExitIntent
   | NoneKeyboardIntent
