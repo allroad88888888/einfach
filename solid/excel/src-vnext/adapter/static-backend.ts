@@ -1,5 +1,6 @@
 import type {
   BackendMutationResult,
+  BackendStructuralShift,
   ClearValidationRuleRequest,
   ConditionalFormatRule,
   ConditionalFormatRuleEntry,
@@ -2835,6 +2836,83 @@ function shiftRangeFormats(
   }
 }
 
+// Excel merge semantics for structural displacement: an insert before a
+// merge shifts it whole, an insert strictly inside extends it; a delete
+// before it shifts it back, a partial overlap shrinks it, and a delete
+// covering the whole merge removes it. A merge that shrinks to a single
+// cell stops being a merge (a 1x1 "merge" is meaningless in Excel).
+function shiftMergeRanges(
+  state: StaticBackendState,
+  sheetId: string,
+  axis: 'row' | 'column',
+  index: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const ranges = state.mergeRangesBySheetId.get(sheetId)
+  if (!ranges || ranges.length === 0) return
+  const startKey = axis === 'row' ? 'rowStart' : 'colStart'
+  const endKey = axis === 'row' ? 'rowEnd' : 'colEnd'
+  const deleteEnd = index + count - 1
+
+  for (let rangeIndex = ranges.length - 1; rangeIndex >= 0; rangeIndex -= 1) {
+    const range = ranges[rangeIndex]
+    const start = range[startKey]
+    const end = range[endKey]
+
+    if (direction === 1) {
+      if (start >= index) {
+        range[startKey] = start + count
+        range[endKey] = end + count
+      } else if (end >= index) {
+        range[endKey] = end + count
+      }
+      continue
+    }
+
+    if (end < index) continue
+    if (start > deleteEnd) {
+      range[startKey] = start - count
+      range[endKey] = end - count
+      continue
+    }
+
+    const hasBefore = start < index
+    const hasAfter = end > deleteEnd
+    if (!hasBefore && !hasAfter) {
+      ranges.splice(rangeIndex, 1)
+      continue
+    }
+
+    range[startKey] = hasBefore ? start : index
+    range[endKey] = hasAfter ? end - count : index - 1
+    if (range.rowStart === range.rowEnd && range.colStart === range.colEnd) {
+      ranges.splice(rangeIndex, 1)
+    }
+  }
+}
+
+// Freeze counts describe the frozen leading band [0, rows) / [0, cols).
+// Inserting strictly above/left of the freeze line (index < frozen)
+// grows the band; deleting indices inside the band shrinks it by the
+// overlap. Operations at or past the freeze line leave it untouched.
+function shiftFreezeConfig(
+  state: StaticBackendState,
+  sheetId: string,
+  axis: 'row' | 'column',
+  index: number,
+  count: number,
+  direction: 1 | -1,
+) {
+  const freeze = state.freezeBySheetId.get(sheetId)
+  if (!freeze) return
+  const key = axis === 'row' ? 'rows' : 'cols'
+  const frozen = freeze[key]
+  if (frozen <= 0 || index >= frozen) return
+  freeze[key] =
+    direction === 1 ? frozen + count : frozen - (Math.min(index + count, frozen) - index)
+}
+
 function structuralMutationResult(
   request:
     | InsertRowsRequest
@@ -2842,11 +2920,20 @@ function structuralMutationResult(
     | InsertColumnsRequest
     | DeleteColumnsRequest,
   revision: ProjectionRevision,
-) {
+): BackendMutationResult {
+  const structuralShift: BackendStructuralShift =
+    request.kind === 'insert-rows'
+      ? { axis: 'row', kind: 'insert', index: request.rowIndex, count: request.count }
+      : request.kind === 'delete-rows'
+        ? { axis: 'row', kind: 'delete', index: request.rowIndex, count: request.count }
+        : request.kind === 'insert-columns'
+          ? { axis: 'column', kind: 'insert', index: request.colIndex, count: request.count }
+          : { axis: 'column', kind: 'delete', index: request.colIndex, count: request.count }
   return {
     sheetId: request.sheetId,
     requestId: request.requestId,
     revision: request.revision ?? revision,
+    structuralShift,
   }
 }
 
@@ -3145,6 +3232,8 @@ export function createStaticSpreadsheetBackend(
       )
       const hiddenRows = state.hiddenRowsBySheetId.get(request.sheetId)
       if (hiddenRows) shiftHiddenIndexSet(hiddenRows, request.rowIndex, request.count, 1)
+      shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
+      shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, 1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3170,6 +3259,8 @@ export function createStaticSpreadsheetBackend(
         shiftHiddenIndexSet(hiddenRows, request.rowIndex, request.count, -1)
         if (hiddenRows.size === 0) state.hiddenRowsBySheetId.delete(request.sheetId)
       }
+      shiftMergeRanges(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
+      shiftFreezeConfig(state, request.sheetId, 'row', request.rowIndex, request.count, -1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3192,6 +3283,8 @@ export function createStaticSpreadsheetBackend(
       )
       const hiddenCols = state.hiddenColsBySheetId.get(request.sheetId)
       if (hiddenCols) shiftHiddenIndexSet(hiddenCols, request.colIndex, request.count, 1)
+      shiftMergeRanges(state, request.sheetId, 'column', request.colIndex, request.count, 1)
+      shiftFreezeConfig(state, request.sheetId, 'column', request.colIndex, request.count, 1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },
@@ -3217,6 +3310,8 @@ export function createStaticSpreadsheetBackend(
         shiftHiddenIndexSet(hiddenCols, request.colIndex, request.count, -1)
         if (hiddenCols.size === 0) state.hiddenColsBySheetId.delete(request.sheetId)
       }
+      shiftMergeRanges(state, request.sheetId, 'column', request.colIndex, request.count, -1)
+      shiftFreezeConfig(state, request.sheetId, 'column', request.colIndex, request.count, -1)
       state.revision = bumpRevision(state.revision)
       return structuralMutationResult(request, state.revision)
     },

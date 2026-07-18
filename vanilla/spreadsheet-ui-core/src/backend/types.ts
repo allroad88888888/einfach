@@ -670,10 +670,40 @@ export interface UnmergeRangeRequest extends SheetRef {
   revision?: ProjectionRevision
 }
 
+/**
+ * Index-space displacement produced by a structural mutation
+ * (insert/delete rows or columns). Hosts use it to remap any view
+ * metadata they index by absolute row/column number (hidden sets,
+ * merge ranges, freeze counts, row heights / column widths) without
+ * refetching the whole sheet.
+ *
+ * Semantics (all indices are zero-based, pre-mutation coordinates):
+ * - `index` is the first affected row/column index on `axis`.
+ * - `kind: 'insert'` — `count` new indices now occupy
+ *   `[index, index + count)`; every pre-mutation index `>= index`
+ *   moved up by `count`.
+ * - `kind: 'delete'` — the pre-mutation indices `[index, index + count)`
+ *   were removed; every pre-mutation index `>= index + count` moved
+ *   down by `count`.
+ */
+export interface BackendStructuralShift {
+  axis: 'row' | 'column'
+  kind: 'insert' | 'delete'
+  index: number
+  count: number
+}
+
 export interface BackendMutationResult extends SheetRef {
   requestId?: ProjectionRequestId
   revision?: ProjectionRevision
   affectedRange?: CellRange
+  /**
+   * Present only when the mutation structurally displaced index space
+   * (insert/delete rows/columns). Optional and backward compatible:
+   * absence means "no displacement happened"; consumers must not
+   * infer anything else from a missing field.
+   */
+  structuralShift?: BackendStructuralShift
 }
 
 export interface SpreadsheetSheetMetadata {
